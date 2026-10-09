@@ -60,19 +60,22 @@ use crate::{
 /// cascade on a trending value column. The cascade is realized on disk
 /// (`weftseg::write_value_column_cascading` / `VAL_CODEC_DELTA_CASCADE`) but is a broad
 /// realized-bytes change, so it is opt-in and surfaced advisory-first (like FOR/f64 before
-/// adoption); the default `value_codec` is unchanged. v16 added
+/// adoption); the default `value_codec` is unchanged. v16 added the report's optional
+/// `metadata.engine` (whether the interpolation backends were calibrated, the GPU adapter, and
+/// `Backend::Auto`'s thresholds for the run). v17 added
 /// `storage.advisory_dfor_value_bytes` — the footprint of the **decimal-exponent FOR** value codec
 /// (each block factors out its common power of ten before FOR packing) when it beats the realized
 /// codec, the potential saving on a `ScaledI64` column whose scale is set by a few high-precision
-/// values. v17 added two timestamp-column advisories: `storage.advisory_common_multiple_timestamp_bytes`
+/// values. v18 added two timestamp-column advisories: `storage.advisory_common_multiple_timestamp_bytes`
 /// (the delta-of-delta column with the GCD of its deltas factored out, for instants stored at a
 /// finer unit than their precision) and `storage.advisory_delta_for_timestamp_bytes` (first-order
 /// deltas under per-block FOR, for independent random intervals), each present only when it
-/// beats the realized timestamp codec. v18 added the report's `metadata.work_disk_kind` /
+/// beats the realized timestamp codec. v19 added the report's `metadata.work_disk_kind` /
 /// `work_disk_file_system` / `work_disk_mount_point` (the disk under the working directory, so
-/// an HDD-backed run is distinguishable from a solid-state one). All optional fields are
+/// an HDD-backed run is distinguishable from a solid-state one). (v17–v19 were numbered v16–v18
+/// on the 2026-10-08 routine branch before it merged behind main's v16.) All optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -287,7 +290,7 @@ pub struct StorageEstimate {
 	/// high-precision values (real BTC closes: 13.58 vs 33.74 bits/value in
 	/// `weft-physical-type/benches/alp_vs_f64_codecs.rs`). `Some` only when it strictly beats
 	/// [`realized_value_bytes`](Self::realized_value_bytes); `None` otherwise, for a non-scaled
-	/// encoding, or on a pre-v16 artifact. Advisory: not yet a realized value codec (owner-gated).
+	/// encoding, or on a pre-v17 artifact. Advisory: not yet a realized value codec (owner-gated).
 	#[serde(default)]
 	pub advisory_dfor_value_bytes: Option<usize>,
 	/// **Advisory** timestamp-column footprint with the column's common multiple factored out
@@ -295,14 +298,14 @@ pub struct StorageEstimate {
 	/// It covers instants stored at a finer unit than their precision, such as millisecond
 	/// events in a microsecond column (20 → 10 bits/value in
 	/// `weft-physical-type/benches/timestamp_vs_pco.rs`). `Some` only when it strictly beats
-	/// [`timestamp_bytes`](Self::timestamp_bytes); `None` otherwise or on a pre-v17 artifact.
+	/// [`timestamp_bytes`](Self::timestamp_bytes); `None` otherwise or on a pre-v18 artifact.
 	#[serde(default)]
 	pub advisory_common_multiple_timestamp_bytes: Option<usize>,
 	/// **Advisory** timestamp-column footprint as first-order deltas under per-block FOR
 	/// ([`DeltaOfDeltaColumn::delta_for_estimated_bytes`](weft_physical_type::DeltaOfDeltaColumn::delta_for_estimated_bytes)).
 	/// It wins on independent random intervals, where delta-of-delta's stride assumption costs
 	/// about a bit per value. `Some` only when it strictly beats
-	/// [`timestamp_bytes`](Self::timestamp_bytes); `None` otherwise or on a pre-v17 artifact.
+	/// [`timestamp_bytes`](Self::timestamp_bytes); `None` otherwise or on a pre-v18 artifact.
 	#[serde(default)]
 	pub advisory_delta_for_timestamp_bytes: Option<usize>,
 }

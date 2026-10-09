@@ -1,4 +1,4 @@
-//! End-to-end read cost of the **transposed (`FastLanes`-layout) value codec** on disk vs the
+//! End-to-end read cost of the **bit-sliced (transposed) value codec** on disk vs the
 //! linear per-block codec it permutes — roadmap Phase 6.1, the "realize the transposed layout
 //! on disk" residue.
 //!
@@ -14,7 +14,7 @@
 //!
 //! - **full decode** (`read_segment`, the range-scan / downsample path),
 //! - **streaming point read** (`read_segment_point`, `GET …/storage/{aspect}/at`), where the
-//!   transposed layout must decode a whole 1024-lane tile to serve one value while the linear
+//!   transposed layout must decode a whole 1024-value tile to serve one value while the linear
 //!   codec decodes a 64-value block — the honest cost side of the trade,
 //! - **windowed range read** (`read_segment_range`, `GET …/points?start=&end=`).
 //! - **batch point read** (`read_segment_points`, `GET …/storage/{aspect}/at-multi`) in two
@@ -26,6 +26,9 @@
 //! transposed layout is byte-comparable and the policy's overhead ceiling admits it. On a
 //! clustered-high-base column FOR wins by a wide margin and the ceiling rejects the transposed
 //! layout — that case is not benchmarked because it is never written.
+//!
+//! Needs the `bitsliced-codec` feature (`cargo bench -p weft-physical-type --features
+//! bitsliced-codec --bench transposed_read`).
 
 use std::hint::black_box;
 

@@ -33,12 +33,17 @@
 
 pub mod backup_daemon;
 pub mod downsample;
+pub mod gpu;
+pub mod host_guard;
 pub mod interpolate;
 pub mod manage;
 pub mod metrics;
 pub mod reconcile_daemon;
 pub mod state;
 pub mod storage;
+pub mod store_open;
+#[cfg(test)]
+mod test_fs;
 pub mod trace;
 
 use axum::{
@@ -46,8 +51,9 @@ use axum::{
 };
 pub use backup_daemon::{backup_tick, list_generated_backups, prune_generated_backups, spawn_backup_daemon, BackupDaemonConfig};
 pub use downsample::{downsample, downsample_arrow, downsample_csv, downsample_ilp, downsample_ilp_arrow, downsample_ilp_csv, downsample_ilp_parquet, downsample_parquet, Aggregation, DownsampleRequest, DownsampleResponse};
-pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpolate_ilp, interpolate_ilp_arrow, interpolate_ilp_csv, interpolate_ilp_parquet, interpolate_parquet, interpolate_point, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse};
-pub use manage::{declare_aspect, ingest_csv, ingest_ilp, ingest_points, reconcile_aspect, reconcile_store, CsvIngestParams, DeclareAspectRequest, DeclareAspectResponse, IlpIngestParams, IngestPoint, IngestRequest, IngestResponse, ReconcileResponse, ReconcileStoreResponse};
+pub use host_guard::{HostGuard, ALLOW_ANY_HOST_ENV};
+pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpolate_ilp, interpolate_ilp_arrow, interpolate_ilp_csv, interpolate_ilp_parquet, interpolate_parquet, interpolate_point, InterpolateConfig, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse, MAX_INTERPOLATE_OUTPUT_POINTS, MAX_INTERPOLATE_POINTS_ENV};
+pub use manage::{declare_aspect, ingest_csv, ingest_ilp, ingest_points, reconcile_aspect, reconcile_store, CsvIngestParams, DeclareAspectRequest, DeclareAspectResponse, IlpIngestParams, IngestPoint, IngestRequest, IngestResponse, ReconcileResponse, ReconcileStoreResponse, SweepFailure};
 pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyHistogram, LatencyHistogramSnapshot, LatencyProfile, Metrics, MetricsSnapshot, ProfileReport, SharedMetrics};
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
 use serde::Serialize;
@@ -80,6 +86,7 @@ impl Default for HealthResponse {
 
 /// Response body for the readiness probe (`GET /ready`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[allow(clippy::struct_excessive_bools, reason = "a probe body is a set of independent flags that orchestrators and operators read by name")]
 pub struct ReadyResponse {
 	/// `true` once the service can accept traffic. The stateless API is always
 	/// ready; this gains further dependency checks as more of the control plane is
@@ -92,11 +99,30 @@ pub struct ReadyResponse {
 	/// Whether a segment store is configured — i.e. the storage-query endpoints
 	/// (`/api/v1/storage/...`) are live rather than answering `503`.
 	pub segment_store: bool,
+	/// Whether the segment store is write-poisoned: a control-plane COMMIT failed in a
+	/// way that may still have committed (not a conflict found while validating it), and
+	/// the store refuses every write until the server restarts. Reads keep working, so
+	/// `ready` stays `true`.
+	pub poisoned: bool,
+	/// Whether the server must be restarted to accept writes again. The restart's open
+	/// replays the control plane's log, which settles the ambiguous commit.
+	pub restart_required: bool,
+	/// Why the store is poisoned, while it is.
+	pub poison_reason: Option<String>,
 }
 
 impl Default for ReadyResponse {
 	fn default() -> Self {
-		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false }
+		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false, poisoned: false, restart_required: false, poison_reason: None }
+	}
+}
+
+impl ReadyResponse {
+	/// This response with the store's write poison, if it has one, reported.
+	#[must_use]
+	pub fn with_poison(self, poison: Option<weftdb::Poisoned>) -> Self {
+		let poisoned = poison.is_some();
+		Self { poisoned, restart_required: poisoned, poison_reason: poison.map(|p| p.reason), ..self }
 	}
 }
 
@@ -118,10 +144,11 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// Build the application router over a fully-formed [`AppState`].
 ///
 /// This is the single place routes are registered. The state carries the metrics
-/// handle (projected to the capability handlers via [`axum::extract::FromRef`])
-/// and an optional segment store backing the storage-query endpoints.
+/// handle (projected to the capability handlers via [`axum::extract::FromRef`]),
+/// an optional segment store backing the storage-query endpoints, and the request
+/// guard ([`host_guard`]) applied to every route, inside the per-request trace span.
 pub fn app_with_state(state: AppState) -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/debug/profile/current", get(metrics::profile_current)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/csv", post(interpolate_csv)).route("/api/v1/interpolate/arrow", post(interpolate_arrow)).route("/api/v1/interpolate/parquet", post(interpolate_parquet)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/ilp/csv", post(interpolate_ilp_csv)).route("/api/v1/interpolate/ilp/arrow", post(interpolate_ilp_arrow)).route("/api/v1/interpolate/ilp/parquet", post(interpolate_ilp_parquet)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/csv", post(downsample_csv)).route("/api/v1/downsample/arrow", post(downsample_arrow)).route("/api/v1/downsample/parquet", post(downsample_parquet)).route("/api/v1/downsample/ilp", post(downsample_ilp)).route("/api/v1/downsample/ilp/csv", post(downsample_ilp_csv)).route("/api/v1/downsample/ilp/arrow", post(downsample_ilp_arrow)).route("/api/v1/downsample/ilp/parquet", post(downsample_ilp_parquet)).route("/api/v1/storage/aspects", get(storage_aspects).post(manage::declare_aspect)).route("/api/v1/storage/catalog", get(storage_catalog)).route("/api/v1/storage/stats", get(storage_stats)).route("/api/v1/storage/reconcile", post(manage::reconcile_store)).route("/api/v1/storage/backup", post(manage::backup_store)).route("/api/v1/storage/restore/drill", post(manage::restore_drill)).route("/api/v1/storage/{aspect}/range", get(storage_time_range)).route("/api/v1/storage/{aspect}/range.parquet", get(storage_time_range_parquet)).route("/api/v1/storage/{aspect}/range.csv", get(storage_time_range_csv)).route("/api/v1/storage/{aspect}/points", get(storage_time_range_json).post(manage::ingest_points)).route("/api/v1/storage/{aspect}/downsample", get(storage_downsample).post(storage_downsample)).route("/api/v1/storage/{aspect}/downsample.csv", get(storage_downsample_csv).post(storage_downsample_csv)).route("/api/v1/storage/{aspect}/downsample.arrow", get(storage_downsample_arrow).post(storage_downsample_arrow)).route("/api/v1/storage/{aspect}/downsample.parquet", get(storage_downsample_parquet).post(storage_downsample_parquet)).route("/api/v1/storage/{aspect}/at", get(storage_point)).route("/api/v1/storage/{aspect}/at-multi", get(storage_points)).route("/api/v1/storage/{aspect}/reconcile", post(manage::reconcile_aspect)).route("/api/v1/storage/{aspect}/squash", post(manage::squash_aspect)).route("/api/v1/storage/{aspect}/compact", post(manage::compact_aspect)).route("/api/v1/storage/{aspect}/ilp", post(manage::ingest_ilp)).route("/api/v1/storage/{aspect}/csv", post(manage::ingest_csv)).route("/api/v1/storage/{aspect}/value-range", get(storage_value_range)).route("/api/v1/storage/{aspect}/value-range.parquet", get(storage_value_range_parquet)).route("/api/v1/storage/{aspect}/value-range.csv", get(storage_value_range_csv)).route("/api/v1/storage/{aspect}/value-points", get(storage_value_range_json)).route("/api/v1/storage/{aspect}/parquet", post(storage_ingest_parquet)).route("/api/v1/storage/{aspect}/stats", get(storage_aspect_stats)).route("/api/v1/storage/{aspect}/schema", get(storage_aspect_schema)).layer(middleware::from_fn(trace::request_span)).with_state(state)
+	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/debug/profile/current", get(metrics::profile_current)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/csv", post(interpolate_csv)).route("/api/v1/interpolate/arrow", post(interpolate_arrow)).route("/api/v1/interpolate/parquet", post(interpolate_parquet)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/ilp/csv", post(interpolate_ilp_csv)).route("/api/v1/interpolate/ilp/arrow", post(interpolate_ilp_arrow)).route("/api/v1/interpolate/ilp/parquet", post(interpolate_ilp_parquet)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/csv", post(downsample_csv)).route("/api/v1/downsample/arrow", post(downsample_arrow)).route("/api/v1/downsample/parquet", post(downsample_parquet)).route("/api/v1/downsample/ilp", post(downsample_ilp)).route("/api/v1/downsample/ilp/csv", post(downsample_ilp_csv)).route("/api/v1/downsample/ilp/arrow", post(downsample_ilp_arrow)).route("/api/v1/downsample/ilp/parquet", post(downsample_ilp_parquet)).route("/api/v1/storage/aspects", get(storage_aspects).post(manage::declare_aspect)).route("/api/v1/storage/catalog", get(storage_catalog)).route("/api/v1/storage/stats", get(storage_stats)).route("/api/v1/storage/reconcile", post(manage::reconcile_store)).route("/api/v1/storage/backup", post(manage::backup_store)).route("/api/v1/storage/restore/drill", post(manage::restore_drill)).route("/api/v1/storage/{aspect}/range", get(storage_time_range)).route("/api/v1/storage/{aspect}/range.parquet", get(storage_time_range_parquet)).route("/api/v1/storage/{aspect}/range.csv", get(storage_time_range_csv)).route("/api/v1/storage/{aspect}/points", get(storage_time_range_json).post(manage::ingest_points)).route("/api/v1/storage/{aspect}/downsample", get(storage_downsample).post(storage_downsample)).route("/api/v1/storage/{aspect}/downsample.csv", get(storage_downsample_csv).post(storage_downsample_csv)).route("/api/v1/storage/{aspect}/downsample.arrow", get(storage_downsample_arrow).post(storage_downsample_arrow)).route("/api/v1/storage/{aspect}/downsample.parquet", get(storage_downsample_parquet).post(storage_downsample_parquet)).route("/api/v1/storage/{aspect}/at", get(storage_point)).route("/api/v1/storage/{aspect}/at-multi", get(storage_points)).route("/api/v1/storage/{aspect}/reconcile", post(manage::reconcile_aspect)).route("/api/v1/storage/{aspect}/squash", post(manage::squash_aspect)).route("/api/v1/storage/{aspect}/compact", post(manage::compact_aspect)).route("/api/v1/storage/{aspect}/ilp", post(manage::ingest_ilp)).route("/api/v1/storage/{aspect}/csv", post(manage::ingest_csv)).route("/api/v1/storage/{aspect}/value-range", get(storage_value_range)).route("/api/v1/storage/{aspect}/value-range.parquet", get(storage_value_range_parquet)).route("/api/v1/storage/{aspect}/value-range.csv", get(storage_value_range_csv)).route("/api/v1/storage/{aspect}/value-points", get(storage_value_range_json)).route("/api/v1/storage/{aspect}/parquet", post(storage_ingest_parquet)).route("/api/v1/storage/{aspect}/stats", get(storage_aspect_stats)).route("/api/v1/storage/{aspect}/schema", get(storage_aspect_schema)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(trace::request_span)).with_state(state)
 }
 
 /// Liveness probe: the process is up and can serve a request.
@@ -131,9 +158,10 @@ async fn health() -> Json<HealthResponse> {
 
 /// Readiness probe: the service is ready to accept traffic. Reports whether a
 /// segment store is configured so an operator can confirm the storage endpoints
-/// are live.
+/// are live, and whether that store is write-poisoned and needs a restart.
 async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> Json<ReadyResponse> {
-	Json(ReadyResponse { segment_store: state.store().is_some(), ..ReadyResponse::default() })
+	let poison = state.store().and_then(|store| store.poisoned());
+	Json(ReadyResponse { segment_store: state.store().is_some(), ..ReadyResponse::default() }.with_poison(poison))
 }
 
 #[cfg(test)]
@@ -171,6 +199,24 @@ mod tests {
 		assert_eq!(body["version"], VERSION);
 		// The default router has no segment store, so the storage endpoints are off.
 		assert_eq!(body["segment_store"], false);
+		// No store, so nothing to poison.
+		assert_eq!(body["poisoned"], false);
+		assert_eq!(body["restart_required"], false);
+		assert_eq!(body["poison_reason"], serde_json::Value::Null);
+	}
+
+	/// A poisoned store is reported as poisoned and needing a restart, with the reason,
+	/// and the service stays ready: reads keep working.
+	#[test]
+	fn ready_reports_a_poisoned_store() {
+		let reason = "segment_index transaction failed with an ambiguous COMMIT: COMMIT: I/O error (Other): sync".to_string();
+		let ready = ReadyResponse { segment_store: true, ..ReadyResponse::default() }.with_poison(Some(weftdb::Poisoned { reason: reason.clone() }));
+		let body = serde_json::to_value(&ready).unwrap();
+		assert_eq!(body["ready"], true);
+		assert_eq!(body["poisoned"], true);
+		assert_eq!(body["restart_required"], true);
+		assert_eq!(body["poison_reason"], reason);
+		assert_eq!(ReadyResponse::default().with_poison(None), ReadyResponse::default(), "no poison changes nothing");
 	}
 
 	#[tokio::test]
@@ -190,6 +236,10 @@ mod tests {
 		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 		// With a store attached, readiness advertises the storage endpoints as live.
 		assert_eq!(body["segment_store"], true);
+		// A freshly opened store is not poisoned.
+		assert_eq!(body["poisoned"], false);
+		assert_eq!(body["restart_required"], false);
+		assert_eq!(body["poison_reason"], serde_json::Value::Null);
 	}
 
 	#[tokio::test]

@@ -21,9 +21,11 @@ You need **Rust 1.95 or newer** on stable. The one exception is formatting:
 cargo +nightly fmt --all
 ```
 
-A GPU is optional. Without a `wgpu` backend the engine falls back to SIMD/parallel CPU,
-and the test suite is expected to pass either way — if a test only passes with a GPU,
-that's a bug in the test.
+A GPU is optional. The engine (splimes 1.0) runs on one CPU thread or the rayon pool,
+by grid size, and uses the GPU only after `splimes::calibrate()` has started it and
+measured where it is faster (`weft-server` calibrates at startup; the tests don't).
+Without a `wgpu` backend everything runs on the CPU, and the test suite is expected to
+pass either way — if a test only passes with a GPU, that's a bug in the test.
 
 ## What CI checks
 
@@ -35,6 +37,8 @@ that's a bug in the test.
 | `test` | `cargo test --workspace -- --test-threads=4` on Linux, macOS and Windows |
 | `docs` | `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS=-D warnings` |
 | `package` | `cargo package --workspace --no-verify` |
+| `contrib` | `python3 -m unittest discover -s scripts/contrib -p 'test_*.py'` (tests for the contribution-terms checker) |
+| `contribution-terms` | a DCO sign-off on every commit, or a signed CLA ([below](#contribution-terms)); a separate workflow, `contribution-terms.yml` |
 
 Two notes on the gates:
 
@@ -60,8 +64,141 @@ hard constraints. Two of those constraints shape most reviews:
   `weft-arrow`, and `weft-arrow-store` is the only crate allowed to depend on both
   `weftdb` and `weft-arrow`.
 
+## Contribution terms
+
+WeftDB is licensed under either of the Apache License 2.0 or the MIT license, at your
+option. Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed
+as above (`MIT OR Apache-2.0`), without any additional terms or conditions.
+
+Every pull request also takes one of two routes. Pick whichever suits you; one is enough.
+
+### Route 1: sign off every commit (DCO)
+
+Commit with `git commit -s`, which adds a line like this to the message:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+By signing off you certify the [Developer Certificate of Origin 1.1](https://developercertificate.org):
+that you wrote the change or otherwise have the right to submit it under the project's
+open-source license (for example because it builds on suitably licensed earlier work, or
+came to you from someone who certified the same), and that you understand the contribution
+and the record of it, including the name and email in your sign-off, are public and kept
+indefinitely. The full text is short; read it before you sign off for the first time.
+
+The email in the sign-off must be the commit's author email (`git config user.email`);
+case does not matter. Merge commits need a sign-off too (`git merge --signoff`), since a
+merge can carry changes of its own. The exception is a merge a person makes in GitHub's web
+UI, such as the one from the **Update branch** button. A pull request needs at least one
+commit of its own, besides such merges, to pass this way.
+
+A commit made by a bot account, for example by a workflow in your fork that commits as
+`github-actions[bot]`, cannot pass this way, sign-off or not: a bot cannot certify the DCO.
+Squash or recommit such changes as your own signed-off commits.
+
+### Route 2: sign the CLA once
+
+Sign the [WeftDB Individual Contributor License Agreement](CLA.md) by posting this comment
+on your pull request:
+
+```text
+I have read the CLA Document and I hereby sign the CLA
+```
+
+The CLA is the Apache Software Foundation's individual CLA with Justin Icenhour as the
+recipient. You grant him, and everyone who receives WeftDB from him, a copyright license
+(including the right to sublicense) and a patent license for your contributions, and you
+confirm that you have the right to make them. You sign once, and it covers your later pull
+requests too. The signature is recorded against your GitHub account, so your commits must
+be linked to it: add their author email to your GitHub account. What you sign is version 1
+as fixed at the [`cla-v1` tag](https://github.com/basic-automation/weftdb/blob/cla-v1/CLA.md).
+
+The bot that records signatures has three limits:
+
+- It reads only the first 30 comments on a pull request. On a longer thread, post the
+  signing comment on a fresh pull request instead.
+- It reads only the first 100 commits, so a longer pull request has to take the DCO route
+  or be split.
+- It records a signature only on a pull request where the DCO route does not hold.
+
+### How the check decides
+
+The `contribution-terms` check passes when every commit is signed off by its author, and
+otherwise when every commit author has signed the CLA. The routes do not combine per
+commit: if some commits rely on a sign-off and others on the CLA, every author still needs
+the CLA, or every commit needs a sign-off.
+
+Commenting `recheck` re-runs the CLA step; once every author has signed, the bot re-runs
+the pull request's check. To re-run the DCO check, push (for example after
+`git rebase --signoff`), or close and reopen the pull request. If the check does not update
+after you sign the CLA, push a commit or ask a maintainer to re-run the workflow.
+
+### Fixing a missing sign-off
+
+```bash
+# Only the last commit:
+git commit --amend --signoff --no-edit
+
+# Every commit on your branch (use upstream/main if you work from a fork):
+git rebase --signoff main
+git push --force-with-lease
+```
+
+If the author email is wrong as well, set `git config user.email` first, then rewrite the
+author and the sign-off together:
+`git rebase --exec 'git commit --amend --no-edit --reset-author --signoff' main`.
+
+### For maintainers
+
+- Branch protection requires the **`contribution-terms`** job of
+  `.github/workflows/contribution-terms.yml`, and only that job. `DCO sign-off` and `CLA`
+  feed it; `CLA` is skipped whenever the DCO route holds.
+- Before requiring it, create the `cla-signatures` branch holding
+  `signatures/cla/v1.json` and leave the branch unprotected, since the workflow commits
+  signatures to it. Tag the main commit that carries CLA.md version 1 as `cla-v1` and
+  protect the tag with a ruleset; the CLA comments link to it. The workflow's header has the
+  commands.
+- `physics515`, `dependabot[bot]` and `github-actions[bot]` are allowlisted. When an
+  allowlisted account opens a pull request whose head branch is in this repository or in
+  that account's own fork, the pull request passes without either route, and that account
+  answers for the terms of any commits in it that are not its own. When you open a pull
+  request from someone else's fork, for example to take over an abandoned one, it is
+  checked commit by commit, because the fork's owner can keep pushing to it.
+- In anyone else's pull request, only your own commits are exempt per commit, and only when
+  GitHub verified their signature as you, as both author and committer. GitHub links a
+  commit to an account by its email alone, so anyone can make a commit look like yours.
+  When you push to a contributor's branch, sign off (`git commit -s`) or sign your commits.
+  Web-based commits, such as **Commit suggestion**, are committed by GitHub rather than by
+  you and so need a sign-off: write one into the commit message, or turn on the repository
+  setting that requires sign-off on web-based commits.
+- The bots get no per-commit exemption. Any workflow, in anyone's fork, can make GitHub
+  sign a commit as `github-actions[bot]`, so "verified" proves nothing for a bot. A commit
+  authored or committed by a bot account fails the DCO route even with a sign-off.
+- A merge a person made in GitHub's web UI (user-authored, committed by `web-flow`,
+  verified) needs no sign-off, and that includes a merge made by resolving conflicts in
+  GitHub's web editor, which can carry the resolver's own edits. Review such a merge like
+  any other change. A merge a GitHub App made through the API is authored by its bot
+  account and gets no exemption.
+- The CLA bot's own allowlist matches a name the committer chooses, and the bot always
+  skips `github-actions[bot]`. So the check refuses the CLA route when the bot would skip a
+  commit that fails the DCO route; the `DCO sign-off` job's summary lists such commits.
+- Both routes attest commit metadata, not identity. Anyone can write another person's
+  sign-off, or set a CLA signer's email as their commit author email, and the CLA bot then
+  counts that signer's signature. The check is a record of the terms each commit claims,
+  not authentication of who wrote it; weigh an unfamiliar contributor's claims accordingly.
+- The check re-runs when a pull request is edited, including when its base branch changes,
+  so a result collected against another branch's copy of the workflow does not stand. It
+  also fails if the pull request's head or commit count changed while it ran; the newer run
+  decides.
+- Comment-triggered runs report their checks on main's latest commit, not the pull request,
+  and the `contribution-terms` gate does not run in them. Read the result on the pull
+  request.
+
 ## Pull requests
 
+- Sign off your commits or sign the CLA; see [Contribution terms](#contribution-terms).
 - One logical change per commit; keep mechanical churn (renames, reformatting) in
   commits of its own.
 - Add a `CHANGELOG.md` entry under `## [Unreleased]` for anything user-visible.

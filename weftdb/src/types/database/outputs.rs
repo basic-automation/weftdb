@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
-use splimes::{Point, Resolution, Spline};
+use splimes::{Interpolator, Point, Resolution, Spline};
 use uuid::Uuid;
 
 use crate::{
 	cache::{self}, correlation::ErrorRate, types::{
-		database::traits::{aspect_structure::AspectStructure, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, error::is_transient_mvcc_error
-	}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, VariablilityType
+		database::traits::{aspect_structure::AspectStructure, config::Config, connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure}, error::is_transient_mvcc_error
+	}, AnalysisResult, AspectId, Batch, BatchId, BatchMetatdata, BatchedMeasurement, Correlation, CorrelationID, Database, DatabaseInfo, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, Manifestation, ManifestationId, Measurement, MeasurementId, Occurrence, Pattern, PatternID, Relative, SignalType, Steps, SubjectId, UnbatchedEntry, Variability, VariablilityType
 };
 
 /// Maximum retries for transient MVCC errors during concurrent compression
@@ -60,6 +60,32 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		Self::commit_concurrent(&conn).await?;
 		Ok(timestamps)
+	}
+
+	/// Get every unbatched queue entry for an aspect, with its `queued_at`
+	async fn get_unbatched_entries(&self, aspect_id: &AspectId) -> Result<Vec<UnbatchedEntry>> {
+		let db = self.metadata();
+		let db_path = self.metadata_path();
+		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
+
+		let sql = r"
+			SELECT data_timestamp, queued_at FROM unbatched_measurements
+			WHERE aspect_id = ?
+			ORDER BY queued_at ASC
+		";
+
+		let mut rows = conn.as_ref().query(sql, turso::params![aspect_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query unbatched measurements: {e}")))?;
+
+		let mut entries = Vec::new();
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get unbatched row: {e}")))? {
+			let ts_millis: i64 = row.get(0).map_err(|e| Error::DatabaseError(format!("Failed to get timestamp: {e}")))?;
+			let queued_at: i64 = row.get(1).map_err(|e| Error::DatabaseError(format!("Failed to get queued_at: {e}")))?;
+			let data_timestamp = DateTime::from_timestamp_millis(ts_millis).ok_or_else(|| Error::DatabaseError("Invalid timestamp".to_string()))?;
+			entries.push(UnbatchedEntry { data_timestamp, queued_at });
+		}
+
+		Self::commit_concurrent(&conn).await?;
+		Ok(entries)
 	}
 
 	/// Count unbatched measurements for an aspect
@@ -239,18 +265,13 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			return Ok(Point { timestamp: cached_result.timestamp(), value: cached_result.value().clone() });
 		}
 
-		// Determine minimum points needed for this interpolation method
-		let min_points_needed = match method {
-			Spline::Linear => 2,
-			Spline::Quadratic => 3,
-			Spline::Cubic => 4,
-			Spline::Polynomial(degree, _) => degree + 1,
-		};
+		// Determine minimum points needed for this interpolation method (its degree + 1)
+		let min_points_needed = method.min_points();
 
 		// Get measurements efficiently using pagination with time range optimization
 		// For point analysis, fetch data around the target time for better efficiency
 		// Start with a reasonable window and expand if needed
-		let base_window = resolution.to_step() * 100;
+		let base_window = resolution.step() * 100;
 		let initial_page_size = 10_000;
 		let mut all_measurements = Vec::new();
 		let mut found_target_range = false;
@@ -334,15 +355,15 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		all_measurements.sort_by_key(|m: &Measurement| m.timestamp());
 
 		// Convert to Points for splimes
-		let mut points: Vec<Point> = all_measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
+		let points: Vec<Point> = all_measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
 
-		// Use splimes::auto_interpolate which handles both interpolation and extrapolation
-		// We just need a single point, so set end_time slightly after our target
-		let end_time = time + resolution.to_step();
-		let interpolated = splimes::auto_interpolate(&mut points, time, end_time, *resolution, *method).await?;
+		// splimes handles both interpolation and extrapolation. We need a single point, and a
+		// grid with `start == end` is exactly that one instant. splimes is synchronous and
+		// CPU-bound, so it runs on tokio's blocking pool rather than this async task.
+		let interpolated = Interpolator::new(*method, *resolution).run_async(points, time, time).await?;
 
-		// Get the interpolated point (should be the first and likely only point)
-		let point = interpolated.into_iter().next().unwrap_or_else(|| Point { timestamp: time, value: BigDecimal::zero() });
+		// Get the interpolated point (the grid's only point)
+		let point = interpolated.into_points().into_iter().next().unwrap_or_else(|| Point { timestamp: time, value: BigDecimal::zero() });
 
 		// Cache the result
 		let method_description = if all_measurements.len() == 1 {
@@ -379,18 +400,13 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		// Calculate chunk parameters
 		let total_duration = end - start;
-		let step_duration = resolution.to_step();
+		let step_duration = resolution.step();
 		let total_ns = total_duration.num_nanoseconds().unwrap_or(i64::MAX);
 		let step_ns = step_duration.num_nanoseconds().unwrap_or(1);
 		let expected_points = if step_ns > 0 { (total_ns / step_ns) + 1 } else { 1 };
 
-		// Calculate overlap needed for interpolation method
-		let overlap_points = match method {
-			Spline::Linear => 1,
-			Spline::Quadratic => 2,
-			Spline::Cubic => 3,
-			Spline::Polynomial(d, _) => d,
-		};
+		// Calculate overlap needed for interpolation method (its degree)
+		let overlap_points = method.degree();
 		let overlap_duration = step_duration * i32::try_from(overlap_points).unwrap_or(3);
 
 		// Target ~50,000 output points per chunk for responsive streaming
@@ -462,7 +478,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				}
 
 				// Convert to points
-				let mut points: Vec<Point> = measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
+				let points: Vec<Point> = measurements.iter().map(|m| Point { timestamp: m.timestamp(), value: m.value().clone() }).collect();
 
 				// Adjust effective end to not extrapolate beyond actual data
 				let actual_data_end = points.iter().map(|p| p.timestamp).max().unwrap_or(chunk_end);
@@ -470,11 +486,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 				// That clamp can COLLAPSE the range. The chunk fetch is inclusive at both
 				// ends, so a chunk whose only visible measurement sits exactly at (or before)
-				// `current_chunk_start` clamps the end back onto the start — and
-				// `auto_interpolate` rejects `start >= end` with "Invalid time range: start
-				// time must be before end time", failing the whole stream. The
-				// `measurements.is_empty()` guard above does not catch this, because the
-				// chunk is not empty; its data is simply all at or behind the start.
+				// `current_chunk_start` clamps the end back onto (or behind) the start — and
+				// splimes rejects `start > end` with `Error::InvalidTimeRange`, failing the
+				// whole stream. The `measurements.is_empty()` guard above does not catch this,
+				// because the chunk is not empty; its data is simply all at or behind the start.
 				//
 				// A zero-width window has exactly one sensible answer — the last known value
 				// at the start instant — so emit that and advance, mirroring the empty-chunk
@@ -487,11 +502,12 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 					return Some((Ok(Point { timestamp: current_chunk_start, value }), (chunk_end, None, is_last_chunk)));
 				}
 
-				// Interpolate this chunk
-				match splimes::auto_interpolate(&mut points, current_chunk_start, effective_chunk_end, resolution_val, method_val).await {
+				// Interpolate this chunk, on tokio's blocking pool: splimes is synchronous and
+				// CPU-bound, and a chunk can be tens of thousands of grid points.
+				match Interpolator::new(method_val, resolution_val).run_async(points, current_chunk_start, effective_chunk_end).await {
 					Ok(interpolated) => {
 						let is_last_chunk = chunk_end >= end_time;
-						let mut new_iter = interpolated.into_iter();
+						let mut new_iter = interpolated.into_points().into_iter();
 
 						// Return first point and set up iterator for the rest
 						match new_iter.next() {
@@ -505,7 +521,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 							}
 						}
 					}
-					Err(e) => Some((Err(e), (chunk_end, None, true))),
+					Err(e) => Some((Err(e.into()), (chunk_end, None, true))),
 				}
 			}
 		});
@@ -750,111 +766,67 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 	//
 
 	async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>> {
-		// Check cache first
-		let cache_key = format!("dictionary_metadata_{dictionary_name}");
-		if let Some(metadata) = self.cache.lock().await.get::<DictionaryMetadata>(&cache_key).await {
-			return Ok(Some(metadata));
-		}
-
-		// Get from database
-		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
-		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
-		let query_sql = r"
-                        SELECT id, name, description, created_at, updated_at
-                        FROM dictionary_metadata 
-                        WHERE name = ?
-                ";
-
-		let mut metadata_rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary metadata: {e}")))?;
-		if let Some(row) = metadata_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get metadata row: {e}")))? {
-			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
-			let name_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
-			let description_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
-			let created_at_millis: i64 = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Created at is not integer".to_string()))?;
-			let updated_at_millis: i64 = *row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Updated at is not integer".to_string()))?;
-
-			let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
-			let _created_at = DateTime::from_timestamp_millis(created_at_millis).ok_or_else(|| Error::DatabaseError("Invalid created at timestamp".to_string()))?;
-			let _updated_at = DateTime::from_timestamp_millis(updated_at_millis).ok_or_else(|| Error::DatabaseError("Invalid updated at timestamp".to_string()))?;
-
-			let constraint_query_sql = r"
-                                SELECT steps_count, steps_interpolation
-                                FROM dictionary_constraints
-                                WHERE dictionary_id = ?
-                        "
-			.to_string();
-
-			let mut constraint_rows: turso::Rows = conn.as_ref().query(&constraint_query_sql, turso::params![id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary constraints: {e}")))?;
-			let result = if let Some(constraint_row) = constraint_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get constraint row: {e}")))? {
-				let steps_count_str = constraint_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Steps count is not text".to_string()))?.clone();
-				let steps_interpolation_str = constraint_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Steps interpolation is not text".to_string()))?.clone();
-
-				// Parse steps configuration
-				let steps: Option<Steps> = if steps_count_str.is_empty() || steps_count_str == "null" {
-					None
-				} else {
-					let count: usize = steps_count_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid steps count format: {e}")))?;
-					let interpolation: Spline = steps_interpolation_str.parse().map_err(|e| Error::DatabaseError(format!("Invalid interpolation format: {e}")))?;
-					Some(Steps::new(count, interpolation))
-				};
-
-				// Parse variabilities - try to get from a separate query or use None
-				let variabilities: Option<Vec<VariablilityType>> = None;
-
-				let constraints = DictionaryConstraints::new(steps, variabilities);
-
-				let metadata = DictionaryMetadata { id, name: name_str, description: description_str, constraints };
-
-				// Cache the metadata
-				self.cache.lock().await.store(&cache_key, metadata.clone()).await;
-
-				Some(metadata)
-			} else {
-				None
-			};
-			Self::commit_concurrent(&conn).await?;
-			Ok(result)
-		} else {
-			Self::commit_concurrent(&conn).await?;
-			Ok(None)
-		}
+		self.dictionary_registration(aspect_id, dictionary_name).await?.transpose()
 	}
 
 	async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>> {
-		// Check cache first
-		let cache_key = format!("dictionaries_list_{}", aspect_id.as_uuid());
-		if let Some(dictionaries) = self.cache.lock().await.get::<Vec<DictionaryMetadata>>(&cache_key).await {
-			return Ok(dictionaries);
+		// Each dictionary is its own `<aspect>/dictionaries/<name>.db`, so the aspect's
+		// dictionaries are the `.db` files there. (This read one dictionary's database, the
+		// one named "default", and failed for an aspect without it.) Not cached: a
+		// dictionary created through `Aspect::new_dictionary` could not invalidate it, and
+		// each dictionary's metadata is cached by `get_dictionary_metadata`.
+		let aspect = self.get_aspect(aspect_id).await?;
+		let dictionaries_path = Self::aspect_dictionaries_path(&self.name, aspect.subject_name(), aspect.name());
+		let mut entries = match tokio::fs::read_dir(&dictionaries_path).await {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(e) => return Err(Error::DatabaseError(format!("Failed to read dictionaries directory '{dictionaries_path}': {e}")).into()),
+		};
+		let mut names = Vec::new();
+		while let Some(entry) = entries.next_entry().await.map_err(|e| Error::DatabaseError(format!("Failed to read dictionaries directory '{dictionaries_path}': {e}")))? {
+			// `<name>.db` only, not Turso's `<name>.db-wal` and `<name>.db-log` beside it.
+			let path = entry.path();
+			if !path.extension().is_some_and(|ext| ext == "db") {
+				continue;
+			}
+			// A regular file only. Reading a dictionary opens its file, which sets its journal
+			// mode and can create its tables, so a symlink (to anywhere), a directory or a
+			// device named `*.db` is skipped: `symlink_metadata` does not follow the link.
+			match tokio::fs::symlink_metadata(&path).await {
+				Ok(metadata) if metadata.file_type().is_file() => {}
+				Ok(_) => {
+					tracing::warn!(path = %path.display(), "Skipping an entry in the dictionaries directory that is not a regular file");
+					continue;
+				}
+				Err(e) => {
+					tracing::warn!(error = %e, path = %path.display(), "Skipping an entry in the dictionaries directory that cannot be inspected");
+					continue;
+				}
+			}
+			if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
+				// No dictionary operation accepts a name that fails validation, so such a
+				// file (`.backup.db`, `CON.db`) is not one of the aspect's dictionaries.
+				match crate::dictionary_name::validate(name) {
+					Ok(()) => names.push(name.to_string()),
+					Err(e) => tracing::warn!(error = %e, path = %path.display(), "Skipping a file in the dictionaries directory whose name is not a dictionary name"),
+				}
+			}
 		}
+		names.sort_unstable();
 
-		// Get from database
-		let db = self.get_dictionary_db(aspect_id, "default").await?;
-		let conn: cache::Connection = Self::begin_concurrent(&db, "default", Some(self.cache.clone())).await?;
-		let query_sql = r"
-                        SELECT id, name, description, created_at, updated_at
-                        FROM dictionary_metadata
-                ";
-
-		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionaries: {e}")))?;
-		let mut dictionaries: Vec<DictionaryMetadata> = Vec::new();
-
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get dictionary row: {e}")))? {
-			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone();
-			let name_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
-			let description_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
-			let created_at_millis: i64 = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Created at is not integer".to_string()))?;
-			let updated_at_millis: i64 = *row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Updated at is not integer".to_string()))?;
-
-			let id = DictionaryId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
-			let _created_at = DateTime::from_timestamp_millis(created_at_millis).ok_or_else(|| Error::DatabaseError("Invalid created at timestamp".to_string()))?;
-			let _updated_at = DateTime::from_timestamp_millis(updated_at_millis).ok_or_else(|| Error::DatabaseError("Invalid updated at timestamp".to_string()))?;
-
-			let metadata = DictionaryMetadata { id, name: name_str, description: description_str, constraints: DictionaryConstraints::default() };
-
-			dictionaries.push(metadata);
+		// A file with no complete registration (see `read_dictionary_registration`) is not
+		// listed. Nor is one whose stored registration does not parse, such as a step method
+		// splimes rejects: it is logged, and the readable dictionaries are still listed
+		// (`get_dictionary_metadata` reports its error). A read that fails (a query, I/O, an
+		// MVCC conflict) fails the listing, so that a shorter list never just means absent.
+		let mut dictionaries = Vec::with_capacity(names.len());
+		for name in names {
+			match self.dictionary_registration(aspect_id, &name).await? {
+				Some(Ok(metadata)) => dictionaries.push(metadata),
+				Some(Err(e)) => tracing::warn!(error = %e, dictionary = %name, aspect = %aspect_id, "Skipping a dictionary whose stored registration does not parse"),
+				None => {}
+			}
 		}
-		Self::commit_concurrent(&conn).await?;
-		self.cache.lock().await.store(&cache_key, dictionaries.clone()).await;
 		Ok(dictionaries)
 	}
 
@@ -1625,5 +1597,263 @@ impl Database {
 		let value = BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid value format: {e}")))?;
 
 		Ok(Measurement::new(id, dataset_id, timestamp, value))
+	}
+
+	/// The key `get_dictionary_metadata` caches a dictionary's metadata under, which
+	/// `set_dictionary_metadata` invalidates. Dictionary names are per aspect, so it has both.
+	pub(crate) fn dictionary_metadata_cache_key(aspect_id: &AspectId, dictionary_name: &str) -> String {
+		format!("dictionary_metadata_{}_{dictionary_name}", aspect_id.as_uuid())
+	}
+
+	/// [`get_dictionary_metadata`](crate::database::traits::Outputs::get_dictionary_metadata),
+	/// with a registration whose stored values do not parse as `Some(Err(…))` instead of an
+	/// error: [`list_dictionaries`](crate::database::traits::Outputs::list_dictionaries)
+	/// skips such a dictionary, but fails on a read that failed.
+	///
+	/// A registration that was read is cached (see `get_dictionary_metadata`), and only if
+	/// no write on this `Database` invalidated its entry since the read began: the cache
+	/// generation is taken before the read's snapshot. Only `DatabaseCache`'s
+	/// `store_if_generation` is tested for that; the interleaving inside this method, a
+	/// replacing commit between the snapshot and the store, has no deterministic test.
+	///
+	/// # Errors
+	///
+	/// An [`InvalidDictionaryName`](crate::InvalidDictionaryName), an unknown aspect, or a
+	/// failed read: I/O, a query, or an MVCC conflict.
+	async fn dictionary_registration(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<StoredRegistration>> {
+		// Check cache first. Keyed by aspect too: dictionary names are per aspect.
+		let cache_key = Self::dictionary_metadata_cache_key(aspect_id, dictionary_name);
+		if let Some(metadata) = self.cache.lock().await.get::<DictionaryMetadata>(&cache_key).await {
+			return Ok(Some(Ok(metadata)));
+		}
+
+		// Each dictionary is its own database file. Without one nothing is registered under
+		// this name, so the answer is `None` (on which `load_dictionary` registers the
+		// dictionary), not the error `get_dictionary_db` gives for a missing file.
+		let aspect = self.get_aspect(aspect_id).await?;
+		let db_path = Self::aspect_dictionaries_db_path(&self.name, aspect.subject_name(), aspect.name(), dictionary_name)?;
+		if !tokio::fs::try_exists(&db_path).await? {
+			return Ok(None);
+		}
+
+		// Get from database. The cache generation is taken before the read's snapshot, so a
+		// registration a writer replaces meanwhile is not cached over its invalidation.
+		let generation = self.cache.lock().await.generation(&cache_key).await;
+		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		let registration = match Self::read_dictionary_registration(&conn, dictionary_name).await {
+			Ok(registration) => registration,
+			Err(e) => {
+				// Report why the read failed, not a failed rollback.
+				Self::rollback_after_error(&conn).await;
+				return Err(e);
+			}
+		};
+		Self::commit_concurrent(&conn).await?;
+
+		if let Some(Ok(metadata)) = &registration {
+			self.cache.lock().await.store_if_generation(&cache_key, generation, metadata.clone()).await;
+		}
+		Ok(registration)
+	}
+
+	/// Read `dictionary_name`'s registration on `conn`, a transaction on its database.
+	///
+	/// A registration is a `dictionary_metadata` row with a `dictionary_constraints` row;
+	/// its `dictionary_variabilities` rows, in the order they were written, are its
+	/// variabilities (none is `None`). The metadata table has no unique constraint, and
+	/// databases written before `set_dictionary_metadata` replaced registrations can hold
+	/// several rows for a name, some without constraints (it wrote none): the newest
+	/// complete one, by `created_at` and then id, is read, and a name with none is `None`.
+	///
+	/// A dictionary file can exist without its tables: one that
+	/// `insert_pattern_into_dictionary` opened first (it creates none), or one this process
+	/// opened while another was still creating them. It cannot hold a registration, so it
+	/// is `None`, on which `load_dictionary` registers the dictionary and so creates them.
+	///
+	/// A registration whose stored values do not parse is `Some(Err(…))`: see
+	/// [`parse_stored_steps`](Self::parse_stored_steps) and
+	/// [`parse_stored_variability`](Self::parse_stored_variability).
+	///
+	/// # Errors
+	///
+	/// A failed query.
+	async fn read_dictionary_registration(conn: &cache::Connection, dictionary_name: &str) -> Result<Option<StoredRegistration>> {
+		let tables = Self::registration_tables(conn).await?;
+		if !(tables.metadata && tables.constraints) {
+			return Ok(None);
+		}
+		let query_sql = r"
+                        SELECT m.id, m.name, m.description, c.steps_count, c.steps_interpolation
+                        FROM dictionary_metadata m
+                        JOIN dictionary_constraints c ON c.dictionary_id = m.id
+                        WHERE m.name = ?
+                        ORDER BY m.created_at DESC, m.id DESC
+                        LIMIT 1
+                ";
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary metadata: {e}")))?;
+		let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get metadata row: {e}")))? else {
+			return Ok(None);
+		};
+		let columns = [row.get_value(0)?, row.get_value(1)?, row.get_value(2)?, row.get_value(3)?, row.get_value(4)?];
+		drop(rows);
+		let [id, name, description, steps_count, steps_interpolation] = &columns;
+		let parsed = (|| -> Result<_> {
+			let id_str = id.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?;
+			let name = name.as_text().ok_or_else(|| Error::DatabaseError("Dictionary name is not text".to_string()))?.clone();
+			let description = description.as_text().ok_or_else(|| Error::DatabaseError("Dictionary description is not text".to_string()))?.clone();
+			let steps = Self::parse_stored_steps(steps_count, steps_interpolation)?;
+			let id = DictionaryId::from_uuid(Uuid::parse_str(id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for dictionary ID: {e}")))?);
+			Ok((id, id_str.clone(), name, description, steps))
+		})();
+		let (id, id_str, name, description, steps) = match parsed {
+			Ok(parsed) => parsed,
+			Err(e) => return Ok(Some(Err(e))),
+		};
+
+		let variability_query_sql = r"
+                        SELECT variability_type, variability_value
+                        FROM dictionary_variabilities
+                        WHERE dictionary_id = ?
+                        ORDER BY id
+                ";
+		let mut stored_variabilities = Vec::new();
+		if tables.variabilities {
+			let mut rows: turso::Rows = conn.as_ref().query(variability_query_sql, turso::params![id_str]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionary variabilities: {e}")))?;
+			while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get variability row: {e}")))? {
+				stored_variabilities.push((row.get_value(0)?, row.get_value(1)?));
+			}
+		}
+		let variabilities = match stored_variabilities.iter().map(|(kind, value)| Self::parse_stored_variability(kind, value)).collect::<Result<Vec<_>>>() {
+			Ok(variabilities) => (!variabilities.is_empty()).then_some(variabilities),
+			Err(e) => return Ok(Some(Err(e))),
+		};
+
+		Ok(Some(Ok(DictionaryMetadata { id, name, description, constraints: DictionaryConstraints::new(steps, variabilities) })))
+	}
+
+	/// Which of a registration's tables exist in the dictionary's database, on `conn`.
+	///
+	/// # Errors
+	///
+	/// A failed query of `sqlite_master`.
+	async fn registration_tables(conn: &cache::Connection) -> Result<RegistrationTables> {
+		let mut tables = RegistrationTables::default();
+		let mut rows = conn.as_ref().query("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('dictionary_metadata', 'dictionary_constraints', 'dictionary_variabilities')", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to list the dictionary's tables: {e}")))?;
+		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to list the dictionary's tables: {e}")))? {
+			match row.get_value(0)?.as_text().map(String::as_str) {
+				Some("dictionary_metadata") => tables.metadata = true,
+				Some("dictionary_constraints") => tables.constraints = true,
+				Some("dictionary_variabilities") => tables.variabilities = true,
+				_ => {}
+			}
+		}
+		Ok(tables)
+	}
+
+	/// Parse one of a dictionary's stored variabilities: the `variability_type` and
+	/// `variability_value` columns of a `dictionary_variabilities` row, which hold the
+	/// variant's name ([`VariablilityType::kind`]) and its value as decimal text.
+	///
+	/// # Errors
+	///
+	/// A `DatabaseError` for a column that is not text, a value that is not a decimal, or a
+	/// name that is no variant, e.g. `Invalid variability: Unknown VariabilityType: Median`.
+	fn parse_stored_variability(variability_type: &turso::Value, variability_value: &turso::Value) -> Result<VariablilityType> {
+		let kind = variability_type.as_text().ok_or_else(|| Error::DatabaseError("Variability type is not text".to_string()))?;
+		let value = variability_value.as_text().ok_or_else(|| Error::DatabaseError("Variability value is not text".to_string()))?;
+		let value = BigDecimal::from_str(value).map_err(|e| Error::DatabaseError(format!("Invalid variability value '{value}': {e}")))?;
+		Ok(VariablilityType::from_kind(kind, Variability::new(value)).map_err(|e| Error::DatabaseError(format!("Invalid variability: {e}")))?)
+	}
+
+	/// Parse a dictionary's stored step configuration: the `steps_count` and
+	/// `steps_interpolation` columns of its `dictionary_constraints` row.
+	///
+	/// `steps_count` is an `INTEGER` column, so the count `new_dictionary` binds as text is
+	/// stored as an integer; text is accepted too. A `NULL` count (or an empty or `"null"`
+	/// text one) means the dictionary has no steps, and its interpolation is not read.
+	/// The interpolation is the [`Spline`]'s text, which splimes validates as it parses.
+	///
+	/// # Errors
+	///
+	/// A `DatabaseError` for a count that is not a non-negative integer, or an
+	/// interpolation that is not text or not a valid [`Spline`], e.g.
+	/// `Invalid interpolation format: invalid polynomial degree 9: must be between 1 and 8`.
+	fn parse_stored_steps(steps_count: &turso::Value, steps_interpolation: &turso::Value) -> Result<Option<Steps>> {
+		let count: usize = match steps_count {
+			turso::Value::Null => return Ok(None),
+			turso::Value::Text(text) if text.is_empty() || text == "null" => return Ok(None),
+			turso::Value::Integer(count) => usize::try_from(*count).map_err(|e| Error::DatabaseError(format!("Invalid steps count {count}: {e}")))?,
+			turso::Value::Text(text) => text.parse().map_err(|e| Error::DatabaseError(format!("Invalid steps count format: {e}")))?,
+			turso::Value::Real(_) | turso::Value::Blob(_) => bail!(Error::DatabaseError("Steps count is neither an integer nor text".to_string())),
+		};
+		let interpolation = steps_interpolation.as_text().ok_or_else(|| Error::DatabaseError("Steps interpolation is not text".to_string()))?;
+		let interpolation: Spline = interpolation.parse().map_err(|e| Error::DatabaseError(format!("Invalid interpolation format: {e}")))?;
+		Ok(Some(Steps::new(count, interpolation)))
+	}
+}
+
+/// A dictionary's registration as stored: its metadata, or why its stored values do not
+/// parse (see `Database::read_dictionary_registration`).
+type StoredRegistration = Result<DictionaryMetadata>;
+
+/// Which of the tables a dictionary's registration is stored in exist in its database.
+#[derive(Debug, Default, Clone, Copy)]
+struct RegistrationTables {
+	/// `dictionary_metadata`.
+	metadata: bool,
+	/// `dictionary_constraints`.
+	constraints: bool,
+	/// `dictionary_variabilities`.
+	variabilities: bool,
+}
+
+#[cfg(test)]
+mod tests {
+	use turso::Value;
+
+	use super::*;
+
+	fn text(s: &str) -> Value {
+		Value::Text(s.to_string())
+	}
+
+	#[test]
+	fn stored_steps_read_an_integer_or_text_count() {
+		// The column's INTEGER affinity stores the count `new_dictionary` binds as text as
+		// an integer; the old reader required text, so no stored dictionary ever loaded.
+		let steps = Database::parse_stored_steps(&Value::Integer(10), &text("Cubic")).expect("integer count").expect("steps");
+		assert_eq!((steps.count(), *steps.interpolation()), (10, Spline::Cubic));
+		let steps = Database::parse_stored_steps(&text("4"), &text("Polynomial(degree: 8, bounds_factor: None)")).expect("text count").expect("steps");
+		assert_eq!((steps.count(), *steps.interpolation()), (4, Spline::Polynomial(8, None)));
+	}
+
+	#[test]
+	fn stored_steps_without_a_count_are_none() {
+		// `new_dictionary` writes NULL for both columns when the dictionary has no steps.
+		for count in [Value::Null, text(""), text("null")] {
+			assert!(Database::parse_stored_steps(&count, &Value::Null).expect("no steps").is_none());
+		}
+	}
+
+	#[test]
+	fn stored_variabilities_read_their_kind_and_value() {
+		let variability = Database::parse_stored_variability(&text("AveragePercentile"), &text("0.000000001")).expect("a stored variability");
+		assert_eq!(variability.kind(), "AveragePercentile");
+		assert_eq!(variability.variability().value(), &BigDecimal::from_str("0.000000001").unwrap());
+		let err = Database::parse_stored_variability(&text("Median"), &text("1")).expect_err("no such variant");
+		assert_eq!(err.to_string(), "Database error: Invalid variability: Unknown VariabilityType: Median");
+		assert!(Database::parse_stored_variability(&text("SumStatic"), &text("lots")).is_err());
+		assert!(Database::parse_stored_variability(&Value::Null, &text("1")).is_err());
+	}
+
+	#[test]
+	fn stored_steps_reject_what_splimes_rejects() {
+		let err = Database::parse_stored_steps(&Value::Integer(10), &text("Polynomial(degree: 9, bounds_factor: None)")).expect_err("degree 9");
+		assert_eq!(err.to_string(), "Database error: Invalid interpolation format: invalid polynomial degree 9: must be between 1 and 8");
+		let err = Database::parse_stored_steps(&Value::Integer(10), &text("Polynomial(degree: 3, bounds_factor: -1)")).expect_err("negative bounds");
+		assert_eq!(err.to_string(), "Database error: Invalid interpolation format: invalid bounds factor -1: must be finite and not negative");
+		assert!(Database::parse_stored_steps(&Value::Integer(-1), &text("Cubic")).is_err());
+		assert!(Database::parse_stored_steps(&Value::Integer(10), &Value::Null).is_err());
 	}
 }

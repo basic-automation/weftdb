@@ -60,24 +60,22 @@ fn noise(seed: u64) -> impl FnMut() -> u64 {
 fn ms_as_micros() -> Vec<i64> {
 	let mut next = noise(0x2545_f491_4f6c_dd1d);
 	let mut t = 1_700_000_000_000_000_i64;
-	(0..N)
-		.map(|_| {
-			t += i64::try_from(next() % 500 + 1).unwrap_or(1) * 1_000;
-			t
-		})
-		.collect()
+	(0..N).map(|_| {
+		t += i64::try_from(next() % 500 + 1).unwrap_or(1) * 1_000;
+		t
+	})
+	.collect()
 }
 
 /// Instants 1-500 ms apart with full microsecond jitter.
 fn jittered_micros() -> Vec<i64> {
 	let mut next = noise(0x9e37_79b9_7f4a_7c15);
 	let mut t = 1_700_000_000_000_000_i64;
-	(0..N)
-		.map(|_| {
-			t += i64::try_from(next() % 500_000 + 1_000).unwrap_or(1_000);
-			t
-		})
-		.collect()
+	(0..N).map(|_| {
+		t += i64::try_from(next() % 500_000 + 1_000).unwrap_or(1_000);
+		t
+	})
+	.collect()
 }
 
 fn bits_per_value(bytes: usize) -> f64 {

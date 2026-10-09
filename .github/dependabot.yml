@@ -1,0 +1,13 @@
+# Keeps the commit-SHA pins on GitHub Actions current: Dependabot proposes the new SHA
+# with its version comment, and the update goes through review like any other change.
+# Do not count on it for dtolnay/rust-toolchain (pinned to a master commit; the repo has
+# no release tags) or for the actionlint image digest in ci.yml: bump those by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

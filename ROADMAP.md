@@ -169,7 +169,7 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [ ] Remaining workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, gap fill, compressed query, analytics pipeline
 - [ ] Fair-protocol depth (Phase 1.1) — ≥10 reps for short tests, cold/warm/hot/post-compaction/post-restart separation, saturation curves (batch size, clients, writers, query concurrency, cardinality, dataset size, GPU output size), seeded randomized query mixes (published seeds), failure tests (restart during ingest, crash during compaction, network retry, partial/corrupt segment), independent-reproducibility packaging (versions, SHAs, images, configs, hardware, drivers, command lines, raw artifacts)
 - [ ] Fair interpolation comparisons (Phase 1.2) — report three classes where possible: (A) native in-DB (Timescale gapfill, QuestDB `SAMPLE BY … FILL`, InfluxQL/SQL fill, ClickHouse ASOF/window, DuckDB window fns, IoTDB fns); (B) portable SQL baseline; (C) client-side end-to-end. Don't hide unfavorable results.
-- [x] **DONE (2026-10-08) — disk capture:** `RunMetadata.work_disk_{kind,file_system,mount_point}` (schema v18). The disk
+- [x] **DONE (2026-10-08) — disk capture:** `RunMetadata.work_disk_{kind,file_system,mount_point}` (schema v19). The disk
   under the working directory, found by longest mount-point prefix through `sysinfo::Disks`.
   Verified live: a run from `/mnt/deepmem` reports `hdd btrfs`, one from `/` reports `ssd btrfs`.
 - [ ] Remaining hardware capture — GPU and driver versions in run metadata. **Blocked on the splimes 0.1→1 migration** (`deps/splimes-1`): `splimes` 1.0 exposes `gpu::gpu_info()` with a `driver` field, 0.1 does not. Original note: needs a wgpu adapter
@@ -372,7 +372,7 @@ points/sec for irregular cubic interpolation including storage read, decode, GPU
 transfer, kernel, readback, and API serialization, p95 = Z."*
 
 - [x] Interpolation/extrapolation capability — linear/quadratic/cubic/polynomial on CPU, SIMD, and GPU (`Outputs::analyze_range`/`analyze_point`)
-- [x] GPU infra — size-tiered LRU buffer pool (wired through the static f64/f32 paths), persistent staging buffers, async-handle scaffold (`GpuInterpolationResult<T>` + `IntoFuture`; computes synchronously today), `GpuConfig` presets + `prewarm_gpu_with_config()`/`gpu_buffer_pool_stats()`
+- [x] GPU infra — size-tiered LRU buffer pool (wired through the static f64/f32 paths), persistent staging buffers, async-handle scaffold (`GpuInterpolationResult<T>` + `IntoFuture`; computes synchronously today), `GpuConfig` presets + `prewarm_gpu_with_config()`/`gpu_buffer_pool_stats()` *(splimes 0.1; 1.0 replaced them with `configure_gpu(GpuConfig)`, `prewarm_gpu() -> GpuInfo`, `gpu_pool_stats()` and `calibrate()`, which `weft-server` runs at startup)*
 - [ ] 5.1 Command batching
 - [ ] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
 - [ ] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
@@ -396,7 +396,45 @@ detection within Y% and improving historical query latency by Z."*
   disk in the value block)*; Chimp-style f64; ALP-inspired vectorized f64;
   Decimal128/scaled-int codecs; **block-level random access** *(shipped —
   `blocked`/`for_bitpack_decode_range` + `weftseg::read_value_at`)*. *(Check codec
-  patents/licenses before embedding.)*
+  patents/licenses before embedding — and before shipping; see the gate below.)*
+  - [ ] **Codec patent/licence gate (owner decisions 2026-10-08).** The check covers **every
+    codec the crates ship**, not only what the `.weftseg` writer embeds: a codec in a published
+    crate's public API, or one that only a bench reaches, is still distributed code. Status:
+    - [x] **Elf, FIRE and the advisory f64 codecs: gated.** Gorilla-XOR, Chimp, Chimp128, Elf,
+      the `best_f64_*` selector and the Sprintz FIRE forecaster sit behind
+      `weft-physical-type`'s non-default `experimental-codecs` feature, outside the 1.0 semver
+      promise. None is written to disk and no default read or write path calls one; only the
+      unpublished `weft-bench` enables the feature. A flagged Chongqing patent names Elf
+      explicitly, so Elf stays gated (or is removed) unless counsel clears it.
+    - [x] **Bit-sliced value codec: gated pending counsel.** The opt-in `VAL_CODEC_TRANSPOSED`
+      codec is behind the non-default `bitsliced-codec` feature (forwarded by `weftdb` and
+      `weft-server`) because a WARF patent is flagged against it. Without the feature the writer
+      never selects it, `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` is ignored with a warning, and
+      readers return `WeftSegError::CodecNotEnabled`. Its docs now call it bit-sliced; it was
+      never the FastLanes layout.
+    - [ ] **Default FOR codec and the Tiger Data family: with counsel.** Amazon US 11,308,093 is
+      flagged against the frame-of-reference value codec WeftDB writes **by default**
+      (`VAL_CODEC_FOR`), and Tiger Data patents against both ingest paths. Technical claim charts
+      are prepared. These stay ungated because default stores depend on them; the decision is
+      counsel's.
+    - [ ] **SAP family: review before the Phase 6.2 design.** Read the flagged SAP patents before
+      designing model-based compression (6.2), so the design starts clear of them rather than
+      being reworked afterwards.
+    - [ ] **Possible future: a patent-clear codec in a new crate.** If counsel advises against a
+      shipped codec, implement a replacement that avoids the claims in its own crate, and keep
+      the gated original only so existing stores stay readable.
+    - [x] **Attribution for adapted code.** Chimp/Chimp128 (`weft-physical-type`) and DDSketch
+      (`weft-reduce`) are treated as adapted from their Apache-2.0 reference implementations: a
+      root `NOTICE` and per-crate `THIRD-PARTY-NOTICES` (shipped in each package) meet
+      Apache-2.0 section 4.
+    - [ ] **Package licence metadata: mitigated by the relicense; the expression is with
+      counsel.** Every crate now declares `license = "MIT OR Apache-2.0"`, so Apache-2.0 is one
+      of the two options scanners see, and the two crates' `THIRD-PARTY-NOTICES` and READMEs say
+      that the Chimp and DDSketch portions stay under Apache-2.0 whichever option a user picks.
+      The field itself still offers MIT for the whole of `weft-physical-type` and `weft-reduce`.
+      The candidate expression for those two crates is `(MIT OR Apache-2.0) AND Apache-2.0`;
+      it is on the [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta) counsel
+      list.
   - [x] **Gorilla + RLE realized on disk** — the timestamp block now carries four
     codecs (varint/bit-pack/RLE/Gorilla) chosen by the single-source-of-truth
     `best_encoding_name`, so the reported codec always matches the bytes written; the
@@ -429,8 +467,8 @@ detection within Y% and improving historical query latency by Z."*
     folded into `best_estimated_bytes`/`best_encoding_name` (`delta_of_delta_blocked`),
     and round-trip- + runtime-verified. A single-block stream ties global bit-pack, so the
     selector keeps the simpler label there. *(src: "Dynamic Bit Packing", Sensors 2023 —
-    https://www.mdpi.com/1424-8220/23/20/8575 · Sprintz per-block bit-packing, ACM TODS'18
-    — https://arxiv.org/abs/1808.02515)*
+    https://www.mdpi.com/1424-8220/23/20/8575 · Sprintz per-block bit-packing, Proc. ACM
+    IMWUT 2(3), 2018 — https://doi.org/10.1145/3264903 · https://arxiv.org/abs/1808.02515)*
   - [x] **Frame-of-Reference (FOR) per-block codec — prototyped + benchmarked (advisory).**
     `for_bitpack_bytes`/`encode`/`decode` beside the blocked codec: each block emits a
     zig-zag-varint reference (the block minimum) then the *unsigned* residuals (`v - min`)
@@ -462,8 +500,8 @@ detection within Y% and improving historical query latency by Z."*
     {varint, bit-pack, blocked bit-pack, **RLE**} over the residual tail (the zero/run-length
     half). Surfaced in the bench as `StorageEstimate.advisory_fire_timestamp_bytes` (schema
     v14) so the FIRE-vs-dod question is answered on the *real* timestamp corpus. Measured
-    54.8% below dod on a constructed geometric-velocity stream. *(src: Sprintz, ACM TODS'18 —
-    https://arxiv.org/abs/1808.02515)*
+    54.8% below dod on a constructed geometric-velocity stream. *(src: Sprintz, Proc. ACM IMWUT
+    2(3), 2018 — https://doi.org/10.1145/3264903 · https://arxiv.org/abs/1808.02515)*
   - [x] **FIRE adopt-or-drop — DECIDED (2026-07-16): DROPPED.** Measured on the *real* bench
     corpora exactly as this item demanded, via the shipped `advisory_fire_timestamp_bytes` (8
     distinct timestamp corpora — jitter 0.0/0.02/0.05/0.15/0.35/0.5/0.8/0.9 × missingness
@@ -537,7 +575,7 @@ detection within Y% and improving historical query latency by Z."*
       over the reduced column, plus a varint for g). Measured on ms_as_micros at **20.000 → 10.000
       bits/value** (g = 1000; pco 9.001). On real btc_minutes it finds g = 60 at no gain (already
       0 bits); on jittered µs it finds none. Surfaced as `storage.advisory_common_multiple_timestamp_bytes`
-      (and the delta-FOR one as `advisory_delta_for_timestamp_bytes`, schema v17). On a real
+      (and the delta-FOR one as `advisory_delta_for_timestamp_bytes`, schema v18). On a real
       `weft-bench --input` run over 20k ms-precise instants: 50,007 → 25,011 timestamp bytes.
       - [ ] **NEXT — realize the common-multiple factor as a timestamp codec flag (owner sign-off:
         headline bytes/point change).** Original rationale: A µs column holding ms-precise instants costs WeftDB **20 bits/value against pco's
@@ -705,7 +743,7 @@ detection within Y% and improving historical query latency by Z."*
       `ingest_path_profile_legacy_vs_columnar` on the real corpus: the 4.22 B/point realized headline
       should fall, since the value column is most of it. Expected value column: ~13.6 b vs ~33.7 b.
       - [x] **DONE (2026-10-08)** surfaced as `storage.advisory_dfor_value_bytes` in the `weft-bench`
-        `StorageEstimate` (schema v16; `Some` only when it strictly beats the realized codec).
+        `StorageEstimate` (schema v17; `Some` only when it strictly beats the realized codec).
     - [x] **DONE (2026-10-08) — the scalar FOR/blocked decode is the read-path bottleneck at wide widths.**
       `for_bitpack_decode` takes **70.8 ms per 1 Mi values at ~33 bits** (11.3 ms at ~5.5 bits). It
       loops per bit per value, so cost scales with width. The `fastlanes` unpack inside the ALP arm
@@ -790,7 +828,9 @@ detection within Y% and improving historical query latency by Z."*
     win visible and maps onto the $/billion-interpolated-points north star.
     *(src: https://azimafroozeh.org/assets/papers/g-alp.pdf)*
   - [x] **FastLanes "Unified Transposed Layout" for the bit-pack codecs (decode-speed
-    slice): shipped (prototype).** `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode`
+    slice): shipped (prototype).** *(Correction 2026-10-08: what shipped is a bit-sliced,
+    bit-plane-major layout, not the FastLanes layout; it is now behind the `bitsliced-codec`
+    feature — see the codec patent/licence gate above.)* `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode`
     — a per-tile bit-plane-major layout whose decoder reads `u64` words and walks only the *set*
     bits (`w &= w-1`), so the empty high bit-planes of a small-magnitude stream are skipped
     wholesale (where the scalar per-value loop pays every bit of every value). Byte footprint is a
@@ -843,8 +883,34 @@ recovery, with bounded p99 and no loss beyond the declared durability mode.
 - [ ] **7.1 Online ingest** — scheduled polling daemon, runtime source registration, retry
   buffer, backpressure, idempotency ledger, at-least-once, dedup/upsert, late-arrival
   policy *(maps backlog B-poll, B-retry, B-register, B-dedup)*
-- [ ] **7.2 WAL & crash consistency** — WAL design, segment-seal protocol, atomic catalog
-  updates, recovery, partial-write handling, fsync policy, durability modes
+- [ ] **7.2 WAL & crash consistency.** The design is in [`docs/design/crash-consistency.md`](docs/design/crash-consistency.md) (2026-10-05).
+  A code audit verified **43 crash/consistency windows**: 7 lose data that was already acknowledged, and 6 corrupt data that was already committed.
+  The worst: segment frames are never fsynced while the index commit is; maintenance rewrites committed frames in place;
+  concurrent seals can share an id; and a cold open deletes the legacy `metadata.db-log`, dropping committed rows.
+  The design is "Atomic Publish": write-once fsynced frames, one control-plane transaction per state change, and startup recovery. There is no separate WAL in 1.0.
+  Milestones: **M1** (S1–S12 + S15) makes the strict promise true; **M2** (S13–S14) adds idempotent HTTP ingest; **M3** (S16) adds whole-store backup;
+  **M4** (S18–S20) moves legacy ingest onto the seal (Immediate #1). Slices:
+  - [ ] **S1** Preserve legacy MVCC logs and drop no-op sync pragmas *(~2.5 h; after none)*
+  - [ ] **S2** Durable I/O layer, fault points and power-cut simulator *(~8 h; after none)*
+  - [ ] **S3** Storage-v2 open hardening: MVCC/FULL probes, root LOCK, register_scope, directory durability *(~4 h; after S2)*
+  - [ ] **S4** Store-wide sweep isolation *(~4 h; after none)*
+  - [ ] **S5** Backup directory atomic publish, manifest, retention and drill hygiene *(~7 h; after S2)*
+  - [ ] **S6** Schema v2, IndexTxn, write poison, root-relative frame path resolution *(~7 h; after S3)*
+  - [ ] **S7** Persistent per-aspect id allocator, per-aspect commit/maint locks, plain INSERT for seals *(~6 h; after S6)*
+  - [ ] **S8** Write-once maintenance I: generational outputs, frame journal, single-transaction swap, reaper and reader pins (reconcile_segment, split_segment) *(~8 h; after S7)*
+  - [ ] **S9** Write-once maintenance II: overlap merge (both branches), squash, size-targeted compaction *(~8 h; after S8)*
+  - [ ] **S10** Write-once durable seal with id assigned at commit *(~8 h; after S9)*
+  - [ ] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
+  - [ ] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
+  - [ ] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
+  - [ ] **S14** HTTP ingest wiring: Idempotency-Key, detached tasks, body limit, backpressure, status classes, graceful shutdown *(~7 h; after S13)*
+  - [ ] **S15** Partial sidecar v4: CRC trailer, frame-stem naming, frame_crc stamp, tmp+rename, backfill *(~5 h; after S10)*
+  - [ ] **S16** Whole-store backup with hard-linked frames; restore_store and in-place restore mode with adoption *(~8 h; after S5, S12)*
+  - [ ] **S17** Relaxed durability mode with synced_epoch watermark (optional for 1.0) *(~6 h; after S12)*
+  - [ ] **S18** Legacy rows-mode hygiene: atomic Database::new, write-ahead enqueue, batch dedupe *(~5 h; after S1)*
+  - [ ] **S19** Seal-backed legacy aspects: storage_mode, legacy ingest and reads through SegmentStore *(~8 h; after S13, S18)*
+  - [ ] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*
+  - [ ] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
 - [ ] **7.3 Corruption detection** — segment/page checksums *(CRC-32 shipped in the
   `.weftseg` frame)*, catalog checks, startup verification, repair tooling
 - **7.4 Backup/restore** — online backup, PITR if feasible, verification, drills, documented RPO/RTO
@@ -870,7 +936,15 @@ metrics, recover from a restart, and file useful support tickets.
 - [ ] Packaging — static binaries, Docker, Compose, Helm (later), systemd, config schema, migration/upgrade/rollback
 - [ ] Observability — Prometheus, Grafana, OTel, structured logs, bench dashboard, query profiles
 - [ ] SDKs — Rust → Python → TypeScript → R/Arrow
-- [ ] Licensing/legal — open-core vs commercial, comparative-benchmark terms, kdb+ restrictions, dependency + codec licenses, customer-data handling, trademark use
+- [ ] Licensing/legal — open-core vs commercial, comparative-benchmark terms, kdb+ restrictions, dependency + codec licenses, customer-data handling, trademark use. **Owner decisions 2026-10-08:**
+  - [x] **Licence: `MIT OR Apache-2.0`**, the Rust ecosystem's dual licence, for every WeftDB crate: `LICENSE-MIT` and `LICENSE-APACHE` at the root and in every crate, `license = "MIT OR Apache-2.0"` in `[workspace.package]`. Earlier commits remain available under MIT. `splimes` (its own repository) stays MIT.
+  - [x] **Copyright holder: Justin Icenhour**, as an individual, and the only one. His employer has signed off. Every commit so far is his (some carry `test@example.com` as the author email; AI-co-authored commits carry Claude trailers). No crate was on crates.io yet, so relicensing needed no one else's consent.
+  - [x] **Contribution terms: DCO or CLA, the contributor's choice.** `git commit -s` on every commit, or the CLA ([`CLA.md`](CLA.md), version 1, adapted from the ASF ICLA, with Justin Icenhour as the counterparty) signed once by a pull request comment. Contributions are licensed `MIT OR Apache-2.0`. The `contribution-terms` workflow passes a pull request when either holds; see [CONTRIBUTING.md](CONTRIBUTING.md#contribution-terms).
+    - [ ] **Enforce it (owner, once on main):** create the `cla-signatures` branch with `signatures/cla/v1.json`, tag the main commit carrying CLA.md version 1 as `cla-v1` and protect the tag with a ruleset (commands in the workflow's header), then require the `contribution-terms` check in branch protection.
+  - [x] **kdb+/KDB-X: excluded from published benchmarks** unless KX consents in writing. See the [Legal notes](#research--business-notes).
+  - [x] **Codec patents: gate the flagged opt-in codecs.** The advisory float/timestamp codecs are behind `experimental-codecs` and the bit-sliced value codec behind `bitsliced-codec` (the [Phase 6.1 codec gate](#phase-6--compression-v2--high)).
+  - [ ] **With counsel:** Amazon US 11,308,093 against the default FOR codec; the Tiger Data family (both ingest paths); the SAP family, before the Phase 6.2 design; **WEFTDB** trademark clearance; the benchmark policy — which competitor editions may be run and published, dataset redistribution, and the claims wording; the package licence expression for the two crates with adapted code, `(MIT OR Apache-2.0) AND Apache-2.0` ([Phase 6.1](#phase-6--compression-v2--high)); CLA v1 — a successors-and-assigns clause and any outbound-licence undertaking, before the CLA is enforced.
+  - [ ] Still open: open-core vs commercial split; customer-data handling.
 
 ### Phase 9 — Analytics premium · *Medium, after benchmark foundation*
 
@@ -897,8 +971,17 @@ vector DB. *(Maps backlog Themes 5, 6, 8.)*
 
 The phases above define **beta** (Phase 7) and **paid beta** (Phase 8); this section
 defines **1.0 / stable**: the point at which WeftDB makes a semver promise about its
-API, its on-disk format, and its durability. Today WeftDB is **pre-beta** — every crate
-is `0.1.0` and nothing is tagged. 1.0 ships when every box below is ticked.
+API, its on-disk format, and its durability. Today WeftDB is **pre-beta**: every crate
+is `0.1.0`, and v0.1.0 is the pre-beta baseline release (GitHub release binaries only, no
+crates.io), the previous release the upgrade, rollback and compatibility gates below test
+against. 1.0 ships when every box below is ticked.
+
+**Execution plan:** [`docs/release/1.0-plan.md`](docs/release/1.0-plan.md) orders every
+remaining box into waves W0–W15. Its preface records the owner's decisions of 2026-10-08:
+everything ships as 1.0, the library crates included, with a frozen Rust API; B-tags stay a
+gate; a v0.1.0 baseline GitHub release (no crates.io) is tagged before durability slice S6
+reaches main; the soak and report runs use a dedicated SSD volume at `/mnt/weftbench`; every
+other open question takes the plan's recommendation.
 
 Gates that point at an item elsewhere in this file are ticked **only** when that item
 is ticked there — the referenced item stays the source of truth for its detail.
@@ -919,10 +1002,12 @@ report → API/format freeze → **1.0**.
 
 ### Hot path & data model *(must land before the freeze)*
 
-- [ ] **splimes 1.0 is released**, and WeftDB depends on it. The interpolation engine is
-  its own crate ([basic-automation/splimes](https://github.com/basic-automation/splimes),
-  0.1.0 published 2026-10-05) with its own 1.0 criteria; a stable WeftDB can't promise a
-  stable API on top of an unstable engine
+- [x] **splimes 1.0 is released**, and WeftDB depends on it. The interpolation engine is
+  its own crate ([basic-automation/splimes](https://github.com/basic-automation/splimes))
+  with its own 1.0 criteria; a stable WeftDB can't promise a stable API on top of an
+  unstable engine. *splimes 1.0.0 was published to crates.io on 2026-10-05, and WeftDB
+  depends on it from the registry (`splimes = "1"`, no patch or git source). The migration
+  merged to main as PR #62 on 2026-10-08.*
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal** — the legacy `batch_capture_measurements` path is super-linear (see [Immediate next actions](#immediate-next-actions))
 - [ ] **B-tags** — per-measurement tags/labels; a data-model change that must precede the API/format freeze
@@ -939,19 +1024,22 @@ report → API/format freeze → **1.0**.
 
 - [x] **Dependencies current and audited (2026-10-05)** — every dependency on its latest major (turso 0.8, wgpu 30, arrow/parquet 60, OpenTelemetry 0.33, rand 0.10, thiserror 2, …). The unmaintained `bincode` (RUSTSEC-2025-0141; its 3.0.0 release is a `compile_error!` tombstone) was replaced by `postcard` 1.x for the `.weftpart` sidecar (frame v3, magic `\x02`; older sidecars are ignored and the segment is decoded instead). The `crossbeam-epoch` and `h2` advisories were cleared, and wildcard `"0"` requirements were pinned to their minor versions
 - [ ] **CI** — build, test, `clippy`, `fmt` on every PR (the repository has no workflows today); a nightly benchmark-regression job
-- [ ] **Public surface declared and frozen** — `/api/v1` HTTP contract, `.weftseg` `format_version`, control-plane schema; anything not listed is explicitly unstable
+- [ ] **Public surface declared and frozen** — `/api/v1` HTTP contract, `.weftseg` `format_version`, control-plane schema, and the published library crates' Rust API (owner decision 2026-10-08: every crate ships as 1.0); anything not listed is explicitly unstable
 - [ ] **Compatibility tests** — a fixture store written by the previous release is read by the current one; a format change requires a version bump and a migration
 - [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
 - [ ] **Crate publishing split** — `publish = false` on internal crates (`weft-bench`, `weft-tui`, likely `database_orchestration`); published crates carry versioned path dependencies, docs, and a single edition
 - [ ] **Panic audit on server paths** — no `.unwrap()`/`.expect()` reachable from a request or ingest path; failures surface as typed errors / HTTP status codes
-- [ ] **Security process** — `SECURITY.md` with a disclosure contact, `cargo audit`/`cargo deny` (advisories + licenses) in CI
+- [ ] **Security process** — `SECURITY.md` with a disclosure contact, `cargo audit`/`cargo deny` (advisories + licenses) in CI. *Checked on main 2026-10-08:*
+  - [x] `SECURITY.md` is on main; it routes reports to GitHub private vulnerability reporting
+  - [x] `cargo deny check advisories bans licenses sources` runs in CI (the `deny` job of `ci.yml`), covering what `cargo audit` would
+  - [ ] **Private vulnerability reporting is off** — the repository API reports `enabled: false`, so the channel `SECURITY.md` names does not work yet. The owner turns it on (Settings → Security), then this box is ticked
 
 ### Claims & documentation
 
 - [ ] Every performance claim in the README links to a benchmark artifact (the [governing rule](#weftdb-roadmap))
 - [ ] First cross-engine report — WeftDB vs DuckDB at minimum, meeting the [Benchmark report requirements](#benchmark-report-requirements)
 - [ ] Honesty pages shipped (see [Commercial thesis](#commercial-thesis--positioning))
-- [ ] Legal review of competitor benchmark-publication terms + codec licenses (see [Research & business notes](#research--business-notes))
+- [ ] Legal review of competitor benchmark-publication terms + codec licenses (see [Research & business notes](#research--business-notes)). *2026-10-08: licence and contribution terms decided, kdb+/KDB-X excluded unless KX consents, flagged opt-in codecs gated; the counsel items are listed under Phase 8.*
 - [ ] README *Project status* table updated to reflect 1.0 and the status badge changed from `pre-beta`
 
 ---
@@ -1270,6 +1358,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 **Legal (before publishing comparative results):**
 
 - [ ] Review each competitor's benchmark-publication terms (kdb+ especially); disclose configs; include reproduction instructions; check dependency + **compression-codec patents/licenses**; document trademark usage; clarify whether benchmark data may be redistributed
+  - [x] **kdb+/KDB-X (owner decision 2026-10-08): excluded from every published benchmark unless KX consents in writing.** No published report, README figure or claim may include a kdb+/KDB-X result without that consent on file.
+  - [x] **WeftDB's own terms (2026-10-08):** `MIT OR Apache-2.0`; contributions by DCO sign-off or the CLA; sole copyright holder Justin Icenhour, with his employer's sign-off. Detail under [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta).
+  - [x] **Codec patents (2026-10-08):** the flagged opt-in codecs are gated (`experimental-codecs`, `bitsliced-codec`); the default FOR codec stays ungated pending counsel (the [Phase 6.1 codec gate](#phase-6--compression-v2--high)).
+  - [ ] **Open with counsel:** Amazon FOR (US 11,308,093), Tiger Data, SAP (before Phase 6.2), **WEFTDB** trademark clearance, and the benchmark policy: which competitor editions may be run and published, whether the datasets may be redistributed, and the wording of claims. Also the package licence expression for `weft-physical-type` and `weft-reduce`, and CLA v1's successors-and-assigns clause and any outbound-licence undertaking.
 
 ---
 
@@ -1893,6 +1985,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   (`scaled_for`, strict-win selection); timestamps stay advisory (small dods, FOR
   rarely wins). Decided together with the headline flip below — one metric break.
 - [x] **FastLanes transposed bit-unpack (Phase 6.1, decode-speed): shipped (prototype).**
+  *(Correction 2026-10-08: a bit-sliced layout, not FastLanes'; now behind `bitsliced-codec`.)*
   `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode` — a per-tile bit-plane-major
   layout whose decoder reads `u64` words and walks only the *set* bits (`w &= w-1`), so the empty
   high bit-planes of a small-magnitude stream are skipped wholesale. Byte footprint identical to
@@ -1930,7 +2023,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [x] **Windowed value reads no longer re-walk the codec chain per row (found by review of the
   above).** `read_range_from_section` resolved a window by calling `read_value_at` once per row, and
   every fixed-layout codec locates a value by walking its block/tile headers *from the start of the
-  stream* — so an `N`-row window cost `N` walks, and on the 1024-lane transposed layout it decoded a
+  stream* — so an `N`-row window cost `N` walks, and on the 1024-value-tile bit-sliced layout it decoded a
   whole tile per value (measured ~27× slower than linear, and ~20× slower than the full-decode
   fallback it was supposed to beat). Fixed by `weftseg::read_value_range(bytes, start, len)`, which
   does the range decode **once** per codec; this also removes the pre-existing per-row walk for the
@@ -1952,8 +2045,11 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   and so re-decodes one tile per instant when several instants share a tile (measured by review:
   500 same-tile instants ≈ 2.33 ms vs 0.52 ms linear). *(src: https://lib.rs/crates/fastlanes)*
 - [ ] **NEXT — upstream FastLanes does NOT make the transposed layout its default either, and
-  exposes the permutation instead (research 2026-09-23).** The FastLanes *file format* paper states
-  they "use the Unified Transposed Layout (UTL) as an option rather than as the default", because
+  exposes the permutation instead (research 2026-09-23).**
+  *(Correction 2026-10-08: WeftDB's codec is bit-sliced, not FastLanes' transposed layout; the
+  FastLanes findings below are an analogy for it, not a description of it.)* The FastLanes *file
+  format* paper states they "use the Unified Transposed Layout (UTL) as an option rather than as the
+  default", because
   for Delta schemes it permutes tuple order and restoring that order costs a gather; their escape
   hatch is a **shareable 1024-entry selection vector** that a vectorized engine can apply in front of
   decoded vectors, with the restore performed only on request. This independently validates WeftDB's
@@ -1963,8 +2059,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   interpolation path restores. *(src: FastLanes file format, VLDB'25 —
   https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
 - [x] **DONE (2026-10-08) — Cross-check WeftDB's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
-  2026-09-02, Apache-2.0).** It provides the same 1024-element layout (BitPacking pack/unpack,
-  single-value unpack, transposed Delta/RLE, linear FoR) via LLVM auto-vectorization. If WeftDB's
+  2026-09-02, Apache-2.0).** *(Correction 2026-10-08: the tile size matches, the bit order does
+  not; WeftDB's codec is bit-sliced, so compare decode speed at a width, not layouts.)* It provides
+  a 1024-element layout (BitPacking pack/unpack, single-value unpack, transposed Delta/RLE, linear
+  FoR) via LLVM auto-vectorization. If WeftDB's
   decoder is materially slower at the same bit width, that is a bug rather than a design choice —
   a cheap external yardstick for `benches/transposed_read.rs`. *(src: https://lib.rs/crates/fastlanes)*
   - [x] Yardstick shipped (`benches/fastlanes_yardstick.rs`, bench-only pinned dev-dep). It found
@@ -2063,7 +2161,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   baseline). Pre-v10 bytes/point artifacts are not comparable.
 - [x] **weft-bench parallel-test OOM — ROOT-CAUSED + FIXED (it was a logic bug, not
   environmental).** A full-backtrace capture pinned the ~28 GB allocation to
-  `splimes::helpers::generate_target_times::TargetTimesIterator::next_impl`, which sized the
+  `splimes::helpers::generate_target_times::TargetTimesIterator::next_impl` (splimes 0.1; 1.0 has no such iterator), which sized the
   per-batch `Vec<DateTime<Utc>>` from *free system memory* (`available_memory / point_size /
   2`) instead of from the number of timestamps to produce — a tens-of-GiB speculative
   `Vec::with_capacity` per call. Single-threaded one such allocation succeeds when RAM is

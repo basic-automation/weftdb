@@ -14,13 +14,34 @@ use crate::{cache, database::traits::Connection, DatabaseCache};
 /// transaction poisoned by an abandoned write statement) means **nothing was written**, so
 /// the error must reach the caller. The best-effort `ROLLBACK` leaves the connection
 /// without a dangling transaction; its own error is ignored because the commit error is
-/// the one that matters.
+/// the one that matters. The commit's `turso::Error` stays in the returned error's chain,
+/// so [`is_transient_mvcc_error`](crate::error::is_transient_mvcc_error) can tell a
+/// conflict from a failure.
 async fn commit_or_rollback(conn: &cache::Connection) -> Result<()> {
 	match conn.as_ref().execute("COMMIT", turso::params![]).await {
 		Ok(_) => Ok(()),
 		Err(e) => {
 			let _ = conn.as_ref().execute("ROLLBACK", turso::params![]).await;
-			Err(anyhow::anyhow!("Commit failed; the transaction was rolled back: {e}"))
+			let message = format!("Commit failed; the transaction was rolled back: {e}");
+			Err(anyhow::Error::new(e).context(message))
+		}
+	}
+}
+
+impl Database {
+	/// Roll back `conn`'s transaction after one of its statements failed, so that the caller
+	/// can return that statement's error.
+	///
+	/// Turso rolls a transaction back itself when one of its statements loses an MVCC
+	/// write-write conflict, so the `ROLLBACK` then fails (`cannot rollback - no transaction
+	/// is active`). A failed rollback is logged at warn and never replaces the statement's
+	/// error: that error is what tells the caller, and
+	/// [`is_transient_mvcc_error`](crate::error::is_transient_mvcc_error), that the write
+	/// conflicted and can be retried. (Propagating the rollback's error with `?` reported
+	/// every such conflict as `Rollback failed: …`.)
+	pub(crate) async fn rollback_after_error(conn: &cache::Connection) {
+		if let Err(rollback) = Self::rollback_concurrent(conn).await {
+			tracing::warn!(error = %rollback, "Rolling back after a failed statement failed; returning the statement's error");
 		}
 	}
 }
@@ -87,7 +108,12 @@ impl Connection for Database {
 		// Enable MVCC mode - required for BEGIN CONCURRENT (Turso 0.4.0+)
 		conn.execute("PRAGMA journal_mode=experimental_mvcc", turso::params![]).await.ok();
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok(); // 10 minutes for large concurrent operations
-		conn.execute("PRAGMA synchronous=NORMAL", turso::params![]).await.ok();
+
+		// No `PRAGMA synchronous` here: it is per connection, so setting it on this throwaway
+		// connection would change nothing. Every Turso connection starts in `SyncMode::Full`
+		// (turso_core-0.8.1 database.rs:2591), which fsyncs the MVCC log on every COMMIT, and
+		// WeftDB relies on that for its durability.
+
 		conn.execute("PRAGMA temp_store=memory", turso::params![]).await.ok();
 		conn.execute("PRAGMA wal_autocheckpoint=1000", turso::params![]).await.ok(); // Better WAL handling for large writes
 		conn.execute("PRAGMA cache_size=-256000", turso::params![]).await.ok(); // 256MB cache for large batch operations
@@ -151,8 +177,13 @@ impl Connection for Database {
 				Ok(())
 			}
 			Err(e) => {
-				tracing::warn!("[checkpoint_wal_passive] PASSIVE checkpoint failed: {e}");
-				// Not critical - data is still in WAL
+				// Expected under MVCC: Turso rejects PASSIVE unless
+				// `experimental_mvcc_passive_checkpoint` is set (turso_core-0.8.1
+				// translate/pragma.rs:943-948). Nothing is lost: every committed transaction is
+				// already durable, either in the `-log` (fsynced at COMMIT, replayed at open) or,
+				// once Turso's own TRUNCATE checkpoint has run past ~4 MB of log
+				// (mvcc/database/mod.rs:3706-3715), in the main file.
+				tracing::warn!("[checkpoint_wal_passive] PASSIVE checkpoint not run ({e}): Turso rejects PASSIVE under MVCC; committed data stays durable in the -log (or the main file after Turso's own checkpoint)");
 				Ok(())
 			}
 		}

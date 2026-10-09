@@ -5,25 +5,26 @@ use ::weftdb::{
 };
 use bigdecimal::BigDecimal;
 use chrono::{Duration, TimeZone, Utc};
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{criterion_group, BatchSize, Criterion};
 use splimes::{Resolution, Spline};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+
+mod common;
 
 // Shared benchmark infrastructure to reduce setup overhead
 struct BenchmarkContext {
 	db: Arc<Database>,
 	aspect_id: AspectId,
-	_cleanup_path: String,
+	db_name: String,
 }
 
 impl BenchmarkContext {
 	async fn new(name: &str, measurement_count: usize) -> anyhow::Result<Self> {
 		let db_name = format!("bench_{}_{}", name, Uuid::new_v4());
-		let cleanup_path = format!("data/{db_name}");
 
 		// Clean up any existing data
-		std::fs::remove_dir_all(&cleanup_path).ok();
+		common::remove_database(&db_name);
 		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
 		let db = Arc::new(Database::new(&db_name).await?);
@@ -37,13 +38,13 @@ impl BenchmarkContext {
 			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await?;
 		}
 
-		Ok(Self { db, aspect_id: aspect.id(), _cleanup_path: cleanup_path })
+		Ok(Self { db, aspect_id: aspect.id(), db_name })
 	}
 }
 
 impl Drop for BenchmarkContext {
 	fn drop(&mut self) {
-		std::fs::remove_dir_all(&self._cleanup_path).ok();
+		common::remove_database(&self.db_name);
 	}
 }
 
@@ -92,4 +93,7 @@ fn benchmark_cache_efficiency(c: &mut Criterion) {
 }
 
 criterion_group!(benches, benchmark_optimized_interpolation, benchmark_cache_efficiency);
-criterion_main!(benches);
+
+fn main() {
+	common::criterion_main(&[benches]);
+}

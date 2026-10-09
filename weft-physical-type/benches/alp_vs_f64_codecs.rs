@@ -59,8 +59,7 @@ struct AlpVector {
 }
 
 fn alp_encode(values: &[f64]) -> Vec<AlpVector> {
-	values
-		.chunks(VECTOR)
+	values.chunks(VECTOR)
 		.map(|chunk| {
 			let (exponents, encoded, positions, patch_values, _offsets) = alp::encode::<f64>(chunk, None);
 			let reference = encoded.iter().copied().min().unwrap_or(0);

@@ -9,10 +9,13 @@
 //!
 //! The environment capture records `weft-bench` version, OS, and CPU architecture,
 //! plus a best-effort hardware probe (CPU model, physical/logical core counts,
-//! total RAM) toward the benchmark-report template's hardware block. The remaining
-//! template fields (disk, GPU, driver versions, cloud instance + cost) are a later
-//! increment; every field is honest about its scope — the hardware facts are
-//! `Option` and omitted when unread, never claiming more than was measured.
+//! total RAM) toward the benchmark-report template's hardware block, and, for an
+//! interpolation run, the engine's backend selection ([`EngineMetadata`]: whether
+//! splimes was calibrated, the GPU adapter it started, and `Backend::Auto`'s
+//! thresholds). The remaining template fields (disk, driver versions, cloud
+//! instance + cost) are a later increment; every field is honest about its scope —
+//! the hardware facts are `Option` and omitted when unread, never claiming more than
+//! was measured.
 //!
 //! Reports also render to a self-contained HTML view ([`BenchReport::to_html`])
 //! beside the JSON, for human reading without external assets.
@@ -21,7 +24,9 @@ use std::{fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{BenchResult, SCHEMA_VERSION};
+use crate::{
+	engine::EngineMetadata, schema::{BenchResult, SCHEMA_VERSION}
+};
 
 /// Description of the environment a report was produced in.
 ///
@@ -62,6 +67,11 @@ pub struct RunMetadata {
 	/// Mount point of that disk (the longest mount-point prefix of the working directory).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub work_disk_mount_point: Option<String>,
+	/// The interpolation engine's backends for an interpolation run: calibration, GPU
+	/// and `Backend::Auto` thresholds. `None` for the storage workloads, which do not
+	/// interpolate, and for pre-v16 artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub engine: Option<EngineMetadata>,
 	/// When the report was generated, RFC 3339 / ISO 8601. Empty when the caller
 	/// constructs metadata without a timestamp (e.g. for reproducible tests).
 	pub generated_at: String,
@@ -91,7 +101,14 @@ impl RunMetadata {
 		let cpu_cores_physical = sysinfo::System::physical_core_count();
 		let total_memory_bytes = Some(sys.total_memory()).filter(|&b| b > 0);
 		let (work_disk_kind, work_disk_file_system, work_disk_mount_point) = std::env::current_dir().map_or((None, None, None), |dir| work_disk(&dir));
-		Self { weft_bench_version: env!("CARGO_PKG_VERSION").to_string(), os: std::env::consts::OS.to_string(), arch: std::env::consts::ARCH.to_string(), cpu_model, cpu_cores_physical, cpu_cores_logical, total_memory_bytes, work_disk_kind, work_disk_file_system, work_disk_mount_point, generated_at }
+		Self { weft_bench_version: env!("CARGO_PKG_VERSION").to_string(), os: std::env::consts::OS.to_string(), arch: std::env::consts::ARCH.to_string(), cpu_model, cpu_cores_physical, cpu_cores_logical, total_memory_bytes, work_disk_kind, work_disk_file_system, work_disk_mount_point, engine: None, generated_at }
+	}
+
+	/// Record the interpolation engine's backends for this run (see [`EngineMetadata`]).
+	#[must_use]
+	pub fn with_engine(mut self, engine: Option<EngineMetadata>) -> Self {
+		self.engine = engine;
+		self
 	}
 }
 
@@ -302,11 +319,16 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 		let fs = m.work_disk_file_system.as_deref().map(|f| format!(" {f}")).unwrap_or_default();
 		parts.push(escape_html(&format!("work disk: {kind}{fs} at {mount}")));
 	}
-	if parts.is_empty() {
-		String::new()
-	} else {
-		format!("<p class=\"meta\">{}</p>\n", parts.join(" \u{b7} "))
-	}
+	let hardware = if parts.is_empty() { String::new() } else { format!("<p class=\"meta\">{}</p>\n", parts.join(" \u{b7} ")) };
+	hardware + &engine_meta_html(m.engine.as_ref())
+}
+
+/// Render the interpolation engine's backends (calibration, GPU, `Auto` thresholds) as a
+/// metadata paragraph, or an empty string for a run without them.
+fn engine_meta_html(engine: Option<&EngineMetadata>) -> String {
+	let Some(engine) = engine else { return String::new() };
+	let gpu = engine.gpu.as_deref().map_or_else(|| "no GPU".to_string(), |gpu| format!("GPU {}", escape_html(gpu)));
+	format!("<p class=\"meta\">interpolation engine: {} \u{b7} {gpu} \u{b7} {}</p>\n", escape_html(&engine.describe_calibration()), engine.describe_thresholds())
 }
 
 /// Render one result as an HTML table row. `is_best` tags the most-accurate row.
@@ -389,7 +411,7 @@ mod tests {
 	}
 
 	fn metadata() -> RunMetadata {
-		RunMetadata { weft_bench_version: "0.1.0".to_string(), os: "testos".to_string(), arch: "testarch".to_string(), cpu_model: Some("Test CPU 9000".to_string()), cpu_cores_physical: Some(8), cpu_cores_logical: Some(16), total_memory_bytes: Some(34_359_738_368), work_disk_kind: Some("hdd".to_string()), work_disk_file_system: Some("btrfs".to_string()), work_disk_mount_point: Some("/mnt/data".to_string()), generated_at: "2026-06-06T00:00:00+00:00".to_string() }
+		RunMetadata { weft_bench_version: "0.1.0".to_string(), os: "testos".to_string(), arch: "testarch".to_string(), cpu_model: Some("Test CPU 9000".to_string()), cpu_cores_physical: Some(8), cpu_cores_logical: Some(16), total_memory_bytes: Some(34_359_738_368), work_disk_kind: Some("hdd".to_string()), work_disk_file_system: Some("btrfs".to_string()), work_disk_mount_point: Some("/mnt/data".to_string()), engine: None, generated_at: "2026-06-06T00:00:00+00:00".to_string() }
 	}
 
 	#[test]
@@ -460,6 +482,21 @@ mod tests {
 		assert!(html.contains("8 physical / 16 logical cores"), "core split must appear: {html}");
 		assert!(html.contains("32.0 GiB RAM"), "RAM in GiB must appear: {html}");
 		assert!(html.contains("work disk: hdd btrfs at /mnt/data"), "the work disk must appear: {html}");
+	}
+
+	#[test]
+	fn to_html_and_json_carry_the_engine_thresholds() {
+		// An interpolation run records how the backends were chosen beside the hardware.
+		let engine = EngineMetadata::new(crate::engine::CalibrationStatus::Calibrated, Some("Test GPU (vulkan, discrete; f64 shaders: yes)".to_string()), None, splimes::AutoThresholds::new(16_384, 4_096));
+		let report = BenchReport::with_results(metadata().with_engine(Some(engine.clone())), vec![sample_result("weftdb", true)]);
+		let html = report.to_html();
+		assert!(html.contains("interpolation engine: calibrated \u{b7} GPU Test GPU (vulkan, discrete; f64 shaders: yes) \u{b7} rayon from 16384 grid points, GPU from 4096 (f64) / 4096 (f32)"), "engine must appear: {html}");
+		let back: BenchReport = serde_json::from_str(&report.to_json_pretty().unwrap()).unwrap();
+		assert_eq!(back.metadata.engine, Some(engine));
+		// A storage workload has no engine block, and an artifact without one still parses.
+		let plain = BenchReport::with_results(metadata(), vec![sample_result("weftdb", true)]);
+		assert!(!plain.to_html().contains("interpolation engine"));
+		assert!(!plain.to_json_pretty().unwrap().contains("\"engine\""));
 	}
 
 	#[test]

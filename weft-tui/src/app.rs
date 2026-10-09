@@ -1849,26 +1849,9 @@ fn validate_csv_path(path: &str) -> Option<String> {
 }
 
 async fn list_databases() -> Result<Vec<String>> {
-	// List directories in the active data dir that contain metadata.db
-	use std::fs;
-	let data_dir = weftdb::data_dir();
-	let mut dbs = vec![];
-	let entries = match fs::read_dir(&data_dir) {
-		Ok(entries) => entries,
-		Err(_) => return Ok(dbs), // Data directory doesn't exist yet — no databases
-	};
-	for entry in entries {
-		let entry = entry?;
-		if entry.path().is_dir() {
-			let metadata_path = entry.path().join("metadata.db");
-			if metadata_path.exists() {
-				if let Some(name) = entry.file_name().to_str() {
-					dbs.push(name.to_string());
-				}
-			}
-		}
-	}
-	Ok(dbs)
+	// The directories in the active data dir that contain metadata.db. This also sweeps the
+	// build directories of interrupted database creations, and never lists one.
+	Database::list_stored_databases().await
 }
 
 async fn list_subjects(db_name: &str) -> Result<Vec<Subject>> {

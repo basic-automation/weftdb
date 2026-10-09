@@ -825,3 +825,753 @@ fn read_close_series(path: &std::path::Path, n: usize, skip: usize) -> Result<(V
 	}
 	Ok((ts_ms, values))
 }
+
+/// Release every in-process handle to the database `db_name`, so the next
+/// [`Database::existing`] is a **cold** open, exactly as after a process restart.
+///
+/// Turso keeps one shared database per path in a process-wide registry of weak
+/// references, so the reopen only goes back to disk once nothing holds the old one: not
+/// the `Database` value, not its `DATABASES` entry (which also owns the subject and
+/// aspect handles), and not WeftDB's own connection cache.
+async fn release_database(db: Database, db_name: &str) {
+	let id = db.id();
+	drop(db);
+	DATABASES.lock().await.remove(&id);
+	weftdb::clear_connection_cache_by_name(db_name).await;
+}
+
+/// The MVCC logical log beside a database's `metadata.db`.
+fn metadata_log_path(db_name: &str) -> std::path::PathBuf {
+	std::path::Path::new(&Database::get_data_dir()).join(db_name).join("metadata.db-log")
+}
+
+/// Fold `metadata.db`'s logical log into the main file, leaving a zero-length `-log`
+/// (TRUNCATE is the default checkpoint mode under MVCC).
+async fn truncate_checkpoint(metadata: &turso::Database) -> Result<()> {
+	let conn = metadata.connect()?;
+	let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+	while rows.next().await?.is_some() {}
+	Ok(())
+}
+
+/// Give `metadata.db` and its sidecars (`-log`, any `-wal`) fresh inodes at the same paths,
+/// by copying each one and renaming the copy over it, so the next open is **cold by
+/// construction**.
+///
+/// [`release_database`] makes the reopen cold only as long as nothing else still holds the
+/// old Turso database. Turso's process-wide registry is keyed by the DB file's (dev, ino),
+/// so if a strong handle ever leaked (in `DatabaseInfo`, a cache or a background task) the
+/// reopen would get the live in-memory database back, and the test would pass even with the
+/// log deleted, because the unlink would not touch the live MVCC store. New inodes cannot
+/// match a registry entry, so the reopen has to replay the `-log` from disk. The paths stay
+/// put because the legacy store records its absolute `metadata_path` in metadata.db.
+fn reinode_metadata_files(db_name: &str) -> Result<()> {
+	let dir = std::path::Path::new(&Database::get_data_dir()).join(db_name);
+	for entry in std::fs::read_dir(&dir)? {
+		let path = entry?.path();
+		let is_metadata = path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("metadata.db"));
+		if is_metadata && path.is_file() {
+			let mut copy = path.clone().into_os_string();
+			copy.push(".reinode");
+			std::fs::copy(&path, &copy).with_context(|| format!("copying {}", path.display()))?;
+			std::fs::rename(&copy, &path).with_context(|| format!("renaming the copy over {}", path.display()))?;
+		}
+	}
+	Ok(())
+}
+
+/// Release every handle to `db_name`, check that the acknowledged commits are still only in
+/// the logical log, then give the files fresh inodes, so the following
+/// [`Database::existing`] is a genuine cold open that must replay that log.
+async fn restart_with_uncheckpointed_log(db: Database, db_name: &str) -> Result<()> {
+	release_database(db, db_name).await;
+
+	// Precondition: the acknowledged commits are still only in the logical log. Without
+	// it the test would pass for the wrong reason (a checkpoint had already moved them).
+	let log_len = std::fs::metadata(metadata_log_path(db_name)).context("metadata.db-log is missing before the reopen")?.len();
+	assert!(log_len > 0, "precondition: metadata.db-log holds the uncheckpointed commits (it is empty)");
+
+	reinode_metadata_files(db_name)
+}
+
+/// **Regression (legacy-open-deletes-mvcc-logical-log).** Commits to `metadata.db` that
+/// were acknowledged before a restart must still be there after it, and after a second
+/// restart that follows more writes (replay, then append, then replay again).
+///
+/// Under MVCC every committed transaction lives in the `metadata.db-log` until a
+/// checkpoint copies it into the main file. WeftDB's own PASSIVE checkpoints are rejected
+/// under MVCC, so they never run, and Turso checkpoints by itself only once the log passes
+/// about 4 MB, which this test stays far below (the precondition in
+/// [`restart_with_uncheckpointed_log`] checks it). The cold-open path used to delete that log
+/// unconditionally, which threw away the subject, the aspect and the unbatched queue; on
+/// main the reopen does not even find the `database` table.
+#[tokio::test]
+#[serial]
+async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
+	let temp_dir = tempfile::tempdir()?;
+	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	let db_name = format!("reopen_{}", Uuid::new_v4());
+
+	let db = Database::new(&db_name).await?;
+	let subject = db.observe_subject("reopen_subject").await?;
+	let aspect = db.track_aspect(&subject.id(), "reopen_aspect", &Resolution::Seconds, None).await?;
+	let (subject_id, aspect_id) = (subject.id(), aspect.id());
+
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	let batch = |range: std::ops::Range<i64>| -> Vec<InputMeasurement> { range.map(|i| InputMeasurement::new(base + Duration::seconds(i), BigDecimal::from(i))).collect() };
+	let first = batch(0..8);
+	let mut expected: Vec<DateTime<Utc>> = first.iter().map(InputMeasurement::timestamp).collect();
+	db.batch_capture_measurements(aspect_id, DatasetId::new(), first).await?;
+	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 8, "the batch is queued before the restart");
+
+	drop((subject, aspect));
+	restart_with_uncheckpointed_log(db, &db_name).await?;
+
+	let reopened = Database::existing(&db_name).await.context("cold reopen of a database with acknowledged metadata commits")?;
+
+	let subjects = reopened.list_subjects().await?;
+	assert_eq!(subjects.get(&subject_id).map(String::as_str), Some("reopen_subject"), "the subject survives the reopen");
+	let aspects = reopened.get_subject_aspects(&subject_id).await?;
+	assert!(aspects.iter().any(|a| a.id() == aspect_id && a.name() == "reopen_aspect"), "the aspect survives the reopen");
+
+	let mut queued = reopened.get_unbatched_measurements(&aspect_id).await?;
+	queued.sort();
+	expected.sort();
+	assert_eq!(queued, expected, "every queued timestamp survives the reopen");
+
+	// Append to the replayed log, then restart again: both generations of commits must survive.
+	let second = batch(8..16);
+	expected.extend(second.iter().map(InputMeasurement::timestamp));
+	reopened.batch_capture_measurements(aspect_id, DatasetId::new(), second).await?;
+	assert_eq!(reopened.count_unbatched_measurements(&aspect_id).await?, 16, "the second batch is queued before the second restart");
+	restart_with_uncheckpointed_log(reopened, &db_name).await?;
+
+	let reopened = Database::existing(&db_name).await.context("second cold reopen after appending to the replayed log")?;
+	assert!(reopened.list_subjects().await?.contains_key(&subject_id), "the subject survives the second reopen");
+	let mut queued = reopened.get_unbatched_measurements(&aspect_id).await?;
+	queued.sort();
+	expected.sort();
+	assert_eq!(queued, expected, "the queued timestamps from both batches survive the second reopen");
+
+	release_database(reopened, &db_name).await;
+	Ok(())
+}
+
+/// The cold-open sweep still removes a **zero-length** `metadata.db-log`: it holds no
+/// commits and, once every handle is released, nothing has it open, so it is litter, the
+/// same rule `remove_empty_sidecars` applies to backups.
+///
+/// Turso may create a fresh log as it opens, so "the path is gone" is not observable.
+/// Instead a hard link pins the empty log's inode: if the sweep unlinked it, the probe is
+/// its only remaining name (`nlink == 1`); had it been kept, `-log` would still be a
+/// second name for it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn zero_length_metadata_log_is_removed_on_cold_open() -> Result<()> {
+	use std::os::unix::fs::MetadataExt as _;
+
+	let temp_dir = tempfile::tempdir()?;
+	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	let db_name = format!("emptylog_{}", Uuid::new_v4());
+
+	let db = Database::new(&db_name).await?;
+	let subject = db.observe_subject("emptylog_subject").await?;
+	let subject_id = subject.id();
+	drop(subject);
+
+	// Fold the logical log into the main file; TRUNCATE leaves the `-log` in place at
+	// length zero.
+	truncate_checkpoint(db.metadata()).await?;
+	release_database(db, &db_name).await;
+
+	let log = metadata_log_path(&db_name);
+	assert_eq!(std::fs::metadata(&log).context("metadata.db-log is missing before the reopen")?.len(), 0, "precondition: the checkpoint left a zero-length log");
+	let probe = log.with_extension("db-log.probe");
+	std::fs::hard_link(&log, &probe)?;
+	assert_eq!(std::fs::metadata(&probe)?.nlink(), 2);
+
+	let reopened = Database::existing(&db_name).await?;
+	assert_eq!(std::fs::metadata(&probe)?.nlink(), 1, "the zero-length metadata.db-log was not removed by the cold open");
+	assert!(reopened.list_subjects().await?.contains_key(&subject_id), "the checkpointed subject is still readable");
+
+	release_database(reopened, &db_name).await;
+	Ok(())
+}
+
+/// Two concurrent cold opens of the same `metadata.db` over a zero-length `-log` must not
+/// unlink each other's live log.
+///
+/// The cold-open sweep removes a zero-length log as litter. Without the connection-cache
+/// guard held across the whole cold path, the second open could miss the cache, see the
+/// fresh empty log the first open's Turso open had just created, and unlink it; Turso
+/// (keyed by the DB file's inode) then hands both callers the same live database, whose
+/// commits are fsynced into an unlinked file that no restart will replay. Each round
+/// races two opens with the second one staggered across the first one's cold path,
+/// commits through the first, and checks the commit reached the `-log` on disk; after a
+/// crash-like release (no checkpoint) the next round's cold open must replay it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
+	const ROUNDS: u64 = 20;
+
+	let temp_dir = tempfile::tempdir()?;
+	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	let db_name = format!("coldrace_{}", Uuid::new_v4());
+	let db = Database::new(&db_name).await?;
+	let metadata_path = format!("{}/{}/metadata.db", Database::get_data_dir(), db_name);
+	release_database(db, &db_name).await;
+	let log = metadata_log_path(&db_name);
+
+	for round in 0..ROUNDS {
+		// Start from a zero-length log, which the sweep treats as litter.
+		let metadata = Database::get_turso_database(&metadata_path).await?;
+		truncate_checkpoint(&metadata).await?;
+		drop(metadata);
+		weftdb::clear_connection_cache_by_name(&db_name).await;
+		assert_eq!(std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0), 0, "precondition: round {round} starts from an empty log");
+
+		let first_path = metadata_path.clone();
+		let first = tokio::spawn(async move { Database::get_turso_database(&first_path).await });
+		let second_path = metadata_path.clone();
+		let stagger = std::time::Duration::from_micros(round * 250);
+		let second = tokio::spawn(async move {
+			tokio::time::sleep(stagger).await;
+			Database::get_turso_database(&second_path).await
+		});
+		let (first, second) = (first.await??, second.await??);
+
+		first.connect()?.execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![Uuid::new_v4().to_string(), format!("race {round}"), 0]).await?;
+		let log_len = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+		assert!(log_len > 0, "round {round} (stagger {stagger:?}): the acknowledged commit is not in the metadata.db-log on disk, so it went to an unlinked log");
+
+		// Release without a checkpoint, as a crash would.
+		drop((first, second));
+		weftdb::clear_connection_cache_by_name(&db_name).await;
+	}
+
+	let metadata = Database::get_turso_database(&metadata_path).await?;
+	let mut rows = metadata.connect()?.query("SELECT COUNT(*) FROM transactions WHERE message LIKE 'race %'", ()).await?;
+	let count: i64 = rows.next().await?.context("COUNT(*) returned no row")?.get(0)?;
+	assert_eq!(count, i64::try_from(ROUNDS)?, "every acknowledged commit survives the cold reopens");
+	drop((rows, metadata));
+	weftdb::clear_connection_cache_by_name(&db_name).await;
+	Ok(())
+}
+
+/// **Regression (legacy-queue-consumer-batch-before-dequeue, crash-consistency design
+/// S18).** Queuing a batch whose measurements are already queued, or already processed,
+/// stores nothing, through either insert API; a new batch is still queued. The processed
+/// case holds although processing rewrites a batch's measurements: the processed row keeps
+/// the hash the batch was queued under. On main every call inserted another copy.
+#[tokio::test]
+#[serial]
+async fn queuing_a_queued_or_processed_batch_again_stores_nothing() -> Result<()> {
+	use futures::TryStreamExt;
+	use weftdb::{Batch, BatchedMeasurement, Point};
+
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let info = db.get_database_info().await?;
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	// A fresh `Batch` (new id) over the five points from minute `start`, as the consumer
+	// builds one for a window.
+	let batch = |start: i64| {
+		let points = (start..start + 5).map(|i| BatchedMeasurement::new(Point::new(base + Duration::minutes(i), BigDecimal::from((i * 7) % 11)))).collect();
+		Batch::new(5, points, Resolution::Minutes, aspect_id, info.clone())
+	};
+	let queued = || db.count_unprocessed_batches(&aspect_id);
+
+	db.insert_unprocessed_batch(&aspect_id, &batch(0)).await?;
+	db.insert_unprocessed_batch(&aspect_id, &batch(0)).await?;
+	assert_eq!(queued().await?, 1, "insert_unprocessed_batch queued the same batch twice");
+	let tx_ids = db.batch_insert_unprocessed_batches(&aspect_id, vec![batch(0), batch(1), batch(1)]).await?;
+	assert_eq!(tx_ids.len(), 3, "every input batch gets a TxId, stored or skipped");
+	assert_eq!(queued().await?, 2, "batch_insert_unprocessed_batches stores only the new batch, once");
+
+	// Process the queued batches, as the batch processor does, and move them over.
+	let mut stored: Vec<Batch> = db.get_unprocessed_batches(&aspect_id).await?.try_collect().await?;
+	for stored in &mut stored {
+		let before = serde_json::to_string(stored.measurements())?;
+		stored.process()?;
+		assert_ne!(serde_json::to_string(stored.measurements())?, before, "precondition: processing rewrites the measurements");
+	}
+	db.move_batches_to_processed(&aspect_id, &stored).await?;
+	assert_eq!((queued().await?, db.count_processed_batches(&aspect_id).await?), (0, 2), "precondition: both batches are processed");
+
+	db.insert_unprocessed_batch(&aspect_id, &batch(0)).await?;
+	db.batch_insert_unprocessed_batches(&aspect_id, vec![batch(1)]).await?;
+	assert_eq!(queued().await?, 0, "a processed batch was queued again");
+	db.insert_unprocessed_batch(&aspect_id, &batch(2)).await?;
+	db.batch_insert_unprocessed_batches(&aspect_id, vec![batch(3)]).await?;
+	assert_eq!(queued().await?, 2, "new batches are still queued");
+	Ok(())
+}
+
+/// **Regression (crash-consistency design, S18: the dedupe after extraction).** A batch
+/// that pattern extraction consumed is not queued again: `remove_extracted_batches`
+/// records its hash in the transaction that deletes it, and the queue's duplicate check
+/// looks there too. A batch removed with the plain `bulk_remove_processed_batches` is not
+/// recorded, and `clear_processed_batches` clears the record, so a full rebuild queues
+/// every window again. Before, a batch extraction had deleted was queued again, and
+/// extracted as a second occurrence of its window.
+#[tokio::test]
+#[serial]
+async fn queuing_an_extracted_batch_again_stores_nothing() -> Result<()> {
+	use futures::TryStreamExt;
+	use weftdb::{Batch, BatchId, BatchedMeasurement, Point};
+
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let info = db.get_database_info().await?;
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	let batch = |start: i64| {
+		let points = (start..start + 5).map(|i| BatchedMeasurement::new(Point::new(base + Duration::minutes(i), BigDecimal::from((i * 7) % 11)))).collect();
+		Batch::new(5, points, Resolution::Minutes, aspect_id, info.clone())
+	};
+	let windows = || vec![batch(0), batch(1), batch(2)];
+	let queued = || db.count_unprocessed_batches(&aspect_id);
+
+	db.batch_insert_unprocessed_batches(&aspect_id, windows()).await?;
+	let mut stored: Vec<Batch> = db.get_unprocessed_batches(&aspect_id).await?.try_collect().await?;
+	let window = |start: i64| -> Result<BatchId> { Ok(*stored.iter().find(|stored| *stored.measurements()[0].get_measurement_timestamp() == base + Duration::minutes(start)).context("the window's batch")?.batch_id()) };
+	let (extracted, removed) = ([window(0)?, window(1)?], window(2)?);
+	for stored in &mut stored {
+		stored.process()?;
+	}
+	db.move_batches_to_processed(&aspect_id, &stored).await?;
+	db.remove_extracted_batches(&aspect_id, &extracted).await?;
+	db.bulk_remove_processed_batches(&aspect_id, &[removed]).await?;
+	assert_eq!((queued().await?, db.count_processed_batches(&aspect_id).await?), (0, 0), "precondition: every batch is gone from both tables");
+
+	db.batch_insert_unprocessed_batches(&aspect_id, windows()).await?;
+	db.insert_unprocessed_batch(&aspect_id, &batch(1)).await?;
+	assert_eq!(queued().await?, 1, "only the window removed without extraction is queued again");
+
+	// A full rebuild clears the batches, and with the processed ones the record.
+	db.clear_unprocessed_batches(&aspect_id).await?;
+	db.clear_processed_batches(&aspect_id).await?;
+	db.batch_insert_unprocessed_batches(&aspect_id, windows()).await?;
+	assert_eq!(queued().await?, 3, "after clear_processed_batches every window is queued again");
+	Ok(())
+}
+
+/// **Regression (crash-consistency design, S18: the extracted-batch record is bounded).**
+/// `remove_extracted_batches` deletes the records older than the retention (48 hours by
+/// default) in the transaction that writes the new ones, so the record holds about the
+/// retention's worth of batches instead of one row per batch ever extracted. A batch whose
+/// record expired is queued again; one still recorded is not. Before, only
+/// `clear_processed_batches` removed a record, and the table grew by about one row per
+/// resolution step of every aspect, forever.
+#[tokio::test]
+#[serial]
+async fn the_extracted_batch_record_expires_after_its_retention() -> Result<()> {
+	use futures::TryStreamExt;
+	use weftdb::{Batch, BatchId, BatchedMeasurement, Point};
+
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let info = db.get_database_info().await?;
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	let batch = |start: i64| {
+		let points = (start..start + 5).map(|i| BatchedMeasurement::new(Point::new(base + Duration::minutes(i), BigDecimal::from((i * 7) % 11)))).collect();
+		Batch::new(5, points, Resolution::Minutes, aspect_id, info.clone())
+	};
+	let queued = || db.count_unprocessed_batches(&aspect_id);
+	let processed = db.get_processed_batches_db(&aspect_id).await?.connect()?;
+	let recorded = || async {
+		let mut rows = processed.query("SELECT COUNT(*) FROM extracted_batches", ()).await?;
+		let count: i64 = rows.next().await?.context("COUNT(*) returned no row")?.get(0)?;
+		anyhow::Ok(count)
+	};
+
+	db.batch_insert_unprocessed_batches(&aspect_id, vec![batch(0), batch(1)]).await?;
+	let mut stored: Vec<Batch> = db.get_unprocessed_batches(&aspect_id).await?.try_collect().await?;
+	let window = |start: i64| -> Result<BatchId> { Ok(*stored.iter().find(|stored| *stored.measurements()[0].get_measurement_timestamp() == base + Duration::minutes(start)).context("the window's batch")?.batch_id()) };
+	let (first, second) = (window(0)?, window(1)?);
+	for stored in &mut stored {
+		stored.process()?;
+	}
+	db.move_batches_to_processed(&aspect_id, &stored).await?;
+
+	db.remove_extracted_batches(&aspect_id, &[first]).await?;
+	assert_eq!(recorded().await?, 1, "precondition: extraction recorded the batch");
+	// The record is now older than the default retention, as two days later.
+	processed.execute("UPDATE extracted_batches SET extracted_at = extracted_at - ?", (49 * 60 * 60 * 1000_i64,)).await?;
+	db.remove_extracted_batches(&aspect_id, &[second]).await?;
+	assert_eq!(recorded().await?, 1, "the next extraction deleted the expired record and recorded its own batch");
+
+	db.insert_unprocessed_batch(&aspect_id, &batch(1)).await?;
+	assert_eq!(queued().await?, 0, "a batch still recorded is not queued again");
+	db.insert_unprocessed_batch(&aspect_id, &batch(0)).await?;
+	assert_eq!(queued().await?, 1, "a batch whose record expired is queued again");
+	Ok(())
+}
+
+/// Queue writes retry an MVCC write-write conflict over the same entry (crash-consistency
+/// design, S18). The enqueue is an upsert, so it writes an entry that is already queued,
+/// and conflicts with a consumer's dequeue (or another ingest's enqueue) of the same
+/// timestamp. A held, uncommitted write stands in for the other side here:
+///
+/// - an ingest whose write-ahead enqueue meets a dequeue of its timestamp retries until
+///   the dequeue commits, instead of failing the call (one attempt fails);
+/// - a dequeue that meets an enqueue of an entry it read retries until the enqueue
+///   commits, and then leaves that entry queued, since it moved past what was read.
+#[tokio::test]
+#[serial]
+async fn queue_writes_retry_a_conflict_over_the_same_entry() -> Result<()> {
+	/// Commit the held transaction after a while, so that the other side meets it first.
+	async fn release_later(holder: &turso::Connection) -> Result<()> {
+		tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+		holder.execute("COMMIT", ()).await?;
+		Ok(())
+	}
+
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let aspect_key = aspect_id.as_uuid().to_string();
+	let at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	db.enqueue_unbatched_measurement(&aspect_id, at).await?;
+	let holder = db.metadata().connect()?;
+
+	// A consumer's dequeue holds the entry while an ingest queues the same timestamp.
+	holder.execute("BEGIN CONCURRENT", ()).await?;
+	holder.execute("DELETE FROM unbatched_measurements WHERE aspect_id = ? AND data_timestamp = ?", (aspect_key.clone(), at.timestamp_millis())).await?;
+	let err = db.enqueue_unbatched_measurement(&aspect_id, at).await.expect_err("precondition: a single enqueue loses the conflict");
+	assert!(weftdb::error::is_transient_mvcc_error(&err), "a conflict is reported as transient: {err:#}");
+	let (row, dataset) = (InputMeasurement::new(at, BigDecimal::from(1)), DatasetId::new());
+	let (captured, released) = tokio::join!(db.capture_measurement(&aspect_id, &dataset, &row), release_later(&holder));
+	released?;
+	captured.context("the ingest retries its enqueue past the conflict")?;
+	assert_eq!(db.get_unbatched_measurements(&aspect_id).await?, vec![at], "the ingest's row is queued");
+
+	// An ingest's enqueue holds the entry while a consumer dequeues what it read.
+	let read = db.get_unbatched_entries(&aspect_id).await?;
+	holder.execute("BEGIN CONCURRENT", ()).await?;
+	holder.execute("UPDATE unbatched_measurements SET queued_at = queued_at + 1 WHERE aspect_id = ? AND data_timestamp = ?", (aspect_key, at.timestamp_millis())).await?;
+	let (dequeued, released) = tokio::join!(db.dequeue_unbatched_entries(&aspect_id, &read), release_later(&holder));
+	released?;
+	dequeued.context("the dequeue retries past the conflict")?;
+	assert_eq!(db.get_unbatched_measurements(&aspect_id).await?, vec![at], "the entry queued again during the dequeue stays queued");
+	Ok(())
+}
+
+/// A queue entry read by a consumer and queued again afterwards survives the consumer's
+/// dequeue (crash-consistency design, S18): enqueuing a queued timestamp moves its
+/// `queued_at` strictly forward, even within the same millisecond, and
+/// `dequeue_unbatched_entries` removes an entry only while it has the `queued_at` it was
+/// read with. Ingest relies on this to keep a row it committed after a consumer read the
+/// row's write-ahead entry. Dequeuing bare timestamps removed it.
+#[tokio::test]
+#[serial]
+async fn an_entry_queued_again_after_it_was_read_survives_the_dequeue() -> Result<()> {
+	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	let (requeued, untouched) = (base, base + Duration::minutes(1));
+
+	db.enqueue_unbatched_measurements(&aspect_id, &[requeued, untouched]).await?;
+	let read = db.get_unbatched_entries(&aspect_id).await?;
+	assert_eq!(read.len(), 2);
+	db.enqueue_unbatched_measurement(&aspect_id, requeued).await?;
+	let after = db.get_unbatched_entries(&aspect_id).await?;
+	let queued_at = |entries: &[weftdb::UnbatchedEntry], at| entries.iter().find(|entry| entry.data_timestamp == at).map(|entry| entry.queued_at);
+	assert!(queued_at(&after, requeued) > queued_at(&read, requeued), "queuing again moves queued_at forward: {read:?} -> {after:?}");
+	assert_eq!(queued_at(&after, untouched), queued_at(&read, untouched));
+
+	db.dequeue_unbatched_entries(&aspect_id, &read).await?;
+	assert_eq!(db.get_unbatched_measurements(&aspect_id).await?, vec![requeued], "only the entry not queued again since the read is dequeued");
+	db.dequeue_unbatched_entries(&aspect_id, &db.get_unbatched_entries(&aspect_id).await?).await?;
+	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 0);
+	Ok(())
+}
+
+/// The batch tables, and the processed batches DB's record of the extracted ones, carry
+/// the hash index that the queue's duplicate check looks a batch up in (crash-consistency
+/// design, S18): `(aspect_id, batch_hash)` on the batches, `batch_hash` on the record
+/// (whose DB belongs to one aspect). So each check is a point lookup instead of a scan of
+/// every stored batch; and a DB created before the index (or the record) gets it the next
+/// time a process opens it.
+#[tokio::test]
+#[serial]
+async fn the_batch_tables_index_their_hashes() -> Result<()> {
+	/// Turso's plan for the duplicate check's lookup in `table`.
+	async fn lookup_plan(conn: &turso::Connection, table: &str) -> Result<String> {
+		let mut rows = if table == "extracted_batches" { conn.query("EXPLAIN QUERY PLAN SELECT 1 FROM extracted_batches WHERE batch_hash = ? LIMIT 1", ("hash",)).await? } else { conn.query(&format!("EXPLAIN QUERY PLAN SELECT 1 FROM {table} WHERE aspect_id = ? AND batch_hash = ? LIMIT 1"), ("aspect", "hash")).await? };
+		let mut plan = String::new();
+		while let Some(row) = rows.next().await? {
+			plan.push_str(&row.get::<String>(3)?);
+		}
+		Ok(plan)
+	}
+
+	let (_temp_dir, db, subject, aspect) = setup_test_database().await?;
+	let aspect_id = aspect.id();
+	let name = db.name().to_string();
+	drop((subject, aspect));
+	for processed in [false, true] {
+		let batches = if processed { db.get_processed_batches_db(&aspect_id).await? } else { db.get_unprocessed_batches_db(&aspect_id).await? };
+		let conn = batches.connect()?;
+		let plan = lookup_plan(&conn, "batches").await?;
+		assert!(plan.contains("idx_batches_hash"), "processed={processed}: the lookup does not use the hash index: {plan}");
+		// What a batch table created before the index looks like.
+		conn.execute("DROP INDEX idx_batches_hash", ()).await?;
+		assert!(!lookup_plan(&conn, "batches").await?.contains("idx_batches_hash"), "precondition: the index is gone");
+	}
+	// The processed batches DB also records the batches extraction consumed, indexed the
+	// same way; a DB created before that record gets it when it is next opened.
+	let conn = db.get_processed_batches_db(&aspect_id).await?.connect()?;
+	let plan = lookup_plan(&conn, "extracted_batches").await?;
+	assert!(plan.contains("idx_extracted_batches_hash"), "the extracted lookup does not use its hash index: {plan}");
+	conn.execute("DROP TABLE extracted_batches", ()).await?;
+	drop(conn);
+	release_database(db, &name).await;
+
+	let db = Database::existing(&name).await?;
+	for processed in [false, true] {
+		let batches = if processed { db.get_processed_batches_db(&aspect_id).await? } else { db.get_unprocessed_batches_db(&aspect_id).await? };
+		let plan = lookup_plan(&batches.connect()?, "batches").await?;
+		assert!(plan.contains("idx_batches_hash"), "processed={processed}: reopening did not add the hash index: {plan}");
+	}
+	let plan = lookup_plan(&db.get_processed_batches_db(&aspect_id).await?.connect()?, "extracted_batches").await?;
+	assert!(plan.contains("idx_extracted_batches_hash"), "reopening did not add the extracted batches and their index: {plan}");
+	release_database(db, &name).await;
+	Ok(())
+}
+
+/// `Database::new` refuses a name of the form of its own build directories
+/// (`.{name}.creating-{nonce}`), which a stale-build sweep would take for crash litter.
+#[tokio::test]
+#[serial]
+async fn database_new_refuses_a_build_directory_name() -> Result<()> {
+	let temp_dir = tempfile::tempdir()?;
+	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	let name = format!(".sensors.creating-{}", Uuid::new_v4().simple());
+	let err = Database::new(&name).await.expect_err("a build directory's name is reserved");
+	assert!(err.to_string().contains("reserved"), "{err:#}");
+	assert!(!temp_dir.path().join(&name).exists(), "nothing was created");
+	Ok(())
+}
+
+/// Crash tests for `Database::new` at its fault points (crash-consistency design, S18:
+/// legacy-database-new-half-created).
+#[cfg(feature = "fault-injection")]
+mod database_new_crash {
+	use std::{
+		path::{Path, PathBuf}, sync::Arc, time::Duration
+	};
+
+	use anyhow::{Context, Result};
+	use serial_test::serial;
+	use tokio::sync::Notify;
+	use uuid::Uuid;
+	use weftdb::{
+		database::traits::DatabaseStructure, durable::fault::{self, FaultAction, FaultPoint, FAULT_ENV}, Config, Database
+	};
+
+	use super::release_database;
+
+	/// Set only in the child process [`a_process_crash_at_each_point_is_recoverable`]
+	/// spawns; it holds the name of the database the child creates.
+	const CHILD_ENV: &str = "WEFT_DB_NEW_CRASH_CHILD";
+
+	fn database_dir(name: &str) -> PathBuf {
+		Path::new(&Database::get_data_dir()).join(name)
+	}
+
+	/// The `.{name}.creating-*` build directories under the data directory.
+	fn build_dirs(name: &str) -> Vec<String> {
+		let prefix = format!(".{name}.creating-");
+		let Ok(entries) = std::fs::read_dir(Database::get_data_dir()) else { return Vec::new() };
+		entries.filter_map(Result::ok).filter_map(|entry| entry.file_name().into_string().ok()).filter(|file| file.starts_with(&prefix)).collect()
+	}
+
+	/// `existing(name)` opens the database cold and finds the row `new` committed, with the
+	/// final (not the build directory's) metadata path, and a subject written through it
+	/// survives another cold reopen.
+	async fn assert_usable(name: &str) -> Result<()> {
+		let db = Database::existing(name).await.with_context(|| format!("Database::existing({name})"))?;
+		let subject = db.observe_subject("after_crash").await?;
+		let subject_id = subject.id();
+		drop(subject);
+		let metadata = db.metadata().clone();
+		let mut rows = metadata.connect()?.query("SELECT name, metadata_path FROM database", ()).await?;
+		let row = rows.next().await?.context("no database row")?;
+		let (stored_name, stored_path): (String, String) = (row.get(0)?, row.get(1)?);
+		assert!(rows.next().await?.is_none(), "exactly one database row");
+		drop((rows, metadata));
+		assert_eq!(stored_name, name);
+		assert_eq!(Path::new(&stored_path), database_dir(name).join("metadata.db"), "the row records the final metadata path, not the build directory's");
+		release_database(db, name).await;
+
+		let reopened = Database::existing(name).await?;
+		assert!(reopened.list_subjects().await?.contains_key(&subject_id), "a subject written after the recovery survives a cold reopen");
+		release_database(reopened, name).await;
+		Ok(())
+	}
+
+	/// **Regression (legacy-database-new-half-created).** A failure at either fault point
+	/// makes `new` return an error and leaves a usable state. On main the failed call left
+	/// a half-built `{name}` folder, so the retry failed with "Database folder already
+	/// exists" and `existing` could not open it.
+	///
+	/// - At `L-new-created`, before the rename, nothing is left behind: retrying
+	///   `new(name)` succeeds, and `existing(name)` works.
+	/// - At `L-new-renamed` (standing in for a failed fsync of the data directory) the
+	///   rename, which is the commit point, has happened: the complete database stays, the
+	///   error says it was created and to open it with `existing`, and `new(name)` reports
+	///   that it exists. It used to be renamed back and removed, which deleted the files
+	///   under any handle a concurrent `existing(name)` had opened meanwhile.
+	#[tokio::test]
+	#[serial]
+	async fn a_failure_at_each_point_is_recoverable() -> Result<()> {
+		let temp_dir = tempfile::tempdir()?;
+		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+
+		for point in [FaultPoint::LNewCreated, FaultPoint::LNewRenamed] {
+			let name = format!("newfail_{}", Uuid::new_v4().simple());
+			{
+				let _armed = fault::arm(point, FaultAction::ReturnErr);
+				let err = Database::new(&name).await.expect_err("the armed point fails the call");
+				assert!(format!("{err:#}").contains(&format!("injected fault at {point}")), "{point}: unexpected error {err:#}");
+				if point == FaultPoint::LNewRenamed {
+					assert!(format!("{err:#}").contains("was created") && format!("{err:#}").contains("Database::existing"), "{point}: the error says the database exists: {err:#}");
+				}
+			}
+			assert_eq!(build_dirs(&name), Vec::<String>::new(), "{point}: a failed Database::new left its build directory behind");
+
+			if point == FaultPoint::LNewCreated {
+				assert!(!database_dir(&name).exists(), "{point}: a failed Database::new left a database folder behind");
+				let db = Database::new(&name).await.with_context(|| format!("retrying Database::new after a failure at {point}"))?;
+				release_database(db, &name).await;
+			} else {
+				assert!(database_dir(&name).join("metadata.db").exists(), "{point}: the published database stays in place");
+				let err = Database::new(&name).await.expect_err("the database exists, so new() refuses it");
+				assert!(err.to_string().contains("already exists"), "{point}: {err:#}");
+			}
+			assert_usable(&name).await.with_context(|| format!("after a failure at {point}"))?;
+		}
+		Ok(())
+	}
+
+	/// The on-disk listing never lists a build directory, never sweeps the one a running
+	/// `new` owns, and sweeps a stale one (left by a crashed `new`) once no `new` is running.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[serial]
+	async fn the_listing_sweeps_stale_builds_but_never_a_live_one() -> Result<()> {
+		let temp_dir = tempfile::tempdir()?;
+		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+		let listed = format!("listed_{}", Uuid::new_v4().simple());
+		release_database(Database::new(&listed).await?, &listed).await;
+
+		// A `new` paused after building, before its rename.
+		let pending = format!("pending_{}", Uuid::new_v4().simple());
+		let resume = Arc::new(Notify::new());
+		let armed = fault::arm(FaultPoint::LNewCreated, FaultAction::Pause(resume.clone()));
+		let before = fault::hits(FaultPoint::LNewCreated);
+		let creating = tokio::spawn({
+			let pending = pending.clone();
+			async move { Database::new(&pending).await }
+		});
+		tokio::time::timeout(Duration::from_secs(30), fault::reached(FaultPoint::LNewCreated, before + 1)).await.context("the new() reaches L-new-created")?;
+		drop(armed);
+		let live = build_dirs(&pending);
+		assert_eq!(live.len(), 1, "the paused new() has its build directory");
+
+		// What a `new` that crashed after building leaves: a complete-looking build
+		// directory. (Made only now: the paused `new` swept the data directory as it began.)
+		let stale = database_dir(&format!(".ghost.creating-{}", Uuid::new_v4().simple()));
+		std::fs::create_dir(&stale)?;
+		std::fs::write(stale.join("metadata.db"), b"")?;
+
+		assert_eq!(Database::list_stored_databases().await?, vec![listed.clone()], "build directories are never listed");
+		assert_eq!(build_dirs(&pending), live, "the live build directory is not swept");
+		assert!(stale.exists(), "no sweep runs while a new() is running");
+
+		resume.notify_one();
+		let db = creating.await?.context("the paused new() completes")?;
+		release_database(db, &pending).await;
+		let mut expected = vec![listed.clone(), pending.clone()];
+		expected.sort();
+		assert_eq!(Database::list_stored_databases().await?, expected);
+		assert!(!stale.exists(), "the listing swept the stale build directory");
+		assert_usable(&pending).await
+	}
+
+	/// The body the re-executed child runs: create the database named by [`CHILD_ENV`],
+	/// which aborts at the point `WEFT_FAULT` arms. In a normal run the variable is unset
+	/// and this does nothing.
+	#[tokio::test]
+	async fn child() -> Result<()> {
+		let Some(name) = std::env::var_os(CHILD_ENV) else { return Ok(()) };
+		suppress_core_dump();
+		let name = name.into_string().map_err(|raw| anyhow::anyhow!("{raw:?} is not UTF-8"))?;
+		Database::new(&name).await?;
+		panic!("{FAULT_ENV} did not abort Database::new");
+	}
+
+	/// Keep the child's deliberate abort from dumping core, exactly as the fault module's
+	/// own abort test does: this machine (and CI) may run systemd-coredump, which would
+	/// otherwise store a core of the test binary on every run.
+	fn suppress_core_dump() {
+		#[cfg(unix)]
+		{
+			let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+			// SAFETY: setrlimit only reads the struct, for the duration of the call.
+			unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const none) };
+		}
+		// A pipe `core_pattern` (systemd-coredump) ignores RLIMIT_CORE, but the kernel
+		// never dumps a process that is not dumpable.
+		#[cfg(target_os = "linux")]
+		{
+			let not_dumpable: libc::c_ulong = 0;
+			// SAFETY: PR_SET_DUMPABLE takes one integer and changes only this process's
+			// dumpable flag.
+			unsafe { libc::prctl(libc::PR_SET_DUMPABLE, not_dumpable) };
+		}
+	}
+
+	/// A process crash (abort) at each point of `Database::new`.
+	///
+	/// - At `L-new-created` the database is fully built but still under its
+	///   `.{name}.creating-*` name: `{name}` does not exist, the next `new(name)` sweeps the
+	///   stale build directory and succeeds, and `existing(name)` works. On main the crash
+	///   left a half-created `{name}` folder that neither `new` nor `existing` could use.
+	/// - At `L-new-renamed` the rename, which is the commit point, has happened: the
+	///   database is complete under `{name}`, so `existing(name)` works and `new(name)`
+	///   reports that it already exists, as for any existing database.
+	#[tokio::test]
+	#[serial]
+	async fn a_process_crash_at_each_point_is_recoverable() -> Result<()> {
+		let temp_dir = tempfile::tempdir()?;
+		let data_dir = temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?;
+		std::env::set_var("TEST_DATA_DIR", data_dir);
+
+		for point in [FaultPoint::LNewCreated, FaultPoint::LNewRenamed] {
+			let name = format!("newcrash_{}", Uuid::new_v4().simple());
+			let output = std::process::Command::new(std::env::current_exe()?).args(["database_new_crash::child", "--exact", "--nocapture", "--test-threads=1"]).env(CHILD_ENV, &name).env("TEST_DATA_DIR", data_dir).env(FAULT_ENV, format!("{point}:abort")).output()?;
+			assert!(!output.status.success(), "{point}: the child aborted: {output:?}");
+			#[cfg(unix)]
+			{
+				use std::os::unix::process::ExitStatusExt;
+				assert_eq!(output.status.signal(), Some(6), "{point}: killed by SIGABRT: {output:?}");
+			}
+			assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("aborting at fault point {point}")), "{point}: the child reached the point: {output:?}");
+
+			if point == FaultPoint::LNewCreated {
+				assert!(!database_dir(&name).exists(), "{point}: a crash before the rename must not leave a {name} folder");
+				assert_eq!(build_dirs(&name).len(), 1, "{point}: the crash leaves its build directory for the next sweep");
+				let db = Database::new(&name).await.with_context(|| format!("retrying Database::new after a crash at {point}"))?;
+				release_database(db, &name).await;
+				assert_eq!(build_dirs(&name), Vec::<String>::new(), "{point}: the retry swept the stale build directory");
+			} else {
+				assert!(database_dir(&name).join("metadata.db").exists(), "{point}: the renamed database is in place");
+				assert_eq!(build_dirs(&name), Vec::<String>::new(), "{point}: nothing is left under the build name");
+				let err = Database::new(&name).await.expect_err("the database exists, so new() refuses it");
+				assert!(err.to_string().contains("already exists"), "{point}: {err:#}");
+			}
+			assert_usable(&name).await.with_context(|| format!("after a crash at {point}"))?;
+		}
+		Ok(())
+	}
+}

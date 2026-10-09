@@ -33,12 +33,36 @@
 //! `SnapshotOnly` is a *self*-consistency check: it proves the file is a complete,
 //! readable database, not that it equals any particular state of a moving source. That
 //! is the strongest statement available without stopping writers, since the source has
-//! no stable row count to compare to while it is being written.
+//! no stable row count to compare to while it is being written. Both modes also require
+//! the database's expected table set, so an empty file never passes.
+//!
+//! # Backup directories (docs/design/crash-consistency.md section 9)
+//!
+//! A backup directory is visible under its final name only once it is complete and
+//! durable. [`SegmentStore::backup_control_plane`](crate::SegmentStore::backup_control_plane)
+//! builds it in `.partial-{label}-{nonce}/`, verifies every snapshot, writes a
+//! [`BACKUP_MANIFEST`] and fsyncs the directory, then renames it to its label and fsyncs
+//! the base. Every other name a crash can leave behind starts with one of the
+//! [`STAGING_PREFIXES`]: such a directory is never counted, listed or restored, and
+//! [`sweep_backup_staging`] (which weft-server's backup daemon runs) removes it once it
+//! has been left untouched for [`STAGING_SWEEP_AGE`]. A backup that fails with an error,
+//! rather than a crash, removes its own build directory. Retention removes a backup
+//! with [`retire_backup`], which renames it to `.deleting-*` (durably) before removing
+//! its files, so a crash part-way through never leaves a half-removed directory under a
+//! backup's name. Directories from before the manifest (the four databases, no
+//! manifest) still count and restore.
 
-use std::path::{Path, PathBuf};
+use std::{
+	collections::BTreeSet, ffi::{OsStr, OsString}, io, path::{Path, PathBuf}, time::{Duration, SystemTime}
+};
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use turso::Builder;
+
+use crate::types::durable::{
+	create_dir_all_durable, fault::{self, FaultPoint}, RealFs, StoreFs, SyncPolicy
+};
 
 /// How a snapshot's copy is verified after `VACUUM INTO` writes it.
 ///
@@ -66,6 +90,8 @@ pub struct SnapshotReport {
 	pub dest: PathBuf,
 	/// The number of user tables (excluding `sqlite_*`) that were verified.
 	pub tables: usize,
+	/// The names of those tables, in name order. A backup's manifest records them.
+	pub table_names: Vec<String>,
 	/// The total number of rows verified across those tables — compared equal to the
 	/// source under [`VerifyMode::SourceMatch`], read out of the copy itself under
 	/// [`VerifyMode::SnapshotOnly`].
@@ -162,19 +188,27 @@ pub async fn scan_rows(conn: &turso::Connection, table: &str) -> Result<i64> {
 	Ok(count)
 }
 
-/// The sidecar suffixes libSQL/Turso leaves beside a database file once it has been
-/// opened: the WAL (`-wal`) and Turso's MVCC logical log (`-log`). The same two names
-/// the legacy `Database` opener sweeps before reopening a measurement DB.
-const SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-log"];
+/// The sidecar files libSQL/Turso leaves beside the database file `db` once it has been
+/// opened, named as Turso names them: the WAL is `<db>-wal`, and the MVCC logical log is
+/// `db` with its extension replaced by `db-log` (`turso_core`'s `open_mv_store`). For a
+/// `*.db` file both read as a suffix (`catalog.db-wal`, `catalog.db-log`), the names
+/// the legacy `Database` opener sweeps beside a measurement DB. For the
+/// `catalog.db.tmp` a restore stages they do not: its log is `catalog.db.db-log`.
+fn sidecars_of(db: &Path) -> [PathBuf; 2] {
+	let mut wal = db.as_os_str().to_os_string();
+	wal.push("-wal");
+	[PathBuf::from(wal), db.with_extension("db-log")]
+}
 
 /// Remove the **empty** sidecar files Turso leaves beside `db` after a verification
 /// reopens it.
 ///
 /// `VACUUM INTO` creates a zero-byte `<db>-wal` beside the copy it writes, and reopening
-/// the snapshot to verify it (which both [`VerifyMode`]s do) adds a zero-byte `<db>-log`
-/// — the journal scaffolding for a database nobody will ever write to. They are pure
-/// litter in a backup directory: the reported `bytes` never counted them, but an operator
-/// listing a control-plane backup should see four files, not twelve.
+/// the snapshot to verify it (which both [`VerifyMode`]s do) adds a zero-byte MVCC log
+/// (`<db>-log` for a `*.db` file; see `sidecars_of`) — the journal scaffolding for a
+/// database nobody will ever write to. They are pure litter in a backup directory: the
+/// reported `bytes` never counted them, but an operator listing a control-plane backup
+/// should see four files, not twelve.
 ///
 /// Only a sidecar whose length is **exactly zero** is removed. A non-empty `-wal`/`-log`
 /// holds frames that have not been checkpointed into the main file — data — and is never
@@ -186,10 +220,7 @@ const SIDECAR_SUFFIXES: [&str; 2] = ["-wal", "-log"];
 /// An empty sidecar exists and cannot be removed (a filesystem error).
 pub async fn remove_empty_sidecars(db: &Path) -> Result<usize> {
 	let mut removed = 0usize;
-	for suffix in SIDECAR_SUFFIXES {
-		let mut name = db.as_os_str().to_os_string();
-		name.push(suffix);
-		let sidecar = PathBuf::from(name);
+	for sidecar in sidecars_of(db) {
 		let Ok(meta) = tokio::fs::metadata(&sidecar).await else { continue };
 		if meta.len() == 0 {
 			tokio::fs::remove_file(&sidecar).await.with_context(|| format!("removing empty sidecar {}", sidecar.display()))?;
@@ -199,8 +230,20 @@ pub async fn remove_empty_sidecars(db: &Path) -> Result<usize> {
 	Ok(removed)
 }
 
+/// Fail unless every one of `expected` is among `found`, the user tables of the copy at
+/// `dest`. An empty or truncated-to-the-header database opens and scans cleanly, so
+/// without this an empty `catalog.db` would verify as a backup of a populated one.
+fn require_tables(dest: &Path, found: &[String], expected: &[&str]) -> Result<()> {
+	let missing: Vec<&str> = expected.iter().copied().filter(|table| !found.iter().any(|f| f == table)).collect();
+	if !missing.is_empty() {
+		bail!("backup copy {} is missing the table(s) {missing:?} it must hold (it has {found:?}): not a complete snapshot", dest.display());
+	}
+	Ok(())
+}
+
 /// Verify a snapshot **on its own terms** (the [`VerifyMode::SnapshotOnly`] check):
-/// reopen `dest`, enumerate its user tables, and fully scan each one.
+/// reopen `dest`, require each of `expected_tables`, enumerate its user tables, and
+/// fully scan each one.
 ///
 /// Reads nothing from the source, so it is correct while writers are committing to the
 /// source — the verification an online/background backup needs. Returns a
@@ -208,16 +251,22 @@ pub async fn remove_empty_sidecars(db: &Path) -> Result<usize> {
 /// sidecars the reopen leaves beside the copy are swept afterwards
 /// ([`remove_empty_sidecars`]).
 ///
+/// `expected_tables` is the database's own table set (for a control-plane database,
+/// its store's `TABLES`, as [`expected_tables`] returns). A copy may hold more tables
+/// than that (a newer schema), never fewer.
+///
 /// # Errors
 ///
 /// - The copy will not open or connect.
+/// - Any of `expected_tables` is missing (an empty or wrong database).
 /// - Any table cannot be enumerated or fully read (a truncated/corrupt copy).
 /// - The snapshot file cannot be stat'd, or an empty sidecar cannot be removed.
-pub async fn verify_snapshot(dest: &Path) -> Result<SnapshotReport> {
+pub async fn verify_snapshot(dest: &Path, expected_tables: &[&str]) -> Result<SnapshotReport> {
 	let dest_db = Builder::new_local(dest.to_str().unwrap_or_default()).build().await.with_context(|| format!("reopening backup copy {}", dest.display()))?;
 	let dest_conn = dest_db.connect().with_context(|| format!("connecting to backup copy {}", dest.display()))?;
 
 	let tables = user_tables(&dest_conn).await.context("enumerating backup-copy tables")?;
+	require_tables(dest, &tables, expected_tables)?;
 	let mut rows = 0i64;
 	for table in &tables {
 		rows += scan_rows(&dest_conn, table).await.with_context(|| format!("scanning backup-copy rows in {table}"))?;
@@ -227,7 +276,7 @@ pub async fn verify_snapshot(dest: &Path) -> Result<SnapshotReport> {
 	remove_empty_sidecars(dest).await?;
 
 	let bytes = tokio::fs::metadata(dest).await.with_context(|| format!("stat backup copy {}", dest.display()))?.len();
-	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: tables.len(), rows, bytes, mode: VerifyMode::SnapshotOnly })
+	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: tables.len(), table_names: tables, rows, bytes, mode: VerifyMode::SnapshotOnly })
 }
 
 /// Run `VACUUM INTO <dest>` on `conn`, writing a compacted, transactionally-consistent
@@ -257,7 +306,8 @@ pub async fn vacuum_into(conn: &turso::Connection, dest: &Path) -> Result<()> {
 /// Runs [`vacuum_into`], then reopens the copy and verifies it is a valid libSQL
 /// database whose user-table set and per-table row counts match the source. Returns a
 /// [`SnapshotReport`] describing what was written and verified. See the module docs for
-/// the quiescence scope of the row-count match.
+/// the quiescence scope of the row-count match. No particular table is required; use
+/// [`snapshot_with_verify`] to name the tables a database must hold.
 ///
 /// # Errors
 ///
@@ -265,11 +315,11 @@ pub async fn vacuum_into(conn: &turso::Connection, dest: &Path) -> Result<()> {
 /// - The copy will not open, or its table set / any table's row count differs from the
 ///   source.
 pub async fn snapshot_and_verify(src: &turso::Connection, dest: &Path) -> Result<SnapshotReport> {
-	snapshot_with_verify(src, dest, VerifyMode::SourceMatch).await
+	snapshot_with_verify(src, dest, VerifyMode::SourceMatch, &[]).await
 }
 
 /// Snapshot the database reachable through `src` to `dest`, then verify the copy under
-/// the requested [`VerifyMode`].
+/// the requested [`VerifyMode`], requiring each of `expected_tables` in it.
 ///
 /// [`VerifyMode::SourceMatch`] cross-checks the copy against a fresh source read (sound
 /// only on a quiescent source); [`VerifyMode::SnapshotOnly`] validates the copy alone
@@ -278,13 +328,14 @@ pub async fn snapshot_and_verify(src: &turso::Connection, dest: &Path) -> Result
 /// # Errors
 ///
 /// - [`vacuum_into`] fails (bad/existing destination, libSQL error).
-/// - The copy will not open, cannot be fully read, or (under `SourceMatch`) its table
-///   set / any table's row count differs from the source.
-pub async fn snapshot_with_verify(src: &turso::Connection, dest: &Path, mode: VerifyMode) -> Result<SnapshotReport> {
+/// - The copy will not open, cannot be fully read, lacks one of `expected_tables`, or
+///   (under `SourceMatch`) its table set / any table's row count differs from the
+///   source.
+pub async fn snapshot_with_verify(src: &turso::Connection, dest: &Path, mode: VerifyMode, expected_tables: &[&str]) -> Result<SnapshotReport> {
 	vacuum_into(src, dest).await?;
 	match mode {
-		VerifyMode::SnapshotOnly => verify_snapshot(dest).await,
-		VerifyMode::SourceMatch => verify_against_source(src, dest).await,
+		VerifyMode::SnapshotOnly => verify_snapshot(dest, expected_tables).await,
+		VerifyMode::SourceMatch => verify_against_source(src, dest, expected_tables).await,
 	}
 }
 
@@ -296,7 +347,7 @@ pub async fn snapshot_with_verify(src: &turso::Connection, dest: &Path, mode: Ve
 ///
 /// The copy will not open, or its table set / any table's row count differs from the
 /// source (which a concurrent commit to the source can cause — see the module docs).
-async fn verify_against_source(src: &turso::Connection, dest: &Path) -> Result<SnapshotReport> {
+async fn verify_against_source(src: &turso::Connection, dest: &Path, expected_tables: &[&str]) -> Result<SnapshotReport> {
 	let dest_db = Builder::new_local(dest.to_str().unwrap_or_default()).build().await.with_context(|| format!("reopening backup copy {}", dest.display()))?;
 	let dest_conn = dest_db.connect().with_context(|| format!("connecting to backup copy {}", dest.display()))?;
 
@@ -305,6 +356,7 @@ async fn verify_against_source(src: &turso::Connection, dest: &Path) -> Result<S
 	if src_tables != dest_tables {
 		bail!("backup copy table set differs from source: source {src_tables:?} vs copy {dest_tables:?}");
 	}
+	require_tables(dest, &dest_tables, expected_tables)?;
 
 	let mut rows = 0i64;
 	for table in &src_tables {
@@ -320,7 +372,7 @@ async fn verify_against_source(src: &turso::Connection, dest: &Path) -> Result<S
 	remove_empty_sidecars(dest).await?;
 
 	let bytes = tokio::fs::metadata(dest).await.with_context(|| format!("stat backup copy {}", dest.display()))?.len();
-	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: src_tables.len(), rows, bytes, mode: VerifyMode::SourceMatch })
+	Ok(SnapshotReport { dest: dest.to_path_buf(), tables: src_tables.len(), table_names: src_tables, rows, bytes, mode: VerifyMode::SourceMatch })
 }
 
 /// The four control-plane database file names.
@@ -329,6 +381,289 @@ async fn verify_against_source(src: &turso::Connection, dest: &Path) -> Result<S
 /// store root holds — one source of truth for both directions, so a restore can never
 /// disagree with the backup about what the control plane consists of.
 pub const CONTROL_PLANE_FILES: [&str; 4] = ["segment_index.db", "metadata.db", "aspect_catalog.db", "catalog.db"];
+
+/// The tables the control-plane database file `file` (one of [`CONTROL_PLANE_FILES`])
+/// must hold: its store's `TABLES`. `None` for any other name.
+#[must_use]
+pub fn expected_tables(file: &str) -> Option<&'static [&'static str]> {
+	match file {
+		"segment_index.db" => Some(crate::SegmentIndexStore::TABLES),
+		"metadata.db" => Some(crate::AspectMetadataStore::TABLES),
+		"aspect_catalog.db" => Some(crate::AspectCatalog::TABLES),
+		"catalog.db" => Some(crate::CatalogStore::TABLES),
+		_ => None,
+	}
+}
+
+/// The file a backup directory is published with, written last (and fsynced) before
+/// the directory is renamed to its final name: its presence is what makes a backup
+/// directory complete.
+pub const BACKUP_MANIFEST: &str = "MANIFEST.json";
+
+/// The [`BackupManifest::format`] of a control-plane backup. A restore refuses any
+/// other, so a backup a newer release writes (with frames, S16) is never restored as
+/// if it were control plane only.
+pub const MANIFEST_FORMAT: &str = "weftdb-control-plane-backup/1";
+
+/// Prefix of the directory a backup is built in: `.partial-{label}-{nonce}`.
+pub const PARTIAL_PREFIX: &str = ".partial-";
+/// Prefix a backup is renamed to before retention removes its files:
+/// `.deleting-{label}-{nonce}`.
+pub const DELETING_PREFIX: &str = ".deleting-";
+/// Prefix of the throwaway directory a restore drill restores into.
+pub const RESTORE_DRILL_PREFIX: &str = ".restore-drill-";
+/// The names only an unfinished backup, prune or drill leaves behind.
+///
+/// An entry under a backup base whose name starts with one of these is never a backup:
+/// it is never counted, listed or restored, and [`sweep_backup_staging`] removes it once
+/// stale.
+pub const STAGING_PREFIXES: [&str; 3] = [PARTIAL_PREFIX, DELETING_PREFIX, RESTORE_DRILL_PREFIX];
+
+/// How long the daemon leaves a staging entry untouched before sweeping it: one hour.
+///
+/// Long enough that a backup or drill still running (a manual one, beside the daemon)
+/// is never swept from under itself, short enough that a crash's litter does not
+/// linger.
+pub const STAGING_SWEEP_AGE: Duration = Duration::from_hours(1);
+
+/// Whether `name` is reserved for a staging entry (see [`STAGING_PREFIXES`]).
+#[must_use]
+pub fn is_staging_name(name: &str) -> bool {
+	STAGING_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// Whether `dir`'s own name is reserved for a staging entry.
+fn is_staging_dir(dir: &Path) -> bool {
+	dir.file_name().and_then(OsStr::to_str).is_some_and(is_staging_name)
+}
+
+/// One snapshot file of a [`BackupManifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestFile {
+	/// The file name, one of [`CONTROL_PLANE_FILES`].
+	pub name: String,
+	/// Its size in bytes when the backup was published.
+	pub bytes: u64,
+	/// The user tables the snapshot held, in name order.
+	pub tables: Vec<String>,
+	/// The rows its verification read.
+	pub rows: i64,
+}
+
+/// The `MANIFEST.json` a published backup directory carries: what was verified, so a
+/// restore can check the files are still the ones the backup wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupManifest {
+	/// [`MANIFEST_FORMAT`] for a backup this release writes.
+	pub format: String,
+	/// When the backup was taken, in Unix milliseconds.
+	pub created_ms: u64,
+	/// Every snapshot file in the directory.
+	pub files: Vec<ManifestFile>,
+}
+
+impl BackupManifest {
+	/// The manifest for snapshots verified as `reports`, each `(file name, report)`.
+	#[must_use]
+	pub fn new(created_ms: u64, reports: &[(&str, &SnapshotReport)]) -> Self {
+		let files = reports.iter().map(|(name, report)| ManifestFile { name: (*name).to_string(), bytes: report.bytes, tables: report.table_names.clone(), rows: report.rows }).collect();
+		Self { format: MANIFEST_FORMAT.to_string(), created_ms, files }
+	}
+
+	/// Read `dir`'s manifest, or `None` if it has none (a backup from before manifests).
+	///
+	/// # Errors
+	///
+	/// The manifest exists but cannot be read, does not parse, names a format this
+	/// release does not know, or does not list exactly the [`CONTROL_PLANE_FILES`].
+	pub async fn read(dir: &Path) -> Result<Option<Self>> {
+		let path = dir.join(BACKUP_MANIFEST);
+		let bytes = match tokio::fs::read(&path).await {
+			Ok(bytes) => bytes,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+			Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+		};
+		let manifest: Self = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+		if manifest.format != MANIFEST_FORMAT {
+			bail!("{} declares format {:?}; this release restores only {MANIFEST_FORMAT:?}", path.display(), manifest.format);
+		}
+		let listed: BTreeSet<&str> = manifest.files.iter().map(|file| file.name.as_str()).collect();
+		if listed.len() != manifest.files.len() || listed != CONTROL_PLANE_FILES.into_iter().collect::<BTreeSet<&str>>() {
+			bail!("{} lists {listed:?}, not exactly the control-plane files {CONTROL_PLANE_FILES:?}", path.display());
+		}
+		Ok(Some(manifest))
+	}
+
+	fn file(&self, name: &str) -> Option<&ManifestFile> {
+		self.files.iter().find(|file| file.name == name)
+	}
+}
+
+/// Whether `path` is a regular file (following symlinks), `false` if nothing is there.
+async fn is_file(path: &Path) -> io::Result<bool> {
+	match tokio::fs::metadata(path).await {
+		Ok(meta) => Ok(meta.is_file()),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+		Err(e) => Err(e),
+	}
+}
+
+/// Whether `dir` holds a complete backup: the test retention counts by.
+///
+/// A complete backup carries a [`BACKUP_MANIFEST`] (written last, so a backup that has
+/// one was fully written and verified), or, from before manifests, all four
+/// [`CONTROL_PLANE_FILES`]. A directory with a staging name is never complete, whatever
+/// it holds.
+///
+/// This is a cheap structural test. [`restore_control_plane`] still verifies every
+/// file before it trusts one.
+///
+/// # Errors
+///
+/// A stat failure other than `NotFound`.
+pub async fn is_complete_backup(dir: &Path) -> io::Result<bool> {
+	if is_staging_dir(dir) {
+		return Ok(false);
+	}
+	if is_file(&dir.join(BACKUP_MANIFEST)).await? {
+		return Ok(true);
+	}
+	for name in CONTROL_PLANE_FILES {
+		if !is_file(&dir.join(name)).await? {
+			return Ok(false);
+		}
+	}
+	Ok(true)
+}
+
+/// `dir`'s parent and its own name, for building a sibling of it. A bare name's parent
+/// is the current directory.
+pub(crate) fn split_dir(dir: &Path) -> io::Result<(PathBuf, OsString)> {
+	let name = dir.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{} does not end in a directory name", dir.display())))?;
+	let parent = dir.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+	Ok((parent.to_path_buf(), name.to_os_string()))
+}
+
+/// `{prefix}{name}-{nonce}`: a staging name that no other run can be using.
+pub(crate) fn staging_name(prefix: &str, name: &OsStr) -> OsString {
+	let mut staged = OsString::from(prefix);
+	staged.push(name);
+	staged.push(format!("-{:016x}", fastrand::u64(..)));
+	staged
+}
+
+/// Remove the backup directory `dir` without ever leaving it half-removed under a backup's
+/// name.
+///
+/// It is renamed to `.deleting-{name}-{nonce}`, the base is fsynced so the rename is
+/// durable, and only then are its files removed. A crash after the rename leaves a
+/// `.deleting-*` entry, which is never counted or restored and which
+/// [`sweep_backup_staging`] removes; removing in place could leave a backup name holding
+/// some of its files (design section 9, `prune-partial-remove`).
+///
+/// # Errors
+///
+/// Any rename, sync or removal error, or an injected fault at `prune-renamed` /
+/// `prune-removed`. The backup is then either intact under its name or under a
+/// `.deleting-*` name.
+pub async fn retire_backup(fs: &dyn StoreFs, dir: &Path) -> io::Result<()> {
+	let (base, name) = split_dir(dir)?;
+	let doomed = base.join(staging_name(DELETING_PREFIX, &name));
+	fs.rename(dir, &doomed).await?;
+	fault::hit(FaultPoint::PruneRenamed).await?;
+	fs.sync_dir(&base).await?;
+	fs.remove_dir_all(&doomed).await?;
+	fault::hit(FaultPoint::PruneRemoved).await?;
+	Ok(())
+}
+
+/// What [`sweep_backup_staging`] did.
+#[derive(Debug, Default)]
+pub struct StagingSweep {
+	/// The staging entries removed.
+	pub removed: Vec<PathBuf>,
+	/// The stale staging entries that could not be removed, each with its error. The
+	/// sweep carries on past them, and the next sweep retries.
+	pub failed: Vec<(PathBuf, io::Error)>,
+}
+
+/// The newest modification time of `path` and, for a directory, of its entries: a
+/// build still writing into a big snapshot file updates the file's mtime but not its
+/// directory's, and must not look stale.
+async fn newest_mtime(path: &Path) -> io::Result<SystemTime> {
+	let meta = tokio::fs::symlink_metadata(path).await?;
+	let mut newest = meta.modified()?;
+	if meta.is_dir() {
+		let mut entries = tokio::fs::read_dir(path).await?;
+		while let Some(entry) = entries.next_entry().await? {
+			if let Ok(modified) = entry.metadata().await.and_then(|meta| meta.modified()) {
+				newest = newest.max(modified);
+			}
+		}
+	}
+	Ok(newest)
+}
+
+/// Remove every staging entry directly under `base` (see [`STAGING_PREFIXES`]: unfinished
+/// backups, prunes and drills) that nothing has modified for at least `older_than`. A
+/// missing `base` is an empty one.
+///
+/// The age guard keeps the sweep from removing a backup or drill that another task is
+/// still writing; the daemon passes [`STAGING_SWEEP_AGE`]. An entry is judged by the
+/// newest mtime of itself and its direct entries.
+///
+/// # Errors
+///
+/// Only a failure to list `base`. Failures on single entries are reported in
+/// [`StagingSweep::failed`].
+pub async fn sweep_backup_staging(fs: &dyn StoreFs, base: &Path, older_than: Duration) -> io::Result<StagingSweep> {
+	sweep_backup_staging_at(fs, base, older_than, SystemTime::now()).await
+}
+
+/// [`sweep_backup_staging`] with the clock reading `now`: an entry is stale once `now` is
+/// at least `older_than` past its newest mtime.
+///
+/// This is the seam that lets a test age an entry by moving the clock instead of its
+/// mtime. Std below Rust 1.99 (the MSRV is 1.95) cannot set a directory's mtime on
+/// Windows, where `File::open` neither opens a directory nor grants the
+/// write-attributes access that setting a time needs.
+///
+/// # Errors
+///
+/// As [`sweep_backup_staging`].
+pub async fn sweep_backup_staging_at(fs: &dyn StoreFs, base: &Path, older_than: Duration, now: SystemTime) -> io::Result<StagingSweep> {
+	let entries = match fs.read_dir(base).await {
+		Ok(entries) => entries,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StagingSweep::default()),
+		Err(e) => return Err(e),
+	};
+	let mut sweep = StagingSweep::default();
+	for entry in entries {
+		if !entry.name.to_str().is_some_and(is_staging_name) {
+			continue;
+		}
+		let path = base.join(&entry.name);
+		let stale = match newest_mtime(&path).await {
+			// A clock that moved backwards makes the entry look new: keep it.
+			Ok(modified) => now.duration_since(modified).is_ok_and(|age| age >= older_than),
+			// Gone already: another sweep or prune finished it.
+			Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+			Err(e) => {
+				sweep.failed.push((path, e));
+				continue;
+			}
+		};
+		if !stale {
+			continue;
+		}
+		let removed = if entry.is_dir { fs.remove_dir_all(&path).await } else { fs.remove_file(&path).await };
+		match removed {
+			Ok(()) => sweep.removed.push(path),
+			Err(e) => sweep.failed.push((path, e)),
+		}
+	}
+	Ok(sweep)
+}
 
 /// What a [`restore_control_plane`] call put back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,40 +708,109 @@ impl RestoreReport {
 /// control-plane-corruption recovery. A restore into an empty root yields a valid but
 /// frame-less store whose index rows point at missing files.
 ///
+/// See [`restore_control_plane_with`] for what is checked and in what order.
+///
 /// # Errors
 ///
-/// - `backup_dir` is missing any of the four files.
-/// - Any target file already exists in `root`.
-/// - A copy fails, or any restored file fails verification.
+/// As [`restore_control_plane_with`].
 pub async fn restore_control_plane(backup_dir: &Path, root: &Path) -> Result<RestoreReport> {
+	restore_control_plane_with(&RealFs, backup_dir, root).await
+}
+
+/// [`restore_control_plane`] through `fs`.
+///
+/// A directory with a [`BACKUP_MANIFEST`] must match it: exactly the control-plane
+/// files, each the recorded size, each holding the recorded tables and rows. One without
+/// a manifest (from before manifests) must hold all four files. Either way each file
+/// must hold its store's expected tables, so an empty database fails. A directory with
+/// a staging name (see [`STAGING_PREFIXES`]) is refused outright: it is an unfinished
+/// backup, prune or drill, whatever it holds.
+///
+/// `root` and any missing ancestors are created durably. Every file is copied to
+/// `<name>.tmp` in `root` and synced through the handle that wrote it, then verified
+/// there. Only once all four verify are they renamed to their final names, one after
+/// another, after which `root` is fsynced.
+///
+/// So a failure or crash before the renames leaves only `.tmp` files, which a retried
+/// restore replaces. The four renames are not one atomic step, though: a failure or
+/// crash part-way through them leaves some databases under their final names and the
+/// rest as `.tmp`. A store opened on that root would create the missing databases
+/// empty, and a retried restore refuses to overwrite the ones in place, so clear the
+/// root before retrying. An error from the final fsync of `root` leaves all four in
+/// place, restored but not known to survive power loss. (Design section 1.2 leaves a
+/// partial restore out of scope: the only production caller is the drill, which
+/// restores into a throwaway directory.)
+///
+/// # Errors
+///
+/// - `backup_dir` has a staging name, or is missing any of the four files.
+/// - Its manifest cannot be read, or the files do not match it.
+/// - Any target file already exists in `root`.
+/// - Creating `root`, or a copy, rename or sync, fails, or any restored file fails
+///   verification.
+pub async fn restore_control_plane_with(fs: &dyn StoreFs, backup_dir: &Path, root: &Path) -> Result<RestoreReport> {
+	if is_staging_dir(backup_dir) {
+		bail!("{} is an unfinished backup, prune or drill (its name starts with one of {STAGING_PREFIXES:?}), not a backup", backup_dir.display());
+	}
+	let manifest = BackupManifest::read(backup_dir).await?;
 	// Pre-flight both directions before writing anything, so a partial restore cannot
 	// leave a half-populated control plane behind.
 	for name in CONTROL_PLANE_FILES {
 		let src = backup_dir.join(name);
-		if !src.exists() {
+		if !is_file(&src).await.with_context(|| format!("checking {}", src.display()))? {
 			bail!("backup dir {} is missing {name} — not a complete control-plane backup", backup_dir.display());
+		}
+		if let Some(file) = manifest.as_ref().and_then(|manifest| manifest.file(name)) {
+			let len = tokio::fs::metadata(&src).await.with_context(|| format!("checking {}", src.display()))?.len();
+			if len != file.bytes {
+				bail!("backup file {} holds {len} bytes but its manifest recorded {}: the backup was changed after it was taken", src.display(), file.bytes);
+			}
 		}
 		let dest = root.join(name);
 		if dest.exists() {
 			bail!("refusing to overwrite an existing control plane: {} already exists (restore into a fresh root)", dest.display());
 		}
 	}
-	tokio::fs::create_dir_all(root).await.with_context(|| format!("creating restore root {}", root.display()))?;
+	// Through `fs`, with each new directory's parent fsynced: the root's fsync below
+	// covers the files in it, not the root's own entry.
+	create_dir_all_durable(fs, root).await.with_context(|| format!("creating restore root {}", root.display()))?;
 
-	let mut restored = Vec::with_capacity(CONTROL_PLANE_FILES.len());
-	for name in CONTROL_PLANE_FILES {
+	let mut staged = Vec::with_capacity(CONTROL_PLANE_FILES.len());
+	for (k, name) in (0u32..).zip(CONTROL_PLANE_FILES) {
 		let src = backup_dir.join(name);
-		let dest = root.join(name);
-		tokio::fs::copy(&src, &dest).await.with_context(|| format!("restoring {} -> {}", src.display(), dest.display()))?;
-		// Verify at the destination, not the source: what matters is that the file the
-		// store will open is readable.
-		restored.push(verify_snapshot(&dest).await.with_context(|| format!("verifying restored {name}"))?);
+		let tmp = root.join(format!("{name}.tmp"));
+		// A restore that crashed may have left this name behind.
+		fs.remove_file(&tmp).await.with_context(|| format!("clearing {}", tmp.display()))?;
+		fs.copy_new(&src, &tmp, SyncPolicy::Full).await.with_context(|| format!("restoring {} -> {}", src.display(), tmp.display()))?;
+		fault::hit(FaultPoint::RestoreCopied(k)).await?;
+		// Verify the copy, not the source: what matters is that the file the store will
+		// open is readable. The rename below keeps the very same file.
+		let recorded = manifest.as_ref().and_then(|manifest| manifest.file(name));
+		let mut expected: Vec<&str> = expected_tables(name).unwrap_or_default().to_vec();
+		expected.extend(recorded.iter().flat_map(|file| file.tables.iter().map(String::as_str)));
+		let report = verify_snapshot(&tmp, &expected).await.with_context(|| format!("verifying restored {name}"))?;
+		if let Some(file) = recorded {
+			if report.rows != file.rows {
+				bail!("restored {name} holds {} rows but its manifest recorded {}", report.rows, file.rows);
+			}
+		}
+		staged.push((tmp, root.join(name), report));
 	}
+	let mut restored = Vec::with_capacity(staged.len());
+	for (tmp, dest, mut report) in staged {
+		fs.rename(&tmp, &dest).await.with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+		report.dest = dest;
+		restored.push(report);
+	}
+	fault::hit(FaultPoint::RestoreRenamed).await?;
+	fs.sync_dir(root).await.with_context(|| format!("syncing restore root {}", root.display()))?;
 	Ok(RestoreReport { root: root.to_path_buf(), restored })
 }
 
 #[cfg(test)]
 mod tests {
+	use serial_test::serial;
+
 	use super::*;
 
 	async fn seed_db(path: &Path) -> turso::Connection {
@@ -469,7 +873,7 @@ mod tests {
 		let conn = seed_db(&dir.path().join("src.db")).await;
 		let dest = dir.path().join("online.db");
 
-		let report = snapshot_with_verify(&conn, &dest, VerifyMode::SnapshotOnly).await.unwrap();
+		let report = snapshot_with_verify(&conn, &dest, VerifyMode::SnapshotOnly, &["gadget", "widget"]).await.unwrap();
 		assert_eq!(report.mode, VerifyMode::SnapshotOnly);
 		assert_eq!(report.tables, 2);
 		assert_eq!(report.rows, 10, "the copy's own rows, scanned out of the snapshot");
@@ -489,13 +893,13 @@ mod tests {
 		for i in 100..110i64 {
 			conn.execute("INSERT INTO widget (id, name) VALUES (?, ?)", turso::params![i, format!("late{i}")]).await.unwrap();
 		}
-		let report = verify_snapshot(&online).await.unwrap();
+		let report = verify_snapshot(&online, &["widget"]).await.unwrap();
 		assert_eq!(report.rows, 10, "the snapshot holds its point-in-time image, not the grown source");
 		assert_eq!(count_rows(&conn, "widget").await.unwrap(), 17, "the source really did move on");
 
 		// And the source-matching verify is exactly what would have failed here.
 		let stale = dir.path().join("stale.db");
-		let err = snapshot_with_verify(&conn, &stale, VerifyMode::SourceMatch).await;
+		let err = snapshot_with_verify(&conn, &stale, VerifyMode::SourceMatch, &["widget"]).await;
 		assert!(err.is_ok(), "a fresh vacuum of the settled source still matches: {err:?}");
 	}
 
@@ -515,7 +919,7 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let bogus = dir.path().join("not-a-db.db");
 		tokio::fs::write(&bogus, b"this is not a libSQL database at all, not even close").await.unwrap();
-		assert!(verify_snapshot(&bogus).await.is_err(), "a non-database file must fail verification");
+		assert!(verify_snapshot(&bogus, &[]).await.is_err(), "a non-database file must fail verification");
 	}
 
 	/// The two sidecar paths Turso creates beside `db` on open.
@@ -566,14 +970,14 @@ mod tests {
 		let conn = seed_db(&dir.path().join("src.db")).await;
 
 		let snapshot_only = dir.path().join("snapshot_only.db");
-		let report = snapshot_with_verify(&conn, &snapshot_only, VerifyMode::SnapshotOnly).await.unwrap();
+		let report = snapshot_with_verify(&conn, &snapshot_only, VerifyMode::SnapshotOnly, &[]).await.unwrap();
 		assert_eq!(report.rows, 10);
 		for sidecar in sidecars(&snapshot_only) {
 			assert!(!sidecar.exists(), "SnapshotOnly left {} behind", sidecar.display());
 		}
 
 		let source_match = dir.path().join("source_match.db");
-		let report = snapshot_with_verify(&conn, &source_match, VerifyMode::SourceMatch).await.unwrap();
+		let report = snapshot_with_verify(&conn, &source_match, VerifyMode::SourceMatch, &[]).await.unwrap();
 		assert_eq!(report.rows, 10);
 		for sidecar in sidecars(&source_match) {
 			assert!(!sidecar.exists(), "SourceMatch left {} behind", sidecar.display());
@@ -604,6 +1008,21 @@ mod tests {
 		assert_eq!(remove_empty_sidecars(&db).await.unwrap(), 0);
 	}
 
+	/// Turso names the MVCC log by replacing the file's extension, so verifying a copy
+	/// staged as `catalog.db.tmp` (as a restore does) leaves `catalog.db.db-log`, not
+	/// `catalog.db.tmp-log`. The sweep looked only for the latter and left the log in the
+	/// restored root.
+	#[tokio::test]
+	async fn verifying_a_copy_without_a_db_extension_leaves_no_sidecars() {
+		let dir = tempfile::tempdir().unwrap();
+		let conn = seed_db(&dir.path().join("src.db")).await;
+		let staged = dir.path().join("copy.db.tmp");
+		vacuum_into(&conn, &staged).await.unwrap();
+		verify_snapshot(&staged, &["widget"]).await.unwrap();
+		let left: Vec<String> = names_in(dir.path()).into_iter().filter(|name| !name.starts_with("src.db")).collect();
+		assert_eq!(left, ["copy.db.tmp"], "the verification's sidecars are gone, whatever Turso named them");
+	}
+
 	#[tokio::test]
 	async fn vacuum_into_refuses_an_existing_destination() {
 		let dir = tempfile::tempdir().unwrap();
@@ -612,6 +1031,219 @@ mod tests {
 		tokio::fs::write(&dest, b"occupied").await.unwrap();
 		let err = vacuum_into(&conn, &dest).await.unwrap_err();
 		assert!(err.to_string().contains("already exists"), "got: {err}");
+	}
+
+	/// The regression for `backup-vacuum-into-partial-dest`: a database file that opens
+	/// but holds none of its tables (an empty file, or a copy torn back to its header)
+	/// scanned as a valid snapshot of zero rows, so an empty `catalog.db` verified.
+	#[tokio::test]
+	async fn an_empty_database_fails_verification_against_its_expected_tables() {
+		let dir = tempfile::tempdir().unwrap();
+		let empty = dir.path().join("catalog.db");
+		let db = Builder::new_local(empty.to_str().unwrap()).build().await.unwrap();
+		drop(db.connect().unwrap());
+		drop(db);
+
+		let err = verify_snapshot(&empty, crate::CatalogStore::TABLES).await.unwrap_err();
+		assert!(format!("{err:#}").contains("missing the table(s)"), "got: {err:#}");
+		assert!(verify_snapshot(&empty, &[]).await.is_ok(), "only the expected table set tells an empty catalog from a valid one");
+
+		// The source-matching mode requires them too, even when the source is as empty.
+		let conn = Builder::new_local(dir.path().join("src.db").to_str().unwrap()).build().await.unwrap().connect().unwrap();
+		let err = snapshot_with_verify(&conn, &dir.path().join("copy.db"), VerifyMode::SourceMatch, crate::CatalogStore::TABLES).await.unwrap_err();
+		assert!(format!("{err:#}").contains("missing the table(s)"), "got: {err:#}");
+	}
+
+	#[test]
+	fn every_control_plane_file_has_an_expected_table_set() {
+		for name in CONTROL_PLANE_FILES {
+			assert!(expected_tables(name).is_some_and(|tables| !tables.is_empty()), "{name}");
+		}
+		assert_eq!(expected_tables("other.db"), None);
+		for name in [".partial-backup-1-00ff", ".deleting-backup-1-00ff", ".restore-drill-17"] {
+			assert!(is_staging_name(name), "{name}");
+		}
+		for name in ["backup-1", "nightly", ".hidden", "partial-1"] {
+			assert!(!is_staging_name(name), "{name}");
+		}
+	}
+
+	#[tokio::test]
+	async fn a_manifest_must_name_a_known_format_and_exactly_the_control_plane_files() {
+		let dir = tempfile::tempdir().unwrap();
+		assert_eq!(BackupManifest::read(dir.path()).await.unwrap(), None, "no manifest: a legacy backup");
+
+		let report = |name: &str| SnapshotReport { dest: dir.path().join(name), tables: 1, table_names: vec!["t".into()], rows: 3, bytes: 4096, mode: VerifyMode::SnapshotOnly };
+		let reports: Vec<_> = CONTROL_PLANE_FILES.iter().map(|name| report(name)).collect();
+		let named: Vec<_> = CONTROL_PLANE_FILES.iter().copied().zip(reports.iter()).collect();
+		let manifest = BackupManifest::new(42, &named);
+		std::fs::write(dir.path().join(BACKUP_MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
+		assert_eq!(BackupManifest::read(dir.path()).await.unwrap(), Some(manifest.clone()), "it round-trips");
+
+		let mut future = manifest.clone();
+		future.format = "weftdb-store-backup/2".into();
+		std::fs::write(dir.path().join(BACKUP_MANIFEST), serde_json::to_vec(&future).unwrap()).unwrap();
+		assert!(BackupManifest::read(dir.path()).await.is_err(), "an unknown format is refused, not restored as control plane only");
+
+		let mut short = manifest;
+		short.files.pop();
+		std::fs::write(dir.path().join(BACKUP_MANIFEST), serde_json::to_vec(&short).unwrap()).unwrap();
+		assert!(BackupManifest::read(dir.path()).await.is_err(), "a manifest missing a file is refused");
+
+		std::fs::write(dir.path().join(BACKUP_MANIFEST), b"{\"format\": \"weftdb-control-pl").unwrap();
+		assert!(BackupManifest::read(dir.path()).await.is_err(), "a torn manifest is refused");
+	}
+
+	#[tokio::test]
+	async fn completeness_needs_a_manifest_or_all_four_files_and_never_a_staging_name() {
+		let dir = tempfile::tempdir().unwrap();
+		let legacy = dir.path().join("backup-1");
+		std::fs::create_dir(&legacy).unwrap();
+		for name in &CONTROL_PLANE_FILES[..3] {
+			std::fs::write(legacy.join(name), b"x").unwrap();
+		}
+		assert!(!is_complete_backup(&legacy).await.unwrap(), "three of four files: a pre-manifest backup that never finished");
+		std::fs::write(legacy.join(CONTROL_PLANE_FILES[3]), b"x").unwrap();
+		assert!(is_complete_backup(&legacy).await.unwrap(), "all four files: a complete pre-manifest backup");
+
+		let manifested = dir.path().join("backup-2");
+		std::fs::create_dir(&manifested).unwrap();
+		std::fs::write(manifested.join(BACKUP_MANIFEST), b"{}").unwrap();
+		assert!(is_complete_backup(&manifested).await.unwrap(), "the manifest is written last, so it marks a complete backup");
+
+		let partial = dir.path().join(".partial-backup-3-0123456789abcdef");
+		std::fs::rename(&manifested, &partial).unwrap();
+		assert!(!is_complete_backup(&partial).await.unwrap(), "a staging directory is never a backup, whatever it holds");
+		assert!(!is_complete_backup(&dir.path().join("missing")).await.unwrap());
+	}
+
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn retiring_a_backup_renames_it_away_before_removing_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let victim = dir.path().join("backup-1");
+		std::fs::create_dir(&victim).unwrap();
+		std::fs::write(victim.join("catalog.db"), b"x").unwrap();
+		std::fs::create_dir(dir.path().join("backup-2")).unwrap();
+
+		// Stop it between the rename and the removal, as a crash would.
+		let armed = fault::arm(FaultPoint::PruneRenamed, fault::FaultAction::ReturnErr);
+		let err = retire_backup(&RealFs, &victim).await.unwrap_err();
+		drop(armed);
+		assert_eq!(fault::injected_point(&err), Some(FaultPoint::PruneRenamed));
+		let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+		assert!(!victim.exists(), "the backup name is gone before any file is removed");
+		assert!(names.iter().any(|n| n.starts_with(".deleting-backup-1-")), "{names:?}");
+
+		let swept = sweep_backup_staging(&RealFs, dir.path(), Duration::ZERO).await.unwrap();
+		assert_eq!(swept.removed.len(), 1, "the sweep finishes the interrupted prune");
+		assert!(swept.failed.is_empty());
+		let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+		assert_eq!(names, vec!["backup-2".to_string()], "only the other backup is left");
+
+		// Stopped after the removal, before anything else: nothing is left to sweep.
+		let armed = fault::arm(FaultPoint::PruneRemoved, fault::FaultAction::ReturnErr);
+		let err = retire_backup(&RealFs, &dir.path().join("backup-2")).await.unwrap_err();
+		drop(armed);
+		assert_eq!(fault::injected_point(&err), Some(FaultPoint::PruneRemoved));
+		assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the backup and its `.deleting-*` name are both gone");
+
+		std::fs::create_dir(dir.path().join("backup-3")).unwrap();
+		retire_backup(&RealFs, &dir.path().join("backup-3")).await.unwrap();
+		assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "an uninterrupted retire leaves nothing");
+	}
+
+	/// The names directly under `dir`, sorted.
+	fn names_in(dir: &Path) -> Vec<String> {
+		let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+		names.sort();
+		names
+	}
+
+	fn mtime(path: &Path) -> SystemTime {
+		std::fs::metadata(path).unwrap().modified().unwrap()
+	}
+
+	// Entries are aged by moving the sweep's clock rather than their mtimes: std cannot
+	// set a directory's mtime on Windows below Rust 1.99, and CI tests on Windows.
+	#[tokio::test]
+	async fn the_sweep_removes_only_stale_staging_entries() {
+		let dir = tempfile::tempdir().unwrap();
+		let base = dir.path();
+		for name in [".partial-backup-1-00", ".deleting-backup-2-00", ".restore-drill-3", "backup-4", "nightly"] {
+			std::fs::create_dir(base.join(name)).unwrap();
+			std::fs::write(base.join(name).join("catalog.db"), b"x").unwrap();
+		}
+		std::fs::write(base.join(".partial-stray-file"), b"x").unwrap();
+
+		let swept = sweep_backup_staging(&RealFs, base, STAGING_SWEEP_AGE).await.unwrap();
+		assert!(swept.removed.is_empty() && swept.failed.is_empty(), "nothing is an hour old yet: a backup or drill may still be writing it");
+		let now = SystemTime::now();
+		let swept = sweep_backup_staging_at(&RealFs, base, STAGING_SWEEP_AGE, now + STAGING_SWEEP_AGE / 2).await.unwrap();
+		assert!(swept.removed.is_empty() && swept.failed.is_empty(), "half an hour on, still nothing is stale");
+
+		let swept = sweep_backup_staging_at(&RealFs, base, STAGING_SWEEP_AGE, now + 2 * STAGING_SWEEP_AGE).await.unwrap();
+		assert!(swept.failed.is_empty(), "{:?}", swept.failed);
+		let mut removed: Vec<String> = swept.removed.iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+		removed.sort();
+		assert_eq!(removed, [".deleting-backup-2-00", ".partial-backup-1-00", ".partial-stray-file", ".restore-drill-3"], "two hours on, every staging entry, file or directory");
+		assert_eq!(names_in(base), ["backup-4", "nightly"], "backups are never swept");
+		assert!(sweep_backup_staging(&RealFs, &base.join("missing"), Duration::ZERO).await.unwrap().removed.is_empty(), "a missing base is empty");
+	}
+
+	/// A build still writing into a big snapshot file updates the file's mtime but not its
+	/// directory's, so the sweep judges a staging directory by the newest mtime among
+	/// itself and its entries.
+	#[tokio::test]
+	async fn the_sweep_ages_a_staging_directory_by_its_newest_entry() {
+		let dir = tempfile::tempdir().unwrap();
+		let staging = dir.path().join(".partial-backup-1-00");
+		std::fs::create_dir(&staging).unwrap();
+		let file = staging.join("catalog.db");
+		std::fs::write(&file, b"x").unwrap();
+		// Append until the file is strictly newer than its directory. Appending changes no
+		// directory entry, so the directory keeps the mtime the file's create gave it.
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		while mtime(&file) <= mtime(&staging) {
+			assert!(std::time::Instant::now() < deadline, "the file's mtime never passed its directory's");
+			std::thread::sleep(Duration::from_millis(10));
+			std::io::Write::write_all(&mut std::fs::OpenOptions::new().append(true).open(&file).unwrap(), b"x").unwrap();
+		}
+		let (dir_mtime, file_mtime) = (mtime(&staging), mtime(&file));
+		let gap = file_mtime.duration_since(dir_mtime).unwrap();
+
+		// The directory alone is past the age, the file it holds is not.
+		let swept = sweep_backup_staging_at(&RealFs, dir.path(), STAGING_SWEEP_AGE, dir_mtime + STAGING_SWEEP_AGE + gap / 2).await.unwrap();
+		assert!(swept.removed.is_empty(), "a directory whose file is still being written is not stale");
+		assert!(staging.exists());
+		let swept = sweep_backup_staging_at(&RealFs, dir.path(), STAGING_SWEEP_AGE, file_mtime + STAGING_SWEEP_AGE).await.unwrap();
+		assert_eq!(swept.removed, vec![staging], "once its newest entry is past the age, it goes");
+	}
+
+	/// A retired backup never comes back half-removed under its name. Every image a power
+	/// cut right after `retire_backup` could leave lacks the name, because the rename to
+	/// `.deleting-*` is made durable before any file goes. Without the base fsync between
+	/// them, an image could keep the name and lose some of its files.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_power_cut_after_a_retire_never_leaves_the_backup_half_removed() {
+		let dir = tempfile::tempdir().unwrap();
+		let base = dir.path().join("backups");
+		let victim = base.join("backup-1");
+		std::fs::create_dir_all(&victim).unwrap();
+		for name in CONTROL_PLANE_FILES.into_iter().chain([BACKUP_MANIFEST]) {
+			std::fs::write(victim.join(name), name.as_bytes()).unwrap();
+		}
+		let sim = crate::durable::SimFs::new(dir.path()).unwrap();
+		retire_backup(&sim, &victim).await.unwrap();
+
+		for seed in 0..64 {
+			let image = tempfile::tempdir().unwrap();
+			sim.power_cut(seed, image.path()).unwrap();
+			let names = names_in(&image.path().join("backups"));
+			assert!(!names.iter().any(|name| name == "backup-1"), "seed {seed}: the retired backup is not under its name: {names:?}");
+			assert!(names.iter().all(|name| is_staging_name(name)), "seed {seed}: at most its `.deleting-*` name is left, for the sweep: {names:?}");
+		}
 	}
 
 	#[tokio::test]
@@ -643,7 +1275,7 @@ mod tests {
 		};
 		eprintln!("PRAGMA page_count on the MVCC source reads {page_count:?} (turso#4929 reports 0)");
 		for (mode, name) in [(VerifyMode::SourceMatch, "source.db"), (VerifyMode::SnapshotOnly, "snapshot.db")] {
-			let report = snapshot_with_verify(&conn, &dir.path().join(name), mode).await.unwrap();
+			let report = snapshot_with_verify(&conn, &dir.path().join(name), mode, &["gadget", "widget"]).await.unwrap();
 			assert_eq!((report.tables, report.rows), (2, 10), "{mode:?} must count the real tables/rows, not a pragma");
 		}
 	}

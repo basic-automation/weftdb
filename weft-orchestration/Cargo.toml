@@ -37,4 +37,21 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
 serial_test = {workspace =  true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tempfile = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Only to keep the crash tests' deliberately aborted child from dumping core.
+libc = { workspace = true }
+
+[features]
+# Arms weftdb's crash points (`durable::fault`) for the crash tests below. A feature
+# rather than a dev-dependency feature: Cargo unifies features across a workspace build,
+# so a dev-dependency enabling it would turn it on for every crate's tests in
+# `cargo test --workspace`, and weftdb's check that production builds keep the points
+# inert (tests/durable_fault_disabled.rs) would compile to nothing.
+fault-injection = ["weftdb/fault-injection"]
+
+# Run with `cargo test -p weft-orchestration --features fault-injection --test legacy_queue_crash`.
+[[test]]
+name = "legacy_queue_crash"
+required-features = ["fault-injection"]

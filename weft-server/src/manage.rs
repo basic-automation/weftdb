@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 use weft_physical_type::{first_order_violation, AspectSchema, PhysicalType, SegmentDescriptor, TimeUnit};
-use weftdb::VerifyMode;
+use weftdb::{
+	durable::{RealFs, StoreFs}, MaintenanceBusy, MaintenanceWait, VerifyMode, RESTORE_DRILL_PREFIX
+};
 
 use crate::{
 	state::AppState, storage::{AspectInfo, StorageError}
@@ -90,7 +92,10 @@ fn parse_time_unit(token: &str) -> Result<TimeUnit, String> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeclareAspectRequest {
 	/// The aspect name to declare (unique within the store's `(database, subject)`
-	/// scope; a re-declaration overwrites).
+	/// scope; a re-declaration overwrites). It also names the aspect's files on disk, so
+	/// it must pass [`weftdb::aspect_name::validate`]: at most 160 bytes, no `/`, `\`,
+	/// control characters, leading `.`, trailing `.` or space, not a Windows device name
+	/// such as `CON` or `nul:x`, and, on Windows, none of `<>:"|?*`.
 	pub name: String,
 	/// The physical encoding token (e.g. `"f64"`, `"scaled_i64"`).
 	pub physical_type: String,
@@ -132,17 +137,37 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, S
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when a token/tolerance does not parse, and
-/// [`StorageError::Internal`] on a control-plane write failure.
+/// [`StorageError::BadRequest`] when the name is not a valid aspect name or a
+/// token/tolerance does not parse, and [`StorageError::Internal`] on a control-plane
+/// write failure.
 pub async fn declare_aspect(State(state): State<AppState>, Json(request): Json<DeclareAspectRequest>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
+	// The name becomes part of every frame's file name: refuse one that could leave the
+	// store's `segments/` directory before anything is written.
+	weftdb::aspect_name::validate(&request.name).map_err(|err| StorageError::BadRequest(err.to_string()))?;
 	let schema = schema_from_request(&request)?;
 	let result = store.declare(&request.name, &schema).await;
 	drop(store);
 	result.map_err(|err| StorageError::Internal(err.to_string()))?;
 	let aspect = AspectInfo { name: request.name, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() };
 	Ok((StatusCode::CREATED, Json(DeclareAspectResponse { aspect })).into_response())
+}
+
+/// Classify a per-aspect maintenance error (reconcile, squash, compact): another
+/// maintenance operation holding the aspect for longer than the store's maintenance wait
+/// ([`MaintenanceBusy`]) is a `409`, to retry once it is done; an aspect whose name is not
+/// safe as a file name, declared before names were checked, is a `400`, as on ingest and
+/// read; anything else (a damaged frame, a filesystem or control-plane failure) is a
+/// `500`.
+fn maintenance_error(err: &anyhow::Error) -> StorageError {
+	if err.downcast_ref::<MaintenanceBusy>().is_some() {
+		StorageError::Conflict(format!("{err:#}"))
+	} else if err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
+		StorageError::BadRequest(err.to_string())
+	} else {
+		StorageError::Internal(err.to_string())
+	}
 }
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/reconcile`.
@@ -222,11 +247,18 @@ pub struct ReconcileResponse {
 /// threshold are not). Returns `200 OK` with whether it triggered, the number
 /// rewritten, and the post-pass order-health count.
 ///
+/// Maintenance operations on one aspect take turns: while another one (a daemon pass,
+/// another request) holds the aspect, this waits for it up to the store's maintenance
+/// wait (30 s by default) and then answers `409 Conflict` without touching the aspect.
+///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::NotFound`] when the aspect is undeclared, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::NotFound`] when the aspect is undeclared,
+/// [`StorageError::BadRequest`] when its name is not safe as a file name (declared
+/// before names were checked),
+/// [`StorageError::Conflict`] when another maintenance operation held the aspect for the
+/// whole wait, and [`StorageError::Internal`] on a read/seal/control-plane failure.
 pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ReconcileParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
@@ -255,17 +287,17 @@ async fn reconcile_aspect_inner(store: &weftdb::SegmentStore, aspect: &str, thre
 		// `split_min_bytes` selects the split-not-rewrite floor; absent → the default
 		// 50 MiB QuestDB floor (small components always full-rewrite).
 		let removed = match split_min_bytes {
-			Some(min) => store.reconcile_overlaps_with_policy(aspect, weft_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
-			None => store.reconcile_overlaps(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			Some(min) => store.reconcile_overlaps_with_policy(aspect, weft_physical_type::SplitPolicy::new(min)).await.map_err(|err| maintenance_error(&err))?,
+			None => store.reconcile_overlaps(aspect).await.map_err(|err| maintenance_error(&err))?,
 		};
 		("overlaps", true, removed, 0, 0)
 	} else if hot_cold {
-		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		let outcome = store.reconcile_aspect_hot_cold(aspect, threshold.unwrap_or(1)).await.map_err(|err| maintenance_error(&err))?;
 		("hot_cold", true, outcome.total(), outcome.cold_reconciled, outcome.hot_reconciled)
 	} else {
 		let (triggered, reconciled) = match threshold {
-			Some(threshold) => store.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |reconciled| (true, reconciled)),
-			None => (true, store.reconcile_aspect(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+			Some(threshold) => store.reconcile_aspect_if_unsorted_exceeds(aspect, threshold).await.map_err(|err| maintenance_error(&err))?.map_or((false, 0), |reconciled| (true, reconciled)),
+			None => (true, store.reconcile_aspect(aspect).await.map_err(|err| maintenance_error(&err))?),
 		};
 		("threshold", triggered, reconciled, 0, 0)
 	};
@@ -279,6 +311,26 @@ async fn reconcile_aspect_inner(store: &weftdb::SegmentStore, aspect: &str, thre
 	}
 	let stats = store.aspect_stats(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	Ok((StatusCode::OK, Json(ReconcileResponse { aspect: aspect.to_string(), mode, triggered, reconciled, cold_reconciled, hot_reconciled, unsorted_segments: stats.unsorted_segments, overlapping_segments: stats.overlapping_segments })).into_response())
+}
+
+/// One aspect a store-wide sweep could not maintain, as listed in
+/// [`ReconcileStoreResponse::failed`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SweepFailure {
+	/// The aspect whose pass failed.
+	pub aspect: String,
+	/// The failure with its full cause chain (for a damaged frame, the decode error and
+	/// the frame's path).
+	pub error: String,
+}
+
+impl SweepFailure {
+	/// Render a sweep's `failed` list for the response body, keeping the whole cause
+	/// chain (`{:#}`) so an operator sees *which* frame is damaged, not just that a
+	/// decode failed.
+	fn list(failed: &[(String, anyhow::Error)]) -> Vec<Self> {
+		failed.iter().map(|(aspect, err)| Self { aspect: aspect.clone(), error: format!("{err:#}") }).collect()
+	}
 }
 
 /// Response body for `POST /api/v1/storage/reconcile` — the outcome of a store-wide
@@ -307,6 +359,17 @@ pub struct ReconcileStoreResponse {
 	/// The store-wide cross-segment overlap count *after* the sweep — zero once no two
 	/// segments' windows intersect (the `overlaps` mode drives this to zero).
 	pub overlapping_segments: usize,
+	/// The aspects whose pass failed, each `{aspect, error}`, in the order the sweep
+	/// visited them (declared-name order). Empty when every aspect succeeded.
+	///
+	/// **Response change (crash-consistency S4):** a per-aspect failure used to fail the
+	/// whole request with a `500` at the first failing aspect, leaving every aspect after
+	/// it in name order unswept. The sweep now visits every aspect and answers `200` with
+	/// the failures listed here, so a caller must check this list (or
+	/// `weft_reconcile_failed_passes_total`) to tell a partial sweep from a clean one. A
+	/// failed aspect is counted in `aspects_scanned` only. Failing to list the aspects at
+	/// all is still a `500`.
+	pub failed: Vec<SweepFailure>,
 }
 
 /// Handle `POST /api/v1/storage/reconcile`: sweep **every** declared aspect,
@@ -330,10 +393,23 @@ pub struct ReconcileStoreResponse {
 /// merging each aspect's time-overlap groups; `segments_reconciled` is then the number
 /// of segments merged away. `overlaps` takes precedence over `hot_cold`/`threshold`.
 ///
+/// An aspect whose pass fails (a damaged frame, an I/O error) does not stop the sweep:
+/// it is listed in [`ReconcileStoreResponse::failed`], counted in
+/// `weft_reconcile_failed_passes_total`, and the remaining aspects are still swept; the
+/// response is a `200` either way.
+///
+/// An aspect another maintenance operation holds (a daemon pass, another request) is
+/// waited for, with one maintenance wait (the store's, 30 s by default) shared by the
+/// whole sweep. If an aspect is still held when that runs out, the sweep leaves it alone,
+/// maintains the rest, and answers `409 Conflict` naming the aspects it left, so the
+/// caller knows to retry.
+///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] when no store is attached, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::Unconfigured`] when no store is attached,
+/// [`StorageError::Conflict`] when other maintenance operations held some aspects for
+/// the whole wait, and [`StorageError::Internal`] when the aspect list or the post-sweep
+/// store stats cannot be read.
 pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query<ReconcileParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
@@ -347,33 +423,41 @@ pub async fn reconcile_store(State(state): State<AppState>, Query(params): Query
 /// [`SegmentStore`](weftdb::SegmentStore) handle is dropped in the caller.
 async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, StorageError> {
 	let threshold = threshold.unwrap_or(1).max(1);
-	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled) = if overlaps {
+	// Wait out a daemon pass (or another request) on an aspect rather than skip it.
+	let wait = MaintenanceWait::Wait(store.maintenance_wait());
+	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed, busy) = if overlaps {
 		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
 		// default 50 MiB floor (every aspect's small components full-rewrite).
 		let sweep = match split_min_bytes {
-			Some(min) => store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min)).await.map_err(|err| StorageError::Internal(err.to_string()))?,
-			None => store.reconcile_all_overlaps().await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			Some(min) => store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min), wait).await.map_err(|err| StorageError::Internal(err.to_string()))?,
+			None => store.reconcile_all_overlaps(wait).await.map_err(|err| StorageError::Internal(err.to_string()))?,
 		};
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 		}
-		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0)
+		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy)
 	} else if hot_cold {
-		let sweep = store.reconcile_all_hot_cold(threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		let sweep = store.reconcile_all_hot_cold(threshold, wait).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 		}
-		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled)
+		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed), sweep.busy)
 	} else {
-		let sweep = store.reconcile_all_over_threshold(threshold).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+		let sweep = store.reconcile_all_over_threshold(threshold, wait).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 		}
-		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0)
+		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy)
 	};
+	if !failed.is_empty() {
+		metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
+	}
+	if !busy.is_empty() {
+		return Err(StorageError::Conflict(format!("aspects {busy:?} were held by other maintenance operations for the whole {:?} wait and were not swept; the other {} aspects were swept; retry", store.maintenance_wait(), aspects_scanned.saturating_sub(busy.len()))));
+	}
 	let unsorted_segments = store.store_stats().await.map_err(|err| StorageError::Internal(err.to_string()))?.unsorted_segments;
 	let overlapping_segments = store.store_overlapping_segments().await.map_err(|err| StorageError::Internal(err.to_string()))?;
-	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments })).into_response())
+	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments, failed })).into_response())
 }
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/squash`.
@@ -411,13 +495,18 @@ pub struct SquashResponse {
 /// [`squash_aspect_if_exceeds`](weftdb::SegmentStore::squash_aspect_if_exceeds), so
 /// the rewrite runs only when the segment count exceeds `N` — the trigger that bounds
 /// the fragmentation repeated split carve-offs create. Returns `200 OK` with whether
-/// it triggered, how many segments it removed, and the post-pass segment count.
+/// it triggered, how many segments it removed, and the post-pass segment count. Like
+/// the reconcile endpoint, it waits for an aspect another maintenance operation holds up
+/// to the store's maintenance wait (30 s by default), then answers `409 Conflict`.
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::NotFound`] when the aspect is undeclared, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::NotFound`] when the aspect is undeclared,
+/// [`StorageError::BadRequest`] when its name is not safe as a file name (declared
+/// before names were checked),
+/// [`StorageError::Conflict`] when another maintenance operation held the aspect for the
+/// whole wait, and [`StorageError::Internal`] on a read/seal/control-plane failure.
 pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<SquashParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
@@ -426,8 +515,8 @@ pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<Str
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
 	let (triggered, removed) = match params.max_segments {
-		Some(max) => store.squash_aspect_if_exceeds(&aspect, max).await.map_err(|err| StorageError::Internal(err.to_string()))?.map_or((false, 0), |removed| (true, removed)),
-		None => (true, store.squash_aspect(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?),
+		Some(max) => store.squash_aspect_if_exceeds(&aspect, max).await.map_err(|err| maintenance_error(&err))?.map_or((false, 0), |removed| (true, removed)),
+		None => (true, store.squash_aspect(&aspect).await.map_err(|err| maintenance_error(&err))?),
 	};
 	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
@@ -464,13 +553,17 @@ pub struct CompactResponse {
 /// The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass, delegating to
 /// [`SegmentStore::squash_aspect_to_target_rows`](weftdb::SegmentStore::squash_aspect_to_target_rows).
 /// Returns `200 OK` with how many segments it removed and the post-pass segment count.
+/// Like the reconcile endpoint, it waits for an aspect another maintenance operation holds
+/// up to the store's maintenance wait (30 s by default), then answers `409 Conflict`.
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when `target_rows` is absent,
-/// [`StorageError::NotFound`] when the aspect is undeclared, and
-/// [`StorageError::Internal`] on a read/seal/control-plane failure.
+/// [`StorageError::BadRequest`] when `target_rows` is absent or the aspect's name is not
+/// safe as a file name (declared before names were checked),
+/// [`StorageError::NotFound`] when the aspect is undeclared,
+/// [`StorageError::Conflict`] when another maintenance operation held the aspect for the
+/// whole wait, and [`StorageError::Internal`] on a read/seal/control-plane failure.
 pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<CompactParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
@@ -479,7 +572,7 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 	if store.schema_for(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?.is_none() {
 		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
-	let removed = store.squash_aspect_to_target_rows(&aspect, target_rows).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let removed = store.squash_aspect_to_target_rows(&aspect, target_rows).await.map_err(|err| maintenance_error(&err))?;
 	let segment_count = store.segment_count(&aspect).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
 	Ok((StatusCode::OK, Json(CompactResponse { aspect, removed, segment_count })).into_response())
@@ -489,7 +582,9 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 #[derive(Debug, Clone, Deserialize)]
 pub struct RestoreDrillParams {
 	/// The backup subdirectory to rehearse restoring, under the same backup root the
-	/// snapshot endpoint writes to. Traversal-guarded exactly like the backup label.
+	/// snapshot endpoint writes to, in the same label grammar
+	/// (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`). Unlike the backup
+	/// endpoint, the drill accepts a daemon snapshot's `backup-<digits>`: it only reads it.
 	pub label: String,
 }
 
@@ -509,6 +604,11 @@ pub struct RestoreDrillResponse {
 	/// Always `true` when the call returns `200`: the backup restored and every restored
 	/// database opened and scanned. A failure is reported as a non-`200` instead.
 	pub restorable: bool,
+	/// Why the rehearsal copy could not be removed afterwards, or `null` when it was.
+	/// The drill's answer stands either way; a copy left behind is a
+	/// `.restore-drill-*` directory beside the backups. The backup daemon's sweep removes
+	/// it once it is an hour old; where the daemon is not enabled, remove it by hand.
+	pub cleanup_error: Option<String>,
 }
 
 /// Handle `POST /api/v1/storage/restore/drill?label=`: **rehearse** restoring a backup.
@@ -517,7 +617,9 @@ pub struct RestoreDrillResponse {
 /// every restored database at its destination (it opens, and every row of every table
 /// reads), reports what came back, and then deletes the rehearsal copy. The live store is
 /// never touched and nothing is overwritten — the whole point is that an operator can
-/// answer "is my backup actually restorable?" on a running system without risking it.
+/// answer "is my backup actually restorable?" on a running system without risking it. If
+/// the copy cannot be deleted, the response says so in `cleanup_error` (and the backup
+/// daemon's sweep, when the daemon is enabled, removes the copy once it is an hour old).
 ///
 /// Restoring *over* a live control plane is deliberately not offered here: the library
 /// primitive refuses to clobber, and choosing a new store root is a deployment decision
@@ -526,14 +628,20 @@ pub struct RestoreDrillResponse {
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached, [`StorageError::BadRequest`]
-/// when the label is malformed, [`StorageError::NotFound`] when no such backup exists, and
-/// [`StorageError::Internal`] when the backup will not restore or verify — which is a
-/// failed drill, and the answer the caller asked for.
+/// when the label is malformed (see [`BackupParams::label`] for the grammar) or names a
+/// staging directory (an unfinished backup, prune or drill), [`StorageError::NotFound`]
+/// when no such backup exists, [`StorageError::AlreadyExists`] when the rehearsal
+/// directory is already taken by another drill, and [`StorageError::Internal`] when the
+/// backup will not restore or verify — which is a failed drill, and the answer the
+/// caller asked for.
 pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<RestoreDrillParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	drop(state);
 	if !valid_backup_label(&params.label) {
-		return Err(StorageError::BadRequest(format!("invalid backup label `{}` — use only letters, digits, '.', '_', '-'", params.label)));
+		return Err(invalid_backup_label(&params.label));
+	}
+	if weftdb::is_staging_name(&params.label) {
+		return Err(StorageError::BadRequest(format!("`{}` names an unfinished backup, prune or drill (a name starting with one of {:?}), not a backup", params.label, weftdb::STAGING_PREFIXES)));
 	}
 	let base = std::env::var_os("WEFT_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
 	let backup_dir = base.join(&params.label);
@@ -543,25 +651,59 @@ pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<R
 	drop(store);
 
 	// A throwaway destination beside the backups: same volume (so the rehearsal is sized
-	// like the real thing) and never the live store root. Cleaned up on every path,
-	// success or failure.
+	// like the real thing) and never the live store root. Once claimed, it is cleaned up
+	// on every path, success or failure.
 	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
-	let target = base.join(format!(".restore-drill-{millis}"));
-	let outcome = weftdb::restore_control_plane(&backup_dir, &target).await;
-	let _ = tokio::fs::remove_dir_all(&target).await;
-	let report = outcome.map_err(|err| StorageError::Internal(format!("restore drill for `{}` FAILED: {err:#}", params.label)))?;
+	let target = base.join(format!("{RESTORE_DRILL_PREFIX}{millis}"));
+	let response = drill_response(&RealFs, params.label, &backup_dir, &target).await?;
+	Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Rehearse restoring `backup_dir` into the throwaway directory `target` through `fs`,
+/// remove `target` again whatever the outcome, and build the drill's answer.
+///
+/// `target` is claimed first, by creating it with a call that fails if anything is
+/// already there, so two drills never share a rehearsal directory. A drill that finds it
+/// taken (another drill started in the same millisecond) answers `409 already_exists`
+/// and leaves it alone, instead of restoring into it and then removing the other drill's
+/// copy. The new directory's entry is not fsynced: the copy is removed when the drill
+/// ends, and one a crash leaves behind is swept like any other stale drill.
+async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path::Path, target: &std::path::Path) -> Result<RestoreDrillResponse, StorageError> {
+	match fs.create_dir(target).await {
+		Ok(()) => {}
+		Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+			return Err(StorageError::AlreadyExists(format!("restore drill for `{label}`: its rehearsal directory {} already exists; nothing was restored into it or removed — retry the drill, which picks a fresh directory", target.display())));
+		}
+		Err(err) => return Err(StorageError::Internal(format!("restore drill for `{label}` could not create its rehearsal directory {}: {err}", target.display()))),
+	}
+	let outcome = weftdb::restore_control_plane_with(fs, backup_dir, target).await;
+	// The drill's answer stands whether or not its copy can be removed, but a copy left
+	// behind is disk an operator is paying for: say so instead of dropping the error.
+	let cleanup_error = fs.remove_dir_all(target).await.err().map(|err| format!("could not remove the rehearsal copy {}: {err}", target.display()));
+	if let Some(cleanup) = &cleanup_error {
+		tracing::warn!(label = %label, error = %cleanup, "restore drill left its rehearsal copy behind; the backup daemon's sweep removes it once stale, if the daemon is enabled");
+	}
+	let report = outcome.map_err(|err| {
+		let also = cleanup_error.as_deref().map_or_else(String::new, |cleanup| format!(" (and it {cleanup})"));
+		StorageError::Internal(format!("restore drill for `{label}` FAILED: {err:#}{also}"))
+	})?;
 
 	let databases = report.restored.iter().map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes }).collect();
-	let response = RestoreDrillResponse { label: params.label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true };
-	Ok((StatusCode::OK, Json(response)).into_response())
+	Ok(RestoreDrillResponse { label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true, cleanup_error })
 }
 
 /// Query parameters for `POST /api/v1/storage/backup`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BackupParams {
-	/// A subdirectory name for this snapshot under the backup root. Restricted to
-	/// `[A-Za-z0-9._-]` (and not `.`/`..`) so an API caller can never traverse out of
-	/// the backup root. Absent → a `backup-<unix_millis>` name is generated.
+	/// A subdirectory name for this snapshot under the backup root, in the grammar
+	/// `[A-Za-z0-9][A-Za-z0-9._-]{0,99}` and not ending with `.`, so an API caller can never
+	/// traverse out of the backup root and every platform names the directory exactly as
+	/// given (Windows would strip a trailing `.`); anything else → `400`. Absent → a
+	/// `manual-<unix_millis>` name is generated. The backup daemon's grammar (`backup-` and
+	/// digits only) is reserved for the daemon, because backup retention counts and prunes
+	/// exactly those names; a label matching it → `400`. A label already taken → `409`
+	/// with code `already_exists`. No snapshot taken through this endpoint is ever pruned
+	/// by retention.
 	pub label: Option<String>,
 	/// How each snapshot copy is verified: `source` (default) cross-checks it against a
 	/// fresh read of the live control plane — the strongest check, but it assumes a
@@ -624,11 +766,34 @@ const fn verify_token(mode: VerifyMode) -> &'static str {
 	}
 }
 
-/// Validate a caller-supplied backup `label`: non-empty, only `[A-Za-z0-9._-]`, and
-/// neither `.` nor `..` — so it names a single fresh subdirectory under the backup root
-/// and can never be an absolute path or a `../` traversal.
+/// The longest backup label [`valid_backup_label`] accepts, in bytes; a label is ASCII,
+/// so this is also its length in characters.
+const MAX_BACKUP_LABEL_LEN: usize = 100;
+
+/// The error for a `label` that [`valid_backup_label`] rejects.
+fn invalid_backup_label(label: &str) -> StorageError {
+	StorageError::BadRequest(format!("invalid backup label `{label}` — use 1 to {MAX_BACKUP_LABEL_LEN} letters, digits, '.', '_' or '-', starting with a letter or digit and not ending with '.'"))
+}
+
+/// Validate a backup `label` against the grammar frozen for 1.0:
+/// `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`. A label is therefore 1 to
+/// [`MAX_BACKUP_LABEL_LEN`] ASCII characters naming a single subdirectory under the
+/// backup root, the same one on every platform, and can never be an absolute path or a
+/// `../` traversal. Both the backup and the restore-drill endpoints apply it.
+///
+/// The trailing-dot rule matters on Windows, which strips trailing dots from a path
+/// component: `backup-123.` would otherwise pass the reserved-grammar check in
+/// [`backup_store`] and still create the directory `backup-123`, which retention counts
+/// and prunes. With no trailing dot or space, no platform names a label as anything but
+/// itself. The first character is a letter or digit: a leading `.` would make a hidden
+/// directory and could take a staging prefix (`.partial-`, `.deleting-`,
+/// `.restore-drill-`), and a leading `-` reads as an option to the command-line tools an
+/// operator points at the backup directory. The length bound keeps the label, and the
+/// `.partial-{label}-{nonce}` and `.deleting-{label}-{nonce}` names built from it, well
+/// inside every filesystem's 255-byte name limit.
 fn valid_backup_label(label: &str) -> bool {
-	!label.is_empty() && label != "." && label != ".." && label.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+	let bytes = label.as_bytes();
+	bytes.first().is_some_and(u8::is_ascii_alphanumeric) && bytes.len() <= MAX_BACKUP_LABEL_LEN && bytes.last() != Some(&b'.') && bytes.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Handle `POST /api/v1/storage/backup`: snapshot the store's four control-plane DBs.
@@ -638,16 +803,24 @@ fn valid_backup_label(label: &str) -> bool {
 ///
 /// The snapshot lands in `<base>/<label>`, where `<base>` is `WEFT_BACKUP_DIR` if set
 /// else `<store_root>/backups`, and `<label>` is the (validated) `?label=` or a generated
-/// `backup-<unix_millis>`. Each destination file must be fresh (`VACUUM INTO` needs a
-/// non-existing file), so a directory that already exists is rejected. The `.weftseg`
-/// measurement frames are **not** part of this backup — control plane only, per the
-/// storage boundary (hard-constraint #3).
+/// `manual-<unix_millis>` ([`manual_label`](crate::backup_daemon::manual_label)), which
+/// backup retention never counts or prunes. The backup is built in a `.partial-*`
+/// directory beside it and renamed into place, with a `MANIFEST.json`, only once complete
+/// and durable, so a directory that already exists is rejected (`409 already_exists`). A
+/// backup that fails removes its build directory again, except in one window: if the final
+/// fsync of `<base>` fails after the rename, the response is a `500` although the complete
+/// backup is already under its label (so a retry with the same label is a `409`). The
+/// `.weftseg` measurement frames are **not** part of this backup — control plane only, per
+/// the storage boundary (hard-constraint #3).
 ///
 /// # Errors
 ///
 /// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when `label` is malformed or the target dir already
-/// exists, and [`StorageError::Internal`] on a backup/verify failure.
+/// [`StorageError::BadRequest`] when `label` is malformed (see [`BackupParams::label`]
+/// for the grammar), in the reserved `backup-<digits>` form, or reserved for a staging
+/// directory (`.partial-*`, `.deleting-*`, `.restore-drill-*`),
+/// [`StorageError::AlreadyExists`] when the target dir already exists, and
+/// [`StorageError::Internal`] on a backup/verify failure.
 pub async fn backup_store(State(state): State<AppState>, Query(params): Query<BackupParams>) -> Result<Response, StorageError> {
 	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
 	let metrics = state.metrics().clone();
@@ -659,16 +832,28 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 	let base = std::env::var_os("WEFT_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
 	let sub = if let Some(label) = params.label {
 		if !valid_backup_label(&label) {
-			return Err(StorageError::BadRequest(format!("invalid backup label `{label}` — use only letters, digits, '.', '_', '-'")));
+			return Err(invalid_backup_label(&label));
+		}
+		// Retention counts and prunes `backup-<digits>` directories as the daemon's
+		// snapshots, so a caller-chosen label in that form could crowd genuine ones out.
+		// `valid_backup_label` has refused a trailing `.`, so the label checked here is
+		// the directory name on every platform.
+		if crate::backup_daemon::is_generated_label(&label) {
+			return Err(StorageError::BadRequest(format!("backup label `{label}` is reserved: `backup-<digits>` names are generated by the backup daemon and managed by backup retention — choose another label, or omit `label` to have one generated")));
+		}
+		if weftdb::is_staging_name(&label) {
+			return Err(StorageError::BadRequest(format!("backup label `{label}` is reserved: names starting with one of {:?} are unfinished backups, prunes and drills, which are swept", weftdb::STAGING_PREFIXES)));
 		}
 		label
 	} else {
+		// Not the daemon's `backup-<digits>`: an API caller taking unlabelled backups must
+		// not push the daemon's snapshots out of the retained set.
 		let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
-		format!("backup-{millis}")
+		crate::backup_daemon::manual_label(millis)
 	};
 	let dest = base.join(&sub);
 	if dest.exists() {
-		return Err(StorageError::BadRequest(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
+		return Err(StorageError::AlreadyExists(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
 	}
 	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| StorageError::Internal(err.to_string()))?;
 	drop(store);
@@ -747,7 +932,9 @@ pub struct IngestResponse {
 /// libSQL) is a `500`.
 fn classify_seal_error(err: &anyhow::Error) -> StorageError {
 	let message = err.to_string();
-	if message.contains("seal failed") || message.contains("paged seal failed") {
+	// An aspect declared under a name that is not safe as a file name (before names were
+	// checked) is the caller's addressing problem, not a server fault.
+	if message.contains("seal failed") || message.contains("paged seal failed") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
 		StorageError::BadRequest(message)
 	} else {
 		StorageError::Internal(message)
@@ -1139,7 +1326,9 @@ mod tests {
 	use tower::ServiceExt;
 	use weftdb::SegmentStore;
 
-	use crate::{app_with_state, AppState};
+	use crate::{
+		app_with_state, test_fs::{FsOp, RecordingFs, INJECTED_CLEANUP_FAILURE}, AppState
+	};
 
 	/// Build a router over a fresh, empty store under `dir` (no aspects declared).
 	async fn router_with_empty_store(dir: &TempDir) -> axum::Router {
@@ -1223,6 +1412,77 @@ mod tests {
 		let body = serde_json::json!({ "name": "x", "physical_type": "f64", "timestamp_unit": "seconds" });
 		let (status, _body) = post_json(router, "/api/v1/storage/aspects", &body).await;
 		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	/// Every `.weftseg`/`.weftpart` file anywhere under `dir`.
+	fn frames_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+		let mut found = Vec::new();
+		for entry in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
+			let path = entry.path();
+			if path.is_dir() {
+				found.extend(frames_under(&path));
+			} else if path.extension().is_some_and(|ext| ext == "weftseg" || ext == "weftpart") {
+				found.push(path);
+			}
+		}
+		found
+	}
+
+	/// Regression: the declared name becomes part of every frame's file name, so a name
+	/// that would leave the store's `segments/` directory — a `..` traversal or an
+	/// absolute path — is a `400` in the JSON error envelope, and nothing is declared or
+	/// written.
+	#[tokio::test]
+	async fn declare_rejects_path_escaping_names() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.expect("opens store"));
+		let state = AppState::new().with_store(store.clone());
+		let absolute = dir.path().join("abs").to_string_lossy().into_owned();
+		for name in ["../x", "../../x", absolute.as_str(), "a/b", "..", ".hidden", "CON", "a\u{0}b"] {
+			let body = serde_json::json!({ "name": name, "physical_type": "f64", "timestamp_unit": "seconds" });
+			let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/aspects", &body).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?} must be refused; body: {body}");
+			assert!(body["error"].as_str().unwrap().contains("invalid aspect name"), "body: {body}");
+		}
+		// An ingest addressed through percent-encoded separators finds nothing declared.
+		let points = serde_json::json!({ "points": [{ "timestamp": 0, "value": "1" }] });
+		let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/..%2F..%2Fx/points", &points).await;
+		assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+		let declared = store.list_declared_aspects().await.unwrap();
+		drop(state);
+		drop(store);
+		assert!(declared.is_empty(), "nothing was declared: {declared:?}");
+		assert!(frames_under(dir.path()).is_empty(), "no frame was written anywhere");
+	}
+
+	/// An aspect declared under an unsafe name by an older version (straight into the
+	/// catalog) is refused on use with a `400` (ingest, read and per-aspect maintenance),
+	/// the store-wide sweep lists it in `failed`, and no frame is written for it.
+	#[tokio::test]
+	async fn a_previously_declared_unsafe_name_is_a_bad_request_on_use() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.expect("opens store"));
+		let schema = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		store.catalog().declare(store.database(), store.subject(), "../x", &schema).await.expect("raw declare");
+		let state = AppState::new().with_store(store.clone());
+		let points = serde_json::json!({ "points": [{ "timestamp": 0, "value": "1" }] });
+		let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/..%2Fx/points", &points).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("invalid aspect name"), "body: {body}");
+		let response = app_with_state(state.clone()).oneshot(Request::builder().uri("/api/v1/storage/..%2Fx/range.csv?start=0&end=10").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		for uri in ["/api/v1/storage/..%2Fx/reconcile", "/api/v1/storage/..%2Fx/reconcile?threshold=1", "/api/v1/storage/..%2Fx/reconcile?hot_cold=true", "/api/v1/storage/..%2Fx/reconcile?overlaps=true", "/api/v1/storage/..%2Fx/squash", "/api/v1/storage/..%2Fx/squash?max_segments=1", "/api/v1/storage/..%2Fx/compact?target_rows=10"] {
+			let (status, body) = post_empty(app_with_state(state.clone()), uri).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "POST {uri}: {body}");
+			assert!(body["error"].as_str().unwrap().contains("invalid aspect name"), "POST {uri}: {body}");
+		}
+		let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/reconcile").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["failed"][0]["aspect"], "../x", "the sweep reports the unsafe aspect: {body}");
+		assert!(body["failed"][0]["error"].as_str().unwrap().contains("invalid aspect name"), "body: {body}");
+		drop(state);
+		drop(store);
+		assert!(frames_under(dir.path()).is_empty(), "no frame was written anywhere");
 	}
 
 	/// Declare `price` (F64, seconds) in a fresh store under `dir`, returning a router
@@ -1331,6 +1591,49 @@ mod tests {
 		assert_eq!(json["segments_reconciled"], 2);
 		assert_eq!(json["unsorted_segments"], 0);
 		assert_eq!(json["overlapping_segments"], 0, "the reconciled segments cover disjoint windows");
+		assert_eq!(json["failed"], serde_json::json!([]), "a clean sweep lists no failures");
+	}
+
+	/// Crash-consistency S4: six aspects (`s1`..`s6`), each with three out-of-order,
+	/// time-overlapping segments, and `s2`'s lowest-id frame truncated to half its length.
+	/// Every store-wide reconcile mode must answer `200`, sweep the five healthy aspects and
+	/// list `s2` (with the damaged frame in its error) in `failed`; before S4 the request
+	/// failed with a `500` at `s2` and `s3`..`s6` were never swept.
+	#[tokio::test]
+	async fn reconcile_store_endpoint_lists_a_failed_aspect_and_sweeps_the_rest() {
+		let sc = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		let v = |s: &str| -> bigdecimal::BigDecimal { s.parse().unwrap() };
+		for uri in ["/api/v1/storage/reconcile", "/api/v1/storage/reconcile?hot_cold=true", "/api/v1/storage/reconcile?overlaps=true", "/api/v1/storage/reconcile?overlaps=true&split_min_bytes=1"] {
+			let dir = TempDir::new().unwrap();
+			let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+			for aspect in ["s1", "s2", "s3", "s4", "s5", "s6"] {
+				store.declare(aspect, &sc).await.expect("declares");
+				let first = store.seal(aspect, &sc, &[100_i64, 130, 110], &[v("1"), v("3"), v("2")]).await.expect("seal 0");
+				store.seal(aspect, &sc, &[120_i64, 150, 125], &[v("4"), v("6"), v("5")]).await.expect("seal 1");
+				store.seal(aspect, &sc, &[140_i64, 170, 145], &[v("7"), v("9"), v("8")]).await.expect("seal 2");
+				if aspect == "s2" {
+					let file = std::fs::OpenOptions::new().write(true).open(&first.path).expect("opens frame");
+					let len = file.metadata().expect("stats frame").len();
+					file.set_len(len / 2).expect("truncates frame");
+				}
+			}
+			let router = app_with_state(AppState::new().with_store(store.clone()));
+			let response = router.oneshot(Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			let status = response.status();
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+			let s6 = store.aspect_stats("s6").await.unwrap();
+			drop(store);
+			assert_eq!(status, StatusCode::OK, "{uri}: a failed aspect does not fail the request: {json}");
+			assert_eq!(json["aspects_scanned"], 6, "{uri}");
+			assert_eq!(json["aspects_reconciled"], 5, "{uri}: every healthy aspect is swept: {json}");
+			let failed = json["failed"].as_array().unwrap_or_else(|| panic!("{uri}: failed is a list: {json}"));
+			assert_eq!(failed.len(), 1, "{uri}: only the damaged aspect fails: {json}");
+			assert_eq!(failed[0]["aspect"], "s2", "{uri}");
+			assert!(failed[0]["error"].as_str().unwrap_or_default().contains("s2-0.weftseg"), "{uri}: the error names the damaged frame: {json}");
+			let reached = if uri.contains("overlaps") { s6.overlapping_segments == 0 } else { s6.unsorted_segments == 0 };
+			assert!(reached, "{uri}: the last aspect in name order is still reached: {s6:?}");
+		}
 	}
 
 	#[tokio::test]
@@ -1374,6 +1677,24 @@ mod tests {
 		assert!(!valid_backup_label("a/b"));
 		assert!(!valid_backup_label("a\\b"));
 		assert!(!valid_backup_label("a b"));
+		// Windows strips a trailing dot, so `backup-1.` would create `backup-1`.
+		assert!(!valid_backup_label("backup-1."));
+		assert!(!valid_backup_label("nightly.."));
+		assert!(!valid_backup_label(".hidden"));
+		assert!(!valid_backup_label(".restore-drill-1"));
+		assert!(valid_backup_label("a.b"), "a dot inside the label is fine");
+		// The frozen grammar: `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`.
+		assert!(valid_backup_label("A"), "one letter is a label");
+		assert!(valid_backup_label("7"), "one digit is a label");
+		assert!(valid_backup_label("nightly-") && valid_backup_label("nightly_"), "only a trailing `.` is refused");
+		assert!(valid_backup_label("backup-123"), "the grammar admits a daemon name; the backup endpoint reserves it separately");
+		assert!(!valid_backup_label("-nightly"), "a label starts with a letter or digit, so it never reads as a command-line option");
+		assert!(!valid_backup_label("_nightly"));
+		assert!(!valid_backup_label(".partial-x"));
+		assert!(valid_backup_label(&"a".repeat(100)), "100 characters is the limit");
+		assert!(!valid_backup_label(&"a".repeat(101)), "101 characters is one too many");
+		assert!(!valid_backup_label("café"), "ASCII only");
+		assert!(!valid_backup_label("a:b") && !valid_backup_label("a\0b") && !valid_backup_label("a\tb"));
 	}
 
 	#[tokio::test]
@@ -1408,10 +1729,13 @@ mod tests {
 			assert!(backup_dir.join(name).exists(), "{name} written to disk");
 		}
 
-		// Re-using the same label collides with the existing dir → 400 (VACUUM INTO needs a fresh file).
-		let router = app_with_state(state.clone());
-		let dup = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/backup?label=nightly").body(Body::empty()).unwrap()).await.unwrap();
-		assert_eq!(dup.status(), StatusCode::BAD_REQUEST, "an existing backup dir is rejected");
+		// Re-using the same label collides with the existing dir → 409 `already_exists`
+		// (a backup is published under a fresh name), and the existing backup is kept.
+		let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/backup?label=nightly").await;
+		assert_eq!(status, StatusCode::CONFLICT, "an existing backup dir is a conflict; body: {body}");
+		assert_eq!(body["code"], "already_exists", "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("already exists"), "body: {body}");
+		assert!(backup_dir.join(weftdb::BACKUP_MANIFEST).exists(), "the existing backup is untouched");
 
 		// /metrics reflects the one successful snapshot (the failed dup did not bump it).
 		let router = app_with_state(state.clone());
@@ -1449,6 +1773,7 @@ mod tests {
 		let djson: serde_json::Value = serde_json::from_slice(&dbytes).unwrap();
 		assert_eq!(dstatus, StatusCode::OK, "body: {djson}");
 		assert_eq!(djson["restorable"], true, "the backup restored and verified");
+		assert_eq!(djson["cleanup_error"], serde_json::Value::Null, "the rehearsal copy was removed");
 		assert_eq!(djson["databases"].as_array().unwrap().len(), 4, "all four control-plane DBs came back");
 		assert!(djson["total_rows"].as_i64().unwrap() >= 2, "rows read back out of the restored copies");
 		// The rehearsal left nothing behind, and the live store is untouched.
@@ -1464,6 +1789,236 @@ mod tests {
 		let traversal = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=..").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(traversal.status(), StatusCode::BAD_REQUEST, "traversal label rejected on the drill too");
 		drop(store);
+	}
+
+	/// The regression for `drill-dir-leak`: the drill discarded its cleanup error, so a
+	/// rehearsal copy it could not remove was left on disk with nobody told.
+	#[tokio::test]
+	async fn a_failed_drill_cleanup_is_reported_in_the_response() {
+		let dir = TempDir::new().unwrap();
+		let sc = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("price", &sc).await.expect("declares");
+		let base = dir.path().join("backups");
+		store.backup_control_plane_with_verify(base.join("nightly"), weftdb::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+
+		let target = base.join(".restore-drill-1");
+		let fs = RecordingFs::failing_remove_dir_all();
+		let response = super::drill_response(&fs, "nightly".to_string(), &base.join("nightly"), &target).await.expect("the backup itself restores");
+		assert!(response.restorable);
+		let cleanup = response.cleanup_error.as_deref().expect("the failed cleanup is reported, not swallowed");
+		assert!(cleanup.contains(INJECTED_CLEANUP_FAILURE) && cleanup.contains(".restore-drill-1"), "names the cause and the leftover: {cleanup}");
+		assert!(fs.ops().contains(&FsOp::RemoveDirAll(target.clone())), "the drill tried to remove its copy");
+		assert_eq!(serde_json::to_value(&response).unwrap()["cleanup_error"], serde_json::json!(cleanup), "it is in the JSON body");
+		assert!(target.exists(), "the copy really was left behind, for the sweep");
+
+		// A drill whose restore fails reports a failed cleanup in its error as well.
+		let err = super::drill_response(&fs, "missing".to_string(), &base.join("missing"), &base.join(".restore-drill-2")).await.unwrap_err();
+		let super::StorageError::Internal(message) = err else { panic!("a failed drill is an internal error") };
+		assert!(message.contains("FAILED") && message.contains(INJECTED_CLEANUP_FAILURE), "{message}");
+	}
+
+	#[tokio::test]
+	async fn staging_names_are_refused_as_backup_and_drill_labels() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let state = AppState::new().with_store(store.clone());
+		for label in [".partial-backup-1-00", ".deleting-backup-1-00", ".restore-drill-1"] {
+			// A backup under such a name would be swept as litter an hour later.
+			let uri = format!("/api/v1/storage/backup?label={label}");
+			let response = app_with_state(state.clone()).oneshot(Request::builder().method("POST").uri(&uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}: a staging name is reserved");
+			assert!(!dir.path().join("backups").join(label).exists(), "{uri}: nothing was written");
+
+			// And a directory under such a name is an unfinished backup, prune or drill.
+			std::fs::create_dir_all(dir.path().join("backups").join(label)).unwrap();
+			let uri = format!("/api/v1/storage/restore/drill?label={label}");
+			let response = app_with_state(state.clone()).oneshot(Request::builder().method("POST").uri(&uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}: a staging name is never a backup");
+		}
+		drop(store);
+	}
+
+	/// POST `uri` with an empty body, returning the status and parsed JSON body.
+	async fn post_empty(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+		let response = router.oneshot(Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+	}
+
+	/// Regression: backup retention counts and prunes `backup-<digits>` directories as the
+	/// daemon's snapshots, so a caller must not be able to create one with a stamp of its
+	/// choosing (a far-future one would crowd genuine snapshots out).
+	#[tokio::test]
+	async fn backup_endpoint_reserves_the_generated_label_grammar() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let state = AppState::new().with_store(store.clone());
+		let backups = dir.path().join("backups");
+		for label in ["backup-99999999999999", "backup-0", "backup-1753000000000"] {
+			let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/backup?label={label}")).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{label} must be refused; body: {body}");
+			assert!(body["error"].as_str().unwrap().contains("reserved"), "body: {body}");
+			assert!(!backups.join(label).exists(), "a refused label writes nothing");
+		}
+		// Regression: Windows strips trailing dots from a path component, so `backup-<n>.`
+		// would create the reserved `backup-<n>` there while passing the reserved-name
+		// check here. A trailing (or leading) dot is refused on every platform.
+		for label in ["backup-1753000000000.", "backup-1753000000000..", ".backup-1753000000000"] {
+			let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/backup?label={label}&verify=snapshot")).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{label} must be refused; body: {body}");
+			assert!(body["error"].as_str().unwrap().contains("ending with '.'"), "body: {body}");
+		}
+		assert!(!backups.exists() || std::fs::read_dir(&backups).unwrap().next().is_none(), "refused labels write nothing");
+		// Near misses are ordinary operator labels.
+		let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/backup?label=backup-nightly&verify=snapshot").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// An unlabelled backup gets a `manual-<millis>` name, outside the daemon's grammar,
+		// and that snapshot can be drilled.
+		let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/backup?verify=snapshot").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		let generated = std::path::Path::new(body["dir"].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned();
+		assert!(generated.strip_prefix("manual-").is_some_and(|stamp| stamp.parse::<u128>().is_ok()), "{generated}");
+		assert!(!crate::backup_daemon::is_generated_label(&generated), "{generated} is not a daemon name");
+		let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/restore/drill?label={generated}")).await;
+		drop(state);
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "a generated snapshot can still be drilled; body: {body}");
+	}
+
+	/// Regression: unlabelled API backups used to be named `backup-<now>`, which retention
+	/// counts as the newest daemon snapshots, so `WEFT_BACKUP_KEEP` of them in a row got
+	/// every older daemon snapshot pruned at the next tick. Retention now ignores them.
+	#[tokio::test]
+	async fn unlabelled_backups_never_evict_daemon_snapshots() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let state = AppState::new().with_store(store.clone());
+		let backups = dir.path().join("backups");
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+		let daemon: Vec<std::path::PathBuf> = [3_000_u128, 2_000].into_iter().map(|age| backups.join(crate::backup_daemon::generated_label(now - age))).collect();
+		// Complete backups (all four control-plane files), so retention counts them.
+		for snapshot in &daemon {
+			tokio::fs::create_dir_all(snapshot).await.unwrap();
+			for file in weftdb::CONTROL_PLANE_FILES {
+				tokio::fs::write(snapshot.join(file), b"x").await.unwrap();
+			}
+		}
+		let keep = 2;
+		for _ in 0..keep {
+			let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/backup?verify=snapshot").await;
+			assert_eq!(status, StatusCode::OK, "body: {body}");
+			// A fresh millisecond, so the next unlabelled name is fresh too.
+			tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+		}
+		drop(state);
+		drop(store);
+		let removed = crate::backup_daemon::prune_generated_backups(&backups, keep).await.unwrap();
+		assert_eq!(removed, 0, "the daemon's snapshots are still the only {keep} it counts");
+		for snapshot in &daemon {
+			assert!(snapshot.exists(), "{} was evicted by unlabelled API backups", snapshot.display());
+		}
+	}
+
+	/// SEC-1's retention-poisoning case end to end: with `keep = 2`, three attempts to plant
+	/// far-future `backup-<digits>` snapshots through `?label=` all fail, so the next prune
+	/// keeps both genuine daemon snapshots.
+	#[tokio::test]
+	async fn poisoned_labels_never_evict_daemon_snapshots() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let state = AppState::new().with_store(store.clone());
+		let backups = dir.path().join("backups");
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+		let daemon: Vec<std::path::PathBuf> = [3_000_u128, 2_000].into_iter().map(|age| backups.join(crate::backup_daemon::generated_label(now - age))).collect();
+		for snapshot in &daemon {
+			tokio::fs::create_dir_all(snapshot).await.unwrap();
+			for file in weftdb::CONTROL_PLANE_FILES {
+				tokio::fs::write(snapshot.join(file), b"x").await.unwrap();
+			}
+		}
+		for label in ["backup-99999999999999", "backup-99999999999998.", "backup-99999999999997"] {
+			let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/backup?label={label}&verify=snapshot")).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{label} must be refused; body: {body}");
+		}
+		drop(state);
+		drop(store);
+		let mut names: Vec<String> = std::fs::read_dir(&backups).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+		names.sort();
+		let mut expected: Vec<String> = daemon.iter().map(|snapshot| snapshot.file_name().unwrap().to_string_lossy().into_owned()).collect();
+		expected.sort();
+		assert_eq!(names, expected, "the refused labels created nothing");
+		let removed = crate::backup_daemon::prune_generated_backups(&backups, 2).await.unwrap();
+		assert_eq!(removed, 0, "both genuine snapshots are kept");
+		for snapshot in &daemon {
+			assert!(snapshot.exists(), "{} was pruned", snapshot.display());
+		}
+	}
+
+	/// SEC-1 / FRE-7b: the backup label grammar frozen for 1.0 is
+	/// `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`, on the backup and the drill
+	/// endpoints alike. A drill still accepts a daemon name, because it only reads.
+	#[tokio::test]
+	async fn backup_and_drill_labels_follow_the_frozen_grammar() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let state = AppState::new().with_store(store.clone());
+		let backups = dir.path().join("backups");
+		let too_long = "a".repeat(101);
+		for label in ["-nightly", "_nightly", ".partial-x", too_long.as_str()] {
+			let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/backup?label={label}&verify=snapshot")).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: body: {body}");
+			assert!(body["error"].as_str().unwrap().contains("invalid backup label"), "{label}: body: {body}");
+			assert!(!backups.join(label).exists(), "{label}: a refused label writes nothing");
+			// A directory under such a name is refused by the drill too, before it is looked up.
+			std::fs::create_dir_all(backups.join(label)).unwrap();
+			let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/restore/drill?label={label}")).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: the drill uses the same grammar; body: {body}");
+		}
+		// The longest label the grammar admits is an ordinary backup.
+		let longest = "a".repeat(100);
+		let (status, body) = post_empty(app_with_state(state.clone()), &format!("/api/v1/storage/backup?label={longest}&verify=snapshot")).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		// A daemon snapshot can be drilled: the reservation guards creation only.
+		store.backup_control_plane_with_verify(backups.join("backup-123"), weftdb::VerifyMode::SnapshotOnly).await.expect("backs up");
+		let (status, body) = post_empty(app_with_state(state.clone()), "/api/v1/storage/restore/drill?label=backup-123").await;
+		drop(state);
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "a drill of backup-<digits> is accepted; body: {body}");
+		assert_eq!(body["restorable"], true, "body: {body}");
+	}
+
+	/// Regression: a drill restored into its rehearsal directory even when that directory
+	/// already existed (another drill started in the same millisecond), and then removed
+	/// it, deleting the other drill's copy. It is now a `409 already_exists` that leaves
+	/// the directory as it found it.
+	#[tokio::test]
+	async fn a_drill_whose_rehearsal_directory_exists_is_a_conflict_and_leaves_it_alone() {
+		use axum::response::IntoResponse as _;
+
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let base = dir.path().join("backups");
+		store.backup_control_plane_with_verify(base.join("nightly"), weftdb::VerifyMode::SnapshotOnly).await.expect("backs up");
+		drop(store);
+		let target = base.join(".restore-drill-1");
+		std::fs::create_dir_all(&target).unwrap();
+		std::fs::write(target.join("in-use"), b"another drill's copy").unwrap();
+
+		let fs = RecordingFs::default();
+		let err = super::drill_response(&fs, "nightly".to_string(), &base.join("nightly"), &target).await.expect_err("an existing rehearsal directory is never reused");
+		let response = err.into_response();
+		let status = response.status();
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+		assert_eq!(body["code"], "already_exists", "body: {body}");
+		assert!(target.join("in-use").exists(), "the other drill's copy is untouched");
+		for name in weftdb::CONTROL_PLANE_FILES {
+			assert!(!target.join(name).exists(), "nothing was restored into it: {name}");
+		}
+		assert!(!fs.ops().iter().any(|op| matches!(op, FsOp::RemoveDirAll(_))), "nothing was removed: {:?}", fs.ops());
 	}
 
 	#[test]

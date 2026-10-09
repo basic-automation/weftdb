@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use splimes::{Point, Resolution, Spline};
 
-use crate::{AspectId, Batch, BatchId, Correlation, CorrelationID, DictionaryMetadata, Event, EventID, Measurement, Pattern, PatternID};
+use crate::{AspectId, Batch, BatchId, Correlation, CorrelationID, DictionaryMetadata, Event, EventID, Measurement, Pattern, PatternID, UnbatchedEntry};
 
 /// Trait for database analysis and output operations
 #[async_trait::async_trait]
@@ -16,6 +16,14 @@ pub trait Outputs {
 
 	/// Get all unbatched measurement timestamps for an aspect (measurements not yet included in batches)
 	async fn get_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<Vec<DateTime<Utc>>>;
+
+	/// Get every unbatched queue entry for an aspect, with the `queued_at` it was read at.
+	///
+	/// A queue consumer reads these, not bare timestamps, and dequeues what it batched with
+	/// [`Inputs::dequeue_unbatched_entries`](crate::database::traits::Inputs::dequeue_unbatched_entries),
+	/// so that a timestamp queued again after this read stays queued (see
+	/// [`UnbatchedEntry`]).
+	async fn get_unbatched_entries(&self, aspect_id: &AspectId) -> Result<Vec<UnbatchedEntry>>;
 
 	/// Count unbatched measurements for an aspect
 	async fn count_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<u64>;
@@ -68,8 +76,45 @@ pub trait Outputs {
 	// Dictionaries
 	//
 
+	/// The registration of the aspect's dictionary `dictionary_name`: its id, description,
+	/// steps and variabilities. `None` when there is none, because the dictionary has no
+	/// database yet, its database has no tables yet, or nothing complete is registered in
+	/// it.
+	///
+	/// A registration that was read is cached for up to ten minutes, per `Database`
+	/// handle. [`set_dictionary_metadata`](crate::database::traits::Inputs::set_dictionary_metadata)
+	/// and [`register_dictionary_if_absent`](crate::database::traits::Inputs::register_dictionary_if_absent)
+	/// on the same handle invalidate it, and a read that overlapped such a write does not
+	/// cache what it read. A registration written any other way, through
+	/// [`AspectStructure::new_dictionary`](crate::database::traits::AspectStructure::new_dictionary),
+	/// another handle or another process, can be answered from the cache until the entry
+	/// expires.
+	///
+	/// # Errors
+	///
+	/// An [`InvalidDictionaryName`](crate::InvalidDictionaryName) for a name that cannot
+	/// name a dictionary's file, a failed read, or a stored value that does not parse, such
+	/// as a step interpolation splimes rejects.
 	async fn get_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Option<DictionaryMetadata>>;
 
+	/// The registration of each of the aspect's dictionaries, by name, as
+	/// [`get_dictionary_metadata`](Self::get_dictionary_metadata) reads it.
+	///
+	/// The aspect's dictionaries are the regular files `<name>.db` in its `dictionaries/`
+	/// directory whose `<name>` is a valid dictionary name; symlinks, directories and other
+	/// entries are skipped. Each of them is opened, which sets its journal mode and can
+	/// create the dictionary tables in it, so keep copies and backups out of that directory
+	/// or give them another extension. A dictionary without a registration is not listed,
+	/// and one whose stored registration does not parse (such as a stored step
+	/// interpolation splimes rejects) is logged as a warning and skipped, so the readable
+	/// ones are still listed; `get_dictionary_metadata` reports why it does not parse.
+	///
+	/// # Errors
+	///
+	/// When the aspect is unknown, its dictionaries directory cannot be read, or reading a
+	/// dictionary's registration fails (I/O, a query, an MVCC conflict such as `Busy`):
+	/// such a failure fails the whole listing, so a dictionary is never left out of it
+	/// only because it could not be read this time.
 	async fn list_dictionaries(&self, aspect_id: &AspectId) -> Result<Vec<DictionaryMetadata>>;
 
 	async fn get_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern>;

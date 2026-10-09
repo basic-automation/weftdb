@@ -70,7 +70,7 @@ pub struct ValueRangeParams {
 }
 
 /// An error from a storage endpoint, rendered as `{"error": "..."}` with the
-/// status code that fits the cause.
+/// status code that fits the cause (plus a machine-readable `"code"` where noted).
 #[derive(Debug)]
 pub enum StorageError {
 	/// No segment store is configured (no store root) → 503.
@@ -79,6 +79,14 @@ pub enum StorageError {
 	NotFound(String),
 	/// A malformed request parameter (e.g. an unparseable value bound) → 400.
 	BadRequest(String),
+	/// The request conflicts with work in progress (another maintenance operation held
+	/// the aspect for longer than the request would wait) → 409; retry later.
+	Conflict(String),
+	/// The directory the request would create already exists (a backup label already
+	/// taken, or a restore drill's rehearsal directory already in use) → 409 with
+	/// `"code": "already_exists"`. Nothing was written or removed: choose another label,
+	/// or retry the drill, which picks a fresh rehearsal directory.
+	AlreadyExists(String),
 	/// An underlying read or serialization failure → 500.
 	Internal(String),
 }
@@ -87,17 +95,22 @@ pub enum StorageError {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
 	error: String,
+	/// A stable machine-readable error code, for the errors that carry one.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	code: Option<&'static str>,
 }
 
 impl IntoResponse for StorageError {
 	fn into_response(self) -> Response {
-		let (status, error) = match self {
-			Self::Unconfigured => (StatusCode::SERVICE_UNAVAILABLE, "no segment store is configured on this server".to_string()),
-			Self::NotFound(message) => (StatusCode::NOT_FOUND, message),
-			Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
-			Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+		let (status, error, code) = match self {
+			Self::Unconfigured => (StatusCode::SERVICE_UNAVAILABLE, "no segment store is configured on this server".to_string(), None),
+			Self::NotFound(message) => (StatusCode::NOT_FOUND, message, None),
+			Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message, None),
+			Self::Conflict(message) => (StatusCode::CONFLICT, message, None),
+			Self::AlreadyExists(message) => (StatusCode::CONFLICT, message, Some("already_exists")),
+			Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message, None),
 		};
-		(status, Json(ErrorBody { error })).into_response()
+		(status, Json(ErrorBody { error, code })).into_response()
 	}
 }
 
@@ -116,12 +129,15 @@ impl From<crate::interpolate::ApiError> for StorageError {
 }
 
 /// Classify a bridge read error: an undeclared aspect (its schema is unknown) is a
-/// `404`, everything else (libSQL prune, filesystem read, corrupt frame, IPC
-/// serialization) is a `500`.
+/// `404`, an aspect whose name is not safe as a file name (declared before names were
+/// checked) is a `400`, and everything else (libSQL prune, filesystem read, corrupt
+/// frame, IPC serialization) is a `500`.
 fn classify_read_error(err: &anyhow::Error) -> StorageError {
 	let message = err.to_string();
 	if message.contains("no declared schema") {
 		StorageError::NotFound(message)
+	} else if err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
+		StorageError::BadRequest(message)
 	} else {
 		StorageError::Internal(message)
 	}
@@ -319,13 +335,13 @@ pub struct ParquetIngestParams {
 
 /// Classify a Parquet-ingest error: an undeclared aspect is a `404`; a malformed
 /// Parquet body, a batch missing WeftDB's columns, or a value unrepresentable under the
-/// declared encoding/tolerance (hard constraint #4) are client-data problems →
-/// `400`; anything else (filesystem, libSQL) is a `500`.
+/// declared encoding/tolerance (hard constraint #4), and an aspect name that is not safe
+/// as a file name are client-data problems → `400`; anything else (filesystem, libSQL) is a `500`.
 fn classify_ingest_error(err: &anyhow::Error) -> StorageError {
 	let message = err.to_string();
 	if message.contains("no declared schema") {
 		StorageError::NotFound(message)
-	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") {
+	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
 		StorageError::BadRequest(message)
 	} else {
 		StorageError::Internal(message)

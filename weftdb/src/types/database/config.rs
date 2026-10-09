@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use crate::{
-	cache::Connection, types::database::{traits::config::Config, Database}
+	cache::Connection, dictionary_name, types::database::{traits::config::Config, Database}
 };
 
 static METADATA_DB_FILENAME: &str = "metadata.db";
@@ -128,16 +128,17 @@ impl Config for Database {
 		db_path.to_string_lossy().to_string()
 	}
 
-	fn aspect_dictionaries_db_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String {
+	fn aspect_dictionaries_db_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> Result<String> {
+		// `PathBuf::push` would follow `..` out of `dictionaries/`, and an absolute name would
+		// replace the whole path, so the name is checked before it becomes one.
+		dictionary_name::validate(dictionary_name)?;
 		let mut db_path: PathBuf = Self::aspect_dictionaries_path(db_name, subject_name, aspect_name).into();
 		db_path.push(format!("{dictionary_name}.db"));
-		db_path.to_string_lossy().to_string()
+		Ok(db_path.to_string_lossy().to_string())
 	}
 
-	fn dictionary_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> String {
-		let mut db_path: PathBuf = Self::aspect_dictionaries_path(db_name, subject_name, aspect_name).into();
-		db_path.push(format!("{dictionary_name}.db"));
-		db_path.to_string_lossy().to_string()
+	fn dictionary_path(db_name: &str, subject_name: &str, aspect_name: &str, dictionary_name: &str) -> Result<String> {
+		Self::aspect_dictionaries_db_path(db_name, subject_name, aspect_name, dictionary_name)
 	}
 
 	async fn db_name(metadata_conn: &Connection) -> Result<String> {

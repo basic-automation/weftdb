@@ -1,0 +1,39 @@
+{
+  "number": 42,
+  "state": "open",
+  "title": "Example change",
+  "user": {
+    "login": "physics515",
+    "id": 7,
+    "type": "User"
+  },
+  "head": {
+    "ref": "fix-range",
+    "sha": "dddddddddddddddddddddddddddddddddddddddd",
+    "user": {
+      "login": "basic-automation",
+      "id": 9000,
+      "type": "Organization"
+    },
+    "repo": {
+      "full_name": "basic-automation/weftdb",
+      "owner": {
+        "login": "basic-automation",
+        "id": 9000,
+        "type": "Organization"
+      }
+    }
+  },
+  "base": {
+    "ref": "main",
+    "repo": {
+      "full_name": "basic-automation/weftdb",
+      "owner": {
+        "login": "basic-automation",
+        "id": 9000,
+        "type": "Organization"
+      }
+    }
+  },
+  "commits": 4
+}

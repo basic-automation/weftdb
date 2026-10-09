@@ -9,6 +9,8 @@ database/datasets
 *.db-log
 *.weftseg
 *.weftpart
+# ...except the checked-in compatibility fixtures, which are stores on purpose
+!weftdb/tests/fixtures/**
 
 # Agent/routine scratch output (transient run logs, bench output, server logs)
 scratch
@@ -28,3 +30,6 @@ DETAILED_CHANGES.txt
 # Editor workspace settings
 .vscode
 .zed
+
+# Python bytecode (scripts/contrib)
+__pycache__

@@ -11,7 +11,7 @@ use crate::{
 	cache::Connection, types::{
 		compression::CompressionConfig, database::{
 			traits::{aspect_structure::AspectStructure, connection::Connection as ConnectionTrait}, Config
-		}, dictionary::VariablilityType
+		}
 	}, Database, DatabaseStructure, DictionaryConstraints, DictionaryId, SubjectId
 };
 
@@ -164,6 +164,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&processed_batches).await?;
 			trace!("Wireframing batches tables for: {}", processed_batches_path);
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
+			Self::wireframe_extracted_batches_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed batches tables for: {}", processed_batches_path);
@@ -542,8 +543,7 @@ impl AspectStructure for Aspect {
 			)
 			.await?;
 
-		// Note: No indexes to support MVCC (turso MVCC doesn't support indexes yet)
-		// Duplicate batch detection must be handled at application level
+		Self::index_batch_hashes(conn).await;
 
 		Database::commit_concurrent(conn).await?;
 
@@ -569,6 +569,7 @@ impl AspectStructure for Aspect {
 		if was_new {
 			let schema_conn = Database::begin_immediate(&processed_batches).await?;
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
+			Self::wireframe_extracted_batches_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
@@ -1098,6 +1099,10 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn new_dictionary(&self, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()> {
+		// The step interpolation is stored as text and validated by `Spline::from_str` when
+		// it is read back (`get_dictionary_metadata`), so refuse one that could not load.
+		Database::check_dictionary_constraints(name, constraints)?;
+
 		// Extract db_name from path (path is like C:\Users\...\weft_data\{db_name}\{subject}\{aspect})
 		// Use the parent's parent to get db_name from the aspect path
 		let path = std::path::Path::new(&self.path);
@@ -1105,7 +1110,7 @@ impl AspectStructure for Aspect {
 		let db_path = subject_path.parent().ok_or_else(|| anyhow::anyhow!("Cannot get db path from subject path"))?;
 		let db_name = db_path.file_name().ok_or_else(|| anyhow::anyhow!("Cannot extract db_name from path"))?.to_string_lossy().to_string();
 
-		let dictionaries_db_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name);
+		let dictionaries_db_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name)?;
 		let (dictionaries_db, was_new) = Database::get_or_create_turso_database(&dictionaries_db_path).await?;
 
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
@@ -1117,37 +1122,13 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 		}
 
-		// Now use BEGIN CONCURRENT for data operations
+		// Now use BEGIN CONCURRENT for data operations. The registration is written as
+		// `set_dictionary_metadata` writes it, so creating a dictionary that exists replaces
+		// its registration rather than adding a second one.
 		let conn = Database::begin_concurrent(&dictionaries_db, &dictionaries_db_path, None).await?;
-		let id = DictionaryId::new();
-
-		// Insert metadata
-		conn.as_ref().execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![id.as_uuid().to_string(), name, description, chrono::Utc::now().timestamp_millis()]).await?;
-
-		// Insert constraints
-		let steps_count = constraints.steps().as_ref().map(|s| s.count().to_string());
-		let steps_interpolation = constraints.steps().as_ref().map(|s| s.interpolation().to_string());
-		conn.as_ref().execute("INSERT INTO dictionary_constraints (dictionary_id, steps_count, steps_interpolation) VALUES (?, ?, ?)", turso::params![id.as_uuid().to_string(), steps_count, steps_interpolation]).await?;
-
-		// Insert variabilities
-		if let Some(variabilities) = constraints.variabilities() {
-			for variability in variabilities {
-				let (var_type, var_value) = match variability {
-					VariablilityType::MaximumStatic(v) => ("MaximumStatic", v.value().to_string()),
-					VariablilityType::AverageStatic(v) => ("AverageStatic", v.value().to_string()),
-					VariablilityType::AbsoluteMaximumStatic(v) => ("AbsoluteMaximumStatic", v.value().to_string()),
-					VariablilityType::AbsoluteAverageStatic(v) => ("AbsoluteAverageStatic", v.value().to_string()),
-					VariablilityType::MaximumPercentile(v) => ("MaximumPercentile", v.value().to_string()),
-					VariablilityType::AveragePercentile(v) => ("AveragePercentile", v.value().to_string()),
-					VariablilityType::AbsoluteMaximumPercentile(v) => ("AbsoluteMaximumPercentile", v.value().to_string()),
-					VariablilityType::AbsoluteAveragePercentile(v) => ("AbsoluteAveragePercentile", v.value().to_string()),
-					VariablilityType::SumStatic(v) => ("SumStatic", v.value().to_string()),
-					VariablilityType::SumPercentile(v) => ("SumPercentile", v.value().to_string()),
-					VariablilityType::AbsoluteSumStatic(v) => ("AbsoluteSumStatic", v.value().to_string()),
-					VariablilityType::AbsoluteSumPercentile(v) => ("AbsoluteSumPercentile", v.value().to_string()),
-				};
-				conn.as_ref().execute("INSERT INTO dictionary_variabilities (dictionary_id, variability_type, variability_value) VALUES (?, ?, ?)", turso::params![id.as_uuid().to_string(), var_type, var_value]).await?;
-			}
+		if let Err(e) = Database::replace_dictionary_registration(&conn, &DictionaryId::new(), name, description, constraints).await {
+			Database::rollback_after_error(&conn).await;
+			return Err(e);
 		}
 
 		Database::commit_concurrent(&conn).await?;
@@ -1170,7 +1151,7 @@ impl AspectStructure for Aspect {
 		let db_name = db_path_parent.file_name().ok_or_else(|| anyhow::anyhow!("Cannot extract db_name from path"))?.to_string_lossy().to_string();
 
 		// Get the path for this dictionary
-		let dictionary_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name);
+		let dictionary_path = Database::aspect_dictionaries_db_path(&db_name, &self.subject_name, &self.name, name)?;
 
 		// Check if path exists on disk (dictionary may have been created but not cached in paths map)
 		if !std::path::Path::new(&dictionary_path).exists() && !self.dictionaries_paths.contains_key(name) {
@@ -1345,6 +1326,56 @@ impl Aspect {
 			)
 			.await?;
 
+		Self::index_batch_hashes(conn).await;
+
+		Ok(())
+	}
+
+	/// Index the batches by `(aspect_id, batch_hash)` for the queue's duplicate check
+	/// (crash-consistency design, S18), which looks a batch's hash up in the unprocessed and
+	/// the processed batches before queuing it. Without the index each lookup scans the
+	/// table, measurements and all, and the processed batches are drained only by pattern
+	/// extraction. `IF NOT EXISTS`, so a table created before the index exists gets it the
+	/// first time this process opens it. Turso 0.8 maintains indexes under MVCC; like the
+	/// measurements' timestamp index this is best-effort, and a failure only makes the
+	/// lookups scan. Not unique: duplicate batches stored before the check may exist, and
+	/// the dedupe is application-level.
+	async fn index_batch_hashes(conn: &Connection) {
+		if let Err(e) = conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_batches_hash ON batches(aspect_id, batch_hash)", turso::params![]).await {
+			tracing::warn!("Could not create the batch hash index; duplicate checks will scan the batches: {e}");
+		}
+	}
+
+	/// The processed batches DB's record of the batches pattern extraction consumed: the
+	/// `batch_hash` of each and when it was extracted, written in the transaction that
+	/// deletes the batch (`remove_extracted_batches`), and checked by the queue's duplicate
+	/// check like the two batch tables (crash-consistency design, S18). Without it a batch
+	/// that was extracted, and so deleted, was queued again when the consumer rebuilt its
+	/// window (after a consumer crash, or after an ingest that ran during the consumer),
+	/// and became a second occurrence of the same span.
+	///
+	/// The record only has to outlive the next consumer run, so it is bounded:
+	/// `remove_extracted_batches` deletes the rows older than the retention
+	/// (`WEFT_EXTRACTED_BATCH_RETENTION_SECS`, 48 hours by default) in the same transaction,
+	/// and `clear_processed_batches` (a full rebuild) deletes them all. Extraction consumes
+	/// about one sliding-window batch per resolution step, so the table holds about one row
+	/// per step of the retention. There is no `aspect_id` column: the DB belongs to one
+	/// aspect. `IF NOT EXISTS`, so a processed batches DB created before the table gets it
+	/// the first time this process opens it; the index is best-effort, as for the batches.
+	async fn wireframe_extracted_batches_direct(conn: &Connection) -> Result<()> {
+		conn.as_ref()
+			.execute(
+				r"
+			CREATE TABLE IF NOT EXISTS extracted_batches (
+				batch_hash TEXT NOT NULL,
+				extracted_at INTEGER NOT NULL
+			)",
+				turso::params![],
+			)
+			.await?;
+		if let Err(e) = conn.as_ref().execute("CREATE INDEX IF NOT EXISTS idx_extracted_batches_hash ON extracted_batches(batch_hash)", turso::params![]).await {
+			tracing::warn!("Could not create the extracted batch hash index; duplicate checks will scan the extracted batches: {e}");
+		}
 		Ok(())
 	}
 

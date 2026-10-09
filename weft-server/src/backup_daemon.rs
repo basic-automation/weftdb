@@ -14,19 +14,53 @@
 //! # Retention safety
 //!
 //! Pruning only ever removes directories the daemon itself generated —
-//! `backup-<digits>`, the shape [`generated_label`] writes. A snapshot an operator
-//! took by hand with `POST …/storage/backup?label=nightly` is never a prune candidate,
-//! so a retention setting cannot silently delete a deliberately-kept backup.
+//! `backup-<digits>`, the shape [`generated_label`] writes. A snapshot taken through
+//! `POST …/storage/backup` is never a prune candidate, so a retention setting cannot
+//! silently delete a deliberately-kept backup. That grammar is reserved for the daemon:
+//! the endpoint refuses a `?label=` that matches it ([`is_generated_label`]), and names
+//! an unlabelled snapshot `manual-<unix_millis>` ([`manual_label`]). So an API caller can
+//! neither plant a directory retention would count nor, by taking backups, push the
+//! daemon's own snapshots out of the retained set.
+//!
+//! Retention also distrusts a generated-looking directory whose stamp lies more than
+//! [`FUTURE_STAMP_TOLERANCE`] past the current clock, or past the directory's own
+//! modification time. Such a stamp sorts as the newest snapshot, so enough of them would
+//! fill the retained set and get every genuine snapshot pruned. The daemon writes
+//! neither: it stamps a snapshot with the wall clock just before creating the directory
+//! and writing into it, so a genuine snapshot is modified at or after its stamp (a copy
+//! keeps that time or moves it later). A distrusted directory is not counted and not
+//! removed, and each listing logs a warning naming it; an operator should remove it.
+//!
+//! The modification-time comparison is what keeps distrusting a directory planted ahead
+//! of time once the clock catches up with its stamp, because the directory keeps its
+//! planting time. It needs a readable modification time that nothing has changed since;
+//! without one only the clock comparison applies, and the directory starts counting once
+//! the clock is within the tolerance of its stamp. A directory planted with a stamp
+//! within the tolerance of its planting time is indistinguishable from a snapshot taken
+//! on a skewed clock and is counted; it stops being the newest once the daemon's stamps
+//! pass it, within [`FUTURE_STAMP_TOLERANCE`] of its planting.
+//!
+//! Retention counts only **complete** backups (design section 9): a directory with a
+//! `MANIFEST.json`, or one from before manifests that holds all four databases. A backup
+//! is built in a `.partial-*` directory and renamed into place only once complete, so a
+//! crash can no longer leave a half-written `backup-<digits>`; one left by an older
+//! release is neither counted nor pruned. A pruned backup is renamed to `.deleting-*`,
+//! durably, before its files are removed, so a crash part-way never leaves a
+//! half-removed directory under a backup's name. At start and on every tick the daemon
+//! sweeps `.partial-*`, `.deleting-*` and `.restore-drill-*` entries untouched for an
+//! hour ([`weftdb::STAGING_SWEEP_AGE`]): what a crashed backup, prune or drill left.
 //!
 //! The daemon holds only `Arc` handles (the store and the metrics registry), so it is
 //! a detached side task; the router and its handlers are untouched.
 
 use std::{
-	path::{Path, PathBuf}, sync::Arc, time::Duration
+	path::{Path, PathBuf}, sync::Arc, time::{Duration, SystemTime}
 };
 
 use tracing::Instrument as _;
-use weftdb::{ControlPlaneBackup, SegmentStore, VerifyMode};
+use weftdb::{
+	durable::{RealFs, StoreFs}, ControlPlaneBackup, SegmentStore, VerifyMode
+};
 
 use crate::metrics::SharedMetrics;
 
@@ -45,8 +79,8 @@ pub struct BackupDaemonConfig {
 	pub keep: Option<usize>,
 }
 
-/// The label a daemon tick writes its snapshot under: `backup-<unix_millis>`, matching
-/// the manual endpoint's generated (unlabelled) form.
+/// The label a daemon tick writes its snapshot under: `backup-<unix_millis>`, the only
+/// shape retention counts and prunes.
 ///
 /// `millis` is the wall-clock stamp; the caller passes it so the naming is testable
 /// without a clock.
@@ -55,10 +89,53 @@ pub fn generated_label(millis: u128) -> String {
 	format!("backup-{millis}")
 }
 
-/// True for a directory name this daemon generated — `backup-` followed by at least one
-/// digit and nothing else. The prune predicate: an operator's own `?label=nightly`
-/// snapshot does not match and is never removed.
-fn is_generated_label(name: &str) -> bool {
+/// The label an unlabelled `POST …/storage/backup` writes its snapshot under:
+/// `manual-<unix_millis>`.
+///
+/// Deliberately outside the daemon's `backup-<digits>` grammar: retention counts and
+/// prunes only daemon snapshots, so API calls cannot crowd them out of the retained set,
+/// and a snapshot taken by hand is never pruned.
+#[must_use]
+pub fn manual_label(millis: u128) -> String {
+	format!("manual-{millis}")
+}
+
+/// How far past the current clock, and past the directory's own modification time, a
+/// generated directory's stamp may lie and still count.
+///
+/// 24 hours: far more than any clock correction, any skew between hosts sharing a backup
+/// directory, and any time-zone error in a filesystem's timestamps. A stamp beyond it did
+/// not come from this daemon's clock, so [`list_generated_backups`] ignores it (see the
+/// module docs).
+pub const FUTURE_STAMP_TOLERANCE: Duration = Duration::from_hours(24);
+
+/// Whether retention may count, and prune, a generated directory stamped `stamp`, given
+/// the clock reading `now` and the directory's modification time `modified` (all unix
+/// millis; `None` when the filesystem does not report one).
+///
+/// False when the stamp is more than [`FUTURE_STAMP_TOLERANCE`] past either reading: the
+/// daemon stamps a snapshot just before it creates and writes the directory, so a genuine
+/// stamp is never far ahead of either.
+fn stamp_is_trusted(stamp: u128, now: u128, modified: Option<u128>) -> bool {
+	let tolerance = FUTURE_STAMP_TOLERANCE.as_millis();
+	stamp <= now.saturating_add(tolerance) && modified.is_none_or(|modified| stamp <= modified.saturating_add(tolerance))
+}
+
+/// A directory entry's modification time in unix millis, or `None` when it cannot be
+/// read or precedes the epoch.
+async fn modified_millis(entry: &tokio::fs::DirEntry) -> Option<u128> {
+	let modified = entry.metadata().await.ok()?.modified().ok()?;
+	modified.duration_since(std::time::UNIX_EPOCH).ok().map(|since| since.as_millis())
+}
+
+/// True for a directory name in the daemon's generated grammar: `backup-` and digits.
+///
+/// `backup-` must be followed by at least one digit and nothing else. This is the prune
+/// predicate: an operator's own `?label=nightly` snapshot and an unlabelled
+/// `manual-<unix_millis>` one do not match and are never removed. The backup endpoint
+/// refuses a caller-chosen label that matches, so only the daemon creates such names.
+#[must_use]
+pub fn is_generated_label(name: &str) -> bool {
 	name.strip_prefix("backup-").is_some_and(|stamp| !stamp.is_empty() && stamp.chars().all(|c| c.is_ascii_digit()))
 }
 
@@ -87,17 +164,39 @@ fn fresh_dir(base: &Path, millis: u128) -> PathBuf {
 	}
 }
 
+/// The wall clock in unix milliseconds, or 0 if it reads before the epoch. A zero clock
+/// makes every stamp look far in the future, so retention then counts and prunes
+/// nothing — the safe direction.
+fn now_millis() -> u128 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_millis())
+}
+
 /// List the daemon-generated snapshot directories under `base`, oldest first.
 ///
 /// Returns `(stamp, path)` pairs sorted by the numeric stamp, so "oldest" is the
 /// snapshot's own recorded time rather than a filesystem mtime (which a copy or a
 /// restore would perturb). Non-matching entries (an operator's labelled backup, a stray
-/// file) are ignored. A missing `base` yields an empty list.
+/// file) are ignored, and so, with a warning, is a generated-looking directory stamped
+/// more than [`FUTURE_STAMP_TOLERANCE`] past the current clock or past its own
+/// modification time: it is not counted toward retention and not pruned. So is an
+/// incomplete one: only a directory [`weftdb::is_complete_backup`] accepts (a manifest,
+/// or all four databases from before manifests) is a backup, so a half-written directory
+/// never counts toward retention and is never pruned in a good backup's place. A
+/// directory whose completeness cannot be checked (a stat inside it fails with something
+/// other than `NotFound`, such as a permission error) is skipped the same way, and
+/// logged: one unreadable directory must not stop retention for every other backup. A
+/// missing `base` yields an empty list.
 ///
 /// # Errors
 ///
 /// Propagates a failure reading `base` (other than its absence).
 pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, PathBuf)>> {
+	list_generated_backups_at(base, now_millis()).await
+}
+
+/// [`list_generated_backups`] against an explicit clock reading `now` (unix millis), so
+/// the future-stamp rule is testable without a clock.
+async fn list_generated_backups_at(base: &Path, now: u128) -> anyhow::Result<Vec<(u128, PathBuf)>> {
 	let mut entries = match tokio::fs::read_dir(base).await {
 		Ok(entries) => entries,
 		Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -114,7 +213,17 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 			continue;
 		}
 		let Ok(stamp) = name.trim_start_matches("backup-").parse::<u128>() else { continue };
-		found.push((stamp, entry.path()));
+		let modified = modified_millis(&entry).await;
+		if !stamp_is_trusted(stamp, now, modified) {
+			tracing::warn!(dir = %entry.path().display(), stamp, now, modified, "backup retention ignores a generated-looking directory stamped more than 24 h past the clock or past its own modification time: the backup daemon did not write it, so it is not counted or pruned; inspect it and remove it by hand");
+			continue;
+		}
+		let path = entry.path();
+		match weftdb::is_complete_backup(&path).await {
+			Ok(true) => found.push((stamp, path)),
+			Ok(false) => {}
+			Err(err) => tracing::warn!(dir = %path.display(), error = %err, "backup retention: cannot tell whether this backup is complete, so it is neither counted nor pruned"),
+		}
 	}
 	found.sort_unstable_by_key(|(stamp, _)| *stamp);
 	Ok(found)
@@ -123,21 +232,56 @@ pub async fn list_generated_backups(base: &Path) -> anyhow::Result<Vec<(u128, Pa
 /// Remove the oldest daemon-generated snapshots under `base` until at most `keep`
 /// remain, returning how many directories were removed.
 ///
-/// Only `backup-<digits>` directories are candidates (see `is_generated_label`), so a
-/// hand-labelled snapshot is never pruned. `keep = 0` removes every generated snapshot.
+/// Only complete `backup-<digits>` directories are candidates (see
+/// [`is_generated_label`] and [`list_generated_backups`]), so a hand-labelled snapshot is
+/// never pruned, and one stamped more than [`FUTURE_STAMP_TOLERANCE`] past the clock or
+/// its own modification time is neither counted nor pruned. `keep = 0` removes every
+/// generated snapshot. Each is removed with [`weftdb::retire_backup`]: renamed to
+/// `.deleting-*` and the rename made durable before any file goes, so a crash part-way
+/// leaves a `.deleting-*` entry for the sweep rather than a backup name over half its
+/// files.
 ///
 /// # Errors
 ///
-/// Propagates a failure listing `base` or removing a snapshot directory.
+/// Propagates a failure listing `base` or retiring a snapshot directory.
 pub async fn prune_generated_backups(base: &Path, keep: usize) -> anyhow::Result<usize> {
-	let found = list_generated_backups(base).await?;
+	prune_generated_backups_at(base, keep, now_millis()).await
+}
+
+/// [`prune_generated_backups`] against an explicit clock reading `now` (unix millis).
+async fn prune_generated_backups_at(base: &Path, keep: usize, now: u128) -> anyhow::Result<usize> {
+	prune_generated_backups_via(&RealFs, base, keep, now).await
+}
+
+/// [`prune_generated_backups_at`], with each retirement's rename, fsync and removal going
+/// through `fs`, so a test can see the order they happen in.
+async fn prune_generated_backups_via(fs: &dyn StoreFs, base: &Path, keep: usize, now: u128) -> anyhow::Result<usize> {
+	let found = list_generated_backups_at(base, now).await?;
 	let excess = found.len().saturating_sub(keep);
 	let mut removed = 0usize;
 	for (_, path) in found.into_iter().take(excess) {
-		tokio::fs::remove_dir_all(&path).await.map_err(|err| anyhow::Error::new(err).context(format!("pruning backup {}", path.display())))?;
+		weftdb::retire_backup(fs, &path).await.map_err(|err| anyhow::Error::new(err).context(format!("pruning backup {}", path.display())))?;
 		removed += 1;
 	}
 	Ok(removed)
+}
+
+/// Remove the staging entries under `base` (`.partial-*`, `.deleting-*`,
+/// `.restore-drill-*`) left untouched for [`weftdb::STAGING_SWEEP_AGE`] as of `now`,
+/// logging what it did. A failure is logged and left for the next sweep: litter must
+/// never stop a backup.
+async fn sweep_stale_staging(base: &Path, now: SystemTime) {
+	match weftdb::sweep_backup_staging_at(&RealFs, base, weftdb::STAGING_SWEEP_AGE, now).await {
+		Ok(swept) => {
+			if !swept.removed.is_empty() {
+				println!("backup daemon: swept {} stale staging entr{} under {}", swept.removed.len(), if swept.removed.len() == 1 { "y" } else { "ies" }, base.display());
+			}
+			for (path, err) in &swept.failed {
+				eprintln!("backup daemon: could not sweep {}: {err}", path.display());
+			}
+		}
+		Err(err) => eprintln!("backup daemon: could not list {} to sweep it: {err}", base.display()),
+	}
 }
 
 /// Run one backup tick: snapshot the control plane into a fresh directory under
@@ -180,15 +324,30 @@ pub async fn backup_tick(store: &SegmentStore, metrics: &SharedMetrics, base: &P
 /// consumed first), so start-up is not stampeded by an eager backup. Each snapshot logs
 /// a one-line summary; a failed snapshot is logged and the loop continues (a transient
 /// control-plane error must not kill the daemon, and the next tick retries into a fresh
-/// directory).
+/// directory). The stale-staging sweep runs at start, without waiting for the first
+/// interval, and again before every snapshot.
 #[must_use]
 pub fn spawn_backup_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, config: BackupDaemonConfig) -> tokio::task::JoinHandle<()> {
+	spawn_backup_daemon_with_clock(store, metrics, config, SystemTime::now)
+}
+
+/// [`spawn_backup_daemon`], with the stale-staging sweep reading the time from `now`.
+///
+/// The tests pass a clock ahead of the real one, which ages a staging entry without
+/// setting its mtime: std below Rust 1.99 cannot set a directory's mtime on Windows.
+fn spawn_backup_daemon_with_clock<C>(store: Arc<SegmentStore>, metrics: SharedMetrics, config: BackupDaemonConfig, now: C) -> tokio::task::JoinHandle<()>
+where
+	C: Fn() -> SystemTime + Send + 'static,
+{
 	tokio::spawn(async move {
+		// What a crash before this start left behind goes first.
+		sweep_stale_staging(&config.base, now()).await;
 		let mut ticker = tokio::time::interval(config.interval);
 		// Consume the immediate first tick so the first snapshot waits one interval.
 		ticker.tick().await;
 		loop {
 			ticker.tick().await;
+			sweep_stale_staging(&config.base, now()).await;
 			match backup_tick(&store, &metrics, &config.base).await {
 				Ok(backup) => {
 					println!("backup daemon: snapshotted control plane to {} ({} row(s), {} byte(s))", backup.dir.display(), backup.total_rows(), backup.total_bytes());
@@ -215,10 +374,12 @@ mod tests {
 	use bigdecimal::BigDecimal;
 	use tempfile::TempDir;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use weftdb::SegmentStore;
+	use weftdb::{SegmentStore, CONTROL_PLANE_FILES};
 
 	use super::*;
-	use crate::metrics::Metrics;
+	use crate::{
+		metrics::Metrics, test_fs::{FsOp, RecordingFs, INJECTED_CLEANUP_FAILURE}
+	};
 
 	fn schema() -> AspectSchema {
 		AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)
@@ -287,10 +448,13 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let base = dir.path().join("backups");
 		// Three generated snapshots (stamps out of creation order to prove the sort is by
-		// stamp, not by mtime) plus one hand-labelled operator backup.
+		// stamp, not by mtime) plus one hand-labelled operator backup. Each holds all four
+		// control-plane files, the shape of a complete backup from before manifests.
 		for name in ["backup-300", "backup-100", "backup-200", "nightly"] {
 			tokio::fs::create_dir_all(base.join(name)).await.unwrap();
-			tokio::fs::write(base.join(name).join("catalog.db"), b"x").await.unwrap();
+			for file in CONTROL_PLANE_FILES {
+				tokio::fs::write(base.join(name).join(file), b"x").await.unwrap();
+			}
 		}
 
 		let removed = prune_generated_backups(&base, 2).await.unwrap();
@@ -299,9 +463,104 @@ mod tests {
 		assert!(base.join("backup-200").exists());
 		assert!(base.join("backup-300").exists());
 		assert!(base.join("nightly").exists(), "an operator's labelled backup is never pruned");
+		let mut left: Vec<String> = std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+		left.sort();
+		assert_eq!(left, ["backup-200", "backup-300", "nightly"], "the pruned backup's `.deleting-*` name went with it");
 
 		// Retention is idempotent once the count is at the limit.
 		assert_eq!(prune_generated_backups(&base, 2).await.unwrap(), 0);
+	}
+
+	/// Create one fake snapshot directory per name under `base`, each a complete backup
+	/// of the pre-manifest shape (all four control-plane files), so retention's
+	/// completeness rule counts it and only the stamp rule decides.
+	async fn make_backup_dirs<'a>(base: &Path, names: impl IntoIterator<Item = &'a str>) {
+		for name in names {
+			tokio::fs::create_dir_all(base.join(name)).await.unwrap();
+			for file in CONTROL_PLANE_FILES {
+				tokio::fs::write(base.join(name).join(file), b"x").await.unwrap();
+			}
+		}
+	}
+
+	/// Regression: a generated-looking directory stamped far in the future sorts as the
+	/// newest snapshot, so `keep` of them used to fill the retained set and get every
+	/// genuine snapshot pruned. They are now neither counted nor removed.
+	#[tokio::test]
+	async fn future_stamped_dirs_never_evict_genuine_snapshots() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+		let genuine: Vec<String> = [3_000_u128, 2_000, 1_000].into_iter().map(|age| generated_label(now - age)).collect();
+		let poisoned = ["backup-99999999999999", "backup-99999999999998"];
+		make_backup_dirs(&base, genuine.iter().map(String::as_str).chain(poisoned)).await;
+
+		let removed = prune_generated_backups(&base, 2).await.unwrap();
+		assert_eq!(removed, 1, "only the oldest genuine snapshot is beyond the newest two");
+		assert!(!base.join(&genuine[0]).exists(), "the oldest genuine snapshot was pruned");
+		assert!(base.join(&genuine[1]).exists(), "a genuine snapshot was evicted");
+		assert!(base.join(&genuine[2]).exists(), "a genuine snapshot was evicted");
+		for name in poisoned {
+			assert!(base.join(name).exists(), "{name} is never pruned (left for an operator to inspect)");
+		}
+		let listed: Vec<PathBuf> = list_generated_backups(&base).await.unwrap().into_iter().map(|(_, path)| path).collect();
+		assert_eq!(listed, [base.join(&genuine[1]), base.join(&genuine[2])], "future stamps are not listed as retained snapshots");
+	}
+
+	#[test]
+	fn a_stamp_is_trusted_within_the_tolerance_of_both_the_clock_and_the_mtime() {
+		let tolerance = FUTURE_STAMP_TOLERANCE.as_millis();
+		let now = 1_800_000_000_000_u128;
+		assert!(stamp_is_trusted(now, now, Some(now)));
+		assert!(stamp_is_trusted(now + tolerance, now, Some(now)), "up to 24 h ahead of both readings");
+		assert!(!stamp_is_trusted(now + tolerance + 1, now, Some(now + tolerance)), "past the clock's tolerance");
+		assert!(!stamp_is_trusted(now, now + tolerance, Some(now - tolerance - 1)), "past the mtime's tolerance, although the clock has caught up");
+		assert!(stamp_is_trusted(now - 5_000, now, Some(now + 7_000)), "a copy is modified after its stamp");
+		assert!(stamp_is_trusted(now + tolerance, now, None), "without an mtime only the clock decides");
+		assert!(!stamp_is_trusted(now + tolerance + 1, now, None));
+		assert!(!stamp_is_trusted(now, 0, Some(now)), "a clock read as zero (before the epoch) trusts no real stamp");
+	}
+
+	/// Regression: a directory planted with a stamp a few days ahead used to be ignored only
+	/// until the clock came within 24 h of that stamp, and from then on `keep` of them
+	/// counted as the newest snapshots and got every genuine one pruned. It keeps its
+	/// planting time as its mtime, so it now stays distrusted after the clock catches up.
+	#[tokio::test]
+	async fn a_future_stamped_dir_stays_distrusted_after_the_clock_catches_up() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		let hour = Duration::from_hours(1).as_millis();
+		let planted_at = now_millis();
+		let genuine = generated_label(planted_at - 1_000);
+		let poisoned = [generated_label(planted_at + 48 * hour), generated_label(planted_at + 48 * hour + 1)];
+		make_backup_dirs(&base, std::iter::once(genuine.as_str()).chain(poisoned.iter().map(String::as_str))).await;
+
+		for later in [0, 30 * hour, 47 * hour, 49 * hour, 1_000 * hour] {
+			let listed: Vec<PathBuf> = list_generated_backups_at(&base, planted_at + later).await.unwrap().into_iter().map(|(_, path)| path).collect();
+			assert_eq!(listed, [base.join(&genuine)], "{later} ms after planting, only the genuine snapshot counts");
+		}
+		assert_eq!(prune_generated_backups_at(&base, 1, planted_at + 30 * hour).await.unwrap(), 0, "the genuine snapshot is not evicted");
+		assert!(base.join(&genuine).exists());
+		for name in &poisoned {
+			assert!(base.join(name).exists(), "{name} is not pruned either (left for an operator to inspect)");
+		}
+	}
+
+	#[tokio::test]
+	async fn the_future_stamp_cut_off_tolerates_clock_skew() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		// An hour before the directories are made, so every stamp below is within the
+		// tolerance of their mtime and only the clock comparison decides.
+		let now = now_millis() - Duration::from_hours(1).as_millis();
+		let tolerance = FUTURE_STAMP_TOLERANCE.as_millis();
+		let names = [generated_label(now), generated_label(now + tolerance), generated_label(now + tolerance + 1)];
+		make_backup_dirs(&base, names.iter().map(String::as_str)).await;
+
+		let stamps: Vec<u128> = list_generated_backups_at(&base, now).await.unwrap().into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(stamps, [now, now + tolerance], "a stamp up to 24 h ahead is still a snapshot; one past it is not");
+		assert_eq!(prune_generated_backups_at(&base, 0, now).await.unwrap(), 2);
+		assert!(base.join(&names[2]).exists(), "the untrusted directory survives even keep = 0");
 	}
 
 	#[tokio::test]
@@ -334,5 +593,193 @@ mod tests {
 		assert_eq!(listed[0].1, dirs[2], "the newest two survive");
 		assert_eq!(listed[1].1, dirs[3]);
 		assert_eq!(metrics.snapshot().backup.snapshots, 4, "every tick was still counted");
+	}
+
+	#[tokio::test]
+	async fn retention_counts_only_complete_backups_including_pre_manifest_ones() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		let base = dir.path().join("backups");
+		for stamp in [100, 200, 300] {
+			store.backup_control_plane_with_verify(base.join(generated_label(stamp)), VerifyMode::SnapshotOnly).await.unwrap();
+		}
+		drop(store);
+		// backup-100 predates manifests: the four databases and nothing else.
+		std::fs::remove_file(base.join("backup-100").join(weftdb::BACKUP_MANIFEST)).unwrap();
+		// backup-150 is a pre-manifest backup that never finished: two of its databases.
+		std::fs::create_dir(base.join("backup-150")).unwrap();
+		for file in &CONTROL_PLANE_FILES[..2] {
+			std::fs::copy(base.join("backup-100").join(file), base.join("backup-150").join(file)).unwrap();
+		}
+
+		let listed: Vec<u128> = list_generated_backups(&base).await.unwrap().into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(listed, vec![100, 200, 300], "the unfinished backup is not counted, the pre-manifest one is");
+
+		assert_eq!(prune_generated_backups(&base, 2).await.unwrap(), 1);
+		assert!(!base.join("backup-100").exists(), "a complete pre-manifest backup is still pruned by retention");
+		assert!(base.join("backup-150").exists(), "an unfinished one is not a backup, so retention never takes it for one");
+		let listed: Vec<u128> = list_generated_backups(&base).await.unwrap().into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(listed, vec![200, 300], "and it never displaced a complete backup");
+	}
+
+	/// The names directly under `dir`, sorted.
+	fn names_in(dir: &Path) -> Vec<String> {
+		let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+		names.sort();
+		names
+	}
+
+	fn mtime(path: &Path) -> SystemTime {
+		std::fs::metadata(path).unwrap().modified().unwrap()
+	}
+
+	/// Make each of `names` under `base` a complete backup of the pre-manifest shape: the
+	/// four control-plane files, and nothing else.
+	fn plant_backups(base: &Path, names: &[&str]) {
+		for name in names {
+			std::fs::create_dir_all(base.join(name)).unwrap();
+			for file in CONTROL_PLANE_FILES {
+				std::fs::write(base.join(name).join(file), b"x").unwrap();
+			}
+		}
+	}
+
+	async fn wait_until_gone(path: &Path, what: &str) {
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while path.exists() {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.unwrap_or_else(|_| panic!("{what}"));
+	}
+
+	/// The regression for a prune that removes a backup in place, which a crash part-way
+	/// leaves half-removed under its own name. A successful prune ends in the same state
+	/// either way, so the order of the operations is what is checked: each victim is
+	/// renamed to `.deleting-*` beside it, the base fsynced, and only then removed.
+	#[tokio::test]
+	async fn prune_retires_each_victim_through_a_durable_rename_before_removing_it() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		plant_backups(&base, &["backup-100", "backup-200", "backup-300"]);
+
+		let fs = RecordingFs::default();
+		assert_eq!(prune_generated_backups_via(&fs, &base, 1, now_millis()).await.unwrap(), 2);
+		let ops = fs.ops();
+		let mut rest = ops.as_slice();
+		for victim in ["backup-100", "backup-200"] {
+			let [FsOp::Rename(from, to), FsOp::SyncDir(synced), FsOp::RemoveDirAll(removed), tail @ ..] = rest else { panic!("{victim}: expected a rename, the base fsync, then the removal; got {rest:?}") };
+			assert_eq!(from, &base.join(victim), "{victim} is renamed away first");
+			assert_eq!(to.parent(), Some(base.as_path()), "{victim}: beside the backups");
+			assert!(to.file_name().unwrap().to_str().unwrap().starts_with(&format!(".deleting-{victim}-")), "{victim}: to a `.deleting-*` name: {}", to.display());
+			assert_eq!(synced, &base, "{victim}: the rename is made durable before any file goes");
+			assert_eq!(removed, to, "{victim}: only the `.deleting-*` name is removed, never the backup's own");
+			rest = tail;
+		}
+		assert!(rest.is_empty(), "nothing else: {rest:?}");
+		assert_eq!(names_in(&base), ["backup-300"]);
+	}
+
+	#[tokio::test]
+	async fn a_prune_whose_removal_fails_leaves_no_backup_name_behind() {
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		plant_backups(&base, &["backup-100", "backup-200"]);
+
+		let err = prune_generated_backups_via(&RecordingFs::failing_remove_dir_all(), &base, 1, now_millis()).await.unwrap_err();
+		assert!(format!("{err:#}").contains(INJECTED_CLEANUP_FAILURE), "{err:#}");
+		let names = names_in(&base);
+		assert!(!names.iter().any(|name| name == "backup-100"), "the victim's name went before its files: {names:?}");
+		assert!(names.iter().any(|name| name.starts_with(".deleting-backup-100-")), "its files wait under a `.deleting-*` name, for the sweep: {names:?}");
+		let listed: Vec<u128> = list_generated_backups(&base).await.unwrap().into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(listed, [200], "retention never counts the half-pruned backup again");
+	}
+
+	/// One backup directory that cannot be inspected used to fail the whole listing, so
+	/// retention failed on every tick and never pruned anything again.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn a_backup_that_cannot_be_inspected_is_skipped_rather_than_failing_retention() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = TempDir::new().unwrap();
+		let base = dir.path().join("backups");
+		plant_backups(&base, &["backup-100", "backup-200", "backup-300"]);
+		let locked = base.join("backup-200");
+		std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+		if std::fs::metadata(locked.join(CONTROL_PLANE_FILES[0])).is_ok() {
+			// Running as root, which permissions do not stop: nothing to provoke.
+			std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+			return;
+		}
+		let listed = list_generated_backups(&base).await;
+		let pruned = prune_generated_backups(&base, 1).await;
+		std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		let listed: Vec<u128> = listed.expect("one unreadable backup does not fail the listing").into_iter().map(|(stamp, _)| stamp).collect();
+		assert_eq!(listed, [100, 300], "it is neither counted nor pruned");
+		assert_eq!(pruned.expect("nor does it stop retention"), 1);
+		assert_eq!(names_in(&base), ["backup-200", "backup-300"]);
+	}
+
+	// The daemon tests age staging entries by moving the sweep's clock, not their mtimes:
+	// std cannot set a directory's mtime on Windows below Rust 1.99, and CI tests there.
+
+	#[tokio::test]
+	async fn the_daemon_sweeps_stale_staging_entries_when_it_starts() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.unwrap());
+		let base = dir.path().join("backups");
+		// `stale` sorts after `fresh`, so once the sweep has removed `stale` it has already
+		// judged `fresh`.
+		let fresh = base.join(".partial-backup-1-0011223344556677");
+		let stale = base.join(".restore-drill-2");
+		std::fs::create_dir_all(&stale).unwrap();
+		std::fs::create_dir(base.join("nightly")).unwrap();
+		// `fresh` must be strictly newer than `stale`: the clock below sits between them.
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		loop {
+			std::fs::create_dir(&fresh).unwrap();
+			if mtime(&fresh) > mtime(&stale) {
+				break;
+			}
+			std::fs::remove_dir(&fresh).unwrap();
+			assert!(std::time::Instant::now() < deadline, "the clock never moved past the stale entry's mtime");
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		let gap = mtime(&fresh).duration_since(mtime(&stale)).unwrap();
+		// `stale` has sat untouched for longer than the sweep age, `fresh` for not quite
+		// that long.
+		let now = mtime(&stale) + weftdb::STAGING_SWEEP_AGE + gap / 2;
+
+		let config = BackupDaemonConfig { interval: Duration::from_secs(3600), base: base.clone(), keep: None };
+		let daemon = spawn_backup_daemon_with_clock(store, Arc::new(Metrics::default()), config, move || now);
+		wait_until_gone(&stale, "the start-up sweep removes a stale entry without waiting for a tick").await;
+		daemon.abort();
+		let _ = daemon.await;
+		assert!(fresh.exists(), "a backup that may still be building is left alone");
+		assert!(base.join("nightly").exists(), "backups are never swept");
+	}
+
+	#[tokio::test]
+	async fn the_daemon_sweeps_again_on_every_tick() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.unwrap());
+		let base = dir.path().join("backups");
+		let first = base.join(".partial-backup-1-00");
+		std::fs::create_dir_all(&first).unwrap();
+
+		// Two sweep ages ahead, every staging entry is stale.
+		let config = BackupDaemonConfig { interval: Duration::from_millis(50), base: base.clone(), keep: None };
+		let daemon = spawn_backup_daemon_with_clock(store, Arc::new(Metrics::default()), config, || SystemTime::now() + 2 * weftdb::STAGING_SWEEP_AGE);
+		wait_until_gone(&first, "the start-up sweep runs").await;
+		// Made after the start-up sweep listed the base, so only a tick's sweep can see it.
+		let second = base.join(".restore-drill-2");
+		std::fs::create_dir(&second).unwrap();
+		wait_until_gone(&second, "a tick sweeps what a crash left while the daemon was running").await;
+		daemon.abort();
+		let _ = daemon.await;
 	}
 }

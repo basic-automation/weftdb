@@ -18,29 +18,20 @@ use std::collections::BTreeMap;
 
 use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use chrono::{DateTime, Utc};
-use splimes::{Resolution, SECONDS_IN_DAY, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_MONTH, SECONDS_IN_WEEK, SECONDS_IN_YEAR};
+use splimes::Resolution;
 
-use crate::{bucket_start, Aggregation, Bucket, BucketAcc, DdSketch, PartialReduction, ReduceError};
+use crate::{bucket_start, resolution_step_secs, Aggregation, Bucket, BucketAcc, DdSketch, PartialReduction, ReduceError};
 
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// The bucket index of an instant given in epoch nanoseconds, identical to
-/// [`Resolution::to_base`] on the same instant: whole nanos/micros/millis/seconds are floored
-/// (as `chrono`'s `timestamp*` accessors floor), and the coarser grids divide the floored
-/// seconds with truncating `/`, exactly as `to_base` does.
+/// [`bucket_index`](crate::bucket_index) on the same instant: the sub-second grids floor the
+/// nanoseconds to their step, and the second-and-coarser grids divide the floored seconds by
+/// the step in seconds with truncating `/`, exactly as `bucket_index` does.
 const fn base_of(resolution: Resolution, nanos: i64) -> i64 {
-	let seconds = nanos.div_euclid(NANOS_PER_SECOND);
-	match resolution {
-		Resolution::Nanoseconds => nanos,
-		Resolution::Microseconds => nanos.div_euclid(1_000),
-		Resolution::Milliseconds => nanos.div_euclid(1_000_000),
-		Resolution::Seconds => seconds,
-		Resolution::Minutes => seconds / SECONDS_IN_MINUTE,
-		Resolution::Hours => seconds / SECONDS_IN_HOUR,
-		Resolution::Days => seconds / SECONDS_IN_DAY,
-		Resolution::Weeks => seconds / SECONDS_IN_WEEK,
-		Resolution::Months => seconds / SECONDS_IN_MONTH,
-		Resolution::Years => seconds / SECONDS_IN_YEAR,
+	match resolution_step_secs(resolution) {
+		Some(step_secs) => nanos.div_euclid(NANOS_PER_SECOND) / step_secs,
+		None => nanos.div_euclid(resolution.step_nanos()),
 	}
 }
 
@@ -274,8 +265,7 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 
 	let scale = i64::from(scale);
 	let decimal = |m: i128| BigDecimal::new(BigInt::from(m), scale);
-	buckets
-		.into_iter()
+	buckets.into_iter()
 		.map(|(base, acc)| {
 			let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
 			let sum = decimal(acc.sum);
@@ -354,9 +344,10 @@ pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32,
 
 #[cfg(test)]
 mod tests {
+	use splimes::Point;
+
 	use super::*;
 	use crate::reduce;
-	use splimes::Point;
 
 	/// The equivalent `BigDecimal` points for a scaled column.
 	fn points(nanos: &[i64], mantissas: &[i64], scale: u32) -> Vec<Point> {
@@ -375,7 +366,7 @@ mod tests {
 	}
 
 	#[test]
-	fn base_of_matches_to_base_for_every_resolution() {
+	fn base_of_matches_bucket_index_for_every_resolution() {
 		let mut next = noise(0x9e37_79b9_7f4a_7c15);
 		let resolutions = [Resolution::Nanoseconds, Resolution::Microseconds, Resolution::Milliseconds, Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days, Resolution::Weeks, Resolution::Months, Resolution::Years];
 		let fixed = [0_i64, 1, -1, 999_999_999, -999_999_999, -1_000_000_000, 59 * NANOS_PER_SECOND, -61 * NANOS_PER_SECOND, 1_505_412_060 * NANOS_PER_SECOND];
@@ -383,7 +374,7 @@ mod tests {
 		for nanos in fixed.into_iter().chain(random) {
 			let t = DateTime::from_timestamp_nanos(nanos);
 			for r in resolutions {
-				assert_eq!(base_of(r, nanos), r.to_base(&t).expect("indexable"), "{r:?} at {nanos}");
+				assert_eq!(base_of(r, nanos), crate::bucket_index(r, &t).expect("indexable"), "{r:?} at {nanos}");
 			}
 		}
 	}

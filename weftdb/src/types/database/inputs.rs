@@ -1,12 +1,140 @@
+use std::future::Future;
+
 use anyhow::Result;
 
 use crate::{
-	cache::Connection, database::traits::{AspectStructure, Inputs}, types::{
+	cache::Connection, database::traits::{AspectStructure, Inputs}, error::is_transient_mvcc_error, types::{
 		database::{
 			helpers::safe_usize_to_f64, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
-		}, TxId
-	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID
+		}, durable::{fault, FaultPoint}, TxId
+	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID, UnbatchedEntry
 };
+
+/// How often a write to the unbatched queue is attempted when it loses an MVCC
+/// write-write conflict over the same entries (crash-consistency design, S18): ingest's
+/// enqueues and a consumer's dequeue upsert and delete the same `(aspect_id,
+/// data_timestamp)` rows, and two ingests into one aspect can queue the same timestamps.
+/// With the backoff of [`queue_write_backoff`] the attempts span about three seconds.
+///
+/// That is many times a dequeue transaction (at most [`DEQUEUE_CHUNK`] entries) and the
+/// second enqueue after a chunk's commit (one chunk's timestamps), which are what an
+/// ingest and a consumer normally meet. It is not a bound on the write-ahead enqueue: that
+/// upserts every timestamp of a `batch_capture_measurements` call in one transaction, so
+/// a dequeue that meets it (only when the call re-imports timestamps that are still
+/// queued and that the consumer read) waits for the whole of it and can run out of
+/// attempts, failing the consumer run; the other way round the whole upsert is retried
+/// and can fail the call before any row is stored. Both are recoverable: the entries
+/// stay queued, and the batch dedupe makes the consumer's re-run safe.
+const QUEUE_WRITE_ATTEMPTS: u32 = 10;
+
+/// The most queue entries one dequeue transaction removes. A consumer dequeues in several
+/// short transactions rather than one per run, so an ingest whose enqueue conflicts with
+/// it waits for one of them, never for the whole dequeue, and a conflict retries one of
+/// them. Each transaction is a synced commit, so this also sets the dequeue's commit count:
+/// one per this many entries (a run used to dequeue in a single commit).
+const DEQUEUE_CHUNK: usize = 5_000;
+
+/// The environment variable that sets, in whole seconds, how long the processed batches DB
+/// remembers a batch pattern extraction consumed (its `extracted_batches` row), and so
+/// how long the queue's duplicate check recognises that batch (crash-consistency design,
+/// S18). Unset, zero or not a number: [`DEFAULT_EXTRACTED_BATCH_RETENTION_SECS`].
+const EXTRACTED_BATCH_RETENTION_ENV: &str = "WEFT_EXTRACTED_BATCH_RETENTION_SECS";
+
+/// The default retention of the extracted-batch record: 48 hours.
+///
+/// The record is only consulted when the consumer rebuilds a window whose batch was
+/// already extracted, which happens on the first consumer run after an ingest that
+/// overlapped a pipeline run queues its committed rows again, or on the re-run after a
+/// consumer crash. So it has to outlive one interval between pipeline runs, plus the
+/// ingest; 48 hours covers a daily schedule with a day to spare. Extraction consumes
+/// about one batch per resolution step, so the record holds about one row per step of the
+/// retention (2,880 rows for a minute-resolution aspect, 172,800 for a second-resolution
+/// one); before it was bounded it kept a row for every step ever extracted.
+const DEFAULT_EXTRACTED_BATCH_RETENTION_SECS: i64 = 48 * 60 * 60;
+
+/// The extracted-batch retention in milliseconds, from [`EXTRACTED_BATCH_RETENTION_ENV`],
+/// read once per process.
+fn extracted_batch_retention_millis() -> i64 {
+	static RETENTION: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+	*RETENTION.get_or_init(|| {
+		let raw = std::env::var(EXTRACTED_BATCH_RETENTION_ENV).ok();
+		let secs = parse_extracted_batch_retention(raw.as_deref());
+		if raw.is_some_and(|raw| raw.trim().parse::<i64>().ok() != Some(secs)) {
+			tracing::warn!("{EXTRACTED_BATCH_RETENTION_ENV} is not a positive number of seconds; keeping extracted batches for the default {DEFAULT_EXTRACTED_BATCH_RETENTION_SECS} s");
+		}
+		secs.saturating_mul(1000)
+	})
+}
+
+/// The retention, in seconds, that a raw [`EXTRACTED_BATCH_RETENTION_ENV`] value sets: a
+/// positive whole number, else the default.
+fn parse_extracted_batch_retention(raw: Option<&str>) -> i64 {
+	raw.and_then(|raw| raw.trim().parse::<i64>().ok()).filter(|&secs| secs > 0).unwrap_or(DEFAULT_EXTRACTED_BATCH_RETENTION_SECS)
+}
+
+/// The wait before the retry that follows attempt `attempt` (from 1) of a queue write:
+/// doubling from 20 ms up to 500 ms, plus up to half again of jitter, so that two writers
+/// that conflicted do not retry in step.
+fn queue_write_backoff(attempt: u32) -> std::time::Duration {
+	let base = std::cmp::min(10u64 << attempt.min(6), 500);
+	std::time::Duration::from_millis(base + fastrand::u64(0..=base / 2))
+}
+
+/// Whether `e` is an MVCC conflict that retrying the whole transaction can resolve: a
+/// write-write conflict with another open transaction (Turso 0.8 reports it only as a
+/// generic error, by its message), a stale snapshot or aborted commit dependency
+/// (`BusySnapshot`), or a busy database.
+fn is_mvcc_conflict(e: &turso::Error) -> bool {
+	match e {
+		turso::Error::Busy(_) | turso::Error::BusySnapshot(_) => true,
+		turso::Error::Error(message) => message.contains("Write-write conflict"),
+		_ => false,
+	}
+}
+
+/// The error of a failed queue write: an [`Error::TransientMvccError`] when `e` is a
+/// conflict that a retry can resolve (see [`is_mvcc_conflict`]), so that the retry loops
+/// recognise it, and a plain error otherwise.
+fn queue_write_error(context: &str, e: &turso::Error) -> anyhow::Error {
+	if is_mvcc_conflict(e) {
+		Error::TransientMvccError(format!("{context}: {e}")).into()
+	} else {
+		anyhow::anyhow!("{context}: {e}")
+	}
+}
+
+/// `COMMIT` a queue write; on failure roll back and return the error classified as by
+/// [`queue_write_error`]. (`commit_concurrent` returns the error as text, so a conflict
+/// at the commit could not be told apart from any other failure.)
+async fn commit_queue_write(conn: &Connection, context: &str) -> Result<()> {
+	if let Err(e) = conn.as_ref().execute("COMMIT", turso::params![]).await {
+		let _ = conn.as_ref().execute("ROLLBACK", turso::params![]).await;
+		return Err(queue_write_error(&format!("{context}: the commit failed and was rolled back"), &e));
+	}
+	Ok(())
+}
+
+/// Run `write`, a whole queue-write transaction, again while it fails with a transient
+/// MVCC conflict, up to [`QUEUE_WRITE_ATTEMPTS`] times in all, and return its last result.
+/// Each attempt is a fresh transaction on a fresh snapshot, and a failed one wrote
+/// nothing.
+async fn retry_queue_write<F, Fut>(what: &str, mut write: F) -> Result<()>
+where
+	F: FnMut() -> Fut + Send,
+	Fut: std::future::Future<Output = Result<()>> + Send,
+{
+	let mut attempt = 1;
+	loop {
+		match write().await {
+			Err(e) if attempt < QUEUE_WRITE_ATTEMPTS && is_transient_mvcc_error(&e) => {
+				tracing::debug!("{what} lost an MVCC conflict (attempt {attempt} of {QUEUE_WRITE_ATTEMPTS}), retrying: {e}");
+				tokio::time::sleep(queue_write_backoff(attempt)).await;
+				attempt += 1;
+			}
+			done => return done,
+		}
+	}
+}
 
 #[async_trait::async_trait]
 impl Inputs for Database {
@@ -19,7 +147,20 @@ impl Inputs for Database {
 		self.enqueue_unbatched_measurements(aspect_id, &[data_timestamp]).await
 	}
 
-	/// Enqueue multiple measurement timestamps as unbatched (bulk insert with INSERT OR IGNORE for deduplication)
+	/// Enqueue multiple measurement timestamps as unbatched (bulk upsert, one entry per timestamp)
+	///
+	/// A timestamp that is already queued keeps its one entry, but its `queued_at` moves
+	/// strictly forward (to the later of now and one past its old value). The
+	/// queue consumer dequeues an entry only while it has the `queued_at` it was read with
+	/// ([`dequeue_unbatched_entries`](Inputs::dequeue_unbatched_entries)), so an enqueue
+	/// that lands after the consumer's read, such as ingest's second enqueue once its rows
+	/// are committed, keeps the timestamp queued for the next run (crash-consistency
+	/// design, S18). This used to be `INSERT OR IGNORE`, which left the old `queued_at`.
+	///
+	/// One attempt: an MVCC write-write conflict with another write to the same entries
+	/// (a concurrent enqueue of the same timestamps, or a consumer's dequeue) is returned as
+	/// an [`Error::TransientMvccError`], after which nothing was written and a retry can
+	/// succeed; ingest retries it.
 	async fn enqueue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
 		if data_timestamps.is_empty() {
 			return Ok(());
@@ -37,8 +178,9 @@ impl Inputs for Database {
 		for chunk in data_timestamps.chunks(chunk_size) {
 			let placeholder = "(?, ?, ?)";
 			let placeholders: Vec<&str> = (0..chunk.len()).map(|_| placeholder).collect();
-			// Use INSERT OR IGNORE to deduplicate (aspect_id + data_timestamp combo)
-			let bulk_sql = format!("INSERT OR IGNORE INTO unbatched_measurements (aspect_id, data_timestamp, queued_at) VALUES {}", placeholders.join(", "));
+			// One entry per (aspect_id, data_timestamp), the table's UNIQUE key; a repeat moves
+			// the entry's queued_at strictly forward (see above).
+			let bulk_sql = format!("INSERT INTO unbatched_measurements (aspect_id, data_timestamp, queued_at) VALUES {} ON CONFLICT(aspect_id, data_timestamp) DO UPDATE SET queued_at = MAX(excluded.queued_at, unbatched_measurements.queued_at + 1)", placeholders.join(", "));
 
 			let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 3);
 			for ts in chunk {
@@ -47,15 +189,14 @@ impl Inputs for Database {
 				params.push(queued_at.to_string());
 			}
 
-			let res = conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await;
-			if let Err(e) = res {
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to enqueue unbatched measurements: {e}"));
+			if let Err(e) = conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await {
+				// The conflict, not a failed rollback of the transaction it ended, is the error.
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(queue_write_error("Failed to enqueue unbatched measurements", &e));
 			}
 		}
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+		commit_queue_write(&conn, "Failed to enqueue unbatched measurements").await
 	}
 
 	/// Dequeue unbatched measurements after they have been included in batches
@@ -84,12 +225,33 @@ impl Inputs for Database {
 
 			let res = conn.as_ref().execute(&delete_sql, turso::params_from_iter(params)).await;
 			if let Err(e) = res {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to dequeue unbatched measurements: {e}"));
 			}
 		}
 
 		Self::commit_concurrent(&conn).await?;
+		Ok(())
+	}
+
+	/// Dequeue the queue entries a consumer read, each only while it still has the
+	/// `queued_at` it was read with.
+	///
+	/// The entries are removed in transactions of at most 5,000 (`DEQUEUE_CHUNK`), so that an
+	/// ingest queuing one of the same timestamps meanwhile waits for one short transaction,
+	/// not for the whole dequeue. A transaction that loses an MVCC conflict to such an
+	/// enqueue is retried: it re-reads the entries, so one queued again in the meantime no
+	/// longer matches and stays queued. Each transaction runs one `DELETE` per entry,
+	/// prepared once: Turso seeks the `(aspect_id, data_timestamp)` key for an equality,
+	/// but not for an `IN` list, which it answers by scanning the aspect's entries.
+	///
+	/// On an error the transactions before the failed one stay committed; the entries left
+	/// queued are batched again by the next run, whose duplicate check skips the batches
+	/// already stored.
+	async fn dequeue_unbatched_entries(&self, aspect_id: &AspectId, entries: &[UnbatchedEntry]) -> Result<()> {
+		for chunk in entries.chunks(DEQUEUE_CHUNK) {
+			retry_queue_write("Dequeuing unbatched measurements", || self.dequeue_entry_chunk(aspect_id, chunk)).await?;
+		}
 		Ok(())
 	}
 
@@ -104,7 +266,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all unbatched measurements for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear unbatched measurements: {e}"));
 			}
 		}
@@ -129,6 +291,15 @@ impl Inputs for Database {
 		let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 		let data_timestamp = measurement.timestamp();
 
+		// Write-ahead enqueue (crash-consistency design, S18): queue the timestamp before the
+		// row is inserted. Enqueuing only after the insert left a committed but unqueued
+		// row, which the incremental build could miss, whenever the call failed or crashed
+		// in between. A consumer can now read the timestamp before its row exists, so it is
+		// queued again after the commit (below). A timestamp whose row never lands is
+		// handled by the consumer like any other (see the trait docs).
+		self.enqueue_retrying(aspect_id, &[data_timestamp]).await?;
+		fault::hit(FaultPoint::LEnqueued).await?;
+
 		// Simple INSERT - no unique constraints with MVCC, duplicates handled at app level
 		let insert_sql = r"
 			INSERT INTO measurements (id, dataset_id, timestamp, value) 
@@ -141,26 +312,38 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Successfully inserted measurement for dataset {dataset_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 1: `{e}`"));
 			}
 		}
 
 		Self::commit_concurrent(&conn).await?;
+		self.forget_cached_earliest_measurement(aspect_id).await;
+
+		// The row is stored. Every step from here on is best-effort: an error must not fail a
+		// call whose row is committed, since the client would retry it into a duplicate
+		// (crash-consistency design, legacy-committed-before-ack).
+		self.requeue_committed(aspect_id, &[data_timestamp]).await;
 
 		// Checkpoint WAL to ensure measurement is persisted
-		Self::checkpoint_wal_passive(&db).await?;
-
-		// Enqueue measurement for incremental batch processing
-		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
+		if let Err(e) = Self::checkpoint_wal_passive(&db).await {
+			tracing::debug!("Failed to checkpoint after capturing a measurement; it is committed: {e}");
+		}
 
 		// Check if this measurement falls in a previously compressed range and mark dirty if so
-		// This is best-effort - errors are logged but don't fail the insert
 		if let Err(e) = self.mark_dirty_region_if_needed(aspect_id, data_timestamp).await {
 			tracing::debug!("Failed to check dirty region for measurement: {e}");
 		}
 
-		self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {}", measurement.timestamp(), measurement.value(), dataset_id)).await
+		// The transaction log is an audit trail; the measurement row's own id stands in when
+		// it cannot be written.
+		match self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {}", measurement.timestamp(), measurement.value(), dataset_id)).await {
+			Ok(logged) => Ok(logged),
+			Err(e) => {
+				tracing::warn!("Failed to record the transaction for a measurement of aspect {aspect_id}; the measurement is stored: {e}");
+				Ok(tx_id)
+			}
+		}
 	}
 
 	/// Capture new measurements for a given aspect
@@ -186,7 +369,7 @@ impl Inputs for Database {
 		match res {
 			Ok(rows) => tracing::debug!("Inserted {rows} rows"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("SQL execution failure 2: `{e}`"));
 			}
 		}
@@ -196,8 +379,11 @@ impl Inputs for Database {
 		// Checkpoint WAL to ensure measurement is persisted
 		Self::checkpoint_wal_passive(&db).await?;
 
-		// Enqueue measurement for incremental batch processing
-		self.enqueue_unbatched_measurement(aspect_id, data_timestamp).await?;
+		// Enqueue measurement for incremental batch processing. The enqueue is an upsert, so
+		// it writes an entry that is already queued and can lose an MVCC conflict to a
+		// consumer's dequeue of it; retry that, as the write-ahead paths do (crash-consistency
+		// design, S18). This path still enqueues only after the commit (see the trait docs).
+		self.enqueue_retrying(aspect_id, &[data_timestamp]).await?;
 
 		self.record_transaction(&format!("Inserted new measurement at {} for dataset {}", measurement.timestamp(), dataset_id)).await
 	}
@@ -236,8 +422,22 @@ impl Inputs for Database {
 		let db = self.get_measurement_db(&aspect_id).await?;
 		tracing::debug!("[batch_capture] Got measurement DB, getting path...");
 		let db_path = self.get_measurement_db_path(&aspect_id).await?;
-		tracing::debug!("[batch_capture] Got DB path, starting chunk loop ({} chunks of {})", total_measurements / chunk_size + 1, chunk_size);
 		let dataset_id_str = dataset_id.as_uuid().to_string();
+
+		// Write-ahead enqueue (crash-consistency design, S18): queue every timestamp before
+		// the first chunk is inserted. The chunks commit one by one, so a failure or crash
+		// mid-call leaves a committed prefix; enqueuing only after the loop left that prefix
+		// unqueued, and the incremental build could miss it. A consumer can now read the
+		// timestamps before their rows exist, so each chunk's are queued again after it
+		// commits (below). Timestamps whose rows never land are handled by the consumer like
+		// any others (see the trait docs).
+		tracing::debug!("[batch_capture] Enqueuing {} unbatched measurements...", input_measurements.len());
+		let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
+		self.enqueue_retrying(&aspect_id, &all_timestamps).await?;
+		fault::hit(FaultPoint::LEnqueued).await?;
+		tracing::debug!("[batch_capture] Unbatched measurements enqueued");
+
+		tracing::debug!("[batch_capture] Starting chunk loop ({} chunks of {})", total_measurements / chunk_size + 1, chunk_size);
 
 		for (chunk_idx, chunk) in input_measurements.chunks(chunk_size).enumerate() {
 			let start = chunk_idx * chunk_size;
@@ -302,7 +502,11 @@ impl Inputs for Database {
 			}
 
 			Self::commit_concurrent(&conn).await?;
+			self.forget_cached_earliest_measurement(&aspect_id).await;
 			all_tx_ids.extend(chunk_tx_ids);
+			fault::hit(FaultPoint::LChunk(u32::try_from(chunk_idx).unwrap_or(u32::MAX))).await?;
+			let chunk_timestamps: Vec<chrono::DateTime<chrono::Utc>> = chunk.iter().map(InputMeasurement::timestamp).collect();
+			self.requeue_committed(&aspect_id, &chunk_timestamps).await;
 
 			// Periodic PASSIVE checkpoint every 100 chunks to prevent WAL from growing too large
 			// PASSIVE doesn't block, unlike TRUNCATE
@@ -320,17 +524,17 @@ impl Inputs for Database {
 		let cache_key = format!("aspect_measurements_{}", aspect_id.as_uuid());
 		self.cache.lock().await.invalidate(&cache_key).await;
 
+		// Every row is committed and queued by now, so the steps from here on are
+		// best-effort: their error must not turn a stored batch into a failed call that the
+		// client retries, which in rows mode stores it twice.
+
 		// Use PASSIVE checkpoint during imports to avoid blocking subsequent operations
 		// TRUNCATE checkpoint requires exclusive access which can cause contention with MVCC
 		tracing::debug!("[batch_capture] Starting final PASSIVE checkpoint...");
-		Self::checkpoint_wal_passive(&db).await?;
-		tracing::debug!("[batch_capture] Final checkpoint complete");
-
-		// Enqueue all measurement timestamps for incremental batch processing
-		tracing::debug!("[batch_capture] Enqueuing {} unbatched measurements...", input_measurements.len());
-		let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
-		self.enqueue_unbatched_measurements(&aspect_id, &all_timestamps).await?;
-		tracing::debug!("[batch_capture] Unbatched measurements enqueued");
+		match Self::checkpoint_wal_passive(&db).await {
+			Ok(()) => tracing::debug!("[batch_capture] Final checkpoint complete"),
+			Err(e) => tracing::debug!("[batch_capture] Final checkpoint failed; the measurements are committed: {e}"),
+		}
 
 		// Check if any measurements in this batch fall within previously compressed ranges
 		// This is best-effort - errors are logged but don't fail the import
@@ -338,9 +542,13 @@ impl Inputs for Database {
 			tracing::debug!("[batch_capture] Failed to check dirty regions for batch: {e}");
 		}
 
-		// Update earliest and latest in metadata
+		// Update earliest and latest in metadata. Nothing reads these columns back (the
+		// earliest and latest measurement are computed from the rows), so a failure is
+		// only logged.
 		tracing::debug!("[batch_capture] Updating aspect timestamps...");
-		self.update_aspect_timestamps(&aspect_id, min_new, max_new).await?;
+		if let Err(e) = self.update_aspect_timestamps(&aspect_id, min_new, max_new).await {
+			tracing::warn!("[batch_capture] Failed to update aspect timestamps for {aspect_id}; the measurements are stored: {e}");
+		}
 		tracing::info!("[batch_capture] Batch complete: {} measurements imported for aspect {}", total_measurements, aspect_id);
 		Ok(all_tx_ids)
 	}
@@ -386,9 +594,10 @@ impl Inputs for Database {
 
 		Self::commit_concurrent(&conn).await?;
 
-		// Enqueue all measurement timestamps for incremental batch processing
+		// Enqueue all measurement timestamps for incremental batch processing, retrying an
+		// MVCC conflict over an entry that is already queued (see capture_new_measurement).
 		let chunk_timestamps: Vec<chrono::DateTime<chrono::Utc>> = chunk.iter().map(InputMeasurement::timestamp).collect();
-		self.enqueue_unbatched_measurements(aspect_id, &chunk_timestamps).await?;
+		self.enqueue_retrying(aspect_id, &chunk_timestamps).await?;
 
 		Ok(chunk_tx_ids)
 	}
@@ -426,7 +635,7 @@ impl Inputs for Database {
 					successful_timestamps.push(m.timestamp());
 				}
 				Err(e) => {
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert in chunk: {e}"));
 				}
 			}
@@ -434,64 +643,76 @@ impl Inputs for Database {
 			Self::commit_concurrent(&conn).await?;
 		}
 
-		// Enqueue all successfully inserted measurement timestamps for incremental batch processing
+		// Enqueue all successfully inserted measurement timestamps for incremental batch
+		// processing, retrying an MVCC conflict over an entry that is already queued (see
+		// capture_new_measurement).
 		if !successful_timestamps.is_empty() {
-			self.enqueue_unbatched_measurements(aspect_id, &successful_timestamps).await?;
+			self.enqueue_retrying(aspect_id, &successful_timestamps).await?;
 		}
 
 		Ok(successful)
 	}
 
 	/// Insert unprocessed batch (implement missing trait method)
+	///
+	/// Skips the insert, and still returns `Ok`, when a batch with the same
+	/// `(aspect_id, batch_hash)` is already queued, processed, or extracted
+	/// (crash-consistency design, S18). The consumer rebuilds a window it already batched
+	/// whenever a timestamp in it is queued again: after a consumer crash between its
+	/// inserts and its dequeue, and after an ingest that ran during a consumer run queues
+	/// its committed rows again (see [`UnbatchedEntry`]). With the same rows the rebuilt
+	/// batch is byte-identical; without this check it was queued, processed and turned
+	/// into a pattern occurrence a second time. The hash is the MD5 of the batch's
+	/// measurements, which include their timestamps, so two different windows never share
+	/// one, while a window rebuilt over changed rows (a gap filled since) gets a new hash
+	/// and is queued. Extracted batches are known by the hashes
+	/// [`remove_extracted_batches`](Inputs::remove_extracted_batches) recorded when it
+	/// deleted them, for as long as it keeps them (48 hours by default; see there). Every
+	/// check is a point lookup on a hash index, the queued one first
+	/// (`queue_batch_unless_known` says why the order matters).
+	///
+	/// The index is not unique (a hash can be `NULL`, and batches stored before the dedupe
+	/// may repeat), so two consumers racing on the same aspect can still both insert a
+	/// batch; the consumer runs once per aspect.
 	async fn insert_unprocessed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId> {
 		let tx_id = TxId::new();
-		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
-		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
-		let batch_id = batch.id().to_string();
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		// Simple INSERT - no unique constraints with MVCC
-		let insert_sql = r"
-			INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		";
-
-		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
-			Ok(size) => size,
-			Err(e) => {
-				return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
-			}
-		};
-
-		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
-		match res {
-			Ok(_) => {}
-			Err(e) => {
-				tracing::warn!("Failed to insert unprocessed batch {batch_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to insert unprocessed batch: {e}"));
-			}
-		}
-
-		Self::commit_concurrent(&conn).await?;
-
+		let processed = self.get_processed_batches_db(aspect_id).await?.connect()?;
+		self.queue_batch_unless_known(aspect_id, batch, &db, &db_path, &processed).await?;
 		Ok(tx_id)
 	}
 
 	/// Batch insert unprocessed batches (implement missing trait method)
+	///
+	/// Applies the same dedupe as [`insert_unprocessed_batch`](Self::insert_unprocessed_batch)
+	/// to every batch, which also drops repeats within `batches` (a repeat finds the first
+	/// one queued). Every input batch still gets a `TxId`, inserted or skipped. A full
+	/// rebuild stores through this, so it too skips the windows already extracted; a
+	/// rebuild meant to extract every window again clears the processed batches first
+	/// (`Pipeline::prepare_data_full_rebuild` does), which clears that record.
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>> {
 		let total = batches.len();
 		let mut tx_ids = Vec::with_capacity(total);
 		let report_interval = std::cmp::max(1000, total / 10); // Report every 1000 or 10% (whichever is larger)
+		let mut skipped = 0usize;
+		let db = self.get_unprocessed_batches_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
+		let processed = self.get_processed_batches_db(aspect_id).await?.connect()?;
 
 		for (i, b) in batches.into_iter().enumerate() {
-			let tx = self.insert_unprocessed_batch(aspect_id, &b).await?;
-			tx_ids.push(tx);
+			if !self.queue_batch_unless_known(aspect_id, &b, &db, &db_path, &processed).await? {
+				skipped += 1;
+			}
+			tx_ids.push(TxId::new());
 
 			// Report progress intermittently
 			if (i + 1) % report_interval == 0 || i + 1 == total {
 				tracing::debug!("Inserted unprocessed batches: {}/{}", i + 1, total);
 			}
+		}
+		if skipped > 0 {
+			tracing::debug!("Skipped {skipped} of {total} unprocessed batches for aspect {aspect_id}: already queued, processed or extracted");
 		}
 		Ok(tx_ids)
 	}
@@ -534,7 +755,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![batch_id.to_string()]).await;
 		if let Err(e) = res {
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to remove unprocessed batch: {e}"));
 		}
 
@@ -555,7 +776,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all unprocessed batches for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed batches: {e}"));
 			}
 		}
@@ -576,7 +797,7 @@ impl Inputs for Database {
 		match res {
 			Ok(deleted) => tracing::debug!("Cleaned up {deleted} unprocessed batches older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to cleanup unprocessed batches: {e}"));
 			}
 		}
@@ -590,7 +811,7 @@ impl Inputs for Database {
 	async fn insert_processed_batch(&self, aspect_id: &AspectId, batch: &Batch) -> Result<TxId> {
 		let tx_id = TxId::new();
 		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
-		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
+		let batch_hash = Self::processed_batch_hash(batch, &measurements_json);
 		let batch_id = batch.batch_id().to_string();
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
@@ -600,7 +821,7 @@ impl Inputs for Database {
 		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
 			Ok(size) => size,
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
 			}
 		};
@@ -608,7 +829,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json.clone(), batch_hash.clone(), "processed", chrono::Utc::now().timestamp_millis()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to insert processed batch {batch_id}: {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to insert processed batch: {e}"));
 		}
 
@@ -645,7 +866,7 @@ impl Inputs for Database {
 
 		let res = conn.as_ref().execute(delete_sql, turso::params![batch_id.to_string()]).await;
 		if let Err(e) = res {
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to remove processed batch: {e}"));
 		}
 
@@ -679,19 +900,61 @@ impl Inputs for Database {
 		Ok(())
 	}
 
-	/// clear all processed batches for a given aspect
+	/// Remove processed batches that pattern extraction consumed, recording each one's
+	/// `batch_hash` in `extracted_batches` in the same transaction (crash-consistency
+	/// design, S18). The same transaction deletes the records older than the retention
+	/// (`WEFT_EXTRACTED_BATCH_RETENTION_SECS`, 48 hours by default), which keeps the record
+	/// bounded; the delete scans the record, which that bound keeps small.
+	async fn remove_extracted_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()> {
+		if batch_ids.is_empty() {
+			return Ok(());
+		}
+
+		let db = self.get_processed_batches_db(aspect_id).await?;
+		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		let extracted_at = chrono::Utc::now().timestamp_millis();
+		let expired_before = extracted_at.saturating_sub(extracted_batch_retention_millis());
+
+		let removed = async {
+			conn.as_ref().execute("DELETE FROM extracted_batches WHERE extracted_at < ?", turso::params![expired_before]).await?;
+			// Sub-chunks keep each statement under SQLite's variable limit.
+			for sub_chunk in batch_ids.chunks(500) {
+				let placeholders: Vec<&str> = (0..sub_chunk.len()).map(|_| "?").collect();
+				let placeholders = placeholders.join(", ");
+				let ids: Vec<String> = sub_chunk.iter().map(std::string::ToString::to_string).collect();
+				conn.as_ref().execute(&format!("INSERT INTO extracted_batches (batch_hash, extracted_at) SELECT batch_hash, {extracted_at} FROM batches WHERE batch_hash IS NOT NULL AND id IN ({placeholders})"), turso::params_from_iter(ids.clone())).await?;
+				conn.as_ref().execute(&format!("DELETE FROM batches WHERE id IN ({placeholders})"), turso::params_from_iter(ids)).await?;
+			}
+			Ok::<_, turso::Error>(())
+		}
+		.await;
+		if let Err(e) = removed {
+			let _ = Self::rollback_concurrent(&conn).await;
+			return Err(Error::DatabaseError(format!("Failed to remove extracted batches: {e}")).into());
+		}
+
+		Self::commit_concurrent(&conn).await
+	}
+
+	/// clear all processed batches for a given aspect, and the record of the batches
+	/// extraction consumed
 	async fn clear_processed_batches(&self, aspect_id: &AspectId) -> Result<TxId> {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
 
-		let delete_sql = r"DELETE FROM batches";
-
-		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
+		// The extracted-batch record goes with the batches: a full rebuild clears them to
+		// batch, process and extract every window again, which the duplicate check would
+		// otherwise refuse for every window extracted before.
+		let mut res = conn.as_ref().execute(r"DELETE FROM batches", turso::params![]).await;
+		if res.is_ok() {
+			res = conn.as_ref().execute(r"DELETE FROM extracted_batches", turso::params![]).await;
+		}
 		match res {
 			Ok(_) => tracing::debug!("Cleared all processed batches for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear processed batches: {e}"));
 			}
 		}
@@ -713,7 +976,7 @@ impl Inputs for Database {
 		match res {
 			Ok(deleted) => tracing::debug!("Cleaned up {deleted} processed batches older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to cleanup processed batches: {e}"));
 			}
 		}
@@ -750,7 +1013,7 @@ impl Inputs for Database {
 			let mut params: Vec<String> = Vec::with_capacity(sub_chunk.len() * 9);
 			for batch in sub_chunk {
 				let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
-				let batch_hash = format!("{:x}", md5::compute(&measurements_json));
+				let batch_hash = Self::processed_batch_hash(batch, &measurements_json);
 				let batch_metadata_size: i64 = i64::try_from(batch.metadata.size).unwrap_or(0);
 
 				params.push(batch.batch_id().to_string());
@@ -833,7 +1096,7 @@ impl Inputs for Database {
 			Err(e) => {
 				let id = pattern.id();
 				tracing::warn!("Failed to insert pattern '{id}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to insert pattern: {e}"));
 			}
 		}
@@ -849,7 +1112,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = pattern.id();
 					tracing::warn!("Failed to insert occurrence for pattern '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert occurrence: {e}"));
 				}
 			}
@@ -866,7 +1129,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = pattern.id();
 					tracing::warn!("Failed to insert relative {i} for pattern '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert relative: {e}"));
 				}
 			}
@@ -900,7 +1163,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed pattern '{pattern}' for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove pattern: {e}"));
 			}
 		}
@@ -919,7 +1182,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all patterns for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear patterns: {e}"));
 			}
 		}
@@ -986,7 +1249,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove event: {e}"));
 			}
 		}
@@ -1006,7 +1269,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all events for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear events: {e}"));
 			}
 		}
@@ -1018,9 +1281,12 @@ impl Inputs for Database {
 
 	async fn set_dictionary_metadata(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<TxId> {
 		let tx_id = TxId::new();
+		// Refuse a step method that `get_dictionary_metadata` could not load, before the
+		// dictionary's database file exists.
+		Self::check_dictionary_constraints(dictionary_name, &metadata.constraints)?;
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
-		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
+		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		// Create the schema FIRST, in an exclusive transaction. Turso rejects DDL inside
 		// `BEGIN CONCURRENT` ("DDL statements require an exclusive transaction"), so the
@@ -1037,19 +1303,21 @@ impl Inputs for Database {
 		Aspect::ensure_dictionary_tables(&db).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
-		// Insert dictionary metadata (no ON CONFLICT since no unique constraint - app handles duplicates)
-		let insert_sql = r"INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)";
-		let res = conn.as_ref().execute(insert_sql, turso::params![metadata.id.as_uuid().to_string(), dictionary_name, metadata.description.clone(), chrono::Utc::now().timestamp_millis()]).await;
-		match res {
-			Ok(_) => (),
-			Err(e) => {
-				tracing::warn!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
-				return Err(anyhow::anyhow!("Failed to set dictionary metadata: {e}"));
-			}
+		// The whole registration: metadata, steps and variabilities. It used to insert only the
+		// metadata row, so `get_dictionary_metadata` (which needs the constraints row) never
+		// found the dictionary, and every `load_dictionary` inserted another metadata row.
+		if let Err(e) = Self::replace_dictionary_registration(&conn, &metadata.id, dictionary_name, &metadata.description, &metadata.constraints).await {
+			tracing::warn!("Failed to set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
+			Self::rollback_after_error(&conn).await;
+			// Keep `e` as the source: a write-write conflict is what makes the write retryable.
+			let message = format!("Failed to set dictionary metadata: {e}");
+			return Err(e.context(message));
 		}
 
 		Self::commit_concurrent(&conn).await?;
+		// After the commit, and as a new generation: a read whose snapshot predates the commit
+		// then does not cache the registration this replaced.
+		self.cache.lock().await.invalidate_generation(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
 
 		let log = format!("Set metadata for dictionary '{dictionary_name}' for aspect {aspect_id}");
 		let _ = self.record_transaction(&log).await?;
@@ -1057,12 +1325,17 @@ impl Inputs for Database {
 		Ok(tx_id)
 	}
 
+	async fn register_dictionary_if_absent(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<bool> {
+		Self::check_dictionary_constraints(dictionary_name, &metadata.constraints)?;
+		retry_once_if_transient(dictionary_name, || self.register_dictionary_if_absent_once(aspect_id, dictionary_name, metadata)).await
+	}
+
 	/// insert pattern into dictionary for a given aspect
 	async fn insert_pattern_into_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str, pattern: &Pattern) -> Result<TxId> {
 		let tx_id = TxId::new();
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
-		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name);
+		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
@@ -1074,7 +1347,7 @@ impl Inputs for Database {
 			Err(e) => {
 				let id = pattern.id();
 				tracing::warn!("Failed to insert pattern '{id}' into dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to insert pattern into dictionary: {e}"));
 			}
 		}
@@ -1091,7 +1364,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = pattern.id();
 					tracing::warn!("Failed to insert occurrence for pattern '{id}' in dictionary '{dictionary_name}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert occurrence: {e}"));
 				}
 			}
@@ -1108,7 +1381,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = pattern.id();
 					tracing::warn!("Failed to insert relative {i} for pattern '{id}' in dictionary '{dictionary_name}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert relative: {e}"));
 				}
 			}
@@ -1153,7 +1426,7 @@ impl Inputs for Database {
 			Err(e) => {
 				let id = correlation.id();
 				tracing::warn!("Failed to insert correlation '{id}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to insert correlation: {e}"));
 			}
 		}
@@ -1167,7 +1440,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = correlation.id();
 					tracing::warn!("Failed to insert error rate for correlation '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
 				}
 			}
@@ -1185,7 +1458,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = correlation.id();
 					tracing::warn!("Failed to insert occurrence {index} for correlation '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
 				}
 			}
@@ -1215,7 +1488,7 @@ impl Inputs for Database {
 			Err(e) => {
 				let id = correlation.id();
 				tracing::warn!("Failed to update correlation '{id}' for aspect {aspect_id}: {e}");
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to update correlation: {e}"));
 			}
 		}
@@ -1226,7 +1499,7 @@ impl Inputs for Database {
 		if let Err(e) = res {
 			let id = correlation.id();
 			tracing::warn!("Failed to delete error rates for correlation '{id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
 		}
 
@@ -1239,7 +1512,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = correlation.id();
 					tracing::warn!("Failed to insert error rate for correlation '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert correlation error rate: {e}"));
 				}
 			}
@@ -1251,7 +1524,7 @@ impl Inputs for Database {
 		if let Err(e) = res {
 			let id = correlation.id();
 			tracing::warn!("Failed to delete occurrences for correlation '{id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
 		}
 
@@ -1267,7 +1540,7 @@ impl Inputs for Database {
 				Err(e) => {
 					let id = correlation.id();
 					tracing::warn!("Failed to insert occurrence {index} for correlation '{id}': {e}");
-					Self::rollback_concurrent(&conn).await?;
+					Self::rollback_after_error(&conn).await;
 					return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
 				}
 			}
@@ -1295,7 +1568,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_err_sql, turso::params![correlation_id.to_string()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to delete error rates for correlation '{correlation_id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete correlation error rates: {e}"));
 		}
 
@@ -1304,7 +1577,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation_id.to_string()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to delete occurrences for correlation '{correlation_id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
 		}
 
@@ -1314,7 +1587,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed correlation {correlation_id} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove correlation: {e}"));
 			}
 		}
@@ -1375,7 +1648,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![event_id.to_string()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to delete manifestations for unprocessed event '{event_id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete unprocessed event manifestations: {e}"));
 		}
 
@@ -1385,7 +1658,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed unprocessed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove unprocessed event: {e}"));
 			}
 		}
@@ -1405,7 +1678,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all unprocessed event manifestations for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed event manifestations: {e}"));
 			}
 		}
@@ -1415,7 +1688,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all unprocessed events for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear unprocessed events: {e}"));
 			}
 		}
@@ -1435,7 +1708,7 @@ impl Inputs for Database {
 		match res {
 			Ok(deleted) => tracing::debug!("Cleaned up {deleted} unprocessed events older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to cleanup unprocessed events: {e}"));
 			}
 		}
@@ -1493,7 +1766,7 @@ impl Inputs for Database {
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![event_id.to_string()]).await;
 		if let Err(e) = res {
 			tracing::warn!("Failed to delete manifestations for processed event '{event_id}': {e}");
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete processed event manifestations: {e}"));
 		}
 
@@ -1503,7 +1776,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Removed processed event {event_id} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to remove processed event: {e}"));
 			}
 		}
@@ -1523,7 +1796,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all processed event manifestations for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear processed event manifestations: {e}"));
 			}
 		}
@@ -1533,7 +1806,7 @@ impl Inputs for Database {
 		match res {
 			Ok(_) => tracing::debug!("Cleared all processed events for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to clear processed events: {e}"));
 			}
 		}
@@ -1553,7 +1826,7 @@ impl Inputs for Database {
 		match res {
 			Ok(deleted) => tracing::debug!("Cleaned up {deleted} processed events older than {older_than} for aspect {aspect_id}"),
 			Err(e) => {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to cleanup processed events: {e}"));
 			}
 		}
@@ -1579,7 +1852,7 @@ impl Inputs for Database {
 			let delete_sql = "DELETE FROM measurements WHERE timestamp >= ? AND timestamp <= ?";
 			let res = conn.as_ref().execute(delete_sql, turso::params![start.timestamp_millis(), end.timestamp_millis()]).await;
 			if let Err(e) = res {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to delete measurements in range: {e}"));
 			}
 
@@ -1596,7 +1869,7 @@ impl Inputs for Database {
 		let delete_sql = "DELETE FROM measurements WHERE timestamp >= ? AND timestamp <= ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![start.timestamp_millis(), end.timestamp_millis()]).await;
 		if let Err(e) = res {
-			Self::rollback_concurrent(&conn).await?;
+			Self::rollback_after_error(&conn).await;
 			return Err(anyhow::anyhow!("Failed to delete measurements in range: {e}"));
 		}
 
@@ -1621,7 +1894,7 @@ impl Inputs for Database {
 
 			let res = conn.as_ref().execute(&bulk_sql, turso::params_from_iter(params)).await;
 			if let Err(e) = res {
-				Self::rollback_concurrent(&conn).await?;
+				Self::rollback_after_error(&conn).await;
 				return Err(anyhow::anyhow!("Failed to insert compressed measurements: {e}"));
 			}
 		}
@@ -1647,6 +1920,174 @@ impl Inputs for Database {
 
 /// Helper methods for dirty region tracking (not part of trait)
 impl Database {
+	/// A batch's identity for the queue dedupe: its measurements as stored (JSON) and
+	/// their MD5, the `batch_hash` column.
+	fn batch_identity(batch: &Batch) -> Result<(String, String)> {
+		let measurements_json = serde_json::to_string(&batch.measurements).map_err(|e| Error::DatabaseError(format!("Failed to serialize: {e}")))?;
+		let batch_hash = format!("{:x}", md5::compute(&measurements_json));
+		Ok((measurements_json, batch_hash))
+	}
+
+	/// The `batch_hash` a processed batch is stored under: the hash it was queued under,
+	/// when it came from the unprocessed queue, so that
+	/// [`insert_unprocessed_batch`](Inputs::insert_unprocessed_batch) recognises it. Processing
+	/// rewrites the measurements (level transform, analysis), so a hash of the processed
+	/// measurements would never match the batch the consumer rebuilds.
+	fn processed_batch_hash(batch: &Batch, measurements_json: &str) -> String {
+		batch.batch_hash().cloned().unwrap_or_else(|| format!("{:x}", md5::compute(measurements_json)))
+	}
+
+	/// Whether the `batches` table of the DB `conn` is open on (the unprocessed or the
+	/// processed batches) holds `batch_hash` for `aspect_id`: a point lookup on its
+	/// `(aspect_id, batch_hash)` index, read in `conn`'s open transaction if it has one,
+	/// else in a statement of its own.
+	async fn batch_hash_stored(conn: &turso::Connection, aspect_id: &AspectId, batch_hash: &str) -> Result<bool> {
+		let rows = conn.query("SELECT 1 FROM batches WHERE aspect_id = ? AND batch_hash = ? LIMIT 1", turso::params![aspect_id.as_uuid().to_string(), batch_hash.to_string()]).await;
+		Self::lookup_found(rows, "batches").await
+	}
+
+	/// Whether the processed batches DB `conn` is open on records `batch_hash` as extracted
+	/// (`extracted_batches`, which has no `aspect_id` column: the DB belongs to one
+	/// aspect): a point lookup on its `batch_hash` index, in a statement of its own.
+	async fn batch_hash_extracted(conn: &turso::Connection, batch_hash: &str) -> Result<bool> {
+		let rows = conn.query("SELECT 1 FROM extracted_batches WHERE batch_hash = ? LIMIT 1", turso::params![batch_hash.to_string()]).await;
+		Self::lookup_found(rows, "extracted_batches").await
+	}
+
+	/// Whether a point lookup in `table` found a row.
+	async fn lookup_found(rows: std::result::Result<turso::Rows, turso::Error>, table: &str) -> Result<bool> {
+		let failed = |e: turso::Error| Error::DatabaseError(format!("Failed to look up batch hash in {table}: {e}"));
+		Ok(rows.map_err(failed)?.next().await.map_err(failed)?.is_some())
+	}
+
+	/// Whether a batch with `batch_hash` is processed (in the processed batches) or was
+	/// extracted (recorded in `extracted_batches` when extraction deleted it), checked in
+	/// that order, each in a statement of its own on `processed`.
+	async fn processed_or_extracted(processed: &turso::Connection, aspect_id: &AspectId, batch_hash: &str) -> Result<Option<&'static str>> {
+		if Self::batch_hash_stored(processed, aspect_id, batch_hash).await? {
+			return Ok(Some("processed"));
+		}
+		Ok(Self::batch_hash_extracted(processed, batch_hash).await?.then_some("extracted"))
+	}
+
+	/// Insert `batch` into the unprocessed batches (`db`) unless its
+	/// `(aspect_id, batch_hash)` is already queued there, processed, or extracted
+	/// (`processed`, a connection to the processed batches DB with no open transaction),
+	/// and return whether it was inserted.
+	///
+	/// The checks follow a batch's way through the tables, each as of when it runs: the
+	/// queued check first, inside the insert's transaction, then the processed batches,
+	/// then the extracted ones. A batch moves forward by being written to the next table
+	/// no later than it is deleted from the previous one (`move_batches_to_processed`
+	/// inserts the processed batch before it deletes the queued one;
+	/// `remove_extracted_batches` records the hash in the transaction that deletes the
+	/// processed batch), so a batch that moves between two checks is still seen by the
+	/// later one. Checking in any other order could miss a moving batch in every table.
+	async fn queue_batch_unless_known(&self, aspect_id: &AspectId, batch: &Batch, db: &turso::Database, db_path: &str, processed: &turso::Connection) -> Result<bool> {
+		let (measurements_json, batch_hash) = Self::batch_identity(batch)?;
+		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
+		let known = match Self::batch_hash_stored(conn.as_ref(), aspect_id, &batch_hash).await {
+			Ok(true) => Ok(Some("queued")),
+			Ok(false) => Self::processed_or_extracted(processed, aspect_id, &batch_hash).await,
+			Err(e) => Err(e),
+		};
+		match known {
+			Ok(None) => {}
+			Ok(Some(state)) => {
+				let _ = Self::rollback_concurrent(&conn).await;
+				tracing::debug!("Batch {} for aspect {aspect_id} is already {state} (hash {batch_hash}); not queuing it again", batch.id());
+				return Ok(false);
+			}
+			Err(e) => {
+				let _ = Self::rollback_concurrent(&conn).await;
+				return Err(e);
+			}
+		}
+		self.insert_unprocessed_batch_row(&conn, aspect_id, batch, measurements_json, batch_hash).await?;
+		Self::commit_concurrent(&conn).await?;
+		Ok(true)
+	}
+
+	/// Queue `timestamps` again once their rows are committed (crash-consistency design,
+	/// S18).
+	///
+	/// Ingest queued them before inserting the rows (the write-ahead enqueue), so a queue
+	/// consumer that ran in between may have read them, built their windows without the
+	/// rows and dequeued them. Enqueuing again re-adds a dequeued timestamp, and moves a
+	/// still-queued one's `queued_at` past what that consumer read, so that its dequeue
+	/// leaves it (see [`UnbatchedEntry`]); either way the next run batches the rows.
+	///
+	/// It runs after the rows are committed, so like every post-commit step it is
+	/// best-effort and never fails the call (the client would retry it into duplicate
+	/// rows). An MVCC write-write conflict with a consumer dequeuing the same entries is
+	/// retried, as by [`enqueue_retrying`](Self::enqueue_retrying); a failure that outlasts
+	/// the retries is logged, and the rows stay covered by the write-ahead entry unless a
+	/// consumer dequeued it during this call.
+	async fn requeue_committed(&self, aspect_id: &AspectId, timestamps: &[chrono::DateTime<chrono::Utc>]) {
+		if let Err(e) = self.enqueue_retrying(aspect_id, timestamps).await {
+			tracing::warn!("Could not queue {} committed timestamps of aspect {aspect_id} again; they stay queued unless a batch consumer ran during this ingest: {e}", timestamps.len());
+		}
+	}
+
+	/// Enqueue `timestamps`, retrying an MVCC write-write conflict with another write to the
+	/// same queue entries (see [`QUEUE_WRITE_ATTEMPTS`]): a consumer's dequeue, or another
+	/// ingest queuing the same timestamps. The enqueue is an upsert, so unlike the
+	/// `INSERT OR IGNORE` it replaced it writes an entry that is already queued, and such a
+	/// conflict would otherwise fail the call. Retrying is safe: a failed attempt wrote
+	/// nothing.
+	async fn enqueue_retrying(&self, aspect_id: &AspectId, timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
+		retry_queue_write("Enqueuing unbatched measurements", || self.enqueue_unbatched_measurements(aspect_id, timestamps)).await
+	}
+
+	/// One transaction of [`dequeue_unbatched_entries`](Inputs::dequeue_unbatched_entries):
+	/// delete each of `entries` that still has the `queued_at` it was read with. A
+	/// conflict is returned as an [`Error::TransientMvccError`].
+	async fn dequeue_entry_chunk(&self, aspect_id: &AspectId, entries: &[UnbatchedEntry]) -> Result<()> {
+		let conn = Self::begin_concurrent(self.metadata(), self.metadata_path(), Some(self.cache.clone())).await?;
+		let aspect_id_str = aspect_id.as_uuid().to_string();
+
+		let deleted = async {
+			let mut delete = conn.as_ref().prepare("DELETE FROM unbatched_measurements WHERE aspect_id = ? AND data_timestamp = ? AND queued_at = ?").await?;
+			for entry in entries {
+				delete.execute(turso::params![aspect_id_str.clone(), entry.data_timestamp.timestamp_millis(), entry.queued_at]).await?;
+			}
+			Ok::<_, turso::Error>(())
+		}
+		.await;
+		if let Err(e) = deleted {
+			let _ = Self::rollback_concurrent(&conn).await;
+			return Err(queue_write_error("Failed to dequeue unbatched measurements", &e));
+		}
+
+		commit_queue_write(&conn, "Failed to dequeue unbatched measurements").await
+	}
+
+	/// INSERT one unprocessed batch row inside `conn`'s open transaction. On error the
+	/// transaction is rolled back.
+	async fn insert_unprocessed_batch_row(&self, conn: &Connection, aspect_id: &AspectId, batch: &Batch, measurements_json: String, batch_hash: String) -> Result<()> {
+		let batch_id = batch.id().to_string();
+		// Simple INSERT - no unique constraints with MVCC
+		let insert_sql = r"
+			INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		";
+
+		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
+			Ok(size) => size,
+			Err(e) => {
+				let _ = Self::rollback_concurrent(conn).await;
+				return Err(anyhow::anyhow!("Batch size conversion error: {e}"));
+			}
+		};
+
+		let res = conn.as_ref().execute(insert_sql, turso::params![batch_id.clone(), aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string(), batch_metadata_size, format!("{}", batch.metadata.resolution), measurements_json, batch_hash, "unprocessed", chrono::Utc::now().timestamp_millis()]).await;
+		if let Err(e) = res {
+			tracing::warn!("Failed to insert unprocessed batch {batch_id}: {e}");
+			Self::rollback_after_error(conn).await;
+			return Err(anyhow::anyhow!("Failed to insert unprocessed batch: {e}"));
+		}
+		Ok(())
+	}
+
 	/// Check if a timestamp falls within a previously compressed range and mark it as dirty if so.
 	///
 	/// This is called after inserting measurements to track when new data is inserted
@@ -1756,5 +2197,200 @@ impl Database {
 		}
 
 		Ok(())
+	}
+}
+
+/// A dictionary's registration: its `dictionary_metadata` row and the
+/// `dictionary_constraints` and `dictionary_variabilities` rows keyed by its id, all in the
+/// dictionary's own `<aspect>/dictionaries/<name>.db`.
+impl Database {
+	/// Refuse constraints that [`get_dictionary_metadata`](crate::Outputs::get_dictionary_metadata)
+	/// could not load back: the step interpolation is stored as the [`Spline`](splimes::Spline)'s
+	/// text, and splimes validates it again as it parses it.
+	///
+	/// # Errors
+	///
+	/// `Invalid step interpolation for dictionary '<name>': <reason>`, e.g. `invalid polynomial
+	/// degree 9: must be between 1 and 8`.
+	pub(crate) fn check_dictionary_constraints(dictionary_name: &str, constraints: &DictionaryConstraints) -> Result<()> {
+		if let Some(steps) = constraints.steps() {
+			steps.interpolation().validate().map_err(|e| anyhow::anyhow!("Invalid step interpolation for dictionary '{dictionary_name}': {e}"))?;
+		}
+		Ok(())
+	}
+
+	/// One attempt of [`register_dictionary_if_absent`](Inputs::register_dictionary_if_absent).
+	async fn register_dictionary_if_absent_once(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<bool> {
+		let aspect = self.get_aspect(aspect_id).await?;
+		let db_path = Self::aspect_dictionaries_db_path(self.name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
+		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
+		Aspect::ensure_dictionary_tables(&db).await?;
+		let conn = Self::begin_concurrent(&db, &self.name, Some(self.cache.clone())).await?;
+
+		// Check again in this transaction: a registration committed since the caller read
+		// none is kept. Only rows without constraints are replaced.
+		let registered = match Self::has_complete_registration(&conn, dictionary_name).await {
+			Ok(true) => Ok(false),
+			Ok(false) => Self::replace_dictionary_registration(&conn, &metadata.id, dictionary_name, &metadata.description, &metadata.constraints).await.map(|()| true),
+			Err(e) => Err(e),
+		};
+		let registered = match registered {
+			Ok(registered) => registered,
+			Err(e) => {
+				Self::rollback_after_error(&conn).await;
+				let message = format!("Failed to register dictionary '{dictionary_name}': {e}");
+				return Err(e.context(message));
+			}
+		};
+		Self::commit_concurrent(&conn).await?;
+		if registered {
+			self.cache.lock().await.invalidate_generation(&Self::dictionary_metadata_cache_key(aspect_id, dictionary_name)).await;
+			let log = format!("Registered dictionary '{dictionary_name}' for aspect {aspect_id}");
+			let _ = self.record_transaction(&log).await?;
+		}
+		Ok(registered)
+	}
+
+	/// Whether `name` has a complete registration, a `dictionary_metadata` row with a
+	/// `dictionary_constraints` row, on `conn`, a transaction on the dictionary's database.
+	/// Whether its stored values parse does not matter here.
+	///
+	/// # Errors
+	///
+	/// A failed query.
+	pub(crate) async fn has_complete_registration(conn: &Connection, name: &str) -> Result<bool> {
+		let mut rows = conn.as_ref().query("SELECT 1 FROM dictionary_metadata m JOIN dictionary_constraints c ON c.dictionary_id = m.id WHERE m.name = ? LIMIT 1", turso::params![name]).await?;
+		Ok(rows.next().await?.is_some())
+	}
+
+	/// Write `name`'s registration on `conn`, a `BEGIN CONCURRENT` transaction on the
+	/// dictionary's database that the caller commits, or rolls back on an error.
+	///
+	/// The tables have no unique constraint (no indexes under MVCC), so this keeps a name to
+	/// one registration itself: it deletes every metadata row with that name, and the
+	/// constraints and variabilities of each, before it inserts the new ones. A dictionary
+	/// without steps stores `NULL` in both step columns. Variabilities are stored one row
+	/// each, in order; an empty list stores none, and so reads back as `None`.
+	///
+	/// # Errors
+	///
+	/// The first statement that fails.
+	pub(crate) async fn replace_dictionary_registration(conn: &Connection, id: &DictionaryId, name: &str, description: &str, constraints: &DictionaryConstraints) -> Result<()> {
+		let mut replaced = Vec::new();
+		let mut rows = conn.as_ref().query("SELECT id FROM dictionary_metadata WHERE name = ?", turso::params![name]).await?;
+		while let Some(row) = rows.next().await? {
+			replaced.push(row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Dictionary ID is not text".to_string()))?.clone());
+		}
+		drop(rows);
+		for old_id in replaced {
+			conn.as_ref().execute("DELETE FROM dictionary_constraints WHERE dictionary_id = ?", turso::params![old_id.as_str()]).await?;
+			conn.as_ref().execute("DELETE FROM dictionary_variabilities WHERE dictionary_id = ?", turso::params![old_id.as_str()]).await?;
+		}
+		conn.as_ref().execute("DELETE FROM dictionary_metadata WHERE name = ?", turso::params![name]).await?;
+
+		let id = id.as_uuid().to_string();
+		conn.as_ref().execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![id.as_str(), name, description, chrono::Utc::now().timestamp_millis()]).await?;
+
+		let steps_count = constraints.steps().as_ref().map(|s| s.count().to_string());
+		let steps_interpolation = constraints.steps().as_ref().map(|s| s.interpolation().to_string());
+		conn.as_ref().execute("INSERT INTO dictionary_constraints (dictionary_id, steps_count, steps_interpolation) VALUES (?, ?, ?)", turso::params![id.as_str(), steps_count, steps_interpolation]).await?;
+
+		for variability in constraints.variabilities().iter().flatten() {
+			conn.as_ref().execute("INSERT INTO dictionary_variabilities (dictionary_id, variability_type, variability_value) VALUES (?, ?, ?)", turso::params![id.as_str(), variability.kind(), variability.variability().value().to_string()]).await?;
+		}
+		Ok(())
+	}
+}
+
+/// How long [`retry_once_if_transient`] waits before its second attempt, in milliseconds:
+/// a random delay in this range, like `begin_concurrent`'s first backoff.
+const RETRY_DELAY_MS: std::ops::RangeInclusive<u64> = 10..=50;
+
+/// Run `attempt`, and once more if it fails with a transient MVCC error
+/// ([`is_transient_mvcc_error`]): a write-write conflict or a stale snapshot, after which
+/// the transaction is gone and a new one can succeed. The second attempt's result is
+/// returned as it is.
+///
+/// It waits a short random delay ([`RETRY_DELAY_MS`]) first. A write-write conflict also
+/// fires against another transaction's uncommitted write, and a second attempt made at
+/// once, while that writer is still open, would most likely conflict again; after the
+/// delay it usually sees the winner's commit (and `register_dictionary_if_absent` then
+/// finds its registration).
+async fn retry_once_if_transient<T, F, Fut>(dictionary_name: &str, mut attempt: F) -> Result<T>
+where
+	F: FnMut() -> Fut + Send,
+	Fut: Future<Output = Result<T>> + Send,
+	T: Send,
+{
+	match attempt().await {
+		Err(e) if is_transient_mvcc_error(&e) => {
+			tracing::debug!(error = %e, dictionary = dictionary_name, "Registering the dictionary conflicted with another write; trying once more");
+			tokio::time::sleep(std::time::Duration::from_millis(fastrand::u64(RETRY_DELAY_MS))).await;
+			attempt().await
+		}
+		result => result,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use super::*;
+
+	fn conflict() -> anyhow::Error {
+		anyhow::Error::new(turso::Error::Error("Write-write conflict".to_string())).context("Failed to register dictionary 'd': Write-write conflict")
+	}
+
+	#[tokio::test]
+	async fn a_transient_failure_is_tried_once_more_after_a_delay() {
+		let attempts = AtomicUsize::new(0);
+		let started = std::time::Instant::now();
+		let result = retry_once_if_transient("d", || async {
+			if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+				Err(conflict())
+			} else {
+				Ok(true)
+			}
+		})
+		.await;
+		assert!(result.expect("the second attempt succeeds"));
+		assert_eq!(attempts.load(Ordering::SeqCst), 2);
+		assert!(started.elapsed() >= std::time::Duration::from_millis(*RETRY_DELAY_MS.start()), "it waited before trying again: {:?}", started.elapsed());
+	}
+
+	#[tokio::test]
+	async fn only_once_and_only_for_a_transient_failure() {
+		let attempts = AtomicUsize::new(0);
+		let err = retry_once_if_transient("d", || async {
+			attempts.fetch_add(1, Ordering::SeqCst);
+			Err::<bool, _>(conflict())
+		})
+		.await
+		.expect_err("still conflicting");
+		assert!(is_transient_mvcc_error(&err), "the second conflict is returned: {err:#}");
+		assert_eq!(attempts.load(Ordering::SeqCst), 2, "tried twice, not more");
+
+		let attempts = AtomicUsize::new(0);
+		retry_once_if_transient("d", || async {
+			attempts.fetch_add(1, Ordering::SeqCst);
+			Err::<bool, _>(anyhow::anyhow!("no such table: dictionary_metadata"))
+		})
+		.await
+		.expect_err("not transient");
+		assert_eq!(attempts.load(Ordering::SeqCst), 1, "a failure that is not transient is not retried");
+	}
+
+	/// `WEFT_EXTRACTED_BATCH_RETENTION_SECS` takes a positive whole number of seconds;
+	/// anything else keeps the default, so a typo cannot switch the record off (or make
+	/// extraction delete every record as soon as it is written).
+	#[test]
+	fn the_extracted_batch_retention_is_a_positive_number_of_seconds() {
+		assert_eq!(parse_extracted_batch_retention(None), DEFAULT_EXTRACTED_BATCH_RETENTION_SECS);
+		assert_eq!(parse_extracted_batch_retention(Some("3600")), 3600);
+		assert_eq!(parse_extracted_batch_retention(Some(" 600 ")), 600);
+		for invalid in ["", "0", "-5", "1.5", "2d", "forever"] {
+			assert_eq!(parse_extracted_batch_retention(Some(invalid)), DEFAULT_EXTRACTED_BATCH_RETENTION_SECS, "{invalid:?}");
+		}
 	}
 }

@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Stage the release archives and their checksums.
+#
+#   scripts/release/stage.sh archive <target> <label> <bin-dir> <src-dir> <out-dir>
+#       Packs weft-server, weft-tui and weft-bench from <bin-dir>, with the files in
+#       DOCS from <src-dir>, into <out-dir>/weftdb-<label>-<target>.tar.gz (a .zip for a
+#       Windows target), and writes <archive>.sha256 next to it.
+#
+#   scripts/release/stage.sh sums <dist-dir> <label> <target>...
+#       Requires exactly weftdb-<label>-<target> for each <target> in <dist-dir> and no
+#       other archive, checks each against its .sha256, then writes
+#       <dist-dir>/SHA256SUMS over all of them and checks that too.
+#
+# <label> is a release tag (vX.Y.Z or vX.Y.Z-rc.N), or for a dry run
+# v<version>-dryrun-<12-hex commit>, with -dev appended for a dev-profile build, so a
+# dry run's archives can never be named like a release's.
+#
+# Runs on Linux, macOS and Windows (Git Bash). The checksum files use the
+# "<sha256>  <file name>" format that `sha256sum -c` and `shasum -a 256 -c` read.
+set -euo pipefail
+# Byte-wise regexes: in a locale like en_US.UTF-8, bash's [0-9] also matches other
+# scripts' digits (v１.2.3 passes), so every pattern below is matched in the C locale.
+export LC_ALL=C
+
+TARGET_RE='^[a-z0-9_]+(-[a-z0-9_]+){2,3}$'
+TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+DRY_RUN_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?-dryrun-[0-9a-f]{12}(-dev)?$'
+BINARIES=(weft-server weft-tui weft-bench)
+# What every archive carries besides the binaries, as <path in the source tree>:<name in
+# the archive>. Apache-2.0 section 4: the binaries contain code adapted from Chimp
+# (weft-physical-type) and DDSketch (weft-reduce), so both crates' notices ship. Both
+# files are named THIRD-PARTY-NOTICES, so each is renamed after its crate.
+DOCS=(
+	README.md:README.md
+	LICENSE-MIT:LICENSE-MIT
+	LICENSE-APACHE:LICENSE-APACHE
+	NOTICE:NOTICE
+	weft-physical-type/THIRD-PARTY-NOTICES:THIRD-PARTY-NOTICES-weft-physical-type
+	weft-reduce/THIRD-PARTY-NOTICES:THIRD-PARTY-NOTICES-weft-reduce
+)
+
+fail() {
+	if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+		printf '::error title=release stage::%s\n' "$*"
+	else
+		printf 'stage: %s\n' "$*" >&2
+	fi
+	exit 1
+}
+
+usage() {
+	fail "usage: stage.sh archive <target> <label> <bin-dir> <src-dir> <out-dir> | stage.sh sums <dist-dir> <label> <target>..."
+}
+
+check_label() {
+	[[ $1 =~ $TAG_RE || $1 =~ $DRY_RUN_RE ]] ||
+		fail "not a release tag or a dry-run label: $(printf '%q' "$1")"
+}
+
+# archive_name <label> <target>: the archive's file name.
+archive_name() {
+	if [[ $2 == *-windows-* ]]; then
+		printf 'weftdb-%s-%s.zip\n' "$1" "$2"
+	else
+		printf 'weftdb-%s-%s.tar.gz\n' "$1" "$2"
+	fi
+}
+
+sha256_of() {
+	local digest
+	if command -v sha256sum >/dev/null 2>&1; then
+		digest=$(sha256sum -- "$1")
+	else
+		digest=$(shasum -a 256 -- "$1")
+	fi
+	# Some sha256sum builds prefix the digest with "\" or the name with "*".
+	digest=${digest#\\}
+	printf '%s\n' "${digest%% *}"
+}
+
+# check_line <dir> <"digest  name" line>: the named file in <dir> must have that digest.
+check_line() {
+	local dir=$1 line=$2 want name got
+	want=${line%% *}
+	name=${line#*  }
+	[[ $want =~ ^[0-9a-f]{64}$ && $name != "$line" && $name != */* ]] ||
+		fail "malformed checksum line: $line"
+	[[ -f $dir/$name ]] || fail "$name is listed but missing"
+	got=$(sha256_of "$dir/$name")
+	[[ $got == "$want" ]] || fail "$name: sha256 is $got, expected $want"
+}
+
+archive() {
+	[[ $# -eq 5 ]] || usage
+	local target=$1 label=$2 bin_dir=$3 src_dir=$4 out_dir=$5 exe='' format name work f from to
+	[[ $target =~ $TARGET_RE ]] || fail "not a target triple: $(printf '%q' "$target")"
+	check_label "$label"
+	[[ $target == *-windows-* ]] && exe=.exe
+	format=tar.gz
+	[[ $target == *-windows-* ]] && format=zip
+
+	name="weftdb-$label-$target"
+	mkdir -p "$out_dir"
+	out_dir=$(cd "$out_dir" && pwd)
+	work=$(mktemp -d)
+	# shellcheck disable=SC2064 # expand now: $work is local
+	trap "rm -rf '$work'" EXIT
+	mkdir "$work/$name"
+
+	for f in "${BINARIES[@]}"; do
+		[[ -f $bin_dir/$f$exe ]] || fail "missing binary: $bin_dir/$f$exe"
+		cp "$bin_dir/$f$exe" "$work/$name/"
+	done
+	for f in "${DOCS[@]}"; do
+		from=${f%%:*}
+		to=${f#*:}
+		[[ -f $src_dir/$from ]] || fail "missing file: $src_dir/$from"
+		[[ ! -e $work/$name/$to ]] || fail "two files would be packed as $to"
+		cp "$src_dir/$from" "$work/$name/$to"
+	done
+
+	# Archive from inside the scratch dir with relative paths, so the archive holds a
+	# single top-level directory and no Windows path translation is involved.
+	if [[ $format == zip ]]; then
+		command -v 7z >/dev/null 2>&1 || fail "7z is needed to build a zip"
+		(cd "$work" && 7z a -tzip -bd -bso0 "$name.zip" "$name")
+	else
+		# COPYFILE_DISABLE keeps macOS tar from adding AppleDouble ._ entries.
+		(cd "$work" && COPYFILE_DISABLE=1 tar -czf "$name.tar.gz" "$name")
+	fi
+	mv "$work/$name.$format" "$out_dir/"
+	printf '%s  %s\n' "$(sha256_of "$out_dir/$name.$format")" "$name.$format" \
+		>"$out_dir/$name.$format.sha256"
+
+	echo "staged $out_dir/$name.$format"
+	cat "$out_dir/$name.$format.sha256"
+}
+
+sums() {
+	[[ $# -ge 3 ]] || usage
+	local dist=$1 label=$2 target line f
+	shift 2
+	[[ -d $dist ]] || fail "no such directory: $dist"
+	check_label "$label"
+	local -a archives=() all=()
+	for target in "$@"; do
+		[[ $target =~ $TARGET_RE ]] || fail "not a target triple: $(printf '%q' "$target")"
+		f=$(archive_name "$label" "$target")
+		[[ -f $dist/$f ]] || fail "missing the archive for $target: $f"
+		archives+=("$f")
+	done
+
+	shopt -s nullglob
+	all=("$dist"/*.tar.gz "$dist"/*.zip)
+	shopt -u nullglob
+	[[ ${#all[@]} -eq ${#archives[@]} ]] ||
+		fail "found ${#all[@]} archives for ${#archives[@]} targets: ${all[*]##*/}"
+
+	for f in "${archives[@]}"; do
+		[[ -f $dist/$f.sha256 ]] || fail "missing $f.sha256"
+		IFS= read -r line <"$dist/$f.sha256" || fail "empty $f.sha256"
+		[[ ${line#*  } == "$f" ]] || fail "$f.sha256 names ${line#*  }"
+		check_line "$dist" "$line"
+	done
+
+	: >"$dist/SHA256SUMS"
+	while IFS= read -r f; do
+		printf '%s  %s\n' "$(sha256_of "$dist/$f")" "$f" >>"$dist/SHA256SUMS"
+	done < <(printf '%s\n' "${archives[@]}" | LC_ALL=C sort)
+
+	while IFS= read -r line; do
+		check_line "$dist" "$line"
+	done <"$dist/SHA256SUMS"
+	cat "$dist/SHA256SUMS"
+}
+
+[[ $# -ge 1 ]] || usage
+command=$1
+shift
+case $command in
+archive) archive "$@" ;;
+sums) sums "$@" ;;
+*) usage ;;
+esac

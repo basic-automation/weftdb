@@ -13,6 +13,12 @@
 //!           --precision s --spline cubic --resolution minutes --reps 10
 //! ```
 //!
+//! Before an interpolation run (line protocol or `--synthetic`) it calibrates the
+//! engine's backends once, as `weft-server` does at startup, so the numbers are the
+//! ones the server would produce on this machine; `--no-gpu-calibrate` skips it. The
+//! calibration and the `Backend::Auto` thresholds it set are printed and recorded in
+//! the report beside the hardware.
+//!
 //! It deliberately stays dependency-free (hand-rolled arg parsing, no `clap`):
 //! `weft-bench` is a leaf crate and the CLI surface is small, so the parser lives
 //! here as a pure, unit-tested function rather than pulling a new dependency into
@@ -25,7 +31,7 @@ use std::{path::PathBuf, process::ExitCode};
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -68,6 +74,24 @@ fn main() -> ExitCode {
 	}
 }
 
+/// Calibrate the interpolation backends as `weft-server` does at startup (unless
+/// `--no-gpu-calibrate`), print what was found, and return it for the report.
+///
+/// Runs on tokio's blocking pool, off the async runtime: the calibration is blocking and
+/// takes several seconds. Like the server, a panicking calibration does not stop the
+/// run; it leaves splimes' defaults, and the report says so.
+async fn calibrate_engine(enabled: bool) -> EngineMetadata {
+	if enabled {
+		println!("engine: calibrating the interpolation backends, as weft-server does at startup (several seconds; --no-gpu-calibrate skips it)");
+	}
+	let engine = tokio::task::spawn_blocking(move || if enabled { engine::calibrate() } else { EngineMetadata::uncalibrated() }).await.unwrap_or_else(|err| EngineMetadata::new(CalibrationStatus::Failed, None, Some(format!("calibration aborted: {err}")), splimes::auto_thresholds()));
+	println!("engine: {}; {}", engine.describe_calibration(), engine.describe_thresholds());
+	if let Some(gpu) = &engine.gpu {
+		println!("engine: GPU {gpu}");
+	}
+	engine
+}
+
 /// Load the dataset, run the selected workload, and persist the report.
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	// The point-lookup workload is a parallel path: it seals a columnar segment from
@@ -103,6 +127,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 		InterpolationProfile::from_line_protocol(profile_name, &payload, field, cli.precision, cli.spline, cli.resolution).map_err(|e| anyhow::anyhow!("cannot build a profile from {}: {e}", input.display()))?
 	};
 
+	// Calibrate before anything is timed, once the input has loaded (so a bad input fails
+	// at once). Only the interpolation workloads run splimes, so only they calibrate.
+	let engine = calibrate_engine(cli.gpu_calibrate).await;
+
 	// WeftDB is always run; under `--compare` the full portable-baseline suite runs
 	// too — linear (fair-protocol class C) and forward-fill/LOCF (class B, the
 	// in-process mirror of native TSDB `FILL(previous)`) — so the report carries a
@@ -117,7 +145,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 		results.push(forward_fill);
 	}
 
-	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(Some(engine));
 	let report = BenchReport::with_results(metadata, results);
 	finish(&cli, &report)
 }
@@ -167,7 +195,8 @@ fn run_range_fetch_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		run_range_fetch_on(&profile, &timestamps, &values, weft_physical_type::TimeUnit::Seconds, generation_ns, cli.reps)
 	} else {
 		run_range_fetch(&profile, cli.reps)
-	}.map_err(|e| anyhow::anyhow!("range-fetch benchmark run failed: {e}"))?;
+	}
+	.map_err(|e| anyhow::anyhow!("range-fetch benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -267,6 +296,13 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 	// cores, RAM — lands in the artifact and the HTML report).
 	if let Some(cpu) = &report.metadata.cpu_model {
 		println!("  cpu          : {cpu}");
+	}
+	// How the interpolation backends were chosen (interpolation workloads only).
+	if let Some(engine) = &report.metadata.engine {
+		println!("  engine       : {}; {}", engine.describe_calibration(), engine.describe_thresholds());
+		if let Some(gpu) = &engine.gpu {
+			println!("  gpu          : {gpu}");
+		}
 	}
 	// Synthetic runs record which analytic ground-truth shape was generated; a
 	// line-protocol run has none, so the line is skipped.
@@ -368,6 +404,8 @@ impl CsvKnobs {
 /// (`input` + `field`) or the seeded `synthetic` generator. Synthetic mode is the
 /// only one with a known analytic ground truth, so it is the only one that yields
 /// accuracy metrics.
+// One field per on/off command-line flag; an enum per flag would only rename them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 struct Cli {
 	/// Path to the `.lp` / TSBS line-protocol input file (line-protocol mode).
@@ -443,6 +481,9 @@ struct Cli {
 	compare: bool,
 	/// Also write a human-readable HTML report alongside the JSON artifact.
 	html: bool,
+	/// Calibrate the interpolation backends before an interpolation run, as
+	/// `weft-server` does at startup (`--no-gpu-calibrate` turns it off).
+	gpu_calibrate: bool,
 }
 
 /// Which input mode / workload a run drives. Exactly one is selected per
@@ -523,6 +564,7 @@ impl Cli {
 		let mut name: Option<String> = None;
 		let mut compare = false;
 		let mut html = false;
+		let mut gpu_calibrate = true;
 
 		let mut iter = args.into_iter();
 		while let Some(token) = iter.next() {
@@ -582,6 +624,7 @@ impl Cli {
 				"--name" => name = Some(take_value(&key)?),
 				"-c" | "--compare" => compare = true,
 				"--html" => html = true,
+				"--no-gpu-calibrate" => gpu_calibrate = false,
 				other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
 				// A bare positional is taken as the input path if one is not set yet.
 				other => {
@@ -595,9 +638,9 @@ impl Cli {
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
-		validate_mode(mode, input.as_ref(), field.as_deref(), compare)?;
+		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
 	}
 }
 
@@ -628,12 +671,13 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 /// conflicting combination.
 ///
 /// The storage workloads (point-lookup, range-fetch, compression) seal their own
-/// corpus, so they reject every interpolation input flag (and `--compare`, which has
-/// no meaning for them); synthetic mode generates its own data, so an input file or
+/// corpus, so they reject every interpolation input flag (and `--compare` and
+/// `--no-gpu-calibrate`, which have no meaning for them: they never interpolate, so
+/// they never calibrate); synthetic mode generates its own data, so an input file or
 /// `--field` projection is a conflict; line-protocol mode requires both `--input` and
 /// `--field`. The "exactly one workload mode" check is the caller's, which keeps this
 /// free of the mode-selector booleans.
-fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, compare: bool) -> Result<(), String> {
+fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, compare: bool, gpu_calibrate: bool) -> Result<(), String> {
 	if let Some(mode_flag) = self_generating_mode_flag(mode) {
 		if input.is_some() {
 			return Err(format!("`{mode_flag}` cannot be combined with an input file"));
@@ -643,6 +687,9 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 		}
 		if compare {
 			return Err(format!("`--compare` has no meaning in `{mode_flag}` mode"));
+		}
+		if !gpu_calibrate {
+			return Err(format!("`--no-gpu-calibrate` has no meaning in `{mode_flag}` mode (it does not interpolate, so it never calibrates)"));
 		}
 		return Ok(());
 	}
@@ -680,7 +727,9 @@ fn parse_precision(s: &str) -> Result<TimestampPrecision, String> {
 }
 
 /// Parse a spline token. `polynomial`/`poly` accepts an optional `:<degree>`
-/// suffix (e.g. `poly:4`); without one it defaults to degree 3.
+/// suffix (e.g. `poly:4`); without one it defaults to degree 3. The degree must be one
+/// splimes accepts (1 to [`splimes::MAX_POLYNOMIAL_DEGREE`]), so a bad one is an argument
+/// error rather than a failed run.
 fn parse_spline(s: &str) -> Result<Spline, String> {
 	let lower = s.to_ascii_lowercase();
 	if let Some(rest) = lower.strip_prefix("polynomial").or_else(|| lower.strip_prefix("poly")) {
@@ -690,7 +739,9 @@ fn parse_spline(s: &str) -> Result<Spline, String> {
 			let digits = rest.strip_prefix(':').unwrap_or(rest);
 			digits.parse::<usize>().map_err(|_| format!("invalid polynomial degree in `{s}`"))?
 		};
-		return Ok(Spline::Polynomial(degree, None));
+		let spline = Spline::Polynomial(degree, None);
+		spline.validate().map_err(|e| format!("invalid --spline `{s}`: {e}"))?;
+		return Ok(spline);
 	}
 	match lower.as_str() {
 		"linear" => Ok(Spline::Linear),
@@ -924,7 +975,8 @@ SYNTHETIC OPTIONS (with --synthetic):
 
 OPTIONS:
         --precision <P>      Timestamp precision: ns|us|ms|s         [default: ns]
-        --spline <S>         Spline: linear|quadratic|cubic|poly[:N] [default: cubic]
+        --spline <S>         Spline: linear|quadratic|cubic|poly[:N], N in 1..=8
+                                                                [default: cubic]
         --resolution <R>     Output grid: ns|us|ms|s|m|h|d|w|mo|y    [default: s]
         --reps <N>           Timed repetitions (>0)                  [default: 10]
         --out-dir <DIR>      Report output directory          [default: reports/json]
@@ -933,6 +985,12 @@ OPTIONS:
                              forward-fill) for comparison
         --html               Also write a human-readable HTML report alongside
                              the JSON artifact
+        --no-gpu-calibrate   Don't calibrate the interpolation backends first. By
+                             default an interpolation run calls splimes::calibrate()
+                             once (several seconds), as weft-server does at startup,
+                             so Backend::Auto uses the GPU and rayon where they are
+                             faster on this machine; the calibration and thresholds
+                             are printed and recorded in the report
     -h, --help               Print this help
 
 The report is written as <out-dir>/<profile>__<adapters>.json (e.g.
@@ -1241,6 +1299,32 @@ mod tests {
 		assert_eq!(parse_spline("polynomial:2").unwrap(), Spline::Polynomial(2, None));
 		assert!(parse_spline("poly:x").is_err());
 		assert!(parse_spline("bezier").is_err());
+	}
+
+	#[test]
+	fn polynomial_degree_is_validated_at_argument_parsing() {
+		// splimes accepts degrees 1 to 8; anything else is an argument error naming the
+		// limit, not a run that fails in the engine.
+		assert_eq!(parse_spline("poly:1").unwrap(), Spline::Polynomial(1, None));
+		assert_eq!(parse_spline("poly:8").unwrap(), Spline::Polynomial(8, None));
+		for bad in ["poly:0", "poly:9", "polynomial:100"] {
+			let err = parse_spline(bad).expect_err(bad);
+			assert!(err.contains(&format!("invalid --spline `{bad}`")) && err.contains("must be between 1 and 8"), "{bad}: {err}");
+		}
+		let err = run_cli(&["--synthetic", "--spline", "poly:9"]).unwrap_err();
+		assert!(err.contains("must be between 1 and 8"), "{err}");
+	}
+
+	#[test]
+	fn gpu_calibration_is_on_by_default_and_can_be_turned_off() {
+		assert!(expect_run(&["--synthetic"]).gpu_calibrate, "an interpolation run calibrates by default");
+		assert!(!expect_run(&["--synthetic", "--no-gpu-calibrate"]).gpu_calibrate);
+		assert!(!expect_run(&["--input", "data.lp", "--field", "usage", "--no-gpu-calibrate"]).gpu_calibrate);
+		// The storage workloads never interpolate, so they never calibrate and reject the flag.
+		for mode in ["--point-lookup", "--range-fetch", "--compression", "--downsample"] {
+			let err = run_cli(&[mode, "--no-gpu-calibrate"]).unwrap_err();
+			assert!(err.contains("`--no-gpu-calibrate` has no meaning"), "{mode}: {err}");
+		}
 	}
 
 	#[test]
