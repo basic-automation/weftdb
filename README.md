@@ -1457,7 +1457,11 @@ What it does today:
   `experimental-codecs` feature, which only `weft-bench` enables.
 - **Reports** — a `BenchReport` JSON artifact (run metadata + a best-effort
   hardware probe: CPU model, cores, RAM, and the kind/file system/mount of the disk under the working directory) under `reports/json/`, plus a
-  self-contained **HTML** view (`--html`) with the most-accurate row highlighted.
+  self-contained **HTML** view (`--html`) with the most-accurate row highlighted, and a flat
+  **Parquet** results table (`--parquet`, same stem): one row per result with the run metadata
+  repeated (machine, GPU and driver, workload, latency percentiles, throughput, timing,
+  correctness, nullable accuracy and storage columns), so a directory of runs reads as one
+  dataset in DuckDB, Polars or Grafana.
 - **The engine the server runs** — an interpolation run first calls
   `splimes::calibrate()` once, as `weft-server` does at startup (skipping a
   CPU/software adapter the same way), so `Backend::Auto` uses rayon and the GPU

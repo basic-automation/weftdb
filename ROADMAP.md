@@ -182,7 +182,8 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
   `metadata.engine` names the adapter (`gpu`, schema v16) and now its driver (`gpu_driver`, schema
   v20, from splimes' `GpuInfo::driver`). Verified live: `NVIDIA GeForce RTX 4070 Ti SUPER (vulkan,
   discrete; f64 shaders: yes)`, driver `NVIDIA 610.57.04`.
-- [ ] Report surfaces beyond JSON/HTML — Parquet / Grafana dashboards
+- [x] **DONE (2026-10-09) — Parquet report surface:** `--parquet` writes a flat results table (one row per result, run metadata repeated, nullable accuracy/storage) beside the JSON, through `weft-arrow`'s writer.
+- [ ] Report surfaces beyond JSON/HTML/Parquet — Grafana dashboards (the Parquet table is their natural source)
 - [ ] Anti-Goodhart (Phase 1.3) — publish negative results + WeftDB-losing workloads; benchmark code separate from engine code; run customer-supplied workloads; README policy line *("WeftDB benchmarks guide real engineering decisions, not synthetic wins")* — policy line + the sawtooth negative finding shipped; the publication pipeline is open
 
 ### Phase 2 — Benchmark-grade server/API · *Very high*

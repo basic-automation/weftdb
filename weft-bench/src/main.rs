@@ -301,9 +301,21 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 		None
 	};
 
+	// And optionally the flat results table (same stem, `.parquet`), one row per result.
+	let parquet_path = if cli.parquet {
+		let path = out_path.with_extension("parquet");
+		weft_bench::parquet_report::write_parquet(report, &path)?;
+		Some(path)
+	} else {
+		None
+	};
+
 	print_summary(report, &out_path);
 	if let Some(path) = &html_path {
 		println!("  html report  : {}", path.display());
+	}
+	if let Some(path) = &parquet_path {
+		println!("  parquet table: {}", path.display());
 	}
 
 	// The run is honest about its own verdict: a correctness failure is a non-zero
@@ -514,6 +526,8 @@ struct Cli {
 	compare: bool,
 	/// Also write a human-readable HTML report alongside the JSON artifact.
 	html: bool,
+	/// Also write the flat Parquet results table beside the JSON artifact.
+	parquet: bool,
 	/// Calibrate the interpolation backends before an interpolation run, as
 	/// `weft-server` does at startup (`--no-gpu-calibrate` turns it off).
 	gpu_calibrate: bool,
@@ -596,7 +610,7 @@ impl Cli {
 		let mut out_dir = PathBuf::from("reports").join("json");
 		let mut name: Option<String> = None;
 		let mut compare = false;
-		let mut html = false;
+		let (mut html, mut parquet) = (false, false);
 		let mut gpu_calibrate = true;
 
 		let mut iter = args.into_iter();
@@ -660,6 +674,7 @@ impl Cli {
 				"--name" => name = Some(take_value(&key)?),
 				"-c" | "--compare" => compare = true,
 				"--html" => html = true,
+				"--parquet" => parquet = true,
 				"--no-gpu-calibrate" => gpu_calibrate = false,
 				other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
 				// A bare positional is taken as the input path if one is not set yet.
@@ -676,7 +691,7 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, gap_fill, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, gap_fill, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
 	}
 }
 
@@ -1075,6 +1090,9 @@ OPTIONS:
                              forward-fill) for comparison
         --html               Also write a human-readable HTML report alongside
                              the JSON artifact
+        --parquet            Also write the results as a flat Parquet table (one
+                             row per result) beside the JSON, for DuckDB/Polars/
+                             Grafana queries across many runs
         --no-gpu-calibrate   Don't calibrate the interpolation backends first. By
                              default an interpolation run calls splimes::calibrate()
                              once (several seconds), as weft-server does at startup,
@@ -1372,6 +1390,8 @@ mod tests {
 		assert!(!expect_run(&["data.lp", "-f", "v"]).html, "html is off unless requested");
 		assert!(expect_run(&["data.lp", "-f", "v", "--html"]).html);
 		assert!(expect_run(&["-s", "--html"]).html);
+		assert!(!expect_run(&["-s"]).parquet, "parquet is off unless requested");
+		assert!(expect_run(&["-g", "--parquet"]).parquet);
 	}
 
 	#[test]

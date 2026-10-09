@@ -53,6 +53,7 @@ pub mod engine;
 pub mod forward_fill_adapter;
 pub mod gap_fill;
 pub mod line_protocol;
+pub mod parquet_report;
 pub mod point_lookup;
 pub mod profile;
 pub mod range_fetch;

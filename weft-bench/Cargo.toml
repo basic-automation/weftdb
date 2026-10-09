@@ -16,6 +16,9 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+# The Parquet results table (`--parquet`): arrow builders + weft-arrow's uncompressed writer.
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 bigdecimal = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
@@ -25,6 +28,7 @@ rayon = { workspace = true }
 # StorageEstimate reports. Enabled here only, so no published crate turns them on.
 weft-physical-type = { workspace = true, features = ["experimental-codecs"] }
 weft-reduce = { workspace = true }
+weft-arrow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 rand = { workspace = true }

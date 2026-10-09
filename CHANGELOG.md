@@ -205,6 +205,8 @@ only the control plane, not the segment frames.
   `--gf-outage-len`, `--gf-fill`, `--gf-agg`), gated on a dense grid and scoring the filled
   buckets against the clean signal; `--gf-csv` cuts the outages from a real series and
   scores against the real values removed.
+- **Weft-Bench `--parquet`**: the results as a flat Parquet table beside the JSON report, one
+  row per result with the run metadata repeated, for querying many runs at once.
 - **Weft-Bench records the GPU driver.** An interpolation run's `metadata.engine` gains
   `gpu_driver`, the driver's name and version as splimes' `GpuInfo::driver` reports it
   (e.g. `NVIDIA 610.57.04`), beside the adapter in `gpu`; it is printed and shown in the
