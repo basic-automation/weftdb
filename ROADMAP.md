@@ -1084,8 +1084,10 @@ phase of the [1.0 plan](docs/release/1.0-plan.md#6-waves) (lanes, dependencies, 
 `→` is merge order after the previous slice, *(owner)* marks a step only the owner can take,
 and a box is ticked only when its slice is on main.
 
-*Status 2026-10-08:* W0 is nearly closed. The durability store lane runs ahead: S8/S9 (W2)
-are on main, S10 and S11 merged on the durability integration branch, S12 in progress.
+*Status 2026-10-09:* W0's code is all on main; only the owner's private-reporting switch is
+left. The durability store lane runs ahead: S8/S9 (W2) are on main; S10 and S11 are reviewed
+and merged on `durability/base`, not yet on main; S12 is in review round 7 (identity before
+any write, never purge an unproven frame), with its unfinished work on `durability/s12-r7-wip`.
 
 - [ ] **W0 · Land in-flight work and lock the shapes S6/S7 depend on** — ticks **splimes 1.0 is released** (ticked, #62) and **Security process** (once private vulnerability reporting is on)
   - [x] **INT-0** Merge deps/splimes-1 → routine/dsp-2026-10-08 → legal → durability/base into main — #61/#62, #67, #63, and the routine (#68) through #73
@@ -1133,9 +1135,9 @@ are on main, S10 and S11 merged on the durability integration branch, S12 in pro
   - [ ] **SOA-3** Open-loop scheduler, HDR interval logs, harness self-monitoring and null server
   - [ ] **SOA-4** Deterministic workload model, lanes, format-exact value grids and body encoders
 - [ ] **W3 · Gate, serve path, input domain** — no gate of its own
-  - [ ] Store lane: **D-S10** Write-once durable seal with id assigned at commit (+ contained frame/sidecar paths) — *in progress* (merged into durability/base)
+  - [ ] Store lane: **D-S10** Write-once durable seal with id assigned at commit (+ contained frame/sidecar paths) — *reviewed; on `durability/base`, not yet on main*
   - [ ] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)
-  - [ ] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions — *in progress* (merged into durability/base)
+  - [ ] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions — *reviewed; on `durability/base`, not yet on main*
   - [ ] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
   - [ ] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
   - [ ] **ROB-6** Bounded decimals: the plain form is at most 1,024 digits, at every parse site (absorbs FRE-8a)
@@ -1143,7 +1145,7 @@ are on main, S10 and S11 merged on the durability integration branch, S12 in pro
   - [ ] **SOA-5** Soak ingest client: strict outcome classes, keyed retry, write-ahead ledger, receipts
   - [ ] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
 - [ ] **W4 · Auth, config, ILP fix** — no gate of its own
-  - [ ] Store lane: **D-S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report (+ the C5 fault policy) — *in progress*
+  - [ ] Store lane: **D-S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report (+ the C5 fault policy) — *in review, round 7*
   - [ ] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
   - [ ] **SEC-5** TLS listener (rustls with ring) on the shared serve path
   - [ ] **SEC-6** API keys, Bearer authentication, keys file and keygen
