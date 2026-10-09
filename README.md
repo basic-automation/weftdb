@@ -1469,6 +1469,17 @@ What it does today:
   repeated (machine, GPU and driver, workload, latency percentiles, throughput, timing,
   correctness, nullable accuracy and storage columns), so a directory of runs reads as one
   dataset in DuckDB, Polars or Grafana.
+- **GPU memory stability** (`--gpu-memory`, needs a hardware GPU) — rounds of GPU
+  interpolations (`Backend::Gpu`, cubic, `f64`) at mixed output sizes (`--gm-sizes`, default
+  16 Ki, 1 Mi and 4 Mi points, seeded order), sampling splimes' buffer-pool statistics after
+  every call; gated on full finite grids, idle pool bytes never over the cap, and no idle-byte
+  growth after the first round. The report's `gpu_pool` block (schema v22) records the cap and
+  the buffer sets created, reused and evicted. On the RTX 4070 Ti SUPER (driver 610.57.04; 20
+  rounds, 60 calls, 2026-10-09): with splimes' default 512 MiB pool, **2 buffer sets created in
+  all, none after the first round, 58 reuses, 0 evictions**, idle bytes steady at 112 MiB, p50
+  8.29 ms per call, 152M output points/sec; with `--gm-pool-mib 32`, 20 evictions and 19
+  re-creations (the 4 Mi-point set churns every round) at an unchanged p50 of 7.96 ms, so on
+  this GPU eviction churn costs nothing measurable next to the kernels.
 - **First rep apart from the rest** — every result with two or more reps records its first
   timed rep separately from the warm ones (`cold_warm`, schema v21; printed as `first rep`
   and in the Parquet table), while `latency` still covers every rep. It is first-in-process,

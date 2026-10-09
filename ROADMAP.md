@@ -393,7 +393,8 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
 - [ ] 5.7 Multi-GPU *(deferred until single-GPU wins are proven)*
 - [ ] Memory-mapped GPU I/O *(only after transfer bottlenecks are measured)*
 - [ ] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
-- [ ] GPU memory-stability + pool-eviction benchmark (verify stable GPU memory across repeated interpolation calls; pool statistics under large/small batches)
+- [x] **DONE (2026-10-09) — GPU memory-stability + pool-eviction benchmark** (`weft-bench --gpu-memory`, `gpu_pool` in schema v22): on the RTX 4070 Ti SUPER the default 512 MiB pool created 2 buffer sets over 60 mixed-size calls (none after round 1, 0 evictions, idle steady at 112 MiB); a 32 MiB cap evicted 20 and re-created 19 at an unchanged per-call p50.
+  - [ ] **NEXT — device memory, not just pool bytes:** `gpu_pool_stats` counts splimes' idle buffers; a leak outside the pool (wgpu staging, driver) would not show. Sample the adapter's allocated bytes (wgpu's `generate_allocator_report`, if splimes exposes it, or `nvidia-smi` per call as an out-of-process check) over a long soak.
 
 ### Phase 6 — Compression v2 · *High*
 

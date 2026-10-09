@@ -52,6 +52,7 @@ pub mod downsample;
 pub mod engine;
 pub mod forward_fill_adapter;
 pub mod gap_fill;
+pub mod gpu_memory;
 pub mod line_protocol;
 pub mod parquet_report;
 pub mod point_lookup;
@@ -161,7 +162,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns) })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None })
 }
 
 /// Measure reconstruction *accuracy*: run `adapter` once over `profile` and score

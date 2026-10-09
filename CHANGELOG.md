@@ -205,6 +205,10 @@ only the control plane, not the segment frames.
   `--gf-outage-len`, `--gf-fill`, `--gf-agg`), gated on a dense grid and scoring the filled
   buckets against the clean signal; `--gf-csv` cuts the outages from a real series and
   scores against the real values removed.
+- **Weft-Bench `--gpu-memory` workload**: repeated mixed-size GPU interpolations with the
+  buffer pool's statistics sampled after every call, gated on bounded, non-growing idle
+  memory (`--gm-rounds`, `--gm-sizes`, `--gm-knots`, `--gm-pool-mib`); reports carry a
+  `gpu_pool` block (bench schema v22).
 - **Weft-Bench reports the first rep apart from the rest**: `cold_warm` (bench schema v21)
   carries the first timed rep and the warm reps' latency statistics for every result with
   two or more reps; `latency` still covers every rep.

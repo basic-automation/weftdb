@@ -113,6 +113,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	if cli.mode == InputMode::GapFill {
 		return run_gap_fill_workload(&cli);
 	}
+	if cli.mode == InputMode::GpuMemory {
+		return run_gpu_memory_workload(&cli);
+	}
 
 	// Build the profile from whichever input mode was selected. Synthetic mode
 	// carries a known analytic ground truth, so its report will also include
@@ -273,6 +276,22 @@ fn run_gap_fill_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	}
 	.map_err(|e| anyhow::anyhow!("gap-fill benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the GPU memory-stability workload: start the GPU with the requested pool cap, run the
+/// rounds of mixed-size GPU interpolations, and report the pool's behaviour.
+fn run_gpu_memory_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let profile_name = cli.name.clone().unwrap_or_else(|| "gpu-memory".to_string());
+	let profile = weft_bench::gpu_memory::GpuMemoryProfile::new(profile_name, weft_bench::gpu_memory::GpuMemoryParams { seed: cli.seed, ..cli.gpu_memory.clone() });
+	let engine = weft_bench::gpu_memory::start_gpu(&profile)?;
+	println!("engine: GPU {}", engine.describe_gpu().unwrap_or_default());
+	let result = weft_bench::gpu_memory::run_gpu_memory(&profile).map_err(|e| anyhow::anyhow!("gpu-memory benchmark run failed: {e}"))?;
+	if let Some(pool) = &result.gpu_pool {
+		println!("gpu pool: cap {} MiB; created {} ({} after round 1), reused {}, evicted {}; idle peak {} MiB (round 1) / {} MiB (later), final {} MiB; stable: {}", pool.max_pool_bytes >> 20, pool.created, pool.created_after_first_round, pool.reused, pool.evicted, pool.peak_idle_bytes_first_round >> 20, pool.peak_idle_bytes_later >> 20, pool.final_idle_bytes >> 20, pool.stable);
+	}
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(Some(engine));
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
 }
@@ -480,6 +499,8 @@ struct Cli {
 	ds_decimals: Option<u32>,
 	/// Gap-fill mode: the workload knobs (the seed comes from `--seed`).
 	gap_fill: GapFillParams,
+	/// GPU-memory mode: the workload knobs (the seed comes from `--seed`).
+	gpu_memory: weft_bench::gpu_memory::GpuMemoryParams,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -557,6 +578,8 @@ enum InputMode {
 	Downsample,
 	/// The gap-fill workload (a bucketed query that fills the buckets outages left empty).
 	GapFill,
+	/// The GPU memory-stability workload (repeated mixed-size GPU interpolations).
+	GpuMemory,
 }
 
 /// What the parsed command line asks the program to do.
@@ -595,18 +618,15 @@ impl Cli {
 
 		let (mut input, mut field): (Option<PathBuf>, Option<String>) = (None, None);
 		// The workload-mode flags; exactly one may be set (`select_workload_mode`).
-		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode) = (false, false, false, false, false, false);
-		let mut gap_fill = GapFillParams::default();
+		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode, mut gpu_memory_mode) = (false, false, false, false, false, false, false);
+		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
 		let (mut ds_aggs, mut ds_parallel, mut ds_decimals) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1), ds_defaults.value_decimals);
 		let mut irregular = false;
 		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
 		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
-		let mut seed = defaults.seed;
-		let mut points = defaults.input_points;
-		let mut missingness = defaults.missingness_fraction;
-		let mut jitter = defaults.jitter_fraction;
+		let (mut seed, mut points, mut missingness, mut jitter) = (defaults.seed, defaults.input_points, defaults.missingness_fraction, defaults.jitter_fraction);
 		let (mut noise, mut decimals) = (defaults.noise_amplitude, defaults.value_decimals);
 		let mut shape = defaults.signal_shape;
 		let mut precision = TimestampPrecision::Nanoseconds;
@@ -650,6 +670,8 @@ impl Cli {
 				"-d" | "--downsample" => downsample = true,
 				"-g" | "--gap-fill" => gap_fill_mode = true,
 				flag if GAP_FILL_FLAGS.contains(&flag) => set_gap_fill_knob(&mut gap_fill, flag, &take_value(&key)?)?,
+				"--gpu-memory" => gpu_memory_mode = true,
+				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
 				"--ds-bucket" => ds_bucket = parse_resolution(&take_value(&key)?)?,
@@ -695,10 +717,10 @@ impl Cli {
 		}
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill)])?;
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (gpu_memory_mode, InputMode::GpuMemory)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, gap_fill, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, gap_fill, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
 	}
 }
 
@@ -707,7 +729,7 @@ impl Cli {
 fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
 	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
 	if selected.len() > 1 {
-		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill)".to_string());
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --gpu-memory)".to_string());
 	}
 	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
@@ -722,6 +744,7 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 		InputMode::Compression => Some("--compression"),
 		InputMode::Downsample => Some("--downsample"),
 		InputMode::GapFill => Some("--gap-fill"),
+		InputMode::GpuMemory => Some("--gpu-memory"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
 }
@@ -769,7 +792,7 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill => unreachable!("handled by self_generating_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::GpuMemory => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -905,6 +928,22 @@ fn set_gap_fill_knob(params: &mut GapFillParams, flag: &str, value: &str) -> Res
 	Ok(())
 }
 
+/// The GPU-memory workload's knob flags, each taking one value ([`set_gpu_memory_knob`]).
+const GPU_MEMORY_FLAGS: [&str; 4] = ["--gm-rounds", "--gm-sizes", "--gm-knots", "--gm-pool-mib"];
+
+/// Apply one GPU-memory knob (`flag` from [`GPU_MEMORY_FLAGS`]) to `params`.
+fn set_gpu_memory_knob(params: &mut weft_bench::gpu_memory::GpuMemoryParams, flag: &str, value: &str) -> Result<(), String> {
+	let positive = |name: &str, v: &str| v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("{name} must be a positive whole number"));
+	match flag {
+		"--gm-rounds" => params.rounds = positive("--gm-rounds", value)?,
+		"--gm-knots" => params.knots = positive("--gm-knots", value)?.max(2),
+		"--gm-sizes" => params.sizes = value.split(',').map(|v| positive("--gm-sizes", v.trim()).map(|n| n.max(2))).collect::<Result<_, _>>()?,
+		"--gm-pool-mib" => params.pool_mib = Some(value.parse::<u64>().map_err(|_| "--gm-pool-mib must be a whole number of MiB".to_string())?),
+		_ => unreachable!("only GPU_MEMORY_FLAGS are dispatched here"),
+	}
+	Ok(())
+}
+
 /// Parse a `--ds-decimals` value: a place count in `0..=MAX_VALUE_DECIMALS`, or `full`.
 fn parse_value_decimals(s: &str) -> Result<Option<u32>, String> {
 	if s.eq_ignore_ascii_case("full") {
@@ -980,6 +1019,7 @@ USAGE:
     weft-bench --compression [COMPRESSION OPTIONS]
     weft-bench --downsample [DOWNSAMPLE OPTIONS]
     weft-bench --gap-fill [GAP-FILL OPTIONS]
+    weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -1075,6 +1115,13 @@ GAP-FILL OPTIONS (with --gap-fill; seeded by --seed):
         --gf-csv <FILE>      Cut the outages from a REAL series instead (same CSV
                              rules as --comp-csv; --gf-points caps it); filled
                              buckets are scored against the real values removed
+
+GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
+        --gm-rounds <N>      Rounds; each calls every size once       [default: 20]
+        --gm-sizes <LIST>    Output points per call, comma-separated
+                                               [default: 16384,1048576,4194304]
+        --gm-knots <N>       Input knots per call                    [default: 1000]
+        --gm-pool-mib <N>    Start the GPU with this pool cap  [default: splimes' 512]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -1241,6 +1288,18 @@ mod tests {
 		assert!(run_cli(&["--range-fetch", "--synthetic"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--range-fetch", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
 		assert!(run_cli(&["--range-fetch", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
+	}
+
+	#[test]
+	fn gpu_memory_mode_parses_its_knobs() {
+		let cli = expect_run(&["--gpu-memory"]);
+		assert_eq!(cli.mode, InputMode::GpuMemory);
+		assert_eq!(cli.gpu_memory, weft_bench::gpu_memory::GpuMemoryParams::default());
+		let cli = expect_run(&["--gpu-memory", "--gm-rounds", "5", "--gm-sizes", "1024, 65536", "--gm-knots", "50", "--gm-pool-mib", "32"]);
+		assert_eq!((cli.gpu_memory.rounds, cli.gpu_memory.sizes.clone(), cli.gpu_memory.knots, cli.gpu_memory.pool_mib), (5, vec![1_024, 65_536], 50, Some(32)));
+		assert!(run_cli(&["--gpu-memory", "--gm-sizes", "10,x"]).unwrap_err().contains("--gm-sizes"));
+		assert!(run_cli(&["--gpu-memory", "--gm-rounds", "0"]).unwrap_err().contains("--gm-rounds"));
+		assert!(run_cli(&["--gpu-memory", "-g"]).unwrap_err().contains("only one workload mode"));
 	}
 
 	#[test]

@@ -270,7 +270,7 @@ pub fn run_compression_on(run: &CorpusRun<'_>, timestamps: &[i64], values: &[Big
 	};
 	let irregular = timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]);
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: run.name.to_string(), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSION.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: dec_ts.len(), irregular, missingness_fraction: 0.0, seed: run.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns) })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: run.name.to_string(), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSION.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: dec_ts.len(), irregular, missingness_fraction: 0.0, seed: run.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None })
 }
 
 /// Load a real `(timestamp, value)` corpus from a CSV file for [`run_compression_on`].
