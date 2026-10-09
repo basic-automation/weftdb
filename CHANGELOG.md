@@ -123,6 +123,39 @@ only the control plane, not the segment frames.
   write-once frame names (crash-consistency design §4): `[a-z0-9_]` as they are, every
   other byte as `%XX` in uppercase hex, injective even where the filesystem folds case
   or normalises Unicode.
+- **Integer-native exact-decimal reductions** (`weft-reduce`). `reduce_scaled` and
+  `reduce_partial_scaled` reduce `ScaledI64` mantissas at one scale, with epoch-nanosecond
+  instants, in integer accumulators and build one `BigDecimal` per bucket; their buckets
+  equal `reduce` / `reduce_partial` on the same data. `reduce_scaled` covers `min`, `max`,
+  `avg`, `sum`, `first` and `last`; `reduce_partial_scaled` also takes the `sketch_p*`
+  reductions, with identical sketches. Both return `Ok(None)` for a reduction they do not
+  cover, so the caller falls back.
+- **Physical-value and batch reads** (`weft-physical-type`).
+  `weftseg::read_segment_range_physical` and `read_paged_segment_range_physical` return
+  each present value as its stored `PhysicalValue` (for `ScaledI64`, the mantissa and
+  scale) instead of a `BigDecimal`. `weftseg::read_values_at` reads many indices of a
+  value block in one walk of its block chain, through the new
+  `timestamp::{blocked_bitpack_decode_gather, for_bitpack_decode_gather}` (and, with
+  `bitsliced-codec`, `transpose_bitpack_decode_gather`). The blocked and bit-sliced ones
+  decode a block whole once `timestamp::GATHER_WHOLE_TILE_THRESHOLD` requests land in it
+  and value by value below that.
+- **Advisory size estimates for three codecs not written to disk** (`weft-physical-type`):
+  the decimal-exponent FOR value codec, which factors each block's shared power of ten out
+  before FOR packing (`timestamp::dfor_bitpack_{bytes,encode,decode,decode_range}`,
+  `ColumnEncoding::dfor_value_bytes`), and two timestamp-column estimates,
+  `DeltaOfDeltaColumn::common_multiple` / `common_multiple_estimated_bytes` (the deltas'
+  common factor taken out) and `delta_for_estimated_bytes` (first-order deltas under
+  per-block FOR). They are not behind `experimental-codecs` and have not had the patent
+  review the gated codecs are waiting on.
+- **Weft-Bench runs its storage workloads on a real CSV corpus.** `--comp-csv`,
+  `--pl-csv`, `--rf-csv` and `--ds-csv` feed the compression, point-lookup, range-fetch
+  and downsample workloads from a CSV file instead of a generator, with
+  `--csv-value-col` (0-based value column) and `--csv-skip` (data rows skipped after the
+  header). Reports gain `storage.advisory_dfor_value_bytes` (bench schema v17),
+  `storage.advisory_common_multiple_timestamp_bytes` and
+  `storage.advisory_delta_for_timestamp_bytes` (v18), each present only when it beats the
+  realized codec, and `metadata.work_disk_kind`, `work_disk_file_system` and
+  `work_disk_mount_point`, the disk under the working directory (v19).
 
 ### Changed
 
@@ -313,6 +346,23 @@ only the control plane, not the segment frames.
   higher id overlaps the suffix's span (its first timestamp at or after `boundary` to
   the segment's last); the check runs again under the aspect's commit lock right before
   the swap, against a seal that committed meanwhile.
+- **The stored-range downsample reduces `ScaledI64` segments on their mantissas.**
+  `SegmentStore::downsample_range` (behind `/api/v1/storage/{aspect}/downsample` and its
+  CSV, Arrow and Parquet forms) reads a segment's window in its physical encoding and uses
+  `reduce_partial_scaled` when every present value in it is a `ScaledI64` at one scale and
+  every requested reduction is a streaming one or a `sketch_p*`; anything else takes the
+  `BigDecimal` path as before. Results are unchanged.
+- **Every reduction computes `avg` by integer long division**, in `weft-reduce`'s `reduce`
+  and partials as well, whenever the bucket sum's unscaled integer fits an `i128`. The
+  quotient equals `bigdecimal`'s own division in value and representation (scale
+  included); a larger sum still divides as a `BigDecimal`.
+- **Faster reads, same bytes on disk** (`weft-physical-type`). The frame checksum is
+  computed sixteen bytes per step (slicing-by-16, the same CRC-32, so every stored frame
+  still verifies); the bit-packed value and timestamp codecs, and the f64 codecs behind
+  `experimental-codecs`, read a whole field per load instead of a bit at a time; the
+  batch point read (`read_segment_points`, `/api/v1/storage/{aspect}/at-multi`) walks each
+  value block once instead of once per instant; and the bit-sliced tile decoder
+  (`bitsliced-codec`) is branch-free. The bench schema is now v19.
 
 ### Deprecated
 

@@ -9,10 +9,11 @@
 //!
 //! The environment capture records `weft-bench` version, OS, and CPU architecture,
 //! plus a best-effort hardware probe (CPU model, physical/logical core counts,
-//! total RAM) toward the benchmark-report template's hardware block, and, for an
+//! total RAM, and the kind, file system and mount point of the disk under the working
+//! directory) toward the benchmark-report template's hardware block, and, for an
 //! interpolation run, the engine's backend selection ([`EngineMetadata`]: whether
 //! splimes was calibrated, the GPU adapter it started, and `Backend::Auto`'s
-//! thresholds). The remaining template fields (disk, driver versions, cloud
+//! thresholds). The remaining template fields (driver versions, cloud
 //! instance + cost) are a later increment; every field is honest about its scope —
 //! the hardware facts are `Option` and omitted when unread, never claiming more than
 //! was measured.
@@ -56,6 +57,17 @@ pub struct RunMetadata {
 	/// Total physical memory in bytes, when available.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub total_memory_bytes: Option<u64>,
+	/// Kind of the disk holding the run's working directory (`"ssd"` or `"hdd"`), when the
+	/// platform reports it. Storage workloads write and read under the working directory, so
+	/// a spinning disk under a contended array is a different measurement from a solid-state drive.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub work_disk_kind: Option<String>,
+	/// File system of that disk (e.g. `btrfs`, `ext4`, `NTFS`), when available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub work_disk_file_system: Option<String>,
+	/// Mount point of that disk (the longest mount-point prefix of the working directory).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub work_disk_mount_point: Option<String>,
 	/// The interpolation engine's backends for an interpolation run: calibration, GPU
 	/// and `Backend::Auto` thresholds. `None` for the storage workloads, which do not
 	/// interpolate, and for pre-v16 artifacts.
@@ -89,7 +101,8 @@ impl RunMetadata {
 		let cpu_cores_logical = Some(sys.cpus().len()).filter(|&n| n > 0);
 		let cpu_cores_physical = sysinfo::System::physical_core_count();
 		let total_memory_bytes = Some(sys.total_memory()).filter(|&b| b > 0);
-		Self { weft_bench_version: env!("CARGO_PKG_VERSION").to_string(), os: std::env::consts::OS.to_string(), arch: std::env::consts::ARCH.to_string(), cpu_model, cpu_cores_physical, cpu_cores_logical, total_memory_bytes, engine: None, generated_at }
+		let (work_disk_kind, work_disk_file_system, work_disk_mount_point) = std::env::current_dir().map_or((None, None, None), |dir| work_disk(&dir));
+		Self { weft_bench_version: env!("CARGO_PKG_VERSION").to_string(), os: std::env::consts::OS.to_string(), arch: std::env::consts::ARCH.to_string(), cpu_model, cpu_cores_physical, cpu_cores_logical, total_memory_bytes, work_disk_kind, work_disk_file_system, work_disk_mount_point, engine: None, generated_at }
 	}
 
 	/// Record the interpolation engine's backends for this run (see [`EngineMetadata`]).
@@ -98,6 +111,32 @@ impl RunMetadata {
 		self.engine = engine;
 		self
 	}
+}
+
+/// The `(kind, file system, mount point)` of the disk holding `dir`: the disk whose mount
+/// point is the longest prefix of `dir` (canonicalized when possible). Each part is `None` when
+/// unreadable; the kind is `None` when the platform reports it as unknown.
+fn work_disk(dir: &std::path::Path) -> (Option<String>, Option<String>, Option<String>) {
+	let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+	let disks = sysinfo::Disks::new_with_refreshed_list();
+	let Some(index) = longest_mount_prefix(&dir, disks.list().iter().map(sysinfo::Disk::mount_point)) else {
+		return (None, None, None);
+	};
+	let disk = &disks.list()[index];
+	let kind = match disk.kind() {
+		sysinfo::DiskKind::SSD => Some("ssd".to_string()),
+		sysinfo::DiskKind::HDD => Some("hdd".to_string()),
+		sysinfo::DiskKind::Unknown(_) => None,
+	};
+	let file_system = Some(disk.file_system().to_string_lossy().into_owned()).filter(|f| !f.is_empty());
+	(kind, file_system, Some(disk.mount_point().display().to_string()))
+}
+
+/// The index of the mount point that is the longest path prefix of `dir`, or `None` when no
+/// mount point contains it. Compared by path components, so `/mnt/data2` never matches
+/// `/mnt/data`.
+fn longest_mount_prefix<'a>(dir: &std::path::Path, mounts: impl Iterator<Item = &'a std::path::Path>) -> Option<usize> {
+	mounts.enumerate().filter(|(_, mount)| dir.starts_with(mount)).max_by_key(|(_, mount)| mount.components().count()).map(|(index, _)| index)
 }
 
 /// A Weft-Bench report: run metadata plus the results gathered in one session.
@@ -276,6 +315,11 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 		let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 		parts.push(format!("{gib:.1} GiB RAM"));
 	}
+	if let Some(mount) = &m.work_disk_mount_point {
+		let kind = m.work_disk_kind.as_deref().unwrap_or("unknown-kind");
+		let fs = m.work_disk_file_system.as_deref().map(|f| format!(" {f}")).unwrap_or_default();
+		parts.push(escape_html(&format!("work disk: {kind}{fs} at {mount}")));
+	}
 	let hardware = if parts.is_empty() { String::new() } else { format!("<p class=\"meta\">{}</p>\n", parts.join(" \u{b7} ")) };
 	hardware + &engine_meta_html(m.engine.as_ref())
 }
@@ -352,8 +396,23 @@ mod tests {
 		r
 	}
 
+	#[test]
+	fn the_work_disk_is_the_longest_mount_prefix_by_component() {
+		use std::path::Path;
+		let mounts = [Path::new("/"), Path::new("/mnt/data"), Path::new("/mnt/data2"), Path::new("/home")];
+		assert_eq!(longest_mount_prefix(Path::new("/mnt/data/weft/run"), mounts.iter().copied()), Some(1));
+		assert_eq!(longest_mount_prefix(Path::new("/mnt/data2/x"), mounts.iter().copied()), Some(2), "a sibling mount with a shared string prefix must not match");
+		assert_eq!(longest_mount_prefix(Path::new("/tmp/x"), mounts.iter().copied()), Some(0));
+		assert_eq!(longest_mount_prefix(Path::new("relative"), mounts.iter().copied()), None);
+		// The live probe never panics and, when it names a mount, it contains the working dir.
+		let dir = std::env::current_dir().expect("a working directory");
+		if let (_, _, Some(mount)) = work_disk(&dir) {
+			assert!(dir.canonicalize().unwrap_or(dir).starts_with(&mount), "{mount} must contain the working directory");
+		}
+	}
+
 	fn metadata() -> RunMetadata {
-		RunMetadata { weft_bench_version: "0.1.0".to_string(), os: "testos".to_string(), arch: "testarch".to_string(), cpu_model: Some("Test CPU 9000".to_string()), cpu_cores_physical: Some(8), cpu_cores_logical: Some(16), total_memory_bytes: Some(34_359_738_368), engine: None, generated_at: "2026-06-06T00:00:00+00:00".to_string() }
+		RunMetadata { weft_bench_version: "0.1.0".to_string(), os: "testos".to_string(), arch: "testarch".to_string(), cpu_model: Some("Test CPU 9000".to_string()), cpu_cores_physical: Some(8), cpu_cores_logical: Some(16), total_memory_bytes: Some(34_359_738_368), work_disk_kind: Some("hdd".to_string()), work_disk_file_system: Some("btrfs".to_string()), work_disk_mount_point: Some("/mnt/data".to_string()), engine: None, generated_at: "2026-06-06T00:00:00+00:00".to_string() }
 	}
 
 	#[test]
@@ -423,6 +482,7 @@ mod tests {
 		assert!(html.contains("Test CPU 9000"), "CPU model must appear: {html}");
 		assert!(html.contains("8 physical / 16 logical cores"), "core split must appear: {html}");
 		assert!(html.contains("32.0 GiB RAM"), "RAM in GiB must appear: {html}");
+		assert!(html.contains("work disk: hdd btrfs at /mnt/data"), "the work disk must appear: {html}");
 	}
 
 	#[test]
@@ -529,7 +589,7 @@ mod tests {
 		// bytes/point; a result without one (the sample default) shows em-dashes so
 		// the columns stay aligned. The header always carries the two storage cells.
 		let mut with_storage = sample_result("weftdb", true);
-		with_storage.storage = Some(crate::schema::StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(190), advisory_delta_cascade_value_bytes: None });
+		with_storage.storage = Some(crate::schema::StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(190), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None });
 		let report = BenchReport::with_results(metadata(), vec![with_storage, sample_result("baseline-linear", true)]);
 		let html = report.to_html();
 		assert!(html.contains("<th>enc</th><th>val B/pt</th><th>tot B/pt</th>"), "header must carry storage columns: {html}");
@@ -559,7 +619,7 @@ mod tests {
 		// A non-exact encoding pick is flagged with a trailing `*` so a lossy storage
 		// choice is visible at a glance in the table.
 		let mut r = sample_result("weftdb", true);
-		r.storage = Some(crate::schema::StorageEstimate { physical_type: "f64".to_string(), value_count: 10, estimated_value_bytes: 80, realized_value_bytes: 80, value_codec: "varint".to_string(), bytes_per_point: 8.0, is_exact: false, lossy_count: 3, max_abs_error: "0.0001".to_string(), tolerance: "0.001".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 12, timestamp_bytes_per_point: 1.2, total_bytes_per_point: 9.2, advisory_best_f64_bytes: Some(64), advisory_best_f64_codec: Some("gorilla".to_string()), advisory_fire_timestamp_bytes: Some(10), advisory_delta_cascade_value_bytes: None });
+		r.storage = Some(crate::schema::StorageEstimate { physical_type: "f64".to_string(), value_count: 10, estimated_value_bytes: 80, realized_value_bytes: 80, value_codec: "varint".to_string(), bytes_per_point: 8.0, is_exact: false, lossy_count: 3, max_abs_error: "0.0001".to_string(), tolerance: "0.001".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 12, timestamp_bytes_per_point: 1.2, total_bytes_per_point: 9.2, advisory_best_f64_bytes: Some(64), advisory_best_f64_codec: Some("gorilla".to_string()), advisory_fire_timestamp_bytes: Some(10), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None });
 		let html = BenchReport::with_results(metadata(), vec![r]).to_html();
 		assert!(html.contains("<td>f64*</td><td>8.00</td><td>9.20</td>"), "lossy encoding must be flagged: {html}");
 	}

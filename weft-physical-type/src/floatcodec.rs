@@ -68,9 +68,23 @@ impl BitWriter {
 	}
 
 	/// Append the low `count` bits of `value`, most-significant first. `count` is `0..=64`.
+	///
+	/// Fills the current byte's free bits, then whole bytes, a byte-sized chunk per step
+	/// rather than one bit per step.
 	fn put_bits(&mut self, value: u64, count: u32) {
-		for i in (0..count).rev() {
-			self.put_bit(value >> i);
+		let mut remaining = count.min(64);
+		while remaining > 0 {
+			if self.bit == 0 {
+				self.bytes.push(0);
+			}
+			let room = 8 - self.bit;
+			let take = room.min(remaining);
+			let chunk = (value >> (remaining - take)) & ((1 << take) - 1);
+			let last = self.bytes.len() - 1;
+			// `chunk < 2^take <= 2^room`, so after the shift it fits the byte.
+			self.bytes[last] |= u8::try_from(chunk << (room - take)).unwrap_or(0);
+			self.bit = (self.bit + take) % 8;
+			remaining -= take;
 		}
 	}
 
@@ -102,12 +116,30 @@ impl<'a> BitReader<'a> {
 
 	/// Read `count` bits (most-significant first) as the low bits of a `u64`. `count`
 	/// is `0..=64`.
+	///
+	/// One unaligned big-endian load and a shift per field (a zero-padded 16-byte window
+	/// when the field straddles 8 bytes or runs off the end), rather than one bit per step.
 	fn get_bits(&mut self, count: u32) -> u64 {
-		let mut out = 0_u64;
-		for _ in 0..count {
-			out = (out << 1) | self.get_bit();
+		let count = count.min(64);
+		if count == 0 {
+			return 0;
 		}
-		out
+		let (byte, off) = (self.pos / 8, self.pos % 8);
+		self.pos += count as usize;
+		let width = count as usize;
+		if off + width <= 64 {
+			if let Some(word) = self.bytes.get(byte..byte + 8) {
+				let mut be = [0_u8; 8];
+				be.copy_from_slice(word);
+				return (u64::from_be_bytes(be) << off) >> (64 - width);
+			}
+		}
+		let mut be = [0_u8; 16];
+		let tail = self.bytes.get(byte..).unwrap_or(&[]);
+		let take = tail.len().min(16);
+		be[..take].copy_from_slice(&tail[..take]);
+		let field = (u128::from_be_bytes(be) << off) >> (128 - width);
+		u64::try_from(field).unwrap_or(0)
 	}
 }
 
@@ -691,6 +723,38 @@ pub fn best_f64_bytes(values: &[f64]) -> usize {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn word_wise_bit_fields_match_the_single_bit_reader_and_writer() {
+		// A long mixed sequence of field widths 0..=64 at every alignment: the chunked
+		// `put_bits` must emit exactly the bytes a bit-at-a-time writer would, and the
+		// word-wise `get_bits` must read every field back, including past the buffer end.
+		let fields: Vec<(u64, u32)> = (0..2_000_u64).map(|i| (i.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(u32::try_from(i % 64).unwrap_or(0)), u32::try_from((i * 7) % 65).unwrap_or(0))).collect();
+		let (mut chunked, mut single) = (BitWriter::new(), BitWriter::new());
+		for &(value, count) in &fields {
+			chunked.put_bits(value, count);
+			for i in (0..count).rev() {
+				single.put_bit(value >> i);
+			}
+		}
+		let bytes = chunked.into_bytes();
+		assert_eq!(bytes, single.into_bytes(), "chunked writes must equal single-bit writes");
+		let (mut words, mut bits) = (BitReader::new(&bytes), BitReader::new(&bytes));
+		for &(value, count) in &fields {
+			let mask = if count == 0 { 0 } else { u64::MAX >> (64 - count) };
+			let expected = (0..count).fold(0_u64, |acc, _| (acc << 1) | bits.get_bit());
+			assert_eq!(expected, value & mask);
+			assert_eq!(words.get_bits(count), expected, "field of {count} bits");
+		}
+		// Past the end: missing bits read as zero, and a field straddling the end keeps its
+		// present high bits.
+		let mut tail = BitReader::new(&[0b1010_0000]);
+		assert_eq!(tail.get_bits(3), 0b101);
+		assert_eq!(tail.get_bits(64), 0);
+		let mut straddle = BitReader::new(&[0xff]);
+		straddle.pos = 4;
+		assert_eq!(straddle.get_bits(8), 0b1111_0000);
+	}
 
 	fn assert_bit_exact(values: &[f64], decoded: &[f64], codec: &str) {
 		assert_eq!(decoded.len(), values.len(), "{codec} decodes the right count");

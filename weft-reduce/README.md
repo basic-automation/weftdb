@@ -28,6 +28,7 @@ inclusion in the work by you, as defined in the Apache-2.0 license, shall be dua
 licensed as above, without any additional terms or conditions.
 
 The `DdSketch` quantile sketch is adapted from Datadog's DDSketch reference implementation
-(sketches-java, Apache-2.0). That portion stays under the Apache License 2.0 whichever
-option you choose; [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) carries the attribution and
-the license text.
+(sketches-java, Apache-2.0), and the integer `avg` division behind every reduction's `avg` is
+adapted from bigdecimal-rs (MIT OR Apache-2.0, taken here under Apache-2.0). Those portions
+stay under the Apache License 2.0 whichever option you choose;
+[THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) carries the attribution and the license text.

@@ -84,7 +84,7 @@ use anyhow::{bail, Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
-use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
+use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
@@ -186,10 +186,12 @@ impl CheckpointPolicy {
 /// (bit-plane-major)** codec instead of the size-selected one.
 ///
 /// The bit-sliced layout stores the same *code* as the linear bit-pack with its bits permuted,
-/// so it never wins on size — it is a **decode-latency** trade. Its decoder reads `u64` plane
-/// words and walks only the set bits, so a small-magnitude column's empty high bit-planes are
-/// skipped wholesale (measured ~5.7x the linear per-block unpack at the primitive level,
-/// `weft-physical-type`'s `benches/bitunpack.rs`).
+/// so it rarely wins on size — it was meant as a **decode-latency** trade. Its decoder rebuilds
+/// eight lanes per plane byte with branch-free table spreads, and each tile's width header
+/// drops a small-magnitude column's empty high bit-planes. The trade did not pay: the ~5.7x
+/// primitive-level win once measured in `weft-physical-type`'s `benches/bitunpack.rs` was
+/// against the old per-bit linear decoder, the word-wise linear unpack is now faster, and end
+/// to end the codec is byte-neutral and reads no faster (`benches/transposed_read.rs`).
 ///
 /// It is therefore **off by default**: `DISABLED` writes byte-for-byte the frames WeftDB has
 /// always written. Enable per-deployment with `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` — the
@@ -249,6 +251,33 @@ const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>>
 	}
 }
 
+/// The present in-window rows of a physically-decoded window as `(epoch nanoseconds,
+/// mantissas, scale)`, when every present value is a `ScaledI64` at one shared scale and every
+/// instant fits in epoch nanoseconds. `None` sends the caller to the `BigDecimal` path.
+fn scaled_rows(ts: &[i64], vs: &[Option<PhysicalValue>], start: i64, end: i64, unit: TimeUnit) -> Option<(Vec<i64>, Vec<i64>, u8)> {
+	let per_unit: i64 = match unit {
+		TimeUnit::Seconds => 1_000_000_000,
+		TimeUnit::Millis => 1_000_000,
+		TimeUnit::Micros => 1_000,
+		TimeUnit::Nanos => 1,
+	};
+	let (mut nanos, mut mantissas) = (Vec::with_capacity(ts.len()), Vec::with_capacity(ts.len()));
+	let mut shared_scale: Option<u8> = None;
+	for (&t, v) in ts.iter().zip(vs) {
+		let Some(value) = v else { continue };
+		if t < start || t > end {
+			continue;
+		}
+		let PhysicalValue::ScaledI64 { mantissa, scale } = *value else { return None };
+		if *shared_scale.get_or_insert(scale) != scale {
+			return None;
+		}
+		nanos.push(t.checked_mul(per_unit)?);
+		mantissas.push(mantissa);
+	}
+	Some((nanos, mantissas, shared_scale.unwrap_or(0)))
+}
+
 /// Decode one already-read segment frame's `[start, end]` window and fold it into its
 /// own [`PartialReduction`] — the per-segment half of
 /// [`SegmentStore::downsample_range`], factored out so it can run on the blocking pool.
@@ -258,13 +287,26 @@ const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>>
 /// Pure and synchronous: it takes the frame bytes and returns the partial, so it holds
 /// no store state and the whole call is `spawn_blocking`-safe.
 fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
-	let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_range(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
+	// Read the window in its physical encoding, so a ScaledI64 column can be reduced on its
+	// stored mantissas without building a BigDecimal per row.
+	let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range_physical(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_range_physical(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
+	// Integer-native path: every present in-window value is ScaledI64 at one scale and every
+	// requested reduction is a streaming one. `reduce_partial_scaled` then builds the same
+	// mergeable partial `reduce_partial` would, from integer accumulators.
+	if let Some((nanos, mantissas, scale)) = scaled_rows(&ts, &vs, start, end, unit) {
+		if nanos.is_empty() {
+			return Ok(None);
+		}
+		if let Some(partial) = weft_reduce::reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))? {
+			return Ok(Some(partial));
+		}
+	}
 	// Null rows carry no value to reduce; present rows lift to absolute instants.
 	let mut points: Vec<Point> = Vec::with_capacity(ts.len());
 	for (t, v) in ts.into_iter().zip(vs) {
 		if let Some(value) = v {
 			if start <= t && t <= end {
-				points.push(Point::new(instant_from_epoch(t, unit).ok_or_else(|| anyhow::anyhow!("segment {} holds epoch {t} outside the representable instant range", descriptor.path))?, value));
+				points.push(Point::new(instant_from_epoch(t, unit).ok_or_else(|| anyhow::anyhow!("segment {} holds epoch {t} outside the representable instant range", descriptor.path))?, value.to_logical()));
 			}
 		}
 	}
@@ -7089,6 +7131,22 @@ mod tests {
 		assert!(plain.load_partial_sidecar("temp", &plain_desc).await.expect("reads").is_none(), "no sidecar without a policy");
 	}
 
+	/// `scaled_rows` admits a window to the integer path only when every present in-window
+	/// value is a `ScaledI64` at one scale and every instant fits in epoch nanoseconds.
+	#[test]
+	fn scaled_rows_takes_one_scale_scaled_columns_and_declines_the_rest() {
+		let scaled = |m: i64, scale: u8| Some(PhysicalValue::ScaledI64 { mantissa: m, scale });
+		// In-window present rows of one scale lift to nanoseconds; nulls and out-of-window rows drop.
+		let ts = [10_i64, 20, 30, 40];
+		let vs = [scaled(125, 2), None, scaled(-5, 2), scaled(7, 2)];
+		assert_eq!(scaled_rows(&ts, &vs, 10, 30, TimeUnit::Seconds), Some((vec![10_000_000_000, 30_000_000_000], vec![125, -5], 2)));
+		assert_eq!(scaled_rows(&ts, &vs, 50, 60, TimeUnit::Millis), Some((Vec::new(), Vec::new(), 0)));
+		// Mixed scales, a non-scaled value, and an instant past the nanosecond range all decline.
+		assert_eq!(scaled_rows(&ts[..2], &[scaled(1, 2), scaled(1, 3)], 0, 100, TimeUnit::Seconds), None);
+		assert_eq!(scaled_rows(&ts[..1], &[Some(PhysicalValue::F64(1.5))], 0, 100, TimeUnit::Seconds), None);
+		assert_eq!(scaled_rows(&[i64::MAX / 10], &[scaled(1, 0)], 0, i64::MAX, TimeUnit::Seconds), None);
+	}
+
 	/// The cross-segment downsample must equal reading the whole range and reducing it in
 	/// one pass — for every reduction, across many segments, including the sketch.
 	#[tokio::test]
@@ -7137,6 +7195,103 @@ mod tests {
 		let one = store.downsample_range("temp", s_start, s_end, Resolution::Hours, &aggs).await.expect("downsamples");
 		let in_one: Vec<Point> = all.iter().filter(|p| (s_start..=s_end).contains(&p.timestamp.timestamp())).cloned().collect();
 		assert_eq!(one, reduce(&in_one, Resolution::Hours, None, None, &aggs).expect("reduces"), "the single-segment fast path must equal the single pass");
+	}
+
+	/// The integer path end to end: on a `ScaledI64` aspect every frame's window goes through
+	/// `scaled_rows` into `reduce_partial_scaled`, and the merged downsample must still equal
+	/// `read_time_range` followed by one `reduce` — value for value and exponent for exponent —
+	/// across overlapping, out-of-order, nullable and paged segments, and again after
+	/// maintenance has rewritten them.
+	#[tokio::test]
+	async fn downsample_range_on_scaled_segments_takes_the_integer_path_and_matches_a_single_pass() {
+		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
+
+		const ASPECT: &str = "px";
+
+		/// `downsample_range` over `[start, end]` against `read_time_range` + one `reduce`.
+		async fn assert_single_pass(store: &SegmentStore, start: i64, end: i64, aggs: &[Aggregation], label: &str) {
+			let (ts, vs) = store.read_time_range(ASPECT, start, end).await.expect("reads");
+			let points: Vec<Point> = ts.iter().zip(vs).filter_map(|(t, v)| v.map(|v| Point::new(DateTime::<Utc>::from_timestamp_millis(*t).expect("instant"), v))).collect();
+			let single = reduce(&points, Resolution::Minutes, None, None, aggs).expect("reduces");
+			let cross = store.downsample_range(ASPECT, start, end, Resolution::Minutes, aggs).await.expect("downsamples");
+			assert!(cross.len() > 1, "{label}: the fixture must span several buckets, got {}", cross.len());
+			assert_eq!(cross, single, "{label}: the downsample must equal the single pass");
+			// `BigDecimal` equality ignores the exponent, so compare the representation too.
+			for (c, s) in cross.iter().zip(&single) {
+				for (name, value) in &c.values {
+					assert_eq!(Some(value.as_bigint_and_exponent()), s.values.get(name).map(BigDecimal::as_bigint_and_exponent), "{label}: {name} at {} must carry the same digits and exponent", c.timestamp);
+				}
+			}
+		}
+
+		/// Every frame of the aspect is admitted to the integer path rather than the fallback.
+		async fn assert_integer_path(store: &SegmentStore, aggs: &[Aggregation]) {
+			let descriptors = store.index.prune_by_time(ASPECT, i64::MIN, i64::MAX).await.expect("prunes");
+			assert!(descriptors.len() > 1, "the fixture must span several segments");
+			for descriptor in &descriptors {
+				let bytes = store.read_frame(descriptor).await.expect("reads the frame");
+				let decoded = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range_physical(&bytes, i64::MIN, i64::MAX) } else { weft_physical_type::weftseg::read_segment_range_physical(&bytes, i64::MIN, i64::MAX) };
+				let (ts, vs) = decoded.expect("decodes");
+				let (nanos, mantissas, scale) = scaled_rows(&ts, &vs, i64::MIN, i64::MAX, TimeUnit::Millis).expect("a ScaledI64 frame is admitted to the integer path");
+				assert_eq!(scale, 4, "the declared scale reaches the reducer");
+				assert!(weft_reduce::reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Minutes, None, None, aggs).expect("reduces").is_some(), "every requested reduction is integer-native");
+			}
+		}
+
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let scaled = AspectSchema::new(PhysicalType::ScaledI64 { scale: 4 }, bd("0"), TimeUnit::Millis);
+		store.declare(ASPECT, &scaled).await.expect("declares");
+		// Four-decimal values, negative and whole ones included, so the integer `avg` quotient
+		// has digits and an exponent to disagree with `BigDecimal`'s on.
+		let value = |i: i64| if i % 13 == 0 { bd(&format!("{}", i % 50 - 25)) } else { bd(&format!("{}.{:04}", (i * 37) % 211 - 100, (i * 7919).rem_euclid(10_000))) };
+		let base = 1_700_000_000_000_i64;
+		// A sorted segment, and a second interleaved with it (distinct instants, overlapping windows).
+		let a_ts: Vec<i64> = (0..300).map(|i| base + i * 7_000).collect();
+		store.seal(ASPECT, &scaled, &a_ts, &(0..300).map(value).collect::<Vec<_>>()).await.expect("seals a");
+		let b_ts: Vec<i64> = (100..400).map(|i| base + 3_500 + i * 7_000).collect();
+		store.seal(ASPECT, &scaled, &b_ts, &(100..400).map(|i| value(i + 1_000)).collect::<Vec<_>>()).await.expect("seals b");
+		// An out-of-order segment.
+		let c_ts: Vec<i64> = (0..200).rev().map(|i| base + 3_000_000 + i * 11_000).collect();
+		store.seal(ASPECT, &scaled, &c_ts, &(0..200).rev().map(|i| value(i + 2_000)).collect::<Vec<_>>()).await.expect("seals c");
+		// A nullable segment, and a paged nullable one overlapping its tail.
+		let d_ts: Vec<i64> = (0..250).map(|i| base + 6_000_000 + i * 5_000).collect();
+		let d_vs: Vec<Option<BigDecimal>> = (0..250).map(|i| (i % 5 != 0).then(|| value(i + 3_000))).collect();
+		store.seal_nullable(ASPECT, &scaled, &d_ts, &d_vs).await.expect("seals d");
+		let e_ts: Vec<i64> = (0..300).map(|i| base + 7_000_001 + i * 3_000).collect();
+		let e_vs: Vec<Option<BigDecimal>> = (0..300).map(|i| (i % 7 != 3).then(|| value(i + 4_000))).collect();
+		let paged = store.seal_paged_nullable(ASPECT, &scaled, &e_ts, &e_vs, 32).await.expect("seals e");
+		assert_eq!(paged.format_version, PAGED_SEGMENT_FORMAT_VERSION, "e is a paged frame");
+		let stats = store.aspect_stats(ASPECT).await.expect("stats");
+		assert!(stats.unsorted_segments >= 1 && stats.overlapping_segments >= 4, "the fixture holds unsorted and overlapping segments: {stats:?}");
+
+		// Streaming reductions and the sketch take the integer path; exact percentiles and TWA
+		// fall back, and must agree on the same scaled store too.
+		let integer = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP99];
+		let fallback = [Aggregation::Avg, Aggregation::P99, Aggregation::Twa];
+		let whole = (i64::MIN, i64::MAX);
+		// A window that trims inside the first, second and nullable segments.
+		let window = (base + 1_000_000, base + 6_500_000);
+
+		assert_integer_path(&store, &integer).await;
+		for (start, end) in [whole, window] {
+			assert_single_pass(&store, start, end, &integer, "sealed, integer path").await;
+			assert_single_pass(&store, start, end, &fallback, "sealed, fallback").await;
+		}
+
+		// Maintenance sorts the out-of-order segment and merges the overlapping ones; the
+		// rewritten frames must still be admitted and still agree.
+		store.reconcile_aspect(ASPECT).await.expect("reconciles");
+		store.reconcile_overlaps(ASPECT).await.expect("merges");
+		let stats = store.aspect_stats(ASPECT).await.expect("stats");
+		assert_eq!((stats.unsorted_segments, stats.overlapping_segments), (0, 0), "maintenance left no unsorted or overlapping segment: {stats:?}");
+		assert_integer_path(&store, &integer).await;
+		for (start, end) in [whole, window] {
+			assert_single_pass(&store, start, end, &integer, "maintained, integer path").await;
+			assert_single_pass(&store, start, end, &fallback, "maintained, fallback").await;
+		}
+		drop(store);
 	}
 
 	/// The sidecar **consumption** path: with a partial sidecar written per segment at the

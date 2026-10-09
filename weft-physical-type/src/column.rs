@@ -187,18 +187,34 @@ impl ColumnEncoding {
 		self.scaled_i64_mantissas().map(|m| crate::timestamp::for_bitpack_bytes(&m, crate::timestamp::BLOCKED_BITPACK_BLOCK))
 	}
 
+	/// The footprint in bytes of the **decimal-exponent FOR** per-block codec for a
+	/// `ScaledI64` column ([`crate::timestamp::dfor_bitpack_bytes`] at
+	/// [`crate::timestamp::BLOCKED_BITPACK_BLOCK`]): each block factors out its common power of
+	/// ten before FOR packing, so one high-precision value no longer costs every other block
+	/// the column-wide scale. `None` for any other physical type.
+	///
+	/// **Advisory** — sized and benchmarked (`benches/alp_vs_f64_codecs.rs`), not yet a
+	/// realized value codec and not consulted by [`best_value_codec`](Self::best_value_codec):
+	/// adopting it moves the headline bytes/point, which is owner-gated like FOR was.
+	#[must_use]
+	pub fn dfor_value_bytes(&self) -> Option<usize> {
+		self.scaled_i64_mantissas().map(|m| crate::timestamp::dfor_bitpack_bytes(&m, crate::timestamp::BLOCKED_BITPACK_BLOCK))
+	}
+
 	/// The realized footprint in bytes of the **bit-sliced (bit-plane-major) per-tile
 	/// bit-packed** value codec for a `ScaledI64` column —
 	/// [`crate::timestamp::transpose_bitpack_bytes`] at [`crate::timestamp::TRANSPOSE_TILE`].
 	/// `None` for any other physical type.
 	///
-	/// This is primarily a **decode-speed** codec. Its bit budget is the same code as the linear
+	/// This was meant as a **decode-speed** codec. Its bit budget is the same code as the linear
 	/// bit-pack with the bits permuted, so on a uniform-width column it ties the global
 	/// bit-pack, and a short trailing tile costs up to `width - 1` extra bytes (each bit-plane
-	/// rounds up to a whole byte independently). What it buys is decode latency: the decoder
-	/// reads `u64` plane words and walks only the *set* bits, so the empty high bit-planes of a
-	/// small-magnitude stream are skipped wholesale (measured ~5.7× the linear per-block unpack
-	/// in `benches/bitunpack.rs`).
+	/// rounds up to a whole byte independently). The decoder rebuilds eight lanes per plane byte
+	/// with branch-free table spreads, and each tile's width header drops the empty high
+	/// bit-planes of a small-magnitude stream. It no longer buys decode latency: the word-wise
+	/// linear unpack is faster in `benches/bitunpack.rs` (the earlier several-fold win was
+	/// against a per-bit linear decoder), and end to end it reads no faster
+	/// (`benches/transposed_read.rs`).
 	///
 	/// It is **not** strictly larger, though: it adapts its width per 1024-value *tile* while
 	/// paying one width header per tile, where the blocked codec pays one per 64-value block.
@@ -735,6 +751,21 @@ mod tests {
 		let rec = recommend_encoding(&[], &BigDecimal::from(0));
 		assert_eq!(rec.physical_type, PhysicalType::F32);
 		assert!(rec.is_empty());
+	}
+
+	#[test]
+	fn dfor_value_bytes_beats_for_when_one_value_forces_a_finer_scale() {
+		// 128 two-decimal prices plus one four-decimal value: the column scale is 4, so plain
+		// FOR pays two wasted decimal digits on every mantissa; the decimal-exponent FOR
+		// factors them back out of every block the odd value is not in.
+		let mut lits: Vec<String> = (0..128).map(|i| format!("{}.{:02}", 3_500 + i % 7, (i * 13) % 100)).collect();
+		lits[3] = "3501.1234".to_string();
+		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
+		let enc = recommend_encoding(&col(&refs), &BigDecimal::from(0));
+		assert_eq!(enc.physical_type, PhysicalType::ScaledI64 { scale: 4 });
+		let (dfor, for_) = (enc.dfor_value_bytes().expect("scaled"), enc.for_value_bytes().expect("scaled"));
+		assert!(dfor < for_, "dfor {dfor} must beat FOR {for_}");
+		assert_eq!(encode_column(PhysicalType::F64, &col(&["1.5"])).expect("encodes").dfor_value_bytes(), None);
 	}
 
 	#[test]

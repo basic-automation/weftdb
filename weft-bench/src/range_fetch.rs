@@ -208,28 +208,47 @@ fn fetch(bytes: &[u8], windows: &[(i64, i64)], paged: bool) -> anyhow::Result<Ve
 /// Returns an error if `reps == 0`, if the corpus cannot be sealed into a segment,
 /// or if any rep's fetch fails.
 pub fn run_range_fetch(profile: &RangeFetchProfile, reps: usize) -> anyhow::Result<BenchResult> {
+	let generate_start = Instant::now();
+	let (timestamps, values) = profile.generate();
+	let generation_ns = span_ns(generate_start);
+	run_range_fetch_on(profile, &timestamps, &values, SEGMENT_UNIT, generation_ns, reps)
+}
+
+/// Run the range-fetch workload over an explicit, time-sorted `(timestamps, values)` corpus
+/// in `unit`.
+///
+/// The engine behind [`run_range_fetch`], exposed so a real corpus
+/// ([`load_csv_corpus`](crate::load_csv_corpus)) is measured by exactly the same code: the
+/// profile supplies the window knobs, and the windows are drawn from these timestamps.
+/// `generation_ns` is charged to setup; `irregular` in the result is derived from the data.
+///
+/// # Errors
+///
+/// Returns an error if `reps == 0`, if the corpus has fewer than two rows or cannot be sealed,
+/// or if any rep's read fails.
+pub fn run_range_fetch_on(profile: &RangeFetchProfile, timestamps: &[i64], values: &[BigDecimal], unit: TimeUnit, generation_ns: u64, reps: usize) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(reps > 0, "reps must be > 0");
+	anyhow::ensure!(timestamps.len() >= 2, "a range-fetch corpus needs at least two rows");
 
 	let run_start = Instant::now();
 
 	let setup_start = Instant::now();
-	let (timestamps, values) = profile.generate();
-	let windows = profile.windows(&timestamps);
+	let windows = profile.windows(timestamps);
 	let paged = profile.rows_per_page > 0;
 	// Seal the corpus once (single-block or paged) and take the full-decode ground
 	// truth from the same in-memory segment. `decode_nullable` reads the
 	// already-decoded segment, so the reference is independent of the windowed read
 	// path under test.
 	let (bytes, all_ts, all_vals) = if paged {
-		let segment = PagedSegment::build(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0), profile.rows_per_page).map_err(|e| anyhow::anyhow!("cannot seal paged range-fetch segment: {e:?}"))?;
+		let segment = PagedSegment::build(timestamps, values, unit, &BigDecimal::from(0), profile.rows_per_page).map_err(|e| anyhow::anyhow!("cannot seal paged range-fetch segment: {e:?}"))?;
 		let (t, v) = segment.decode_nullable();
 		(segment.write_to(), t, v)
 	} else {
-		let segment = Segment::build_sorted(&timestamps, &values, SEGMENT_UNIT, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal range-fetch segment: {e:?}"))?;
+		let segment = Segment::build_sorted(timestamps, values, unit, &BigDecimal::from(0)).map_err(|e| anyhow::anyhow!("cannot seal range-fetch segment: {e:?}"))?;
 		let (t, v) = segment.decode_nullable();
 		(segment.write_to(), t, v)
 	};
-	let setup_ns = span_ns(setup_start);
+	let setup_ns = span_ns(setup_start).saturating_add(generation_ns);
 
 	let expected: Vec<WindowRows> = windows.iter().map(|&(start, end)| all_ts.iter().copied().zip(all_vals.iter().cloned()).filter(|(t, _)| start <= *t && *t <= end).unzip()).collect();
 
@@ -243,7 +262,7 @@ pub fn run_range_fetch(profile: &RangeFetchProfile, reps: usize) -> anyhow::Resu
 	}
 
 	let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
-	let end_to_end_ns = span_ns(run_start);
+	let end_to_end_ns = span_ns(run_start).saturating_add(generation_ns);
 	let timing = TimingBreakdown { dataset_generation_ns: setup_ns, measured_ns, end_to_end_ns };
 
 	// Correctness: every windowed read must reproduce the full-decode-filtered window,
@@ -255,7 +274,7 @@ pub fn run_range_fetch(profile: &RangeFetchProfile, reps: usize) -> anyhow::Resu
 	let values_finite = last_output.iter().flat_map(|(_, v)| v.iter().flatten()).all(|v| v.to_f64().is_some_and(f64::is_finite));
 	let correctness = CorrectnessReport { output_count_ok: rows_fetched == expected_rows && windowed_matches_truth, expected_output_points: expected_rows, actual_output_points: rows_fetched, values_finite };
 
-	let storage = Some(StorageEstimate::from_columns(&values, &timestamps, SEGMENT_UNIT, &BigDecimal::from(0)));
+	let storage = Some(StorageEstimate::from_columns(values, timestamps, unit, &BigDecimal::from(0)));
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
@@ -270,7 +289,7 @@ pub fn run_range_fetch(profile: &RangeFetchProfile, reps: usize) -> anyhow::Resu
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_RANGE_FETCH.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: rows_fetched, irregular: !profile.regular, missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_RANGE_FETCH.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: rows_fetched, irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
 }
 
 #[cfg(test)]
@@ -288,6 +307,21 @@ mod tests {
 		assert_eq!(profile.generate(), profile.generate(), "same seed -> identical corpus");
 		let (ts, _) = profile.generate();
 		assert_eq!(profile.windows(&ts), profile.windows(&ts), "same seed -> identical windows");
+	}
+
+	#[test]
+	fn an_explicit_corpus_runs_through_the_same_range_engine() {
+		// A real-shaped corpus (60 s stride in seconds, exact 8-decimal values) passes the
+		// windowed-vs-full-decode gate single-block and paged.
+		let ts: Vec<i64> = (0..3_000_i64).map(|i| 1_505_412_060 + i * 60).collect();
+		let vals: Vec<BigDecimal> = (0..3_000_i64).map(|i| BigDecimal::new((355_893_000_000 + i * 1_234_567).into(), 8)).collect();
+		for rows_per_page in [0, 512] {
+			let profile = RangeFetchProfile::new("rf-csv", RangeFetchParams { window_rows: 100, window_count: 8, rows_per_page, ..RangeFetchParams::default() });
+			let result = run_range_fetch_on(&profile, &ts, &vals, TimeUnit::Seconds, 0, 2).expect("runs");
+			assert!(result.correctness.passed(), "{rows_per_page}: {:?}", result.correctness);
+			assert!(!result.dataset.irregular);
+		}
+		assert!(run_range_fetch_on(&RangeFetchProfile::new("x", RangeFetchParams::default()), &ts[..1], &vals[..1], TimeUnit::Seconds, 0, 1).is_err());
 	}
 
 	#[test]

@@ -169,7 +169,11 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [ ] Remaining workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, gap fill, compressed query, analytics pipeline
 - [ ] Fair-protocol depth (Phase 1.1) — ≥10 reps for short tests, cold/warm/hot/post-compaction/post-restart separation, saturation curves (batch size, clients, writers, query concurrency, cardinality, dataset size, GPU output size), seeded randomized query mixes (published seeds), failure tests (restart during ingest, crash during compaction, network retry, partial/corrupt segment), independent-reproducibility packaging (versions, SHAs, images, configs, hardware, drivers, command lines, raw artifacts)
 - [ ] Fair interpolation comparisons (Phase 1.2) — report three classes where possible: (A) native in-DB (Timescale gapfill, QuestDB `SAMPLE BY … FILL`, InfluxQL/SQL fill, ClickHouse ASOF/window, DuckDB window fns, IoTDB fns); (B) portable SQL baseline; (C) client-side end-to-end. Don't hide unfavorable results.
-- [ ] Remaining hardware capture — disk, GPU, and driver versions in run metadata
+- [x] **DONE (2026-10-08) — disk capture:** `RunMetadata.work_disk_{kind,file_system,mount_point}` (schema v19). The disk
+  under the working directory, found by longest mount-point prefix through `sysinfo::Disks`.
+  Verified live: a run from `/mnt/deepmem` reports `hdd btrfs`, one from `/` reports `ssd btrfs`.
+- [ ] Remaining hardware capture — GPU and driver versions in run metadata. **Unblocked (INT-0, 2026-10-08):** splimes 1.0 is on main (PR #62) and its `gpu::gpu_info()` has a `driver` field; an interpolation run's `metadata.engine.gpu` (schema v16) already names the GPU adapter, so the driver version is what remains. Original note: needs a wgpu adapter
+  query; `splimes` owns the adapter)
 - [ ] Report surfaces beyond JSON/HTML — Parquet / Grafana dashboards
 - [ ] Anti-Goodhart (Phase 1.3) — publish negative results + WeftDB-losing workloads; benchmark code separate from engine code; run customer-supplied workloads; README policy line *("WeftDB benchmarks guide real engineering decisions, not synthetic wins")* — policy line + the sawtooth negative finding shipped; the publication pipeline is open
 
@@ -385,6 +389,14 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
 **Acceptance:** honest claim like *"this mode cuts storage by X while preserving event
 detection within Y% and improving historical query latency by Z."*
 
+**Real-corpus figures.** Every "real BTC" number in this phase and below (`btc_close`,
+`btc_minutes`, 4.22 B/point, the `--*-csv` workloads) comes from `database/datasets/btc_1min.csv`,
+a local, gitignored file that is **not distributed with the repository**, so a clone cannot
+reproduce them (the benches that load it by default skip it when the file is absent). Whether the datasets
+may be redistributed, and clearing or retiring the BTC-corpus numbers before 1.0, are open with
+counsel ([Phase 8](#phase-8--commercial-hardening--required-for-paid-beta);
+[1.0 plan, Appendix B](docs/release/1.0-plan.md#appendix-b-human-only-tasks)).
+
 - [ ] **6.1 Lossless typed codecs** — timestamp delta/delta-of-delta + **fixed-width
   bit-packing** + **RLE** + **Gorilla variable-length** + **per-block adaptive
   bit-packing** *(all five realized on disk in the `.weftseg` timestamp block, chosen
@@ -413,6 +425,17 @@ detection within Y% and improving historical query latency by Z."*
       (`VAL_CODEC_FOR`), and Tiger Data patents against both ingest paths. Technical claim charts
       are prepared. These stay ungated because default stores depend on them; the decision is
       counsel's.
+    - [ ] **The 2026-10-08 routine's advisory codecs: not yet reviewed, and ungated.** INT-0
+      merged them after this gate was set: the decimal-exponent FOR (`timestamp::dfor_bitpack_*`,
+      `ColumnEncoding::dfor_value_bytes`) and the timestamp common-multiple and delta-FOR estimates
+      (`DeltaOfDeltaColumn::common_multiple`, `common_multiple_estimated_bytes`,
+      `delta_for_estimated_bytes`). None is written to disk, but all are in `weft-physical-type`'s
+      public API, so the check above covers them, and the decimal-exponent FOR is a
+      frame-of-reference variant, so the FOR item's counsel question reaches it too. They fit
+      `experimental-codecs`' description (advisory codecs the writer never emits) without being
+      behind it; whether to move them there before the next release is the owner's call. The
+      bench-only ALP arm (`benches/alp_vs_f64_codecs.rs`, over the `alp` crate) already requires
+      `experimental-codecs`.
     - [ ] **SAP family: review before the Phase 6.2 design.** Read the flagged SAP patents before
       designing model-based compression (6.2), so the design starts clear of them rather than
       being reworked afterwards.
@@ -422,11 +445,14 @@ detection within Y% and improving historical query latency by Z."*
     - [x] **Attribution for adapted code.** Chimp/Chimp128 (`weft-physical-type`) and DDSketch
       (`weft-reduce`) are treated as adapted from their Apache-2.0 reference implementations: a
       root `NOTICE` and per-crate `THIRD-PARTY-NOTICES` (shipped in each package) meet
-      Apache-2.0 section 4.
+      Apache-2.0 section 4. *(INT-0, 2026-10-08: the routine's integer `avg` division in
+      `weft-reduce` transcribes bigdecimal-rs's `impl_division`; it is attributed the same way,
+      taken under the Apache-2.0 option of bigdecimal-rs's MIT OR Apache-2.0.)*
     - [ ] **Package licence metadata: mitigated by the relicense; the expression is with
       counsel.** Every crate now declares `license = "MIT OR Apache-2.0"`, so Apache-2.0 is one
       of the two options scanners see, and the two crates' `THIRD-PARTY-NOTICES` and READMEs say
-      that the Chimp and DDSketch portions stay under Apache-2.0 whichever option a user picks.
+      that the Chimp, DDSketch and bigdecimal-rs portions stay under Apache-2.0 whichever option a
+      user picks.
       The field itself still offers MIT for the whole of `weft-physical-type` and `weft-reduce`.
       The candidate expression for those two crates is `(MIT OR Apache-2.0) AND Apache-2.0`;
       it is on the [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta) counsel
@@ -540,11 +566,56 @@ detection within Y% and improving historical query latency by Z."*
       `best_value_codec` on the real corpus, the actionable outcome is to steal the **heuristic**,
       which stays inside hard-constraint #4 because WeftDB's scale is already schema-declared.
       *(src: https://arxiv.org/pdf/2502.06112)*
-    - [ ] **`pco` is now 1.0 (1.0.3, 2026-08-01) — pin it in `weft-bench` only**, keeping it out of
-      the core crates until an adopt decision, per the out-of-core boundary. Build the harness with
-      the `bmi1`/`bmi2`/`avx2` target features the crate's docs call for ("improves ... decompression
-      speed substantially") or the measured decode throughput will understate pco and produce a false
-      adopt-or-drop verdict. *(src: https://lib.rs/crates/pco)*
+    - [x] **DONE (2026-10-08) — `pco` reached 1.0 (1.0.3, 2026-08-01); `pco =1.0.4` is pinned as a
+      bench-only dev-dependency of `weft-physical-type`, not a runtime dependency of any core
+      crate.** The library links none of it, so the out-of-core boundary holds until an adopt
+      decision (the plan was to pin it in `weft-bench`; the arm went beside the other codec arms
+      instead, see below). The crate's docs call for the `bmi1`/`bmi2`/`avx2` target features
+      ("improves ... decompression speed substantially"); the measurement below was built without
+      them, so its pco decode times are a floor and must not decide adopt-or-drop on speed.
+      *(src: https://lib.rs/crates/pco)*
+    - [x] **Measured (2026-10-08), value column, per column as asked.** `pco =1.0.4` is pinned as
+      a bench-only dev-dependency of `weft-physical-type`, beside `alp`/`fastlanes` in
+      `benches/alp_vs_f64_codecs.rs`. The library links none of them; the arm sits with the other
+      codec arms rather than in `weft-bench`. Bits/value at default level 8: **btc_close: pco on exact
+      mantissas 11.09**, pco on floats 11.64, vs dfor 13.58, ALP 15.35, realized `scaled_for` 33.74,
+      opt-in delta cascade 32.55. **sensor_2dp: pco 2.81** (= log₂7, the entropy of its ±3-cent
+      steps), pco floats 3.43, vs delta cascade **3.000**, realized 5.51. **real_doubles: pco 45.90**
+      vs Chimp 49.50, ALP-RD 56.16. Decode times were taken at load avg 48–63 and are indicative
+      only (pco 4.6–10 ms per 1 Mi values vs realized FOR ~1.9 ms). Built without BMI/AVX2, so pco's
+      times are a floor. Reading: pco is the **ratio ceiling** on every corpus. On a random walk the
+      shipped opt-in cascade is already within 0.19 bits of it. On BTC, dfor plus in-block deltas
+      reaches only 13.06 bits (Python estimate over the same window). The remaining ~2 bits are
+      pco's entropy coding of heavy-tailed deltas, which bit-packing at the block's max width cannot
+      reach. That is a cold-tier argument (pco's page-serial decode), not a hot-path one, matching
+      the scope correction above.
+    - [x] **DONE (2026-10-08) — timestamp half measured** (`benches/timestamp_vs_pco.rs`, 1 Mi each,
+      bits/value, shipped DoD selector vs pco level 8): real **btc_minutes** (rows 3M..) 0.000 vs
+      0.001 (the window is perfectly regular, so both are free); **ms_as_micros** (ms-precise instants
+      stored in µs) **20.000 vs 9.001**; **jittered_micros** 20.000 vs 19.001. pco decode 0.88 /
+      1.63 / 1.28 ms.
+    - [x] **DONE (2026-10-08, advisory) — factor a timestamp column's common multiple (pco's `IntMult`) before DoD
+      packing.** Shipped as `DeltaOfDeltaColumn::common_multiple()` (the GCD of the first delta and
+      every second difference) and `common_multiple_estimated_bytes()` (the shipped selector's best
+      over the reduced column, plus a varint for g). Measured on ms_as_micros at **20.000 → 10.000
+      bits/value** (g = 1000; pco 9.001). On real btc_minutes it finds g = 60 at no gain (already
+      0 bits); on jittered µs it finds none. Surfaced as `storage.advisory_common_multiple_timestamp_bytes`
+      (and the delta-FOR one as `advisory_delta_for_timestamp_bytes`, schema v18). On a real
+      `weft-bench --input` run over 20k ms-precise instants: 50,007 → 25,011 timestamp bytes.
+      - [ ] **NEXT — realize the common-multiple factor as a timestamp codec flag (owner sign-off:
+        headline bytes/point change).** Original rationale: A µs column holding ms-precise instants costs WeftDB **20 bits/value against pco's
+      9**, because every second difference carries three wasted decimal digits. This is the
+      timestamp twin of the decimal-exponent FOR. Per block (or column), compute the GCD of the
+      deltas, store it once, and pack `dod / gcd`. Expect ~10 bits on that corpus. It stays exact,
+      and the declared `TimeUnit` is unchanged.
+    - [x] **DONE (2026-10-08, advisory) — first-order delta + FOR as a timestamp candidate beside DoD.**
+      `DeltaOfDeltaColumn::delta_for_estimated_bytes()`, measured at jittered_micros **20.000 →
+      19.424** bits/value (pco 19.001), ms_as_micros 19.420 (the common-multiple factor's 10.000 is
+      far better there), and btc_minutes 0.250 (it loses on a constant stride, as expected). A
+      modest ~3% on random-interval streams only. Original rationale: On fully jittered
+      intervals the second difference doubles the variance, costing ~1 bit/value (20 vs pco's 19).
+      Add a "delta-FOR" arm to `best_estimated_bytes`'s race; it wins only on random-interval
+      streams, and that is also exactly where DoD's premise (a near-constant stride) fails.
   - [x] **Scaled-int value bit-pack codec — realized on disk.** The `.weftseg` value block
     now carries a self-describing codec selector (`VAL_CODEC_VARINT`/`VAL_CODEC_BITPACK`);
     a `ScaledI64` column whose mantissas fixed-width bit-pack below the per-value varint
@@ -637,7 +708,7 @@ detection within Y% and improving historical query latency by Z."*
     the Parquet spec** (mode 0 = ALP, other modes reserved), so if WeftDB uses ALPrd for the
     high-precision fallback, declare it a WeftDB-private mode id and keep mode 0 byte-compatible.
     *(src: https://parquet.apache.org/docs/file-format/data-pages/alpencoding/)*
-  - [ ] **Use the `alp` crate to get the ALP adopt benchmarked, rather than hand-rolling it first.**
+  - [x] **DONE (2026-10-08) — Use the `alp` crate to get the ALP adopt benchmarked, rather than hand-rolling it first.**
     spiraldb's `alp` 0.0.4 (2026-09-08, Apache-2.0) implements both classic ALP and ALP-RD with
     `ENCODE_CHUNK_SIZE = 1024` — matching WeftDB's tile granularity — and an encode/decode API whose
     `decode_single`/`decode_slice_inplace` map onto `read_value_at`/`read_value_range`. It is a pure
@@ -645,6 +716,107 @@ detection within Y% and improving historical query latency by Z."*
     `0.0.x` means no semver promise (pin exactly or vendor), and `alp` pins `fastlanes ^0.6` while
     that crate is at 0.7.2, so a combined dependency pulls two versions unless pinned.
     *(src: https://docs.rs/alp/latest/alp/)*
+    - [x] Shipped `weft-physical-type/benches/alp_vs_f64_codecs.rs` (`alp =0.0.4` + `fastlanes =0.7.2`,
+      bench-only). The ALP arm uses a Parquet-style container: per-1024 vector exponents, FOR, a
+      `fastlanes` pack, and `u16` + f64 exceptions. Every arm is asserted bit-exact before timing.
+      Bits/value and 1 Mi decode (loaded box, load avg ~27):
+      **real BTC closes** (rows 3M..+1Mi): ALP **15.35 b, 0.57 ms** · Chimp128 23.34 b, 17.4 ms ·
+      Elf 38.84 b, 28.1 ms · Chimp 42.09 b · Gorilla 51.74 b · **realized `scaled_for` (scale 8)
+      33.74 b, 70.8 ms**. **sensor_2dp**: ALP 7.22 b, 0.73 ms · realized `scaled_for` **5.51 b**,
+      11.3 ms · Chimp128 11.58 b, 7.85 ms. **real_doubles**: ALP 82.2 b (33.8% exceptions) ·
+      ALP-RD 56.2 b · Chimp **49.5 b**. Against the shipped f64 codecs, ALP clears the acceptance bar
+      below by a wide margin on both decimal-shaped corpora (−34% / −38% bytes vs Chimp128, 10–30×
+      decode). It loses badly on full-mantissa doubles, where ALP-RD or Chimp must be the fallback.
+    - [ ] **ALP adopt as `VAL_CODEC_ALP` — owner sign-off (headline change).** The benchmark says
+      adopt for decimal-shaped f64 columns, with a per-column fallback to Chimp/ALP-RD when the
+      exception rate is high (ALP's own sampling picks this). Mirror the Parquet layout per the
+      frozen-wire-layout item above.
+    - [x] **DONE (2026-10-08, advisory) — per-vector scale is the lever the realized exact path is missing.** On the BTC
+      window, `recommend_encoding` must declare **scale 8 for the whole column** because a few
+      closes carry 8 decimals, which inflates every FOR residual to ~33 bits. ALP picks an exponent
+      **per 1024 vector** and pushes the 0.01% odd values to exceptions, reaching 15.35 bits. A
+      `ScaledI64` codec with a per-tile scale and an exception list would keep the `BigDecimal`
+      logical type exact, with no float on the path, and should approach ALP's figure. Measure it on
+      the same bench before deciding between that and ALP.
+      Shipped as the **decimal-exponent FOR** (`timestamp::dfor_bitpack_{bytes,encode,decode,decode_range}`
+      + `ColumnEncoding::dfor_value_bytes`). Each 64-value block factors out its common power of ten
+      (the fewest trailing decimal zeros of any mantissa in it, stored in one header byte), then
+      FOR-packs. It is exact integer arithmetic, so no float and no exception list are needed. Only 1
+      of 16,384 BTC blocks had to keep scale 8. Measured (`alp_vs_f64_codecs`): **btc_close 13.58 b**
+      vs realized `scaled_for` 33.74 b (**2.48× smaller**) vs ALP 15.35 b; decode 2.10 ms vs
+      1.78 ms (FOR) / 0.67 ms (ALP). **sensor_2dp 5.64 b vs 5.51 b**: it loses by the header byte
+      when nothing factors out, so a selector must pick it only when strictly smallest.
+    - [x] **DECIDED (2026-10-08) — per-block wins on BTC.** A Python sizing over the same 1 Mi window
+      gives a per-value minimal exponent (Pseudodecimal-style) **25.20 bits/value**: digits FOR-packed
+      at 20.28, plus an RLE'd exponent column at 4.92 across 322,504 runs. That is against **13.58**
+      for the per-block exponent. A value's *minimal* exponent depends on its trailing digits
+      (3558.90 → k=7, 3559.00 → k=8; the k histogram is 6:832k, 7:102k, 8:71k, 9:35k), so per-value
+      exponents scatter and jumble the digit magnitudes FOR then pays for. Keep per-block for
+      `VAL_CODEC_DFOR`. The original item:
+    - [x] **Prior art for the decimal-exponent FOR: BtrBlocks' Pseudodecimal Encoding (SIGMOD'23)
+      chooses the exponent PER VALUE, not per block (research 2026-10-08).** It splits a double into
+      two integer columns (signed significant digits and an exponent) plus an exception column,
+      then cascades each into integer schemes such as RLE/FOR/bit-packing. Its selection rule:
+      disable when >50% of values are exceptions, and skip columns with <10% unique values. Before
+      freezing `VAL_CODEC_DFOR`, size a per-value exponent column (RLE'd) against the per-block
+      header byte on `alp_vs_f64_codecs`. On BTC only 1 of 16,384 blocks needed k=0, so per-block
+      should win there, but a column mixing precisions value by value is where per-value would.
+      *(src: https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf)*
+    - [ ] **NEXT — realize the decimal-exponent FOR as `VAL_CODEC_DFOR` (owner sign-off: headline
+      bytes/point change).** Add it to `best_value_codec`'s strict-smallest race and wire a
+      writer/reader selector byte plus the range and gather paths, mirroring `VAL_CODEC_FOR`. Then re-run
+      `ingest_path_profile_legacy_vs_columnar` on the real corpus: the 4.22 B/point realized headline
+      should fall, since the value column is most of it. Expected value column: ~13.6 b vs ~33.7 b.
+      - [x] **DONE (2026-10-08)** surfaced as `storage.advisory_dfor_value_bytes` in the `weft-bench`
+        `StorageEstimate` (schema v17; `Some` only when it strictly beats the realized codec).
+    - [x] **DONE (2026-10-08) — the scalar FOR/blocked decode is the read-path bottleneck at wide widths.**
+      `for_bitpack_decode` takes **70.8 ms per 1 Mi values at ~33 bits** (11.3 ms at ~5.5 bits). It
+      loops per bit per value, so cost scales with width. The `fastlanes` unpack inside the ALP arm
+      does the same FOR + unpack work in under 1 ms. Port the FOR/blocked unpack to a word-wise
+      (or `fastlanes`-style) kernel and re-run `alp_vs_f64_codecs` + `bitunpack`.
+      Fixed with a shared word-wise `read_bits`/`write_bits` (one unaligned LE load + shift/mask)
+      behind every LSB-first codec (global/blocked/FOR bit-pack, the FOR range + gather, Gorilla).
+      A/B: `bitunpack` scalar_global **16.53→1.09 ms**, scalar_blocked **17.19→1.83 ms**;
+      realized `scaled_for` on BTC **78.1→1.66 ms** (47×), sensor_2dp 11.9→2.55 ms;
+      `transposed_read` linear full decode **15.5→6.87 ms**. ALP's 0.57 ms on BTC is now a 2.9×
+      decode gap rather than a 124× one; its byte win (15.35 vs 33.74 b) is unchanged.
+    - [ ] **Re-decide the transposed layout now that the linear baseline is honest — RECOMMEND
+      RETIRING `VAL_CODEC_TRANSPOSED` to read-only (owner decision).** Tried 2026-10-08: replacing
+      the table spread with a branch-free 8×8 bit-matrix transpose (Hacker's Delight `transpose8`) made
+      the tile decode **11–25% slower** (w3/w10/w20: 0.895/1.78/2.87 ms vs 0.78/1.50/2.32 ms on the
+      `fastlanes` yardstick), so it was reverted. The bit-plane layout needs a transpose that
+      FastLanes' own layout avoids by design. No remaining kernel idea is credible for the ≥3× it
+      would need to beat the linear unpack (1.09 ms), and end to end it is byte-neutral and
+      slightly slower. Keep the reader so existing frames still decode; stop offering
+      `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` for new seals. Original item: After the
+      word-wise read the linear unpack beats the transposed one (1.09 vs 1.95 ms per 1 Mi values), and
+      end-to-end full decode is 6.87 (linear) vs 7.81 ms (transposed). The old "~5.7× kernel win"
+      was measured against a per-bit decoder. Either close the yardstick residue
+      above (≥3× faster tile decode) or retire `VAL_CODEC_TRANSPOSED` to read-only.
+    - [x] **DONE (2026-10-08) — The f64 codecs (Gorilla/Chimp/Chimp128/Elf) still read with their own per-bit loops**
+      in `floatcodec.rs` (17–55 ms per 1 Mi values in `alp_vs_f64_codecs`). Port them to the same
+      word-wise read before any adopt decision compares them with ALP on decode speed.
+      `BitReader::get_bits` is now one big-endian load + shift per field, and `BitWriter::put_bits`
+      writes byte-sized chunks. A/B on BTC: Gorilla **36.4→3.41 ms**, Chimp 35.7→6.77,
+      Chimp128 **19.8→4.45**, Elf 29.4→5.58 ms. Range across all three corpora: 2.7–10.9×. ALP
+      (0.57 ms, 15.35 b) is still the fastest and smallest on BTC, but the decode gap to Chimp128
+      is now 7.8×, not 30×.
+    - [x] **DONE (2026-10-08) — the ~2.4 ms "frame parse" floor under every read was the CRC.**
+      `weftseg::crc32` was a byte-at-a-time table CRC over the whole frame body, run by every read
+      (~0.5 GB/s). Now slicing-by-16 (same IEEE polynomial, identical checksums, no dependency).
+      A/B: 1M-row point read **2.50→0.81 ms**, 1000-row range 2.32→0.63 ms; `pointread` streaming point
+      185→56 µs, paged 175→33 µs, 64-instant batch 189→67 µs. README read table re-measured.
+    - [ ] **Next read-path floor: every point read still CRCs the whole frame** (real-data evidence
+      2026-10-08: 1M BTC closes, 128-instant batch p50 2.43 ms single-block vs 0.90 ms paged). Now ~0.8 ms on a
+      1M-row frame, against the ~10 GB/s a CLMUL CRC reaches. Two options. Add a per-block
+      (or per-page) checksum so a point read verifies only the bytes it decodes; this is a format
+      bump, but the paged frame already has the page structure. Or adopt a hardware CRC (`crc32fast`,
+      a pure codec crate). The per-block checksum is the one that changes the asymptotics.
+      *(research 2026-10-08)* crc32fast's own benchmark puts its 16-bytes-per-iteration baseline,
+      the same shape as WeftDB's new slicing-by-16, at **1,499 MB/s**, against **7,314 MB/s** for the
+      PCLMULQDQ path (~4.9×). The hardware CRC therefore caps the remaining whole-frame cost at about
+      5× less, while a per-block checksum removes it from point reads altogether. Dual MIT/Apache-2.0,
+      so it is admissible if chosen. *(src: https://github.com/srijs/rust-crc32fast)*
   - [ ] **Set the ALP acceptance bar from upstream's own ablation, and be willing to DECLINE.**
     FastLanes' per-encoding ablation (VLDB'25, Table 7, PUBLIC_BI) reports ALP at **+4.36%
     compression ratio for −7.28% decompression speed**, with ALP_RD +0.57%/−2.30% and Patch
@@ -684,15 +856,24 @@ detection within Y% and improving historical query latency by Z."*
     slice): shipped (prototype).** *(Correction 2026-10-08: what shipped is a bit-sliced,
     bit-plane-major layout, not the FastLanes layout; it is now behind the `bitsliced-codec`
     feature — see the codec patent/licence gate above.)* `TRANSPOSE_TILE`/`transpose_bitpack_bytes`/`_encode`/`_decode`
-    — a per-tile bit-plane-major layout whose decoder reads `u64` words and walks only the *set*
-    bits (`w &= w-1`), so the empty high bit-planes of a small-magnitude stream are skipped
-    wholesale (where the scalar per-value loop pays every bit of every value). Byte footprint is a
-    permutation of the linear per-block layout (identical on aligned tiles). Measured (release,
-    `benches/bitunpack.rs`, 1 Mi small-magnitude stream): **~238 Melem/s vs ~41.6 Melem/s** for the
-    linear per-block decode at the same footprint — **~5.7× decode speedup**, bytes/point unchanged.
-    Residue: realize it as the stored blocked layout behind a format-version bump + reader dispatch,
-    and measure the *end-to-end* read win (decode is often bandwidth-bound —
-    https://arxiv.org/pdf/2606.22423). *(src: FastLanes Compression Layout, VLDB'23 —
+    — a per-tile bit-plane-major layout. A plane byte holds the same bit of eight lanes, so the
+    shipped decoder rebuilds eight lanes per byte read with a fixed, branch-free table spread
+    (`SPREAD`) written straight into the output, and each tile's one-byte width header drops a
+    small-magnitude stream's empty high bit-planes. It replaced the first decoder, which read `u64`
+    words and walked only the *set* bits (`w &= w-1`), after the `fastlanes` yardstick found that
+    one 3.7–15× slower than the crate at widths 3/10/20; the rewrite took it from 1.32→0.78 /
+    5.27→1.50 / 7.60→2.32 ms per 1 Mi values (1.7× / 3.5× / 3.3×)
+    ([`benches/fastlanes_yardstick.rs`](weft-physical-type/benches/fastlanes_yardstick.rs)). Byte
+    footprint is a permutation of the linear per-block layout (identical on aligned tiles). The
+    **~5.7× decode speedup** once quoted here (~238 vs ~41.6 Melem/s, 1 Mi small-magnitude stream)
+    belongs to that old set-bit decoder, measured against a linear decoder that read one bit at a
+    time, and it did not survive. Once the linear unpack moved to word-wise reads it unpacks faster
+    than the table spread (1.09 vs 1.95 ms per 1 Mi values,
+    [`benches/bitunpack.rs`](weft-physical-type/benches/bitunpack.rs)), and realized on disk as the
+    opt-in `VAL_CODEC_TRANSPOSED` the layout is byte-neutral (+0.08%) and reads no faster end to end
+    ([`benches/transposed_read.rs`](weft-physical-type/benches/transposed_read.rs)), as the
+    caveat that decode is often bandwidth-bound predicted (https://arxiv.org/pdf/2606.22423). See
+    the retire-to-read-only item above. *(src: FastLanes Compression Layout, VLDB'23 —
     https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf)*
   - [x] **Cascading (recursive) codec composition — delta→best-packer chain: advisory + on disk.**
     WeftDB's other value codecs are single-level (one of varint/bit-pack/blocked/FOR); this is the
@@ -1035,7 +1216,11 @@ of them turn Turso into the measurement backend.
   + WAL truncate-checkpoint). Record this as the attribution rather than re-litigating it, and stop
   reading the ~1–2.5 s tick drift as daemon scheduling jitter. *(src:
   https://docs.turso.tech/sql-reference/statements/vacuum)*
-- [ ] **Backup cost residue (b) — two cheap A/B experiments on the shipped bench, in this order.**
+- [ ] **Backup cost residue (b) — (i) MEASURED 2026-10-08: `synchronous=OFF` is NOT a material win.**
+  `backup_cost` on the HDD volume (`WEFT_BENCH_BACKUP_DIR` under /mnt/deepmem, load average ~12–21):
+  snapshot_only/1 4.77 → 4.25 s, /16 4.88 → 4.61 s, with overlapping confidence intervals. The
+  pragma was set on the store connection in a throwaway patch, never committed. (ii) checkpoint-first
+  is still untried. Original item:
   (i) Upstream SQLite makes the output fsync **conditional** on the *source* database's
   `PRAGMA synchronous` being NORMAL or FULL, and Turso implements that pragma partially (OFF and FULL
   only) — so `synchronous=OFF` on the snapshot connection may collapse the seconds-scale cost. Note
@@ -1216,7 +1401,17 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **START HERE (filed 2026-09-23 for the next run).** The 2026-09-23 run closed both cheap backup
+- [ ] **START HERE (filed 2026-10-08 for the next run).** The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
+  rebuilt the codec read path and cut the exact-decimal reduction tax. Recommended order:
+  (1) owner decisions waiting: `VAL_CODEC_DFOR` (BTC 33.7 → 13.6 bits/value), the timestamp
+  common-multiple codec, ALP adoption, and retiring `VAL_CODEC_TRANSPOSED`; (2) the remaining ~6×
+  decimal tax (profile per-bucket materialization); (3) the backup checkpoint-first A/B;
+  (4) bulk ingest through the `.weftseg` seal, once the durability arc has landed.
+  Lanes first ([1.0 plan §2](docs/release/1.0-plan.md#2-operating-rules-for-the-whole-release),
+  single-writer hot-file lanes): `backup.rs` and `segment_store.rs` (L-STORE) belong to the
+  durability track and the `weft-physical-type` frame/codec files to L-FMT, so work on them is
+  coordinated with the owning lane, not landed independently.
+- [ ] **(2026-09-23 list; item 3 shipped 2026-10-08.)** The 2026-09-23 run closed both cheap backup
   follow-ons (sidecar sweep shipped; snapshot cost **measured**, and the diagnosis on record was
   wrong — it is I/O, not vacuum CPU) and landed the depth item (**transposed layout realized on
   disk**, with an honest end-to-end *no-win* result). Recommended order:
@@ -1256,6 +1451,68 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   state **its own decimal-vs-f64 slowdown factor** against QuestDB's published ~2× or the wedge is
   asserted rather than measured. *(src: https://questdb.com/docs/query/datatypes/decimal/)*
 
+  - [x] **MEASURED (2026-10-08) — WeftDB's own decimal-vs-f64 factor is ~43×, not ~2×.**
+    `weft-reduce/benches/decimal_tax.rs` takes 1 Mi real BTC closes, hourly `avg`, three paths
+    cross-checked first (17,477 buckets; the integer sums equal the BigDecimal sums exactly). The
+    shipped `weft_reduce::reduce` over BigDecimal takes **100.65 ms**, an f64 loop **2.33 ms**, and
+    an **exact** scale-8 i64-mantissa loop summed in i128 **1.44 ms**. The shipped path also pays
+    `Point`/`DateTime` bucketing, which the tight loops do not, so 43× is the whole path, not pure
+    arithmetic. Either way, against QuestDB's documented ~2× the precision wedge currently costs
+    more than the competitor's, while the exact integer path WeftDB's `ScaledI64` columns already
+    store is *faster* than f64.
+  - [x] **DONE (2026-10-08) — `weft_reduce::reduce_scaled`**, the integer-native streaming reduction
+    (count/sum/avg/min/max/first/last over `(epoch_nanos, mantissa, scale)`, i128/i64 accumulators,
+    one BigDecimal per output bucket). It is **equal bucket-for-bucket to `reduce`** (tested over
+    resolutions, filters and out-of-order input; bucket keys property-tested against
+    `Resolution::to_base`, and since INT-0 against `weft_reduce::bucket_index`, as splimes 1.0
+    removed `to_base`) and returns `None` for percentiles, TWA and sketches. On the real-BTC
+    `decimal_tax` bench: **`sum` 58.65 → 8.46 ms (6.9×)**. **`avg` 133–153 → 50–133 ms** across two
+    loaded runs, because the per-bucket `BigDecimal` division (17,477 of them) now dominates both
+    paths.
+  - [x] **DONE (2026-10-08) — the `avg` division floor.** `avg_like_bigdecimal` transcribes
+    `bigdecimal` 0.4's `impl_division` (special cases, 100-digit precision, round-half-up on the next
+    digit) into `u128` long division, building the BigInt once per 38 digits. It is **identical in
+    representation** (`int_val`, `scale`) to `bigdecimal`'s own `/` over 20,000+ random and edge cases.
+    Hourly `avg` on real BTC: shipped **122.75 ms → `reduce_scaled` 28.45 ms (4.3×)**, f64 2.77 ms,
+    so the decimal tax on this path went from ~44× to ~10× (one run, load avg ~50).
+  - [x] **DONE (2026-10-08) — wired into `SegmentStore::downsample_range`:** `segment_partial` reads
+    the window physically (`read_segment_range_physical`) and uses `reduce_partial_scaled` for
+    one-scale ScaledI64 rows, falling back otherwise. Runtime-verified on the real server: 100k BTC
+    closes, hourly min/max/avg/sum/first/last, all 1,667 buckets match an independent Python
+    `Decimal` recomputation.
+  - [x] **DONE (2026-10-08) — `reduce_partial_scaled` accepts `sketch_p*`**, feeding each bucket's
+    DdSketch through the same `add_decimal` (so sketches are identical; tested against
+    `reduce_partial` with the full sidecar set). Stored-range `sketch_p*` downsamples therefore take
+    the integer path too. Not switched: bigdecimal's `to_f64` is a custom digit-trimming
+    conversion, not provably correctly rounded, so `m as f64 / 10^s` cannot replace it.
+  - [x] **MEASURED (2026-10-08) — per-segment end to end** (`decimal_tax` `segment_downsample_*`, one real
+    1 Mi-row 4.42 MB frame, decode + reduce, both routes asserted equal, load avg ~50): six streaming
+    reductions **183.6 → 134.0 ms (1.37×)**; avg + sketch_p99 309.6 → 281.5 ms (1.10×). The
+    reduction itself is no longer the cost (~28 ms in isolation), so the next lever is the
+    physical window decode. Profile `read_segment_range_physical` on this frame.
+  - [x] **DONE (2026-10-08) — `BucketAcc::finish` computes `avg` through `avg_of_sum`**, the
+    proven-identical integer long division, whenever the sum's unscaled integer fits i128. This
+    speeds up every path, the BigDecimal `reduce` included. Quieter-box numbers (load avg ~11):
+    hourly avg `reduce` **60.04 ms**, `reduce_scaled` **13.52 ms**, f64 2.14 ms; per-segment
+    streaming6 **127.6 → 59.7 ms**; avg+sketch_p99 176.5 → 144.0 ms (the sketch's per-value
+    `to_f64` is now the cost). The decimal tax on the integer path is ~6.3× f64, against QuestDB's
+    documented ~2×.
+  - [ ] **NEXT — the remaining 6.3×:** per-bucket BigDecimal materialization (six values + the
+    `BTreeMap<String, _>` per bucket) and the window decode (~30 ms of the 59.7). Profile before
+    choosing.
+  - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
+    (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
+    so switching it means threading the seal's encoded column through instead. Its callers sit in
+    the persist paths the durability arc is reworking, so do it after that lands. Then add a
+    server-level downsample timing (real corpus, many segments) and publish the end-to-end factor
+    beside QuestDB's ~2×. `decimal_tax` covers the reduction only.
+  - [ ] *(original item)* **a `ScaledI64`-native reduction fast path in `weft-reduce`:** reduce
+    `(epoch, mantissa, scale)` columns straight from the segment for count/sum/avg/min/max/first/last
+    (i128 accumulators), materializing a BigDecimal only per output bucket. It stays exact (the
+    BigDecimal stays the API type) and the measured ceiling is ~70× over today's path on this
+    corpus. Wire `SegmentStore::downsample_range` / the `.weftpart` sidecar to it, re-run
+    `decimal_tax` and `--ds-csv`, and publish the new factor beside QuestDB's.
+
 - [ ] **External-engine adapter fairness — three concrete rules from the 2026 landscape.**
   (a) **QuestDB egress:** QuestDB 10.0 (2026-08-06) introduced **QWP**, a binary columnar WebSocket
   protocol that supersedes both ILP (writes) and PG Wire (reads) and streams **Apache Arrow** record
@@ -1294,7 +1551,9 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 - [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters WeftDB, by a lot (measured 2026-07-23).**
   Running `ingest_path_profile_legacy_vs_columnar` on the real corpus for the first time contradicted
   the synthetic numbers three ways, all now guarded in the harness but worth carrying as a standing
-  caution for every workload that uses a generator:
+  caution for every workload that uses a generator. (The real corpus, `database/datasets/btc_1min.csv`,
+  is a local file not distributed with the repository, so the real-data figures below cannot be
+  reproduced from a clone; see the note under [Phase 6](#phase-6--compression-v2--high).)
   - **Compression was overstated ~2.5×.** A representative 1M-row real window frames at **4.22
     B/point** against the synthetic corpus's **1.71 B/point**.
   - **The head of `btc_1min.csv` is degenerate.** Its first ~20k rows are 2012 ticks holding constant
@@ -1309,6 +1568,30 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     scale is *window-dependent* — which is exactly why it must be derived, not declared by a benchmark.
   - [ ] Audit the other `weft-bench` workloads' generators for the same class of flattery (the shape
     knobs are seeded and reproducible, but "reproducible" is not "representative").
+    - [x] **DONE (2026-10-08) — the compression workload runs on a real corpus:** `--comp-csv <FILE>`
+      (`--csv-value-col`, `--csv-skip`; exact decimal text; header auto-skipped; rows sorted).
+      1M real BTC closes (rows 3M..): **4.22 B/point realized** (`scaled_for`), round trip PASS,
+      20.8M points/s decode, `advisory_dfor_value_bytes` = 1.70 B/point.
+    - [x] **DONE (2026-10-08) — `point_lookup` on a real corpus:** `--pl-csv <FILE>`. On 1M real BTC
+      closes, a 128-instant batch over 50 reps has p50 **2.43 ms** single-block vs **0.90 ms** paged
+      (8,192 rows/page), both PASS. The single-block frame is 4.2 MB, and every read CRCs all of it.
+      That is real-data evidence for the per-block checksum item.
+    - [x] **DONE (2026-10-08) — `range_fetch` on a real corpus:** `--rf-csv <FILE>`. On 1M real BTC
+      closes, 32 windows of 100 rows over 30 reps have p50 **60.8 ms** single-block vs **17.8 ms**
+      paged (8,192 rows/page), both PASS. That is ~1.9 ms per window, dominated by the whole-frame
+      CRC of the 4.2 MB frame.
+    - [x] **DONE (2026-10-08) — `downsample` on a real series:** `--ds-csv <FILE>`. **Finding: the
+      generator flatters in the OTHER direction here.** On 1M real BTC closes, hourly buckets with
+      `avg,p99,twa` run at **3.39M points/s** (p50 292 ms, 5 reps, PASS). The same-size generated series
+      (60 s stride) runs at **0.53M points/s** (p50 1,808 ms), **6.4× slower**, measured back to back at
+      load avg ~44–62. The generator builds values with `BigDecimal::from_f64(signal)`, whose exact
+      binary expansions carry ~50 significant digits and make every BigDecimal op expensive. Real
+      two-decimal prices do not. So the README's reduction table, which is all generator-based,
+      **understates** WeftDB on real price data.
+    - [ ] **NEXT — make the downsample generator emit realistic decimals** (e.g. round the signal to
+      2–4 places, as the compression shapes already do) and re-measure the README reduction table.
+      This changes published numbers, so do it as one explicit re-baselining commit, keeping the old
+      figures cited as "pre-2026-10 generator".
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the
@@ -1413,6 +1696,13 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   `Invalid time range: start time must be before end time`. These are **pre-existing** and unrelated
   to the 2026-09-23 increments — they have simply never run in CI because the guard hides them. The
   DDL-under-`BEGIN CONCURRENT` one looks like a genuine control-plane bug rather than a test bug.
+  - [x] **Re-checked 2026-10-08:** `test_api_precise` now **passes**. The DDL-under-`BEGIN CONCURRENT`
+    defect is fixed on main: `set_dictionary_metadata` creates its tables through
+    `Aspect::ensure_dictionary_tables` in an exclusive transaction first. `test_pipeline_api_precise`
+    ran **>29 min without failing**, then hit a 30-min `timeout` (no "Invalid time range" in its
+    output), and `test_pipeline_api_with_fake_db` was never reached. The time-range failures are
+    therefore **unconfirmed either way**. These tests need the bounding below before they can give
+    a verdict.
 - [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.** Each
   spends ~6–10 minutes; `test_create_btc_1min_database` was made runnable by capping its row count
   and using a temp data dir (`BTC_TEST_MAX_ROWS`, default 5,000). The same treatment here would let
@@ -1785,7 +2075,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   the fallback arm sliced against that count — a panic inside a fallible public parser. Now slices
   with `get`, matching `read_value_at`'s existing behaviour; regression-tested with a hand-built
   short-decoding block.
-- [ ] **NEXT — the transposed layout's real lever is a per-tile decode-count threshold, not the
+- [x] **DONE (2026-10-08) — the transposed layout's real lever is a per-tile decode-count threshold, not the
   layout itself (research 2026-09-23).** The `fastlanes` crate's docs state that beyond roughly **10
   values** it is typically faster to unpack a whole tile and index than to unpack values
   individually. WeftDB's reader currently always takes the single-value path in `read_value_at` and
@@ -1809,13 +2099,21 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   before decompression, CPU filter before GPU transfer) pay no gather at all, while only the ordered
   interpolation path restores. *(src: FastLanes file format, VLDB'25 —
   https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf)*
-- [ ] **Cross-check WeftDB's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
+- [x] **DONE (2026-10-08) — Cross-check WeftDB's hand-rolled bit-plane decoder against the `fastlanes` crate (0.7.2,
   2026-09-02, Apache-2.0).** *(Correction 2026-10-08: the tile size matches, the bit order does
   not; WeftDB's codec is bit-sliced, so compare decode speed at a width, not layouts.)* It provides
   a 1024-element layout (BitPacking pack/unpack, single-value unpack, transposed Delta/RLE, linear
   FoR) via LLVM auto-vectorization. If WeftDB's
   decoder is materially slower at the same bit width, that is a bug rather than a design choice —
   a cheap external yardstick for `benches/transposed_read.rs`. *(src: https://lib.rs/crates/fastlanes)*
+  - [x] Yardstick shipped (`benches/fastlanes_yardstick.rs`, bench-only pinned dev-dep). It found
+    the set-bit-walking decoder **3.7–15× slower** than `fastlanes` at widths 3/10/20 — a bug, per
+    the rule above. Rewritten as a branch-free table spread written straight into the output:
+    **1.32→0.78 / 5.27→1.50 / 7.60→2.32 ms** per 1 Mi values (1.7× / 3.5× / 3.3×).
+  - [ ] **Residue — still 2.4–7× behind `fastlanes` (0.33 ms flat across widths).** The remaining
+    cost scales with width (~0.07 ns/value/bit). Candidates: a 64×64 bit-matrix transpose per
+    64-lane plane-word column (fixed cost per value regardless of width), or explicit SIMD on the
+    spread. Re-run the yardstick on a quiet box before and after.
 - [ ] **Track the FastLanes SPEC, not the CWI reference implementation.** `cwida/fastlanes` is on a
   `dev` branch with no tagged release (the paper's v0.1), its Rust bindings are path-only
   (`fls-rs = { path = "./rust" }`, not a published crate), and its CUDA reader is listed under
