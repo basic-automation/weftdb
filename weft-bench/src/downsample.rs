@@ -267,7 +267,7 @@ pub fn run_downsample_on(profile: &DownsampleProfile, points: &[Point], generati
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_DOWNSAMPLE.to_string(), reps, dataset: DatasetMeta { input_points: points.len(), output_points: last_buckets.len(), irregular: points.windows(3).any(|w| w[2].timestamp - w[1].timestamp != w[1].timestamp - w[0].timestamp), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_DOWNSAMPLE.to_string(), reps, dataset: DatasetMeta { input_points: points.len(), output_points: last_buckets.len(), irregular: points.windows(3).any(|w| w[2].timestamp - w[1].timestamp != w[1].timestamp - w[0].timestamp), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns) })
 }
 
 #[cfg(test)]

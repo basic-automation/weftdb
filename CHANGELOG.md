@@ -205,6 +205,9 @@ only the control plane, not the segment frames.
   `--gf-outage-len`, `--gf-fill`, `--gf-agg`), gated on a dense grid and scoring the filled
   buckets against the clean signal; `--gf-csv` cuts the outages from a real series and
   scores against the real values removed.
+- **Weft-Bench reports the first rep apart from the rest**: `cold_warm` (bench schema v21)
+  carries the first timed rep and the warm reps' latency statistics for every result with
+  two or more reps; `latency` still covers every rep.
 - **Weft-Bench `--decimals N`** for `--synthetic` (`SyntheticParams::value_decimals`):
   rounds the generated samples to N places. The default keeps each sample's exact binary
   expansion, which interpolates ~2× slower at 100k samples than two-decimal input.

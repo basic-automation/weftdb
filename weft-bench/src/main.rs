@@ -353,6 +353,10 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 		println!("    input points : {}", r.dataset.input_points);
 		println!("    output points: {}", r.dataset.output_points);
 		println!("    latency (ms) : p50={:.3} p95={:.3} p99={:.3} mean={:.3}", ms(l.p50_ns), ms(l.p95_ns), ms(l.p99_ns), ms(l.mean_ns));
+		if let Some(split) = &r.cold_warm {
+			let ratio = split.first_rep_ratio().map_or_else(String::new, |x| format!(" ({x:.2}x the warm p50)"));
+			println!("    first rep    : {:.3} ms{ratio}; warm p50={:.3} over {} reps", ms(split.first_rep_ns), ms(split.warm.p50_ns), split.warm.count);
+		}
 		println!("    throughput   : {:.0} points/sec", r.throughput_points_per_sec);
 		println!("    correctness  : {}", if r.correctness.passed() { "PASS" } else { "FAIL" });
 		// Accuracy is present only for a synthetic profile (known ground truth);

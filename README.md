@@ -1469,6 +1469,14 @@ What it does today:
   repeated (machine, GPU and driver, workload, latency percentiles, throughput, timing,
   correctness, nullable accuracy and storage columns), so a directory of runs reads as one
   dataset in DuckDB, Polars or Grafana.
+- **First rep apart from the rest** — every result with two or more reps records its first
+  timed rep separately from the warm ones (`cold_warm`, schema v21; printed as `first rep`
+  and in the Parquet table), while `latency` still covers every rep. It is first-in-process,
+  not OS-cold (the data is already in memory). Measured 2026-10-09 (release, default knobs
+  unless noted): interpolation (100k two-decimal samples) 1.00× the warm p50, downsample (500k,
+  hourly `avg`) 0.99×, range fetch 1.04×, gap fill 1.13×, point lookup 1.30×, and
+  **compression 4.93×** (1.198 vs 0.243 ms), so that workload's p95 over 10 reps is its first
+  decode.
 - **The engine the server runs** — an interpolation run first calls
   `splimes::calibrate()` once, as `weft-server` does at startup (skipping a
   CPU/software adapter the same way), so `Backend::Auto` uses rayon and the GPU

@@ -311,7 +311,7 @@ pub fn run_gap_fill_on(profile: &GapFillProfile, corpus: &GapFillCorpus, generat
 	#[allow(clippy::cast_precision_loss)]
 	let missingness_fraction = 1.0 - corpus.points.len() as f64 / corpus.generated as f64;
 	let irregular = corpus.points.windows(3).any(|w| w[2].timestamp - w[1].timestamp != w[1].timestamp - w[0].timestamp);
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GAP_FILL.to_string(), reps, dataset: DatasetMeta { input_points: corpus.points.len(), output_points: grid.len(), irregular, missingness_fraction, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GAP_FILL.to_string(), reps, dataset: DatasetMeta { input_points: corpus.points.len(), output_points: grid.len(), irregular, missingness_fraction, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns) })
 }
 
 #[cfg(test)]
