@@ -88,6 +88,12 @@ impl ScaledAcc {
 	}
 }
 
+// Portions adapted from bigdecimal-rs (https://github.com/akubera/bigdecimal-rs), licensed under
+// MIT OR Apache-2.0 and used here under Apache-2.0; see THIRD-PARTY-NOTICES. Modifications: its
+// `Div` special cases and `impl_division` long division re-implemented over `u128`/`u64` integers
+// instead of a `BigInt` division per digit, for an `i128` numerator and a `u64` divisor. The
+// adapted code is `avg_like_bigdecimal`.
+
 /// The significant digits `bigdecimal`'s `/` keeps (its build-time `DEFAULT_PRECISION`, `100`
 /// unless `RUST_BIGDECIMAL_DEFAULT_PRECISION` overrides it at build time). The equality tests
 /// below compare against `bigdecimal`'s own division, so a build with a different precision
