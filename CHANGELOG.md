@@ -137,11 +137,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   the `fault-injection` feature `SegmentStore` has a hidden `hold_maintenance` test hook,
   used by `cargo test -p weft-server --features fault-injection --test maintenance_busy`.
 - `SegmentStore::reap(MaintenanceWait)` (`weftdb::ReapSweep`): runs the reaper of the
-  frame journal (see the write-once maintenance entry under Changed) over every aspect
-  with journal rows, unlinking each frame a reconcile or split retired once no running
-  read and no backup may still need it. Reconciles and splits reap after themselves, and
-  every open replays the whole journal, so this is for frames a long read still held, or
-  that the filesystem asked to retry later.
+  frame journal (see the write-once maintenance entries under Changed) over every aspect
+  with journal rows, unlinking each frame a maintenance operation retired once no
+  running read and no backup may still need it, and each output an operation journaled
+  but never swapped in. Every maintenance operation reaps after itself, and every open
+  replays the whole journal, so this is for frames a long read still held, that the
+  filesystem asked to retry later, or that an operation stopped part way (its future
+  dropped, a request cancelled say) left behind; the next maintenance operation on such
+  an aspect also settles those first.
 - `weftdb::aspect_name::encode` and `decode`: the file-name form of an aspect name in the
   write-once frame names (crash-consistency design §4): `[a-z0-9_]` as they are, every
   other byte as `%XX` in uppercase hex, injective even where the filesystem folds case
@@ -429,17 +432,39 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   rebuilt. A reconcile also checks that the frame it reads is the one its row was
   committed with (its length, and its CRC once bound), and the sidecars of its outputs
   are written under a `.tmp-*` name and renamed into place. The overlap merge, squash
-  and compaction still rewrite in place until S9; when they rewrite a segment a
-  reconcile or split had moved to a write-once frame, they go back to its
-  `{aspect}-{id}.weftseg` name and remove the write-once frame. An older layout-2
-  WeftDB reads the new frames (the index keeps recording root-joined paths) but does not
+  and compaction became write-once too (see the next entry). An older layout-2 WeftDB
+  reads the new frames (the index keeps recording root-joined paths) but does not
   replay the journal.
+- **The overlap merge, squash and compaction are write-once** (crash-consistency design
+  §5.3 and §7, S9). `reconcile_overlaps`/`reconcile_overlaps_with_policy` (both the full
+  rewrite of a component and the split of its cold prefix), `squash_aspect` and
+  `squash_aspect_to_target_rows`, and every sweep and threshold variant built on them, no
+  longer rewrite a segment's frame in place and then delete the other members in commits
+  of their own. Each component, squash or compaction group is now one swap, as a
+  reconcile's is: its output frames are written under new names, fsynced, and
+  `segments/` fsynced, then one `segment_index.db` transaction replaces the members'
+  rows with the outputs' and deletes the members left over, each only if it is still the
+  version that was read (a member another writer changed fails the swap with a
+  `Conflict`, writing nothing), and journals every member's frame as retired for the
+  reaper. The outputs' rows record the frame actually written, so a paged member merged
+  into a single-block output never leaves a row describing the wrong frame kind, and
+  carry the largest adoption order (`prec`) of their members. Merges also check that each
+  member's frame is the one its row was committed with, and merge on a blocking thread.
+  Outputs take their members' ids, the `j`-th output in time order the `j`-th smallest
+  (release plan D17, without a change to the `segment_index` key), and are cut only at
+  timestamp boundaries, so a run of equal timestamps never spans two outputs.
+- ⚠️ **An overlap merge that splits its component no longer allocates an id for the
+  suffix.** The hot suffix takes the component's second-smallest segment id (the cold
+  prefix keeps the smallest), where it used to take a fresh id from the allocator. The
+  segment ids an overlap split leaves, and those later seals receive, change
+  accordingly; the merged data does not.
 - ⚠️ **`split_segment` refuses a split whose suffix a newer segment overlaps.** The
   suffix takes an id above every segment of the aspect, so where it shares a timestamp
   with a segment sealed after the split one it would outrank that segment's newer
   value. The split now fails with an error, changing nothing, when any segment with a
-  higher id overlaps `[boundary, max_ts]`; the check runs again under the aspect's
-  commit lock right before the swap, against a seal that committed meanwhile.
+  higher id overlaps the suffix's span (its first timestamp at or after `boundary` to
+  the segment's last); the check runs again under the aspect's commit lock right before
+  the swap, against a seal that committed meanwhile.
 - **Advisory codecs moved behind the `experimental-codecs` feature** (`weft-physical-type`).
   ⚠️ Breaking for code that calls them: the `floatcodec` module (Gorilla-XOR, Chimp,
   Chimp128, Elf and `best_f64_*`), `ColumnEncoding::{gorilla_f64_bytes, best_f64_bytes,
@@ -490,6 +515,24 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   it shrank its prefix, so a read in between returned the suffix's rows twice. A swap is
   now one transaction, and the frames it retires stay until no read that may open them
   is running.
+- **Power loss during or after an overlap merge, squash or compaction could lose or tear
+  rows.** Each rewrote its lowest segment's frame in place with an unsynced write, then
+  deleted the other members' rows and frames one by one, so a power cut, even after the
+  call returned, could leave the merged row over an empty, torn or zero-filled frame,
+  with the members whose rows it had absorbed already deleted: their rows gone and reads
+  over the merged range failing with a checksum error. A crash between the rewrite and
+  the row update could also leave a paged segment's row over a single-block frame. Each
+  merge is now one swap of fsynced new frames (see Changed).
+- **A read during an overlap merge, squash or compaction could fail or see rows twice.**
+  Between a merge's rewrite of its lowest segment and the deletion of the others, a read
+  returned the merged rows beside the members' own, and a read during the rewrite could
+  open a half-written frame. The swap is now one transaction, and the frames it retires
+  stay until no read that may open them is running.
+- **An overlap merge's split suffix could outrank a newer seal.** The suffix took a fresh
+  id from the allocator when the merge wrote it, above that of a seal that had taken its
+  id meanwhile, or before the merge but committed after it, so where the two shared a
+  timestamp the merge's older value won over the seal's acknowledged one. The suffix now
+  takes a member's id, below the seal's.
 - **A reconcile whose segment another operation changed meanwhile wrote it back.** Its
   swap now requires the segment's row to be the version it read and fails with a
   `Conflict` otherwise (the maintenance lock already keeps the store's own operations

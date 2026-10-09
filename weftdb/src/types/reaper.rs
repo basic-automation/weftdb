@@ -38,6 +38,15 @@
 //! no row references was never swapped in and is unlinked, one a row references
 //! committed and only its row goes; a `'retired'` frame is unlinked unless a live row
 //! references it; then `segments/` is fsynced and the rows are deleted.
+//!
+//! **Abandoned outputs** (release plan D-S9, the robustness track's ROB-21). A swap holds
+//! the outputs it journaled as pending in an RAII guard until its outcome settles them.
+//! One that stops without settling them (it panicked, or its future was dropped, a request
+//! cancelled say) hands them to the reaper on drop ([`Reaper::abandon`]), and the store
+//! runs a pass over the aspect at the start of its next swap: their journal rows are
+//! `'pending'`, so the pass unlinks the ones no row references and drops the rows of the
+//! ones that were swapped in after all. Nothing is unlinked on drop itself, since only a
+//! pass that reads the live rows can tell the two apart.
 
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet}, io, path::PathBuf, sync::{
@@ -261,13 +270,55 @@ pub(crate) struct Reaper {
 	segments: PathBuf,
 	syncer: DirSyncer,
 	epochs: ReclaimEpochs,
+	/// The outputs swaps stopped without settling, by aspect (see the module
+	/// documentation), until a pass over the aspect finds their journal rows gone.
+	abandoned: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl Reaper {
 	/// The reaper of the store whose frames live in `segments`, writing through `fs`.
 	pub(crate) fn new(fs: Arc<dyn StoreFs>, segments: PathBuf) -> Self {
 		let syncer = DirSyncer::new(fs.clone(), segments.clone());
-		Self { fs, segments, syncer, epochs: ReclaimEpochs::default() }
+		Self { fs, segments, syncer, epochs: ReclaimEpochs::default(), abandoned: Mutex::default() }
+	}
+
+	fn abandoned_lock(&self) -> MutexGuard<'_, BTreeMap<String, BTreeSet<String>>> {
+		// Every update is one map operation that leaves the state consistent.
+		self.abandoned.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Take `names`, outputs of a swap of `aspect` that stopped without swapping them in or
+	/// discarding them, for the next pass over the aspect. Their journal rows say
+	/// `'pending'`, so that pass (or, after a restart, the open's replay) unlinks each one
+	/// no live row references and drops the row of each one a row does.
+	pub(crate) fn abandon(&self, aspect: &str, names: Vec<String>) {
+		if names.is_empty() {
+			return;
+		}
+		self.abandoned_lock().entry(aspect.to_string()).or_default().extend(names);
+	}
+
+	/// Whether a swap of `aspect` abandoned outputs that no pass has settled yet.
+	pub(crate) fn has_abandoned(&self, aspect: &str) -> bool {
+		self.abandoned_lock().get(aspect).is_some_and(|names| !names.is_empty())
+	}
+
+	/// The outputs of `aspect` abandoned and not yet settled, by name.
+	#[cfg(test)]
+	pub(crate) fn abandoned(&self, aspect: &str) -> Vec<String> {
+		self.abandoned_lock().get(aspect).map(|names| names.iter().cloned().collect()).unwrap_or_default()
+	}
+
+	/// After a pass over `aspect`: keep only the abandoned outputs `journaled` still says
+	/// have a journal row (an unlink to retry later); the rest are settled.
+	pub(crate) fn settle_abandoned(&self, aspect: &str, journaled: impl Fn(&str) -> bool) {
+		let mut abandoned = self.abandoned_lock();
+		if let Some(names) = abandoned.get_mut(aspect) {
+			names.retain(|name| journaled(name));
+			if names.is_empty() {
+				abandoned.remove(aspect);
+			}
+		}
 	}
 
 	/// The store's reclaim epochs.
@@ -594,6 +645,25 @@ mod tests {
 		assert_eq!(pinned, (1, false), "the read in flight protects the frame");
 		assert!(timed_out);
 		assert_eq!((epochs.pins(), epochs.reclaimable("frame")), (0, true), "the dropped future released its pin");
+	}
+
+	/// The outputs a dropped swap guard hands over are kept per aspect until a pass finds
+	/// their journal rows gone; one whose row is still there (an unlink to retry) stays.
+	#[test]
+	fn abandoned_outputs_wait_for_a_pass_that_settles_them() {
+		let reaper = Reaper::new(Arc::new(crate::types::durable::RealFs), PathBuf::from("segments"));
+		reaper.abandon("a", Vec::new());
+		let none = reaper.has_abandoned("a");
+		reaper.abandon("a", vec!["a~g1~p0.weftseg".to_string(), "a~g2~p0.weftseg".to_string()]);
+		reaper.abandon("b", vec!["b~g1~p0.weftseg".to_string()]);
+		let held = (reaper.has_abandoned("a"), reaper.abandoned("a"));
+		reaper.settle_abandoned("a", |name| name == "a~g2~p0.weftseg");
+		let retried = reaper.abandoned("a");
+		reaper.settle_abandoned("a", |_| false);
+		assert!(!none, "nothing abandoned is nothing held");
+		assert_eq!(held, (true, vec!["a~g1~p0.weftseg".to_string(), "a~g2~p0.weftseg".to_string()]));
+		assert_eq!(retried, vec!["a~g2~p0.weftseg".to_string()], "an output whose row is still journaled stays");
+		assert!(!reaper.has_abandoned("a") && reaper.has_abandoned("b"), "each aspect is settled on its own");
 	}
 
 	#[test]
