@@ -1687,11 +1687,19 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         WeftDB's exact nearest-rank `p*` over exact decimals now runs level with its own sketch, so
         Weft-Bench's QuestDB arm should compare `approx_percentile` against both `sketch_p*` and
         exact `p*`, and say which is which. *(src: https://questdb.com/docs/query/functions/aggregation/)*
-      - [ ] **NEXT — integer-mantissa percentiles in the scaled path.** `reduce_partial_scaled`
-        still returns `None` for `p*`, so a stored-range percentile downsample builds a
-        `BigDecimal` per row; selecting on the `i64` mantissas would materialize one value per
-        bucket, but a `PartialReduction` carries `BigDecimal` samples for merging, so the
-        unmerged single-segment case is the one to take first.
+      - [x] **DONE (2026-10-09) — the scaled partial serves exact percentiles and TWA.**
+        `reduce_partial_scaled` now accepts every reduction, collecting each bucket's
+        `(instant, value)` samples in input order as `reduce_partial` does while sum, min, max,
+        first and last stay integer (equality-tested alone, filtered, and merged both ways with
+        BigDecimal partials). Before, a stored-range `p*`/`twa` downsample decoded the window
+        physically, was declined, and decoded it again. `decimal_tax` per real 1 Mi-row segment,
+        `avg,p99,twa`, pinned, three pairs: the store's route 210.9/215.6/245.3 → 147.3/167.2/155.1
+        ms (the plain BigDecimal route is 190–210 ms). Runtime-verified on the live server against
+        an independent Python nearest-rank and LOCF computation.
+      - [ ] **NEXT — select on the mantissas when a partial is not merged.** A single-segment
+        downsample could rank `i64` mantissas and build one `BigDecimal` per bucket, but a
+        `PartialReduction` must carry `BigDecimal` samples to merge; a finish-only fast path
+        needs `SegmentStore::downsample_range`'s inline single-segment route (L-STORE lane).
 
 - [x] **DONE (2026-07-20) — BUG ROOT-CAUSED + FIXED: the "flaky GPU interpolation tests" were never a
   GPU bug.** The roadmap offered two hypotheses — a real GPU race, or an unsound check. **Both the

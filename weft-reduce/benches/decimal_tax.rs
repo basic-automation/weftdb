@@ -156,7 +156,8 @@ fn segment_bigdecimal(bytes: &[u8], aggs: &[Aggregation]) -> Vec<Bucket> {
 	reduce_partial(&points, Resolution::Hours, None, None, aggs).expect("reduces").finish(Resolution::Hours, aggs).expect("finishes")
 }
 
-/// The integer route: physical windowed read, mantissas, `reduce_partial_scaled`.
+/// The integer route: physical windowed read, mantissas, `reduce_partial_scaled` (falling
+/// back to the `BigDecimal` route when it declines).
 fn segment_scaled(bytes: &[u8], aggs: &[Aggregation]) -> Vec<Bucket> {
 	let (ts, vs) = read_segment_range_physical(bytes, i64::MIN, i64::MAX).expect("reads");
 	let (mut nanos, mut mantissas, mut scale) = (Vec::with_capacity(ts.len()), Vec::with_capacity(ts.len()), 0_u8);
@@ -167,7 +168,12 @@ fn segment_scaled(bytes: &[u8], aggs: &[Aggregation]) -> Vec<Bucket> {
 			scale = s;
 		}
 	}
-	reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Hours, None, None, aggs).expect("reduces").expect("covered").finish(Resolution::Hours, aggs).expect("finishes")
+	// As `SegmentStore::segment_partial` does, a request the integer path declines takes the
+	// BigDecimal route.
+	match reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Hours, None, None, aggs).expect("reduces") {
+		Some(partial) => partial.finish(Resolution::Hours, aggs).expect("finishes"),
+		None => segment_bigdecimal(bytes, aggs),
+	}
 }
 
 fn bench_segment_downsample(c: &mut Criterion) {
@@ -178,7 +184,8 @@ fn bench_segment_downsample(c: &mut Criterion) {
 	let bytes = Segment::build_sorted(&corpus.seconds, &values, TimeUnit::Seconds, &BigDecimal::from(0)).expect("seals").write_to();
 	let streaming = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last];
 	let with_sketch = [Aggregation::Avg, Aggregation::SketchP99];
-	for aggs in [&streaming[..], &with_sketch[..]] {
+	let with_exact = [Aggregation::Avg, Aggregation::P99, Aggregation::Twa];
+	for aggs in [&streaming[..], &with_sketch[..], &with_exact[..]] {
 		assert_eq!(segment_scaled(&bytes, aggs), segment_bigdecimal(&bytes, aggs), "both segment routes must produce the same buckets");
 	}
 	eprintln!("segment_downsample: {} byte frame, both routes agree", bytes.len());
@@ -191,6 +198,8 @@ fn bench_segment_downsample(c: &mut Criterion) {
 	group.bench_function("scaled_streaming6", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &streaming))));
 	group.bench_function("bigdecimal_avg_sketch_p99", |b| b.iter(|| black_box(segment_bigdecimal(black_box(&bytes), &with_sketch))));
 	group.bench_function("scaled_avg_sketch_p99", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &with_sketch))));
+	group.bench_function("bigdecimal_avg_p99_twa", |b| b.iter(|| black_box(segment_bigdecimal(black_box(&bytes), &with_exact))));
+	group.bench_function("scaled_avg_p99_twa", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &with_exact))));
 	group.finish();
 }
 

@@ -10,9 +10,11 @@
 //! `BigDecimal` logical/API type and its exactness are unchanged. Only the hot loop moves to
 //! integers.
 //!
-//! It covers the streaming reductions (`min`/`max`/`avg`/`sum`/`first`/`last`). Exact
-//! percentiles, time-weighted averages and sketches need the per-sample values, so a request
-//! naming any of them returns `Ok(None)` and the caller falls back to [`reduce`](crate::reduce).
+//! [`reduce_scaled`] covers the streaming reductions (`min`/`max`/`avg`/`sum`/`first`/`last`);
+//! exact percentiles, time-weighted averages and sketches need the per-sample values, so a
+//! request naming any of them returns `Ok(None)` and the caller falls back to
+//! [`reduce`](crate::reduce). The mergeable [`reduce_partial_scaled`] serves every reduction:
+//! it feeds sketches from the mantissas and collects samples for the rest.
 
 use std::{collections::BTreeMap, sync::OnceLock};
 
@@ -389,11 +391,13 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 ///
 /// Each bucket's integer state is converted once into the `BigDecimal` accumulator the
 /// partial carries (sum, min, max, and first/last with their instants), so the per-sample
-/// work stays in integers and only the per-bucket conversion touches `BigDecimal`. Like
-/// [`reduce_scaled`], it returns `Ok(None)` for an exact percentile or TWA, a bound outside
-/// epoch nanoseconds, or mismatched slices, and the caller falls back to `reduce_partial`.
-/// Unlike [`reduce_scaled`] it also accepts the `sketch_p*` reductions (see below), so it covers
-/// the whole `.weftpart` sidecar set.
+/// work stays in integers and only the per-bucket conversion touches `BigDecimal`. It
+/// returns `Ok(None)` for a bound outside epoch nanoseconds or mismatched slices, and the
+/// caller falls back to `reduce_partial`. Unlike [`reduce_scaled`] it accepts every
+/// reduction: the `sketch_p*` ones (see below), so it covers the whole `.weftpart` sidecar
+/// set, and the exact percentiles and time-weighted averages, for which it collects each
+/// bucket's `(instant, value)` samples in input order exactly as `reduce_partial` does,
+/// while sum, min, max, first and last stay integer.
 ///
 /// # Errors
 ///
@@ -401,14 +405,16 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 /// a timestamp (unreachable for nanosecond epochs, which always are).
 pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
-	// The `sketch_p*` reductions are accepted too: they need each value, but only as the
-	// sketch's `f64`, which `DdSketch::add_scaled` derives from the mantissa as the same `f64`
-	// `add_decimal` gives the equal BigDecimal, so every sketch is identical. Percentiles and
-	// TWA still need the samples: decline.
-	if !aggregations.iter().all(|&a| is_streaming(a) || a.sketch_quantile().is_some()) {
+	// The `sketch_p*` reductions need each value, but only as the sketch's `f64`, which
+	// `DdSketch::add_scaled` derives from the mantissa as the same `f64` `add_decimal` gives
+	// the equal BigDecimal, so every sketch is identical. The percentiles and TWA need the
+	// samples themselves, which are collected below in input order, as `reduce_partial`
+	// collects them.
+	if !aggregations.iter().all(|&a| is_streaming(a) || a.sketch_quantile().is_some() || a.needs_full_bucket()) {
 		return Ok(None);
 	}
 	let sketching = aggregations.iter().any(|a| a.sketch_quantile().is_some());
+	let collecting = aggregations.iter().any(|a| a.needs_full_bucket());
 	let Some(buckets) = accumulate(epoch_nanos, mantissas, resolution, start, end) else {
 		return Ok(None);
 	};
@@ -418,11 +424,11 @@ pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32,
 	let mut converted: BTreeMap<i64, BucketAcc> = buckets
 		.into_iter()
 		.map(|(base, acc)| {
-			let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(acc.sum), scale), min: Some(decimal(acc.min)), max: Some(decimal(acc.max)), first: Some((instant(acc.first.0), decimal(acc.first.1))), last: Some((instant(acc.last.0), decimal(acc.last.1))), samples: Vec::new(), collect: false, sketch: sketching.then(DdSketch::with_default_accuracy) };
+			let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(acc.sum), scale), min: Some(decimal(acc.min)), max: Some(decimal(acc.max)), first: Some((instant(acc.first.0), decimal(acc.first.1))), last: Some((instant(acc.last.0), decimal(acc.last.1))), samples: if collecting { Vec::with_capacity(usize::try_from(acc.count).unwrap_or(0)) } else { Vec::new() }, collect: collecting, sketch: sketching.then(DdSketch::with_default_accuracy) };
 			Ok((base, state))
 		})
 		.collect::<Result<_, ReduceError>>()?;
-	if sketching {
+	if sketching || collecting {
 		let bound = |b: Option<DateTime<Utc>>| b.and_then(|t| t.timestamp_nanos_opt());
 		let (lo, hi) = (bound(start), bound(end));
 		// The buckets in key order, so a time-ordered pass finds each sample's bucket by its
@@ -442,8 +448,12 @@ pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32,
 					position
 				}
 			};
-			if let Some(sketch) = ordered[position].1.sketch.as_mut() {
+			let acc = &mut *ordered[position].1;
+			if let Some(sketch) = acc.sketch.as_mut() {
 				sketch.add_scaled(mantissa, scale).map_err(|_| ReduceError::SketchValue)?;
+			}
+			if collecting {
+				acc.samples.push((instant(nanos), decimal(mantissa)));
 			}
 		}
 	}
@@ -596,7 +606,45 @@ mod tests {
 			assert_eq!(a.finish(resolution, &aggs).expect("finishes"), whole);
 			assert_eq!(b.finish(resolution, &aggs).expect("finishes"), whole);
 		}
-		assert!(reduce_partial_scaled(&nanos, &mantissas, 6, Resolution::Hours, None, None, &[Aggregation::P50]).expect("ok").is_none());
+	}
+
+	#[test]
+	fn reduce_partial_scaled_serves_exact_percentiles_and_twa_identically() {
+		// Out-of-order instants with duplicates and repeated values, filtered and not, with
+		// every reduction that needs the whole bucket: the integer partial must finish to the
+		// BigDecimal partial's buckets exactly, alone and merged with one in both orders.
+		let mut next = noise(0xbb67_ae85_84ca_a73b);
+		let mut nanos: Vec<i64> = (0..3_000_i64).map(|i| i * 11_000_000_000 + (next() % 30_000_000_000).cast_signed()).collect();
+		nanos[100] = nanos[99];
+		nanos[2_000] = nanos[1_999];
+		let mantissas: Vec<i64> = (0..3_000).map(|_| (next() % 40).cast_signed() * 25_000 - 400_000).collect();
+		let pts = points(&nanos, &mantissas, 4);
+		let aggs = [Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd, Aggregation::Avg, Aggregation::Max, Aggregation::SketchP99];
+		let window = (Some(DateTime::from_timestamp_nanos(nanos[200])), Some(DateTime::from_timestamp_nanos(nanos[2_500])));
+		for resolution in [Resolution::Minutes, Resolution::Hours] {
+			for (start, end) in [(None, None), window] {
+				let scaled = reduce_partial_scaled(&nanos, &mantissas, 4, resolution, start, end, &aggs).expect("reduces").expect("served");
+				let big = crate::reduce_partial(&pts, resolution, start, end, &aggs).expect("reduces");
+				assert_eq!(scaled.finish(resolution, &aggs).expect("finishes"), big.finish(resolution, &aggs).expect("finishes"), "{resolution:?} {start:?}");
+				for p50 in [&[Aggregation::P50][..], &[Aggregation::Twa][..]] {
+					assert_eq!(reduce_partial_scaled(&nanos, &mantissas, 4, resolution, start, end, p50).expect("reduces").expect("served").finish(resolution, p50).expect("finishes"), reduce(&pts, resolution, start, end, p50).expect("reduces"));
+				}
+			}
+			let whole = reduce(&pts, resolution, None, None, &aggs).expect("reduces");
+			let scaled_half = reduce_partial_scaled(&nanos[..1_700], &mantissas[..1_700], 4, resolution, None, None, &aggs).expect("reduces").expect("served");
+			let big_half = crate::reduce_partial(&pts[1_700..], resolution, None, None, &aggs).expect("reduces");
+			let (mut a, mut b) = (scaled_half.clone(), big_half.clone());
+			a.merge(big_half).expect("merges");
+			b.merge(scaled_half).expect("merges");
+			assert_eq!(a.finish(resolution, &aggs).expect("finishes"), whole);
+			// Merging the other way round concatenates the samples in another order; the
+			// percentiles and TWA must not depend on it beyond what `reduce_partial` itself does.
+			assert_eq!(b.finish(resolution, &aggs).expect("finishes"), {
+				let mut c = crate::reduce_partial(&pts[1_700..], resolution, None, None, &aggs).expect("reduces");
+				c.merge(crate::reduce_partial(&pts[..1_700], resolution, None, None, &aggs).expect("reduces")).expect("merges");
+				c.finish(resolution, &aggs).expect("finishes")
+			});
+		}
 	}
 
 	#[test]

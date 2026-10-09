@@ -230,6 +230,11 @@ only the control plane, not the segment frames.
   which of two numerically equal values (`1.0`, `1.00`) is returned. A lone hourly `p99`
   runs ~1.6–3.4× faster on the bench (two-decimal, real BTC and full-expansion series),
   which made it about twice as fast as `sketch_p99` until the next entry.
+- **Stored-range percentile and time-weighted-average downsamples take the integer path**
+  (`weft-reduce`): `reduce_partial_scaled` serves `p*` and `twa*` too, collecting samples
+  from the stored mantissas, so `GET …/storage/{aspect}/downsample?agg=p99,twa` on a
+  `ScaledI64` aspect no longer decodes each segment twice. Results are unchanged; ~1.4× per
+  segment on the bench.
 - **Bucket averages that never terminate are computed in one step** (`weft-reduce`): their
   100 significant digits come from one big-integer multiplication and one division by the
   count instead of a digit loop, with an identical result. Hourly `avg` on the integer
