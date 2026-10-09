@@ -44,6 +44,19 @@ use serde::{Deserialize, Serialize};
 /// Every power of ten an `f64` holds exactly: `10^0` through `10^22`.
 const EXACT_POWERS_OF_TEN: [f64; 23] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22];
 
+/// `v` as the nearest `f64`, bit-identical to `bigdecimal`'s `to_f64`.
+///
+/// It is cheaper for the common case of at most 15–16 significant digits and at most 22
+/// decimal places, which it converts by one exact division (both operands exact in `f64`, so
+/// it rounds once, as `to_f64`'s correctly rounded parse does) instead
+/// of formatting and parsing the decimal. Other values take `to_f64` itself. `None` when
+/// `to_f64` gives none.
+#[must_use]
+pub fn decimal_to_f64(v: &BigDecimal) -> Option<f64> {
+	let (digits, scale) = v.as_bigint_and_scale();
+	digits.to_i64().and_then(|m| scaled_to_f64(m, scale)).or_else(|| v.to_f64())
+}
+
 /// `mantissa × 10^-scale` as the nearest `f64`, when `|mantissa| < 2^53` and
 /// `0 <= scale <= 22`; `None` otherwise.
 ///
@@ -287,11 +300,7 @@ impl DdSketch {
 	///
 	/// [`SketchError::ValueRange`] if the value has no finite `f64` image.
 	pub fn add_decimal(&mut self, v: &BigDecimal) -> Result<(), SketchError> {
-		let (digits, scale) = v.as_bigint_and_scale();
-		if let Some(f) = digits.to_i64().and_then(|m| scaled_to_f64(m, scale)) {
-			return self.add(f);
-		}
-		self.add(v.to_f64().ok_or(SketchError::ValueRange)?)
+		self.add(decimal_to_f64(v).ok_or(SketchError::ValueRange)?)
 	}
 
 	/// Fold in the sample `mantissa × 10^-scale` (a `ScaledI64` value), as
@@ -428,6 +437,16 @@ mod tests {
 		assert_eq!(scaled_to_f64(i64::MIN, 2), None);
 		assert_eq!(scaled_to_f64(5, 23), None);
 		assert_eq!(scaled_to_f64(5, -1), None);
+	}
+
+	#[test]
+	fn decimal_to_f64_is_to_f64_bit_for_bit() {
+		for (m, s) in [(250_i64, 2_i64), (-1_999, 3), (0, 4), (123_456_789_012, 8), (9_007_199_254_740_993, 2), (7, 30), (-42, -2), (5, 0), (355_893, 2)] {
+			let v = BigDecimal::new(m.into(), s);
+			assert_eq!(decimal_to_f64(&v).map(f64::to_bits), v.to_f64().map(f64::to_bits), "{v}");
+		}
+		let huge: BigDecimal = "1e400".parse().expect("decimal");
+		assert_eq!(decimal_to_f64(&huge).map(f64::to_bits), huge.to_f64().map(f64::to_bits));
 	}
 
 	#[test]

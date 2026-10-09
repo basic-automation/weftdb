@@ -15,6 +15,15 @@
 //! side). Samples at one instant in several segments are all passed to splimes in seal order,
 //! and splimes keeps the last one given, so the newest write wins as it does elsewhere in the
 //! store.
+//!
+//! [`SegmentStore::interpolate_range_f64`] is the same reconstruction with `f64` values out.
+//! splimes computes every method in `f64` and its `BigDecimal` result is the shortest decimal
+//! that round-trips each computed `f64`, so for interpolated and extrapolated points the
+//! `f64` result carries exactly the same information; only a raw point, which the
+//! `BigDecimal` result returns as the stored value exactly, is rounded to the nearest `f64`.
+//! Building a `BigDecimal` per output point is most of the `BigDecimal` call's cost (on the
+//! bench, ~1M points: 38.0 ms against 7.7 ms for the `f64` call on rayon), so a caller whose
+//! own boundary is `f64` (a JSON body, Arrow `Float64`, a plot) should take this one.
 
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
@@ -35,7 +44,32 @@ const fn instant(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>> {
 	}
 }
 
+/// The stored rows a reconstruction of `[start, end]` reads, with the grid bounds as instants.
+struct StoredWindow {
+	/// The grid's first and last instants.
+	from: DateTime<Utc>,
+	to: DateTime<Utc>,
+	/// The aspect's declared time unit.
+	unit: TimeUnit,
+	/// The rows in `[start − margin, end + margin]`, as `read_time_range` returns them.
+	timestamps: Vec<i64>,
+	values: Vec<Option<BigDecimal>>,
+}
+
 impl SegmentStore {
+	/// Validate a reconstruction request and read its rows.
+	async fn stored_window(&self, aspect: &str, start: i64, end: i64, margin: i64) -> Result<StoredWindow> {
+		anyhow::ensure!(start <= end, "interpolate_range: start {start} is after end {end}");
+		anyhow::ensure!(margin >= 0, "interpolate_range: margin {margin} is negative");
+		let schema = self.schema_for(aspect).await?.with_context(|| format!("aspect {aspect:?} is not declared"))?;
+		let unit = schema.timestamp_unit;
+		let (from, to) = (instant(start, unit).with_context(|| format!("start {start} is outside the representable range"))?, instant(end, unit).with_context(|| format!("end {end} is outside the representable range"))?);
+		let (lo, hi) = (start.saturating_sub(margin), end.saturating_add(margin));
+		let (timestamps, values) = self.read_time_range(aspect, lo, hi).await?;
+		anyhow::ensure!(values.iter().any(Option::is_some), "aspect {aspect:?} has no stored sample in [{lo}, {hi}]");
+		Ok(StoredWindow { from, to, unit, timestamps, values })
+	}
+
 	/// Reconstruct `aspect` on `interpolator`'s regular grid from `start` to `end`
 	/// (inclusive, in the aspect's declared time unit; the grid is anchored at `start`), from
 	/// the stored samples in `[start − margin, end + margin]`.
@@ -50,15 +84,29 @@ impl SegmentStore {
 	/// the read fails, or splimes rejects the interpolation (for example a grid larger than
 	/// the interpolator's `max_points`, or `Backend::Gpu` without a usable GPU).
 	pub async fn interpolate_range(&self, aspect: &str, start: i64, end: i64, margin: i64, interpolator: Interpolator) -> Result<Interpolation<BigDecimal>> {
-		anyhow::ensure!(start <= end, "interpolate_range: start {start} is after end {end}");
-		anyhow::ensure!(margin >= 0, "interpolate_range: margin {margin} is negative");
-		let schema = self.schema_for(aspect).await?.with_context(|| format!("aspect {aspect:?} is not declared"))?;
-		let unit = schema.timestamp_unit;
-		let (from, to) = (instant(start, unit).with_context(|| format!("start {start} is outside the representable range"))?, instant(end, unit).with_context(|| format!("end {end} is outside the representable range"))?);
-		let (timestamps, values) = self.read_time_range(aspect, start.saturating_sub(margin), end.saturating_add(margin)).await?;
+		let StoredWindow { from, to, unit, timestamps, values } = self.stored_window(aspect, start, end, margin).await?;
 		let knots = timestamps.into_iter().zip(values).filter_map(|(t, v)| v.map(|value| instant(t, unit).map(|at| Point::new(at, value)).with_context(|| format!("stored epoch {t} is outside the representable range")))).collect::<Result<Vec<Point>>>()?;
-		anyhow::ensure!(!knots.is_empty(), "aspect {aspect:?} has no stored sample in [{}, {}]", start.saturating_sub(margin), end.saturating_add(margin));
 		tokio::task::spawn_blocking(move || interpolator.run(&knots, from, to)).await.context("the interpolation task panicked")?.with_context(|| format!("interpolating aspect {aspect:?}"))
+	}
+
+	/// [`interpolate_range`](Self::interpolate_range) with `f64` values out (see the
+	/// [module docs](self) for what differs: only raw points, rounded to the nearest `f64`).
+	///
+	/// # Errors
+	///
+	/// As [`interpolate_range`](Self::interpolate_range), and if a stored value has no finite
+	/// `f64` image.
+	pub async fn interpolate_range_f64(&self, aspect: &str, start: i64, end: i64, margin: i64, interpolator: Interpolator) -> Result<Interpolation<f64>> {
+		let StoredWindow { from, to, unit, timestamps, values } = self.stored_window(aspect, start, end, margin).await?;
+		let (mut instants, mut floats) = (Vec::with_capacity(timestamps.len()), Vec::with_capacity(timestamps.len()));
+		for (t, v) in timestamps.into_iter().zip(values) {
+			if let Some(value) = v {
+				instants.push(instant(t, unit).with_context(|| format!("stored epoch {t} is outside the representable range"))?);
+				// The same `f64` as `to_f64`, without formatting and parsing a short decimal.
+				floats.push(weft_reduce::decimal_to_f64(&value).filter(|f| f.is_finite()).with_context(|| format!("stored value {value} has no finite f64 image"))?);
+			}
+		}
+		tokio::task::spawn_blocking(move || interpolator.run_f64(&instants, &floats, from, to)).await.context("the interpolation task panicked")?.with_context(|| format!("interpolating aspect {aspect:?}"))
 	}
 }
 
@@ -66,6 +114,7 @@ impl SegmentStore {
 mod tests {
 	use std::str::FromStr;
 
+	use bigdecimal::ToPrimitive;
 	use splimes::{PointKind, Resolution, Spline};
 	use tempfile::TempDir;
 	use weft_physical_type::{AspectSchema, PhysicalType};
@@ -118,6 +167,24 @@ mod tests {
 		let padded = store.interpolate_range("line", 95, 105, 10, linear).await.expect("interpolates");
 		drop(store);
 		assert_eq!((padded.kinds()[0], &padded.values()[0]), (PointKind::Interpolated, &dec("190")));
+	}
+
+	#[tokio::test]
+	async fn the_f64_call_returns_the_bigdecimal_calls_values_as_f64() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = line_store(&dir).await;
+		for spline in [Spline::Linear, Spline::Cubic] {
+			let interpolator = Interpolator::new(spline, Resolution::Seconds);
+			let exact = store.interpolate_range("line", 3, 187, 20, interpolator).await.expect("interpolates");
+			let float = store.interpolate_range_f64("line", 3, 187, 20, interpolator).await.expect("interpolates");
+			assert_eq!((exact.timestamps(), exact.kinds()), (float.timestamps(), float.kinds()));
+			for (e, f) in exact.values().iter().zip(float.values()) {
+				// The BigDecimal is the shortest decimal of the computed f64: it parses back to it.
+				assert_eq!(e.to_f64().expect("finite").to_bits(), f.to_bits(), "{e} vs {f}");
+			}
+		}
+		assert!(store.interpolate_range_f64("nope", 0, 10, 0, Interpolator::new(Spline::Linear, Resolution::Seconds)).await.is_err());
+		drop(store);
 	}
 
 	#[tokio::test]

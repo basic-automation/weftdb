@@ -232,8 +232,11 @@ only the control plane, not the segment frames.
   which made it about twice as fast as `sketch_p99` until the next entry.
 - **`SegmentStore::interpolate_range`** (`weftdb`): interpolate-on-read over stored segments
   — the aspect's samples in a window (plus a `margin` of knots past each edge) run through a
-  caller-supplied splimes `Interpolator`, returning the grid with provenance. Library only;
-  no HTTP endpoint yet.
+  caller-supplied splimes `Interpolator`, returning the grid with provenance;
+  `interpolate_range_f64` returns `f64` values (~3× faster at 1M points, since building a
+  `BigDecimal` per output point dominates). Library only; no HTTP endpoint yet.
+- **`weft_reduce::decimal_to_f64`**: a `BigDecimal` to `f64` conversion bit-identical to
+  `bigdecimal`'s `to_f64`, fast for values of at most 15–16 significant digits.
 - **Stored-range percentile and time-weighted-average downsamples take the integer path**
   (`weft-reduce`): `reduce_partial_scaled` serves `p*` and `twa*` too, collecting samples
   from the stored mantissas, so `GET …/storage/{aspect}/downsample?agg=p99,twa` on a

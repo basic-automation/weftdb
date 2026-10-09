@@ -81,7 +81,30 @@ fn bench_interpolate_range(c: &mut Criterion) {
 		for &(label, backend) in backends {
 			let interpolator = Interpolator::new(Spline::Cubic, Resolution::Seconds).backend(backend);
 			group.bench_with_input(BenchmarkId::new(label, knots), &knots, |b, _| b.iter(|| black_box(rt.block_on(store.interpolate_range("sensor", start, end, 60, interpolator)).expect("interpolates"))));
+			group.bench_with_input(BenchmarkId::new(format!("{label}_f64"), knots), &knots, |b, _| b.iter(|| black_box(rt.block_on(store.interpolate_range_f64("sensor", start, end, 60, interpolator)).expect("interpolates"))));
 		}
+	}
+	group.finish();
+
+	// Where the time goes, on the 100k-knot window: the storage read and decode alone, then
+	// the same interpolation on already-lifted knots with an `f64` result (`run_f64`, no
+	// per-point `BigDecimal`) and with the `BigDecimal` result `interpolate_range` returns.
+	let knots = 100_000_i64;
+	let (start, end) = (ROWS / 2 * STRIDE_SECS, (ROWS / 2 + knots) * STRIDE_SECS);
+	let mut group = c.benchmark_group("interpolate_range_parts");
+	group.sample_size(10);
+	group.bench_function("read_time_range", |b| b.iter(|| black_box(rt.block_on(store.read_time_range("sensor", start - 60, end + 60)).expect("reads"))));
+	let (ts, vs) = rt.block_on(store.read_time_range("sensor", start - 60, end + 60)).expect("reads");
+	let instants: Vec<chrono::DateTime<chrono::Utc>> = ts.iter().map(|&t| chrono::DateTime::from_timestamp(t, 0).expect("in range")).collect();
+	let values: Vec<BigDecimal> = vs.into_iter().map(|v| v.expect("present")).collect();
+	let floats: Vec<f64> = values.iter().map(|v| bigdecimal::ToPrimitive::to_f64(v).expect("finite")).collect();
+	let points: Vec<splimes::Point> = instants.iter().zip(&values).map(|(&t, v)| splimes::Point::new(t, v.clone())).collect();
+	let (from, to) = (chrono::DateTime::from_timestamp(start, 0).expect("in range"), chrono::DateTime::from_timestamp(end, 0).expect("in range"));
+	let backends: &[(&str, Backend)] = if gpu { &[("parallel", Backend::Parallel), ("gpu", Backend::Gpu)] } else { &[("parallel", Backend::Parallel)] };
+	for &(label, backend) in backends {
+		let interpolator = Interpolator::new(Spline::Cubic, Resolution::Seconds).backend(backend);
+		group.bench_function(format!("run_f64/{label}"), |b| b.iter(|| black_box(interpolator.run_f64(&instants, &floats, from, to).expect("interpolates"))));
+		group.bench_function(format!("run_bigdecimal/{label}"), |b| b.iter(|| black_box(interpolator.run(&points, from, to).expect("interpolates"))));
 	}
 	group.finish();
 	drop(store);

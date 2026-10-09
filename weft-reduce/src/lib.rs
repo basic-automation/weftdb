@@ -32,7 +32,7 @@ use chrono::{DateTime, Utc};
 pub use fill::{fill, Fill, FillError};
 pub use scaled::{reduce_partial_scaled, reduce_scaled};
 use serde::{Deserialize, Serialize};
-pub use sketch::{DdSketch, SketchError};
+pub use sketch::{decimal_to_f64, DdSketch, SketchError};
 use splimes::{Point, Resolution};
 
 /// A per-bucket reduction over the values that fell in the bucket.
