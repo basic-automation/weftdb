@@ -172,8 +172,10 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [x] **DONE (2026-10-08) — disk capture:** `RunMetadata.work_disk_{kind,file_system,mount_point}` (schema v19). The disk
   under the working directory, found by longest mount-point prefix through `sysinfo::Disks`.
   Verified live: a run from `/mnt/deepmem` reports `hdd btrfs`, one from `/` reports `ssd btrfs`.
-- [ ] Remaining hardware capture — GPU and driver versions in run metadata. **Unblocked (INT-0, 2026-10-08):** splimes 1.0 is on main (PR #62) and its `gpu::gpu_info()` has a `driver` field; an interpolation run's `metadata.engine.gpu` (schema v16) already names the GPU adapter, so the driver version is what remains. Original note: needs a wgpu adapter
-  query; `splimes` owns the adapter)
+- [x] **DONE (2026-10-09) — GPU and driver versions in run metadata:** an interpolation run's
+  `metadata.engine` names the adapter (`gpu`, schema v16) and now its driver (`gpu_driver`, schema
+  v20, from splimes' `GpuInfo::driver`). Verified live: `NVIDIA GeForce RTX 4070 Ti SUPER (vulkan,
+  discrete; f64 shaders: yes)`, driver `NVIDIA 610.57.04`.
 - [ ] Report surfaces beyond JSON/HTML — Parquet / Grafana dashboards
 - [ ] Anti-Goodhart (Phase 1.3) — publish negative results + WeftDB-losing workloads; benchmark code separate from engine code; run customer-supplied workloads; README policy line *("WeftDB benchmarks guide real engineering decisions, not synthetic wins")* — policy line + the sawtooth negative finding shipped; the publication pipeline is open
 

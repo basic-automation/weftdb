@@ -73,9 +73,11 @@ use crate::{
 /// beats the realized timestamp codec. v19 added the report's `metadata.work_disk_kind` /
 /// `work_disk_file_system` / `work_disk_mount_point` (the disk under the working directory, so
 /// an HDD-backed run is distinguishable from a solid-state one). (v17–v19 were numbered v16–v18
-/// on the 2026-10-08 routine branch before it merged behind main's v16.) All optional fields are
+/// on the 2026-10-08 routine branch before it merged behind main's v16.) v20 added
+/// `metadata.engine.gpu_driver` (the GPU driver's name and version, beside the adapter in
+/// `metadata.engine.gpu`). All optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// Metadata describing the dataset a result was measured against.
 ///

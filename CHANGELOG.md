@@ -189,6 +189,10 @@ only the control plane, not the segment frames.
   `storage.advisory_delta_for_timestamp_bytes` (v18), each present only when it beats the
   realized codec, and `metadata.work_disk_kind`, `work_disk_file_system` and
   `work_disk_mount_point`, the disk under the working directory (v19).
+- **Weft-Bench records the GPU driver.** An interpolation run's `metadata.engine` gains
+  `gpu_driver`, the driver's name and version as splimes' `GpuInfo::driver` reports it
+  (e.g. `NVIDIA 610.57.04`), beside the adapter in `gpu`; it is printed and shown in the
+  HTML report, and omitted when the driver reports nothing (bench schema v20).
 
 ### Changed
 

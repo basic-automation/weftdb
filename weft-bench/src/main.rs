@@ -86,7 +86,7 @@ async fn calibrate_engine(enabled: bool) -> EngineMetadata {
 	}
 	let engine = tokio::task::spawn_blocking(move || if enabled { engine::calibrate() } else { EngineMetadata::uncalibrated() }).await.unwrap_or_else(|err| EngineMetadata::new(CalibrationStatus::Failed, None, Some(format!("calibration aborted: {err}")), splimes::auto_thresholds()));
 	println!("engine: {}; {}", engine.describe_calibration(), engine.describe_thresholds());
-	if let Some(gpu) = &engine.gpu {
+	if let Some(gpu) = engine.describe_gpu() {
 		println!("engine: GPU {gpu}");
 	}
 	engine
@@ -300,7 +300,7 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 	// How the interpolation backends were chosen (interpolation workloads only).
 	if let Some(engine) = &report.metadata.engine {
 		println!("  engine       : {}; {}", engine.describe_calibration(), engine.describe_thresholds());
-		if let Some(gpu) = &engine.gpu {
+		if let Some(gpu) = engine.describe_gpu() {
 			println!("  gpu          : {gpu}");
 		}
 	}

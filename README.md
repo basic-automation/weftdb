@@ -1415,8 +1415,9 @@ What it does today:
 - **The engine the server runs** — an interpolation run first calls
   `splimes::calibrate()` once, as `weft-server` does at startup (skipping a
   CPU/software adapter the same way), so `Backend::Auto` uses rayon and the GPU
-  where they are faster on this machine. The calibration, GPU and thresholds are
-  printed and recorded in the report's `metadata.engine` (schema v16);
+  where they are faster on this machine. The calibration, GPU, its driver version and
+  the thresholds are printed and recorded in the report's `metadata.engine` (schema v16;
+  `gpu_driver` since v20);
   `--no-gpu-calibrate` skips it and records splimes' defaults. There is no
   counterpart to the server's `WEFT_GPU_CALIBRATE=force`: on a software adapter the
   bench always skips calibration, so there it cannot reproduce a server started with

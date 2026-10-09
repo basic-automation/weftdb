@@ -328,7 +328,7 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 /// metadata paragraph, or an empty string for a run without them.
 fn engine_meta_html(engine: Option<&EngineMetadata>) -> String {
 	let Some(engine) = engine else { return String::new() };
-	let gpu = engine.gpu.as_deref().map_or_else(|| "no GPU".to_string(), |gpu| format!("GPU {}", escape_html(gpu)));
+	let gpu = engine.describe_gpu().map_or_else(|| "no GPU".to_string(), |gpu| format!("GPU {}", escape_html(&gpu)));
 	format!("<p class=\"meta\">interpolation engine: {} \u{b7} {gpu} \u{b7} {}</p>\n", escape_html(&engine.describe_calibration()), engine.describe_thresholds())
 }
 
