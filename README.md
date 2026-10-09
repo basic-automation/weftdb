@@ -1386,6 +1386,20 @@ What it does today:
   `--ds-csv` at a CSV of your own to run the same workloads on real data.
   The underlying point/range read speedups are quantified at the codec layer in
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).
+- **Gap fill** (`--gap-fill`) — the shape of TSM-Bench's interpolation query Q5
+  (`SAMPLE BY … FILL(LINEAR)`): a seeded series loses whole outages (runs of buckets,
+  `--gf-outage` percent of them, `--gf-outage-len` buckets on average), and the timed query
+  reduces what is left and fills every empty bucket with `weft_reduce::fill`
+  (`--gf-fill linear|prev|null|<decimal>`). It is gated on a dense grid whose synthesized
+  (`count == 0`) buckets are exactly the outages, and it **scores the filled values** against
+  the mean of the generator's noise-free signal under each outage bucket. One day of one-second
+  samples into minute buckets (70,020 surviving samples, 1,440 buckets, 273 filled; 10 reps,
+  PASS, 2026-10-09, load average ~15): `linear` p50 **4.70 ms**, RMSE **0.87** (max error 2.54);
+  `prev` 3.73 ms, RMSE 6.36; the constant `50` 4.69 ms, RMSE 13.72; `null` 3.51 ms (nothing to
+  score). At 1M generated samples (809,920 surviving, 16,667 buckets) a linear fill takes
+  62.4 ms against 63.5 ms for `null`, so the fill itself is lost in the reduction's noise
+  (`weft-bench --gap-fill [--gf-points 1000000] --gf-fill <M> --reps 10`). WeftDB's grid has
+  only unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
@@ -1545,7 +1559,7 @@ server and an interactive application:
 | [`weft-physical-type`](weft-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.weftseg` columnar segment format (single-block and paged). |
 | [`weft-arrow`](weft-arrow) / [`weft-arrow-store`](weft-arrow-store) | Apache Arrow / Parquet interchange for sealed segments and stored reads, kept in leaf crates so the `arrow-*` dependency tree never reaches the hot-path core. |
 | [`weft-line-protocol`](weft-line-protocol) | Dependency-free InfluxDB Line Protocol parser shared by the server and the benchmark harness. |
-| [`weft-reduce`](weft-reduce) | Vendor-neutral downsampling reductions, computable over parts and merged (`reduce_partial`/`PartialReduction`, exact for every reduction) — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + three time-weighted averages (LOCF, linear/trapezoidal, LOCF-to-bucket-end) + mergeable bounded-error `sketch_p*` percentiles, over an epoch-aligned bucket grid, computed in `BigDecimal`. A `PartialReduction` is **serde-serializable** (so a segment's partial can be persisted and merged later, in place of re-reading it) and **re-bucketable** to any coarser nesting resolution (`rebucket`/`grids_nest`). Shared by the HTTP `downsample` endpoint and the benchmark harness. |
+| [`weft-reduce`](weft-reduce) | Vendor-neutral downsampling reductions, computable over parts and merged (`reduce_partial`/`PartialReduction`, exact for every reduction) — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + three time-weighted averages (LOCF, linear/trapezoidal, LOCF-to-bucket-end) + mergeable bounded-error `sketch_p*` percentiles, over an epoch-aligned bucket grid, computed in `BigDecimal`. A `PartialReduction` is **serde-serializable** (so a segment's partial can be persisted and merged later, in place of re-reading it) and **re-bucketable** to any coarser nesting resolution (`rebucket`/`grids_nest`). **Gap filling** (`fill`): the dense bucket grid between two bounds, measured buckets unchanged and every empty step synthesized with `count == 0` by a declared `Fill` (`Null`, `Previous`, `Linear` by grid step, or a constant), SQL `FILL(…)`'s vocabulary. Shared by the HTTP `downsample` endpoint and the benchmark harness. |
 | [`weft-server`](weft-server) | Benchmark-grade `axum` HTTP API — interpolation, downsampling, storage ingest/query, catalog management, Prometheus metrics, live latency profiles. |
 | [`weft-bench`](weft-bench) | Reproducible, correctness-gated benchmark harness — the roadmap's spine; both an internal suite and a customer-runnable diagnostic. |
 | [`weft-tui`](weft-tui) | Terminal user interface (Ratatui + Crossterm) for creating databases, importing CSV data, browsing and plotting aspects, and running compression. |

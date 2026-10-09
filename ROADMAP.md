@@ -166,7 +166,11 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [ ] External-engine adapters — DuckDB first, then ClickHouse, InfluxDB 3, QuestDB, TimescaleDB (+ IoTDB)
 - [ ] Full TSBS-compatible comparison harness (ILP parser shipped; harness pending)
 - [x] **Storage/read/aggregation workloads shipped (2026-07-14)** — `point_lookup` (streaming point read, single/paged/batch, regular closed-form vs irregular), `range_fetch` (windowed range read), `compression` (realized bytes/point + value-column compression ratio + decode throughput), and `downsample` (the full reduction set: min/max/avg/sum/first/last + **p50/p90/p95/p99 percentiles** + **TWA**). Each is a parallel `run_*` runner over the `.weftseg`/`weft-reduce` hot path with a correctness gate, p50/p95/p99 latency, and a `--point-lookup`/`--range-fetch`/`--compression`/`--downsample` CLI mode; storage workloads take a `rows_per_page` paged-segment path. OHLC is open/high/low/close = first/max/min/last (already covered by the shipped reductions).
-- [ ] Remaining workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, gap fill, compressed query, analytics pipeline
+- [x] **DONE (2026-10-09) — `gap_fill` workload** (`--gap-fill`): TSM-Bench Q5's shape (`SAMPLE BY … FILL(LINEAR)`) over a seeded series with outages, timing reduce + `weft_reduce::fill` (new: `Fill::{Null, Previous, Linear, Value}`, dense grid, `count == 0` marks a synthesized bucket) and scoring the filled buckets against the clean signal. One day at 1 s → minutes: linear 4.70 ms, RMSE 0.87; prev RMSE 6.36.
+  - [ ] **NEXT — `?fill=` on the downsample endpoints** (`POST /api/v1/downsample`, `GET …/storage/{aspect}/downsample` and their columnar siblings), with a bounded grid (`FillError::TooManyBuckets` → 400) and the `count == 0` provenance carried to JSON/CSV/Arrow/Parquet. Lanes: the compute handlers are L-COMPUTE and the stored-range handler L-STORAGE-READ ([1.0 plan §2](docs/release/1.0-plan.md#2-operating-rules-for-the-whole-release)), so coordinate before landing.
+  - [ ] **NEXT — arbitrary bucket widths** (`5s`, `15m`): `Resolution` only has unit steps, so Q5's literal `SAMPLE BY 5s` cannot be expressed. A width multiplier over `bucket_index` is the smallest change; it touches every reducing surface and the `.weftpart` re-bucket rules (`grids_nest`).
+  - [ ] **NEXT — gap fill on a real corpus** (`--gf-csv`): cut outages from `btc_1min.csv` (or use its own real gaps) so the accuracy figure is not only the generator's.
+- [ ] Remaining workloads — bulk-ingest growth curves (1M→10M→100M→1B), online ingest+query, compressed query, analytics pipeline
 - [ ] Fair-protocol depth (Phase 1.1) — ≥10 reps for short tests, cold/warm/hot/post-compaction/post-restart separation, saturation curves (batch size, clients, writers, query concurrency, cardinality, dataset size, GPU output size), seeded randomized query mixes (published seeds), failure tests (restart during ingest, crash during compaction, network retry, partial/corrupt segment), independent-reproducibility packaging (versions, SHAs, images, configs, hardware, drivers, command lines, raw artifacts)
 - [ ] Fair interpolation comparisons (Phase 1.2) — report three classes where possible: (A) native in-DB (Timescale gapfill, QuestDB `SAMPLE BY … FILL`, InfluxQL/SQL fill, ClickHouse ASOF/window, DuckDB window fns, IoTDB fns); (B) portable SQL baseline; (C) client-side end-to-end. Don't hide unfavorable results.
 - [x] **DONE (2026-10-08) — disk capture:** `RunMetadata.work_disk_{kind,file_system,mount_point}` (schema v19). The disk
@@ -1620,6 +1624,24 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         1 Mi-row real segment (`decimal_tax` criterion, decode + `avg,sketch_p99`, load avg ~38): the
         scaled route **202.2 → 97.0 ms (−54%)**, the BigDecimal route 196.4 → 145.5 ms (−27%).
         Re-check if `bigdecimal` is upgraded: the proof leans on its `to_f64` implementation.
+        *(Checked 2026-10-09: 0.4.11, released 2026-10-03, is the latest on crates.io and the one
+        locked; its notes touch square root, inverse and exp, not `to_f64` or `/`. src:
+        https://github.com/akubera/bigdecimal-rs/releases)*
+      - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
+        `DdSketch::index` computes `v.ln()` per sample. DataDog's reference sketches-java ships
+        `CubicallyInterpolatedMapping`, which takes `floor(log2 v)` from the float's bits and
+        interpolates the rest cubically, "much faster than computing the logarithm … by a factor of
+        6" at **1%** more bins than the logarithmic mapping. Adopting it changes every bin index, so
+        persisted `.weftpart` sketches would no longer merge with new ones: it needs a sidecar
+        format/version bump (L-FMT/freeze territory) and a measurement that `index` is a material
+        share of `sketch_p99` first. *(src:
+        https://github.com/DataDog/sketches-java/blob/master/src/main/java/com/datadoghq/sketch/ddsketch/mapping/CubicallyInterpolatedMapping.java)*
+      - [ ] **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
+        QuestDB's aggregate docs list only `approx_percentile`/`approx_median` (HdrHistogram, a
+        precision knob 0–5, and an error on any negative value); no exact percentile is listed.
+        WeftDB's exact nearest-rank `p*` over exact decimals now runs level with its own sketch, so
+        Weft-Bench's QuestDB arm should compare `approx_percentile` against both `sketch_p*` and
+        exact `p*`, and say which is which. *(src: https://questdb.com/docs/query/functions/aggregation/)*
       - [ ] **NEXT — integer-mantissa percentiles in the scaled path.** `reduce_partial_scaled`
         still returns `None` for `p*`, so a stored-range percentile downsample builds a
         `BigDecimal` per row; selecting on the `i64` mantissas would materialize one value per

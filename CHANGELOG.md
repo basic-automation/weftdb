@@ -194,6 +194,15 @@ only the control plane, not the segment frames.
   carried ~50 significant digits and made the published reduction figures 7.3× slower than real
   data; the README table is re-measured with both generators, and its claim that `sketch_p99` is
   ~2.6× faster than exact `p99` is withdrawn (level on two-decimal values, 1.36× on real BTC).
+- **Gap filling** (`weft-reduce`): `weft_reduce::fill` turns a reduction's buckets into the
+  dense grid between two bounds, keeping measured buckets unchanged and synthesizing every
+  empty step with `count == 0` by a declared `Fill` (`Null`, `Previous`, `Linear` by grid
+  step, or a constant `Value`; `Fill::from_token` parses `null`/`prev`/`linear`/a decimal),
+  bounded by a caller-given bucket limit (`FillError`).
+- **Weft-Bench `--gap-fill` workload**: TSM-Bench Q5's `SAMPLE BY … FILL(LINEAR)` shape over
+  a seeded series with outages (`--gf-points`, `--gf-stride`, `--gf-bucket`, `--gf-outage`,
+  `--gf-outage-len`, `--gf-fill`, `--gf-agg`), gated on a dense grid and scoring the filled
+  buckets against the clean signal.
 - **Weft-Bench records the GPU driver.** An interpolation run's `metadata.engine` gains
   `gpu_driver`, the driver's name and version as splimes' `GpuInfo::driver` reports it
   (e.g. `NVIDIA 610.57.04`), beside the adapter in `gpu`; it is printed and shown in the

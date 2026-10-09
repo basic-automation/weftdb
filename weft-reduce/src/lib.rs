@@ -21,6 +21,7 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod fill;
 mod scaled;
 pub mod sketch;
 
@@ -28,6 +29,7 @@ use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
+pub use fill::{fill, Fill, FillError};
 pub use scaled::{reduce_partial_scaled, reduce_scaled};
 use serde::{Deserialize, Serialize};
 pub use sketch::{DdSketch, SketchError};

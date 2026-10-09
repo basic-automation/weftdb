@@ -31,7 +31,7 @@ use std::{path::PathBuf, process::ExitCode};
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -109,6 +109,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.mode == InputMode::Downsample {
 		return run_downsample_workload(&cli);
+	}
+	if cli.mode == InputMode::GapFill {
+		return run_gap_fill_workload(&cli);
 	}
 
 	// Build the profile from whichever input mode was selected. Synthetic mode
@@ -247,6 +250,18 @@ fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		run_downsample(&profile, cli.reps)
 	}
 	.map_err(|e| anyhow::anyhow!("downsample benchmark run failed: {e}"))?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the gap-fill workload: generate a seeded series with outages, then time the
+/// bucketed query that reduces it and fills the empty buckets (`weft_reduce::fill`),
+/// scoring the filled buckets against the generator's clean signal.
+fn run_gap_fill_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let profile_name = cli.name.clone().unwrap_or_else(|| "gap-fill".to_string());
+	let profile = GapFillProfile::new(profile_name, GapFillParams { seed: cli.seed, ..cli.gap_fill.clone() });
+	let result = run_gap_fill(&profile, cli.reps).map_err(|e| anyhow::anyhow!("gap-fill benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -434,6 +449,8 @@ struct Cli {
 	/// Downsample mode: decimal places of the generated values; `None` = the exact
 	/// binary expansion (`--ds-decimals full`).
 	ds_decimals: Option<u32>,
+	/// Gap-fill mode: the workload knobs (the seed comes from `--seed`).
+	gap_fill: GapFillParams,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -505,6 +522,8 @@ enum InputMode {
 	Compression,
 	/// The downsample workload (reduces a generated series into grid-aligned buckets).
 	Downsample,
+	/// The gap-fill workload (a bucketed query that fills the buckets outages left empty).
+	GapFill,
 }
 
 /// What the parsed command line asks the program to do.
@@ -542,11 +561,9 @@ impl Cli {
 		let ds_defaults = DownsampleParams::default();
 
 		let (mut input, mut field): (Option<PathBuf>, Option<String>) = (None, None);
-		let mut synthetic = false;
-		let mut point_lookup = false;
-		let mut range_fetch = false;
-		let mut compression = false;
-		let mut downsample = false;
+		// The workload-mode flags; exactly one may be set (`select_workload_mode`).
+		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode) = (false, false, false, false, false, false);
+		let mut gap_fill = GapFillParams::default();
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
 		let (mut ds_aggs, mut ds_parallel, mut ds_decimals) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1), ds_defaults.value_decimals);
@@ -598,6 +615,8 @@ impl Cli {
 				"--comp-shape" => comp_shape = parse_value_shape(&take_value(&key)?)?,
 				flag if CsvKnobs::FLAGS.contains(&flag) => csv.set(flag, take_value(&key)?)?,
 				"-d" | "--downsample" => downsample = true,
+				"-g" | "--gap-fill" => gap_fill_mode = true,
+				flag if GAP_FILL_FLAGS.contains(&flag) => set_gap_fill_knob(&mut gap_fill, flag, &take_value(&key)?)?,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
 				"--ds-bucket" => ds_bucket = parse_resolution(&take_value(&key)?)?,
@@ -641,10 +660,10 @@ impl Cli {
 		}
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample)])?;
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, gap_fill, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, shape, precision, spline, resolution, reps, out_dir, name, compare, html, gpu_calibrate })))
 	}
 }
 
@@ -653,7 +672,7 @@ impl Cli {
 fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
 	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
 	if selected.len() > 1 {
-		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample)".to_string());
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill)".to_string());
 	}
 	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
@@ -667,6 +686,7 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 		InputMode::RangeFetch => Some("--range-fetch"),
 		InputMode::Compression => Some("--compression"),
 		InputMode::Downsample => Some("--downsample"),
+		InputMode::GapFill => Some("--gap-fill"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
 }
@@ -714,7 +734,7 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample => unreachable!("handled by self_generating_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -832,6 +852,24 @@ fn parse_stride_secs(s: &str) -> Result<i64, String> {
 	Ok(n)
 }
 
+/// The gap-fill workload's knob flags, each taking one value ([`set_gap_fill_knob`]).
+const GAP_FILL_FLAGS: [&str; 7] = ["--gf-points", "--gf-stride", "--gf-bucket", "--gf-outage", "--gf-outage-len", "--gf-fill", "--gf-agg"];
+
+/// Apply one gap-fill knob (`flag` from [`GAP_FILL_FLAGS`]) to `params`.
+fn set_gap_fill_knob(params: &mut GapFillParams, flag: &str, value: &str) -> Result<(), String> {
+	match flag {
+		"--gf-points" => params.point_count = parse_points_count(value)?,
+		"--gf-stride" => params.input_stride_secs = parse_stride_secs(value)?,
+		"--gf-bucket" => params.bucket_resolution = parse_resolution(value)?,
+		"--gf-outage" => params.outage_percent = value.parse::<u32>().ok().filter(|p| *p <= 90).ok_or_else(|| "--gf-outage must be a whole percent in 0..=90".to_string())?,
+		"--gf-outage-len" => params.mean_outage_buckets = value.parse::<u32>().ok().filter(|n| *n >= 1).ok_or_else(|| "--gf-outage-len must be a positive whole number of buckets".to_string())?,
+		"--gf-fill" => params.method = weft_reduce::Fill::from_token(value).ok_or_else(|| format!("invalid --gf-fill `{value}` (use linear|prev|null|<decimal>)"))?,
+		"--gf-agg" => params.aggregation = Aggregation::from_token(value).ok_or_else(|| format!("invalid --gf-agg `{value}`"))?,
+		_ => unreachable!("only GAP_FILL_FLAGS are dispatched here"),
+	}
+	Ok(())
+}
+
 /// Parse a `--ds-decimals` value: a place count in `0..=MAX_VALUE_DECIMALS`, or `full`.
 fn parse_value_decimals(s: &str) -> Result<Option<u32>, String> {
 	if s.eq_ignore_ascii_case("full") {
@@ -906,6 +944,7 @@ USAGE:
     weft-bench --range-fetch [RANGE-FETCH OPTIONS]
     weft-bench --compression [COMPRESSION OPTIONS]
     weft-bench --downsample [DOWNSAMPLE OPTIONS]
+    weft-bench --gap-fill [GAP-FILL OPTIONS]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -930,6 +969,11 @@ INPUT MODE (choose one):
                              dense series and time WeftDB's canonical reduction (min/max/
                              avg/sum/first/last) into grid-aligned buckets. Gated on
                              the reduction being total (bucket counts sum to input).
+    -g, --gap-fill           Run the gap-fill workload (TSM-Bench Q5's shape, SAMPLE BY
+                             ... FILL(LINEAR)): cut outages from a seeded series, then
+                             time reduce + fill of every empty bucket. Gated on a dense
+                             grid whose synthesized buckets are exactly the outages;
+                             scores the filled values against the clean signal.
 
 STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
         --irregular          Jittered timestamps (decode + search/filter) instead of
@@ -981,6 +1025,17 @@ DOWNSAMPLE OPTIONS (with --downsample):
         --ds-aggs <LIST>     Reductions, comma-separated: min,max,avg,sum,first,
                              last,p50,p90,p95,p99          [default: min,max,avg,
                              sum,first,last]
+
+GAP-FILL OPTIONS (with --gap-fill; seeded by --seed):
+        --gf-points <N>      Samples generated before outages (>=2)  [default: 86400]
+        --gf-stride <N>      Seconds between samples (>=1)              [default: 1]
+        --gf-bucket <R>      Bucket resolution: s|m|h|d|w|mo|y     [default: minutes]
+        --gf-outage <PCT>    Share of interior buckets lost to outages, 0..=90
+                                                                       [default: 20]
+        --gf-outage-len <N>  Mean outage length in buckets (>=1)        [default: 5]
+        --gf-fill <M>        Fill: linear|prev|null|<decimal>      [default: linear]
+        --gf-agg <A>         Reduction per bucket, scored on filled buckets
+                                                                      [default: avg]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -1141,6 +1196,22 @@ mod tests {
 		assert!(run_cli(&["--range-fetch", "--synthetic"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--range-fetch", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
 		assert!(run_cli(&["--range-fetch", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
+	}
+
+	#[test]
+	fn gap_fill_mode_parses_its_knobs_and_rejects_bad_ones() {
+		let cli = expect_run(&["--gap-fill"]);
+		assert_eq!(cli.mode, InputMode::GapFill);
+		assert_eq!(cli.gap_fill, GapFillParams::default());
+		let cli = expect_run(&["-g", "--gf-points", "7200", "--gf-bucket", "s", "--gf-outage", "35", "--gf-outage-len", "3", "--gf-fill", "prev", "--gf-agg", "max", "--gf-stride", "2"]);
+		let expected = GapFillParams { point_count: 7_200, input_stride_secs: 2, bucket_resolution: Resolution::Seconds, outage_percent: 35, mean_outage_buckets: 3, method: weft_reduce::Fill::Previous, aggregation: Aggregation::Max, ..GapFillParams::default() };
+		assert_eq!(cli.gap_fill, expected);
+		assert_eq!(expect_run(&["-g", "--gf-fill", "0.5"]).gap_fill.method, weft_reduce::Fill::Value("0.5".parse().unwrap()));
+		assert!(run_cli(&["-g", "--gf-outage", "95"]).unwrap_err().contains("--gf-outage"));
+		assert!(run_cli(&["-g", "--gf-outage-len", "0"]).unwrap_err().contains("--gf-outage-len"));
+		assert!(run_cli(&["-g", "--gf-fill", "nearest"]).unwrap_err().contains("invalid --gf-fill"));
+		assert!(run_cli(&["-g", "--downsample"]).unwrap_err().contains("only one workload mode"));
+		assert!(run_cli(&["-g", "--compare"]).unwrap_err().contains("`--compare` has no meaning in `--gap-fill` mode"));
 	}
 
 	#[test]
