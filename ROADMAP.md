@@ -1528,7 +1528,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       6.85/5.41/6.80 ms, hourly `avg` 16.40/17.36/16.37 → 15.08/15.50/14.99 ms; per segment
       `scaled_avg_sketch_p99` 83.8/92.4/85.6 → 60.7/59.2/74.9 ms (unpinned, load ~14);
       `scaled_streaming6` unchanged within noise (the decode dominates).
-    - [ ] **NEXT — the `avg` division is now the biggest piece of `reduce_scaled`:** hourly `avg`
+    - [x] **DONE (2026-10-09, sub-items below) — the `avg` division was the biggest piece of `reduce_scaled`:** hourly `avg`
       costs ~8 ms over `sum` for 17,477 buckets (~0.5 µs each); BTC averages do not terminate, so
       every bucket's quotient carries all 100 digits.
       - [x] **TRIED (2026-10-09), NO WIN — 19 digits per `u128` division.** Base-10¹⁹ long
@@ -1707,6 +1707,13 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         `avg,p99,twa`, pinned, three pairs: the store's route 210.9/215.6/245.3 → 147.3/167.2/155.1
         ms (the plain BigDecimal route is 190–210 ms). Runtime-verified on the live server against
         an independent Python nearest-rank and LOCF computation.
+      - [ ] **NEXT — `reduce`/`reduce_partial` over `BigDecimal` points could take the integer path
+        themselves** when the values fit `i64` mantissas. For one-scale input the integer path's
+        output is identical even in representation, but JSON/CSV values carry mixed scales
+        (`99.92`, `99.9`, `100`), so the useful version tracks each extremal sample's original
+        scale (min/max/first/last and collected samples keep their own representation; the sum is
+        at the largest scale, as `BigDecimal` addition gives it). That would make
+        `POST /api/v1/downsample` ~8–25× cheaper once the `from_f64` widening above is fixed.
       - [ ] **NEXT — select on the mantissas when a partial is not merged.** A single-segment
         downsample could rank `i64` mantissas and build one `BigDecimal` per bucket, but a
         `PartialReduction` must carry `BigDecimal` samples to merge; a finish-only fast path
