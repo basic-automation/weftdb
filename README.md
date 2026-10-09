@@ -367,6 +367,20 @@ every reduction (exact percentiles and time-weighted averages collect their samp
 mantissas, ~1.4× faster per segment for `avg,p99,twa` than before, 2026-10-09)
 ([`weft-reduce/benches/decimal_tax.rs`](weft-reduce/benches/decimal_tax.rs), load average ~11).
 
+Three more results from 2026-10-09 where the obvious answer was wrong:
+
+- **The GPU is not the fastest way to interpolate stored data.** Reconstructing ~1M one-second
+  points from 100k stored knots end to end (`SegmentStore::interpolate_range_f64`) takes 14.1–16.3
+  ms on rayon and 17.0–29.8 ms on the RTX 4070 Ti SUPER; with `BigDecimal` output both spend most
+  of their time building a decimal per point
+  ([`weftdb/benches/interpolate_range.rs`](weftdb/benches/interpolate_range.rs)).
+- **A spline gap fill is less accurate than a straight line on prices.** On real BTC closes a
+  cubic fill's MAE is $55.34 against linear's $49.27 (hourly buckets); the spline wins only on a
+  smooth signal (`weft-bench --gap-fill --gf-fill cubic`, see [Benchmarking](#benchmarking)).
+- **The approximate percentile is not faster than the exact one.** `sketch_p99` once measured
+  ~2.6× faster than exact `p99`, but only on the old generator's ~50-digit values; on real-shaped
+  decimals the two run level (see [Compute endpoints](#compute-endpoints)).
+
 ---
 
 ## HTTP API
