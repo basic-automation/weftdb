@@ -4940,6 +4940,7 @@ mod tests {
 	/// (Turso commits them FULL); everything the backup writes, including the snapshots
 	/// Turso vacuums into it, counts only once made durable through `StoreFs`.
 	#[tokio::test]
+	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
 	#[serial(backup_fault_points)]
 	async fn a_power_cut_after_a_reported_backup_leaves_it_complete() {
 		fn live_database(rel: &Path) -> bool {
@@ -7777,6 +7778,7 @@ mod tests {
 	/// would be, fails this at the first cut. Every image then opens, settles its marker,
 	/// and reads what the store held.
 	#[tokio::test]
+	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
 	async fn a_power_cut_at_any_marker_write_never_leaves_floors_below_a_committed_migration() {
 		// Sixteen seeds, so that the floor invariant by itself catches a marker write that
 		// skips the root's fsync (with three, only the cut count below did).
@@ -8215,6 +8217,7 @@ mod tests {
 	/// serving, including the phantom transaction's row, which did commit. A restart
 	/// clears the poison.
 	#[tokio::test]
+	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
 	#[serial(index_txn_fault_points)]
 	async fn a_phantom_commit_poisons_writes_and_leaves_reads_up() {
 		let dir = TempDir::new().expect("tempdir");
@@ -8740,6 +8743,7 @@ mod tests {
 	/// does not wait. Once the holder lets go within a `MaintenanceWait::Wait`, the sweep
 	/// takes the aspect and maintains it.
 	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
 	async fn a_busy_aspect_is_refused_skipped_or_waited_for() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens").with_maintenance_wait(std::time::Duration::from_millis(100));

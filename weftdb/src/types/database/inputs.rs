@@ -237,7 +237,7 @@ impl Inputs for Database {
 	/// Dequeue the queue entries a consumer read, each only while it still has the
 	/// `queued_at` it was read with.
 	///
-	/// The entries are removed in transactions of at most [`DEQUEUE_CHUNK`], so that an
+	/// The entries are removed in transactions of at most 5,000 (`DEQUEUE_CHUNK`), so that an
 	/// ingest queuing one of the same timestamps meanwhile waits for one short transaction,
 	/// not for the whole dequeue. A transaction that loses an MVCC conflict to such an
 	/// enqueue is retried: it re-reads the entries, so one queued again in the meantime no

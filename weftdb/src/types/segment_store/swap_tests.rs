@@ -640,6 +640,7 @@ async fn the_crash_matrix_with_errors_at_every_point_loses_nothing() {
 /// `M-*` and `G-*` point, and every image recovers to the store before or after the
 /// operation, whole.
 #[tokio::test]
+#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
 async fn the_crash_matrix_with_power_cuts_at_every_point_loses_nothing() {
 	let dir = TempDir::new().expect("tempdir");
 	let runs = Op::ALL.map(|op| {
