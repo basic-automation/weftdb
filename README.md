@@ -362,8 +362,9 @@ accumulation; computing each bucket's `avg` by integer long division that reprod
 them), producing its 100 digits with one `BigUint` multiplication and one division by the
 count instead of a digit loop. Per sealed 1M-row segment (decode + six reductions), the
 stored-range downsample went from 127.6 ms to 59.7 ms. The server's `GET
-/api/v1/storage/{aspect}/downsample` now takes the integer path for `ScaledI64` segments when every
-requested reduction is streaming or a `sketch_p*`, and falls back otherwise
+/api/v1/storage/{aspect}/downsample` takes the integer path for one-scale `ScaledI64` segments for
+every reduction (exact percentiles and time-weighted averages collect their samples from the stored
+mantissas, ~1.4× faster per segment for `avg,p99,twa` than before, 2026-10-09)
 ([`weft-reduce/benches/decimal_tax.rs`](weft-reduce/benches/decimal_tax.rs), load average ~11).
 
 ---
