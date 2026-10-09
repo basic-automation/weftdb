@@ -230,6 +230,10 @@ only the control plane, not the segment frames.
   which of two numerically equal values (`1.0`, `1.00`) is returned. A lone hourly `p99`
   runs ~1.6–3.4× faster on the bench (two-decimal, real BTC and full-expansion series),
   which made it about twice as fast as `sketch_p99` until the next entry.
+- **`SegmentStore::interpolate_range`** (`weftdb`): interpolate-on-read over stored segments
+  — the aspect's samples in a window (plus a `margin` of knots past each edge) run through a
+  caller-supplied splimes `Interpolator`, returning the grid with provenance. Library only;
+  no HTTP endpoint yet.
 - **Stored-range percentile and time-weighted-average downsamples take the integer path**
   (`weft-reduce`): `reduce_partial_scaled` serves `p*` and `twa*` too, collecting samples
   from the stored mantissas, so `GET …/storage/{aspect}/downsample?agg=p99,twa` on a
