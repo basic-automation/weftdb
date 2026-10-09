@@ -1518,12 +1518,19 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       `scaled_avg_sketch_p99` 83.8/92.4/85.6 → 60.7/59.2/74.9 ms (unpinned, load ~14);
       `scaled_streaming6` unchanged within noise (the decode dominates).
     - [ ] **NEXT — the `avg` division is now the biggest piece of `reduce_scaled`:** hourly `avg`
-      costs ~8 ms over `sum` for 17,477 buckets (~0.5 µs each), because BTC averages do not
-      terminate and `avg_like_bigdecimal` produces all 100 digits one `u64` division at a time.
-      Producing up to 19 digits per `u128` division (base-10¹⁹ long division gives the same digit
-      string; strip the final chunk's trailing zeros when the remainder reaches zero, take the
-      rounding digit from the last remainder) should cut that ~5×; the existing 20,000-case
-      equality test against `bigdecimal`'s `/` guards it.
+      costs ~8 ms over `sum` for 17,477 buckets (~0.5 µs each); BTC averages do not terminate, so
+      every bucket's quotient carries all 100 digits.
+      - [x] **TRIED (2026-10-09), NO WIN — 19 digits per `u128` division.** Base-10¹⁹ long
+        division gives `bigdecimal`'s digit string exactly (it passed the equality test, widened
+        this run to 25,000+ cases including full-range `u64` counts and quotients that terminate
+        mid-chunk), but pinned A/B over three pairs left hourly `avg` at 14.49/15.38/15.77 →
+        15.61/14.30/13.97 ms, inside the noise. The digit loop is not the cost; not landed (the
+        widened test is).
+      - [ ] **NEXT — measure the `BigInt` build instead:** each bucket multiplies its quotient
+        `BigInt` by `10^38` up to three times and allocates. Building the quotient as
+        `floor(num · 10^m / den)` with one `BigUint` multiply and one division by the `u64`
+        count, or a criterion bench of `avg_like_bigdecimal` alone, would show whether that
+        allocation-heavy part is the ~0.5 µs.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in
@@ -1776,6 +1783,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     output), and `test_pipeline_api_with_fake_db` was never reached. The time-range failures are
     therefore **unconfirmed either way**. These tests need the bounding below before they can give
     a verdict.
+- [ ] **Re-measured 2026-10-09 — still unbounded.** With test databases now in a per-binary temp dir,
+  `cargo test -p weft-orchestration` without `SKIP_SLOW_TESTS` passed 12 tests and
+  `test_api_precise` in **331 s**, then hit a 40-minute `timeout` with eight `#[serial]` tests
+  unfinished (`test_api`, `test_batch_processing`, `test_load_or_create_pipeline`,
+  `test_pipeline_api`, `test_pipeline_api_precise`, `test_pipeline_api_with_fake_db`,
+  `test_run_subject_pipelines`, `test_specific_process_batch`; being serial, most had not
+  started). No failure was printed, so the time-range failures stay unconfirmed. Another session
+  was running `weft-orchestration` crash tests on the same box (`legacy_queue_crash`, durability),
+  so bounding these belongs with whoever owns that crate's lane.
 - [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.** Each
   spends ~6–10 minutes; `test_create_btc_1min_database` was made runnable by capping its row count
   and using a temp data dir (`BTC_TEST_MAX_ROWS`, default 5,000). The same treatment here would let

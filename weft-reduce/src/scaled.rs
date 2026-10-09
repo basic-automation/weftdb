@@ -495,6 +495,17 @@ mod tests {
 			let scale = (next() % 12).cast_signed();
 			cases.push((sum, scale, count));
 		}
+		// Counts across the whole `u64` range (every remainder width the chunked division
+		// sees), sums across `i128`, and divisors whose quotient terminates inside a chunk.
+		for _ in 0..5_000 {
+			let count = (next() >> (next() % 64)).max(1);
+			let sum = (i128::from(next()) << (next() % 60)) * if next().is_multiple_of(2) { 1 } else { -1 };
+			cases.push((sum, (next() % 30).cast_signed(), count));
+		}
+		for exp in 0..40_u32 {
+			let (two, five) = (1_u64 << exp.min(63), 5_u64.saturating_pow(exp.min(27)));
+			cases.extend([(1, 0, two), (3, 2, two), (7, 0, five), (-13, 4, five), (1, 0, two.saturating_mul(3))]);
+		}
 		for (sum, scale, count) in cases {
 			let expected = &BigDecimal::new(BigInt::from(sum), scale) / &BigDecimal::from(count);
 			let actual = avg_like_bigdecimal(sum, scale, count);
