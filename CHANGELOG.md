@@ -123,6 +123,36 @@ only the control plane, not the segment frames.
   write-once frame names (crash-consistency design §4): `[a-z0-9_]` as they are, every
   other byte as `%XX` in uppercase hex, injective even where the filesystem folds case
   or normalises Unicode.
+- **Series tags: `TagSet`, `SeriesKey` and `SeriesSelector`** (B-tags, TAG-1), in the
+  new `weft_physical_type::tags` module and re-exported by `weftdb` (also as
+  `weftdb::tags`). Nothing stores or reads tags yet; this is the one validated form
+  that frames, the control plane, ingest and reads will share. The canonical form and
+  its caps are **frozen format**:
+  - a key is 1–128 bytes, starts with an ASCII letter or `_` and continues with ASCII
+    letters, digits, `_`, `.` or `-`; the prefix `__` is reserved for system
+    dimensions;
+  - a value is 1–256 bytes of UTF-8 with no C0 control character (U+0000–U+001F) and
+    no U+007F, compared byte for byte (no Unicode normalization);
+  - a tag set holds at most 16 tags, with no key twice. An empty value or a repeated
+    key is an error, never dropped or merged;
+  - the canonical key (`SeriesKey`) is the tags sorted bytewise by key, each written
+    as key, 0x1F, value, joined by 0x1E, and is at most 1,024 bytes. The empty set is
+    the empty string and names series 0. Neither separator can occur in a key or a
+    value, so the form is injective without escaping, and a frame's binding to its
+    series will be a byte compare.
+
+  `TagSet::from_pairs` takes pairs in any order and rejects every rule break with a
+  typed, `#[non_exhaustive]` `TagError` that names the key and the limit.
+  `SeriesKey::from_canonical` reads stored bytes back and rejects bytes that are
+  unsorted, repeat a key, break a rule (non-UTF-8 values included) or exceed the cap.
+  Unlike input, it accepts a reserved `__` key, so that a frame a later version writes
+  with a system dimension stays readable. `SeriesSelector` holds equality matchers
+  joined by AND, at most one per key, where `None` means "tag absent". An exact
+  selector also requires that the tag set has no other tag. With no matchers, a
+  selector selects every series, or only series 0 when exact. The caps and separators
+  are public constants (`MAX_TAG_KEY_BYTES`, `MAX_TAG_VALUE_BYTES`, `MAX_TAGS`,
+  `MAX_SERIES_KEY_BYTES`, `TAG_KEY_VALUE_SEPARATOR`, `TAG_PAIR_SEPARATOR`,
+  `RESERVED_TAG_KEY_PREFIX`).
 
 ### Changed
 

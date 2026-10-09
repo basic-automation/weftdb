@@ -267,3 +267,22 @@ mod types;
 // Re-export types from splimes that are commonly used
 pub use splimes::{Point, Resolution, Spline};
 pub use types::*;
+// Series tags (B-tags). They are defined in weft-physical-type, because a frame stores the
+// canonical series key, and re-exported here so a weftdb user need not depend on that
+// crate. `weftdb::tags` also carries the frozen caps and separators.
+pub use weft_physical_type::tags::{self, SeriesKey, SeriesSelector, TagError, TagSet};
+
+#[cfg(test)]
+mod tests {
+	use super::{tags, SeriesKey, SeriesSelector, TagError, TagSet};
+
+	#[test]
+	fn tag_types_are_reexported() {
+		let set = TagSet::from_pairs([("host", "a")]).expect("valid tags");
+		let key = SeriesKey::from_canonical(set.series_key().as_bytes()).expect("canonical bytes");
+		assert_eq!(TagSet::from(key), set);
+		assert!(SeriesSelector::new([("host", Some("a"))], true).expect("valid selector").matches(&set));
+		assert_eq!(TagSet::from_pairs([("__host", "a")]), Err(TagError::ReservedKey { key: "__host".to_owned() }));
+		assert_eq!(tags::MAX_SERIES_KEY_BYTES, 1024);
+	}
+}

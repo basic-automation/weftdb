@@ -57,6 +57,10 @@
 //!   [`SegmentIndex`] that prunes a query to the segments it must open
 //!   ([`SegmentIndex::prune_by_time`]) without reading a `.weftseg` byte — the
 //!   resident shape of the libSQL `segment_index` the next slice persists.
+//! - [`tags`] — B-tags series identity: a validated [`TagSet`], its canonical
+//!   [`SeriesKey`] bytes (what a frame and the control plane store, so binding a frame to
+//!   its series is a byte compare), and the [`SeriesSelector`] a query picks series with.
+//!   The canonical form and its caps are frozen format.
 //!
 //! [`F64`]: PhysicalType::F64
 //! [`F32`]: PhysicalType::F32
@@ -107,6 +111,7 @@ pub mod page;
 pub mod schema;
 pub mod segment;
 pub mod split;
+pub mod tags;
 pub mod timestamp;
 pub mod weftseg;
 
@@ -123,6 +128,7 @@ pub use schema::{AspectSchema, SealError};
 pub use segment::{prune_by_time, prune_by_value, prune_present_by_time, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 pub use split::{merge_newer_wins, split_index, SplitDecision, SplitPolicy};
+pub use tags::{SeriesKey, SeriesSelector, TagError, TagSet, MAX_SERIES_KEY_BYTES, MAX_TAGS, MAX_TAG_KEY_BYTES, MAX_TAG_VALUE_BYTES, RESERVED_TAG_KEY_PREFIX, TAG_KEY_VALUE_SEPARATOR, TAG_PAIR_SEPARATOR};
 pub use timestamp::{bitpack_bytes, bitpack_decode, bitpack_encode, bitpack_width, decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, first_order_violation, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 #[cfg(feature = "experimental-codecs")]
 pub use timestamp::{fire_estimated_bytes, fire_reconstruct, fire_residuals};
