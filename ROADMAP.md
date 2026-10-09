@@ -898,11 +898,13 @@ report → API/format freeze → **1.0**.
 
 ### Execution waves (W0–W15)
 
-A wave is one phase of the [1.0 plan](docs/release/1.0-plan.md#6-waves), which holds the
-detail: lanes, dependencies and estimates. `→` is merge order, and *(owner)* marks a step
-only the owner can take. A box is ticked only when the slice is on main. *Status
-2026-10-08:* W0 is nearly closed; the durability store lane is running ahead, with S8/S9 of
-W2 on main and S10–S12 of W3/W4 in progress.
+This list is the execution plan; the gates above remain the release criteria. A wave is one
+phase of the [1.0 plan](docs/release/1.0-plan.md#6-waves) (lanes, dependencies, estimates).
+`→` is merge order after the previous slice, *(owner)* marks a step only the owner can take,
+and a box is ticked only when its slice is on main.
+
+*Status 2026-10-08:* W0 is nearly closed. The durability store lane runs ahead: S8/S9 (W2)
+are on main, S10 and S11 merged on the durability integration branch, S12 in progress.
 
 - [ ] **W0 · Land in-flight work and lock the shapes S6/S7 depend on** — ticks **splimes 1.0 is released** (ticked, #62) and **Security process** (once private vulnerability reporting is on)
   - [ ] **INT-0** Merge deps/splimes-1 → routine/dsp-2026-10-08 → legal → durability/base into main — *in progress*: all but the routine branch are on main (#61/#62, #67, #63); the routine branch (#68) is being merged with main (`integrate/routine-2026-10-08`)
@@ -917,8 +919,8 @@ W2 on main and S10–S12 of W3/W4 in progress.
   - [ ] Turn on GitHub private vulnerability reporting (Settings → Security) *(owner)*
 - [ ] **W1 · Baseline release, server split, goldens** — starts **Semver policy + `CHANGELOG.md`** (from the first tagged pre-release)
   - [ ] **PAC-4** Cut the v0.1.0 baseline release (GitHub release only) — *released 2026-10-08: tag `v0.1.0` → b9a8ee4 (the #71 merge), five targets + SHA256SUMS, no crates.io; only the `compat/releases.toml` pin is left*
-  - [ ] Delete the stale draft prerelease `v0.1.0-preview.1` *(owner)*
   - [ ] → **X-FX** One fixture set under `compat/fixtures/v0.1.0/`, written by the v0.1.0 binary (absorbs PAC-FX, FRE-2)
+  - [ ] Delete the stale draft prerelease `v0.1.0-preview.1` *(owner)*
   - [x] Store lane: **D-S6** merges only after the v0.1.0 tag (see W0) — #72
   - [x] → **D-S7** (see W0) — #72
   - [ ] **X-SPLIT-SRV** Split manage.rs into declare/ingest/maintain/backup_routes, and main.rs into startup phases
@@ -952,7 +954,7 @@ W2 on main and S10–S12 of W3/W4 in progress.
 - [ ] **W3 · Gate, serve path, input domain** — no gate of its own
   - [ ] Store lane: **D-S10** Write-once durable seal with id assigned at commit (+ contained frame/sidecar paths) — *in progress* (merged into durability/base)
   - [ ] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)
-  - [ ] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions — *in progress*
+  - [ ] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions — *in progress* (merged into durability/base)
   - [ ] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
   - [ ] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
   - [ ] **ROB-6** Bounded decimals: the plain form is at most 1,024 digits, at every parse site (absorbs FRE-8a)
@@ -1045,7 +1047,7 @@ W2 on main and S10–S12 of W3/W4 in progress.
   - [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames
   - [ ] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
   - [ ] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
-  - [ ] **TAG-10** HTTP read surface: selectors on every read, /series, stats, freeze-time rename
+  - [ ] storage read handlers lane: **TAG-10** HTTP read surface: selectors on every read, /series, stats, freeze-time rename
   - [ ] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
   - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [ ] **SOA-16** Soak upgrade lane: previous on-disk generation to candidate under kills
@@ -1056,12 +1058,12 @@ W2 on main and S10–S12 of W3/W4 in progress.
   - [ ] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
   - [ ] **PAC-15** Operator documentation: install paths, production checklist, honest status
 - [ ] **W11 · Contract candidate, beta tag, calibration** — ticks **7.6 Quotas/limits** (ROB-24 evidence), **B-tags** (TAG-12) and **Panic audit on server paths** (ROB-2/3/4 + ROB-24)
-  - [ ] **FRE-9b** OpenAPI: storage and operator endpoints
-  - [ ] → Approve and push the **v1.0.0-beta.1** tag *(owner)*
   - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
-  - [ ] → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh`
-  - [ ] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
-  - [ ] → **FRE-16** CI compatibility gates: OpenAPI breaking-change check, fixture guard, golden coverage
+  - [ ] **FRE-9b** OpenAPI: storage and operator endpoints — the last change before the beta tag
+    - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*; the release workflow runs on that tag push and drafts the beta release
+  - [ ] → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh` — on the beta tag
+  - [ ] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage — tests and CI only, during calibration
+  - [ ] → **FRE-16** CI compatibility gates: OpenAPI breaking-change check, fixture guard, golden coverage — tests and CI only, during calibration
   - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
   - [ ] **ROB-24** Limits and overload evidence; frozen configuration documentation
 - [ ] **W12 · Phase 7 acceptance** — ticks **Phase 7 acceptance run**
@@ -1070,16 +1072,16 @@ W2 on main and S10–S12 of W3/W4 in progress.
 - [ ] **W13 · Freeze** — ticks **Public surface declared and frozen**; **Legal review** must be closed before the cut
   - [ ] Settle the [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta) counsel items (codec patents, **WEFTDB** trademark, benchmark policy) before rc.1 *(owner)*
   - [ ] **FRE-18** rc.1 freeze cut and layout-2 baseline fixtures; the OpenAPI breaking-change check blocks
-  - [ ] Approve and push the **v1.0.0-rc.1** tag *(owner)*
+    - [ ] Approve and push the **v1.0.0-rc.1** tag on FRE-18's merge *(owner)*; the release workflow runs on that tag push and drafts rc.1
 - [ ] **W14 · RC verification on release artifacts** — ticks **Every performance claim in the README links to a benchmark artifact**; re-confirms **Upgrade/rollback procedure** and refreshes **First cross-engine report**
   - [ ] **SOA-19** RC soak on the rc release artifact in the shipped default config (8 h, or 24 h)
   - [ ] **EVI-21** 1.0 evidence run at the rc: strict claims, cross-engine matrix re-run
   - [ ] **PAC-18** Dress rehearsal: compatibility matrix with the N-1 leg, container and systemd jobs on the rc
 - [ ] **W15 · 1.0.0** — ticks **README *Project status* table updated to reflect 1.0** and closes **Semver policy + `CHANGELOG.md`**
+  - [ ] Write or approve the 1.0 release notes and upgrade notes before the cut *(owner)*
   - [ ] **EVI-22** README 1.0 project status, badge and versions
-  - [ ] Write or approve the 1.0 release notes and upgrade notes *(owner)*
   - [ ] → **PAC-18** Cut 1.0.0: binaries, image, release notes
-  - [ ] Approve and push the **v1.0.0** tag *(owner)*
+    - [ ] Approve and push the **v1.0.0** tag *(owner)*; the release workflow runs on that tag push and drafts the 1.0.0 release
 
 ---
 
