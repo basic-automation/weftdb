@@ -244,6 +244,10 @@ only the control plane, not the segment frames.
   from the stored mantissas, so `GET …/storage/{aspect}/downsample?agg=p99,twa` on a
   `ScaledI64` aspect no longer decodes each segment twice. Results are unchanged; ~1.4× per
   segment on the bench.
+- **`reduce` and `reduce_partial` compute on integers when the values allow it**
+  (`weft-reduce`): when every value fits an `i64` mantissa at the series' largest scale, the
+  reduction compares and sums integers and returns the same buckets, value for value and in
+  representation. ~2.3× on real price series, ~4× on two-decimal ones.
 - **Bucket averages that never terminate are computed in one step** (`weft-reduce`): their
   100 significant digits come from one big-integer multiplication and one division by the
   count instead of a digit loop, with an identical result. Hourly `avg` on the integer

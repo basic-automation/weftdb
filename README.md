@@ -322,9 +322,9 @@ as results.
 
 At 500k two-decimal points, hour buckets, correctness-gated
 ([`weft-bench --downsample`](weft-bench); re-measured 2026-10-09 on the two-decimal generator, full
-table under [Compute endpoints](#compute-endpoints)): `avg` takes **14.4 ms (34.5M points/sec)**;
-time-weighted average costs about 3.4× that. Exact `p99` takes **31.5 ms** and the approximate
-`sketch_p99` about the same (**30.3 ms**), on real BTC closes too; what the sketch buys is bounded
+table under [Compute endpoints](#compute-endpoints)): `avg` takes **4.5 ms (118M points/sec)**;
+time-weighted average costs about 5.7× that. Exact `p99` takes **23.5 ms** and the approximate
+`sketch_p99` about the same (**18.8 ms**), on real BTC closes too; what the sketch buys is bounded
 memory per bucket and mergeability, within its 1% bound.
 
 ### Where it doesn't pay off
@@ -348,11 +348,12 @@ same buckets:
 |---|---|---|
 | `f64` loop (lossy baseline) | 2.27 ms | 1× |
 | `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **8.99 ms** | ~4.0× |
-| `weft_reduce::reduce` (exact, per-sample `BigDecimal`) | 54.6 ms | ~24× |
+| `weft_reduce::reduce` (exact, `BigDecimal` points; integer arithmetic inside since 2026-10-09) | 22.9 ms | ~10× |
 
 (Re-measured 2026-10-09, criterion pinned to one core; `reduce_scaled` is the median of nine
 alternating runs, 6.74–9.66 ms apart from two load-spike outliers at 18.8 and 20.1 ms. It was
-13.52 ms on 2026-10-08.)
+13.52 ms on 2026-10-08. `reduce` is the median of three runs, 22.9–28.3 ms; it was 52.6–53.0 ms
+before it took the integer path for points that fit, and 60.04 ms on 2026-10-08.)
 
 QuestDB [documents ~2×](https://questdb.com/docs/query/datatypes/decimal/) for its `DECIMAL`, so
 the precision wedge still costs more here. Before this work the shipped path measured 100.65 ms
@@ -464,23 +465,31 @@ and the old generator at **0.61M points/sec**, 7.3× slower than real data:
 
 | reduction | p50 (two decimals) | throughput | p50 (`full`, the pre-2026-10 generator) | throughput | note |
 |---|---|---|---|---|---|
-| `avg` | 14.4 ms | 34,471,692 points/sec | 197.8 ms | 2,552,581 points/sec | the streaming baseline — no bucket materialized |
-| `twa` | 49.0 ms | 10,006,950 points/sec | 257.6 ms | 1,878,669 points/sec | 3.4× the streaming cost: dwell-weighting needs the time-ordered samples |
-| `twa_bucket_end` | 48.5 ms | 10,006,152 points/sec | 259.1 ms | 1,876,355 points/sec | within noise of `twa` — one extra weight, effectively free |
-| `twa_linear` | 99.3 ms | 5,002,694 points/sec | 345.5 ms | 1,430,149 points/sec | 2.0× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
-| `p99` (exact) | 31.5 ms | 15,749,611 points/sec | 414.2 ms | 1,207,521 points/sec | collects each bucket and selects the rank in linear time (was 57.9 ms / 1,397.7 ms with a full sort of cloned values) |
-| `sketch_p99` | 30.3 ms¹ | 16,253,937 points/sec | 304.6 ms | 1,643,273 points/sec | streams into a DDSketch; see below (was 59.7 ms before the `f64` fast path) |
+| `avg` | 4.46 ms | 118,238,781 points/sec | 187.5 ms | 2,686,264 points/sec | the streaming baseline — no bucket materialized |
+| `twa` | 25.44 ms | 16,659,311 points/sec | 240.8 ms | 2,045,708 points/sec | 5.7× the streaming cost: dwell-weighting needs the time-ordered samples |
+| `twa_bucket_end` | 24.40 ms | 17,340,324 points/sec | 241.4 ms | 2,045,536 points/sec | within noise of `twa` — one extra weight, effectively free |
+| `twa_linear` | 68.76 ms | 6,919,376 points/sec | 313.5 ms | 1,578,596 points/sec | 2.7× `twa`: an extra `BigDecimal` add + divide per interval for the trapezoidal mean |
+| `p99` (exact) | 23.46 ms | 20,871,526 points/sec | 391.0 ms | 1,271,820 points/sec | collects each bucket and selects the rank in linear time |
+| `sketch_p99` | 18.79 ms | 25,871,740 points/sec | 280.1 ms | 1,785,661 points/sec | streams into a DDSketch; see below |
 
-¹ 10 reps.
+(Re-measured 2026-10-09 after `reduce` started taking the integer path for values that fit
+`i64` mantissas at a common scale; the two-decimal series does, the `full` one does not. The
+same day's earlier figures, before that change: `avg` 14.4 ms, `twa` 49.0, `twa_linear` 99.3,
+`p99` 31.5 (57.9 before the selection change), `sketch_p99` 30.3 (59.7 before the `f64` fast
+path).)
 
 These time `weft_reduce::reduce` over `BigDecimal` points, the path `POST /api/v1/downsample` takes.
-A stored `ScaledI64` aspect is reduced by the integer path instead (`reduce_partial_scaled`, see
-[Where it doesn't pay off](#where-it-doesnt-pay-off) for the decimal tax), which `--ds-scaled` times
-on the same series, gated on an identical result (10 reps, 2026-10-09, load average ~24, so the
-absolute times are high): hourly `avg` over the 500k two-decimal points **0.58 ms** against 14.40 ms,
-and over 1M real BTC closes **6.4 ms** against 52.8 ms; the six streaming reductions 7.6 against
-53.3 ms, `sketch_p99` 22.3 against 68.7 ms, and `avg,p99,twa` 109.0 against 169.8 ms on the real
-series (`weft-bench --downsample --ds-scaled …`).
+Since 2026-10-09 `reduce` itself compares and sums on integers whenever every value fits an `i64`
+mantissa at the series' largest scale, with a result identical in value and representation
+(min, max, first, last and collected samples are the original values; each bucket's sum carries its
+own largest scale); on 1M real BTC closes, hourly `avg` went from 52.4 to 21.6–22.3 ms, `sketch_p99`
+from 71.0 to 42.3–42.9 ms and `avg,p99,twa` from 171.4 to 141.3–142.9 ms (two runs each). A stored
+`ScaledI64` aspect goes further, straight from the stored mantissas (`reduce_partial_scaled`, see
+[Where it doesn't pay off](#where-it-doesnt-pay-off) for the decimal tax), which `--ds-scaled` times on
+the same series, gated on an identical result (10 reps, load average ~24): hourly `avg` over the 500k
+two-decimal points **0.58 ms**, over 1M real BTC closes **6.4 ms**; the six streaming reductions
+7.6 ms, `sketch_p99` 22.3 ms and `avg,p99,twa` 109.0 ms on the real series (`weft-bench --downsample
+--ds-scaled …`).
 
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
@@ -490,11 +499,10 @@ materialize and sort the whole bucket, and two buckets' results cannot be combin
 (`weft_reduce::SKETCH_ALPHA`), **bounded memory** regardless of bucket size (values fold in as they
 arrive; `SKETCH_MAX_BINS` caps the store absolutely), and an **exactly mergeable** structure, so a
 p99 can be computed over a large or streaming bucket. **Speed is not the reason to choose it.** On the
-shipped harness (10 reps, correctness PASS, 2026-10-09) the two run level: p50 **33.4 ms** exact vs
-**38.5 ms** sketch on two-decimal values (500k points, hourly), and **82.5 ms** vs **77.9 ms** on 1M
+shipped harness (10 reps, correctness PASS, 2026-10-09) the two run level: p50 **21.3 ms** exact vs
+**18.8 ms** sketch on two-decimal values (500k points, hourly), and **43.4 ms** vs **41.2 ms** on 1M
 real BTC closes (hourly), where values carry up to eight decimal places (`weft-bench --downsample
---ds-aggs p99` vs `--ds-aggs sketch_p99`, with `--ds-csv` for the real series; load average ~40, so
-the absolute times are high). The exact percentile selects its rank in linear time over borrowed
+--ds-aggs p99` vs `--ds-aggs sketch_p99`, with `--ds-csv` for the real series). The exact percentile selects its rank in linear time over borrowed
 values, cloning only the result. The sketch converts a value with at most 15–16 significant digits
 and at most 22 decimal places to `f64` by one division, which is provably the same `f64` as
 `bigdecimal`'s `to_f64` (tested bit for bit); before that change `sketch_p99` took 63.8 ms here. The

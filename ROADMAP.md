@@ -1707,13 +1707,15 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         `avg,p99,twa`, pinned, three pairs: the store's route 210.9/215.6/245.3 → 147.3/167.2/155.1
         ms (the plain BigDecimal route is 190–210 ms). Runtime-verified on the live server against
         an independent Python nearest-rank and LOCF computation.
-      - [ ] **NEXT — `reduce`/`reduce_partial` over `BigDecimal` points could take the integer path
-        themselves** when the values fit `i64` mantissas. For one-scale input the integer path's
-        output is identical even in representation, but JSON/CSV values carry mixed scales
-        (`99.92`, `99.9`, `100`), so the useful version tracks each extremal sample's original
-        scale (min/max/first/last and collected samples keep their own representation; the sum is
-        at the largest scale, as `BigDecimal` addition gives it). That would make
-        `POST /api/v1/downsample` ~8–25× cheaper once the `from_f64` widening above is fixed.
+      - [x] **DONE (2026-10-09) — `reduce`/`reduce_partial` take the integer path themselves**
+        when every value fits an `i64` mantissa at the series' largest scale (≤ 18 places), mixed
+        scales included: compare and sum on integers, locate min/max/first/last by position and
+        return the original values, collect original samples, bring each bucket's sum back to its own
+        largest scale. Postcard bytes of the partial and every finished value's `(digits, scale)` are
+        identical to the BigDecimal reference (tested over mixed scales 0..=8 with equal values at
+        different scales). Pinned criterion on 1 Mi real BTC closes: hourly `avg` 53.0/52.8/52.6 →
+        23.0/22.9/28.3 ms, `sum` 50.8/50.9/50.6 → 20.8/20.4/21.9 ms. `POST /api/v1/downsample` gains
+        once its `from_f64` widening (above) is fixed; today its ~50-digit values decline the path.
       - [ ] **NEXT — select on the mantissas when a partial is not merged.** A single-segment
         downsample could rank `i64` mantissas and build one `BigDecimal` per bucket, but a
         `PartialReduction` must carry `BigDecimal` samples to merge; a finish-only fast path

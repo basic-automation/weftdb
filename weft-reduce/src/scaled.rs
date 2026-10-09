@@ -22,7 +22,7 @@ use bigdecimal::{
 	num_bigint::{BigInt, BigUint, Sign}, BigDecimal, ToPrimitive
 };
 use chrono::{DateTime, Utc};
-use splimes::Resolution;
+use splimes::{Point, Resolution};
 
 use crate::{bucket_start, resolution_step_secs, Aggregation, Bucket, BucketAcc, DdSketch, PartialReduction, ReduceError};
 
@@ -460,6 +460,187 @@ pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32,
 	Ok(Some(PartialReduction { buckets: converted }))
 }
 
+/// Per-bucket state for [`reduce_partial_points`]: the integer accumulators at the series'
+/// common scale, the bucket's own largest scale, and for each extremal sample its position in
+/// the input, so the `BigDecimal` partial is built from the original values.
+#[derive(Debug, Clone, Copy)]
+struct PointAcc {
+	count: u64,
+	sum: i128,
+	max_scale: u32,
+	/// `(mantissa at the common scale, position)` of the first-encountered minimum / maximum.
+	min: (i64, usize),
+	max: (i64, usize),
+	/// `(epoch nanos, position)` of the first / last sample, with `reduce`'s tie rules.
+	first: (i64, usize),
+	last: (i64, usize),
+}
+
+impl PointAcc {
+	const fn new(nanos: i64, mantissa: i64, scale: u32, at: usize) -> Self {
+		Self { count: 1, sum: mantissa as i128, max_scale: scale, min: (mantissa, at), max: (mantissa, at), first: (nanos, at), last: (nanos, at) }
+	}
+
+	const fn push(&mut self, nanos: i64, mantissa: i64, scale: u32, at: usize) {
+		self.count += 1;
+		self.sum += mantissa as i128;
+		if scale > self.max_scale {
+			self.max_scale = scale;
+		}
+		if mantissa < self.min.0 {
+			self.min = (mantissa, at);
+		}
+		if mantissa > self.max.0 {
+			self.max = (mantissa, at);
+		}
+		if nanos < self.first.0 {
+			self.first = (nanos, at);
+		}
+		if nanos >= self.last.0 {
+			self.last = (nanos, at);
+		}
+	}
+
+	/// Fold a later run of the same bucket in: ties keep the earlier run's min, max and first
+	/// and take the later run's last, as a single pass would.
+	const fn merge(&mut self, other: &Self) {
+		self.count += other.count;
+		self.sum += other.sum;
+		if other.max_scale > self.max_scale {
+			self.max_scale = other.max_scale;
+		}
+		if other.min.0 < self.min.0 {
+			self.min = other.min;
+		}
+		if other.max.0 > self.max.0 {
+			self.max = other.max;
+		}
+		if other.first.0 < self.first.0 {
+			self.first = other.first;
+		}
+		if other.last.0 >= self.last.0 {
+			self.last = other.last;
+		}
+	}
+}
+
+/// The bucket [`reduce_partial_points`] is filling: key, state, nanosecond range.
+type OpenBucket = (i64, PointAcc, Option<(i64, i64)>);
+
+/// The most decimal places [`reduce_partial_points`] brings a series to (`10^18` fits `i64`).
+const MAX_COMMON_SCALE: u32 = 18;
+
+/// [`reduce_partial`](crate::reduce_partial) on integers, for `BigDecimal` points whose values
+/// all fit `i64` mantissas once brought to the series' largest scale: the same partial, value
+/// for value **and in representation**.
+///
+/// The values are compared and summed as integers at that common scale. What the partial
+/// keeps is what the `BigDecimal` accumulator keeps: min, max, first and last are the original
+/// samples (located by position, with the same tie rules), collected samples are the
+/// originals in input order, sketches are fed through the same `add_decimal`, and each
+/// bucket's sum is brought back to the largest scale among *that bucket's* samples, which is
+/// the scale `BigDecimal` addition gives it.
+///
+/// `Ok(None)` when the series does not qualify (a value with a negative scale, more than
+/// [`MAX_COMMON_SCALE`] places or a mantissa beyond `i64` at the common scale, an instant or
+/// bound without a nanosecond epoch, or no points), and the caller takes the `BigDecimal`
+/// path.
+pub fn reduce_partial_points(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>, ReduceError> {
+	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
+	let mut lifted: Vec<(i64, i64, u32)> = Vec::with_capacity(points.len());
+	for point in points {
+		let (digits, scale) = point.value.as_bigint_and_scale();
+		let (Some(nanos), Some(mantissa), Ok(scale)) = (point.timestamp.timestamp_nanos_opt(), digits.to_i64(), u32::try_from(scale)) else {
+			return Ok(None);
+		};
+		lifted.push((nanos, mantissa, scale));
+	}
+	let Some(common) = lifted.iter().map(|&(_, _, s)| s).max() else {
+		return Ok(None);
+	};
+	if common > MAX_COMMON_SCALE {
+		return Ok(None);
+	}
+	for (_, mantissa, scale) in &mut lifted {
+		let Some(m) = 10_i64.checked_pow(common - *scale).and_then(|f| mantissa.checked_mul(f)) else {
+			return Ok(None);
+		};
+		*mantissa = m;
+	}
+	let bound = |b: Option<DateTime<Utc>>| b.map(|t| t.timestamp_nanos_opt()).map_or(Some(None), |n| n.map(Some));
+	let (Some(lo), Some(hi)) = (bound(start), bound(end)) else {
+		return Ok(None);
+	};
+	let inside = |nanos: i64| lo.is_none_or(|l| nanos >= l) && hi.is_none_or(|h| nanos <= h);
+
+	// Accumulate as `accumulate` does: the current bucket stays open while samples stay in
+	// its nanosecond range, and a re-entered bucket merges with its earlier runs.
+	let mut buckets: BTreeMap<i64, PointAcc> = BTreeMap::new();
+	// The open bucket: its key, its state, and its nanosecond range.
+	let mut current: Option<OpenBucket> = None;
+	for (at, &(nanos, mantissa, scale)) in lifted.iter().enumerate() {
+		if !inside(nanos) {
+			continue;
+		}
+		if let Some((_, acc, Some((from, to)))) = current.as_mut() {
+			if *from <= nanos && nanos <= *to {
+				acc.push(nanos, mantissa, scale, at);
+				continue;
+			}
+		}
+		let base = base_of(resolution, nanos);
+		match current.as_mut() {
+			Some((key, acc, _)) if *key == base => acc.push(nanos, mantissa, scale, at),
+			_ => {
+				if let Some((key, acc, _)) = current.take() {
+					buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
+				}
+				current = Some((base, PointAcc::new(nanos, mantissa, scale, at), base_range(resolution, base)));
+			}
+		}
+	}
+	if let Some((key, acc, _)) = current {
+		buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
+	}
+
+	let sketching = aggregations.iter().any(|a| a.sketch_quantile().is_some());
+	let collecting = aggregations.iter().any(|a| a.needs_full_bucket());
+	let mut converted: BTreeMap<i64, BucketAcc> = BTreeMap::new();
+	for (base, acc) in buckets {
+		// Exact: every sample in the bucket is a multiple of 10^(common - max_scale).
+		let sum = acc.sum / 10_i128.pow(common - acc.max_scale);
+		let sample = |at: usize| (points[at].timestamp, points[at].value.clone());
+		let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(sum), i64::from(acc.max_scale)), min: Some(points[acc.min.1].value.clone()), max: Some(points[acc.max.1].value.clone()), first: Some(sample(acc.first.1)), last: Some(sample(acc.last.1)), samples: if collecting { Vec::with_capacity(usize::try_from(acc.count).unwrap_or(0)) } else { Vec::new() }, collect: collecting, sketch: sketching.then(DdSketch::with_default_accuracy) };
+		converted.insert(base, state);
+	}
+	if sketching || collecting {
+		let mut ordered: Vec<(i64, &mut BucketAcc)> = converted.iter_mut().map(|(&base, acc)| (base, acc)).collect();
+		let mut current: Option<(usize, Option<(i64, i64)>)> = None;
+		for (point, &(nanos, _, _)) in points.iter().zip(&lifted) {
+			if !inside(nanos) {
+				continue;
+			}
+			let position = match current {
+				Some((position, Some((from, to)))) if from <= nanos && nanos <= to => position,
+				_ => {
+					let base = base_of(resolution, nanos);
+					let Ok(position) = ordered.binary_search_by_key(&base, |(b, _)| *b) else { continue };
+					current = Some((position, base_range(resolution, base)));
+					position
+				}
+			};
+			let acc = &mut *ordered[position].1;
+			if let Some(sketch) = acc.sketch.as_mut() {
+				sketch.add_decimal(&point.value).map_err(|_| ReduceError::SketchValue)?;
+			}
+			if collecting {
+				acc.samples.push((point.timestamp, point.value.clone()));
+			}
+		}
+	}
+	Ok(Some(PartialReduction { buckets: converted }))
+}
+
 #[cfg(test)]
 mod tests {
 	use splimes::Point;
@@ -606,6 +787,55 @@ mod tests {
 			assert_eq!(a.finish(resolution, &aggs).expect("finishes"), whole);
 			assert_eq!(b.finish(resolution, &aggs).expect("finishes"), whole);
 		}
+	}
+
+	#[test]
+	fn reduce_partial_on_mixed_scale_points_is_identical_in_representation() {
+		// Mixed scales 0..=8 (prices, integers, eight-decimal values), equal values written
+		// at different scales (2.5 / 2.50 / 2.500), negatives, out-of-order instants and
+		// duplicates; every reduction, filtered and not. The partial `reduce_partial` builds
+		// (the integer path) must serialize to the same bytes as the BigDecimal reference -
+		// the sidecar's own form, which writes every BigDecimal as its string - and every
+		// finished value must have the same digits and scale.
+		let mut next = noise(0x3c6e_f372_fe94_f82b);
+		let mut nanos: Vec<i64> = (0..4_000_i64).map(|i| i * 7_000_000_000 + (next() % 20_000_000_000).cast_signed()).collect();
+		nanos[50] = nanos[49];
+		nanos[3_000] = nanos[2_999];
+		let pts: Vec<Point> = nanos
+			.iter()
+			.map(|&n| {
+				let scale = (next() % 9).cast_signed();
+				let base = (next() % 2_000).cast_signed() - 1_000;
+				// Some values repeat at another scale: 25e-1, 250e-2, 2500e-3.
+				let value = if next().is_multiple_of(5) { BigDecimal::new((25 * 10_i64.pow(u32::try_from(scale).unwrap())).into(), scale + 1) } else { BigDecimal::new(base.into(), scale) };
+				Point { timestamp: DateTime::from_timestamp_nanos(n), value }
+			})
+			.collect();
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd, Aggregation::SketchP90];
+		let window = (Some(DateTime::from_timestamp_nanos(nanos[400])), Some(DateTime::from_timestamp_nanos(nanos[3_500])));
+		for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours] {
+			for (start, end) in [(None, None), window] {
+				let fast = reduce_partial_points(&pts, resolution, start, end, &aggs).expect("reduces").expect("qualifies");
+				let reference = crate::reduce_partial_decimal(&pts, resolution, start, end, &aggs).expect("reduces");
+				assert_eq!(postcard::to_allocvec(&fast).expect("serializes"), postcard::to_allocvec(&reference).expect("serializes"), "{resolution:?} {start:?}");
+				let (a, b) = (fast.finish(resolution, &aggs).expect("finishes"), reference.finish(resolution, &aggs).expect("finishes"));
+				assert_eq!(a.len(), b.len());
+				for (x, y) in a.iter().zip(&b) {
+					assert_eq!((x.timestamp, x.count), (y.timestamp, y.count));
+					let repr = |bucket: &Bucket| bucket.values.iter().map(|(k, v)| (k.clone(), v.as_bigint_and_exponent())).collect::<Vec<_>>();
+					assert_eq!(repr(x), repr(y), "{resolution:?} bucket {}", x.timestamp);
+				}
+			}
+		}
+		// Series the integer path declines take the BigDecimal path through `reduce_partial`.
+		let huge = vec![Point { timestamp: DateTime::from_timestamp_nanos(0), value: BigDecimal::new(BigInt::from(i128::MAX), 2) }];
+		assert!(reduce_partial_points(&huge, Resolution::Hours, None, None, &aggs).expect("ok").is_none());
+		let deep = vec![Point { timestamp: DateTime::from_timestamp_nanos(0), value: BigDecimal::new(1.into(), 19) }];
+		assert!(reduce_partial_points(&deep, Resolution::Hours, None, None, &aggs).expect("ok").is_none(), "more than 18 places");
+		let negative_scale = vec![Point { timestamp: DateTime::from_timestamp_nanos(0), value: BigDecimal::new(5.into(), -3) }];
+		assert!(reduce_partial_points(&negative_scale, Resolution::Hours, None, None, &aggs).expect("ok").is_none());
+		assert!(reduce_partial_points(&[], Resolution::Hours, None, None, &aggs).expect("ok").is_none());
+		assert_eq!(reduce(&huge, Resolution::Hours, None, None, &[Aggregation::Max]).expect("reduces")[0].values["max"], huge[0].value);
 	}
 
 	#[test]

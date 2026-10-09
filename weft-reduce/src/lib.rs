@@ -661,6 +661,17 @@ impl PartialReduction {
 /// As [`reduce`], plus [`ReduceError::SketchValue`] if a `sketch_p*` reduction was asked
 /// for and a value has no finite `f64` image.
 pub fn reduce_partial(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<PartialReduction, ReduceError> {
+	// Values that fit `i64` mantissas at one common scale reduce on integers, with an
+	// identical result (see `scaled::reduce_partial_points`); anything else, here.
+	if let Some(partial) = scaled::reduce_partial_points(points, resolution, start, end, aggregations)? {
+		return Ok(partial);
+	}
+	reduce_partial_decimal(points, resolution, start, end, aggregations)
+}
+
+/// [`reduce_partial`] in `BigDecimal` arithmetic throughout: the path for series the
+/// integer path declines, and the reference it is tested against.
+fn reduce_partial_decimal(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<PartialReduction, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
 	// The exact percentiles and TWA require the full bucket materialized; the streaming
 	// reductions do not, so only collect when one of those is actually requested.
