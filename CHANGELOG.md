@@ -197,7 +197,8 @@ only the control plane, not the segment frames.
 - **Gap filling** (`weft-reduce`): `weft_reduce::fill` turns a reduction's buckets into the
   dense grid between two bounds, keeping measured buckets unchanged and synthesizing every
   empty step with `count == 0` by a declared `Fill` (`Null`, `Previous`, `Linear` by grid
-  step, or a constant `Value`; `Fill::from_token` parses `null`/`prev`/`linear`/a decimal),
+  step, a constant `Value`, or `Spline`, a splimes spline through the bucket values;
+  `Fill::from_token` parses `null`/`prev`/`linear`/`quadratic`/`cubic`/a decimal),
   bounded by a caller-given bucket limit (`FillError`).
 - **Weft-Bench `--gap-fill` workload**: TSM-Bench Q5's `SAMPLE BY … FILL(LINEAR)` shape over
   a seeded series with outages (`--gf-points`, `--gf-stride`, `--gf-bucket`, `--gf-outage`,

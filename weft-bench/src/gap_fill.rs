@@ -47,7 +47,7 @@ pub const DEFAULT_GAP_FILL_SEED: u64 = 0x6A9F_111E_D5EE_D001;
 const MAX_GRID_BUCKETS: usize = 10_000_000;
 
 /// The tunable knobs for a gap-fill profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GapFillParams {
 	/// RNG seed; publishing it regenerates the corpus and its outages exactly.
 	pub seed: u64,
@@ -76,7 +76,7 @@ impl Default for GapFillParams {
 }
 
 /// A reproducible gap-fill workload profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GapFillProfile {
 	/// Human-readable profile name, recorded in results.
 	pub name: String,

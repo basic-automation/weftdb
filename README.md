@@ -1405,8 +1405,15 @@ What it does today:
   10 reps, PASS): `linear` p50 **57.2 ms**, MAE **$49.27** (0.67% of the mean), RMSE $91.77, worst
   $957.18; `prev` MAE $76.45, RMSE $147.23; `null` 55.1 ms (`--gf-csv database/datasets/btc_1min.csv
   --csv-value-col 4 --csv-skip 3000000 --gf-points 1000000 --gf-bucket h`; the local corpus
-  described under [Ingest](#ingest), not distributed with the repository). WeftDB's grid has only
-  unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
+  described under [Ingest](#ingest), not distributed with the repository). `--gf-fill cubic` /
+  `quadratic` fill with a splimes spline through the bucket values instead (`Fill::Spline`).
+  That is **not a general win, and the default stays `linear`**: on the smooth generated signal a
+  cubic fill cuts RMSE **7.5×** (0.115 vs 0.865), but on real BTC closes, which move close to a
+  random walk, linear is more accurate — hourly MAE $49.27 linear vs $55.34 cubic vs $61.32
+  quadratic, and at one-minute buckets (187,421 filled minutes, outages averaging three) $6.79
+  vs $8.37 — while the spline costs ~14% more time (64.8 vs 56.7 ms hourly; 10 reps,
+  2026-10-09, load average ~6). Reach for the spline on smooth physical signals, not on prices.
+  WeftDB's grid has only unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
@@ -1566,7 +1573,7 @@ server and an interactive application:
 | [`weft-physical-type`](weft-physical-type) | Vendor-neutral physical type system — schema-declared numeric encodings with explicit exactness, timestamp codecs, and the `.weftseg` columnar segment format (single-block and paged). |
 | [`weft-arrow`](weft-arrow) / [`weft-arrow-store`](weft-arrow-store) | Apache Arrow / Parquet interchange for sealed segments and stored reads, kept in leaf crates so the `arrow-*` dependency tree never reaches the hot-path core. |
 | [`weft-line-protocol`](weft-line-protocol) | Dependency-free InfluxDB Line Protocol parser shared by the server and the benchmark harness. |
-| [`weft-reduce`](weft-reduce) | Vendor-neutral downsampling reductions, computable over parts and merged (`reduce_partial`/`PartialReduction`, exact for every reduction) — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + three time-weighted averages (LOCF, linear/trapezoidal, LOCF-to-bucket-end) + mergeable bounded-error `sketch_p*` percentiles, over an epoch-aligned bucket grid, computed in `BigDecimal`. A `PartialReduction` is **serde-serializable** (so a segment's partial can be persisted and merged later, in place of re-reading it) and **re-bucketable** to any coarser nesting resolution (`rebucket`/`grids_nest`). **Gap filling** (`fill`): the dense bucket grid between two bounds, measured buckets unchanged and every empty step synthesized with `count == 0` by a declared `Fill` (`Null`, `Previous`, `Linear` by grid step, or a constant), SQL `FILL(…)`'s vocabulary. Shared by the HTTP `downsample` endpoint and the benchmark harness. |
+| [`weft-reduce`](weft-reduce) | Vendor-neutral downsampling reductions, computable over parts and merged (`reduce_partial`/`PartialReduction`, exact for every reduction) — `min`/`max`/`avg`/`sum`/`first`/`last` + nearest-rank `p50`/`p90`/`p95`/`p99` + three time-weighted averages (LOCF, linear/trapezoidal, LOCF-to-bucket-end) + mergeable bounded-error `sketch_p*` percentiles, over an epoch-aligned bucket grid, computed in `BigDecimal`. A `PartialReduction` is **serde-serializable** (so a segment's partial can be persisted and merged later, in place of re-reading it) and **re-bucketable** to any coarser nesting resolution (`rebucket`/`grids_nest`). **Gap filling** (`fill`): the dense bucket grid between two bounds, measured buckets unchanged and every empty step synthesized with `count == 0` by a declared `Fill` (`Null`, `Previous`, `Linear` by grid step, or a constant, SQL `FILL(…)`'s vocabulary, plus `Spline`, a splimes spline through the bucket values). Shared by the HTTP `downsample` endpoint and the benchmark harness. |
 | [`weft-server`](weft-server) | Benchmark-grade `axum` HTTP API — interpolation, downsampling, storage ingest/query, catalog management, Prometheus metrics, live latency profiles. |
 | [`weft-bench`](weft-bench) | Reproducible, correctness-gated benchmark harness — the roadmap's spine; both an internal suite and a customer-runnable diagnostic. |
 | [`weft-tui`](weft-tui) | Terminal user interface (Ratatui + Crossterm) for creating databases, importing CSV data, browsing and plotting aspects, and running compression. |

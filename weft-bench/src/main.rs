@@ -876,7 +876,7 @@ fn set_gap_fill_knob(params: &mut GapFillParams, flag: &str, value: &str) -> Res
 		"--gf-bucket" => params.bucket_resolution = parse_resolution(value)?,
 		"--gf-outage" => params.outage_percent = value.parse::<u32>().ok().filter(|p| *p <= 90).ok_or_else(|| "--gf-outage must be a whole percent in 0..=90".to_string())?,
 		"--gf-outage-len" => params.mean_outage_buckets = value.parse::<u32>().ok().filter(|n| *n >= 1).ok_or_else(|| "--gf-outage-len must be a positive whole number of buckets".to_string())?,
-		"--gf-fill" => params.method = weft_reduce::Fill::from_token(value).ok_or_else(|| format!("invalid --gf-fill `{value}` (use linear|prev|null|<decimal>)"))?,
+		"--gf-fill" => params.method = weft_reduce::Fill::from_token(value).ok_or_else(|| format!("invalid --gf-fill `{value}` (use linear|cubic|quadratic|prev|null|<decimal>)"))?,
 		"--gf-agg" => params.aggregation = Aggregation::from_token(value).ok_or_else(|| format!("invalid --gf-agg `{value}`"))?,
 		_ => unreachable!("only GAP_FILL_FLAGS are dispatched here"),
 	}
@@ -1046,7 +1046,8 @@ GAP-FILL OPTIONS (with --gap-fill; seeded by --seed):
         --gf-outage <PCT>    Share of interior buckets lost to outages, 0..=90
                                                                        [default: 20]
         --gf-outage-len <N>  Mean outage length in buckets (>=1)        [default: 5]
-        --gf-fill <M>        Fill: linear|prev|null|<decimal>      [default: linear]
+        --gf-fill <M>        Fill: linear|cubic|quadratic|prev|null|<decimal>
+                             (cubic/quadratic: a splimes spline) [default: linear]
         --gf-agg <A>         Reduction per bucket, scored on filled buckets
                                                                       [default: avg]
         --gf-csv <FILE>      Cut the outages from a REAL series instead (same CSV

@@ -18,20 +18,27 @@
 //!   nearest earlier and later buckets that have it. Steps before the first or after the last
 //!   such bucket have no neighbour on one side and are left without that value.
 //! - [`Fill::Value`]: every reduction takes the given constant.
+//! - [`Fill::Spline`]: each reduction is interpolated by a splimes spline through the
+//!   buckets that have it (the bucket values at their grid starts), which is WeftDB's
+//!   interpolation engine applied to the reduced series. Like the linear fill it gives no
+//!   value outside the first and last such bucket.
 //!
 //! Values stay in [`BigDecimal`]. A linear fill computes `prev + (next − prev)·k/n` exactly
 //! when the quotient terminates and to `BigDecimal`'s default division precision otherwise.
+//! A spline fill carries splimes' numerical contract instead: inputs are rounded to `f64`
+//! and each filled value is the shortest decimal that round-trips to the computed `f64`.
+//! Either way a filled value is synthesized and marked so by its `count == 0`.
 
 use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use splimes::Resolution;
+use splimes::{Point, PointKind, Resolution, Spline};
 
 use crate::{bucket_index, bucket_start, Bucket};
 
 /// How [`fill`] synthesizes the values of a bucket that held no samples.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Fill {
 	/// Emit the bucket with no values (SQL `FILL(NULL)`).
 	Null,
@@ -41,11 +48,15 @@ pub enum Fill {
 	Linear,
 	/// Give every reduction this constant (SQL `FILL(<value>)`).
 	Value(BigDecimal),
+	/// Interpolate each reduction with this splimes spline through its buckets.
+	Spline(Spline),
 }
 
 impl Fill {
-	/// Parse a wire token: `null`, `prev`/`previous`/`locf`, `linear`, or a decimal constant
-	/// (case-insensitive, surrounding whitespace ignored). `None` for anything else.
+	/// Parse a wire token: `null`, `prev`/`previous`/`locf`, `linear`, `quadratic`, `cubic`,
+	/// or a decimal constant (case-insensitive, surrounding whitespace ignored). `None` for
+	/// anything else. `quadratic` and `cubic` are [`Fill::Spline`]s; `linear` is the exact
+	/// [`Fill::Linear`], not a linear spline.
 	#[must_use]
 	pub fn from_token(token: &str) -> Option<Self> {
 		let token = token.trim();
@@ -53,6 +64,8 @@ impl Fill {
 			"null" => Some(Self::Null),
 			"prev" | "previous" | "locf" => Some(Self::Previous),
 			"linear" => Some(Self::Linear),
+			"quadratic" => Some(Self::Spline(Spline::Quadratic)),
+			"cubic" => Some(Self::Spline(Spline::Cubic)),
 			_ => token.parse::<BigDecimal>().ok().map(Self::Value),
 		}
 	}
@@ -78,6 +91,9 @@ pub enum FillError {
 	/// A grid step's start lies outside the representable time range.
 	#[error("a bucket start overflows the representable time range")]
 	BucketStartOverflow,
+	/// The spline interpolation failed (an invalid spline, or a value with no finite `f64`).
+	#[error("spline fill failed: {0}")]
+	Spline(String),
 }
 
 /// The dense bucket grid at `resolution` from `start`'s bucket to `end`'s, with the steps
@@ -131,6 +147,10 @@ pub fn fill(buckets: &[Bucket], resolution: Resolution, start: Option<DateTime<U
 	for (bucket, &s) in buckets[..next].iter().zip(&steps) {
 		latest.extend(bucket.values.iter().map(|(k, v)| (k, (s, v))));
 	}
+	let splined = match method {
+		Fill::Spline(spline) => spline_values(buckets, resolution, first, last, *spline)?,
+		_ => BTreeMap::new(),
+	};
 	let mut out = Vec::with_capacity(usize::try_from(grid).unwrap_or(0));
 	for step in first..=last {
 		if steps.get(next) == Some(&step) {
@@ -145,6 +165,7 @@ pub fn fill(buckets: &[Bucket], resolution: Resolution, start: Option<DateTime<U
 			Fill::Value(constant) => keys.iter().map(|&k| (k.clone(), constant.clone())).collect(),
 			Fill::Previous => latest.iter().map(|(&k, &(_, v))| (k.clone(), v.clone())).collect(),
 			Fill::Linear => linear_values(&latest, &buckets[next..], &steps[next..], step),
+			Fill::Spline(_) => splined.iter().filter_map(|(key, by_step)| Some((key.clone(), by_step.get(&step)?.clone()))).collect(),
 		};
 		out.push(Bucket { timestamp, count: 0, values });
 	}
@@ -163,6 +184,26 @@ fn linear_values(latest: &BTreeMap<&String, (i64, &BigDecimal)>, later: &[Bucket
 			Some((key.clone(), value))
 		})
 		.collect()
+}
+
+/// For each reduction the buckets carry, its spline interpolation at every grid step of
+/// `first..=last` that lies strictly inside that reduction's buckets and is not one of
+/// them, keyed by step. splimes' grid at `resolution` anchored at bucket `first`'s start
+/// is exactly the bucket grid (both step by `Resolution::step_nanos`), so grid point `k`
+/// is step `first + k`.
+fn spline_values(buckets: &[Bucket], resolution: Resolution, first: i64, last: i64, spline: Spline) -> Result<BTreeMap<String, BTreeMap<i64, BigDecimal>>, FillError> {
+	let (start, end) = (bucket_start(resolution, first).ok_or(FillError::BucketStartOverflow)?, bucket_start(resolution, last).ok_or(FillError::BucketStartOverflow)?);
+	let mut keys: Vec<&String> = buckets.iter().flat_map(|b| b.values.keys()).collect();
+	keys.sort_unstable();
+	keys.dedup();
+	let mut out = BTreeMap::new();
+	for key in keys {
+		let knots: Vec<Point> = buckets.iter().filter_map(|b| b.values.get(key).map(|v| Point::new(b.timestamp, v.clone()))).collect();
+		let series = splimes::interpolate(&knots, start, end, resolution, spline).map_err(|e| FillError::Spline(e.to_string()))?;
+		let by_step: BTreeMap<i64, BigDecimal> = series.kinds().iter().zip(series.values()).zip(first..).filter(|((kind, _), _)| **kind == PointKind::Interpolated).map(|((_, value), step)| (step, value.clone())).collect();
+		out.insert(key.clone(), by_step);
+	}
+	Ok(out)
 }
 
 #[cfg(test)]
@@ -285,12 +326,46 @@ mod tests {
 	}
 
 	#[test]
+	fn a_spline_fill_follows_the_curve_and_leaves_the_edges() {
+		// Hourly buckets of a parabola v = h² with hours 3..=5 missing, plus one leading
+		// and one trailing step beyond the data.
+		let samples: Vec<(i64, String)> = (0..10_i64).filter(|h| !(3..=5).contains(h)).map(|h| (h * 3_600, (h * h).to_string())).collect();
+		let samples: Vec<(i64, &str)> = samples.iter().map(|(t, v)| (*t, v.as_str())).collect();
+		let buckets = reduce(&points(&samples), Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces");
+		let filled = fill(&buckets, Resolution::Hours, Some(at(-3_600)), Some(at(10 * 3_600)), &Fill::Spline(Spline::Quadratic), 100).expect("fills");
+		assert_eq!(filled.len(), 12);
+		for h in 3..=5_i64 {
+			let bucket = &filled[usize::try_from(h + 1).unwrap()];
+			assert_eq!(bucket.count, 0);
+			let v = avg(bucket).expect("interpolated").to_string().parse::<f64>().unwrap();
+			// A quadratic through a parabola's knots reproduces it, to f64 precision.
+			assert!((v - f64::from(i32::try_from(h * h).unwrap())).abs() < 1e-9, "hour {h}: {v}");
+		}
+		assert!(filled[0].values.is_empty() && filled[11].values.is_empty(), "no spline value outside the data");
+		for kept in [1, 2, 3, 7, 8, 9, 10] {
+			assert!(buckets.contains(&filled[kept]), "measured buckets are unchanged");
+		}
+		// Linear, by contrast, cuts the chord: 4 → 36 at hour 3 gives 12, not 9.
+		let linear = fill(&buckets, Resolution::Hours, None, None, &Fill::Linear, 100).expect("fills");
+		assert_eq!(avg(&linear[3]), Some(&dec("12")));
+	}
+
+	#[test]
+	fn an_invalid_spline_is_an_error() {
+		let buckets = gappy();
+		let err = fill(&buckets, Resolution::Minutes, None, None, &Fill::Spline(Spline::Polynomial(0, None)), 100).unwrap_err();
+		assert!(matches!(err, FillError::Spline(_)), "{err:?}");
+	}
+
+	#[test]
 	fn tokens_parse() {
 		assert_eq!(Fill::from_token(" NULL "), Some(Fill::Null));
 		assert_eq!(Fill::from_token("prev"), Some(Fill::Previous));
 		assert_eq!(Fill::from_token("locf"), Some(Fill::Previous));
 		assert_eq!(Fill::from_token("Linear"), Some(Fill::Linear));
 		assert_eq!(Fill::from_token("-2.50"), Some(Fill::Value(dec("-2.50"))));
+		assert_eq!(Fill::from_token("CUBIC"), Some(Fill::Spline(Spline::Cubic)));
+		assert_eq!(Fill::from_token("quadratic"), Some(Fill::Spline(Spline::Quadratic)));
 		assert_eq!(Fill::from_token("nearest"), None);
 	}
 }
