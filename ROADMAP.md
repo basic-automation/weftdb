@@ -172,7 +172,7 @@ pattern_pipeline), `datasets/`, `runners/` (local, docker_compose, cloud),
 - [x] **DONE (2026-10-08) — disk capture:** `RunMetadata.work_disk_{kind,file_system,mount_point}` (schema v19). The disk
   under the working directory, found by longest mount-point prefix through `sysinfo::Disks`.
   Verified live: a run from `/mnt/deepmem` reports `hdd btrfs`, one from `/` reports `ssd btrfs`.
-- [ ] Remaining hardware capture — GPU and driver versions in run metadata. **Blocked on the splimes 0.1→1 migration** (`deps/splimes-1`): `splimes` 1.0 exposes `gpu::gpu_info()` with a `driver` field, 0.1 does not. Original note: needs a wgpu adapter
+- [ ] Remaining hardware capture — GPU and driver versions in run metadata. **Unblocked (INT-0, 2026-10-08):** splimes 1.0 is on main (PR #62) and its `gpu::gpu_info()` has a `driver` field; an interpolation run's `metadata.engine.gpu` (schema v16) already names the GPU adapter, so the driver version is what remains. Original note: needs a wgpu adapter
   query; `splimes` owns the adapter)
 - [ ] Report surfaces beyond JSON/HTML — Parquet / Grafana dashboards
 - [ ] Anti-Goodhart (Phase 1.3) — publish negative results + WeftDB-losing workloads; benchmark code separate from engine code; run customer-supplied workloads; README policy line *("WeftDB benchmarks guide real engineering decisions, not synthetic wins")* — policy line + the sawtooth negative finding shipped; the publication pipeline is open
@@ -417,6 +417,17 @@ detection within Y% and improving historical query latency by Z."*
       (`VAL_CODEC_FOR`), and Tiger Data patents against both ingest paths. Technical claim charts
       are prepared. These stay ungated because default stores depend on them; the decision is
       counsel's.
+    - [ ] **The 2026-10-08 routine's advisory codecs: not yet reviewed, and ungated.** INT-0
+      merged them after this gate was set: the decimal-exponent FOR (`timestamp::dfor_bitpack_*`,
+      `ColumnEncoding::dfor_value_bytes`) and the timestamp common-multiple and delta-FOR estimates
+      (`DeltaOfDeltaColumn::common_multiple`, `common_multiple_estimated_bytes`,
+      `delta_for_estimated_bytes`). None is written to disk, but all are in `weft-physical-type`'s
+      public API, so the check above covers them, and the decimal-exponent FOR is a
+      frame-of-reference variant, so the FOR item's counsel question reaches it too. They fit
+      `experimental-codecs`' description (advisory codecs the writer never emits) without being
+      behind it; whether to move them there before the next release is the owner's call. The
+      bench-only ALP arm (`benches/alp_vs_f64_codecs.rs`, over the `alp` crate) already requires
+      `experimental-codecs`.
     - [ ] **SAP family: review before the Phase 6.2 design.** Read the flagged SAP patents before
       designing model-based compression (6.2), so the design starts clear of them rather than
       being reworked afterwards.
@@ -1429,7 +1440,8 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
     (count/sum/avg/min/max/first/last over `(epoch_nanos, mantissa, scale)`, i128/i64 accumulators,
     one BigDecimal per output bucket). It is **equal bucket-for-bucket to `reduce`** (tested over
     resolutions, filters and out-of-order input; bucket keys property-tested against
-    `Resolution::to_base`) and returns `None` for percentiles, TWA and sketches. On the real-BTC
+    `Resolution::to_base`, and since INT-0 against `weft_reduce::bucket_index`, as splimes 1.0
+    removed `to_base`) and returns `None` for percentiles, TWA and sketches. On the real-BTC
     `decimal_tax` bench: **`sum` 58.65 → 8.46 ms (6.9×)**. **`avg` 133–153 → 50–133 ms** across two
     loaded runs, because the per-bucket `BigDecimal` division (17,477 of them) now dominates both
     paths.

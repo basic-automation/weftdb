@@ -9,10 +9,11 @@
 //!
 //! The environment capture records `weft-bench` version, OS, and CPU architecture,
 //! plus a best-effort hardware probe (CPU model, physical/logical core counts,
-//! total RAM) toward the benchmark-report template's hardware block, and, for an
+//! total RAM, and the kind, file system and mount point of the disk under the working
+//! directory) toward the benchmark-report template's hardware block, and, for an
 //! interpolation run, the engine's backend selection ([`EngineMetadata`]: whether
 //! splimes was calibrated, the GPU adapter it started, and `Backend::Auto`'s
-//! thresholds). The remaining template fields (disk, driver versions, cloud
+//! thresholds). The remaining template fields (driver versions, cloud
 //! instance + cost) are a later increment; every field is honest about its scope —
 //! the hardware facts are `Option` and omitted when unread, never claiming more than
 //! was measured.
