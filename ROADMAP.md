@@ -743,15 +743,15 @@ recovery, with bounded p99 and no loss beyond the declared durability mode.
   The design is "Atomic Publish": write-once fsynced frames, one control-plane transaction per state change, and startup recovery. There is no separate WAL in 1.0.
   Milestones: **M1** (S1–S12 + S15) makes the strict promise true; **M2** (S13–S14) adds idempotent HTTP ingest; **M3** (S16) adds whole-store backup;
   **M4** (S18–S20) moves legacy ingest onto the seal (Immediate #1). Slices:
-  - [ ] **S1** Preserve legacy MVCC logs and drop no-op sync pragmas *(~2.5 h; after none)*
-  - [ ] **S2** Durable I/O layer, fault points and power-cut simulator *(~8 h; after none)*
-  - [ ] **S3** Storage-v2 open hardening: MVCC/FULL probes, root LOCK, register_scope, directory durability *(~4 h; after S2)*
-  - [ ] **S4** Store-wide sweep isolation *(~4 h; after none)*
-  - [ ] **S5** Backup directory atomic publish, manifest, retention and drill hygiene *(~7 h; after S2)*
-  - [ ] **S6** Schema v2, IndexTxn, write poison, root-relative frame path resolution *(~7 h; after S3)*
-  - [ ] **S7** Persistent per-aspect id allocator, per-aspect commit/maint locks, plain INSERT for seals *(~6 h; after S6)*
-  - [ ] **S8** Write-once maintenance I: generational outputs, frame journal, single-transaction swap, reaper and reader pins (reconcile_segment, split_segment) *(~8 h; after S7)*
-  - [ ] **S9** Write-once maintenance II: overlap merge (both branches), squash, size-targeted compaction *(~8 h; after S8)*
+  - [x] **S1** Preserve legacy MVCC logs and drop no-op sync pragmas *(~2.5 h; after none)*
+  - [x] **S2** Durable I/O layer, fault points and power-cut simulator *(~8 h; after none)*
+  - [x] **S3** Storage-v2 open hardening: MVCC/FULL probes, root LOCK, register_scope, directory durability *(~4 h; after S2)*
+  - [x] **S4** Store-wide sweep isolation *(~4 h; after none)*
+  - [x] **S5** Backup directory atomic publish, manifest, retention and drill hygiene *(~7 h; after S2)*
+  - [x] **S6** Schema v2, IndexTxn, write poison, root-relative frame path resolution *(~7 h; after S3)*
+  - [x] **S7** Persistent per-aspect id allocator, per-aspect commit/maint locks, plain INSERT for seals *(~6 h; after S6)*
+  - [x] **S8** Write-once maintenance I: generational outputs, frame journal, single-transaction swap, reaper and reader pins (reconcile_segment, split_segment) *(~8 h; after S7)*
+  - [x] **S9** Write-once maintenance II: overlap merge (both branches), squash, size-targeted compaction *(~8 h; after S8)*
   - [ ] **S10** Write-once durable seal with id assigned at commit *(~8 h; after S9)*
   - [ ] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
   - [ ] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
@@ -760,7 +760,7 @@ recovery, with bounded p99 and no loss beyond the declared durability mode.
   - [ ] **S15** Partial sidecar v4: CRC trailer, frame-stem naming, frame_crc stamp, tmp+rename, backfill *(~5 h; after S10)*
   - [ ] **S16** Whole-store backup with hard-linked frames; restore_store and in-place restore mode with adoption *(~8 h; after S5, S12)*
   - [ ] **S17** Relaxed durability mode with synced_epoch watermark (optional for 1.0) *(~6 h; after S12)*
-  - [ ] **S18** Legacy rows-mode hygiene: atomic Database::new, write-ahead enqueue, batch dedupe *(~5 h; after S1)*
+  - [x] **S18** Legacy rows-mode hygiene: atomic Database::new, write-ahead enqueue, batch dedupe *(~5 h; after S1)*
   - [ ] **S19** Seal-backed legacy aspects: storage_mode, legacy ingest and reads through SegmentStore *(~8 h; after S13, S18)*
   - [ ] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*
   - [ ] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
@@ -834,7 +834,8 @@ remaining box into waves W0–W15. Its preface records the owner's decisions of 
 everything ships as 1.0, the library crates included, with a frozen Rust API; B-tags stay a
 gate; a v0.1.0 baseline GitHub release (no crates.io) is tagged before durability slice S6
 reaches main; the soak and report runs use a dedicated SSD volume at `/mnt/weftbench`; every
-other open question takes the plan's recommendation.
+other open question takes the plan's recommendation. Every wave, its slices and their status
+are listed under [Execution waves (W0–W15)](#execution-waves-w0w15) below.
 
 Gates that point at an item elsewhere in this file are ticked **only** when that item
 is ticked there — the referenced item stays the source of truth for its detail.
@@ -894,6 +895,191 @@ report → API/format freeze → **1.0**.
 - [ ] Honesty pages shipped (see [Commercial thesis](#commercial-thesis--positioning))
 - [ ] Legal review of competitor benchmark-publication terms + codec licenses (see [Research & business notes](#research--business-notes)). *2026-10-08: licence and contribution terms decided, kdb+/KDB-X excluded unless KX consents, flagged opt-in codecs gated; the counsel items are listed under Phase 8.*
 - [ ] README *Project status* table updated to reflect 1.0 and the status badge changed from `pre-beta`
+
+### Execution waves (W0–W15)
+
+A wave is one phase of the [1.0 plan](docs/release/1.0-plan.md#6-waves), which holds the
+detail: lanes, dependencies and estimates. `→` is merge order, and *(owner)* marks a step
+only the owner can take. A box is ticked only when the slice is on main. *Status
+2026-10-08:* W0 is nearly closed; the durability store lane is running ahead, with S8/S9 of
+W2 on main and S10–S12 of W3/W4 in progress.
+
+- [ ] **W0 · Land in-flight work and lock the shapes S6/S7 depend on** — ticks **splimes 1.0 is released** (ticked, #62) and **Security process** (once private vulnerability reporting is on)
+  - [ ] **INT-0** Merge deps/splimes-1 → routine/dsp-2026-10-08 → legal → durability/base into main — *in progress*: all but the routine branch are on main (#61/#62, #67, #63); the routine branch (#68) is being merged with main (`integrate/routine-2026-10-08`)
+  - [x] **D-S3** Storage-v2 open hardening: MVCC/FULL probes, root LOCK, register_scope, directory durability — #72
+  - [x] **D-S5** Backup directory atomic publish, manifest, retention and drill hygiene, + **SEC-1** backup-label grammar — #72
+  - [x] **D-S18** Legacy rows-mode hygiene: atomic Database::new, write-ahead enqueue, batch dedupe — #72
+  - [x] **D-S6** Schema v2, IndexTxn, write poison, root-relative frame paths; **FRE-12a** (STORE_FORMAT gate, migrations) first — #72
+  - [x] **D-S7** Persistent per-aspect id allocator, commit/maint locks, plain INSERT for seals (+ `next_series_id`) — #72
+  - [x] **PAC-1a** Release pipeline: a safe first run — #64
+  - [ ] **TAG-1** TagSet, SeriesKey and SeriesSelector with canonical form and frozen caps — *in progress*
+  - [x] **Decision 1** Store shapes for S6/S7: STORE_FORMAT + migration registry, `series_id`, P1/P2 with no key change, `SegmentStoreOptions`, `store_uuid`/`OpenReport` — adopted, #72
+  - [ ] Turn on GitHub private vulnerability reporting (Settings → Security) *(owner)*
+- [ ] **W1 · Baseline release, server split, goldens** — starts **Semver policy + `CHANGELOG.md`** (from the first tagged pre-release)
+  - [ ] **PAC-4** Cut the v0.1.0 baseline release (GitHub release only) — *released 2026-10-08: tag `v0.1.0` → b9a8ee4 (the #71 merge), five targets + SHA256SUMS, no crates.io; only the `compat/releases.toml` pin is left*
+  - [ ] Delete the stale draft prerelease `v0.1.0-preview.1` *(owner)*
+  - [ ] → **X-FX** One fixture set under `compat/fixtures/v0.1.0/`, written by the v0.1.0 binary (absorbs PAC-FX, FRE-2)
+  - [x] Store lane: **D-S6** merges only after the v0.1.0 tag (see W0) — #72
+  - [x] → **D-S7** (see W0) — #72
+  - [ ] **X-SPLIT-SRV** Split manage.rs into declare/ingest/maintain/backup_routes, and main.rs into startup phases
+  - [ ] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
+  - [ ] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
+  - [ ] **PAC-1b** Stripped dist profile and a third-party license bundle (absorbs EVI-20) — *the dist profile shipped in #71*
+  - [ ] **PAC-5a** Configuration registry skeleton: one `VarSpec` registry (absorbs FRE-11, ROB-10's knobs)
+  - [ ] **TAG-3** Open `ValueKind` in weftdb, provenance scope; rewords the **B-tags** gate and backlog item
+  - [ ] **EVI-1** Claims hygiene: links, contradicted wording, precision, memory, cadence, corpus protection
+  - [ ] **EVI-3** Run manifest v17: runtime provenance, secret-safe capture, reference_grade verdict
+  - [ ] **EVI-9** Block missingness and scale presets
+  - [ ] **SOA-1** Soak harness skeleton: profile, `weft-bench soak` CLI, cross-platform supervisor, capability probe
+- [ ] **W2 · Error contract, frame format, portable builds** — ticks **CI** (EVI-5's nightly benchmark-regression job) and **Crate publishing split** (FRE-1 + PAC-3)
+  - [x] Store lane: **D-S8** Write-once maintenance I: generational outputs, frame journal, swap, reaper, reader pins — #72
+  - [x] → **D-S9** Write-once maintenance II: overlap merge, squash, compaction (+ P1/P2 output ids) — #72
+  - [ ] **X-ERR** One error envelope and code table in `error.rs` (absorbs SEC-2, FRE-6a, ROB-1, TAG-0's envelope)
+  - [ ] → **X-NAME** `aspect_name::encode` and `validate_new` at HTTP declare (absorbs FRE-7a, SEC-0) — *partly on main: `validate` and the declare check (#66), `encode` (#72)*
+  - [ ] **ROB-2** Storage-engine panic fail-stop: a turso-origin panic aborts
+  - [ ] **PAC-3** Library crate hygiene: no global allocator or wgpu features imposed on library users
+  - [ ] L-FMT: **X-FRAME** Frame registry, v7 envelope, `read_frame*`/`describe_frame`, `FrameFault` classes (absorbs FRE-4, TAG-2)
+  - [ ] Legacy lane: **FRE-14** Legacy data-directory marker, numbered migrations and measurement upgrade test
+  - [ ] **PAC-2** Portable Linux binaries on a glibc 2.28 baseline
+  - [ ] **EVI-5** Nightly benchmark-regression workflow and `weft-bench compare`
+  - [ ] **EVI-2** Claims registry and markdown claim/link lint
+  - [ ] → **EVI-4** Artifact pipeline: out-of-tree runs, real-volume temp dirs, argv execution, criterion import
+  - [ ] **EVI-6** Ingest workload over SegmentStore and the UCI corpus loader
+  - [ ] **EVI-8A** Benchmark adapter v2 I: BenchSystem trait, lifecycle runner, process model
+  - [ ] **SOA-2** Soak preflight, device resolution, run metadata and secret redaction
+  - [ ] **SOA-3** Open-loop scheduler, HDR interval logs, harness self-monitoring and null server
+  - [ ] **SOA-4** Deterministic workload model, lanes, format-exact value grids and body encoders
+- [ ] **W3 · Gate, serve path, input domain** — no gate of its own
+  - [ ] Store lane: **D-S10** Write-once durable seal with id assigned at commit (+ contained frame/sidecar paths) — *in progress* (merged into durability/base)
+  - [ ] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)
+  - [ ] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions — *in progress*
+  - [ ] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
+  - [ ] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
+  - [ ] **ROB-6** Bounded decimals: the plain form is at most 1,024 digits, at every parse site (absorbs FRE-8a)
+  - [ ] **EVI-8B** Benchmark adapter v2 II: agreement gate, engine provenance, f64 arm
+  - [ ] **SOA-5** Soak ingest client: strict outcome classes, keyed retry, write-ahead ledger, receipts
+  - [ ] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
+- [ ] **W4 · Auth, config, ILP fix** — no gate of its own
+  - [ ] Store lane: **D-S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report (+ the C5 fault policy) — *in progress*
+  - [ ] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
+  - [ ] **SEC-5** TLS listener (rustls with ring) on the shared serve path
+  - [ ] **SEC-6** API keys, Bearer authentication, keys file and keygen
+  - [ ] **ROB-3** Panic containment, daemon supervision, Daemons registry, `weftdb::exec`
+  - [ ] **PAC-5b** Strict server configuration and store filesystem check (the bind guard moves to SEC-8)
+  - [ ] **TAG-0** Fix ILP series merging: `measurement=` required (L-INGEST)
+  - [ ] L-FMT: **ROB-8** Frame decode hardening: DecodeLimits from the request budget, cross-checks
+  - [ ] **EVI-11** Stored WeftDB benchmark adapter
+  - [ ] **SOA-6** Soak oracle core: expected index, duplicate detectors, offline verify
+- [ ] **W5 · Ingest wiring, whole-store backup, legacy seal** — ticks **7.4 Whole-store backup manifest**
+  - [ ] Store lane: **D-S16** Whole-store backup with hard-linked frames; restore_store and in-place restore with adoption
+  - [ ] → **D-S15** Partial sidecar v4: CRC trailer, frame-stem naming, frame_crc stamp, tmp+rename, backfill
+  - [ ] → **D-S19** Seal-backed legacy aspects: storage_mode, legacy ingest and reads through SegmentStore (store lane only if it edits the store)
+  - [ ] L-INGEST: **D-S14** HTTP ingest wiring: Idempotency-Key, detached tasks, body limit, backpressure, graceful shutdown
+  - [ ] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
+  - [ ] **ROB-10** Admission I: route classes, per-class semaphores, PermitBody
+  - [ ] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth — *an interim loopback Host/Origin guard is on main (#66)*
+  - [ ] → **SEC-10** Exposure and secrets hygiene: log sanitiser, umask, OTLP endpoint redaction
+  - [ ] **FRE-5** Compute vocabulary, exact-case tokens and no silent narrowing
+  - [ ] **FRE-7b** Immutable declarations, scale rules and schema read-back
+  - [ ] **EVI-13** DuckDB adapter I: weft-xbench crate, seeded lock, load and interpolation arms
+  - [ ] **EVI-15R** Report renderer with honesty-section generation
+  - [ ] **EVI-16** Honesty pages I: not the right tool, benchmark and accuracy methodology, precision
+  - [ ] **SOA-7** Window digests and the oracle self-test
+  - [ ] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
+- [ ] **W6 · Durability CI, store split, scheduler** — ticks **7.2 WAL & crash consistency** (crash matrix, kill test and power-loss run green; decision 20)
+  - [ ] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
+  - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
+  - [ ] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
+  - [ ] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
+  - [ ] **FRE-6b** Strict request parsing and caller updates
+  - [ ] **SEC-7** Key reload: SIGHUP and the admin endpoint
+  - [ ] **SEC-9** Audit: fsynced JSONL attempt/outcome log, detached audited execution, `weft_audit` events
+  - [ ] **SEC-11** Aspect-name traversal HTTP regression tests
+  - [ ] **PAC-7** Operator CLI, exit-code contract and store identity at startup
+  - [ ] → **ROB-11** Admission II: query timeout, work-bound CPU slots, Busy to 503, explicit runtime
+  - [ ] **ROB-19** Maintenance scheduler, compaction on by default, per-aspect circuit breaker
+  - [ ] **SOA-10** Derived-read checks: maintenance invariance, interpolation, downsample, compression
+  - [ ] **SOA-14** Server hooks: build info, store identity and shutdown state on /ready; OTLP print redacted
+  - [ ] **EVI-14** DuckDB adapter II: downsample, storage bytes, DECIMAL arm, nightly smoke
+  - [ ] **EVI-18** Backup health metrics and catch-up-free ticking
+  - [ ] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
+- [ ] **W7 · Post-split lanes open; security and packaging close** — ticks **TLS on `weft-server`** and **API-key/token auth + basic RBAC + audit log** (SEC-13), **7.4 Documented RPO/RTO** (EVI-19), **Measurement bulk ingest routed through the `.weftseg` seal** (D-S19 + D-S20) and **First cross-engine report** (EVI-15; numbers regenerated in W14)
+  - [ ] open lane: **TAG-5** Control-plane series schema, SeriesIntern, SeriesCatalog, layout stamp
+  - [ ] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code
+  - [ ] seal lane: **D-S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects
+  - [ ] read lane: **ROB-12** Bounded range and value-range reads, plus storage-read metrics
+  - [ ] → **ROB-13** Bounded stored downsample and point lookups; corrected claims (absorbs EVI-24)
+  - [ ] **ROB-7** Ingest decode bounds: row cap, decoded-byte weight, non-finite input is 400 (L-INGEST)
+  - [ ] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
+  - [ ] **ROB-23r** Probe-only admin listener; a directory-open error is Definite, not poison
+  - [ ] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
+  - [ ] **ROB-5** Legacy queue-consumer panics; legacy metadata writes wrapped
+  - [ ] **SEC-13** Security acceptance: end-to-end run and overhead numbers
+  - [ ] **PAC-9** Docker image and container smoke test (with a mounted keys file)
+  - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
+  - [ ] **EVI-15** First cross-engine report: WeftDB vs DuckDB (needs the reference host)
+  - [ ] Write or approve the cross-engine report narrative *(owner)*
+  - [ ] **EVI-19** Documented RPO/RTO: `docs/durability-and-recovery.md`
+  - [ ] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
+- [ ] **W8 · Tags core, memory budget** — ticks **Honesty pages shipped** (EVI-17) and **Packaging** (PAC-2/9/11, the PAC-5b/6 config docs, PAC-10 after auth; wording per decision 21); SEC-14 refreshes **Security process**
+  - [ ] open lane: **PAC-6** Library store options, generated configuration reference and registry scan
+  - [ ] → **TAG-9** Frame error classes in recovery; fsck re-bind; restore adoption of series
+  - [ ] seal lane: **TAG-7** Tagged seal in the library (gated) with series-scoped ledger
+  - [ ] → **ROB-17** Disk guard, headroom API and space gauges
+  - [ ] maint lane: **TAG-6** Series-partitioned maintenance with multi-plan swaps
+  - [ ] read lane: **TAG-8** Library series reads: selector, single-series rule, read-time binding check (after TAG-7)
+  - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
+  - [ ] **FRE-8b** Stored-value text and one float-input rule across every ingest format
+  - [ ] **FRE-9a** OpenAPI generated from code: framework, probes and compute endpoints
+  - [ ] **ROB-9** Mutation harness for frames, sidecars and Parquet
+  - [ ] **SEC-14** Security documentation, config schema and upgrade notes
+  - [ ] **PAC-10** Publish the multi-arch image (only after API auth)
+  - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
+  - [ ] **EVI-17** Honesty pages II: when WeftDB wins, GPU tuning and economics
+  - [ ] Write or approve the honesty-page narrative *(owner)*
+  - [ ] **FRE-13** Layout-1 to layout-2 upgrade test
+  - [ ] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
+  - [ ] → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
+- [ ] **W9 · Read semantics, limits, upgrade legs** — ticks **7.3 Corruption detection** (D-S12 + ROB-8/9/22), **Compatibility tests** (FRE-13 + PAC-14a) and **Upgrade/rollback procedure, exercised against the previous release** (PAC-14a legs A and C against v0.1.0; re-run on the rc in W14)
+  - [ ] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
+  - [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames
+  - [ ] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
+  - [ ] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
+  - [ ] **TAG-10** HTTP read surface: selectors on every read, /series, stats, freeze-time rename
+  - [ ] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
+  - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
+  - [ ] **SOA-16** Soak upgrade lane: previous on-disk generation to candidate under kills
+- [ ] **W10 · Tag gate flip, compaction closes** — ticks **7.5 Compaction** (ROB-21) and **Semver policy + `CHANGELOG.md`** (STABILITY.md + CHANGELOG since v0.1.0)
+  - [ ] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
+  - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
+  - [ ] read lane: **ROB-15** Pagination contract freeze: append-tolerant cursor v1 (after TAG-10)
+  - [ ] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
+  - [ ] **PAC-15** Operator documentation: install paths, production checklist, honest status
+- [ ] **W11 · Contract candidate, beta tag, calibration** — ticks **7.6 Quotas/limits** (ROB-24 evidence), **B-tags** (TAG-12) and **Panic audit on server paths** (ROB-2/3/4 + ROB-24)
+  - [ ] **FRE-9b** OpenAPI: storage and operator endpoints
+  - [ ] → Approve and push the **v1.0.0-beta.1** tag *(owner)*
+  - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
+  - [ ] → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh`
+  - [ ] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
+  - [ ] → **FRE-16** CI compatibility gates: OpenAPI breaking-change check, fixture guard, golden coverage
+  - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
+  - [ ] **ROB-24** Limits and overload evidence; frozen configuration documentation
+- [ ] **W12 · Phase 7 acceptance** — ticks **Phase 7 acceptance run**
+  - [ ] **SOA-18** 24 h acceptance run on the reference SSD, published as an artifact
+  - [ ] Run the privileged power-loss validation on the acceptance commit *(owner)*
+- [ ] **W13 · Freeze** — ticks **Public surface declared and frozen**; **Legal review** must be closed before the cut
+  - [ ] Settle the [Phase 8](#phase-8--commercial-hardening--required-for-paid-beta) counsel items (codec patents, **WEFTDB** trademark, benchmark policy) before rc.1 *(owner)*
+  - [ ] **FRE-18** rc.1 freeze cut and layout-2 baseline fixtures; the OpenAPI breaking-change check blocks
+  - [ ] Approve and push the **v1.0.0-rc.1** tag *(owner)*
+- [ ] **W14 · RC verification on release artifacts** — ticks **Every performance claim in the README links to a benchmark artifact**; re-confirms **Upgrade/rollback procedure** and refreshes **First cross-engine report**
+  - [ ] **SOA-19** RC soak on the rc release artifact in the shipped default config (8 h, or 24 h)
+  - [ ] **EVI-21** 1.0 evidence run at the rc: strict claims, cross-engine matrix re-run
+  - [ ] **PAC-18** Dress rehearsal: compatibility matrix with the N-1 leg, container and systemd jobs on the rc
+- [ ] **W15 · 1.0.0** — ticks **README *Project status* table updated to reflect 1.0** and closes **Semver policy + `CHANGELOG.md`**
+  - [ ] **EVI-22** README 1.0 project status, badge and versions
+  - [ ] Write or approve the 1.0 release notes and upgrade notes *(owner)*
+  - [ ] → **PAC-18** Cut 1.0.0: binaries, image, release notes
+  - [ ] Approve and push the **v1.0.0** tag *(owner)*
 
 ---
 
