@@ -314,8 +314,9 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
 	// The `sketch_p*` reductions are accepted too: they need each value, but only as the
-	// sketch's `f64`, which is fed through the same `DdSketch::add_decimal` the BigDecimal path
-	// uses so every sketch is identical. Percentiles and TWA still need the samples: decline.
+	// sketch's `f64`, which `DdSketch::add_scaled` derives from the mantissa as the same `f64`
+	// `add_decimal` gives the equal BigDecimal, so every sketch is identical. Percentiles and
+	// TWA still need the samples: decline.
 	if !aggregations.iter().all(|&a| is_streaming(a) || a.sketch_quantile().is_some()) {
 		return Ok(None);
 	}
@@ -341,7 +342,7 @@ pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32,
 				continue;
 			}
 			if let Some(sketch) = converted.get_mut(&base_of(resolution, nanos)).and_then(|acc| acc.sketch.as_mut()) {
-				sketch.add_decimal(&decimal(mantissa)).map_err(|_| ReduceError::SketchValue)?;
+				sketch.add_scaled(mantissa, scale).map_err(|_| ReduceError::SketchValue)?;
 			}
 		}
 	}

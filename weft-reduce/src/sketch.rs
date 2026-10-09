@@ -41,6 +41,30 @@ use std::collections::BTreeMap;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 
+/// Every power of ten an `f64` holds exactly: `10^0` through `10^22`.
+const EXACT_POWERS_OF_TEN: [f64; 23] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22];
+
+/// `mantissa × 10^-scale` as the nearest `f64`, when `|mantissa| < 2^53` and
+/// `0 <= scale <= 22`; `None` otherwise.
+///
+/// Under those bounds `mantissa as f64` and `10^scale` are both exact, so the one IEEE
+/// division rounds the exact quotient once, to nearest: the result is the correctly
+/// rounded image of the decimal. `bigdecimal`'s own `to_f64` returns that same value for
+/// such a decimal (it formats the digits as `<digits>e-<scale>` and parses them with the
+/// standard library's correctly rounded parser, trimming digits only past ~44), so this is
+/// the same `f64` without the formatting and parsing. Correct rounding also makes it
+/// independent of representation: `2.5` and `2.50` give the same `f64`.
+fn scaled_to_f64(mantissa: i64, scale: i64) -> Option<f64> {
+	const EXACT_MANTISSA: u64 = 1 << 53;
+	if mantissa.unsigned_abs() >= EXACT_MANTISSA {
+		return None;
+	}
+	let power = EXACT_POWERS_OF_TEN.get(usize::try_from(scale).ok()?)?;
+	#[allow(clippy::cast_precision_loss)]
+	let m = mantissa as f64;
+	Some(m / power)
+}
+
 /// Why a sketch could not be built or fed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SketchError {
@@ -263,7 +287,21 @@ impl DdSketch {
 	///
 	/// [`SketchError::ValueRange`] if the value has no finite `f64` image.
 	pub fn add_decimal(&mut self, v: &BigDecimal) -> Result<(), SketchError> {
+		let (digits, scale) = v.as_bigint_and_scale();
+		if let Some(f) = digits.to_i64().and_then(|m| scaled_to_f64(m, scale)) {
+			return self.add(f);
+		}
 		self.add(v.to_f64().ok_or(SketchError::ValueRange)?)
+	}
+
+	/// Fold in the sample `mantissa × 10^-scale` (a `ScaledI64` value), as
+	/// [`add_decimal`](Self::add_decimal) would fold the equal `BigDecimal`, without
+	/// building one when [`scaled_to_f64`] applies.
+	pub(crate) fn add_scaled(&mut self, mantissa: i64, scale: i64) -> Result<(), SketchError> {
+		match scaled_to_f64(mantissa, scale) {
+			Some(f) => self.add(f),
+			None => self.add_decimal(&BigDecimal::new(mantissa.into(), scale)),
+		}
 	}
 
 	/// Merge `other` into `self`. Exact: the result is the sketch that feeding every
@@ -356,6 +394,55 @@ impl DdSketch {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn scaled_to_f64_is_bigdecimals_to_f64() {
+		let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+		let mut next = move || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state
+		};
+		let limit = (1_i64 << 53) - 1;
+		let edges = [0, 1, -1, 7, -7, 5, 25, 1_234_567_891, limit, -limit, limit - 1, 4_503_599_627_370_497];
+		for scale in 0..=22_i64 {
+			let random = (0..4_000).map(|i| {
+				// Mix full-range mantissas with short ones (prices), both signs.
+				let m = (next() % (1 << 53)).cast_signed();
+				let m = if i % 2 == 0 { m } else { m % 1_000_000 };
+				if next() % 2 == 0 {
+					m
+				} else {
+					-m
+				}
+			});
+			for m in edges.into_iter().chain(random) {
+				let expected = BigDecimal::new(m.into(), scale).to_f64().expect("finite");
+				let got = scaled_to_f64(m, scale).expect("in range");
+				assert_eq!(got.to_bits(), expected.to_bits(), "{m}e-{scale}: {got} vs {expected}");
+			}
+		}
+		// Outside the bounds it declines, and the sketch falls back to `to_f64`.
+		assert_eq!(scaled_to_f64(1 << 53, 2), None);
+		assert_eq!(scaled_to_f64(i64::MIN, 2), None);
+		assert_eq!(scaled_to_f64(5, 23), None);
+		assert_eq!(scaled_to_f64(5, -1), None);
+	}
+
+	#[test]
+	fn add_decimal_and_add_scaled_build_the_same_sketch_as_to_f64() {
+		let values: Vec<(i64, i64)> = vec![(250, 2), (25, 1), (-1_999, 3), (0, 4), (123_456_789_012, 8), (9_007_199_254_740_993, 2), (7, 30), (-42, -2), (5, 0)];
+		let (mut reference, mut decimal, mut scaled) = (DdSketch::with_default_accuracy(), DdSketch::with_default_accuracy(), DdSketch::with_default_accuracy());
+		for &(m, s) in &values {
+			let v = BigDecimal::new(m.into(), s);
+			reference.add(v.to_f64().expect("finite")).expect("adds");
+			decimal.add_decimal(&v).expect("adds");
+			scaled.add_scaled(m, s).expect("adds");
+		}
+		assert_eq!(decimal, reference);
+		assert_eq!(scaled, reference);
+	}
 
 	/// The guarantee that justifies the whole structure: every reported quantile is
 	/// within α relative error of the true value, checked against an exact sort.

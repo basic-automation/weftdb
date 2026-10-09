@@ -206,7 +206,14 @@ only the control plane, not the segment frames.
   and several share one sort; only the result is cloned. Results are identical, including
   which of two numerically equal values (`1.0`, `1.00`) is returned. A lone hourly `p99`
   runs ~1.6–3.4× faster on the bench (two-decimal, real BTC and full-expansion series),
-  which makes it about twice as fast as `sketch_p99`.
+  which made it about twice as fast as `sketch_p99` until the next entry.
+- **`sketch_p*` reductions convert most values to `f64` by one division** (`weft-reduce`).
+  A value `m × 10^-s` with `|m| < 2^53` and `0 <= s <= 22` is converted as
+  `m as f64 / 10^s`, which is bit-identical to `bigdecimal`'s `to_f64`, so sketches and
+  results do not change; `ScaledI64` segments feed their mantissas straight in. Hourly
+  `sketch_p99` runs ~2× faster on two-decimal and real BTC series, and a stored segment's
+  `avg,sketch_p99` downsample ~2× faster on the integer path. Values outside those bounds
+  take the previous conversion.
 - **Breaking for Rust users: `weftdb` reads no `WEFT_*` variable when it opens a
   segment store, and never exits the process** (release plan C-1).
   `SegmentStore::open` and `open_scoped` now use `SegmentStoreOptions::default()`

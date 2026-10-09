@@ -1608,12 +1608,18 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         **203/116 → 77/96 ms**, full-expansion 500k (5 reps) **1,451/1,362 → 387/418 ms**; all four
         percentiles together level (real 120/155 → 119/115 ms). Exact `p99` is now ~2× faster than
         `sketch_p99`.
-      - [ ] **NEXT — the sketch's per-sample `BigDecimal → f64`.** `sketch_p99` now costs ~2× exact
-        `p99` because `DdSketch::add_decimal` converts every sample through `bigdecimal`'s
-        digit-trimming `to_f64`. On `ScaledI64` input a correctly-rounded `mantissa / 10^scale`
-        would be cheaper, but it is not provably the same `f64` as `to_f64` (the reason
-        `reduce_partial_scaled` kept `add_decimal`), so it needs either a proof over the
-        mantissa range or a sketch-format note that the image may differ by one ulp.
+      - [x] **DONE (2026-10-09) — the sketch's per-sample `BigDecimal → f64`.** For a value
+        `m × 10^-s` with `|m| < 2^53` and `0 <= s <= 22`, `m as f64 / 10^s` rounds the exact quotient
+        once and is bit-identical to `bigdecimal` 0.4.11's `to_f64`, which (below ~44 digits) formats
+        `<digits>e-<s>` and parses it with std's correctly rounded parser. `DdSketch::add_decimal`
+        takes that path (borrowing the digits), and `reduce_partial_scaled` feeds mantissas straight
+        in (`add_scaled`), so sketches are unchanged (tested bit for bit over 23 scales × 4,000+
+        mantissas). Harness `sketch_p99`, hourly, before → after: two-decimal 500k **63.8/67.0 →
+        30.3/31.6 ms**, real BTC 1M **148.8/149.0 → 76.2/77.4 ms**; the ~50-digit `full` series
+        falls back and is ~4% slower (288.6/303.9 → 304.6/314.9 ms, the extra check). Per sealed
+        1 Mi-row real segment (`decimal_tax` criterion, decode + `avg,sketch_p99`, load avg ~38): the
+        scaled route **202.2 → 97.0 ms (−54%)**, the BigDecimal route 196.4 → 145.5 ms (−27%).
+        Re-check if `bigdecimal` is upgraded: the proof leans on its `to_f64` implementation.
       - [ ] **NEXT — integer-mantissa percentiles in the scaled path.** `reduce_partial_scaled`
         still returns `None` for `p*`, so a stored-range percentile downsample builds a
         `BigDecimal` per row; selecting on the `i64` mantissas would materialize one value per
