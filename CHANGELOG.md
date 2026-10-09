@@ -142,14 +142,17 @@ only the control plane, not the segment frames.
     series will be a byte compare.
 
   `TagSet::from_pairs` takes pairs in any order and rejects every rule break with a
-  typed, `#[non_exhaustive]` `TagError` that names the key and the limit.
+  typed `TagError` that names the key and the limit; the enum and each of its variants
+  with fields are `#[non_exhaustive]`.
   `SeriesKey::from_canonical` reads stored bytes back and rejects bytes that are
   unsorted, repeat a key, break a rule (non-UTF-8 values included) or exceed the cap.
   Unlike input, it accepts a reserved `__` key, so that a frame a later version writes
   with a system dimension stays readable. `SeriesSelector` holds equality matchers
-  joined by AND, at most one per key, where `None` means "tag absent". An exact
-  selector also requires that the tag set has no other tag. With no matchers, a
-  selector selects every series, or only series 0 when exact. The caps and separators
+  joined by AND, at most one per key, where `None` means "tag absent".
+  `SeriesSelector::new` selects every tag set the matchers hold for;
+  `SeriesSelector::exact` also requires that the tag set has no other tag. With no
+  matchers they are `SeriesSelector::all` (every series) and `SeriesSelector::untagged`
+  (series 0 only). The caps and separators
   are public constants (`MAX_TAG_KEY_BYTES`, `MAX_TAG_VALUE_BYTES`, `MAX_TAGS`,
   `MAX_SERIES_KEY_BYTES`, `TAG_KEY_VALUE_SEPARATOR`, `TAG_PAIR_SEPARATOR`,
   `RESERVED_TAG_KEY_PREFIX`).

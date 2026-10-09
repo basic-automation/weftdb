@@ -281,8 +281,10 @@ mod tests {
 		let set = TagSet::from_pairs([("host", "a")]).expect("valid tags");
 		let key = SeriesKey::from_canonical(set.series_key().as_bytes()).expect("canonical bytes");
 		assert_eq!(TagSet::from(key), set);
-		assert!(SeriesSelector::new([("host", Some("a"))], true).expect("valid selector").matches(&set));
-		assert_eq!(TagSet::from_pairs([("__host", "a")]), Err(TagError::ReservedKey { key: "__host".to_owned() }));
+		assert!(SeriesSelector::exact([("host", Some("a"))]).expect("valid selector").matches(&set));
+		assert!(SeriesSelector::new([("host", Some("a"))]).expect("valid selector").matches(&set));
+		// Outside its crate a `TagError` variant is matched with `..`, never built.
+		assert!(matches!(TagSet::from_pairs([("__host", "a")]), Err(TagError::ReservedKey { key, .. }) if key == "__host"));
 		assert_eq!(tags::MAX_SERIES_KEY_BYTES, 1024);
 	}
 }

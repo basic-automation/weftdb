@@ -56,8 +56,8 @@
 //! # Reserved keys
 //!
 //! A key that starts with `__` is reserved for system dimensions that a later WeftDB may
-//! add. Input never creates one: [`TagSet::from_pairs`] and [`SeriesSelector::new`]
-//! reject it with [`TagError::ReservedKey`].
+//! add. Input never creates one: [`TagSet::from_pairs`], [`SeriesSelector::new`] and
+//! [`SeriesSelector::exact`] reject it with [`TagError::ReservedKey`].
 //!
 //! [`SeriesKey::from_canonical`] accepts reserved keys. Its bytes come from a frame or from
 //! the control plane, which only WeftDB writes. A frame that a later version wrote with a
@@ -74,12 +74,17 @@
 //!
 //! A [`SeriesSelector`] holds equality matchers, joined by AND, at most one per key:
 //! - `(key, Some(value))` holds when the tag set has `key` with exactly that value;
-//! - `(key, None)` holds when the tag set has no tag `key` (the HTTP spelling is `key=""`).
+//! - `(key, None)` holds when the tag set has no tag `key`.
 //!
-//! A tag set matches when every matcher holds, and, for an *exact* selector, when it also
-//! has no tag beyond the matchers that carry a value, so that it equals them. A selector
-//! with no matchers selects every series; with no matchers and exact, it selects series 0
-//! only. 1.0 has no `!=`, regex or OR matcher.
+//! In Rust an absent matcher is a [`None`] value. How a request spells one is not part of
+//! this module: the query API defines the HTTP form (TAG-10; the tags design plans
+//! `tag.<k>=` with an empty value).
+//!
+//! A tag set matches a selector from [`SeriesSelector::new`] when every matcher holds. A
+//! selector from [`SeriesSelector::exact`] also requires that the tag set has no tag beyond
+//! the matchers that carry a value, so that it equals them. With no matchers, the first
+//! selects every series ([`SeriesSelector::all`]) and the second series 0 only
+//! ([`SeriesSelector::untagged`]). 1.0 has no `!=`, regex or OR matcher.
 //!
 //! # Example
 //!
@@ -94,7 +99,7 @@
 //! assert_eq!(TagSet::from(stored), tags);
 //!
 //! // `host` is `a` and there is no `rack` tag.
-//! let selector = SeriesSelector::new([("host", Some("a")), ("rack", None)], false)?;
+//! let selector = SeriesSelector::new([("host", Some("a")), ("rack", None)])?;
 //! assert!(selector.matches(&tags));
 //! # Ok::<(), weft_physical_type::tags::TagError>(())
 //! ```
@@ -121,9 +126,9 @@ pub const TAG_KEY_VALUE_SEPARATOR: u8 = 0x1F;
 /// Frozen format.
 pub const TAG_PAIR_SEPARATOR: u8 = 0x1E;
 
-/// The key prefix reserved for system dimensions. [`TagSet::from_pairs`] and
-/// [`SeriesSelector::new`] reject a key that starts with it; see the
-/// [module documentation](crate::tags#reserved-keys).
+/// The key prefix reserved for system dimensions. [`TagSet::from_pairs`],
+/// [`SeriesSelector::new`] and [`SeriesSelector::exact`] reject a key that starts with it;
+/// see the [module documentation](crate::tags#reserved-keys).
 pub const RESERVED_TAG_KEY_PREFIX: &str = "__";
 
 /// [`TAG_KEY_VALUE_SEPARATOR`] as a `char`, for building and splitting the canonical text.
@@ -153,7 +158,7 @@ const PAIR_SEPARATOR_CHAR: char = '\u{1e}';
 ///
 /// // A repeated key is an error, never a silent overwrite.
 /// let repeated = TagSet::from_pairs([("host", "a"), ("host", "b")]);
-/// assert_eq!(repeated, Err(TagError::DuplicateKey { key: "host".to_owned() }));
+/// assert!(matches!(repeated, Err(TagError::DuplicateKey { key, .. }) if key == "host"));
 /// # Ok::<(), TagError>(())
 /// ```
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -177,50 +182,59 @@ impl TagSet {
 	/// # Errors
 	///
 	/// [`TagError`] when the pairs break a rule of the
-	/// [module documentation](crate::tags). The pairs are checked in input order, each key
-	/// before its value; then the number of tags; then repeated keys; then the length of
-	/// the canonical key. The first problem found is returned:
+	/// [module documentation](crate::tags). The number of pairs is checked first: reading
+	/// stops at the first pair beyond [`MAX_TAGS`], so an iterator that never ends still
+	/// gets an answer. Then the pairs are checked in input order, each key before its
+	/// value; then repeated keys; then the length of the canonical key. The first problem
+	/// found is returned:
+	/// - [`TooManyTags`](TagError::TooManyTags) for a pair beyond the 16th;
 	/// - [`EmptyKey`](TagError::EmptyKey), [`KeyTooLong`](TagError::KeyTooLong),
 	///   [`InvalidKey`](TagError::InvalidKey) or [`ReservedKey`](TagError::ReservedKey) for
 	///   a key;
 	/// - [`EmptyValue`](TagError::EmptyValue), [`ValueTooLong`](TagError::ValueTooLong) or
 	///   [`ControlCharacter`](TagError::ControlCharacter) for a value;
-	/// - [`TooManyTags`](TagError::TooManyTags), [`DuplicateKey`](TagError::DuplicateKey)
-	///   or [`SeriesKeyTooLong`](TagError::SeriesKeyTooLong) for the set.
+	/// - [`DuplicateKey`](TagError::DuplicateKey) or
+	///   [`SeriesKeyTooLong`](TagError::SeriesKeyTooLong) for the set.
+	///
+	/// Each key and value is read through [`AsRef::as_ref`] exactly once, so the text that
+	/// is checked is the text that is stored.
 	pub fn from_pairs<I, K, V>(pairs: I) -> Result<Self, TagError>
 	where
 		I: IntoIterator<Item = (K, V)>,
 		K: AsRef<str>,
 		V: AsRef<str>,
 	{
-		let mut held: Vec<(K, V)> = Vec::new();
-		let mut count = 0_usize;
-		for (key, value) in pairs {
-			check_key(key.as_ref().as_bytes(), ReservedKeys::Reject)?;
-			check_value(key.as_ref().as_bytes(), value.as_ref().as_bytes())?;
-			count += 1;
-			if count <= MAX_TAGS {
-				held.push((key, value));
+		let pairs = pairs.into_iter();
+		let mut given: Vec<(K, V)> = Vec::with_capacity(pairs.size_hint().0.min(MAX_TAGS));
+		for pair in pairs {
+			if given.len() == MAX_TAGS {
+				return Err(TagError::TooManyTags { count: MAX_TAGS + 1 });
 			}
+			given.push(pair);
 		}
-		if count > MAX_TAGS {
-			return Err(TagError::TooManyTags { count });
+		// One `as_ref` per key and value: an `AsRef` that answers differently on a later
+		// call cannot get one string checked and another stored.
+		let mut held: Vec<(&str, &str)> = Vec::with_capacity(given.len());
+		for (key, value) in &given {
+			let key = check_key(key.as_ref().as_bytes(), ReservedKeys::Reject)?;
+			let value = check_value(key.as_bytes(), value.as_ref().as_bytes())?;
+			held.push((key, value));
 		}
-		held.sort_unstable_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+		held.sort_unstable_by(|a, b| a.0.cmp(b.0));
 		let repeated = held.windows(2).find_map(|pair| match pair {
-			[first, second] if first.0.as_ref() == second.0.as_ref() => Some(first.0.as_ref()),
+			[first, second] if first.0 == second.0 => Some(first.0),
 			_ => None,
 		});
 		if let Some(key) = repeated {
 			return Err(TagError::DuplicateKey { key: key_for_error(key.as_bytes()) });
 		}
-		let len = held.iter().map(|(key, value)| key.as_ref().len() + 1 + value.as_ref().len()).sum::<usize>() + held.len().saturating_sub(1);
+		let len = held.iter().map(|(key, value)| key.len() + 1 + value.len()).sum::<usize>() + held.len().saturating_sub(1);
 		if len > MAX_SERIES_KEY_BYTES {
 			return Err(TagError::SeriesKeyTooLong { len });
 		}
 		let mut canonical = String::with_capacity(len);
-		for (key, value) in &held {
-			push_pair(&mut canonical, key.as_ref(), value.as_ref());
+		for (key, value) in held {
+			push_pair(&mut canonical, key, value);
 		}
 		Ok(Self { key: SeriesKey { canonical: canonical.into_boxed_str() } })
 	}
@@ -441,10 +455,11 @@ impl From<TagSet> for SeriesKey {
 /// Picks the series a query reads: equality matchers, joined by AND, at most one per key.
 ///
 /// See [Selecting series](crate::tags#selecting-series) for the rules.
-/// [`all`](Self::all) (also [`Default`]) selects every series and
-/// [`untagged`](Self::untagged) only series 0; [`new`](Self::new) builds any other
-/// selector. Two selectors are equal when they hold the same matchers, in whatever order
-/// they were given, and the same exactness.
+/// [`new`](Self::new) builds a selector that a tag set matches when it has the tags the
+/// matchers name, whatever else it has; [`exact`](Self::exact) builds one that it matches
+/// only when it equals them. [`all`](Self::all) (also [`Default`]) selects every series and
+/// [`untagged`](Self::untagged) only series 0. Two selectors are equal when they hold the
+/// same matchers, in whatever order they were given, and the same exactness.
 ///
 /// ```
 /// use weft_physical_type::tags::{SeriesSelector, TagSet};
@@ -452,15 +467,15 @@ impl From<TagSet> for SeriesKey {
 /// let host_a = TagSet::from_pairs([("host", "a")])?;
 /// let host_a_dc_x = TagSet::from_pairs([("host", "a"), ("dc", "x")])?;
 ///
-/// let loose = SeriesSelector::new([("host", Some("a"))], false)?;
+/// let loose = SeriesSelector::new([("host", Some("a"))])?;
 /// assert!(loose.matches(&host_a) && loose.matches(&host_a_dc_x));
 ///
 /// // Exact: the tag set must be exactly `host=a`.
-/// let exact = SeriesSelector::new([("host", Some("a"))], true)?;
+/// let exact = SeriesSelector::exact([("host", Some("a"))])?;
 /// assert!(exact.matches(&host_a) && !exact.matches(&host_a_dc_x));
 ///
 /// // `dc` must be absent.
-/// let no_dc = SeriesSelector::new([("dc", None::<&str>)], false)?;
+/// let no_dc = SeriesSelector::new([("dc", None::<&str>)])?;
 /// assert!(no_dc.matches(&host_a) && !no_dc.matches(&host_a_dc_x));
 ///
 /// assert!(SeriesSelector::untagged().matches(&TagSet::new()));
@@ -477,22 +492,24 @@ pub struct SeriesSelector {
 
 impl SeriesSelector {
 	/// The selector with no matchers, not exact: every series matches, series 0 included.
+	/// The same selector as [`new`](Self::new) with no matchers.
 	#[must_use]
 	pub const fn all() -> Self {
 		Self { matchers: Vec::new(), exact: false }
 	}
 
 	/// The selector with no matchers, exact: only the empty tag set, series 0, matches.
+	/// The same selector as [`exact`](Self::exact) with no matchers.
 	#[must_use]
 	pub const fn untagged() -> Self {
 		Self { matchers: Vec::new(), exact: true }
 	}
 
-	/// Build a selector from `(key, value)` matchers given in any order.
+	/// Build a selector from `(key, value)` matchers given in any order, which a tag set
+	/// matches when every matcher holds, whatever other tags it has.
 	///
 	/// `(key, Some(value))` requires tag `key` with exactly `value`; `(key, None)` requires
-	/// that the tag set has no tag `key`. With `exact`, a matching tag set must also have
-	/// no tag beyond the matchers that carry a value.
+	/// that the tag set has no tag `key`.
 	///
 	/// # Errors
 	///
@@ -501,7 +518,38 @@ impl SeriesSelector {
 	/// key appears in more than one matcher. A key with the reserved `__` prefix is
 	/// [`TagError::ReservedKey`]. `Some("")` is [`TagError::EmptyValue`]: absence is
 	/// spelled `None`.
-	pub fn new<I, K, V>(matchers: I, exact: bool) -> Result<Self, TagError>
+	pub fn new<I, K, V>(matchers: I) -> Result<Self, TagError>
+	where
+		I: IntoIterator<Item = (K, Option<V>)>,
+		K: AsRef<str>,
+		V: AsRef<str>,
+	{
+		Self::build(matchers, false)
+	}
+
+	/// Build a selector from `(key, value)` matchers given in any order, which a tag set
+	/// matches only when it equals them: every matcher holds and the tag set has no tag
+	/// beyond the matchers that carry a value.
+	///
+	/// `(key, Some(value))` requires tag `key` with exactly `value`; `(key, None)` requires
+	/// that the tag set has no tag `key`, which an exact selector already requires of every
+	/// key it does not name with a value.
+	///
+	/// # Errors
+	///
+	/// The same as [`new`](Self::new).
+	pub fn exact<I, K, V>(matchers: I) -> Result<Self, TagError>
+	where
+		I: IntoIterator<Item = (K, Option<V>)>,
+		K: AsRef<str>,
+		V: AsRef<str>,
+	{
+		Self::build(matchers, true)
+	}
+
+	/// Validate and sort `matchers` into a selector; [`new`](Self::new) and
+	/// [`exact`](Self::exact) differ only in `exact`.
+	fn build<I, K, V>(matchers: I, exact: bool) -> Result<Self, TagError>
 	where
 		I: IntoIterator<Item = (K, Option<V>)>,
 		K: AsRef<str>,
@@ -594,12 +642,17 @@ impl FusedIterator for Matchers<'_> {}
 /// longer), and a byte of it that is not UTF-8, possible only in canonical bytes, is
 /// replaced with U+FFFD. The [`Display`](fmt::Display) form quotes keys escaped, so a
 /// control character in one cannot break a log line.
+///
+/// The enum and every variant with fields are `#[non_exhaustive]`: match a variant with
+/// `..`, as in `TagError::DuplicateKey { key, .. }`, so that a later version can add a
+/// variant or a field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TagError {
 	/// A tag key is empty.
 	EmptyKey,
 	/// A tag key is longer than [`MAX_TAG_KEY_BYTES`].
+	#[non_exhaustive]
 	KeyTooLong {
 		/// The key, cut to its first [`MAX_TAG_KEY_BYTES`] bytes, never inside a character.
 		key: String,
@@ -609,6 +662,7 @@ pub enum TagError {
 	/// A tag key holds a byte the key grammar does not allow where it stands: the first
 	/// byte must be an ASCII letter or `_`, and every later one an ASCII letter, an ASCII
 	/// digit, `_`, `.` or `-`.
+	#[non_exhaustive]
 	InvalidKey {
 		/// The key.
 		key: String,
@@ -617,16 +671,19 @@ pub enum TagError {
 	},
 	/// A tag key starts with [`RESERVED_TAG_KEY_PREFIX`], which is reserved for system
 	/// dimensions.
+	#[non_exhaustive]
 	ReservedKey {
 		/// The key.
 		key: String,
 	},
 	/// A tag value is empty. A selector spells an absent tag `None`, not `Some("")`.
+	#[non_exhaustive]
 	EmptyValue {
 		/// The key of the tag.
 		key: String,
 	},
 	/// A tag value is longer than [`MAX_TAG_VALUE_BYTES`].
+	#[non_exhaustive]
 	ValueTooLong {
 		/// The key of the tag.
 		key: String,
@@ -634,6 +691,7 @@ pub enum TagError {
 		len: usize,
 	},
 	/// A tag value contains a C0 control character (U+0000 to U+001F) or U+007F.
+	#[non_exhaustive]
 	ControlCharacter {
 		/// The key of the tag.
 		key: String,
@@ -643,6 +701,7 @@ pub enum TagError {
 		character: char,
 	},
 	/// A tag value in canonical bytes is not valid UTF-8.
+	#[non_exhaustive]
 	ValueNotUtf8 {
 		/// The key of the tag.
 		key: String,
@@ -652,22 +711,28 @@ pub enum TagError {
 	},
 	/// A tag key appears more than once: twice in a tag set, twice in a selector, or
 	/// twice in canonical bytes.
+	#[non_exhaustive]
 	DuplicateKey {
 		/// The key.
 		key: String,
 	},
 	/// More than [`MAX_TAGS`] tags.
+	#[non_exhaustive]
 	TooManyTags {
-		/// The number of tags given.
+		/// How many tags were given, at least. [`TagSet::from_pairs`] stops reading at the
+		/// first tag beyond [`MAX_TAGS`] and reports `MAX_TAGS + 1`;
+		/// [`SeriesKey::from_canonical`], whose input is bounded, counts every pair.
 		count: usize,
 	},
 	/// The canonical key is longer than [`MAX_SERIES_KEY_BYTES`].
+	#[non_exhaustive]
 	SeriesKeyTooLong {
 		/// The length of the canonical key, in bytes.
 		len: usize,
 	},
 	/// Canonical bytes list a key before a key that sorts below it: the pairs of a
 	/// canonical key are in ascending bytewise order of key.
+	#[non_exhaustive]
 	UnsortedKeys {
 		/// The key that is out of order.
 		key: String,
@@ -677,6 +742,7 @@ pub enum TagError {
 	/// A pair of canonical bytes has no key-value separator ([`TAG_KEY_VALUE_SEPARATOR`]).
 	/// An empty pair, left by a leading, trailing or doubled [`TAG_PAIR_SEPARATOR`], has
 	/// none either.
+	#[non_exhaustive]
 	MissingSeparator {
 		/// The position of the pair, counting from 0.
 		pair: usize,
@@ -696,7 +762,7 @@ impl fmt::Display for TagError {
 			Self::ControlCharacter { key, index, character } => write!(f, "the value of tag {key:?} contains the control character U+{:04X} at byte {index}; values may not contain U+0000 to U+001F or U+007F", u32::from(*character)),
 			Self::ValueNotUtf8 { key, index } => write!(f, "the value of tag {key:?} is not valid UTF-8 from byte {index}"),
 			Self::DuplicateKey { key } => write!(f, "the tag key {key:?} appears more than once"),
-			Self::TooManyTags { count } => write!(f, "{count} tags given; a tag set holds at most {MAX_TAGS}"),
+			Self::TooManyTags { count } => write!(f, "at least {count} tags given; a tag set holds at most {MAX_TAGS}"),
 			Self::SeriesKeyTooLong { len } => write!(f, "the canonical series key is {len} bytes long; it may be at most {MAX_SERIES_KEY_BYTES} bytes"),
 			Self::UnsortedKeys { key, previous } => write!(f, "the canonical series key lists the tag key {key:?} after {previous:?}; keys must be in ascending byte order"),
 			Self::MissingSeparator { pair } => write!(f, "pair {pair} of the canonical series key has no key-value separator (0x1F)"),
@@ -709,7 +775,7 @@ impl std::error::Error for TagError {}
 /// Whether a key check accepts the reserved `__` prefix: only the storage path does.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReservedKeys {
-	/// Input: [`TagSet::from_pairs`] and [`SeriesSelector::new`].
+	/// Input: [`TagSet::from_pairs`], [`SeriesSelector::new`] and [`SeriesSelector::exact`].
 	Reject,
 	/// Stored canonical bytes: [`SeriesKey::from_canonical`].
 	Accept,
@@ -787,7 +853,9 @@ fn key_for_error(key: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-	use std::collections::{BTreeMap, BTreeSet, HashMap};
+	use std::{
+		cell::Cell, collections::{BTreeMap, BTreeSet, HashMap}
+	};
 
 	use super::*;
 
@@ -1089,7 +1157,7 @@ mod tests {
 		let mut canonical = over.clone().into_bytes();
 		canonical.extend_from_slice(b"\x1fv");
 		assert_eq!(canonical_err(&canonical), TagError::KeyTooLong { key: at_cap, len: 129 });
-		assert_eq!(SeriesSelector::new([(over.as_str(), Some("v"))], false), Err(TagError::KeyTooLong { key: over[..128].to_owned(), len: 129 }));
+		assert_eq!(SeriesSelector::new([(over.as_str(), Some("v"))]), Err(TagError::KeyTooLong { key: over[..128].to_owned(), len: 129 }));
 	}
 
 	#[test]
@@ -1103,7 +1171,7 @@ mod tests {
 		let over = "v".repeat(257);
 		assert_eq!(pairs_err(&[("k", over.as_str())]), TagError::ValueTooLong { key: "k".to_owned(), len: 257 });
 		assert_eq!(canonical_err(format!("k\u{1f}{over}").as_bytes()), TagError::ValueTooLong { key: "k".to_owned(), len: 257 });
-		assert_eq!(SeriesSelector::new([("k", Some(over.as_str()))], false), Err(TagError::ValueTooLong { key: "k".to_owned(), len: 257 }));
+		assert_eq!(SeriesSelector::new([("k", Some(over.as_str()))]), Err(TagError::ValueTooLong { key: "k".to_owned(), len: 257 }));
 
 		// The limit counts bytes, not characters: 128 two-byte characters fit, one more byte does not.
 		let wide = "é".repeat(128);
@@ -1126,9 +1194,77 @@ mod tests {
 		let canonical = names.iter().map(|key| format!("{key}\u{1f}v")).collect::<Vec<_>>().join("\u{1e}");
 		assert!(canonical.len() <= 1024, "only the count is over");
 		assert_eq!(canonical_err(canonical.as_bytes()), TagError::TooManyTags { count: 17 });
-		// The count is reported in full, not cut at the limit.
+		// The count comes before any pair is checked.
+		let mut bad_first = seventeen.clone();
+		bad_first[0] = ("", "");
+		assert_eq!(pairs_err(&bad_first), TagError::TooManyTags { count: 17 });
+		// Canonical bytes are bounded, so they are counted in full.
+		let twenty = (0..20).map(|i| format!("k{i:02}\u{1f}v")).collect::<Vec<_>>().join("\u{1e}");
+		assert_eq!(canonical_err(twenty.as_bytes()), TagError::TooManyTags { count: 20 });
+	}
+
+	#[test]
+	fn from_pairs_stops_reading_at_the_seventeenth_pair() {
+		// Pairs are drawn one by one; an iterator that never ends still gets an answer, and
+		// the count is the lower bound known when reading stopped.
+		let mut drawn = 0_usize;
+		let endless = (0_u64..).map(|i| {
+			drawn += 1;
+			(format!("k{i}"), "v")
+		});
+		assert_eq!(TagSet::from_pairs(endless), Err(TagError::TooManyTags { count: 17 }));
+		assert_eq!(drawn, 17);
+		// The same for twenty pairs: reading stops at the seventeenth.
 		let twenty: Vec<String> = (0..20).map(|i| format!("k{i:02}")).collect();
-		assert_eq!(TagSet::from_pairs(twenty.iter().map(|key| (key.as_str(), "v"))), Err(TagError::TooManyTags { count: 20 }));
+		assert_eq!(TagSet::from_pairs(twenty.iter().map(|key| (key.as_str(), "v"))), Err(TagError::TooManyTags { count: 17 }));
+		// Even endless repeats of one invalid pair end at the count.
+		assert_eq!(TagSet::from_pairs(std::iter::repeat(("", ""))), Err(TagError::TooManyTags { count: 17 }));
+	}
+
+	/// Text whose `as_ref` gives `first` on the first call and `later` on every other, and
+	/// counts the calls: an `AsRef` a caller is free to write.
+	struct Fickle {
+		first: &'static str,
+		later: &'static str,
+		calls: Cell<usize>,
+	}
+
+	impl Fickle {
+		const fn new(first: &'static str, later: &'static str) -> Self {
+			Self { first, later, calls: Cell::new(0) }
+		}
+	}
+
+	impl AsRef<str> for Fickle {
+		fn as_ref(&self) -> &str {
+			let calls = self.calls.get();
+			self.calls.set(calls + 1);
+			if calls == 0 {
+				self.first
+			} else {
+				self.later
+			}
+		}
+	}
+
+	#[test]
+	fn each_key_and_value_is_read_once() {
+		// Read twice, both keys would be `zz` (a duplicate) and both values empty.
+		let (b, a) = (Fickle::new("b", "zz"), Fickle::new("a", "zz"));
+		let (one, two) = (Fickle::new("1", ""), Fickle::new("2", ""));
+		let set = TagSet::from_pairs([(&b, &one), (&a, &two)]).expect("the first answers are valid");
+		assert_eq!(set.iter().collect::<Vec<_>>(), [("a", "2"), ("b", "1")]);
+		for text in [&b, &a, &one, &two] {
+			assert_eq!(text.calls.get(), 1);
+		}
+		// What is checked is what would be stored: an invalid first answer is rejected.
+		let (bad, value) = (Fickle::new("0bad", "good"), Fickle::new("v", "v"));
+		assert_eq!(TagSet::from_pairs([(&bad, &value)]), Err(TagError::InvalidKey { key: "0bad".to_owned(), index: 0 }));
+		// Selectors read each key and value once too.
+		let (key, value) = (Fickle::new("host", "0bad"), Fickle::new("a", ""));
+		let selector = SeriesSelector::exact([(&key, Some(&value))]).expect("the first answers are valid");
+		assert_eq!(selector.matchers().collect::<Vec<_>>(), [("host", Some("a"))]);
+		assert_eq!((key.calls.get(), value.calls.get()), (1, 1));
 	}
 
 	/// Four one-byte keys with values of 256, 256, 256 and `last` bytes: a canonical key of
@@ -1165,7 +1301,7 @@ mod tests {
 	fn an_invalid_first_byte_is_rejected() {
 		for key in ["0a", "9", "-a", ".a", " a", "éa", "\u{1f}a", "=a", "/a"] {
 			assert_eq!(pairs_err(&[(key, "v")]), TagError::InvalidKey { key: key.to_owned(), index: 0 }, "{key:?}");
-			assert_eq!(SeriesSelector::new([(key, None::<&str>)], false), Err(TagError::InvalidKey { key: key.to_owned(), index: 0 }), "{key:?}");
+			assert_eq!(SeriesSelector::new([(key, None::<&str>)]), Err(TagError::InvalidKey { key: key.to_owned(), index: 0 }), "{key:?}");
 		}
 		// From canonical bytes, a byte that is not UTF-8 is quoted as U+FFFD.
 		assert_eq!(canonical_err(b"\xff\x1fv"), TagError::InvalidKey { key: "\u{fffd}".to_owned(), index: 0 });
@@ -1187,16 +1323,16 @@ mod tests {
 		assert_eq!(pairs_err(&[("k", "")]), TagError::EmptyValue { key: "k".to_owned() });
 		assert_eq!(canonical_err(b"\x1fv"), TagError::EmptyKey);
 		assert_eq!(canonical_err(b"k\x1f"), TagError::EmptyValue { key: "k".to_owned() });
-		assert_eq!(SeriesSelector::new([("", Some("v"))], false), Err(TagError::EmptyKey));
-		assert_eq!(SeriesSelector::new([("k", Some(""))], false), Err(TagError::EmptyValue { key: "k".to_owned() }));
+		assert_eq!(SeriesSelector::new([("", Some("v"))]), Err(TagError::EmptyKey));
+		assert_eq!(SeriesSelector::new([("k", Some(""))]), Err(TagError::EmptyValue { key: "k".to_owned() }));
 	}
 
 	#[test]
 	fn the_reserved_prefix_is_input_only() {
 		for key in ["__", "__x", "__x_y", "___"] {
 			assert_eq!(pairs_err(&[(key, "v")]), TagError::ReservedKey { key: key.to_owned() });
-			assert_eq!(SeriesSelector::new([(key, Some("v"))], false), Err(TagError::ReservedKey { key: key.to_owned() }));
-			assert_eq!(SeriesSelector::new([(key, None::<&str>)], true), Err(TagError::ReservedKey { key: key.to_owned() }));
+			assert_eq!(SeriesSelector::new([(key, Some("v"))]), Err(TagError::ReservedKey { key: key.to_owned() }));
+			assert_eq!(SeriesSelector::exact([(key, None::<&str>)]), Err(TagError::ReservedKey { key: key.to_owned() }));
 		}
 		// The storage path accepts a reserved key, still checking everything else.
 		let stored = SeriesKey::from_canonical(b"__dim\x1fs\x1ehost\x1fa").expect("a later version's system dimension");
@@ -1208,8 +1344,8 @@ mod tests {
 		assert_eq!(canonical_err(b"__d m\x1fs"), TagError::InvalidKey { key: "__d m".to_owned(), index: 3 });
 		// Selectors cannot name it: non-exact selectors see past it, exact ones never match it.
 		assert!(SeriesSelector::all().matches(&set));
-		assert!(SeriesSelector::new([("host", Some("a"))], false).expect("valid").matches(&set));
-		assert!(!SeriesSelector::new([("host", Some("a"))], true).expect("valid").matches(&set));
+		assert!(SeriesSelector::new([("host", Some("a"))]).expect("valid").matches(&set));
+		assert!(!SeriesSelector::exact([("host", Some("a"))]).expect("valid").matches(&set));
 		assert!(!SeriesSelector::untagged().matches(&set));
 	}
 
@@ -1222,7 +1358,7 @@ mod tests {
 			for (value, index) in [(format!("{c}"), 0), (format!("a{c}b"), 1), (format!("ab{c}"), 2)] {
 				let expected = TagError::ControlCharacter { key: "k".to_owned(), index, character: c };
 				assert_eq!(TagSet::from_pairs([("k", value.as_str())]), Err(expected.clone()), "U+{:04X}", u32::from(byte));
-				assert_eq!(SeriesSelector::new([("k", Some(value.as_str()))], false), Err(expected.clone()));
+				assert_eq!(SeriesSelector::new([("k", Some(value.as_str()))]), Err(expected.clone()));
 				// 0x1E splits pairs in canonical bytes, so it is a different error there.
 				if byte != 0x1E {
 					assert_eq!(canonical_err(format!("k\u{1f}{value}").as_bytes()), expected, "U+{:04X}", u32::from(byte));
@@ -1302,7 +1438,7 @@ mod tests {
 	#[test]
 	fn selector_truth_table() {
 		let sets = [tags(&[]), tags(&[("host", "a")]), tags(&[("host", "a"), ("dc", "x")]), tags(&[("host", "b")]), tags(&[("dc", "x")])];
-		let selector = |matchers: &[(&str, Option<&str>)], exact: bool| SeriesSelector::new(matchers.iter().copied(), exact).expect("valid selector");
+		let selector = |matchers: &[(&str, Option<&str>)], exact: bool| if exact { SeriesSelector::exact(matchers.iter().copied()) } else { SeriesSelector::new(matchers.iter().copied()) }.expect("valid selector");
 		// Columns: {}, {host=a}, {host=a, dc=x}, {host=b}, {dc=x}.
 		let table: [(SeriesSelector, [bool; 5]); 16] = [(SeriesSelector::all(), [true, true, true, true, true]), (SeriesSelector::default(), [true, true, true, true, true]), (SeriesSelector::untagged(), [true, false, false, false, false]), (selector(&[], true), [true, false, false, false, false]), (selector(&[("host", Some("a"))], false), [false, true, true, false, false]), (selector(&[("host", Some("a"))], true), [false, true, false, false, false]), (selector(&[("host", Some("a")), ("dc", None)], false), [false, true, false, false, false]), (selector(&[("host", Some("a")), ("dc", None)], true), [false, true, false, false, false]), (selector(&[("dc", None)], false), [true, true, false, true, false]), (selector(&[("dc", None)], true), [true, false, false, false, false]), (selector(&[("host", Some("a")), ("dc", Some("x"))], false), [false, false, true, false, false]), (selector(&[("dc", Some("x")), ("host", Some("a"))], true), [false, false, true, false, false]), (selector(&[("host", Some("a")), ("dc", Some("y"))], false), [false, false, false, false, false]), (selector(&[("host", None), ("dc", None)], false), [true, false, false, false, false]), (selector(&[("dc", Some("x"))], false), [false, false, true, false, true]), (selector(&[("rack", Some("r"))], false), [false, false, false, false, false])];
 		for (selector, expected) in &table {
@@ -1324,7 +1460,7 @@ mod tests {
 				matchers.insert(*rng.pick(KEYS), value);
 			}
 			let exact = rng.below(2) == 0;
-			let selector = SeriesSelector::new(matchers.clone(), exact).expect("valid selector");
+			let selector = if exact { SeriesSelector::exact(matchers.clone()) } else { SeriesSelector::new(matchers.clone()) }.expect("valid selector");
 			let model: BTreeMap<&str, &str> = set.iter().collect();
 			let every_matcher_holds = matchers.iter().all(|(key, value)| model.get(key).copied() == *value);
 			let valued: BTreeMap<&str, &str> = matchers.iter().filter_map(|(key, value)| value.map(|value| (*key, value))).collect();
@@ -1335,8 +1471,8 @@ mod tests {
 
 	#[test]
 	fn selectors_are_validated_and_order_independent() {
-		let one = SeriesSelector::new([("host", Some("a")), ("dc", None)], true).expect("valid");
-		let two = SeriesSelector::new([("dc", None), ("host", Some("a"))], true).expect("valid");
+		let one = SeriesSelector::exact([("host", Some("a")), ("dc", None)]).expect("valid");
+		let two = SeriesSelector::exact([("dc", None), ("host", Some("a"))]).expect("valid");
 		assert_eq!(one, two);
 		assert!(one.is_exact());
 		assert!(!SeriesSelector::all().is_exact());
@@ -1344,16 +1480,16 @@ mod tests {
 		assert_eq!(one.matchers().collect::<Vec<_>>(), vec![("dc", None), ("host", Some("a"))]);
 		assert_eq!(one.matchers().len(), 2);
 		assert_eq!(SeriesSelector::all().matchers().len(), 0);
-		assert_ne!(one, SeriesSelector::new([("host", Some("a")), ("dc", None)], false).expect("valid"));
+		assert_ne!(one, SeriesSelector::new([("host", Some("a")), ("dc", None)]).expect("valid"));
 
-		assert_eq!(SeriesSelector::new([("host", Some("a")), ("host", Some("b"))], false), Err(TagError::DuplicateKey { key: "host".to_owned() }));
-		assert_eq!(SeriesSelector::new([("host", Some("a")), ("host", None)], false), Err(TagError::DuplicateKey { key: "host".to_owned() }));
-		assert_eq!(SeriesSelector::new([("host", None::<&str>), ("host", None)], false), Err(TagError::DuplicateKey { key: "host".to_owned() }));
-		assert_eq!(SeriesSelector::new([("1host", None::<&str>)], false), Err(TagError::InvalidKey { key: "1host".to_owned(), index: 0 }));
-		assert_eq!(SeriesSelector::new([("k", Some("a\nb"))], false), Err(TagError::ControlCharacter { key: "k".to_owned(), index: 1, character: '\n' }));
+		assert_eq!(SeriesSelector::new([("host", Some("a")), ("host", Some("b"))]), Err(TagError::DuplicateKey { key: "host".to_owned() }));
+		assert_eq!(SeriesSelector::new([("host", Some("a")), ("host", None)]), Err(TagError::DuplicateKey { key: "host".to_owned() }));
+		assert_eq!(SeriesSelector::new([("host", None::<&str>), ("host", None)]), Err(TagError::DuplicateKey { key: "host".to_owned() }));
+		assert_eq!(SeriesSelector::new([("1host", None::<&str>)]), Err(TagError::InvalidKey { key: "1host".to_owned(), index: 0 }));
+		assert_eq!(SeriesSelector::new([("k", Some("a\nb"))]), Err(TagError::ControlCharacter { key: "k".to_owned(), index: 1, character: '\n' }));
 		// No cap on matchers beyond one per key: absent-tag matchers may name many keys.
 		let many: Vec<String> = (0..40).map(|i| format!("k{i}")).collect();
-		let absent = SeriesSelector::new(many.iter().map(|key| (key.as_str(), None::<&str>)), false).expect("valid");
+		let absent = SeriesSelector::new(many.iter().map(|key| (key.as_str(), None::<&str>))).expect("valid");
 		assert!(absent.matches(&tags(&[("host", "a")])));
 	}
 
@@ -1362,7 +1498,7 @@ mod tests {
 	#[test]
 	fn errors_name_the_key_and_the_limit() {
 		let long_key = "k".repeat(300);
-		let cases: [(TagError, &[&str]); 14] = [(pairs_err(&[("", "v")]), &["empty"]), (pairs_err(&[(long_key.as_str(), "v")]), &["300 bytes", "128"]), (pairs_err(&[("1a", "v")]), &["\"1a\"", "start"]), (pairs_err(&[("a b", "v")]), &["\"a b\"", "byte 1"]), (pairs_err(&[("__a", "v")]), &["\"__a\"", "reserved"]), (pairs_err(&[("k", "")]), &["\"k\"", "empty"]), (pairs_err(&[("k", &"v".repeat(300))]), &["\"k\"", "300 bytes", "256"]), (pairs_err(&[("k", "a\tb")]), &["\"k\"", "U+0009", "byte 1"]), (canonical_err(b"k\x1f\xff"), &["\"k\"", "UTF-8"]), (pairs_err(&[("k", "1"), ("k", "2")]), &["\"k\"", "more than once"]), (TagSet::from_pairs((0..17).map(|i| (format!("k{i}"), "v"))).expect_err("17 tags"), &["17 tags", "16"]), (TagSet::from_pairs(four_wide_tags(246)).expect_err("1025 bytes"), &["1025 bytes", "1024"]), (canonical_err(b"b\x1f1\x1ea\x1f2"), &["\"a\"", "\"b\""]), (canonical_err(b"a\x1f1\x1eb"), &["pair 1", "0x1F"])];
+		let cases: [(TagError, &[&str]); 14] = [(pairs_err(&[("", "v")]), &["empty"]), (pairs_err(&[(long_key.as_str(), "v")]), &["300 bytes", "128"]), (pairs_err(&[("1a", "v")]), &["\"1a\"", "start"]), (pairs_err(&[("a b", "v")]), &["\"a b\"", "byte 1"]), (pairs_err(&[("__a", "v")]), &["\"__a\"", "reserved"]), (pairs_err(&[("k", "")]), &["\"k\"", "empty"]), (pairs_err(&[("k", &"v".repeat(300))]), &["\"k\"", "300 bytes", "256"]), (pairs_err(&[("k", "a\tb")]), &["\"k\"", "U+0009", "byte 1"]), (canonical_err(b"k\x1f\xff"), &["\"k\"", "UTF-8"]), (pairs_err(&[("k", "1"), ("k", "2")]), &["\"k\"", "more than once"]), (TagSet::from_pairs((0..17).map(|i| (format!("k{i}"), "v"))).expect_err("17 tags"), &["at least 17 tags", "16"]), (TagSet::from_pairs(four_wide_tags(246)).expect_err("1025 bytes"), &["1025 bytes", "1024"]), (canonical_err(b"b\x1f1\x1ea\x1f2"), &["\"a\"", "\"b\""]), (canonical_err(b"a\x1f1\x1eb"), &["pair 1", "0x1F"])];
 		for (error, needles) in cases {
 			let message = error.to_string();
 			for needle in needles {
