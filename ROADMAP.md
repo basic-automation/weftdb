@@ -861,8 +861,8 @@ counsel ([Phase 8](#phase-8--commercial-hardening--required-for-paid-beta);
     (`SPREAD`) written straight into the output, and each tile's one-byte width header drops a
     small-magnitude stream's empty high bit-planes. It replaced the first decoder, which read `u64`
     words and walked only the *set* bits (`w &= w-1`), after the `fastlanes` yardstick found that
-    one 3.7–15× slower than the crate: 1.32→0.78 / 5.27→1.50 / 7.60→2.32 ms per 1 Mi values at
-    widths 3/10/20
+    one 3.7–15× slower than the crate at widths 3/10/20; the rewrite took it from 1.32→0.78 /
+    5.27→1.50 / 7.60→2.32 ms per 1 Mi values (1.7× / 3.5× / 3.3×)
     ([`benches/fastlanes_yardstick.rs`](weft-physical-type/benches/fastlanes_yardstick.rs)). Byte
     footprint is a permutation of the linear per-block layout (identical on aligned tiles). The
     **~5.7× decode speedup** once quoted here (~238 vs ~41.6 Melem/s, 1 Mi small-magnitude stream)
