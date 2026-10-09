@@ -35,6 +35,29 @@ const fn base_of(resolution: Resolution, nanos: i64) -> i64 {
 	}
 }
 
+/// The inclusive range of epoch nanoseconds [`base_of`] maps to bucket `base`, or `None` if
+/// it is not representable in `i64` nanoseconds (the caller then indexes every sample).
+///
+/// The sub-second grids floor, so bucket `b` is `[b·step, b·step + step − 1]`. The
+/// second-and-coarser grids divide the floored seconds with truncating `/`, so their bucket 0
+/// spans `−(step − 1) ..= step − 1` seconds and a negative bucket `b` spans
+/// `b·step − (step − 1) ..= b·step` seconds; each second then covers a whole second of
+/// nanoseconds.
+fn base_range(resolution: Resolution, base: i64) -> Option<(i64, i64)> {
+	let Some(step) = resolution_step_secs(resolution) else {
+		let step = resolution.step_nanos();
+		let lo = base.checked_mul(step)?;
+		return Some((lo, lo.checked_add(step - 1)?));
+	};
+	let anchor = base.checked_mul(step)?;
+	let (lo_secs, hi_secs) = match base.signum() {
+		1 => (anchor, anchor.checked_add(step - 1)?),
+		0 => (-(step - 1), step - 1),
+		_ => (anchor.checked_sub(step - 1)?, anchor),
+	};
+	Some((lo_secs.checked_mul(NANOS_PER_SECOND)?, hi_secs.checked_mul(NANOS_PER_SECOND)?.checked_add(NANOS_PER_SECOND - 1)?))
+}
+
 /// Running integer state for one bucket. `first`/`last` carry their instant and resolve ties
 /// exactly as [`reduce`](crate::reduce) does (`first`: strictly earlier wins; `last`: equal
 /// or later wins), so input order never changes the answer.
@@ -219,11 +242,19 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 
 	let mut buckets: BTreeMap<i64, ScaledAcc> = BTreeMap::new();
 	// The bucket being filled. Time-ordered input stays in it until the key changes, so the
-	// map is touched once per bucket rather than once per sample.
+	// map is touched once per bucket rather than once per sample, and while a sample's
+	// instant lies in the bucket's nanosecond range (`span`) it is not indexed at all.
 	let mut current: Option<(i64, ScaledAcc)> = None;
+	let mut span: Option<(i64, i64)> = None;
 	for (&nanos, &mantissa) in epoch_nanos.iter().zip(mantissas) {
 		if lo.is_some_and(|l| nanos < l) || hi.is_some_and(|h| nanos > h) {
 			continue;
+		}
+		if let (Some((_, acc)), Some((from, to))) = (current.as_mut(), span) {
+			if from <= nanos && nanos <= to {
+				acc.push(nanos, mantissa);
+				continue;
+			}
 		}
 		let base = base_of(resolution, nanos);
 		match current.as_mut() {
@@ -233,6 +264,7 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 					buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
 				}
 				current = Some((base, ScaledAcc::new(nanos, mantissa)));
+				span = base_range(resolution, base);
 			}
 		}
 	}
@@ -337,11 +369,24 @@ pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32,
 	if sketching {
 		let bound = |b: Option<DateTime<Utc>>| b.and_then(|t| t.timestamp_nanos_opt());
 		let (lo, hi) = (bound(start), bound(end));
+		// The buckets in key order, so a time-ordered pass finds each sample's bucket by its
+		// nanosecond range and looks a bucket up only when the range is left.
+		let mut ordered: Vec<(i64, &mut BucketAcc)> = converted.iter_mut().map(|(&base, acc)| (base, acc)).collect();
+		let mut current: Option<(usize, Option<(i64, i64)>)> = None;
 		for (&nanos, &mantissa) in epoch_nanos.iter().zip(mantissas) {
 			if lo.is_some_and(|l| nanos < l) || hi.is_some_and(|h| nanos > h) {
 				continue;
 			}
-			if let Some(sketch) = converted.get_mut(&base_of(resolution, nanos)).and_then(|acc| acc.sketch.as_mut()) {
+			let position = match current {
+				Some((position, Some((from, to)))) if from <= nanos && nanos <= to => position,
+				_ => {
+					let base = base_of(resolution, nanos);
+					let Ok(position) = ordered.binary_search_by_key(&base, |(b, _)| *b) else { continue };
+					current = Some((position, base_range(resolution, base)));
+					position
+				}
+			};
+			if let Some(sketch) = ordered[position].1.sketch.as_mut() {
 				sketch.add_scaled(mantissa, scale).map_err(|_| ReduceError::SketchValue)?;
 			}
 		}
@@ -370,6 +415,26 @@ mod tests {
 			state ^= state << 17;
 			state
 		}
+	}
+
+	#[test]
+	fn base_range_is_exactly_the_nanoseconds_base_of_maps_to_each_bucket() {
+		let mut next = noise(0x51_7cc1_b727_220a);
+		let resolutions = [Resolution::Nanoseconds, Resolution::Microseconds, Resolution::Milliseconds, Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days, Resolution::Weeks, Resolution::Months, Resolution::Years];
+		let fixed = [0_i64, 1, -1, 999_999_999, -999_999_999, -1_000_000_000, -1_000_000_001, 59 * NANOS_PER_SECOND, -61 * NANOS_PER_SECOND, 3_599_999_999_999, -3_600_000_000_000, 1_505_412_060 * NANOS_PER_SECOND];
+		let random = (0..2_000).map(|_| (next() % 4_000_000_000_000_000_000).cast_signed() - 2_000_000_000_000_000_000);
+		for nanos in fixed.into_iter().chain(random) {
+			for r in resolutions {
+				let base = base_of(r, nanos);
+				let (from, to) = base_range(r, base).expect("representable");
+				assert!(from <= nanos && nanos <= to, "{r:?}: {nanos} outside {from}..={to}");
+				// The range is tight: its ends belong to the bucket and one past them do not.
+				assert_eq!((base_of(r, from), base_of(r, to)), (base, base), "{r:?} at {nanos}");
+				assert_ne!(from.checked_sub(1).map(|n| base_of(r, n)), Some(base), "{r:?}: {from} - 1");
+				assert_ne!(to.checked_add(1).map(|n| base_of(r, n)), Some(base), "{r:?}: {to} + 1");
+			}
+		}
+		assert_eq!(base_range(Resolution::Years, i64::MAX / 2), None, "unrepresentable ranges are declined");
 	}
 
 	#[test]

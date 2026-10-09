@@ -1508,6 +1508,22 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
   - [ ] **NEXT — the remaining 6.3×:** per-bucket BigDecimal materialization (six values + the
     `BTreeMap<String, _>` per bucket) and the window decode (~30 ms of the 59.7). Profile before
     choosing.
+    - [x] **DONE (2026-10-09) — no per-sample bucket indexing on time-ordered input.**
+      `reduce_scaled`'s accumulation and `reduce_partial_scaled`'s sketch pass keep the current
+      bucket's nanosecond range (`base_range`, proven tight against `base_of` over every
+      resolution, both signs) and index a sample only when it leaves it; the sketch pass finds a
+      bucket by binary search instead of a `BTreeMap` lookup per sample. Criterion
+      `decimal_tax`, pinned to one core, three alternating pairs: hourly `sum` 7.52/8.02/7.83 →
+      6.85/5.41/6.80 ms, hourly `avg` 16.40/17.36/16.37 → 15.08/15.50/14.99 ms; per segment
+      `scaled_avg_sketch_p99` 83.8/92.4/85.6 → 60.7/59.2/74.9 ms (unpinned, load ~14);
+      `scaled_streaming6` unchanged within noise (the decode dominates).
+    - [ ] **NEXT — the `avg` division is now the biggest piece of `reduce_scaled`:** hourly `avg`
+      costs ~8 ms over `sum` for 17,477 buckets (~0.5 µs each), because BTC averages do not
+      terminate and `avg_like_bigdecimal` produces all 100 digits one `u64` division at a time.
+      Producing up to 19 digits per `u128` division (base-10¹⁹ long division gives the same digit
+      string; strip the final chunk's trailing zeros when the remainder reaches zero, take the
+      rounding digit from the last remainder) should cut that ~5×; the existing 20,000-case
+      equality test against `bigdecimal`'s `/` guards it.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in
