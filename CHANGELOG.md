@@ -607,6 +607,19 @@ only the control plane, not the segment frames.
 - Rows-mode ingest residuals remain until aspects move to the segment store, and are now
   documented on `batch_capture_measurements` and `capture_measurement`: an error mid-call
   leaves the chunks committed before it, and retrying stores those rows again.
+- **A downsample served from `.weftpart` sidecars could lose a zero's decimal scale.**
+  With a partial-sidecar policy on, a zero `min`, `max`, `sum`, `avg`, `first` or
+  `last` came back at scale 0 (`0`) where decoding the segment gives it the column's
+  scale (`0.000` on a `ScaledI64 { scale: 3 }` aspect). The values were equal, but
+  exact-decimal output differed. `bigdecimal` writes a decimal as its display string,
+  which loses the scale of a zero and of a decimal with a small negative scale (`5E+2`
+  is written `500`), so the sidecar lost it. A `PartialReduction` now writes those
+  decimals in scientific form (`0e-3`, `5e2`) and every other one as before. The frame
+  layout and version (v3) are unchanged, and a `bigdecimal` reader, 0.1.0's included,
+  parses the new form exactly. A sidecar 0.1.0 wrote for a `ScaledI64` or `ScaledI128`
+  segment gets the segment's scale back on its zeros when it is loaded. One it wrote for
+  a segment of another physical type still reads back with those scales lost: nothing
+  rebuilds it unless maintenance rewrites the segment.
 
 ### Security
 

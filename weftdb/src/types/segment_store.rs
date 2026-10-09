@@ -3003,8 +3003,13 @@ impl SegmentStore {
 		};
 		// A malformed or version-mismatched frame is not an error the caller must handle —
 		// it just means "no usable sidecar", so the read falls back to a full decode.
-		let Ok(sidecar) = PartialSidecar::from_bytes(&bytes) else { return Ok(None) };
-		Ok(sidecar.matches(descriptor).then_some(sidecar))
+		let Ok(mut sidecar) = PartialSidecar::from_bytes(&bytes) else { return Ok(None) };
+		if !sidecar.matches(descriptor) {
+			return Ok(None);
+		}
+		// One written by 0.1.0 reads its zeros back at exponent 0, not the column's scale.
+		sidecar.rescale_zeros_to(descriptor);
+		Ok(Some(sidecar))
 	}
 
 	/// Delete the partial sidecar for `aspect`/`id`, if one exists, through the store's
@@ -8965,3 +8970,7 @@ mod tests {
 /// reader pins.
 #[cfg(test)]
 mod swap_tests;
+
+/// A sidecar-served downsample keeps the column's decimal scale.
+#[cfg(test)]
+mod sidecar_scale_tests;

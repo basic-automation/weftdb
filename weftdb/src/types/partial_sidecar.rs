@@ -31,7 +31,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
-use weft_physical_type::SegmentDescriptor;
+use weft_physical_type::{PhysicalType, SegmentDescriptor};
 use weft_reduce::{grids_nest, Aggregation, PartialReduction, ReduceError};
 
 /// Magic prefix identifying a `.weftpart` frame — guards against feeding a foreign or
@@ -234,6 +234,22 @@ impl PartialSidecar {
 	#[must_use]
 	pub const fn matches(&self, descriptor: &SegmentDescriptor) -> bool {
 		self.seg_row_count == descriptor.row_count as u64 && self.seg_byte_len == descriptor.byte_len
+	}
+
+	/// Give the zeros of every materialized grid the scale of `descriptor`'s fixed-scale
+	/// column (`ScaledI64` or `ScaledI128`); a no-op for any other physical type.
+	///
+	/// WeftDB 0.1.0 wrote every zero into a sidecar as `"0"`, so a sidecar it built for a
+	/// `ScaledI64 { scale: 3 }` segment reads its zeros back at scale 0, not 3 (a sidecar
+	/// written since keeps them at 3: see `weft_reduce`'s `exact` serializers). This
+	/// restores the scale a decode of the segment gives them. Remove it with the v3
+	/// reader: v4 sidecars (D-S15) ignore every v3 file.
+	pub(crate) fn rescale_zeros_to(&mut self, descriptor: &SegmentDescriptor) {
+		let Some(PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale }) = descriptor.physical_type else { return };
+		self.partial.rescale_zeros(u32::from(scale));
+		for (_, rollup) in &mut self.rollups {
+			rollup.rescale_zeros(u32::from(scale));
+		}
 	}
 }
 
