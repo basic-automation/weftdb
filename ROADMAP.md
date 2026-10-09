@@ -1420,7 +1420,21 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
-- [ ] **START HERE (filed 2026-10-08 for the next run).** The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
+- [ ] **START HERE (filed 2026-10-09 for the next run).** The 2026-10-09 run (PR `routine/dsp-2026-10-09`)
+  worked the lanes no other session owns (weft-reduce, weft-bench, a new `weftdb` child module) and
+  filed the lane-owned follow-ups instead of landing them. Recommended order:
+  1. **Lane-owned fixes this run measured and filed (hand to the owners):** the compute endpoints'
+     `BigDecimal::from_f64` widening (13.7× reduction tax on JSON input; L-COMPUTE), their
+     per-point `BigDecimal` output before narrowing to JSON `f64` (~80% of an interpolation;
+     L-COMPUTE), and `?fill=` on the downsample endpoints (L-COMPUTE / L-STORAGE-READ).
+  2. **EVI-10A review:** `SegmentStore::interpolate_range` / `_f64` already have the form decision 18
+     asks for; the evidence track adopts or reshapes them.
+  3. **Free-lane residue:** the sketch's dense bin store (keeps the sidecar's serde form; the
+     sketch is now the costliest per-sample reduction on the integer path), arbitrary bucket
+     widths for Q5's `SAMPLE BY 5s` (freeze-track API decision first), a real smooth-signal corpus
+     for the spline-fill question.
+  4. The 2026-10-08 list below still stands for owner decisions and the durability-gated items.
+- [ ] **(2026-10-08 list.)** The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
   rebuilt the codec read path and cut the exact-decimal reduction tax. Recommended order:
   (1) owner decisions waiting: `VAL_CODEC_DFOR` (BTC 33.7 → 13.6 bits/value), the timestamp
   common-multiple codec, ALP adoption, and retiring `VAL_CODEC_TRANSPOSED`; (2) the remaining ~6×
