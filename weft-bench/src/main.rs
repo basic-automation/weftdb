@@ -31,7 +31,7 @@ use std::{path::PathBuf, process::ExitCode};
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -261,7 +261,17 @@ fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 fn run_gap_fill_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| "gap-fill".to_string());
 	let profile = GapFillProfile::new(profile_name, GapFillParams { seed: cli.seed, ..cli.gap_fill.clone() });
-	let result = run_gap_fill(&profile, cli.reps).map_err(|e| anyhow::anyhow!("gap-fill benchmark run failed: {e}"))?;
+	let result = if let Some(path) = &cli.csv.gap_fill {
+		// A real series: the same outages cut from loaded rows, scored against the real values.
+		let load_start = std::time::Instant::now();
+		let (timestamps, values) = load_csv_corpus(path, cli.csv.value_column, cli.csv.skip_rows, cli.gap_fill.point_count)?;
+		let series = timestamps.iter().zip(values).map(|(&t, value)| chrono::DateTime::from_timestamp(t, 0).map(|timestamp| splimes::Point { timestamp, value }).ok_or_else(|| anyhow::anyhow!("epoch {t} is out of range"))).collect::<anyhow::Result<Vec<_>>>()?;
+		let corpus = profile.cut(series)?;
+		run_gap_fill_on(&profile, &corpus, u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX), cli.reps)
+	} else {
+		run_gap_fill(&profile, cli.reps)
+	}
+	.map_err(|e| anyhow::anyhow!("gap-fill benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -382,6 +392,8 @@ struct CsvKnobs {
 	range_fetch: Option<PathBuf>,
 	/// `--ds-csv`: downsample series (`--ds-points` caps it).
 	downsample: Option<PathBuf>,
+	/// `--gf-csv`: gap-fill series to cut outages from (`--gf-points` caps it).
+	gap_fill: Option<PathBuf>,
 	/// `--csv-value-col`: 0-based column holding the value.
 	value_column: usize,
 	/// `--csv-skip`: data rows skipped after the header.
@@ -390,13 +402,13 @@ struct CsvKnobs {
 
 impl Default for CsvKnobs {
 	fn default() -> Self {
-		Self { compression: None, point_lookup: None, range_fetch: None, downsample: None, value_column: 1, skip_rows: 0 }
+		Self { compression: None, point_lookup: None, range_fetch: None, downsample: None, gap_fill: None, value_column: 1, skip_rows: 0 }
 	}
 }
 
 impl CsvKnobs {
 	/// Every flag this group owns.
-	const FLAGS: [&'static str; 6] = ["--comp-csv", "--pl-csv", "--rf-csv", "--ds-csv", "--csv-value-col", "--csv-skip"];
+	const FLAGS: [&'static str; 7] = ["--comp-csv", "--pl-csv", "--rf-csv", "--ds-csv", "--gf-csv", "--csv-value-col", "--csv-skip"];
 
 	/// Apply one of [`Self::FLAGS`] with its value.
 	fn set(&mut self, flag: &str, value: String) -> Result<(), String> {
@@ -405,6 +417,7 @@ impl CsvKnobs {
 			"--pl-csv" => self.point_lookup = Some(PathBuf::from(value)),
 			"--rf-csv" => self.range_fetch = Some(PathBuf::from(value)),
 			"--ds-csv" => self.downsample = Some(PathBuf::from(value)),
+			"--gf-csv" => self.gap_fill = Some(PathBuf::from(value)),
 			"--csv-value-col" => self.value_column = value.parse().map_err(|_| "invalid --csv-value-col (expected a 0-based column index)".to_string())?,
 			"--csv-skip" => self.skip_rows = value.parse().map_err(|_| "invalid --csv-skip (expected a row count)".to_string())?,
 			other => return Err(format!("unknown CSV flag `{other}`")),
@@ -1036,6 +1049,9 @@ GAP-FILL OPTIONS (with --gap-fill; seeded by --seed):
         --gf-fill <M>        Fill: linear|prev|null|<decimal>      [default: linear]
         --gf-agg <A>         Reduction per bucket, scored on filled buckets
                                                                       [default: avg]
+        --gf-csv <FILE>      Cut the outages from a REAL series instead (same CSV
+                             rules as --comp-csv; --gf-points caps it); filled
+                             buckets are scored against the real values removed
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -1206,6 +1222,7 @@ mod tests {
 		let cli = expect_run(&["-g", "--gf-points", "7200", "--gf-bucket", "s", "--gf-outage", "35", "--gf-outage-len", "3", "--gf-fill", "prev", "--gf-agg", "max", "--gf-stride", "2"]);
 		let expected = GapFillParams { point_count: 7_200, input_stride_secs: 2, bucket_resolution: Resolution::Seconds, outage_percent: 35, mean_outage_buckets: 3, method: weft_reduce::Fill::Previous, aggregation: Aggregation::Max, ..GapFillParams::default() };
 		assert_eq!(cli.gap_fill, expected);
+		assert_eq!(expect_run(&["-g", "--gf-csv", "x.csv"]).csv.gap_fill, Some(PathBuf::from("x.csv")));
 		assert_eq!(expect_run(&["-g", "--gf-fill", "0.5"]).gap_fill.method, weft_reduce::Fill::Value("0.5".parse().unwrap()));
 		assert!(run_cli(&["-g", "--gf-outage", "95"]).unwrap_err().contains("--gf-outage"));
 		assert!(run_cli(&["-g", "--gf-outage-len", "0"]).unwrap_err().contains("--gf-outage-len"));

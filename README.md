@@ -1398,8 +1398,15 @@ What it does today:
   `prev` 3.73 ms, RMSE 6.36; the constant `50` 4.69 ms, RMSE 13.72; `null` 3.51 ms (nothing to
   score). At 1M generated samples (809,920 surviving, 16,667 buckets) a linear fill takes
   62.4 ms against 63.5 ms for `null`, so the fill itself is lost in the reduction's noise
-  (`weft-bench --gap-fill [--gf-points 1000000] --gf-fill <M> --reps 10`). WeftDB's grid has
-  only unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
+  (`weft-bench --gap-fill [--gf-points 1000000] --gf-fill <M> --reps 10`). `--gf-csv <FILE>` cuts
+  the same outages from a **real** series and scores the fills against the real values removed;
+  the series' own empty buckets are filled too but not scored. On 1M real BTC/USD one-minute
+  closes (2017-09-14 to 2019-08-10, mean $7,336; hourly buckets, 3,168 of 16,667 hours cut;
+  10 reps, PASS): `linear` p50 **57.2 ms**, MAE **$49.27** (0.67% of the mean), RMSE $91.77, worst
+  $957.18; `prev` MAE $76.45, RMSE $147.23; `null` 55.1 ms (`--gf-csv database/datasets/btc_1min.csv
+  --csv-value-col 4 --csv-skip 3000000 --gf-points 1000000 --gf-bucket h`; the local corpus
+  described under [Ingest](#ingest), not distributed with the repository). WeftDB's grid has only
+  unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a

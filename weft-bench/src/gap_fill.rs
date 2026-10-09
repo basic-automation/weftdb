@@ -18,7 +18,9 @@
 //! WeftDB's grid only has unit widths (`s`/`m`/`h`/…), so Q5's 5-second buckets are not
 //! expressible; the default here is one-second samples into one-minute buckets.
 
-use std::{collections::BTreeSet, time::Instant};
+use std::{
+	collections::{BTreeMap, BTreeSet}, time::Instant
+};
 
 use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -90,10 +92,14 @@ pub struct GapFillCorpus {
 	pub points: Vec<Point>,
 	/// `(bucket start, clean mean)` for each deleted bucket, ascending.
 	pub truth: Vec<(DateTime<Utc>, f64)>,
-	/// Samples generated before the outages were cut.
+	/// Samples in the series before the outages were cut.
 	pub generated: usize,
 	/// The first and last bucket of the grid (both kept, so every outage is interior).
 	pub span: (DateTime<Utc>, DateTime<Utc>),
+	/// Buckets inside the span that were already empty before any outage was cut (a real
+	/// series' own gaps; never any for the generator). They are filled too, but have no
+	/// truth to score.
+	pub natural_gaps: Vec<DateTime<Utc>>,
 }
 
 impl GapFillProfile {
@@ -113,7 +119,36 @@ impl GapFillProfile {
 		20.0_f64.mul_add((seconds / 3_600.0 * TAU).sin(), 50.0)
 	}
 
-	/// Generate the series, cut the outages, and record the truth under them.
+	/// The interior buckets of `first..=last` an outage removes, drawn from `rng`: walking
+	/// the buckets, start an outage with the probability that makes the expected removed
+	/// share `outage_percent` (an outage of mean length m costs m buckets, then at least one
+	/// kept bucket separates it from the next).
+	fn outages(&self, rng: &mut ChaCha8Rng, first: i64, last: i64) -> BTreeSet<i64> {
+		let p = &self.params;
+		let share = f64::from(p.outage_percent) / 100.0;
+		let mean = f64::from(p.mean_outage_buckets);
+		let start_probability = if share > 0.0 { (share / mean.mul_add(1.0 - share, share)).min(1.0) } else { 0.0 };
+		let mut removed = BTreeSet::new();
+		let mut b = first + 1;
+		while b < last {
+			if rng.random_range(0.0..1.0) < start_probability {
+				let length = i64::from(rng.random_range(1..=2 * p.mean_outage_buckets - 1));
+				removed.extend(b..(b + length).min(last));
+				b += length + 1;
+			} else {
+				b += 1;
+			}
+		}
+		removed
+	}
+
+	/// The grid start of bucket `step`.
+	fn start_of(&self, step: i64) -> anyhow::Result<DateTime<Utc>> {
+		weft_reduce::bucket_start(self.params.bucket_resolution, step).ok_or_else(|| anyhow::anyhow!("bucket {step} is outside the representable time range"))
+	}
+
+	/// Generate the series, cut the outages, and record the truth under them: the mean of
+	/// the noise-free signal over each removed bucket's instants.
 	///
 	/// # Panics
 	///
@@ -129,27 +164,10 @@ impl GapFillProfile {
 		let instant = |i: usize| anchor + Duration::seconds(i as i64 * p.input_stride_secs);
 		let step = |i: usize| bucket_index(p.bucket_resolution, &instant(i)).expect("indexable");
 		let (first, last) = (step(0), step(n - 1));
-
-		// Outages: walking the interior buckets, start one with the probability that makes
-		// the expected removed share `outage_percent` (an outage of mean length m costs m
-		// buckets, then at least one kept bucket separates it from the next).
-		let share = f64::from(p.outage_percent) / 100.0;
-		let mean = f64::from(p.mean_outage_buckets);
-		let start_probability = if share > 0.0 { (share / mean.mul_add(1.0 - share, share)).min(1.0) } else { 0.0 };
-		let mut removed = BTreeSet::new();
-		let mut b = first + 1;
-		while b < last {
-			if rng.random_range(0.0..1.0) < start_probability {
-				let length = i64::from(rng.random_range(1..=2 * p.mean_outage_buckets - 1));
-				removed.extend(b..(b + length).min(last));
-				b += length + 1;
-			} else {
-				b += 1;
-			}
-		}
+		let removed = self.outages(&mut rng, first, last);
 
 		let mut points = Vec::with_capacity(n);
-		let mut sums: std::collections::BTreeMap<i64, (f64, u32)> = std::collections::BTreeMap::new();
+		let mut sums: BTreeMap<i64, (f64, u32)> = BTreeMap::new();
 		for i in 0..n {
 			let clean = self.clean(i);
 			let noise = rng.random_range(-1.0..=1.0);
@@ -164,9 +182,47 @@ impl GapFillProfile {
 			let cents = ((clean + noise) * 100.0).round() as i64;
 			points.push(Point { timestamp: instant(i), value: BigDecimal::new(cents.into(), 2) });
 		}
-		let start_of = |s: i64| weft_reduce::bucket_start(p.bucket_resolution, s).expect("in range");
+		let start_of = |s: i64| self.start_of(s).expect("in range");
 		let truth = sums.into_iter().map(|(s, (sum, count))| (start_of(s), sum / f64::from(count))).collect();
-		GapFillCorpus { points, truth, generated: n, span: (start_of(first), start_of(last)) }
+		GapFillCorpus { points, truth, generated: n, span: (start_of(first), start_of(last)), natural_gaps: Vec::new() }
+	}
+
+	/// Cut the profile's outages from a given, time-sorted series (a real corpus) and record
+	/// the truth under them: the mean of the **real** values each removed bucket held. The
+	/// profile's seed, bucket resolution and outage knobs apply; its generator knobs do not.
+	///
+	/// # Errors
+	///
+	/// Returns an error if `series` has fewer than two samples, is not time-sorted, or holds
+	/// an instant or value that cannot be indexed or scored.
+	pub fn cut(&self, series: Vec<Point>) -> anyhow::Result<GapFillCorpus> {
+		let p = &self.params;
+		anyhow::ensure!(series.len() >= 2, "a gap-fill series needs at least two samples");
+		anyhow::ensure!(series.windows(2).all(|w| w[0].timestamp <= w[1].timestamp), "a gap-fill series must be time-sorted");
+		let steps = series.iter().map(|pt| bucket_index(p.bucket_resolution, &pt.timestamp)).collect::<Result<Vec<i64>, _>>().map_err(|e| anyhow::anyhow!("{e}"))?;
+		let (first, last) = (steps[0], steps[steps.len() - 1]);
+		let mut rng = ChaCha8Rng::seed_from_u64(p.seed);
+		let removed = self.outages(&mut rng, first, last);
+		let occupied: BTreeSet<i64> = steps.iter().copied().collect();
+
+		let generated = series.len();
+		let mut points = Vec::with_capacity(generated);
+		let mut sums: BTreeMap<i64, (f64, u32)> = BTreeMap::new();
+		for (point, s) in series.into_iter().zip(steps) {
+			if removed.contains(&s) {
+				let value = point.value.to_f64().filter(|v| v.is_finite()).ok_or_else(|| anyhow::anyhow!("value {} has no finite f64 image to score against", point.value))?;
+				let entry = sums.entry(s).or_insert((0.0, 0));
+				entry.0 += value;
+				entry.1 += 1;
+			} else {
+				points.push(point);
+			}
+		}
+		let truth = sums.into_iter().map(|(s, (sum, count))| Ok((self.start_of(s)?, sum / f64::from(count)))).collect::<anyhow::Result<_>>()?;
+		// The series' own empty buckets that no outage covers (an outage over an empty
+		// bucket removes nothing, so it has no truth either: count it here).
+		let natural_gaps = (first..=last).filter(|s| !occupied.contains(s)).map(|s| self.start_of(s)).collect::<anyhow::Result<_>>()?;
+		Ok(GapFillCorpus { points, truth, generated, span: (self.start_of(first)?, self.start_of(last)?), natural_gaps })
 	}
 }
 
@@ -196,10 +252,20 @@ fn query(profile: &GapFillProfile, corpus: &GapFillCorpus) -> anyhow::Result<Vec
 /// Returns an error if `reps == 0`, if the corpus has no outage to fill or no samples, or
 /// if the query fails.
 pub fn run_gap_fill(profile: &GapFillProfile, reps: usize) -> anyhow::Result<BenchResult> {
+	let setup_start = Instant::now();
+	let corpus = profile.generate();
+	run_gap_fill_on(profile, &corpus, span_ns(setup_start), reps)
+}
+
+/// Run the gap-fill query over an explicit corpus ([`GapFillProfile::generate`], or
+/// [`GapFillProfile::cut`] over a real series), charging `generation_ns` to setup.
+///
+/// # Errors
+///
+/// As [`run_gap_fill`].
+pub fn run_gap_fill_on(profile: &GapFillProfile, corpus: &GapFillCorpus, generation_ns: u64, reps: usize) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(reps > 0, "reps must be > 0");
 	let run_start = Instant::now();
-	let corpus = profile.generate();
-	let generation_ns = span_ns(run_start);
 	anyhow::ensure!(!corpus.points.is_empty(), "the corpus has no samples");
 	anyhow::ensure!(!corpus.truth.is_empty(), "the corpus has no outage to fill (raise --gf-outage or --gf-points)");
 
@@ -207,26 +273,30 @@ pub fn run_gap_fill(profile: &GapFillProfile, reps: usize) -> anyhow::Result<Ben
 	let mut grid = Vec::new();
 	for _ in 0..reps {
 		let t0 = Instant::now();
-		grid = query(profile, &corpus)?;
+		grid = query(profile, corpus)?;
 		samples_ns.push(span_ns(t0));
 	}
 	let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
-	let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(run_start) };
+	let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(run_start).saturating_add(generation_ns) };
 
-	// Correctness: one bucket per grid step, the outage buckets exactly the synthesized
-	// ones, the measured ones holding every surviving sample, every value finite.
+	// Correctness: one bucket per grid step, the synthesized buckets exactly the outages
+	// plus the series' own gaps, the measured ones holding every surviving sample, every
+	// value finite.
 	let p = &profile.params;
 	let steps: Vec<i64> = grid.iter().map(|b| bucket_index(p.bucket_resolution, &b.timestamp)).collect::<Result<_, _>>().map_err(|e| anyhow::anyhow!("{e}"))?;
 	let dense = steps.windows(2).all(|w| w[1] == w[0] + 1) && grid.first().map(|b| b.timestamp) == Some(corpus.span.0) && grid.last().map(|b| b.timestamp) == Some(corpus.span.1);
 	let filled: Vec<&Bucket> = grid.iter().filter(|b| b.count == 0).collect();
-	let filled_match = filled.len() == corpus.truth.len() && filled.iter().zip(&corpus.truth).all(|(b, (t, _))| b.timestamp == *t);
+	let mut expected_filled: Vec<DateTime<Utc>> = corpus.truth.iter().map(|(t, _)| *t).chain(corpus.natural_gaps.iter().copied()).collect();
+	expected_filled.sort_unstable();
+	let filled_match = filled.iter().map(|b| b.timestamp).eq(expected_filled.iter().copied());
 	let counted: usize = grid.iter().map(|b| b.count).sum();
 	let values_finite = grid.iter().flat_map(|b| b.values.values()).all(|v| v.to_f64().is_some_and(f64::is_finite));
-	let correctness = CorrectnessReport { output_count_ok: dense && filled_match && counted == corpus.points.len(), expected_output_points: corpus.truth.len(), actual_output_points: filled.len(), values_finite };
+	let correctness = CorrectnessReport { output_count_ok: dense && filled_match && counted == corpus.points.len(), expected_output_points: expected_filled.len(), actual_output_points: filled.len(), values_finite };
 
-	// Accuracy: each filled bucket's value against the clean mean under it.
+	// Accuracy: each filled outage bucket's value against the truth under it.
 	let key = p.aggregation.as_str();
-	let scored: Vec<(Point, f64)> = filled.iter().zip(&corpus.truth).filter_map(|(b, &(timestamp, truth))| b.values.get(key).map(|v| (Point { timestamp, value: v.clone() }, truth))).collect();
+	let truth: BTreeMap<DateTime<Utc>, f64> = corpus.truth.iter().copied().collect();
+	let scored: Vec<(Point, f64)> = filled.iter().filter_map(|b| Some((Point { timestamp: b.timestamp, value: b.values.get(key)?.clone() }, *truth.get(&b.timestamp)?))).collect();
 	let accuracy = if scored.is_empty() {
 		None
 	} else {
@@ -240,7 +310,8 @@ pub fn run_gap_fill(profile: &GapFillProfile, reps: usize) -> anyhow::Result<Ben
 	let throughput_points_per_sec = if latency.mean_ns > 0 { corpus.points.len() as f64 / (latency.mean_ns as f64 / 1e9) } else { 0.0 };
 	#[allow(clippy::cast_precision_loss)]
 	let missingness_fraction = 1.0 - corpus.points.len() as f64 / corpus.generated as f64;
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GAP_FILL.to_string(), reps, dataset: DatasetMeta { input_points: corpus.points.len(), output_points: grid.len(), irregular: false, missingness_fraction, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage: None })
+	let irregular = corpus.points.windows(3).any(|w| w[2].timestamp - w[1].timestamp != w[1].timestamp - w[0].timestamp);
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GAP_FILL.to_string(), reps, dataset: DatasetMeta { input_points: corpus.points.len(), output_points: grid.len(), irregular, missingness_fraction, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage: None })
 }
 
 #[cfg(test)]
@@ -284,6 +355,26 @@ mod tests {
 		let linear = run_gap_fill(&small(Fill::Linear), 1).expect("runs").accuracy.expect("scored");
 		let previous = run_gap_fill(&small(Fill::Previous), 1).expect("runs").accuracy.expect("scored");
 		assert!(linear.rmse < previous.rmse, "linear {} vs previous {}", linear.rmse, previous.rmse);
+	}
+
+	#[test]
+	fn a_given_series_keeps_its_own_gaps_apart_from_the_cut_outages() {
+		// Two-decimal prices every minute for two days, with a natural six-hour hole.
+		let anchor = Utc.timestamp_opt(1_505_412_000, 0).single().expect("valid epoch");
+		let series: Vec<Point> = (0..2 * 1_440_i64).filter(|m| !(600..960).contains(m)).map(|m| Point { timestamp: anchor + Duration::minutes(m), value: BigDecimal::new((355_893 + m % 97).into(), 2) }).collect();
+		let profile = GapFillProfile::new("gf-real", GapFillParams { bucket_resolution: Resolution::Hours, ..GapFillParams::default() });
+		let corpus = profile.cut(series.clone()).expect("cuts");
+		assert_eq!(corpus.natural_gaps.len(), 6, "the six empty hours");
+		assert_ne!(corpus.truth.len(), 0, "some hours were cut");
+		assert!(corpus.truth.iter().all(|(t, _)| !corpus.natural_gaps.contains(t)), "an outage over an empty hour removes nothing and has no truth");
+		assert_eq!(corpus.points.len() + corpus.truth.len() * 60, series.len(), "a removed hour loses its 60 samples");
+		let result = run_gap_fill_on(&profile, &corpus, 0, 2).expect("runs");
+		assert!(result.correctness.passed(), "{:?}", result.correctness);
+		assert_eq!(result.correctness.expected_output_points, corpus.truth.len() + 6);
+		assert_eq!(result.accuracy.expect("scored").count, corpus.truth.len(), "only the cut outages are scored");
+		let mut unsorted = series;
+		unsorted.swap(0, 1);
+		assert!(profile.cut(unsorted).is_err());
 	}
 
 	#[test]
