@@ -1634,6 +1634,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       binary expansions carry ~50 significant digits and make every BigDecimal op expensive. Real
       two-decimal prices do not. So the README's reduction table, which is all generator-based,
       **understates** WeftDB on real price data.
+    - [x] **DONE (2026-10-09) — the harness times the integer path too:** `--ds-scaled` runs
+      `reduce_partial_scaled` + `finish` over the series as one `ScaledI64` column (rescaled to the
+      largest scale, as a sealed column is), gated on equalling `reduce` bucket for bucket. Hourly
+      `avg`: 500k two-decimal points 0.58 vs 14.40 ms; 1M real BTC closes 6.4 vs 52.8 ms.
     - [x] **DONE (2026-10-09) — the interpolation generator: pessimistic at scale, now a knob.**
       Its samples are exact binary expansions too. On 100k samples the flagship-shaped run
       interpolates in 50.4–53.7 ms against 24.6–25.8 ms at two decimals (~2×, three runs each,

@@ -240,7 +240,7 @@ fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// is that the reduction is total (the bucket counts sum to the input size).
 fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| "downsample".to_string());
-	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel, value_decimals: cli.ds_decimals };
+	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel, value_decimals: cli.ds_decimals, scaled: cli.ds_scaled };
 	let profile = DownsampleProfile::new(profile_name, params);
 	let result = if let Some(path) = &cli.csv.downsample {
 		// A real series: the same reduction engine over loaded rows (epoch seconds, exact decimals).
@@ -497,6 +497,8 @@ struct Cli {
 	/// Downsample mode: decimal places of the generated values; `None` = the exact
 	/// binary expansion (`--ds-decimals full`).
 	ds_decimals: Option<u32>,
+	/// Downsample mode: time the integer-native path (`--ds-scaled`).
+	ds_scaled: bool,
 	/// Gap-fill mode: the workload knobs (the seed comes from `--seed`).
 	gap_fill: GapFillParams,
 	/// GPU-memory mode: the workload knobs (the seed comes from `--seed`).
@@ -636,7 +638,7 @@ impl Cli {
 		let mut out_dir = PathBuf::from("reports").join("json");
 		let mut name: Option<String> = None;
 		let mut compare = false;
-		let (mut html, mut parquet) = (false, false);
+		let (mut html, mut parquet, mut ds_scaled) = (false, false, false);
 		let mut gpu_calibrate = true;
 
 		let mut iter = args.into_iter();
@@ -704,6 +706,7 @@ impl Cli {
 				"-c" | "--compare" => compare = true,
 				"--html" => html = true,
 				"--parquet" => parquet = true,
+				"--ds-scaled" => ds_scaled = true,
 				"--no-gpu-calibrate" => gpu_calibrate = false,
 				other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
 				// A bare positional is taken as the input path if one is not set yet.
@@ -720,7 +723,7 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (gpu_memory_mode, InputMode::GpuMemory)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, gap_fill, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
 	}
 }
 
@@ -1095,6 +1098,9 @@ DOWNSAMPLE OPTIONS (with --downsample):
         --ds-decimals <N>    Decimal places of the generated values (0..=12), or
                              `full` for the f64 signal's exact binary expansion (the
                              generator before 2026-10-09)               [default: 2]
+        --ds-scaled          Time the integer-native path the stored-range downsample
+                             takes (reduce_partial_scaled over one ScaledI64 column),
+                             gated on equalling the BigDecimal reduce
         --ds-stride <N>      Seconds between input samples (>=1)        [default: 1]
         --ds-bucket <R>      Bucket resolution: s|m|h|d|w|mo|y     [default: minutes]
         --ds-aggs <LIST>     Reductions, comma-separated: min,max,avg,sum,first,
@@ -1340,6 +1346,8 @@ mod tests {
 		assert!(run_cli(&["-d", "--ds-decimals", "13"]).unwrap_err().contains("invalid decimal places"));
 		assert_eq!(expect_run(&["-s"]).decimals, None, "synthetic samples keep their exact expansion by default");
 		assert_eq!(expect_run(&["-s", "--decimals", "2"]).decimals, Some(2));
+		assert!(!expect_run(&["-d"]).ds_scaled);
+		assert!(expect_run(&["-d", "--ds-scaled"]).ds_scaled);
 		// Aggregations parse from a comma list (including percentiles) and reject unknowns.
 		assert_eq!(cli.ds_aggs, Aggregation::ALL.to_vec(), "default is the six streaming reductions");
 		assert_eq!(expect_run(&["-d", "--ds-aggs", "min,max,p99"]).ds_aggs, vec![Aggregation::Min, Aggregation::Max, Aggregation::P99]);

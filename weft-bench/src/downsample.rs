@@ -60,6 +60,8 @@ pub struct DownsampleParams {
 	/// Decimal places the generated values are rounded to. See
 	/// [`DownsampleProfile::value_decimals`].
 	pub value_decimals: Option<u32>,
+	/// Time the integer-native path instead. See [`DownsampleProfile::scaled`].
+	pub scaled: bool,
 }
 
 /// Decimal places a generated downsample value carries by default: two, like the prices
@@ -75,7 +77,7 @@ impl Default for DownsampleParams {
 	/// hours) reduced to per-minute buckets (~60 samples/bucket), every reduction, values
 	/// at two decimal places.
 	fn default() -> Self {
-		Self { parallel_chunks: 1, seed: DEFAULT_DOWNSAMPLE_SEED, point_count: 60_000, input_stride_secs: 1, bucket_resolution: Resolution::Minutes, aggregations: Aggregation::ALL.to_vec(), value_decimals: Some(DEFAULT_VALUE_DECIMALS) }
+		Self { parallel_chunks: 1, seed: DEFAULT_DOWNSAMPLE_SEED, point_count: 60_000, input_stride_secs: 1, bucket_resolution: Resolution::Minutes, aggregations: Aggregation::ALL.to_vec(), value_decimals: Some(DEFAULT_VALUE_DECIMALS), scaled: false }
 	}
 }
 
@@ -109,6 +111,13 @@ pub struct DownsampleProfile {
 	/// two-decimal BTC closes. Rounding to a few places, as prices and most sensor
 	/// readings are, keeps the generated corpus representative.
 	pub value_decimals: Option<u32>,
+	/// Time `weft_reduce::reduce_partial_scaled` (then `finish`) over the series as one
+	/// `ScaledI64` column, the integer-native path `SegmentStore::downsample_range` takes for
+	/// stored segments, instead of `reduce` over `BigDecimal` points. The column is built in
+	/// setup, every value rescaled to the largest scale in the series (as a sealed column
+	/// at its declared scale holds them), and the correctness gate also requires the
+	/// result to equal `reduce`'s bucket for bucket. `parallel_chunks` does not apply.
+	pub scaled: bool,
 }
 
 impl DownsampleProfile {
@@ -121,8 +130,8 @@ impl DownsampleProfile {
 	/// Build a downsample profile from an explicit [`DownsampleParams`] knob set.
 	#[must_use]
 	pub fn new(name: impl Into<String>, params: DownsampleParams) -> Self {
-		let DownsampleParams { seed, point_count, input_stride_secs, bucket_resolution, aggregations, parallel_chunks, value_decimals } = params;
-		Self { parallel_chunks, name: name.into(), seed, point_count: point_count.max(2), input_stride_secs: input_stride_secs.max(1), bucket_resolution, aggregations, value_decimals: value_decimals.map(|places| places.min(MAX_VALUE_DECIMALS)) }
+		let DownsampleParams { seed, point_count, input_stride_secs, bucket_resolution, aggregations, parallel_chunks, value_decimals, scaled } = params;
+		Self { parallel_chunks, name: name.into(), seed, point_count: point_count.max(2), input_stride_secs: input_stride_secs.max(1), bucket_resolution, aggregations, value_decimals: value_decimals.map(|places| places.min(MAX_VALUE_DECIMALS)), scaled }
 	}
 
 	/// The fixed epoch anchor (2020-01-01T00:00:00Z).
@@ -161,6 +170,23 @@ impl DownsampleProfile {
 		let mantissa = (signal * 10_f64.powi(places.cast_signed())).round() as i64;
 		BigDecimal::new(mantissa.into(), i64::from(places))
 	}
+}
+
+/// `points` as one `ScaledI64` column: epoch nanoseconds and mantissas at the largest scale
+/// in the series. `None` when an instant has no nanosecond epoch or a rescaled mantissa does
+/// not fit `i64`.
+fn scaled_column(points: &[Point]) -> Option<(Vec<i64>, Vec<i64>, u32)> {
+	let scale = points.iter().map(|p| p.value.as_bigint_and_scale().1).max()?.max(0);
+	let mut nanos = Vec::with_capacity(points.len());
+	let mut mantissas = Vec::with_capacity(points.len());
+	for point in points {
+		let (digits, s) = point.value.as_bigint_and_scale();
+		let shift = u32::try_from(scale - s.max(0)).ok()?;
+		let digits = if s < 0 { digits.into_owned() * bigdecimal::num_bigint::BigInt::from(10).pow(u32::try_from(-s).ok()?) } else { digits.into_owned() };
+		mantissas.push(digits.to_i64()?.checked_mul(10_i64.checked_pow(shift)?)?);
+		nanos.push(point.timestamp.timestamp_nanos_opt()?);
+	}
+	Some((nanos, mantissas, u32::try_from(scale).ok()?))
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
@@ -235,12 +261,20 @@ pub fn run_downsample_on(profile: &DownsampleProfile, points: &[Point], generati
 
 	let mut samples_ns: Vec<u64> = Vec::with_capacity(reps);
 	let mut last_buckets: Vec<Bucket> = Vec::new();
+	// The integer path's column is built once, in setup, as the store's sealed column is.
+	let column = if profile.scaled { Some(scaled_column(points).ok_or_else(|| anyhow::anyhow!("the series cannot be held as one ScaledI64 column (a value needs more than i64 at the common scale)"))?) } else { None };
 	for _ in 0..reps {
 		let t0 = Instant::now();
-		let buckets = reduce_points(points, profile).map_err(|e| anyhow::anyhow!("downsample reduction failed: {e}"))?;
+		let buckets = match &column {
+			Some((nanos, mantissas, scale)) => weft_reduce::reduce_partial_scaled(nanos, mantissas, *scale, profile.bucket_resolution, None, None, &profile.aggregations).and_then(|partial| partial.map_or_else(|| Ok(Vec::new()), |p| p.finish(profile.bucket_resolution, &profile.aggregations))),
+			None => reduce_points(points, profile),
+		}
+		.map_err(|e| anyhow::anyhow!("downsample reduction failed: {e}"))?;
 		samples_ns.push(span_ns(t0));
 		last_buckets = buckets;
 	}
+	// The integer path must be the same answer, not merely a fast one.
+	let same_as_reduce = column.is_none() || reduce(points, profile.bucket_resolution, None, None, &profile.aggregations).is_ok_and(|expected| expected == last_buckets);
 
 	let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
 	let end_to_end_ns = span_ns(run_start).saturating_add(generation_ns);
@@ -252,7 +286,7 @@ pub fn run_downsample_on(profile: &DownsampleProfile, points: &[Point], generati
 	let total_count: usize = last_buckets.iter().map(|b| b.count).sum();
 	let ordered = last_buckets.windows(2).all(|w| w[0].timestamp < w[1].timestamp);
 	let values_finite = last_buckets.iter().flat_map(|b| b.values.values()).all(|v| v.to_f64().is_some_and(f64::is_finite));
-	let correctness = CorrectnessReport { output_count_ok: total_count == points.len() && ordered && !last_buckets.is_empty(), expected_output_points: points.len(), actual_output_points: total_count, values_finite };
+	let correctness = CorrectnessReport { output_count_ok: total_count == points.len() && ordered && !last_buckets.is_empty() && same_as_reduce, expected_output_points: points.len(), actual_output_points: total_count, values_finite };
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
@@ -303,6 +337,23 @@ mod tests {
 	}
 
 	use super::*;
+
+	#[test]
+	fn the_scaled_path_is_gated_on_equalling_reduce() {
+		let aggs = vec![Aggregation::Avg, Aggregation::Min, Aggregation::P99, Aggregation::Twa, Aggregation::SketchP99];
+		let profile = DownsampleProfile::new("ds-scaled", DownsampleParams { point_count: 7_200, bucket_resolution: Resolution::Minutes, aggregations: aggs, scaled: true, ..DownsampleParams::default() });
+		let result = run_downsample(&profile, 2).expect("runs");
+		assert!(result.correctness.passed(), "{:?}", result.correctness);
+		// Mixed scales are rescaled to the largest, as a sealed column holds them.
+		let anchor = Utc.timestamp_opt(EPOCH_ANCHOR_SECS, 0).single().expect("valid epoch");
+		let mixed: Vec<Point> = (0..600_i64).map(|i| Point { timestamp: anchor + Duration::seconds(i), value: if i % 2 == 0 { BigDecimal::new((35_589 + i).into(), 1) } else { BigDecimal::new((3_558_912 + i).into(), 3) } }).collect();
+		let (_, mantissas, scale) = scaled_column(&mixed).expect("one column");
+		assert_eq!((scale, mantissas[0], mantissas[1]), (3, 3_558_900, 3_558_913));
+		assert!(run_downsample_on(&profile, &mixed, 0, 2).expect("runs").correctness.passed());
+		// The pre-2026-10 generator's ~50-digit values do not fit one i64 column.
+		let full = DownsampleProfile::new("ds-scaled-full", DownsampleParams { point_count: 100, value_decimals: None, scaled: true, ..DownsampleParams::default() });
+		assert!(run_downsample(&full, 1).is_err());
+	}
 
 	#[test]
 	fn generated_values_carry_the_declared_decimal_places() {

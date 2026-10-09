@@ -473,6 +473,15 @@ and the old generator at **0.61M points/sec**, 7.3× slower than real data:
 
 ¹ 10 reps.
 
+These time `weft_reduce::reduce` over `BigDecimal` points, the path `POST /api/v1/downsample` takes.
+A stored `ScaledI64` aspect is reduced by the integer path instead (`reduce_partial_scaled`, see
+[Where it doesn't pay off](#where-it-doesnt-pay-off) for the decimal tax), which `--ds-scaled` times
+on the same series, gated on an identical result (10 reps, 2026-10-09, load average ~24, so the
+absolute times are high): hourly `avg` over the 500k two-decimal points **0.58 ms** against 14.40 ms,
+and over 1M real BTC closes **6.4 ms** against 52.8 ms; the six streaming reductions 7.6 against
+53.3 ms, `sketch_p99` 22.3 against 68.7 ms, and `avg,p99,twa` 109.0 against 169.8 ms on the real
+series (`weft-bench --downsample --ds-scaled …`).
+
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
 materialize and sort the whole bucket, and two buckets' results cannot be combined. The

@@ -212,6 +212,8 @@ only the control plane, not the segment frames.
 - **Weft-Bench reports the first rep apart from the rest**: `cold_warm` (bench schema v21)
   carries the first timed rep and the warm reps' latency statistics for every result with
   two or more reps; `latency` still covers every rep.
+- **Weft-Bench `--ds-scaled`**: the downsample workload times the integer-native reduction a
+  stored `ScaledI64` aspect takes (`reduce_partial_scaled`), gated on matching `reduce`.
 - **Weft-Bench `--decimals N`** for `--synthetic` (`SyntheticParams::value_decimals`):
   rounds the generated samples to N places. The default keeps each sample's exact binary
   expansion, which interpolates ~2× slower at 100k samples than two-decimal input.
