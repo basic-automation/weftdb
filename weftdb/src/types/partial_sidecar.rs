@@ -31,7 +31,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
-use weft_physical_type::SegmentDescriptor;
+use weft_physical_type::{PhysicalType, SegmentDescriptor};
 use weft_reduce::{grids_nest, Aggregation, PartialReduction, ReduceError};
 
 /// Magic prefix identifying a `.weftpart` frame — guards against feeding a foreign or
@@ -50,6 +50,12 @@ const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"WEFTPRT\x02";
 /// `postcard`, whose wire format is frozen for its 1.x line. The magic's last byte moved
 /// with it (`\x01` → `\x02`), so a bincode-era frame fails the magic check and is treated
 /// as absent instead of being fed to the wrong decoder.
+///
+/// Still v3 since 0.1.0, although decimals now keep their exponent: one whose display
+/// string drops it (a zero with fractional digits, or a negative exponent) is written as
+/// `{digits}e{exponent}`, a string every v3 reader parses. The zeros of a 0.1.0 sidecar
+/// read back at exponent 0, and [`PartialSidecar::rescale_zeros_to`] restores them for
+/// a fixed-scale segment.
 pub const PARTIAL_SIDECAR_VERSION: u16 = 3;
 
 /// The **bounded** reductions a sidecar materializes — every [`Aggregation`] whose
@@ -226,6 +232,23 @@ impl PartialSidecar {
 			bail!("partial sidecar version {} is not the supported {PARTIAL_SIDECAR_VERSION}", sidecar.version);
 		}
 		Ok(sidecar)
+	}
+
+	/// Give the zeros of every materialized grid the scale of `descriptor`'s fixed-scale
+	/// column (`ScaledI64` or `ScaledI128`); a no-op for any other physical type.
+	///
+	/// WeftDB 0.1.0 wrote every zero into a sidecar as `"0"`, so a sidecar it built for a
+	/// `ScaledI64 { scale: 3 }` segment reads its zeros back at exponent 0, not 3. This
+	/// restores the exponent a decode of the segment gives them (see
+	/// [`PartialReduction::rescale_zeros`]); a sidecar written since holds them at that
+	/// exponent already.
+	pub fn rescale_zeros_to(&mut self, descriptor: &SegmentDescriptor) {
+		let Some(PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale }) = descriptor.physical_type else { return };
+		let scale = i64::from(scale);
+		self.partial.rescale_zeros(scale);
+		for (_, rollup) in &mut self.rollups {
+			rollup.rescale_zeros(scale);
+		}
 	}
 
 	/// Whether this sidecar was built from exactly the segment `descriptor` names — the

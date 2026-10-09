@@ -21,12 +21,13 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::module_name_repetitions)]
 
+mod exact;
 mod scaled;
 pub mod sketch;
 
 use std::collections::BTreeMap;
 
-use bigdecimal::BigDecimal;
+use bigdecimal::{num_bigint::BigInt, BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 pub use scaled::{reduce_partial_scaled, reduce_scaled};
 use serde::{Deserialize, Serialize};
@@ -277,20 +278,26 @@ pub enum ReduceError {
 /// streaming reductions pay no collection cost.
 ///
 /// Serde-serializable so a [`PartialReduction`] can be persisted whole and reloaded
-/// exactly (the merge property below survives a round-trip). For a *bounded* sidecar a
-/// caller reduces with only the streaming reductions, leaving `samples` empty and the
+/// exactly (the merge property below survives a round-trip), every decimal with its
+/// exponent (see [`exact`]). For a *bounded* sidecar a caller reduces with only the streaming reductions, leaving `samples` empty and the
 /// per-bucket state constant-sized — the exact-percentile/TWA path is what fills
 /// `samples`, so persisting those is unbounded by design.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BucketAcc {
 	count: usize,
+	#[serde(serialize_with = "exact::decimal")]
 	sum: BigDecimal,
+	#[serde(serialize_with = "exact::option")]
 	min: Option<BigDecimal>,
+	#[serde(serialize_with = "exact::option")]
 	max: Option<BigDecimal>,
+	#[serde(serialize_with = "exact::stamped")]
 	first: Option<(DateTime<Utc>, BigDecimal)>,
+	#[serde(serialize_with = "exact::stamped")]
 	last: Option<(DateTime<Utc>, BigDecimal)>,
 	/// `(timestamp, value)` pairs, populated only when `collect` is set (a percentile
 	/// or time-weighted average is requested).
+	#[serde(serialize_with = "exact::samples")]
 	samples: Vec<(DateTime<Utc>, BigDecimal)>,
 	collect: bool,
 	/// Present only when a `sketch_p*` reduction is requested; values fold in as they
@@ -371,6 +378,17 @@ impl BucketAcc {
 			_ => {}
 		}
 		Ok(())
+	}
+
+	/// Set the scale of every zero this bucket holds to `scale` (see
+	/// [`PartialReduction::rescale_zeros`]).
+	fn rescale_zeros(&mut self, scale: i64) {
+		let values = std::iter::once(&mut self.sum).chain(self.min.as_mut()).chain(self.max.as_mut()).chain(self.first.as_mut().map(|(_, v)| v)).chain(self.last.as_mut().map(|(_, v)| v)).chain(self.samples.iter_mut().map(|(_, v)| v));
+		for value in values {
+			if value.is_zero() && value.fractional_digit_count() != scale {
+				*value = BigDecimal::new(BigInt::from(0), scale);
+			}
+		}
 	}
 
 	/// Materialize the requested reductions and the grid-aligned bucket start.
@@ -531,9 +549,10 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 /// sealed segment is immutable, so a partial computed over it at seal time can never go
 /// stale, and a later cross-segment downsample can merge the stored partials instead of
 /// re-decoding every value column. A round-trip is exact (every field round-trips,
-/// including the [`DdSketch`]), so a deserialized partial merges with a freshly built one
-/// to the same result a single pass would produce — verified by
-/// `serde_round_trip_preserves_merge_exactness`.
+/// including the [`DdSketch`], and every decimal keeps its exponent), so a deserialized
+/// partial merges with a freshly built one to the same result a single pass would
+/// produce — verified by `serde_round_trip_preserves_merge_exactness` and
+/// `serde_round_trip_keeps_the_exponent_of_a_zero`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialReduction {
 	buckets: BTreeMap<i64, BucketAcc>,
@@ -558,6 +577,21 @@ impl PartialReduction {
 			}
 		}
 		Ok(())
+	}
+
+	/// Set the scale of every zero this partial holds to `scale`, so that
+	/// `as_bigint_and_exponent` reads `(0, scale)`, and leave every other value as it is.
+	///
+	/// Meant for a partial of a fixed-scale column, whose values are all
+	/// `mantissa × 10^-scale`, so every decimal a reduction of it holds, sums included, has
+	/// that scale. WeftDB 0.1.0 serialized a zero as `"0"` whatever its scale, so a partial
+	/// it persisted reads its zeros back at scale 0; this gives them the scale a reduction
+	/// of the decoded values does. The values are equal either way: the scale only shows in
+	/// exact-decimal output (`0` against `0.000`).
+	pub fn rescale_zeros(&mut self, scale: i64) {
+		for acc in self.buckets.values_mut() {
+			acc.rescale_zeros(scale);
+		}
 	}
 
 	/// Whether no points landed in this partial.
@@ -1085,6 +1119,77 @@ mod tests {
 		let bytes = postcard::to_allocvec(&original).expect("serializes");
 		let reloaded: PartialReduction = postcard::from_bytes(&bytes).expect("reloads");
 		assert_eq!(reloaded.finish(Resolution::Minutes, &aggs).expect("finishes"), original.finish(Resolution::Minutes, &aggs).expect("finishes"), "a reloaded partial finishes to the same buckets");
+	}
+
+	/// Every value of every bucket in `actual` has the digits and exponent of the same
+	/// value in `expected` (`BigDecimal` equality ignores the exponent).
+	fn assert_same_representation(actual: &[Bucket], expected: &[Bucket], label: &str) {
+		assert_eq!(actual, expected, "{label}");
+		for (a, e) in actual.iter().zip(expected) {
+			for (name, value) in &e.values {
+				assert_eq!(a.values.get(name).map(BigDecimal::as_bigint_and_exponent), Some(value.as_bigint_and_exponent()), "{label}: {name} at {}", e.timestamp);
+			}
+		}
+	}
+
+	/// Minute buckets of two samples each, every value `mantissa × 10^-scale`: both zero, a
+	/// zero `min` and `first` beside a positive value, and two opposite values (a zero `sum`
+	/// and `avg`).
+	fn zero_points(scale: i64) -> Vec<Point> {
+		let mantissas = [0, 0, 0, 5, -5, 5];
+		(0..60_i64).map(|i| Point { timestamp: Utc.timestamp_opt(i * 30, 0).single().expect("valid instant"), value: BigDecimal::new(BigInt::from(mantissas[usize::try_from(i % 6).expect("small")]), scale) }).collect()
+	}
+
+	/// A zero keeps its exponent across a round-trip. `bigdecimal` alone writes `0.000` as
+	/// `"0"`, so a reloaded partial would finish a zero `min`, `sum`, `first`, … at exponent
+	/// 0 where a single pass over the same values gives it their scale.
+	#[test]
+	fn serde_round_trip_keeps_the_exponent_of_a_zero() {
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50, Aggregation::P50, Aggregation::Twa];
+		for scale in [3, 6, 0, -2] {
+			let points = zero_points(scale);
+			let whole = reduce(&points, Resolution::Minutes, None, None, &aggs).expect("reduces");
+			assert!(whole.iter().any(|b| b.values.get("min").is_some_and(|v| v.is_zero() && v.fractional_digit_count() == scale)), "the fixture holds a zero min at scale {scale}");
+			let bytes = postcard::to_allocvec(&reduce_partial(&points, Resolution::Minutes, None, None, &aggs).expect("partial")).expect("serializes");
+			let reloaded: PartialReduction = postcard::from_bytes(&bytes).expect("reloads");
+			assert_same_representation(&reloaded.finish(Resolution::Minutes, &aggs).expect("finishes"), &whole, &format!("scale {scale}"));
+		}
+	}
+
+	/// Every decimal reads back with its digits and exponent. Only one whose exponent
+	/// `bigdecimal`'s own string can drop (a zero with fractional digits, or any negative
+	/// exponent) is written differently, as `{digits}e{exponent}`, which `bigdecimal`'s
+	/// reader (an older WeftDB's too) parses back exactly.
+	#[test]
+	fn serialization_keeps_every_exponent() {
+		#[derive(Serialize)]
+		struct Exact(#[serde(serialize_with = "exact::decimal")] BigDecimal);
+		let cases = [("0", None), ("1.500", None), ("-0.001", None), ("0.000000100", None), ("123456789.123456789", None), ("0.000", Some("0e-3")), ("1E+20", Some("1e20")), ("0E+2", Some("0e2")), ("-5E+2", Some("-5e2"))];
+		for (value, rewritten) in cases {
+			let decimal = BigDecimal::from_str(value).expect("valid decimal");
+			let bytes = postcard::to_allocvec(&Exact(decimal.clone())).expect("serializes");
+			match rewritten {
+				None => assert_eq!(bytes, postcard::to_allocvec(&decimal).expect("serializes"), "{value} is written as bigdecimal writes it"),
+				Some(written) => assert_eq!(postcard::from_bytes::<&str>(&bytes).expect("a string"), written, "{value}"),
+			}
+			let read: BigDecimal = postcard::from_bytes(&bytes).expect("reads");
+			assert_eq!(read.as_bigint_and_exponent(), decimal.as_bigint_and_exponent(), "{value} reads back exactly");
+		}
+	}
+
+	/// `rescale_zeros` gives the zeros of a partial that an older version persisted (written
+	/// `"0"`, so read back at exponent 0) the column's scale, and leaves every other value
+	/// alone: the partial then finishes exactly as a single pass over the scaled values.
+	#[test]
+	fn rescale_zeros_restores_the_scale_of_an_unscaled_zero() {
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50];
+		let points = zero_points(3);
+		let whole = reduce(&points, Resolution::Minutes, None, None, &aggs).expect("reduces");
+		// What a 0.1.0 sidecar reads back as: every zero at exponent 0.
+		let unscaled: Vec<Point> = points.iter().map(|p| if p.value.is_zero() { Point { value: BigDecimal::from(0), ..p.clone() } } else { p.clone() }).collect();
+		let mut partial = reduce_partial(&unscaled, Resolution::Minutes, None, None, &aggs).expect("partial");
+		partial.rescale_zeros(3);
+		assert_same_representation(&partial.finish(Resolution::Minutes, &aggs).expect("finishes"), &whole, "rescaled");
 	}
 
 	/// Re-keying a partial from a fine base to a coarser nesting resolution equals reducing
