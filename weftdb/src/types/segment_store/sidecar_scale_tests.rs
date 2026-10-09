@@ -1,8 +1,9 @@
 //! A sidecar-served downsample carries the column's decimal scale (INT-0 review,
 //! 2026-10-08): on a `ScaledI64` aspect a zero `min`, `max`, `sum`, `avg`, `first` or
 //! `last` must come back as `(0, scale)`, the representation `read_time_range` + `reduce`
-//! gives it, not as `(0, 0)`. `BigDecimal` equality ignores the exponent, so every
-//! comparison here is on `as_bigint_and_exponent`.
+//! gives it, not as `(0, 0)`, and on a `Decimal128` one every value keeps its own scale.
+//! `BigDecimal` equality ignores the scale, so every comparison here is on
+//! `as_bigint_and_exponent`.
 
 use std::str::FromStr;
 
@@ -38,13 +39,13 @@ struct Seg {
 /// sits alone in hour 2; and `d`, every bucket summing to zero, alone in hour 3.
 const SEGMENTS: [Seg; 5] = [Seg { start: 0, pattern: |k| k % 5 }, Seg { start: 1_200, pattern: |k| (k + 2) % 5 }, Seg { start: 5, pattern: |_| 0 }, Seg { start: 7_200, pattern: |_| 0 }, Seg { start: 10_800, pattern: |_| 3 }];
 
-fn rows(seg: &Seg, scale: u8) -> (Vec<i64>, Vec<BigDecimal>) {
+fn rows(seg: &Seg, scale: i64) -> (Vec<i64>, Vec<BigDecimal>) {
 	let mut ts = Vec::new();
 	let mut vs = Vec::new();
 	for k in 0..10 {
 		for (j, &m) in PATTERNS[(seg.pattern)(k)].iter().enumerate() {
 			ts.push(seg.start + (k as i64) * 60 + (j as i64) * 10);
-			vs.push(BigDecimal::new(BigInt::from(m), i64::from(scale)));
+			vs.push(BigDecimal::new(BigInt::from(m), scale));
 		}
 	}
 	(ts, vs)
@@ -88,11 +89,12 @@ async fn assert_matches(store: &SegmentStore, expected: &[Vec<Bucket>], label: &
 	assert!(mismatches.is_empty(), "{label}: {} values differ in digits or exponent:\n{}", mismatches.len(), mismatches.join("\n"));
 }
 
-/// Seal the fixture at `scale` into a fresh store writing sidecars, and return it with
-/// its descriptors and the decode-then-reduce answers, taken while the frames exist.
-async fn fixture(dir: &TempDir, scale: u8) -> (SegmentStore, Vec<SegmentDescriptor>, Vec<Vec<Bucket>>) {
+/// Seal the fixture at `scale` into a fresh store of `physical` columns writing sidecars,
+/// and return it with its descriptors and the decode-then-reduce answers, taken while the
+/// frames exist.
+async fn fixture(dir: &TempDir, physical: PhysicalType, scale: i64) -> (SegmentStore, Vec<SegmentDescriptor>, Vec<Vec<Bucket>>) {
 	let store = SegmentStore::open(dir.path()).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at_tiered(BASE, 1, &TIERS));
-	let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale }, BigDecimal::from_str("0").expect("parses"), TimeUnit::Seconds);
+	let schema = AspectSchema::new(physical, BigDecimal::from_str("0").expect("parses"), TimeUnit::Seconds);
 	store.declare(ASPECT, &schema).await.expect("declares");
 	let mut descriptors = Vec::new();
 	for seg in &SEGMENTS {
@@ -103,9 +105,11 @@ async fn fixture(dir: &TempDir, scale: u8) -> (SegmentStore, Vec<SegmentDescript
 		assert!(store.load_partial_sidecar(ASPECT, descriptor).await.expect("loads").is_some(), "segment {} has a sidecar", descriptor.id);
 	}
 	let expected = decode_then_reduce(&store).await;
-	// The fixture has zeros to lose: at least one zero in each streaming reduction.
-	for name in ["min", "max", "sum", "avg", "first", "last"] {
-		assert!(expected.iter().flatten().any(|b| b.values.get(name).is_some_and(|v| v.as_bigint_and_exponent() == (BigInt::from(0), i64::from(scale)))), "the fixture yields a zero {name} at scale {scale}");
+	// The fixture has zeros to lose: at least one zero in each streaming reduction. (A sum
+	// starts at scale 0, so under a negative scale only the others carry it.)
+	let names: &[&str] = if scale > 0 { &["min", "max", "sum", "avg", "first", "last"] } else { &["min", "max", "first", "last"] };
+	for name in names {
+		assert!(expected.iter().flatten().any(|b| b.values.get(*name).is_some_and(|v| v.as_bigint_and_exponent() == (BigInt::from(0), scale))), "the fixture yields a zero {name} at scale {scale}");
 	}
 	(store, descriptors, expected)
 }
@@ -123,7 +127,7 @@ fn remove_frames(descriptors: &[SegmentDescriptor]) {
 async fn sidecar_served_downsample_keeps_the_column_scale() {
 	for scale in [3, 4, 6] {
 		let dir = TempDir::new().expect("tempdir");
-		let (store, descriptors, expected) = fixture(&dir, scale).await;
+		let (store, descriptors, expected) = fixture(&dir, PhysicalType::ScaledI64 { scale }, i64::from(scale)).await;
 		assert_matches(&store, &expected, &format!("scale {scale}, frames present")).await;
 		remove_frames(&descriptors);
 		assert_matches(&store, &expected, &format!("scale {scale}, sidecars only")).await;
@@ -137,10 +141,10 @@ async fn sidecar_served_downsample_keeps_the_column_scale() {
 async fn sidecars_with_unscaled_zeros_are_served_at_the_column_scale() {
 	for scale in [3, 4, 6] {
 		let dir = TempDir::new().expect("tempdir");
-		let (store, descriptors, expected) = fixture(&dir, scale).await;
+		let (store, descriptors, expected) = fixture(&dir, PhysicalType::ScaledI64 { scale }, i64::from(scale)).await;
 		// Rewrite each sidecar as an older version read it back: every zero at exponent 0.
 		for (seg, descriptor) in SEGMENTS.iter().zip(&descriptors) {
-			let (ts, vs) = rows(seg, scale);
+			let (ts, vs) = rows(seg, i64::from(scale));
 			let points: Vec<Point> = ts.iter().zip(vs).map(|(t, v)| Point::new(DateTime::from_timestamp(*t, 0).expect("instant"), if v.is_zero() { BigDecimal::from(0) } else { v })).collect();
 			let partial = reduce_partial(&points, BASE, None, None, &SIDECAR_AGGREGATIONS).expect("reduces");
 			let sidecar = PartialSidecar::materialize(BASE, descriptor, partial, &TIERS).expect("materializes");
@@ -148,5 +152,18 @@ async fn sidecars_with_unscaled_zeros_are_served_at_the_column_scale() {
 		}
 		remove_frames(&descriptors);
 		assert_matches(&store, &expected, &format!("scale {scale}, unscaled sidecars")).await;
+	}
+}
+
+/// A `Decimal128` column keeps each value's own scale, so no load-time rescale applies:
+/// only the serializer carries a zero's scale, and a negative scale (`5E+2`), through the
+/// sidecar.
+#[tokio::test]
+async fn decimal128_sidecars_keep_each_values_scale() {
+	for scale in [3, -2] {
+		let dir = TempDir::new().expect("tempdir");
+		let (store, descriptors, expected) = fixture(&dir, PhysicalType::Decimal128, scale).await;
+		remove_frames(&descriptors);
+		assert_matches(&store, &expected, &format!("decimal128 at scale {scale}, sidecars only")).await;
 	}
 }

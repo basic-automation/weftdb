@@ -279,9 +279,10 @@ pub enum ReduceError {
 ///
 /// Serde-serializable so a [`PartialReduction`] can be persisted whole and reloaded
 /// exactly (the merge property below survives a round-trip), every decimal with its
-/// exponent (see [`exact`]). For a *bounded* sidecar a caller reduces with only the streaming reductions, leaving `samples` empty and the
-/// per-bucket state constant-sized — the exact-percentile/TWA path is what fills
-/// `samples`, so persisting those is unbounded by design.
+/// scale (see [`exact`]). For a *bounded* sidecar a caller reduces with only the
+/// streaming reductions, leaving `samples` empty and the per-bucket state
+/// constant-sized — the exact-percentile/TWA path is what fills `samples`, so
+/// persisting those is unbounded by design.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BucketAcc {
 	count: usize,
@@ -382,7 +383,8 @@ impl BucketAcc {
 
 	/// Set the scale of every zero this bucket holds to `scale` (see
 	/// [`PartialReduction::rescale_zeros`]).
-	fn rescale_zeros(&mut self, scale: i64) {
+	fn rescale_zeros(&mut self, scale: u32) {
+		let scale = i64::from(scale);
 		let values = std::iter::once(&mut self.sum).chain(self.min.as_mut()).chain(self.max.as_mut()).chain(self.first.as_mut().map(|(_, v)| v)).chain(self.last.as_mut().map(|(_, v)| v)).chain(self.samples.iter_mut().map(|(_, v)| v));
 		for value in values {
 			if value.is_zero() && value.fractional_digit_count() != scale {
@@ -582,13 +584,17 @@ impl PartialReduction {
 	/// Set the scale of every zero this partial holds to `scale`, so that
 	/// `as_bigint_and_exponent` reads `(0, scale)`, and leave every other value as it is.
 	///
-	/// Meant for a partial of a fixed-scale column, whose values are all
-	/// `mantissa × 10^-scale`, so every decimal a reduction of it holds, sums included, has
-	/// that scale. WeftDB 0.1.0 serialized a zero as `"0"` whatever its scale, so a partial
-	/// it persisted reads its zeros back at scale 0; this gives them the scale a reduction
-	/// of the decoded values does. The values are equal either way: the scale only shows in
-	/// exact-decimal output (`0` against `0.000`).
-	pub fn rescale_zeros(&mut self, scale: i64) {
+	/// For a partial of a fixed-scale column, whose values are all `mantissa × 10^-scale`,
+	/// so every decimal a reduction of it holds, sums included, has that scale. WeftDB
+	/// 0.1.0 serialized a zero as `"0"` whatever its scale, so a partial it persisted reads
+	/// its zeros back at scale 0; this gives them the scale a reduction of the decoded
+	/// values does. The values are equal either way: the scale only shows in exact-decimal
+	/// output (`0` against `0.000`).
+	///
+	/// Hidden because it only exists to read weftdb's v3 `.weftpart` sidecars, which its v4
+	/// sidecars (D-S15) replace; it goes with the v3 reader.
+	#[doc(hidden)]
+	pub fn rescale_zeros(&mut self, scale: u32) {
 		for acc in self.buckets.values_mut() {
 			acc.rescale_zeros(scale);
 		}
@@ -1156,10 +1162,10 @@ mod tests {
 		}
 	}
 
-	/// Every decimal reads back with its digits and exponent. Only one whose exponent
-	/// `bigdecimal`'s own string can drop (a zero with fractional digits, or any negative
-	/// exponent) is written differently, as `{digits}e{exponent}`, which `bigdecimal`'s
-	/// reader (an older WeftDB's too) parses back exactly.
+	/// Every decimal reads back with its digits and scale. Only one whose scale
+	/// `bigdecimal`'s own string can lose (a zero with a positive scale, or any negative
+	/// scale) is written differently, as `{digits}e{-scale}`, which `bigdecimal`'s reader
+	/// (an older WeftDB's too) parses back exactly.
 	#[test]
 	fn serialization_keeps_every_exponent() {
 		#[derive(Serialize)]
