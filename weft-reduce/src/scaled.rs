@@ -336,14 +336,25 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 	if let Some((key, acc)) = current {
 		close(key, acc);
 	}
+	Some(in_key_order(closed, ordered, ScaledAcc::merge))
+}
+
+/// Closed buckets in ascending key order with each key once: as they are when they closed in
+/// strictly ascending order (`ordered`), otherwise merged through a map.
+fn in_key_order<A>(closed: Vec<(i64, A)>, ordered: bool, merge: impl Fn(&mut A, &A)) -> Vec<(i64, A)> {
 	if ordered {
-		return Some(closed);
+		return closed;
 	}
-	let mut buckets: BTreeMap<i64, ScaledAcc> = BTreeMap::new();
+	let mut merged: BTreeMap<i64, A> = BTreeMap::new();
 	for (key, acc) in closed {
-		buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
+		match merged.entry(key) {
+			std::collections::btree_map::Entry::Occupied(mut existing) => merge(existing.get_mut(), &acc),
+			std::collections::btree_map::Entry::Vacant(slot) => {
+				slot.insert(acc);
+			}
+		}
 	}
-	Some(buckets.into_iter().collect())
+	merged.into_iter().collect()
 }
 
 /// Reduce a `ScaledI64` column (`value = mantissa × 10^-scale`) into grid-aligned buckets.
@@ -567,17 +578,20 @@ pub fn reduce_partial_points(points: &[Point], resolution: Resolution, start: Op
 		};
 		lifted.push((nanos, mantissa, scale));
 	}
-	let Some(common) = lifted.iter().map(|&(_, _, s)| s).max() else {
+	let (Some(common), Some(least)) = (lifted.iter().map(|&(_, _, s)| s).max(), lifted.iter().map(|&(_, _, s)| s).min()) else {
 		return Ok(None);
 	};
 	if common > MAX_COMMON_SCALE {
 		return Ok(None);
 	}
-	for (_, mantissa, scale) in &mut lifted {
-		let Some(m) = 10_i64.checked_pow(common - *scale).and_then(|f| mantissa.checked_mul(f)) else {
-			return Ok(None);
-		};
-		*mantissa = m;
+	// A series stored at one scale (the usual case) is already at the common scale.
+	if least < common {
+		for (_, mantissa, scale) in &mut lifted {
+			let Some(m) = 10_i64.checked_pow(common - *scale).and_then(|f| mantissa.checked_mul(f)) else {
+				return Ok(None);
+			};
+			*mantissa = m;
+		}
 	}
 	let bound = |b: Option<DateTime<Utc>>| b.map(|t| t.timestamp_nanos_opt()).map_or(Some(None), |n| n.map(Some));
 	let (Some(lo), Some(hi)) = (bound(start), bound(end)) else {
@@ -586,8 +600,14 @@ pub fn reduce_partial_points(points: &[Point], resolution: Resolution, start: Op
 	let inside = |nanos: i64| lo.is_none_or(|l| nanos >= l) && hi.is_none_or(|h| nanos <= h);
 
 	// Accumulate as `accumulate` does: the current bucket stays open while samples stay in
-	// its nanosecond range, and a re-entered bucket merges with its earlier runs.
-	let mut buckets: BTreeMap<i64, PointAcc> = BTreeMap::new();
+	// its nanosecond range, closed buckets are kept in closing order, and a re-entered bucket
+	// merges with its earlier runs at the end.
+	let mut closed: Vec<(i64, PointAcc)> = Vec::new();
+	let mut ordered = true;
+	let mut close = |key: i64, acc: PointAcc| {
+		ordered &= closed.last().is_none_or(|&(last, _)| last < key);
+		closed.push((key, acc));
+	};
 	// The open bucket: its key, its state, and its nanosecond range.
 	let mut current: Option<OpenBucket> = None;
 	for (at, &(nanos, mantissa, scale)) in lifted.iter().enumerate() {
@@ -605,26 +625,29 @@ pub fn reduce_partial_points(points: &[Point], resolution: Resolution, start: Op
 			Some((key, acc, _)) if *key == base => acc.push(nanos, mantissa, scale, at),
 			_ => {
 				if let Some((key, acc, _)) = current.take() {
-					buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
+					close(key, acc);
 				}
 				current = Some((base, PointAcc::new(nanos, mantissa, scale, at), base_range(resolution, base)));
 			}
 		}
 	}
 	if let Some((key, acc, _)) = current {
-		buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
+		close(key, acc);
 	}
+	let buckets = in_key_order(closed, ordered, PointAcc::merge);
 
 	let sketching = aggregations.iter().any(|a| a.sketch_quantile().is_some());
 	let collecting = aggregations.iter().any(|a| a.needs_full_bucket());
-	let mut converted: BTreeMap<i64, BucketAcc> = BTreeMap::new();
+	// Built in ascending key order, then bulk-loaded into the map.
+	let mut converted: Vec<(i64, BucketAcc)> = Vec::with_capacity(buckets.len());
 	for (base, acc) in buckets {
 		// Exact: every sample in the bucket is a multiple of 10^(common - max_scale).
 		let sum = acc.sum / 10_i128.pow(common - acc.max_scale);
 		let sample = |at: usize| (points[at].timestamp, points[at].value.clone());
 		let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(sum), i64::from(acc.max_scale)), min: Some(points[acc.min.1].value.clone()), max: Some(points[acc.max.1].value.clone()), first: Some(sample(acc.first.1)), last: Some(sample(acc.last.1)), samples: if collecting { Vec::with_capacity(usize::try_from(acc.count).unwrap_or(0)) } else { Vec::new() }, collect: collecting, sketch: sketching.then(DdSketch::with_default_accuracy) };
-		converted.insert(base, state);
+		converted.push((base, state));
 	}
+	let mut converted: BTreeMap<i64, BucketAcc> = converted.into_iter().collect();
 	if sketching || collecting {
 		let mut ordered: Vec<(i64, &mut BucketAcc)> = converted.iter_mut().map(|(&base, acc)| (base, acc)).collect();
 		let mut current: Option<(usize, Option<(i64, i64)>)> = None;
@@ -832,17 +855,24 @@ mod tests {
 			.collect();
 		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd, Aggregation::SketchP90];
 		let window = (Some(DateTime::from_timestamp_nanos(nanos[400])), Some(DateTime::from_timestamp_nanos(nanos[3_500])));
-		for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours] {
-			for (start, end) in [(None, None), window] {
-				let fast = reduce_partial_points(&pts, resolution, start, end, &aggs).expect("reduces").expect("qualifies");
-				let reference = crate::reduce_partial_decimal(&pts, resolution, start, end, &aggs).expect("reduces");
-				assert_eq!(postcard::to_allocvec(&fast).expect("serializes"), postcard::to_allocvec(&reference).expect("serializes"), "{resolution:?} {start:?}");
-				let (a, b) = (fast.finish(resolution, &aggs).expect("finishes"), reference.finish(resolution, &aggs).expect("finishes"));
-				assert_eq!(a.len(), b.len());
-				for (x, y) in a.iter().zip(&b) {
-					assert_eq!((x.timestamp, x.count), (y.timestamp, y.count));
-					let repr = |bucket: &Bucket| bucket.values.iter().map(|(k, v)| (k.clone(), v.as_bigint_and_exponent())).collect::<Vec<_>>();
-					assert_eq!(repr(x), repr(y), "{resolution:?} bucket {}", x.timestamp);
+		// Also time-ordered (each bucket closes once, in key order) and at a single scale (no
+		// rescaling pass), the two shapes a stored series usually has.
+		let mut sorted = pts.clone();
+		sorted.sort_by_key(|p| p.timestamp);
+		let one_scale: Vec<Point> = sorted.iter().map(|p| Point { timestamp: p.timestamp, value: p.value.with_scale(4) }).collect();
+		for (series, pts) in [("mixed", &pts), ("sorted", &sorted), ("one scale", &one_scale)] {
+			for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours] {
+				for (start, end) in [(None, None), window] {
+					let fast = reduce_partial_points(pts, resolution, start, end, &aggs).expect("reduces").expect("qualifies");
+					let reference = crate::reduce_partial_decimal(pts, resolution, start, end, &aggs).expect("reduces");
+					assert_eq!(postcard::to_allocvec(&fast).expect("serializes"), postcard::to_allocvec(&reference).expect("serializes"), "{series} {resolution:?} {start:?}");
+					let (a, b) = (fast.finish(resolution, &aggs).expect("finishes"), reference.finish(resolution, &aggs).expect("finishes"));
+					assert_eq!(a.len(), b.len());
+					for (x, y) in a.iter().zip(&b) {
+						assert_eq!((x.timestamp, x.count), (y.timestamp, y.count));
+						let repr = |bucket: &Bucket| bucket.values.iter().map(|(k, v)| (k.clone(), v.as_bigint_and_exponent())).collect::<Vec<_>>();
+						assert_eq!(repr(x), repr(y), "{series} {resolution:?} bucket {}", x.timestamp);
+					}
 				}
 			}
 		}

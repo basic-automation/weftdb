@@ -1761,6 +1761,14 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       hourly `sum` 4.42 → 3.05 ms. Per-segment arms moved within the box's noise (the decode
       dominates). What is left per bucket is the API's own shape: a `String` key and a
       `BTreeMap` node per value, and the `BigDecimal` itself.
+    - [x] **DONE (2026-10-11) — the same for `reduce` on `BigDecimal` points**
+      (`reduce_partial_points`): ordered buckets close into a `Vec`, the partial's map is
+      bulk-built, and the rescaling pass is skipped when every value has the common scale (the
+      representation test now also runs sorted and single-scale series against the `BigDecimal`
+      reference). Hourly on 1M real closes, criterion A/B, f64 control flat: `avg` 24.09 → 20.96
+      ms, `sum` 21.57 → 19.19 ms (~10× f64). Measured split on 1M two-decimal points before it:
+      lifting values out of `BigDecimal` ~3 ms, accumulation ~3 ms, building the partial's
+      `BucketAcc`s (five `BigDecimal` clones per bucket) ~4 ms, finishing ~2 ms.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in
