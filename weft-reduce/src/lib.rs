@@ -1345,7 +1345,7 @@ mod tests {
 		let mut empty = reduce_partial(&[], Resolution::Minutes, None, None, &[Aggregation::Sum]).expect("partial");
 		assert!(empty.is_empty());
 		empty.merge(reduce_partial(&[], Resolution::Minutes, None, None, &[Aggregation::Sum]).expect("partial")).expect("merges");
-		assert!(empty.finish(Resolution::Minutes, &[Aggregation::Sum]).expect("finishes").is_empty());
+		assert_eq!(empty.finish(Resolution::Minutes, &[Aggregation::Sum]).expect("finishes"), Vec::<Bucket>::new());
 	}
 
 	#[test]
