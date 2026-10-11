@@ -1142,7 +1142,7 @@ any write, never purge an unproven frame), with its unfinished work on `durabili
   - [ ] **PAC-5a** Configuration registry skeleton: one `VarSpec` registry (absorbs FRE-11, ROB-10's knobs)
   - [ ] **TAG-3** Open `ValueKind` in weftdb, provenance scope; rewords the **B-tags** gate and backlog item
   - [ ] **EVI-1** Claims hygiene: links, contradicted wording, precision, memory, cadence, corpus protection
-  - [ ] **EVI-3** Run manifest v20: runtime provenance, secret-safe capture, reference_grade verdict
+  - [ ] **EVI-3** Run manifest (schema v23: the 2026-10-09 routine took v20–v22, so EVI-3 takes the next free number per the plan's rule): runtime provenance, secret-safe capture, reference_grade verdict
   - [ ] **EVI-9** Block missingness and scale presets
   - [ ] **SOA-1** Soak harness skeleton: profile, `weft-bench soak` CLI, cross-platform supervisor, capability probe
 - [ ] **W2 · Error contract, frame format, portable builds** — ticks **CI** (EVI-5's nightly benchmark-regression job) and **Crate publishing split** (FRE-1 + PAC-3)
@@ -1621,6 +1621,35 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
 
 ## Immediate next actions
 
+- [ ] **START HERE (filed 2026-10-11 for the next run).** The 2026-10-11 run (PR `routine/dsp-2026-10-11`)
+  stacked the open 2026-10-09 routine (#75) on main (one conflict, `weft-reduce/src/lib.rs`), so
+  merging it lands both. It stayed in the free `weft-reduce` lane: integer-path bookkeeping (hourly
+  `avg` ~3.1× → ~2.1× f64), the same for `reduce` on points (~−13%), and integer time-weighted
+  averages identical in representation (`avg,p99,twa` ~2.6–3× on real prices); the dense sketch
+  store was measured and dropped; the storage generators were shown to flatter reads 1.5–2.7×.
+  Recommended order:
+  1. **Owner:** merge this PR (it carries #75); pick up the `POST /api/v1/downsample` token bug for
+     FRE-5 (filed below under Phase 5's compute-endpoint items).
+  2. **Free lane, measurable:** the per-bucket `BucketAcc` build on the points path (five
+     `BigDecimal` clones per bucket, ~4 ms of ~11 per 1M points) and exact percentiles over
+     integer mantissas in `finish` (compare `(i64, index)` instead of `BigDecimal`) — both must keep
+     results identical in representation.
+  3. **Bench:** a representative storage generator or real-corpus quick-start commands (filed
+     under the generator audit); a cross-engine TWA arm (below) once EVI-13's adapter exists.
+- [ ] **Research (2026-10-11) — the exact TWA is now a measurable differentiator.** QuestDB 9.3.3
+  added `twap(price, timestamp)`: step-function (LOCF) integration returning `double`, falling back
+  to the arithmetic mean when every observation shares one timestamp — the same semantics as
+  WeftDB's `twa`, in floating point. TimescaleDB's `time_weight(method, ts, value DOUBLE PRECISION)`
+  offers `LOCF` and `linear`/`trapezoidal` — WeftDB's `twa` and `twa_linear` — also only over
+  `double`. So a Weft-Bench TWA arm (hourly `twa`/`twa_linear` on the real corpus) compares an exact
+  decimal result against two engines' `double` results at a now-comparable cost, and should report
+  the `double` engines' deviation from the exact value beside the timings. Depends on EVI-13's
+  adapter shape (DuckDB first); QuestDB and TimescaleDB arms come after. `bigdecimal` 0.4.11 is
+  still the latest release, so the TWA emulation's operator rules (filed under the decimal tax)
+  stand. *(src: https://questdb.com/docs/query/functions/aggregation/ ·
+  https://questdb.com/blog/questdb-9-3-3-release/ ·
+  https://www.tigerdata.com/docs/api/latest/hyperfunctions/time-weighted-calculations/time_weight ·
+  https://github.com/akubera/bigdecimal-rs/releases)*
 - [ ] **START HERE (filed 2026-10-09 for the next run).** The 2026-10-09 run (PR `routine/dsp-2026-10-09`)
   worked the lanes no other session owns (weft-reduce, weft-bench, a new `weftdb` child module) and
   filed the lane-owned follow-ups instead of landing them. Recommended order:
@@ -1630,7 +1659,7 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
      L-COMPUTE), and `?fill=` on the downsample endpoints (L-COMPUTE / L-STORAGE-READ).
   2. **EVI-10A review:** `SegmentStore::interpolate_range` / `_f64` already have the form decision 18
      asks for; the evidence track adopts or reshapes them.
-  3. **Free-lane residue:** the sketch's dense bin store (keeps the sidecar's serde form; the
+  3. **Free-lane residue:** ~~the sketch's dense bin store~~ (measured 2026-10-11, no win; see the sketch list) (keeps the sidecar's serde form; the
      sketch is now the costliest per-sample reduction on the integer path), arbitrary bucket
      widths for Q5's `SAMPLE BY 5s` (freeze-track API decision first), a real smooth-signal corpus
      for the spline-fill question.
