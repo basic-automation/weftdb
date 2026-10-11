@@ -1868,11 +1868,22 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       (`SyntheticParams::value_decimals`) rounds the samples; the default stays the exact
       expansion, because zero-noise accuracy scoring needs samples exactly on the truth. No
       published figure used the generator's speed.
-    - [ ] **Remaining audit:** the storage generators already emit exact two-decimal text (checked
-      2026-10-09: `point_lookup` and `range_fetch` seal the sawtooth `10000000.{i % 97:02}`, the
-      `compression` shapes are two-decimal), so the open part is whether those value patterns are
-      representative, which only a real-corpus run per workload answers; all three now have one
-      (`--pl-csv`, `--rf-csv`, `--comp-csv`).
+    - [x] **DONE (2026-10-11) — the storage generators are NOT representative; they flatter.**
+      They emit exact two-decimal text (checked 2026-10-09: `point_lookup` and `range_fetch` seal
+      the sawtooth `10000000.{i % 97:02}`, the `compression` shapes are two-decimal), but the
+      patterns compress far better than real data, and reads scale with frame bytes. 1M rows each,
+      generated vs real BTC closes (rows 3M..), back to back at load ~210, all PASS: realized
+      0.92 B/point (sawtooth, `clustered`, `trending`) and 0.53 (`jitter`) vs **4.22**; point batch
+      (128 instants) p50 0.66 vs 1.58 ms single-block, 0.51 vs 0.75 ms paged (8,192 rows/page);
+      range fetch (32 × 100 rows) 17.7 vs 48.1 ms and 9.0 vs 14.8 ms; full decode ~22M points/s
+      for every shape and the real series alike. README now warns against quoting generated storage
+      figures. Evidence: `weft-bench --point-lookup|--range-fetch|--compression` with and without
+      `--pl-csv|--rf-csv|--comp-csv database/datasets/btc_1min.csv --csv-value-col 4 --csv-skip
+      3000000` at `--*-rows 1000000`.
+    - [ ] **NEXT — a representative storage generator, or real-corpus defaults.** Either make the
+      generated storage corpus a seeded random walk with realistic decimal width (BTC-like 4.2
+      B/point) or make the README's quick-start commands for these workloads take a real CSV. The
+      sawtooth stays useful as a best-case arm, labelled as one.
     - [x] **DONE (2026-10-09) — the downsample generator emits realistic decimals:** values are
       rounded to `--ds-decimals` places (default 2; `full` keeps the pre-2026-10 binary expansion), and
       the README reduction table was re-baselined with both generators measured back to back. On 1M

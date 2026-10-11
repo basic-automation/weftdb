@@ -1436,7 +1436,13 @@ What it does today:
   (6.7×).
   The real-corpus figures in this bullet come from `btc_1min.csv`, a local file not distributed
   with the repository (see [Ingest](#ingest)); point `--pl-csv` / `--rf-csv` / `--comp-csv` /
-  `--ds-csv` at a CSV of your own to run the same workloads on real data.
+  `--ds-csv` at a CSV of your own to run the same workloads on real data. **Do not quote the
+  generated storage corpora as performance figures: they flatter WeftDB.** Measured back to back
+  on 2026-10-11 at 1M rows (load average ~210): the generators seal at 0.53–0.92 B/point against
+  4.22 for real closes, and the reads run faster in proportion: a 128-instant point batch 0.66 vs
+  1.58 ms single-block and 0.51 vs 0.75 ms paged, 32 × 100-row windows 17.7 vs 48.1 ms and 9.0 vs
+  14.8 ms. Full-decode throughput is the exception (~22M points/sec for every shape and the real
+  series). The downsample generator errs the other way (see above).
   The underlying point/range read speedups are quantified at the codec layer in
   [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs).
 - **Gap fill** (`--gap-fill`) — the shape of TSM-Bench's interpolation query Q5
