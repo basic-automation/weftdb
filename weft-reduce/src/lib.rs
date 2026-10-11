@@ -648,7 +648,12 @@ impl PartialReduction {
 	/// representable time range.
 	pub fn finish(self, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
 		let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
-		self.buckets.into_iter().map(|(base, acc)| acc.finish(resolution, base, aggregations)).collect()
+		// A loop rather than a `Result` collect, which cannot size the output from its input.
+		let mut out = Vec::with_capacity(self.buckets.len());
+		for (base, acc) in self.buckets {
+			out.push(acc.finish(resolution, base, aggregations)?);
+		}
+		Ok(out)
 	}
 
 	/// Re-key this partial from the `from` resolution it was built at to a **coarser**

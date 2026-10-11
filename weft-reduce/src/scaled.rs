@@ -287,9 +287,9 @@ const fn is_streaming(aggregation: Aggregation) -> bool {
 }
 
 /// Fold `(epoch_nanos, mantissa)` pairs into integer per-bucket state, applying the inclusive
-/// `[start, end]` filter. `None` when a bound cannot be expressed in epoch nanoseconds or the
+/// `[start, end]` filter, and return the buckets in ascending key order. `None` when a bound cannot be expressed in epoch nanoseconds or the
 /// slices differ in length (the caller falls back to the `BigDecimal` path).
-fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<BTreeMap<i64, ScaledAcc>> {
+fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<Vec<(i64, ScaledAcc)>> {
 	if epoch_nanos.len() != mantissas.len() {
 		return None;
 	}
@@ -298,9 +298,16 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 		return None;
 	};
 
-	let mut buckets: BTreeMap<i64, ScaledAcc> = BTreeMap::new();
-	// The bucket being filled. Time-ordered input stays in it until the key changes, so the
-	// map is touched once per bucket rather than once per sample, and while a sample's
+	// Closed buckets in the order they closed. Time-ordered input closes each bucket once, in
+	// ascending key order, so they need no map; any other order is merged through one at the end.
+	let mut closed: Vec<(i64, ScaledAcc)> = Vec::new();
+	let mut ordered = true;
+	let mut close = |key: i64, acc: ScaledAcc| {
+		ordered &= closed.last().is_none_or(|&(last, _)| last < key);
+		closed.push((key, acc));
+	};
+	// The bucket being filled. Time-ordered input stays in it until the key changes, so each
+	// bucket is closed once rather than touched once per sample, and while a sample's
 	// instant lies in the bucket's nanosecond range (`span`) it is not indexed at all.
 	let mut current: Option<(i64, ScaledAcc)> = None;
 	let mut span: Option<(i64, i64)> = None;
@@ -319,7 +326,7 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 			Some((key, acc)) if *key == base => acc.push(nanos, mantissa),
 			_ => {
 				if let Some((key, acc)) = current.take() {
-					buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
+					close(key, acc);
 				}
 				current = Some((base, ScaledAcc::new(nanos, mantissa)));
 				span = base_range(resolution, base);
@@ -327,10 +334,16 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 		}
 	}
 	if let Some((key, acc)) = current {
+		close(key, acc);
+	}
+	if ordered {
+		return Some(closed);
+	}
+	let mut buckets: BTreeMap<i64, ScaledAcc> = BTreeMap::new();
+	for (key, acc) in closed {
 		buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
 	}
-
-	Some(buckets)
+	Some(buckets.into_iter().collect())
 }
 
 /// Reduce a `ScaledI64` column (`value = mantissa × 10^-scale`) into grid-aligned buckets.
@@ -361,28 +374,27 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 
 	let scale = i64::from(scale);
 	let decimal = |m: i128| BigDecimal::new(BigInt::from(m), scale);
-	buckets.into_iter()
-		.map(|(base, acc)| {
-			let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
-			let sum = decimal(acc.sum);
-			let mut values: BTreeMap<String, BigDecimal> = BTreeMap::new();
-			for &agg in aggregations {
-				let value = match agg {
-					Aggregation::Min => decimal(i128::from(acc.min)),
-					Aggregation::Max => decimal(i128::from(acc.max)),
-					Aggregation::Sum => sum.clone(),
-					// The same result `reduce`'s `sum / count` produces, from integer long division.
-					Aggregation::Avg => avg_like_bigdecimal(acc.sum, scale, acc.count),
-					Aggregation::First => decimal(i128::from(acc.first.1)),
-					Aggregation::Last => decimal(i128::from(acc.last.1)),
-					_ => unreachable!("non-streaming reductions return Ok(None) above"),
-				};
-				values.insert(agg.as_str().to_string(), value);
-			}
-			Ok(Bucket { timestamp, count: usize::try_from(acc.count).unwrap_or(usize::MAX), values })
-		})
-		.collect::<Result<Vec<_>, _>>()
-		.map(Some)
+	// A loop rather than a `Result` collect, which cannot size the output from its input.
+	let mut out = Vec::with_capacity(buckets.len());
+	for (base, acc) in buckets {
+		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
+		let mut values: BTreeMap<String, BigDecimal> = BTreeMap::new();
+		for &agg in aggregations {
+			let value = match agg {
+				Aggregation::Min => decimal(i128::from(acc.min)),
+				Aggregation::Max => decimal(i128::from(acc.max)),
+				Aggregation::Sum => decimal(acc.sum),
+				// The same result `reduce`'s `sum / count` produces, from integer long division.
+				Aggregation::Avg => avg_like_bigdecimal(acc.sum, scale, acc.count),
+				Aggregation::First => decimal(i128::from(acc.first.1)),
+				Aggregation::Last => decimal(i128::from(acc.last.1)),
+				_ => unreachable!("non-streaming reductions return Ok(None) above"),
+			};
+			values.insert(agg.as_str().to_string(), value);
+		}
+		out.push(Bucket { timestamp, count: usize::try_from(acc.count).unwrap_or(usize::MAX), values });
+	}
+	Ok(Some(out))
 }
 
 /// The mergeable form of [`reduce_scaled`]: the same integer accumulation, returned as a
@@ -715,15 +727,22 @@ mod tests {
 			nanos.swap(i, (i + 11) % 5_000);
 		}
 		let mantissas: Vec<i64> = (0..5_000).map(|_| (next() % 2_000_000_000_000).cast_signed() - 1_000_000_000_000).collect();
-		let pts = points(&nanos, &mantissas, 8);
+		// The same samples time-ordered, which closes each bucket once in key order (the
+		// accumulator's no-map path), beside the shuffled order (its merge path).
+		let mut sorted: Vec<(i64, i64)> = nanos.iter().copied().zip(mantissas.iter().copied()).collect();
+		sorted.sort_by_key(|&(t, _)| t);
+		let (sorted_nanos, sorted_mantissas): (Vec<i64>, Vec<i64>) = sorted.into_iter().unzip();
 		let all = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last];
 		let window = (Some(DateTime::from_timestamp_nanos(nanos[100])), Some(DateTime::from_timestamp_nanos(nanos[4_000])));
-		for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days] {
-			for (start, end) in [(None, None), window] {
-				for aggs in [&all[..], &[][..], &[Aggregation::Avg][..]] {
-					let expected = reduce(&pts, resolution, start, end, aggs).expect("reduces");
-					let actual = reduce_scaled(&nanos, &mantissas, 8, resolution, start, end, aggs).expect("reduces").expect("streaming reductions are supported");
-					assert_eq!(actual, expected, "{resolution:?} {start:?}..{end:?} {aggs:?}");
+		for (nanos, mantissas) in [(&nanos, &mantissas), (&sorted_nanos, &sorted_mantissas)] {
+			let pts = points(nanos, mantissas, 8);
+			for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days] {
+				for (start, end) in [(None, None), window] {
+					for aggs in [&all[..], &[][..], &[Aggregation::Avg][..]] {
+						let expected = reduce(&pts, resolution, start, end, aggs).expect("reduces");
+						let actual = reduce_scaled(nanos, mantissas, 8, resolution, start, end, aggs).expect("reduces").expect("streaming reductions are supported");
+						assert_eq!(actual, expected, "{resolution:?} {start:?}..{end:?} {aggs:?}");
+					}
 				}
 			}
 		}

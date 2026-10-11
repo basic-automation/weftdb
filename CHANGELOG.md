@@ -226,6 +226,12 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **Integer-path reductions spend less per bucket** (`weft-reduce`): `reduce_scaled` and
+  `reduce_partial_scaled` close time-ordered buckets into a `Vec` instead of a map insert per
+  bucket (out-of-order input still merges through the map), `reduce_scaled` builds a bucket's
+  `sum` decimal only when `sum` is requested, and `reduce_scaled` and `PartialReduction::finish`
+  size their output once. Results are unchanged. Hourly `avg` over 1M real BTC closes went from
+  ~3.1× an `f64` loop to ~2.1–2.2× (4.26–4.61 ms against 2.06–2.07 ms in the same runs).
 - **Exact percentiles (`p50`/`p90`/`p95`/`p99`) no longer clone and sort every bucket**
   (`weft-reduce`). A single percentile selects its rank in linear time over borrowed values
   and several share one sort; only the result is cloned. Results are identical, including

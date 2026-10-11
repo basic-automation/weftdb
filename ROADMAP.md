@@ -1751,6 +1751,16 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         8.99 ms** (seven pairs 6.74–9.66 ms after; two load-spike outliers at 18.8/20.1), the
         BigDecimal `reduce` 63.2/64.4/60.0 → 54.6/53.3/55.0 ms. The exact-integer path is now
         **~4.0× f64** (2.27 ms), against QuestDB's documented ~2×.
+    - [x] **DONE (2026-10-11) — per-bucket bookkeeping off the integer path.** The accumulator
+      closes time-ordered buckets into a `Vec` (one map merge only for out-of-order input),
+      `reduce_scaled` builds `sum`'s decimal only when asked and sizes its output once, and so
+      does `PartialReduction::finish` (every downsample ends there). Results unchanged (the
+      `reduce` equality test now runs sorted and shuffled input). Criterion `decimal_tax`, load
+      average ~200, ratios against the `f64` loop in the same run: hourly `avg` `reduce_scaled`
+      6.50/7.78 ms (f64 2.08/2.54) → 4.26/4.61 ms (f64 2.06/2.07), i.e. **~3.1× → ~2.1–2.2× f64**;
+      hourly `sum` 4.42 → 3.05 ms. Per-segment arms moved within the box's noise (the decode
+      dominates). What is left per bucket is the API's own shape: a `String` key and a
+      `BTreeMap` node per value, and the `BigDecimal` itself.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in
@@ -1894,6 +1904,14 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
         unchanged). `sketch_p99`, hourly, 10 reps, three alternating pairs at load ~33: real BTC
         closes 48.3/46.2/46.7 → 35.4/36.2/35.8 ms (BigDecimal points) and 27.5/24.7/25.2 →
         18.1/18.9/17.9 ms (`--ds-scaled`); the noisier generated series gains ~5%.
+      - [x] **TRIED (2026-10-11), NO WIN — a dense bin store.** The sign stores as a ring (and then
+        a `Vec` with an in-range fast path) of counts from an offset, sparse past 4,096 buckets,
+        serializing byte-for-byte as the `BTreeMap` (tested against a map model with collapsing).
+        On real prices a bucket's sketch holds one to three bins, where a B-tree node is already a
+        short linear scan: 1 Mi samples into hourly sketches took 5.3 ms with the map against 6.4 ms
+        dense, and `weft-bench --downsample --ds-aggs sketch_p99` on 1M real closes ran 3–10%
+        slower in three alternating pairs (load ~200). Not landed. The dense form would pay only
+        for wide-range buckets (latency-like data), which no workload here measures yet.
       - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
         `DdSketch::index` computes `v.ln()` per sample. DataDog's reference sketches-java ships
         `CubicallyInterpolatedMapping`, which takes `floor(log2 v)` from the float's bits and

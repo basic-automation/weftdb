@@ -346,17 +346,22 @@ same buckets:
 
 | path | time | vs `f64` |
 |---|---|---|
-| `f64` loop (lossy baseline) | 2.27 ms | 1× |
-| `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **8.99 ms** | ~4.0× |
-| `weft_reduce::reduce` (exact, `BigDecimal` points; integer arithmetic inside since 2026-10-09) | 22.9 ms | ~10× |
+| `f64` loop (lossy baseline) | 2.06 ms | 1× |
+| `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **4.26 ms** | ~2.1× |
+| `weft_reduce::reduce` (exact, `BigDecimal` points; integer arithmetic inside since 2026-10-09) | 23.8 ms | ~11.5× |
 
-(Re-measured 2026-10-09, criterion pinned to one core; `reduce_scaled` is the median of nine
-alternating runs, 6.74–9.66 ms apart from two load-spike outliers at 18.8 and 20.1 ms. It was
-13.52 ms on 2026-10-08. `reduce` is the median of three runs, 22.9–28.3 ms; it was 52.6–53.0 ms
-before it took the integer path for points that fit, and 60.04 ms on 2026-10-08.)
+(Re-measured 2026-10-11 on a heavily loaded box (load average ~200, not pinned), each ratio taken
+against the `f64` loop in the same criterion run. `reduce_scaled` ran 4.26 and 4.61 ms against `f64`
+2.06 and 2.07 ms, i.e. 2.1–2.2×; in the same conditions before that day's change it ran 6.50 and
+7.78 ms against 2.08 and 2.54 ms, ~3.1×. The change: the integer accumulator closes time-ordered
+buckets into a `Vec` instead of inserting each into a map, builds a bucket's `sum` decimal only when
+`sum` is asked for, and sizes the output once. On 2026-10-09 `reduce_scaled` measured 8.99 ms
+(criterion pinned to one core, median of nine alternating runs) and on 2026-10-08 13.52 ms. `reduce`
+was 52.6–53.0 ms before it took the integer path for points that fit, and 60.04 ms on 2026-10-08.)
 
-QuestDB [documents ~2×](https://questdb.com/docs/query/datatypes/decimal/) for its `DECIMAL`, so
-the precision wedge still costs more here. Before this work the shipped path measured 100.65 ms
+QuestDB [documents ~2×](https://questdb.com/docs/query/datatypes/decimal/) for its `DECIMAL`; the
+integer path is now about level with that on this reduction (a ratio against each engine's own
+`DOUBLE`/`f64`, not a cross-engine timing), while the `BigDecimal`-points path still costs ~11×. Before this work the shipped path measured 100.65 ms
 (~43×). Three changes closed most of the gap: integer
 accumulation; computing each bucket's `avg` by integer long division that reproduces
 `bigdecimal`'s quotient digit for digit; and, for an average that never terminates (most of
