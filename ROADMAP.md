@@ -1769,6 +1769,21 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       ms, `sum` 21.57 → 19.19 ms (~10× f64). Measured split on 1M two-decimal points before it:
       lifting values out of `BigDecimal` ~3 ms, accumulation ~3 ms, building the partial's
       `BucketAcc`s (five `BigDecimal` clones per bucket) ~4 ms, finishing ~2 ms.
+    - [x] **DONE (2026-10-11) — time-weighted averages on integers.** Measured first: on 1M
+      two-decimal samples hourly, `finish` took 94 ms for `twa` and 180 ms for `twa_linear` against
+      15 ms to collect the samples. `scaled::twa_scaled` replays the `BigDecimal` loop on
+      `(i128 digits, scale)` pairs, following `bigdecimal` 0.4's `Mul` (a value of exactly one
+      returns `dt` at scale 0), `Add` (a zero operand raises the other's scale by up to 15),
+      `AddAssign` (zero terms skipped, a zero accumulator replaced) and `Div` (through
+      `avg_like_bigdecimal`), and declines (falls back) on a scale past 17, an overflow or no time
+      spread. A differential test over 6,000 random buckets (scales 0–19, mixed scales, zeros, ±1,
+      near-`i64::MAX` mantissas, duplicate and sub-millisecond instants, shuffled order, bucket ends
+      before and after the last sample) compares `(digits, scale)` against the untouched
+      `BigDecimal` loop. Criterion per stored segment (decode + reduce, real 1 Mi-row frame):
+      `scaled_avg_p99_twa` 155.2 → 79.1 ms, `bigdecimal_avg_p99_twa` 197.0 → 119.5 ms. Hourly on
+      1M real closes (weft-bench, all PASS): `avg,p99,twa` 150 → 55–58 ms (points) and 119 → 38 ms
+      (`--ds-scaled`); `twa_linear` 223–229 → 71–82 and 160–170 → 42–54 ms. Re-check on a
+      `bigdecimal` upgrade: the emulation follows 0.4.11's operator code.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in

@@ -226,6 +226,13 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **Time-weighted averages run on integers** (`weft-reduce`): `twa`, `twa_linear` and
+  `twa_bucket_end` over samples with `i64` mantissas at scales up to 17 compute the weighted sum
+  in `i128` and divide once with the integer long division `avg` uses, reproducing the `BigDecimal`
+  result in value and representation (including `bigdecimal`'s special cases for a value of one
+  and for zeros); other samples take the `BigDecimal` loop as before. Hourly `avg,p99,twa` over 1M
+  real BTC closes: 150 → 55–58 ms on points, 119 → 38 ms on stored mantissas; per stored segment
+  (decode included) 155 → 79 ms.
 - **Integer-path reductions spend less per bucket** (`weft-reduce`): `reduce_scaled` and
   `reduce_partial_scaled` close time-ordered buckets into a `Vec` instead of a map insert per
   bucket (out-of-order input still merges through the map), `reduce_scaled` builds a bucket's

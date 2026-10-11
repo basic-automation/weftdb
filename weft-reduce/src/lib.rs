@@ -467,6 +467,13 @@ fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)], method: TwaMet
 	if samples.len() == 1 && bucket_end.is_none() {
 		return Some(samples[0].1.clone());
 	}
+	// One-scale samples (a stored `ScaledI64` column, or prices) take the identical integer path.
+	Some(scaled::twa_scaled(samples, method == TwaMethod::Linear, bucket_end).unwrap_or_else(|| twa_decimal(samples, method, bucket_end)))
+}
+
+/// [`time_weighted_average`] in `BigDecimal` arithmetic, for two or more samples or a
+/// `bucket_end`: the reference [`scaled::twa_scaled`] reproduces.
+fn twa_decimal(samples: &[(DateTime<Utc>, BigDecimal)], method: TwaMethod, bucket_end: Option<DateTime<Utc>>) -> BigDecimal {
 	let mut ordered: Vec<&(DateTime<Utc>, BigDecimal)> = samples.iter().collect();
 	ordered.sort_by_key(|(t, _)| *t);
 	let mut weighted = BigDecimal::from(0);
@@ -498,9 +505,9 @@ fn time_weighted_average(samples: &[(DateTime<Utc>, BigDecimal)], method: TwaMet
 		// Degenerate: all samples within one millisecond — no time spread to weight by,
 		// so report the plain arithmetic mean.
 		let sum: BigDecimal = samples.iter().map(|(_, v)| v.clone()).sum();
-		return Some(sum / BigDecimal::from(samples.len() as u64));
+		return sum / BigDecimal::from(samples.len() as u64);
 	}
-	Some(weighted / BigDecimal::from(total_ms))
+	weighted / BigDecimal::from(total_ms)
 }
 
 /// The nearest-rank percentile of `samples`: the value at rank `ceil(rank/100 * n)`

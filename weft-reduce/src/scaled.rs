@@ -281,6 +281,95 @@ pub fn avg_of_sum(sum: &BigDecimal, count: u64) -> BigDecimal {
 	i128::try_from(&digits).map_or_else(|_| sum / &BigDecimal::from(count), |int| avg_like_bigdecimal(int, scale, count))
 }
 
+/// The time-weighted average [`time_weighted_average`](crate::time_weighted_average) returns
+/// for `samples`, computed on integers, or `None` when it cannot be (the caller then takes the
+/// `BigDecimal` path).
+///
+/// It applies when every sample has an `i64` mantissa at a scale in `0..=17` and a nanosecond
+/// epoch, and the weighted sum fits `i128`. The result is identical **in representation**, not
+/// just in value, because it reproduces the `(digits, scale)` the `BigDecimal` loop builds,
+/// step by step, from `bigdecimal` 0.4's own rules:
+///
+/// - a term `value * dt` (owned operands) keeps `(m·dt, s)`, except that a value of exactly
+///   one (`m == 10^s`) returns `dt` itself, `(dt, 0)`; the bucket-end term `&value * dt`
+///   multiplies through, `(m·dt, s)`, with no such case;
+/// - the linear method's `a + b` is the exact sum at the larger scale, except that a zero
+///   operand returns the other one with its scale raised by the zero's excess scale (at most
+///   15); `/ 2` is then [`avg_like_bigdecimal`];
+/// - `weighted += term` skips a zero term, replaces a zero accumulator outright, and otherwise
+///   aligns both to the larger scale;
+/// - the final `weighted / total_ms` is [`avg_like_bigdecimal`].
+///
+/// The degenerate case (no time spread) and a lone sample are left to the caller.
+pub fn twa_scaled(samples: &[(DateTime<Utc>, BigDecimal)], linear: bool, bucket_end: Option<DateTime<Utc>>) -> Option<BigDecimal> {
+	const NANOS_PER_MILLI: i64 = 1_000_000;
+	if samples.len() < 2 && bucket_end.is_none() {
+		return None;
+	}
+	let mut lifted: Vec<(i64, i64, i64)> = Vec::with_capacity(samples.len());
+	for (t, v) in samples {
+		let (digits, scale) = v.as_bigint_and_scale();
+		if !(0..=17).contains(&scale) {
+			return None;
+		}
+		lifted.push((t.timestamp_nanos_opt()?, digits.to_i64()?, scale));
+	}
+	lifted.sort_by_key(|&(t, _, _)| t);
+	let up = |x: i128, by: i64| u32::try_from(by).ok().and_then(|by| 10_i128.checked_pow(by)).and_then(|p| x.checked_mul(p));
+	let mut weighted = (0_i128, 0_i64);
+	let mut add = |(int, scale): (i128, i64)| -> Option<()> {
+		if int == 0 {
+			return Some(());
+		}
+		if weighted.0 == 0 {
+			weighted = (int, scale);
+			return Some(());
+		}
+		weighted = match weighted.1.cmp(&scale) {
+			std::cmp::Ordering::Less => (up(weighted.0, scale - weighted.1)?.checked_add(int)?, scale),
+			std::cmp::Ordering::Greater => (weighted.0.checked_add(up(int, weighted.1 - scale)?)?, weighted.1),
+			std::cmp::Ordering::Equal => (weighted.0.checked_add(int)?, scale),
+		};
+		Some(())
+	};
+	let mut total_ms: i64 = 0;
+	if let (Some(end), Some(&(last_t, last_m, last_s))) = (bucket_end, lifted.last()) {
+		let dt = (end.timestamp_nanos_opt()?.checked_sub(last_t)? / NANOS_PER_MILLI).max(0);
+		if dt > 0 {
+			add((i128::from(last_m).checked_mul(i128::from(dt))?, last_s))?;
+			total_ms = total_ms.checked_add(dt)?;
+		}
+	}
+	for pair in lifted.windows(2) {
+		let dt = (pair[1].0.checked_sub(pair[0].0)? / NANOS_PER_MILLI).max(0);
+		if dt > 0 {
+			let ((_, ma, sa), (_, mb, sb)) = (pair[0], pair[1]);
+			let (m, s) = if linear {
+				let (sum, scale) = match (ma, mb) {
+					(_, 0) => (up(i128::from(ma), (sb - sa).clamp(0, 15))?, sa + (sb - sa).clamp(0, 15)),
+					(0, _) => (up(i128::from(mb), (sa - sb).clamp(0, 15))?, sb + (sa - sb).clamp(0, 15)),
+					_ if sa >= sb => (i128::from(ma).checked_add(up(i128::from(mb), sa - sb)?)?, sa),
+					_ => (up(i128::from(ma), sb - sa)?.checked_add(i128::from(mb))?, sb),
+				};
+				let half = avg_like_bigdecimal(sum, scale, 2);
+				let (digits, scale) = half.as_bigint_and_scale();
+				(digits.to_i128()?, scale)
+			} else {
+				(i128::from(ma), sa)
+			};
+			// `is_one_quickcheck` answers for scales up to 19; past that, decline.
+			if s > 19 {
+				return None;
+			}
+			let one = up(1, s) == Some(m);
+			add(if one { (i128::from(dt), 0) } else { (m.checked_mul(i128::from(dt))?, s) })?;
+			total_ms = total_ms.checked_add(dt)?;
+		}
+	}
+	let total = u64::try_from(total_ms).ok().filter(|&t| t > 0)?;
+	Some(avg_like_bigdecimal(weighted.0, weighted.1, total))
+}
+
 /// Whether [`reduce_scaled`] can compute `aggregation` from integer state alone.
 const fn is_streaming(aggregation: Aggregation) -> bool {
 	matches!(aggregation, Aggregation::Min | Aggregation::Max | Aggregation::Avg | Aggregation::Sum | Aggregation::First | Aggregation::Last)
@@ -731,6 +820,72 @@ mod tests {
 				assert_eq!(base_of(r, nanos), crate::bucket_index(r, &t).expect("indexable"), "{r:?} at {nanos}");
 			}
 		}
+	}
+
+	#[test]
+	fn twa_scaled_is_the_bigdecimal_twa_in_representation() {
+		use crate::{twa_decimal, TwaMethod};
+		// Random buckets, one-scale and mixed-scale, both methods, with and without a bucket end;
+		// values include zeros, exactly one and minus one at the scale (the multiplication's
+		// special case), cancelling signs and mantissas near `i64::MAX` (the overflow fallback);
+		// instants include duplicates, sub-millisecond gaps and shuffled order.
+		let mut next = noise(0x510e_527f_ade6_82d1);
+		let (mut compared, mut mixed, mut fell_back) = (0_u32, 0_u32, 0_u32);
+		for round in 0..6_000_u64 {
+			let scale = (next() % 20).cast_signed();
+			let unit = 10_i64.checked_pow(u32::try_from(scale).unwrap_or(0)).unwrap_or(1);
+			let len = usize::try_from(next() % 12).unwrap_or(0) + 1;
+			let mut t = 1_700_000_000_000_000_000_i64 + (next() % 1_000_000_000_000).cast_signed();
+			let mut samples: Vec<(DateTime<Utc>, BigDecimal)> = (0..len)
+				.map(|_| {
+					t += match next() % 6 {
+						0 => 0,
+						1 => (next() % 999_999).cast_signed(),
+						2 => 1_000_000,
+						_ => (next() % 120_000_000_000).cast_signed(),
+					};
+					let m = match next() % 9 {
+						0 => 0,
+						1 => unit,
+						2 => -unit,
+						3 => i64::MAX - (next() % 1_000).cast_signed(),
+						4 => (next() % 200).cast_signed() - 100,
+						_ => (next() % 4_000_000_000_000).cast_signed() - 2_000_000_000_000,
+					};
+					// A third of the rounds mix scales within the bucket, as decimal text does
+					// (`9.0` beside `9.01`); some of those carry a scale past the integer path.
+					let scale = if round % 3 == 1 { (next() % 20).cast_signed() } else { scale };
+					let m = if round % 3 == 1 { m % 1_000_000_000_000_000 } else { m };
+					(DateTime::from_timestamp_nanos(t), BigDecimal::new(BigInt::from(m), scale))
+				})
+				.collect();
+			if round % 3 == 0 {
+				samples.reverse();
+				samples.swap(0, len / 2);
+			}
+			let last = samples.iter().map(|(t, _)| *t).max().expect("non-empty");
+			let ends = [None, Some(last), Some(last + chrono::TimeDelta::milliseconds((next() % 90_000).cast_signed())), Some(last - chrono::TimeDelta::milliseconds(3))];
+			for end in ends {
+				for (linear, method) in [(false, TwaMethod::Locf), (true, TwaMethod::Linear)] {
+					if linear && end.is_some() {
+						continue;
+					}
+					let Some(fast) = twa_scaled(&samples, linear, end) else {
+						fell_back += 1;
+						continue;
+					};
+					let reference = twa_decimal(&samples, method, end);
+					assert_eq!(fast.as_bigint_and_scale(), reference.as_bigint_and_scale(), "round {round} linear {linear} end {end:?}: {samples:?}");
+					compared += 1;
+					mixed += u32::from(round % 3 == 1);
+				}
+			}
+		}
+		assert!(compared > 10_000 && mixed > 2_000 && fell_back > 1_000, "every path exercised: {compared} compared ({mixed} mixed-scale), {fell_back} declined");
+		// A scale past 17 and a lone sample are declined.
+		let at = |s: i64| DateTime::from_timestamp_nanos(s * 1_000_000_000);
+		assert!(twa_scaled(&[(at(0), BigDecimal::new(5.into(), 1)), (at(1), BigDecimal::new(5.into(), 18))], false, None).is_none());
+		assert!(twa_scaled(&[(at(0), BigDecimal::new(5.into(), 1))], false, None).is_none());
 	}
 
 	#[test]

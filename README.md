@@ -499,6 +499,17 @@ two-decimal points **0.58 ms**, over 1M real BTC closes **6.4 ms**; the six stre
 7.6 ms, `sketch_p99` 22.3 ms (17.9–18.9 ms with the bucket cache, three runs at load average ~33)
 and `avg,p99,twa` 109.0 ms on the real series (`weft-bench --downsample --ds-scaled …`).
 
+Since 2026-10-11 the time-weighted averages run on integers too: `twa`, `twa_linear` and
+`twa_bucket_end` over samples whose mantissas fit `i64` at scales up to 17 (mixed scales included,
+as decimal text has them) reproduce the `BigDecimal` loop's result digit for digit and scale for
+scale, and only the rest take the `BigDecimal` loop. On the same 1M real closes, hourly (17,477
+buckets), against the morning's build in alternating runs at load average ~210, all PASS:
+`avg,p99,twa` 150 → 55–58 ms on points and 119 → 38 ms on stored mantissas (`--ds-scaled`);
+`twa_linear` 223–229 → 71–82 ms and 160–170 → 42–54 ms. The gain is mostly the per-bucket
+100-digit division, so it shrinks with fewer, larger buckets: on the 500k-point table series above
+(139 hourly buckets) `twa` and `twa_bucket_end` run level (22–25 ms both builds) and `twa_linear`
+78 → 53 ms.
+
 **Exact vs sketch percentiles — which to ask for.** The `p50`/`p90`/`p95`/`p99` reductions are
 *exact* nearest-rank: they return an actual observed `BigDecimal` from the bucket, but they
 materialize and sort the whole bucket, and two buckets' results cannot be combined. The
