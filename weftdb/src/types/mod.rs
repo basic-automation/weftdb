@@ -57,6 +57,7 @@ pub mod exec;
 pub(crate) mod frame_name;
 pub(crate) mod index_txn;
 pub mod input_measurement;
+pub mod interpolate_range;
 pub mod measurement;
 pub mod measurement_vector;
 pub mod metadata;

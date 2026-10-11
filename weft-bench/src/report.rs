@@ -244,6 +244,8 @@ impl BenchReport {
 		let generated = escape_html(if m.generated_at.is_empty() { "(unstamped)" } else { m.generated_at.as_str() });
 		let publishable = if self.is_publishable() { "yes" } else { "no" };
 		let hw = hardware_meta_html(m);
+		let pools: String = self.results.iter().filter_map(|r| r.gpu_pool.as_ref().map(|p| format!("<p class=\"meta\">GPU pool ({}): cap {} MiB \u{b7} {} calls \u{b7} created {} ({} after round 1) \u{b7} reused {} \u{b7} evicted {} \u{b7} idle peak {} / {} MiB (round 1 / later) \u{b7} stable: {}</p>\n", escape_html(&r.profile), p.max_pool_bytes >> 20, p.calls, p.created, p.created_after_first_round, p.reused, p.evicted, p.peak_idle_bytes_first_round >> 20, p.peak_idle_bytes_later >> 20, if p.stable { "yes" } else { "no" }))).collect();
+		let hw = format!("{hw}{pools}");
 		format!("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Weft-Bench report</title>\n<style>{style}</style>\n</head>\n<body>\n<h1>Weft-Bench report</h1>\n<p class=\"meta\">weft-bench {version} \u{b7} {os}/{arch} \u{b7} schema v{schema} \u{b7} generated {generated} \u{b7} publishable: {publishable}</p>\n{hw}<table>\n<thead><tr>{head}</tr></thead>\n<tbody>\n{rows}</tbody>\n</table>\n</body>\n</html>\n", style = HTML_STYLE, schema = self.schema_version, head = HTML_HEAD_CELLS)
 	}
 
@@ -288,7 +290,7 @@ pub fn default_html_filename(profile: &str, adapter: &str) -> String {
 const HTML_STYLE: &str = "body{font-family:system-ui,sans-serif;margin:2rem;color:#1a1a1a}h1{font-size:1.4rem}.meta{color:#555;font-size:.9rem}table{border-collapse:collapse;margin-top:1rem;font-size:.9rem}th,td{border:1px solid #ccc;padding:.3rem .6rem;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}thead{background:#f0f0f0}tr.best{background:#e7f7e7;font-weight:600}";
 
 /// Table header cells for [`BenchReport::to_html`], matching [`result_row_html`].
-const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>workload</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th><th>enc</th><th>val B/pt</th><th>tot B/pt</th>";
+const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>workload</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>1st ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th><th>enc</th><th>val B/pt</th><th>tot B/pt</th>";
 
 /// Nanoseconds rendered as fractional milliseconds for display.
 #[allow(clippy::cast_precision_loss)]
@@ -328,7 +330,7 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 /// metadata paragraph, or an empty string for a run without them.
 fn engine_meta_html(engine: Option<&EngineMetadata>) -> String {
 	let Some(engine) = engine else { return String::new() };
-	let gpu = engine.gpu.as_deref().map_or_else(|| "no GPU".to_string(), |gpu| format!("GPU {}", escape_html(gpu)));
+	let gpu = engine.describe_gpu().map_or_else(|| "no GPU".to_string(), |gpu| format!("GPU {}", escape_html(&gpu)));
 	format!("<p class=\"meta\">interpolation engine: {} \u{b7} {gpu} \u{b7} {}</p>\n", escape_html(&engine.describe_calibration()), engine.describe_thresholds())
 }
 
@@ -346,8 +348,10 @@ fn result_row_html(r: &BenchResult, is_best: bool) -> String {
 	// callers that omit it render two em-dashes so the columns stay aligned. The
 	// encoding name carries a lossy marker (`*`) so a non-exact pick is visible.
 	let storage = r.storage.as_ref().map_or_else(|| "<td>&mdash;</td><td>&mdash;</td><td>&mdash;</td>".to_string(), |s| format!("<td>{}{}</td><td>{:.2}</td><td>{:.2}</td>", escape_html(&s.physical_type), if s.is_exact { "" } else { "*" }, s.bytes_per_point, s.total_bytes_per_point));
+	// The first timed rep, apart from the warm ones (schema v21); an em-dash under two reps.
+	let first = r.cold_warm.as_ref().map_or_else(|| "&mdash;".to_string(), |c| format!("{:.3}", ms(c.first_rep_ns)));
 	let cls = if is_best { " class=\"best\"" } else { "" };
-	format!("<tr{cls}><td>{adapter}</td><td>{workload}</td><td>{shape}</td><td>{in_pts}</td><td>{out_pts}</td><td>{p50:.3}</td><td>{p95:.3}</td><td>{p99:.3}</td><td>{mean:.3}</td><td>{tput:.0}</td><td>{correctness}</td>{accuracy}{storage}</tr>\n", in_pts = r.dataset.input_points, out_pts = r.dataset.output_points, p50 = ms(l.p50_ns), p95 = ms(l.p95_ns), p99 = ms(l.p99_ns), mean = ms(l.mean_ns), tput = r.throughput_points_per_sec)
+	format!("<tr{cls}><td>{adapter}</td><td>{workload}</td><td>{shape}</td><td>{in_pts}</td><td>{out_pts}</td><td>{p50:.3}</td><td>{p95:.3}</td><td>{p99:.3}</td><td>{mean:.3}</td><td>{first}</td><td>{tput:.0}</td><td>{correctness}</td>{accuracy}{storage}</tr>\n", in_pts = r.dataset.input_points, out_pts = r.dataset.output_points, p50 = ms(l.p50_ns), p95 = ms(l.p95_ns), p99 = ms(l.p99_ns), mean = ms(l.mean_ns), tput = r.throughput_points_per_sec)
 }
 
 /// Escape the five HTML-significant characters so caller-supplied strings (adapter
@@ -385,7 +389,7 @@ mod tests {
 	};
 
 	fn sample_result(adapter: &str, publishable: bool) -> BenchResult {
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: crate::schema::TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: if publishable { 1000 } else { 0 }, values_finite: publishable }, accuracy: None, storage: None }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: crate::schema::TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: if publishable { 1000 } else { 0 }, values_finite: publishable }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None }
 	}
 
 	/// A publishable result for `adapter` carrying an accuracy report with the given
@@ -568,6 +572,18 @@ mod tests {
 		assert!(html.contains("<td>baseline-linear</td>"), "baseline-linear row missing");
 		// Two data rows.
 		assert_eq!(html.matches("<tr").count(), 3, "one header row + two data rows expected");
+	}
+
+	#[test]
+	fn to_html_shows_the_first_rep_and_the_gpu_pool() {
+		let mut with_split = result_with_rmse("weftdb", 1.0);
+		with_split.cold_warm = crate::schema::ColdWarm::from_samples(&[2_500_000, 1_000_000, 1_100_000]);
+		with_split.gpu_pool = Some(crate::gpu_memory::GpuPoolSummary { max_pool_bytes: 512 << 20, rounds: 2, calls: 6, created: 2, created_after_first_round: 0, reused: 4, evicted: 0, peak_idle_bytes_first_round: 112 << 20, peak_idle_bytes_later: 112 << 20, final_idle_bytes: 112 << 20, stable: true });
+		let html = BenchReport::with_results(metadata(), vec![with_split, result_with_rmse("baseline-linear", 1.2)]).to_html();
+		assert!(html.contains("<th>mean ms</th><th>1st ms</th>"), "{html}");
+		assert!(html.contains("<td>2.500</td>"), "the first rep in ms: {html}");
+		assert!(html.contains("cap 512 MiB") && html.contains("created 2 (0 after round 1)") && html.contains("stable: yes"), "{html}");
+		assert_eq!(html.matches("GPU pool").count(), 1, "only results with a pool summary get the line");
 	}
 
 	#[test]

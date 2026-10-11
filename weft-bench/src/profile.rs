@@ -183,6 +183,9 @@ pub struct SyntheticParams {
 	pub spline: Spline,
 	/// Output grid resolution requested of the adapter.
 	pub resolution: Resolution,
+	/// Decimal places each generated value is rounded to; `None` (the default) keeps the
+	/// `f64` sample's exact binary expansion. See [`InterpolationProfile::value_decimals`].
+	pub value_decimals: Option<u32>,
 }
 
 impl Default for SyntheticParams {
@@ -190,7 +193,7 @@ impl Default for SyntheticParams {
 	/// over a day, 20% gaps, 0.6 jitter, ±2.0 noise, a multi-sine signal, per-minute
 	/// cubic reconstruction.
 	fn default() -> Self {
-		Self { seed: DEFAULT_SEED, input_points: 480, missingness_fraction: 0.20, jitter_fraction: 0.6, noise_amplitude: DEFAULT_NOISE_AMPLITUDE, signal_shape: SignalShape::MultiSine, spline: Spline::Cubic, resolution: Resolution::Minutes }
+		Self { seed: DEFAULT_SEED, input_points: 480, missingness_fraction: 0.20, jitter_fraction: 0.6, noise_amplitude: DEFAULT_NOISE_AMPLITUDE, signal_shape: SignalShape::MultiSine, spline: Spline::Cubic, resolution: Resolution::Minutes, value_decimals: None }
 	}
 }
 
@@ -230,6 +233,16 @@ pub struct InterpolationProfile {
 	/// Where the input series comes from (synthetic generation vs a parsed
 	/// line-protocol payload). The rest of the harness is identical either way.
 	pub source: DatasetSource,
+	/// Decimal places each generated sample is rounded to (half away from zero, at most
+	/// [`MAX_VALUE_DECIMALS`](crate::downsample::MAX_VALUE_DECIMALS)), or `None` for the
+	/// sample's exact binary expansion (~50 significant digits).
+	///
+	/// `None` is the default because it keeps a zero-noise sample exactly on the analytic
+	/// ground truth, which accuracy scoring relies on. It is not representative input,
+	/// though: splimes converts every input to `f64` first, and on 100k samples a series of
+	/// ~50-digit values interpolated 2.2× slower than the same series at two decimals
+	/// (2026-10-09). Throughput runs should set it.
+	pub value_decimals: Option<u32>,
 }
 
 impl InterpolationProfile {
@@ -253,8 +266,8 @@ impl InterpolationProfile {
 	/// signal (and thus a known analytic ground truth for accuracy scoring).
 	#[must_use]
 	pub fn synthetic(name: impl Into<String>, params: SyntheticParams) -> Self {
-		let SyntheticParams { seed, input_points, missingness_fraction, jitter_fraction, noise_amplitude, signal_shape, spline, resolution } = params;
-		Self { name: name.into(), seed, input_points, missingness_fraction, jitter_fraction, noise_amplitude, signal_shape, span: Duration::days(1), spline, resolution, source: DatasetSource::Generated }
+		let SyntheticParams { seed, input_points, missingness_fraction, jitter_fraction, noise_amplitude, signal_shape, spline, resolution, value_decimals } = params;
+		Self { name: name.into(), seed, input_points, missingness_fraction, jitter_fraction, noise_amplitude, signal_shape, span: Duration::days(1), spline, resolution, source: DatasetSource::Generated, value_decimals: value_decimals.map(|p| p.min(crate::downsample::MAX_VALUE_DECIMALS)) }
 	}
 
 	/// Build a profile whose input series is parsed from an `InfluxDB`
@@ -286,7 +299,7 @@ impl InterpolationProfile {
 		if first >= last {
 			return Err(LineProtocolProfileError::ZeroSpan);
 		}
-		Ok(Self { name: name.into(), seed: 0, input_points: points.len(), missingness_fraction: 0.0, jitter_fraction: 0.0, noise_amplitude: 0.0, signal_shape: SignalShape::default(), span: last - first, spline, resolution, source: DatasetSource::LineProtocol { points } })
+		Ok(Self { name: name.into(), seed: 0, input_points: points.len(), missingness_fraction: 0.0, jitter_fraction: 0.0, noise_amplitude: 0.0, signal_shape: SignalShape::default(), span: last - first, spline, resolution, source: DatasetSource::LineProtocol { points }, value_decimals: None })
 	}
 
 	/// Start instant of the series.
@@ -424,7 +437,9 @@ impl InterpolationProfile {
 			// non-empty range, so guard the degenerate case explicitly.
 			let noise = if self.noise_amplitude > 0.0 { rng.random_range(-self.noise_amplitude..=self.noise_amplitude) } else { 0.0 };
 			let signal = self.signal_shape.evaluate(phase) + noise;
-			let value = BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(0));
+			#[allow(clippy::cast_possible_truncation)]
+			let rounded = |places: u32| BigDecimal::new(((signal * 10_f64.powi(places.cast_signed())).round() as i64).into(), i64::from(places));
+			let value = self.value_decimals.map_or_else(|| BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(0)), rounded);
 			points.push(Point { timestamp, value });
 		}
 
@@ -545,12 +560,25 @@ cpu,host=h0 usage=13.0 120\n";
 	}
 
 	#[test]
+	fn rounded_samples_keep_their_instants_and_sit_within_half_a_step_of_the_exact_ones() {
+		let exact = InterpolationProfile::synthetic("exact", SyntheticParams::default()).generate();
+		let rounded = InterpolationProfile::synthetic("rounded", SyntheticParams { value_decimals: Some(2), ..SyntheticParams::default() }).generate();
+		assert_eq!(exact.len(), rounded.len());
+		for (e, r) in exact.iter().zip(&rounded) {
+			assert_eq!(e.timestamp, r.timestamp, "rounding moves no sample");
+			assert_eq!(r.value.fractional_digit_count(), 2);
+			assert!((e.value.clone() - r.value.clone()).abs() <= BigDecimal::new(5.into(), 3), "{} vs {}", e.value, r.value);
+		}
+		assert!(exact.iter().any(|p| p.value.fractional_digit_count() > 20), "the default keeps the exact expansion");
+	}
+
+	#[test]
 	fn zero_noise_samples_lie_exactly_on_the_ground_truth() {
 		use bigdecimal::ToPrimitive;
 		// No noise: every generated sample's value must equal the analytic ground
 		// truth at its own (jittered) timestamp, so the only reconstruction error a
 		// benchmark sees is the method's own — not measurement noise.
-		let profile = InterpolationProfile::synthetic("clean", SyntheticParams { seed: 7, input_points: 100, missingness_fraction: 0.0, jitter_fraction: 0.5, noise_amplitude: 0.0, signal_shape: SignalShape::MultiSine, spline: Spline::Cubic, resolution: Resolution::Minutes });
+		let profile = InterpolationProfile::synthetic("clean", SyntheticParams { seed: 7, input_points: 100, missingness_fraction: 0.0, jitter_fraction: 0.5, noise_amplitude: 0.0, signal_shape: SignalShape::MultiSine, spline: Spline::Cubic, resolution: Resolution::Minutes, value_decimals: None });
 		let points = profile.generate();
 		assert!(points.len() >= 2);
 		for p in &points {
