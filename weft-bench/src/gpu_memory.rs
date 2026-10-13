@@ -15,8 +15,9 @@
 //! records the cap, the buffer sets created, reused and evicted, how many were created after
 //! the first round (zero means every later call reused the pool; more means eviction churn),
 //! and the peaks, beside the per-call latency. A smaller `--gm-pool-mib` shows the eviction
-//! behaviour. It needs a hardware GPU: a CPU/software adapter is refused, as the server does
-//! not calibrate onto one either.
+//! behaviour. It needs a hardware GPU with `f64` shaders: a CPU/software adapter is refused,
+//! as the server does not calibrate onto one either, and so is a device without `f64`
+//! support (such as the Apple Paravirtual device on a macOS CI runner).
 
 use std::time::Instant;
 
@@ -136,14 +137,16 @@ fn span_ns(since: Instant) -> u64 {
 ///
 /// # Errors
 ///
-/// If the cap cannot be applied (the GPU already started with another), no GPU starts, or
-/// the adapter is a CPU/software one.
+/// If the cap cannot be applied (the GPU already started with another), no GPU starts, the
+/// adapter is a CPU/software one, or it has no `f64` shader support (the workload runs
+/// `run_f64`, so such a device would fail every call).
 pub fn start_gpu(profile: &GpuMemoryProfile) -> anyhow::Result<EngineMetadata> {
 	if let Some(mib) = profile.params.pool_mib {
 		splimes::configure_gpu(GpuConfig::DEFAULT.with_max_pool_bytes(mib << 20)).map_err(|e| anyhow::anyhow!("cannot set the GPU pool cap: {e}"))?;
 	}
 	let info = splimes::prewarm_gpu().map_err(|e| anyhow::anyhow!("the gpu-memory workload needs a GPU: {e}"))?;
 	anyhow::ensure!(!is_software_adapter(&info.device_type, &info.name), "the gpu-memory workload needs a hardware GPU; {} is a CPU/software adapter", info.name);
+	anyhow::ensure!(info.supports_f64, "the gpu-memory workload runs f64 shaders; {} has no f64 shader support", info.name);
 	let gpu = format!("{} ({}, {}; f64 shaders: {})", info.name, info.api, info.device_type, if info.supports_f64 { "yes" } else { "no" });
 	Ok(EngineMetadata::new(CalibrationStatus::Disabled, Some(gpu), Some("gpu-memory workload: Backend::Gpu forced, not calibrated".to_string()), splimes::auto_thresholds()).with_gpu_driver(&info.driver))
 }

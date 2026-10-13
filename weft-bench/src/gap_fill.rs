@@ -6,7 +6,7 @@
 //! the empty ones. The workload generates a dense, seeded series (a smooth sinusoid plus a
 //! little noise, at two decimal places like the downsample generator), deletes whole
 //! **outages** (runs of consecutive buckets), and times [`weft_reduce::reduce`] followed by
-//! [`weft_reduce::fill`] over what remains.
+//! [`weft_reduce::fill()`] over what remains.
 //!
 //! Unlike the plain downsample it has a ground truth to score: the generator knows the
 //! noise-free signal under every deleted bucket, so the report's accuracy block compares
