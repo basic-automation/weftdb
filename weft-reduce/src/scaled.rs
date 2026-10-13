@@ -304,7 +304,7 @@ pub fn avg_of_sum(sum: &BigDecimal, count: u64) -> BigDecimal {
 ///
 /// The linear method's halving is [`avg_like_bigdecimal`] with a divisor of 2, which always
 /// terminates and so stays on the integer path. A divisor whose quotient may not terminate
-/// would still be correct (a long quotient falls back to the BigDecimal path) but slower.
+/// would still be correct (a long quotient falls back to the `BigDecimal` path) but slower.
 pub fn twa_scaled(samples: &[(DateTime<Utc>, BigDecimal)], linear: bool, bucket_end: Option<DateTime<Utc>>) -> Option<BigDecimal> {
 	const NANOS_PER_MILLI: i64 = 1_000_000;
 	if samples.len() < 2 && bucket_end.is_none() {
@@ -965,7 +965,7 @@ mod tests {
 		assert_eq!(avg_of_sum(&huge, 7).as_bigint_and_exponent(), (&huge / &BigDecimal::from(7_u64)).as_bigint_and_exponent());
 	}
 
-	/// The BigDecimal reference: `reduce_partial_decimal` finished. `reduce` and
+	/// The `BigDecimal` reference: `reduce_partial_decimal` finished. `reduce` and
 	/// `reduce_partial` themselves route through the integer path, so they cannot serve as
 	/// the reference for it.
 	fn decimal(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggs: &[Aggregation]) -> Vec<Bucket> {
