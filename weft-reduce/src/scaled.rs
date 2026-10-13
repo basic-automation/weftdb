@@ -921,7 +921,7 @@ mod tests {
 			for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days] {
 				for (start, end) in [(None, None), window] {
 					for aggs in [&all[..], &[][..], &[Aggregation::Avg][..]] {
-						let expected = reduce(&pts, resolution, start, end, aggs).expect("reduces");
+						let expected = decimal(&pts, resolution, start, end, aggs);
 						let actual = reduce_scaled(nanos, mantissas, 8, resolution, start, end, aggs).expect("reduces").expect("streaming reductions are supported");
 						assert_eq!(actual, expected, "{resolution:?} {start:?}..{end:?} {aggs:?}");
 					}
