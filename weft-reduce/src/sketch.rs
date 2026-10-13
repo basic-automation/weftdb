@@ -41,6 +41,43 @@ use std::collections::BTreeMap;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 
+/// Every power of ten an `f64` holds exactly: `10^0` through `10^22`.
+const EXACT_POWERS_OF_TEN: [f64; 23] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22];
+
+/// `v` as the nearest `f64`, bit-identical to `bigdecimal`'s `to_f64`.
+///
+/// It is cheaper for the common case of at most 15–16 significant digits and at most 22
+/// decimal places, which it converts by one exact division (both operands exact in `f64`, so
+/// it rounds once, as `to_f64`'s correctly rounded parse does) instead
+/// of formatting and parsing the decimal. Other values take `to_f64` itself. `None` when
+/// `to_f64` gives none.
+#[must_use]
+pub fn decimal_to_f64(v: &BigDecimal) -> Option<f64> {
+	let (digits, scale) = v.as_bigint_and_scale();
+	digits.to_i64().and_then(|m| scaled_to_f64(m, scale)).or_else(|| v.to_f64())
+}
+
+/// `mantissa × 10^-scale` as the nearest `f64`, when `|mantissa| < 2^53` and
+/// `0 <= scale <= 22`; `None` otherwise.
+///
+/// Under those bounds `mantissa as f64` and `10^scale` are both exact, so the one IEEE
+/// division rounds the exact quotient once, to nearest: the result is the correctly
+/// rounded image of the decimal. `bigdecimal`'s own `to_f64` returns that same value for
+/// such a decimal (it formats the digits as `<digits>e-<scale>` and parses them with the
+/// standard library's correctly rounded parser, trimming digits only past ~44), so this is
+/// the same `f64` without the formatting and parsing. Correct rounding also makes it
+/// independent of representation: `2.5` and `2.50` give the same `f64`.
+fn scaled_to_f64(mantissa: i64, scale: i64) -> Option<f64> {
+	const EXACT_MANTISSA: u64 = 1 << 53;
+	if mantissa.unsigned_abs() >= EXACT_MANTISSA {
+		return None;
+	}
+	let power = EXACT_POWERS_OF_TEN.get(usize::try_from(scale).ok()?)?;
+	#[allow(clippy::cast_precision_loss)]
+	let m = mantissa as f64;
+	Some(m / power)
+}
+
 /// Why a sketch could not be built or fed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SketchError {
@@ -88,7 +125,32 @@ pub struct DdSketch {
 	/// Maximum buckets per (positive/negative) store before the lowest are collapsed;
 	/// `None` leaves the sketch unbounded. See [`DdSketch::with_max_bins`].
 	max_bins: Option<usize>,
+	/// The bucket the last positive sample mapped to (see [`BinCache`]). Not part of the
+	/// sketch's value: never serialized, and ignored by equality.
+	#[serde(skip)]
+	last_bin: BinCache,
 }
+
+/// The bucket index the last positive sample mapped to, with an interval of values safely
+/// inside that bucket, so the next sample there skips the logarithm.
+///
+/// The interval is the bucket `(γ^(i−1), γ^i]` shrunk by a relative `1e-9` at each end.
+/// In index units that margin is `1e-9 / ln γ` (~5e-8 at 1% accuracy), while
+/// `ln(v) / ln γ` is off by at most ~`|ln v| · 2^-52 / ln γ` (~1e-11 even at `v = 1e300`), so
+/// a value inside the interval gets exactly the index [`DdSketch::index`] computes; anything
+/// near a boundary still computes it. Equality always holds and serde skips it, so a sketch's
+/// value, its comparisons and its persisted form do not depend on it.
+#[derive(Debug, Clone, Copy, Default)]
+struct BinCache(Option<(i32, f64, f64)>);
+
+impl PartialEq for BinCache {
+	fn eq(&self, _: &Self) -> bool {
+		true
+	}
+}
+
+/// Relative margin [`BinCache`] keeps from each bucket boundary.
+const BIN_CACHE_MARGIN: f64 = 1e-9;
 
 impl DdSketch {
 	/// A sketch guaranteeing relative accuracy `alpha` on every quantile it reports.
@@ -160,7 +222,7 @@ impl DdSketch {
 	/// Build the mapping for an already-validated `alpha`.
 	fn from_alpha(alpha: f64) -> Self {
 		let gamma = (1.0 + alpha) / (1.0 - alpha);
-		Self { alpha, gamma, log_gamma: gamma.ln(), positive: BTreeMap::new(), negative: BTreeMap::new(), zeros: 0, count: 0, max_bins: None }
+		Self { alpha, gamma, log_gamma: gamma.ln(), positive: BTreeMap::new(), negative: BTreeMap::new(), zeros: 0, count: 0, max_bins: None, last_bin: BinCache::default() }
 	}
 
 	/// Collapse `store`'s lowest buckets together until it fits `max_bins`, folding each
@@ -224,6 +286,21 @@ impl DdSketch {
 		Ok(raw as i32)
 	}
 
+	/// [`index`](Self::index) for a positive `v`, through the [`BinCache`] when `v` is safely
+	/// inside the last sample's bucket.
+	fn positive_index(&mut self, v: f64) -> Result<i32, SketchError> {
+		if let BinCache(Some((i, lo, hi))) = self.last_bin {
+			if lo < v && v < hi {
+				return Ok(i);
+			}
+		}
+		let i = self.index(v)?;
+		let (lo, hi) = ((f64::from(i) - 1.0) * self.log_gamma, f64::from(i) * self.log_gamma);
+		let (lo, hi) = (lo.exp() * (1.0 + BIN_CACHE_MARGIN), hi.exp() * (1.0 - BIN_CACHE_MARGIN));
+		self.last_bin = BinCache((lo.is_finite() && hi.is_finite() && lo < hi).then_some((i, lo, hi)));
+		Ok(i)
+	}
+
 	/// The value reported for bucket `i`: `2γⁱ/(γ+1)`, the point whose relative distance
 	/// to every value in the bucket is within `α`.
 	fn value_of(&self, i: i32) -> f64 {
@@ -241,7 +318,7 @@ impl DdSketch {
 			return Err(SketchError::ValueRange);
 		}
 		if v > 0.0 {
-			let i = self.index(v)?;
+			let i = self.positive_index(v)?;
 			*self.positive.entry(i).or_insert(0) += 1;
 		} else if v < 0.0 {
 			let i = self.index(-v)?;
@@ -263,7 +340,17 @@ impl DdSketch {
 	///
 	/// [`SketchError::ValueRange`] if the value has no finite `f64` image.
 	pub fn add_decimal(&mut self, v: &BigDecimal) -> Result<(), SketchError> {
-		self.add(v.to_f64().ok_or(SketchError::ValueRange)?)
+		self.add(decimal_to_f64(v).ok_or(SketchError::ValueRange)?)
+	}
+
+	/// Fold in the sample `mantissa × 10^-scale` (a `ScaledI64` value), as
+	/// [`add_decimal`](Self::add_decimal) would fold the equal `BigDecimal`, without
+	/// building one when [`scaled_to_f64`] applies.
+	pub(crate) fn add_scaled(&mut self, mantissa: i64, scale: i64) -> Result<(), SketchError> {
+		match scaled_to_f64(mantissa, scale) {
+			Some(f) => self.add(f),
+			None => self.add_decimal(&BigDecimal::new(mantissa.into(), scale)),
+		}
 	}
 
 	/// Merge `other` into `self`. Exact: the result is the sketch that feeding every
@@ -356,6 +443,105 @@ impl DdSketch {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn scaled_to_f64_is_bigdecimals_to_f64() {
+		let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+		let mut next = move || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state
+		};
+		let limit = (1_i64 << 53) - 1;
+		let edges = [0, 1, -1, 7, -7, 5, 25, 1_234_567_891, limit, -limit, limit - 1, 4_503_599_627_370_497];
+		for scale in 0..=22_i64 {
+			let random = (0..4_000).map(|i| {
+				// Mix full-range mantissas with short ones (prices), both signs.
+				let m = (next() % (1 << 53)).cast_signed();
+				let m = if i % 2 == 0 { m } else { m % 1_000_000 };
+				if next() % 2 == 0 {
+					m
+				} else {
+					-m
+				}
+			});
+			for m in edges.into_iter().chain(random) {
+				let expected = BigDecimal::new(m.into(), scale).to_f64().expect("finite");
+				let got = scaled_to_f64(m, scale).expect("in range");
+				assert_eq!(got.to_bits(), expected.to_bits(), "{m}e-{scale}: {got} vs {expected}");
+			}
+		}
+		// Outside the bounds it declines, and the sketch falls back to `to_f64`.
+		assert_eq!(scaled_to_f64(1 << 53, 2), None);
+		assert_eq!(scaled_to_f64(i64::MIN, 2), None);
+		assert_eq!(scaled_to_f64(5, 23), None);
+		assert_eq!(scaled_to_f64(5, -1), None);
+	}
+
+	#[test]
+	fn the_bin_cache_gives_the_index_the_logarithm_gives() {
+		// Runs of nearby values (the cache's case), values a hair either side of bucket
+		// boundaries (the margin's case), and values across the whole f64 range.
+		let mut sketch = DdSketch::with_default_accuracy();
+		let lg = sketch.log_gamma;
+		let mut state = 0x6a09_e667_f3bc_c909_u64;
+		let mut next = move || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state
+		};
+		let mut values = Vec::new();
+		for k in [-30_000_i32, -500, -1, 0, 1, 2, 100, 3_000, 30_000] {
+			let boundary = (f64::from(k) * lg).exp();
+			for rel in [-1e-6, -1e-9, -1e-12, -1e-15, 0.0, 1e-15, 1e-12, 1e-9, 1e-6] {
+				values.push(boundary * (1.0 + rel));
+			}
+		}
+		#[allow(clippy::cast_precision_loss)]
+		let walk = (0..20_000).scan(100.0_f64, |price, _| {
+			*price *= ((next() % 2_001) as f64 - 1_000.0).mul_add(1e-6, 1.0);
+			Some(*price)
+		});
+		values.extend(walk);
+		values.extend((0..2_000).map(|_| f64::from_bits(next() % 0x7fef_ffff_ffff_ffff + 1)).filter(|v| v.is_finite() && *v > 0.0));
+		for v in values {
+			if let Ok(expected) = sketch.index(v) {
+				assert_eq!(sketch.positive_index(v), Ok(expected), "{v:e}");
+			}
+		}
+		// The cache is invisible to equality and to the persisted form.
+		let mut a = DdSketch::with_default_accuracy();
+		let b = DdSketch::with_default_accuracy();
+		a.last_bin = BinCache(Some((7, 1.0, 2.0)));
+		assert_eq!(a, b);
+		assert_eq!(postcard::to_allocvec(&a).unwrap(), postcard::to_allocvec(&b).unwrap(), "the sidecar codec never sees it");
+	}
+
+	#[test]
+	fn decimal_to_f64_is_to_f64_bit_for_bit() {
+		for (m, s) in [(250_i64, 2_i64), (-1_999, 3), (0, 4), (123_456_789_012, 8), (9_007_199_254_740_993, 2), (7, 30), (-42, -2), (5, 0), (355_893, 2)] {
+			let v = BigDecimal::new(m.into(), s);
+			assert_eq!(decimal_to_f64(&v).map(f64::to_bits), v.to_f64().map(f64::to_bits), "{v}");
+		}
+		let huge: BigDecimal = "1e400".parse().expect("decimal");
+		assert_eq!(decimal_to_f64(&huge).map(f64::to_bits), huge.to_f64().map(f64::to_bits));
+	}
+
+	#[test]
+	fn add_decimal_and_add_scaled_build_the_same_sketch_as_to_f64() {
+		let values: Vec<(i64, i64)> = vec![(250, 2), (25, 1), (-1_999, 3), (0, 4), (123_456_789_012, 8), (9_007_199_254_740_993, 2), (7, 30), (-42, -2), (5, 0)];
+		let (mut reference, mut decimal, mut scaled) = (DdSketch::with_default_accuracy(), DdSketch::with_default_accuracy(), DdSketch::with_default_accuracy());
+		for &(m, s) in &values {
+			let v = BigDecimal::new(m.into(), s);
+			reference.add(v.to_f64().expect("finite")).expect("adds");
+			decimal.add_decimal(&v).expect("adds");
+			scaled.add_scaled(m, s).expect("adds");
+		}
+		assert_eq!(decimal, reference);
+		assert_eq!(scaled, reference);
+	}
 
 	/// The guarantee that justifies the whole structure: every reported quantile is
 	/// within α relative error of the true value, checked against an exact sort.

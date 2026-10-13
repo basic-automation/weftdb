@@ -289,7 +289,7 @@ pub fn run_range_fetch_on(profile: &RangeFetchProfile, timestamps: &[i64], value
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_RANGE_FETCH.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: rows_fetched, irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_RANGE_FETCH.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: rows_fetched, irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None })
 }
 
 #[cfg(test)]

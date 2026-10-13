@@ -10,15 +10,19 @@
 //! `BigDecimal` logical/API type and its exactness are unchanged. Only the hot loop moves to
 //! integers.
 //!
-//! It covers the streaming reductions (`min`/`max`/`avg`/`sum`/`first`/`last`). Exact
-//! percentiles, time-weighted averages and sketches need the per-sample values, so a request
-//! naming any of them returns `Ok(None)` and the caller falls back to [`reduce`](crate::reduce).
+//! [`reduce_scaled`] covers the streaming reductions (`min`/`max`/`avg`/`sum`/`first`/`last`);
+//! exact percentiles, time-weighted averages and sketches need the per-sample values, so a
+//! request naming any of them returns `Ok(None)` and the caller falls back to
+//! [`reduce`](crate::reduce). The mergeable [`reduce_partial_scaled`] serves every reduction:
+//! it feeds sketches from the mantissas and collects samples for the rest.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
 
-use bigdecimal::{num_bigint::BigInt, BigDecimal};
+use bigdecimal::{
+	num_bigint::{BigInt, BigUint, Sign}, BigDecimal, ToPrimitive
+};
 use chrono::{DateTime, Utc};
-use splimes::Resolution;
+use splimes::{Point, Resolution};
 
 use crate::{bucket_start, resolution_step_secs, Aggregation, Bucket, BucketAcc, DdSketch, PartialReduction, ReduceError};
 
@@ -33,6 +37,29 @@ const fn base_of(resolution: Resolution, nanos: i64) -> i64 {
 		Some(step_secs) => nanos.div_euclid(NANOS_PER_SECOND) / step_secs,
 		None => nanos.div_euclid(resolution.step_nanos()),
 	}
+}
+
+/// The inclusive range of epoch nanoseconds [`base_of`] maps to bucket `base`, or `None` if
+/// it is not representable in `i64` nanoseconds (the caller then indexes every sample).
+///
+/// The sub-second grids floor, so bucket `b` is `[b·step, b·step + step − 1]`. The
+/// second-and-coarser grids divide the floored seconds with truncating `/`, so their bucket 0
+/// spans `−(step − 1) ..= step − 1` seconds and a negative bucket `b` spans
+/// `b·step − (step − 1) ..= b·step` seconds; each second then covers a whole second of
+/// nanoseconds.
+fn base_range(resolution: Resolution, base: i64) -> Option<(i64, i64)> {
+	let Some(step) = resolution_step_secs(resolution) else {
+		let step = resolution.step_nanos();
+		let lo = base.checked_mul(step)?;
+		return Some((lo, lo.checked_add(step - 1)?));
+	};
+	let anchor = base.checked_mul(step)?;
+	let (lo_secs, hi_secs) = match base.signum() {
+		1 => (anchor, anchor.checked_add(step - 1)?),
+		0 => (-(step - 1), step - 1),
+		_ => (anchor.checked_sub(step - 1)?, anchor),
+	};
+	Some((lo_secs.checked_mul(NANOS_PER_SECOND)?, hi_secs.checked_mul(NANOS_PER_SECOND)?.checked_add(NANOS_PER_SECOND - 1)?))
 }
 
 /// Running integer state for one bucket. `first`/`last` carry their instant and resolve ties
@@ -126,6 +153,9 @@ fn avg_like_bigdecimal(sum: i128, scale: i64, count: u64) -> BigDecimal {
 		num *= 10;
 	}
 	let (lead, mut rem) = (num / den, num % den);
+	if rem != 0 && !terminates(num, count) {
+		return non_terminating_quotient(num, lead, scale, count, negative);
+	}
 	let mut quotient = BigInt::from(lead);
 	if rem != 0 {
 		let mut precision = lead.checked_ilog10().map_or(1, |d| d + 1);
@@ -173,6 +203,57 @@ fn avg_like_bigdecimal(sum: i128, scale: i64, count: u64) -> BigDecimal {
 	}
 }
 
+/// Whether `num / count` has a finite decimal expansion: the divisor, reduced by the common
+/// factor, has no prime factor but 2 and 5.
+fn terminates(num: u128, count: u64) -> bool {
+	let (mut a, mut b) = (count, u64::try_from(num % u128::from(count)).unwrap_or(0));
+	while b != 0 {
+		(a, b) = (b, a % b);
+	}
+	let mut d = count / a;
+	d >>= d.trailing_zeros();
+	while d.is_multiple_of(5) {
+		d /= 5;
+	}
+	d == 1
+}
+
+/// `10^k` for `k` in `0..=BIGDECIMAL_DIV_PRECISION`, built once.
+fn power_of_ten(k: u32) -> &'static BigUint {
+	static POWERS: OnceLock<Vec<BigUint>> = OnceLock::new();
+	let powers = POWERS.get_or_init(|| {
+		let mut powers = vec![BigUint::from(1_u8)];
+		for _ in 0..BIGDECIMAL_DIV_PRECISION {
+			let next = powers.last().map_or_else(|| BigUint::from(1_u8), |p| p * 10_u8);
+			powers.push(next);
+		}
+		powers
+	});
+	&powers[usize::try_from(k).unwrap_or(0).min(powers.len() - 1)]
+}
+
+/// The tail of [`avg_like_bigdecimal`] for a quotient that never terminates, where its digit
+/// loop always runs to [`BIGDECIMAL_DIV_PRECISION`] digits: those digits are
+/// `floor(num · 10^m / count)` for the `m` digits after `lead`'s, computed as one `BigUint`
+/// multiplication and one division, then rounded up when the next digit is `>= 5`. The
+/// remainder is never zero, so no digit loop stops early and the result is the loop's.
+/// `BigUint`'s division by a `u64` is a single pass over its limbs.
+fn non_terminating_quotient(num: u128, lead: u128, scale: i64, count: u64, negative: bool) -> BigDecimal {
+	let m = BIGDECIMAL_DIV_PRECISION - lead.checked_ilog10().map_or(1, |d| d + 1);
+	let shifted = BigUint::from(num) * power_of_ten(m);
+	let remainder = u128::from((&shifted % count).to_u64().unwrap_or(0));
+	let mut quotient = shifted / count;
+	if remainder * 10 / u128::from(count) >= 5 {
+		quotient += 1_u8;
+	}
+	let magnitude = BigDecimal::new(BigInt::from_biguint(Sign::Plus, quotient), scale + i64::from(m));
+	if negative {
+		-magnitude
+	} else {
+		magnitude
+	}
+}
+
 /// Accumulates quotient digits into a `BigInt`, 38 at a time through a `u128` chunk, so the
 /// `BigInt` is touched once per chunk rather than once per digit.
 struct DigitSink {
@@ -200,15 +281,104 @@ pub fn avg_of_sum(sum: &BigDecimal, count: u64) -> BigDecimal {
 	i128::try_from(&digits).map_or_else(|_| sum / &BigDecimal::from(count), |int| avg_like_bigdecimal(int, scale, count))
 }
 
+/// The time-weighted average [`time_weighted_average`](crate::time_weighted_average) returns
+/// for `samples`, computed on integers, or `None` when it cannot be (the caller then takes the
+/// `BigDecimal` path).
+///
+/// It applies when every sample has an `i64` mantissa at a scale in `0..=17` and a nanosecond
+/// epoch, and the weighted sum fits `i128`. The result is identical **in representation**, not
+/// just in value, because it reproduces the `(digits, scale)` the `BigDecimal` loop builds,
+/// step by step, from `bigdecimal` 0.4's own rules:
+///
+/// - a term `value * dt` (owned operands) keeps `(m·dt, s)`, except that a value of exactly
+///   one (`m == 10^s`) returns `dt` itself, `(dt, 0)`; the bucket-end term `&value * dt`
+///   multiplies through, `(m·dt, s)`, with no such case;
+/// - the linear method's `a + b` is the exact sum at the larger scale, except that a zero
+///   operand returns the other one with its scale raised by the zero's excess scale (at most
+///   15); `/ 2` is then [`avg_like_bigdecimal`];
+/// - `weighted += term` skips a zero term, replaces a zero accumulator outright, and otherwise
+///   aligns both to the larger scale;
+/// - the final `weighted / total_ms` is [`avg_like_bigdecimal`].
+///
+/// The degenerate case (no time spread) and a lone sample are left to the caller.
+pub fn twa_scaled(samples: &[(DateTime<Utc>, BigDecimal)], linear: bool, bucket_end: Option<DateTime<Utc>>) -> Option<BigDecimal> {
+	const NANOS_PER_MILLI: i64 = 1_000_000;
+	if samples.len() < 2 && bucket_end.is_none() {
+		return None;
+	}
+	let mut lifted: Vec<(i64, i64, i64)> = Vec::with_capacity(samples.len());
+	for (t, v) in samples {
+		let (digits, scale) = v.as_bigint_and_scale();
+		if !(0..=17).contains(&scale) {
+			return None;
+		}
+		lifted.push((t.timestamp_nanos_opt()?, digits.to_i64()?, scale));
+	}
+	lifted.sort_by_key(|&(t, _, _)| t);
+	let up = |x: i128, by: i64| u32::try_from(by).ok().and_then(|by| 10_i128.checked_pow(by)).and_then(|p| x.checked_mul(p));
+	let mut weighted = (0_i128, 0_i64);
+	let mut add = |(int, scale): (i128, i64)| -> Option<()> {
+		if int == 0 {
+			return Some(());
+		}
+		if weighted.0 == 0 {
+			weighted = (int, scale);
+			return Some(());
+		}
+		weighted = match weighted.1.cmp(&scale) {
+			std::cmp::Ordering::Less => (up(weighted.0, scale - weighted.1)?.checked_add(int)?, scale),
+			std::cmp::Ordering::Greater => (weighted.0.checked_add(up(int, weighted.1 - scale)?)?, weighted.1),
+			std::cmp::Ordering::Equal => (weighted.0.checked_add(int)?, scale),
+		};
+		Some(())
+	};
+	let mut total_ms: i64 = 0;
+	if let (Some(end), Some(&(last_t, last_m, last_s))) = (bucket_end, lifted.last()) {
+		let dt = (end.timestamp_nanos_opt()?.checked_sub(last_t)? / NANOS_PER_MILLI).max(0);
+		if dt > 0 {
+			add((i128::from(last_m).checked_mul(i128::from(dt))?, last_s))?;
+			total_ms = total_ms.checked_add(dt)?;
+		}
+	}
+	for pair in lifted.windows(2) {
+		let dt = (pair[1].0.checked_sub(pair[0].0)? / NANOS_PER_MILLI).max(0);
+		if dt > 0 {
+			let ((_, ma, sa), (_, mb, sb)) = (pair[0], pair[1]);
+			let (m, s) = if linear {
+				let (sum, scale) = match (ma, mb) {
+					(_, 0) => (up(i128::from(ma), (sb - sa).clamp(0, 15))?, sa + (sb - sa).clamp(0, 15)),
+					(0, _) => (up(i128::from(mb), (sa - sb).clamp(0, 15))?, sb + (sa - sb).clamp(0, 15)),
+					_ if sa >= sb => (i128::from(ma).checked_add(up(i128::from(mb), sa - sb)?)?, sa),
+					_ => (up(i128::from(ma), sb - sa)?.checked_add(i128::from(mb))?, sb),
+				};
+				let half = avg_like_bigdecimal(sum, scale, 2);
+				let (digits, scale) = half.as_bigint_and_scale();
+				(digits.to_i128()?, scale)
+			} else {
+				(i128::from(ma), sa)
+			};
+			// `is_one_quickcheck` answers for scales up to 19; past that, decline.
+			if s > 19 {
+				return None;
+			}
+			let one = up(1, s) == Some(m);
+			add(if one { (i128::from(dt), 0) } else { (m.checked_mul(i128::from(dt))?, s) })?;
+			total_ms = total_ms.checked_add(dt)?;
+		}
+	}
+	let total = u64::try_from(total_ms).ok().filter(|&t| t > 0)?;
+	Some(avg_like_bigdecimal(weighted.0, weighted.1, total))
+}
+
 /// Whether [`reduce_scaled`] can compute `aggregation` from integer state alone.
 const fn is_streaming(aggregation: Aggregation) -> bool {
 	matches!(aggregation, Aggregation::Min | Aggregation::Max | Aggregation::Avg | Aggregation::Sum | Aggregation::First | Aggregation::Last)
 }
 
 /// Fold `(epoch_nanos, mantissa)` pairs into integer per-bucket state, applying the inclusive
-/// `[start, end]` filter. `None` when a bound cannot be expressed in epoch nanoseconds or the
+/// `[start, end]` filter, and return the buckets in ascending key order. `None` when a bound cannot be expressed in epoch nanoseconds or the
 /// slices differ in length (the caller falls back to the `BigDecimal` path).
-fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<BTreeMap<i64, ScaledAcc>> {
+fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<Vec<(i64, ScaledAcc)>> {
 	if epoch_nanos.len() != mantissas.len() {
 		return None;
 	}
@@ -217,30 +387,63 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 		return None;
 	};
 
-	let mut buckets: BTreeMap<i64, ScaledAcc> = BTreeMap::new();
-	// The bucket being filled. Time-ordered input stays in it until the key changes, so the
-	// map is touched once per bucket rather than once per sample.
+	// Closed buckets in the order they closed. Time-ordered input closes each bucket once, in
+	// ascending key order, so they need no map; any other order is merged through one at the end.
+	let mut closed: Vec<(i64, ScaledAcc)> = Vec::new();
+	let mut ordered = true;
+	let mut close = |key: i64, acc: ScaledAcc| {
+		ordered &= closed.last().is_none_or(|&(last, _)| last < key);
+		closed.push((key, acc));
+	};
+	// The bucket being filled. Time-ordered input stays in it until the key changes, so each
+	// bucket is closed once rather than touched once per sample, and while a sample's
+	// instant lies in the bucket's nanosecond range (`span`) it is not indexed at all.
 	let mut current: Option<(i64, ScaledAcc)> = None;
+	let mut span: Option<(i64, i64)> = None;
 	for (&nanos, &mantissa) in epoch_nanos.iter().zip(mantissas) {
 		if lo.is_some_and(|l| nanos < l) || hi.is_some_and(|h| nanos > h) {
 			continue;
+		}
+		if let (Some((_, acc)), Some((from, to))) = (current.as_mut(), span) {
+			if from <= nanos && nanos <= to {
+				acc.push(nanos, mantissa);
+				continue;
+			}
 		}
 		let base = base_of(resolution, nanos);
 		match current.as_mut() {
 			Some((key, acc)) if *key == base => acc.push(nanos, mantissa),
 			_ => {
 				if let Some((key, acc)) = current.take() {
-					buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
+					close(key, acc);
 				}
 				current = Some((base, ScaledAcc::new(nanos, mantissa)));
+				span = base_range(resolution, base);
 			}
 		}
 	}
 	if let Some((key, acc)) = current {
-		buckets.entry(key).and_modify(|existing| existing.merge(&acc)).or_insert(acc);
+		close(key, acc);
 	}
+	Some(in_key_order(closed, ordered, ScaledAcc::merge))
+}
 
-	Some(buckets)
+/// Closed buckets in ascending key order with each key once: as they are when they closed in
+/// strictly ascending order (`ordered`), otherwise merged through a map.
+fn in_key_order<A>(closed: Vec<(i64, A)>, ordered: bool, merge: impl Fn(&mut A, &A)) -> Vec<(i64, A)> {
+	if ordered {
+		return closed;
+	}
+	let mut merged: BTreeMap<i64, A> = BTreeMap::new();
+	for (key, acc) in closed {
+		match merged.entry(key) {
+			std::collections::btree_map::Entry::Occupied(mut existing) => merge(existing.get_mut(), &acc),
+			std::collections::btree_map::Entry::Vacant(slot) => {
+				slot.insert(acc);
+			}
+		}
+	}
+	merged.into_iter().collect()
 }
 
 /// Reduce a `ScaledI64` column (`value = mantissa × 10^-scale`) into grid-aligned buckets.
@@ -271,28 +474,27 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 
 	let scale = i64::from(scale);
 	let decimal = |m: i128| BigDecimal::new(BigInt::from(m), scale);
-	buckets.into_iter()
-		.map(|(base, acc)| {
-			let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
-			let sum = decimal(acc.sum);
-			let mut values: BTreeMap<String, BigDecimal> = BTreeMap::new();
-			for &agg in aggregations {
-				let value = match agg {
-					Aggregation::Min => decimal(i128::from(acc.min)),
-					Aggregation::Max => decimal(i128::from(acc.max)),
-					Aggregation::Sum => sum.clone(),
-					// The same result `reduce`'s `sum / count` produces, from integer long division.
-					Aggregation::Avg => avg_like_bigdecimal(acc.sum, scale, acc.count),
-					Aggregation::First => decimal(i128::from(acc.first.1)),
-					Aggregation::Last => decimal(i128::from(acc.last.1)),
-					_ => unreachable!("non-streaming reductions return Ok(None) above"),
-				};
-				values.insert(agg.as_str().to_string(), value);
-			}
-			Ok(Bucket { timestamp, count: usize::try_from(acc.count).unwrap_or(usize::MAX), values })
-		})
-		.collect::<Result<Vec<_>, _>>()
-		.map(Some)
+	// A loop rather than a `Result` collect, which cannot size the output from its input.
+	let mut out = Vec::with_capacity(buckets.len());
+	for (base, acc) in buckets {
+		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
+		let mut values: BTreeMap<String, BigDecimal> = BTreeMap::new();
+		for &agg in aggregations {
+			let value = match agg {
+				Aggregation::Min => decimal(i128::from(acc.min)),
+				Aggregation::Max => decimal(i128::from(acc.max)),
+				Aggregation::Sum => decimal(acc.sum),
+				// The same result `reduce`'s `sum / count` produces, from integer long division.
+				Aggregation::Avg => avg_like_bigdecimal(acc.sum, scale, acc.count),
+				Aggregation::First => decimal(i128::from(acc.first.1)),
+				Aggregation::Last => decimal(i128::from(acc.last.1)),
+				_ => unreachable!("non-streaming reductions return Ok(None) above"),
+			};
+			values.insert(agg.as_str().to_string(), value);
+		}
+		out.push(Bucket { timestamp, count: usize::try_from(acc.count).unwrap_or(usize::MAX), values });
+	}
+	Ok(Some(out))
 }
 
 /// The mergeable form of [`reduce_scaled`]: the same integer accumulation, returned as a
@@ -301,11 +503,13 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 ///
 /// Each bucket's integer state is converted once into the `BigDecimal` accumulator the
 /// partial carries (sum, min, max, and first/last with their instants), so the per-sample
-/// work stays in integers and only the per-bucket conversion touches `BigDecimal`. Like
-/// [`reduce_scaled`], it returns `Ok(None)` for an exact percentile or TWA, a bound outside
-/// epoch nanoseconds, or mismatched slices, and the caller falls back to `reduce_partial`.
-/// Unlike [`reduce_scaled`] it also accepts the `sketch_p*` reductions (see below), so it covers
-/// the whole `.weftpart` sidecar set.
+/// work stays in integers and only the per-bucket conversion touches `BigDecimal`. It
+/// returns `Ok(None)` for a bound outside epoch nanoseconds or mismatched slices, and the
+/// caller falls back to `reduce_partial`. Unlike [`reduce_scaled`] it accepts every
+/// reduction: the `sketch_p*` ones (see below), so it covers the whole `.weftpart` sidecar
+/// set, and the exact percentiles and time-weighted averages, for which it collects each
+/// bucket's `(instant, value)` samples in input order exactly as `reduce_partial` does,
+/// while sum, min, max, first and last stay integer.
 ///
 /// # Errors
 ///
@@ -313,13 +517,16 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 /// a timestamp (unreachable for nanosecond epochs, which always are).
 pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>, ReduceError> {
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
-	// The `sketch_p*` reductions are accepted too: they need each value, but only as the
-	// sketch's `f64`, which is fed through the same `DdSketch::add_decimal` the BigDecimal path
-	// uses so every sketch is identical. Percentiles and TWA still need the samples: decline.
-	if !aggregations.iter().all(|&a| is_streaming(a) || a.sketch_quantile().is_some()) {
+	// The `sketch_p*` reductions need each value, but only as the sketch's `f64`, which
+	// `DdSketch::add_scaled` derives from the mantissa as the same `f64` `add_decimal` gives
+	// the equal BigDecimal, so every sketch is identical. The percentiles and TWA need the
+	// samples themselves, which are collected below in input order, as `reduce_partial`
+	// collects them.
+	if !aggregations.iter().all(|&a| is_streaming(a) || a.sketch_quantile().is_some() || a.needs_full_bucket()) {
 		return Ok(None);
 	}
 	let sketching = aggregations.iter().any(|a| a.sketch_quantile().is_some());
+	let collecting = aggregations.iter().any(|a| a.needs_full_bucket());
 	let Some(buckets) = accumulate(epoch_nanos, mantissas, resolution, start, end) else {
 		return Ok(None);
 	};
@@ -329,19 +536,229 @@ pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32,
 	let mut converted: BTreeMap<i64, BucketAcc> = buckets
 		.into_iter()
 		.map(|(base, acc)| {
-			let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(acc.sum), scale), min: Some(decimal(acc.min)), max: Some(decimal(acc.max)), first: Some((instant(acc.first.0), decimal(acc.first.1))), last: Some((instant(acc.last.0), decimal(acc.last.1))), samples: Vec::new(), collect: false, sketch: sketching.then(DdSketch::with_default_accuracy) };
+			let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(acc.sum), scale), min: Some(decimal(acc.min)), max: Some(decimal(acc.max)), first: Some((instant(acc.first.0), decimal(acc.first.1))), last: Some((instant(acc.last.0), decimal(acc.last.1))), samples: if collecting { Vec::with_capacity(usize::try_from(acc.count).unwrap_or(0)) } else { Vec::new() }, collect: collecting, sketch: sketching.then(DdSketch::with_default_accuracy) };
 			Ok((base, state))
 		})
 		.collect::<Result<_, ReduceError>>()?;
-	if sketching {
+	if sketching || collecting {
 		let bound = |b: Option<DateTime<Utc>>| b.and_then(|t| t.timestamp_nanos_opt());
 		let (lo, hi) = (bound(start), bound(end));
+		// The buckets in key order, so a time-ordered pass finds each sample's bucket by its
+		// nanosecond range and looks a bucket up only when the range is left.
+		let mut ordered: Vec<(i64, &mut BucketAcc)> = converted.iter_mut().map(|(&base, acc)| (base, acc)).collect();
+		let mut current: Option<(usize, Option<(i64, i64)>)> = None;
 		for (&nanos, &mantissa) in epoch_nanos.iter().zip(mantissas) {
 			if lo.is_some_and(|l| nanos < l) || hi.is_some_and(|h| nanos > h) {
 				continue;
 			}
-			if let Some(sketch) = converted.get_mut(&base_of(resolution, nanos)).and_then(|acc| acc.sketch.as_mut()) {
-				sketch.add_decimal(&decimal(mantissa)).map_err(|_| ReduceError::SketchValue)?;
+			let position = match current {
+				Some((position, Some((from, to)))) if from <= nanos && nanos <= to => position,
+				_ => {
+					let base = base_of(resolution, nanos);
+					let Ok(position) = ordered.binary_search_by_key(&base, |(b, _)| *b) else { continue };
+					current = Some((position, base_range(resolution, base)));
+					position
+				}
+			};
+			let acc = &mut *ordered[position].1;
+			if let Some(sketch) = acc.sketch.as_mut() {
+				sketch.add_scaled(mantissa, scale).map_err(|_| ReduceError::SketchValue)?;
+			}
+			if collecting {
+				acc.samples.push((instant(nanos), decimal(mantissa)));
+			}
+		}
+	}
+	Ok(Some(PartialReduction { buckets: converted }))
+}
+
+/// Per-bucket state for [`reduce_partial_points`]: the integer accumulators at the series'
+/// common scale, the bucket's own largest scale, and for each extremal sample its position in
+/// the input, so the `BigDecimal` partial is built from the original values.
+#[derive(Debug, Clone, Copy)]
+struct PointAcc {
+	count: u64,
+	sum: i128,
+	max_scale: u32,
+	/// `(mantissa at the common scale, position)` of the first-encountered minimum / maximum.
+	min: (i64, usize),
+	max: (i64, usize),
+	/// `(epoch nanos, position)` of the first / last sample, with `reduce`'s tie rules.
+	first: (i64, usize),
+	last: (i64, usize),
+}
+
+impl PointAcc {
+	const fn new(nanos: i64, mantissa: i64, scale: u32, at: usize) -> Self {
+		Self { count: 1, sum: mantissa as i128, max_scale: scale, min: (mantissa, at), max: (mantissa, at), first: (nanos, at), last: (nanos, at) }
+	}
+
+	const fn push(&mut self, nanos: i64, mantissa: i64, scale: u32, at: usize) {
+		self.count += 1;
+		self.sum += mantissa as i128;
+		if scale > self.max_scale {
+			self.max_scale = scale;
+		}
+		if mantissa < self.min.0 {
+			self.min = (mantissa, at);
+		}
+		if mantissa > self.max.0 {
+			self.max = (mantissa, at);
+		}
+		if nanos < self.first.0 {
+			self.first = (nanos, at);
+		}
+		if nanos >= self.last.0 {
+			self.last = (nanos, at);
+		}
+	}
+
+	/// Fold a later run of the same bucket in: ties keep the earlier run's min, max and first
+	/// and take the later run's last, as a single pass would.
+	const fn merge(&mut self, other: &Self) {
+		self.count += other.count;
+		self.sum += other.sum;
+		if other.max_scale > self.max_scale {
+			self.max_scale = other.max_scale;
+		}
+		if other.min.0 < self.min.0 {
+			self.min = other.min;
+		}
+		if other.max.0 > self.max.0 {
+			self.max = other.max;
+		}
+		if other.first.0 < self.first.0 {
+			self.first = other.first;
+		}
+		if other.last.0 >= self.last.0 {
+			self.last = other.last;
+		}
+	}
+}
+
+/// The bucket [`reduce_partial_points`] is filling: key, state, nanosecond range.
+type OpenBucket = (i64, PointAcc, Option<(i64, i64)>);
+
+/// The most decimal places [`reduce_partial_points`] brings a series to (`10^18` fits `i64`).
+const MAX_COMMON_SCALE: u32 = 18;
+
+/// [`reduce_partial`](crate::reduce_partial) on integers, for `BigDecimal` points whose values
+/// all fit `i64` mantissas once brought to the series' largest scale: the same partial, value
+/// for value **and in representation**.
+///
+/// The values are compared and summed as integers at that common scale. What the partial
+/// keeps is what the `BigDecimal` accumulator keeps: min, max, first and last are the original
+/// samples (located by position, with the same tie rules), collected samples are the
+/// originals in input order, sketches are fed through the same `add_decimal`, and each
+/// bucket's sum is brought back to the largest scale among *that bucket's* samples, which is
+/// the scale `BigDecimal` addition gives it.
+///
+/// `Ok(None)` when the series does not qualify (a value with a negative scale, more than
+/// [`MAX_COMMON_SCALE`] places or a mantissa beyond `i64` at the common scale, an instant or
+/// bound without a nanosecond epoch, or no points), and the caller takes the `BigDecimal`
+/// path.
+pub fn reduce_partial_points(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>, ReduceError> {
+	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
+	let mut lifted: Vec<(i64, i64, u32)> = Vec::with_capacity(points.len());
+	for point in points {
+		let (digits, scale) = point.value.as_bigint_and_scale();
+		let (Some(nanos), Some(mantissa), Ok(scale)) = (point.timestamp.timestamp_nanos_opt(), digits.to_i64(), u32::try_from(scale)) else {
+			return Ok(None);
+		};
+		lifted.push((nanos, mantissa, scale));
+	}
+	let (Some(common), Some(least)) = (lifted.iter().map(|&(_, _, s)| s).max(), lifted.iter().map(|&(_, _, s)| s).min()) else {
+		return Ok(None);
+	};
+	if common > MAX_COMMON_SCALE {
+		return Ok(None);
+	}
+	// A series stored at one scale (the usual case) is already at the common scale.
+	if least < common {
+		for (_, mantissa, scale) in &mut lifted {
+			let Some(m) = 10_i64.checked_pow(common - *scale).and_then(|f| mantissa.checked_mul(f)) else {
+				return Ok(None);
+			};
+			*mantissa = m;
+		}
+	}
+	let bound = |b: Option<DateTime<Utc>>| b.map(|t| t.timestamp_nanos_opt()).map_or(Some(None), |n| n.map(Some));
+	let (Some(lo), Some(hi)) = (bound(start), bound(end)) else {
+		return Ok(None);
+	};
+	let inside = |nanos: i64| lo.is_none_or(|l| nanos >= l) && hi.is_none_or(|h| nanos <= h);
+
+	// Accumulate as `accumulate` does: the current bucket stays open while samples stay in
+	// its nanosecond range, closed buckets are kept in closing order, and a re-entered bucket
+	// merges with its earlier runs at the end.
+	let mut closed: Vec<(i64, PointAcc)> = Vec::new();
+	let mut ordered = true;
+	let mut close = |key: i64, acc: PointAcc| {
+		ordered &= closed.last().is_none_or(|&(last, _)| last < key);
+		closed.push((key, acc));
+	};
+	// The open bucket: its key, its state, and its nanosecond range.
+	let mut current: Option<OpenBucket> = None;
+	for (at, &(nanos, mantissa, scale)) in lifted.iter().enumerate() {
+		if !inside(nanos) {
+			continue;
+		}
+		if let Some((_, acc, Some((from, to)))) = current.as_mut() {
+			if *from <= nanos && nanos <= *to {
+				acc.push(nanos, mantissa, scale, at);
+				continue;
+			}
+		}
+		let base = base_of(resolution, nanos);
+		match current.as_mut() {
+			Some((key, acc, _)) if *key == base => acc.push(nanos, mantissa, scale, at),
+			_ => {
+				if let Some((key, acc, _)) = current.take() {
+					close(key, acc);
+				}
+				current = Some((base, PointAcc::new(nanos, mantissa, scale, at), base_range(resolution, base)));
+			}
+		}
+	}
+	if let Some((key, acc, _)) = current {
+		close(key, acc);
+	}
+	let buckets = in_key_order(closed, ordered, PointAcc::merge);
+
+	let sketching = aggregations.iter().any(|a| a.sketch_quantile().is_some());
+	let collecting = aggregations.iter().any(|a| a.needs_full_bucket());
+	// Built in ascending key order, then bulk-loaded into the map.
+	let mut converted: Vec<(i64, BucketAcc)> = Vec::with_capacity(buckets.len());
+	for (base, acc) in buckets {
+		// Exact: every sample in the bucket is a multiple of 10^(common - max_scale).
+		let sum = acc.sum / 10_i128.pow(common - acc.max_scale);
+		let sample = |at: usize| (points[at].timestamp, points[at].value.clone());
+		let state = BucketAcc { count: usize::try_from(acc.count).map_err(|_| ReduceError::TimestampRange)?, sum: BigDecimal::new(BigInt::from(sum), i64::from(acc.max_scale)), min: Some(points[acc.min.1].value.clone()), max: Some(points[acc.max.1].value.clone()), first: Some(sample(acc.first.1)), last: Some(sample(acc.last.1)), samples: if collecting { Vec::with_capacity(usize::try_from(acc.count).unwrap_or(0)) } else { Vec::new() }, collect: collecting, sketch: sketching.then(DdSketch::with_default_accuracy) };
+		converted.push((base, state));
+	}
+	let mut converted: BTreeMap<i64, BucketAcc> = converted.into_iter().collect();
+	if sketching || collecting {
+		let mut ordered: Vec<(i64, &mut BucketAcc)> = converted.iter_mut().map(|(&base, acc)| (base, acc)).collect();
+		let mut current: Option<(usize, Option<(i64, i64)>)> = None;
+		for (point, &(nanos, _, _)) in points.iter().zip(&lifted) {
+			if !inside(nanos) {
+				continue;
+			}
+			let position = match current {
+				Some((position, Some((from, to)))) if from <= nanos && nanos <= to => position,
+				_ => {
+					let base = base_of(resolution, nanos);
+					let Ok(position) = ordered.binary_search_by_key(&base, |(b, _)| *b) else { continue };
+					current = Some((position, base_range(resolution, base)));
+					position
+				}
+			};
+			let acc = &mut *ordered[position].1;
+			if let Some(sketch) = acc.sketch.as_mut() {
+				sketch.add_decimal(&point.value).map_err(|_| ReduceError::SketchValue)?;
+			}
+			if collecting {
+				acc.samples.push((point.timestamp, point.value.clone()));
 			}
 		}
 	}
@@ -372,6 +789,26 @@ mod tests {
 	}
 
 	#[test]
+	fn base_range_is_exactly_the_nanoseconds_base_of_maps_to_each_bucket() {
+		let mut next = noise(0x51_7cc1_b727_220a);
+		let resolutions = [Resolution::Nanoseconds, Resolution::Microseconds, Resolution::Milliseconds, Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days, Resolution::Weeks, Resolution::Months, Resolution::Years];
+		let fixed = [0_i64, 1, -1, 999_999_999, -999_999_999, -1_000_000_000, -1_000_000_001, 59 * NANOS_PER_SECOND, -61 * NANOS_PER_SECOND, 3_599_999_999_999, -3_600_000_000_000, 1_505_412_060 * NANOS_PER_SECOND];
+		let random = (0..2_000).map(|_| (next() % 4_000_000_000_000_000_000).cast_signed() - 2_000_000_000_000_000_000);
+		for nanos in fixed.into_iter().chain(random) {
+			for r in resolutions {
+				let base = base_of(r, nanos);
+				let (from, to) = base_range(r, base).expect("representable");
+				assert!(from <= nanos && nanos <= to, "{r:?}: {nanos} outside {from}..={to}");
+				// The range is tight: its ends belong to the bucket and one past them do not.
+				assert_eq!((base_of(r, from), base_of(r, to)), (base, base), "{r:?} at {nanos}");
+				assert_ne!(from.checked_sub(1).map(|n| base_of(r, n)), Some(base), "{r:?}: {from} - 1");
+				assert_ne!(to.checked_add(1).map(|n| base_of(r, n)), Some(base), "{r:?}: {to} + 1");
+			}
+		}
+		assert_eq!(base_range(Resolution::Years, i64::MAX / 2), None, "unrepresentable ranges are declined");
+	}
+
+	#[test]
 	fn base_of_matches_bucket_index_for_every_resolution() {
 		let mut next = noise(0x9e37_79b9_7f4a_7c15);
 		let resolutions = [Resolution::Nanoseconds, Resolution::Microseconds, Resolution::Milliseconds, Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days, Resolution::Weeks, Resolution::Months, Resolution::Years];
@@ -383,6 +820,72 @@ mod tests {
 				assert_eq!(base_of(r, nanos), crate::bucket_index(r, &t).expect("indexable"), "{r:?} at {nanos}");
 			}
 		}
+	}
+
+	#[test]
+	fn twa_scaled_is_the_bigdecimal_twa_in_representation() {
+		use crate::{twa_decimal, TwaMethod};
+		// Random buckets, one-scale and mixed-scale, both methods, with and without a bucket end;
+		// values include zeros, exactly one and minus one at the scale (the multiplication's
+		// special case), cancelling signs and mantissas near `i64::MAX` (the overflow fallback);
+		// instants include duplicates, sub-millisecond gaps and shuffled order.
+		let mut next = noise(0x510e_527f_ade6_82d1);
+		let (mut compared, mut mixed, mut fell_back) = (0_u32, 0_u32, 0_u32);
+		for round in 0..6_000_u64 {
+			let scale = (next() % 20).cast_signed();
+			let unit = 10_i64.checked_pow(u32::try_from(scale).unwrap_or(0)).unwrap_or(1);
+			let len = usize::try_from(next() % 12).unwrap_or(0) + 1;
+			let mut t = 1_700_000_000_000_000_000_i64 + (next() % 1_000_000_000_000).cast_signed();
+			let mut samples: Vec<(DateTime<Utc>, BigDecimal)> = (0..len)
+				.map(|_| {
+					t += match next() % 6 {
+						0 => 0,
+						1 => (next() % 999_999).cast_signed(),
+						2 => 1_000_000,
+						_ => (next() % 120_000_000_000).cast_signed(),
+					};
+					let m = match next() % 9 {
+						0 => 0,
+						1 => unit,
+						2 => -unit,
+						3 => i64::MAX - (next() % 1_000).cast_signed(),
+						4 => (next() % 200).cast_signed() - 100,
+						_ => (next() % 4_000_000_000_000).cast_signed() - 2_000_000_000_000,
+					};
+					// A third of the rounds mix scales within the bucket, as decimal text does
+					// (`9.0` beside `9.01`); some of those carry a scale past the integer path.
+					let scale = if round % 3 == 1 { (next() % 20).cast_signed() } else { scale };
+					let m = if round % 3 == 1 { m % 1_000_000_000_000_000 } else { m };
+					(DateTime::from_timestamp_nanos(t), BigDecimal::new(BigInt::from(m), scale))
+				})
+				.collect();
+			if round % 3 == 0 {
+				samples.reverse();
+				samples.swap(0, len / 2);
+			}
+			let last = samples.iter().map(|(t, _)| *t).max().expect("non-empty");
+			let ends = [None, Some(last), Some(last + chrono::TimeDelta::milliseconds((next() % 90_000).cast_signed())), Some(last - chrono::TimeDelta::milliseconds(3))];
+			for end in ends {
+				for (linear, method) in [(false, TwaMethod::Locf), (true, TwaMethod::Linear)] {
+					if linear && end.is_some() {
+						continue;
+					}
+					let Some(fast) = twa_scaled(&samples, linear, end) else {
+						fell_back += 1;
+						continue;
+					};
+					let reference = twa_decimal(&samples, method, end);
+					assert_eq!(fast.as_bigint_and_scale(), reference.as_bigint_and_scale(), "round {round} linear {linear} end {end:?}: {samples:?}");
+					compared += 1;
+					mixed += u32::from(round % 3 == 1);
+				}
+			}
+		}
+		assert!(compared > 10_000 && mixed > 2_000 && fell_back > 1_000, "every path exercised: {compared} compared ({mixed} mixed-scale), {fell_back} declined");
+		// A scale past 17 and a lone sample are declined.
+		let at = |s: i64| DateTime::from_timestamp_nanos(s * 1_000_000_000);
+		assert!(twa_scaled(&[(at(0), BigDecimal::new(5.into(), 1)), (at(1), BigDecimal::new(5.into(), 18))], false, None).is_none());
+		assert!(twa_scaled(&[(at(0), BigDecimal::new(5.into(), 1))], false, None).is_none());
 	}
 
 	#[test]
@@ -402,15 +905,22 @@ mod tests {
 			nanos.swap(i, (i + 11) % 5_000);
 		}
 		let mantissas: Vec<i64> = (0..5_000).map(|_| (next() % 2_000_000_000_000).cast_signed() - 1_000_000_000_000).collect();
-		let pts = points(&nanos, &mantissas, 8);
+		// The same samples time-ordered, which closes each bucket once in key order (the
+		// accumulator's no-map path), beside the shuffled order (its merge path).
+		let mut sorted: Vec<(i64, i64)> = nanos.iter().copied().zip(mantissas.iter().copied()).collect();
+		sorted.sort_by_key(|&(t, _)| t);
+		let (sorted_nanos, sorted_mantissas): (Vec<i64>, Vec<i64>) = sorted.into_iter().unzip();
 		let all = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last];
 		let window = (Some(DateTime::from_timestamp_nanos(nanos[100])), Some(DateTime::from_timestamp_nanos(nanos[4_000])));
-		for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days] {
-			for (start, end) in [(None, None), window] {
-				for aggs in [&all[..], &[][..], &[Aggregation::Avg][..]] {
-					let expected = reduce(&pts, resolution, start, end, aggs).expect("reduces");
-					let actual = reduce_scaled(&nanos, &mantissas, 8, resolution, start, end, aggs).expect("reduces").expect("streaming reductions are supported");
-					assert_eq!(actual, expected, "{resolution:?} {start:?}..{end:?} {aggs:?}");
+		for (nanos, mantissas) in [(&nanos, &mantissas), (&sorted_nanos, &sorted_mantissas)] {
+			let pts = points(nanos, mantissas, 8);
+			for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days] {
+				for (start, end) in [(None, None), window] {
+					for aggs in [&all[..], &[][..], &[Aggregation::Avg][..]] {
+						let expected = reduce(&pts, resolution, start, end, aggs).expect("reduces");
+						let actual = reduce_scaled(nanos, mantissas, 8, resolution, start, end, aggs).expect("reduces").expect("streaming reductions are supported");
+						assert_eq!(actual, expected, "{resolution:?} {start:?}..{end:?} {aggs:?}");
+					}
 				}
 			}
 		}
@@ -428,6 +938,17 @@ mod tests {
 			let count = next() % 100_000 + 1;
 			let scale = (next() % 12).cast_signed();
 			cases.push((sum, scale, count));
+		}
+		// Counts across the whole `u64` range (every remainder width the chunked division
+		// sees), sums across `i128`, and divisors whose quotient terminates inside a chunk.
+		for _ in 0..5_000 {
+			let count = (next() >> (next() % 64)).max(1);
+			let sum = (i128::from(next()) << (next() % 60)) * if next().is_multiple_of(2) { 1 } else { -1 };
+			cases.push((sum, (next() % 30).cast_signed(), count));
+		}
+		for exp in 0..40_u32 {
+			let (two, five) = (1_u64 << exp.min(63), 5_u64.saturating_pow(exp.min(27)));
+			cases.extend([(1, 0, two), (3, 2, two), (7, 0, five), (-13, 4, five), (1, 0, two.saturating_mul(3))]);
 		}
 		for (sum, scale, count) in cases {
 			let expected = &BigDecimal::new(BigInt::from(sum), scale) / &BigDecimal::from(count);
@@ -463,7 +984,101 @@ mod tests {
 			assert_eq!(a.finish(resolution, &aggs).expect("finishes"), whole);
 			assert_eq!(b.finish(resolution, &aggs).expect("finishes"), whole);
 		}
-		assert!(reduce_partial_scaled(&nanos, &mantissas, 6, Resolution::Hours, None, None, &[Aggregation::P50]).expect("ok").is_none());
+	}
+
+	#[test]
+	fn reduce_partial_on_mixed_scale_points_is_identical_in_representation() {
+		// Mixed scales 0..=8 (prices, integers, eight-decimal values), equal values written
+		// at different scales (2.5 / 2.50 / 2.500), negatives, out-of-order instants and
+		// duplicates; every reduction, filtered and not. The partial `reduce_partial` builds
+		// (the integer path) must serialize to the same bytes as the BigDecimal reference -
+		// the sidecar's own form, which writes every BigDecimal as its string - and every
+		// finished value must have the same digits and scale.
+		let mut next = noise(0x3c6e_f372_fe94_f82b);
+		let mut nanos: Vec<i64> = (0..4_000_i64).map(|i| i * 7_000_000_000 + (next() % 20_000_000_000).cast_signed()).collect();
+		nanos[50] = nanos[49];
+		nanos[3_000] = nanos[2_999];
+		let pts: Vec<Point> = nanos
+			.iter()
+			.map(|&n| {
+				let scale = (next() % 9).cast_signed();
+				let base = (next() % 2_000).cast_signed() - 1_000;
+				// Some values repeat at another scale: 25e-1, 250e-2, 2500e-3.
+				let value = if next().is_multiple_of(5) { BigDecimal::new((25 * 10_i64.pow(u32::try_from(scale).unwrap())).into(), scale + 1) } else { BigDecimal::new(base.into(), scale) };
+				Point { timestamp: DateTime::from_timestamp_nanos(n), value }
+			})
+			.collect();
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd, Aggregation::SketchP90];
+		let window = (Some(DateTime::from_timestamp_nanos(nanos[400])), Some(DateTime::from_timestamp_nanos(nanos[3_500])));
+		// Also time-ordered (each bucket closes once, in key order) and at a single scale (no
+		// rescaling pass), the two shapes a stored series usually has.
+		let mut sorted = pts.clone();
+		sorted.sort_by_key(|p| p.timestamp);
+		let one_scale: Vec<Point> = sorted.iter().map(|p| Point { timestamp: p.timestamp, value: p.value.with_scale(4) }).collect();
+		for (series, pts) in [("mixed", &pts), ("sorted", &sorted), ("one scale", &one_scale)] {
+			for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours] {
+				for (start, end) in [(None, None), window] {
+					let fast = reduce_partial_points(pts, resolution, start, end, &aggs).expect("reduces").expect("qualifies");
+					let reference = crate::reduce_partial_decimal(pts, resolution, start, end, &aggs).expect("reduces");
+					assert_eq!(postcard::to_allocvec(&fast).expect("serializes"), postcard::to_allocvec(&reference).expect("serializes"), "{series} {resolution:?} {start:?}");
+					let (a, b) = (fast.finish(resolution, &aggs).expect("finishes"), reference.finish(resolution, &aggs).expect("finishes"));
+					assert_eq!(a.len(), b.len());
+					for (x, y) in a.iter().zip(&b) {
+						assert_eq!((x.timestamp, x.count), (y.timestamp, y.count));
+						let repr = |bucket: &Bucket| bucket.values.iter().map(|(k, v)| (k.clone(), v.as_bigint_and_exponent())).collect::<Vec<_>>();
+						assert_eq!(repr(x), repr(y), "{series} {resolution:?} bucket {}", x.timestamp);
+					}
+				}
+			}
+		}
+		// Series the integer path declines take the BigDecimal path through `reduce_partial`.
+		let huge = vec![Point { timestamp: DateTime::from_timestamp_nanos(0), value: BigDecimal::new(BigInt::from(i128::MAX), 2) }];
+		assert!(reduce_partial_points(&huge, Resolution::Hours, None, None, &aggs).expect("ok").is_none());
+		let deep = vec![Point { timestamp: DateTime::from_timestamp_nanos(0), value: BigDecimal::new(1.into(), 19) }];
+		assert!(reduce_partial_points(&deep, Resolution::Hours, None, None, &aggs).expect("ok").is_none(), "more than 18 places");
+		let negative_scale = vec![Point { timestamp: DateTime::from_timestamp_nanos(0), value: BigDecimal::new(5.into(), -3) }];
+		assert!(reduce_partial_points(&negative_scale, Resolution::Hours, None, None, &aggs).expect("ok").is_none());
+		assert!(reduce_partial_points(&[], Resolution::Hours, None, None, &aggs).expect("ok").is_none());
+		assert_eq!(reduce(&huge, Resolution::Hours, None, None, &[Aggregation::Max]).expect("reduces")[0].values["max"], huge[0].value);
+	}
+
+	#[test]
+	fn reduce_partial_scaled_serves_exact_percentiles_and_twa_identically() {
+		// Out-of-order instants with duplicates and repeated values, filtered and not, with
+		// every reduction that needs the whole bucket: the integer partial must finish to the
+		// BigDecimal partial's buckets exactly, alone and merged with one in both orders.
+		let mut next = noise(0xbb67_ae85_84ca_a73b);
+		let mut nanos: Vec<i64> = (0..3_000_i64).map(|i| i * 11_000_000_000 + (next() % 30_000_000_000).cast_signed()).collect();
+		nanos[100] = nanos[99];
+		nanos[2_000] = nanos[1_999];
+		let mantissas: Vec<i64> = (0..3_000).map(|_| (next() % 40).cast_signed() * 25_000 - 400_000).collect();
+		let pts = points(&nanos, &mantissas, 4);
+		let aggs = [Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd, Aggregation::Avg, Aggregation::Max, Aggregation::SketchP99];
+		let window = (Some(DateTime::from_timestamp_nanos(nanos[200])), Some(DateTime::from_timestamp_nanos(nanos[2_500])));
+		for resolution in [Resolution::Minutes, Resolution::Hours] {
+			for (start, end) in [(None, None), window] {
+				let scaled = reduce_partial_scaled(&nanos, &mantissas, 4, resolution, start, end, &aggs).expect("reduces").expect("served");
+				let big = crate::reduce_partial(&pts, resolution, start, end, &aggs).expect("reduces");
+				assert_eq!(scaled.finish(resolution, &aggs).expect("finishes"), big.finish(resolution, &aggs).expect("finishes"), "{resolution:?} {start:?}");
+				for p50 in [&[Aggregation::P50][..], &[Aggregation::Twa][..]] {
+					assert_eq!(reduce_partial_scaled(&nanos, &mantissas, 4, resolution, start, end, p50).expect("reduces").expect("served").finish(resolution, p50).expect("finishes"), reduce(&pts, resolution, start, end, p50).expect("reduces"));
+				}
+			}
+			let whole = reduce(&pts, resolution, None, None, &aggs).expect("reduces");
+			let scaled_half = reduce_partial_scaled(&nanos[..1_700], &mantissas[..1_700], 4, resolution, None, None, &aggs).expect("reduces").expect("served");
+			let big_half = crate::reduce_partial(&pts[1_700..], resolution, None, None, &aggs).expect("reduces");
+			let (mut a, mut b) = (scaled_half.clone(), big_half.clone());
+			a.merge(big_half).expect("merges");
+			b.merge(scaled_half).expect("merges");
+			assert_eq!(a.finish(resolution, &aggs).expect("finishes"), whole);
+			// Merging the other way round concatenates the samples in another order; the
+			// percentiles and TWA must not depend on it beyond what `reduce_partial` itself does.
+			assert_eq!(b.finish(resolution, &aggs).expect("finishes"), {
+				let mut c = crate::reduce_partial(&pts[1_700..], resolution, None, None, &aggs).expect("reduces");
+				c.merge(crate::reduce_partial(&pts[..1_700], resolution, None, None, &aggs).expect("reduces")).expect("merges");
+				c.finish(resolution, &aggs).expect("finishes")
+			});
+		}
 	}
 
 	#[test]
