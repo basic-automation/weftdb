@@ -180,7 +180,10 @@ fn linear_values(latest: &BTreeMap<&String, (i64, &BigDecimal)>, later: &[Bucket
 		.filter_map(|(&key, &(s0, v0))| {
 			// Usually the very next bucket carries the reduction and the search ends at once.
 			let (s1, v1) = later.iter().zip(steps).find_map(|(b, &s)| b.values.get(key).map(|v| (s, v)))?;
-			let value = v0 + (v1 - v0) * BigDecimal::from(step - s0) / BigDecimal::from(s1 - s0);
+			// Step indices at nanosecond resolution are epoch nanoseconds, so the spans can
+			// exceed `i64` (neighbours near both ends of the range); widen before subtracting.
+			let (offset, span) = (i128::from(step) - i128::from(s0), i128::from(s1) - i128::from(s0));
+			let value = v0 + (v1 - v0) * BigDecimal::from(offset) / BigDecimal::from(span);
 			Some((key.clone(), value))
 		})
 		.collect()
@@ -293,6 +296,17 @@ mod tests {
 		assert_eq!(inner.len(), 1);
 		assert_eq!((inner[0].timestamp, inner[0].count, avg(&inner[0])), (at(120), 0, Some(&dec("30"))));
 		assert_eq!(fill(&buckets, Resolution::Minutes, Some(at(300)), Some(at(0)), &Fill::Null, 100), Ok(Vec::new()), "start after end");
+	}
+
+	#[test]
+	fn a_linear_span_wider_than_i64_does_not_overflow() {
+		// Nanosecond buckets near both ends of the epoch: `s1 - s0` is ~1.8e19, past `i64::MAX`.
+		let (lo, hi) = (-9_000_000_000_000_000_000_i64, 9_000_000_000_000_000_000_i64);
+		let buckets = reduce(&[Point { timestamp: DateTime::from_timestamp_nanos(lo), value: dec("0") }, Point { timestamp: DateTime::from_timestamp_nanos(hi), value: dec("18") }], Resolution::Nanoseconds, None, None, &[Aggregation::Avg]).expect("reduces");
+		let filled = fill(&buckets, Resolution::Nanoseconds, Some(DateTime::from_timestamp_nanos(0)), Some(DateTime::from_timestamp_nanos(0)), &Fill::Linear, 10).expect("fills");
+		// Halfway between: 0 + 18 * 9e18 / 1.8e19 = 9.
+		assert_eq!(filled.len(), 1);
+		assert_eq!(avg(&filled[0]), Some(&dec("9")));
 	}
 
 	#[test]
