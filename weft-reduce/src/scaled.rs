@@ -301,6 +301,10 @@ pub fn avg_of_sum(sum: &BigDecimal, count: u64) -> BigDecimal {
 /// - the final `weighted / total_ms` is [`avg_like_bigdecimal`].
 ///
 /// The degenerate case (no time spread) and a lone sample are left to the caller.
+///
+/// The linear method's halving is [`avg_like_bigdecimal`] with a divisor of 2, which always
+/// terminates and so stays on the integer path. A divisor whose quotient may not terminate
+/// would still be correct (a long quotient falls back to the `BigDecimal` path) but slower.
 pub fn twa_scaled(samples: &[(DateTime<Utc>, BigDecimal)], linear: bool, bucket_end: Option<DateTime<Utc>>) -> Option<BigDecimal> {
 	const NANOS_PER_MILLI: i64 = 1_000_000;
 	if samples.len() < 2 && bucket_end.is_none() {
@@ -917,7 +921,7 @@ mod tests {
 			for resolution in [Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days] {
 				for (start, end) in [(None, None), window] {
 					for aggs in [&all[..], &[][..], &[Aggregation::Avg][..]] {
-						let expected = reduce(&pts, resolution, start, end, aggs).expect("reduces");
+						let expected = decimal(&pts, resolution, start, end, aggs);
 						let actual = reduce_scaled(nanos, mantissas, 8, resolution, start, end, aggs).expect("reduces").expect("streaming reductions are supported");
 						assert_eq!(actual, expected, "{resolution:?} {start:?}..{end:?} {aggs:?}");
 					}
@@ -961,6 +965,13 @@ mod tests {
 		assert_eq!(avg_of_sum(&huge, 7).as_bigint_and_exponent(), (&huge / &BigDecimal::from(7_u64)).as_bigint_and_exponent());
 	}
 
+	/// The `BigDecimal` reference: `reduce_partial_decimal` finished. `reduce` and
+	/// `reduce_partial` themselves route through the integer path, so they cannot serve as
+	/// the reference for it.
+	fn decimal(points: &[Point], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggs: &[Aggregation]) -> Vec<Bucket> {
+		crate::reduce_partial_decimal(points, resolution, start, end, aggs).expect("reduces").finish(resolution, aggs).expect("finishes")
+	}
+
 	#[test]
 	fn reduce_partial_scaled_merges_exactly_with_bigdecimal_partials() {
 		// Split one series in two: reduce one half with the integer partial and the other with
@@ -973,10 +984,10 @@ mod tests {
 		let pts = points(&nanos, &mantissas, 6);
 		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last];
 		for resolution in [Resolution::Minutes, Resolution::Hours] {
-			let whole = reduce(&pts, resolution, None, None, &aggs).expect("reduces");
+			let whole = decimal(&pts, resolution, None, None, &aggs);
 			let scaled_half = reduce_partial_scaled(&nanos[..2_500], &mantissas[..2_500], 6, resolution, None, None, &aggs).expect("reduces").expect("streaming");
-			assert_eq!(scaled_half.clone().finish(resolution, &aggs).expect("finishes"), reduce(&pts[..2_500], resolution, None, None, &aggs).expect("reduces"));
-			let big_half = crate::reduce_partial(&pts[2_500..], resolution, None, None, &aggs).expect("reduces");
+			assert_eq!(scaled_half.clone().finish(resolution, &aggs).expect("finishes"), decimal(&pts[..2_500], resolution, None, None, &aggs));
+			let big_half = crate::reduce_partial_decimal(&pts[2_500..], resolution, None, None, &aggs).expect("reduces");
 			let mut a = scaled_half.clone();
 			a.merge(big_half.clone()).expect("merges");
 			let mut b = big_half;
@@ -1058,15 +1069,15 @@ mod tests {
 		for resolution in [Resolution::Minutes, Resolution::Hours] {
 			for (start, end) in [(None, None), window] {
 				let scaled = reduce_partial_scaled(&nanos, &mantissas, 4, resolution, start, end, &aggs).expect("reduces").expect("served");
-				let big = crate::reduce_partial(&pts, resolution, start, end, &aggs).expect("reduces");
+				let big = crate::reduce_partial_decimal(&pts, resolution, start, end, &aggs).expect("reduces");
 				assert_eq!(scaled.finish(resolution, &aggs).expect("finishes"), big.finish(resolution, &aggs).expect("finishes"), "{resolution:?} {start:?}");
 				for p50 in [&[Aggregation::P50][..], &[Aggregation::Twa][..]] {
-					assert_eq!(reduce_partial_scaled(&nanos, &mantissas, 4, resolution, start, end, p50).expect("reduces").expect("served").finish(resolution, p50).expect("finishes"), reduce(&pts, resolution, start, end, p50).expect("reduces"));
+					assert_eq!(reduce_partial_scaled(&nanos, &mantissas, 4, resolution, start, end, p50).expect("reduces").expect("served").finish(resolution, p50).expect("finishes"), decimal(&pts, resolution, start, end, p50));
 				}
 			}
-			let whole = reduce(&pts, resolution, None, None, &aggs).expect("reduces");
+			let whole = decimal(&pts, resolution, None, None, &aggs);
 			let scaled_half = reduce_partial_scaled(&nanos[..1_700], &mantissas[..1_700], 4, resolution, None, None, &aggs).expect("reduces").expect("served");
-			let big_half = crate::reduce_partial(&pts[1_700..], resolution, None, None, &aggs).expect("reduces");
+			let big_half = crate::reduce_partial_decimal(&pts[1_700..], resolution, None, None, &aggs).expect("reduces");
 			let (mut a, mut b) = (scaled_half.clone(), big_half.clone());
 			a.merge(big_half).expect("merges");
 			b.merge(scaled_half).expect("merges");
@@ -1074,8 +1085,8 @@ mod tests {
 			// Merging the other way round concatenates the samples in another order; the
 			// percentiles and TWA must not depend on it beyond what `reduce_partial` itself does.
 			assert_eq!(b.finish(resolution, &aggs).expect("finishes"), {
-				let mut c = crate::reduce_partial(&pts[1_700..], resolution, None, None, &aggs).expect("reduces");
-				c.merge(crate::reduce_partial(&pts[..1_700], resolution, None, None, &aggs).expect("reduces")).expect("merges");
+				let mut c = crate::reduce_partial_decimal(&pts[1_700..], resolution, None, None, &aggs).expect("reduces");
+				c.merge(crate::reduce_partial_decimal(&pts[..1_700], resolution, None, None, &aggs).expect("reduces")).expect("merges");
 				c.finish(resolution, &aggs).expect("finishes")
 			});
 		}
@@ -1092,7 +1103,7 @@ mod tests {
 		let pts = points(&nanos, &mantissas, 4);
 		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50, Aggregation::SketchP90, Aggregation::SketchP95, Aggregation::SketchP99];
 		for (start, end) in [(None, None), (Some(DateTime::from_timestamp_nanos(nanos[300])), Some(DateTime::from_timestamp_nanos(nanos[2_200])))] {
-			let expected = crate::reduce_partial(&pts, Resolution::Hours, start, end, &aggs).expect("reduces").finish(Resolution::Hours, &aggs).expect("finishes");
+			let expected = decimal(&pts, Resolution::Hours, start, end, &aggs);
 			let actual = reduce_partial_scaled(&nanos, &mantissas, 4, Resolution::Hours, start, end, &aggs).expect("reduces").expect("covered").finish(Resolution::Hours, &aggs).expect("finishes");
 			assert_eq!(actual, expected, "{start:?}..{end:?}");
 		}

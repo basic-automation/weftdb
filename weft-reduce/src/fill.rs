@@ -180,7 +180,10 @@ fn linear_values(latest: &BTreeMap<&String, (i64, &BigDecimal)>, later: &[Bucket
 		.filter_map(|(&key, &(s0, v0))| {
 			// Usually the very next bucket carries the reduction and the search ends at once.
 			let (s1, v1) = later.iter().zip(steps).find_map(|(b, &s)| b.values.get(key).map(|v| (s, v)))?;
-			let value = v0 + (v1 - v0) * BigDecimal::from(step - s0) / BigDecimal::from(s1 - s0);
+			// At nanosecond or microsecond resolution the step indices span more than `i64`
+			// between neighbours near both ends of the range; widen before subtracting.
+			let (offset, span) = (i128::from(step) - i128::from(s0), i128::from(s1) - i128::from(s0));
+			let value = v0 + (v1 - v0) * BigDecimal::from(offset) / BigDecimal::from(span);
 			Some((key.clone(), value))
 		})
 		.collect()
@@ -200,7 +203,7 @@ fn spline_values(buckets: &[Bucket], resolution: Resolution, first: i64, last: i
 	for key in keys {
 		let knots: Vec<Point> = buckets.iter().filter_map(|b| b.values.get(key).map(|v| Point::new(b.timestamp, v.clone()))).collect();
 		let series = splimes::interpolate(&knots, start, end, resolution, spline).map_err(|e| FillError::Spline(e.to_string()))?;
-		let by_step: BTreeMap<i64, BigDecimal> = series.kinds().iter().zip(series.values()).zip(first..).filter(|((kind, _), _)| **kind == PointKind::Interpolated).map(|((_, value), step)| (step, value.clone())).collect();
+		let by_step: BTreeMap<i64, BigDecimal> = series.kinds().iter().zip(series.values()).zip(first..=last).filter(|((kind, _), _)| **kind == PointKind::Interpolated).map(|((_, value), step)| (step, value.clone())).collect();
 		out.insert(key.clone(), by_step);
 	}
 	Ok(out)
@@ -296,6 +299,17 @@ mod tests {
 	}
 
 	#[test]
+	fn a_linear_span_wider_than_i64_does_not_overflow() {
+		// Nanosecond buckets near both ends of the epoch: `s1 - s0` is ~1.8e19, past `i64::MAX`.
+		let (lo, hi) = (-9_000_000_000_000_000_000_i64, 9_000_000_000_000_000_000_i64);
+		let buckets = reduce(&[Point { timestamp: DateTime::from_timestamp_nanos(lo), value: dec("0") }, Point { timestamp: DateTime::from_timestamp_nanos(hi), value: dec("18") }], Resolution::Nanoseconds, None, None, &[Aggregation::Avg]).expect("reduces");
+		let filled = fill(&buckets, Resolution::Nanoseconds, Some(DateTime::from_timestamp_nanos(0)), Some(DateTime::from_timestamp_nanos(0)), &Fill::Linear, 10).expect("fills");
+		// Halfway between: 0 + 18 * 9e18 / 1.8e19 = 9.
+		assert_eq!(filled.len(), 1);
+		assert_eq!(avg(&filled[0]), Some(&dec("9")));
+	}
+
+	#[test]
 	fn empty_input_needs_both_bounds() {
 		assert_eq!(fill(&[], Resolution::Minutes, None, Some(at(600)), &Fill::Null, 100), Ok(Vec::new()));
 		let filled = fill(&[], Resolution::Minutes, Some(at(0)), Some(at(179)), &Fill::Value(dec("7")), 100).expect("fills");
@@ -348,6 +362,17 @@ mod tests {
 		// Linear, by contrast, cuts the chord: 4 → 36 at hour 3 gives 12, not 9.
 		let linear = fill(&buckets, Resolution::Hours, None, None, &Fill::Linear, 100).expect("fills");
 		assert_eq!(avg(&linear[3]), Some(&dec("12")));
+	}
+
+	#[test]
+	fn a_spline_fill_ending_at_the_last_nanosecond_does_not_overflow() {
+		// Knots at i64::MAX - 6, - 4, - 2 and i64::MAX itself: the step counter must not
+		// advance past the last step.
+		let pts: Vec<Point> = [6_i64, 4, 2, 0].iter().zip(["1", "2", "3", "4"]).map(|(&back, v)| Point { timestamp: DateTime::from_timestamp_nanos(i64::MAX - back), value: dec(v) }).collect();
+		let buckets = reduce(&pts, Resolution::Nanoseconds, None, None, &[Aggregation::Avg]).expect("reduces");
+		let filled = fill(&buckets, Resolution::Nanoseconds, None, None, &Fill::Spline(Spline::Quadratic), 10).expect("fills");
+		assert_eq!(filled.len(), 7);
+		assert!([1, 3, 5].iter().all(|&i| filled[i].count == 0 && avg(&filled[i]).is_some()), "every gap is interpolated");
 	}
 
 	#[test]
