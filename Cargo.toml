@@ -31,6 +31,10 @@ async-trait = "0.1"
 # Pinned exactly: weft-reduce reproduces 0.4.11's operator rules (the Div/Mul/Add special cases)
 # so its integer fast paths return results identical in representation. A newer 0.4.x must pass
 # the differential tests in weft-reduce/src/scaled.rs before this moves.
+# Cost, accepted for 1.0: BigDecimal is in the published API, so a downstream crate (or another
+# dependency) that needs >= 0.4.12 fails to resolve, and a RustSec advisory on bigdecimal needs
+# a release here rather than `cargo update`. The lighter alternative is a CI job that runs those
+# differential tests after `cargo update -p bigdecimal`; revisit this pin if either cost bites.
 bigdecimal = "=0.4.11"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 chrono = { version = "0.4", features = ["serde"] }
