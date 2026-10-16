@@ -28,7 +28,10 @@ rust-version = "1.95"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
-bigdecimal = "0.4"
+# Pinned exactly: weft-reduce reproduces 0.4.11's operator rules (the Div/Mul/Add special cases)
+# so its integer fast paths return results identical in representation. A newer 0.4.x must pass
+# the differential tests in weft-reduce/src/scaled.rs before this moves.
+bigdecimal = "=0.4.11"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 chrono = { version = "0.4", features = ["serde"] }
 criterion = { version = "0.8", features = ["html_reports"] }

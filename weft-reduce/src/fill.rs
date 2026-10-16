@@ -39,6 +39,7 @@ use crate::{bucket_index, bucket_start, Bucket};
 
 /// How [`fill`] synthesizes the values of a bucket that held no samples.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Fill {
 	/// Emit the bucket with no values (SQL `FILL(NULL)`).
 	Null,
@@ -73,6 +74,7 @@ impl Fill {
 
 /// Why a fill could not be produced.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum FillError {
 	/// The buckets were not in strictly ascending grid order, or two fell on one step.
 	#[error("buckets must be in strictly ascending grid order")]
