@@ -1,0 +1,47 @@
+name: bigdecimal drift
+
+# weft-reduce's integer fast paths reproduce bigdecimal 0.4.11's operator rules (the Div, Mul
+# and Add special cases) so that results are identical in representation to the BigDecimal
+# path. The workspace allows any 0.4.x (see the comment on the dependency in Cargo.toml), so
+# this job moves bigdecimal to the newest 0.4.x and runs the differential tests in
+# weft-reduce/src/scaled.rs against it.
+#
+# A separate workflow on purpose: scripts/release/verify.sh reads the latest completed run of
+# ci.yml for a commit as release evidence, so a red run here, caused by an upstream release
+# and not by a change in this repository, must not be able to veto a release. A scheduled
+# failure still notifies. It is not a required check and runs on no push or pull request.
+
+on:
+  schedule:
+    - cron: "30 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  drift:
+    name: weft-reduce against the newest bigdecimal 0.4.x
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # Deliberately not --locked: the point is to leave Cargo.lock's 0.4.11 behind.
+      - name: Move bigdecimal to the newest 0.4.x
+        run: cargo update -p bigdecimal
+      - name: Show the version under test
+        run: cargo tree -p weft-reduce --invert bigdecimal --depth 0
+      - name: Differential tests
+        run: cargo test -p weft-reduce --lib

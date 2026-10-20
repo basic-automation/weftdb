@@ -1658,7 +1658,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
      per-point `BigDecimal` output before narrowing to JSON `f64` (~80% of an interpolation;
      L-COMPUTE), and `?fill=` on the downsample endpoints (L-COMPUTE / L-STORAGE-READ).
   2. **EVI-10A review:** `SegmentStore::interpolate_range` / `_f64` already have the form decision 18
-     asks for; the evidence track adopts or reshapes them.
+     asks for; the evidence track adopts or reshapes them. They now carry an input cap
+     (`interpolate_range::MAX_KNOTS`, 4 Mi stored rows per read window), checked on the rows
+     `read_time_range` returns. Refusing before the decode needs the index's per-segment row
+     counts (a `prune_by_time` sum), which live in `segment_store.rs`: the store lane's follow-up.
   3. **Free-lane residue:** ~~the sketch's dense bin store~~ (measured 2026-10-11, no win; see the sketch list) (keeps the sidecar's serde form; the
      sketch is now the costliest per-sample reduction on the integer path), arbitrary bucket
      widths for Q5's `SAMPLE BY 5s` (freeze-track API decision first), a real smooth-signal corpus

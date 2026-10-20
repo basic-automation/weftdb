@@ -251,7 +251,8 @@ only the control plane, not the segment frames.
   — the aspect's samples in a window (plus a `margin` of knots past each edge) run through a
   caller-supplied splimes `Interpolator`, returning the grid with provenance;
   `interpolate_range_f64` returns `f64` values (~3× faster at 1M points, since building a
-  `BigDecimal` per output point dominates). Library only; no HTTP endpoint yet.
+  `BigDecimal` per output point dominates). A read window holding more than 4 Mi stored rows
+  (`interpolate_range::MAX_KNOTS`) is refused. Library only; no HTTP endpoint yet.
 - **`weft_reduce::decimal_to_f64`**: a `BigDecimal` to `f64` conversion bit-identical to
   `bigdecimal`'s `to_f64`, fast for values of at most 15–16 significant digits.
 - **Stored-range percentile and time-weighted-average downsamples take the integer path**
