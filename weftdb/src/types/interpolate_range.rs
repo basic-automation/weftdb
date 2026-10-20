@@ -216,7 +216,9 @@ mod tests {
 		assert!(err.contains("holds 20 stored rows") && err.contains("narrow the window"), "{err}");
 		// The margin counts: [95, 105] alone holds one row, with a margin of 50 it holds more.
 		assert!(store.stored_window_capped("line", 95, 105, 0, 1).await.is_ok());
-		assert!(store.stored_window_capped("line", 95, 105, 50, 5).await.is_err());
+		let padded = store.stored_window_capped("line", 95, 105, 50, 5).await.err().expect("the margin counts toward the cap").to_string();
+		assert!(padded.contains("holds 11 stored rows"), "{padded}");
+		assert!(store.stored_window_capped("line", 95, 105, 50, 11).await.is_ok());
 		// The default cap is far above anything these tests read.
 		assert!(MAX_KNOTS >= 4_000_000);
 		drop(store);
