@@ -1,0 +1,40 @@
+# Vendored copy of `branches` 0.4.6 (MIT, github.com/fereidani/branches) with ONE changed line:
+# the no-`std` nightly path of `abort()` calls `core::intrinsics::abort_immediate()` because
+# nightly 2026-10-15 removed `core::intrinsics::abort` (branches 0.5.1 makes the same change).
+#
+# Why it exists: `turso_core` 0.8.x requires `branches = "0.4.3"`, so Cargo cannot move it to
+# the fixed 0.5.x line, and the advisory `check (nightly)` CI job failed to compile it. Wired
+# in by `[patch.crates-io]` in the workspace manifest; delete this directory and that patch
+# once `turso_core` depends on `branches` >= 0.5.1 (or a 0.4.x release with the fix).
+[package]
+edition = "2018"
+rust-version = "1.59"
+name = "branches"
+version = "0.4.6"
+authors = ["Khashayar Fereidani"]
+build = "build.rs"
+description = "Vendored branches 0.4.6 with the nightly abort intrinsic fix; see the comment at the top of this manifest"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/fereidani/branches"
+publish = false
+
+[features]
+default = ["std", "prefetch"]
+prefetch = []
+std = []
+
+[build-dependencies]
+rustc_version = "0.4"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(branches_stable)",
+    "cfg(branches_nightly)",
+    "cfg(rustc_ge_1_81_0)",
+    "cfg(rustc_ge_1_84_0)",
+    "cfg(rustc_ge_1_95_0)",
+    "cfg(branches_check_asm)",
+]
