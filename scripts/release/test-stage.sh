@@ -60,8 +60,9 @@ done
 dir=weftdb-v1.2.3-x86_64-unknown-linux-gnu
 listing=$(tar -tzf "$tmp/dist/$dir.tar.gz" | LC_ALL=C sort | tr '\n' ' ')
 want=""
-for f in / /LICENSE-APACHE /LICENSE-MIT /NOTICE /README.md /THIRD-PARTY-NOTICES-weft-physical-type \
-	/THIRD-PARTY-NOTICES-weft-reduce /weft-bench /weft-server /weft-tui; do
+for f in / /LICENSE-APACHE /LICENSE-MIT /NOTICE /README.md /THIRD-PARTY-LICENSES.md \
+	/THIRD-PARTY-NOTICES-weft-physical-type /THIRD-PARTY-NOTICES-weft-reduce /weft-bench \
+	/weft-server /weft-tui; do
 	want+="$dir$f "
 done
 check "the archive holds one directory with the binaries, licenses and notices" \
@@ -72,6 +73,10 @@ for crate in weft-physical-type weft-reduce; do
 	check "$crate's THIRD-PARTY-NOTICES is packed under its own name" \
 		cmp "$src/$crate/THIRD-PARTY-NOTICES" "$tmp/unpacked/$dir/THIRD-PARTY-NOTICES-$crate"
 done
+# The dependency bundle is generated, so the tree can hold one that Cargo.lock contradicts
+# (caught by scripts/licenses/generate.sh check) or none at all (caught here).
+check "THIRD-PARTY-LICENSES.md is packed unchanged" cmp -s "$src/THIRD-PARTY-LICENSES.md" \
+	"$tmp/unpacked/$dir/THIRD-PARTY-LICENSES.md"
 check "the .sha256 verifies with sha256sum -c" \
 	sha256sum_c "$tmp/dist" weftdb-v1.2.3-x86_64-unknown-linux-gnu.tar.gz.sha256
 
@@ -85,10 +90,18 @@ else
 fi
 
 mkdir -p "$tmp/partial"
-cp "$src/README.md" "$src/LICENSE-MIT" "$src/LICENSE-APACHE" "$src/NOTICE" "$tmp/partial/"
+cp "$src/README.md" "$src/LICENSE-MIT" "$src/LICENSE-APACHE" "$src/NOTICE" \
+	"$src/THIRD-PARTY-LICENSES.md" "$tmp/partial/"
 refuses reason:"missing file: $tmp/partial/weft-physical-type/THIRD-PARTY-NOTICES" \
 	"archive with a notice file missing" \
 	"$stage" archive x86_64-unknown-linux-gnu v1.2.3 "$tmp/bin/x86_64-unknown-linux-gnu" "$tmp/partial" "$tmp/other"
+mkdir -p "$tmp/nobundle/weft-physical-type" "$tmp/nobundle/weft-reduce"
+cp "$src/README.md" "$src/LICENSE-MIT" "$src/LICENSE-APACHE" "$src/NOTICE" "$tmp/nobundle/"
+cp "$src/weft-physical-type/THIRD-PARTY-NOTICES" "$tmp/nobundle/weft-physical-type/"
+cp "$src/weft-reduce/THIRD-PARTY-NOTICES" "$tmp/nobundle/weft-reduce/"
+refuses reason:"missing file: $tmp/nobundle/THIRD-PARTY-LICENSES.md" \
+	"archive with the generated license bundle missing" \
+	"$stage" archive x86_64-unknown-linux-gnu v1.2.3 "$tmp/bin/x86_64-unknown-linux-gnu" "$tmp/nobundle" "$tmp/other"
 refuses "archive with a missing binary" \
 	"$stage" archive x86_64-unknown-linux-gnu v1.2.3 "$tmp/nowhere" "$src" "$tmp/other"
 linux_bin=$tmp/bin/x86_64-unknown-linux-gnu

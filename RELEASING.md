@@ -84,10 +84,25 @@ on Windows) with a `.sha256` next to it, and a last job checks every archive and
 one `SHA256SUMS` over all five.
 
 Every archive holds the three binaries, `README.md`, both license files (`LICENSE-MIT`,
-`LICENSE-APACHE`), `NOTICE`, and the `THIRD-PARTY-NOTICES` of `weft-physical-type` and
-`weft-reduce` (as `THIRD-PARTY-NOTICES-weft-physical-type` and
+`LICENSE-APACHE`), `NOTICE`, `THIRD-PARTY-LICENSES.md`, and the `THIRD-PARTY-NOTICES` of
+`weft-physical-type` and `weft-reduce` (as `THIRD-PARTY-NOTICES-weft-physical-type` and
 `THIRD-PARTY-NOTICES-weft-reduce`), whose Apache-2.0 portions are compiled into the
 binaries. `scripts/release/stage.sh` lists them.
+
+`THIRD-PARTY-LICENSES.md` is generated, not handwritten: it names every crate the released
+binaries link, with the license text that covers it, for all five targets at once. Regenerate
+it whenever a dependency changes:
+
+```bash
+scripts/licenses/generate.sh          # rewrite it
+scripts/licenses/generate.sh check    # what CI runs: fail if it is stale
+```
+
+The generator is `cargo-about`, pinned to one version in the script and in `ci.yml` because
+the file is committed and an unpinned generator makes every tool upgrade an unexplained diff.
+`about.toml` holds the policy — the five release targets, build-dependencies in,
+dev-dependencies out, and the same license set `deny.toml` allows, so `cargo deny check
+licenses` and the bundle cannot disagree about what may ship.
 
 Dispatching the workflow is a dry run unless you say otherwise:
 
