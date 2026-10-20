@@ -36,8 +36,12 @@ commit = "b9a8ee424e5b9df84b2f3d5b904a0a7301565541"
 published_at = "2026-10-09T00:56:59Z"
 binaries = true
 crates_io = false
-# `fixtures` is added by the PR that commits compat/fixtures/v0.1.0/, the store, the
-# legacy data directory and the backup that the v0.1.0 binaries wrote (slice X-FX).
+# The fixture set this release's own binaries wrote, committed by 1.0 plan slice X-FX: a
+# Storage-v2 root, the backup that same server took, a rows-mode database, and every read
+# that server recorded while it owned them. `scripts/compat/make-v010-fixtures.sh`
+# regenerates it from the tag; `weftdb/tests/compat_v010.rs` opens it with the build under
+# test; `verify` here re-hashes every file in it, so a fixture that drifts fails CI.
+fixtures = "compat/fixtures/v0.1.0"
 legs = ["upgrade", "rollback"]
 
 [release.assets]

@@ -235,6 +235,30 @@ class Assets(unittest.TestCase):
 
 
 class ThePinnedTree(unittest.TestCase):
+	def test_the_v010_pin_names_the_fixture_set_x_fx_committed(self):
+		"""The baseline pin names what X-FX committed, and the set is the shape a gate needs.
+
+		A pin without its fixture set is a gate with nothing to open; a fixture set missing a
+		tree, a record or the segment files inside `store/` is a gate that proves less than it
+		claims. `verify` re-hashes every byte of it; this says what those bytes have to be."""
+		blocks = [b for b in releases.load_pin(REPO_ROOT / releases.PIN_FILE) if b.get("version") == "0.1.0"]
+		self.assertEqual(len(blocks), 1, "the baseline release is pinned exactly once")
+		fixture = blocks[0].get("fixtures")
+		self.assertEqual(fixture, "compat/fixtures/v0.1.0", "the v0.1.0 pin must name its fixture set: X-FX is what commits it")
+		root = REPO_ROOT / fixture
+		for tree in ("store", "backup", "legacy"):
+			self.assertTrue((root / tree).is_dir(), f"{fixture}/{tree}: one of the three trees the v0.1.0 binaries wrote")
+		for record in ("rows.csv", "expected_reads.txt", "aspects.json", "aspect_stats.txt", "stats.json", "backup.json", "restore_drill.json", "segment_listing.txt", "MANIFEST.sha256", "binaries.sha256", "provenance.txt", "README.md"):
+			self.assertTrue((root / record).is_file(), f"{fixture}/{record}: how a fixture set says what it holds and who wrote it")
+		self.assertTrue((REPO_ROOT / "scripts/compat/make-v010-fixtures.sh").is_file(), "a fixture set a gate cannot regenerate is a fixture set nobody can fix")
+		self.assertTrue((REPO_ROOT / "weftdb/tests/compat_v010.rs").is_file(), "the pin names a fixture set; a test has to open it")
+		# The shape that makes this root worth having: segments keyed in a control-plane
+		# database, and no format marker at all, because the marker postdates the tag.
+		self.assertTrue((root / "store" / "segment_index.db").is_file())
+		self.assertFalse((root / "store" / "store.json").exists(), "a v0.1.0 root predates the format marker; a fixture that has one was not written by the tag")
+		self.assertFalse((root / "store" / "segment_manifest.json").exists())
+		self.assertTrue(any(path.name.endswith(".weftseg") for path in (root / "store" / "segments").iterdir()), "a Storage-v2 fixture with no segments tests nothing")
+
 	def test_this_repositories_pins_verify(self):
 		"""The file this repository ships must pass its own checks."""
 		try:

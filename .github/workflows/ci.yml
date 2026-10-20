@@ -263,8 +263,10 @@ jobs:
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
           args: -color
+      # The release pipeline scripts, and the fixture generator X-FX added: neither has any
+      # other gate on it, and both run against a real tag rather than a mocked one.
       - name: shellcheck
-        run: shellcheck --version && shellcheck scripts/release/*.sh
+        run: shellcheck --version && shellcheck scripts/release/*.sh scripts/compat/*.sh
       - name: verify.sh tests
         run: scripts/release/test-verify.sh
       - name: stage.sh tests

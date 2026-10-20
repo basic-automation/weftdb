@@ -1,0 +1,14 @@
+{
+    "aspect_count": 3,
+    "segment_count": 6,
+    "total_rows": 877,
+    "total_nulls": 21,
+    "total_bytes": 3220,
+    "bytes_per_point": 3.6716077537058154,
+    "unsorted_segments": 2,
+    "overlapping_segments": 5,
+    "time_range": [
+        0,
+        4070900000
+    ]
+}
