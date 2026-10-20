@@ -1,6 +1,6 @@
 //! Automatic background control-plane backup (roadmap **Phase 7.4**).
 //!
-//! The manual `POST /api/v1/storage/backup` endpoint (see [`manage`](crate::manage))
+//! The manual `POST /api/v1/storage/backup` endpoint (see [`backup_routes`](crate::backup_routes))
 //! lets an operator take one online, verified snapshot of the store's four
 //! control-plane databases over Turso's `VACUUM INTO`. This module turns that same
 //! primitive into a **background timer**, mirroring the

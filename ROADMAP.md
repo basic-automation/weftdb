@@ -1142,7 +1142,7 @@ any write, never purge an unproven frame), with its unfinished work on `durabili
   - [ ] Delete the stale draft prerelease `v0.1.0-preview.1` *(owner)*
   - [x] Store lane: **D-S6** merges only after the v0.1.0 tag (see W0) — #72
   - [x] → **D-S7** (see W0) — #72
-  - [ ] **X-SPLIT-SRV** Split manage.rs into declare/ingest/maintain/backup_routes, and main.rs into startup phases
+  - [x] **X-SPLIT-SRV** Split manage.rs into declare/ingest/maintain/backup_routes, and main.rs into startup phases — *#86: `weft-server/src/manage.rs` (2,696 lines) became `declare.rs` (schema tokens + declare), `ingest.rs` (JSON/CSV/ILP, and the Parquet ingest that `storage.rs` handed over as `ingest_parquet`, so all four formats share one ordering gate and one seal), `maintain.rs` (reconcile/squash/compact + the sweep) and `backup_routes.rs` (backup + restore drill), with the endpoint tests' routers and request helpers in one shared `test_support.rs`; `main.rs` is now the runtime plus one call into `startup/{hooks,config,state,daemons,serve}.rs`. Behaviour and route table unchanged (256 weft-server tests, same count). Design-doc line citations that name `manage.rs`/`storage.rs:351-382` predate the move — the code they describe is in `ingest.rs`/`maintain.rs`/`backup_routes.rs` now.*
   - [ ] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
   - [ ] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
   - [ ] **PAC-1b** Stripped dist profile and a third-party license bundle (absorbs EVI-20) — *the dist profile shipped in #71*
