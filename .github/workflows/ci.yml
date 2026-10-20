@@ -269,3 +269,21 @@ jobs:
         run: scripts/release/test-verify.sh
       - name: stage.sh tests
         run: scripts/release/test-stage.sh
+
+  # compat/releases.toml is the pin every compatibility, upgrade and rollback gate runs
+  # against: the tag, the commit it points at, the fixture set that release wrote and the
+  # digest of every archive it published. This job re-checks the pin against git and
+  # against compat/fixtures/, and runs the checker's own tests. The GitHub-side digest
+  # check (`releases.py verify-assets`) runs in the release workflow, which has the token.
+  compat:
+    name: release pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the pins name tags; verify resolves each one locally
+      - run: python3 -m unittest discover -s scripts/compat -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      - run: python3 scripts/compat/releases.py verify

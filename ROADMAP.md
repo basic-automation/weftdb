@@ -1130,7 +1130,7 @@ any write, never purge an unproven frame), with its unfinished work on `durabili
   - [x] **Decision 1** Store shapes for S6/S7: STORE_FORMAT + migration registry, `series_id`, P1/P2 with no key change, `SegmentStoreOptions`, `store_uuid`/`OpenReport` — adopted, #72
   - [ ] Turn on GitHub private vulnerability reporting (Settings → Security) *(owner)*
 - [ ] **W1 · Baseline release, server split, goldens** — starts **Semver policy + `CHANGELOG.md`** (from the first tagged pre-release)
-  - [ ] **PAC-4** Cut the v0.1.0 baseline release (GitHub release only) — *released 2026-10-08: tag `v0.1.0` → b9a8ee4 (the #71 merge), five targets + SHA256SUMS, no crates.io; only the `compat/releases.toml` pin is left*
+  - [x] **PAC-4** Cut the v0.1.0 baseline release (GitHub release only) — *released 2026-10-08: tag `v0.1.0` → b9a8ee4 (the #71 merge), five targets + SHA256SUMS, no crates.io. The pin is `compat/releases.toml`, read by every compatibility/upgrade/rollback gate and re-checked in CI (the `compat` job): tag → commit, the fixture set it names, and the sha256 of each archive against the release's own `SHA256SUMS` (`scripts/compat/releases.py`)*
   - [ ] → **X-FX** One fixture set under `compat/fixtures/v0.1.0/`, written by the v0.1.0 binary (absorbs PAC-FX, FRE-2)
   - [ ] Delete the stale draft prerelease `v0.1.0-preview.1` *(owner)*
   - [x] Store lane: **D-S6** merges only after the v0.1.0 tag (see W0) — #72

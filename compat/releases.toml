@@ -1,0 +1,48 @@
+# The releases that every compatibility, upgrade and rollback gate runs against.
+#
+# One `[[release]]` block per released version, oldest first. This file is the pin the
+# 1.0 gates name ("a fixture store written by the previous release is read by the current
+# one", ROADMAP.md "Compatibility tests"; `UPGRADING.md`'s legs, PAC-14a): a gate takes the
+# release it tests from here rather than from a version string in a workflow, so the tag,
+# the commit it points at, the fixture that release wrote and the artifacts it published
+# cannot drift apart.
+#
+# Add a block with `python3 scripts/compat/releases.py pin <tag> --write`, which reads the
+# tag, the commit it points at and the release's own `SHA256SUMS` asset. Never edit a block
+# after its release has been used by a gate: the pin is append-only history, and a changed
+# digest means the artifact a run was measured against no longer exists. `verify` re-checks
+# what is written here against git and against `compat/fixtures/`; CI runs it.
+#
+# Fields:
+#   version       the crate/binary version released (the tag without its leading "v")
+#   tag           the git tag the release workflow cut
+#   commit        the exact commit tagged — `git rev-list -n1 <tag>` must equal this
+#   published_at  when the release became public, from GitHub
+#   binaries      true when GitHub carries release archives for it
+#   crates_io     true when the crates were published to crates.io for it
+#   fixtures      the fixture set this release wrote, relative to the repository root
+#                 (`compat/fixtures/<tag>/`), which later releases' compatibility tests read
+#   legs          which compatibility legs this release is the "previous release" for:
+#                 `upgrade` (its store opens on the candidate), `rollback` (the candidate's
+#                 writes are read back by this release's binary) and `binary` (this release's
+#                 binary runs against the candidate's store)
+#   assets        every archive the release published, by name, with the sha256 its
+#                 `SHA256SUMS` asset carries
+
+[[release]]
+version = "0.1.0"
+tag = "v0.1.0"
+commit = "b9a8ee424e5b9df84b2f3d5b904a0a7301565541"
+published_at = "2026-10-09T00:56:59Z"
+binaries = true
+crates_io = false
+# `fixtures` is added by the PR that commits compat/fixtures/v0.1.0/, the store, the
+# legacy data directory and the backup that the v0.1.0 binaries wrote (slice X-FX).
+legs = ["upgrade", "rollback"]
+
+[release.assets]
+"weftdb-v0.1.0-aarch64-apple-darwin.tar.gz" = "62f9adc08bdd4442e0dbade1ea95cdc14415340d007e98557ddc1015a6dd5f1f"
+"weftdb-v0.1.0-aarch64-unknown-linux-gnu.tar.gz" = "cdb242903b47228531758ee2970aeb45be9c5a219321bc9781064add8e07edce"
+"weftdb-v0.1.0-x86_64-apple-darwin.tar.gz" = "791e2fd11e3ab3202019c22790bcf44ca2ddbf36ce869112d7389d68c0275cb5"
+"weftdb-v0.1.0-x86_64-pc-windows-msvc.zip" = "a1854092a1bb07d968a497e1113adb34a6ac5b385aa847d052baf522f586f1c8"
+"weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz" = "d7ff31ffe6d6e93972ebf5f91b2759e8ee3116a0070e094b84bbf3f70143c612"
