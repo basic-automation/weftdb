@@ -1,0 +1,32 @@
+{
+    "dir": "<work>/backups/manual-<timestamp>",
+    "databases": [
+        {
+            "name": "segment_index.db",
+            "tables": 1,
+            "rows": 6,
+            "bytes": 20480
+        },
+        {
+            "name": "metadata.db",
+            "tables": 1,
+            "rows": 3,
+            "bytes": 16384
+        },
+        {
+            "name": "aspect_catalog.db",
+            "tables": 1,
+            "rows": 3,
+            "bytes": 16384
+        },
+        {
+            "name": "catalog.db",
+            "tables": 2,
+            "rows": 2,
+            "bytes": 24576
+        }
+    ],
+    "total_rows": 14,
+    "total_bytes": 77824,
+    "verify": "source"
+}

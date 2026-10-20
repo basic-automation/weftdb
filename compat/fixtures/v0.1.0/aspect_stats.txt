@@ -1,0 +1,6 @@
+# stats price
+{"aspect":"price","segment_count":3,"total_rows":725,"total_nulls":14,"total_bytes":1833,"bytes_per_point":2.5282758620689654,"unsorted_segments":2,"overlapping_segments":3,"time_range":[0,4070900000],"value_range":["100.2500","106.5"]}
+# stats temp
+{"aspect":"temp","segment_count":2,"total_rows":72,"total_nulls":7,"total_bytes":674,"bytes_per_point":9.36111111111111,"unsorted_segments":0,"overlapping_segments":2,"time_range":[1767225600,1767232680],"value_range":["21.5000","26.5"]}
+# stats flow
+{"aspect":"flow","segment_count":1,"total_rows":80,"total_nulls":0,"total_bytes":713,"bytes_per_point":8.9125,"unsorted_segments":0,"overlapping_segments":0,"time_range":[1767225600,1767231540],"value_range":["0","139"]}

@@ -1,0 +1,1 @@
+{"aspects":[{"name":"flow","physical_type":"f64","value_tolerance":"0","timestamp_unit":"seconds"},{"name":"price","physical_type":"scaled_i64","value_tolerance":"0","timestamp_unit":"seconds"},{"name":"temp","physical_type":"f64","value_tolerance":"0","timestamp_unit":"seconds"}]}

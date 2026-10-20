@@ -29,7 +29,8 @@ cp compat/v010/weftdb/examples/gen_legacy_fixture.rs /tmp/weft-v010/weftdb/examp
 
 ## What that generator leaves on disk (checked by running it)
 
-500 rows across three aspects, 540 KB total:
+The committed fixture runs it over `compat/fixtures/v0.1.0/rows.csv` — 384 rows for
+`plant/{price,temp,flow}`, of which 13 are null — and the tree is ~490 KB:
 
 ```text
 <data_dir>/v010_legacy/
@@ -39,8 +40,13 @@ cp compat/v010/weftdb/examples/gen_legacy_fixture.rs /tmp/weft-v010/weftdb/examp
 │   ├── dictionaries/
 │   └── pipeline.db correlations.db patterns.db processed_*.db unprocessed_*.db
 ├── plant/temp/
-└── plant-b/price/
+└── plant/flow/
 ```
+
+Rows-mode has no null value, so the generator **skips** null grid rows rather than writing a
+sentinel; `legacy/` is therefore the non-null subset of the grid the Storage-v2 tree holds.
+It says so on stderr (`skipped N row with no value for rows-mode`) so the count is on the
+record rather than in a comment.
 
 `metadata.db` is a **turso** file, not SQLite — `python3 -c "import sqlite3; …"` refuses it
 ("file is not a database"), so the fixture can only be read by the crate that wrote it. That
@@ -74,19 +80,32 @@ Verified present at the tag (`weft-server/src/lib.rs`'s router):
   `expected_reads.txt` while the v0.1.0 server is still the one answering them
 - `GET /api/v1/storage/catalog`, `/api/v1/storage/aspects`, `/api/v1/storage/stats`
 
-## Still to do for X-FX
+## What X-FX landed with
 
-1. `scripts/compat/make-v010-fixtures.sh` — set up the worktree above, start a v0.1.0 server
-   on `127.0.0.1` with `WEFT_SEGMENT_STORE_ROOT` in a temp dir, declare + ingest one aspect
-   through all three formats, reconcile, read back, take a backup, then run the legacy
-   generator; copy the three trees plus `MANIFEST.sha256` and `expected_reads.txt` into
-   `compat/fixtures/v0.1.0/`.
-2. A `compat/` crate whose tests open each fixture with the **current** build: the store
-   fixture must report its format version through `describe_store()` before and after the
-   migration and keep returning the same values; the legacy tree must become a v2 database
-   that reads the same values; the backup must restore into an empty root.
-3. A CI job for those tests (the fixture set is small on purpose — the large one comes at
-   slice 17).
+1. `scripts/compat/make-v010-fixtures.sh` builds nothing; it takes a `--bin-dir` holding
+   `weft-server` and `examples/gen_legacy_fixture` compiled from the tag, starts a v0.1.0
+   server on `127.0.0.1` with `WEFT_SEGMENT_STORE_ROOT` in a temp dir, declares three
+   aspects, ingests one grid through CSV / JSON `points` / ILP, leaves the aspects in the
+   three shapes a reader meets (overlapping batches, a batch reconciled in place, a squashed
+   aspect), records every read it can make, takes a backup, runs the restore drill, then runs
+   this generator. Its output is `compat/fixtures/v0.1.0/`, `MANIFEST.sha256` included.
+2. `weftdb/tests/compat_v010.rs` opens each tree with **this** build. Not a separate
+   `compat/` crate: the thing under test is `SegmentStore`'s own open path, and a crate that
+   depends on `weftdb` would test the same code through an extra layer while sitting outside
+   the build matrix that already runs `weftdb`'s integration tests on the release compiler,
+   the MSRV and Windows.
+3. CI needs no new job: the build matrix runs `weftdb`'s tests, and the `release pins` job
+   runs `scripts/compat/releases.py verify`, which re-hashes every file in the fixture set the
+   pin names — so a fixture byte changed by accident fails there, not in a test three months
+   later.
 
-Until 1–3 land, nothing in this directory is exercised by CI; the generator has only been run
-by hand, against a worktree at the tag, with the result above.
+**What the fixture settled, and what it did not.** A v0.1.0 Storage-v2 root carries no
+`store.json` and no `segment_manifest.json`: the descriptors live in `segment_index.db`. This
+build classifies such a root as layout 1, migrates it forward, and reads back the same
+timestamps, values and nulls the v0.1.0 server recorded — then reopens without migrating
+again. A v0.1.0 backup covers the four control-plane databases and **none** of `segments/`, so
+it cannot restore an ingested store; that is a finding about the release, not a wish.
+A v0.1.0 **rows-mode** tree is not readable by this build at all — rows-mode measurements sit
+in Turso databases and the current engine never opens Turso (roadmap D-S4: "Nothing in the
+repo reads it back"). `legacy/` is committed as the input FRE-14 has to work from, and its
+test asserts the shape of what that migration must consume rather than pretending to read it.

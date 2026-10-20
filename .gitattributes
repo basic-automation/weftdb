@@ -5,3 +5,8 @@
 # expected_reads.txt to what it builds with LF line endings, so a CRLF checkout
 # (core.autocrlf=true, the Windows runners' default) would fail it.
 weftdb/tests/fixtures/** -text
+# The v0.1.0 compatibility fixture (X-FX): every byte of it is what the first public release
+# wrote, so nothing here may be normalized on checkout either - the databases would stop
+# being the release's, and `weftdb/tests/compat_v010.rs` parses expected_reads.txt with LF
+# line endings on every platform.
+compat/fixtures/** -text
