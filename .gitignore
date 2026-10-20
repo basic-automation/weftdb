@@ -9,8 +9,11 @@ database/datasets
 *.db-log
 *.weftseg
 *.weftpart
-# ...except the checked-in compatibility fixtures, which are stores on purpose
+# ...except the checked-in compatibility fixtures, which are stores on purpose: a
+# v0.1.0 Turso metadata.db cannot be regenerated in CI, so its databases and frames
+# are committed byte-for-byte (see compat/releases.toml and compat/fixtures/).
 !weftdb/tests/fixtures/**
+!compat/fixtures/**
 
 # Agent/routine scratch output (transient run logs, bench output, server logs)
 scratch
