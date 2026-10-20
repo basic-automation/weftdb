@@ -110,3 +110,10 @@ codegen-units = 1
 
 [profile.test]
 debug = 1
+
+# `turso_core` 0.8.x pins `branches = "0.4.3"`, whose no-`std` nightly path calls an intrinsic
+# that nightly 2026-10-15 removed, so the advisory `check (nightly)` job could not compile it.
+# The patched copy changes that one line (see patches/branches/Cargo.toml). Drop this patch and
+# the directory once turso_core depends on branches >= 0.5.1.
+[patch.crates-io]
+branches = { path = "patches/branches" }
