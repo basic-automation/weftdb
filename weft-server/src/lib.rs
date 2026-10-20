@@ -42,6 +42,7 @@ pub mod interpolate;
 pub mod maintain;
 pub mod metrics;
 pub mod reconcile_daemon;
+pub mod settings;
 pub mod state;
 pub mod storage;
 pub mod store_open;
