@@ -1,0 +1,93 @@
+//! The startup phases of the `weft-server` binary, in the order they run.
+//!
+//! The entry point ([`main`](crate)) only installs the runtime; what happens
+//! after that is this list. Each phase is one module, so a later wave edits a
+//! startup behaviour by editing that module rather than by growing a single file.
+//!
+//! The order matters:
+//!
+//! 1. [`hooks`] — the tracing subscriber, and the OTLP exporter when configured.
+//!    Installed first so every later phase is observable.
+//! 2. [`config`] — what the operator asked for: bind address, interpolation cap,
+//!    and (once the address is known) the request guard.
+//! 3. [`state`] — the router state, which means opening the segment store when
+//!    one is configured.
+//! 4. [`daemons`] — the background reconcile/backup/GPU-calibration tasks.
+//! 5. [`serve`] — bind, print the banner, serve until shutdown.
+//!
+//! ## Request guard
+//!
+//! When the bound address is a loopback address, every request must be addressed to a
+//! loopback host (`Host: localhost`, `127.0.0.0/8` or `[::1]`, else `421`), and a
+//! state-changing request carrying a non-loopback `Origin` is refused (`403`), so web
+//! pages from non-loopback origins, open in a local browser, cannot drive the server
+//! ([`weft_server::host_guard`]).
+//! `WEFT_ALLOW_ANY_HOST=1` turns this off for a local reverse proxy that forwards a
+//! different `Host` or a browser UI's non-loopback `Origin`. A non-loopback bind is not guarded: there is no authentication yet,
+//! so such a server must not be reachable from an untrusted network.
+//!
+//! ## Optional segment store
+//!
+//! Set `WEFT_SEGMENT_STORE_ROOT` to a directory to open a
+//! [`SegmentStore`](weftdb::SegmentStore) rooted there (creating the Storage v2 layout
+//! if absent). With it set, the stored-range query endpoints (`/api/v1/storage/...`) go
+//! live; without it the server serves only the stateless interpolation/downsample API
+//! and those endpoints answer `503`. Readiness (`GET /ready`) reports which mode is
+//! active.
+//!
+//! The store is opened with the options the `WEFT_SEGMENT_*` variables describe
+//! ([`weft_server::store_open`]); the library reads none of them itself. With
+//! `WEFT_ON_AMBIGUOUS_COMMIT=exit` the server exits with status 70 once the store is
+//! write-poisoned.
+//!
+//! ## Interpolation cap
+//!
+//! Every `/api/v1/interpolate*` request may produce at most 10,000,000 output points
+//! (`weft_server::MAX_INTERPOLATE_OUTPUT_POINTS`); `WEFT_MAX_INTERPOLATE_POINTS` sets
+//! another positive limit. It is read once at startup, and a value that is not a
+//! positive integer stops the server from starting.
+//!
+//! ## GPU calibration
+//!
+//! Once the listener is bound, the server calibrates the interpolation engine's backend
+//! choice once, in the background ([`weft_server::gpu`]): it starts the GPU if there is
+//! one and measures where the rayon pool and the GPU overtake a single core. That takes
+//! several seconds, during which requests are already served and interpolate on the CPU
+//! with splimes' default thresholds. A CPU/software adapter (llvmpipe, lavapipe, WARP) is
+//! not calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips
+//! calibration altogether. It never stops the server from starting.
+
+pub(crate) mod config;
+pub(crate) mod daemons;
+pub(crate) mod hooks;
+pub(crate) mod serve;
+pub(crate) mod state;
+
+/// Run every startup phase, in order, until the server stops serving.
+///
+/// # Errors
+///
+/// Any phase that refuses to start the server: a malformed address, a malformed
+/// operator setting, a segment store that cannot be opened, or a listener that
+/// cannot be bound. A background task failing does not fail startup.
+pub(crate) async fn run() -> anyhow::Result<()> {
+	// The OTLP provider (when configured) is held for the process lifetime: dropping it
+	// early would tear down the batch span processor and stop export. It is shut down on
+	// a clean exit to flush any buffered spans.
+	let otel_provider = hooks::init_tracing();
+
+	let addr = config::bind_addr()?;
+	let interpolate = config::interpolate_config()?;
+	let state = state::build().await?.with_interpolate_config(interpolate);
+
+	daemons::spawn_reconcile_if_configured(&state)?;
+	daemons::spawn_backup_if_configured(&state)?;
+
+	let listener = serve::bind(addr).await?;
+	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
+
+	// After the bind and in the background, so serving never waits for it.
+	daemons::spawn_gpu_calibration_if_enabled();
+
+	serve::run(listener, state, otel_provider).await
+}

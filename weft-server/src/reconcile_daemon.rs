@@ -1,7 +1,7 @@
 //! Automatic background out-of-order reconciliation (roadmap **Phase 4.6**).
 //!
 //! The manual `POST /api/v1/storage/{aspect}/reconcile` endpoint (see
-//! [`manage`](crate::manage)) lets an operator trigger a reconciliation pass, and
+//! [`maintain`](crate::maintain)) lets an operator trigger a reconciliation pass, and
 //! its `?threshold=N` form gates that pass on the `unsorted_segments` order-health
 //! backlog. This module turns that same trigger into a **background timer**: on an
 //! interval it sweeps every declared aspect through

@@ -28,13 +28,13 @@
 //! to read), and any other read failure is a `500`.
 
 use axum::{
-	body::{Body, Bytes}, extract::{Path, Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json
+	body::Body, extract::{Path, Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 
-use crate::{manage::IngestResponse, state::AppState};
+use crate::state::AppState;
 
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.
 const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
@@ -319,82 +319,6 @@ pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(asp
 	let result = weft_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
 	drop(store);
 	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
-}
-
-/// Query parameters for the Parquet ingest endpoint: an optional page height.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ParquetIngestParams {
-	/// Optional page height — seal a paged segment of this many rows per page.
-	#[serde(default)]
-	pub rows_per_page: Option<usize>,
-	/// When `true`, reject an out-of-order batch (`400`) instead of sealing it — the
-	/// Parquet counterpart of the JSON/CSV/ILP `require_sorted` flag.
-	#[serde(default)]
-	pub require_sorted: bool,
-}
-
-/// Classify a Parquet-ingest error: an undeclared aspect is a `404`; a malformed
-/// Parquet body, a batch missing WeftDB's columns, or a value unrepresentable under the
-/// declared encoding/tolerance (hard constraint #4), and an aspect name that is not safe
-/// as a file name are client-data problems → `400`; anything else (filesystem, libSQL) is a `500`.
-fn classify_ingest_error(err: &anyhow::Error) -> StorageError {
-	let message = err.to_string();
-	if message.contains("no declared schema") {
-		StorageError::NotFound(message)
-	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
-		StorageError::BadRequest(message)
-	} else {
-		StorageError::Internal(message)
-	}
-}
-
-/// Handle `POST /api/v1/storage/{aspect}/parquet?rows_per_page`.
-///
-/// The write-side counterpart of the Parquet range export and the Parquet sibling
-/// of the JSON / ILP ingest endpoints: ingests an Apache Parquet file (the request
-/// body, `application/vnd.apache.parquet`) into `aspect`'s declared schema, sealing
-/// one new segment. The decode + seal lives in `weft-arrow-store` (so the heavy
-/// `arrow-*` tree stays off the lean core); the no-silent-downcast guarantee holds
-/// — a value unrepresentable under the declared encoding/tolerance is rejected
-/// `400`, never downcast. Returns `201 Created` with the sealed segment's descriptor.
-///
-/// # Errors
-///
-/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
-/// undeclared), [`StorageError::BadRequest`] (empty/malformed Parquet body or values
-/// unrepresentable under the declared encoding/tolerance), and
-/// [`StorageError::Internal`] on a filesystem/control-plane failure.
-pub async fn storage_ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ParquetIngestParams>, body: Bytes) -> Result<Response, StorageError> {
-	let metrics = state.metrics().clone();
-	metrics.record_ingest_request();
-	let store = state.store().cloned().ok_or_else(|| {
-		metrics.record_ingest_error();
-		StorageError::Unconfigured
-	})?;
-	drop(state);
-	let result = storage_ingest_parquet_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
-	drop(store);
-	if result.is_err() {
-		metrics.record_ingest_error();
-	}
-	result
-}
-
-/// The body of [`storage_ingest_parquet`], split out so the handler records an error
-/// metric for any failure path uniformly.
-async fn storage_ingest_parquet_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, StorageError> {
-	if body.is_empty() {
-		return Err(StorageError::BadRequest("empty Parquet body".to_string()));
-	}
-	// `storage.ingest.parquet` stage span (roadmap Phase 3 — the Arrow-decode-on-ingest
-	// analogue of the JSON/CSV/ILP `storage.ingest.parse`+`seal` spans). The arrow-store
-	// ingest is atomic (Parquet decode → typed-column seal in one call) and the leaf
-	// `weft-arrow-store` stays tracing-free by design, so decode+seal ride one span here,
-	// carrying the request's byte length and the sort-guard flag.
-	let descriptor = weft_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await.map_err(|err| classify_ingest_error(&err))?;
-	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
-	Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
 /// One stored row in the JSON range response: an integer timestamp and its value
@@ -1119,7 +1043,7 @@ pub async fn storage_downsample_parquet(State(state): State<AppState>, Path(aspe
 
 #[cfg(test)]
 mod tests {
-	use std::{str::FromStr, sync::Arc};
+	use std::sync::Arc;
 
 	use axum::{
 		body::Body, http::{Request, StatusCode}
@@ -1131,11 +1055,7 @@ mod tests {
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use weftdb::SegmentStore;
 
-	use crate::{app_with_state, AppState};
-
-	fn bd(s: &str) -> BigDecimal {
-		BigDecimal::from_str(s).expect("test literal parses")
-	}
+	use crate::{app_with_state, test_support::*, AppState};
 
 	/// Open a store under `dir`, declare `price` (F64, seconds), seal one batch, and
 	/// hand back the ready store. The significant-`Drop` `SegmentStore` lives only
@@ -1284,84 +1204,6 @@ mod tests {
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 
-	/// Build a router over a store with `price` declared (F64, seconds) but no rows
-	/// sealed — the starting point for an ingest test.
-	async fn router_with_declared_empty_price(dir: &TempDir) -> axum::Router {
-		let store = SegmentStore::open(dir.path()).await.expect("opens store");
-		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares aspect");
-		app_with_state(AppState::new().with_store(Arc::new(store)))
-	}
-
-	/// Build a Parquet file body carrying the given columns under an F64/seconds
-	/// schema, the way an external producer would.
-	fn price_parquet_body(timestamps: &[i64], values: &[Option<BigDecimal>]) -> Vec<u8> {
-		use weft_arrow::{columns_to_record_batch_typed, write_parquet};
-		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, timestamps, values);
-		write_parquet(std::slice::from_ref(&batch)).expect("writes parquet")
-	}
-
-	async fn post_parquet(router: axum::Router, uri: &str, body: Vec<u8>) -> (StatusCode, serde_json::Value) {
-		let response = router.oneshot(Request::builder().method("POST").uri(uri).body(Body::from(body)).unwrap()).await.unwrap();
-		let status = response.status();
-		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-		let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-		(status, json)
-	}
-
-	#[tokio::test]
-	async fn parquet_ingest_seals_a_batch_the_read_surface_returns() {
-		let dir = TempDir::new().unwrap();
-		let router = router_with_declared_empty_price(&dir).await;
-		let body = price_parquet_body(&[100, 110, 120], &[Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))]);
-		let (status, json) = post_parquet(router, "/api/v1/storage/price/parquet", body).await;
-		assert_eq!(status, StatusCode::CREATED, "body: {json}");
-		assert_eq!(json["aspect"], "price");
-		assert_eq!(json["row_count"], 3);
-		assert_eq!(json["null_count"], 0);
-		assert_eq!(json["min_ts"], 100);
-		assert_eq!(json["max_ts"], 120);
-
-		// Reopen and read back through the JSON points surface.
-		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("reopens"));
-		let router = app_with_state(AppState::new().with_store(store));
-		let (status, read) = get_json(router, "/api/v1/storage/price/points?start=100&end=120").await;
-		assert_eq!(status, StatusCode::OK);
-		assert_eq!(read["count"], 3);
-		assert_eq!(read["points"][1]["value"], "2.5");
-	}
-
-	#[tokio::test]
-	async fn parquet_ingest_into_undeclared_aspect_is_not_found() {
-		let dir = TempDir::new().unwrap();
-		let router = router_with_declared_empty_price(&dir).await;
-		let body = price_parquet_body(&[1], &[Some(bd("1"))]);
-		let (status, _json) = post_parquet(router, "/api/v1/storage/never_declared/parquet", body).await;
-		assert_eq!(status, StatusCode::NOT_FOUND);
-	}
-
-	#[tokio::test]
-	async fn parquet_ingest_rejects_a_garbage_body() {
-		let dir = TempDir::new().unwrap();
-		let router = router_with_declared_empty_price(&dir).await;
-		let (status, _json) = post_parquet(router, "/api/v1/storage/price/parquet", b"not a parquet file".to_vec()).await;
-		assert_eq!(status, StatusCode::BAD_REQUEST);
-	}
-
-	#[tokio::test]
-	async fn parquet_ingest_empty_body_is_bad_request() {
-		let dir = TempDir::new().unwrap();
-		let router = router_with_declared_empty_price(&dir).await;
-		let (status, _json) = post_parquet(router, "/api/v1/storage/price/parquet", Vec::new()).await;
-		assert_eq!(status, StatusCode::BAD_REQUEST);
-	}
-
-	#[tokio::test]
-	async fn parquet_ingest_without_store_is_unavailable() {
-		let router = app_with_state(AppState::new());
-		let (status, _json) = post_parquet(router, "/api/v1/storage/price/parquet", price_parquet_body(&[1], &[Some(bd("1"))])).await;
-		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-	}
-
 	#[tokio::test]
 	async fn empty_window_is_a_valid_zero_row_stream() {
 		let (_dir, router) = router_with_sealed_price().await;
@@ -1402,14 +1244,6 @@ mod tests {
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 	}
 
-	/// Fetch and parse a JSON GET response from a router.
-	async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
-		let response = router.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
-		let status = response.status();
-		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-		(status, serde_json::from_slice(&bytes).unwrap())
-	}
-
 	#[tokio::test]
 	async fn aspects_lists_the_declared_aspect_with_its_schema() {
 		let (_dir, router) = router_with_sealed_price().await;
@@ -1438,34 +1272,6 @@ mod tests {
 		assert!(bpp > 0.0 && bpp.is_finite(), "bytes_per_point = {bpp}");
 		// The sole sealed segment is in order, so the order-health signal is clean.
 		assert_eq!(body["unsorted_segments"], 0);
-	}
-
-	#[tokio::test]
-	async fn parquet_ingest_require_sorted_rejects_out_of_order() {
-		use weft_arrow::{columns_to_record_batch_typed, write_parquet};
-
-		let dir = TempDir::new().expect("temp dir");
-		let store = SegmentStore::open(dir.path()).await.expect("opens store");
-		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
-		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
-		// An out-of-order Parquet batch (row 1: 90 < 100).
-		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &[100_i64, 90, 120], &[Some(bd("1")), Some(bd("2")), Some(bd("3"))]);
-		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes parquet");
-
-		let post = |uri: &'static str| {
-			let router = router.clone();
-			let body = bytes.clone();
-			async move { router.oneshot(Request::builder().method("POST").uri(uri).header("content-type", "application/vnd.apache.parquet").body(Body::from(body)).unwrap()).await.unwrap() }
-		};
-		// require_sorted -> 400 with the offending row.
-		let rejected = post("/api/v1/storage/price/parquet?require_sorted=true").await;
-		assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-		let msg = axum::body::to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
-		let msg: serde_json::Value = serde_json::from_slice(&msg).unwrap();
-		assert!(msg["error"].as_str().unwrap().contains("out-of-order timestamp"), "body: {msg}");
-		// Default (no flag) -> 201.
-		let accepted = post("/api/v1/storage/price/parquet").await;
-		assert_eq!(accepted.status(), StatusCode::CREATED);
 	}
 
 	#[tokio::test]
