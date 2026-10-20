@@ -408,7 +408,7 @@ transfer, kernel, readback, and API serialization, p95 = Z."*
     **FRE-5** (compute vocabulary, L-COMPUTE), which should pin both spellings in a contract test.
   - [ ] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138`, `interpolate.rs:347` and `:591`), i.e. to each float's exact binary expansion: a client's `99.92` is reduced as `99.9200000000000017053025658242404460906982421875`. That is exactly the downsample generator's old `--ds-decimals full` case, measured at **13.7×** slower hourly `avg` (197.8 vs 14.4 ms at 500k points) and **13.1×** for exact `p99` (414.2 vs 31.5 ms) against two-decimal values. Widening through the shortest round-trip decimal (`f.to_string().parse::<BigDecimal>()`, or a `serde_json` arbitrary-precision number so the client's decimal text arrives intact) would make the reductions cost what they do on real decimals and compute on the value the client wrote. L-COMPUTE lane; it changes result digits only below `f64` resolution, which the JSON response narrows away.
   - [ ] **NEXT — the compute endpoints pay the same tax:** `POST /api/v1/interpolate` builds a `BigDecimal` per output point and then narrows it to JSON `f64` ("only the final wire value is narrowed"), so its JSON/CSV/Arrow outputs could take `run_f64` and skip ~80% of the work (raw points would then be `f64`-rounded; they already are on the JSON wire). L-COMPUTE lane.
-  - [ ] **Reconcile with EVI-10A:** the 1.0 plan's decision 18 ships stored interpolation as a library API in slice EVI-10A (W3, a new child module with a one-line `mod` hook between D-S10 and D-S11), with the HTTP route deferred past 1.0. `SegmentStore::interpolate_range` / `interpolate_range_f64` (2026-10-09) take exactly that form; the evidence track should review the API (the `margin` knob, the `f64` variant, the error vocabulary) and adopt or reshape it rather than land a second one.
+  - [ ] **Reconcile with EVI-10A** (2026-10-19: the API now has an input cap, `interpolate_range::MAX_KNOTS`, a `pub` const the review may keep, turn into an option or drop): the 1.0 plan's decision 18 ships stored interpolation as a library API in slice EVI-10A (W3, a new child module with a one-line `mod` hook between D-S10 and D-S11), with the HTTP route deferred past 1.0. `SegmentStore::interpolate_range` / `interpolate_range_f64` (2026-10-09) take exactly that form; the evidence track should review the API (the `margin` knob, the `f64` variant, the error vocabulary) and adopt or reshape it rather than land a second one.
   - [ ] **NEXT (post-1.0 per decision 18) — the HTTP endpoint:** `GET …/storage/{aspect}/interpolate?start=&end=&resolution=&spline=&margin=` with JSON/CSV/Arrow/Parquet like the other storage reads and a bounded grid. **Missing today and not tracked before:** the HTTP API can interpolate only a request-supplied series, so commercial claim #1 (interpolation-on-read for large stored ranges) has no API surface. The router (L-ROUTER) and storage read handlers (L-STORAGE-READ) are lanes, so it lands through their owners.
 - [x] **DONE (2026-10-09) — GPU memory-stability + pool-eviction benchmark** (`weft-bench --gpu-memory`, `gpu_pool` in schema v22): on the RTX 4070 Ti SUPER the default 512 MiB pool created 2 buffer sets over 60 mixed-size calls (none after round 1, 0 evictions, idle steady at 112 MiB); a 32 MiB cap evicted 20 and re-created 19 at an unchanged per-call p50.
   - [ ] **NEXT — device memory, not just pool bytes:** `gpu_pool_stats` counts splimes' idle buffers; a leak outside the pool (wgpu staging, driver) would not show. Sample the adapter's allocated bytes over a long soak. **Checked 2026-10-09: `nvidia-smi` cannot do it here** — a wgpu (Vulkan) process does not appear in `--query-compute-apps`, and the device total is shared with every other workload on the GPU, so it cannot attribute a leak. The route is wgpu's own allocator report (`Device::generate_allocator_report`), which splimes would have to expose (a splimes-repo ask).
@@ -1658,7 +1658,10 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
      per-point `BigDecimal` output before narrowing to JSON `f64` (~80% of an interpolation;
      L-COMPUTE), and `?fill=` on the downsample endpoints (L-COMPUTE / L-STORAGE-READ).
   2. **EVI-10A review:** `SegmentStore::interpolate_range` / `_f64` already have the form decision 18
-     asks for; the evidence track adopts or reshapes them.
+     asks for; the evidence track adopts or reshapes them. They now carry an input cap
+     (`interpolate_range::MAX_KNOTS`, 4 Mi stored rows per read window), checked on the rows
+     `read_time_range` returns. Refusing before the decode needs the index's per-segment row
+     counts (a `prune_by_time` sum), which live in `segment_store.rs`: the store lane's follow-up.
   3. **Free-lane residue:** ~~the sketch's dense bin store~~ (measured 2026-10-11, no win; see the sketch list) (keeps the sidecar's serde form; the
      sketch is now the costliest per-sample reduction on the integer path), arbitrary bucket
      widths for Q5's `SAMPLE BY 5s` (freeze-track API decision first), a real smooth-signal corpus
@@ -1822,7 +1825,8 @@ interpolation performance a budget-owning pain, or merely an engineering annoyan
       `scaled_avg_p99_twa` 155.2 → 79.1 ms, `bigdecimal_avg_p99_twa` 197.0 → 119.5 ms. Hourly on
       1M real closes (weft-bench, all PASS): `avg,p99,twa` 150 → 55–58 ms (points) and 119 → 38 ms
       (`--ds-scaled`); `twa_linear` 223–229 → 71–82 and 160–170 → 42–54 ms. Re-check on a
-      `bigdecimal` upgrade: the emulation follows 0.4.11's operator code.
+      `bigdecimal` upgrade: the emulation follows 0.4.11's operator code; the weekly
+      `.github/workflows/bigdecimal-drift.yml` runs these differential tests against the newest 0.4.x.
   - [ ] **NEXT — the sidecar build.** The `.weftpart` sidecar build
     (`write_partial_sidecar`) receives the seal's BigDecimal values rather than stored mantissas,
     so switching it means threading the seal's encoded column through instead. Its callers sit in

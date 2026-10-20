@@ -16,6 +16,13 @@
 //! and splimes keeps the last one given, so the newest write wins as it does elsewhere in the
 //! store.
 //!
+//! **Input cap.** A request is refused when its read window holds more than [`MAX_KNOTS`]
+//! stored rows, so the knots handed to splimes (and the second copy built for them) are
+//! bounded; splimes' `max_points` bounds the output grid. The check runs on the rows
+//! [`SegmentStore::read_time_range`] returns, so the decode itself is bounded only by the
+//! window: refusing before decoding needs the index's per-segment row counts, which are private
+//! to `segment_store.rs` (the store lane's file), so that tightening belongs to that lane.
+//!
 //! [`SegmentStore::interpolate_range_f64`] is the same reconstruction with `f64` values out.
 //! splimes computes every method in `f64` and its `BigDecimal` result is the shortest decimal
 //! that round-trips each computed `f64`, so for interpolated and extrapolated points the
@@ -56,9 +63,19 @@ struct StoredWindow {
 	values: Vec<Option<BigDecimal>>,
 }
 
+/// The most stored rows one reconstruction reads (null rows count): 4 Mi, about 40 times the
+/// 100k-knot window the bench measures. A wider window is refused: narrow `[start, end]` or
+/// `margin`, or interpolate in pieces.
+pub const MAX_KNOTS: usize = 4 << 20;
+
 impl SegmentStore {
 	/// Validate a reconstruction request and read its rows.
 	async fn stored_window(&self, aspect: &str, start: i64, end: i64, margin: i64) -> Result<StoredWindow> {
+		self.stored_window_capped(aspect, start, end, margin, MAX_KNOTS).await
+	}
+
+	/// [`stored_window`](Self::stored_window) with an explicit row cap (tests lower it).
+	async fn stored_window_capped(&self, aspect: &str, start: i64, end: i64, margin: i64, max_rows: usize) -> Result<StoredWindow> {
 		anyhow::ensure!(start <= end, "interpolate_range: start {start} is after end {end}");
 		anyhow::ensure!(margin >= 0, "interpolate_range: margin {margin} is negative");
 		let schema = self.schema_for(aspect).await?.with_context(|| format!("aspect {aspect:?} is not declared"))?;
@@ -66,6 +83,7 @@ impl SegmentStore {
 		let (from, to) = (instant(start, unit).with_context(|| format!("start {start} is outside the representable range"))?, instant(end, unit).with_context(|| format!("end {end} is outside the representable range"))?);
 		let (lo, hi) = (start.saturating_sub(margin), end.saturating_add(margin));
 		let (timestamps, values) = self.read_time_range(aspect, lo, hi).await?;
+		anyhow::ensure!(timestamps.len() <= max_rows, "interpolate_range: [{lo}, {hi}] holds {} stored rows of aspect {aspect:?}, more than the {max_rows} one reconstruction reads; narrow the window or the margin", timestamps.len());
 		anyhow::ensure!(values.iter().any(Option::is_some), "aspect {aspect:?} has no stored sample in [{lo}, {hi}]");
 		Ok(StoredWindow { from, to, unit, timestamps, values })
 	}
@@ -80,8 +98,8 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// If `aspect` is undeclared or its name invalid, `start > end`, `margin` is negative, a
-	/// bound or stored instant is outside chrono's range, the window holds no stored sample,
-	/// the read fails, or splimes rejects the interpolation (for example a grid larger than
+	/// bound or stored instant is outside chrono's range, the window holds no stored sample or
+	/// more than [`MAX_KNOTS`] rows, the read fails, or splimes rejects the interpolation (for example a grid larger than
 	/// the interpolator's `max_points`, or `Backend::Gpu` without a usable GPU).
 	pub async fn interpolate_range(&self, aspect: &str, start: i64, end: i64, margin: i64, interpolator: Interpolator) -> Result<Interpolation<BigDecimal>> {
 		let StoredWindow { from, to, unit, timestamps, values } = self.stored_window(aspect, start, end, margin).await?;
@@ -184,6 +202,25 @@ mod tests {
 			}
 		}
 		assert!(store.interpolate_range_f64("nope", 0, 10, 0, Interpolator::new(Spline::Linear, Resolution::Seconds)).await.is_err());
+		drop(store);
+	}
+
+	#[tokio::test]
+	async fn a_window_with_more_rows_than_the_cap_is_refused() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = line_store(&dir).await;
+		// The store holds 20 rows; a cap of 20 admits the whole range and a cap of 19 does not.
+		let whole = store.stored_window_capped("line", 0, 190, 0, 20).await.expect("at the cap");
+		assert_eq!(whole.timestamps.len(), 20);
+		let err = store.stored_window_capped("line", 0, 190, 0, 19).await.err().expect("over the cap").to_string();
+		assert!(err.contains("holds 20 stored rows") && err.contains("narrow the window"), "{err}");
+		// The margin counts: [95, 105] alone holds one row, with a margin of 50 it holds more.
+		assert!(store.stored_window_capped("line", 95, 105, 0, 1).await.is_ok());
+		let padded = store.stored_window_capped("line", 95, 105, 50, 5).await.err().expect("the margin counts toward the cap").to_string();
+		assert!(padded.contains("holds 11 stored rows"), "{padded}");
+		assert!(store.stored_window_capped("line", 95, 105, 50, 11).await.is_ok());
+		// The default cap is far above anything these tests read.
+		assert!(MAX_KNOTS >= 4_000_000);
 		drop(store);
 	}
 
