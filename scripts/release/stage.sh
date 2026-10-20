@@ -30,11 +30,17 @@ BINARIES=(weft-server weft-tui weft-bench)
 # the archive>. Apache-2.0 section 4: the binaries contain code adapted from Chimp
 # (weft-physical-type) and DDSketch (weft-reduce), so both crates' notices ship. Both
 # files are named THIRD-PARTY-NOTICES, so each is renamed after its crate.
+# THIRD-PARTY-LICENSES.md is the dependency license bundle (1.0 plan PAC-1b, absorbing
+# EVI-20: one bundle for every archive, not one built per track). It is generated, so a
+# release that ships a stale one fails scripts/licenses/generate.sh check in CI; and a
+# release whose bundle is simply absent fails here, because a missing file is a hard fail
+# for every entry below.
 DOCS=(
 	README.md:README.md
 	LICENSE-MIT:LICENSE-MIT
 	LICENSE-APACHE:LICENSE-APACHE
 	NOTICE:NOTICE
+	THIRD-PARTY-LICENSES.md:THIRD-PARTY-LICENSES.md
 	weft-physical-type/THIRD-PARTY-NOTICES:THIRD-PARTY-NOTICES-weft-physical-type
 	weft-reduce/THIRD-PARTY-NOTICES:THIRD-PARTY-NOTICES-weft-reduce
 )

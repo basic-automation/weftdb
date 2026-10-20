@@ -10,6 +10,10 @@ all-features = true
 ignore = []
 
 [licenses]
+# The allow-list below is also about.toml's, which generates THIRD-PARTY-LICENSES.md, the
+# dependency license bundle every release archive carries: change one and change the other.
+# A dependency this file accepts but about.toml does not would still be linked into a
+# released binary while being missing from the bundle that names its license.
 # Permissive licenses only. WeftDB is MIT OR Apache-2.0; anything copyleft needs an explicit exception.
 allow = [
 	"MIT",

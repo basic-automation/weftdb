@@ -1,0 +1,79 @@
+# cargo-about configuration — the source of THIRD-PARTY-LICENSES.md, the license bundle
+# every release archive carries (1.0 plan PAC-1b, which absorbs EVI-20: one bundle, not
+# one per track). Regenerate with `scripts/licenses/generate.sh`; the `third-party
+# licenses` job in .github/workflows/ci.yml regenerates it and fails on any drift, so the
+# file that ships can never disagree with Cargo.lock.
+
+# The same set cargo-deny allows in deny.toml's [licenses] block, plus the same two
+# per-crate exceptions, so the two tools cannot disagree about what may ship. Keeping them
+# in step is a rule, not a coincidence: a dependency that passes `cargo deny check
+# licenses` but is missing here would still be linked into a released binary.
+accepted = [
+	"Apache-2.0",
+	"Apache-2.0 WITH LLVM-exception",
+	"BSD-2-Clause",
+	"BSD-3-Clause",
+	"BSL-1.0",
+	"CC0-1.0",
+	"ISC",
+	"MIT",
+	"Unicode-3.0",
+	"Unicode-DFS-2016",
+	"Unlicense",
+	"WTFPL",
+	"Zlib",
+]
+
+# The five targets .github/workflows/release.yml builds, so the bundle names everything a
+# released binary can link — including the Windows-only and macOS-only crates that a
+# Linux-only graph would drop. `cargo metadata --filter-platform` resolves each one, and
+# the union is what ships.
+targets = [
+	"x86_64-unknown-linux-gnu",
+	"aarch64-unknown-linux-gnu",
+	"x86_64-apple-darwin",
+	"aarch64-apple-darwin",
+	"x86_64-pc-windows-msvc",
+]
+
+# Build dependencies stay in: a `-sys` crate's build script compiles and links foreign
+# code into the binary (libmimalloc-sys, turso's sqlite C, zstd, simsimd), so a license
+# held only by a build-time crate can still cover bytes in the archive.
+ignore-build-dependencies = false
+
+# Dev-dependencies stay out: `cargo test` never links them into a `--profile dist`
+# binary, and the archive carries binaries, not tests. A crate that is also a normal
+# dependency of any shipped crate is still listed, because the graph is a union.
+ignore-dev-dependencies = true
+
+# Transitive dependencies are exactly the point: they are the crates the binary is made
+# of, and the ones no one in this repository reads.
+ignore-transitive-dependencies = false
+
+# The one license cargo-about cannot work out on its own. `cfg_block` (pulled in by
+# turso_core) declares `license-file = "LICENSE"` rather than a `license` expression, and
+# its LICENSE is the Apache-2.0 *notice* ("Licensed under the Apache License, Version
+# 2.0…"), not the full text — too short for the matcher's 0.8 confidence threshold, so it
+# is reported as unlicensed and would be dropped from the bundle. `clarify` replaces the
+# guess with a checksum of the exact file in the published package: the entry only applies
+# while that file hashes to what is recorded here, so a license change upstream fails the
+# generation step instead of quietly rewriting the bundle.
+[cfg_block.clarify]
+license = "Apache-2.0"
+
+[[cfg_block.clarify.files]]
+path = "LICENSE"
+checksum = "408bbc4d10bdf74d8c9b74b64ea4910603257e24133da18edc4d16198e3b4010"
+
+# The per-crate exception deny.toml grants that applies to this graph: option-ext's MPL-2.0,
+# reached through `dirs`. It is file-level copyleft over option-ext's own files, used
+# unmodified, and it is named in the bundle rather than smoothed over.
+#
+# deny.toml's other exceptions — MIT OR Apache-2.0 for the Redox-family crates `libredox`,
+# `redox_users` and `redox_syscall`, and terminfo's WTFPL — are deliberately not repeated
+# here: none of them is in the graph for any shipped target, and cargo-about warns about
+# configuration for a crate that is not present. If a dependency ever pulls one in, the
+# generation step reports the missing license, and the exception gets added here and in
+# deny.toml in the same commit.
+[option-ext]
+accepted = ["MPL-2.0"]
