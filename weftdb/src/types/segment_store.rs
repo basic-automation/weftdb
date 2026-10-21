@@ -1455,6 +1455,17 @@ impl SegmentStore {
 		if let Some(marker) = found.as_ref().filter(|marker| !marker.writable_by(SUPPORTED_LAYOUT)) {
 			return Err(anyhow::Error::new(StoreError::IncompatibleLayout { min_write: marker.min_write_layout, supported: SUPPORTED_LAYOUT }).context(opening()));
 		}
+		// 4a. A root with no marker is not necessarily an empty directory: the 0.1.x line was
+		// a data directory with one database per aspect, and its top-level database carries
+		// this build's control-plane name. Opening it as a store would build the rest of a
+		// store beside that data and report it empty with no error, so it is refused here,
+		// before any database opens and before any file of ours exists in the directory.
+		if found.is_none() {
+			let aspects = store_format::rows_mode_aspects(&root).await;
+			if !aspects.is_empty() {
+				return Err(anyhow::Error::new(StoreError::RowsModeDataDirectory { aspects }).context(opening()));
+			}
+		}
 		// 7, for a root that has databases: they open now, before anything is written to the
 		// root. segment_index.db opens first and refuses a write floor its store_meta records
 		// newer than this build (the gate of a root without a marker, 4) before anything is

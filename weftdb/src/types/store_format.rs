@@ -185,6 +185,49 @@ pub async fn write_marker(fs: &dyn StoreFs, root: &Path, format: &StoreFormat) -
 	Ok(())
 }
 
+/// The `<subject>/<aspect>` pairs under `root` that show a **WeftDB 0.1.x data directory**
+/// rather than a store, and nothing for anything else.
+///
+/// Shape decides, not a name: 0.1.x kept one database per aspect two levels down
+/// (`<subject>/<aspect>/measurements.db`, the layout `Database::aspect_measurements_db_path`
+/// writes — a private helper on the legacy rows-mode type, so named in prose here rather
+/// than linked). That top-level name is the hazard — it is one of [`CONTROL_PLANE_FILES`](crate::types::backup::CONTROL_PLANE_FILES),
+/// so a data directory looks like a store whose control plane is incomplete, and a layout-1
+/// store root has the same file. What separates the two is the second level: a store's
+/// subdirectories hold frames and backup trees, never an aspect's own database.
+///
+/// The caller runs this only for a root with no `STORE_FORMAT` marker, so a store at the
+/// current layout never pays for it; the probe costs one directory read at the top and one
+/// per child directory.
+#[must_use]
+pub(crate) async fn rows_mode_aspects(root: &Path) -> Vec<String> {
+	if !tokio::fs::try_exists(root.join("metadata.db")).await.unwrap_or(false) {
+		return Vec::new();
+	}
+	// A root that cannot be read is not reported as a data directory: the open goes on to
+	// fail on its own, with its own context, rather than blaming a shape it did not see.
+	let Ok(mut subjects) = tokio::fs::read_dir(root).await else { return Vec::new() };
+	let mut found = Vec::new();
+	while let Ok(Some(subject)) = subjects.next_entry().await {
+		// A symlink's type describes the link, so links are passed over with the files here
+		// rather than followed into somebody else's tree.
+		if !subject.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+			continue;
+		}
+		let Ok(mut aspects) = tokio::fs::read_dir(subject.path()).await else { continue };
+		while let Ok(Some(aspect)) = aspects.next_entry().await {
+			if !aspect.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+				continue;
+			}
+			if tokio::fs::try_exists(aspect.path().join("measurements.db")).await.unwrap_or(false) {
+				found.push(format!("{}/{}", subject.file_name().to_string_lossy(), aspect.file_name().to_string_lossy()));
+			}
+		}
+	}
+	found.sort();
+	found
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -218,6 +261,70 @@ mod tests {
 		let format = read_marker(dir.path()).await.unwrap().expect("a marker");
 		assert_eq!((format.layout_version, format.min_read_layout, format.min_write_layout, format.applied_through.as_deref()), (3, 3, 2, Some("0009_future")));
 		assert!(format.writable_by(SUPPORTED_LAYOUT) && !format.writable_by(1));
+	}
+
+	/// A helper for the shape probes: a file at `path`, with its parents created.
+	fn touch(path: &Path) {
+		std::fs::create_dir_all(path.parent().expect("a parent")).expect("the parent directory");
+		std::fs::write(path, b"").expect("the placeholder file");
+	}
+
+	#[tokio::test]
+	async fn a_rows_mode_root_reports_its_aspect_databases_in_order() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		// 0.1.x laid a control-plane `metadata.db` at the root and one database per aspect
+		// two levels down. The order matters: the refusal names them, and a `read_dir` order
+		// would make the sentence (and any test of it) move with the filesystem.
+		touch(&root.join("metadata.db"));
+		touch(&root.join("plant/temp/measurements.db"));
+		touch(&root.join("plant/price/measurements.db"));
+		// A directory under the same parent that is not a measurement store stays unnamed:
+		// `dictionaries/` and its siblings were 0.1.x plumbing, not a series to migrate.
+		touch(&root.join("plant/dictionaries/words.db"));
+		assert_eq!(rows_mode_aspects(root).await, ["plant/price", "plant/temp"]);
+	}
+
+	#[tokio::test]
+	async fn a_store_root_is_never_mistaken_for_a_rows_mode_root() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		// The shape that matters is the one the migration path meets: a pre-marker store,
+		// whose `metadata.db` is a control-plane file, keeps its frames under `segments/`.
+		// Flagging that root would refuse the very store FRE-14 exists to upgrade.
+		for file in ["metadata.db", "segment_index.db", "aspect_catalog.db", "catalog.db"] {
+			touch(&root.join(file));
+		}
+		touch(&root.join("segments/price-0.weftseg"));
+		// The same shape but not the same file name, and one level deeper than the probe
+		// looks: neither is a measurement store, because the probe asks for
+		// `measurements.db` exactly, at `<subject>/<aspect>/`.
+		touch(&root.join("segments/price/measurements.dbx"));
+		touch(&root.join("plant/price/nested/measurements.db"));
+		let found = rows_mode_aspects(root).await;
+		assert_eq!(found, Vec::<String>::new(), "a storage-v2 root with a `segments/` tree is a store, not a data directory");
+		// The same root once the marker exists is equally uninteresting, and an empty root
+		// — the case every new store takes — must not pay more than one directory read.
+		std::fs::write(root.join(STORE_FORMAT_FILE), r#"{"kind":"weftdb-store","layout_version":2,"min_read_layout":1,"min_write_layout":1,"last_written_layout":2,"store_uuid":"u","scope":{"database":"d","subject":"s"}}"#).expect("a marker");
+		assert_eq!(rows_mode_aspects(root).await, Vec::<String>::new(), "the same root once marked is a store too");
+		let empty = tempfile::tempdir().unwrap();
+		assert_eq!(rows_mode_aspects(empty.path()).await, Vec::<String>::new(), "an empty root — the case every new store takes — finds nothing");
+	}
+
+	#[tokio::test]
+	#[cfg(unix)]
+	async fn a_rows_mode_probe_does_not_follow_a_symlink() {
+		// The probe is a refusal, so the worst it may do is name a shape. Following a link
+		// would let a data directory outside the root decide whether an open is refused.
+		// Unix only: `std::os::unix::fs::symlink` is the whole point of the test, and
+		// Windows' equivalent needs developer mode or elevation, so CI would skip it anyway.
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		let outside = tempfile::tempdir().unwrap();
+		touch(&outside.path().join("price/measurements.db"));
+		touch(&root.join("metadata.db"));
+		std::os::unix::fs::symlink(outside.path(), root.join("plant")).expect("a symlink");
+		assert_eq!(rows_mode_aspects(root).await, Vec::<String>::new(), "a symlinked database directory is not reported");
 	}
 
 	#[tokio::test]
