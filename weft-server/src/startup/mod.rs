@@ -6,7 +6,8 @@
 //!
 //! The order matters:
 //!
-//! 1. [`hooks`] — the tracing subscriber, and the OTLP exporter when configured.
+//! 1. [`hooks`] — the tracing subscriber and the OTLP exporter when configured, then the
+//!    panic hook that ends the process when a control-plane write panics.
 //!    Installed first so every later phase is observable.
 //! 2. [`config`] — what the operator asked for: bind address, interpolation cap,
 //!    and (once the address is known) the request guard.
@@ -84,6 +85,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// early would tear down the batch span processor and stop export. It is shut down on
 	// a clean exit to flush any buffered spans.
 	let otel_provider = hooks::init_tracing();
+	// Immediately after tracing, so the panic hook reports through the subscriber it chains.
+	hooks::init_panic_hook();
 
 	let addr = config::bind_addr()?;
 	let interpolate = config::interpolate_config()?;

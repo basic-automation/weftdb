@@ -1,10 +1,14 @@
-//! Startup phase 1 — the process-wide hooks: the tracing subscriber, and the OTLP
-//! exporter when the operator configured a collector.
+//! Startup phase 1 — the process-wide hooks: the tracing subscriber, the OTLP exporter
+//! when the operator configured a collector, and the panic hook.
 //!
 //! Installed before anything else runs, so every later startup phase and every
 //! request is observable. Installing a subscriber cannot fail the server: a
 //! `try_init` is a no-op when one is already installed, and a collector that
 //! cannot be reached falls back to the `fmt`-only path.
+//!
+//! The panic hook is installed **after** the subscriber because it reports through it:
+//! [`std::panic::set_hook`] replaces the installed hook and hands the replaced one back, so
+//! the order decides who prints the panic. See [`init_panic_hook`].
 
 use weft_server::SERVICE;
 
@@ -47,6 +51,17 @@ pub(crate) fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvid
 		println!("otlp trace export: enabled (exporting spans to {})", std::env::var(OTEL_ENDPOINT_ENV).unwrap_or_default());
 	}
 	provider
+}
+
+/// Startup phase 1b — install the panic hook ([`weft_server::panic_hook`], robustness track
+/// ROB-2): a panic while the process is writing the control plane ends the process.
+///
+/// Called right after [`init_tracing`] because the hook chains the hook it replaces:
+/// installing it first would leave the tracing subscriber's hook calling it, and every
+/// panic would print twice. It is a no-op when this crate already installed one, so a test
+/// that installs the hook itself does not change what startup does.
+pub(crate) fn init_panic_hook() {
+	weft_server::panic_hook::install();
 }
 
 /// Build an OTLP tracer provider when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (roadmap

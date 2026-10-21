@@ -33,6 +33,20 @@ only the control plane, not the segment frames.
   it (unset or `poison` keeps the default); the library itself never exits the process
   (see the options entry under Changed). `SegmentStore::wait_until_poisoned()` and
   `subscribe_poison()` let an embedder do the same.
+- **A panic during a control-plane write ends the process** (robustness track ROB-2, release
+  plan C12, C22). `weftdb::exec::control_plane_write` already marks the region that the whole
+  `segment_index.db` write path runs in; the server now acts on it. `weft_server::panic_hook::install()`
+  is installed at startup immediately after the tracing subscriber, chained to the hook it
+  replaces so the panic is still reported with its message and location. A panic whose
+  panicking task is inside that region is written to stderr and the process
+  `std::process::abort()`s: the exit carries a signal a supervisor sees (SIGABRT) instead of
+  an HTTP status, and the restart that follows reopens the store under the engine's own crash
+  recovery, which is the component that can tell whether a commit was torn. A panic anywhere
+  else is reported and left unwinding, because wave 6's ROB-3 catch layer is the only layer
+  that catches panics. The hook does not write the poison marker — most of the region reads
+  before it writes, so a marker there would turn a benign panic into an outage lasting until
+  an operator deletes a file. `weft-server/tests/control_plane_panic.rs` proves both halves
+  by re-executing the test binary as a child, the way `poison_exit.rs` does.
 - **Store format marker and migration registry** (freeze design §4.3, FRE-12a). A
   segment store root now carries a `STORE_FORMAT` file (plain JSON: `layout_version`,
   `min_read_layout`, `min_write_layout`, `last_written_layout`, `migrating_to`,
@@ -69,9 +83,10 @@ only the control plane, not the segment frames.
 - `weftdb::exec::control_plane_write` and `weftdb::durable::poison_global()`
   (robustness track ROB-2): every segment-index transaction runs inside the
   task-local control-plane write scope, so a panic hook can tell a panic in the middle
-  of a control-plane write from one in a read, and the process-wide poison it would set
-  refuses every write of every store, as a store's own poison does, while reads go on.
-  It refuses every store open too (`weftdb::Poisoned`), since an open writes.
+  of a control-plane write from one in a read. `poison_global()` is a process-wide
+  poison that, once set, refuses every write of every store, as a store's own poison
+  does, while reads go on. It refuses every store open too (`weftdb::Poisoned`), since
+  an open writes.
 - `LOCK.holder` records the holder's host name and boot id beside its pid, and a
   second opener's error names the host (`… in use by pid 1 on host db-2 (session …)`).
   The short wait for a lock that a child being spawned still shares now applies only to
