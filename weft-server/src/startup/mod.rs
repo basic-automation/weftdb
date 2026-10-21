@@ -56,6 +56,11 @@
 //! with splimes' default thresholds. A CPU/software adapter (llvmpipe, lavapipe, WARP) is
 //! not calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips
 //! calibration altogether. It never stops the server from starting.
+//! Before the first phase, [`weft_server::settings::report`] checks the environment against the
+//! registry of every variable the workspace reads: a `WEFT_` name no crate reads, or a test
+//! harness's own channel set on a real server, prints one line there. It runs first so an
+//! operator's typo is the first thing they read, rather than a missing behaviour they
+//! deduce three screens down.
 
 pub(crate) mod config;
 pub(crate) mod daemons;
@@ -71,6 +76,10 @@ pub(crate) mod state;
 /// operator setting, a segment store that cannot be opened, or a listener that
 /// cannot be bound. A background task failing does not fail startup.
 pub(crate) async fn run() -> anyhow::Result<()> {
+	// First, before any phase reads a setting or opens a store: what the environment got
+	// wrong, answered from the registry in [`crate::settings`].
+	weft_server::settings::report();
+
 	// The OTLP provider (when configured) is held for the process lifetime: dropping it
 	// early would tear down the batch span processor and stop export. It is shut down on
 	// a clean exit to flush any buffered spans.
