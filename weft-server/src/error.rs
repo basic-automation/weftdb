@@ -328,8 +328,8 @@ impl ApiError {
 	}
 
 	/// A server-side failure: `detail` is the cause (an `anyhow` chain, a driver message).
-	/// It is logged under its code and never reaches the client, which gets
-	/// [`Code::redacted_message`].
+	/// It is logged under its code and never reaches the client, which gets the fixed sentence
+	/// its code carries (`Code::redacted_message`).
 	#[must_use]
 	pub fn internal(detail: impl std::fmt::Display) -> Self {
 		Self::server(Code::Internal, detail)
@@ -505,7 +505,7 @@ where
 /// caller sent us (their problem, `400`), and the same variant on an export route is our own
 /// encoder failing (ours, `500`). Everything direction-free — a name the store cannot
 /// address, a batch that will not seal, a store this binary cannot open — is decided by
-/// [`classify_typed`], which both classifiers consult first.
+/// `classify_typed`, which both classifiers consult first.
 pub fn classify_read(err: &anyhow::Error) -> ApiError {
 	if let Some(api) = classify_typed(err) {
 		return api;
