@@ -10,14 +10,16 @@
 //!
 //! While the server is bound to a loopback address, [`enforce`] refuses:
 //!
-//! - **a request not addressed to a loopback host**, with `421 Misdirected Request`. The
+//! - **a request not addressed to a loopback host**, with `403 Forbidden` and error code
+//!   `host_not_allowed`. The
 //!   `Host` header must be `localhost`, an IPv4 address in `127.0.0.0/8` or `[::1]` (or
 //!   the IPv4-mapped form of a `127.0.0.0/8` address, `[::ffff:127.0.0.1]`), each with an
 //!   optional port (the name is compared case-insensitively). A request target
 //!   that carries its own authority (absolute form, HTTP/2) is held to the same rule. A
 //!   request with no host at all, or with more than one `Host` header, is refused too;
 //!   HTTP/1.1 requires exactly one, and browsers always send it.
-//! - **a state-changing request from a non-loopback web origin**, with `403 Forbidden`:
+//! - **a state-changing request from a non-loopback web origin**, with `403 Forbidden` and
+//!   error code `cross_origin_write`:
 //!   any method but `GET`, `HEAD`, `OPTIONS` and `TRACE` that carries an `Origin` header
 //!   whose host is not a loopback host, including the opaque `null` origin. Browsers
 //!   send `Origin` with every cross-origin `POST`; `curl` and other non-browser clients
@@ -28,7 +30,7 @@
 //! `/health` and `/ready` get no exemption. A probe on the same host reaches a
 //! loopback-bound server as `localhost` or `127.0.0.1` and passes if it sends that
 //! `Host`, as every HTTP/1.1 client does; an HTTP/1.0 probe that sends no `Host` gets
-//! `421` and must be configured to send one (or the guard turned off). A probe from
+//! a `403` and must be configured to send a loopback `Host` (or the guard turned off). A probe from
 //! another network namespace (a container health check from outside, a kubelet) can only
 //! reach a server bound to a non-loopback address, where the guard is off.
 //!
@@ -47,8 +49,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use axum::{
-	extract::{Request, State}, http::{header, HeaderValue, StatusCode}, middleware::Next, response::{IntoResponse, Response}, Json
+	extract::{Request, State}, http::{header, HeaderValue}, middleware::Next, response::{IntoResponse, Response}
 };
+
+use crate::error::{ApiError, Code};
 
 /// Environment variable that turns the guard off on a loopback bind: `1`, `true`, `yes`
 /// or `on` (any case). For a local reverse proxy that forwards a non-loopback `Host`, or
@@ -59,7 +63,7 @@ pub const ALLOW_ANY_HOST_ENV: &str = "WEFT_ALLOW_ANY_HOST";
 const SHOWN_VALUE_CHARS: usize = 64;
 
 /// A refused request: the status to answer with and the message for the error envelope.
-type Refusal = (StatusCode, String);
+type Refusal = (Code, String);
 
 /// Whether the server checks `Host` and `Origin` (see the [module docs](self)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,13 +98,12 @@ pub fn allow_any_host_from_env(value: Option<&str>) -> bool {
 	value.is_some_and(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
-/// axum middleware: apply `guard` to the request, answering `421`/`403` in the usual
-/// JSON error envelope when it is refused and passing it on otherwise.
+/// axum middleware: apply `guard` to the request, answering `403 host_not_allowed` or
+/// `403 cross_origin_write` in the error envelope when it is refused, and passing it on otherwise.
 pub async fn enforce(State(guard): State<HostGuard>, request: Request, next: Next) -> Response {
 	if guard == HostGuard::Loopback {
-		if let Err((status, error)) = check_loopback(&request) {
-			// The `{"error": …}` envelope the other endpoints use.
-			return (status, Json(serde_json::json!({ "error": error }))).into_response();
+		if let Err((code, problem)) = check_loopback(&request) {
+			return ApiError::new(code, problem).into_response();
 		}
 	}
 	next.run(request).await
@@ -131,7 +134,7 @@ fn check_loopback(request: &Request) -> Result<(), Refusal> {
 	if !request.method().is_safe() {
 		for origin in request.headers().get_all(header::ORIGIN) {
 			if !origin.to_str().is_ok_and(is_loopback_origin) {
-				return Err((StatusCode::FORBIDDEN, format!("this server is bound to a loopback address and refuses a {} request from the web origin {} (behind a local reverse proxy that forwards a browser's non-loopback Origin, set {ALLOW_ANY_HOST_ENV}=1)", request.method(), shown(origin))));
+				return Err((Code::CrossOriginWrite, format!("this server is bound to a loopback address and refuses a {} request from the web origin {} (behind a local reverse proxy that forwards a browser's non-loopback Origin, set {ALLOW_ANY_HOST_ENV}=1)", request.method(), shown(origin))));
 			}
 		}
 	}
@@ -172,15 +175,15 @@ fn shown(value: &HeaderValue) -> String {
 	format!("{prefix:?}{ellipsis}")
 }
 
-/// A `421 Misdirected Request` naming what was wrong with the host and the escape hatch.
+/// A `403 host_not_allowed` naming what was wrong with the host and the escape hatch.
 fn misdirected(problem: &str) -> Refusal {
-	(StatusCode::MISDIRECTED_REQUEST, format!("{problem}: this server is bound to a loopback address and only answers requests addressed to localhost, 127.0.0.0/8 or [::1] (behind a local reverse proxy that rewrites Host, set {ALLOW_ANY_HOST_ENV}=1)"))
+	(Code::HostNotAllowed, format!("{problem}: this server is bound to a loopback address and only answers requests addressed to localhost, 127.0.0.0/8 or [::1] (behind a local reverse proxy that rewrites Host, set {ALLOW_ANY_HOST_ENV}=1)"))
 }
 
 #[cfg(test)]
 mod tests {
 	use axum::{
-		body::Body, http::{Method, Request as HttpRequest}
+		body::Body, http::{Method, Request as HttpRequest, StatusCode}
 	};
 	use tower::ServiceExt as _;
 
@@ -243,13 +246,13 @@ mod tests {
 		for host in ["evil.example", "evil.example:8080", "localhost.evil.example", "127.0.0.1.nip.io", "10.0.0.1:8080", "0.0.0.0:8080", "[::2]:8080", "[::ffff:10.0.0.1]", "::1", "localhost:80a", "localhost:123456", "user@localhost", "localhost/x"] {
 			for uri in ["/health", "/ready", "/metrics", "/api/v1/storage/stats"] {
 				let (status, body) = send(guarded(&metrics), get(uri, Some(host))).await;
-				assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "GET {uri} with Host {host:?}: {body}");
+				assert_eq!(status, StatusCode::FORBIDDEN, "GET {uri} with Host {host:?}: {body}");
 				assert!(body["error"].as_str().unwrap().contains(ALLOW_ANY_HOST_ENV), "the refusal names the escape hatch: {body}");
 			}
 		}
 		// A state-changing request is refused the same way, before its handler runs.
 		let (status, _) = send(guarded(&metrics), interpolate("evil.example:8080", None)).await;
-		assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+		assert_eq!(status, StatusCode::FORBIDDEN);
 		assert_eq!(metrics.snapshot().interpolate.requests, 0, "the handler never ran");
 	}
 
@@ -257,11 +260,11 @@ mod tests {
 	async fn a_missing_duplicated_or_foreign_target_host_is_misdirected() {
 		let metrics = SharedMetrics::default();
 		let (status, _) = send(guarded(&metrics), get("/health", None)).await;
-		assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "no Host");
+		assert_eq!(status, StatusCode::FORBIDDEN, "no Host");
 		let twice = HttpRequest::builder().uri("/health").header(header::HOST, "localhost").header(header::HOST, "evil.example").body(Body::empty()).unwrap();
-		assert_eq!(send(guarded(&metrics), twice).await.0, StatusCode::MISDIRECTED_REQUEST, "two Host headers");
+		assert_eq!(send(guarded(&metrics), twice).await.0, StatusCode::FORBIDDEN, "two Host headers");
 		let absolute = HttpRequest::builder().uri("http://evil.example/health").header(header::HOST, "localhost").body(Body::empty()).unwrap();
-		assert_eq!(send(guarded(&metrics), absolute).await.0, StatusCode::MISDIRECTED_REQUEST, "a foreign absolute-form target");
+		assert_eq!(send(guarded(&metrics), absolute).await.0, StatusCode::FORBIDDEN, "a foreign absolute-form target");
 		let absolute = HttpRequest::builder().uri("http://127.0.0.1:8080/health").body(Body::empty()).unwrap();
 		assert_eq!(send(guarded(&metrics), absolute).await.0, StatusCode::OK, "a loopback absolute-form target without Host (HTTP/2 style)");
 	}

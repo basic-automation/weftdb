@@ -46,7 +46,7 @@
 use std::borrow::Cow;
 
 use axum::{
-	extract::{rejection::JsonRejection, FromRequest, Request}, http::{HeaderName, StatusCode}, response::{IntoResponse, Response}, Json
+	extract::{rejection::JsonRejection, FromRequest, FromRequestParts, Query, Request}, http::{request::Parts, HeaderName, StatusCode}, response::{IntoResponse, Response}, Json
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -336,6 +336,37 @@ impl ApiError {
 		Self { code: Code::Internal, message: String::new(), details: None, limit: None, committed: None, retry_after: None, cause: Some(detail) }
 	}
 
+	/// A caller-side problem the table has no more specific name for.
+	pub fn bad_request(message: impl Into<String>) -> Self {
+		Self::new(Code::BadRequest, message)
+	}
+
+	/// The aspect in the path is not one this store has.
+	pub fn aspect_not_found(message: impl Into<String>) -> Self {
+		Self::new(Code::AspectNotFound, message)
+	}
+
+	/// The route asked for something this server was started without.
+	#[must_use = "a refusal is returned to the caller; constructing and dropping one does nothing"]
+	pub fn unconfigured() -> Self {
+		Self::new(Code::Unconfigured, "no segment store is configured on this server")
+	}
+
+	/// The request collides with the same thing existing, under a different definition.
+	pub fn schema_conflict(message: impl Into<String>) -> Self {
+		Self::new(Code::SchemaConflict, message)
+	}
+
+	/// The thing the request would create is already there.
+	pub fn already_exists(message: impl Into<String>) -> Self {
+		Self::new(Code::AlreadyExists, message)
+	}
+
+	/// Another operation held what this request needed for longer than it would wait.
+	pub fn busy(message: impl Into<String>) -> Self {
+		Self::new(Code::Busy, message)
+	}
+
 	/// The code this error will be sent with.
 	#[must_use]
 	pub const fn code(&self) -> Code {
@@ -425,10 +456,45 @@ where
 	}
 }
 
+/// A query-string extractor that answers an unreadable parameter with the envelope.
+///
+/// Thirty-one routes take a typed `Query<T>`, and until now a parameter the endpoint could
+/// not read — `?start=soon` on a read that wants an integer, or a window with the `end`
+/// left out — came back as axum's plain-text `400`: not JSON, no `code`, no `request_id`.
+/// Those are the most-travelled routes in the API, so the hole mattered more than the
+/// `Json` one. Handlers take `StrictQuery(params): StrictQuery<MyParams>` and the value
+/// binds exactly as before; the message stays axum's, because it already names the
+/// offending parameter and what was wrong with it.
+///
+/// Like axum's `Query`, this reads the request parts rather than the body: a text endpoint
+/// such as the ILP one takes a query *and* a body, and a route may only have one extractor
+/// that consumes the request.
+#[derive(Debug)]
+pub struct StrictQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for StrictQuery<T>
+where
+	T: DeserializeOwned,
+	S: Send + Sync,
+{
+	type Rejection = ApiError;
+
+	async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+		Query::<T>::from_request_parts(parts, state).await.map(|Query(value)| Self(value)).map_err(|rejection| ApiError::bad_request(rejection.body_text()))
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use axum::{body::Body, http::StatusCode, response::Response};
+	use serde::Deserialize;
 	use serde_json::Value;
+
+	/// Parse a response body as JSON, for the assertions that care about the wire shape.
+	async fn response_json(response: Response) -> Value {
+		let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.expect("the envelope fits");
+		serde_json::from_slice(&bytes).expect("the body is JSON")
+	}
 
 	use super::*;
 
@@ -569,6 +635,45 @@ mod tests {
 		assert_eq!(err.code(), Code::UnsupportedMediaType);
 		let body = json_of(err.into_response()).await;
 		assert_eq!(body["code"], "unsupported_media_type");
+	}
+
+	/// The shape one read endpoint expects, used to exercise the query extractor.
+	#[derive(Debug, Deserialize)]
+	struct Window {
+		start: i64,
+		end: i64,
+	}
+
+	/// Bind the query of `uri` as a `Window`, the way a handler would.
+	async fn bind_window(uri: &str) -> Result<Window, ApiError> {
+		let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+		let (mut parts, _body) = request.into_parts();
+		let StrictQuery(window) = StrictQuery::<Window>::from_request_parts(&mut parts, &()).await?;
+		Ok(window)
+	}
+
+	#[tokio::test]
+	async fn a_query_the_endpoint_cannot_read_becomes_the_envelope() {
+		// `?start=soon` used to be axum's plain-text 400. The text is kept — it names the
+		// parameter — but it arrives as JSON with a code now.
+		let rejection = bind_window("/api/v1/storage/temperature/points?start=soon&end=2").await.expect_err("a word is not an integer");
+		assert_eq!(rejection.code(), Code::BadRequest);
+		let body = response_json(rejection.into_response()).await;
+		assert_eq!(body["code"], "bad_request", "{body}");
+		assert_eq!(body["error"], "Failed to deserialize query string: start: invalid digit found in string", "{body}");
+	}
+
+	#[tokio::test]
+	async fn a_query_missing_a_required_parameter_is_the_same_refusal() {
+		let rejection = bind_window("/api/v1/storage/temperature/points?start=1").await.expect_err("the window needs both bounds");
+		assert_eq!(rejection.code(), Code::BadRequest);
+		assert!(rejection.message().contains("end"), "the message names what is missing: {}", rejection.message());
+	}
+
+	#[tokio::test]
+	async fn a_query_the_endpoint_can_read_still_binds() {
+		let window = bind_window("/api/v1/storage/temperature/points?start=1&end=2").await.expect("a readable window");
+		assert_eq!((window.start, window.end), (1, 2));
 	}
 
 	#[tokio::test]

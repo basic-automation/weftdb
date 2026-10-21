@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 
 use crate::{
-	state::AppState, storage::{AspectInfo, StorageError}
+	error::{ApiError, StrictJson}, state::AppState, storage::AspectInfo
 };
 
 /// Parse a [`PhysicalType`] from its stable wire token (the inverse of
@@ -92,11 +92,11 @@ pub struct DeclareAspectResponse {
 
 /// Build the [`AspectSchema`] a [`DeclareAspectRequest`] describes, mapping every
 /// parse failure to a `400`.
-fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, StorageError> {
-	let physical_type = parse_physical_type(&request.physical_type, request.scale).map_err(StorageError::BadRequest)?;
-	let timestamp_unit = parse_time_unit(&request.timestamp_unit).map_err(StorageError::BadRequest)?;
+fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, ApiError> {
+	let physical_type = parse_physical_type(&request.physical_type, request.scale).map_err(ApiError::bad_request)?;
+	let timestamp_unit = parse_time_unit(&request.timestamp_unit).map_err(ApiError::bad_request)?;
 	let tolerance_text = request.value_tolerance.as_deref().unwrap_or("0");
-	let value_tolerance: BigDecimal = tolerance_text.parse().map_err(|_| StorageError::BadRequest(format!("`value_tolerance` is not a decimal: {tolerance_text:?}")))?;
+	let value_tolerance: BigDecimal = tolerance_text.parse().map_err(|_| ApiError::bad_request(format!("`value_tolerance` is not a decimal: {tolerance_text:?}")))?;
 	Ok(AspectSchema::new(physical_type, value_tolerance, timestamp_unit))
 }
 
@@ -108,20 +108,20 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, S
 ///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when the name is not a valid aspect name or a
-/// token/tolerance does not parse, and [`StorageError::Internal`] on a control-plane
+/// [`ApiError::unconfigured`] when no store is attached,
+/// [`ApiError::bad_request`] when the name is not a valid aspect name or a
+/// token/tolerance does not parse, and [`ApiError::internal`] on a control-plane
 /// write failure.
-pub async fn declare_aspect(State(state): State<AppState>, Json(request): Json<DeclareAspectRequest>) -> Result<Response, StorageError> {
-	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): StrictJson<DeclareAspectRequest>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
 	// The name becomes part of every frame's file name: refuse one that could leave the
 	// store's `segments/` directory before anything is written.
-	weftdb::aspect_name::validate(&request.name).map_err(|err| StorageError::BadRequest(err.to_string()))?;
+	weftdb::aspect_name::validate(&request.name).map_err(|err| ApiError::bad_request(err.to_string()))?;
 	let schema = schema_from_request(&request)?;
 	let result = store.declare(&request.name, &schema).await;
 	drop(store);
-	result.map_err(|err| StorageError::Internal(err.to_string()))?;
+	result.map_err(|err| ApiError::internal(err.to_string()))?;
 	let aspect = AspectInfo { name: request.name, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() };
 	Ok((StatusCode::CREATED, Json(DeclareAspectResponse { aspect })).into_response())
 }

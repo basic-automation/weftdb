@@ -8,14 +8,16 @@
 //! nobody has restored is a hope, not a plan.
 
 use axum::{
-	extract::{Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json
+	extract::State, http::StatusCode, response::{IntoResponse, Response}, Json
 };
 use serde::{Deserialize, Serialize};
 use weftdb::{
 	durable::{RealFs, StoreFs}, VerifyMode, RESTORE_DRILL_PREFIX
 };
 
-use crate::{state::AppState, storage::StorageError};
+use crate::{
+	error::{ApiError, StrictQuery}, state::AppState
+};
 
 /// Query parameters for `POST /api/v1/storage/restore/drill`.
 #[derive(Debug, Clone, Deserialize)]
@@ -66,33 +68,33 @@ pub struct RestoreDrillResponse {
 ///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] when no store is attached, [`StorageError::BadRequest`]
+/// [`ApiError::unconfigured`] when no store is attached, [`ApiError::bad_request`]
 /// when the label is malformed (see [`BackupParams::label`] for the grammar) or names a
-/// staging directory (an unfinished backup, prune or drill), [`StorageError::NotFound`]
-/// when no such backup exists, [`StorageError::AlreadyExists`] when the rehearsal
-/// directory is already taken by another drill, and [`StorageError::Internal`] when the
+/// staging directory (an unfinished backup, prune or drill), [`ApiError::aspect_not_found`]
+/// when no such backup exists, [`ApiError::already_exists`] when the rehearsal
+/// directory is already taken by another drill, and [`ApiError::internal`] when the
 /// backup will not restore or verify — which is a failed drill, and the answer the
 /// caller asked for.
-pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<RestoreDrillParams>) -> Result<Response, StorageError> {
-	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+pub async fn restore_drill(State(state): State<AppState>, StrictQuery(params): StrictQuery<RestoreDrillParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
 	if !valid_backup_label(&params.label) {
 		return Err(invalid_backup_label(&params.label));
 	}
 	if weftdb::is_staging_name(&params.label) {
-		return Err(StorageError::BadRequest(format!("`{}` names an unfinished backup, prune or drill (a name starting with one of {:?}), not a backup", params.label, weftdb::STAGING_PREFIXES)));
+		return Err(ApiError::bad_request(format!("`{}` names an unfinished backup, prune or drill (a name starting with one of {:?}), not a backup", params.label, weftdb::STAGING_PREFIXES)));
 	}
 	let base = std::env::var_os("WEFT_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
 	let backup_dir = base.join(&params.label);
 	if !backup_dir.is_dir() {
-		return Err(StorageError::NotFound(format!("no backup named `{}` under {}", params.label, base.display())));
+		return Err(ApiError::aspect_not_found(format!("no backup named `{}` under {}", params.label, base.display())));
 	}
 	drop(store);
 
 	// A throwaway destination beside the backups: same volume (so the rehearsal is sized
 	// like the real thing) and never the live store root. Once claimed, it is cleaned up
 	// on every path, success or failure.
-	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
+	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| ApiError::internal(err.to_string()))?.as_millis();
 	let target = base.join(format!("{RESTORE_DRILL_PREFIX}{millis}"));
 	let response = drill_response(&RealFs, params.label, &backup_dir, &target).await?;
 	Ok((StatusCode::OK, Json(response)).into_response())
@@ -107,13 +109,13 @@ pub async fn restore_drill(State(state): State<AppState>, Query(params): Query<R
 /// and leaves it alone, instead of restoring into it and then removing the other drill's
 /// copy. The new directory's entry is not fsynced: the copy is removed when the drill
 /// ends, and one a crash leaves behind is swept like any other stale drill.
-async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path::Path, target: &std::path::Path) -> Result<RestoreDrillResponse, StorageError> {
+async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path::Path, target: &std::path::Path) -> Result<RestoreDrillResponse, ApiError> {
 	match fs.create_dir(target).await {
 		Ok(()) => {}
 		Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-			return Err(StorageError::AlreadyExists(format!("restore drill for `{label}`: its rehearsal directory {} already exists; nothing was restored into it or removed — retry the drill, which picks a fresh directory", target.display())));
+			return Err(ApiError::already_exists(format!("restore drill for `{label}`: its rehearsal directory {} already exists; nothing was restored into it or removed — retry the drill, which picks a fresh directory", target.display())));
 		}
-		Err(err) => return Err(StorageError::Internal(format!("restore drill for `{label}` could not create its rehearsal directory {}: {err}", target.display()))),
+		Err(err) => return Err(ApiError::internal(format!("restore drill for `{label}` could not create its rehearsal directory {}: {err}", target.display()))),
 	}
 	let outcome = weftdb::restore_control_plane_with(fs, backup_dir, target).await;
 	// The drill's answer stands whether or not its copy can be removed, but a copy left
@@ -124,7 +126,7 @@ async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path:
 	}
 	let report = outcome.map_err(|err| {
 		let also = cleanup_error.as_deref().map_or_else(String::new, |cleanup| format!(" (and it {cleanup})"));
-		StorageError::Internal(format!("restore drill for `{label}` FAILED: {err:#}{also}"))
+		ApiError::internal(format!("restore drill for `{label}` FAILED: {err:#}{also}"))
 	})?;
 
 	let databases = report.restored.iter().map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes }).collect();
@@ -210,8 +212,8 @@ const fn verify_token(mode: VerifyMode) -> &'static str {
 const MAX_BACKUP_LABEL_LEN: usize = 100;
 
 /// The error for a `label` that [`valid_backup_label`] rejects.
-fn invalid_backup_label(label: &str) -> StorageError {
-	StorageError::BadRequest(format!("invalid backup label `{label}` — use 1 to {MAX_BACKUP_LABEL_LEN} letters, digits, '.', '_' or '-', starting with a letter or digit and not ending with '.'"))
+fn invalid_backup_label(label: &str) -> ApiError {
+	ApiError::bad_request(format!("invalid backup label `{label}` — use 1 to {MAX_BACKUP_LABEL_LEN} letters, digits, '.', '_' or '-', starting with a letter or digit and not ending with '.'"))
 }
 
 /// Validate a backup `label` against the grammar frozen for 1.0:
@@ -254,18 +256,18 @@ fn valid_backup_label(label: &str) -> bool {
 ///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] when no store is attached,
-/// [`StorageError::BadRequest`] when `label` is malformed (see [`BackupParams::label`]
+/// [`ApiError::unconfigured`] when no store is attached,
+/// [`ApiError::bad_request`] when `label` is malformed (see [`BackupParams::label`]
 /// for the grammar), in the reserved `backup-<digits>` form, or reserved for a staging
 /// directory (`.partial-*`, `.deleting-*`, `.restore-drill-*`),
-/// [`StorageError::AlreadyExists`] when the target dir already exists, and
-/// [`StorageError::Internal`] on a backup/verify failure.
-pub async fn backup_store(State(state): State<AppState>, Query(params): Query<BackupParams>) -> Result<Response, StorageError> {
-	let store = state.store().cloned().ok_or(StorageError::Unconfigured)?;
+/// [`ApiError::already_exists`] when the target dir already exists, and
+/// [`ApiError::internal`] on a backup/verify failure.
+pub async fn backup_store(State(state): State<AppState>, StrictQuery(params): StrictQuery<BackupParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	let metrics = state.metrics().clone();
 	drop(state);
 	let mode = match params.verify.as_deref() {
-		Some(token) => parse_verify_mode(token).ok_or_else(|| StorageError::BadRequest(format!("unknown verify mode `{token}` — use `source` (quiescent cross-check) or `snapshot` (concurrent-write-safe copy-only check)")))?,
+		Some(token) => parse_verify_mode(token).ok_or_else(|| ApiError::bad_request(format!("unknown verify mode `{token}` — use `source` (quiescent cross-check) or `snapshot` (concurrent-write-safe copy-only check)")))?,
 		None => VerifyMode::default(),
 	};
 	let base = std::env::var_os("WEFT_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
@@ -278,23 +280,23 @@ pub async fn backup_store(State(state): State<AppState>, Query(params): Query<Ba
 		// `valid_backup_label` has refused a trailing `.`, so the label checked here is
 		// the directory name on every platform.
 		if crate::backup_daemon::is_generated_label(&label) {
-			return Err(StorageError::BadRequest(format!("backup label `{label}` is reserved: `backup-<digits>` names are generated by the backup daemon and managed by backup retention — choose another label, or omit `label` to have one generated")));
+			return Err(ApiError::bad_request(format!("backup label `{label}` is reserved: `backup-<digits>` names are generated by the backup daemon and managed by backup retention — choose another label, or omit `label` to have one generated")));
 		}
 		if weftdb::is_staging_name(&label) {
-			return Err(StorageError::BadRequest(format!("backup label `{label}` is reserved: names starting with one of {:?} are unfinished backups, prunes and drills, which are swept", weftdb::STAGING_PREFIXES)));
+			return Err(ApiError::bad_request(format!("backup label `{label}` is reserved: names starting with one of {:?} are unfinished backups, prunes and drills, which are swept", weftdb::STAGING_PREFIXES)));
 		}
 		label
 	} else {
 		// Not the daemon's `backup-<digits>`: an API caller taking unlabelled backups must
 		// not push the daemon's snapshots out of the retained set.
-		let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| StorageError::Internal(err.to_string()))?.as_millis();
+		let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|err| ApiError::internal(err.to_string()))?.as_millis();
 		crate::backup_daemon::manual_label(millis)
 	};
 	let dest = base.join(&sub);
 	if dest.exists() {
-		return Err(StorageError::AlreadyExists(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
+		return Err(ApiError::already_exists(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
 	}
-	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| StorageError::Internal(err.to_string()))?;
+	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| ApiError::internal(err.to_string()))?;
 	drop(store);
 	metrics.record_backup(backup.total_bytes());
 	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)].into_iter().map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes }).collect();
@@ -316,7 +318,7 @@ mod tests {
 	use weftdb::SegmentStore;
 
 	use crate::{
-		app_with_state, test_fs::{FsOp, RecordingFs, INJECTED_CLEANUP_FAILURE}, test_support::*, AppState
+		app_with_state, error::Code, test_fs::{FsOp, RecordingFs, INJECTED_CLEANUP_FAILURE}, test_support::*, AppState
 	};
 
 	#[test]
@@ -468,7 +470,10 @@ mod tests {
 
 		// A drill whose restore fails reports a failed cleanup in its error as well.
 		let err = super::drill_response(&fs, "missing".to_string(), &base.join("missing"), &base.join(".restore-drill-2")).await.unwrap_err();
-		let super::StorageError::Internal(message) = err else { panic!("a failed drill is an internal error") };
+		assert_eq!(err.code(), Code::Internal, "a failed drill is an internal error");
+		// The cause is what the assertion wants: it is logged and kept on the value, but it
+		// is no longer in the response body, which says only that the drill failed.
+		let message = err.message();
 		assert!(message.contains("FAILED") && message.contains(INJECTED_CLEANUP_FAILURE), "{message}");
 	}
 

@@ -26,7 +26,7 @@
 use std::num::NonZeroUsize;
 
 use axum::{
-	extract::{Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json
+	extract::State, http::header, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
@@ -40,7 +40,9 @@ use splimes::{Interpolator, Point, Resolution, Spline};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 
-use crate::metrics::SharedMetrics;
+use crate::{
+	error::{ApiError, Code, StrictJson, StrictQuery}, metrics::SharedMetrics
+};
 
 /// One input sample on the wire.
 #[derive(Debug, Clone, Deserialize)]
@@ -246,56 +248,27 @@ pub struct InterpolateResponse {
 	pub points: Vec<OutputPoint>,
 }
 
-/// An API error rendered as `{"error": "..."}` with an appropriate status.
-#[derive(Debug)]
-pub enum ApiError {
-	/// Caller-side problem (malformed or out-of-domain request) → 400.
-	BadRequest(String),
-	/// Engine-side failure → 500.
-	Internal(String),
-}
-
-impl ApiError {
-	fn bad_request(message: impl Into<String>) -> Self {
-		Self::BadRequest(message.into())
-	}
-
-	fn internal(message: impl Into<String>) -> Self {
-		Self::Internal(message.into())
-	}
-
-	/// Map an interpolation failure to a status by its variant: a request the engine
-	/// cannot serve as asked (a grid over the cap, bad polynomial parameters, a value or
-	/// an extrapolation beyond `f64`'s range) is the caller's `400`; anything else is a
-	/// `500`. `config` supplies the cap an oversized grid's message names.
-	fn from_engine(err: &splimes::Error, config: InterpolateConfig) -> Self {
-		use splimes::Error as E;
-		match err {
-			E::OutputTooLarge { points } => Self::bad_request(format!("the output grid would have {points} points, more than the {} one request may produce; narrow `start`..`end` or use a coarser `resolution`", config.max_output_points())),
-			E::NoPoints => Self::bad_request("`points` must not be empty"),
-			E::InvalidTimeRange { .. } => Self::bad_request("`end` must not be before `start`"),
-			E::InvalidDegree { .. } | E::InvalidBoundsFactor(_) | E::ValueOutOfRange { .. } | E::NonFiniteResult { .. } | E::InsufficientPoints { .. } => Self::bad_request(err.to_string()),
-			// GPU failures (only an explicit `Backend::Gpu` surfaces them), a panicked
-			// blocking task (`Task`), the variants `run` never returns, and any variant added
-			// after splimes 1.0 (`Error` is `#[non_exhaustive]`).
-			_ => Self::internal(err.to_string()),
-		}
-	}
-}
-
-/// JSON error envelope.
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-	error: String,
-}
-
-impl IntoResponse for ApiError {
-	fn into_response(self) -> Response {
-		let (status, error) = match self {
-			Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
-			Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
-		};
-		(status, Json(ErrorBody { error })).into_response()
+/// Map an interpolation failure to a code by its variant: a request the engine cannot serve
+/// as asked (a grid over the cap, bad polynomial parameters, a value or an extrapolation
+/// outside the representable range) is the caller's, and the table says which code; anything
+/// else is a `500`. `config` supplies the cap that an oversized grid's message names, and the
+/// `limit` the envelope carries with it so a client can size its next request without parsing
+/// the sentence.
+fn engine_error(err: &splimes::Error, config: InterpolateConfig) -> ApiError {
+	use splimes::Error as E;
+	match err {
+		E::OutputTooLarge { points } => ApiError::new(Code::ResultTooLarge, format!("the output grid would have {points} points, more than the {} one request may produce; narrow `start`..`end` or use a coarser `resolution`", config.max_output_points())).with_limit(config.max_output_points() as u64),
+		E::NoPoints => ApiError::bad_request("`points` must not be empty"),
+		E::InvalidTimeRange { .. } => ApiError::bad_request("`end` must not be before `start`"),
+		E::InvalidDegree { .. } | E::InvalidBoundsFactor(_) | E::InsufficientPoints { .. } => ApiError::bad_request(err.to_string()),
+		// A value, or an extrapolation of one, that does not survive the range this numeric
+		// type can hold: the request asked for something the type cannot answer with.
+		E::ValueOutOfRange { .. } => ApiError::new(Code::ValueNotRepresentable, err.to_string()),
+		E::NonFiniteResult { .. } => ApiError::new(Code::NotFinite, err.to_string()),
+		// GPU failures (only an explicit `Backend::Gpu` surfaces them), a panicked blocking
+		// task (`Task`), the variants `run` never returns, and any variant added after
+		// splimes 1.0 (`Error` is `#[non_exhaustive]`).
+		_ => ApiError::internal(err.to_string()),
 	}
 }
 
@@ -307,10 +280,10 @@ impl IntoResponse for ApiError {
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value,
+/// Returns `bad_request` (`400`) for an empty point set, a non-finite value,
 /// an inverted range, an output grid above [`InterpolateConfig::max_output_points`], or
-/// parameters the engine rejects, and [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
+/// parameters the engine rejects, and `internal` (`500`) if the engine fails.
+pub async fn interpolate(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<InterpolateRequest>) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request, config).await;
@@ -379,7 +352,7 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	// itself, on tokio's blocking pool, isolated from the result shaping so the
 	// dominant compute cost is attributable on its own. splimes labels every output
 	// point raw / interpolated / extrapolated as it goes.
-	let output = config.interpolator(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| ApiError::from_engine(&err, config))?;
+	let output = config.interpolator(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| engine_error(&err, config))?;
 
 	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
 	// conversion of every output grid point, with its provenance — the result-shaping
@@ -447,7 +420,7 @@ fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::Internal`] if the Arrow encoding fails.
+/// Returns `internal` (`500`) if the Arrow encoding fails.
 fn interpolate_response_to_arrow(response: &InterpolateResponse) -> Result<Response, ApiError> {
 	let (timestamps, values, kinds) = response_columns(response);
 	let bytes = weft_arrow::reconstructed_series_to_ipc_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
@@ -460,7 +433,7 @@ fn interpolate_response_to_arrow(response: &InterpolateResponse) -> Result<Respo
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::Internal`] if the Parquet encoding fails.
+/// Returns `internal` (`500`) if the Parquet encoding fails.
 fn interpolate_response_to_parquet(response: &InterpolateResponse) -> Result<Response, ApiError> {
 	let (timestamps, values, kinds) = response_columns(response);
 	let bytes = weft_arrow::reconstructed_series_to_parquet_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
@@ -480,10 +453,10 @@ fn interpolate_response_to_parquet(response: &InterpolateResponse) -> Result<Res
 ///
 /// # Errors
 ///
-/// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
-/// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
+/// As [`interpolate`]: `bad_request` (`400`) for an empty point set, a
+/// non-finite value, or an inverted range, and `internal` (`500`) on an engine
 /// or Arrow-encoding failure.
-pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
@@ -502,10 +475,10 @@ pub async fn interpolate_arrow(State(metrics): State<SharedMetrics>, State(confi
 ///
 /// # Errors
 ///
-/// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
-/// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
+/// As [`interpolate`]: `bad_request` (`400`) for an empty point set, a
+/// non-finite value, or an inverted range, and `internal` (`500`) on an engine
 /// or Parquet-encoding failure.
-pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
@@ -523,10 +496,10 @@ pub async fn interpolate_parquet(State(metrics): State<SharedMetrics>, State(con
 ///
 /// # Errors
 ///
-/// As [`interpolate`]: [`ApiError::BadRequest`] for an empty point set, a
-/// non-finite value, or an inverted range, and [`ApiError::Internal`] on an engine
+/// As [`interpolate`]: `bad_request` (`400`) for an empty point set, a
+/// non-finite value, or an inverted range, and `internal` (`500`) on an engine
 /// failure.
-pub async fn interpolate_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<InterpolateRequest>) -> Result<Response, ApiError> {
+pub async fn interpolate_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<InterpolateRequest>) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_inner(request, config).await;
 	record_outcome(&metrics, &result);
@@ -568,9 +541,9 @@ pub struct PointResponse {
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value, or
-/// parameters the engine rejects, and [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate_point(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Json(request): Json<PointRequest>) -> Result<Json<PointResponse>, ApiError> {
+/// Returns `bad_request` (`400`) for an empty point set, a non-finite value, or
+/// parameters the engine rejects, and `internal` (`500`) if the engine fails.
+pub async fn interpolate_point(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<PointRequest>) -> Result<Json<PointResponse>, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_point_inner(request, config).await;
 	match &result {
@@ -598,7 +571,7 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 	// exactly that one instant, and splimes labels it raw / interpolated / extrapolated
 	// against the inputs. (The resolution only sets the step, which a one-point grid
 	// never takes.)
-	let output = config.interpolator(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| ApiError::from_engine(&err, config))?;
+	let output = config.interpolator(spline, Resolution::Nanoseconds).run_async(points, instant, instant).await.map_err(|err| engine_error(&err, config))?;
 	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
 	// The method splimes ran, which may be simpler than the requested one.
@@ -649,11 +622,11 @@ impl IlpParams {
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::BadRequest`] for an unknown precision/spline/resolution
+/// Returns `bad_request` (`400`) for an unknown precision/spline/resolution
 /// token, a malformed payload, fewer than two usable points, a zero-span series,
 /// or an output grid above [`InterpolateConfig::max_output_points`], and
-/// [`ApiError::Internal`] if the engine fails.
-pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
+/// `internal` (`500`) if the engine fails.
+pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_interpolate_request();
 	let result = interpolate_ilp_inner(&params, &body, config).await;
@@ -675,7 +648,7 @@ pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, State(config)
 /// # Errors
 ///
 /// As [`interpolate_ilp`].
-pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
@@ -691,8 +664,8 @@ pub async fn interpolate_ilp_csv(State(metrics): State<SharedMetrics>, State(con
 ///
 /// # Errors
 ///
-/// As [`interpolate_ilp`], plus [`ApiError::Internal`] on an Arrow-encoding failure.
-pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+/// As [`interpolate_ilp`], plus `internal` (`500`) on an Arrow-encoding failure.
+pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
@@ -707,8 +680,8 @@ pub async fn interpolate_ilp_arrow(State(metrics): State<SharedMetrics>, State(c
 ///
 /// # Errors
 ///
-/// As [`interpolate_ilp`], plus [`ApiError::Internal`] on a Parquet-encoding failure.
-pub async fn interpolate_ilp_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, Query(params): Query<IlpParams>, body: String) -> Result<Response, ApiError> {
+/// As [`interpolate_ilp`], plus `internal` (`500`) on a Parquet-encoding failure.
+pub async fn interpolate_ilp_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<IlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_interpolate_request();
 	let result = interpolate_ilp_inner(&params, &body, config).await;
 	record_outcome(&metrics, &result);
@@ -1153,9 +1126,10 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn oversized_grid_is_bad_request() {
+	async fn oversized_grid_is_refused_with_the_cap() {
 		// A nanosecond grid over a minute is 60 billion points: refused up front with a
-		// 400 naming the cap, not allocated.
+		// `422 result_too_large` naming the cap, not allocated. The cap is also a machine
+		// field, so a client that wants a smaller grid does not parse the sentence.
 		let body = serde_json::json!({
 			"spline": "linear",
 			"resolution": "nanoseconds",
@@ -1166,14 +1140,17 @@ mod tests {
 		});
 		for uri in ["/api/v1/interpolate", "/api/v1/interpolate/csv", "/api/v1/interpolate/arrow", "/api/v1/interpolate/parquet"] {
 			let (status, _content_type, text) = post_json_for_text(uri, body.clone()).await;
-			assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+			assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {text}");
 			let error: serde_json::Value = serde_json::from_str(&text).unwrap();
+			assert_eq!(error["code"], "result_too_large", "{uri}: {error}");
+			assert_eq!(error["limit"], MAX_INTERPOLATE_OUTPUT_POINTS as u64, "{uri}: the cap is a field, not only prose");
 			let message = error["error"].as_str().unwrap();
 			assert!(message.contains("60000000001 points") && message.contains(&MAX_INTERPOLATE_OUTPUT_POINTS.to_string()), "{uri}: {message}");
 		}
 		// The ILP path derives its range from the data, and is capped the same way.
 		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&resolution=nanoseconds", "cpu load=0 0\ncpu load=60 60\n").await;
-		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+		assert_eq!(body["code"], "result_too_large", "body: {body}");
 		assert!(body["error"].as_str().unwrap().contains("more than the"));
 	}
 
@@ -1200,7 +1177,7 @@ mod tests {
 	#[tokio::test]
 	async fn every_endpoint_applies_the_configured_cap() {
 		// With the cap set to 10, a 10-point grid (0..=9 s) is served and an 11-point grid
-		// (0..=10 s) is a 400 naming both sizes, on every grid-producing endpoint.
+		// (0..=10 s) is a 422 naming both sizes, on every grid-producing endpoint.
 		let router = || crate::app_with_state(crate::AppState::new().with_interpolate_config(ten_point_cap()));
 		let request = |uri: &str, content_type: &str, body: Vec<u8>| Request::builder().method("POST").uri(uri).header("content-type", content_type).body(Body::from(body)).unwrap();
 		let json_body = |end: i64| serde_json::to_vec(&serde_json::json!({ "spline": "linear", "resolution": "seconds", "points": [ { "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(end), "value": 1.0 } ] })).unwrap();
@@ -1208,8 +1185,10 @@ mod tests {
 			let at_cap = router().oneshot(request(uri, "application/json", json_body(9))).await.unwrap();
 			assert_eq!(at_cap.status(), StatusCode::OK, "{uri}: exactly at the cap");
 			let over = router().oneshot(request(uri, "application/json", json_body(10))).await.unwrap();
-			assert_eq!(over.status(), StatusCode::BAD_REQUEST, "{uri}: one over the cap");
+			assert_eq!(over.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}: one over the cap");
 			let error: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(over.into_body(), usize::MAX).await.unwrap()).unwrap();
+			assert_eq!(error["code"], "result_too_large", "{uri}: {error}");
+			assert_eq!(error["limit"], 10, "{uri}: the cap the client may still ask for");
 			assert!(error["error"].as_str().unwrap().contains("would have 11 points, more than the 10 one request"), "{uri}: {error}");
 		}
 		let response = router().oneshot(request("/api/v1/interpolate", "application/json", json_body(9))).await.unwrap();
@@ -1221,7 +1200,7 @@ mod tests {
 			let at_cap = router().oneshot(request(&uri, "text/plain", b"cpu load=0 0\ncpu load=1 9\n".to_vec())).await.unwrap();
 			assert_eq!(at_cap.status(), StatusCode::OK, "{uri}: exactly at the cap");
 			let over = router().oneshot(request(&uri, "text/plain", b"cpu load=0 0\ncpu load=1 10\n".to_vec())).await.unwrap();
-			assert_eq!(over.status(), StatusCode::BAD_REQUEST, "{uri}: one over the cap");
+			assert_eq!(over.status(), StatusCode::UNPROCESSABLE_ENTITY, "{uri}: one over the cap");
 		}
 	}
 
@@ -1239,18 +1218,16 @@ mod tests {
 
 	#[test]
 	fn engine_errors_map_to_status_by_variant() {
-		let status = |err: splimes::Error| ApiError::from_engine(&err, InterpolateConfig::DEFAULT).into_response().status();
 		let at = Utc.timestamp_opt(0, 0).unwrap();
-		assert_eq!(status(splimes::Error::OutputTooLarge { points: 1 << 40 }), StatusCode::BAD_REQUEST);
-		assert_eq!(status(splimes::Error::NoPoints), StatusCode::BAD_REQUEST);
-		assert_eq!(status(splimes::Error::InvalidTimeRange { start: at, end: at }), StatusCode::BAD_REQUEST);
-		assert_eq!(status(splimes::Error::InvalidDegree { degree: 9, max: 8 }), StatusCode::BAD_REQUEST);
-		assert_eq!(status(splimes::Error::InvalidBoundsFactor(-1.0)), StatusCode::BAD_REQUEST);
-		assert_eq!(status(splimes::Error::ValueOutOfRange { timestamp: at }), StatusCode::BAD_REQUEST);
-		assert_eq!(status(splimes::Error::NonFiniteResult { timestamp: at }), StatusCode::BAD_REQUEST);
-		assert_eq!(status(splimes::Error::GpuUnavailable("no adapter".into())), StatusCode::INTERNAL_SERVER_ERROR);
-		assert_eq!(status(splimes::Error::Gpu("device lost".into())), StatusCode::INTERNAL_SERVER_ERROR);
-		assert_eq!(status(splimes::Error::Task("panicked".into())), StatusCode::INTERNAL_SERVER_ERROR);
+		// The code is the contract; the status is derived from it, so both are pinned.
+		// `engine_error` is a total function, and the `_` arm is what keeps it total across
+		// a splimes release that adds a variant.
+		let cases = [(splimes::Error::OutputTooLarge { points: 1 << 40 }, Code::ResultTooLarge), (splimes::Error::NoPoints, Code::BadRequest), (splimes::Error::InvalidTimeRange { start: at, end: at }, Code::BadRequest), (splimes::Error::InvalidDegree { degree: 9, max: 8 }, Code::BadRequest), (splimes::Error::InvalidBoundsFactor(-1.0), Code::BadRequest), (splimes::Error::InsufficientPoints { spline: splimes::Spline::Cubic, required: 4, available: 2 }, Code::BadRequest), (splimes::Error::ValueOutOfRange { timestamp: at }, Code::ValueNotRepresentable), (splimes::Error::NonFiniteResult { timestamp: at }, Code::NotFinite), (splimes::Error::GpuUnavailable("no adapter".into()), Code::Internal), (splimes::Error::Gpu("device lost".into()), Code::Internal), (splimes::Error::Task("panicked".into()), Code::Internal)];
+		for (err, code) in cases {
+			let mapped = engine_error(&err, InterpolateConfig::DEFAULT);
+			assert_eq!(mapped.code(), code, "{err}");
+			assert_eq!(mapped.into_response().status(), code.status(), "{err}: the status follows the code");
+		}
 	}
 
 	#[tokio::test]

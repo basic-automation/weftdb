@@ -14,7 +14,7 @@
 //! way a batch can arrive shares one ordering gate and one seal.
 
 use axum::{
-	body::Bytes, extract::{Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json
+	body::Bytes, extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
@@ -23,7 +23,9 @@ use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 use weft_physical_type::{first_order_violation, AspectSchema, SegmentDescriptor, TimeUnit};
 
-use crate::{state::AppState, storage::StorageError};
+use crate::{
+	error::{ApiError, StrictJson, StrictQuery}, state::AppState
+};
 
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
 /// declared [`TimeUnit`]) and its value as lossless decimal text, or `null` for an
@@ -92,14 +94,14 @@ pub struct IngestResponse {
 /// (the supplied values cannot be represented under the aspect's declared encoding
 /// within its tolerance — hard constraint #4) → `400`; anything else (filesystem,
 /// libSQL) is a `500`.
-fn classify_seal_error(err: &anyhow::Error) -> StorageError {
+fn classify_seal_error(err: &anyhow::Error) -> ApiError {
 	let message = err.to_string();
 	// An aspect declared under a name that is not safe as a file name (before names were
 	// checked) is the caller's addressing problem, not a server fault.
 	if message.contains("seal failed") || message.contains("paged seal failed") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
-		StorageError::BadRequest(message)
+		ApiError::bad_request(message)
 	} else {
-		StorageError::Internal(message)
+		ApiError::internal(message)
 	}
 }
 
@@ -110,12 +112,12 @@ fn classify_seal_error(err: &anyhow::Error) -> StorageError {
 /// A client ingesting an append-only stream can demand the server reject an
 /// out-of-order batch (which would otherwise seal an unsortable segment that forces
 /// linear scans on read) rather than silently store it. Returns
-/// [`StorageError::BadRequest`] naming the first backwards row; a `false` flag (the
+/// [`ApiError::bad_request`] naming the first backwards row; a `false` flag (the
 /// default) is a no-op so the permissive path is unchanged.
-fn enforce_order_if_required(require_sorted: bool, timestamps: &[i64]) -> Result<(), StorageError> {
+fn enforce_order_if_required(require_sorted: bool, timestamps: &[i64]) -> Result<(), ApiError> {
 	if require_sorted {
 		if let Some((index, previous, current)) = first_order_violation(timestamps) {
-			return Err(StorageError::BadRequest(format!("out-of-order timestamp at row {index}: {current} < previous {previous} (require_sorted was set)")));
+			return Err(ApiError::bad_request(format!("out-of-order timestamp at row {index}: {current} < previous {previous} (require_sorted was set)")));
 		}
 	}
 	Ok(())
@@ -131,16 +133,16 @@ fn enforce_order_if_required(require_sorted: bool, timestamps: &[i64]) -> Result
 ///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
-/// undeclared), [`StorageError::BadRequest`] (empty batch, an unparseable value, or
+/// [`ApiError::unconfigured`] (no store), [`ApiError::aspect_not_found`] (aspect
+/// undeclared), [`ApiError::bad_request`] (empty batch, an unparseable value, or
 /// values unrepresentable under the declared encoding/tolerance), and
-/// [`StorageError::Internal`] on a filesystem/control-plane failure.
-pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, Json(request): Json<IngestRequest>) -> Result<Response, StorageError> {
+/// [`ApiError::internal`] on a filesystem/control-plane failure.
+pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, StrictJson(request): StrictJson<IngestRequest>) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
 		metrics.record_ingest_error();
-		StorageError::Unconfigured
+		ApiError::unconfigured()
 	})?;
 	drop(state);
 	// Time the seal path (not the store-unconfigured fast-fail above): this is the
@@ -157,15 +159,15 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 
 /// The body of [`ingest_points`], split out so the handler can record an error
 /// metric for any failure path uniformly.
-async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, request: IngestRequest) -> Result<Response, StorageError> {
+async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, request: IngestRequest) -> Result<Response, ApiError> {
 	if request.points.is_empty() {
-		return Err(StorageError::BadRequest("no points to ingest (`points` is empty)".to_string()));
+		return Err(ApiError::bad_request("no points to ingest (`points` is empty)".to_string()));
 	}
 	// An undeclared aspect is a clean 404 (its encoding is unknown) rather than the
 	// seal's generic error; fetching the schema here also lets the nullable/paged
 	// seal variants take it directly.
-	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
-		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| ApiError::internal(err.to_string()))? else {
+		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 
 	let point_count = request.points.len();
@@ -186,7 +188,7 @@ async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metr
 					values.push(None);
 				}
 				Some(text) => {
-					let parsed: BigDecimal = text.parse().map_err(|_| StorageError::BadRequest(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp)))?;
+					let parsed: BigDecimal = text.parse().map_err(|_| ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp)))?;
 					values.push(Some(parsed));
 				}
 			}
@@ -256,9 +258,9 @@ struct ParsedCsv {
 ///
 /// # Errors
 ///
-/// [`StorageError::BadRequest`] for a line without a comma, a non-integer
+/// [`ApiError::bad_request`] for a line without a comma, a non-integer
 /// timestamp, an unparseable value, or an empty body (no data rows).
-fn parse_csv_points(body: &str) -> Result<ParsedCsv, StorageError> {
+fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 	let mut timestamps = Vec::new();
 	let mut values = Vec::new();
 	let mut any_null = false;
@@ -267,25 +269,25 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, StorageError> {
 		if line.is_empty() {
 			continue;
 		}
-		let (ts_text, value_text) = line.split_once(',').ok_or_else(|| StorageError::BadRequest(format!("CSV line {} has no comma separator: {raw:?}", index + 1)))?;
+		let (ts_text, value_text) = line.split_once(',').ok_or_else(|| ApiError::bad_request(format!("CSV line {} has no comma separator: {raw:?}", index + 1)))?;
 		let ts_text = ts_text.trim();
 		let value_text = value_text.trim();
 		// Skip an optional leading header row (`timestamp,value`).
 		if timestamps.is_empty() && ts_text.eq_ignore_ascii_case("timestamp") {
 			continue;
 		}
-		let timestamp: i64 = ts_text.parse().map_err(|_| StorageError::BadRequest(format!("CSV line {}: timestamp {ts_text:?} is not an integer", index + 1)))?;
+		let timestamp: i64 = ts_text.parse().map_err(|_| ApiError::bad_request(format!("CSV line {}: timestamp {ts_text:?} is not an integer", index + 1)))?;
 		if value_text.is_empty() {
 			any_null = true;
 			values.push(None);
 		} else {
-			let parsed: BigDecimal = value_text.parse().map_err(|_| StorageError::BadRequest(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1)))?;
+			let parsed: BigDecimal = value_text.parse().map_err(|_| ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1)))?;
 			values.push(Some(parsed));
 		}
 		timestamps.push(timestamp);
 	}
 	if timestamps.is_empty() {
-		return Err(StorageError::BadRequest("no CSV rows to ingest".to_string()));
+		return Err(ApiError::bad_request("no CSV rows to ingest".to_string()));
 	}
 	Ok(ParsedCsv { timestamps, values, any_null })
 }
@@ -302,16 +304,16 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, StorageError> {
 ///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
-/// undeclared), [`StorageError::BadRequest`] (malformed CSV, empty body, or values
+/// [`ApiError::unconfigured`] (no store), [`ApiError::aspect_not_found`] (aspect
+/// undeclared), [`ApiError::bad_request`] (malformed CSV, empty body, or values
 /// unrepresentable under the declared encoding/tolerance), and
-/// [`StorageError::Internal`] on a filesystem/control-plane failure.
-pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<CsvIngestParams>, body: String) -> Result<Response, StorageError> {
+/// [`ApiError::internal`] on a filesystem/control-plane failure.
+pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<CsvIngestParams>, body: String) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
 		metrics.record_ingest_error();
-		StorageError::Unconfigured
+		ApiError::unconfigured()
 	})?;
 	drop(state);
 	let start = std::time::Instant::now();
@@ -327,9 +329,9 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 /// The body of [`ingest_csv`], split out so the handler records an error metric for
 /// any failure path uniformly. Shares [`seal_batch`] / [`classify_seal_error`] with
 /// the JSON ingest path, so a CSV-sealed batch is byte-identical to a JSON-sealed one.
-async fn ingest_csv_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, StorageError> {
-	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
-		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+async fn ingest_csv_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| ApiError::internal(err.to_string()))? else {
+		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
 	// `(timestamp, value)` columns, timed apart from the seal.
@@ -412,17 +414,17 @@ const fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 ///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
-/// undeclared), [`StorageError::BadRequest`] (unknown precision token, malformed
+/// [`ApiError::unconfigured`] (no store), [`ApiError::aspect_not_found`] (aspect
+/// undeclared), [`ApiError::bad_request`] (unknown precision token, malformed
 /// payload, no points carrying the field, a timestamp outside the declared unit's
 /// range, or values unrepresentable under the declared encoding/tolerance), and
-/// [`StorageError::Internal`] on a filesystem/control-plane failure.
-pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<IlpIngestParams>, body: String) -> Result<Response, StorageError> {
+/// [`ApiError::internal`] on a filesystem/control-plane failure.
+pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<IlpIngestParams>, body: String) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
 		metrics.record_ingest_error();
-		StorageError::Unconfigured
+		ApiError::unconfigured()
 	})?;
 	drop(state);
 	let start = std::time::Instant::now();
@@ -437,16 +439,16 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 
 /// The body of [`ingest_ilp`], split out so the handler records an error metric for
 /// any failure path uniformly.
-async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, params: &IlpIngestParams, body: &str) -> Result<Response, StorageError> {
-	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(StorageError::BadRequest)?;
-	let Some(schema) = store.schema_for(aspect).await.map_err(|err| StorageError::Internal(err.to_string()))? else {
-		return Err(StorageError::NotFound(format!("aspect `{aspect}` has no declared schema in the segment store")));
+async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
+	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(ApiError::bad_request)?;
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| ApiError::internal(err.to_string()))? else {
+		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the line-protocol text →
 	// typed points, timed apart from the timestamp normalization and the seal.
-	let points = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field).in_scope(|| weft_line_protocol::parse_points(body, &params.field, precision)).map_err(|err| StorageError::BadRequest(err.to_string()))?;
+	let points = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field).in_scope(|| weft_line_protocol::parse_points(body, &params.field, precision)).map_err(|err| ApiError::bad_request(err.to_string()))?;
 	if points.is_empty() {
-		return Err(StorageError::BadRequest(format!("no points carrying field `{}` with a timestamp in the payload", params.field)));
+		return Err(ApiError::bad_request(format!("no points carrying field `{}` with a timestamp in the payload", params.field)));
 	}
 
 	// `storage.ingest.normalize` span (roadmap Phase 3): rescale each wire epoch to the
@@ -457,7 +459,7 @@ async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics
 		let mut timestamps = Vec::with_capacity(points.len());
 		let mut values = Vec::with_capacity(points.len());
 		for point in points {
-			let epoch = epoch_in_unit(point.timestamp, schema.timestamp_unit).ok_or_else(|| StorageError::BadRequest(format!("timestamp {} is outside the range of the declared `{}` unit", point.timestamp, schema.timestamp_unit.name())))?;
+			let epoch = epoch_in_unit(point.timestamp, schema.timestamp_unit).ok_or_else(|| ApiError::bad_request(format!("timestamp {} is outside the range of the declared `{}` unit", point.timestamp, schema.timestamp_unit.name())))?;
 			timestamps.push(epoch);
 			values.push(point.value);
 		}
@@ -493,14 +495,14 @@ pub struct ParquetIngestParams {
 /// Parquet body, a batch missing WeftDB's columns, or a value unrepresentable under the
 /// declared encoding/tolerance (hard constraint #4), and an aspect name that is not safe
 /// as a file name are client-data problems → `400`; anything else (filesystem, libSQL) is a `500`.
-fn classify_ingest_error(err: &anyhow::Error) -> StorageError {
+fn classify_ingest_error(err: &anyhow::Error) -> ApiError {
 	let message = err.to_string();
 	if message.contains("no declared schema") {
-		StorageError::NotFound(message)
+		ApiError::aspect_not_found(message)
 	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
-		StorageError::BadRequest(message)
+		ApiError::bad_request(message)
 	} else {
-		StorageError::Internal(message)
+		ApiError::internal(message)
 	}
 }
 
@@ -516,16 +518,16 @@ fn classify_ingest_error(err: &anyhow::Error) -> StorageError {
 ///
 /// # Errors
 ///
-/// [`StorageError::Unconfigured`] (no store), [`StorageError::NotFound`] (aspect
-/// undeclared), [`StorageError::BadRequest`] (empty/malformed Parquet body or values
+/// [`ApiError::unconfigured`] (no store), [`ApiError::aspect_not_found`] (aspect
+/// undeclared), [`ApiError::bad_request`] (empty/malformed Parquet body or values
 /// unrepresentable under the declared encoding/tolerance), and
-/// [`StorageError::Internal`] on a filesystem/control-plane failure.
-pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, Query(params): Query<ParquetIngestParams>, body: Bytes) -> Result<Response, StorageError> {
+/// [`ApiError::internal`] on a filesystem/control-plane failure.
+pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ParquetIngestParams>, body: Bytes) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
 		metrics.record_ingest_error();
-		StorageError::Unconfigured
+		ApiError::unconfigured()
 	})?;
 	drop(state);
 	let start = std::time::Instant::now();
@@ -540,9 +542,9 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 
 /// The body of [`ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn ingest_parquet_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, StorageError> {
+async fn ingest_parquet_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
 	if body.is_empty() {
-		return Err(StorageError::BadRequest("empty Parquet body".to_string()));
+		return Err(ApiError::bad_request("empty Parquet body".to_string()));
 	}
 	// `storage.ingest.parquet` stage span (roadmap Phase 3 — the Arrow-decode-on-ingest
 	// analogue of the JSON/CSV/ILP `storage.ingest.parse`+`seal` spans). The arrow-store
