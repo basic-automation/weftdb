@@ -17,6 +17,12 @@ use std::{
 /// How long a server may take to start listening.
 const DEADLINE: Duration = Duration::from_secs(60);
 
+/// How long after the listening banner the request-guard line is allowed to take. The guard
+/// reports the address it is guarding, which it only knows once the bind happened, so it is
+/// printed after the banner; the grace is only a faster failure for the case where it never
+/// comes at all.
+const GUARD_GRACE: Duration = Duration::from_secs(10);
+
 /// Variables the surrounding test harness may itself set, or that would start a background
 /// task, removed from every child so the assertions are about the test's own settings.
 const NEUTRALIZED: &[&str] = &["WEFT_RECONCILE_INTERVAL_SECS", "WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_BACKUP_DIR", "OTEL_EXPORTER_OTLP_ENDPOINT", "WEFT_GPU_CALIBRATE", "TEST_DATA_DIR", "WEFT_DATA_DIR", "SKIP_SLOW_TESTS", "WEFT_VERBOSE", "WEFT_REQUIRE_GPU", "WEFT_FAULT"];
@@ -56,23 +62,42 @@ fn start_server(extra: &[(&str, &str)]) -> Started {
 	let mut stdout_lines: Vec<String> = Vec::new();
 	let deadline = Instant::now() + DEADLINE;
 	let mut listened = false;
-	// The banner is what tells us startup finished, so the child is killed there to end the
-	// stream. Collecting continues to EOF rather than stopping at the banner, because the
-	// phase that needs the bound address (the request guard) reports after it.
+	let mut guarded = false;
+	let mut guard_deadline: Option<Instant> = None;
+	// The listening banner is not the last line startup writes: the request guard reports
+	// after it, because it needs the address the socket actually got. Killing the child at
+	// the banner — which an earlier revision of this harness did — races it and loses that
+	// line on slower runners, where macOS CI failed. So the child is killed at the guard
+	// line, the last line before the server serves, and collection continues to EOF after it.
 	loop {
 		match received.recv_timeout(Duration::from_millis(100)) {
 			Ok(line) => {
 				let banner = line.contains("listening on");
+				let guard_line = line.contains("request guard:");
 				stdout_lines.push(line);
 				if banner && !listened {
 					listened = true;
+					guard_deadline = Some(Instant::now() + GUARD_GRACE);
+				}
+				if guard_line && !guarded {
+					guarded = true;
 					let _ = child.kill();
 				}
 			}
 			Err(mpsc::RecvTimeoutError::Disconnected) => break,
 			Err(mpsc::RecvTimeoutError::Timeout) => {
-				if Instant::now() > deadline {
-					break;
+				let now = Instant::now();
+				match guard_deadline {
+					Some(until) => {
+						if now > until {
+							break;
+						}
+					}
+					None => {
+						if now > deadline {
+							break;
+						}
+					}
 				}
 			}
 		}
@@ -80,6 +105,7 @@ fn start_server(extra: &[(&str, &str)]) -> Started {
 	let _ = child.wait();
 	let stderr = stderr.join().expect("the stderr reader finishes once the server exits");
 	assert!(listened, "the server reached its listening banner, so the report changed nothing about startup: {stderr}");
+	assert!(guarded, "and reached the request-guard line, the last line it prints before serving: {stderr}");
 	Started { stdout: stdout_lines.join("\n"), stderr }
 }
 
@@ -97,12 +123,25 @@ fn drain(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<String> {
 /// otherwise ignore completely.
 #[test]
 fn a_misspelled_variable_names_itself_and_the_nearest_real_one() {
-	let started = start_server(&[("WEFT_BACKUP_DIRS", "/var/backups"), ("WEFT_RECONCIL_INTERVAL_SECS", "60"), ("WEFT_ON_AMBIGUOUS_COMIT", "exit"), ("weft_server_addr", "0.0.0.0:9000")]);
-	for (mistyped, intended) in [("WEFT_BACKUP_DIRS", "WEFT_BACKUP_DIR"), ("WEFT_RECONCIL_INTERVAL_SECS", "WEFT_RECONCILE_INTERVAL_SECS"), ("WEFT_ON_AMBIGUOUS_COMIT", "WEFT_ON_AMBIGUOUS_COMMIT"), ("weft_server_addr", "WEFT_SERVER_ADDR")] {
-		let expected = format!("weft-server: {mistyped} is not a WeftDB variable; did you mean {intended}?");
-		assert!(started.stderr.contains(&expected), "{expected:?} is one of the lines it prints: {stderr}", stderr = started.stderr);
+	let mut extra: Vec<(&str, &str)> = vec![("WEFT_BACKUP_DIRS", "/var/backups"), ("WEFT_RECONCIL_INTERVAL_SECS", "60"), ("WEFT_ON_AMBIGUOUS_COMIT", "exit")];
+	let mut expected: Vec<(&str, &str)> = vec![("WEFT_BACKUP_DIRS", "WEFT_BACKUP_DIR"), ("WEFT_RECONCIL_INTERVAL_SECS", "WEFT_RECONCILE_INTERVAL_SECS"), ("WEFT_ON_AMBIGUOUS_COMIT", "WEFT_ON_AMBIGUOUS_COMMIT")];
+	// A lowercase `weft_server_addr` is a mistake worth naming everywhere, because the
+	// registry's lookup is case-sensitive and it matches nothing. But it can only be *set*
+	// where the environment is case-sensitive: a Windows environment block keeps one entry per
+	// name whatever its spelling, so setting it there would overwrite `WEFT_SERVER_ADDR` — and
+	// with it the port this harness binds — instead of adding a second variable. The
+	// case-insensitive suggestion is still covered, by `settings::tests`, which never touches
+	// the environment.
+	if cfg!(unix) {
+		extra.push(("weft_server_addr", "0.0.0.0:9000"));
+		expected.push(("weft_server_addr", "WEFT_SERVER_ADDR"));
 	}
-	assert_eq!(started.complaints().len(), 4, "one line per mistyped name, and no others: {stderr}", stderr = started.stderr);
+	let started = start_server(&extra);
+	for (mistyped, intended) in &expected {
+		let line = format!("weft-server: {mistyped} is not a WeftDB variable; did you mean {intended}?");
+		assert!(started.stderr.contains(&line), "{line:?} is one of the lines it prints: {stderr}", stderr = started.stderr);
+	}
+	assert_eq!(started.complaints().len(), expected.len(), "one line per mistyped name, and no others: {stderr}", stderr = started.stderr);
 }
 
 /// A name in our namespace that is nobody's variable is reported as itself. Guessing would

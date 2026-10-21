@@ -182,7 +182,8 @@ pub fn vars() -> impl Iterator<Item = &'static VarSpec> {
 }
 
 /// The registered name closest to `name`, when one is close enough to be the spelling the
-/// operator meant: case-insensitive, at most [`MAX_SUGGEST_DISTANCE`] edits apart.
+/// operator meant: case-insensitive, at most `MAX_SUGGEST_DISTANCE` edits apart, the nearest
+/// one if several are equally close.
 #[must_use]
 pub fn suggest(name: &str) -> Option<&'static str> {
 	let misspelled = name.to_ascii_lowercase();
@@ -199,7 +200,8 @@ pub fn suggest(name: &str) -> Option<&'static str> {
 /// - a `Test`-tier channel set on a real process, which does nothing useful and usually
 ///   means a harness's environment leaked into a deployment.
 ///
-/// Unset variables, and variables outside [`OUR_PREFIXES`], are not commented on.
+/// Unset variables, and variables outside the `WEFT_` namespace the project owns, are not
+/// commented on.
 #[must_use]
 pub fn warnings_for(entries: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
 	let mut warnings = Vec::new();
