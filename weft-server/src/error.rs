@@ -874,7 +874,7 @@ mod tests {
 		assert_eq!(api.code(), Code::BadRequest, "a body we could not read is the caller's");
 		let api = classify_read(&failure());
 		assert_eq!(api.code(), Code::Internal, "our own encoder failing is not");
-		assert!(api.message().is_empty(), "a server fault sends no detail: {:?}", api.message());
+		assert_eq!(api.wire_message(), "the server could not complete the request", "a server fault sends its fixed sentence, not the parquet detail: {:?}", api.wire_message());
 		assert!(api.cause.as_deref().expect("the cause is kept for the log").contains("truncated"));
 	}
 
@@ -900,7 +900,7 @@ mod tests {
 		assert_eq!(api.code(), Code::IncompatibleStore);
 		assert_eq!(api.code().status(), StatusCode::SERVICE_UNAVAILABLE);
 		assert!(api.cause.as_deref().unwrap().contains("layout 7"), "the layout numbers are logged");
-		assert!(api.message().is_empty(), "nothing of the store's wording reaches the wire");
+		assert_eq!(api.wire_message(), "the store on disk uses a format this server cannot open", "the root's numbers stay in the log: {:?}", api.message());
 	}
 
 	/// The library's own reduction failures are typed at the call site, and none of them is a
@@ -922,7 +922,7 @@ mod tests {
 	fn an_unnamed_failure_stays_internal() {
 		let api = classify_read(&anyhow::anyhow!("libSQL: no such table: segment_index"));
 		assert_eq!(api.code(), Code::Internal);
-		assert!(api.message().is_empty(), "the driver's sentence is logged, not sent: {:?}", api.message());
+		assert_eq!(api.wire_message(), "the server could not complete the request", "the driver's sentence is logged, not sent: {:?}", api.wire_message());
 		assert_eq!(api.cause.as_deref().unwrap(), "libSQL: no such table: segment_index");
 		// The one message rule the read path still has, kept until D-S13 types the schema
 		// lookup's absence: an aspect with no declared schema is still the caller's 404.
