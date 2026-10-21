@@ -278,6 +278,31 @@ only the control plane, not the segment frames.
   `main.rs`, through a direct `mimalloc` dependency rather than one inherited from a library.
   Same allocator, same version, same measured behaviour — the decision is just made in the place
   that owns the process (see the dependency entry under Changed).
+- **Frame versions are a registry, and a frame says what it is** (1.0 plan X-FRAME; absorbs FRE-4,
+  TAG-2 and ROB-8's fault-class naming). `weft_physical_type::frame_registry` names the frame
+  layouts — `5` single-block, `6` paged, `7` envelope — on the rule stated there that a number is
+  never reused or renumbered once it has shipped. The v7 envelope is a header and a trailer around
+  a frame stored **verbatim**: `WEFTSEG | u16 7 | u16 body_version | extension table | frame |
+  crc32`, 16 bytes of overhead (a 12-byte header plus the trailer), so a v5 or v6 body keeps every
+  byte-for-byte expectation a released server already holds while a reader gains somewhere to put
+  material in front of a body it is not allowed to change. An extension is `{id, critical,
+  payload}`: a reader that does not know a **critical** one refuses the frame, because that body
+  was written on the assumption that the extension would be applied, and an optional one is
+  ignored. The set this build implements (`KNOWN_EXTENSIONS`) is deliberately empty — the envelope
+  ships with no extensions, and a number invented before there is a feature behind it can never be
+  taken back. `describe_frame`, `frame_layout_of`, `wrap_frame_envelope`/`unwrap_frame_envelope`
+  and the layout-aware readers `read_frame_segment`, `read_frame_paged_segment`, `read_frame_point`,
+  `read_frame_points`, `read_frame_range` and `read_frame_range_physical` read a frame without the
+  caller knowing how it is framed, and `frame_fault_of` gives the class an operator acts on (plan
+  C5): `Integrity`, the bytes are damaged, or `Undecodable { newer_format }`, this binary is behind
+  the file. `SegmentStore` picks its reader from the frame's own header rather than the
+  `format_version` it recorded in the index row, where any value that was not `6` used to send a
+  paged frame into the single-block decoder; the decode failures it returns carry
+  `weftdb::FrameFaultError` in the `anyhow` chain under the `decoding [paged ]segment <path>: …`
+  sentence they have always produced. Over HTTP that is C5: a frame this build has no reader for is
+  `503 incompatible_store`, and any other frame that will not decode is `500 frame_undecodable`,
+  the code X-ERR gave a wire sentence but no producer. **No writer opts into the envelope yet** —
+  seals keep writing 5 and 6 — so this is the mechanism, not a format change.
 
 ### Changed
 
