@@ -109,9 +109,11 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 /// # Errors
 ///
 /// [`ApiError::unconfigured`] when no store is attached,
-/// [`Code::InvalidAspectName`](crate::error::Code::InvalidAspectName) when the name is not one the store can
-/// address as a frame file name, [`ApiError::bad_request`] when a physical type, time unit or
-/// tolerance does not parse, and a `500` on a control-plane write failure.
+/// [`Code::InvalidAspectName`](crate::error::Code::InvalidAspectName) when the name is not one this
+/// server will create — it either breaks a rule every aspect name must keep (it would move a
+/// path, or Windows could not open it) or one that only a new name can keep (an ASCII capital,
+/// which could take another aspect's file name) — [`ApiError::bad_request`] when a physical type,
+/// time unit or tolerance does not parse, and a `500` on a control-plane write failure.
 pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): StrictJson<DeclareAspectRequest>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
@@ -119,7 +121,13 @@ pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): 
 	// store's `segments/` directory before anything is written. This has its own code in the §4
 	// table, so a client branches on `invalid_aspect_name` and on `details.reason` rather than on
 	// a sentence shared with every other 400 this route can send.
-	weftdb::aspect_name::validate(&request.name).map_err(|err| error::aspect_name_refusal(&err))?;
+	//
+	// Declaring is where an aspect name is born, so this is the one place the stricter
+	// `validate_new` applies (1.0 plan X-NAME): it adds no capital letters, because `price` and
+	// `PRICE` would be one file name on a case-insensitive filesystem. Everywhere else — every
+	// read, seal, maintenance call — keeps plain `validate`, so an aspect declared before this
+	// rule was written is never stranded by it.
+	weftdb::aspect_name::validate_new(&request.name).map_err(|err| error::aspect_name_refusal(&err))?;
 	let schema = schema_from_request(&request)?;
 	let result = store.declare(&request.name, &schema).await;
 	drop(store);
@@ -273,5 +281,42 @@ mod tests {
 		drop(state);
 		drop(store);
 		assert!(frames_under(dir.path()).is_empty(), "no frame was written anywhere");
+	}
+
+	/// X-NAME: a rule only a name that is not in use yet can satisfy is enforced at declare, and
+	/// reported through `code` and `details`. The rules every existing name already satisfies are
+	/// not tightened here, and an aspect whose name carries a capital from an older version is
+	/// still addressed, sealed and read exactly as before.
+	#[tokio::test]
+	async fn declare_refuses_a_name_only_a_new_aspect_must_keep() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.expect("opens store"));
+		let state = AppState::new().with_store(store.clone());
+		for name in ["Price", "PRICE", "CPU_load"] {
+			let body = serde_json::json!({ "name": name, "physical_type": "f64", "timestamp_unit": "seconds" });
+			let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/aspects", &body).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?} must not be creatable; body: {body}");
+			assert_eq!(body["code"], "invalid_aspect_name", "body: {body}");
+			assert_eq!(body["details"]["aspect"], name, "body: {body}");
+			assert!(body["details"]["reason"].as_str().unwrap().contains("uppercase"), "the reason says which rule: {body}");
+		}
+		let declared = store.list_declared_aspects().await.unwrap();
+		assert!(declared.is_empty(), "a refused declare writes nothing: {declared:?}");
+		// A `:` stays ordinary on Unix, in the creation rules as in the use rules.
+		if cfg!(unix) {
+			let body = serde_json::json!({ "name": "job:rate5m", "physical_type": "f64", "timestamp_unit": "seconds" });
+			let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/aspects", &body).await;
+			assert_eq!(status, StatusCode::CREATED, "a `:` is an ordinary character on Unix: {body}");
+		}
+		// A name an older version put in the catalog directly is grandfathered: the stricter rule
+		// is only ever the creation rule.
+		let schema = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		store.catalog().declare(store.database(), store.subject(), "Price", &schema).await.expect("raw declare");
+		let points = serde_json::json!({ "points": [{ "timestamp": 0, "value": "1" }] });
+		let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/Price/points", &points).await;
+		assert_eq!(status, StatusCode::CREATED, "an aspect that already has a capital in its name is still writable: {body}");
+		assert_eq!(body["row_count"].as_u64(), Some(1), "the sealed frame is described: {body}");
+		drop(state);
+		drop(store);
 	}
 }

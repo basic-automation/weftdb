@@ -244,6 +244,20 @@ only the control plane, not the segment frames.
   process death with the exit code the supervisor sees, not a response body (FRE-6a).
   `ConvertError`, `ReduceError` and `SketchError` gained `#[non_exhaustive]`, so the mapping can
   grow without breaking a semver-minor release.
+- **An aspect name is checked twice — at creation and on use** (1.0 plan X-NAME; absorbs FRE-7a,
+  SEC-0). `weftdb::aspect_name::validate_new` adds the rules that only a name not in use yet can
+  still be held to: no ASCII uppercase letter, because `price` and `PRICE` are one and the same
+  file name on a case-insensitive or case-folding filesystem (NTFS, APFS by default, ext4 with
+  `casefold`), and the legacy `<aspect>-<id>.weftseg` scheme writes the aspect name into that name
+  literally — two aspects, one file, and the second one's frames are read as the first's. Only
+  `POST /api/v1/storage/aspects` applies it, because declaring is where a name is born: reads,
+  seals, maintenance and the store-wide sweep keep plain `validate`, so a store that already holds
+  `Price` is still readable, writable and compactable. A refusal carries
+  `code: "invalid_aspect_name"` and `details.reason`. The characters only Windows forbids
+  (`< > : " | ? *`) are deliberately **not** refused at creation on Unix while the aspect name is
+  still part of the file name — `job:rate5m` is a name in use — and that cross-platform hazard is
+  closed one layer down instead, where `aspect_name::encode` escapes `:` for the write-once frame
+  names (D-S10).
 
 ### Changed
 

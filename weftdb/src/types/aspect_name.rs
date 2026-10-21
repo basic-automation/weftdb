@@ -52,6 +52,14 @@
 //! in uppercase hex, so two names that differ in case or normalisation encode to file
 //! names that differ under case folding and normalisation too. Maintenance outputs take
 //! these names from slice S8 on; seals from S10.
+//!
+//! A name that is being **created** passes [`validate_new`] as well, which adds the rules that
+//! can only be applied while a name is still new — no ASCII uppercase letter, so `price` and
+//! `PRICE` cannot both be created and then take one file name on a case-insensitive filesystem.
+//! The other candidate rule, refusing on every platform the characters only Windows forbids
+//! (`< > : " | ? *`), is deliberately *not* taken while the aspect name still appears literally
+//! in the legacy `<aspect>-<id>` name: `job:rate5m` is a name in use on Unix, and the
+//! cross-platform problem is fixed one layer down, where [`encode`] escapes `:`.
 
 use std::fmt;
 
@@ -100,6 +108,10 @@ pub enum AspectNameReason {
 	/// On Windows, the name contains a character Windows does not allow in a file name
 	/// (`<`, `>`, `:`, `"`, `|`, `?` or `*`).
 	WindowsForbiddenCharacter,
+	/// The name contains an ASCII uppercase letter. Only [`validate_new`] refuses this: an
+	/// aspect already declared with such a name keeps it, but a new one could collide with
+	/// another aspect's file name on a case-insensitive or case-folding filesystem.
+	UppercaseAsciiLetter,
 }
 
 impl fmt::Display for AspectNameReason {
@@ -115,6 +127,7 @@ impl fmt::Display for AspectNameReason {
 			Self::TrailingDotOrSpace => f.write_str("it ends with `.` or a space"),
 			Self::ReservedDeviceName => f.write_str("it is a Windows reserved device name (CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM0-9, LPT0-9)"),
 			Self::WindowsForbiddenCharacter => f.write_str("it contains a character Windows does not allow in a file name (< > : \" | ? *)"),
+			Self::UppercaseAsciiLetter => f.write_str("it contains an uppercase ASCII letter, which could take another aspect's file name on a case-insensitive filesystem"),
 		}
 	}
 }
@@ -159,11 +172,41 @@ impl std::error::Error for InvalidAspectName {}
 /// Check that `name` is safe to use as an aspect name, which also names the aspect's
 /// files on disk. See the [module documentation](self) for the rules.
 ///
+/// A name being **created** is checked by [`validate_new`] as well.
+///
 /// # Errors
 ///
 /// An [`InvalidAspectName`] naming the first rule `name` breaks.
 pub fn validate(name: &str) -> Result<(), InvalidAspectName> {
 	reason(name, cfg!(windows)).map_or(Ok(()), |reason| Err(InvalidAspectName { name: name.to_string(), reason }))
+}
+
+/// Check that `name` is one this store will **create**, not merely one it can address.
+///
+/// Every rule [`validate`] applies, plus the ones that can only be enforced while the name is
+/// still new — a rule that a name already on disk would break strands an aspect whose data is
+/// already written, so those rules live here rather than in [`validate`]. Today there is one:
+/// no ASCII uppercase letter. `price` and `PRICE` are one file name on a case-insensitive or
+/// case-folding filesystem (NTFS, APFS by default, ext4 with `casefold`), and the legacy
+/// `<aspect>-<id>.weftseg` scheme writes the aspect name into that name literally, so the two
+/// aspects cannot both be addressed everywhere a store may be copied.
+///
+/// Declaring a name is where one is born, so that is the only caller that must satisfy this;
+/// every later operation on an aspect calls [`validate`], so an aspect declared before a
+/// new-name rule exists keeps working. 1.0 plan X-NAME.
+///
+/// # Errors
+///
+/// An [`InvalidAspectName`] naming the first rule `name` breaks, [`validate`]'s rules first.
+pub fn validate_new(name: &str) -> Result<(), InvalidAspectName> {
+	match reason(name, cfg!(windows)) {
+		Some(reason) => Err(InvalidAspectName { name: name.to_string(), reason }),
+		// After `reason`, so a name that both escapes a directory and carries a capital is
+		// refused for the escape: the more dangerous of the two, and the one an operator would
+		// otherwise notice last.
+		None if name.chars().any(|c: char| c.is_ascii_uppercase()) => Err(InvalidAspectName { name: name.to_string(), reason: AspectNameReason::UppercaseAsciiLetter }),
+		None => Ok(()),
+	}
 }
 
 /// Whether `byte` stands for itself in [`encode`]'s output: `[a-z0-9_]`.
@@ -429,5 +472,46 @@ mod tests {
 		let err = validate("../x").unwrap_err();
 		assert_eq!(err.name(), "../x");
 		assert_eq!(err.to_string(), "invalid aspect name \"../x\": it starts with `.`");
+	}
+
+	/// X-NAME: the rules that apply only to a name that is not in use yet. `validate` keeps its
+	/// lenience on purpose — a new rule must not strand an aspect whose data is already written.
+	#[test]
+	fn a_new_name_may_not_collide_with_another_in_case() {
+		for name in ["Price", "PRICE", "CPU_load", "Temp1", "ΔT PRICE"] {
+			assert_eq!(validate(name), Ok(()), "{name:?} is addressable, so an aspect declared with it before this rule keeps working");
+			assert_eq!(validate_new(name).expect_err(name).reason(), AspectNameReason::UppercaseAsciiLetter, "{name:?} may not be created");
+		}
+		for name in ["a", "price", "temp_1", "cpu.usage_idle", "load-avg", "Δt", "温度", "con-x", "\u{394}\u{3a4}"] {
+			assert_eq!(validate_new(name), Ok(()), "{name:?} should be creatable");
+		}
+	}
+
+	/// A non-ASCII capital is not an ASCII one, and [`encode`] escapes it rather than folding it,
+	/// so it is not part of the collision class this rule closes either.
+	#[test]
+	fn only_ascii_case_is_refused() {
+		// "ΔΤ": Greek capital delta and Greek capital tau. It reads as "DT", and a human typing it
+		// after looking at a `dt` aspect will not be refused — but nothing folds it onto `dt`,
+		// because NTFS, APFS and ext4 `casefold` fold ASCII only.
+		assert_eq!(validate_new("\u{394}\u{3a4}"), Ok(()));
+		// The rule keys on the ASCII letter, whatever stands next to it.
+		assert_eq!(validate_new("\u{394}T").expect_err("refused").reason(), AspectNameReason::UppercaseAsciiLetter);
+		assert_eq!(validate_new("PRICE"), Err(InvalidAspectName { name: "PRICE".into(), reason: AspectNameReason::UppercaseAsciiLetter }));
+		assert!(validate_new("PRICE").expect_err("refused").to_string().contains("uppercase"), "the message says which rule: {}", validate_new("PRICE").expect_err("refused"));
+	}
+
+	/// The new rule must not bury the refusals that matter more: the first rule a name breaks is
+	/// still the one [`reason`] finds first.
+	#[test]
+	fn the_new_rule_never_hides_a_more_dangerous_one() {
+		for name in ["../Price", "a/b/Temp", "C:\\Price", ".CON", "a ", "", "price.", "CON"] {
+			assert_eq!(validate_new(name).expect_err(name).reason(), validate(name).expect_err(name).reason(), "{name:?}");
+		}
+		// `:` stays a Unix-ordinary character in the creation rules too: it is the frame name that
+		// needs escaping, and `encode` escapes it.
+		if cfg!(unix) {
+			assert_eq!(validate_new("job:rate5m"), Ok(()));
+		}
 	}
 }
