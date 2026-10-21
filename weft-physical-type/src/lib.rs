@@ -106,6 +106,9 @@ pub mod catalog;
 pub mod column;
 #[cfg(feature = "experimental-codecs")]
 pub mod floatcodec;
+/// The `.weftseg` frame version registry, and the two classes of frame-fault a read
+/// can fail with (1.0 plan X-FRAME, resolution C5).
+pub mod frame_registry;
 pub mod nulls;
 pub mod page;
 pub mod schema;
@@ -122,6 +125,7 @@ pub use catalog::{SegmentDescriptor, SegmentIndex};
 pub use column::{encode_column, recommend_encoding, CascadeInner, ColumnEncodeError, ColumnEncoding, DeltaCascadePlan};
 #[cfg(feature = "experimental-codecs")]
 pub use floatcodec::{best_f64_bytes, best_f64_codec, chimp128_f64_bytes, chimp128_f64_decode, chimp128_f64_encode, chimp_f64_bytes, chimp_f64_decode, chimp_f64_encode, elf_f64_bytes, elf_f64_decode, elf_f64_encode, xor_f64_bytes, xor_f64_decode, xor_f64_encode};
+pub use frame_registry::{is_known_extension, layout_of, FrameExtension, FrameExtensionSpec, FrameFault, FrameInfo, FrameLayout, FRAME_ENVELOPE, FRAME_PAGED, FRAME_SINGLE_BLOCK, FRAME_VERSION_MAX_KNOWN, KNOWN_EXTENSIONS};
 pub use nulls::{NullMask, NullMaskError};
 pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
 pub use schema::{AspectSchema, SealError};
@@ -132,7 +136,7 @@ pub use tags::{SeriesKey, SeriesSelector, TagError, TagSet, MAX_SERIES_KEY_BYTES
 pub use timestamp::{bitpack_bytes, bitpack_decode, bitpack_encode, bitpack_width, decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, first_order_violation, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 #[cfg(feature = "experimental-codecs")]
 pub use timestamp::{fire_estimated_bytes, fire_reconstruct, fire_residuals};
-pub use weftseg::{crc32, frame_value_codec, read_paged_segment, read_segment, write_paged_segment, write_segment, write_segment_with, ByteReader, ByteWriter, FrameOptions, WeftSegError};
+pub use weftseg::{crc32, describe_frame, frame_fault_of, frame_layout_of, frame_value_codec, frame_version, read_frame_paged_segment, read_frame_point, read_frame_points, read_frame_range, read_frame_range_physical, read_frame_segment, read_paged_segment, read_segment, unwrap_frame_envelope, wrap_frame_envelope, write_paged_segment, write_segment, write_segment_with, ByteReader, ByteWriter, FrameOptions, WeftSegError};
 
 /// A schema-declared physical encoding for an aspect's numeric values.
 ///

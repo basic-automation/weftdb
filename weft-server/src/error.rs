@@ -571,6 +571,15 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 	if let Some(e) = err.downcast_ref::<weftdb::InvalidAspectName>() {
 		return Some(aspect_name_refusal(e));
 	}
+	// A frame on disk that this build could not decode. The fault class decides the status,
+	// not the decoder's words: a frame written by a newer build is a store this binary must
+	// refuse (C5 sends `incompatible_store`, and the operator's next step is the binary, not
+	// the file), while damage or a frame needing an extension or codec this build lacks is
+	// `frame_undecodable`. Neither is ever derived from the message, which is kept
+	// byte-for-byte what these sites have always logged.
+	if let Some(e) = err.downcast_ref::<weftdb::FrameFaultError>() {
+		return Some(from_frame_fault(e));
+	}
 	// A store on disk this binary cannot open: exit `65` for a CLI, `503 incompatible_store`
 	// here, and the same code for every reason (newer layout, unreadable `STORE_FORMAT`).
 	if let Some(e) = err.downcast_ref::<weftdb::StoreError>() {
@@ -586,6 +595,23 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 		return Some(from_sketch_error(e));
 	}
 	None
+}
+
+/// A frame whose bytes this build could not turn into rows.
+///
+/// `503 incompatible_store` only for `newer_format`, because that is the one case where the
+/// file is fine and the running binary is the thing that is wrong: the same store answers once
+/// the server is updated, so it is reported as a store/version condition and `/ready` says so
+/// too. Damage stays `500 frame_undecodable` — the request was not the problem, but the store as
+/// a whole is not unusable either, and C5's quarantine of the file happens in the storage layer.
+/// A frame needing a critical extension or an off-by-default codec also stays `500`: the build is
+/// behind on a feature, not on the format, and the message names what to enable.
+pub fn from_frame_fault(e: &weftdb::FrameFaultError) -> ApiError {
+	use weft_physical_type::FrameFault;
+
+	let fault = e.fault();
+	let code = if matches!(fault, FrameFault::Undecodable { newer_format: true }) { Code::IncompatibleStore } else { Code::FrameUndecodable };
+	ApiError::server(code, e.to_string()).with_details(serde_json::json!({ "fault": fault.fault_class() }))
 }
 
 /// A batch that will not seal under the aspect's declared schema.
