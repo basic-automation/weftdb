@@ -42,6 +42,10 @@ axum = { workspace = true }
 bigdecimal = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 weftdb = { workspace = true }  # control-plane segment store backing the storage query endpoints
+# The process allocator this binary chooses, stated here rather than inherited from a library
+# dependency (PAC-3); see `main.rs`. The same mimalloc that every benchmark of this server, and
+# every release build of it, has measured.
+mimalloc = { workspace = true }
 weft-arrow = { workspace = true }  # reconstructed-series -> Arrow IPC / Parquet bytes for the interpolate endpoint (arrow types stay inside weft-arrow)
 weft-arrow-store = { workspace = true }  # stored range -> Arrow IPC bytes (keeps the arrow-* tree off the lean core)
 weft-line-protocol = { workspace = true }
@@ -49,7 +53,9 @@ weft-physical-type = { workspace = true }  # AspectSchema / PhysicalType / TimeU
 weft-reduce = { workspace = true }  # canonical downsample reduction (Aggregation / reduce / bucket_start)
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-splimes = { workspace = true, features = ["tokio"] }
+# The GPU backend is this binary's decision, not the libraries': `weft-server/src/gpu.rs`
+# calibrates splimes' backends at startup. PAC-3.
+splimes = { workspace = true, features = ["tokio", "gpu"] }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }  # per-request engine spans on the compute path (Phase 3 instrumentation)
 tracing-subscriber = { workspace = true }  # RUST_LOG-driven span/event subscriber (env-filter from the workspace dep)

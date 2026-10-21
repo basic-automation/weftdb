@@ -1,6 +1,13 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception)]
 
+// The process allocator is this binary's choice, not a side effect of what a library it links
+// happens to depend on (PAC-3). turso used to carry it: its `mimalloc` feature installs a
+// `#[global_allocator]` in turso's own crate root, so any program linking `weftdb` got mimalloc
+// whether it wanted it or not. `weftdb` no longer asks for it; this binary says so itself.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::fs::OpenOptions;
 
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};

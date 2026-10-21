@@ -33,7 +33,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
-splimes = { workspace = true, features = ["tokio"] }
+# The benchmark's engine metadata and its gpu-memory workload call splimes' GPU entry points
+# (`prewarm_gpu`, `calibrate`, `gpu_pool_stats`), so it opts into the backend that the library
+# crates no longer carry. PAC-3.
+splimes = { workspace = true, features = ["tokio", "gpu"] }
 sysinfo = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 

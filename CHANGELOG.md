@@ -273,8 +273,41 @@ only the control plane, not the segment frames.
   still part of the file name — `job:rate5m` is a name in use — and that cross-platform hazard is
   closed one layer down instead, where `aspect_name::encode` escapes `:` for the write-once frame
   names (D-S10).
+- **Our executables say what allocator they run on** (1.0 plan PAC-3). `weft-server` and
+  `weft-tui` each declare `#[global_allocator] static ALLOCATOR: mimalloc::MiMalloc` in their own
+  `main.rs`, through a direct `mimalloc` dependency rather than one inherited from a library.
+  Same allocator, same version, same measured behaviour — the decision is just made in the place
+  that owns the process (see the dependency entry under Changed).
 
 ### Changed
+
+- **Library crates stop deciding their users' allocator and GPU stack** (1.0 plan PAC-3). No
+  library in this workspace enables turso's `mimalloc` feature or splimes' default `gpu` feature
+  any more, because both are decisions a dependency makes for the whole process. turso 0.8.1
+  installs a `#[global_allocator]` in its own crate root when `mimalloc` is on, so every program
+  linking `weftdb` — an embedder with its own allocator, a program that wants the system one — was
+  switched to mimalloc without being asked; `gpu` drags `wgpu`, and with it the Vulkan, Metal and
+  DX12 backends, into the graph of everything that depends on splimes. Counting the distinct
+  packages in each crate's non-dev dependency graph, before and after: `weft-line-protocol` and
+  `weft-reduce` 77 → 25, `weftdb` 266 → 227, `weft-orchestration` 267 → 231. Our own GPU users —
+  `weft-server` and `weft-bench`, which call `prewarm_gpu`, `calibrate` and `gpu_pool_stats` —
+  enable `gpu` themselves, as do `weftdb`'s interpolation benches through a dev-dependency, so
+  nothing this repository runs lost its GPU path. A library user who wants either asks for it: an
+  allocator by declaring one in their own binary, the GPU by enabling `splimes/gpu`. ⚠️ Rust code
+  that reached the GPU *through* `weftdb` — a `splimes::Backend::Gpu` while depending on `weftdb`
+  alone — names `splimes` itself now. One default stays on deliberately: splimes' `serde`, because
+  `weftdb::BatchedMeasurement` derives `Serialize`/`Deserialize` over a `splimes::Resolution` field.
+  turso's other default, `fts`, stays off, as it already was: it is turso's full-text search, and
+  turning it on grows the graph with tantivy, tantivy-columnar, zstd-sys and the rest of that tree,
+  which the first attempt at this dependency line showed in the lock diff.
+  One number to be aware of: `cargo bench -p weftdb` is criterion, not test code, so it used to
+  inherit mimalloc through turso and now runs on the system allocator — a `weftdb` bench figure
+  from before this release is not comparable with one taken after. `weft-bench` never linked
+  `weftdb` and never had mimalloc, so the Weft-Bench series, including the nightly regression
+  track, does not move.
+- **`tracing-subscriber` is a dev-dependency of `weftdb`, not a dependency.** No code in the
+  library installs a subscriber outside `#[cfg(test)]`, so every program linking `weftdb` was
+  building registry, fmt and env-filter code it never called.
 
 - **Statuses split where the §4 table names a different condition** (1.0 plan X-ERR). A batch
   that will not seal under an aspect's declared schema no longer answers `400` whatever the
