@@ -18,6 +18,9 @@ publish = false
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 weftdb = { workspace = true }
+# The process allocator this binary chooses, stated here rather than inherited from a library
+# dependency (PAC-3); see `main.rs`.
+mimalloc = { workspace = true }
 splimes = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
