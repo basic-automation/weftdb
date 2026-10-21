@@ -42,6 +42,7 @@ pub mod ingest;
 pub mod interpolate;
 pub mod maintain;
 pub mod metrics;
+pub mod panic_hook;
 pub mod reconcile_daemon;
 pub mod settings;
 pub mod state;

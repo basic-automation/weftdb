@@ -131,6 +131,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process the process-wide-poison test spawns: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_OPEN_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process the open-recovery test spawns: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_ORPHAN_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process that seals a frame and crashes before its commit: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store.rs (test child)" },
+	VarSpec { name: "WEFT_TEST_PANIC_CHILD_MODE", tier: Tier::Test, summary: "Names which half of the control-plane panic test the child process is exercising, so its parent can tell a deliberate abort from a real crash. No shipped binary reads it.", accepts: "`inside` panics while the control-plane write scope is held; `outside` panics in an ordinary task", default: "unset: the child returns and the test binary exits 0", read_by: "weft-server/tests/control_plane_panic.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_POISON_EXIT_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child `weft-server` the poison-exit test re-invokes: the store root it opens, so the parent can point the child at the poisoned store.", accepts: "a directory path", default: "unset", read_by: "weft-server/tests/poison_exit.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_RACE_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process that reconciles while a squash races it: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process whose reconcile is merged by a racing squash: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
@@ -363,7 +364,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 51, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 52, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
@@ -400,7 +401,7 @@ mod tests {
 		let experimental: Vec<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Experimental).map(|spec| spec.name).collect();
 		assert_eq!(experimental, ["WEFT_GPU_CALIBRATE", "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD"], "both are knobs whose value is unproven (GPU calibration's thresholds, and a codec the measurements retired)");
 		let harness: BTreeSet<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Test).map(|spec| spec.name).collect();
-		let allowlist: BTreeSet<&str> = ["SKIP_SLOW_TESTS", "TEST_DATA_DIR", "WEFT_FAULT", "WEFT_FAULT_TEST_CHILD", "WEFT_REQUIRE_GPU", "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", "WEFT_TEST_OPEN_CHILD_ROOT", "WEFT_TEST_ORPHAN_CHILD_ROOT", "WEFT_TEST_POISON_EXIT_CHILD_ROOT", "WEFT_TEST_RACE_CHILD_ROOT", "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", "WEFT_TEST_S8_SPLIT_RACE_ROOT", "WEFT_TEST_S9_DROPPED_SWAP_DIR", "WEFT_TEST_S9_SQUASH_RACE_DIR", "WEFT_TEST_S9_SUFFIX_RACE_DIR", "WEFT_TEST_SWAP_MATRIX", "WEFT_TEST_SWAP_MATRIX_DIR", "WEFT_TEST_TXN_CHILD_INDEX", "WEFT_BENCH_BACKUP_DIR", "WEFT_BTC_CSV", "WEFT_DB_NEW_CRASH_CHILD", "WEFT_LEGACY_CONSUMER_CRASH_CHILD", "WEFT_LEGACY_INGEST_CRASH_CHILD", "WEFT_VERBOSE"].into_iter().collect();
+		let allowlist: BTreeSet<&str> = ["SKIP_SLOW_TESTS", "TEST_DATA_DIR", "WEFT_FAULT", "WEFT_FAULT_TEST_CHILD", "WEFT_REQUIRE_GPU", "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", "WEFT_TEST_OPEN_CHILD_ROOT", "WEFT_TEST_ORPHAN_CHILD_ROOT", "WEFT_TEST_PANIC_CHILD_MODE", "WEFT_TEST_POISON_EXIT_CHILD_ROOT", "WEFT_TEST_RACE_CHILD_ROOT", "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", "WEFT_TEST_S8_SPLIT_RACE_ROOT", "WEFT_TEST_S9_DROPPED_SWAP_DIR", "WEFT_TEST_S9_SQUASH_RACE_DIR", "WEFT_TEST_S9_SUFFIX_RACE_DIR", "WEFT_TEST_SWAP_MATRIX", "WEFT_TEST_SWAP_MATRIX_DIR", "WEFT_TEST_TXN_CHILD_INDEX", "WEFT_BENCH_BACKUP_DIR", "WEFT_BTC_CSV", "WEFT_DB_NEW_CRASH_CHILD", "WEFT_LEGACY_CONSUMER_CRASH_CHILD", "WEFT_LEGACY_INGEST_CRASH_CHILD", "WEFT_VERBOSE"].into_iter().collect();
 		assert_eq!(harness, allowlist, "the Test tier is the plan's allowlist: a channel a test harness sets for the child it spawns, and nothing else may sit in it");
 		assert_eq!(VARS.iter().filter(|spec| spec.tier == Tier::Tuning).count(), VARS.len() - stable.len() - experimental.len() - allowlist.len(), "every remaining name is Tuning: a knob whose value is deployment-specific and whose number is still moving");
 	}
