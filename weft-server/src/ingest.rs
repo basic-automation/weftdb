@@ -528,11 +528,13 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 		StorageError::Unconfigured
 	})?;
 	drop(state);
+	let start = std::time::Instant::now();
 	let result = ingest_parquet_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
 	}
+	metrics.observe_ingest_latency(start.elapsed());
 	result
 }
 
@@ -1092,5 +1094,30 @@ mod tests {
 		assert_eq!(read["count"], 3);
 
 		assert_eq!(read["points"][1]["value"], "2.5");
+	}
+
+	#[tokio::test]
+	async fn parquet_ingest_feeds_the_ingest_latency_histogram() {
+		use crate::SharedMetrics;
+
+		let dir = TempDir::new().unwrap();
+		let metrics = SharedMetrics::default();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(store));
+
+		let body = price_parquet_body(&[100, 110, 120], &[Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))]);
+		let (status, json) = post_parquet(router, "/api/v1/storage/price/parquet", body).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {json}");
+
+		// The Parquet leg already counted requests, rows and segments like the other
+		// three formats; it has to feed the same latency histogram too, otherwise
+		// `GET /debug/profile/current` reports ingest p50/p95/p99 measured over three
+		// formats while its `requests`/`rows_sealed` counters cover all four.
+		let snap = metrics.snapshot();
+		assert_eq!(snap.ingest.requests, 1);
+		assert_eq!(snap.ingest.rows_sealed, 3);
+		assert_eq!(snap.ingest.segments_sealed, 1);
+		assert_eq!(metrics.ingest_latency.snapshot().count, 1, "the Parquet ingest leg must observe ingest latency as JSON / CSV / ILP do");
 	}
 }
