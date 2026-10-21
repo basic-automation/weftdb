@@ -148,7 +148,12 @@ pub type ReductionTable = (TimeUnit, Vec<i64>, Vec<i64>, Vec<(String, Vec<f64>)>
 pub const LOGICAL_EXPORT_VERSION: u16 = 0;
 
 /// Why a [`RecordBatch`] could not be converted back into WeftDB columns.
+///
+/// `#[non_exhaustive]` (X-ERR): a caller outside this crate matches with a wildcard arm, so
+/// a new reason can be added without breaking semver. The HTTP layer classifies these by
+/// variant, never by the message text.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConvertError {
 	/// The batch is missing a required column.
 	MissingColumn(&'static str),

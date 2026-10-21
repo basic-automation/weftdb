@@ -42,7 +42,7 @@ use weft_reduce::reduce;
 pub use weft_reduce::Aggregation;
 
 use crate::{
-	error::{ApiError, StrictJson, StrictQuery}, interpolate::{InputPoint, ResolutionSpec}, metrics::SharedMetrics
+	error::{self, ApiError, StrictJson, StrictQuery}, interpolate::{InputPoint, ResolutionSpec}, metrics::SharedMetrics
 };
 
 /// Request body for `POST /api/v1/downsample`.
@@ -165,7 +165,7 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 		return Err(ApiError::bad_request("`end` must not be before `start`".to_string()));
 	}
 
-	let buckets = reduce(points, resolution, Some(start), Some(end), aggregations).map_err(|err| ApiError::internal(err.to_string()))?;
+	let buckets = reduce(points, resolution, Some(start), Some(end), aggregations).map_err(|err| error::from_reduce_error(&err))?;
 	let response = buckets_to_response(buckets, resolution, aggregations);
 
 	let span = tracing::Span::current();

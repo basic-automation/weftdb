@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use weftdb::{MaintenanceBusy, MaintenanceWait};
 
 use crate::{
-	error::{ApiError, StrictQuery}, state::AppState
+	error::{self, ApiError, StrictQuery}, state::AppState
 };
 
 /// Classify a per-aspect maintenance error (reconcile, squash, compact): another
@@ -24,12 +24,11 @@ use crate::{
 /// `500`.
 fn maintenance_error(err: &anyhow::Error) -> ApiError {
 	if err.downcast_ref::<MaintenanceBusy>().is_some() {
-		ApiError::busy(format!("{err:#}"))
-	} else if err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
-		ApiError::bad_request(err.to_string())
-	} else {
-		ApiError::internal(err.to_string())
+		return ApiError::busy(format!("{err:#}"));
 	}
+	// Everything else is classified by its type: the §4 table's own code for an unsafe name or
+	// an unusable store root, and a logged `500` for the rest.
+	error::classify_typed(err).unwrap_or_else(|| ApiError::internal(err))
 }
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/reconcile`.
@@ -135,7 +134,7 @@ pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<
 /// the last use rather than held across the response construction.
 async fn reconcile_aspect_inner(store: &weftdb::SegmentStore, aspect: &str, threshold: Option<usize>, hot_cold: bool, overlaps: bool, split_min_bytes: Option<u64>, metrics: &crate::metrics::SharedMetrics) -> Result<Response, ApiError> {
 	// Undeclared aspect → 404 (mirrors the read surface's not-found semantics).
-	if store.schema_for(aspect).await.map_err(|err| ApiError::internal(err.to_string()))?.is_none() {
+	if store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))?.is_none() {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
 	// Three modes, in precedence order:
@@ -373,7 +372,7 @@ pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<Str
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
 	// Undeclared aspect → 404 (mirrors the reconcile/read surfaces).
-	if store.schema_for(&aspect).await.map_err(|err| ApiError::internal(err.to_string()))?.is_none() {
+	if store.schema_for(&aspect).await.map_err(|err| error::classify_read(&err))?.is_none() {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
 	let (triggered, removed) = match params.max_segments {
@@ -431,7 +430,7 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 	drop(state);
 	let target_rows = params.target_rows.ok_or_else(|| ApiError::bad_request("compact requires a target_rows query parameter".to_string()))?;
 	// Undeclared aspect → 404 (mirrors the reconcile/squash surfaces).
-	if store.schema_for(&aspect).await.map_err(|err| ApiError::internal(err.to_string()))?.is_none() {
+	if store.schema_for(&aspect).await.map_err(|err| error::classify_read(&err))?.is_none() {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
 	let removed = store.squash_aspect_to_target_rows(&aspect, target_rows).await.map_err(|err| maintenance_error(&err))?;

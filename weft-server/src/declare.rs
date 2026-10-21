@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 
 use crate::{
-	error::{ApiError, StrictJson}, state::AppState, storage::AspectInfo
+	error::{self, ApiError, StrictJson}, state::AppState, storage::AspectInfo
 };
 
 /// Parse a [`PhysicalType`] from its stable wire token (the inverse of
@@ -109,19 +109,24 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 /// # Errors
 ///
 /// [`ApiError::unconfigured`] when no store is attached,
-/// [`ApiError::bad_request`] when the name is not a valid aspect name or a
-/// token/tolerance does not parse, and [`ApiError::internal`] on a control-plane
-/// write failure.
+/// [`Code::InvalidAspectName`](crate::error::Code::InvalidAspectName) when the name is not one the store can
+/// address as a frame file name, [`ApiError::bad_request`] when a physical type, time unit or
+/// tolerance does not parse, and a `500` on a control-plane write failure.
 pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): StrictJson<DeclareAspectRequest>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
 	// The name becomes part of every frame's file name: refuse one that could leave the
-	// store's `segments/` directory before anything is written.
-	weftdb::aspect_name::validate(&request.name).map_err(|err| ApiError::bad_request(err.to_string()))?;
+	// store's `segments/` directory before anything is written. This has its own code in the §4
+	// table, so a client branches on `invalid_aspect_name` and on `details.reason` rather than on
+	// a sentence shared with every other 400 this route can send.
+	weftdb::aspect_name::validate(&request.name).map_err(|err| error::aspect_name_refusal(&err))?;
 	let schema = schema_from_request(&request)?;
 	let result = store.declare(&request.name, &schema).await;
 	drop(store);
-	result.map_err(|err| ApiError::internal(err.to_string()))?;
+	// A refusal the store raises itself is classified the way a read's is — it rejects the same
+	// unsafe names, and a root this binary will not open is `503 incompatible_store`. A write
+	// that failed for a reason the table has no name for stays a `500` with the cause logged.
+	result.map_err(|err| error::classify_typed(&err).unwrap_or_else(|| ApiError::internal(&err)))?;
 	let aspect = AspectInfo { name: request.name, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() };
 	Ok((StatusCode::CREATED, Json(DeclareAspectResponse { aspect })).into_response())
 }
@@ -251,7 +256,9 @@ mod tests {
 		let points = serde_json::json!({ "points": [{ "timestamp": 0, "value": "1" }] });
 		let (status, body) = post_json(app_with_state(state.clone()), "/api/v1/storage/..%2Fx/points", &points).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert_eq!(body["code"], "invalid_aspect_name", "the refusal is named by code, not by a sentence: {body}");
 		assert!(body["error"].as_str().unwrap().contains("invalid aspect name"), "body: {body}");
+		assert_eq!(body["details"]["aspect"], "../x", "the name travels beside the refusal: {body}");
 		let response = app_with_state(state.clone()).oneshot(Request::builder().uri("/api/v1/storage/..%2Fx/range.csv?start=0&end=10").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 		for uri in ["/api/v1/storage/..%2Fx/reconcile", "/api/v1/storage/..%2Fx/reconcile?threshold=1", "/api/v1/storage/..%2Fx/reconcile?hot_cold=true", "/api/v1/storage/..%2Fx/reconcile?overlaps=true", "/api/v1/storage/..%2Fx/squash", "/api/v1/storage/..%2Fx/squash?max_segments=1", "/api/v1/storage/..%2Fx/compact?target_rows=10"] {

@@ -24,7 +24,7 @@ use weft_line_protocol::TimestampPrecision;
 use weft_physical_type::{first_order_violation, AspectSchema, SegmentDescriptor, TimeUnit};
 
 use crate::{
-	error::{ApiError, StrictJson, StrictQuery}, state::AppState
+	error::{self, ApiError, StrictJson, StrictQuery}, state::AppState
 };
 
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
@@ -90,21 +90,6 @@ pub struct IngestResponse {
 	pub time_sorted: bool,
 }
 
-/// Classify a seal error: an encode/tolerance failure is a client-data problem
-/// (the supplied values cannot be represented under the aspect's declared encoding
-/// within its tolerance — hard constraint #4) → `400`; anything else (filesystem,
-/// libSQL) is a `500`.
-fn classify_seal_error(err: &anyhow::Error) -> ApiError {
-	let message = err.to_string();
-	// An aspect declared under a name that is not safe as a file name (before names were
-	// checked) is the caller's addressing problem, not a server fault.
-	if message.contains("seal failed") || message.contains("paged seal failed") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
-		ApiError::bad_request(message)
-	} else {
-		ApiError::internal(message)
-	}
-}
-
 /// Enforce monotonic non-decreasing timestamps when a request opts in
 /// (`require_sorted`) — the API surface of the Phase-4.2 order enforcement
 /// ([`weft_physical_type::first_order_violation`] / `AspectSchema::seal_sorted`).
@@ -165,8 +150,9 @@ async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metr
 	}
 	// An undeclared aspect is a clean 404 (its encoding is unknown) rather than the
 	// seal's generic error; fetching the schema here also lets the nullable/paged
-	// seal variants take it directly.
-	let Some(schema) = store.schema_for(aspect).await.map_err(|err| ApiError::internal(err.to_string()))? else {
+	// seal variants take it directly. A store that refuses the name, or a root this binary will
+	// not open, is classified by its type rather than reported as a `500`.
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 
@@ -199,7 +185,7 @@ async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metr
 	// `storage.ingest.seal` child span (roadmap Phase 3): the typed-column encode +
 	// `.weftseg` write + control-plane index update — the write stage timed apart from
 	// value parsing.
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "json")).await.map_err(|err| classify_seal_error(&err))?;
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "json")).await.map_err(|err| error::classify_ingest(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
@@ -327,10 +313,10 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 }
 
 /// The body of [`ingest_csv`], split out so the handler records an error metric for
-/// any failure path uniformly. Shares [`seal_batch`] / [`classify_seal_error`] with
+/// any failure path uniformly. Shares [`seal_batch`] and `error::classify_ingest` with
 /// the JSON ingest path, so a CSV-sealed batch is byte-identical to a JSON-sealed one.
 async fn ingest_csv_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
-	let Some(schema) = store.schema_for(aspect).await.map_err(|err| ApiError::internal(err.to_string()))? else {
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
@@ -338,7 +324,7 @@ async fn ingest_csv_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics
 	let ParsedCsv { timestamps, values, any_null } = tracing::info_span!("storage.ingest.parse", format = "csv").in_scope(|| parse_csv_points(body))?;
 	enforce_order_if_required(require_sorted, &timestamps)?;
 	let point_count = timestamps.len();
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await.map_err(|err| classify_seal_error(&err))?;
+	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await.map_err(|err| error::classify_ingest(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
@@ -441,7 +427,7 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 /// any failure path uniformly.
 async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
 	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(ApiError::bad_request)?;
-	let Some(schema) = store.schema_for(aspect).await.map_err(|err| ApiError::internal(err.to_string()))? else {
+	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the line-protocol text →
@@ -473,7 +459,7 @@ async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics
 		Some(rows_per_page) => store.seal_paged(aspect, &schema, &timestamps, &values, rows_per_page).instrument(seal_span).await,
 		None => store.seal(aspect, &schema, &timestamps, &values).instrument(seal_span).await,
 	}
-	.map_err(|err| classify_seal_error(&err))?;
+	.map_err(|err| error::classify_ingest(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
@@ -489,21 +475,6 @@ pub struct ParquetIngestParams {
 	/// Parquet counterpart of the JSON/CSV/ILP `require_sorted` flag.
 	#[serde(default)]
 	pub require_sorted: bool,
-}
-
-/// Classify a Parquet-ingest error: an undeclared aspect is a `404`; a malformed
-/// Parquet body, a batch missing WeftDB's columns, or a value unrepresentable under the
-/// declared encoding/tolerance (hard constraint #4), and an aspect name that is not safe
-/// as a file name are client-data problems → `400`; anything else (filesystem, libSQL) is a `500`.
-fn classify_ingest_error(err: &anyhow::Error) -> ApiError {
-	let message = err.to_string();
-	if message.contains("no declared schema") {
-		ApiError::aspect_not_found(message)
-	} else if message.contains("seal failed") || message.contains("paged seal failed") || message.contains("parquet error") || message.contains("is missing the") || message.contains("expected Arrow") || message.contains("required metadata") || message.contains("unrecognized time unit") || message.contains("does not parse") || message.contains("out-of-order timestamp") || err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
-		ApiError::bad_request(message)
-	} else {
-		ApiError::internal(message)
-	}
 }
 
 /// Handle `POST /api/v1/storage/{aspect}/parquet?rows_per_page`.
@@ -551,7 +522,7 @@ async fn ingest_parquet_inner(store: &weftdb::SegmentStore, metrics: &crate::met
 	// ingest is atomic (Parquet decode → typed-column seal in one call) and the leaf
 	// `weft-arrow-store` stays tracing-free by design, so decode+seal ride one span here,
 	// carrying the request's byte length and the sort-guard flag.
-	let descriptor = weft_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await.map_err(|err| classify_ingest_error(&err))?;
+	let descriptor = weft_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await.map_err(|err| error::classify_ingest(&err))?;
 	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
 	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
 	Ok((StatusCode::CREATED, Json(response)).into_response())
@@ -672,8 +643,13 @@ mod tests {
 		let router = app_with_state(AppState::new().with_store(store));
 		let body = serde_json::json!({ "points": [{ "timestamp": 1, "value": "1.5" }] });
 		let (status, body) = post_json(router, "/api/v1/storage/counts/points", &body).await;
-		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-		assert!(body["error"].as_str().unwrap().contains("seal failed"));
+		// The request was well-formed and the batch was readable; what cannot be represented is
+		// its content, so the §4 table answers `422 value_not_representable` rather than the
+		// `400` every seal failure used to share — and it says which way the encoding would fail.
+		assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+		assert_eq!(body["code"], "value_not_representable", "body: {body}");
+		assert_eq!(body["details"]["max_abs_error"], "0.5", "the loss the declared encoding would take: {body}");
+		assert_eq!(body["details"]["tolerance"], "0", "the tolerance the schema declares: {body}");
 	}
 
 	#[tokio::test]

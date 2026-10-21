@@ -40,8 +40,9 @@
 //! `err.to_string()` against substrings (`"seal failed"`, `"no declared schema"`,
 //! `"parquet error"`) to guess a status class, which meant an unrelated message that
 //! happened to contain one of those words was reclassified, and a wording change in another
-//! crate silently moved a status code. [`classify`] downcasts instead. The one substring
-//! rule that remains is marked with the slice that will replace it.
+//! crate silently moved a status code. [`classify_read`] and [`classify_ingest`] downcast
+//! instead, and say which direction they are classifying. The few substring rules that
+//! remain each name the slice that replaces them.
 
 use std::borrow::Cow;
 
@@ -331,9 +332,19 @@ impl ApiError {
 	/// [`Code::redacted_message`].
 	#[must_use]
 	pub fn internal(detail: impl std::fmt::Display) -> Self {
+		Self::server(Code::Internal, detail)
+	}
+
+	/// A server-side failure under a specific `5xx` code — for the cases the table names more
+	/// precisely than `internal` (`incompatible_store`, `frame_undecodable`, `poisoned`). As
+	/// with [`internal`](Self::internal), `detail` is logged and the client gets the code's
+	/// fixed sentence.
+	#[must_use]
+	pub fn server(code: Code, detail: impl std::fmt::Display) -> Self {
+		debug_assert!(code.status().is_server_error(), "ApiError::server is for the 5xx codes; {code:?} answers {}", code.status().as_u16());
 		let detail = detail.to_string();
-		tracing::error!(code = Code::Internal.as_str(), cause = %detail, "request failed on the server side");
-		Self { code: Code::Internal, message: String::new(), details: None, limit: None, committed: None, retry_after: None, cause: Some(detail) }
+		tracing::error!(code = code.as_str(), cause = %detail, "request failed on the server side");
+		Self { code, message: String::new(), details: None, limit: None, committed: None, retry_after: None, cause: Some(detail) }
 	}
 
 	/// A caller-side problem the table has no more specific name for.
@@ -481,6 +492,149 @@ where
 
 	async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
 		Query::<T>::from_request_parts(parts, state).await.map(|Query(value)| Self(value)).map_err(|rejection| ApiError::bad_request(rejection.body_text()))
+	}
+}
+
+// ── classification: a library failure mapped by type, never by its message ────────
+
+/// Map a library failure from a **read or export** route to the envelope its condition has
+/// in the §4 table.
+///
+/// The direction is the caller's to state, because one library error means different things
+/// in the two directions: a [`weft_arrow::ConvertError`] on an ingest route is a body the
+/// caller sent us (their problem, `400`), and the same variant on an export route is our own
+/// encoder failing (ours, `500`). Everything direction-free — a name the store cannot
+/// address, a batch that will not seal, a store this binary cannot open — is decided by
+/// [`classify_typed`], which both classifiers consult first.
+pub fn classify_read(err: &anyhow::Error) -> ApiError {
+	if let Some(api) = classify_typed(err) {
+		return api;
+	}
+	// The last message-matching rule on the read path. `SegmentStore::require_schema` and
+	// `weft-arrow-store`'s schema lookup report an undeclared aspect as an `anyhow` sentence
+	// rather than a typed error, so there is nothing to downcast. **D-S13** owns that typing
+	// (it is a store-lane edit) and this line goes with it; the plan keeps D-S13 scheduled
+	// precisely so that this is temporary rather than permanent.
+	if err.to_string().contains("no declared schema") {
+		return ApiError::aspect_not_found(err.to_string());
+	}
+	// Anything else here failed inside the server — a decoder on our own frame, a driver
+	// message, an Arrow write. The cause is logged and the client keeps the generic sentence.
+	ApiError::internal(err)
+}
+
+/// Map a library failure from an **ingest** route: the bytes being refused came from the
+/// caller, so a decode failure is theirs (`4xx`) rather than ours.
+pub fn classify_ingest(err: &anyhow::Error) -> ApiError {
+	if let Some(api) = classify_typed(err) {
+		return api;
+	}
+	// A batch we could not read names what to fix, variant by variant.
+	if let Some(e) = err.downcast_ref::<weft_arrow::ConvertError>() {
+		return match e {
+			weft_arrow::ConvertError::MissingColumn(c) => ApiError::bad_request(format!("the record batch has no `{c}` column; a WeftDB batch carries `timestamp` and `value`")),
+			weft_arrow::ConvertError::WrongType { column, expected } => ApiError::bad_request(format!("column `{column}` is not the Arrow type WeftDB reads here ({expected})")),
+			weft_arrow::ConvertError::MissingMetadata(k) => ApiError::bad_request(format!("the batch schema carries no `{k}` metadata, which says how to read its timestamps")),
+			weft_arrow::ConvertError::UnknownTimeUnit(s) => ApiError::bad_request(format!("the batch schema names time unit `{s}`, which WeftDB does not use (the units are s, ms, us, ns)")),
+			weft_arrow::ConvertError::BadValue(_) | weft_arrow::ConvertError::Ipc(_) | weft_arrow::ConvertError::Parquet(_) => ApiError::bad_request(e.to_string()),
+			// An empty batch set is a request that carried a schema-less body, and a failed
+			// segment rebuild means the two columns disagreed — both are the batch's doing.
+			_ => ApiError::bad_request(e.to_string()),
+		};
+	}
+	let message = err.to_string();
+	if message.contains("no declared schema") {
+		return ApiError::aspect_not_found(message);
+	}
+	// `weft-arrow-store`'s own `require_sorted` check bails with a sentence where the seal path
+	// produces the typed `SealError::OutOfOrder`. Same condition, so the same code — and the
+	// ingest lane types it (D-S10/D-S14) rather than the router lane rewriting a library call.
+	if message.contains("out-of-order timestamp") {
+		return ApiError::bad_request(message);
+	}
+	ApiError::internal(err)
+}
+
+/// The §4 `invalid_aspect_name` refusal: the offending name and the rule it broke travel in
+/// `details`, so a client fixes the name without parsing a sentence. This is also what the
+/// declare route raises directly, before the store is involved at all.
+pub(crate) fn aspect_name_refusal(error: &weftdb::InvalidAspectName) -> ApiError {
+	ApiError::new(Code::InvalidAspectName, error.to_string()).with_details(serde_json::json!({ "aspect": error.name(), "reason": error.reason().to_string() }))
+}
+
+/// The classification both directions share: downcast the chain for each error type whose
+/// condition the §4 table names, and answer `None` when nothing typed matched. The control
+/// plane (declare) uses this pass alone, because a route that never looked a schema up must
+/// not be sent a `404` by the one message rule the read path still carries.
+pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
+	// A name the store cannot address as a file.
+	if let Some(e) = err.downcast_ref::<weftdb::InvalidAspectName>() {
+		return Some(aspect_name_refusal(e));
+	}
+	// A store on disk this binary cannot open: exit `65` for a CLI, `503 incompatible_store`
+	// here, and the same code for every reason (newer layout, unreadable `STORE_FORMAT`).
+	if let Some(e) = err.downcast_ref::<weftdb::StoreError>() {
+		return Some(ApiError::server(Code::IncompatibleStore, e.to_string()));
+	}
+	if let Some(e) = err.downcast_ref::<weft_physical_type::SealError>() {
+		return Some(from_seal_error(e));
+	}
+	if let Some(e) = err.downcast_ref::<weft_reduce::ReduceError>() {
+		return Some(from_reduce_error(e));
+	}
+	if let Some(e) = err.downcast_ref::<weft_reduce::SketchError>() {
+		return Some(from_sketch_error(e));
+	}
+	None
+}
+
+/// A batch that will not seal under the aspect's declared schema.
+///
+/// This is where the old code's `400 bad_request` for every seal failure splits apart, as the
+/// table requires: a batch whose two columns disagree, a zero page height, or a backwards
+/// timestamp is a malformed request (`400`), while a value that the declared encoding cannot
+/// hold — overflow, or a loss beyond the declared tolerance — is a well-formed request whose
+/// *content* cannot be represented (`422 value_not_representable`), which is the same call the
+/// interpolate route already makes for a value outside the physical type's range.
+pub fn from_seal_error(e: &weft_physical_type::SealError) -> ApiError {
+	use weft_physical_type::{ColumnEncodeError, EncodeError, SealError};
+	match e {
+		SealError::LengthMismatch { timestamps, values } => ApiError::bad_request(format!("the batch carries {timestamps} timestamps and {values} values, so they cannot be paired")).with_details(serde_json::json!({ "timestamps": timestamps, "values": values })),
+		SealError::Encode(ColumnEncodeError { index, source }) => match source {
+			EncodeError::NotFinite => ApiError::new(Code::NotFinite, format!("the value at row {index} is not a finite number, and this aspect stores values as floats")).with_details(serde_json::json!({ "row": index })),
+			EncodeError::Overflow => ApiError::new(Code::ValueNotRepresentable, format!("the value at row {index} does not fit this aspect's declared encoding")).with_details(serde_json::json!({ "row": index })),
+			// No wildcard arm: `EncodeError` names every way a value can fail to encode, and a new
+			// one is meant to stop the build here, where someone has to decide which §4 code it is.
+		},
+		SealError::ToleranceExceeded { max_abs_error, tolerance } => ApiError::new(Code::ValueNotRepresentable, format!("this aspect's declared encoding would lose up to {max_abs_error} per value, more than the {tolerance} its schema allows: send values the encoding holds exactly, or declare a wider encoding")).with_details(serde_json::json!({ "max_abs_error": max_abs_error.to_string(), "tolerance": tolerance.to_string() })),
+		SealError::EmptyPageSize => ApiError::bad_request("`rows_per_page` must be at least 1 row"),
+		SealError::OutOfOrder { index, previous, current } => ApiError::bad_request(format!("the timestamps step backwards at row {index}: {current} follows {previous}")).with_details(serde_json::json!({ "row": index, "previous": previous, "current": current })),
+	}
+}
+
+/// A reduction the library could not produce, by variant (all three are a request whose
+/// window or content cannot be represented, not a server fault — which is what this route
+/// answered with before X-ERR).
+pub fn from_reduce_error(e: &weft_reduce::ReduceError) -> ApiError {
+	match e {
+		weft_reduce::ReduceError::TimestampRange => ApiError::new(Code::ValueNotRepresentable, "a timestamp in the requested window cannot be placed in a bucket at the resolution you asked for"),
+		weft_reduce::ReduceError::BucketStartOverflow => ApiError::new(Code::ValueNotRepresentable, "the requested resolution puts a bucket start outside the range WeftDB can name in time"),
+		weft_reduce::ReduceError::SketchValue => ApiError::new(Code::NotFinite, "a `sketch_*` reduction cannot be taken because a value in the window has no finite representation"),
+		// A reason the table has no name for stays a server fault: it is logged, and guessing a
+		// `4xx` for it would invent a code a client cannot branch on.
+		_ => ApiError::internal(e.to_string()),
+	}
+}
+
+/// A quantile sketch that could not be built or fed. An accuracy or bucket budget came from
+/// the request; two sketches the server built disagreeing is the server's.
+pub fn from_sketch_error(e: &weft_reduce::SketchError) -> ApiError {
+	match e {
+		weft_reduce::SketchError::InvalidAccuracy => ApiError::bad_request("a sketch's relative accuracy must be inside (0, 1)"),
+		weft_reduce::SketchError::InvalidMaxBins => ApiError::bad_request("a sketch needs a bucket budget of at least 1"),
+		weft_reduce::SketchError::ValueRange => ApiError::new(Code::NotFinite, "a value here is not finite, or lies outside the range the sketch can cover"),
+		weft_reduce::SketchError::AccuracyMismatch => ApiError::internal(e.to_string()),
+		_ => ApiError::internal(e.to_string()),
 	}
 }
 
@@ -681,5 +835,99 @@ mod tests {
 		let request = json_request("{\"aspect\":\"price\"}");
 		let StrictJson(value) = StrictJson::<Value>::from_request(request, &()).await.expect("the body is fine");
 		assert_eq!(value["aspect"], "price");
+	}
+
+	// ── classification: the type under the context, not the context's sentence ────
+
+	/// A library failure arrives inside `anyhow` with its own sentence wrapped around it. The
+	/// classifier reads the type underneath, so rewording the wrapper cannot move a status.
+	#[test]
+	fn a_refused_seal_is_classified_by_its_variant() {
+		let sealed = |error: weft_physical_type::SealError| {
+			let shown = error.to_string();
+			anyhow::Error::from(error).context(format!("seal failed: {shown}"))
+		};
+		// A declared encoding that loses more than the schema's tolerance: the request was
+		// well-formed and its content cannot be represented.
+		let api = classify_ingest(&sealed(weft_physical_type::SealError::ToleranceExceeded { max_abs_error: "0.5".parse().unwrap(), tolerance: "0".parse().unwrap() }));
+		assert_eq!(api.code(), Code::ValueNotRepresentable);
+		let details = api.details.clone().expect("the tolerance figures travel as details, not inside a sentence");
+		assert_eq!(details["max_abs_error"], "0.5");
+		assert_eq!(details["tolerance"], "0");
+		// A backwards timestamp is a malformed batch: a different condition, and a different
+		// answer, although both used to send the client the words "seal failed".
+		let api = classify_ingest(&sealed(weft_physical_type::SealError::OutOfOrder { index: 3, previous: 90, current: 80 }));
+		assert_eq!(api.code(), Code::BadRequest);
+		assert!(api.message().contains("row 3"), "the message names the row: {}", api.message());
+		// A value with no finite representation, at the row that carries it.
+		let api = classify_ingest(&sealed(weft_physical_type::SealError::Encode(weft_physical_type::ColumnEncodeError { index: 7, source: weft_physical_type::EncodeError::NotFinite })));
+		assert_eq!(api.code(), Code::NotFinite);
+		assert!(api.message().contains("row 7"), "{}", api.message());
+	}
+
+	/// The direction of a `ConvertError` is the caller's to state, because it changes the answer:
+	/// the bytes are theirs when ingesting and ours when encoding a response.
+	#[test]
+	fn the_same_convert_error_is_theirs_ingesting_and_ours_reading() {
+		let failure = || anyhow::Error::from(weft_arrow::ConvertError::Parquet("file truncated at row 4000".into()));
+		let api = classify_ingest(&failure());
+		assert_eq!(api.code(), Code::BadRequest, "a body we could not read is the caller's");
+		let api = classify_read(&failure());
+		assert_eq!(api.code(), Code::Internal, "our own encoder failing is not");
+		assert!(api.message().is_empty(), "a server fault sends no detail: {:?}", api.message());
+		assert!(api.cause.as_deref().expect("the cause is kept for the log").contains("truncated"));
+	}
+
+	/// A name the store cannot address is reported with the name and the reason beside it, so a
+	/// client does not parse a sentence to find out which rule it broke.
+	#[test]
+	fn an_aspect_name_the_store_cannot_address_carries_its_reason() {
+		let refused = weftdb::aspect_name::validate("../escape").expect_err("traversal is not an aspect name");
+		let api = classify_read(&anyhow::Error::from(refused).context("could not address the aspect"));
+		assert_eq!(api.code(), Code::InvalidAspectName);
+		assert_eq!(api.code().status(), StatusCode::BAD_REQUEST);
+		let details = api.details.clone().expect("the name and its reason travel as details");
+		assert_eq!(details["aspect"], "../escape");
+		assert!(details["reason"].as_str().is_some_and(|reason| !reason.is_empty()), "the reason names the rule: {details}");
+	}
+
+	/// A store on disk this binary will not open is the `65` a CLI exits with, as a `503`: the
+	/// server is fine, this root is not, and the numbers are logged rather than sent.
+	#[test]
+	fn a_store_this_binary_will_not_open_is_incompatible_store() {
+		let refused = weftdb::StoreError::IncompatibleLayout { min_write: 7, supported: 2 };
+		let api = classify_read(&anyhow::Error::from(refused).context("could not open the store root"));
+		assert_eq!(api.code(), Code::IncompatibleStore);
+		assert_eq!(api.code().status(), StatusCode::SERVICE_UNAVAILABLE);
+		assert!(api.cause.as_deref().unwrap().contains("layout 7"), "the layout numbers are logged");
+		assert!(api.message().is_empty(), "nothing of the store's wording reaches the wire");
+	}
+
+	/// The library's own reduction failures are typed at the call site, and none of them is a
+	/// server fault — which is what this route answered with before the table existed.
+	#[test]
+	fn a_reduction_that_could_not_be_taken_says_why() {
+		assert_eq!(from_reduce_error(&weft_reduce::ReduceError::TimestampRange).code(), Code::ValueNotRepresentable);
+		assert_eq!(from_reduce_error(&weft_reduce::ReduceError::BucketStartOverflow).code(), Code::ValueNotRepresentable);
+		assert_eq!(from_reduce_error(&weft_reduce::ReduceError::SketchValue).code(), Code::NotFinite);
+		assert_eq!(from_sketch_error(&weft_reduce::SketchError::InvalidAccuracy).code(), Code::BadRequest);
+		assert_eq!(from_sketch_error(&weft_reduce::SketchError::InvalidMaxBins).code(), Code::BadRequest);
+		// Two sketches the server built disagreeing is the server's, and a reason the table has
+		// no name for stays a server fault rather than inventing a code a client cannot branch on.
+		assert_eq!(from_sketch_error(&weft_reduce::SketchError::AccuracyMismatch).code(), Code::Internal);
+	}
+
+	/// An unnamed failure is a server fault, and the driver's wording never reaches the client.
+	#[test]
+	fn an_unnamed_failure_stays_internal() {
+		let api = classify_read(&anyhow::anyhow!("libSQL: no such table: segment_index"));
+		assert_eq!(api.code(), Code::Internal);
+		assert!(api.message().is_empty(), "the driver's sentence is logged, not sent: {:?}", api.message());
+		assert_eq!(api.cause.as_deref().unwrap(), "libSQL: no such table: segment_index");
+		// The one message rule the read path still has, kept until D-S13 types the schema
+		// lookup's absence: an aspect with no declared schema is still the caller's 404.
+		let api = classify_read(&anyhow::anyhow!("aspect `price` has no declared schema in default/default"));
+		assert_eq!(api.code(), Code::AspectNotFound);
+		assert!(api.message().contains("no declared schema"), "a 4xx keeps its detail: {}", api.message());
 	}
 }

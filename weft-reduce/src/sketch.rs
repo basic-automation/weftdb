@@ -79,7 +79,11 @@ fn scaled_to_f64(mantissa: i64, scale: i64) -> Option<f64> {
 }
 
 /// Why a sketch could not be built or fed.
+///
+/// `#[non_exhaustive]` (X-ERR): callers outside this crate match with a wildcard arm, so a
+/// new reason can be added without breaking semver.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SketchError {
 	/// The requested relative accuracy was not in the open interval `(0, 1)`.
 	#[error("relative accuracy must be in (0, 1)")]

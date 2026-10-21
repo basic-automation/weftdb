@@ -223,9 +223,44 @@ only the control plane, not the segment frames.
   `gpu_driver`, the driver's name and version as splimes' `GpuInfo::driver` reports it
   (e.g. `NVIDIA 610.57.04`), beside the adapter in `gpu`; it is printed and shown in the
   HTML report, and omitted when the driver reports nothing (bench schema v20).
+- **One error envelope and one code table for every refusal** (1.0 plan X-ERR; absorbs SEC-2,
+  FRE-6a, ROB-1 and TAG-0's envelope). Every refusal `weft-server` sends — a route guard, a body
+  or query extractor, or a library failure behind `anyhow` — is now
+  `{"error","code","request_id"}` plus optional `details` / `limit` / `committed`, as JSON on
+  every path, including the ones that answered axum's empty or plain-text 400 and 404 bodies.
+  The code is one of 42 named by `Code` in `weft-server/src/error.rs`, whose table is asserted by
+  name and status against the plan's §4 table. Refusals are classified by **type**: `anyhow`
+  downcasts find `weftdb::InvalidAspectName`, `weftdb::StoreError`,
+  `weft_physical_type::SealError`, `weft_reduce::ReduceError` and `weft_reduce::SketchError`, and
+  the seal wrappers in `SegmentStore` now keep the typed error as the failure's source while
+  keeping their own `seal failed: …` sentence as the message, so rewording a wrapper cannot move
+  a status. Two message rules remain, each labelled with the slice that retires it: `no declared
+  schema` until D-S13 makes an absent schema a typed error, and `weft-arrow-store`'s untyped
+  `require_sorted` bail until the ingest lane types it (D-S10/D-S14). A `5xx` now names only its
+  condition — `internal`, `commit_failed`, `frame_undecodable`, `series_binding_mismatch`,
+  `incompatible_store`, `poisoned`, `outcome_unknown`, … each with one fixed sentence — and its
+  cause goes to the log, so no driver or library message reaches a client carrying a path, a
+  table name or an aspect name (SEC-2). `axum`'s `CatchPanicLayer` is dropped: a panic is a
+  process death with the exit code the supervisor sees, not a response body (FRE-6a).
+  `ConvertError`, `ReduceError` and `SketchError` gained `#[non_exhaustive]`, so the mapping can
+  grow without breaking a semver-minor release.
 
 ### Changed
 
+- **Statuses split where the §4 table names a different condition** (1.0 plan X-ERR). A batch
+  that will not seal under an aspect's declared schema no longer answers `400` whatever the
+  reason: a length mismatch between the two columns, a zero `rows_per_page`, and a backwards
+  timestamp stay `400` (the batch itself is malformed), while a value the declared encoding
+  cannot hold — an overflow, or a loss beyond the declared `value_tolerance` — is `422
+  value_not_representable` with `details.max_abs_error` and `details.tolerance`, the same call
+  `/api/v1/interpolate` already made for a value outside the physical type's range; a value with
+  no finite image is `400 not_finite`, with the row in `details.row`. A name the store cannot
+  address as a frame file is `400 invalid_aspect_name` carrying `details.aspect` and
+  `details.reason`, at declare as well as on use. A store root this binary refuses to open is
+  `503 incompatible_store`, the HTTP shape of the CLI's exit `65`. `POST /api/v1/downsample`
+  answers `422 value_not_representable` for a timestamp that cannot be bucketed at the requested
+  resolution, and `400 not_finite` for a value with no finite `f64` image, where both used to be
+  reported as `500`.
 - **Time-weighted averages run on integers** (`weft-reduce`): `twa`, `twa_linear` and
   `twa_bucket_end` over samples with `i64` mantissas at scales up to 17 compute the weighted sum
   in `i128` and divide once with the integer long division `avg` uses, reproducing the `BigDecimal`

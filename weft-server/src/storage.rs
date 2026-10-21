@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 
 use crate::{
-	error::{ApiError, StrictQuery}, state::AppState
+	error::{self, ApiError, StrictQuery}, state::AppState
 };
 
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.
@@ -69,21 +69,6 @@ pub struct ValueRangeParams {
 	pub lo: String,
 	/// Inclusive upper value bound (decimal text).
 	pub hi: String,
-}
-
-/// Classify a bridge read error: an undeclared aspect (its schema is unknown) is a
-/// `404`, an aspect whose name is not safe as a file name (declared before names were
-/// checked) is a `400`, and everything else (libSQL prune, filesystem read, corrupt
-/// frame, IPC serialization) is a `500`.
-fn classify_read_error(err: &anyhow::Error) -> ApiError {
-	let message = err.to_string();
-	if message.contains("no declared schema") {
-		ApiError::aspect_not_found(message)
-	} else if err.downcast_ref::<weftdb::InvalidAspectName>().is_some() {
-		ApiError::bad_request(message)
-	} else {
-		ApiError::internal(message)
-	}
 }
 
 /// Build the `200 OK` Arrow-IPC-stream response from the serialized bytes.
@@ -135,7 +120,7 @@ where
 /// CSV reads go straight to the store rather than through the bridge, so they
 /// reproduce the bridge's not-found semantics explicitly).
 async fn require_schema(store: &weftdb::SegmentStore, aspect: &str) -> Result<weft_physical_type::AspectSchema, ApiError> {
-	let schema = store.schema_for(aspect).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	let schema = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))?;
 	schema.ok_or_else(|| ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")))
 }
 
@@ -158,7 +143,7 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 	require_schema(&store, &aspect).await?;
 	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "csv")).await;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	Ok(csv_response(render_csv(timestamps.into_iter().zip(values))))
 }
 
@@ -181,7 +166,7 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 	require_schema(&store, &aspect).await?;
 	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	Ok(csv_response(render_csv(timestamps.into_iter().zip(values.into_iter().map(Some)))))
 }
 
@@ -203,7 +188,7 @@ pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Pat
 	// covers both stages of this format's hot path.
 	let result = weft_arrow_store::read_time_range_to_ipc_bytes(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await;
 	drop(store);
-	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
+	Ok(arrow_stream_response(result.map_err(|err| error::classify_read(&err))?))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/value-range?lo&hi`.
@@ -222,7 +207,7 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	let hi: BigDecimal = params.hi.parse().map_err(|_| ApiError::bad_request(format!("`hi` is not a decimal: {:?}", params.hi)))?;
 	let result = weft_arrow_store::read_value_range_to_ipc_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await;
 	drop(store);
-	Ok(arrow_stream_response(result.map_err(|err| classify_read_error(&err))?))
+	Ok(arrow_stream_response(result.map_err(|err| error::classify_read(&err))?))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/range.parquet?start&end`.
@@ -241,7 +226,7 @@ pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspe
 	drop(state);
 	let result = weft_arrow_store::read_time_range_to_parquet_bytes(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await;
 	drop(store);
-	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
+	Ok(parquet_response(result.map_err(|err| error::classify_read(&err))?))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/value-range.parquet?lo&hi`.
@@ -261,7 +246,7 @@ pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(asp
 	let hi: BigDecimal = params.hi.parse().map_err(|_| ApiError::bad_request(format!("`hi` is not a decimal: {:?}", params.hi)))?;
 	let result = weft_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
 	drop(store);
-	Ok(parquet_response(result.map_err(|err| classify_read_error(&err))?))
+	Ok(parquet_response(result.map_err(|err| error::classify_read(&err))?))
 }
 
 /// One stored row in the JSON range response: an integer timestamp and its value
@@ -376,7 +361,7 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	};
 	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "json")).await;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let total = timestamps.len();
 	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
 	// Paginate + stringify under a serialize span: skip `offset` rows of the window,
@@ -495,7 +480,7 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 	};
 	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "json")).await;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| classify_read_error(&err))?;
+	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let total = timestamps.len();
 	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
 	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| {
@@ -559,7 +544,7 @@ pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<Str
 	let schema = require_schema(&store, &aspect).await?;
 	let result = store.read_point(&aspect, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t)).await;
 	drop(store);
-	let value = result.map_err(|err| classify_read_error(&err))?;
+	let value = result.map_err(|err| error::classify_read(&err))?;
 	let found = value.is_some();
 	Ok(Json(StoredPointResponse { aspect, time_unit: schema.timestamp_unit.name(), timestamp: params.t, value: value.map(|v| v.to_string()), found }))
 }
@@ -616,7 +601,7 @@ pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<St
 	let ts: Vec<i64> = params.t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::parse::<i64>).collect::<Result<_, _>>().map_err(|e| ApiError::bad_request(format!("invalid `t` list {:?}: {e}", params.t)))?;
 	let result = store.read_points(&aspect, &ts).instrument(tracing::info_span!("storage.points.read", %aspect, count = ts.len())).await;
 	drop(store);
-	let values = result.map_err(|err| classify_read_error(&err))?;
+	let values = result.map_err(|err| error::classify_read(&err))?;
 	let points = ts.iter().zip(values).map(|(&timestamp, v)| StoredPointEntry { timestamp, found: v.is_some(), value: v.map(|v| v.to_string()) }).collect();
 	Ok(Json(StoredPointsResponse { aspect, time_unit: schema.timestamp_unit.name(), points }))
 }
@@ -921,7 +906,7 @@ async fn storage_downsample_inner(state: AppState, aspect: &str, params: &Storag
 	let span = tracing::info_span!("downsample.range", %aspect, start, end, resolution = ?resolution, buckets = tracing::field::Empty);
 	let result = store.downsample_range(aspect, start, end, resolution, &aggregations).instrument(span.clone()).await;
 	drop(store);
-	let buckets = result.map_err(|err| classify_read_error(&err))?;
+	let buckets = result.map_err(|err| error::classify_read(&err))?;
 	let response = crate::downsample::buckets_to_response(buckets, resolution, &aggregations);
 	span.record("buckets", response.buckets);
 	Ok(response)

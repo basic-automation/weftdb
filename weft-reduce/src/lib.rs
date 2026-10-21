@@ -254,7 +254,11 @@ pub struct Bucket {
 }
 
 /// Why a reduction could not be produced.
+///
+/// `#[non_exhaustive]` (X-ERR): callers outside this crate match with a wildcard arm, so a
+/// new reason can be added without breaking semver. The HTTP layer maps these by variant.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReduceError {
 	/// A point's timestamp could not be mapped to a bucket index at the resolution
 	/// (only nanosecond resolution can overflow, for a timestamp far outside the

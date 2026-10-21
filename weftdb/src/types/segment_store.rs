@@ -648,6 +648,25 @@ fn is_ambiguous(e: &anyhow::Error) -> bool {
 	txn_error(e).is_some_and(IndexTxnError::is_ambiguous)
 }
 
+/// Wrap a failed seal so the [`anyhow::Error`] reads exactly as it always did **and** still
+/// carries the typed [`SealError`](weft_physical_type::SealError) in its chain.
+///
+/// The old form was `anyhow!("seal failed: {e}")`, which flattened the typed error into a
+/// string and left the HTTP layer to re-recognise the failure by substring. `anyhow`'s
+/// `Display` prints only the outermost context, so the same text goes into the context and
+/// the typed error stays underneath it as the source: the message a log or a CLI prints is
+/// unchanged, and `err.downcast_ref::<SealError>()` now finds it (X-ERR's classifier).
+fn seal_failed(error: weft_physical_type::SealError) -> anyhow::Error {
+	let shown = error.to_string();
+	anyhow::Error::from(error).context(format!("seal failed: {shown}"))
+}
+
+/// [`seal_failed`] for the paged seals, whose message has always said `paged seal failed`.
+fn paged_seal_failed(error: weft_physical_type::SealError) -> anyhow::Error {
+	let shown = error.to_string();
+	anyhow::Error::from(error).context(format!("paged seal failed: {shown}"))
+}
+
 /// The span of `timestamps`, or `None` when it is empty.
 fn span_of(timestamps: &[i64]) -> Option<(i64, i64)> {
 	let lo = timestamps.iter().min()?;
@@ -2779,7 +2798,7 @@ impl SegmentStore {
 	/// failure.
 	pub async fn seal(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[BigDecimal]) -> Result<SegmentDescriptor> {
 		self.writable()?;
-		let segment = schema.seal(timestamps, values).map_err(|e| anyhow::anyhow!("seal failed: {e}"))?;
+		let segment = schema.seal(timestamps, values).map_err(seal_failed)?;
 		self.persist(aspect, &segment).await
 	}
 
@@ -2795,7 +2814,7 @@ impl SegmentStore {
 	/// As [`seal`](SegmentStore::seal).
 	pub async fn seal_nullable(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<SegmentDescriptor> {
 		self.writable()?;
-		let segment = schema.seal_nullable(timestamps, values).map_err(|e| anyhow::anyhow!("seal failed: {e}"))?;
+		let segment = schema.seal_nullable(timestamps, values).map_err(seal_failed)?;
 		self.persist(aspect, &segment).await
 	}
 
@@ -2811,7 +2830,7 @@ impl SegmentStore {
 	/// if `rows_per_page` is zero.
 	pub async fn seal_paged(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[BigDecimal], rows_per_page: usize) -> Result<SegmentDescriptor> {
 		self.writable()?;
-		let segment = schema.seal_paged(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("paged seal failed: {e}"))?;
+		let segment = schema.seal_paged(timestamps, values, rows_per_page).map_err(paged_seal_failed)?;
 		self.persist_paged(aspect, &segment).await
 	}
 
@@ -2823,7 +2842,7 @@ impl SegmentStore {
 	/// As [`seal_paged`](SegmentStore::seal_paged).
 	pub async fn seal_paged_nullable(&self, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: usize) -> Result<SegmentDescriptor> {
 		self.writable()?;
-		let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(|e| anyhow::anyhow!("paged seal failed: {e}"))?;
+		let segment = schema.seal_paged_nullable(timestamps, values, rows_per_page).map_err(paged_seal_failed)?;
 		self.persist_paged(aspect, &segment).await
 	}
 
