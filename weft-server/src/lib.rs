@@ -35,6 +35,7 @@ pub mod backup_daemon;
 pub mod backup_routes;
 pub mod declare;
 pub mod downsample;
+pub mod error;
 pub mod gpu;
 pub mod host_guard;
 pub mod ingest;
