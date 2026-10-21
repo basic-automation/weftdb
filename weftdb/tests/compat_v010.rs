@@ -19,16 +19,18 @@
 //! - what a v0.1.0 backup actually contains, which is **not** the segment data. That is a
 //!   finding, not an aspiration: see [`v010_backup_covers_the_control_plane_only`].
 //!
-//! The rows-mode tree is asserted by shape only. Opening it is FRE-14's job (the legacy
-//! data-directory marker and numbered migrations), and the tree is here so that slice is
-//! driven by what the release wrote instead of by a fixture someone invented.
+//! The rows-mode tree is refused, not read: an open of it names the aspect databases and
+//! writes nothing (FRE-14a, [`a_v010_rows_mode_directory_is_refused_and_writes_nothing`]).
+//! Turning those rows into frames is the other half of FRE-14 and is still open; the tree is
+//! here so that slice is driven by what the release wrote instead of by a fixture someone
+//! invented.
 
 use std::{
 	collections::BTreeMap, path::{Path, PathBuf}
 };
 
 use weft_physical_type::{PhysicalType, TimeUnit};
-use weftdb::SegmentStore;
+use weftdb::{SegmentStore, StoreError};
 
 /// The committed fixture set, relative to this crate.
 fn fixture() -> PathBuf {
@@ -271,4 +273,143 @@ async fn v010_legacy_tree_is_a_rows_mode_database_of_the_expected_shape() {
 	// arriving twice because two ingest routes carried them.)
 	let grid_nulls = std::fs::read_to_string(fixture().join("rows.csv")).expect("the shared grid is part of the fixture").lines().filter(|line| line.ends_with(",")).count();
 	assert_eq!(grid_nulls, 13, "the shared grid carries 13 null rows for Storage-v2 to seal; the grid changed");
+}
+
+/// The shape 0.1.x left behind when it kept one database per aspect: a root with a
+/// control-plane `metadata.db` and `<subject>/<aspect>/measurements.db` below it. This
+/// build reads stores, and opening that root would otherwise succeed: `metadata.db` is one
+/// of `[`weftdb::CONTROL_PLANE_FILES`]`, so the open finds a control plane, creates the three
+/// databases it is missing, adds `segments/`, writes a marker beside the old data, and
+/// reports an **empty** store. The refusal has to be loud, and it has to leave nothing.
+#[tokio::test]
+async fn a_v010_rows_mode_directory_is_refused_and_writes_nothing() {
+	let source = fixture().join("legacy/v010_legacy");
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("plant-data");
+	copy_tree(&source, &root);
+	let before = files_under(&root);
+
+	let error = match SegmentStore::open(&root).await {
+		Ok(_) => panic!("a rows-mode directory is not a store, and saying so is the whole point"),
+		Err(error) => error,
+	};
+	let typed = error.downcast_ref::<StoreError>().unwrap_or_else(|| panic!("the refusal is typed, not a sentence: {error:#}"));
+	let StoreError::RowsModeDataDirectory { aspects } = typed else {
+		panic!("the refusal names the rows-mode shape: {error:#}");
+	};
+	assert_eq!(aspects.as_slice(), ["plant/flow", "plant/price", "plant/temp"], "the refusal names every aspect database it found, in path order");
+	// The sentence is what an operator reads, so it is asserted rather than sampled: it says
+	// what the directory is, what was not changed, and which files the open did touch. It is
+	// read off the typed error because the surrounding `anyhow` context replaces `Display`
+	// with its own sentence — `{error:#}` below is what a CLI prints.
+	assert_eq!(typed.to_string(), format!("this is a WeftDB 0.1.x data directory, keeping a database per aspect ({}); this version reads stores, and nothing here was changed (only LOCK and LOCK.holder were written)", ["\"plant/flow\"", "\"plant/price\"", "\"plant/temp\""].join(", ")));
+	assert!(format!("{error:#}").starts_with(&format!("opening segment store {}", root.display())), "the refusal still says which open failed: {error:#}");
+
+	// Nothing was created but the two lock files. The three databases a store needs, the
+	// `segments/` directory, and the `STORE_FORMAT` marker are the writes this refusal exists
+	// to prevent, and their absence is what makes the refusal safe to retry.
+	let mut created = files_under(&root).into_iter().filter(|name| !before.contains(name)).collect::<Vec<_>>();
+	created.sort();
+	assert_eq!(created, ["LOCK", "LOCK.holder"], "a refused open leaves the data directory exactly as it found it");
+	assert!(!before.iter().any(|name| name == "STORE_FORMAT"), "the fixture never had a marker, and the refusal does not add one");
+
+	// A second open refuses the same way: the refusal is not a state transition.
+	let again = match SegmentStore::open(&root).await {
+		Ok(_) => panic!("the same directory is refused twice"),
+		Err(error) => error,
+	};
+	assert!(format!("{again:#}").contains("a WeftDB 0.1.x data directory"), "{again:#}");
+}
+
+/// One aspect's measured facts, as the integers a comparison is made of: segment count,
+/// rows, nulls, bytes, unsorted segments, overlapping segments, then the timestamp span.
+async fn measured(store: &SegmentStore, aspect: &str) -> Vec<u64> {
+	let stats = store.aspect_stats(aspect).await.expect("the aspect is declared");
+	let meta = store.aspect_metadata(aspect).await.expect("the aspect has metadata");
+	let (lo, hi) = stats.time_range.expect("a sealed aspect covers a span");
+	vec![stats.segment_count as u64, stats.total_rows, meta.total_nulls, stats.total_bytes, stats.unsorted_segments as u64, stats.overlapping_segments as u64, lo as u64, hi as u64]
+}
+
+/// The same eight facts as v0.1.0 wrote them into `aspect_stats.txt`.
+fn recorded(recorded: &serde_json::Value, keys: [&str; 6]) -> Vec<u64> {
+	let span = recorded["time_range"].as_array().expect("a recorded timestamp span");
+	let numbers = |value: &serde_json::Value| value.as_u64().expect("a recorded count");
+	let mut out = keys.map(|key| numbers(&recorded[key])).to_vec();
+	out.extend(span.iter().map(numbers));
+	out
+}
+
+/// The store-wide totals, from the same build of integers: aspects, segments, rows, nulls,
+/// bytes, unsorted segments, span.
+async fn measured_store(store: &SegmentStore) -> Vec<u64> {
+	let stats = store.store_stats().await.expect("the store reports itself");
+	let (lo, hi) = stats.time_range.expect("a store with segments covers a span");
+	vec![stats.aspect_count as u64, stats.segment_count as u64, stats.total_rows, stats.total_nulls, stats.total_bytes, stats.unsorted_segments as u64, lo as u64, hi as u64]
+}
+
+/// The X-FX gate the plan asks for in one place: the measurements a v0.1.0 release counted
+/// are the measurements this build counts after the layout-1 upgrade, and after the store
+/// has been moved to another path. `aspect_stats.txt` and `stats.json` are v0.1.0's own
+/// numbers, so the comparison is with the release rather than with this build talking to
+/// itself. Bytes are part of the comparison on purpose: nothing in this build's migration
+/// re-encodes a frame, so a total that moves is a frame that changed.
+#[tokio::test]
+async fn the_migrated_measurements_are_the_ones_v010_counted() {
+	let stats_text = std::fs::read_to_string(fixture().join("aspect_stats.txt")).expect("v0.1.0 recorded its own per-aspect stats");
+	let per_aspect: BTreeMap<String, serde_json::Value> = stats_text
+		.lines()
+		.filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+		.map(|line| {
+			let value: serde_json::Value = serde_json::from_str(line.trim()).expect("a recorded stats line");
+			(value["aspect"].as_str().expect("a named stats row").to_owned(), value)
+		})
+		.collect();
+	assert_eq!(per_aspect.keys().collect::<Vec<_>>(), ["flow", "price", "temp"], "the fixture records stats for exactly the three aspects it wrote");
+	let store_totals: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixture().join("stats.json")).expect("v0.1.0 recorded its own store totals")).expect("the store totals are JSON");
+
+	let dir = tempfile::tempdir().unwrap();
+	let from = dir.path().join("original");
+	let to = dir.path().join("relocated");
+	copy_tree(&fixture().join("store"), &from);
+
+	let store = SegmentStore::open(&from).await.expect("a v0.1.0 store opens");
+	let report = store.open_report();
+	assert_eq!(report.migrated_from, Some(1), "the store was upgraded from a pre-marker layout");
+	assert!(!report.applied.is_empty(), "the upgrade ran here, so it is named: {:?}", report.applied);
+	for aspect in ["flow", "price", "temp"] {
+		assert_eq!(measured(&store, aspect).await, recorded(&per_aspect[aspect], ["segment_count", "total_rows", "total_nulls", "total_bytes", "unsorted_segments", "overlapping_segments"]), "{aspect}: this build counts what v0.1.0 counted");
+	}
+	assert_eq!(measured_store(&store).await, recorded(&store_totals, ["aspect_count", "segment_count", "total_rows", "total_nulls", "total_bytes", "unsorted_segments"]), "the store totals are the ones v0.1.0 printed");
+	// Bytes per point is a division rather than a count, so it is compared loosely: the
+	// recorded value is v0.1.0's float, and a re-derived frame would move it by more than
+	// this while a different rounding of the same quotient cannot.
+	for aspect in ["flow", "price", "temp"] {
+		let recorded = per_aspect[aspect]["bytes_per_point"].as_f64().expect("a recorded ratio");
+		let measured = store.aspect_stats(aspect).await.expect("the aspect is declared").bytes_per_point;
+		assert!((recorded - measured).abs() < 1e-9, "{aspect}: {measured} against the recorded {recorded}");
+	}
+	// The value span is recorded as scaled decimal text, which is what makes it comparable
+	// through `canonical`: 100.2500 and 100.25 are the same measurement.
+	for aspect in ["flow", "price", "temp"] {
+		let want = (canonical(per_aspect[aspect]["value_range"][0].as_str().expect("a recorded low")), canonical(per_aspect[aspect]["value_range"][1].as_str().expect("a recorded high")));
+		let got = store.aspect_metadata(aspect).await.expect("the aspect has metadata").value_range.map(|(lo, hi)| (canonical(&lo.to_string()), canonical(&hi.to_string())));
+		assert_eq!(got.as_ref(), Some(&want), "{aspect}: the value range survives the upgrade");
+	}
+
+	// The upgrade settles: it ran once, and the tree it left behind is what a later start
+	// reads without running anything again.
+	drop(store);
+	std::fs::rename(&from, &to).expect("the store moves");
+	let moved = SegmentStore::open(&to).await.expect("the same store opens at a new path");
+	let report = moved.open_report();
+	assert_eq!(report.migrated_from, None, "a migrated store does not migrate again");
+	assert!(report.applied.is_empty(), "nothing ran on the second open: {:?}", report.applied);
+	for aspect in ["flow", "price", "temp"] {
+		assert_eq!(measured(&moved, aspect).await, recorded(&per_aspect[aspect], ["segment_count", "total_rows", "total_nulls", "total_bytes", "unsorted_segments", "overlapping_segments"]), "{aspect}: a moved store counts the same measurements");
+	}
+	assert_eq!(measured_store(&moved).await, recorded(&store_totals, ["aspect_count", "segment_count", "total_rows", "total_nulls", "total_bytes", "unsorted_segments"]), "the moved store's totals are still v0.1.0's");
+	// The frames themselves: the segment files under the moved root are the ones the fixture
+	// shipped, which is why the byte totals above can be trusted as identity.
+	let frames = files_under(&to).into_iter().filter(|name| name.ends_with(".weftseg")).collect::<Vec<_>>();
+	assert_eq!(frames.iter().filter(|name| name.starts_with("segments/")).count(), 6, "the upgrade moved six frames forward and did not rewrite or add any: {frames:?}");
 }
