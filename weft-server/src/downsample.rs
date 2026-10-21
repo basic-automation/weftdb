@@ -42,7 +42,7 @@ use weft_reduce::reduce;
 pub use weft_reduce::Aggregation;
 
 use crate::{
-	interpolate::{ApiError, InputPoint, ResolutionSpec}, metrics::SharedMetrics
+	error::{self, ApiError, StrictJson, StrictQuery}, interpolate::{InputPoint, ResolutionSpec}, metrics::SharedMetrics
 };
 
 /// Request body for `POST /api/v1/downsample`.
@@ -98,10 +98,10 @@ pub struct DownsampleResponse {
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::BadRequest`] for an empty point set, a non-finite value,
-/// or an inverted range, and [`ApiError::Internal`] if a timestamp cannot be
+/// Returns `bad_request` (`400`) for an empty point set, a non-finite value,
+/// or an inverted range, and `internal` (`500`) if a timestamp cannot be
 /// mapped onto the resolution grid.
-pub async fn downsample(State(metrics): State<SharedMetrics>, Json(request): Json<DownsampleRequest>) -> Result<Json<DownsampleResponse>, ApiError> {
+pub async fn downsample(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Json<DownsampleResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_downsample_request();
 	let result = downsample_inner(request);
@@ -122,7 +122,7 @@ const DEFAULT_AGGREGATIONS: [Aggregation; 3] = Aggregation::DEFAULT;
 fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleResponse>, ApiError> {
 	let DownsampleRequest { resolution, aggregations, start, end, points: input } = request;
 	if input.is_empty() {
-		return Err(ApiError::BadRequest("`points` must not be empty".to_string()));
+		return Err(ApiError::bad_request("`points` must not be empty".to_string()));
 	}
 
 	let resolution: Resolution = resolution.into();
@@ -135,7 +135,7 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 	{
 		let _parse = tracing::info_span!("downsample.parse", candidate_points = input.len()).entered();
 		for sample in &input {
-			let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::BadRequest("a point value is not a finite number".to_string()))?;
+			let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number".to_string()))?;
 			points.push(Point::new(sample.timestamp, value));
 		}
 		points.sort_by_key(|p| p.timestamp);
@@ -162,10 +162,10 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 #[tracing::instrument(name = "downsample.reduce", skip_all, fields(candidate_points = points.len(), resolution = ?resolution, input_points = tracing::field::Empty, buckets = tracing::field::Empty))]
 fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Json<DownsampleResponse>, ApiError> {
 	if end < start {
-		return Err(ApiError::BadRequest("`end` must not be before `start`".to_string()));
+		return Err(ApiError::bad_request("`end` must not be before `start`".to_string()));
 	}
 
-	let buckets = reduce(points, resolution, Some(start), Some(end), aggregations).map_err(|err| ApiError::Internal(err.to_string()))?;
+	let buckets = reduce(points, resolution, Some(start), Some(end), aggregations).map_err(|err| error::from_reduce_error(&err))?;
 	let response = buckets_to_response(buckets, resolution, aggregations);
 
 	let span = tracing::Span::current();
@@ -257,11 +257,11 @@ fn response_columns(response: &DownsampleResponse) -> (Vec<i64>, Vec<i64>, Vec<V
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::Internal`] if the Arrow encoding fails.
+/// Returns `internal` (`500`) if the Arrow encoding fails.
 pub(crate) fn downsample_response_to_arrow(response: &DownsampleResponse) -> Result<Response, ApiError> {
 	let (timestamps, counts, agg_columns) = response_columns(response);
 	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
-	let bytes = weft_arrow::reduction_table_to_ipc_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
+	let bytes = weft_arrow::reduction_table_to_ipc_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::internal(err.to_string()))?;
 	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
 }
 
@@ -271,11 +271,11 @@ pub(crate) fn downsample_response_to_arrow(response: &DownsampleResponse) -> Res
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::Internal`] if the Parquet encoding fails.
+/// Returns `internal` (`500`) if the Parquet encoding fails.
 pub(crate) fn downsample_response_to_parquet(response: &DownsampleResponse) -> Result<Response, ApiError> {
 	let (timestamps, counts, agg_columns) = response_columns(response);
 	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
-	let bytes = weft_arrow::reduction_table_to_parquet_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::Internal(err.to_string()))?;
+	let bytes = weft_arrow::reduction_table_to_parquet_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::internal(err.to_string()))?;
 	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
 }
 
@@ -292,10 +292,10 @@ pub(crate) fn downsample_response_to_parquet(response: &DownsampleResponse) -> R
 ///
 /// # Errors
 ///
-/// As [`downsample`]: [`ApiError::BadRequest`] for an empty point set, a non-finite
-/// value, or an inverted range, and [`ApiError::Internal`] on a grid-mapping or
+/// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
+/// value, or an inverted range, and `internal` (`500`) on a grid-mapping or
 /// Arrow-encoding failure.
-pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, Json(request): Json<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
 	let result = downsample_inner(request);
 	match &result {
@@ -316,10 +316,10 @@ pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, Json(request
 ///
 /// # Errors
 ///
-/// As [`downsample`]: [`ApiError::BadRequest`] for an empty point set, a non-finite
-/// value, or an inverted range, and [`ApiError::Internal`] on a grid-mapping or
+/// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
+/// value, or an inverted range, and `internal` (`500`) on a grid-mapping or
 /// Parquet-encoding failure.
-pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, Json(request): Json<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
 	let result = downsample_inner(request);
 	match &result {
@@ -338,10 +338,10 @@ pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, Json(reque
 ///
 /// # Errors
 ///
-/// As [`downsample`]: [`ApiError::BadRequest`] for an empty point set, a non-finite
-/// value, or an inverted range, and [`ApiError::Internal`] if a timestamp cannot be
+/// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
+/// value, or an inverted range, and `internal` (`500`) if a timestamp cannot be
 /// mapped onto the resolution grid.
-pub async fn downsample_csv(State(metrics): State<SharedMetrics>, Json(request): Json<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_csv(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
 	let result = downsample_inner(request);
 	match &result {
@@ -379,10 +379,10 @@ pub struct DownsampleIlpParams {
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::BadRequest`] for an unknown precision/resolution/aggregation
+/// Returns `bad_request` (`400`) for an unknown precision/resolution/aggregation
 /// token, a malformed payload, or fewer than one usable point, and
-/// [`ApiError::Internal`] if a timestamp cannot be mapped onto the grid.
-pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Json<DownsampleResponse>, ApiError> {
+/// `internal` (`500`) if a timestamp cannot be mapped onto the grid.
+pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Json<DownsampleResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_downsample_request();
 	let result = downsample_ilp_inner(&params, &body);
@@ -415,7 +415,7 @@ fn record_downsample_outcome(metrics: &SharedMetrics, result: &Result<Json<Downs
 /// # Errors
 ///
 /// As [`downsample_ilp`].
-pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
 	let result = downsample_ilp_inner(&params, &body);
 	record_downsample_outcome(&metrics, &result);
@@ -430,8 +430,8 @@ pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, axum::extr
 ///
 /// # Errors
 ///
-/// As [`downsample_ilp`], plus [`ApiError::Internal`] on an Arrow-encoding failure.
-pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+/// As [`downsample_ilp`], plus `internal` (`500`) on an Arrow-encoding failure.
+pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
 	let result = downsample_ilp_inner(&params, &body);
 	record_downsample_outcome(&metrics, &result);
@@ -446,8 +446,8 @@ pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, axum::ex
 ///
 /// # Errors
 ///
-/// As [`downsample_ilp`], plus [`ApiError::Internal`] on a Parquet-encoding failure.
-pub async fn downsample_ilp_parquet(State(metrics): State<SharedMetrics>, axum::extract::Query(params): axum::extract::Query<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+/// As [`downsample_ilp`], plus `internal` (`500`) on a Parquet-encoding failure.
+pub async fn downsample_ilp_parquet(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
 	let result = downsample_ilp_inner(&params, &body);
 	record_downsample_outcome(&metrics, &result);
@@ -460,9 +460,9 @@ fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json
 	let aggregations = parse_aggregations(params.agg.as_deref())?;
 
 	// `parse_points` returns points sorted ascending by timestamp.
-	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::BadRequest(err.to_string()))?;
+	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::bad_request(err.to_string()))?;
 	if points.is_empty() {
-		return Err(ApiError::BadRequest(format!("no points carry field `{}` with a timestamp", params.field)));
+		return Err(ApiError::bad_request(format!("no points carry field `{}` with a timestamp", params.field)));
 	}
 	let start = points.first().map_or_else(Utc::now, |p| p.timestamp);
 	let end = points.last().map_or_else(Utc::now, |p| p.timestamp);
@@ -483,7 +483,7 @@ pub(crate) fn parse_aggregations(token: Option<&str>) -> Result<Vec<Aggregation>
 /// set the reduction supports (including the `median`/`time_weighted_avg` aliases) and
 /// cannot drift from `weft-reduce` as reductions are added.
 fn parse_aggregation_token(token: &str) -> Result<Aggregation, ApiError> {
-	Aggregation::from_token(token).ok_or_else(|| ApiError::BadRequest(format!("unknown aggregation `{token}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa/twa_linear/twa_bucket_end/sketch_p50/sketch_p90/sketch_p95/sketch_p99)")))
+	Aggregation::from_token(token).ok_or_else(|| ApiError::bad_request(format!("unknown aggregation `{token}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa/twa_linear/twa_bucket_end/sketch_p50/sketch_p90/sketch_p95/sketch_p99)")))
 }
 
 #[cfg(test)]

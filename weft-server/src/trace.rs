@@ -17,11 +17,23 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::{extract::Request, http::HeaderValue, middleware::Next, response::Response};
+use axum::{
+	body::{Body, Bytes}, extract::Request, http::{header, HeaderValue}, middleware::Next, response::Response
+};
 use tracing::Instrument as _;
+
+use crate::error::ENVELOPE_MARKER;
 
 /// The request-correlation header, read on the way in and written on the way out.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// How much of a response body the id stamping will touch. An envelope is a handful of
+/// fields; anything larger did not come from [`ApiError`](crate::error::ApiError) and is
+/// passed through as it is.
+const ENVELOPE_BODY_LIMIT: usize = 8 * 1024;
+
+/// The id field the envelope carries, named once here and in `error.rs`'s tests.
+const REQUEST_ID_FIELD: &str = "request_id";
 
 /// Process-local monotonic source of request ids when the client supplies none.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -44,7 +56,44 @@ pub async fn request_span(request: Request, next: Next) -> Response {
 	if let Ok(value) = HeaderValue::from_str(&request_id) {
 		response.headers_mut().insert(REQUEST_ID_HEADER, value);
 	}
-	response
+	// An error envelope names the request id in its body as well as its header: the id is
+	// what an operator asks for in a report, and a body that has to be pasted on its own
+	// has to carry it. The marker header is the handoff — it says "this body is ours", so
+	// a handler's own JSON or a proxied response is left alone — and it is stripped again
+	// because it is an internal signal, not part of the contract.
+	if response.headers_mut().remove(ENVELOPE_MARKER).is_none_or(|marker| marker != "1") {
+		return response;
+	}
+	stamp_request_id(response, &request_id).await
+}
+
+/// Re-open an envelope body, add its `request_id`, and hand the response back unchanged
+/// apart from the (now larger) `Content-Length`. A body that is not a JSON object we can
+/// rewrite stays exactly as it was, with the id still in the header: losing the correlation
+/// id in the body is survivable, replacing the error the server actually produced is not.
+async fn stamp_request_id(response: Response, request_id: &str) -> Response {
+	let (mut parts, body) = response.into_parts();
+	let Ok(bytes): Result<Bytes, _> = axum::body::to_bytes(body, ENVELOPE_BODY_LIMIT).await else {
+		return Response::from_parts(parts, Body::empty());
+	};
+	let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
+		Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+		_ => return Response::from_parts(parts, Body::from(bytes)),
+	};
+	value[REQUEST_ID_FIELD] = serde_json::Value::String(request_id.to_owned());
+	let Ok(serialised) = serde_json::to_vec(&value) else {
+		return Response::from_parts(parts, Body::from(bytes));
+	};
+	// The envelope is built by us and is small; a body over the limit came from somewhere
+	// that is not the envelope path, so it is passed through untouched.
+	if serialised.len() > ENVELOPE_BODY_LIMIT {
+		return Response::from_parts(parts, Body::from(bytes));
+	}
+	// A length always fits a header value, so this conversion cannot fail; the `usize` goes
+	// through `HeaderValue::from` rather than a try-conversion that would leave a branch no
+	// test can reach.
+	parts.headers.insert(header::CONTENT_LENGTH, HeaderValue::from(serialised.len()));
+	Response::from_parts(parts, Body::from(serialised))
 }
 
 #[cfg(test)]
