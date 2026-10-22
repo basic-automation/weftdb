@@ -1113,6 +1113,15 @@ phase of the [1.0 plan](docs/release/1.0-plan.md#6-waves) (lanes, dependencies, 
 `→` is merge order after the previous slice, *(owner)* marks a step only the owner can take,
 and a box is ticked only when its slice is on main.
 
+*Status 2026-10-22:* The W2 stack is on main. #91 (X-NAME → main) was closed after its head branch
+had become the merge target for #92–#96, so X-NAME, ROB-2, PAC-3, X-FRAME and FRE-14's two
+first slices — the 0.1.x data-directory refusal and the rows-mode import — sat on
+`xname/declare-validation` with their boxes ticked and their code off main. This wave lands them:
+the stack, main's two roadmap edits, the `#[cfg(unix)]` that keeps the symlink probe honest on a
+Windows runner, and PAC-5a's roadmap tick (`b5d0667`), whose registry merged in #88 without its
+line being checked. The owner's W0 items are done — private vulnerability reporting is on, and the
+stale `v0.1.0-preview.1` draft prerelease is gone.
+
 *Status 2026-10-20:* W1 is running. The v0.1.0 baseline is cut and pinned (`compat/releases.toml`,
 re-checked by CI's `release pins` job, #83), and X-FX's fixture set is on main (#84): three
 trees written by binaries compiled from the tag, the reads that release recorded for them, and
