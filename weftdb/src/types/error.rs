@@ -151,4 +151,19 @@ pub enum StoreError {
 		/// The aspects with such frames, in name order, each once.
 		aspects: Vec<String>,
 	},
+	/// The directory opened is not a store but a **WeftDB 0.1.x data directory**: it keeps a
+	/// database per aspect at `<subject>/<aspect>/measurements.db`, two levels below a
+	/// top-level `metadata.db`. No reader for that layout exists yet, and opening such a directory as a
+	/// store would be quietly wrong rather than loud: 0.1.x named its top-level database
+	/// `metadata.db`, which is one of this build's [`CONTROL_PLANE_FILES`](crate::types::backup::CONTROL_PLANE_FILES),
+	/// so the open would find a control plane, create the three databases missing from it, add
+	/// `segments/` and a `STORE_FORMAT` marker next to the old data, and report an empty store
+	/// with no error at all. It is refused before any database opens and before any of those
+	/// files exist; only `LOCK` and `LOCK.holder` are touched, as with every other refusal.
+	#[error("this is a WeftDB 0.1.x data directory, keeping a database per aspect ({}); this version reads stores, and nothing here was changed (only LOCK and LOCK.holder were written)", aspects.iter().map(|aspect| format!("{aspect:?}")).collect::<Vec<_>>().join(", "))]
+	RowsModeDataDirectory {
+		/// The `<subject>/<aspect>` directories holding a `measurements.db`, in path order,
+		/// each once.
+		aspects: Vec<String>,
+	},
 }

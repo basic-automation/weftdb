@@ -303,6 +303,18 @@ only the control plane, not the segment frames.
   `503 incompatible_store`, and any other frame that will not decode is `500 frame_undecodable`,
   the code X-ERR gave a wire sentence but no producer. **No writer opts into the envelope yet** —
   seals keep writing 5 and 6 — so this is the mechanism, not a format change.
+- **A WeftDB 0.1.x data directory is refused, not quietly emptied** (1.0 plan FRE-14, first half).
+  A 0.1.x root keeps one database per aspect — `metadata.db` at the top and
+  `<subject>/<aspect>/measurements.db` two levels down — and that `metadata.db` is one of
+  `weftdb::CONTROL_PLANE_FILES`, so opening such a root used to **succeed**: it found a control
+  plane, created the three databases it was missing, added `segments/`, wrote a `STORE_FORMAT`
+  marker beside the old data, and reported an **empty** store with no error anywhere. Before any
+  database is opened, `SegmentStore::open` now recognises the shape and returns
+  `StoreError::RowsModeDataDirectory { aspects }`, naming each `<subject>/<aspect>` pair in path
+  order. It rides X-ERR's existing mapping — `503 incompatible_store`, CLI exit 65 — so there is no
+  new status code. The refusal writes nothing but `LOCK` and `LOCK.holder`: the test asserts the
+  file set is otherwise unchanged, that no marker is added, and that a second open refuses the same
+  way. Turning those rows into frames is the second half of FRE-14 and is still open.
 
 ### Changed
 
