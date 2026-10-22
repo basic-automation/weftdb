@@ -314,7 +314,44 @@ only the control plane, not the segment frames.
   order. It rides X-ERR's existing mapping — `503 incompatible_store`, CLI exit 65 — so there is no
   new status code. The refusal writes nothing but `LOCK` and `LOCK.holder`: the test asserts the
   file set is otherwise unchanged, that no marker is added, and that a second open refuses the same
-  way. Turning those rows into frames is the second half of FRE-14 and is still open.
+  way. Turning those rows into frames is the second half of FRE-14, below.
+- **A WeftDB 0.1.x data directory can be read into a store** (1.0 plan FRE-14, second half).
+  `weftdb::rows_mode` reads the rows-mode tree the refusal above names. `discover` reports the
+  series under `<subject>/<aspect>/measurements.db` — row count, span, how many rows share an
+  instant — and lists, with a reason, everything it will not carry: the `metadata.db` catalog,
+  the databases 0.1.x kept beside the rows, and the `dictionaries/` directories. An aspect's name
+  comes from its **directory**, not from the database: `measurements.db` holds only
+  `(id, dataset_id, timestamp, value)` — 0.1.x's own DDL (`weftdb/src/types/aspect.rs` in the
+  `v0.1.0` tag) — so the directory is the only record of what a series is called. The value column
+  has to be the `value` that DDL created: a database that names it after the aspect is refused, not
+  read, because an aspect called `dataset_id` would otherwise be read out of the column holding its
+  identifiers. `import_into` reads
+  one subject into the store scoped to that `(database, subject)` pair, declares each aspect under
+  the narrowest encoding that holds its values exactly (tolerance zero, `recommend_encoding` — the
+  reading trades no precision across the version boundary), seals the rows in batches
+  (`rows_per_segment`, default `DEFAULT_ROWS_PER_SEGMENT`) without ever splitting a group of rows that
+  share one instant across two segments — the store folds two segments whose windows intersect and
+  keeps the newer row at an instant they share, so a group cut in two would lose rows in a compaction
+  the reading does not control; a segment can therefore come out a few rows longer than asked. The
+  reading then writes an `ImportRecord` into the
+  store's own index under `rows_mode_import:<database>:<subject>`; `read_import_record` reads it
+  back after a reopen. That record is what stops the same tree being read twice
+  (`RowsModeError::AlreadyImported`), because after the fact a migrated row and a row the store
+  sealed itself are indistinguishable — so an aspect that already holds segments refuses first
+  (`AspectNotEmpty`), as does a tree whose database directory is not the store's database
+  (`ScopeMismatch`: 0.1.x puts its database only in the path, so the path is the only thing that
+  can say where a tree belongs). Timestamps are `Millis` and cross unchanged: 0.1.x stamped
+  `timestamp_millis()` into an `INTEGER`, and the `resolution` its catalog records is the sampling
+  grid, not a unit, so there is nothing to infer and nothing is inferred. A value cell that is not
+  the text of a decimal stops the read and quotes the row (`ValueNotDecimal`) rather than putting
+  a number nobody can vouch for into the store. The tree keeps its bytes: each `measurements.db`
+  is opened bare, not through the control plane's `connect`, which switches journal mode and so
+  writes; the test compares every file it found, byte for byte, after the reading. The aspect list is
+  written one aspect at a time and its record last, so a reading that stops partway leaves the aspects
+  that already crossed in the store with nothing recorded — the next attempt refuses on `AspectNotEmpty`
+  rather than finishing the job, and saying what an operator does then is the remaining part of FRE-14:
+  the route an operator runs from the command line or the server, the numbered migrations that register
+  `metadata.db`'s schema, and a reading of a tree too big to hold one aspect in memory.
 
 ### Changed
 
