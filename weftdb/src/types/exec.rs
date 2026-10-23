@@ -8,8 +8,12 @@
 //! `CONTROL_PLANE_WRITE.try_with(|f| f.get())` (or [`in_control_plane_write`]). Every
 //! segment-index transaction (`IndexTxn`, the store's whole `segment_index.db` write
 //! path) runs inside it; a hook that finds the flag set write-poisons the process
-//! ([`poison_global`](crate::durable::poison_global)) instead of letting it go on writing
-//! through that pager.
+//! ([`poison_global`](crate::durable::poison_global)) and stops the process from going on
+//! writing through that pager — `weft-server`'s hook does exactly that and aborts (ROB-2).
+//! The scope is a task-local, not a thread-local, so it follows the task across `await`
+//! points and worker threads. It is **not** inherited by `tokio::spawn`, which is why the
+//! region wraps whole operations rather than individual statements: work a transaction
+//! spawned out of the region would run unmarked, and the tests below check that.
 
 use std::{cell::Cell, future::Future};
 

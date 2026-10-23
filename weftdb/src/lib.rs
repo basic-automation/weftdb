@@ -207,9 +207,11 @@
 //! - **Advanced Interpolation**: Linear, cubic, quadratic, and polynomial spline methods
 //!   (splimes 1.0), run on tokio's blocking pool so they never occupy an async worker
 //! - **Interpolation Backends**: splimes picks one CPU thread or the rayon pool by output
-//!   grid size, and the GPU (`wgpu`) only above the thresholds `splimes::calibrate()`
+//!   grid size, and its GPU backend only above thresholds its own `calibrate` function
 //!   measures; a program calls it once at startup (`weft-server` does), and without it
-//!   interpolation stays on the CPU
+//!   interpolation stays on the CPU. That backend is splimes' opt-in `gpu` feature, which
+//!   this crate does **not** enable: enabling it here would compile Vulkan, Metal and DX12
+//!   support into every program that links `weftdb`, whether or not it has a GPU.
 //! - **MVCC Concurrency**: Concurrent writes with `BEGIN CONCURRENT` transactions
 //! - **Pattern Recognition**: Extract and match recurring patterns in time-series data
 //! - **Event Detection**: Detect significant occurrences and predict future events
@@ -255,7 +257,9 @@
 //! - **Rust Version**: 1.95 or later, on stable
 //! - **Hardware**: `x86_64`, ARM64 architectures
 //! - **GPU Support**: Optional, through splimes' `wgpu` backend (Vulkan, Metal, DX12),
-//!   used once `splimes::calibrate()` has run
+//!   used once splimes' `calibrate` function has run. It is opt-in at the dependency level:
+//!   `weftdb` does not enable splimes' `gpu` feature, so a build that wants the GPU asks
+//!   for it explicitly.
 
 #![recursion_limit = "1024"]
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]

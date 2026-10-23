@@ -50,13 +50,17 @@ serde_json = { workspace = true }
 md5 = { workspace = true }
 sysinfo = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 csv = { workspace = true }
 criterion = { workspace = true , features = ["html_reports"] }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
+# The interpolation benches compare splimes' CPU, rayon and GPU backends, so they need the GPU
+# path that the library deliberately does not enable for its users.
+splimes = { workspace = true, features = ["gpu"] }
+# Only the tests install a subscriber; the library logs through the `tracing` facades.
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Only to keep the fault tests' deliberately aborted child from dumping core.

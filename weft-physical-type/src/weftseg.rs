@@ -31,7 +31,13 @@
 //! by construction, because both count the same varint widths.
 
 /// Why a `.weftseg` byte stream could not be read.
+///
+/// The variants are open: a new frame layout or a new decode restriction adds one
+/// without breaking a caller's `match`. Pair a failure with
+/// [`frame_fault_of`] to get the class an operator
+/// acts on rather than the byte that tripped.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WeftSegError {
 	/// The reader ran out of bytes before a value was fully decoded.
 	UnexpectedEof {
@@ -89,6 +95,25 @@ pub enum WeftSegError {
 		/// The cargo feature of `weft-physical-type` that compiles the codec in.
 		feature: &'static str,
 	},
+	/// A v7 envelope carries a **critical** extension this build does not implement, so
+	/// the body it wraps cannot be trusted: "critical" is the writer's way of saying the
+	/// body below is only correct once a reader has applied this. The file is not
+	/// damaged — a build that implements extension `id` reads it — so it is quarantined
+	/// as suspect and never purged (1.0 plan resolution C5).
+	UnknownCriticalExtension {
+		/// The extension number the frame requires.
+		id: u32,
+	},
+	/// A v7 envelope declares a body layout that the frame inside it does not name. Both
+	/// fields are covered by the same checksum, so no writer produces this: the file was
+	/// edited, or a writer has a bug. It is counted as damage rather than as an unknown
+	/// format, because there is no build that could read it.
+	EnvelopeBodyMismatch {
+		/// The layout the envelope's `body_version` field declares.
+		declared: u16,
+		/// The version the wrapped frame names in its own header.
+		found: u16,
+	},
 }
 
 impl std::fmt::Display for WeftSegError {
@@ -105,6 +130,8 @@ impl std::fmt::Display for WeftSegError {
 			Self::TrailingBytes { remaining } => write!(f, "{remaining} trailing bytes after segment frame"),
 			Self::InvalidNullMask(source) => write!(f, "invalid quality column: {source}"),
 			Self::CodecNotEnabled { codec, feature } => write!(f, "segment uses the {codec} codec, which this build does not include; rebuild with the `{feature}` cargo feature (weft-physical-type; forwarded by weftdb and weft-server) to read it"),
+			Self::UnknownCriticalExtension { id } => write!(f, "frame carries critical extension {id}, which this build does not implement; the frame is left intact because a build that implements it can read it"),
+			Self::EnvelopeBodyMismatch { declared, found } => write!(f, "v7 envelope declares a {declared} body but the frame inside it names version {found}; the envelope's own checksum is correct, so this file was written or edited inconsistently"),
 		}
 	}
 }
@@ -2205,7 +2232,7 @@ fn read_dod_codec(r: &mut ByteReader, count: usize) -> Result<(Vec<i64>, Option<
 // ---------------------------------------------------------------------------
 
 use crate::{
-	nulls::NullMask, page::{Page, PagedSegment, PAGED_SEGMENT_FORMAT_VERSION}, segment::SegmentStats, Segment, SEGMENT_FORMAT_VERSION
+	frame_registry::{layout_of, FrameExtension, FrameFault, FrameInfo, FrameLayout, FRAME_ENVELOPE, FRAME_VERSION_MAX_KNOWN}, nulls::NullMask, page::{Page, PagedSegment, PAGED_SEGMENT_FORMAT_VERSION}, segment::SegmentStats, Segment, SEGMENT_FORMAT_VERSION
 };
 
 /// The magic prefix every `.weftseg` frame starts with.
@@ -2317,6 +2344,352 @@ fn read_segment_stats(r: &mut ByteReader) -> Result<SegmentStats, WeftSegError> 
 	let min_value = read_opt_decimal(r)?;
 	let max_value = read_opt_decimal(r)?;
 	Ok(SegmentStats { row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value })
+}
+
+// ---------------------------------------------------------------------------
+// The v7 envelope: a header in front of a body whose bytes are already frozen.
+// ---------------------------------------------------------------------------
+
+/// The layout version a frame names in its own header, without touching anything
+/// after it. The cheapest thing a server can do with a file it is about to open.
+///
+/// # Errors
+///
+/// [`WeftSegError::UnexpectedEof`] for a file too short to carry a header,
+/// [`WeftSegError::BadMagic`] for bytes that are not a `.weftseg` frame at all, and
+/// never a version error — this reports the version rather than judging it.
+pub fn frame_version(bytes: &[u8]) -> Result<u16, WeftSegError> {
+	if bytes.len() < MAGIC.len() + 2 {
+		return Err(WeftSegError::UnexpectedEof { needed: MAGIC.len() + 2, remaining: bytes.len() });
+	}
+	if !is_known_magic(&bytes[..MAGIC.len()]) {
+		return Err(WeftSegError::BadMagic);
+	}
+	Ok(u16::from_le_bytes([bytes[MAGIC.len()], bytes[MAGIC.len() + 1]]))
+}
+
+/// Which reader a frame needs, read from its header alone.
+///
+/// This is a routing decision, not a verdict: nothing past the version fields is
+/// trusted or verified here, and the reader this chooses checks every byte that
+/// follows. That is what makes it safe to route on the number in the file rather
+/// than the number copied into an index row when the frame was written — a frame
+/// whose header was damaged lands in whichever reader the damaged byte suggests and
+/// fails there on its own checksum, which is the honest answer either way.
+///
+/// An envelope's answer is the layout of the frame it wraps, so a caller can pick a
+/// layout-specific entry point without knowing whether the envelope is in use.
+#[must_use]
+pub fn frame_layout_of(bytes: &[u8]) -> Result<FrameLayout, WeftSegError> {
+	let version = frame_version(bytes)?;
+	if let Some(layout) = layout_of(version) {
+		return Ok(layout);
+	}
+	if version != FRAME_ENVELOPE {
+		return Err(WeftSegError::UnsupportedVersion { found: version });
+	}
+	// The envelope's own version is followed by the version of the frame inside it.
+	if bytes.len() < MAGIC.len() + 4 {
+		return Err(WeftSegError::UnexpectedEof { needed: MAGIC.len() + 4, remaining: bytes.len() });
+	}
+	let body_version = ByteReader::new(&bytes[MAGIC.len() + 2..]).read_u16_le()?;
+	layout_of(body_version).ok_or(WeftSegError::UnsupportedVersion { found: body_version })
+}
+
+/// A frame taken apart: header, extension table, and the body bytes a reader of
+/// `body_version` can be handed as they stand.
+struct FrameParts<'a> {
+	/// The version in the frame's own header.
+	version: u16,
+	/// The version of the body layout.
+	body_version: u16,
+	/// The extension table, empty for a plain frame.
+	extensions: Vec<FrameExtension>,
+	/// A critical extension this build does not implement was named as one.
+	unknown_critical: bool,
+	/// The complete frame of `body_version`: magic, version, body and that frame's own
+	/// CRC trailer. For a plain v5/v6 frame this is the whole input, which is what
+	/// every existing reader in this file expects to be handed.
+	body: &'a [u8],
+}
+
+/// Split a frame into its header, extension table and body, checking the frame's own
+/// trailing CRC on the way.
+///
+/// A v5 or v6 frame comes back with `body == bytes`: the envelope pass changes nothing
+/// about how the two historical layouts are read. A v7 frame is checked end to end —
+/// the outer CRC covers the header, the table and the wrapped frame including that
+/// frame's own CRC — and its wrapped frame is returned as the body, verbatim.
+fn frame_parts(bytes: &[u8]) -> Result<FrameParts<'_>, WeftSegError> {
+	let version = frame_version(bytes)?;
+	if bytes.len() < MAGIC.len() + 6 {
+		// Header plus a CRC-32 trailer is the smallest frame that could ever be valid.
+		return Err(WeftSegError::UnexpectedEof { needed: MAGIC.len() + 6, remaining: bytes.len() });
+	}
+	let (framed, trailer) = bytes.split_at(bytes.len() - 4);
+	let stored = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+	let computed = crc32(framed);
+	if stored != computed {
+		return Err(WeftSegError::ChecksumMismatch { stored, computed });
+	}
+	if version != FRAME_ENVELOPE {
+		return Ok(FrameParts { version, body_version: version, extensions: Vec::new(), unknown_critical: false, body: bytes });
+	}
+	// Skip the magic and the envelope's own version; what follows is body_version,
+	// then the extension table, then the wrapped frame.
+	let rest = &framed[MAGIC.len() + 2..];
+	let mut r = ByteReader::new(rest);
+	let body_version = r.read_u16_le()?;
+	let count = r.read_uvarint()?;
+	// The count is not trusted as a size hint: entries are parsed one at a time and
+	// each needs bytes that must actually be present, so a count invented by damage
+	// stops at the first entry that is not there instead of reserving anything.
+	let mut extensions = Vec::new();
+	let mut unknown_critical = false;
+	for _ in 0..count {
+		let id = u32::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+		let critical = match r.read_u8()? {
+			0 => false,
+			1 => true,
+			value => return Err(WeftSegError::InvalidTag { kind: "extension critical flag", value }),
+		};
+		let payload = r.read_bytes()?.to_vec();
+		if critical && !crate::frame_registry::is_known_extension(id) {
+			unknown_critical = true;
+		}
+		extensions.push(FrameExtension { id, critical, payload });
+	}
+	let body = &rest[r.pos..];
+	// The wrapped frame carries its own header and CRC, and it has to name the layout the
+	// envelope says it is. Both fields sit under the same checksum, so a writer cannot
+	// produce a pair that disagrees: this is a file that was edited, or a writer with a
+	// bug. The check lives here rather than in each caller so that every reader sees the
+	// same answer, and the error names what was found rather than what was claimed — a
+	// version error here would be a lie about a version this build has never heard of.
+	let found = frame_version(body)?;
+	if found != body_version {
+		return Err(WeftSegError::EnvelopeBodyMismatch { declared: body_version, found });
+	}
+	Ok(FrameParts { version, body_version, extensions, unknown_critical, body })
+}
+
+/// Wrap a complete frame in a v7 envelope carrying `extensions`.
+///
+/// The frame inside is stored **verbatim** — magic, version and its own CRC included —
+/// and the envelope adds its header plus a CRC over everything. That costs 16 bytes —
+/// a 12-byte header (magic, envelope version, body version, entry count) plus a 4-byte
+/// trailer —
+/// and buys the envelope's whole point: not one byte inside a v5 or v6 frame moves, so
+/// the byte-for-byte expectations that released servers and on-disk stores already
+/// hold keep holding, while a reader that understands envelopes can put new material
+/// in front of a body it is not allowed to change.
+///
+/// # Errors
+///
+/// [`WeftSegError::BadMagic`] or [`WeftSegError::UnsupportedVersion`] if `inner` is not
+/// a frame of a layout this build can read — an envelope must wrap something real.
+pub fn wrap_frame_envelope(inner: &[u8], extensions: &[FrameExtension]) -> Result<Vec<u8>, WeftSegError> {
+	let body_version = frame_version(inner)?;
+	if layout_of(body_version).is_none() {
+		return Err(WeftSegError::UnsupportedVersion { found: body_version });
+	}
+	let extra = extensions.iter().map(|e| e.payload.len() + 6).sum::<usize>();
+	let mut w = ByteWriter::with_capacity(inner.len() + extra + 32);
+	w.put_raw(MAGIC);
+	w.put_u16_le(FRAME_ENVELOPE);
+	w.put_u16_le(body_version);
+	w.put_uvarint(extensions.len() as u64);
+	for e in extensions {
+		w.put_uvarint(u64::from(e.id));
+		w.put_u8(u8::from(e.critical));
+		w.put_bytes(&e.payload);
+	}
+	w.put_raw(inner);
+	let checksum = crc32(w.as_slice());
+	w.put_u32_le(checksum);
+	Ok(w.into_vec())
+}
+
+/// The complete frame inside a v7 envelope, with the envelope's CRC verified and its
+/// extension table checked.
+///
+/// A plain v5/v6 frame is returned unchanged, so a caller that reads frames through
+/// this function does not have to know which layout it was given.
+///
+/// # Errors
+///
+/// [`WeftSegError::UnknownCriticalExtension`] if the frame carries a critical extension
+/// this build does not implement — the body was written on the assumption that a reader
+/// would apply it, so decoding the body without it would serve data the writer never
+/// meant. Also the CRC, magic, length and varint errors of the envelope check itself.
+pub fn unwrap_frame_envelope(bytes: &[u8]) -> Result<&[u8], WeftSegError> {
+	let parts = frame_parts(bytes)?;
+	if parts.unknown_critical {
+		// Named separately from the generic refusal so the message can say which number
+		// the operator's server has to grow.
+		if let Some(e) = parts.extensions.iter().find(|e| e.critical && !crate::frame_registry::is_known_extension(e.id)) {
+			return Err(WeftSegError::UnknownCriticalExtension { id: e.id });
+		}
+	}
+	// `frame_parts` has already checked that a wrapped frame names the layout its
+	// envelope declares, and the legacy readers below re-check its CRC over exactly
+	// these bytes.
+	Ok(parts.body)
+}
+
+/// Describe a frame without decoding it: which layout it is, which extensions it
+/// carries, and whether this build can serve it.
+///
+/// This is what a server answers for a frame it cannot read, and what an operator
+/// script reads to decide whether a file is damaged or simply ahead of the software.
+/// The answer is already classified: a `FrameFault` says which of the two, and
+/// `FrameInfo::decodable()` says whether the body may be served at all.
+///
+/// # Errors
+///
+/// The [`FrameFault`] class of whatever went wrong — see [`frame_fault_of`].
+pub fn describe_frame(bytes: &[u8]) -> Result<FrameInfo, FrameFault> {
+	match frame_parts(bytes) {
+		Ok(parts) => Ok(FrameInfo { version: parts.version, body_version: parts.body_version, layout: layout_of(parts.body_version), extensions: parts.extensions, unknown_critical: parts.unknown_critical }),
+		Err(error) => Err(frame_fault_of(&error)),
+	}
+}
+
+/// The operator-facing class of a frame read failure, per the plan's C5 resolution.
+///
+/// **Integrity** is damage: the bytes disagree with their own magic, checksum or
+/// length, and the quarantine machinery may purge the file. Everything else is
+/// **undecodable**: the file is self-consistent, and the only reason it failed is that
+/// this build has no reader for it — a version it predates, a codec feature it was
+/// compiled without, an extension it does not implement, or a tag it does not
+/// recognise. Those files hold data that some other build can read, so they are never
+/// purged automatically.
+///
+/// `newer_format` is set when the cause is a frame version above
+/// [`FRAME_VERSION_MAX_KNOWN`], which is the case where the store as a whole should
+/// report `incompatible_store` rather than blame one file.
+#[must_use]
+pub const fn frame_fault_of(error: &WeftSegError) -> FrameFault {
+	match error {
+		WeftSegError::UnsupportedVersion { found } => FrameFault::Undecodable { newer_format: *found > FRAME_VERSION_MAX_KNOWN },
+		WeftSegError::CodecNotEnabled { .. } | WeftSegError::UnknownCriticalExtension { .. } => FrameFault::Undecodable { newer_format: false },
+		// BadMagic, ChecksumMismatch, UnexpectedEof, VarintTooLong, TrailingBytes,
+		// InvalidUtf8, InvalidDecimal, InvalidNullMask, EnvelopeBodyMismatch: the file
+		// does not agree with itself. InvalidTag is counted with them because a tag this
+		// build does not know arrives with a new frame or body version, not inside a
+		// version it already understands.
+		_ => FrameFault::Integrity,
+	}
+}
+
+/// The body layout of a frame this build can read, envelope or not, together with the
+/// body bytes that reader should be handed.
+///
+/// # Errors
+///
+/// [`WeftSegError::UnsupportedVersion`] for a body version with no reader (including a
+/// frame from a newer server), and [`WeftSegError::UnknownCriticalExtension`] for a
+/// critical extension this build does not implement.
+fn read_frame_body(bytes: &[u8]) -> Result<(&[u8], FrameLayout), WeftSegError> {
+	let parts = frame_parts(bytes)?;
+	if parts.unknown_critical {
+		if let Some(e) = parts.extensions.iter().find(|e| e.critical && !crate::frame_registry::is_known_extension(e.id)) {
+			return Err(WeftSegError::UnknownCriticalExtension { id: e.id });
+		}
+	}
+	let body = if parts.version == FRAME_ENVELOPE {
+		// `frame_parts` already proved the wrapped frame names the layout declared in the
+		// envelope header, so the layout below is the layout of these bytes.
+		parts.body
+	} else {
+		bytes
+	};
+	match layout_of(parts.body_version) {
+		Some(layout) => Ok((body, layout)),
+		None => Err(WeftSegError::UnsupportedVersion { found: parts.body_version }),
+	}
+}
+
+/// Read a single-block frame, whether or not it is wrapped in a v7 envelope.
+///
+/// The envelope-aware form of [`read_segment`], for a caller that does not know how the
+/// file was framed.
+///
+/// # Errors
+///
+/// The [`WeftSegError`]s of [`unwrap_frame_envelope`] and [`read_segment`]. Use
+/// [`frame_fault_of`] to turn one into the class the operator acts on.
+pub fn read_frame_segment(bytes: &[u8]) -> Result<Segment, WeftSegError> {
+	read_segment(unwrap_frame_envelope(bytes)?)
+}
+
+/// Read a paged frame, whether or not it is wrapped in a v7 envelope.
+///
+/// The envelope-aware form of [`read_paged_segment`].
+///
+/// # Errors
+///
+/// The [`WeftSegError`]s of [`unwrap_frame_envelope`] and [`read_paged_segment`].
+pub fn read_frame_paged_segment(bytes: &[u8]) -> Result<PagedSegment, WeftSegError> {
+	read_paged_segment(unwrap_frame_envelope(bytes)?)
+}
+
+/// Read one point from a frame of either layout, wrapped or not.
+///
+/// The envelope-aware form of [`read_segment_point`] and [`read_paged_segment_point`],
+/// dispatching on the layout the file itself names rather than on what a caller
+/// believes it wrote.
+///
+/// # Errors
+///
+/// [`WeftSegError::UnsupportedVersion`] for a body layout this build has no point
+/// reader for, otherwise the errors of the two underlying readers.
+pub fn read_frame_point(bytes: &[u8], t: i64) -> Result<Option<BigDecimal>, WeftSegError> {
+	let (body, layout) = read_frame_body(bytes)?;
+	match layout {
+		FrameLayout::SingleBlock => read_segment_point(body, t),
+		FrameLayout::Paged => read_paged_segment_point(body, t),
+	}
+}
+
+/// Read several points from a frame of either layout, wrapped or not.
+///
+/// # Errors
+///
+/// As [`read_frame_point`].
+pub fn read_frame_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<BigDecimal>>, WeftSegError> {
+	let (body, layout) = read_frame_body(bytes)?;
+	match layout {
+		FrameLayout::SingleBlock => read_segment_points(body, ts),
+		FrameLayout::Paged => read_paged_segment_points(body, ts),
+	}
+}
+
+/// Read a timestamp range from a frame of either layout, wrapped or not.
+///
+/// # Errors
+///
+/// As [`read_frame_point`].
+pub fn read_frame_range(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), WeftSegError> {
+	let (body, layout) = read_frame_body(bytes)?;
+	match layout {
+		FrameLayout::SingleBlock => read_segment_range(body, start, end),
+		FrameLayout::Paged => read_paged_segment_range(body, start, end),
+	}
+}
+
+/// Read a timestamp range as physical values from a frame of either layout, wrapped or
+/// not.
+///
+/// # Errors
+///
+/// As [`read_frame_point`].
+pub fn read_frame_range_physical(bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<PhysicalValue>>), WeftSegError> {
+	let (body, layout) = read_frame_body(bytes)?;
+	match layout {
+		FrameLayout::SingleBlock => read_segment_range_physical(body, start, end),
+		FrameLayout::Paged => read_paged_segment_range_physical(body, start, end),
+	}
 }
 
 /// Encode a [`Segment`] into a complete, self-describing, checksummed `.weftseg`
@@ -2696,6 +3069,7 @@ pub fn read_paged_segment(bytes: &[u8]) -> Result<PagedSegment, WeftSegError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::frame_registry::{FrameExtension, FrameFault, FrameLayout, FRAME_ENVELOPE, FRAME_PAGED, FRAME_SINGLE_BLOCK, FRAME_VERSION_MAX_KNOWN};
 
 	#[test]
 	fn crc32_slicing_by_16_matches_the_byte_at_a_time_crc() {
@@ -4172,6 +4546,233 @@ mod tests {
 		let new_crc = crc32(&bytes[..body_len]).to_le_bytes();
 		bytes[body_len..].copy_from_slice(&new_crc);
 		assert_eq!(read_segment(&bytes), Err(WeftSegError::UnsupportedVersion { found: SEGMENT_FORMAT_VERSION + 1 }));
+	}
+
+	// ---------------------------------------------------------------------
+	// The v7 envelope, the frame registry, and the two fault classes C5 names
+	// ---------------------------------------------------------------------
+
+	/// Re-stamp a frame's trailing CRC-32 over everything before it, so a body edit can
+	/// be made with the trailer telling the truth about the damaged bytes.
+	fn restamp(frame: &[u8]) -> Vec<u8> {
+		let mut bytes = frame.to_vec();
+		let body_len = bytes.len() - 4;
+		let new_crc = crc32(&bytes[..body_len]).to_le_bytes();
+		bytes[body_len..].copy_from_slice(&new_crc);
+		bytes
+	}
+
+	/// Rewrite the u16 version at `at` and re-stamp the trailer: a frame that is
+	/// internally consistent apart from the number that was changed, which is how a
+	/// version this build has never seen arrives from a future release.
+	fn reversion(frame: &[u8], at: usize, version: u16) -> Vec<u8> {
+		let mut bytes = frame.to_vec();
+		bytes[at..at + 2].copy_from_slice(&version.to_le_bytes());
+		restamp(&bytes)
+	}
+
+	/// A single-block frame with enough rows that point and range reads do real work.
+	fn single_block_frame() -> Vec<u8> {
+		write_segment(&single_block_segment())
+	}
+
+	fn single_block_segment() -> Segment {
+		let ts: Vec<i64> = (0..400).map(|i| 1_600_000_000 + i * 60).collect();
+		let vs: Vec<BigDecimal> = (0..400).map(|i| BigDecimal::from(i * 3)).collect();
+		Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds")
+	}
+
+	/// A paged frame spanning several pages.
+	fn paged_frame() -> Vec<u8> {
+		write_paged_segment(&paged_segment())
+	}
+
+	fn paged_segment() -> PagedSegment {
+		let ts: Vec<i64> = (0..400).map(|i| 1_600_000_000 + i * 60).collect();
+		let vs: Vec<BigDecimal> = (0..400).map(|i| BigDecimal::from(i * 3)).collect();
+		let seg = PagedSegment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0), 64).expect("builds");
+		assert!(seg.page_count() > 1, "the point of these tests is more than one page");
+		seg
+	}
+
+	#[test]
+	fn an_envelope_stores_the_frame_it_wraps_without_moving_a_byte() {
+		let inner = single_block_frame();
+		let wrapped = wrap_frame_envelope(&inner, &[]).expect("wraps");
+		// magic(7) + envelope version(2) + body version(2) + entry count(1) = 12 bytes of
+		// header, then the inner frame entire, then the envelope's own CRC.
+		let header = MAGIC.len() + 2 + 2 + 1;
+		assert_eq!(&wrapped[header..header + inner.len()], &inner[..], "the wrapped frame keeps its own magic, version and CRC untouched");
+		assert_eq!(wrapped.len(), inner.len() + 16, "an envelope with an empty extension table costs 16 bytes");
+		assert_eq!(frame_version(&wrapped).expect("version"), FRAME_ENVELOPE);
+		assert_eq!(unwrap_frame_envelope(&wrapped).expect("unwraps"), &inner[..]);
+	}
+
+	#[test]
+	fn the_frame_readers_answer_the_same_for_a_wrapped_frame() {
+		for plain in [single_block_frame(), paged_frame()] {
+			let wrapped = wrap_frame_envelope(&plain, &[]).expect("wraps");
+			// A plain frame has to go through the same entry points too, or the family would
+			// be a second format a caller has to detect rather than a superset of the first.
+			assert_eq!(read_frame_point(&wrapped, 1_600_000_060).expect("wrapped point"), read_frame_point(&plain, 1_600_000_060).expect("plain point"));
+			assert_eq!(read_frame_points(&wrapped, &[1_600_000_060, 1_600_001_200]).expect("wrapped points"), read_frame_points(&plain, &[1_600_000_060, 1_600_001_200]).expect("plain points"));
+			assert_eq!(read_frame_range(&wrapped, 1_600_000_000, 1_600_003_000).expect("wrapped range"), read_frame_range(&plain, 1_600_000_000, 1_600_003_000).expect("plain range"));
+			assert_eq!(read_frame_range_physical(&wrapped, 1_600_000_000, 1_600_003_000).expect("wrapped physical"), read_frame_range_physical(&plain, 1_600_000_000, 1_600_003_000).expect("plain physical"));
+		}
+		// The layout-specific entry points keep working too, wrapped or not.
+		let single = single_block_frame();
+		let single_wrapped = wrap_frame_envelope(&single, &[]).expect("wraps");
+		assert_eq!(read_frame_segment(&single_wrapped).expect("segment"), read_segment(&single).expect("segment"));
+		let paged = paged_frame();
+		let paged_wrapped = wrap_frame_envelope(&paged, &[]).expect("wraps");
+		assert_eq!(read_frame_paged_segment(&paged_wrapped).expect("paged"), read_paged_segment(&paged).expect("paged"));
+	}
+
+	#[test]
+	fn a_critical_extension_this_build_lacks_refuses_the_frame() {
+		let inner = single_block_frame();
+		let wrapped = wrap_frame_envelope(&inner, &[FrameExtension { id: 7, critical: true, payload: vec![1, 2, 3] }]).expect("wraps");
+		// Decoding the body without applying the extension would serve data the writer
+		// never meant, so every reader in the family refuses instead.
+		assert_eq!(read_frame_point(&wrapped, 1_600_000_060), Err(WeftSegError::UnknownCriticalExtension { id: 7 }));
+		assert_eq!(read_frame_range(&wrapped, 1_600_000_000, 1_600_003_000), Err(WeftSegError::UnknownCriticalExtension { id: 7 }));
+		assert_eq!(unwrap_frame_envelope(&wrapped), Err(WeftSegError::UnknownCriticalExtension { id: 7 }));
+		// Describing it is still allowed: the fault class is what an operator acts on, and
+		// the file is undecodable-but-intact, not damaged.
+		let info = describe_frame(&wrapped).expect("describes");
+		assert_eq!(info.version, FRAME_ENVELOPE);
+		assert_eq!(info.body_version, FRAME_SINGLE_BLOCK);
+		assert!(info.unknown_critical);
+		assert!(!info.decodable());
+		assert_eq!(info.extensions.len(), 1);
+		assert_eq!(info.extensions[0].id, 7);
+		assert!(info.extensions[0].critical);
+		let error = read_frame_point(&wrapped, 1_600_000_060).expect_err("refuses");
+		assert_eq!(frame_fault_of(&error), FrameFault::Undecodable { newer_format: false });
+		// A build that has never heard of the envelope refuses it too, rather than reading
+		// the extension table as if it were a segment header.
+		assert_eq!(read_segment(&wrapped), Err(WeftSegError::UnsupportedVersion { found: FRAME_ENVELOPE }));
+	}
+
+	#[test]
+	fn an_informational_extension_is_carried_and_ignored() {
+		let inner = single_block_frame();
+		let wrapped = wrap_frame_envelope(&inner, &[FrameExtension { id: 3, critical: false, payload: b"written-by/version ".to_vec() }]).expect("wraps");
+		assert_eq!(read_frame_range(&wrapped, 1_600_000_000, 1_600_003_000).expect("range"), read_frame_range(&inner, 1_600_000_000, 1_600_003_000).expect("range"));
+		let info = describe_frame(&wrapped).expect("describes");
+		assert!(!info.unknown_critical);
+		assert!(info.decodable());
+		assert_eq!(info.extensions[0].payload, b"written-by/version ");
+	}
+
+	#[test]
+	fn a_frame_from_a_newer_build_is_the_newer_format_fault() {
+		let renamed = reversion(&single_block_frame(), MAGIC.len(), FRAME_VERSION_MAX_KNOWN + 1);
+		// Describing is not decoding: the shape is legible, there is just no reader.
+		let info = describe_frame(&renamed).expect("describes");
+		assert_eq!(info.version, FRAME_VERSION_MAX_KNOWN + 1);
+		assert_eq!(info.layout, None, "no reader in this build is named for it");
+		assert!(!info.decodable());
+		let error = read_frame_point(&renamed, 1_600_000_060).expect_err("refuses");
+		assert_eq!(error, WeftSegError::UnsupportedVersion { found: FRAME_VERSION_MAX_KNOWN + 1 });
+		// The whole store is suspect in this case, not one file: a build that wrote it is
+		// ahead of this one, which is what /ready reports as incompatible_store.
+		assert_eq!(frame_fault_of(&error), FrameFault::Undecodable { newer_format: true });
+		// Writing one is refused too: an envelope has to wrap something this build can read.
+		assert_eq!(wrap_frame_envelope(&renamed, &[]), Err(WeftSegError::UnsupportedVersion { found: FRAME_VERSION_MAX_KNOWN + 1 }));
+	}
+
+	#[test]
+	fn an_older_version_is_not_reported_as_a_newer_build() {
+		// The distinction matters because the two faults get different treatment: a frame
+		// this old was written by something that could not have known better, so blaming
+		// the store's version would send an operator hunting for a server that does not
+		// exist.
+		let renamed = reversion(&single_block_frame(), MAGIC.len(), FRAME_SINGLE_BLOCK - 1);
+		let error = read_frame_point(&renamed, 1_600_000_060).expect_err("refuses");
+		assert_eq!(error, WeftSegError::UnsupportedVersion { found: FRAME_SINGLE_BLOCK - 1 });
+		assert_eq!(frame_fault_of(&error), FrameFault::Undecodable { newer_format: false });
+	}
+
+	#[test]
+	fn an_envelope_that_disagrees_with_its_body_is_damage() {
+		let wrapped = wrap_frame_envelope(&single_block_frame(), &[]).expect("wraps");
+		// The envelope's body_version sits after the magic and its own version.
+		let contradicted = reversion(&wrapped, MAGIC.len() + 2, FRAME_PAGED);
+		assert_eq!(read_frame_segment(&contradicted), Err(WeftSegError::EnvelopeBodyMismatch { declared: FRAME_PAGED, found: FRAME_SINGLE_BLOCK }));
+		assert_eq!(read_frame_point(&contradicted, 1_600_000_060), Err(WeftSegError::EnvelopeBodyMismatch { declared: FRAME_PAGED, found: FRAME_SINGLE_BLOCK }));
+		// Both numbers sit under the same checksum, so nothing wrote this file honestly:
+		// it is damage, not a format this build merely predates.
+		assert_eq!(describe_frame(&contradicted), Err(FrameFault::Integrity));
+	}
+
+	#[test]
+	fn an_inner_frame_keeps_its_own_checksum_under_the_envelope() {
+		let inner = single_block_frame();
+		let wrapped = wrap_frame_envelope(&inner, &[]).expect("wraps");
+		let header = MAGIC.len() + 2 + 2 + 1;
+		// Damage in the body, with the envelope's trailer honestly recomputed over it: the
+		// outer check passes and the inner frame's own CRC still catches the byte.
+		let mut damaged = wrapped.clone();
+		// A byte in the middle of the wrapped frame's column data: not the magic, not the
+		// version, nothing the envelope inspects for itself.
+		damaged[header + inner.len() / 2] ^= 0xFF;
+		let stamped = restamp(&damaged);
+		assert_eq!(describe_frame(&stamped).expect("describes").version, FRAME_ENVELOPE, "the envelope itself reads as intact");
+		let error = read_frame_segment(&stamped).expect_err("the body does not");
+		assert!(matches!(error, WeftSegError::ChecksumMismatch { .. }), "the wrapped frame's own trailer is what catches it: {error:?}");
+		assert!(frame_fault_of(&error).is_integrity());
+		// The same byte without re-stamping is caught one layer earlier, and still classifies
+		// the same way, so the two layers cannot tell an operator two different stories.
+		let error = read_frame_segment(&damaged).expect_err("refuses");
+		assert!(matches!(error, WeftSegError::ChecksumMismatch { .. }), "{error:?}");
+		assert!(frame_fault_of(&error).is_integrity());
+	}
+
+	#[test]
+	fn describe_frame_names_the_layout_of_every_frame() {
+		let single = single_block_frame();
+		let paged = paged_frame();
+		let info = describe_frame(&single).expect("v5");
+		assert_eq!((info.version, info.body_version, info.layout), (FRAME_SINGLE_BLOCK, FRAME_SINGLE_BLOCK, Some(FrameLayout::SingleBlock)));
+		assert!(info.extensions.is_empty() && !info.unknown_critical && info.decodable());
+		let info = describe_frame(&paged).expect("v6");
+		assert_eq!((info.version, info.body_version, info.layout), (FRAME_PAGED, FRAME_PAGED, Some(FrameLayout::Paged)));
+		let info = describe_frame(&wrap_frame_envelope(&paged, &[]).expect("wraps")).expect("v7 of v6");
+		assert_eq!((info.version, info.body_version, info.layout), (FRAME_ENVELOPE, FRAME_PAGED, Some(FrameLayout::Paged)));
+		// Damage is described as damage, including a frame too short to hold a trailer.
+		assert_eq!(describe_frame(&[]), Err(FrameFault::Integrity));
+		assert_eq!(describe_frame(&[0; 3]), Err(FrameFault::Integrity));
+	}
+
+	#[test]
+	fn an_envelope_wraps_a_checkpointed_frame() {
+		// The opt-in layouts are exactly the frames whose bytes the envelope exists to
+		// protect, so a wrapped checkpointed frame has to read back identically.
+		let ts: Vec<i64> = (0..400).map(|i| 1_600_000_000 + i * 60).collect();
+		let vs: Vec<BigDecimal> = (0..400).map(|i| BigDecimal::from(i * 3)).collect();
+		let _ = (&ts, &vs);
+		let seg = single_block_segment();
+		let plain = write_segment_checkpointed(&seg, 64);
+		let wrapped = wrap_frame_envelope(&plain, &[]).expect("wraps");
+		assert_eq!(read_frame_segment(&wrapped).expect("segment"), read_segment(&plain).expect("segment"));
+		let paged = paged_segment();
+		let plain = write_paged_segment_checkpointed(&paged, 64);
+		let wrapped = wrap_frame_envelope(&plain, &[]).expect("wraps");
+		assert_eq!(read_frame_paged_segment(&wrapped).expect("paged"), read_paged_segment(&plain).expect("paged"));
+		assert_eq!(read_frame_range(&wrapped, 1_600_000_000, 1_600_003_000).expect("range"), read_paged_segment_range(&plain, 1_600_000_000, 1_600_003_000).expect("legacy range"));
+	}
+
+	#[test]
+	fn the_envelope_rejects_a_frame_it_was_handed_that_is_not_a_frame() {
+		// Not a .weftseg at all, correctly checksummed: refused by magic, and classed as
+		// damage because there is no build that could read it.
+		let mut junk = b"NOTSEG!".to_vec();
+		junk.extend_from_slice(&crc32(&junk).to_le_bytes());
+		assert_eq!(unwrap_frame_envelope(&junk), Err(WeftSegError::BadMagic));
+		assert_eq!(describe_frame(&junk), Err(FrameFault::Integrity));
+		// A truncated envelope: the header does not even fit.
+		assert!(matches!(unwrap_frame_envelope(&[b'W', b'E', b'F', b'T', b'S', b'E', b'G', 7, 0, 5, 0]), Err(WeftSegError::UnexpectedEof { .. })));
 	}
 
 	#[test]

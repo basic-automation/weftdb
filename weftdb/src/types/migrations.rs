@@ -105,7 +105,9 @@ pub(crate) struct Floors {
 	pub min_write: u32,
 }
 
-/// Every registered migration, in id order.
+/// Every registered migration, in id order. An id is four digits, an underscore, and a
+/// lower snake_case name: the digits are the ordinal that `pending` and `after` select on,
+/// so the numbering rule is part of the registry's contract and the test below asserts it.
 pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }];
 
 /// The ordinal of a migration id: its leading digits (`0002_s6_s7` → 2). An id without
@@ -487,6 +489,13 @@ mod tests {
 		let ordinals: Vec<u64> = REGISTRY.iter().map(|migration| ordinal(migration.id)).collect();
 		assert!(ordinals.windows(2).all(|pair| pair[0] < pair[1]), "{ordinals:?}");
 		for migration in REGISTRY {
+			// `ordinal()` takes the digits before the first `_` and falls back to 0 without
+			// complaint, so an id that does not begin with the numbering rule is ordinal 0:
+			// never pending, never after, and it silently never runs. The format is what the
+			// ordering is built from, so it is asserted here rather than left to review.
+			let (digits, name) = migration.id.split_once('_').unwrap_or((migration.id, ""));
+			assert!(digits.len() == 4 && digits.bytes().all(|byte| byte.is_ascii_digit()), "{}: a migration id must begin with four digits, which is its ordinal", migration.id);
+			assert!(!name.is_empty() && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'), "{}: a migration id's name follows the digits and is lower snake_case", migration.id);
 			assert!(migration.min_read_after <= migration.layout && migration.min_write_after <= migration.layout, "{}: a floor above its own layout", migration.id);
 			assert!(migration.layout <= crate::SUPPORTED_LAYOUT, "{}: a layout this build does not support", migration.id);
 			if migration.min_write_after < migration.layout {

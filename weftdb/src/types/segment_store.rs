@@ -84,14 +84,14 @@ use anyhow::{bail, Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
-use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION};
+use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, write_new_durable, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, frame_name, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind, TxnPoints}, migrations, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
+		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind, TxnPoints}, migrations, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
@@ -289,7 +289,7 @@ fn scaled_rows(ts: &[i64], vs: &[Option<PhysicalValue>], start: i64, end: i64, u
 fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
 	// Read the window in its physical encoding, so a ScaledI64 column can be reduced on its
 	// stored mantissas without building a BigDecimal per row.
-	let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range_physical(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_range_physical(bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
+	let (ts, vs) = frame_read::read_range_physical(descriptor.path.as_str(), bytes, start, end)?;
 	// Integer-native path: every present in-window value is ScaledI64 at one scale and every
 	// requested reduction is a streaming one. `reduce_partial_scaled` then builds the same
 	// mergeable partial `reduce_partial` would, from integer accumulators.
@@ -1455,6 +1455,17 @@ impl SegmentStore {
 		if let Some(marker) = found.as_ref().filter(|marker| !marker.writable_by(SUPPORTED_LAYOUT)) {
 			return Err(anyhow::Error::new(StoreError::IncompatibleLayout { min_write: marker.min_write_layout, supported: SUPPORTED_LAYOUT }).context(opening()));
 		}
+		// 4a. A root with no marker is not necessarily an empty directory: the 0.1.x line was
+		// a data directory with one database per aspect, and its top-level database carries
+		// this build's control-plane name. Opening it as a store would build the rest of a
+		// store beside that data and report it empty with no error, so it is refused here,
+		// before any database opens and before any file of ours exists in the directory.
+		if found.is_none() {
+			let aspects = store_format::rows_mode_aspects(&root).await;
+			if !aspects.is_empty() {
+				return Err(anyhow::Error::new(StoreError::RowsModeDataDirectory { aspects }).context(opening()));
+			}
+		}
 		// 7, for a root that has databases: they open now, before anything is written to the
 		// root. segment_index.db opens first and refuses a write floor its store_meta records
 		// newer than this build (the gate of a root without a marker, 4) before anything is
@@ -1921,16 +1932,10 @@ impl SegmentStore {
 				bail!("segment {} does not end in the CRC its row was committed with ({expected:#010x})", descriptor.path);
 			}
 		}
-		if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
-			let rows_per_page = segment.rows_per_page;
-			let (timestamps, values) = segment.decode_nullable();
-			Ok(DecodedFrame { rows_per_page: Some(rows_per_page), timestamps, values })
-		} else {
-			let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
-			let (timestamps, values) = segment.decode_nullable();
-			Ok(DecodedFrame { rows_per_page: None, timestamps, values })
-		}
+		let frame = frame_read::read_full(descriptor.path.as_str(), &bytes)?;
+		let rows_per_page = frame.rows_per_page();
+		let (timestamps, values) = frame.decode_nullable();
+		Ok(DecodedFrame { rows_per_page, timestamps, values })
 	}
 
 	/// Read the frames of `members` (ascending by id), checking each is the frame its row
@@ -3054,8 +3059,9 @@ impl SegmentStore {
 	///
 	/// # Errors
 	///
-	/// Propagates a libSQL prune failure, a filesystem read error, or a
-	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
+	/// Propagates a libSQL prune failure, a filesystem read error, or a frame-decode
+	/// failure carrying a [`crate::FrameFaultError`] — the C5 fault class (`integrity`,
+	/// `newer_format` or `undecodable`) for a corrupt or unreadable `.weftseg`.
 	pub async fn read_time_range(&self, aspect: &str, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
@@ -3070,7 +3076,7 @@ impl SegmentStore {
 			// index range + per-present-row value read) — the paged variant additionally skips whole
 			// pages disjoint from the window — instead of the whole segment; any other shape falls
 			// back to a full decode. Already filtered to `[start, end]`.
-			let (ts, vs) = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_range(&bytes, start, end).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
+			let (ts, vs) = frame_read::read_range(descriptor.path.as_str(), &bytes, start, end)?;
 			for (t, v) in ts.into_iter().zip(vs) {
 				if start <= t && t <= end {
 					timestamps.push(t);
@@ -3193,8 +3199,9 @@ impl SegmentStore {
 	///
 	/// # Errors
 	///
-	/// Propagates a libSQL prune failure, a filesystem read error, or a
-	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
+	/// Propagates a libSQL prune failure, a filesystem read error, or a frame-decode
+	/// failure carrying a [`crate::FrameFaultError`] — the C5 fault class (`integrity`,
+	/// `newer_format` or `undecodable`) for a corrupt or unreadable `.weftseg`.
 	pub async fn read_point(&self, aspect: &str, t: i64) -> Result<Option<BigDecimal>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
@@ -3205,7 +3212,7 @@ impl SegmentStore {
 			// Streaming single-value read: prunes/skips the pages and value-column blocks a point
 			// lookup does not touch, unpacking only the one block covering `t` on a per-block codec
 			// (roadmap Phase 4/6). Equal to `…read_from(&bytes)?.value_at(t)` for every frame.
-			let hit = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_point(&bytes, t).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
+			let hit = frame_read::read_point(descriptor.path.as_str(), &bytes, t)?;
 			if hit.is_some() {
 				found = hit;
 			}
@@ -3228,8 +3235,9 @@ impl SegmentStore {
 	///
 	/// # Errors
 	///
-	/// Propagates a libSQL prune failure, a filesystem read error, or a
-	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
+	/// Propagates a libSQL prune failure, a filesystem read error, or a frame-decode
+	/// failure carrying a [`crate::FrameFaultError`] — the C5 fault class (`integrity`,
+	/// `newer_format` or `undecodable`) for a corrupt or unreadable `.weftseg`.
 	pub async fn read_points(&self, aspect: &str, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
@@ -3242,7 +3250,7 @@ impl SegmentStore {
 		let mut found = vec![None; ts.len()];
 		for descriptor in &descriptors {
 			let bytes = self.read_frame(descriptor).await?;
-			let hits = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))? } else { weft_physical_type::weftseg::read_segment_points(&bytes, ts).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))? };
+			let hits = frame_read::read_points(descriptor.path.as_str(), &bytes, ts)?;
 			// Later (higher seal-id) segments override earlier ones per instant — last-writer-wins.
 			for (slot, hit) in found.iter_mut().zip(hits) {
 				if hit.is_some() {
@@ -4239,8 +4247,9 @@ impl SegmentStore {
 	///
 	/// # Errors
 	///
-	/// Propagates a libSQL read failure, a filesystem read error, or a
-	/// [`weft_physical_type::weftseg::WeftSegError`] for a corrupt/unreadable `.weftseg`.
+	/// Propagates a libSQL read failure, a filesystem read error, or a frame-decode
+	/// failure carrying a [`crate::FrameFaultError`] — the C5 fault class (`integrity`,
+	/// `newer_format` or `undecodable`) for a corrupt or unreadable `.weftseg`.
 	pub async fn read_value_range(&self, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<(Vec<i64>, Vec<BigDecimal>)> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
@@ -4265,13 +4274,7 @@ impl SegmentStore {
 	/// rows aligned `(timestamps, values)` with `None` at every null row.
 	async fn decode_all(&self, descriptor: &SegmentDescriptor) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		let bytes = self.read_frame(descriptor).await?;
-		if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION {
-			let segment = PagedSegment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding paged segment {}: {e}", descriptor.path))?;
-			Ok(segment.decode_nullable())
-		} else {
-			let segment = Segment::read_from(&bytes).map_err(|e| anyhow::anyhow!("decoding segment {}: {e}", descriptor.path))?;
-			Ok(segment.decode_nullable())
-		}
+		Ok(frame_read::read_full(descriptor.path.as_str(), &bytes)?.decode_nullable())
 	}
 
 	/// Number of sealed segments recorded for `aspect`.
@@ -4692,7 +4695,7 @@ mod tests {
 
 	use serial_test::serial;
 	use tempfile::TempDir;
-	use weft_physical_type::{timestamp::TimeUnit, PhysicalType};
+	use weft_physical_type::{timestamp::TimeUnit, PhysicalType, PAGED_SEGMENT_FORMAT_VERSION};
 
 	use super::*;
 	use crate::{types::index_txn::TxnPoints, STORE_FORMAT_FILE};

@@ -16,6 +16,7 @@ pub use dataset::{Dataset, DatasetId};
 pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, DictionaryMetadata, Steps, Variability, VariablilityType};
 pub use dictionary_name::InvalidDictionaryName;
 pub use event::{Event, EventID, EventName, Events, Manifestation, ManifestationId};
+pub use frame_read::FrameFaultError;
 pub use input_measurement::InputMeasurement;
 pub use measurement::{Measurement, MeasurementId};
 pub use measurement_vector::MeasurementVector;
@@ -25,6 +26,7 @@ pub use partial_sidecar::{PartialSidecar, PartialSidecarPolicy, DEFAULT_PARTIAL_
 pub use pattern::{Pattern, PatternID};
 pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};
 pub use relative::Relative;
+pub use rows_mode::{discover, import_into, read_import_record, record_key, ImportRecord, ImportedAspect, LegacyAspect, LegacyTree, NotCarried, RowsModeError, DEFAULT_ROWS_PER_SEGMENT, IMPORT_RECORD_KEY, MEASUREMENTS_FILE, TIMESTAMP_COLUMN, TIMESTAMP_TIME_UNIT, TIMESTAMP_UNIT};
 pub use segment_index::SegmentIndexStore;
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
@@ -55,6 +57,7 @@ pub mod error;
 pub mod event;
 pub mod exec;
 pub(crate) mod frame_name;
+pub(crate) mod frame_read;
 pub(crate) mod index_txn;
 pub mod input_measurement;
 pub mod interpolate_range;
@@ -68,6 +71,7 @@ pub mod pattern;
 pub mod pipeline;
 pub(crate) mod reaper;
 pub mod relative;
+pub mod rows_mode;
 pub mod segment_index;
 pub mod segment_store;
 pub mod signal;

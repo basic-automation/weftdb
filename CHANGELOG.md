@@ -33,6 +33,20 @@ only the control plane, not the segment frames.
   it (unset or `poison` keeps the default); the library itself never exits the process
   (see the options entry under Changed). `SegmentStore::wait_until_poisoned()` and
   `subscribe_poison()` let an embedder do the same.
+- **A panic during a control-plane write ends the process** (robustness track ROB-2, release
+  plan C12, C22). `weftdb::exec::control_plane_write` already marks the region that the whole
+  `segment_index.db` write path runs in; the server now acts on it. `weft_server::panic_hook::install()`
+  is installed at startup immediately after the tracing subscriber, chained to the hook it
+  replaces so the panic is still reported with its message and location. A panic whose
+  panicking task is inside that region is written to stderr and the process
+  `std::process::abort()`s: the exit carries a signal a supervisor sees (SIGABRT) instead of
+  an HTTP status, and the restart that follows reopens the store under the engine's own crash
+  recovery, which is the component that can tell whether a commit was torn. A panic anywhere
+  else is reported and left unwinding, because wave 6's ROB-3 catch layer is the only layer
+  that catches panics. The hook does not write the poison marker — most of the region reads
+  before it writes, so a marker there would turn a benign panic into an outage lasting until
+  an operator deletes a file. `weft-server/tests/control_plane_panic.rs` proves both halves
+  by re-executing the test binary as a child, the way `poison_exit.rs` does.
 - **Store format marker and migration registry** (freeze design §4.3, FRE-12a). A
   segment store root now carries a `STORE_FORMAT` file (plain JSON: `layout_version`,
   `min_read_layout`, `min_write_layout`, `last_written_layout`, `migrating_to`,
@@ -69,9 +83,10 @@ only the control plane, not the segment frames.
 - `weftdb::exec::control_plane_write` and `weftdb::durable::poison_global()`
   (robustness track ROB-2): every segment-index transaction runs inside the
   task-local control-plane write scope, so a panic hook can tell a panic in the middle
-  of a control-plane write from one in a read, and the process-wide poison it would set
-  refuses every write of every store, as a store's own poison does, while reads go on.
-  It refuses every store open too (`weftdb::Poisoned`), since an open writes.
+  of a control-plane write from one in a read. `poison_global()` is a process-wide
+  poison that, once set, refuses every write of every store, as a store's own poison
+  does, while reads go on. It refuses every store open too (`weftdb::Poisoned`), since
+  an open writes.
 - `LOCK.holder` records the holder's host name and boot id beside its pid, and a
   second opener's error names the host (`… in use by pid 1 on host db-2 (session …)`).
   The short wait for a lock that a child being spawned still shares now applies only to
@@ -244,8 +259,129 @@ only the control plane, not the segment frames.
   process death with the exit code the supervisor sees, not a response body (FRE-6a).
   `ConvertError`, `ReduceError` and `SketchError` gained `#[non_exhaustive]`, so the mapping can
   grow without breaking a semver-minor release.
+- **An aspect name is checked twice — at creation and on use** (1.0 plan X-NAME; absorbs FRE-7a,
+  SEC-0). `weftdb::aspect_name::validate_new` adds the rules that only a name not in use yet can
+  still be held to: no ASCII uppercase letter, because `price` and `PRICE` are one and the same
+  file name on a case-insensitive or case-folding filesystem (NTFS, APFS by default, ext4 with
+  `casefold`), and the legacy `<aspect>-<id>.weftseg` scheme writes the aspect name into that name
+  literally — two aspects, one file, and the second one's frames are read as the first's. Only
+  `POST /api/v1/storage/aspects` applies it, because declaring is where a name is born: reads,
+  seals, maintenance and the store-wide sweep keep plain `validate`, so a store that already holds
+  `Price` is still readable, writable and compactable. A refusal carries
+  `code: "invalid_aspect_name"` and `details.reason`. The characters only Windows forbids
+  (`< > : " | ? *`) are deliberately **not** refused at creation on Unix while the aspect name is
+  still part of the file name — `job:rate5m` is a name in use — and that cross-platform hazard is
+  closed one layer down instead, where `aspect_name::encode` escapes `:` for the write-once frame
+  names (D-S10).
+- **Our executables say what allocator they run on** (1.0 plan PAC-3). `weft-server` and
+  `weft-tui` each declare `#[global_allocator] static ALLOCATOR: mimalloc::MiMalloc` in their own
+  `main.rs`, through a direct `mimalloc` dependency rather than one inherited from a library.
+  Same allocator, same version, same measured behaviour — the decision is just made in the place
+  that owns the process (see the dependency entry under Changed).
+- **Frame versions are a registry, and a frame says what it is** (1.0 plan X-FRAME; absorbs FRE-4,
+  TAG-2 and ROB-8's fault-class naming). `weft_physical_type::frame_registry` names the frame
+  layouts — `5` single-block, `6` paged, `7` envelope — on the rule stated there that a number is
+  never reused or renumbered once it has shipped. The v7 envelope is a header and a trailer around
+  a frame stored **verbatim**: `WEFTSEG | u16 7 | u16 body_version | extension table | frame |
+  crc32`, 16 bytes of overhead (a 12-byte header plus the trailer), so a v5 or v6 body keeps every
+  byte-for-byte expectation a released server already holds while a reader gains somewhere to put
+  material in front of a body it is not allowed to change. An extension is `{id, critical,
+  payload}`: a reader that does not know a **critical** one refuses the frame, because that body
+  was written on the assumption that the extension would be applied, and an optional one is
+  ignored. The set this build implements (`KNOWN_EXTENSIONS`) is deliberately empty — the envelope
+  ships with no extensions, and a number invented before there is a feature behind it can never be
+  taken back. `describe_frame`, `frame_layout_of`, `wrap_frame_envelope`/`unwrap_frame_envelope`
+  and the layout-aware readers `read_frame_segment`, `read_frame_paged_segment`, `read_frame_point`,
+  `read_frame_points`, `read_frame_range` and `read_frame_range_physical` read a frame without the
+  caller knowing how it is framed, and `frame_fault_of` gives the class an operator acts on (plan
+  C5): `Integrity`, the bytes are damaged, or `Undecodable { newer_format }`, this binary is behind
+  the file. `SegmentStore` picks its reader from the frame's own header rather than the
+  `format_version` it recorded in the index row, where any value that was not `6` used to send a
+  paged frame into the single-block decoder; the decode failures it returns carry
+  `weftdb::FrameFaultError` in the `anyhow` chain under the `decoding [paged ]segment <path>: …`
+  sentence they have always produced. Over HTTP that is C5: a frame this build has no reader for is
+  `503 incompatible_store`, and any other frame that will not decode is `500 frame_undecodable`,
+  the code X-ERR gave a wire sentence but no producer. **No writer opts into the envelope yet** —
+  seals keep writing 5 and 6 — so this is the mechanism, not a format change.
+- **A WeftDB 0.1.x data directory is refused, not quietly emptied** (1.0 plan FRE-14, first half).
+  A 0.1.x root keeps one database per aspect — `metadata.db` at the top and
+  `<subject>/<aspect>/measurements.db` two levels down — and that `metadata.db` is one of
+  `weftdb::CONTROL_PLANE_FILES`, so opening such a root used to **succeed**: it found a control
+  plane, created the three databases it was missing, added `segments/`, wrote a `STORE_FORMAT`
+  marker beside the old data, and reported an **empty** store with no error anywhere. Before any
+  database is opened, `SegmentStore::open` now recognises the shape and returns
+  `StoreError::RowsModeDataDirectory { aspects }`, naming each `<subject>/<aspect>` pair in path
+  order. It rides X-ERR's existing mapping — `503 incompatible_store`, CLI exit 65 — so there is no
+  new status code. The refusal writes nothing but `LOCK` and `LOCK.holder`: the test asserts the
+  file set is otherwise unchanged, that no marker is added, and that a second open refuses the same
+  way. Turning those rows into frames is the second half of FRE-14, below.
+- **A WeftDB 0.1.x data directory can be read into a store** (1.0 plan FRE-14, second half).
+  `weftdb::rows_mode` reads the rows-mode tree the refusal above names. `discover` reports the
+  series under `<subject>/<aspect>/measurements.db` — row count, span, how many rows share an
+  instant — and lists, with a reason, everything it will not carry: the `metadata.db` catalog,
+  the databases 0.1.x kept beside the rows, and the `dictionaries/` directories. An aspect's name
+  comes from its **directory**, not from the database: `measurements.db` holds only
+  `(id, dataset_id, timestamp, value)` — 0.1.x's own DDL (`weftdb/src/types/aspect.rs` in the
+  `v0.1.0` tag) — so the directory is the only record of what a series is called. The value column
+  has to be the `value` that DDL created: a database that names it after the aspect is refused, not
+  read, because an aspect called `dataset_id` would otherwise be read out of the column holding its
+  identifiers. `import_into` reads
+  one subject into the store scoped to that `(database, subject)` pair, declares each aspect under
+  the narrowest encoding that holds its values exactly (tolerance zero, `recommend_encoding` — the
+  reading trades no precision across the version boundary), seals the rows in batches
+  (`rows_per_segment`, default `DEFAULT_ROWS_PER_SEGMENT`) without ever splitting a group of rows that
+  share one instant across two segments — the store folds two segments whose windows intersect and
+  keeps the newer row at an instant they share, so a group cut in two would lose rows in a compaction
+  the reading does not control; a segment can therefore come out a few rows longer than asked. The
+  reading then writes an `ImportRecord` into the
+  store's own index under `rows_mode_import:<database>:<subject>`; `read_import_record` reads it
+  back after a reopen. That record is what stops the same tree being read twice
+  (`RowsModeError::AlreadyImported`), because after the fact a migrated row and a row the store
+  sealed itself are indistinguishable — so an aspect that already holds segments refuses first
+  (`AspectNotEmpty`), as does a tree whose database directory is not the store's database
+  (`ScopeMismatch`: 0.1.x puts its database only in the path, so the path is the only thing that
+  can say where a tree belongs). Timestamps are `Millis` and cross unchanged: 0.1.x stamped
+  `timestamp_millis()` into an `INTEGER`, and the `resolution` its catalog records is the sampling
+  grid, not a unit, so there is nothing to infer and nothing is inferred. A value cell that is not
+  the text of a decimal stops the read and quotes the row (`ValueNotDecimal`) rather than putting
+  a number nobody can vouch for into the store. The tree keeps its bytes: each `measurements.db`
+  is opened bare, not through the control plane's `connect`, which switches journal mode and so
+  writes; the test compares every file it found, byte for byte, after the reading. The aspect list is
+  written one aspect at a time and its record last, so a reading that stops partway leaves the aspects
+  that already crossed in the store with nothing recorded — the next attempt refuses on `AspectNotEmpty`
+  rather than finishing the job, and saying what an operator does then is the remaining part of FRE-14:
+  the route an operator runs from the command line or the server, the numbered migrations that register
+  `metadata.db`'s schema, and a reading of a tree too big to hold one aspect in memory.
 
 ### Changed
+
+- **Library crates stop deciding their users' allocator and GPU stack** (1.0 plan PAC-3). No
+  library in this workspace enables turso's `mimalloc` feature or splimes' default `gpu` feature
+  any more, because both are decisions a dependency makes for the whole process. turso 0.8.1
+  installs a `#[global_allocator]` in its own crate root when `mimalloc` is on, so every program
+  linking `weftdb` — an embedder with its own allocator, a program that wants the system one — was
+  switched to mimalloc without being asked; `gpu` drags `wgpu`, and with it the Vulkan, Metal and
+  DX12 backends, into the graph of everything that depends on splimes. Counting the distinct
+  packages in each crate's non-dev dependency graph, before and after: `weft-line-protocol` and
+  `weft-reduce` 77 → 25, `weftdb` 266 → 227, `weft-orchestration` 267 → 231. Our own GPU users —
+  `weft-server` and `weft-bench`, which call `prewarm_gpu`, `calibrate` and `gpu_pool_stats` —
+  enable `gpu` themselves, as do `weftdb`'s interpolation benches through a dev-dependency, so
+  nothing this repository runs lost its GPU path. A library user who wants either asks for it: an
+  allocator by declaring one in their own binary, the GPU by enabling `splimes/gpu`. ⚠️ Rust code
+  that reached the GPU *through* `weftdb` — a `splimes::Backend::Gpu` while depending on `weftdb`
+  alone — names `splimes` itself now. One default stays on deliberately: splimes' `serde`, because
+  `weftdb::BatchedMeasurement` derives `Serialize`/`Deserialize` over a `splimes::Resolution` field.
+  turso's other default, `fts`, stays off, as it already was: it is turso's full-text search, and
+  turning it on grows the graph with tantivy, tantivy-columnar, zstd-sys and the rest of that tree,
+  which the first attempt at this dependency line showed in the lock diff.
+  One number to be aware of: `cargo bench -p weftdb` is criterion, not test code, so it used to
+  inherit mimalloc through turso and now runs on the system allocator — a `weftdb` bench figure
+  from before this release is not comparable with one taken after. `weft-bench` never linked
+  `weftdb` and never had mimalloc, so the Weft-Bench series, including the nightly regression
+  track, does not move.
+- **`tracing-subscriber` is a dev-dependency of `weftdb`, not a dependency.** No code in the
+  library installs a subscriber outside `#[cfg(test)]`, so every program linking `weftdb` was
+  building registry, fmt and env-filter code it never called.
 
 - **Statuses split where the §4 table names a different condition** (1.0 plan X-ERR). A batch
   that will not seal under an aspect's declared schema no longer answers `400` whatever the
