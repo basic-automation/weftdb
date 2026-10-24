@@ -1,11 +1,12 @@
 [package]
 name = "weft-orchestration"
-version.workspace = true
-edition = "2021"
+version = "0.1.0"
+edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/weft-orchestration"
 readme = "README.md"
 description = "Analytics pipeline for WeftDB: batching, pattern extraction, event detection, correlation and signal generation over stored aspects."
 keywords = ["timeseries", "pipeline", "analytics", "anomaly", "weftdb"]

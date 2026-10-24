@@ -1,11 +1,12 @@
 [package]
 name = "weft-physical-type"
-version.workspace = true
-edition = "2021"
+version = "0.1.0"
+edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/weft-physical-type"
 readme = "README.md"
 description = "Declared physical numeric encodings for time-series values. BigDecimal stays the logical type; downcasting is explicit and reports exactness, never a silent precision loss."
 keywords = ["timeseries", "encoding", "decimal", "precision", "columnar"]
