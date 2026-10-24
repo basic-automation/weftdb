@@ -217,9 +217,15 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 
 ### Execution waves (W0–W15)
 
-Wave W0 is closed: in-flight work was merged to main, the shapes S6 and S7 depend on were locked, and the v0.1.0 baseline release was cut with one fixture set written by that binary. That wave landed the durability slices D-S3, D-S5 (with SEC-1's backup-label grammar), D-S6, D-S7 and D-S18, the release pipeline (PAC-1a), and the canonical `TagSet`, `SeriesKey` and `SeriesSelector` types (TAG-1). The owner steps are done too: GitHub private vulnerability reporting is on and the stale draft prerelease is gone.
+Later waves landed the v0.1.0 baseline release (PAC-4, a GitHub release only) with one fixture set written by that binary (X-FX), and the stale draft prerelease was deleted. The server and store lanes followed: the `manage.rs` and `main.rs` split (X-SPLIT-SRV), write-once maintenance II (D-S9), the configuration registry skeleton (PAC-5a), the single error envelope and code table (X-ERR), `aspect_name::encode` and `validate_new` at declare (X-NAME), storage-engine panic fail-stop (ROB-2), and the frame registry with its v7 envelope (X-FRAME).
 
-Later waves have also landed on main: write-once maintenance II (D-S9), the stripped dist profile with a third-party licence bundle (PAC-1b), the `manage.rs` and `main.rs` split (X-SPLIT-SRV), the configuration registry skeleton (PAC-5a), the single error envelope and code table (X-ERR), `aspect_name::encode` and `validate_new` at declare (X-NAME), storage-engine panic fail-stop (ROB-2), library crate hygiene (PAC-3), and the frame registry with its v7 envelope (X-FRAME). The remaining waves and open lanes are listed below.
+On packaging, PAC-1b added the stripped dist profile with a third-party licence bundle, and PAC-3 stopped the library crates imposing a global allocator or wgpu features on their users. The remaining waves and open lanes are listed below.
+
+- [x] **W0 · Land in-flight work and lock the shapes S6/S7 depend on**
+
+  In-flight work is merged: INT-0 landed the splimes-1, legal and durability branches into main. The store lane's shapes are locked and implemented: Storage-v2 open hardening (D-S3), atomic backup publish with manifest, retention and drill hygiene plus the backup-label grammar (D-S5, SEC-1), legacy rows-mode hygiene (D-S18), schema v2 with `IndexTxn`, write poison and root-relative frame paths (D-S6), and the persistent per-aspect id allocator with commit and maintenance locks and plain INSERT for seals (D-S7). Decision 1 records the store shapes S6 and S7 rely on.
+
+  On the release and identity side, the release pipeline (PAC-1a) and the canonical `TagSet`, `SeriesKey` and `SeriesSelector` types with their frozen caps (TAG-1) are in, and GitHub private vulnerability reporting is turned on (owner step).
 
 - [ ] **W1 · Baseline release, server split, goldens**
   - [ ] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
@@ -443,6 +449,10 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **(2026-09-23 list; item 3 shipped 2026-10-08.)** The 2026-09-23 run closed both cheap backup
 - [ ] **POSITIONING ALERT — WeftDB's precision wedge now has a direct competitor (research 2026-09-23).**
   - [ ] **NEXT — the remaining 6.3×:**
+    - [x] **DONE (2026-10-09, sub-items below) — the `avg` division was the biggest piece of `reduce_scaled`:**
+
+      One idea, 19 digits per `u128` division, was tried and gave no win. What worked was a single `BigUint` multiply and one division per non-terminating average.
+
   - [ ] **NEXT — the sidecar build.**
   - [ ] *(original item)* **a `ScaledI64`-native reduction fast path in `weft-reduce`:**
 - [ ] **External-engine adapter fairness — three concrete rules from the 2026 landscape.**
@@ -460,6 +470,10 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:**
 - [ ] **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):**
 - [ ] **NEXT — UDDSketch (uniform guarantee under collapse):**
+- [x] **DONE (2026-07-18) — materialize per-segment partials at seal time (the highest-value
+
+  Per-segment `.weftpart` sidecars are written at seal time at a declared base resolution. `downsample_range` merges the sidecars instead of decoding whenever every requested reduction allows it, a fine base can be re-bucketed to a coarser resolution, and the sidecars stay consistent across segment rewrites.
+
 - [ ] **NEXT — (3c) materialized tiers, remaining:**
 - [ ] **Positioning — WeftDB's `.weftpart` sidecar IS the "incremental materialized view", and mergeable
 - [ ] **NEXT — materialize the sidecar at a coarser DEFAULT + adopt sketches:**
