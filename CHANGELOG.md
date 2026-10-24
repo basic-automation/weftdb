@@ -889,6 +889,19 @@ only the control plane, not the segment frames.
   segment gets the segment's scale back on its zeros when it is loaded. One it wrote for
   a segment of another physical type still reads back with those scales lost: nothing
   rebuilds it unless maintenance rewrites the segment.
+- **A checked-out v0.1.0 fixture was not the tree the release wrote.** Rows-mode gave every
+  aspect an empty `dictionaries/` directory beside its `measurements.db`
+  (`v0.1.0:weftdb/src/types/aspect.rs:252`), and an empty directory is the one artifact git
+  cannot store. `MANIFEST.sha256` hashes files, so it names none of them and reports no gap
+  when they are absent: the 109 files came back complete from a fresh checkout — the negation
+  that recovered what `.gitignore` ate accounts for every one — and the three directories did
+  not. The readable leg of the rows-mode work names what it leaves behind, and one path it must
+  name is `plant/price/dictionaries`, so `weftdb/tests/compat_v010.rs` failed on all three CI
+  platforms and passed on any machine that had run the generator: evidence that depended on the
+  machine reading it. The test now restores the directories on the copy it reads, one beside
+  every `measurements.db` it finds, derived from the tree rather than from a list of aspects —
+  so a fixture that grows an aspect grows its directory without anyone editing the test, and the
+  committed tree stays exactly the bytes the release wrote.
 
 ### Security
 
