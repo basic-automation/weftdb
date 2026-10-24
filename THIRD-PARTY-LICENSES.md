@@ -10765,7 +10765,7 @@ Used by:
     https://github.com/tokio-rs/tokio
   * tokio-util 0.7.19
     https://github.com/tokio-rs/tokio
-  * tokio 1.53.2
+  * tokio 1.53.3
     https://github.com/tokio-rs/tokio
 
 MIT License
