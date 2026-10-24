@@ -10,22 +10,35 @@
 # Requires `cargo login` (or CARGO_REGISTRY_TOKEN in the environment). Run --execute
 # from a checkout of the release tag, after the tag is pushed (RELEASING.md).
 #
-# weft-server, weft-tui and weft-bench are `publish = false`: they ship as GitHub
-# release binaries, not registry crates.
+# Which crates this publishes, and in what order, is read from the manifests rather than
+# copied into this file: `scripts/crates/check.py publish-order` prints every member the
+# registry is allowed to carry, dependencies first. A new member therefore joins this run
+# on its own, and a `publish = false` member — weft-server, weft-tui, weft-bench, which
+# ship as GitHub release binaries — can never join it by accident. The same checker's
+# `check` runs as the `crates` CI job, so the metadata the registry is about to be handed
+# is asserted on the PR instead of at the tag.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Dependency order, leaves first.
-CRATES=(
-	weft-physical-type
-	weft-reduce
-	weft-line-protocol
-	weft-arrow
-	weftdb
-	weft-arrow-store
-	weft-orchestration
-)
+CHECK="scripts/crates/check.py"
+
+# Better to stop here than halfway through a partial release: a crate whose version
+# requirement is out of step with the member it names uploads, and then cannot be resolved.
+if ! python3 "$CHECK" check; then
+	echo "refusing to publish: the per-crate release metadata is out of step (the lines above name it)" >&2
+	exit 1
+fi
+
+# `while read`, not `mapfile`: the operator's shell may be the bash 3.2 that macOS ships.
+CRATES=()
+while IFS= read -r crate; do
+	CRATES+=("$crate")
+done < <(python3 "$CHECK" publish-order)
+if [[ ${#CRATES[@]} -eq 0 ]]; then
+	echo "no member of this workspace is publishable, which is not a library release" >&2
+	exit 1
+fi
 
 EXECUTE=0
 [[ "${1:-}" == "--execute" ]] && EXECUTE=1

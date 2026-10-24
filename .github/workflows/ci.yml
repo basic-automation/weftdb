@@ -228,6 +228,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo package --workspace --no-verify --locked
 
+  # The job above proves each crate builds from its own tarball. This one proves the
+  # metadata that decides *what gets published at all* is true: `publish = false` on the
+  # three binaries, an explicit version per crate, exactly one edition across the
+  # workspace, a versioned requirement on every internal path dependency, and a README
+  # and both license texts inside each published crate directory. `scripts/publish.sh`
+  # runs the same check before it uploads anything, so the mistake becomes a red check
+  # rather than a release that has to be yanked.
+  crates:
+    name: crate metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s scripts/crates -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      - run: python3 scripts/crates/check.py check
+
   # Advisories (vulnerable / unmaintained / unsound / yanked), license allow-list,
   # banned wildcards, and crates.io-only sources. Policy lives in deny.toml.
   deny:
