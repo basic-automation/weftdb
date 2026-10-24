@@ -1,9 +1,14 @@
 # Releasing WeftDB
 
-Two artifacts come out of a release: the library crates on crates.io, and the
+Two artifacts can come out of a release: the library crates on crates.io, and the
 cross-platform binaries on the GitHub release. They are separate steps on purpose. In
 order: prepare, dry-run the binaries, tag (which drafts the GitHub release), publish
 the crates, then publish the GitHub release.
+
+The library crates are not on crates.io yet: v0.1.0 was a binaries-only baseline and
+published none, and the crates go up with the 1.0 cut. Everything below is written for
+the release that does publish them, and `scripts/publish.sh` refuses to upload anything
+whose metadata is out of step (see [Which crates are published](#which-crates-are-published)).
 
 ## 0. Before the first release
 
@@ -36,14 +41,22 @@ cargo package --workspace --no-verify
 
 Then:
 
-1. Bump `version` in `[workspace.package]` of the root `Cargo.toml`. Every crate
-   inherits it with `version.workspace = true`, so they release in lockstep.
-2. Bump the `version = "x.y.z"` on the internal `[workspace.dependencies]` path
-   entries in the same file — they carry an explicit version for crates.io.
+1. Bump `version` in the `[package]` section of every crate this release changes. Each
+   crate carries its own version — a patch of one library is not a reason to put a number
+   on nine crates that did not change. `weft-server`'s version is the one the tag names:
+   `scripts/release/verify.sh` reads it and refuses a tag that disagrees, so bump it in
+   every release, changelog or not.
+2. Bump the `version = "x.y.z"` on the internal `[workspace.dependencies]` path entries
+   that name a crate you just bumped, in the same commit. Cargo refuses to package the
+   mismatch and tells you the pair; `python3 scripts/crates/check.py check` says it before
+   that, and names the file and line. A requirement for a crate you did not bump is fine —
+   `0.1.0` is what a `^0.1.0` asks for — but a requirement that no longer admits the
+   member's version is a release that cannot be published.
 3. Move the `## [Unreleased]` items in `CHANGELOG.md` under a new `## [x.y.z] - DATE`
    heading, and update the link definitions at the bottom. The release workflow reads
    this section verbatim for the GitHub release notes and **fails if it is missing**.
-4. Commit, open a PR, merge once CI is green.
+4. Commit, open a PR, merge once CI is green. The `crates` job runs the same checker as
+   step 2, so a version that drifted from its requirements fails there rather than at the tag.
 
 The release compiler is pinned in `.github/release-toolchain`. CI's stable jobs read the
 same file, so the compiler that builds a release is the one CI tested (the build is not
@@ -181,8 +194,9 @@ v0.1.0 is a binaries-only baseline release and publishes no crates: skip this se
 for it and go on to section 5.
 
 Order matters: crates.io resolves path dependencies by version, so nothing can be
-published before its dependencies are on the registry. `scripts/publish.sh` encodes
-the order.
+published before its dependencies are on the registry. `scripts/publish.sh` asks the
+manifests for the order — `python3 scripts/crates/check.py publish-order` prints it on
+its own — and runs the same `check` the `crates` CI job runs before it uploads anything.
 
 ```bash
 ./scripts/publish.sh              # dry run, uploads nothing
@@ -241,6 +255,12 @@ shellcheck.
 
 ## Which crates are published
 
+A crate publishes unless its manifest says `publish = false`, and the list is read from
+the manifests rather than kept beside them: `scripts/publish.sh` takes both the members
+and their order from `scripts/crates/check.py publish-order`, and a hand-written list
+somewhere else is how a crate joins the workspace and then never joins the registry.
+As of writing that is:
+
 Published: `weft-physical-type`, `weft-reduce`, `weft-line-protocol`,
 `weft-arrow`, `weftdb`, `weft-arrow-store`, `weft-orchestration`.
 
@@ -251,3 +271,15 @@ splimes release.
 
 Not published (`publish = false`): `weft-server`, `weft-tui`, `weft-bench`. They are
 binaries and ship as release artifacts instead.
+
+`scripts/crates/check.py check` — in CI as the `crates` job, and inside `publish.sh`
+before any upload — is what makes that sentence true. It checks the two halves of the
+split are named and not merely implied; that every crate declares its own version, that
+the workspace declares one `edition` and no crate argues with it, and that each published
+crate directory holds what a crates.io page is built from: a `README.md` — a library's page
+should describe the library, so it does not inherit the repository README — both license
+texts its `license` expression promises, and a `documentation` URL pointing at its docs.rs.
+It also checks each internal path dependency carries a version requirement that the member's
+own version satisfies, because that is the failure that shows up as an upload error naming
+the workspace instead of the line that caused it. `scripts/crates/test_check.py` holds its
+tests, including the one that runs it against this repository.

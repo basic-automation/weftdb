@@ -37,7 +37,7 @@ pass either way — if a test only passes with a GPU, that's a bug in the test.
 | `test` | `cargo test --workspace -- --test-threads=4` on Linux, macOS and Windows |
 | `docs` | `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS=-D warnings` |
 | `package` | `cargo package --workspace --no-verify` |
-| `contrib` | `python3 -m unittest discover -s scripts/contrib -p 'test_*.py'` (tests for the contribution-terms checker) |
+| `crates` | `python3 scripts/crates/check.py check` — per-crate versions, one edition, the publish split, and the metadata a crates.io upload needs ([below](#per-crate-release-metadata)) || `contrib` | `python3 -m unittest discover -s scripts/contrib -p 'test_*.py'` (tests for the contribution-terms checker) |
 | `contribution-terms` | a DCO sign-off on every commit, or a signed CLA ([below](#contribution-terms)); a separate workflow, `contribution-terms.yml` |
 
 Two notes on the gates:
@@ -208,3 +208,26 @@ author and the sign-off together:
 ## Releasing
 
 See [`RELEASING.md`](RELEASING.md).
+
+### Per-crate release metadata
+
+Each crate carries its own `version`, and the workspace sets exactly one `edition`. The
+point is that a release is a statement about specific crates: shipping a patch of
+`weft-line-protocol` should not put a phantom `1.0.1` on nine crates that did not change,
+and moving to a new Rust edition should be one edit in the root manifest rather than ten
+forgettable ones.
+
+Two consequences for a change that touches a manifest:
+
+- A path dependency on a sibling needs a version requirement — `weftdb = { path = "./weftdb",
+  version = "0.1.0" }` in `[workspace.dependencies]` — because crates.io resolves a
+  dependency by version, and an upload without a requirement fails with a message about the
+  workspace rather than about your line.
+- Bumping a crate means bumping the requirements that name it in the same commit. `cargo`
+  refuses to package the mismatch and `scripts/crates/check.py check` says which line, but
+  the version that reaches a user is decided here, not by the registry.
+
+The same script is what `scripts/publish.sh` runs before it uploads anything, and
+`python3 scripts/crates/check.py publish-order` prints the crates in dependency order — the
+list and the order both come from the manifests, so a new crate is in the release the day it
+joins the workspace. `scripts/crates/test_check.py` holds the checker's own tests.

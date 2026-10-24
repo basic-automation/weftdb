@@ -202,7 +202,7 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 - [ ] **Public surface declared and frozen**
 - [ ] **Compatibility tests**
 - [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
-- [ ] **Crate publishing split**
+- [x] **Crate publishing split**
 - [ ] **Panic audit on server paths**
 - [ ] **Security process**
   - [ ] **Private vulnerability reporting is off**
@@ -222,7 +222,7 @@ Wave W0 is closed: in-flight work was merged to main, the shapes S6 and S7 depen
 Later waves have also landed on main: write-once maintenance II (D-S9), the stripped dist profile with a third-party licence bundle (PAC-1b), the `manage.rs` and `main.rs` split (X-SPLIT-SRV), the configuration registry skeleton (PAC-5a), the single error envelope and code table (X-ERR), `aspect_name::encode` and `validate_new` at declare (X-NAME), storage-engine panic fail-stop (ROB-2), library crate hygiene (PAC-3), and the frame registry with its v7 envelope (X-FRAME). The remaining waves and open lanes are listed below.
 
 - [ ] **W1 · Baseline release, server split, goldens**
-  - [ ] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
+  - [x] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
   - [ ] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
   - [ ] **TAG-3** Open `ValueKind` in weftdb, provenance scope
   - [ ] **EVI-1** Claims hygiene

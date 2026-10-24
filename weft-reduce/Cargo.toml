@@ -1,11 +1,12 @@
 [package]
 name = "weft-reduce"
-version.workspace = true
-edition = "2021"
+version = "0.1.0"
+edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/weft-reduce"
 readme = "README.md"
 description = "Time-series downsampling reductions (min/max/avg/sum/first/last and time-weighted averages) over an epoch-aligned bucket grid, in BigDecimal."
 keywords = ["timeseries", "downsampling", "aggregation", "rollup", "bucket"]
