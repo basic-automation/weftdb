@@ -355,6 +355,19 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **`tokio` is 1.53.3, not 1.53.2.** RustSec advisory RUSTSEC-2026-0386 (`unsound`) reports that
+  `AsyncFd`'s safe constructors — `new`, `with_interest`, `try_new`, `try_with_interest` — accept
+  any `T: AsRawFd` rather than proof that the caller owns the descriptor, and that a descriptor
+  duplicated and then closed while an `AsyncFd` is live can leave a freed registration behind in
+  `epoll`'s user data, which is a use-after-free when a readiness event fires. Tokio deprecates
+  those constructors in favour of `AsyncFd::register` from 1.51.6 and 1.53.3, so the fix here is a
+  patch release: the lockfile moves one version and one checksum, and no API this workspace calls
+  changed name or signature. Nothing in this repository constructs an `AsyncFd` — `grep -rn AsyncFd
+  --include='*.rs' .` finds no match — but `weftdb` and `weft-server` both link tokio directly and
+  everything else reaches it through turso, axum, hyper-util, tonic and reqwest, so every release
+  archive built before this commit carried the flagged version. `deny.toml` keeps
+  `[advisories] ignore = []`: an advisory that names a released fix is upgraded, not muted.
+
 - **Library crates stop deciding their users' allocator and GPU stack** (1.0 plan PAC-3). No
   library in this workspace enables turso's `mimalloc` feature or splimes' default `gpu` feature
   any more, because both are decisions a dependency makes for the whole process. turso 0.8.1
