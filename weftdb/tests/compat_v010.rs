@@ -43,6 +43,7 @@ fn fixture() -> PathBuf {
 /// Every test works on a copy: opening a store writes to it (the format marker, the
 /// migrations, the lock), and the checked-in trees must stay exactly as the release left
 /// them so a later run compares against the same bytes.
+/// Copy a fixture tree into a writable directory, so a test can migrate it.
 fn copy_tree(from: &Path, to: &Path) {
 	std::fs::create_dir_all(to).expect("creating the copy root");
 	let mut pending = vec![(from.to_path_buf(), to.to_path_buf())];
@@ -59,6 +60,40 @@ fn copy_tree(from: &Path, to: &Path) {
 			}
 		}
 	}
+}
+
+/// Materialise the one part of a rows-mode tree that a git checkout cannot carry.
+///
+/// v0.1.0 gave every aspect an empty `dictionaries/` beside its `measurements.db` —
+/// `create_dir_all(&dictionaries_path)` at `v0.1.0:weftdb/src/types/aspect.rs:252` — and an
+/// empty directory is the one thing a checkout cannot reproduce: `MANIFEST.sha256` freezes
+/// 109 files and every one of them is here byte for byte, but the three `dictionaries`
+/// directories exist only in the tree the generator ran in. A test that reads this fixture
+/// is therefore reading a tree with three directories the release always wrote, which is how
+/// `the_v010_rows_mode_tree_reads_into_a_store_of_its_own_database` came to fail on a runner
+/// and nowhere else. 1636778 restored the files `.gitignore` ate from these same trees; this
+/// restores the directories git has no way to store. Applied to the copy, so the committed
+/// tree stays exactly what the release wrote.
+///
+/// The list is read from the tree rather than written out: a `dictionaries` directory belongs
+/// beside every `measurements.db`, so a fixture that gains an aspect gains its directory here
+/// without anyone remembering to update a list.
+fn restore_uncarried_directories(tree: &Path) {
+	let mut restored = 0;
+	let mut subjects = vec![tree.to_path_buf()];
+	while let Some(subject) = subjects.pop() {
+		for entry in std::fs::read_dir(&subject).unwrap_or_else(|err| panic!("reading {}: {err}", subject.display())) {
+			let path = entry.expect("a readable directory entry").path();
+			if path.is_dir() {
+				if path.join("measurements.db").is_file() {
+					std::fs::create_dir_all(path.join("dictionaries")).expect("creating a restored dictionaries directory");
+					restored += 1;
+				}
+				subjects.push(path);
+			}
+		}
+	}
+	assert!(restored > 0, "no aspect directory under {} held a measurements.db, so this helper's idea of a rows-mode tree is stale", tree.display());
 }
 
 /// A decimal as canonical text, so a scale difference is not mistaken for a different
@@ -288,6 +323,7 @@ async fn a_v010_rows_mode_directory_is_refused_and_writes_nothing() {
 	let dir = tempfile::tempdir().unwrap();
 	let root = dir.path().join("plant-data");
 	copy_tree(&source, &root);
+	restore_uncarried_directories(&root);
 	let before = files_under(&root);
 
 	let error = match SegmentStore::open(&root).await {
@@ -456,6 +492,7 @@ async fn the_v010_rows_mode_tree_reads_into_a_store_of_its_own_database() {
 	let dir = tempfile::tempdir().unwrap();
 	let tree = dir.path().join("v010_legacy");
 	copy_tree(&source, &tree);
+	restore_uncarried_directories(&tree);
 
 	let found = weftdb::rows_mode::discover(&tree).await.expect("the tree the release wrote is a tree this build can read");
 	assert_eq!(found.database, "v010_legacy", "0.1.x named its database by that top directory, and that name is what the store's scope takes");
