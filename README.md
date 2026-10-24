@@ -215,7 +215,7 @@ release upgrades one way.
 | Storage engine, interpolation, HTTP API, Arrow/Parquet | Working, tested, benchmarked |
 | Backup & restore (control plane) | Working, with verification and a rehearsal drill |
 | Observability — Prometheus metrics, OpenTelemetry traces | Working |
-| Crash consistency — power-loss durability, crash-safe maintenance | In progress ([design](docs/design/crash-consistency.md)) |
+| Crash consistency — power-loss durability, crash-safe maintenance | In progress ([design](https://basicautomation.io/projects/weftdb/docs/crash-consistency)) |
 | **Security — TLS, auth, RBAC, audit logs** | **Not started** |
 | Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0, on GitHub |
 | Library crates on crates.io | Not published yet |
@@ -312,7 +312,7 @@ gitignored file, **not distributed with this repository** and not required to bu
 the suite skips the tests that use it when it is absent, and so do the benches that load it by
 default. Every "real BTC" figure in this README comes from it, so none of them can be reproduced
 from a clone. Whether those numbers are cleared for publication or retired is an open item with
-counsel before 1.0 ([1.0 plan, Appendix B](docs/release/1.0-plan.md#appendix-b-human-only-tasks)).
+counsel before 1.0 ([1.0 plan, Appendix B](https://basicautomation.io/projects/weftdb/docs/release-plan#appendix-b-human-only-tasks)).
 The ingest figure is quoted anyway because a *synthetic* generator materially flatters the
 result: on the same workload the generated corpus reports **1.71 bytes/point against the real
 4.22**, roughly 2.5× too optimistic. Storage numbers measured on generated data are not reported

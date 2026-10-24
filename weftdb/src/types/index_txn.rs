@@ -1,4 +1,4 @@
-//! Atomic multi-op `segment_index.db` transactions (docs/design/crash-consistency.md
+//! Atomic multi-op `segment_index.db` transactions (basicautomation.io/projects/weftdb/docs/crash-consistency
 //! section 5.1, `IndexTxn`; slice S6).
 //!
 //! Every state change of the write-once design commits exactly one `segment_index.db`

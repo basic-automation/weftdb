@@ -36,7 +36,7 @@
 //! no stable row count to compare to while it is being written. Both modes also require
 //! the database's expected table set, so an empty file never passes.
 //!
-//! # Backup directories (docs/design/crash-consistency.md section 9)
+//! # Backup directories (basicautomation.io/projects/weftdb/docs/crash-consistency section 9)
 //!
 //! A backup directory is visible under its final name only once it is complete and
 //! durable. [`SegmentStore::backup_control_plane`](crate::SegmentStore::backup_control_plane)

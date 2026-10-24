@@ -21,7 +21,7 @@
 //!   `commit_failed`, so a caller knows a retry is safe.
 //!
 //! **The code table** is the contract, not this module's opinion: [`Code`] is the table in
-//! `docs/release/1.0-plan.md` §4 (C6), and a test asserts every code's status against it.
+//! `basicautomation.io/projects/weftdb/docs/release-plan` §4 (C6), and a test asserts every code's status against it.
 //! The set is *open* — later slices (SEC, ROB, TAG) add codes for conditions that have no
 //! route yet — and `#[non_exhaustive]` says so to downstream matches. Codes the tracks used
 //! for the same condition (`invalid_request`, `unauthorized`, `store_unconfigured`,
@@ -52,7 +52,7 @@ use axum::{
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
-/// A machine-readable error condition, from the single table in `docs/release/1.0-plan.md` §4 (C6).
+/// A machine-readable error condition, from the single table in `basicautomation.io/projects/weftdb/docs/release-plan` §4 (C6).
 ///
 /// Every HTTP error this server produces names exactly one of these, and the status comes from
 /// the code rather than from the call site, so one condition cannot be a `409` on one route and

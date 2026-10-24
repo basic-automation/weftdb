@@ -1,4 +1,4 @@
-//! Crash-consistency S8 and S9: write-once maintenance (docs/design/crash-consistency.md
+//! Crash-consistency S8 and S9: write-once maintenance (basicautomation.io/projects/weftdb/docs/crash-consistency
 //! sections 5.3-5.4) for `reconcile_segment` and `split_segment` (S8), and for the
 //! overlap merge, squash and size-targeted compaction (S9).
 

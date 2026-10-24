@@ -24,7 +24,7 @@
 //! **Schema.** The open runs no DDL of its own: the tables are the migration registry's
 //! (`migrations`), which a [`SegmentStore`](crate::SegmentStore) runs once all four of its
 //! databases are open and its `STORE_FORMAT` gate has passed. Layout 2
-//! (docs/design/crash-consistency.md section 4) adds, additively and idempotently,
+//! (basicautomation.io/projects/weftdb/docs/crash-consistency section 4) adds, additively and idempotently,
 //! `gen`, `prec`, `frame_crc`, `commit_epoch` and `series_id` to `segment_index` and the
 //! tables the write-once protocols commit into (`aspect_seq`, `frame_journal`,
 //! `ingest_ledger`, `segment_quarantine`, `aspect_metadata`, `segment_changes`). No row is

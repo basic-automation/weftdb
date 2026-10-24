@@ -1,7 +1,7 @@
 //! The filesystem seam every durable store write goes through.
 //!
 //! [`StoreFs`] names exactly the operations the crash-consistency protocols need
-//! (docs/design/crash-consistency.md section 5): create a never-used name and write it
+//! (basicautomation.io/projects/weftdb/docs/crash-consistency section 5): create a never-used name and write it
 //! once, fsync a file, fsync a directory, hard-link, rename, remove, list and stat.
 //! The store holds an `Arc<dyn StoreFs>`, so production runs on [`RealFs`] while the
 //! crash tests swap in `SimFs` (`fault-injection` feature), which records which bytes and

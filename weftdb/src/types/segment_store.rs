@@ -33,7 +33,7 @@
 //! outside `segments/`. The path builder also checks that each frame path it returns is a
 //! direct child of `segments/`.
 //!
-//! **Concurrency** (docs/design/crash-consistency.md section 5.1, slice S7). Each aspect
+//! **Concurrency** (basicautomation.io/projects/weftdb/docs/crash-consistency section 5.1, slice S7). Each aspect
 //! has two locks. Its *commit* lock is held around every control-plane transaction of the
 //! aspect and guards its id allocator: a seal takes its id from the allocator, writes its
 //! frame with the lock released, then inserts its row (a plain `INSERT`, which cannot

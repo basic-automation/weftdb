@@ -1,4 +1,4 @@
-//! Write-once frame names (docs/design/crash-consistency.md section 4; slice S8).
+//! Write-once frame names (basicautomation.io/projects/weftdb/docs/crash-consistency section 4; slice S8).
 //!
 //! A frame written by the write-once protocols is named
 //! `{enc(aspect)}~g{gen}~p{prec}.weftseg`:

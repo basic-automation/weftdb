@@ -1,5 +1,5 @@
 //! Open-time proof that a control-plane database commits the way the durability
-//! promise assumes (docs/design/crash-consistency.md sections 1.3 and 5.5, OPEN step 2).
+//! promise assumes (basicautomation.io/projects/weftdb/docs/crash-consistency sections 1.3 and 5.5, OPEN step 2).
 //!
 //! Every control-plane write is a `BEGIN CONCURRENT` transaction, and a COMMIT counts
 //! as durable because, under MVCC with `synchronous=FULL`, Turso fsyncs the logical

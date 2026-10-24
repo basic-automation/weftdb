@@ -1,5 +1,5 @@
 //! Reclaiming the frames maintenance retires: reader pins, the backup hold and the
-//! reaper (docs/design/crash-consistency.md sections 5.1 "Reclaim", 5.4 and 6, R6; slice
+//! reaper (basicautomation.io/projects/weftdb/docs/crash-consistency sections 5.1 "Reclaim", 5.4 and 6, R6; slice
 //! S8).
 //!
 //! A write-once swap never deletes a frame. It replaces its inputs' rows with its
