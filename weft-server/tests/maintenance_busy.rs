@@ -1,4 +1,4 @@
-//! Maintenance operations on one aspect take turns (docs/design/crash-consistency.md
+//! Maintenance operations on one aspect take turns (basicautomation.io/projects/weftdb/docs/crash-consistency
 //! section 5.3, M1; slice S7). While another operation holds an aspect, the HTTP
 //! maintenance endpoints wait for it, up to the store's maintenance wait, and then answer
 //! `409 Conflict`, while a daemon tick skips it at once and maintains the other aspects.

@@ -47,7 +47,7 @@
 //! normalises names (HFS+) stores their legacy `<aspect>-<id>` frames under one file
 //! name. That is a collision between two aspects inside `segments/`, not a way out of it.
 //! The write-once frame names of the crash-consistency design
-//! (`docs/design/crash-consistency.md` §4) remove it: they carry the aspect through
+//! (`basicautomation.io/projects/weftdb/docs/crash-consistency` §4) remove it: they carry the aspect through
 //! [`encode`], which keeps only `[a-z0-9_]` literal and escapes every other byte as `%XX`
 //! in uppercase hex, so two names that differ in case or normalisation encode to file
 //! names that differ under case folding and normalisation too. Maintenance outputs take

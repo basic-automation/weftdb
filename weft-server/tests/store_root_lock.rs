@@ -1,4 +1,4 @@
-//! A store root belongs to one process (docs/design/crash-consistency.md section 5.5,
+//! A store root belongs to one process (basicautomation.io/projects/weftdb/docs/crash-consistency section 5.5,
 //! OPEN step 1). A second `weft-server` pointed at the same `WEFT_SEGMENT_STORE_ROOT`
 //! must fail fast, naming the process that holds the root, instead of racing the
 //! first server's frames or failing deep inside Turso.

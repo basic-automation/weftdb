@@ -1,5 +1,5 @@
 //! `GET /ready` reports the write poison of the segment store the server serves
-//! (docs/design/crash-consistency.md section 5.1): `poisoned`, `restart_required` and the
+//! (basicautomation.io/projects/weftdb/docs/crash-consistency section 5.1): `poisoned`, `restart_required` and the
 //! reason, while `ready` stays `true`, because reads keep working. The handler reads the
 //! poison from that store, so this poisons a real one (through weftdb's `fault-injection`
 //! hook) rather than building a response by hand.

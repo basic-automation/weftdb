@@ -1,5 +1,5 @@
 //! Per-aspect commit and maintenance locks, and the id allocator the commit lock guards
-//! (docs/design/crash-consistency.md section 5.1, `AspectLocks`; slice S7).
+//! (basicautomation.io/projects/weftdb/docs/crash-consistency section 5.1, `AspectLocks`; slice S7).
 //!
 //! A [`SegmentStore`](crate::SegmentStore) keeps two locks per aspect:
 //!

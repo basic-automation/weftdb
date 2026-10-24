@@ -1,5 +1,5 @@
 //! Durable I/O primitives for the crash-consistency design
-//! (docs/design/crash-consistency.md, slice S2).
+//! (basicautomation.io/projects/weftdb/docs/crash-consistency, slice S2).
 //!
 //! Every later durability slice is written against these pieces, so they carry the
 //! protocol rules that are easy to get wrong in each call site:
