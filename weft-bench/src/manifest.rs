@@ -643,6 +643,18 @@ pub fn reference_grade(report: &BenchReport) -> ReferenceGrade {
 	ReferenceGrade { publishable: report.is_publishable(), result_count: report.results.len(), publishable_count: report.publishable_count(), measures }
 }
 
+/// The graded measures of one result, for a caller comparing two runs.
+///
+/// `weft-bench compare` takes its metric names, units and better-directions here rather than naming
+/// fields itself, so the manifest and the regression gate cannot disagree about which number a
+/// workload is judged by.
+#[must_use]
+pub fn result_measures(result: &BenchResult) -> Vec<Measure> {
+	let mut measures = Vec::new();
+	push_result_measures(result, &mut measures);
+	measures
+}
+
 /// Append the measures of one result.
 fn push_result_measures(result: &BenchResult, measures: &mut Vec<Measure>) {
 	let adapter = result.adapter.as_str();

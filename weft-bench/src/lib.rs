@@ -47,6 +47,7 @@
 pub mod accuracy;
 pub mod adapter;
 pub mod baseline_adapter;
+pub mod compare;
 pub mod compression;
 pub mod downsample;
 pub mod engine;
