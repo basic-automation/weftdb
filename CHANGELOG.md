@@ -467,6 +467,11 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **The README stops promising what no clone can deliver.** No benchmark artifact — manifest or
+  result JSON — is committed anywhere in the tree, so its Performance section now distinguishes a
+  figure that names the bench it came from from one that is only a dated local measurement, and
+  points the remaining gap at the claims registry (roadmap EVI-2). Documentation only; no number
+  was changed or dropped.
 - **`tokio` is 1.53.3, not 1.53.2.** RustSec advisory RUSTSEC-2026-0386 (`unsound`) reports that
   `AsyncFd`'s safe constructors — `new`, `with_interest`, `try_new`, `try_with_interest` — accept
   any `T: AsRawFd` rather than proof that the caller owns the descriptor, and that a descriptor
