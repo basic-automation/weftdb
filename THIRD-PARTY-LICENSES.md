@@ -31,7 +31,7 @@ rather than assumed.
 OVERVIEW
 --------
 
-  Apache License 2.0 — 295 crate(s)
+  Apache License 2.0 — 296 crate(s)
   MIT License — 104 crate(s)
   Unicode License v3 — 25 crate(s)
   BSD 3-Clause "New" or "Revised" License — 5 crate(s)
@@ -6530,6 +6530,8 @@ Used by:
     https://github.com/RustCrypto/utils
   * polyval 0.6.2
     https://github.com/RustCrypto/universal-hashes
+  * sha2 0.10.9
+    https://github.com/RustCrypto/hashes
   * universal-hash 0.5.1
     https://github.com/RustCrypto/traits
 

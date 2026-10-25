@@ -56,6 +56,8 @@ rand = "0.10"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The run manifest's content hash (`weft-bench verify`). EVI-3.
+sha2 = "0.10.9"
 # The allocator our own executables run on, named by each of them rather than inherited: see
 # `weft-server/src/main.rs` and `weft-tui/src/main.rs`. PAC-3.
 mimalloc = "0.1"
