@@ -70,18 +70,26 @@ separately.
 natively on five targets — no cross toolchains — with the compiler from
 `.github/release-toolchain`:
 
-| Target | Runner |
-|--------|--------|
-| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` |
-| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` |
-| `x86_64-apple-darwin` | `macos-15-intel` |
-| `aarch64-apple-darwin` | `macos-15` |
-| `x86_64-pc-windows-msvc` | `windows-2025` |
+| Target | Runner | Build image |
+|--------|--------|-------------|
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | `quay.io/pypa/manylinux_2_28_x86_64:2026.10.25-1` |
+| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | `quay.io/pypa/manylinux_2_28_aarch64:2026.10.25-1` |
+| `x86_64-apple-darwin` | `macos-15-intel` | the runner itself |
+| `aarch64-apple-darwin` | `macos-15` | the runner itself |
+| `x86_64-pc-windows-msvc` | `windows-2025` | the runner itself |
 
-The images are pinned rather than `*-latest`, so a release is reproducible and the glibc
-floor the README states (from Ubuntu 24.04: 2.39 for `weft-tui`, 2.34 for `weft-server`
-and `weft-bench`) cannot rise silently when GitHub moves `ubuntu-latest`. Moving an
-image is a deliberate change: update this table and the README with it. Intel macOS
+The images are pinned rather than `*-latest`, so a release is reproducible. The two Linux
+legs build inside the manylinux glibc 2.28 baseline, which is what sets the floor the README
+states: a binary linked there starts on any host with glibc 2.28 or newer. The runner image
+is no longer the answer to that question — an Ubuntu 24.04 link produces binaries that need
+2.34 or 2.39, which is what v0.1.0 shipped with. The floor is not taken on trust either:
+`scripts/check-glibc.sh` reads the highest `GLIBC_*` version out of each built artifact and
+fails the job above 2.28, because a single newer symbol (`posix_spawn`, `statx`, the 2.39
+`fcntl64` that was the first clue here) ships silently and fails at `execve` — no message,
+no exit code. Measured on an x86_64 build of `weft-tui` and `weft-server` in the pinned
+image: 2.28, with the ELF interpreter `/lib64/ld-linux-x86-64.so.2`. Moving the baseline is
+a deliberate change: change the tag in both the matrix and the assertion, and update this
+table and the README with it. Intel macOS
 used to build on `macos-13`, which GitHub has retired; `macos-15-intel` is its hosted
 Intel replacement.
 

@@ -81,9 +81,12 @@ Prefer not to build from source? Each
 [GitHub release](https://github.com/basic-automation/weftdb/releases), from v0.1.0 on,
 carries pre-built `weft-server`, `weft-tui` and `weft-bench` archives for Linux (x86_64
 and aarch64), macOS (x86_64 and Apple silicon) and Windows (x86_64), and a `SHA256SUMS`
-file to check them with `sha256sum -c SHA256SUMS`. The Linux binaries are built on
-Ubuntu 24.04: `weft-server` and `weft-bench` need glibc 2.34 or newer, and `weft-tui`
-needs glibc 2.39 or newer. The macOS and Windows binaries are not signed, so Gatekeeper
+file to check them with `sha256sum -c SHA256SUMS`. The Linux binaries are built in the
+manylinux glibc 2.28 baseline image, so they need glibc 2.28 or newer — RHEL 8 and Debian 10
+era hosts — and the release job reads that floor back out of each artifact rather than
+trusting the build machine. (Releases up to and including v0.1.0 were built on Ubuntu 24.04
+instead, so those archives need glibc 2.34 for `weft-server` and `weft-bench` and 2.39 for
+`weft-tui`.) The macOS and Windows binaries are not signed, so Gatekeeper
 and SmartScreen will warn before running them. Read the release's known limitations
 (v0.1.0's are in its
 [changelog](https://github.com/basic-automation/weftdb/blob/v0.1.0/CHANGELOG.md#known-limitations))

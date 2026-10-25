@@ -20,6 +20,16 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **The Linux release binaries start on a seven-year-old glibc** (portability track
+  PAC-2). Both Linux build legs now compile inside the pinned manylinux glibc 2.28
+  baseline image instead of directly on the Ubuntu 24.04 runner, so a released archive
+  needs glibc 2.28 or newer rather than the 2.34 (`weft-server`, `weft-bench`) and 2.39
+  (`weft-tui`) that v0.1.0's did. The floor is asserted, not assumed:
+  `scripts/check-glibc.sh` reads the highest `GLIBC_*` version out of each built
+  artifact's dynamic symbol table and fails the release above 2.28 — a newer reference
+  ships silently and dies at `execve`, which is how this was first noticed (a `fcntl64`
+  at GLIBC_2.39 inside a binary built for "Linux"). Measured in the pinned image: 2.28
+  for `weft-tui` and `weft-server`, interpreter `/lib64/ld-linux-x86-64.so.2`.
 - **Write poison** (crash-consistency design, S6). When a segment-index COMMIT fails
   in a way that may still have committed (any COMMIT error except a conflict Turso
   detects while validating the transaction, which it rolls back before writing
