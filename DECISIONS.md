@@ -286,3 +286,19 @@ are out of scope and the script says so rather than quietly skipping them.
 **Not claimed:** eleven figures are registered, not every number in the repository — the registry
 covers the README's Performance section plus one dated observation in the backup-daemon note. The
 lint's `*Source:*` rule is what pulls future figures in; it is a ratchet, not a completed census.
+## 2026-10-25 — who clicks "merge", and what happens when the rules are silent
+**Ambiguous:** `AGENTS.md` tells this project's agents to "work on branches and open pull
+requests; never commit directly to main", and also never to stop and wait for approval. It says
+nothing about who merges. Slices #105-#112 were squash-merged by the agent on green CI, which made
+an agent-side convention look like an authorised workflow.
+**Chosen:** stop at "PR open, all checks green", report that state, and leave the merge to a human.
+Merging is the one step that is awkward to undo, so the absence of an instruction is read as the
+absence of authority rather than as permission by omission; the "don't wait for approval" rule
+covers *ambiguity about how to do the work*, not permission to take an irreversible action nobody
+asked for. Open PRs are not parked work: the review surface exists, CI has run, and a human can
+merge in one click.
+**Rejected:** continuing the #105-#112 practice. Repetition inside one buildout is not authorisation,
+and it quietly made the agent both author and approver of every change to `main`.
+**Needs human:** confirm which of the two this project wants for the rest of the 1.0 buildout.
+Current queue: #113 (EVI-9 `--sparse` missingness, `--scale` presets) and #114 (EVI-2 claims
+registry + claim/link lint), both waiting only on CI and a merge decision.
