@@ -1,0 +1,7 @@
+fine_ramp_128	winner=gorilla	best=149	xor=149	chimp=236	chimp128=347	elf=348
+coarse_ramp_128	winner=gorilla	best=199	xor=199	chimp=227	chimp128=338	elf=339
+constant_200	winner=gorilla	best=33	xor=33	chimp=58	chimp128=232	elf=233
+alternating_200	winner=gorilla	best=84	xor=84	chimp=307	chimp128=481	elf=482
+scattered_128	winner=gorilla	best=393	xor=393	chimp=512	chimp128=623	elf=624
+empty	winner=raw	best=0	xor=0	chimp=0	chimp128=0	elf=0
+single	winner=raw	best=8	xor=8	chimp=8	chimp128=8	elf=9

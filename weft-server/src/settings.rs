@@ -142,6 +142,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_TEST_SWAP_MATRIX", tier: Tier::Test, summary: "Names which cell of the swap/crash matrix a child process runs, so each cell arms its faults in its own process.", accepts: "a `<mode>:<op>` spec", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_SWAP_MATRIX_DIR", tier: Tier::Test, summary: "The work directory handed to the swap-matrix child named by `WEFT_TEST_SWAP_MATRIX`.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_TXN_CHILD_INDEX", tier: Tier::Test, summary: "Set only in the child process that dies inside an `IndexTxn`: the index database it opens.", accepts: "a file path", default: "unset", read_by: "weftdb/types/index_txn.rs (test child)" },
+	VarSpec { name: "WEFT_UPDATE_GOLDENS", tier: Tier::Test, summary: "Re-record the committed byte goldens from what this build writes, instead of failing when the bytes differ. No shipped binary reads it.", accepts: "any value means rewrite the fixture file", default: "unset: a golden test compares bytes and fails on a difference", read_by: "weft-physical-type/tests/golden/harness.rs, weftdb/tests/golden_sidecar.rs" },
 	VarSpec { name: "WEFT_VERBOSE", tier: Tier::Test, summary: "Not WeftDB's own: it is `splimes`' verbose-logging switch. WeftDB's benchmarks clear it so a dependency's chatter cannot distort the timings they are measuring.", accepts: "any value turns the dependency's verbose output on", default: "unset (and deliberately removed at the top of the benchmarks that care about timings)", read_by: "weftdb/benches (cleared); read by the splimes dependency" },
 ];
 
@@ -364,7 +365,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 52, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 53, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
@@ -401,7 +402,7 @@ mod tests {
 		let experimental: Vec<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Experimental).map(|spec| spec.name).collect();
 		assert_eq!(experimental, ["WEFT_GPU_CALIBRATE", "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD"], "both are knobs whose value is unproven (GPU calibration's thresholds, and a codec the measurements retired)");
 		let harness: BTreeSet<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Test).map(|spec| spec.name).collect();
-		let allowlist: BTreeSet<&str> = ["SKIP_SLOW_TESTS", "TEST_DATA_DIR", "WEFT_FAULT", "WEFT_FAULT_TEST_CHILD", "WEFT_REQUIRE_GPU", "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", "WEFT_TEST_OPEN_CHILD_ROOT", "WEFT_TEST_ORPHAN_CHILD_ROOT", "WEFT_TEST_PANIC_CHILD_MODE", "WEFT_TEST_POISON_EXIT_CHILD_ROOT", "WEFT_TEST_RACE_CHILD_ROOT", "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", "WEFT_TEST_S8_SPLIT_RACE_ROOT", "WEFT_TEST_S9_DROPPED_SWAP_DIR", "WEFT_TEST_S9_SQUASH_RACE_DIR", "WEFT_TEST_S9_SUFFIX_RACE_DIR", "WEFT_TEST_SWAP_MATRIX", "WEFT_TEST_SWAP_MATRIX_DIR", "WEFT_TEST_TXN_CHILD_INDEX", "WEFT_BENCH_BACKUP_DIR", "WEFT_BTC_CSV", "WEFT_DB_NEW_CRASH_CHILD", "WEFT_LEGACY_CONSUMER_CRASH_CHILD", "WEFT_LEGACY_INGEST_CRASH_CHILD", "WEFT_VERBOSE"].into_iter().collect();
+		let allowlist: BTreeSet<&str> = ["SKIP_SLOW_TESTS", "TEST_DATA_DIR", "WEFT_FAULT", "WEFT_FAULT_TEST_CHILD", "WEFT_REQUIRE_GPU", "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", "WEFT_TEST_OPEN_CHILD_ROOT", "WEFT_TEST_ORPHAN_CHILD_ROOT", "WEFT_TEST_PANIC_CHILD_MODE", "WEFT_TEST_POISON_EXIT_CHILD_ROOT", "WEFT_TEST_RACE_CHILD_ROOT", "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", "WEFT_TEST_S8_SPLIT_RACE_ROOT", "WEFT_TEST_S9_DROPPED_SWAP_DIR", "WEFT_TEST_S9_SQUASH_RACE_DIR", "WEFT_TEST_S9_SUFFIX_RACE_DIR", "WEFT_TEST_SWAP_MATRIX", "WEFT_TEST_SWAP_MATRIX_DIR", "WEFT_TEST_TXN_CHILD_INDEX", "WEFT_BENCH_BACKUP_DIR", "WEFT_BTC_CSV", "WEFT_DB_NEW_CRASH_CHILD", "WEFT_LEGACY_CONSUMER_CRASH_CHILD", "WEFT_LEGACY_INGEST_CRASH_CHILD", "WEFT_UPDATE_GOLDENS", "WEFT_VERBOSE"].into_iter().collect();
 		assert_eq!(harness, allowlist, "the Test tier is the plan's allowlist: a channel a test harness sets for the child it spawns, and nothing else may sit in it");
 		assert_eq!(VARS.iter().filter(|spec| spec.tier == Tier::Tuning).count(), VARS.len() - stable.len() - experimental.len() - allowlist.len(), "every remaining name is Tuning: a knob whose value is deployment-specific and whose number is still moving");
 	}
