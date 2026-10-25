@@ -18,6 +18,19 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **Block missingness and size presets in `weft-bench`** (evidence track EVI-9). `--sparse` is a
+  workload of its own: a seeded grid of `--sp-series` series × `--sp-blocks` blocks of `--sp-rows`
+  rows is opened cell by cell at `--sp-density` percent, held as one nullable `f64` column per
+  series (an Arrow buffer plus its validity bitmap, so an absent block is absent from a column
+  rather than an `Option` in a `Vec`), and timed on the block-aligned mean scan that has to visit
+  every block because nothing in the column yet says which ones hold values. The report names the
+  grid and the **observed** missingness rather than the density asked for — a coin flip per cell
+  lands where it lands — and gates cell by cell against the generator's own per-cell means.
+  `--scale tiny|small|medium|large` now expands into the size knobs of the workloads that generate
+  their own data (`--sparse`, `--gap-fill`, `--downsample`), filling only the knobs left at their
+  default and writing the preset into the profile name, so grids of different sizes cannot be
+  compared as though they were one run.
+
 ### Added
 
 - **The Linux release binaries start on a seven-year-old glibc** (portability track

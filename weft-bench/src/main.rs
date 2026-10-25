@@ -33,7 +33,7 @@ use std::{
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -116,6 +116,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.mode == InputMode::GapFill {
 		return run_gap_fill_workload(&cli);
+	}
+	if cli.mode == InputMode::Sparse {
+		return run_sparse_workload(&cli);
 	}
 	if cli.mode == InputMode::GpuMemory {
 		return run_gpu_memory_workload(&cli);
@@ -243,7 +246,9 @@ fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// (`weft-reduce`) into grid-aligned buckets. No analytic ground truth — correctness
 /// is that the reduction is total (the bucket counts sum to the input size).
 fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
-	let profile_name = cli.name.clone().unwrap_or_else(|| "downsample".to_string());
+	let profile_name = profile_name(cli, "downsample");
+	// A preset sizes the series, but only where the caller left the knob at its default: an
+	// explicit --ds-points is a measurement choice, not an omission.
 	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel, value_decimals: cli.ds_decimals, scaled: cli.ds_scaled };
 	let profile = DownsampleProfile::new(profile_name, params);
 	let result = if let Some(path) = &cli.csv.downsample {
@@ -266,7 +271,9 @@ fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// bucketed query that reduces it and fills the empty buckets (`weft_reduce::fill`),
 /// scoring the filled buckets against the generator's clean signal.
 fn run_gap_fill_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
-	let profile_name = cli.name.clone().unwrap_or_else(|| "gap-fill".to_string());
+	let profile_name = profile_name(cli, "gap-fill");
+	// A preset sizes the series, but only where the caller left the knob at its default: an
+	// explicit --gf-points is a measurement choice, not an omission.
 	let profile = GapFillProfile::new(profile_name, GapFillParams { seed: cli.seed, ..cli.gap_fill.clone() });
 	let result = if let Some(path) = &cli.csv.gap_fill {
 		// A real series: the same outages cut from loaded rows, scored against the real values.
@@ -279,6 +286,44 @@ fn run_gap_fill_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		run_gap_fill(&profile, cli.reps)
 	}
 	.map_err(|e| anyhow::anyhow!("gap-fill benchmark run failed: {e}"))?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// The profile name a run is filed under: `--name` wins, otherwise the workload's own name with
+/// the `--scale` preset appended when one was given.
+///
+/// The suffix is the point: `compare` matches runs by profile name, so a gap-fill at 3 300 points
+/// and one at 486 660 would otherwise be filed as the same measurement and scored as a regression.
+/// Workloads a preset does not size carry no suffix, because there is nothing there to record.
+fn profile_name(cli: &Cli, workload: &str) -> String {
+	match &cli.name {
+		Some(name) => name.clone(),
+		None => match cli.scale {
+			Some(preset) => format!("{workload}-{}", preset.as_str()),
+			None => workload.to_string(),
+		},
+	}
+}
+
+/// Run the block-missingness workload: generate the seeded (series x block) grid and time the
+/// block-aligned scan over it.
+fn run_sparse_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	// The generated name carries the grid, because that is what the report records as the shape
+	// of a run: two runs named `sparse` with different densities are not the same measurement,
+	// and `compare` would happily match them. `--name` still overrides.
+	let profile_name = cli.name.clone().unwrap_or_else(|| {
+		let grid = format!("sparse-{}x{}x{}-d{}", cli.sparse.series.max(1), cli.sparse.blocks.max(1), cli.sparse.rows_per_block.max(1), cli.sparse.density_percent.clamp(1, 100));
+		match cli.scale {
+			Some(preset) => format!("{grid}-{}", preset.as_str()),
+			None => grid,
+		}
+	});
+	let profile = SparseProfile::new(profile_name, SparseParams { seed: cli.seed, ..cli.sparse.clone() });
+	println!("grid   : {} series x {} blocks of {} rows, {}% present", profile.params.series, profile.params.blocks, profile.params.rows_per_block, profile.params.density_percent);
+	let result = run_sparse(&profile, cli.reps).map_err(|e| anyhow::anyhow!("block-missingness benchmark run failed: {e}"))?;
+	println!("holes  : {:.1}% of the grid's values absent; {} block aggregates per scan", result.dataset.missingness_fraction * 100.0, result.dataset.output_points);
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
@@ -646,6 +691,10 @@ struct Cli {
 	ds_scaled: bool,
 	/// Gap-fill mode: the workload knobs (the seed comes from `--seed`).
 	gap_fill: GapFillParams,
+	/// Block-missingness mode: the workload knobs (the seed comes from `--seed`).
+	sparse: SparseParams,
+	/// Size preset from `--scale`; `None` leaves every size knob exactly as given.
+	scale: Option<ScalePreset>,
 	/// GPU-memory mode: the workload knobs (the seed comes from `--seed`).
 	gpu_memory: weft_bench::gpu_memory::GpuMemoryParams,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
@@ -732,6 +781,8 @@ enum InputMode {
 	Downsample,
 	/// The gap-fill workload (a bucketed query that fills the buckets outages left empty).
 	GapFill,
+	/// The block-missingness workload (a wide table where whole blocks are absent).
+	Sparse,
 	/// The GPU memory-stability workload (repeated mixed-size GPU interpolations).
 	GpuMemory,
 }
@@ -833,6 +884,8 @@ impl Cli {
 		let (mut html, mut parquet, mut ds_scaled) = (false, false, false);
 		let mut gpu_calibrate = true;
 		let (mut manifest, mut claim, mut labels): (bool, Option<String>, Vec<(String, String)>) = (true, None, Vec::new());
+		let (mut sparse_mode, mut sparse) = (false, SparseParams::default());
+		let mut scale: Option<ScalePreset> = None;
 
 		let mut iter = args.into_iter();
 		while let Some(token) = iter.next() {
@@ -865,6 +918,9 @@ impl Cli {
 				"-d" | "--downsample" => downsample = true,
 				"-g" | "--gap-fill" => gap_fill_mode = true,
 				flag if GAP_FILL_FLAGS.contains(&flag) => set_gap_fill_knob(&mut gap_fill, flag, &take_value(&key)?)?,
+				"--sparse" => sparse_mode = true,
+				flag if SPARSE_FLAGS.contains(&flag) => set_sparse_knob(&mut sparse, flag, &take_value(&key)?)?,
+				"--scale" => scale = Some(ScalePreset::parse(&take_value(&key)?).ok_or_else(|| format!("--scale must name a preset ({})", ScalePreset::names()))?),
 				"--gpu-memory" => gpu_memory_mode = true,
 				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
@@ -916,10 +972,13 @@ impl Cli {
 		}
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (gpu_memory_mode, InputMode::GpuMemory)])?;
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (sparse_mode, InputMode::Sparse), (gpu_memory_mode, InputMode::GpuMemory)])?;
+		if let Some(preset) = scale {
+			apply_scale_preset(preset, &mut ds_points, &mut gap_fill, &mut sparse);
+		}
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1010,7 +1069,7 @@ fn parse_label(token: &str) -> Result<(String, String), String> {
 fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
 	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
 	if selected.len() > 1 {
-		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --gpu-memory)".to_string());
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --sparse / --gpu-memory)".to_string());
 	}
 	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
@@ -1025,6 +1084,7 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 		InputMode::Compression => Some("--compression"),
 		InputMode::Downsample => Some("--downsample"),
 		InputMode::GapFill => Some("--gap-fill"),
+		InputMode::Sparse => Some("--sparse"),
 		InputMode::GpuMemory => Some("--gpu-memory"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
@@ -1073,7 +1133,7 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::GpuMemory => unreachable!("handled by self_generating_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -1191,6 +1251,51 @@ fn parse_stride_secs(s: &str) -> Result<i64, String> {
 	Ok(n)
 }
 
+/// Expand a `--scale` preset into the size knobs the caller left at their default.
+///
+/// A preset is shorthand for numbers, not an override: a knob the caller typed is kept even
+/// where the preset would have chosen differently, because the preset cannot know what they
+/// were holding constant. A knob left at its default is what the preset fills.
+fn apply_scale_preset(preset: ScalePreset, ds_points: &mut usize, gap_fill: &mut GapFillParams, sparse: &mut SparseParams) {
+	if *ds_points == DownsampleParams::default().point_count {
+		*ds_points = preset.point_count();
+	}
+	if gap_fill.point_count == GapFillParams::default().point_count {
+		gap_fill.point_count = preset.point_count();
+	}
+	// Series first, then blocks: the block count is what is left of the budget once the series
+	// count is settled, so it has to be derived from the grid as it now stands.
+	if sparse.series == SparseParams::default().series {
+		sparse.series = preset.sparse(sparse).series;
+	}
+	if sparse.blocks == SparseParams::default().blocks {
+		sparse.blocks = preset.sparse(sparse).blocks;
+	}
+}
+
+/// The block-missingness workload's knob flags, each taking one value ([`set_sparse_knob`]).
+const SPARSE_FLAGS: [&str; 4] = ["--sp-series", "--sp-blocks", "--sp-rows", "--sp-density"];
+
+/// Re-attribute a shared parser's error to the flag the person actually typed.
+///
+/// The size knobs share [`parse_points_count`], whose message names `--points`; someone typing
+/// `--sp-rows 0` has to be told which flag they got wrong.
+fn rename_flag(message: &str, flag: &str) -> String {
+	message.replace("--points", flag)
+}
+
+/// Apply one block-missingness knob (`flag` from [`SPARSE_FLAGS`]) to `params`.
+fn set_sparse_knob(params: &mut SparseParams, flag: &str, value: &str) -> Result<(), String> {
+	match flag {
+		"--sp-series" => params.series = parse_points_count(value).map_err(|e| rename_flag(&e, flag))?,
+		"--sp-blocks" => params.blocks = parse_points_count(value).map_err(|e| rename_flag(&e, flag))?,
+		"--sp-rows" => params.rows_per_block = parse_points_count(value).map_err(|e| rename_flag(&e, flag))?,
+		"--sp-density" => params.density_percent = value.parse::<u32>().ok().filter(|p| (1..=100).contains(p)).ok_or_else(|| "--sp-density must be a whole percent in 1..=100".to_string())?,
+		other => return Err(format!("unrecognised block-missingness flag `{other}`")),
+	}
+	Ok(())
+}
+
 /// The gap-fill workload's knob flags, each taking one value ([`set_gap_fill_knob`]).
 const GAP_FILL_FLAGS: [&str; 7] = ["--gf-points", "--gf-stride", "--gf-bucket", "--gf-outage", "--gf-outage-len", "--gf-fill", "--gf-agg"];
 
@@ -1300,6 +1405,7 @@ USAGE:
     weft-bench --compression [COMPRESSION OPTIONS]
     weft-bench --downsample [DOWNSAMPLE OPTIONS]
     weft-bench --gap-fill [GAP-FILL OPTIONS]
+    weft-bench --sparse [BLOCK-MISSINGNESS OPTIONS]
     weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
     weft-bench verify <RUN.manifest.json> [--accept-advisories]
     weft-bench compare <BASELINE.json> <CANDIDATE.json> [COMPARE OPTIONS]
@@ -1332,6 +1438,11 @@ INPUT MODE (choose one):
                              time reduce + fill of every empty bucket. Gated on a dense
                              grid whose synthesized buckets are exactly the outages;
                              scores the filled values against the clean signal.
+    --sparse                 Run the block-missingness workload: a seeded grid of series x
+                             blocks of rows whose cells are individually present or absent,
+                             held as one nullable column, and timed as a block-aligned mean
+                             scan over the present cells. Reports the share of the grid that
+                             turned out to be holes, so a presence bitmap has a before number.
 
 STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
         --irregular          Jittered timestamps (decode + search/filter) instead of
@@ -1386,6 +1497,20 @@ DOWNSAMPLE OPTIONS (with --downsample):
         --ds-aggs <LIST>     Reductions, comma-separated: min,max,avg,sum,first,
                              last,p50,p90,p95,p99          [default: min,max,avg,
                              sum,first,last]
+
+SIZE PRESETS (any workload; --sparse, --gap-fill and --downsample take the sizes):
+        --scale <NAME>       tiny | small | medium | large: a named table size (65 536 to
+                             16 777 216 values) and sample count (1 hour to 1 month at one
+                             sample per second). A preset fills a size knob still at its
+                             default and leaves one you set alone; the preset name goes into
+                             the profile name, so two grid sizes are never compared as one run.
+
+BLOCK-MISSINGNESS OPTIONS (with --sparse; seeded by --seed):
+        --sp-series <N>      Series (columns) in the table (>=1)        [default: 16]
+        --sp-blocks <N>      Blocks per series (>=1)                   [default: 256]
+        --sp-rows <N>        Rows in a block (>=1)                     [default: 128]
+        --sp-density <PCT>   Share of (series x block) cells present,
+                             1..=100                                   [default: 20]
 
 GAP-FILL OPTIONS (with --gap-fill; seeded by --seed):
         --gf-points <N>      Samples generated before outages (>=2)  [default: 86400]
@@ -1839,6 +1964,56 @@ mod tests {
 		assert!(expect_run(&["-g", "--parquet"]).parquet);
 	}
 
+	/// `--sparse` is its own workload mode, with grid knobs of its own.
+	#[test]
+	fn sparse_mode_takes_grid_knobs() {
+		let cli = expect_run(&["--sparse"]);
+		assert_eq!(cli.mode, InputMode::Sparse);
+		assert_eq!(cli.sparse, SparseParams::default());
+		assert_eq!(cli.scale, None, "no preset means every knob stays exactly as given");
+		let cli = expect_run(&["--sparse", "--sp-series", "4", "--sp-blocks", "64", "--sp-rows", "32", "--sp-density", "80"]);
+		assert_eq!((cli.sparse.series, cli.sparse.blocks, cli.sparse.rows_per_block, cli.sparse.density_percent), (4, 64, 32, 80));
+		for bad in [["--sp-density", "0"], ["--sp-density", "101"], ["--sp-series", "0"], ["--sp-density", "abc"], ["--sp-rows", "-3"]] {
+			assert!(run_cli(&["--sparse", bad[0], bad[1]]).unwrap_err().contains("--sp-"), "{bad:?} should be refused");
+		}
+		// A self-generated mode: it takes no input file and has nothing to compare against.
+		assert!(run_cli(&["--sparse", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
+		assert!(run_cli(&["--sparse", "--gap-fill"]).unwrap_err().contains("only one workload mode"));
+	}
+
+	/// A preset goes into the profile name of the workloads it sizes, so two sizes are two
+	/// measurements to `compare`, and `--name` still wins.
+	#[test]
+	fn scale_preset_names_the_profile_it_sized() {
+		let tiny = expect_run(&["--gap-fill", "--scale", "tiny"]);
+		assert_eq!(profile_name(&tiny, "gap-fill"), "gap-fill-tiny");
+		let downsampled = expect_run(&["--downsample", "--scale", "medium"]);
+		assert_eq!(profile_name(&downsampled, "downsample"), "downsample-medium");
+		let unscaled = expect_run(&["--gap-fill"]);
+		assert_eq!(profile_name(&unscaled, "gap-fill"), "gap-fill", "no preset means no suffix");
+		let named = expect_run(&["--gap-fill", "--scale", "tiny", "--name", "tuesday"]);
+		assert_eq!(profile_name(&named, "gap-fill"), "tuesday");
+	}
+
+	/// `--scale` fills the size knobs left at their default and leaves the rest alone.
+	#[test]
+	fn scale_preset_expands_to_the_size_knobs() {
+		assert!(run_cli(&["--sparse", "--scale", "huge"]).unwrap_err().contains("--scale"));
+		for preset in ScalePreset::all() {
+			let cli = expect_run(&["--sparse", "--scale", preset.as_str()]);
+			assert_eq!(cli.scale, Some(preset), "names are case-insensitive");
+			let expected = preset.sparse(&SparseParams::default());
+			assert_eq!((cli.sparse.series, cli.sparse.blocks), (expected.series, expected.blocks), "{} sizes the grid", preset.as_str());
+			assert_eq!(cli.sparse.rows_per_block, SparseParams::default().rows_per_block, "the preset does not choose the block size");
+			assert_eq!(expect_run(&["--gap-fill", "--scale", preset.as_str()]).gap_fill.point_count, preset.point_count());
+			assert_eq!(expect_run(&["--downsample", "--scale", preset.as_str()]).ds_points, preset.point_count());
+		}
+		// A knob the caller typed survives the preset.
+		let cli = expect_run(&["--sparse", "--scale", "large", "--sp-blocks", "7"]);
+		assert_eq!(cli.sparse.blocks, 7, "a named block count is a measurement choice, not an omission");
+		let cli = expect_run(&["--gap-fill", "--scale", "large", "--gf-points", "1000"]);
+		assert_eq!(cli.gap_fill.point_count, 1000);
+	}
 	#[test]
 	fn accepts_short_flags_and_positional_input() {
 		let cli = expect_run(&["data.lp", "-f", "usage"]);

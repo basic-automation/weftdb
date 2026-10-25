@@ -203,6 +203,54 @@ the roadmap asked for — a finding that took reading, not compute.
 must compile a fourteen-crate workspace cannot stay silent for less than five minutes, so the
 limit does not fit the work; shrinking the task to fit it would only produce a smaller task
 that still cannot be done in the time allowed.
+## 2026-10-25 — what `--scale` was allowed to become
+
+**Ambiguous:** EVI-9 asks for "block missingness and scale presets" and names the ladder
+`--scale small|medium|large|huge` "for every workload". Written literally that is a fifth rung
+nobody can run and a claim about workloads that have no size knob, so both halves had to be
+narrowed, and the narrowing is a decision rather than an implementation detail.
+
+**Chosen — the ladder.** Four rungs: `tiny|small|medium|large`, as value budgets 65 536 /
+524 288 / 4 194 304 / 16 777 216. `Small` is the rung a caller gets for the word "default": it is
+the same budget the flags described before presets existed (16 series × 256 blocks × 128 rows),
+though not the same shape — a preset derives its series count from the cap, so `--scale small` is
+64 × 64 × 128. The budget is what a rung promises; the shape is in the profile name either way. `huge` was dropped rather than implemented: the next rung is 67 108 864 values,
+about 537 MiB of column data before the store's own overhead, which is not a size a benchmark gets
+re-run casually and is past the point where the number still means "the machine", as opposed to
+the page cache. The ladder already spans three orders of magnitude, and `tiny` was added because
+the thing a preset is for — "give me the same shape, smaller" — had no rung below the old default.
+
+**Chosen — which workloads.** A preset expands into the *size* knobs of the workloads that generate
+their own data (`--sparse`, `--gap-fill`, `--downsample`). The interpolation profiles keep their
+own shapes: their point counts are the experiment, not a knob to resize, and silently scaling them
+would compare two different experiments under one name. `README.md` and `ROADMAP.md` say this in
+those terms instead of claiming "every workload".
+
+**Chosen — a preset fills, never overrides.** A size knob left at its default takes the preset's
+value; a knob the caller typed is kept even where the preset would have chosen differently. The
+cost is stated in `weft-bench/src/scale.rs`: a knob typed at exactly its default value is
+indistinguishable from one left alone, so it gets overwritten. The alternative — refusing
+`--scale` alongside any size flag — would make the common case ("large, but with 64-row blocks")
+impossible.
+
+**Chosen — grid shape, and what the profile name says.** `--sparse` derives series as
+`sqrt(values / rows)` clamped to 64 and gives the remainder to blocks, so a bigger preset deepens
+the table past the cap instead of transposing it; 64 is where a "wide table" stops being
+distinguishable from a tall one. The preset's name is written into the profile even when it filled
+nothing (`sparse-3x5x8-d20-large`), because the profile's job is to say what was asked for; the
+grid dimensions are in the same name, so nothing is hidden.
+
+**Chosen — what the preset's name is good for.** The preset is appended to the profile name of
+every workload it sizes (`gap-fill-tiny`, `downsample-medium`, `sparse-64x4096x64-d20-large`),
+not just the new one: `compare` matches runs by profile name, so before this a gap-fill at 3 300
+points and one at 486 660 were the same measurement to it, and the second read as a 100×
+regression. A workload a preset does not size gets no suffix, since there is nothing there to
+record.
+
+**Rejected:** publishing a measured figure for observed missingness in `README.md`. The default
+grid's holes are a property of a seed and a density, and the number anyone re-runs differs the
+moment either moves; the report already prints the observed value, which is the artifact a claim
+should point at.
 
 ## Needs human
 
