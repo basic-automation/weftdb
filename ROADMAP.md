@@ -232,7 +232,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
   - [ ] **TAG-3** Open `ValueKind` in weftdb, provenance scope
   - [ ] **EVI-1** Claims hygiene
-  - [ ] **EVI-3** Run manifest (schema v23: the 2026-10-09 routine took v20–v22, so EVI-3 takes the next free number per the plan's rule)
+  - [x] **EVI-3** Run manifest (schema v23: the 2026-10-09 routine took v20–v22, so EVI-3 takes the next free number per the plan's rule)
   - [ ] **EVI-9** Block missingness and scale presets
   - [ ] **SOA-1** Soak harness skeleton
 - [ ] **W2 · Error contract, frame format, portable builds**

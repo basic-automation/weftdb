@@ -26,12 +26,14 @@
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+	path::{Path, PathBuf}, process::ExitCode
+};
 
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -53,6 +55,7 @@ fn main() -> ExitCode {
 			return ExitCode::SUCCESS;
 		}
 		Command::Run(cli) => *cli,
+		Command::Verify { manifest, accept_advisories } => return verify_manifest(&manifest, accept_advisories),
 	};
 
 	// A multi-threaded runtime is unnecessary for a single sequential run; a
@@ -329,7 +332,22 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 		None
 	};
 
+	// The manifest is written last so it can hash the report as it now sits on disk, and refused
+	// rather than saved if it does not verify against what was just written.
+	let manifest_path = if cli.manifest {
+		let path = manifest_path_for(&out_path);
+		let command_line: Vec<String> = std::env::args().collect();
+		let manifest = RunManifest::capture(report, &out_path, &command_line, &cli.labels, cli.claim.as_deref()).map_err(|e| anyhow::anyhow!("cannot capture a run manifest for {}: {e}", out_path.display()))?;
+		manifest.write_to(&path).map_err(|e| anyhow::anyhow!("cannot write run manifest to {}: {e}", path.display()))?;
+		Some(path)
+	} else {
+		None
+	};
+
 	print_summary(report, &out_path);
+	if let Some(path) = &manifest_path {
+		println!("  run manifest : {}", path.display());
+	}
 	if let Some(path) = &html_path {
 		println!("  html report  : {}", path.display());
 	}
@@ -340,6 +358,53 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 	// The run is honest about its own verdict: a correctness failure is a non-zero
 	// exit so a CI / scripted caller can gate on it.
 	Ok(if report.is_publishable() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+/// The manifest path for a report: same directory, same stem, `.manifest.json`.
+///
+/// The report's own name is `<profile>__<adapters>.json`, so the manifest's stem strip in
+/// [`RunManifest::report_path`] recovers the report from either file alone.
+fn manifest_path_for(report_path: &Path) -> PathBuf {
+	let stem = report_path.file_stem().map_or_else(|| "run".to_string(), |stem| stem.to_string_lossy().into_owned());
+	report_path.with_file_name(format!("{stem}.manifest.json"))
+}
+
+/// `weft-bench verify`: re-check a manifest against the report it points at.
+///
+/// Exits non-zero when the manifest does not verify, and prints every problem rather than the
+/// first — a gate that reports one problem per run turns a review into a loop. `--accept-advisories`
+/// tolerates the two problems that describe the tree the binary was built from (no recorded
+/// revision, a modified tree) instead of the record itself, which is what a development run wants.
+fn verify_manifest(path: &Path, accept_advisories: bool) -> ExitCode {
+	let manifest = match RunManifest::read(path) {
+		Ok(manifest) => manifest,
+		Err(error) => {
+			eprintln!("{PROG}: {error}");
+			return ExitCode::FAILURE;
+		}
+	};
+	let verdict = manifest.verify(path);
+	let shown: Vec<&Problem> = if accept_advisories { verdict.problems.iter().filter(|problem| problem.is_defect()).collect() } else { verdict.problems.iter().collect() };
+	println!("manifest   : {}", path.display());
+	println!("run        : {} @ {}", manifest.sources.git_sha.as_deref().unwrap_or("source unrecorded"), manifest.generated_at);
+	println!("toolchain  : rustc {} / {} / opt-level {}", manifest.provenance.build.rustc.as_deref().unwrap_or("?"), manifest.provenance.build.target.as_deref().unwrap_or("?"), manifest.provenance.build.opt_level.as_deref().unwrap_or("?"));
+	println!("report     : {} ({} bytes, sha256 {})", manifest.sources.report, manifest.sources.report_bytes, &manifest.sources.report_sha256[..manifest.sources.report_sha256.len().min(12)]);
+	println!("grade      : {} results, {} publishable, {} reference-grade measures", manifest.grade.result_count, manifest.grade.publishable_count, manifest.grade.measures.len());
+	if let Some(claim) = &manifest.claim {
+		println!("claim      : {claim}");
+	}
+	if shown.is_empty() {
+		println!("verdict    : VERIFIED ({} headline measures)", manifest.grade.measures.iter().filter(|measure| measure.headline).count());
+		return ExitCode::SUCCESS;
+	}
+	println!("verdict    : NOT VERIFIED ({} problem(s))", shown.len());
+	for problem in &shown {
+		println!("  - {problem}");
+	}
+	if accept_advisories && shown.len() != verdict.problems.len() {
+		println!("  ({} advisory problem(s) accepted by --accept-advisories)", verdict.problems.len() - shown.len());
+	}
+	ExitCode::FAILURE
 }
 
 /// Print a concise human-readable summary of a report, one block per adapter.
@@ -560,6 +625,13 @@ struct Cli {
 	/// Calibrate the interpolation backends before an interpolation run, as
 	/// `weft-server` does at startup (`--no-gpu-calibrate` turns it off).
 	gpu_calibrate: bool,
+	/// Also write a run manifest beside the report (`--no-manifest` turns it off). The manifest is
+	/// the provenance record a published benchmark claim points at (1.0 plan EVI-3).
+	manifest: bool,
+	/// The claim id this run is evidence for, recorded in the manifest (`--claim`).
+	claim: Option<String>,
+	/// Operator labels from repeated `--label name=value`, recorded in the manifest.
+	labels: Vec<(String, String)>,
 }
 
 /// Which input mode / workload a run drives. Exactly one is selected per
@@ -592,6 +664,14 @@ enum Command {
 	/// Run a benchmark with the given configuration. Boxed because [`Cli`] is large
 	/// relative to the unit `Help` variant.
 	Run(Box<Cli>),
+	/// Verify a run manifest against the report it points at.
+	Verify {
+		/// The manifest file to check.
+		manifest: PathBuf,
+		/// Exit zero for a manifest whose only problems are about the tree it was built from
+		/// (no recorded revision, a modified tree) rather than about the record itself.
+		accept_advisories: bool,
+	},
 }
 
 impl Cli {
@@ -607,6 +687,16 @@ impl Cli {
 	/// Returns a human-readable message for an unknown flag, a flag missing its
 	/// value, a malformed enum/number value, or a missing required argument.
 	fn from_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+		// Subcommands are the first token, and `verify` takes no benchmark flags at all: a
+		// verification must be expressible without any of the run's knobs, because the thing being
+		// checked is a finished artifact and not a configuration.
+		let mut tokens = args.into_iter().peekable();
+		if tokens.peek().is_some_and(|token| token == "verify") {
+			tokens.next();
+			return parse_verify_args(tokens);
+		}
+		let args = tokens;
+
 		// Synthetic-knob defaults come from the flagship knob set so the CLI never
 		// hardcodes a second copy of those constants.
 		let defaults = SyntheticParams::default();
@@ -640,6 +730,7 @@ impl Cli {
 		let mut compare = false;
 		let (mut html, mut parquet, mut ds_scaled) = (false, false, false);
 		let mut gpu_calibrate = true;
+		let (mut manifest, mut claim, mut labels): (bool, Option<String>, Vec<(String, String)>) = (true, None, Vec::new());
 
 		let mut iter = args.into_iter();
 		while let Some(token) = iter.next() {
@@ -708,6 +799,9 @@ impl Cli {
 				"--parquet" => parquet = true,
 				"--ds-scaled" => ds_scaled = true,
 				"--no-gpu-calibrate" => gpu_calibrate = false,
+				"--no-manifest" => manifest = false,
+				"--claim" => claim = Some(take_value(&key)?),
+				"--label" => labels.push(parse_label(&take_value(&key)?)?),
 				other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
 				// A bare positional is taken as the input path if one is not set yet.
 				other => {
@@ -723,8 +817,37 @@ impl Cli {
 		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (gpu_memory_mode, InputMode::GpuMemory)])?;
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
+}
+
+/// Parse the arguments of `weft-bench verify <MANIFEST> [--accept-advisories]`.
+fn parse_verify_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+	let mut manifest: Option<PathBuf> = None;
+	let mut accept_advisories = false;
+	for token in args {
+		match token.as_str() {
+			"--accept-advisories" => accept_advisories = true,
+			"-h" | "--help" => return Ok(Command::Help),
+			other if other.starts_with('-') => return Err(format!("unknown flag `{other}` for `verify`")),
+			other => {
+				if manifest.is_some() {
+					return Err(format!("unexpected argument `{other}`; `verify` takes one manifest path"));
+				}
+				manifest = Some(PathBuf::from(other));
+			}
+		}
+	}
+	Ok(Command::Verify { manifest: manifest.ok_or("verify needs a manifest path: weft-bench verify <MANIFEST>")?, accept_advisories })
+}
+
+/// Parse one `--label name=value` into a pair, rejecting an empty name.
+fn parse_label(token: &str) -> Result<(String, String), String> {
+	let (name, value) = token.split_once('=').ok_or_else(|| format!("--label wants name=value, got `{token}`"))?;
+	if name.trim().is_empty() {
+		return Err(format!("--label needs a non-empty name, got `{token}`"));
+	}
+	Ok((name.trim().to_string(), value.to_string()))
 }
 
 /// Select the single workload mode from the `(flag_set, mode)` candidates, defaulting
@@ -1023,6 +1146,7 @@ USAGE:
     weft-bench --downsample [DOWNSAMPLE OPTIONS]
     weft-bench --gap-fill [GAP-FILL OPTIONS]
     weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
+    weft-bench verify <RUN.manifest.json> [--accept-advisories]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -1156,6 +1280,13 @@ OPTIONS:
         --parquet            Also write the results as a flat Parquet table (one
                              row per result) beside the JSON, for DuckDB/Polars/
                              Grafana queries across many runs
+        --no-manifest        Don't write the run manifest beside the report. By default every run
+                             also writes <report-stem>.manifest.json: the provenance record
+                             (toolchain, build profile, hardware, allow-listed environment, sha256
+                             of the report) that a published benchmark claim points at. Capture
+                             refuses to write a manifest it cannot verify.
+        --claim <ID>         Record this run as evidence for claim <ID> in the manifest
+        --label <N>=<V>      Operator label recorded in the manifest; repeat for more than one
         --no-gpu-calibrate   Don't calibrate the interpolation backends first. By
                              default an interpolation run calls splimes::calibrate()
                              once (several seconds), as weft-server does at startup,
@@ -1164,10 +1295,19 @@ OPTIONS:
                              are printed and recorded in the report
     -h, --help               Print this help
 
+VERIFY:
+    weft-bench verify <MANIFEST>
+        Re-check a run manifest: every required provenance field is present, nothing in it still
+        looks like a credential, the report it points at exists and hashes to the sha256 recorded
+        at capture, and its measure set is usable. Prints every problem it finds and exits non-zero.
+        A manifest with no recorded source revision, or compiled from a modified tree, is reported
+        as not verified: those two are about the tree rather than the record, so --accept-advisories
+        tolerates them (useful for a development run that will never back a claim).
+
 The report is written as <out-dir>/<profile>__<adapters>.json (e.g.
 `__weftdb.json`, or `__weftdb+baseline-linear+baseline-forward-fill.json` under
---compare) and the process exits non-zero if any run's correctness gate does not
-pass.
+--compare) beside `<profile>__<adapters>.manifest.json`, and the process exits
+non-zero if any run's correctness gate does not pass.
 ";
 
 #[cfg(test)]
@@ -1182,7 +1322,59 @@ mod tests {
 		match run_cli(args).expect("args should parse") {
 			Command::Run(cli) => *cli,
 			Command::Help => panic!("expected a run, got help"),
+			Command::Verify { .. } => panic!("expected a run, got verify"),
 		}
+	}
+
+	#[test]
+	fn a_run_records_a_manifest_unless_told_otherwise() {
+		let cli = expect_run(&["--synthetic"]);
+		assert!(cli.manifest, "the manifest is on by default: provenance is the default, not an extra step");
+		assert_eq!(cli.claim, None);
+		assert!(cli.labels.is_empty());
+		let cli = expect_run(&["--synthetic", "--no-manifest"]);
+		assert!(!cli.manifest);
+	}
+
+	#[test]
+	fn claim_and_labels_parse_and_repeat() {
+		let cli = expect_run(&["--synthetic", "--claim=EVI-3", "--label", "operator=ci", "--label", "nightly=true"]);
+		assert_eq!(cli.claim.as_deref(), Some("EVI-3"));
+		assert_eq!(cli.labels, vec![("operator".to_string(), "ci".to_string()), ("nightly".to_string(), "true".to_string())]);
+		assert_eq!(run_cli(&["--synthetic", "--label", "oops"]).unwrap_err(), "--label wants name=value, got `oops`");
+		assert_eq!(run_cli(&["--synthetic", "--label", "=value"]).unwrap_err(), "--label needs a non-empty name, got `=value`");
+	}
+
+	#[test]
+	fn verify_subcommand_takes_one_manifest_and_one_flag() {
+		match run_cli(&["verify", "reports/json/run.manifest.json"]).expect("verify parses") {
+			Command::Verify { manifest, accept_advisories } => {
+				assert_eq!(manifest, PathBuf::from("reports/json/run.manifest.json"));
+				assert!(!accept_advisories);
+			}
+			other => panic!("expected verify, got {other:?}"),
+		}
+		match run_cli(&["verify", "a.json", "--accept-advisories"]).expect("advisory flag parses") {
+			Command::Verify { accept_advisories, .. } => assert!(accept_advisories),
+			other => panic!("expected verify, got {other:?}"),
+		}
+		assert_eq!(run_cli(&["verify"]).unwrap_err(), "verify needs a manifest path: weft-bench verify <MANIFEST>");
+		assert_eq!(run_cli(&["verify", "a.json", "b.json"]).unwrap_err(), "unexpected argument `b.json`; `verify` takes one manifest path");
+		assert_eq!(run_cli(&["verify", "a.json", "--reps", "3"]).unwrap_err(), "unknown flag `--reps` for `verify`");
+	}
+
+	#[test]
+	fn a_bare_word_after_verify_is_not_treated_as_an_input_file() {
+		// A positional is the input path for a run, so `verify` must be claimed before that rule.
+		let cli = expect_run(&["data.lp", "--field", "usage"]);
+		assert_eq!(cli.input, Some(PathBuf::from("data.lp")));
+	}
+
+	#[test]
+	fn the_manifest_sits_beside_its_report_with_the_same_stem() {
+		// `RunManifest::report_path` recovers the report from the manifest's stem, which only works
+		// while this naming rule holds.
+		assert_eq!(manifest_path_for(Path::new("reports/json/heavy__weftdb.json")), PathBuf::from("reports/json/heavy__weftdb.manifest.json"));
 	}
 
 	#[test]

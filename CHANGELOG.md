@@ -368,6 +368,37 @@ only the control plane, not the segment frames.
   someone has to remember. `scripts/crates/test_check.py` (36 tests over a throwaway four-crate
   workspace) includes the one that runs the checker against this repository.
 
+- **A run manifest, so a benchmark number can be re-checked** (1.0 plan EVI-3). A Weft-Bench run wrote a
+  report of numbers and a machine fingerprint, and nothing tied the two to the artifact that produced
+  them: a quoted figure carried no proof of which build, which toolchain, or which file it came from, so
+  a claim about a benchmark could not be audited or reproduced from the report alone. Every run now also
+  writes `<report-stem>.manifest.json` beside the report (`--no-manifest` opts out): schema v23, and its
+  own schema — the report artifact's schema stays at v22, because the numbers did not change shape, only
+  the record around them did. It carries the toolchain facts of *the binary that ran*: `rustc` semver,
+  commit and host, LLVM version, target, and the profile the code was optimized with (`profile`,
+  `opt-level`, `debug`, `lto`, `debug_assertions`, `panic`, and `target-cpu` when the build set it). Those
+  are baked in by a new `weft-bench/build.rs` from the environment cargo hands a build script, not read at
+  run time, because by the time a manifest is written the active toolchain may be a different one and a
+  released binary has no toolchain at all — a manifest that described the machine instead of the measured
+  build would be evidence about the wrong thing. Alongside them: the git revision and whether the tree
+  was modified, the hardware and engine fingerprint the report already carried, the allow-listed
+  environment (one entry per variable, a value never read cannot leak), the command line and working
+  directory, `--label name=value` operator labels, the `--claim <ID>` this run is evidence for, and a
+  `grade` block naming every headline measure with its unit and the direction that is better
+  (`latency.p50_ns` lower, `throughput.points_per_sec` higher, `storage.bytes_per_point` lower,
+  `accuracy.rmse` lower, `correctness.passed` as 1 or 0) so a comparison has one vocabulary instead of a
+  reader guessing which of two columns wins. Free text passes through a new `weft_bench::redaction`
+  module — secret-shaped key names, known token prefixes, URL user-info and PEM blocks become
+  `[redacted]`, `$HOME` becomes `~` — while an ordinary CPU model, file system or mount point is left
+  exactly as it was, since a manifest that has eaten its own provenance is not evidence either. Capture
+  refuses to write a manifest that does not verify: a credential still visible in it, a missing report, a
+  digest that does not match, or a duplicated measure name. `weft-bench verify <MANIFEST>` re-checks a
+  manifest later — required fields present, nothing credential-shaped left, the report found beside the
+  manifest or at its recorded path, and its sha256 equal to the recorded one — prints every problem rather
+  than the first, and exits non-zero; a manifest with no recorded revision, or built from a dirty tree, is
+  reported but classed as advisory, so `--accept-advisories` can gate a development run on the record
+  rather than on the state of the checkout.
+
 ### Changed
 
 - **`tokio` is 1.53.3, not 1.53.2.** RustSec advisory RUSTSEC-2026-0386 (`unsound`) reports that
