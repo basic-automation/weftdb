@@ -56,6 +56,7 @@ fn main() -> ExitCode {
 		}
 		Command::Run(cli) => *cli,
 		Command::Verify { manifest, accept_advisories } => return verify_manifest(&manifest, accept_advisories),
+		Command::Compare { baseline, candidate, threshold_pct, ignore_provenance, strict, json, markdown } => return compare_runs(&baseline, &candidate, threshold_pct, ignore_provenance, strict, json.as_deref(), markdown.as_deref()),
 	};
 
 	// A multi-threaded runtime is unnecessary for a single sequential run; a
@@ -407,6 +408,85 @@ fn verify_manifest(path: &Path, accept_advisories: bool) -> ExitCode {
 	ExitCode::FAILURE
 }
 
+/// Compare two stored benchmark reports and exit non-zero when the candidate regressed.
+///
+/// The exit code is the whole point for a nightly job: `0` means nothing got measurably worse,
+/// `1` means it did (under `--strict`, including a move that is beyond the threshold but still
+/// inside the noise). A refusal to compare at all is also a failure, because a nightly that
+/// silently compared nothing would report success forever.
+fn compare_runs(baseline: &Path, candidate: &Path, threshold_pct: f64, ignore_provenance: bool, strict: bool, json: Option<&Path>, markdown: Option<&Path>) -> ExitCode {
+	let (Some(baseline_report), Some(candidate_report)) = (read_report_or_fail(baseline), read_report_or_fail(candidate)) else {
+		return ExitCode::FAILURE;
+	};
+	let comparison = match weft_bench::compare::compare_reports(&baseline_report, &candidate_report, threshold_pct, ignore_provenance) {
+		Ok(comparison) => comparison,
+		Err(error) => {
+			eprintln!("{PROG}: {error}");
+			return ExitCode::FAILURE;
+		}
+	};
+	println!("baseline   : {}", baseline.display());
+	println!("candidate  : {}", candidate.display());
+	println!("threshold  : {}% and disjoint bootstrap intervals", weft_bench::compare::format_pct(threshold_pct));
+	println!("tally      : {}", comparison.tally());
+	for workload in &comparison.workloads {
+		if workload.verdict == weft_bench::compare::Verdict::Flat {
+			continue;
+		}
+		println!("  {} -> {}", workload.key, workload.verdict);
+		for metric in &workload.metrics {
+			if metric.verdict == weft_bench::compare::Verdict::Flat {
+				continue;
+			}
+			println!("    {:<26} {:>14.0} -> {:<14.0} {:+7.1}%  {:<13} {}", metric.metric, metric.baseline, metric.candidate, metric.change_pct, weft_bench::compare::noise_label(metric.noise), metric.verdict);
+		}
+	}
+	for key in &comparison.only_in_baseline {
+		println!("  only in baseline : {key}");
+	}
+	for key in &comparison.only_in_candidate {
+		println!("  only in candidate: {key}");
+	}
+	if let Some(path) = json {
+		if let Err(error) = std::fs::write(path, comparison.to_json().expect("a comparison always serialises")) {
+			eprintln!("{PROG}: cannot write the verdict to {}: {error}", path.display());
+			return ExitCode::FAILURE;
+		}
+		println!("verdict    : {}", path.display());
+	}
+	// Same verdict, same numbers, for a job summary or a notes page. Written from the same
+	// `Comparison`, so the table and the exit code cannot disagree.
+	if let Some(path) = markdown {
+		if let Err(error) = std::fs::write(path, comparison.to_markdown()) {
+			eprintln!("{PROG}: cannot write the verdict to {}: {error}", path.display());
+			return ExitCode::FAILURE;
+		}
+		println!("verdict    : {}", path.display());
+	}
+	if comparison.workloads.is_empty() {
+		// Name the real problem: the gate failed because it compared nothing, not because a
+		// number moved. Renamed workloads, a changed shape and a changed seed all look like this.
+		println!("verdict    : NO WORKLOADS PAIRED ({} baseline, {} candidate result(s))", comparison.workloads.len() + comparison.only_in_baseline.len(), comparison.workloads.len() + comparison.only_in_candidate.len());
+		return ExitCode::FAILURE;
+	}
+	if comparison.failed(strict) {
+		println!("verdict    : REGRESSED");
+		return ExitCode::FAILURE;
+	}
+	println!("verdict    : OK");
+	ExitCode::SUCCESS
+}
+
+fn read_report_or_fail(path: &Path) -> Option<weft_bench::report::BenchReport> {
+	match weft_bench::compare::read_report(path) {
+		Ok(report) => Some(report),
+		Err(error) => {
+			eprintln!("{PROG}: {error}");
+			None
+		}
+	}
+}
+
 /// Print a concise human-readable summary of a report, one block per adapter.
 fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 	println!("Weft-Bench run complete");
@@ -672,6 +752,24 @@ enum Command {
 		/// (no recorded revision, a modified tree) rather than about the record itself.
 		accept_advisories: bool,
 	},
+	/// Decide whether one saved run is slower than another.
+	Compare {
+		/// The stored report the candidate is measured against.
+		baseline: PathBuf,
+		/// The stored report to check.
+		candidate: PathBuf,
+		/// Percentage a metric must worsen by before the comparison calls it anything.
+		threshold_pct: f64,
+		/// Compare across operating systems and architectures, with the difference recorded as a
+		/// note instead of a refusal.
+		ignore_provenance: bool,
+		/// Fail on a move that is beyond the threshold but not separated from the noise.
+		strict: bool,
+		/// Write the machine-readable verdict here instead of only printing the table.
+		json: Option<PathBuf>,
+		/// Write the same verdict as a markdown table, for a job summary or a notes page.
+		markdown: Option<PathBuf>,
+	},
 }
 
 impl Cli {
@@ -694,6 +792,10 @@ impl Cli {
 		if tokens.peek().is_some_and(|token| token == "verify") {
 			tokens.next();
 			return parse_verify_args(tokens);
+		}
+		if tokens.peek().is_some_and(|token| token == "compare") {
+			tokens.next();
+			return parse_compare_args(tokens);
 		}
 		let args = tokens;
 
@@ -839,6 +941,59 @@ fn parse_verify_args(args: impl IntoIterator<Item = String>) -> Result<Command, 
 		}
 	}
 	Ok(Command::Verify { manifest: manifest.ok_or("verify needs a manifest path: weft-bench verify <MANIFEST>")?, accept_advisories })
+}
+
+/// Parse the arguments of
+/// `weft-bench compare <BASELINE.json> <CANDIDATE.json> [--threshold N] [--ignore-provenance] [--strict] [--json PATH] [--markdown PATH]`.
+fn parse_compare_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+	let (mut baseline, mut candidate): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+	let (mut json, mut markdown): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+	let (mut threshold_pct, mut ignore_provenance, mut strict) = (weft_bench::compare::DEFAULT_THRESHOLD_PCT, false, false);
+	// Flags and positional paths interleave, so a value-taking flag keeps its argument here rather
+	// than in a second pass over the tokens.
+	let mut tokens = args.into_iter();
+	let mut pending: Option<&'static str> = None;
+	while let Some(token) = tokens.next() {
+		if let Some(flag) = pending.take() {
+			let value = token.parse::<f64>().map_err(|_| format!("`{flag}` wants a percentage, got `{token}`"))?;
+			if !value.is_finite() || value <= 0.0 || value > 100.0 {
+				return Err(format!("`{flag}` wants a percentage above 0 and at most 100, got `{token}`"));
+			}
+			threshold_pct = value;
+			continue;
+		}
+		match token.as_str() {
+			"--threshold" => pending = Some("--threshold"),
+			"--ignore-provenance" => ignore_provenance = true,
+			"--strict" => strict = true,
+			"--json" => {
+				let path = tokens.next().ok_or("`--json` wants a path")?;
+				json = Some(PathBuf::from(path));
+			}
+			"--markdown" => {
+				let path = tokens.next().ok_or("`--markdown` wants a path")?;
+				markdown = Some(PathBuf::from(path));
+			}
+			"-h" | "--help" => return Ok(Command::Help),
+			other if other.starts_with('-') => return Err(format!("unknown flag `{other}` for `compare`")),
+			other => {
+				if baseline.is_none() {
+					baseline = Some(PathBuf::from(other));
+				} else if candidate.is_none() {
+					candidate = Some(PathBuf::from(other));
+				} else {
+					return Err(format!("unexpected argument `{other}`; `compare` takes a baseline and a candidate path"));
+				}
+			}
+		}
+	}
+	if pending.is_some() {
+		return Err("`--threshold` wants a percentage".to_string());
+	}
+	let (Some(baseline), Some(candidate)) = (baseline, candidate) else {
+		return Err("compare needs two reports: weft-bench compare <BASELINE.json> <CANDIDATE.json>".to_string());
+	};
+	Ok(Command::Compare { baseline, candidate, threshold_pct, ignore_provenance, strict, json, markdown })
 }
 
 /// Parse one `--label name=value` into a pair, rejecting an empty name.
@@ -1147,6 +1302,7 @@ USAGE:
     weft-bench --gap-fill [GAP-FILL OPTIONS]
     weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
     weft-bench verify <RUN.manifest.json> [--accept-advisories]
+    weft-bench compare <BASELINE.json> <CANDIDATE.json> [COMPARE OPTIONS]
 
 INPUT MODE (choose one):
     -i, --input <FILE>       Line-protocol input file (.lp / TSBS payload)
@@ -1304,6 +1460,23 @@ VERIFY:
         as not verified: those two are about the tree rather than the record, so --accept-advisories
         tolerates them (useful for a development run that will never back a claim).
 
+COMPARE:
+    weft-bench compare <BASELINE.json> <CANDIDATE.json>
+        Decide whether the candidate run is materially slower than the baseline. Workloads pair
+        by profile, adapter, workload and dataset shape; a measure counts as a regression only
+        when it worsens by more than --threshold AND the two runs' bootstrap intervals do not
+        overlap. A move beyond the threshold whose intervals still overlap is reported as
+        suspicious and does not fail the gate unless --strict is given. Measures with no
+        interval to begin with (throughput, size, ratio, count) can only ever be suspicious.
+        Refuses to compare across operating systems or architectures unless --ignore-provenance
+        is given, and treats comparing nothing at all as a failure, because a renamed workload
+        would otherwise report success. Exits non-zero on a regression or a refusal.
+        --threshold N        Percentage above 0 and at most 100 (default 10)
+        --ignore-provenance  Compare across platforms, recording the difference as a note
+        --strict             Also fail on a suspicious move that is still inside the noise
+        --json PATH          Write the machine-readable verdict
+        --markdown PATH      Write the same verdict as a markdown table
+
 The report is written as <out-dir>/<profile>__<adapters>.json (e.g.
 `__weftdb.json`, or `__weftdb+baseline-linear+baseline-forward-fill.json` under
 --compare) beside `<profile>__<adapters>.manifest.json`, and the process exits
@@ -1323,6 +1496,7 @@ mod tests {
 			Command::Run(cli) => *cli,
 			Command::Help => panic!("expected a run, got help"),
 			Command::Verify { .. } => panic!("expected a run, got verify"),
+			Command::Compare { .. } => panic!("expected a run, got compare"),
 		}
 	}
 
@@ -1769,5 +1943,42 @@ mod tests {
 	fn derive_profile_name_uses_file_stem() {
 		assert_eq!(derive_profile_name(std::path::Path::new("cpu-usage.lp")), "cpu-usage");
 		assert_eq!(derive_profile_name(std::path::Path::new("/data/sensors/temp.lp")), "temp");
+	}
+
+	#[test]
+	fn compare_subcommand_takes_two_reports_and_five_flags() {
+		match run_cli(&["compare", "old.json", "new.json"]).expect("compare parses") {
+			Command::Compare { baseline, candidate, threshold_pct, ignore_provenance, strict, json, markdown } => {
+				assert_eq!(baseline, PathBuf::from("old.json"));
+				assert_eq!(candidate, PathBuf::from("new.json"));
+				assert_eq!(threshold_pct, weft_bench::compare::DEFAULT_THRESHOLD_PCT);
+				assert!(!ignore_provenance, "cross-platform comparison stays refused by default");
+				assert!(!strict, "a suspicious move does not gate by default");
+				assert!(json.is_none() && markdown.is_none());
+			}
+			other => panic!("expected compare, got {other:?}"),
+		}
+		match run_cli(&["compare", "a.json", "b.json", "--threshold", "2.5", "--strict", "--ignore-provenance", "--json", "v.json", "--markdown", "v.md"]).expect("every compare flag parses") {
+			Command::Compare { threshold_pct, strict, ignore_provenance, json, markdown, .. } => {
+				assert_eq!(threshold_pct, 2.5);
+				assert!(strict && ignore_provenance);
+				assert_eq!(json, Some(PathBuf::from("v.json")));
+				assert_eq!(markdown, Some(PathBuf::from("v.md")));
+			}
+			other => panic!("expected compare, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn compare_arguments_are_validated_before_the_gate_runs() {
+		// Each of these would otherwise be a nightly that reports success having compared
+		// nothing, or that compares against a threshold that was never parsed.
+		assert!(run_cli(&["compare", "only-one.json"]).unwrap_err().contains("needs two reports"));
+		assert!(run_cli(&["compare", "a.json", "b.json", "c.json"]).unwrap_err().contains("unexpected argument"));
+		assert!(run_cli(&["compare", "a.json", "b.json", "--threshold", "0"]).unwrap_err().contains("percentage"));
+		assert!(run_cli(&["compare", "a.json", "b.json", "--threshold", "nonsense"]).unwrap_err().contains("percentage"));
+		assert!(run_cli(&["compare", "a.json", "b.json", "--threshold"]).unwrap_err().contains("percentage"));
+		assert!(run_cli(&["compare", "a.json", "b.json", "--markdown"]).unwrap_err().contains("wants a path"));
+		assert!(run_cli(&["compare", "a.json", "b.json", "--reps", "3"]).unwrap_err().contains("unknown flag"));
 	}
 }

@@ -439,6 +439,32 @@ only the control plane, not the segment frames.
   reported but classed as advisory, so `--accept-advisories` can gate a development run on the record
   rather than on the state of the checkout.
 
+- **A regression gate for benchmark numbers** (1.0 plan EVI-5). The harness could produce a report and a
+  manifest, and nothing could answer the only question a nightly needs: is tonight slower than the last
+  night we were happy with? Comparing two runs by eye is how a 12% latency walk to nowhere gets called
+  noise, and how a real one gets called a bad machine. `weft-bench compare <BASELINE.json> <CANDIDATE.json>`
+  pairs workloads by profile, adapter, workload and dataset shape — a changed point count or seed is a
+  different workload, not a slower one — and rates each headline measure `flat`, `improved`, `suspicious`
+  or `regression`, using the measure names and better-directions from the manifest's `grade` block so the
+  two commands cannot disagree about which of two columns wins. A measure counts as a regression only when
+  it worsens by more than `--threshold` (default 10%) **and** the two runs' bootstrap intervals do not
+  overlap: a large move the noise still explains is reported as suspicious and does not fail the gate
+  unless `--strict` says otherwise. A measure with no interval to begin with — throughput, storage size, a
+  ratio or a count — can therefore never be a regression on its own, and `compare` says so in its note
+  rather than inventing a confidence it does not have. The correctness flag is the exception: it has no
+  magnitude to bound, so a workload that was correct and is not any more is a regression at any threshold.
+  It refuses to compare across operating systems, architectures or report schema versions (a v22 column and
+  a v23 column of the same name need not mean the same thing; `--ignore-provenance` overrides), tolerates
+  the CPU, core count, memory and file system a
+  hosted runner changes by itself, and treats comparing nothing at all as a failure, because a renamed
+  workload would otherwise report success. It exits non-zero on a regression or a refusal; `--json` and
+  `--markdown` write the same `Comparison`, so the verdict file and the exit code cannot drift apart. A
+  new nightly workflow, `.github/workflows/bench-regression.yml`, builds the release profile, runs one
+  fixed synthetic workload with a pinned seed, verifies its own manifest, and compares against the newest
+  *successful* run of itself, so a red night stops being the baseline instead of becoming tomorrow's
+  excuse; it is separate from `ci.yml` on purpose, because `scripts/release/verify.sh` reads CI as release
+  evidence and a noisy night must not be able to veto a release.
+
 ### Changed
 
 - **`tokio` is 1.53.3, not 1.53.2.** RustSec advisory RUSTSEC-2026-0386 (`unsound`) reports that

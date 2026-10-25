@@ -94,6 +94,32 @@ session's deliberate decision and re-adding it would fight that.
 one-liners should link to it; a checklist whose criteria live nowhere reconstructable is how a slice gets
 ticked for less than it means.
 
+## 2026-10-25 — what the nightly benchmark gate compares against, and when a move is a regression
+
+**Ambiguous:** EVI-5 asks for a "nightly benchmark-regression workflow and `weft-bench compare`" and says
+nothing about either of the two decisions that make it work: which run is the baseline, and what makes a
+number "regress". A gate can be built to satisfy the sentence in several incompatible ways, and each of
+them fails differently.
+
+**Chosen.** The baseline is the newest *successful* run of the gate itself, fetched from its artifact; a
+night that regresses goes red and stops being a baseline. Comparing against "yesterday" instead lets the
+truth drift one small step per night — such a gate measures the slope, and a store can lose a third of its
+speed over a quarter without any single night crossing anything. The first night has no baseline: it
+uploads its report, says so in the summary, and passes; the gate starts comparing on the second night.
+
+A regression requires two independent things: the move exceeds `--threshold` (10% by default) **and** the
+bootstrap confidence intervals of the two runs do not overlap. Beyond-threshold-but-overlapping is
+`suspicious`: printed, in the verdict, not gating unless `--strict`. The threshold alone would page on
+hosted-runner shape changes; the interval test alone would call a 2% move on a tiny workload a crisis.
+A measure with no interval (throughput, storage size, ratio, count) can only ever be suspicious, and the
+verdict names that ceiling instead of quietly treating it as evidence of nothing.
+
+**Rejected:** a fixed nanosecond or MB/s budget, because `docs/design/benchmarks.md` "How to cite a
+number" already establishes that hosted runners are not the same machine twice, and a budget written
+today is wrong the first time the runner fleet moves; and putting this job inside `ci.yml`, because
+`scripts/release/verify.sh` reads the latest completed `ci.yml` run as release evidence, so a red night
+caused by a noisy neighbour would gain the power to veto a release.
+
 ## Needs human
 
 - Anything that creates a git tag or GitHub release, or publishes to crates.io (PAC-19, FRE-18,

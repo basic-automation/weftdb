@@ -1,0 +1,192 @@
+name: benchmark regression
+
+# The nightly benchmark gate. It runs one fixed workload with a fixed seed, compares the
+# result against the last run that passed this gate, and fails when the candidate is
+# materially slower. `weft-bench compare` holds the judgement; this file only supplies two
+# reports and reads the exit code.
+#
+# The baseline is the most recent successful run of *this* workflow, fetched from its
+# artifact. A night that regresses goes red and stops being a baseline, so the comparison
+# stays anchored to the last known-good measurement rather than drifting one small step per
+# night — a gate that compares to yesterday measures, at best, the slope.
+#
+# A separate workflow on purpose, like bigdecimal-drift.yml: scripts/release/verify.sh reads
+# the latest completed run of ci.yml as release evidence, so a red night here — a runner
+# that changed shape, a noisy neighbour, an upstream code path we did not touch — must not
+# be able to veto a release. It runs on no push and no pull request.
+#
+# Why a relative threshold plus a noise gate rather than a fixed nanosecond budget: hosted
+# runners are not the same machine twice (see docs/design/benchmarks.md, "How to cite a
+# number"). A move counts as a regression only when it is both larger than the threshold and
+# outside both runs' bootstrap intervals; a larger-than-threshold move whose intervals still
+# overlap is reported as suspicious and does not fail the gate. `weft-bench compare` refuses
+# to compare across operating systems or architectures at all, so the gate is pinned to one
+# runner.
+
+on:
+  schedule:
+    # 06:00 UTC daily, an hour before ci.yml's own nightly run, so the two do not compete for
+    # the same runners and a regression is visible before the morning.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      threshold_pct:
+        description: "Percentage a single measure may move before it is a candidate regression"
+        required: false
+        default: "10"
+      baseline_run:
+        description: "Run id to compare against instead of the last successful run (empty = auto)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  # To list this workflow's earlier runs and download their report artifact. Read-only, and
+  # scoped by GitHub to the repository that owns the run.
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # One fixed workload, so that night N and night N+1 describe the same measurement. The
+  # seed, point count, repetitions and decimal rounding are all pinned: an unpinned seed
+  # changes the dataset, `compare` treats a changed dataset as a different workload, and a
+  # comparison of no workloads at all fails the gate (loudly, on purpose).
+  WORKLOAD_NAME: nightly-interpolation
+  BENCH_DIR: bench-out
+
+jobs:
+  regression:
+    name: ubuntu-latest, ${{ github.event_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+
+      # The release profile, because that is what a user runs. A dev-profile gate would
+      # protect a build nobody benchmarks with: the profile difference is larger than most
+      # regressions this gate is meant to catch.
+      - name: Build the runner
+        run: cargo build --locked --release -p weft-bench
+
+      - name: Run the fixed workload
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/weft-bench \
+            --synthetic \
+            --name "$WORKLOAD_NAME" \
+            --points 100000 \
+            --seed 0x5EED \
+            --reps 7 \
+            --decimals 6 \
+            --no-gpu-calibrate \
+            --out-dir "$BENCH_DIR"
+          echo "candidate=$BENCH_DIR/$WORKLOAD_NAME__weftdb.json" >> "$GITHUB_ENV"
+      # The run manifest is the evidence record (EVI-3): the toolchain, build profile,
+      # hardware and report hash. A candidate whose own manifest will not verify is not
+      # evidence, whatever its numbers say.
+      - name: Verify the run manifest
+        shell: bash
+        run: ./target/release/weft-bench verify "$BENCH_DIR/$WORKLOAD_NAME__weftdb.manifest.json"
+
+      - name: Find the baseline run
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.baseline_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${REQUESTED:-}" ]; then
+            echo "id=$REQUESTED" >> "$GITHUB_OUTPUT"
+            echo "using the run id supplied at dispatch: $REQUESTED"
+            exit 0
+          fi
+          # The newest successful run of this workflow other than this one. `gh` is on the
+          # runner image; --jq keeps the whole list out of the log.
+          id=$(gh run list \
+            --workflow "benchmark regression" \
+            --status success \
+            --limit 10 \
+            --json databaseId \
+            --jq "[.[].databaseId] | map(select(. != ${{ github.run_id }})) | first // empty")
+          echo "id=${id:-}" >> "$GITHUB_OUTPUT"
+          if [ -z "${id:-}" ]; then
+            echo "no previous successful run: this run becomes the first baseline"
+          else
+            echo "baseline is run $id"
+          fi
+
+      - name: Download the baseline report
+        if: steps.baseline.outputs.id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bench-report
+          run-id: ${{ steps.baseline.outputs.id }}
+          path: bench-baseline
+
+      - name: Compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          threshold="${{ inputs.threshold_pct || '10' }}"
+          {
+            echo "## Benchmark regression gate"
+            echo
+            echo "- baseline run: \`${{ steps.baseline.outputs.id || 'none yet' }}\`"
+            echo "- threshold: ${threshold}% and disjoint bootstrap intervals"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f bench-baseline/"$(basename "$candidate")" ]; then
+            {
+              echo
+              echo "**No baseline artifact yet.** This run is uploaded as the first baseline;"
+              echo "the gate starts comparing on the next night."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          set +e
+          ./target/release/weft-bench compare \
+            "bench-baseline/$(basename "$candidate")" \
+            "$candidate" \
+            --threshold "$threshold" \
+            --markdown bench-out/verdict.md \
+            --json bench-out/verdict.json | tee bench-out/compare.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo
+            echo '```'
+            cat bench-out/compare.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # One flat staging directory, because an artifact's internal layout is derived from
+          # the paths given to the uploader: globbed paths would arrive nested, and next
+          # night's download looks for the report by name at the top level.
+          mkdir -p bench-stage
+          for file in "$candidate" "$BENCH_DIR/$(basename "$candidate" .json).manifest.json" bench-out/compare.txt bench-out/verdict.json bench-out/verdict.md; do
+            [ -e "$file" ] && cp "$file" bench-stage/
+          done
+          exit "$status"
+
+      # Uploaded even when the comparison failed: the point of a red night is the numbers,
+      # and the manifest beside them is what makes them citable. `error` rather than `warn`
+      # because an empty artifact means no future night ever finds a baseline.
+      - name: Upload this run's report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-report
+          path: bench-stage
+          if-no-files-found: error
+          retention-days: 90

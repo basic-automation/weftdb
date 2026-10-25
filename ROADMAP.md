@@ -238,7 +238,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 - [ ] **W2 · Error contract, frame format, portable builds**
   - [ ] Legacy lane
   - [ ] **PAC-2** Portable Linux binaries on a glibc 2.28 baseline
-  - [ ] **EVI-5** Nightly benchmark-regression workflow and `weft-bench compare`
+  - [x] **EVI-5** Nightly benchmark-regression workflow and `weft-bench compare`
   - [ ] **EVI-2** Claims registry and markdown claim/link lint
   - [ ] → **EVI-4** Artifact pipeline
   - [ ] **EVI-6** Ingest workload over SegmentStore and the UCI corpus loader
