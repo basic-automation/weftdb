@@ -13,14 +13,25 @@ members = [
 	"weft-reduce",
 ]
 
-# Fields every workspace member inherits with `<field>.workspace = true`. Each crate keeps
-# its own edition and description; everything else is released in lockstep.
+# Fields every workspace member inherits with `<field>.workspace = true`.
+#
+# `version` is deliberately absent. Each crate names its own, so a patch that touches one
+# library does not bump the other nine and ship nine releases whose only change is the
+# number. The release tag is still one version — `weft-server`'s, which
+# scripts/release/verify.sh reads — and `scripts/crates/check.py` keeps the per-crate
+# versions and the path-dependency requirements below in step. FRE-1.
+#
+# `edition` is here so the workspace has exactly one: a crate on another edition compiles
+# under different rules than the crates next to it. FRE-22's move to 2024 is this one line.
+#
+# `readme` is inherited by the binary crates, which the registry never serves. A published
+# crate points at its own README, because that file is what crates.io renders as its page.
 [workspace.package]
-version = "0.1.0"
 license = "MIT OR Apache-2.0"
 authors = ["Justin Icenhour"]
 repository = "https://github.com/basic-automation/weftdb"
 readme = "README.md"
+edition = "2021"
 # The workspace builds on stable Rust. The floor is set by the `sysinfo` dependency,
 # not by the 2024 edition of the `splimes` dependency; verified with `cargo +1.95 check --workspace`.
 rust-version = "1.95"
@@ -69,6 +80,11 @@ num_cpus = "1"
 ratatui = "0.30"
 crossterm = "0.29"
 sysinfo = "0.39"
+# The workspace's own crates. Each row carries the version requirement its dependents get,
+# and the member named by `path` must be at least that version: crates.io resolves a path
+# dependency by its version, so bumping one side and not the other fails `cargo publish` at
+# the tag with a message about the workspace layout. `python3 scripts/crates/check.py check`
+# names the crate that is out of step, on the PR. FRE-1.
 weftdb = { path = "./weftdb", version = "0.1.0" }
 # Developed in its own repository (github.com/basic-automation/splimes), on its own roadmap.
 # `default-features = false` because splimes' defaults turn on its `gpu` backend, which pulls

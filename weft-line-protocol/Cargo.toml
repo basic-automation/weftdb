@@ -1,11 +1,12 @@
 [package]
 name = "weft-line-protocol"
-version.workspace = true
-edition = "2021"
+version = "0.1.0"
+edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/weft-line-protocol"
 readme = "README.md"
 description = "Vendor-neutral InfluxDB Line Protocol (ILP) parser: text in, neutral records / splimes points out. No client, no network, no vendor dependency."
 keywords = ["influxdb", "line-protocol", "parser", "timeseries", "ilp"]

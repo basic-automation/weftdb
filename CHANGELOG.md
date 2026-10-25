@@ -352,6 +352,21 @@ only the control plane, not the segment frames.
   rather than finishing the job, and saying what an operator does then is the remaining part of FRE-14:
   the route an operator runs from the command line or the server, the numbered migrations that register
   `metadata.db`'s schema, and a reading of a tree too big to hold one aspect in memory.
+- **A checker for the metadata a release is made of** (1.0 plan FRE-1). `scripts/crates/check.py`
+  reads the workspace manifests and reports, one line per problem, each state that would make a
+  publish fail or ship the wrong thing: a crate marked `publish = false` that is not one of the three
+  binaries the release archives, or one of those three without it; a crate that declares no version of
+  its own; an `edition` a crate sets against the workspace's; an internal path dependency with no
+  version requirement, or one the member's own version does not satisfy; a published crate with no
+  `README.md`, no `documentation` URL, or a `license` expression whose text is not in the crate
+  directory. It reads the manifests and nothing else — registry resolvability cannot be checked before
+  the first publish, because `cargo package -p weft-reduce` needs `weft-physical-type` to already be on
+  crates.io, which is the chicken-and-egg `scripts/publish.sh` documents — so it runs offline: in CI as
+  the new `crates` job, and again inside `publish.sh` before it uploads anything. Its `publish-order`
+  subcommand prints the publishable members in dependency order, topological with member order as the
+  tie-break, and `publish.sh` takes both its list and its order from it rather than from an array
+  someone has to remember. `scripts/crates/test_check.py` (36 tests over a throwaway four-crate
+  workspace) includes the one that runs the checker against this repository.
 
 ### Changed
 
@@ -368,6 +383,19 @@ only the control plane, not the segment frames.
   archive built before this commit carried the flagged version. `deny.toml` keeps
   `[advisories] ignore = []`: an advisory that names a released fix is upgraded, not muted.
 
+- **Every crate declares its own version, and the workspace declares the edition** (1.0 plan FRE-1).
+  `[workspace.package]` carries no `version` any more and each of the ten members states
+  `version = "0.1.0"` where it inherited one, because a release is a statement about specific crates
+  and a patch of one library is not a reason to put a number on nine that did not change. The release
+  pipeline is unchanged: `weft-server`'s version is still the one a tag names, which is what
+  `scripts/release/verify.sh` reads and refuses a disagreeing tag about. `edition` went the other way —
+  the workspace states `edition = "2021"` and every member inherits it, so FRE-22's move to edition
+  2024 is one edit in one file instead of ten in ten. The internal `[workspace.dependencies]` path
+  entries keep their explicit `version = "0.1.0"` requirements, and `scripts/crates/check.py check`
+  (see Added) is what keeps those requirements and the members' versions in step. Each published crate
+  now states `documentation = "https://docs.rs/<crate>"`, and `weftdb` carries a `README.md` of its
+  own: it inherited the repository's, so its crates.io page would have described a server and a
+  terminal UI on a library's page.
 - **Library crates stop deciding their users' allocator and GPU stack** (1.0 plan PAC-3). No
   library in this workspace enables turso's `mimalloc` feature or splimes' default `gpu` feature
   any more, because both are decisions a dependency makes for the whole process. turso 0.8.1
@@ -889,6 +917,19 @@ only the control plane, not the segment frames.
   segment gets the segment's scale back on its zeros when it is loaded. One it wrote for
   a segment of another physical type still reads back with those scales lost: nothing
   rebuilds it unless maintenance rewrites the segment.
+- **A checked-out v0.1.0 fixture was not the tree the release wrote.** Rows-mode gave every
+  aspect an empty `dictionaries/` directory beside its `measurements.db`
+  (`v0.1.0:weftdb/src/types/aspect.rs:252`), and an empty directory is the one artifact git
+  cannot store. `MANIFEST.sha256` hashes files, so it names none of them and reports no gap
+  when they are absent: the 109 files came back complete from a fresh checkout — the negation
+  that recovered what `.gitignore` ate accounts for every one — and the three directories did
+  not. The readable leg of the rows-mode work names what it leaves behind, and one path it must
+  name is `plant/price/dictionaries`, so `weftdb/tests/compat_v010.rs` failed on all three CI
+  platforms and passed on any machine that had run the generator: evidence that depended on the
+  machine reading it. The test now restores the directories on the copy it reads, one beside
+  every `measurements.db` it finds, derived from the tree rather than from a list of aspects —
+  so a fixture that grows an aspect grows its directory without anyone editing the test, and the
+  committed tree stays exactly the bytes the release wrote.
 
 ### Security
 

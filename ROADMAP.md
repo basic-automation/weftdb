@@ -202,7 +202,7 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 - [ ] **Public surface declared and frozen**
 - [ ] **Compatibility tests**
 - [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
-- [ ] **Crate publishing split**
+- [x] **Crate publishing split**
 - [ ] **Panic audit on server paths**
 - [ ] **Security process**
   - [ ] **Private vulnerability reporting is off**
@@ -228,7 +228,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   On the release and identity side, the release pipeline (PAC-1a) and the canonical `TagSet`, `SeriesKey` and `SeriesSelector` types with their frozen caps (TAG-1) are in, and GitHub private vulnerability reporting is turned on (owner step).
 
 - [ ] **W1 · Baseline release, server split, goldens**
-  - [ ] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
+  - [x] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
   - [ ] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
   - [ ] **TAG-3** Open `ValueKind` in weftdb, provenance scope
   - [ ] **EVI-1** Claims hygiene

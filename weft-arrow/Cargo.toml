@@ -1,11 +1,12 @@
 [package]
 name = "weft-arrow"
-version.workspace = true
-edition = "2021"
+version = "0.1.0"
+edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/weft-arrow"
 readme = "README.md"
 description = "Apache Arrow interchange for WeftDB's typed columnar segments: sealed segment to RecordBatch and back, plus Arrow IPC and Parquet bytes."
 keywords = ["arrow", "parquet", "timeseries", "columnar", "interchange"]
