@@ -230,7 +230,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 - [ ] **W1 · Baseline release, server split, goldens**
   - [x] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
   - [x] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
-  - [ ] **TAG-3** Open `ValueKind` in weftdb, provenance scope
+  - [x] **TAG-3** Open `ValueKind` in weftdb, provenance scope
   - [ ] **EVI-1** Claims hygiene
   - [x] **EVI-3** Run manifest (schema v23: the 2026-10-09 routine took v20–v22, so EVI-3 takes the next free number per the plan's rule)
   - [ ] **EVI-9** Block missingness and scale presets
