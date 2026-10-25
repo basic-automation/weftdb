@@ -1,0 +1,8 @@
+regular_64	total=64	mean=1.000
+regular_gap	total=278	mean=2.896
+constant_200	total=1200	mean=6.000
+alternating_200	total=1200	mean=6.000
+scattered_128	total=384	mean=3.000
+widths	total=42	mean=4.200
+empty	total=0	mean=0.000
+single	total=1	mean=1.000

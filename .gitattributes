@@ -10,3 +10,9 @@ weftdb/tests/fixtures/** -text
 # being the release's, and `weftdb/tests/compat_v010.rs` parses expected_reads.txt with LF
 # line endings on every platform.
 compat/fixtures/** -text
+# The FRE-3 goldens are the bytes themselves: a test compares a fixture against what this
+# build writes, byte for byte, so a checkout that normalizes line endings would rewrite the
+# image instead of revealing a change to it. They live in tests/golden/ beside the suites that
+# read them (frames and codecs in weft-physical-type, .weftpart sidecars in weftdb).
+weft-physical-type/tests/golden/** -text
+weftdb/tests/golden/** -text

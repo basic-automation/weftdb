@@ -367,6 +367,30 @@ only the control plane, not the segment frames.
   tie-break, and `publish.sh` takes both its list and its order from it rather than from an array
   someone has to remember. `scripts/crates/test_check.py` (36 tests over a throwaway four-crate
   workspace) includes the one that runs the checker against this repository.
+- **Committed goldens for the bytes the store writes** (1.0 plan FRE-3). Every frame-format test in this
+  repository was a round trip — encode, decode, compare against the input — which passes unchanged after a
+  change that moves the writer and the reader together, so it said nothing about whether a reader from the
+  previous release can still read a file this one writes. Three suites now diff against committed bytes:
+  `weft-physical-type/tests/golden_frames.rs` over 20 `.weftseg` fixtures (single-block v5 across every
+  reachable physical type and value codec, all five timestamp block codecs, the persisted checkpoint index,
+  the paged v6 layout with its page table, the v7 envelope bare and carrying an unknown non-critical
+  extension, and the bit-sliced transposed codec behind `bitsliced-codec`); `golden_codecs.rs` over 40
+  encoding fixtures — 36 byte images plus four text records, because a run-length split or a
+  codec-selection table is easier to review as words than as hex (the bit-packed width and payload, the
+  run-length split, the delta-of-delta anchors, the zigzag varint sizing and, behind
+  `experimental-codecs`, each persisted `f64` codec over the corpora that realize it plus the fixed table
+  the codec-selection heuristic chooses from); and
+  `weftdb/tests/golden_sidecar.rs` over 2 `.weftpart` fixtures, a base resolution and a rollup chain. Each
+  case pins two things: the bytes, and the contents those bytes decode to, against a result recomputed from
+  the corpus — so a fixture re-recorded after a behaviour change cannot smuggle different numbers through
+  the byte pin. A mismatch reports the offset, a hex window around it, and what a reader from the last
+  release would now make of the file; `WEFT_UPDATE_GOLDENS=1` re-records, and the failure text says plainly
+  that re-recording is a compatibility decision rather than a test fix. An orphan check fails if a fixture
+  appears in `tests/golden` that no case writes, or a case writes one that is not committed, so the fixture
+  set cannot drift from the suite behind it. Gated fixtures stay on disk in a build without their gate and
+  are skipped rather than deleted — their presence is the gate working. The gated halves are exercised by
+  CI's `features` job, which builds `weft-physical-type --all-features` (plan note C21 asked for exactly
+  `--features experimental-codecs,bitsliced-codec`, which that job's `--all-features` is a superset of).
 
 - **A run manifest, so a benchmark number can be re-checked** (1.0 plan EVI-3). A Weft-Bench run wrote a
   report of numbers and a machine fingerprint, and nothing tied the two to the artifact that produced
