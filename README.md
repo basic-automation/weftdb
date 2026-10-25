@@ -288,9 +288,10 @@ truth for status and priorities, and it records negative results alongside wins.
 Every number below was measured by a benchmark in this repo. Where a row names a **Source:**
 path, that is the bench the figure came from and you can re-run it; the run artifacts themselves
 (the manifest and result JSON of schema v23) are not committed, so a figure with no source line is
-a *dated local measurement*, not a claim you can reproduce from a clone. Requiring a source line
-for every figure is the job of the claims registry ([roadmap EVI-2](ROADMAP.md)), which lands
-before 1.0; until then this section says which is which. The exception is any figure measured on
+a *dated local measurement*, not a claim you can reproduce from a clone. Which proof each figure carries is machine-checked, not asserted in prose:
+[`bench/claims.json`](bench/claims.json) is the per-figure registry and
+[`tools/check_claims.py`](tools/check_claims.py) runs it in CI, so a figure with no entry, or an
+entry whose text or source path has drifted, fails the build. The exception is any figure measured on
 the real BTC corpus: that input is a local file the repository does not ship (see
 [Ingest](#ingest)), so those figures cannot be reproduced from a clone at all. All were measured on
 one developer workstation — treat them as *shape*, not as a specification for your hardware.
@@ -304,7 +305,7 @@ one developer workstation — treat them as *shape*, not as a specification for 
 | Batch of 64 instants (one pass vs 64 single lookups) | **67 µs** | 3.57 ms | ~54× |
 | 100-row window over 100k rows | **58 µs** | 2.73 ms | ~47× |
 
-*Source: [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs),
+*Source: [`weft-physical-type/benches/pointread.rs`](weft-physical-type/benches/pointread.rs), <!-- claim:pointread-2026-10-08 -->
 re-measured 2026-10-08 after the word-wise bit reads and the slicing-by-16 frame CRC.*
 The wins come from skipping the value column entirely until a specific row is needed,
 and from resolving regular timestamp columns in closed form.
@@ -317,7 +318,7 @@ Sealing **1M rows** of a real 1-minute financial series into a columnar segment:
 That corpus (`database/datasets/btc_1min.csv`, a BTC/USD one-minute series) is a local,
 gitignored file, **not distributed with this repository** and not required to build or test —
 the suite skips the tests that use it when it is absent, and so do the benches that load it by
-default. Every "real BTC" figure in this README comes from it, so none of them can be reproduced
+default. Every "real BTC" figure in this README comes from it, so none of them can be reproduced <!-- claim:ingest-real-btc -->
 from a clone. Whether those numbers are cleared for publication or retired is an open item with
 counsel before 1.0 ([1.0 plan, Appendix B](https://basicautomation.io/projects/weftdb/docs/release-plan#appendix-b-human-only-tasks)).
 The ingest figure is quoted anyway because a *synthetic* generator materially flatters the
@@ -328,7 +329,7 @@ as results.
 ### Reductions
 
 At 500k two-decimal points, hour buckets, correctness-gated
-([`weft-bench --downsample`](weft-bench); re-measured 2026-10-09 on the two-decimal generator, full
+([`weft-bench --downsample`](weft-bench); re-measured 2026-10-09 on the two-decimal generator, full <!-- claim:reductions-2026-10-09 -->
 table under [Compute endpoints](#compute-endpoints)): `avg` takes **4.5 ms (118M points/sec)**;
 time-weighted average costs about 5.7× that. Exact `p99` takes **23.5 ms** and the approximate
 `sketch_p99` about the same (**18.8 ms**), on real BTC closes too; what the sketch buys is bounded
@@ -357,12 +358,12 @@ same buckets:
 | `weft_reduce::reduce_scaled` (exact, on the stored `ScaledI64` mantissas) | **4.26 ms** | ~2.1× |
 | `weft_reduce::reduce` (exact, `BigDecimal` points; integer arithmetic inside since 2026-10-09) | 21.0 ms | ~10× |
 
-(Re-measured 2026-10-11 on a heavily loaded box (load average ~200, not pinned), each ratio taken
+(Re-measured 2026-10-11 on a heavily loaded box (load average ~200, not pinned), each ratio taken <!-- claim:exact-decimals-2026-10-11 -->
 against the `f64` loop in the same criterion run. `reduce_scaled` ran 4.26 and 4.61 ms against `f64`
 2.06 and 2.07 ms, i.e. 2.1–2.2×; in the same conditions before that day's change it ran 6.50 and
 7.78 ms against 2.08 and 2.54 ms, ~3.1×. The change: the integer accumulator closes time-ordered
 buckets into a `Vec` instead of inserting each into a map, builds a bucket's `sum` decimal only when
-`sum` is asked for, and sizes the output once. On 2026-10-09 `reduce_scaled` measured 8.99 ms
+`sum` is asked for, and sizes the output once. On 2026-10-09 `reduce_scaled` measured 8.99 ms <!-- claim:reduce-scaled-2026-10-09 -->
 (criterion pinned to one core, median of nine alternating runs) and on 2026-10-08 13.52 ms. `reduce`
 ran 24.1 ms (`f64` 2.08 ms) before the same change reached its points path, 21.0 ms (`f64` 2.09 ms)
 after; it was 52.6–53.0 ms before it took the integer path for points that fit, and 60.04 ms on
@@ -370,7 +371,7 @@ after; it was 52.6–53.0 ms before it took the integer path for points that fit
 
 QuestDB [documents ~2×](https://questdb.com/docs/query/datatypes/decimal/) for its `DECIMAL`; the
 integer path is now about level with that on this reduction (a ratio against each engine's own
-`DOUBLE`/`f64`, not a cross-engine timing), while the `BigDecimal`-points path still costs ~10×. Before this work the shipped path measured 100.65 ms
+`DOUBLE`/`f64`, not a cross-engine timing), while the `BigDecimal`-points path still costs ~10×. Before this work the shipped path measured 100.65 ms <!-- claim:decimal-path-before -->
 (~43×). Three changes closed most of the gap: integer
 accumulation; computing each bucket's `avg` by integer long division that reproduces
 `bigdecimal`'s quotient digit for digit; and, for an average that never terminates (most of
@@ -486,7 +487,7 @@ and the old generator at **0.61M points/sec**, 7.3× slower than real data:
 | `p99` (exact) | 23.46 ms | 20,871,526 points/sec | 391.0 ms | 1,271,820 points/sec | collects each bucket and selects the rank in linear time |
 | `sketch_p99` | 18.79 ms | 25,871,740 points/sec | 280.1 ms | 1,785,661 points/sec | streams into a DDSketch; see below |
 
-(Re-measured 2026-10-09 after `reduce` started taking the integer path for values that fit
+(Re-measured 2026-10-09 after `reduce` started taking the integer path for values that fit <!-- claim:serve-reduce-2026-10-09 -->
 `i64` mantissas at a common scale; the two-decimal series does, the `full` one does not. The
 same day's earlier figures, before that change: `avg` 14.4 ms, `twa` 49.0, `twa_linear` 99.3,
 `p99` 31.5 (57.9 before the selection change), `sketch_p99` 30.3 (59.7 before the `f64` fast
@@ -496,13 +497,13 @@ These time `weft_reduce::reduce` over `BigDecimal` points, the path `POST /api/v
 Since 2026-10-09 `reduce` itself compares and sums on integers whenever every value fits an `i64`
 mantissa at the series' largest scale, with a result identical in value and representation
 (min, max, first, last and collected samples are the original values; each bucket's sum carries its
-own largest scale); on 1M real BTC closes, hourly `avg` went from 52.4 to 21.6–22.3 ms, `sketch_p99`
+own largest scale); on 1M real BTC closes, hourly `avg` went from 52.4 to 21.6–22.3 ms, `sketch_p99` <!-- claim:serve-avg-before-after -->
 from 71.0 to 42.3–42.9 ms (35.4–36.2 ms once the sketch also skips the logarithm for a value in the
 previous value's bucket) and `avg,p99,twa` from 171.4 to 141.3–142.9 ms (two runs each). A stored
 `ScaledI64` aspect goes further, straight from the stored mantissas (`reduce_partial_scaled`, see
 [Where it doesn't pay off](#where-it-doesnt-pay-off) for the decimal tax), which `--ds-scaled` times on
 the same series, gated on an identical result (10 reps, load average ~24): hourly `avg` over the 500k
-two-decimal points **0.58 ms**, over 1M real BTC closes **6.4 ms**; the six streaming reductions
+two-decimal points **0.58 ms**, over 1M real BTC closes **6.4 ms**; the six streaming reductions <!-- claim:interp-latency -->
 7.6 ms, `sketch_p99` 22.3 ms (17.9–18.9 ms with the bucket cache, three runs at load average ~33)
 and `avg,p99,twa` 109.0 ms on the real series (`weft-bench --downsample --ds-scaled …`).
 
@@ -532,7 +533,7 @@ real BTC closes (hourly), where values carry up to eight decimal places (`weft-b
 values, cloning only the result. The sketch converts a value with at most 15–16 significant digits
 and at most 22 decimal places to `f64` by one division, which is provably the same `f64` as
 `bigdecimal`'s `to_f64` (tested bit for bit); before that change `sketch_p99` took 63.8 ms here. The
-~2.6× sketch advantage once quoted (327 vs 852 ms) was measured on the old generator's ~50-digit
+~2.6× sketch advantage once quoted (327 vs 852 ms) was measured on the old generator's ~50-digit <!-- claim:sketch-claim-corrected -->
 values, when the exact path also cloned and fully sorted every bucket.
 
 The approximation is **declared, never silent** — WeftDB's precision principle. The sketch shares the
@@ -656,7 +657,7 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   per-database floor. On a real disk it is orders of magnitude slower, because
   Turso's `VACUUM INTO` fsyncs the destination and runs a TRUNCATE checkpoint
   before returning. On this project's btrfs volume (load average ~12) the
-  background daemon's ticks landed 3.0–4.5 s apart at a 2 s configured interval.
+  background daemon's ticks landed 3.0–4.5 s apart at a 2 s configured interval. <!-- claim:backup-daemon-ticks -->
   A tick fires late only when the one before it outlasts the interval (tokio's
   default `Burst` catch-up), so each snapshot and its prune took that long, and
   they ran back to back. **Set `WEFT_BACKUP_INTERVAL_SECS` from what your storage

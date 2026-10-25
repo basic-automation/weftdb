@@ -212,3 +212,29 @@ that still cannot be done in the time allowed.
   port move, privileged power-loss validation, narrative approvals.
 - `~/.cargo/config.toml` on this machine sets nightly-only `rustflags = ["-Z","threads=8"]`, so every
   `+stable` invocation needs `RUSTFLAGS=""`; a human should decide whether that stays.
+
+## 2026-10-25 — what a claims registry has to key on to survive an edit
+
+**Ambiguous:** EVI-2 asks for a "claims registry and markdown claim/link lint", and the README
+quotes figures in prose, in tables, and again in a later architecture section. What does one entry
+describe — a number, a sentence, or a measurement?
+
+**Chosen:** one entry per **measurement paragraph**, keyed by a `<!-- claim:id -->` marker placed
+beside the paragraph in the README, with the entry listing the figure *text* it vouches for. Keying
+on a number fails the first time someone reformats (`56 µs` → `56us`) and silently passes when a
+figure is deleted, because nothing forces the entry to be removed. Keying on a paragraph makes the
+pairing bidirectional: the lint fails if a marker has no entry, if an entry has no marker, and if
+the figure text no longer appears within 12 lines of its marker — so a reworded sentence must
+update the registry, which is the whole point. `*Source: [...](path)` lines are cross-checked
+against the registry so a new bench-cited paragraph cannot ship unregistered, and every relative
+link in the README resolves against the tree.
+
+**Rejected:** a Rust subcommand in `weft-bench` — the check reads markdown and JSON, needs no type
+information, and runs on a runner that already has `python3`, so a subcommand would have added a
+compile step to a documentation gate. And machine-checking GitHub heading anchors: EVI-1 already
+found that approximating GitHub's slug rules for `→` and `'` produces false positives, so anchors
+are out of scope and the script says so rather than quietly skipping them.
+
+**Not claimed:** eleven figures are registered, not every number in the repository — the registry
+covers the README's Performance section plus one dated observation in the backup-daemon note. The
+lint's `*Source:*` rule is what pulls future figures in; it is a ratchet, not a completed census.
