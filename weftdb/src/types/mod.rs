@@ -37,6 +37,7 @@ pub use store_format::{StoreFormat, StoreScope, LEGACY_LAYOUT, STORE_FORMAT_FILE
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
 pub use trend::Trend;
+pub use value_kind::{UnknownValueKind, ValueKind, RESERVED_VALUE_KIND_TOKENS};
 
 pub mod aspect;
 pub mod aspect_catalog;
@@ -79,5 +80,6 @@ pub mod store_format;
 pub mod subject;
 pub mod transaction;
 pub mod trend;
+pub mod value_kind;
 
 pub use error::*;

@@ -391,6 +391,22 @@ only the control plane, not the segment frames.
   are skipped rather than deleted — their presence is the gate working. The gated halves are exercised by
   CI's `features` job, which builds `weft-physical-type --all-features` (plan note C21 asked for exactly
   `--features experimental-codecs,bitsliced-codec`, which that job's `--all-features` is a superset of).
+- **An open value-provenance vocabulary** (1.0 plan TAG-3). `weftdb::ValueKind` names how a value in a
+  result was produced — `raw`, `interpolated`, `extrapolated` — as a type a client can match on without
+  the match becoming a breaking change later. splimes' `PointKind`, which the compute endpoints
+  re-export as the JSON `kind` field today, is an exhaustive enum, so WeftDB cannot grow it in front of
+  its own clients: code compiled against it today stops compiling in the release that adds a kind.
+  `ValueKind` is `#[non_exhaustive]`, and it is open now rather than only in some future release — a
+  token this build cannot name parses to `ValueKind::Unknown` holding the token verbatim, so a newer
+  vocabulary read by an older client degrades to "a kind I have not been told about" instead of a parse
+  error or a wrong arm. The wire tokens are the compatibility surface, and a test pins them to the three
+  strings the endpoints already send; `RESERVED_VALUE_KIND_TOKENS` (`compressed`, `reconstructed`)
+  reserves those token names before either becomes a variant, which is what lets a client special-case
+  them now and still compile when they arrive. `From<PointKind>` is total (splimes' kinds are a subset),
+  `TryFrom<ValueKind> for PointKind` fails with the token it could not express, and the `serde` impls
+  carry the token rather than the variant. No read path emits a `ValueKind` yet: the lanes that report
+  provenance adopt it where they already know it (TAG-0, FRE-5, FRE-6b, ROB-16), so until then adding
+  the type costs an existing caller nothing.
 
 - **A run manifest, so a benchmark number can be re-checked** (1.0 plan EVI-3). A Weft-Bench run wrote a
   report of numbers and a machine fingerprint, and nothing tied the two to the artifact that produced
