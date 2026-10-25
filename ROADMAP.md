@@ -231,7 +231,9 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
   - [x] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
   - [x] **TAG-3** Open `ValueKind` in weftdb, provenance scope
-  - [ ] **EVI-1** Claims hygiene
+  - [x] **EVI-1** Claims hygiene (2026-10-25: every command, flag, endpoint and link in the README
+    checked against the code; the one over-claim — that any figure is reproducible from a clone —
+    is reworded, and per-figure sourcing becomes EVI-2's job)
   - [x] **EVI-3** Run manifest (schema v23: the 2026-10-09 routine took v20–v22, so EVI-3 takes the next free number per the plan's rule)
   - [ ] **EVI-9** Block missingness and scale presets
   - [ ] **SOA-1** Soak harness skeleton

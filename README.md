@@ -282,11 +282,15 @@ truth for status and priorities, and it records negative results alongside wins.
 
 ## Performance
 
-Every number below comes from a benchmark in this repo, named so you can re-run it. The
-exception is any figure measured on the real BTC corpus: that input is a local file the
-repository does not ship (see [Ingest](#ingest)), so those figures cannot be reproduced from a
-clone. All were measured on one developer workstation — treat them as *shape*, not as a
-specification for your hardware.
+Every number below was measured by a benchmark in this repo. Where a row names a **Source:**
+path, that is the bench the figure came from and you can re-run it; the run artifacts themselves
+(the manifest and result JSON of schema v23) are not committed, so a figure with no source line is
+a *dated local measurement*, not a claim you can reproduce from a clone. Requiring a source line
+for every figure is the job of the claims registry ([roadmap EVI-2](ROADMAP.md)), which lands
+before 1.0; until then this section says which is which. The exception is any figure measured on
+the real BTC corpus: that input is a local file the repository does not ship (see
+[Ingest](#ingest)), so those figures cannot be reproduced from a clone at all. All were measured on
+one developer workstation — treat them as *shape*, not as a specification for your hardware.
 
 ### Reads WeftDB optimises specifically
 

@@ -120,6 +120,39 @@ today is wrong the first time the runner fleet moves; and putting this job insid
 `scripts/release/verify.sh` reads the latest completed `ci.yml` run as release evidence, so a red night
 caused by a noisy neighbour would gain the power to veto a release.
 
+## 2026-10-25 — what claims hygiene meant once the README's commands checked out
+
+**Ambiguous:** EVI-1 asks for "claims hygiene" in a README whose commands, endpoints and flags
+were already believed correct. The open question was what is actually left to reconcile, and
+whether a figure with no committed artifact is a false claim or merely an unverifiable one.
+
+**Chosen:** treat the code as ground truth and check every falsifiable claim directly rather than
+trusting prose, then classify what fails into *false* (fix now) and *unverifiable from a clone*
+(disclose now, make checkable in EVI-2). Verified this way, on `main` at 977b812:
+
+- all 26 `weft-bench` flags used in the README are declared in `weft-bench/src/*.rs` string
+  literals — no invented switch;
+- every `/api/v1/...` path the README calls is registered in `weft-server` (including the
+  `/api/v1/storage/{aspect}/...` family, which the README only shows through the `price` aspect);
+- every relative markdown link resolves against the tree, and the two anchors my slug check
+  flagged (`#physical-types--columnar-storage`, `#where-it-doesnt-pay-off`) are artefacts of
+  approximating GitHub's slug rule for `→` and `'`, not broken links;
+- **no measurement artifact of any kind is committed** — grepping the tree for the quoted figures
+  (`218,963`, `118,238,781`, `4.22`, `56 µs`) returns nothing outside `README.md` itself.
+
+The fourth point is the only place the README over-claimed: its Performance preamble said every
+number is "named so you can re-run it", which is true of the *bench code* and false of the
+*figure*, because the schema-v23 manifest and result JSON behind it live on one workstation. The
+preamble now says which figures carry a `Source:` bench path, which are dated local measurements,
+and that the per-figure registry is EVI-2's job before 1.0. The numbers themselves stay: they were
+measured, they are dated, and deleting them would trade an honest caveat for a lost fact.
+
+**Method note:** four read-only sub-agents were dispatched to audit README ranges in parallel and
+every one came back dead — two on the 30-minute hard limit, two on the five-minute no-output
+watchdog, having written nothing. The checks above were run in-session as targeted greps in four
+calls and cost a fraction of that. For a bounded claim-vs-code audit of one known file, do it in
+the parent; sub-agents earn their keep on open-ended search, not on a checklist.
+
 ## Needs human
 
 - Anything that creates a git tag or GitHub release, or publishes to crates.io (PAC-19, FRE-18,
