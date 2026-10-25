@@ -153,6 +153,57 @@ watchdog, having written nothing. The checks above were run in-session as target
 calls and cost a fraction of that. For a bounded claim-vs-code audit of one known file, do it in
 the parent; sub-agents earn their keep on open-ended search, not on a checklist.
 
+## 2026-10-25 — the Linux release baseline is a container image, not the runner
+
+PAC-2 ("Portable Linux binaries on a glibc 2.28 baseline") is a title and a checkbox: its
+slice body was deleted from the roadmap in the upstream restructure, so what "portable" was
+owed had to be chosen. Two questions, both decided here.
+
+**How old is old enough.** Settled on glibc 2.28 — RHEL 8, Debian 10, the 2018/2019 enterprise
+host — rather than the 2.17 of the CentOS 7 era or the 2.34 that an Ubuntu 24.04 link happens
+to produce. 2.17 would have meant a CentOS 7 image that has been off security support for
+years, and its toolchain is older than the workspace's MSRV; 2.34 would have changed nothing,
+because that is what v0.1.0 already shipped and what the README had to apologize for.
+
+**Where the change lands.** Inside the existing `build` job's two Linux legs, with the asset
+names unchanged, rather than a second matrix producing `*-portable` archives. Two artifacts
+claiming one target is how a release ends up publishing whichever the checksums job happened
+to sort first, and the `dist` profile is already LTO over one codegen unit, so doubling the
+Linux builds would have been the expensive way to be ambiguous. The legs now run in
+`quay.io/pypa/manylinux_2_28_{x86_64,aarch64}:2026.10.25-1`, arch-matched to the runner so the
+no-cross-toolchain rule of this job still holds.
+
+**Rejected:** shipping a `-portable` asset set alongside the current one (above); and a
+musl-static build, which would answer the question with a bigger question, since a static
+binary cannot dlopen and the store is not the only thing a deployer might want to load.
+
+**The floor is asserted from the artifact.** `scripts/check-glibc.sh` parses the dynamic
+symbol table (the `.gnu.version_d` section header, walked byte by byte with a struct unpack,
+because no binutils version in CI is guaranteed to print symbol versions) and fails above the
+floor; it runs against the built binaries in the same leg. Measured here before pushing: an
+x86_64 dev-profile build of `weft-tui` and `weft-server` in the pinned image yields 2.28 for
+both, interpreter `/lib64/ld-linux-x86-64.so.2` — the dev profile is what a container build
+reachable from this machine costs, and the CI assertion is what governs the shipped
+dist-profile artifact.
+
+## 2026-10-25 — slice implementation comes back to the main session; delegates audit only
+
+Seven delegated runs in a row died on this machine: three at a 30-minute wall (two after
+1.5M and 2.5M tokens, one having produced 41 tool calls of a ten-file slice) and four killed
+by a five-minute no-output watchdog at zero tokens, including a run whose task text was
+deliberately cut to a tenth of the size to stay inside that watchdog.
+
+**Chosen:** the main session implements slices, and delegates are used only for read-only
+audits, with an explicit scope cap and an instruction to print a line between tool calls so
+the watchdog sees activity. The EVI-1 claim audit went that way and came back with nothing:
+every number in the README's performance section resolves to a named benchmark, which is what
+the roadmap asked for — a finding that took reading, not compute.
+
+**Rejected:** shrinking implementation tasks to satisfy the no-output watchdog. A slice that
+must compile a fourteen-crate workspace cannot stay silent for less than five minutes, so the
+limit does not fit the work; shrinking the task to fit it would only produce a smaller task
+that still cannot be done in the time allowed.
+
 ## Needs human
 
 - Anything that creates a git tag or GitHub release, or publishes to crates.io (PAC-19, FRE-18,
