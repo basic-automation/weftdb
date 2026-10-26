@@ -235,7 +235,7 @@ pub fn run_sparse(profile: &SparseProfile, reps: usize) -> anyhow::Result<BenchR
 	#[allow(clippy::cast_precision_loss)]
 	let missingness_fraction = if table.capacity > 0 { 1.0 - table.populated as f64 / table.capacity as f64 } else { 0.0 };
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_SPARSE.to_string(), reps, dataset: DatasetMeta { input_points: table.populated, output_points: scanned.len(), irregular: false, missingness_fraction, seed: profile.params.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_SPARSE.to_string(), reps, dataset: DatasetMeta { input_points: table.populated, output_points: scanned.len(), irregular: false, missingness_fraction, seed: profile.params.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None })
 }
 
 /// The nanoseconds elapsed since `since`, saturating at `u64::MAX`.

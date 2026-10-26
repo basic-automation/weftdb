@@ -495,7 +495,7 @@ mod tests {
 	}
 
 	fn result(workload: &str, p50: u64, p95: u64, p99: u64, throughput: f64, intervals: Option<LatencyCis>) -> BenchResult {
-		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "standard".into(), adapter: "weft".into(), workload: workload.into(), reps: 3, dataset: dataset(), latency: latency(p50, p95, p99), latency_ci: intervals, throughput_points_per_sec: throughput, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns: 0, end_to_end_ns: 0 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1, actual_output_points: 1, values_finite: true }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None }
+		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "standard".into(), adapter: "weft".into(), workload: workload.into(), reps: 3, dataset: dataset(), latency: latency(p50, p95, p99), latency_ci: intervals, throughput_points_per_sec: throughput, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns: 0, end_to_end_ns: 0 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1, actual_output_points: 1, values_finite: true }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None }
 	}
 
 	fn report(os: &str, arch: &str, results: Vec<BenchResult>) -> BenchReport {

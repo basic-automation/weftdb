@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use splimes::{Interpolator, Point, Resolution, Spline};
 
-use crate::adapter::SystemAdapter;
+use crate::adapter::{AdapterInfo, SystemAdapter, SystemAdapterV2};
 
 /// Adapter that benchmarks WeftDB's native interpolation path.
 #[derive(Debug, Default, Clone, Copy)]
@@ -36,5 +36,29 @@ impl SystemAdapter for WeftAdapter {
 		// hands every rep a fresh clone), so the values are moved out, not copied.
 		let owned: Vec<Point> = points.iter_mut().map(|p| Point::new(p.timestamp, std::mem::take(&mut p.value))).collect();
 		Ok(Interpolator::new(spline, resolution).run_async(owned, start, end).await?.into_points())
+	}
+}
+
+impl SystemAdapterV2 for WeftAdapter {
+	fn adapter_info(&self) -> AdapterInfo {
+		// Both facts are read off the v1 implementation above, not asserted:
+		// it drives splimes' `Interpolator` (a native engine, not an in-process
+		// reimplementation) and passes the requested `spline` straight through
+		// to `Interpolator::new`, unlike the baselines, which ignore it.
+		AdapterInfo { interface_version: 2, engine: "splimes".to_string(), method: "native interpolation via splimes Interpolator (Backend::Auto)".to_string(), native_engine: true, honours_requested_spline: true }
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn v2_report_names_the_engine_and_the_facts_the_code_shows() {
+		let info = WeftAdapter::new().adapter_info();
+		assert_eq!(info.interface_version, 2);
+		assert_eq!(info.engine, "splimes");
+		assert!(info.native_engine, "the adapter drives splimes, not an in-process reimplementation");
+		assert!(info.honours_requested_spline, "the requested spline is passed to Interpolator::new");
 	}
 }
