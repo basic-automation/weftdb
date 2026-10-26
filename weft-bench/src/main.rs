@@ -33,7 +33,7 @@ use std::{
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_ingest_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
 };
 
 /// Program name used in usage / error output.
@@ -122,6 +122,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.mode == InputMode::GpuMemory {
 		return run_gpu_memory_workload(&cli);
+	}
+	if cli.mode == InputMode::Ingest {
+		return run_ingest_workload(&cli).await;
 	}
 
 	// Build the profile from whichever input mode was selected. Synthetic mode
@@ -341,6 +344,27 @@ fn run_gpu_memory_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		println!("gpu pool: cap {} MiB; created {} ({} after round 1), reused {}, evicted {}; idle peak {} MiB (round 1) / {} MiB (later), final {} MiB; stable: {}", pool.max_pool_bytes >> 20, pool.created, pool.created_after_first_round, pool.reused, pool.evicted, pool.peak_idle_bytes_first_round >> 20, pool.peak_idle_bytes_later >> 20, pool.final_idle_bytes >> 20, pool.stable);
 	}
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(Some(engine));
+	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the ingest workload: load one column of a UCI household-power file,
+/// ingest it into a fresh SegmentStore in batches, and persist the report.
+/// The load time is charged to setup (never to latency); the aspect name is
+/// the column name lowercased, because the store refuses uppercase in a new
+/// aspect name, and the aspect is declared as an exact scaled-integer column
+/// at the loader's measured decimal scale (see [`weft_bench::ingest`]).
+async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let uci_path = cli.uci.as_ref().expect("ingest mode requires --uci");
+	let load_start = std::time::Instant::now();
+	let corpus = load_uci_corpus(uci_path, &cli.uci_column, cli.ingest_rows).map_err(|e| anyhow::anyhow!("cannot load UCI corpus {}: {e:#}", uci_path.display()))?;
+	let generation_ns = u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+	println!("uci      : {} rows loaded from {} (column {}, {} rows seen, {} missing, scale {})", corpus.values.len(), uci_path.display(), corpus.column, corpus.rows_seen, corpus.rows_missing, corpus.decimal_scale);
+	let aspect = cli.uci_column.to_ascii_lowercase();
+	let profile_name = cli.name.clone().unwrap_or_else(|| format!("ingest-{}", aspect));
+	let profile = IngestProfile::new(profile_name, aspect, cli.ingest_batch);
+	let result = run_ingest_on(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, cli.reps).await.map_err(|e| anyhow::anyhow!("ingest benchmark run failed: {e}"))?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
 }
@@ -697,6 +721,14 @@ struct Cli {
 	scale: Option<ScalePreset>,
 	/// GPU-memory mode: the workload knobs (the seed comes from `--seed`).
 	gpu_memory: weft_bench::gpu_memory::GpuMemoryParams,
+	/// Ingest mode: UCI household-power file to load (`--uci`, required).
+	uci: Option<PathBuf>,
+	/// Ingest mode: UCI column to project (`--uci-column`).
+	uci_column: String,
+	/// Ingest mode: data rows examined at most (`--ingest-rows`).
+	ingest_rows: usize,
+	/// Ingest mode: rows sealed per batch (`--ingest-batch`).
+	ingest_batch: usize,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -785,6 +817,9 @@ enum InputMode {
 	Sparse,
 	/// The GPU memory-stability workload (repeated mixed-size GPU interpolations).
 	GpuMemory,
+	/// The ingest workload (EVI-6): load a UCI household-power column and seal
+	/// it into a fresh SegmentStore in batches, gated on an exact read-back.
+	Ingest,
 }
 
 /// What the parsed command line asks the program to do.
@@ -863,7 +898,8 @@ impl Cli {
 
 		let (mut input, mut field): (Option<PathBuf>, Option<String>) = (None, None);
 		// The workload-mode flags; exactly one may be set (`select_workload_mode`).
-		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode, mut gpu_memory_mode) = (false, false, false, false, false, false, false);
+		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode, mut gpu_memory_mode, mut ingest_mode) = (false, false, false, false, false, false, false, false);
+		let (mut uci, mut uci_column, mut ingest_rows, mut ingest_batch): (Option<PathBuf>, String, usize, usize) = (None, DEFAULT_UCI_COLUMN.to_string(), usize::MAX, DEFAULT_INGEST_BATCH_ROWS);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
@@ -922,6 +958,11 @@ impl Cli {
 				flag if SPARSE_FLAGS.contains(&flag) => set_sparse_knob(&mut sparse, flag, &take_value(&key)?)?,
 				"--scale" => scale = Some(ScalePreset::parse(&take_value(&key)?).ok_or_else(|| format!("--scale must name a preset ({})", ScalePreset::names()))?),
 				"--gpu-memory" => gpu_memory_mode = true,
+				"--ingest" => ingest_mode = true,
+				"--uci" => uci = Some(PathBuf::from(take_value(&key)?)),
+				"--uci-column" => uci_column = take_value(&key)?,
+				"--ingest-rows" => ingest_rows = parse_points_count(&take_value(&key)?)?,
+				"--ingest-batch" => ingest_batch = parse_points_count(&take_value(&key)?)?.max(1),
 				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
@@ -972,13 +1013,16 @@ impl Cli {
 		}
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (sparse_mode, InputMode::Sparse), (gpu_memory_mode, InputMode::GpuMemory)])?;
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (sparse_mode, InputMode::Sparse), (gpu_memory_mode, InputMode::GpuMemory), (ingest_mode, InputMode::Ingest)])?;
 		if let Some(preset) = scale {
 			apply_scale_preset(preset, &mut ds_points, &mut gap_fill, &mut sparse);
 		}
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
+		if mode == InputMode::Ingest && uci.is_none() {
+			return Err("`--ingest` requires `--uci <household_power_consumption.txt>`".to_string());
+		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1069,7 +1113,7 @@ fn parse_label(token: &str) -> Result<(String, String), String> {
 fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
 	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
 	if selected.len() > 1 {
-		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --sparse / --gpu-memory)".to_string());
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --sparse / --gpu-memory / --ingest)".to_string());
 	}
 	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
@@ -1086,6 +1130,7 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 		InputMode::GapFill => Some("--gap-fill"),
 		InputMode::Sparse => Some("--sparse"),
 		InputMode::GpuMemory => Some("--gpu-memory"),
+		InputMode::Ingest => Some("--ingest"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
 }
@@ -1127,13 +1172,13 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 		}
 		InputMode::LineProtocol => {
 			if input.is_none() {
-				return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup` / `--range-fetch` / `--compression` / `--downsample`)".to_string());
+				return Err("missing required `--input <file.lp>` (or pass `--synthetic` / `--point-lookup` / `--range-fetch` / `--compression` / `--downsample` / `--ingest`)".to_string());
 			}
 			if field.is_none() {
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory => unreachable!("handled by self_generating_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory | InputMode::Ingest => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -1407,6 +1452,7 @@ USAGE:
     weft-bench --gap-fill [GAP-FILL OPTIONS]
     weft-bench --sparse [BLOCK-MISSINGNESS OPTIONS]
     weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
+    weft-bench --ingest --uci <FILE.txt> [INGEST OPTIONS]
     weft-bench verify <RUN.manifest.json> [--accept-advisories]
     weft-bench compare <BASELINE.json> <CANDIDATE.json> [COMPARE OPTIONS]
 
@@ -1526,6 +1572,17 @@ GAP-FILL OPTIONS (with --gap-fill; seeded by --seed):
         --gf-csv <FILE>      Cut the outages from a REAL series instead (same CSV
                              rules as --comp-csv; --gf-points caps it); filled
                              buckets are scored against the real values removed
+
+INGEST OPTIONS (with --ingest):
+        --uci <FILE>         UCI household-power file (household_power_consumption.txt,
+                             semicolon-separated, Date;Time;... header, `?` = missing)
+                             [required]
+        --uci-column <NAME>  Column to ingest [default: Global_active_power]
+        --ingest-rows <N>    Data rows examined at most (missing rows inside the cap
+                             are dropped, so fewer rows may load) [default: all]
+        --ingest-batch <N>   Rows sealed per batch into the SegmentStore [default: 1024]
+                             (each rep ingests into a fresh store; only the seals are
+                             timed; correctness is an exact read-back of every row)
 
 GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
         --gm-rounds <N>      Rounds; each calls every size once       [default: 20]
