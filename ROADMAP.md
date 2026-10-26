@@ -246,7 +246,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-2** Claims registry and markdown claim/link lint
   - [x] `bench/claims.json` vouches for each figure the README quotes: the bench or the local corpus behind it, the date, and whether a clone can re-run it
   - [x] `tools/check_claims.py` in CI pairs every entry with its `<!-- claim:id -->` marker, checks the figure text still sits beside the marker and the source path still exists, fails on a `*Source:*` line no entry claims, and resolves every relative link in the README against the tree
-  - [ ] → **EVI-4** Artifact pipeline
+  - [x] → **EVI-4** Artifact pipeline
   - [x] **EVI-6** Ingest workload over SegmentStore and the UCI corpus loader
   - [ ] **EVI-8A** Benchmark adapter v2 I
   - [ ] **SOA-2** Soak preflight, device resolution, run metadata and secret redaction
