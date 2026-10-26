@@ -3,6 +3,9 @@
 set -euo pipefail
 
 SCRIPT="scripts/bench/stage-artifacts.sh"
+# Invoked via bash, never executed directly: connector pushes land new files
+# mode 100644, so a CI checkout must not rely on the script being +x.
+run_script() { bash "$SCRIPT" "$@"; }
 fail=0
 
 check() { # name, condition-command...
@@ -26,7 +29,7 @@ printf '{"verdict":"flat"}\n' > "$tmp/run/verdict.json"
 printf 'regression gate\n' > "$tmp/run/compare.txt"
 
 # Happy path: everything lands flat, no nesting.
-"$SCRIPT" --report "$tmp/run/workload__weftdb.json" \
+run_script --report "$tmp/run/workload__weftdb.json" \
   --manifest "$tmp/run/workload__weftdb.manifest.json" \
   --out "$tmp/stage" "$tmp/run/verdict.json" "$tmp/run/compare.txt" > "$tmp/log"
 check "stages report flat" test -f "$tmp/stage/workload__weftdb.json"
@@ -36,15 +39,15 @@ check "stages transcript flat" test -f "$tmp/stage/compare.txt"
 check "no nested directories" test "$(find "$tmp/stage" -mindepth 1 -type d | wc -l)" -eq 0
 
 # First run: no verdict files exist yet, but report + manifest still stage.
-"$SCRIPT" --report "$tmp/run/workload__weftdb.json" \
+run_script --report "$tmp/run/workload__weftdb.json" \
   --manifest "$tmp/run/workload__weftdb.manifest.json" \
   --out "$tmp/stage-first" "$tmp/run/verdict-missing.json" > "$tmp/log-first"
 check "first run stages report" test -f "$tmp/stage-first/workload__weftdb.json"
 check "first run stages manifest" test -f "$tmp/stage-first/workload__weftdb.manifest.json"
-check "missing optional file is skipped, not an error" test "$(ls "$tmp/stage-first" | wc -l)" -eq 2
+check "missing optional file is skipped, not an error" test "$(find "$tmp/stage-first" -mindepth 1 -maxdepth 1 | wc -l)" -eq 2
 
 # Missing report: an empty artifact must never be staged.
-if "$SCRIPT" --report "$tmp/run/no-such.json" --out "$tmp/stage-empty" > "$tmp/log-empty" 2>&1; then
+if run_script --report "$tmp/run/no-such.json" --out "$tmp/stage-empty" > "$tmp/log-empty" 2>&1; then
   echo "FAIL - missing report exits non-zero"
   fail=1
 else
@@ -53,12 +56,12 @@ fi
 check "missing report stages nothing" test ! -e "$tmp/stage-empty/workload__weftdb.json"
 
 # Missing --report entirely, and an unknown option, are usage errors.
-if "$SCRIPT" --out "$tmp/stage-nousage" > /dev/null 2>&1; then
+if run_script --out "$tmp/stage-nousage" > /dev/null 2>&1; then
   echo "FAIL - missing --report exits non-zero"; fail=1
 else
   echo "ok - missing --report exits non-zero"
 fi
-if "$SCRIPT" --bogus > /dev/null 2>&1; then
+if run_script --bogus > /dev/null 2>&1; then
   echo "FAIL - unknown option exits non-zero"; fail=1
 else
   echo "ok - unknown option exits non-zero"
