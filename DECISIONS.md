@@ -4,6 +4,51 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-26 — SOA-2 "preflight, device resolution, run metadata and secret redaction" (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W2) lists SOA-2 by name only, and §3 says
+only that "EVI-3 owns the shared run metadata and redaction; SOA-2 reuses
+it" and that SOA keeps its own `soak_schema_version`. The concrete
+preflight gates, the device-resolution mechanism, and what "secrets are
+redacted in soak outputs" means beyond SOA-1's `redacted_label` are not
+specified anywhere. SOA-1's module doc supplies the one seam: preflight
+"validates a config before a harness starts".
+
+**Chosen (grounded in SOA-1's seam plus the plan's §3 ownership rules; if
+merge review disagrees, this decision is revisited there):**
+
+1. Preflight is a report, not a boolean: `SoakHarness::preflight(store_dir)`
+   returns a `SoakPreflight` carrying named gates even when gates fail, and
+   `start_checked(preflight)` is the gate that refuses to start. The SOA-1
+   `start()` transition is kept ungated for compatibility; the scheduler
+   path (SOA-3) must use `start_checked`.
+2. Gates: `config_valid` (name non-blank, duration positive — re-checked
+   because `SoakConfig` fields are public), `store_dir_exists`,
+   `device_resolved`, `store_dir_writable`. Preflight never creates the
+   store directory: creating a store is not a check's side effect.
+3. Device resolution reuses EVI-3's disk probe (`report::disk_for`, factored
+   out of `work_disk` with identical behaviour) for the store directory.
+   The resolved kind/filesystem/mount are the same values `RunMetadata`
+   records as `work_disk_*`; they live only in the preflight report, never
+   as a field on `SoakRun`, per §3's "do not add a second disk field".
+4. No free-space threshold: preflight reports `available_bytes` and leaves
+   the judgement to the operator, because a soak's footprint depends on
+   SOA-4's workload, which does not exist yet. A threshold invented now
+   would be a number with no grounding.
+5. Secret redaction in soak outputs means whole-artifact redaction, not
+   just the label accessor: `SoakRun::redacted_json` serializes a copy
+   with the label redacted, and `SoakPreflight::redacted_json` redacts the
+   store path and every check detail (paths can carry a home directory or
+   a credential-like directory name). Both go through EVI-3's `redact`;
+   no new secret list exists.
+6. No schema bump: SOA-2 adds no field to `SoakRun` or `SoakConfig`, so
+   `SOAK_SCHEMA_VERSION` stays at v1 per SOA-1's bump rule.
+
+**Rejected:** a second disk/driver field on `SoakRun`; a preflight that
+creates the store directory; a free-space pass/fail threshold; and a new
+redaction routine in the soak module (all contradict §3's ownership rules
+or invent an ungrounded number).
+
 ## 2026-10-26 — EVI-8A "adapter v2" and its schema number (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6, W2) lists EVI-8A with no definition of "adapter v2"
