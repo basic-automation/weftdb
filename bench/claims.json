@@ -1,9 +1,10 @@
 {
-  "_comment": "The per-figure registry roadmap EVI-2 asked for. Each entry names the figure text it vouches for, where that figure lives in README.md (the `claim:<id>` marker beside its paragraph), what produced it, and whether a clone can re-run it. tools/check_claims.py is the lint; ci.yml runs it.",
+  "_comment": "The per-figure registry roadmap EVI-2 asked for. Each entry names the figure text it vouches for, where that figure lives in README.md (the `claim:<id>` marker beside its paragraph), what produced it, and whether a clone can re-run it. tools/check_claims.py is the lint; ci.yml runs it. Since EVI-4, every entry also carries an artifact field: null when no pipeline artifact publishes the figure (a dated local measurement has none, by disclosure), or {\"name\", \"workflow\"} naming the Actions artifact and the workflow that uploads it, which the lint verifies against .github/workflows/. No figure quoted in the README is currently produced by a pipeline artifact (the nightly gate publishes the nightly-interpolation workload, which no entry quotes), so every entry here is null until a producer plugs into the pipeline.",
   "schema": 1,
   "claims": [
     {
       "id": "pointread-2026-10-08",
+      "artifact": null,
       "section": "Reads WeftDB optimises specifically",
       "kind": "reproducible",
       "figures": ["**56 µs**", "**33 µs**", "**67 µs**", "**58 µs**"],
@@ -16,6 +17,7 @@
     },
     {
       "id": "ingest-real-btc",
+      "artifact": null,
       "section": "Ingest",
       "kind": "local-measurement",
       "figures": ["218,963 rows/sec at 4.22 bytes/point", "1.71 bytes/point against the real"],
@@ -28,6 +30,7 @@
     },
     {
       "id": "reductions-2026-10-09",
+      "artifact": null,
       "section": "Reductions",
       "kind": "reproducible",
       "figures": ["**18.8 ms**", "weft-bench --downsample"],
@@ -40,6 +43,7 @@
     },
     {
       "id": "exact-decimals-2026-10-11",
+      "artifact": null,
       "section": "Where it doesn't pay off",
       "kind": "local-measurement",
       "figures": ["Re-measured 2026-10-11"],
@@ -52,6 +56,7 @@
     },
     {
       "id": "reduce-scaled-2026-10-09",
+      "artifact": null,
       "section": "Where it doesn't pay off",
       "kind": "local-measurement",
       "figures": ["8.99 ms"],
@@ -64,6 +69,7 @@
     },
     {
       "id": "decimal-path-before",
+      "artifact": null,
       "section": "Where it doesn't pay off",
       "kind": "local-measurement",
       "figures": ["100.65"],
@@ -76,6 +82,7 @@
     },
     {
       "id": "serve-reduce-2026-10-09",
+      "artifact": null,
       "section": "Compute endpoints",
       "kind": "local-measurement",
       "figures": ["118,238,781 points/sec"],
@@ -88,6 +95,7 @@
     },
     {
       "id": "serve-avg-before-after",
+      "artifact": null,
       "section": "Compute endpoints",
       "kind": "local-measurement",
       "figures": ["52.4 to 21.6–22.3 ms"],
@@ -100,6 +108,7 @@
     },
     {
       "id": "interp-latency",
+      "artifact": null,
       "section": "Compute endpoints",
       "kind": "local-measurement",
       "figures": ["**0.58 ms**", "**6.4 ms**"],
@@ -112,6 +121,7 @@
     },
     {
       "id": "sketch-claim-corrected",
+      "artifact": null,
       "section": "Where it doesn't pay off",
       "kind": "corrected-claim",
       "figures": ["327 vs 852 ms"],
@@ -124,6 +134,7 @@
     },
     {
       "id": "backup-daemon-ticks",
+      "artifact": null,
       "section": "Backup daemon interval",
       "kind": "local-measurement",
       "figures": ["3.0–4.5 s apart"],

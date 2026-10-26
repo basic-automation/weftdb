@@ -7,6 +7,15 @@ in the README. The README carries the machine-readable side of the pairing as an
 HTML comment next to the paragraph it belongs to: `<!-- claim:some-id -->`
 (invisible when GitHub renders the file).
 
+EVI-4 artifact wiring: every entry also carries an `artifact` field. It is
+null when no pipeline artifact publishes the figure (a dated local measurement
+has none, by disclosure), and otherwise an object naming the artifact and the
+workflow that publishes it: `{"name": "bench-report", "workflow": "benchmark
+regression"}`. This lint checks the reference is real: the named workflow must
+exist under .github/workflows/ and must contain an upload-artifact step for an
+artifact of that name. The registry never invents provenance, and a workflow
+that stops publishing an artifact it is cited for fails here.
+
 Usage: tools/check_claims.py [--registry bench/claims.json] [--readme README.md]
 """
 
@@ -22,6 +31,83 @@ WINDOW = 12  # lines around a marker within which the figure text must appear
 KINDS = {"reproducible", "local-measurement", "corrected-claim"}
 MARKER = re.compile(r"<!--\s*claim:([a-z0-9][a-z0-9-]*)\s*-->")
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)")
+WORKFLOW_NAME = re.compile(r"^name:\s*[\"']?([^\"'\n]+)[\"']?\s*$")
+UPLOAD_ARTIFACT = "upload-artifact"
+ARTIFACT_NAME = re.compile(r"^\s*name:\s*[\"']?([^\"'\n]+)[\"']?\s*$")
+ARTIFACT_KEYS = {"name", "workflow"}
+
+
+def workflow_artifact_names(workflows_dir: Path) -> dict[str, set[str]]:
+    """Map each workflow's declared name to the artifact names it uploads.
+
+    The parse is deliberately line-based, not YAML: the lint runs on a runner
+    with only python3 guaranteed, and the shape it needs is small — the
+    workflow's top-level `name:` and, after each `upload-artifact` step, the
+    `name:` in that step's `with:` block. A step whose upload name is an
+    expression (`weftdb-${{ matrix.target }}`) is not a literal artifact name
+    and is not recorded, so it can never satisfy a registry reference.
+    """
+    published: dict[str, set[str]] = {}
+    if not workflows_dir.is_dir():
+        return published
+    for path in sorted(workflows_dir.glob("*.yml")) + sorted(workflows_dir.glob("*.yaml")):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        workflow_name = None
+        for line in lines:
+            m = WORKFLOW_NAME.match(line)
+            if m:
+                workflow_name = m.group(1).strip()
+                break
+        if workflow_name is None:
+            continue
+        names = published.setdefault(workflow_name, set())
+        for i, line in enumerate(lines):
+            if UPLOAD_ARTIFACT not in line:
+                continue
+            for following in lines[i + 1 : i + 16]:
+                if following.strip().startswith("- "):
+                    break  # a new step: this upload step names no artifact
+                m = ARTIFACT_NAME.match(following)
+                if m:
+                    candidate = m.group(1).strip()
+                    if "${{" not in candidate:
+                        names.add(candidate)
+                    break
+    return published
+
+
+def check_artifact(claim: dict, published: dict[str, set[str]]) -> list[str]:
+    """Validate one entry's EVI-4 artifact reference against the workflows."""
+    cid = claim.get("id", "<missing id>")
+    if "artifact" not in claim:
+        return [f"{cid}: missing artifact field (null when no pipeline artifact publishes it)"]
+    artifact = claim["artifact"]
+    if artifact is None:
+        return []
+    if not isinstance(artifact, dict):
+        return [f"{cid}: artifact must be an object or null, not {type(artifact).__name__}"]
+    errors = []
+    for key in sorted(set(artifact) - ARTIFACT_KEYS):
+        errors.append(f"{cid}: artifact has unknown key {key!r} (only 'name' and 'workflow')")
+    name = artifact.get("name")
+    workflow = artifact.get("workflow")
+    if not isinstance(name, str) or not name:
+        errors.append(f"{cid}: artifact name must be a non-empty string")
+    if not isinstance(workflow, str) or not workflow:
+        errors.append(f"{cid}: artifact workflow must be a non-empty string")
+    if errors:
+        return errors
+    if workflow not in published:
+        return [f"{cid}: artifact workflow {workflow!r} matches no workflow under .github/workflows/"]
+    if name not in published[workflow]:
+        return [
+            f"{cid}: workflow {workflow!r} publishes no artifact named {name!r} "
+            f"(it publishes {sorted(published[workflow]) or 'nothing'})"
+        ]
+    return []
 SOURCE_LINE = re.compile(r"^\*Source:\s*\[`?([^`\]]+)`?\]")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -61,6 +147,10 @@ def main() -> int:
         errors.append(f"registry entry {mid!r} has no `<!-- claim:{mid} -->` marker in {args.readme}")
     for mid in sorted(set(marked) - set(ids or [])):
         errors.append(f"{args.readme}:{marked[mid] + 1} marks claim {mid!r} that the registry does not define")
+
+    published = workflow_artifact_names(root / ".github" / "workflows")
+    for claim in claims:
+        errors.extend(check_artifact(claim, published))
 
     for claim in claims:
         cid = claim.get("id", "<missing id>")
