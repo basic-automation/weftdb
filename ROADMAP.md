@@ -235,7 +235,9 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     checked against the code; the one over-claim — that any figure is reproducible from a clone —
     is reworded, and per-figure sourcing becomes EVI-2's job)
   - [x] **EVI-3** Run manifest (schema v23: the 2026-10-09 routine took v20–v22, so EVI-3 takes the next free number per the plan's rule)
-  - [ ] **EVI-9** Block missingness and scale presets
+  - [x] **EVI-9** Block missingness and scale presets
+  - [x] `weft-bench --sparse`: a seeded (series × block) grid of nullable cells, the block-aligned mean scan over it, and the observed missingness recorded in the report beside the grid that produced it
+  - [x] `--scale tiny|small|medium|large` for the sized workloads (`--sparse`, `--gap-fill`, `--downsample`), filling only the size knobs left at their default, and naming the preset in the profile so two grid sizes never compare as one run
   - [ ] **SOA-1** Soak harness skeleton
 - [ ] **W2 · Error contract, frame format, portable builds**
   - [ ] Legacy lane

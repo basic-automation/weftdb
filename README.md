@@ -1491,6 +1491,21 @@ What it does today:
   vs $8.37 — while the spline costs ~14% more time (64.8 vs 56.7 ms hourly; 10 reps,
   2026-10-09, load average ~6). Reach for the spline on smooth physical signals, not on prices.
   WeftDB's grid has only unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
+- **Sparse block scans** (`--sparse`) — the input a presence bitmap is supposed to pay for. A
+  seeded grid of `--sp-series` series × `--sp-blocks` blocks of `--sp-rows` rows (default 16 ×
+  256 × 128) is cut open cell by cell: each (series, block) cell survives with probability
+  `--sp-density` percent (default 20), and the result is held as one nullable f64 column per
+  series — an Arrow buffer plus its validity bitmap, so a hole is a hole in a column rather than
+  an `Option` in a `Vec`. The timed operation is the block-aligned mean scan: a pass per column
+  that has to look at every block, present or not, because nothing in the column yet says which
+  blocks hold values. It is gated cell by cell against the generator's own per-cell means.
+  The report records the grid and the **observed** missingness rather than the requested density,
+  because the two are not the same number — a coin flip per cell lands where it lands — and a
+  published figure has to name what was actually absent from the table it measured.
+  `--scale tiny|small|medium|large` sets the size knobs of the sized workloads (`--sparse`,
+  `--gap-fill`, `--downsample`), filling only the knobs left at their default, and writes the
+  preset into the profile name so a 32-series grid is never compared against a 64-series one as
+  though they were one run.
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
