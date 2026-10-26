@@ -4,6 +4,47 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-26 — EVI-8A "adapter v2" and its schema number (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W2) lists EVI-8A with no definition of "adapter v2"
+beyond the name, and §3 says "EVI-3 therefore sets it to 23 and EVI-8A to 24. If
+another bump lands first, each takes the next free number and records it in
+schema.rs's version history." Live state contradicts the assumed numbering:
+the report schema (`weft-bench/src/schema.rs`, `SCHEMA_VERSION`) is at v22,
+while v23 landed on a *different* line — the manifest schema
+(`MANIFEST_SCHEMA_VERSION` = 23 in `manifest.rs`, EVI-3's bump).
+
+**Chosen (owner-authorized best guess, 2026-10-26 — Justin: "use your best guess
+based on the roadmap and docs"; if merge review disagrees, this decision is
+revisited there):**
+
+1. "Adapter v2" is the second version of the bench adapter interface
+   (`SystemAdapter`): v2 adds the capability/provenance reporting the v1 trait
+   lacks (`AdapterInfo`: engine, method, `native_engine`,
+   `honours_requested_spline`). v2 is additive — no v1 method changes — so v1
+   adapters keep working unchanged.
+2. Part I ports only `WeftAdapter` to v2 (`run_profile_v2` records its report
+   in the result); `BaselineLinearAdapter` and `ForwardFillAdapter` stay on v1
+   via `run_profile` and carry no `adapter_info`.
+3. Schema: the REPORT schema bumps 22 → 23, recorded in `schema.rs`'s version
+   history, as the new optional `BenchResult.adapter_info` field. The manifest
+   line is untouched (still 23); the two lines are now numerically equal by
+   coincidence and are bumped independently. §3's own "next free number" rule
+   is what licenses 23 on the report line, not the plan's assumed 24.
+4. Compare: no change needed — `compare` already refuses any cross-schema
+   comparison (v22 vs v23 included) with a clear error, and same-version
+   compare is unchanged (existing test
+   `reports_of_different_schema_versions_are_refused`).
+5. Part II (EVI-8B, W3) ports the remaining adapters to v2 and retires v1;
+   explicitly out of EVI-8A.
+
+**Rejected:** bumping the report schema to 24 to match the plan's literal
+number (it would skip the report line's free 23 and break §3's numbering rule);
+putting the v2 report on the manifest line; and forcing the baselines onto v2
+in part I (that is EVI-8B's scope, and their deliberately-ignored spline is
+exactly what v2's `honours_requested_spline: false` would report — a claim
+this slice does not need to make).
+
 ## 2026-10-24 — merging while a check is red
 
 **Ambiguous:** the standing instruction says never merge with a red or pending check; the operator then

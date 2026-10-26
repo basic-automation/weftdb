@@ -29,9 +29,11 @@ use crate::{redaction, report::BenchReport, schema::BenchResult};
 
 /// The manifest schema version. Bump on any change to the shape below.
 ///
-/// It shares the number line with the report schema ([`crate::schema::SCHEMA_VERSION`], v22) so a
-/// reader can tell at a glance which generation of artifact a pair of files belongs to; the
-/// manifest is the next step on that line.
+/// It shares the number line with the report schema ([`crate::schema::SCHEMA_VERSION`], v23 since
+/// EVI-8A) so a reader can tell at a glance which generation of artifact a pair of files belongs
+/// to. The two lines are bumped independently — EVI-3's 23 landed here while the report was still
+/// v22, and EVI-8A's 23 landed on the report line — so equal numbers are a coincidence, not a
+/// lockstep rule.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 23;
 
 /// The environment variables a manifest records.
@@ -710,7 +712,7 @@ mod tests {
 	/// A result with the shape a real interpolation run produces: latency, storage, and an
 	/// accuracy block (which only a synthetic profile carries).
 	fn sample_result(adapter: &str, publishable: bool) -> BenchResult {
-		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: 1000, values_finite: publishable }, accuracy: Some(crate::accuracy::AccuracyMetrics { count: 1000, rmse: 0.5, mae: 0.4, max_abs_error: 1.5, bias: 0.0 }), storage: Some(sample_storage()), cold_warm: None, gpu_pool: None }
+		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: 1000, values_finite: publishable }, accuracy: Some(crate::accuracy::AccuracyMetrics { count: 1000, rmse: 0.5, mae: 0.4, max_abs_error: 1.5, bias: 0.0 }), storage: Some(sample_storage()), cold_warm: None, gpu_pool: None, adapter_info: None }
 	}
 
 	/// A storage estimate shaped like a real f64 compression result: the value column realized

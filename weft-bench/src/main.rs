@@ -33,7 +33,7 @@ use std::{
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
+	engine, load_csv_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_point_lookup, run_point_lookup_on, run_profile, run_profile_v2, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter
 };
 
 /// Program name used in usage / error output.
@@ -149,7 +149,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	// in-process mirror of native TSDB `FILL(previous)`) — so the report carries a
 	// real multi-system comparison rather than a lone number.
 	let mut results: Vec<BenchResult> = Vec::with_capacity(if cli.compare { 3 } else { 1 });
-	let weft_result = run_profile(&WeftAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("WeftDB benchmark run failed: {e}"))?;
+	// WeftDB runs on the v2 interface, so its result carries the adapter's
+	// capability/provenance report; the v1 baselines below keep the v1 path
+	// and carry no `adapter_info`.
+	let weft_result = run_profile_v2(&WeftAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("WeftDB benchmark run failed: {e}"))?;
 	results.push(weft_result);
 	if cli.compare {
 		let linear = run_profile(&BaselineLinearAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("linear baseline run failed: {e}"))?;
