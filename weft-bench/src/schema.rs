@@ -77,9 +77,14 @@ use crate::{
 /// `metadata.engine.gpu_driver` (the GPU driver's name and version, beside the adapter in
 /// `metadata.engine.gpu`). v21 added `cold_warm` (the first timed rep apart from the rest,
 /// [`ColdWarm`]). v22 added `gpu_pool`, the GPU buffer pool's behaviour over a `gpu_memory` run.
+/// v23 added `adapter_info`, the v2 adapter's capability/provenance report
+/// ([`crate::adapter::AdapterInfo`]); `None` for v1 adapters and pre-v23 artifacts.
+/// (v23 on this report line is independent of the manifest line's v23 in
+/// [`crate::manifest::MANIFEST_SCHEMA_VERSION`]: EVI-3's 23 landed on the manifest
+/// line, so 23 is the report line's next free number.)
 /// All optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -446,6 +451,12 @@ pub struct BenchResult {
 	/// other workload and for older artifacts.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub gpu_pool: Option<crate::gpu_memory::GpuPoolSummary>,
+	/// What the adapter reported about itself (schema v23, adapter v2 only):
+	/// which engine produced the numbers and which capabilities it claims.
+	/// `None` for v1 adapters — the baselines and every pre-v23 artifact — whose
+	/// interface has no reporting method.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub adapter_info: Option<crate::adapter::AdapterInfo>,
 }
 
 /// The first timed repetition apart from the remaining ones.
@@ -498,7 +509,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }), cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }), cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None, adapter_info: None }
 	}
 
 	#[test]
@@ -639,6 +650,28 @@ mod tests {
 		assert!(!json.contains("storage"), "absent storage must be omitted, got: {json}");
 		let back: BenchResult = serde_json::from_str(&json).expect("deserialize");
 		assert!(back.storage.is_none());
+	}
+
+	#[test]
+	fn v22_artifact_without_adapter_info_still_deserializes_and_v1_omits_it() {
+		// A pre-v23 artifact has no `adapter_info` key; serde's default must fill
+		// `None` rather than failing the parse — the v1 adapters' results keep
+		// reading exactly as before. Conversely a v1-shaped result (no report)
+		// must omit the key entirely, as `storage` does above.
+		let mut json = serde_json::to_value(sample_result()).expect("serializes");
+		json.as_object_mut().expect("object").remove("adapter_info");
+		let parsed: BenchResult = serde_json::from_value(json).expect("v22 artifact must still parse");
+		assert_eq!(parsed.adapter_info, None);
+
+		let mut v1 = sample_result();
+		v1.adapter_info = None;
+		let json = serde_json::to_string(&v1).expect("serialize");
+		assert!(!json.contains("adapter_info"), "absent adapter_info must be omitted, got: {json}");
+
+		let mut v2 = sample_result();
+		v2.adapter_info = Some(crate::adapter::AdapterInfo { interface_version: 2, engine: "splimes".to_string(), method: "native interpolation".to_string(), native_engine: true, honours_requested_spline: true });
+		let back: BenchResult = serde_json::from_str(&serde_json::to_string(&v2).expect("serialize")).expect("deserialize");
+		assert_eq!(back, v2, "a v2 report round-trips");
 	}
 
 	#[test]

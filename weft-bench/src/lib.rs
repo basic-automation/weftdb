@@ -80,7 +80,7 @@ use bigdecimal::ToPrimitive;
 
 use crate::adapter::grid_timestamps;
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::SystemAdapter, baseline_adapter::BaselineLinearAdapter, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_on, IngestProfile, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{SoakConfig, SoakHarness, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter, SystemAdapterV2}, baseline_adapter::BaselineLinearAdapter, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_on, IngestProfile, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{SoakConfig, SoakHarness, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -100,12 +100,31 @@ fn span_ns(since: Instant) -> u64 {
 /// fresh clone so in-place mutation by an adapter never contaminates later reps.
 /// Latency is measured around the adapter call only. Correctness is judged on
 /// the final rep's output: the produced grid must be the expected size and every
-/// value must be finite.
+/// value must be finite. A v1 adapter's result carries no `adapter_info`.
 ///
 /// # Errors
 ///
 /// Returns an error if `reps == 0`, or if any rep's adapter call fails.
 pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &InterpolationProfile, reps: usize) -> anyhow::Result<BenchResult> {
+	run_profile_with_info(adapter, profile, reps, None).await
+}
+
+/// Run an interpolation profile against a v2 adapter, recording the adapter's
+/// capability/provenance report in the result (schema v23 `adapter_info`).
+///
+/// Identical to [`run_profile`] except for that field: the timed path, the
+/// correctness gate and every other column are shared, so a v2 result and a
+/// v1 result in the same report differ only in self-reporting, never in what
+/// was measured.
+///
+/// # Errors
+///
+/// Returns an error if `reps == 0`, or if any rep's adapter call fails.
+pub async fn run_profile_v2<A: SystemAdapterV2 + ?Sized>(adapter: &A, profile: &InterpolationProfile, reps: usize) -> anyhow::Result<BenchResult> {
+	run_profile_with_info(adapter, profile, reps, Some(adapter.adapter_info())).await
+}
+
+async fn run_profile_with_info<A: SystemAdapter + ?Sized>(adapter: &A, profile: &InterpolationProfile, reps: usize, adapter_info: Option<AdapterInfo>) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(reps > 0, "reps must be > 0");
 
 	// End-to-end span starts at the very top of the timed work (dataset
@@ -173,7 +192,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info })
 }
 
 /// Measure reconstruction *accuracy*: run `adapter` once over `profile` and score
@@ -413,5 +432,23 @@ cpu,host=h0 usage=14.0 600\n";
 		let adapter = WeftAdapter::new();
 		let err = run_profile(&adapter, &profile, 0).await;
 		assert!(err.is_err(), "zero reps must be rejected");
+	}
+
+	#[tokio::test]
+	async fn v2_run_records_adapter_info_and_v1_run_records_none() {
+		// Part I's seam: the same profile through the v2 path carries the
+		// adapter's report, while a v1 baseline through the v1 path carries
+		// none — and nothing else about the measurement differs in kind.
+		let profile = InterpolationProfile::interpolation_heavy_irregular();
+		let v2 = run_profile_v2(&WeftAdapter::new(), &profile, 2).await.expect("v2 run completes");
+		let info = v2.adapter_info.expect("a v2 result carries adapter_info");
+		assert_eq!(info, WeftAdapter::new().adapter_info(), "the recorded report is the adapter's own report");
+		assert_eq!(v2.schema_version, SCHEMA_VERSION);
+		assert!(v2.correctness.passed(), "v2 must not change the measurement: {:?}", v2.correctness);
+
+		let v1 = run_profile(&BaselineLinearAdapter::new(), &profile, 2).await.expect("v1 run completes");
+		assert_eq!(v1.adapter_info, None, "a v1 adapter keeps working with no report");
+		assert_eq!(v1.schema_version, SCHEMA_VERSION, "v1 and v2 results share the report schema version");
+		assert!(v1.correctness.passed(), "v1 must keep working: {:?}", v1.correctness);
 	}
 }
