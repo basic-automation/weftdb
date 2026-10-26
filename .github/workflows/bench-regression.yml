@@ -170,14 +170,27 @@ jobs:
             cat bench-out/compare.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          # One flat staging directory, because an artifact's internal layout is derived from
-          # the paths given to the uploader: globbed paths would arrive nested, and next
-          # night's download looks for the report by name at the top level.
-          mkdir -p bench-stage
-          for file in "$candidate" "$BENCH_DIR/$(basename "$candidate" .json).manifest.json" bench-out/compare.txt bench-out/verdict.json bench-out/verdict.md; do
-            [ -e "$file" ] && cp "$file" bench-stage/
-          done
           exit "$status"
+
+      # EVI-4 artifact pipeline: publication is scripts/bench/stage-artifacts.sh
+      # plus this upload, not an inline loop. The staging step runs even when the
+      # comparison failed or when there was no baseline yet (the old inline loop
+      # sat after the no-baseline early exit, so a first run staged nothing and
+      # the upload below failed on an empty directory). The script stages flat:
+      # an artifact's internal layout is derived from the paths given to the
+      # uploader, and next night's download looks for the report by name at the
+      # top level. The artifact name and 90-day retention are the pipeline
+      # contract; any future bench-producing job stages through the same script.
+      - name: Stage the run artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/bench/stage-artifacts.sh \
+            --report "$candidate" \
+            --manifest "$BENCH_DIR/$(basename "$candidate" .json).manifest.json" \
+            --out bench-stage \
+            bench-out/compare.txt bench-out/verdict.json bench-out/verdict.md
 
       # Uploaded even when the comparison failed: the point of a red night is the numbers,
       # and the manifest beside them is what makes them citable. `error` rather than `warn`

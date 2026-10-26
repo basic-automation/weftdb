@@ -78,6 +78,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: python3 tools/check_claims.py --registry bench/claims.json --readme README.md
+      # The artifact-reference checks in check_claims.py are part of the gate, so
+      # their tests run here too (EVI-4).
+      - run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
 
   # The MSRV is a published promise in Cargo.toml (rust-version); prove it still holds.
   # Pinned here on purpose, not read from .github/release-toolchain: this job tests the
@@ -332,15 +337,19 @@ jobs:
           args: -color
       # The release pipeline scripts, the fixture generator X-FX added, and the license
       # bundle generator: none of them has any other gate on it, and all three run at
-      # release time against a real tag rather than a mocked one.
+      # release time against a real tag rather than a mocked one. The bench artifact
+      # pipeline script (EVI-4) joins them: it runs in CI jobs, so a quoting slip
+      # in it is a red check here rather than a silently empty artifact.
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck scripts/release/*.sh scripts/compat/*.sh scripts/licenses/*.sh
+          shellcheck scripts/release/*.sh scripts/compat/*.sh scripts/licenses/*.sh scripts/bench/*.sh
       - name: verify.sh tests
         run: scripts/release/test-verify.sh
       - name: stage.sh tests
         run: scripts/release/test-stage.sh
+      - name: bench stage-artifacts.sh tests
+        run: bash scripts/bench/test-stage-artifacts.sh
 
   # compat/releases.toml is the pin every compatibility, upgrade and rollback gate runs
   # against: the tag, the commit it points at, the fixture set that release wrote and the
