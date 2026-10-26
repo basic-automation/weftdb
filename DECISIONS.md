@@ -286,3 +286,62 @@ are out of scope and the script says so rather than quietly skipping them.
 **Not claimed:** eleven figures are registered, not every number in the repository — the registry
 covers the README's Performance section plus one dated observation in the backup-daemon note. The
 lint's `*Source:*` rule is what pulls future figures in; it is a ratchet, not a completed census.
+
+## 2026-10-26 — what the artifact pipeline is, and what it publishes (EVI-4) — FOR MERGE REVIEW
+
+**Ambiguous:** the 1.0 plan says only that D-S21's crash matrices are "artifacts
+published via EVI-4" (§5) and that W2 runs "EVI-2 → EVI-4" (§6); it never says
+what the pipeline publishes, where it lives, or how it connects to the claims
+registry EVI-2 built. EVI-4 on its own is a one-liner with no acceptance shape.
+
+**Owner best-guess decision (2026-10-26, Justin: "use your best guess based on
+the roadmap and docs").** This slice implements that decision; if merge review
+disagrees, the decision is revisited here, not by re-blocking silently:
+1. Scope is generalizing EVI-5's nightly bench-report publication to the CI
+   bench gate: bench jobs upload BenchReport + manifest + compare verdict as a
+   `bench-report` Actions artifact, same shape as nightly, 90-day retention.
+2. Claims wiring: each bench/claims.json entry gains an artifact reference
+   (artifact name + publishing workflow); check_claims.py validates the
+   reference shape and that the named workflow publishes it. verify.sh
+   unchanged.
+3. D-S21 crash matrices are a FUTURE consumer of this pipeline, not part of
+   EVI-4 (D-S21 does not exist yet).
+4. Release binaries out of scope (release.yml already publishes them).
+5. The README "run artifacts are not committed" STANDS — artifacts live in
+   Actions storage, never committed files.
+
+**Chosen, and one correction to the decision's wording.** ci.yml has no
+bench-producing job today, and EVI-5 deliberately kept the regression gate out
+of ci.yml (a red night must not veto a release through verify.sh's latest-ci
+check), so there is no "CI bench job" to generalize onto yet. What this slice
+generalizes is the publication itself: `scripts/bench/stage-artifacts.sh` is the
+pipeline — one flat staging directory, report + manifest + verdict, artifact
+name `bench-report`, 90-day retention — and bench-regression.yml now stages
+through it instead of an inline loop. Any future bench-producing job (D-S21's
+crash matrices, EVI-6's ingest workload reports) publishes by calling the same
+script and uploading the same artifact name; the contract is in the script's
+header. Two consequences fall out of the refactor: staging now runs on every
+path, including a first run with no baseline — the old inline loop sat after
+the no-baseline early exit, so a first run staged nothing and the upload
+failed on an empty directory — and the script refuses to stage when the report
+itself is missing, so an empty artifact can never become a future baseline.
+
+**Claims wiring, honestly null.** No figure the README quotes is currently
+produced by a pipeline artifact: the nightly gate publishes the
+nightly-interpolation workload, which no registry entry quotes, and the
+reproducible entries quote benches the nightly job does not run. So every entry
+gains the field as null rather than inventing provenance, and the lint now
+fails on a missing field, a malformed reference, or a reference to a workflow
+that does not upload an artifact of that name. A future entry that does claim
+a pipeline artifact is machine-checked against the publishing workflow.
+
+**Rejected:** a parallel artifact store or manifest (the registry's artifact
+field points at the workflow that already publishes, it does not duplicate
+it); committing run artifacts to the tree (the README's disclosure stands);
+adding a bench job to ci.yml (no bench gate exists there, and a gating bench
+job would re-create the release veto EVI-5 rejected — a non-gating upload-only
+job is a later slice's call, and it would stage through this same script).
+
+**Not claimed:** the nightly workflow change itself only exercises on its next
+scheduled run; the shape is unchanged (same artifact name, same flat files,
+same retention), so the next night's baseline download is unaffected.
