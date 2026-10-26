@@ -238,7 +238,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-9** Block missingness and scale presets
   - [x] `weft-bench --sparse`: a seeded (series × block) grid of nullable cells, the block-aligned mean scan over it, and the observed missingness recorded in the report beside the grid that produced it
   - [x] `--scale tiny|small|medium|large` for the sized workloads (`--sparse`, `--gap-fill`, `--downsample`), filling only the size knobs left at their default, and naming the preset in the profile so two grid sizes never compare as one run
-  - [ ] **SOA-1** Soak harness skeleton
+  - [x] **SOA-1** Soak harness skeleton
 - [ ] **W2 · Error contract, frame format, portable builds**
   - [ ] Legacy lane
   - [x] **PAC-2** Portable Linux binaries on a glibc 2.28 baseline
