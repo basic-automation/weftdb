@@ -23,6 +23,9 @@ async-trait = { workspace = true }
 bigdecimal = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
 weft-line-protocol = { workspace = true }
+# The ingest workload (EVI-6) drives the store itself, not bare segment bytes:
+# SegmentStore::open/declare/seal_declared/read_time_range.
+weftdb = { workspace = true }
 rayon = { workspace = true }
 # `experimental-codecs`: the advisory f64 (Gorilla/Chimp/Chimp128) and FIRE estimates the
 # StorageEstimate reports. Enabled here only, so no published crate turns them on.
