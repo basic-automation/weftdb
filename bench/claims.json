@@ -1,0 +1,138 @@
+{
+  "_comment": "The per-figure registry roadmap EVI-2 asked for. Each entry names the figure text it vouches for, where that figure lives in README.md (the `claim:<id>` marker beside its paragraph), what produced it, and whether a clone can re-run it. tools/check_claims.py is the lint; ci.yml runs it.",
+  "schema": 1,
+  "claims": [
+    {
+      "id": "pointread-2026-10-08",
+      "section": "Reads WeftDB optimises specifically",
+      "kind": "reproducible",
+      "figures": ["**56 µs**", "**33 µs**", "**67 µs**", "**58 µs**"],
+      "source": "weft-physical-type/benches/pointread.rs",
+      "command": "cargo bench -p weft-physical-type --bench pointread",
+      "dataset": "generated",
+      "measured": "2026-10-08",
+      "reproducible_from_clone": true,
+      "notes": "Re-measured after the word-wise bit reads and the slicing-by-16 frame CRC."
+    },
+    {
+      "id": "ingest-real-btc",
+      "section": "Ingest",
+      "kind": "local-measurement",
+      "figures": ["218,963 rows/sec at 4.22 bytes/point", "1.71 bytes/point against the real"],
+      "source": null,
+      "command": null,
+      "dataset": "btc_1min.csv (local, gitignored, not distributed)",
+      "measured": "2026-10-08",
+      "reproducible_from_clone": false,
+      "notes": "Publication is an open item with counsel before 1.0; the figure is quoted because a synthetic generator flatters it by ~2.5x."
+    },
+    {
+      "id": "reductions-2026-10-09",
+      "section": "Reductions",
+      "kind": "reproducible",
+      "figures": ["**18.8 ms**", "weft-bench --downsample"],
+      "source": "weft-bench/src/main.rs",
+      "command": "cargo run --release -p weft-bench -- --downsample",
+      "dataset": "two-decimal generator",
+      "measured": "2026-10-09",
+      "reproducible_from_clone": true,
+      "notes": "The sketch's win is bounded work, not speed, on this workload."
+    },
+    {
+      "id": "exact-decimals-2026-10-11",
+      "section": "Where it doesn't pay off",
+      "kind": "local-measurement",
+      "figures": ["Re-measured 2026-10-11"],
+      "source": null,
+      "command": null,
+      "dataset": "two-decimal generator",
+      "measured": "2026-10-11",
+      "reproducible_from_clone": false,
+      "notes": "Taken on a heavily loaded box (load average ~200, unpinned); ratios are shape, not a specification."
+    },
+    {
+      "id": "reduce-scaled-2026-10-09",
+      "section": "Where it doesn't pay off",
+      "kind": "local-measurement",
+      "figures": ["8.99 ms"],
+      "source": null,
+      "command": null,
+      "dataset": "two-decimal generator",
+      "measured": "2026-10-09",
+      "reproducible_from_clone": false,
+      "notes": "Before reduce took the integer path for values that fit."
+    },
+    {
+      "id": "decimal-path-before",
+      "section": "Where it doesn't pay off",
+      "kind": "local-measurement",
+      "figures": ["100.65"],
+      "source": null,
+      "command": null,
+      "dataset": "two-decimal generator",
+      "measured": "2026-10-09",
+      "reproducible_from_clone": false,
+      "notes": "The pre-change shipped path; kept so the ~10x cost of the BigDecimal-points path stays readable."
+    },
+    {
+      "id": "serve-reduce-2026-10-09",
+      "section": "Compute endpoints",
+      "kind": "local-measurement",
+      "figures": ["118,238,781 points/sec"],
+      "source": null,
+      "command": null,
+      "dataset": "btc_1min.csv (local, gitignored, not distributed)",
+      "measured": "2026-10-09",
+      "reproducible_from_clone": false,
+      "notes": "Server-side reduce over 1M real closes; the naive baselines in the same table are the comparison."
+    },
+    {
+      "id": "serve-avg-before-after",
+      "section": "Compute endpoints",
+      "kind": "local-measurement",
+      "figures": ["52.4 to 21.6–22.3 ms"],
+      "source": null,
+      "command": null,
+      "dataset": "btc_1min.csv (local, gitignored, not distributed)",
+      "measured": "2026-10-09",
+      "reproducible_from_clone": false,
+      "notes": "Hourly avg over 1M real closes, before and after the integer path."
+    },
+    {
+      "id": "interp-latency",
+      "section": "Compute endpoints",
+      "kind": "local-measurement",
+      "figures": ["**0.58 ms**", "**6.4 ms**"],
+      "source": null,
+      "command": null,
+      "dataset": "generated and btc_1min.csv (the 6.4 ms figure needs the local corpus)",
+      "measured": "2026-10-09",
+      "reproducible_from_clone": false,
+      "notes": "One interpolate_range call; the two-decimal number is re-runnable, the real-closes number is not, so the entry as a whole is not."
+    },
+    {
+      "id": "sketch-claim-corrected",
+      "section": "Where it doesn't pay off",
+      "kind": "corrected-claim",
+      "figures": ["327 vs 852 ms"],
+      "source": null,
+      "command": null,
+      "dataset": "old generator (~50-digit values)",
+      "measured": "2026-10-11",
+      "reproducible_from_clone": false,
+      "notes": "Quoted as a retraction: the ~2.6x sketch advantage was an artefact of the old generator's digit count."
+    },
+    {
+      "id": "backup-daemon-ticks",
+      "section": "Backup daemon interval",
+      "kind": "local-measurement",
+      "figures": ["3.0–4.5 s apart"],
+      "source": null,
+      "command": null,
+      "dataset": "local store, live backup lane",
+      "measured": "2026-10-12",
+      "reproducible_from_clone": false,
+      "notes": "Observation about tokio's sleep-after-work interval, not a performance claim."
+    }
+  ]
+}

@@ -67,6 +67,18 @@ jobs:
         env:
           RUSTFLAGS: ""
 
+  # Every performance figure in the README is vouched for by an entry in
+  # bench/claims.json, which names the bench or the local corpus behind it and says
+  # plainly whether a clone can re-run it. A figure added without an entry, an entry
+  # whose figure text no longer sits by its marker, or a source path that moved fails
+  # here, so the registry cannot rot into a list of stale claims.
+  claims:
+    name: claims registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 tools/check_claims.py --registry bench/claims.json --readme README.md
+
   # The MSRV is a published promise in Cargo.toml (rust-version); prove it still holds.
   # Pinned here on purpose, not read from .github/release-toolchain: this job tests the
   # oldest supported compiler, not the release one.

@@ -33,6 +33,15 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **Every README performance figure now has a registry entry** (evidence track EVI-2).
+  `bench/claims.json` names, per figure, the bench or the local corpus behind it, the date it was
+  measured, and whether a clone can re-run it; `tools/check_claims.py` runs in CI and pairs each
+  entry with its `<!-- claim:id -->` marker in the README, so a figure added without an entry, a
+  figure whose text has drifted away from its marker, a source path that no longer exists, or a
+  `*Source:*` line no entry claims all fail the build. Eleven figures are registered: the
+  point-read set and `--downsample` are marked re-runnable from a clone, the real-BTC corpus
+  figures are marked as not reproducible from a clone, and one entry records a retraction rather
+  than a result. No number changed.
 - **The Linux release binaries start on a seven-year-old glibc** (portability track
   PAC-2). Both Linux build legs now compile inside the pinned manylinux glibc 2.28
   baseline image instead of directly on the Ubuntu 24.04 runner, so a released archive
