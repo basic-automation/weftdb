@@ -346,6 +346,10 @@ should point at.
   port move, privileged power-loss validation, narrative approvals.
 - `~/.cargo/config.toml` on this machine sets nightly-only `rustflags = ["-Z","threads=8"]`, so every
   `+stable` invocation needs `RUSTFLAGS=""`; a human should decide whether that stays.
+- Who owns **FRE-14c**. Two agent loops were told, separately, that the Legacy lane is theirs; the
+  work is pushed but unopened. See "how two agent loops divide the remaining waves" and issue #125.
+- Whether an agent merges a green 1.0-buildout PR, or stops at "open and green". The 2026-10-25
+  entry below asks this and is still unanswered; issue #125 restates it with the merges taken since.
 
 ## 2026-10-25 — what a claims registry has to key on to survive an edit
 
@@ -477,3 +481,44 @@ script is executable and the workflow's existing style is a direct call.
 **Not claimed:** this tests the checker, not the image. That the pinned manylinux image really
 produces 2.28 binaries is a measurement the release run itself makes, and it is recorded in the
 2026-10-25 entry above.
+
+## 2026-10-27 — how two agent loops divide the remaining waves
+
+**Ambiguous:** the operator asked a second agent loop to work the same waves at the same time, and
+two relayed divisions of the work then disagreed about one slice: one gives the Legacy lane (FRE-14)
+to this loop, the other reserves "FRE-14-remainder" to the Muse loop after SOA-2, SOA-3 and SOA-4.
+The Muse loop's convention is that whoever opens the PR owns the slice, which makes opening a PR the
+act that settles an ownership question — and this loop asked on #124 before an answer existed.
+There was no shared place to ask: `list_peers` returns no peers, the repository had no issues until
+this entry, and both loops commit and comment under the same GitHub account, so a comment's author
+cannot tell one loop from the other.
+
+**Chosen:** claims are recorded where both loops and a human can read them, and a branch is not a
+claim. Issue #125 is that record; this entry is why it exists.
+1. A slice is claimed by an **open PR whose title names it** (`[EVI-4] …`), not by a local branch, a
+   pushed branch, or a line in a design note. A pushed branch with no PR is not a claim, and its
+   owner says so on the board rather than letting silence read as availability.
+2. A slice reserved to one loop stays unstarted by the other even where it looks unclaimed:
+   a reservation outranks a race. A stale reservation is argued on the board, not by opening the PR.
+3. Where two relayed divisions conflict, the work stops at "branch pushed, question asked" and the
+   operator arbitrates. Neither loop resolves a conflict the operator created by telling both of us
+   the lane was ours.
+4. Long local builds are announced, because `/mnt/deepmem/Development/Cargo Target` is shared and a
+   workspace `build`/`test`/`clippy` run holds cargo's lock for tens of minutes. Holding that lock
+   is a way of claiming a slice without saying so, so a run that is no longer needed is stopped.
+
+**Rejected:** opening the FRE-14c PR to win the race; rewriting or force-pushing the other loop's
+branches; treating a relayed division as authority over the reservation it names; keeping this
+loop's gate run going because its result would be useful — it blocked the shared target directory
+for an hour for a slice this loop may not own.
+
+**Applied so far:** `w2/fre-14c-legacy-route` (one commit on `e0de4e1`, `weft-server`
+`import-rows-mode` plus two store-scope variables, +776/−8) is pushed, rebased onto `e0de4e1`, and
+deliberately has no PR. Its body is drafted at `.pi/pr/fre-14c-import-route.md` with the gate
+results left as a placeholder rather than filled with claims. SOA-3 (`w2/soa-3`) and SOA-4 are
+untouched. Nothing in `weftdb` is affected by the parked branch.
+
+**Needs human:** who owns FRE-14c, and who clicks merge (both restated on issue #125). This loop has
+followed "make and merge PRs as you go" and merged #98, #100, #101, #102 and #110 on green CI; the
+2026-10-25 entry above concludes the opposite and is marked Needs human. Both loops should end up
+behaving the same way, and which way is not for them to pick.
