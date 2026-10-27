@@ -584,6 +584,23 @@ mod tests {
 		assert!(!server.is_live());
 		let report = scheduler.run_with_server(&mut harness, &preflight, &mut server).expect("null server run");
 		assert_eq!(report.final_state, SoakState::Finished);
+		// `run_with_server` is real time: a runner that stalls past a tick's deadline skips it, by
+		// design, so the executed count is only bounded here. The exact count is the next test's,
+		// through the path that has no clock.
+		assert_eq!(report.monitor.scheduled, 10, "1 s at 100 ms plans 10 ticks");
+		assert_eq!(report.monitor.executed + report.monitor.skipped, 10, "every planned tick either ran or was skipped, none vanished");
+		assert_eq!(report.steps, report.monitor.executed);
+		assert_eq!(server.steps_accepted(), report.monitor.executed, "every executed tick reached the null server");
+		assert_eq!(report.interval_log.total_count(), report.monitor.executed);
+	}
+
+	#[test]
+	fn null_server_takes_every_tick_when_none_is_skipped() {
+		let (mut harness, preflight) = harness_and_preflight(1);
+		let scheduler = OpenLoopScheduler::new(SchedulerConfig::new(100, 1).expect("valid config"));
+		let mut server = NullServer::new();
+		let report = scheduler.run_gated(&mut harness, &preflight, |tick| (Duration::ZERO, server.handle(tick)), always_execute).expect("gated null server run");
+		assert_eq!(report.final_state, SoakState::Finished);
 		assert_eq!(report.steps, 10, "1 s at 100 ms runs 10 ticks against the null server");
 		assert_eq!(server.steps_accepted(), 10, "every executed tick reached the null server");
 		assert_eq!(report.interval_log.total_count(), 10);
