@@ -44,15 +44,16 @@ Interchange and output are covered too: Parquet and CSV in, columnar Arrow/Parqu
 
 ### Phase 3 — Instrument everything · *Very high*
 
-The metrics side is done: a Prometheus `/metrics` surface, latency histograms over the compute and seal paths, a `/debug/profile/current` endpoint, and a harness-level timing breakdown covering dataset generation, adapter and whole run. Affected-row accounting from Turso's `Statement::n_change()` is recorded for the aspect-metadata write on the seal path; the index write is not wired yet (see the open item below).
+The metrics side is done: a Prometheus `/metrics` surface, latency histograms over the compute and seal paths, a `/debug/profile/current` endpoint, and a harness-level timing breakdown covering dataset generation, adapter and whole run. Affected-row accounting from Turso's `Statement::n_change()` is recorded for the aspect-metadata write and the seal's index write, both on the seal path.
 
 Tracing has a `RUST_LOG`-driven foundation, a per-request root span, and per-stage child spans that reach the storage read path and the Arrow/Parquet decode on ingest. OTLP trace export is in, and delivery to a real collector has been verified.
 
-- [ ] Remaining per-stage spans
-  - *Audit 2026-10-27: kept unchecked, with a concrete gap — `.read` spans carry a `format` field on every storage path, but a `.serialize` span exists only on the JSON `range`/`value_range` paths (`storage.rs:369,486`); CSV (`:144,167`), Arrow/Parquet (fused with the read, `:189-247`) and the point lookup (`:545-549`) have none, and no test asserts these spans.*
-- [ ] **`Statement::n_change()` accounting on the seal path's index write**
-  - *Audit 2026-10-27: unchecked — only `AspectMetadataStore::put` (`metadata.rs:228`) reports `rows_changed`. The seal's index write goes `publish_seal` → `commit_index(IndexTxn::InsertNew)` (`segment_store.rs:1837`), not `SegmentIndexStore::insert`/`delete` (`segment_index.rs:179,231`, no non-test callers), so no `control_plane.index.*` span or `rows_changed` is emitted there.*
+- [x] Remaining per-stage spans
+  - *Closed 2026-10-27: every stored read closes a `.serialize` span tagged with its `format` (CSV, Arrow, Parquet, JSON, point and at-multi). The Arrow and Parquet encode now runs as its own stage in the handler, so it is timed apart from the read. The point and at-multi `.read` spans carry `format` too. `every_stored_read_format_closes_its_serialize_span` in `weft-server/src/storage.rs` asserts each one. The downsample handlers' `downsample.range` span is not a `.read` span and is outside this item's list.*
+- [x] **`Statement::n_change()` accounting on the seal path's index write**
+  - *Closed 2026-10-27: `publish_seal` wraps its `InsertNew` commit in a `control_plane.index.insert` span whose `rows_changed` is that op's affected-row count, taken from the `TxnApplied` the commit already returns. `weftdb/tests/seal_index_span.rs` asserts the span.*
 - [ ] `/bench/runs/:id` endpoint
+  - *Deferred 2026-10-27, not built, pending a design decision. Nothing on `main` names a run: the EVI-3 `RunManifest` keys a run on its report path, and no id is assigned. A route that serves run provenance (host hardware, paths) would also expose it before the exposure matrix and auth work (SEC-6, SEC-8) and before the public surface is frozen.*
 
 ### Phase 4 — Hot path: physical types & Storage v2 · *High*
 
@@ -417,7 +418,7 @@ The interpolation item (B-interp, Phase 5) is done.
 
 ## Control-plane engine: Turso/libSQL 0.6 adoption
 
-Turso is migrated from 0.4 to 0.6 and then to 0.8.1 (2026-10-05), with the control-plane schemas moved to plain `INTEGER PRIMARY KEY` for MVCC. The 0.7 upgrade evaluation is settled. Online backups use `VACUUM INTO` with a concurrent-write-safe verify and a background daemon, and snapshot directories no longer accumulate empty `.db-log` and `.db-wal` sidecars. `Statement::n_change()` affected-row accounting is shipped for the aspect-metadata write on the seal path only; the index write is tracked under Phase 3.
+Turso is migrated from 0.4 to 0.6 and then to 0.8.1 (2026-10-05), with the control-plane schemas moved to plain `INTEGER PRIMARY KEY` for MVCC. The 0.7 upgrade evaluation is settled. Online backups use `VACUUM INTO` with a concurrent-write-safe verify and a background daemon, and snapshot directories no longer accumulate empty `.db-log` and `.db-wal` sidecars. `Statement::n_change()` affected-row accounting is shipped for the aspect-metadata write and the seal's index write (Phase 3).
 
 The backup cost was measured on 2026-09-23, and the diagnosis on record at the time turned out to be wrong; the corrected one is in the docs. Everything still listed below is control-plane-only by design: none of it turns Turso into the measurement backend.
 

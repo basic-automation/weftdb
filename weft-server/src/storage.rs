@@ -144,7 +144,8 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "csv")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
-	Ok(csv_response(render_csv(timestamps.into_iter().zip(values))))
+	let body = tracing::info_span!("storage.range.serialize", format = "csv").in_scope(|| render_csv(timestamps.into_iter().zip(values)));
+	Ok(csv_response(body))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/value-range.csv?lo&hi`.
@@ -167,7 +168,8 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await;
 	drop(store);
 	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
-	Ok(csv_response(render_csv(timestamps.into_iter().zip(values.into_iter().map(Some)))))
+	let body = tracing::info_span!("storage.value_range.serialize", format = "csv").in_scope(|| render_csv(timestamps.into_iter().zip(values.into_iter().map(Some))));
+	Ok(csv_response(body))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/range?start&end`.
@@ -184,11 +186,11 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<TimeRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
-	// The columnar read + Arrow encode are fused in the arrow-store call, so one span
-	// covers both stages of this format's hot path.
-	let result = weft_arrow_store::read_time_range_to_ipc_bytes(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await;
+	let batch = weft_arrow_store::read_time_range_to_record_batch_typed(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await;
 	drop(store);
-	Ok(arrow_stream_response(result.map_err(|err| error::classify_read(&err))?))
+	let batch = batch.map_err(|err| error::classify_read(&err))?;
+	let bytes = tracing::info_span!("storage.range.serialize", format = "arrow").in_scope(|| weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
+	Ok(arrow_stream_response(bytes))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/value-range?lo&hi`.
@@ -205,9 +207,11 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	drop(state);
 	let lo: BigDecimal = params.lo.parse().map_err(|_| ApiError::bad_request(format!("`lo` is not a decimal: {:?}", params.lo)))?;
 	let hi: BigDecimal = params.hi.parse().map_err(|_| ApiError::bad_request(format!("`hi` is not a decimal: {:?}", params.hi)))?;
-	let result = weft_arrow_store::read_value_range_to_ipc_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await;
+	let batch = weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await;
 	drop(store);
-	Ok(arrow_stream_response(result.map_err(|err| error::classify_read(&err))?))
+	let batch = batch.map_err(|err| error::classify_read(&err))?;
+	let bytes = tracing::info_span!("storage.value_range.serialize", format = "arrow").in_scope(|| weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
+	Ok(arrow_stream_response(bytes))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/range.parquet?start&end`.
@@ -224,9 +228,11 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<TimeRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
-	let result = weft_arrow_store::read_time_range_to_parquet_bytes(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await;
+	let batch = weft_arrow_store::read_time_range_to_record_batch_typed(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await;
 	drop(store);
-	Ok(parquet_response(result.map_err(|err| error::classify_read(&err))?))
+	let batch = batch.map_err(|err| error::classify_read(&err))?;
+	let bytes = tracing::info_span!("storage.range.serialize", format = "parquet").in_scope(|| weft_arrow::write_parquet(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
+	Ok(parquet_response(bytes))
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/value-range.parquet?lo&hi`.
@@ -244,9 +250,11 @@ pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(asp
 	drop(state);
 	let lo: BigDecimal = params.lo.parse().map_err(|_| ApiError::bad_request(format!("`lo` is not a decimal: {:?}", params.lo)))?;
 	let hi: BigDecimal = params.hi.parse().map_err(|_| ApiError::bad_request(format!("`hi` is not a decimal: {:?}", params.hi)))?;
-	let result = weft_arrow_store::read_value_range_to_parquet_bytes(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
+	let batch = weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
 	drop(store);
-	Ok(parquet_response(result.map_err(|err| error::classify_read(&err))?))
+	let batch = batch.map_err(|err| error::classify_read(&err))?;
+	let bytes = tracing::info_span!("storage.value_range.serialize", format = "parquet").in_scope(|| weft_arrow::write_parquet(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
+	Ok(parquet_response(bytes))
 }
 
 /// One stored row in the JSON range response: an integer timestamp and its value
@@ -542,11 +550,14 @@ pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<Str
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
-	let result = store.read_point(&aspect, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t)).await;
+	let result = store.read_point(&aspect, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t, format = "json")).await;
 	drop(store);
 	let value = result.map_err(|err| error::classify_read(&err))?;
-	let found = value.is_some();
-	Ok(Json(StoredPointResponse { aspect, time_unit: schema.timestamp_unit.name(), timestamp: params.t, value: value.map(|v| v.to_string()), found }))
+	let body = tracing::info_span!("storage.point.serialize", format = "json").in_scope(|| {
+		let found = value.is_some();
+		StoredPointResponse { aspect, time_unit: schema.timestamp_unit.name(), timestamp: params.t, value: value.map(|v| v.to_string()), found }
+	});
+	Ok(Json(body))
 }
 
 /// Query parameters for the batch point lookup: a comma-separated list of instants.
@@ -599,11 +610,14 @@ pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<St
 	let schema = require_schema(&store, &aspect).await?;
 	// Parse the comma-separated instants; a non-integer (or otherwise malformed) entry is a 400.
 	let ts: Vec<i64> = params.t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::parse::<i64>).collect::<Result<_, _>>().map_err(|e| ApiError::bad_request(format!("invalid `t` list {:?}: {e}", params.t)))?;
-	let result = store.read_points(&aspect, &ts).instrument(tracing::info_span!("storage.points.read", %aspect, count = ts.len())).await;
+	let result = store.read_points(&aspect, &ts).instrument(tracing::info_span!("storage.points.read", %aspect, count = ts.len(), format = "json")).await;
 	drop(store);
 	let values = result.map_err(|err| error::classify_read(&err))?;
-	let points = ts.iter().zip(values).map(|(&timestamp, v)| StoredPointEntry { timestamp, found: v.is_some(), value: v.map(|v| v.to_string()) }).collect();
-	Ok(Json(StoredPointsResponse { aspect, time_unit: schema.timestamp_unit.name(), points }))
+	let body = tracing::info_span!("storage.points.serialize", count = ts.len(), format = "json").in_scope(|| {
+		let points = ts.iter().zip(values).map(|(&timestamp, v)| StoredPointEntry { timestamp, found: v.is_some(), value: v.map(|v| v.to_string()) }).collect();
+		StoredPointsResponse { aspect, time_unit: schema.timestamp_unit.name(), points }
+	});
+	Ok(Json(body))
 }
 
 /// One declared aspect's identity in the [`AspectListResponse`].
@@ -1802,5 +1816,47 @@ mod tests {
 		assert_eq!(body["buckets"], 0);
 		assert_eq!(body["input_points"], 0);
 		assert_eq!(body["series"], serde_json::json!([]));
+	}
+
+	/// Every `fmt` line a request writes, read back from a shared buffer, so a test can see
+	/// which spans the handler closed.
+	#[derive(Clone, Default)]
+	struct SpanLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+	impl std::io::Write for SpanLog {
+		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+			self.0.lock().expect("log buffer").extend_from_slice(buf);
+			Ok(buf.len())
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SpanLog {
+		type Writer = Self;
+
+		fn make_writer(&'a self) -> Self::Writer {
+			self.clone()
+		}
+	}
+
+	/// Every stored read closes a `serialize` span beside its `read` span, tagged with the same
+	/// `format`, so the encode is timed apart from the read it follows (roadmap Phase 3).
+	#[tokio::test]
+	async fn every_stored_read_format_closes_its_serialize_span() {
+		let (_dir, router) = router_with_sealed_price().await;
+		let cases = [("/api/v1/storage/price/range?start=110&end=130", "storage.range.serialize", "arrow"), ("/api/v1/storage/price/range.parquet?start=110&end=130", "storage.range.serialize", "parquet"), ("/api/v1/storage/price/range.csv?start=110&end=130", "storage.range.serialize", "csv"), ("/api/v1/storage/price/value-range?lo=2.5&hi=4.5", "storage.value_range.serialize", "arrow"), ("/api/v1/storage/price/value-range.parquet?lo=2.5&hi=4.5", "storage.value_range.serialize", "parquet"), ("/api/v1/storage/price/value-range.csv?lo=2.5&hi=4.5", "storage.value_range.serialize", "csv"), ("/api/v1/storage/price/at?t=110", "storage.point.serialize", "json"), ("/api/v1/storage/price/at-multi?t=110,120", "storage.points.serialize", "json")];
+		for (uri, span, format) in cases {
+			let log = SpanLog::default();
+			let subscriber = tracing_subscriber::fmt().with_writer(log.clone()).with_ansi(false).with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE).with_max_level(tracing::Level::DEBUG).finish();
+			let _guard = tracing::subscriber::set_default(subscriber);
+			let response = router.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{uri}");
+			let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			let text = String::from_utf8(log.0.lock().expect("log buffer").clone()).expect("utf-8 log");
+			assert!(text.lines().any(|line| line.contains(span) && line.contains(&format!("format=\"{format}\""))), "{uri} closed no `{span}` span for format `{format}`:\n{text}");
+		}
 	}
 }
