@@ -6,8 +6,8 @@
 //! [`SoakHarness::start_checked`] (never the ungated `start`), it calls
 //! [`SoakHarness::record_step`] once per executed tick, and it ends the run
 //! with [`SoakHarness::finish`] or [`SoakHarness::abort`]. SOA-4 supplies
-//! the work each step performs; until then the step is whatever the caller
-//! passes — a [`SoakServer`] via [`OpenLoopScheduler::run_with_server`]
+//! the work each step performs ([`crate::soak_workload::WorkloadModel::step`]);
+//! the step is whatever the caller passes — a [`SoakServer`] via [`OpenLoopScheduler::run_with_server`]
 //! (the null server runs the whole harness with no live server), or a
 //! caller-measured step closure via [`OpenLoopScheduler::run_gated`].
 //!
