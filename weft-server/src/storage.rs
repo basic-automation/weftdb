@@ -1842,10 +1842,22 @@ mod tests {
 		}
 	}
 
+	/// tracing-core caches, per span callsite, whether any subscriber wants it. While exactly one
+	/// dispatcher is live it works that out from the *calling thread's* default alone, so a
+	/// parallel test with no subscriber that reaches a callsite first caches "never" for every
+	/// thread, and the span this test installs a subscriber to see is then disabled (seen once in
+	/// 25 runs, and on the Windows runner). Keeping a second dispatcher alive for the process turns
+	/// that shortcut off for good: interest is then taken across every live dispatcher.
+	fn keep_callsite_interest_process_wide() {
+		static SECOND_DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+		SECOND_DISPATCH.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+	}
+
 	/// Every stored read closes a `serialize` span beside its `read` span, tagged with the same
 	/// `format`, so the encode is timed apart from the read it follows (roadmap Phase 3).
 	#[tokio::test]
 	async fn every_stored_read_format_closes_its_serialize_span() {
+		keep_callsite_interest_process_wide();
 		let (_dir, router) = router_with_sealed_price().await;
 		let cases = [("/api/v1/storage/price/range?start=110&end=130", "storage.range.serialize", "arrow"), ("/api/v1/storage/price/range.parquet?start=110&end=130", "storage.range.serialize", "parquet"), ("/api/v1/storage/price/range.csv?start=110&end=130", "storage.range.serialize", "csv"), ("/api/v1/storage/price/value-range?lo=2.5&hi=4.5", "storage.value_range.serialize", "arrow"), ("/api/v1/storage/price/value-range.parquet?lo=2.5&hi=4.5", "storage.value_range.serialize", "parquet"), ("/api/v1/storage/price/value-range.csv?lo=2.5&hi=4.5", "storage.value_range.serialize", "csv"), ("/api/v1/storage/price/at?t=110", "storage.point.serialize", "json"), ("/api/v1/storage/price/at-multi?t=110,120", "storage.points.serialize", "json")];
 		for (uri, span, format) in cases {
