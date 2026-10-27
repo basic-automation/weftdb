@@ -350,6 +350,13 @@ jobs:
         run: scripts/release/test-stage.sh
       - name: bench stage-artifacts.sh tests
         run: bash scripts/bench/test-stage-artifacts.sh
+      # The glibc floor the release promises is asserted by scripts/check-glibc.sh, which
+      # runs only in the release workflow — no CI job otherwise touches it. Its tests stub
+      # objdump and readelf so the floor logic is checked here instead, including that the
+      # script is executable at all: it landed without the bit, and only a release run
+      # would have said so.
+      - name: check-glibc.sh tests
+        run: scripts/release/test-check-glibc.sh
 
   # compat/releases.toml is the pin every compatibility, upgrade and rollback gate runs
   # against: the tag, the commit it points at, the fixture set that release wrote and the
