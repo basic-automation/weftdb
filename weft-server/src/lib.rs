@@ -38,6 +38,10 @@ pub mod downsample;
 pub mod error;
 pub mod gpu;
 pub mod host_guard;
+/// FRE-14c's operator route: `weft-server import-rows-mode`, which reads a 0.1.x data
+/// directory into a Storage v2 store. It is a library module rather than code in `main` so
+/// its argument parsing and its report are testable, like every other server behaviour.
+pub mod import_rows_mode;
 pub mod ingest;
 pub mod interpolate;
 pub mod maintain;

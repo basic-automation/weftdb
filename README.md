@@ -37,7 +37,7 @@ observed endpoints marked `raw`, the 59 between them `interpolated`.
 
 **Start here** · [Why WeftDB](#why-weftdb) · [Quickstart](#quickstart) · [Is WeftDB right for you?](#is-weftdb-right-for-you) · [Project status](#project-status)
 
-**Use it** · [What you get](#what-you-get) · [HTTP API](#http-api) · [Configuration](#configuration) · [Rust library](#rust-library) · [Terminal UI](#terminal-ui)
+**Use it** · [What you get](#what-you-get) · [HTTP API](#http-api) · [Migrate a 0.1.x tree](#migrating-a-01x-data-directory) · [Configuration](#configuration) · [Rust library](#rust-library) · [Terminal UI](#terminal-ui)
 
 **Understand it** · [Performance](#performance) · [How it works](#how-it-works) · [Benchmarking](#benchmarking) · [Development](#development)
 
@@ -708,6 +708,53 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
 
 ---
 
+## Migrating a 0.1.x data directory
+
+A 0.1.x data directory is not a Storage v2 store. It kept one SQLite database per aspect
+(`<database>/<subject>/<aspect>/measurements.db`, timestamps in milliseconds) under a
+`<database>/<subject>/` tree, with the ingest queue, pattern stores and compression
+dictionaries beside them and a `metadata.db` catalog on top. WeftDB reads such a tree as it
+is — `weftdb::rows_mode` — and refuses to open it as a store (`UnsafeLegacyPath`, as
+[above](#http-api)), so carrying one forward is an explicit step, one run per subject:
+
+```console
+$ weft-server import-rows-mode compat/fixtures/v0.1.0/legacy/v010_legacy --subject plant --store /tmp/store
+read compat/fixtures/v0.1.0/legacy/v010_legacy as 0.1.x database "v010_legacy", subject "plant" (millis)
+  flow: 80 row(s) into 1 segment(s) in f32, 1767225600000..1767231540000 millis
+  price: 237 row(s) into 1 segment(s) in f32, 0..4070900000000 millis
+  temp: 54 row(s) into 1 segment(s) in f32, 1767225600000..1767232680000 millis
+  stays behind: metadata.db — the 0.1.x catalog: its subjects, its aspects and its database row.
+  stays behind 21 file(s): 0.1.x kept its ingestion, pipeline, correlation and pattern state
+    beside the rows; the readable leg reads only `measurements.db`, and 1.0 leaves those
+    subsystems behind.
+      plant/flow/correlations.db, plant/flow/patterns.db, … and 16 more (`--json` lists every one)
+imported 371 row(s) into 3 segment(s) at 2026-10-27T07:41:02Z
+serve it with WEFT_SEGMENT_STORE_ROOT set and WEFT_STORE_DATABASE=v010_legacy WEFT_STORE_SUBJECT=plant
+```
+
+That transcript is reproducible from a clone: the tree it reads is the v0.1.0 compatibility
+fixture, committed read-only.
+
+- **The tree is never written.** The run opens each `measurements.db` read-only, so a backup
+  stays a backup and the same tree can be read into another store later.
+- **The store takes the tree's own name.** The database defaults to the tree's directory name
+  and the subject to `--subject`, so the migrated aspects read back under the names the tree
+  used. Point the server at them with `WEFT_STORE_DATABASE` and `WEFT_STORE_SUBJECT` (both in
+  [Configuration](#configuration)); leaving them unset opens the `default` scope, which is
+  what a fresh store uses.
+- **Instants cross unchanged.** 0.1.x's rows-mode path stamped milliseconds, and they stay
+  milliseconds in the aspect's declaration. An aspect already declared in another unit is
+  refused, both schemas printed, rather than silently rescaled.
+- **A tree is read once.** The store keeps a record of the run (source, rows per aspect,
+  chosen encoding, what stayed behind) and a second run against the same tree refuses: the
+  rows-mode read cannot tell its own earlier rows apart from the tree's, so it would quietly
+  double them.
+- `--json` prints the record instead of the summary, for a migration script that has to check
+  what moved. `--database` renames the database, `--rows-per-segment` sizes the sealed
+  segments.
+
+---
+
 ## Configuration
 
 WeftDB is configured primarily through environment variables:
@@ -722,6 +769,8 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_GPU_CALIBRATE` | `weft-server` | Startup calibration. By default, once the listener is bound, the server runs `splimes::calibrate()` once in the background on a blocking thread: it starts the GPU if there is one, times the single-thread, rayon and GPU backends on grids up to 16 Mi points (several seconds, a few hundred MB), and sets where `Backend::Auto` switches between them. Requests are served from the start and interpolate on the CPU with splimes' default thresholds until it finishes. A CPU/software adapter (llvmpipe, lavapipe, WARP) is not calibrated, with a log line saying why; `force` calibrates it anyway. `0` (or `false`/`no`/`off`) skips calibration. It logs the adapter (or why there is none) and the thresholds, and never fails startup; skipped or failed, interpolation stays on the CPU with splimes' defaults. | unset (calibrate, except a software adapter) |
 | `WEFT_MAX_INTERPOLATE_POINTS` | `weft-server` | The most output points one `/api/v1/interpolate*` request may produce; a larger grid is a `400` naming its size and the limit, refused before anything is allocated. A positive integer, read once at startup; anything else (including `0`) stops the server from starting with a message naming the variable. | `10000000` |
 | `WEFT_SEGMENT_STORE_ROOT` | `weft-server` | Root of the Storage v2 segment store; enables the `/storage` endpoints. | unset (storage endpoints answer `503`) |
+| `WEFT_STORE_DATABASE` | `weft-server` | Which database inside the store root the storage endpoints read and write. | `default` |
+| `WEFT_STORE_SUBJECT` | `weft-server` | Which subject inside that database the storage endpoints read and write. | `default` |
 | `WEFT_ON_AMBIGUOUS_COMMIT` | `weft-server` | What the server does once its segment store is write-poisoned (after a COMMIT that may or may not have committed): `poison` keeps serving, refusing every write until the server restarts while reads keep working and `GET /ready` reports `poisoned`; `exit` logs and exits with status 70, for a supervisor that restarts the server. The restart's open settles the transaction either way. Read once, at startup; the `weftdb` library never reads it and never exits the process. | unset (`poison`) |
 | `WEFT_RECONCILE_INTERVAL_SECS` | `weft-server` | Background reconcile daemon sweep interval in seconds; `0`/unset disables it. | unset (disabled) |
 | `WEFT_RECONCILE_THRESHOLD` | `weft-server` | `unsorted_segments` backlog an aspect must reach before the daemon reconciles it. | `1` |

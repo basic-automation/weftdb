@@ -64,18 +64,91 @@ pub fn store_options_from_env() -> SegmentStoreOptions {
 	SegmentStoreOptions::from_env()
 }
 
-/// Open the segment store at `root` as `weft-server` does.
+/// The environment variable naming the `(database, subject)` scope the store is opened
+/// under — the half of a store's address that says which tenant's namespace its declared
+/// aspects and rows live in.
 ///
-/// It opens with the options the environment describes ([`store_options_from_env`]),
-/// and, when `WEFT_ON_AMBIGUOUS_COMMIT=exit` ([`OnPoison::from_env`]), starts the task
-/// that exits the process once the store is write-poisoned ([`spawn_exit_on_poison`]).
+/// A Storage v2 root is a container of scopes, not one scope: the same root can hold
+/// `market/BTCUSD` and `iot/sensor-7`, and which one a process sees is decided by the
+/// scope its open asks for. Before this variable existed the server always asked for the
+/// default scope, so a directory written under any other scope — a migrated 0.1.x
+/// database above all — read as empty.
+pub const DATABASE_ENV: &str = "WEFT_STORE_DATABASE";
+
+/// The subject half of the scope; see [`DATABASE_ENV`].
+pub const SUBJECT_ENV: &str = "WEFT_STORE_SUBJECT";
+
+/// The scope `weftdb::SegmentStore::open` uses, and the scope a server runs under when
+/// neither [`DATABASE_ENV`] nor [`SUBJECT_ENV`] is set. Spelled out here rather than
+/// imported because `weftdb` keeps its copy private, and a server that drifted from it
+/// would silently open a different store than `cargo run -p weftdb` does.
+pub const DEFAULT_SCOPE_DATABASE: &str = "default";
+
+/// The subject half of [`DEFAULT_SCOPE_DATABASE`].
+pub const DEFAULT_SCOPE_SUBJECT: &str = "default";
+
+/// The scope to open a store under, from the environment.
+///
+/// A variable that is set wins as it stands (a scope name is data, and `weftdb` validates
+/// it at the catalog boundary rather than here); a variable that is unset or empty takes
+/// the default, so an operator who sets only one half still gets the other half's default
+/// rather than an empty name.
+#[must_use]
+pub fn store_scope_from_env() -> (String, String) {
+	(scope_half(std::env::var(DATABASE_ENV).ok().as_deref(), DEFAULT_SCOPE_DATABASE), scope_half(std::env::var(SUBJECT_ENV).ok().as_deref(), DEFAULT_SCOPE_SUBJECT))
+}
+
+/// One half of a scope: `value` when it holds something, `default` when it is unset or
+/// blank. Kept out of [`store_scope_from_env`] so the rule is testable without editing a
+/// process environment that other tests are reading.
+fn scope_half(value: Option<&str>, default: &str) -> String {
+	value.map(str::trim).filter(|name| !name.is_empty()).map_or_else(|| default.to_string(), ToString::to_string)
+}
+
+/// The environment variable naming the segment-store root directory, read by startup
+/// phase 3 ([`crate::state`]) and by the `import-rows-mode` command.
+pub const STORE_ROOT_ENV: &str = "WEFT_SEGMENT_STORE_ROOT";
+
+/// The store root the environment names.
 ///
 /// # Errors
 ///
-/// The store's open failing ([`SegmentStore::open_with_options`]).
+/// [`STORE_ROOT_ENV`] being unset or empty: the caller then says which command needed a
+/// store and how to give it one.
+pub fn store_root_from_env() -> anyhow::Result<std::path::PathBuf> {
+	let root = std::env::var(STORE_ROOT_ENV).ok().filter(|value| !value.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("{STORE_ROOT_ENV} is not set: name the store directory to write into, or pass --store"))?;
+	Ok(std::path::PathBuf::from(root))
+}
+
+/// Open the segment store at `root` as `weft-server` does.
+///
+/// It opens with the options the environment describes ([`store_options_from_env`]),
+/// under the scope the environment describes ([`store_scope_from_env`]), and, when
+/// `WEFT_ON_AMBIGUOUS_COMMIT=exit` ([`OnPoison::from_env`]), starts the task that exits
+/// the process once the store is write-poisoned ([`spawn_exit_on_poison`]).
+///
+/// # Errors
+///
+/// The store's open failing ([`SegmentStore::open_scoped_with_options`]).
 pub async fn open_from_env(root: impl AsRef<Path>) -> anyhow::Result<SegmentStore> {
+	let (database, subject) = store_scope_from_env();
+	open_scoped_with_env_options(root, &database, &subject).await
+}
+
+/// Open the segment store at `root` under an explicit scope, with the options and the
+/// poison policy the environment describes.
+///
+/// This is [`open_from_env`] with the scope given rather than read: `import-rows-mode`
+/// writes under the scope the migrated tree names, which is not the environment's — the
+/// process doing the migrating runs in the deployment it migrates *from*, whose
+/// [`DATABASE_ENV`] points somewhere else entirely.
+///
+/// # Errors
+///
+/// The store's open failing ([`SegmentStore::open_scoped_with_options`]).
+pub async fn open_scoped_with_env_options(root: impl AsRef<Path>, database: &str, subject: &str) -> anyhow::Result<SegmentStore> {
 	let on_poison = OnPoison::from_env();
-	let store = SegmentStore::open_with_options(root, store_options_from_env()).await?;
+	let store = SegmentStore::open_scoped_with_options(root, database, subject, store_options_from_env()).await?;
 	if on_poison == OnPoison::Exit {
 		// It ends on its own when the store drops; its handle is dropped on purpose.
 		drop(spawn_exit_on_poison(&store));
@@ -138,6 +211,26 @@ fn exit_poisoned(root: &Path, poisoned: &Poisoned) -> ! {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn an_unset_or_blank_scope_half_takes_the_default() {
+		assert_eq!(scope_half(None, "default"), "default");
+		assert_eq!(scope_half(Some(""), "default"), "default");
+		assert_eq!(scope_half(Some("   "), "default"), "default", "a blank name would open a store under an empty scope rather than the default one");
+	}
+
+	#[test]
+	fn a_set_scope_half_is_taken_as_it_stands() {
+		assert_eq!(scope_half(Some("v010_legacy"), "default"), "v010_legacy");
+		assert_eq!(scope_half(Some(" plant "), "default"), "plant", "surrounding space is the shell's, not the name's");
+	}
+
+	#[test]
+	fn the_default_scope_is_the_one_weftdb_opens() {
+		// A server with no scope set must land in the same namespace as `SegmentStore::open`,
+		// or every store written before this variable existed reads as empty.
+		assert_eq!((DEFAULT_SCOPE_DATABASE, DEFAULT_SCOPE_SUBJECT), ("default", "default"));
+	}
 
 	#[test]
 	fn the_poison_choice_reads_poison_or_exit() {

@@ -241,6 +241,9 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-1** Soak harness skeleton
 - [ ] **W2 · Error contract, frame format, portable builds**
   - [ ] Legacy lane
+    - [x] **FRE-14c** operator route: `weft-server import-rows-mode` reads one 0.1.x subject into a Storage v2 store, prints what stays behind and why, and records the run so a second read refuses
+    - [ ] **FRE-14c** streaming rows-mode read: a whole aspect must not have to fit in memory
+    - [ ] **FRE-14c** migrating `metadata.db`'s non-row state
   - [x] **PAC-2** Portable Linux binaries on a glibc 2.28 baseline
   - [x] **EVI-5** Nightly benchmark-regression workflow and `weft-bench compare`
   - [x] **EVI-2** Claims registry and markdown claim/link lint
