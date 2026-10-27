@@ -16,7 +16,7 @@
 //!   reports use — and adds only the soak's own fields beside it. There is no
 //!   second disk field, driver field, or environment probe in this module.
 //!   SOA-2's device resolution reuses EVI-3's disk probe
-//!   ([`crate::report::disk_for`]) for the soak store directory; the resolved
+//!   for the soak store directory; the resolved
 //!   kind, file system and mount point are the same values
 //!   [`RunMetadata`] records as `work_disk_*` for the working directory, and
 //!   the resolution lives only in the preflight report — never as a field on

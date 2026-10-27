@@ -137,7 +137,7 @@ pub struct DiskInfo {
 /// a device it never identified.
 #[must_use]
 pub(crate) fn disk_for(dir: &std::path::Path) -> Option<DiskInfo> {
-	let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+	let dir = strip_verbatim_prefix(&dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
 	let disks = sysinfo::Disks::new_with_refreshed_list();
 	let index = longest_mount_prefix(&dir, disks.list().iter().map(sysinfo::Disk::mount_point))?;
 	let disk = &disks.list()[index];
@@ -148,6 +148,29 @@ pub(crate) fn disk_for(dir: &std::path::Path) -> Option<DiskInfo> {
 	};
 	let file_system = Some(disk.file_system().to_string_lossy().into_owned()).filter(|f| !f.is_empty());
 	Some(DiskInfo { kind, file_system, mount_point: disk.mount_point().display().to_string(), available_bytes: disk.available_space() })
+}
+
+/// `std::fs::canonicalize` returns `\\?\`-prefixed paths on Windows, but
+/// sysinfo mount points use plain drive letters (`C:\`), so a verbatim path
+/// never prefix-matches a mount and device resolution fails for every real
+/// directory on Windows. Strip the prefix (disk and UNC forms) before
+/// matching; a no-op elsewhere. Only the prefix is touched: a path without
+/// one comes back byte-identical, so non-UTF8 names are never mangled.
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+	let s = path.as_os_str().to_string_lossy();
+	if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+		std::path::PathBuf::from(format!(r"\\{rest}"))
+	} else if let Some(rest) = s.strip_prefix(r"\\?\") {
+		std::path::PathBuf::from(rest)
+	} else {
+		path.to_path_buf()
+	}
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+	path.to_path_buf()
 }
 
 /// The `(kind, file system, mount point)` of the disk holding `dir`: the disk whose mount
@@ -438,6 +461,17 @@ mod tests {
 		if let (_, _, Some(mount)) = work_disk(&dir) {
 			assert!(dir.canonicalize().unwrap_or(dir).starts_with(&mount), "{mount} must contain the working directory");
 		}
+	}
+
+	#[test]
+	#[cfg(windows)]
+	fn strip_verbatim_prefix_normalizes_canonicalized_windows_paths() {
+		use std::path::{Path, PathBuf};
+		// disk_for canonicalizes before matching, and canonicalize returns
+		// verbatim paths on Windows; without the strip, no mount matches.
+		assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\C:\Users\runner\Temp")), PathBuf::from(r"C:\Users\runner\Temp"));
+		assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\dir")), PathBuf::from(r"\\server\share\dir"));
+		assert_eq!(strip_verbatim_prefix(Path::new(r"C:\plain")), PathBuf::from(r"C:\plain"));
 	}
 
 	fn metadata() -> RunMetadata {
