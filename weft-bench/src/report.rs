@@ -457,9 +457,11 @@ mod tests {
 		assert_eq!(longest_mount_prefix(Path::new("/tmp/x"), mounts.iter().copied()), Some(0));
 		assert_eq!(longest_mount_prefix(Path::new("relative"), mounts.iter().copied()), None);
 		// The live probe never panics and, when it names a mount, it contains the working dir.
+		// Compare in disk_for's normalized form: a raw canonicalize on Windows
+		// carries the \\?\ prefix, which no mount point matches.
 		let dir = std::env::current_dir().expect("a working directory");
 		if let (_, _, Some(mount)) = work_disk(&dir) {
-			assert!(dir.canonicalize().unwrap_or(dir).starts_with(&mount), "{mount} must contain the working directory");
+			assert!(strip_verbatim_prefix(&dir.canonicalize().unwrap_or(dir)).starts_with(&mount), "{mount} must contain the working directory");
 		}
 	}
 
