@@ -113,15 +113,33 @@ impl RunMetadata {
 	}
 }
 
-/// The `(kind, file system, mount point)` of the disk holding `dir`: the disk whose mount
-/// point is the longest prefix of `dir` (canonicalized when possible). Each part is `None` when
-/// unreadable; the kind is `None` when the platform reports it as unknown.
-fn work_disk(dir: &std::path::Path) -> (Option<String>, Option<String>, Option<String>) {
-	let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+/// The disk holding a directory, as resolved by EVI-3's probe.
+///
+/// SOA-2's preflight reuses this for the soak store directory instead of adding a second disk probe:
+/// `kind`, `file_system` and `mount_point` are the same three values
+/// [`RunMetadata`] records as `work_disk_*`, and `available_bytes` is a
+/// preflight-only observation — it is never written into a run record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskInfo {
+	/// Kind of the disk (`"ssd"` or `"hdd"`), when the platform reports it.
+	pub kind: Option<String>,
+	/// File system of the disk (e.g. `btrfs`, `ext4`), when available.
+	pub file_system: Option<String>,
+	/// Mount point of the disk (the longest mount-point prefix of the directory).
+	pub mount_point: String,
+	/// Free space on the disk in bytes, as reported at probe time.
+	pub available_bytes: u64,
+}
+
+/// Resolve the disk holding `dir`: the disk whose mount point is the longest
+/// prefix of `dir` (canonicalized when possible). Returns `None` when no
+/// mount contains `dir`, so a caller can fail preflight rather than record
+/// a device it never identified.
+#[must_use]
+pub(crate) fn disk_for(dir: &std::path::Path) -> Option<DiskInfo> {
+	let dir = strip_verbatim_prefix(&dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
 	let disks = sysinfo::Disks::new_with_refreshed_list();
-	let Some(index) = longest_mount_prefix(&dir, disks.list().iter().map(sysinfo::Disk::mount_point)) else {
-		return (None, None, None);
-	};
+	let index = longest_mount_prefix(&dir, disks.list().iter().map(sysinfo::Disk::mount_point))?;
 	let disk = &disks.list()[index];
 	let kind = match disk.kind() {
 		sysinfo::DiskKind::SSD => Some("ssd".to_string()),
@@ -129,7 +147,37 @@ fn work_disk(dir: &std::path::Path) -> (Option<String>, Option<String>, Option<S
 		sysinfo::DiskKind::Unknown(_) => None,
 	};
 	let file_system = Some(disk.file_system().to_string_lossy().into_owned()).filter(|f| !f.is_empty());
-	(kind, file_system, Some(disk.mount_point().display().to_string()))
+	Some(DiskInfo { kind, file_system, mount_point: disk.mount_point().display().to_string(), available_bytes: disk.available_space() })
+}
+
+/// `std::fs::canonicalize` returns `\\?\`-prefixed paths on Windows, but
+/// sysinfo mount points use plain drive letters (`C:\`), so a verbatim path
+/// never prefix-matches a mount and device resolution fails for every real
+/// directory on Windows. Strip the prefix (disk and UNC forms) before
+/// matching; a no-op elsewhere. Only the prefix is touched: a path without
+/// one comes back byte-identical, so non-UTF8 names are never mangled.
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+	let s = path.as_os_str().to_string_lossy();
+	if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+		std::path::PathBuf::from(format!(r"\\{rest}"))
+	} else if let Some(rest) = s.strip_prefix(r"\\?\") {
+		std::path::PathBuf::from(rest)
+	} else {
+		path.to_path_buf()
+	}
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+	path.to_path_buf()
+}
+
+/// The `(kind, file system, mount point)` of the disk holding `dir`: the disk whose mount
+/// point is the longest prefix of `dir` (canonicalized when possible). Each part is `None` when
+/// unreadable; the kind is `None` when the platform reports it as unknown.
+fn work_disk(dir: &std::path::Path) -> (Option<String>, Option<String>, Option<String>) {
+	disk_for(dir).map_or((None, None, None), |disk| (disk.kind, disk.file_system, Some(disk.mount_point)))
 }
 
 /// The index of the mount point that is the longest path prefix of `dir`, or `None` when no
@@ -409,10 +457,23 @@ mod tests {
 		assert_eq!(longest_mount_prefix(Path::new("/tmp/x"), mounts.iter().copied()), Some(0));
 		assert_eq!(longest_mount_prefix(Path::new("relative"), mounts.iter().copied()), None);
 		// The live probe never panics and, when it names a mount, it contains the working dir.
+		// Compare in disk_for's normalized form: a raw canonicalize on Windows
+		// carries the \\?\ prefix, which no mount point matches.
 		let dir = std::env::current_dir().expect("a working directory");
 		if let (_, _, Some(mount)) = work_disk(&dir) {
-			assert!(dir.canonicalize().unwrap_or(dir).starts_with(&mount), "{mount} must contain the working directory");
+			assert!(strip_verbatim_prefix(&dir.canonicalize().unwrap_or(dir)).starts_with(&mount), "{mount} must contain the working directory");
 		}
+	}
+
+	#[test]
+	#[cfg(windows)]
+	fn strip_verbatim_prefix_normalizes_canonicalized_windows_paths() {
+		use std::path::{Path, PathBuf};
+		// disk_for canonicalizes before matching, and canonicalize returns
+		// verbatim paths on Windows; without the strip, no mount matches.
+		assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\C:\Users\runner\Temp")), PathBuf::from(r"C:\Users\runner\Temp"));
+		assert_eq!(strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\dir")), PathBuf::from(r"\\server\share\dir"));
+		assert_eq!(strip_verbatim_prefix(Path::new(r"C:\plain")), PathBuf::from(r"C:\plain"));
 	}
 
 	fn metadata() -> RunMetadata {
