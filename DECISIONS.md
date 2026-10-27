@@ -4,6 +4,67 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-26 — SOA-3 "open-loop scheduler, HDR interval logs, harness self-monitoring and null server" (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** as with SOA-2, the 1.0 plan (§6, W2) lists SOA-3 by name
+only, and §3 says nothing about it beyond the SOA ownership rules (EVI-3
+owns run metadata and redaction; SOA keeps its own `soak_schema_version`).
+What "open-loop" scheduling means for the harness, what an HDR interval
+log contains, what self-monitoring reports, and what the null server's
+seam is are not specified anywhere. SOA-1's module doc supplies the seams:
+the scheduler moves a harness through its states, the scheduler path must
+use `start_checked`, and the scheduler and null server are SOA-3's, with
+SOA-4 supplying the work each step performs.
+
+**Chosen (grounded in SOA-1's seams plus the plan's §3 ownership rules; if
+merge review disagrees, this decision is revisited there):**
+
+1. Open-loop means ticks scheduled on the clock, not on completion: one
+   tick per `interval_ms` for the run's `duration_secs`. A step that
+   overruns its tick causes the *next* tick to be skipped and counted as
+   an overrun, never executed late — executing it late would drift the
+   schedule and silently turn the run closed-loop.
+2. The schedule is computed, not materialized: `tick_count` plus an
+   `index * interval_ms` offset, O(1) memory, so a 24 h run at 1 ms does
+   not allocate ~86M offsets up front.
+3. HDR interval logs group step durations by wall-clock window
+   (`interval_log_secs`, from each tick's planned offset) into an
+   HDR-style histogram with 1024 sub-buckets per power-of-two range
+   (three significant figures, ~0.1% relative error). Each window closes
+   as a record with count, exact min/max/mean, and p50/p90/p99/p999;
+   empty windows still appear, with count zero and no percentiles, so a
+   gap is visible, not missing.
+4. The histogram is implemented in-crate (`soak_hdr`) rather than adding
+   the `hdrhistogram` crate: that crate is not in the workspace lockfile
+   and the gates build `--locked`, so a new dependency would be a
+   lockfile change for a structure small enough to own. Its bucketing is
+   the HDR scheme; only the storage (a growable counts vector) differs.
+5. Self-monitoring reports counts and structurally bad conditions only:
+   scheduled/executed/skipped/failed ticks and the slowest step, with
+   warnings for a failed step, a skipped tick, or a step slower than the
+   tick interval. No pass/fail threshold is invented (cf. SOA-2's refusal
+   of a free-space threshold): each warning is a fact about the schedule.
+6. The null server is the `SoakServer` trait plus a `NullServer` that
+   accepts every step, does no work, and counts acceptances. The trait is
+   the seam SOA-5's live-server client implements; the scheduler only
+   ever sees the trait. `is_live` is `false` for the null server so a
+   null run can never read as a live-server run.
+7. No schema bump: the scheduler's report is its own artifact beside the
+   run record, not a field on `SoakRun`, so `SOAK_SCHEMA_VERSION` stays
+   at v1 per SOA-1's bump rule. The report carries no free text (no
+   label, no path), so it needs no redaction pass.
+8. Step durations on the deterministic path (`run_gated`) are
+   caller-measured and returned by the step closure, so tests replay a
+   schedule with fake durations and no wall clock; the real-time path
+   (`run`) measures around the step itself. One loop serves both.
+
+**Rejected:** a closed-loop scheduler that waits for each step before
+scheduling the next (that is not open-loop); executing overrun ticks late
+(it drifts the schedule); a second metadata/redaction path in the
+scheduler (contradicts §3); putting the report on `SoakRun` (would bump
+the soak schema for no run-record change); and adding an `hdrhistogram`
+dependency (a lockfile change for a small owned structure).
+
 ## 2026-10-26 — SOA-2 "preflight, device resolution, run metadata and secret redaction" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6, W2) lists SOA-2 by name only, and §3 says
