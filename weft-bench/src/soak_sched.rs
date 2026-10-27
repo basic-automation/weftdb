@@ -35,17 +35,18 @@
 //! log is a visible gap, not a missing row.
 //!
 //! **Self-monitoring.** The scheduler watches itself while it runs: the
-//! [`SelfMonitor`] counts scheduled, executed, skipped-overrun and failed
-//! ticks and tracks the slowest step. [`SelfMonitor::warnings`] names
-//! every structurally bad condition — a failed step, a skipped tick, a
-//! step slower than the tick interval — as warnings, not invented
-//! thresholds: each one is a fact about the schedule, not a judgement
-//! about whether the rate was "good".
+//! [`SelfMonitor`] counts scheduled, executed and skipped-overrun ticks
+//! and tracks the slowest step. [`SelfMonitor::warnings`] names every
+//! structurally bad condition — a skipped tick, a step slower than the
+//! tick interval — as warnings, not invented thresholds: each one is a
+//! fact about the schedule, not a judgement about whether the rate was
+//! "good". A failed step aborts the run and surfaces as the returned
+//! error, not as a report warning.
 //!
 //! **No schema bump.** The scheduler's report ([`SchedulerReport`]) is its
-//! own artifact, beside the run record, not a field on [`SoakRun`]: SOA-1's
+//! own artifact, beside the run record, not a field on [`crate::soak::SoakRun`]: SOA-1's
 //! bump rule says a field on the run record would move
-//! [`SOAK_SCHEMA_VERSION`], and the scheduler adds none, so the soak
+//! [`crate::soak::SOAK_SCHEMA_VERSION`], and the scheduler adds none, so the soak
 //! schema stays at v1. The report carries no free text — no label, no
 //! path — so it needs no redaction pass.
 
@@ -133,9 +134,6 @@ pub struct SelfMonitor {
 	pub executed: u64,
 	/// Ticks skipped because the clock was already past their deadline.
 	pub skipped: u64,
-	/// Ticks whose step failed (the run aborted on the first one, so this
-	/// is 0 or 1 in practice, but it is a count, not a flag).
-	pub failed: u64,
 	/// Slowest executed step in nanoseconds, if any step ran.
 	pub max_step_ns: Option<u64>,
 	/// Sum of executed step durations in nanoseconds.
@@ -154,27 +152,13 @@ impl SelfMonitor {
 		}
 	}
 
-	/// Fraction of scheduled ticks that failed (0 when nothing was
-	/// scheduled).
-	#[must_use]
-	pub fn failure_ratio(&self) -> f64 {
-		if self.scheduled == 0 {
-			0.0
-		} else {
-			self.failed as f64 / self.scheduled as f64
-		}
-	}
-
 	/// Structurally bad conditions in this run, each naming the fact:
-	/// failed steps, skipped ticks, and a step slower than the tick
+	/// skipped ticks, and a step slower than the tick
 	/// interval (a step that slow guarantees the next tick overruns).
 	/// An empty list means the schedule ran exactly as planned.
 	#[must_use]
 	pub fn warnings(&self, interval_ms: u64) -> Vec<String> {
 		let mut warnings = Vec::new();
-		if self.failed > 0 {
-			warnings.push(format!("{} step(s) failed; the run aborted", self.failed));
-		}
 		if self.skipped > 0 {
 			warnings.push(format!("{} tick(s) skipped as overruns", self.skipped));
 		}
@@ -340,7 +324,7 @@ impl OpenLoopScheduler {
 	}
 
 	/// Run a harness through its schedule against a server in real time:
-	/// each executed tick submits to the server. With a [`NullServer`]
+	/// each executed tick submits to the server. With a [`crate::soak_null::NullServer`]
 	/// this runs the whole harness with no live server.
 	///
 	/// # Errors
@@ -385,7 +369,6 @@ impl OpenLoopScheduler {
 			}
 			let (duration, result) = step(index);
 			if let Err(error) = result {
-				monitor.failed = monitor.failed.saturating_add(1);
 				harness.abort()?;
 				return Err(anyhow::anyhow!("soak step {index} failed: {error:#}"));
 			}
@@ -471,7 +454,6 @@ mod tests {
 		assert_eq!(report.monitor.scheduled, 20);
 		assert_eq!(report.monitor.executed, 20);
 		assert_eq!(report.monitor.skipped, 0);
-		assert_eq!(report.monitor.failed, 0);
 		assert!(report.monitor.warnings(100).is_empty(), "an exact run warns about nothing");
 		assert_eq!(report.interval_log.intervals.len(), 2, "2 s at a 1 s window logs 2 intervals");
 		assert_eq!(report.interval_log.total_count(), 20);
