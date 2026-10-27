@@ -38,6 +38,10 @@
 //! - [`soak_null`] — the null server (SOA-3): the [`soak_null::SoakServer`]
 //!   seam and its no-live-server implementation, so the harness runs end to
 //!   end without a server until SOA-5's client arrives.
+//! - [`soak_workload`] — the deterministic workload model (SOA-4): lanes,
+//!   format-exact value grids and line-protocol body encoders, derived
+//!   from a soak config's seed alone, supplying the work each scheduler
+//!   tick performs.
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
 //!   distribution + correctness + dataset metadata + end-to-end timing spans).
 //! - [`stats`] — p50/p95/p99 latency summarization + seeded bootstrap
@@ -80,6 +84,7 @@ pub mod soak;
 pub mod soak_hdr;
 pub mod soak_null;
 pub mod soak_sched;
+pub mod soak_workload;
 pub mod sparse;
 pub mod stats;
 pub mod uci;
@@ -91,7 +96,7 @@ use bigdecimal::ToPrimitive;
 
 use crate::adapter::grid_timestamps;
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter, SystemAdapterV2}, baseline_adapter::BaselineLinearAdapter, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_on, IngestProfile, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{PreflightCheck, ResolvedDevice, SoakConfig, SoakHarness, SoakPreflight, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_hdr::HdrHistogram, soak_null::{NullServer, SoakServer}, soak_sched::{IntervalLog, IntervalRecord, OpenLoopScheduler, SchedulerConfig, SchedulerReport, SelfMonitor, TickDecision}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter, SystemAdapterV2}, baseline_adapter::BaselineLinearAdapter, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_on, IngestProfile, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{PreflightCheck, ResolvedDevice, SoakConfig, SoakHarness, SoakPreflight, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_hdr::HdrHistogram, soak_null::{NullServer, SoakServer}, soak_sched::{IntervalLog, IntervalRecord, OpenLoopScheduler, SchedulerConfig, SchedulerReport, SelfMonitor, TickDecision}, soak_workload::{GridValue, LaneWeights, ValueFormat, ValueGrid, WorkloadLane, WorkloadModel, WorkloadParams, WorkloadStep, SOAK_WORKLOAD_EPOCH_NS, SOAK_WORKLOAD_MEASUREMENT}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
 };
 
 /// Workload class label recorded for the interpolation profile.

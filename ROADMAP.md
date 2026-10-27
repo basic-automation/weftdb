@@ -262,7 +262,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-8A** Benchmark adapter v2 I
   - [x] **SOA-2** Soak preflight, device resolution, run metadata and secret redaction
   - [x] **SOA-3** Open-loop scheduler, HDR interval logs, harness self-monitoring and null server
-  - [ ] **SOA-4** Deterministic workload model, lanes, format-exact value grids and body encoders
+  - [x] **SOA-4** Deterministic workload model, lanes, format-exact value grids and body encoders
 - [ ] **W3 · Gate, serve path, input domain**
   - [ ] Store lane
   - [ ] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)

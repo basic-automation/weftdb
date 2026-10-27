@@ -4,6 +4,62 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-27 — SOA-4 "deterministic workload model, lanes, format-exact value grids and body encoders" (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** as with SOA-2 and SOA-3, the 1.0 plan (§6, W2) lists SOA-4
+by name only, and §3 says nothing about it beyond the SOA ownership rules
+(EVI-3 owns run metadata and redaction; SOA keeps its own
+`soak_schema_version`). What the workload model is, what a lane is, what
+makes a value grid "format-exact", and what a body encoder encodes are
+not specified anywhere. SOA-1's module doc supplies the seams: the model
+derives its workload from the config's seed alone, and it supplies the
+work each scheduler step performs; SOA-3's scheduler supplies the ticks.
+
+**Chosen (grounded in SOA-1's seams, SOA-3's scheduler, and the bench
+crate's existing operation families; if merge review disagrees, this
+decision is revisited there):**
+
+1. Deterministic means a pure function of seed, params and tick: the
+   per-tick random stream is seeded from the seed and the tick (with a
+   salt separating the lane stream from the grid stream), never from a
+   running generator's state, so any tick replays identically and in any
+   order. The generator is `ChaCha8`, as in the profile and sparse
+   workloads, so the stream is portable across machines.
+2. Lanes are the bench crate's three operation families — `ingest`,
+   `point_lookup`, `range_scan` (the ingest, point-lookup and
+   range-fetch workloads) — with a weighted mix: a tick belongs to
+   exactly one lane, drawn against cumulative weights, so a run's mix is
+   countable from its steps. A zero total weight is a construction
+   error, not a run that silently does nothing.
+3. A value grid is series × rows, walked series-major like the sparse
+   grid, each cell present with the model's density or absent. Each
+   column carries exactly one of the five line-protocol field formats,
+   cycling float/integer/unsigned/boolean/text, so a column's values
+   are always in that format's exact wire form.
+4. Format-exact means the encoder and the parser agree by test:
+   `GridValue::encode_field` writes the format's wire syntax (bare
+   number, `i`/`u` suffix, `t`/`f`, quoted string with the protocol's
+   escapes) and parsing the result through the line-protocol parser
+   returns the same value. No coercion crosses a format boundary.
+5. A body is line-protocol text: one line per present cell,
+   `soak,lane=<lane>,series=s<series> value=<field> <timestamp_ns>`,
+   timestamps advancing one second per row from the synthetic
+   profiles' epoch anchor. The body carries no free text (generated
+   series names, fixed lane names), so — like the scheduler's report —
+   it needs no redaction pass.
+6. No schema bump: the model adds no field to `SoakRun` or `SoakConfig`,
+   so `SOAK_SCHEMA_VERSION` stays at v1 per SOA-1's bump rule; the
+   model and its steps serialize on their own for artifacts that want
+   them. The workload is not a server client: SOA-5 owns driving a live
+   server, and this slice only produces the steps a client would submit.
+
+**Rejected:** a stateful generator whose tick N depends on ticks before
+it (a replay would have to regenerate the whole run); lanes invented
+outside the crate's existing operation families (nothing would ground
+what a lane means); encoding every value as a float (that is exactly
+the format loss "format-exact" exists to forbid); and putting the model
+on `SoakRun` (would bump the soak schema for no run-record change).
+
 ## 2026-10-26 — SOA-3 "open-loop scheduler, HDR interval logs, harness self-monitoring and null server" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** as with SOA-2, the 1.0 plan (§6, W2) lists SOA-3 by name
