@@ -447,3 +447,33 @@ job is a later slice's call, and it would stage through this same script).
 **Not claimed:** the nightly workflow change itself only exercises on its next
 scheduled run; the shape is unchanged (same artifact name, same flat files,
 same retention), so the next night's baseline download is unaffected.
+
+## 2026-10-26 — what testing a release-only script is allowed to assume (PAC-2 follow-up)
+
+**Ambiguous:** the floor checker had no test and no other caller than the release workflow, and a
+test cannot produce an artifact built against glibc 2.28 on a host that has 2.34. What should the
+suite feed it?
+
+**Chosen:** stub `objdump` and `readelf` on a controlled PATH, with artifacts that are the ELF magic
+and nothing else. The checker's whole input is what binutils prints, so a fixture that says what a
+given tool prints exercises exactly the logic under test — including the `readelf` fallback and the
+case where neither tool exists, neither of which a real artifact could reach on this machine. Each
+case gets its own PATH directory, because `/usr/bin` holds a real `objdump`: a case that wants a
+tool missing cannot put `/usr/bin` on PATH at all, and `bash` is named by absolute path for the same
+reason.
+
+**Rejected:** building real binaries against several glibc versions (that is a cross-compile per
+case, and it tests binutils rather than the checker); parsing an ELF version section in the test to
+compare against the checker's parse (two implementations of one idea, both unverified).
+
+**Two failures the suite found, both on paths no CI job runs.** The script had landed mode 644, and
+`release.yml` invokes it by path — the step that asserts the floor was "Permission denied", exit
+126, on the first real release. And when neither binutils is installed the symbol dump fails, which
+fell through to "requires no glibc symbol (static or non-glibc libc)" and passed the artifact while
+saying nothing useful on stderr; the dump's exit status now decides. The mode fix went on the script
+rather than turning the workflow into `bash scripts/check-glibc.sh`, because every sibling release
+script is executable and the workflow's existing style is a direct call.
+
+**Not claimed:** this tests the checker, not the image. That the pinned manylinux image really
+produces 2.28 binaries is a measurement the release run itself makes, and it is recorded in the
+2026-10-25 entry above.

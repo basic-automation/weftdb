@@ -51,7 +51,12 @@ only the control plane, not the segment frames.
   artifact's dynamic symbol table and fails the release above 2.28 — a newer reference
   ships silently and dies at `execve`, which is how this was first noticed (a `fcntl64`
   at GLIBC_2.39 inside a binary built for "Linux"). Measured in the pinned image: 2.28
-  for `weft-tui` and `weft-server`, interpreter `/lib64/ld-linux-x86-64.so.2`.
+  for `weft-tui` and `weft-server`, interpreter `/lib64/ld-linux-x86-64.so.2`. The two
+  Linux images are now pinned by digest as well as by tag, and
+  `scripts/release/test-check-glibc.sh` tests the checker on every push: it runs only in
+  the release workflow, which no CI job exercises, and it had landed without its
+  executable bit — the step that asserts the floor would have failed with
+  "Permission denied" on the first real release.
 - **Write poison** (crash-consistency design, S6). When a segment-index COMMIT fails
   in a way that may still have committed (any COMMIT error except a conflict Turso
   detects while validating the transaction, which it rolls back before writing

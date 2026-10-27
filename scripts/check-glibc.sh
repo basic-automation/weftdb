@@ -102,7 +102,13 @@ check_one() {
 
 	interp="$(readelf -lW "$file" 2>/dev/null | awk '/Requesting program interpreter/ { sub(/\]$/, ""); print $NF; exit }' || true)"
 
-	dump="$(dump_dynamic_symbols "$file")"
+	# A failed dump is not an empty symbol table. Without either binutils the script used to
+	# fall through to "requires no glibc symbol" and pass the artifact while saying nothing
+	# useful on stderr, so the assignment's status is what decides here.
+	if ! dump="$(dump_dynamic_symbols "$file")"; then
+		printf '%s: FAIL %s could not be read\n' "$prog" "$file" >&2
+		return 1
+	fi
 	required="$(printf '%s\n' "$dump" | highest_glibc_in_dump)"
 
 	if [[ -z "$required" ]]; then
