@@ -33,6 +33,15 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **`weft-server import-rows-mode` migrates one 0.1.x subject into a Storage v2 store**
+  (legacy lane FRE-14c). A 0.1.x data directory keeps one SQLite database per aspect,
+  timestamps in milliseconds, with its ingest queue, pattern stores and `metadata.db` catalog
+  beside the rows; the server reads such a tree as it is and refuses to open it as a store, so
+  carrying one forward meant calling `weftdb::rows_mode` from your own program. The command
+  reads one subject, seals its rows into segments, prints what moved and what stays behind with
+  the reason for each, and records the run in the store — a second run against the same tree
+  refuses rather than doubling the rows. The migrated tree reads back under its own name
+  through `WEFT_STORE_DATABASE` and `WEFT_STORE_SUBJECT`.
 - **Every README performance figure now has a registry entry** (evidence track EVI-2).
   `bench/claims.json` names, per figure, the bench or the local corpus behind it, the date it was
   measured, and whether a clone can re-run it; `tools/check_claims.py` runs in CI and pairs each

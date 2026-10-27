@@ -18,5 +18,11 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	startup::run().await
+	// A word on the command line is a command, and there is exactly one besides serving: a
+	// misspelled `import-rows-mode` must not quietly come up as a server instead of
+	// migrating the tree the operator was pointing at.
+	if std::env::args().nth(1).is_none() {
+		return startup::run().await;
+	}
+	weft_server::import_rows_mode::run(std::env::args().skip(1)).await
 }

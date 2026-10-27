@@ -583,3 +583,35 @@ untouched. Nothing in `weftdb` is affected by the parked branch.
 followed "make and merge PRs as you go" and merged #98, #100, #101, #102 and #110 on green CI; the
 2026-10-25 entry above concludes the opposite and is marked Needs human. Both loops should end up
 behaving the same way, and which way is not for them to pick.
+
+
+## 2026-10-27 — the 0.1.x migration route is a server subcommand, and only half of FRE-14c
+
+**Decision:** `weft-server import-rows-mode <tree> --subject <s>` reads one subject of a 0.1.x
+data directory into the open store. It is a subcommand of the server binary, not an HTTP route:
+the read takes a filesystem path chosen by the operator, and the server's API is unauthenticated
+by default, so a route would turn any reachable client into one that can read arbitrary
+directories off the host. `weftdb` gains nothing — `weftdb::rows_mode` already surveyed, read and
+imported; only the entry point was missing.
+
+**Decision:** the store's scope becomes operator-settable (`WEFT_STORE_DATABASE`,
+`WEFT_STORE_SUBJECT`, both defaulting to `default`) because a migrated tree must read back under
+the name the operator already types for it, and because the server opens exactly one scope at a
+time — which is why `--subject` is required and a many-subject tree migrates as several runs.
+Both halves are validated together before the first file opens, so a half-set scope is an error
+naming both variables rather than a silent store in `default`.
+
+**Coordination — asked, not yet answered.** Two relayed divisions conflict
+about the Legacy lane. One, relayed 2026-10-26, assigns FRE-14 to this session and SOA-3/SOA-4 to
+the other loop. The other, from that loop later, reserves "FRE-14-remainder" for itself and says
+does-not-start applies, under the rule "whoever opens the PR owns the slice". Because opening a
+PR would itself take the slice under that rule, this branch stays local and unopened until the
+operator says who owns it; the entry above records how the work was built, not a claim on it.
+Whichever loop finishes FRE-14c, two parts remain unbuilt either way: the streaming read (an
+aspect is still buffered whole before sealing, so a large subject is bounded by RAM) and the
+`metadata.db` non-row state (named as "stays behind" here, which is honest but is not a
+migration). Both stay unticked in ROADMAP.md.
+
+**Not claimed:** no unit conversion happens. 0.1.x's rows-mode path stamped milliseconds where
+its batch path kept seconds, and an aspect already declared in the other unit is refused with
+both schemas printed rather than rescaled, so nothing here says millis became seconds.
