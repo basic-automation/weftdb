@@ -44,22 +44,27 @@ Interchange and output are covered too: Parquet and CSV in, columnar Arrow/Parqu
 
 ### Phase 3 — Instrument everything · *Very high*
 
-The metrics side is done: a Prometheus `/metrics` surface, latency histograms over the compute and seal paths, a `/debug/profile/current` endpoint, and a harness-level timing breakdown covering dataset generation, adapter and whole run. Affected-row accounting from Turso's `Statement::n_change()` is recorded in the ingest and instrumentation spans.
+The metrics side is done: a Prometheus `/metrics` surface, latency histograms over the compute and seal paths, a `/debug/profile/current` endpoint, and a harness-level timing breakdown covering dataset generation, adapter and whole run. Affected-row accounting from Turso's `Statement::n_change()` is recorded for the aspect-metadata write on the seal path; the index write is not wired yet (see the open item below).
 
 Tracing has a `RUST_LOG`-driven foundation, a per-request root span, and per-stage child spans that reach the storage read path and the Arrow/Parquet decode on ingest. OTLP trace export is in, and delivery to a real collector has been verified.
 
 - [ ] Remaining per-stage spans
+  - *Audit 2026-10-27: kept unchecked, with a concrete gap — `.read` spans carry a `format` field on every storage path, but a `.serialize` span exists only on the JSON `range`/`value_range` paths (`storage.rs:369,486`); CSV (`:144,167`), Arrow/Parquet (fused with the read, `:189-247`) and the point lookup (`:545-549`) have none, and no test asserts these spans.*
+- [ ] **`Statement::n_change()` accounting on the seal path's index write**
+  - *Audit 2026-10-27: unchecked — only `AspectMetadataStore::put` (`metadata.rs:228`) reports `rows_changed`. The seal's index write goes `publish_seal` → `commit_index(IndexTxn::InsertNew)` (`segment_store.rs:1837`), not `SegmentIndexStore::insert`/`delete` (`segment_index.rs:179,231`, no non-test callers), so no `control_plane.index.*` span or `rows_changed` is emitted there.*
 - [ ] `/bench/runs/:id` endpoint
 
 ### Phase 4 — Hot path: physical types & Storage v2 · *High*
 
 The physical-type groundwork is done: integer-epoch `TimeUnit` with lossless delta and delta-of-delta transforms, a zig-zag/LEB128 varint estimate, RLE and a `best_estimated_bytes` selector, fixed-width bit-packing, and Arrow-compatible arrays (4.5). Monotonic order is detected and enforced, and the read planner picks the cheapest way to answer a point or range read.
 
-Out-of-order data is fully handled (4.6): in-place per-segment sort, cross-segment merge, the split-not-rewrite optimisation, threshold-triggered background reconciliation, and a hot/cold split in the background sweep. Reads skip work by pruning on time and value at segment level, on quality for all-null segments and pages, and on pages within a segment.
+Out-of-order data is fully handled (4.6): in-place per-segment sort, cross-segment merge, the split-not-rewrite optimisation, threshold-triggered background reconciliation, and a hot/cold split in the background sweep. Reads skip work by pruning on time and value at segment level, and on pages within a segment. Quality pruning of all-null segments and pages exists as primitives but is not wired into the read path (see 4.3).
 
 - [x] **4.1 Physical numeric encodings**
   - [ ] Explicit tz + leap-second policy
 - [x] **4.3 Columnar segment store**
+  - [ ] Quality pruning wired into the read path (all-null segment/page skipping)
+    - *Audit 2026-10-27: unchecked, replacing the old checked item — only the primitives exist: `prune_present_by_time` (`weft-physical-type/src/segment.rs:760`, `catalog.rs:395`) and `prune_present_pages_by_time` (`page.rs:364`) have no caller outside their own tests. The store's read path prunes by time alone (`segment_index.rs:259` SQL, `weftseg.rs:1792` page overlap), so no all-null segment or page is skipped.*
   - [ ] Tag pruning *(blocked on B-tags — per-measurement tags/labels don't exist yet)*
 - [ ] **4.6 Correctness semantics**
   - [ ] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
@@ -71,7 +76,8 @@ Interpolation and extrapolation run on the GPU, supported by a size-tiered LRU b
 - [ ] 5.1 Command batching
 - [ ] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
 - [ ] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
-- [ ] 5.4 Hardware auto-tuning (calibrate CPU/GPU throughput, transfer cost, break-even sizes; auto-select)
+- [x] 5.4 Hardware auto-tuning (calibrate CPU/GPU throughput, transfer cost, break-even sizes; auto-select)
+  - *Audit 2026-10-27: checked — `weft-server/src/gpu.rs:82` `calibrate()` runs `splimes::calibrate()` at startup (`gpu.rs:95`), timing GPU, rayon pool and single core and installing the measured break-even thresholds that `Backend::Auto` then uses to auto-select (`gpu.rs:1-20`, `settings.rs:109` `WEFT_GPU_CALIBRATE`; tests at `gpu.rs:138-193`).*
 - [ ] 5.5 GPU economics (cloud cost, CPU-only fallback, utilization/contention/cold-start, NVIDIA/AMD/Intel/Apple portability)
 - [ ] 5.6 wgpu/WGSL portability & determinism (conformance matrix, numerical drift, published tolerances)
 - [ ] 5.7 Multi-GPU *(deferred until single-GPU wins are proven)*
@@ -204,8 +210,9 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 - [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
 - [x] **Crate publishing split**
 - [ ] **Panic audit on server paths**
-- [ ] **Security process**
-  - [ ] **Private vulnerability reporting is off**
+- [x] **Security process**
+  - [x] **Private vulnerability reporting is off**
+    - *Audit 2026-10-27: checked — `gh api repos/basic-automation/weftdb/private-vulnerability-reporting` now returns `{"enabled":true}` (the heading text is historical). The other children hold: SECURITY.md routes reports to GitHub private reporting, and the `deny` job in ci.yml runs advisories, bans, licenses and sources.*
 
 ### Claims & documentation
 
@@ -407,7 +414,7 @@ The interpolation item (B-interp, Phase 5) is done.
 
 ## Control-plane engine: Turso/libSQL 0.6 adoption
 
-Turso is migrated from 0.4 to 0.6 and then to 0.8.1 (2026-10-05), with the control-plane schemas moved to plain `INTEGER PRIMARY KEY` for MVCC. The 0.7 upgrade evaluation is settled. Online backups use `VACUUM INTO` with a concurrent-write-safe verify and a background daemon, and snapshot directories no longer accumulate empty `.db-log` and `.db-wal` sidecars. `Statement::n_change()` affected-row accounting is shipped on the seal path.
+Turso is migrated from 0.4 to 0.6 and then to 0.8.1 (2026-10-05), with the control-plane schemas moved to plain `INTEGER PRIMARY KEY` for MVCC. The 0.7 upgrade evaluation is settled. Online backups use `VACUUM INTO` with a concurrent-write-safe verify and a background daemon, and snapshot directories no longer accumulate empty `.db-log` and `.db-wal` sidecars. `Statement::n_change()` affected-row accounting is shipped for the aspect-metadata write on the seal path only; the index write is tracked under Phase 3.
 
 The backup cost was measured on 2026-09-23, and the diagnosis on record at the time turned out to be wrong; the corrected one is in the docs. Everything still listed below is control-plane-only by design: none of it turns Turso into the measurement backend.
 
@@ -420,7 +427,8 @@ The backup cost was measured on 2026-09-23, and the diagnosis on record at the t
 - [ ] **Backup cost residue (c) — DO NOT reach for Turso's experimental passive checkpoint.**
 - [ ] **Backup 7.4 residue (b) is UPSTREAM-GATED, not an open design question (research 2026-09-23):**
 - [ ] **Backup cost residue (d) — evaluate an `sqlite3_rsync`-style page-delta replica.**
-- [ ] **Confirm the snapshot verifier does not depend on MVCC-broken pragmas.**
+- [x] **Confirm the snapshot verifier does not depend on MVCC-broken pragmas.**
+  - *Audit 2026-10-27: checked — `the_verifier_never_relies_on_pragmas_mvcc_reports_as_zero` (weftdb/src/types/backup.rs:1250) statically asserts no verifier code names `page_count`/`user_version`/`application_id`/`freelist_count` and behaviourally checks both `VerifyMode`s count real tables/rows on an MVCC source.*
 - [ ] Triggers (`BEFORE/AFTER/INSTEAD OF` + `WHEN`)
 - [ ] Dynamic auth tokens as closures
 - [ ] `UPDATE … FROM`, aggregate `FILTER`, `INDEXED BY`, `NULLS FIRST/LAST`
@@ -473,7 +481,8 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **The three unguarded `weft-orchestration` failures are latent bugs, not flakes — fix them
 - [ ] **Re-measured 2026-10-09 — still unbounded.**
 - [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.**
-- [ ] **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:**
+- [x] **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:**
+  - *Audit 2026-10-27: checked — this is a historical note and its fix shipped: `[profile.test] debug = 1` is at Cargo.toml:128.*
 - [ ] **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):**
 - [ ] **NEXT — UDDSketch (uniform guarantee under collapse):**
 - [x] **DONE (2026-07-18) — materialize per-segment partials at seal time (the highest-value
