@@ -48,7 +48,7 @@
 //!
 //! **No schema bump.** The workload model is not part of the run record:
 //! it adds no field to [`SoakRun`](crate::soak::SoakRun) or
-//! [`SoakConfig`](crate::soak::SoakConfig), so
+//! [`SoakConfig`], so
 //! [`SOAK_SCHEMA_VERSION`](crate::soak::SOAK_SCHEMA_VERSION) stays at v1
 //! per SOA-1's bump rule. The model and its steps serialize on their own
 //! for artifacts that want them.
