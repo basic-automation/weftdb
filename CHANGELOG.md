@@ -42,6 +42,12 @@ only the control plane, not the segment frames.
   the reason for each, and records the run in the store — a second run against the same tree
   refuses rather than doubling the rows. The migrated tree reads back under its own name
   through `WEFT_STORE_DATABASE` and `WEFT_STORE_SUBJECT`.
+- **Stage spans for every stored read, and an index-write span on the seal** (roadmap Phase 3).
+  Each stored read (CSV, Arrow, Parquet, JSON, point and at-multi) now closes a
+  `storage.<stage>.serialize` span tagged with its `format`, so the encode is timed apart from the
+  read it follows; the Arrow and Parquet handlers split their encode out of the read to do it. A
+  seal's index write closes a `control_plane.index.insert` span carrying `rows_changed`, the
+  affected-row count of the insert.
 - **Every README performance figure now has a registry entry** (evidence track EVI-2).
   `bench/claims.json` names, per figure, the bench or the local corpus behind it, the date it was
   measured, and whether a clone can re-run it; `tools/check_claims.py` runs in CI and pairs each

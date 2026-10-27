@@ -84,6 +84,7 @@ use anyhow::{bail, Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
+use tracing::Instrument as _;
 use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
@@ -1834,7 +1835,11 @@ impl SegmentStore {
 	/// or writing meanwhile.
 	async fn publish_seal(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
 		let commit = self.commit_lock(aspect).await?;
-		self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }, seq_bump(aspect, &commit)])).await?;
+		// The seal's index write, spanned like `SegmentIndexStore::insert` (roadmap Phase 3). Its
+		// `rows_changed` is the affected-row count of the first op, the `InsertNew`.
+		let span = tracing::debug_span!("control_plane.index.insert", aspect, id = descriptor.id, rows_changed = tracing::field::Empty);
+		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }, seq_bump(aspect, &commit)])).instrument(span.clone()).await?;
+		span.record("rows_changed", applied.changes.first().copied().unwrap_or(0));
 		self.metadata.record_seal(aspect, descriptor).await?;
 		drop(commit);
 		Ok(())
