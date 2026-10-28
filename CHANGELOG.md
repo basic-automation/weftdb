@@ -33,6 +33,21 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **The `TimeUnit` calendar policy, stated and pinned** (roadmap 4.1). A timestamp column
+  holds ticks since `1970-01-01T00:00:00Z` in UTC under the POSIX rule: no zone is stored —
+  the column holds instants, so a segment means the same thing whatever the writer's offset —
+  and no leap second is modelled: a stored day is exactly `86_400 × nanos_per_unit()` ticks,
+  which means the two moments the real calendar inserted a second are represented by counting
+  that second twice rather than by a discontinuity or a renumbering. WeftDB carries no
+  leap-second table, does not smear, and cannot answer "what was the TAI-UTC offset here"; a
+  downsample or interpolation across a real leap second sees the interval as one second long.
+  The arithmetic the policy implies moved off the call sites and onto the type:
+  `TimeUnit::nanos_per_unit`, `TimeUnit::to_nanos` (checked — a coarse unit near either end of
+  `i64` is refused rather than wrapped into a wrongly sorted instant) and
+  `TimeUnit::from_nanos` (truncates toward minus infinity, so `-0.5 s` and `+0.5 s` no longer
+  share a bucket that a full second either side misses). `scaled_rows` in
+  `weftdb/src/types/segment_store.rs` now calls it instead of repeating the per-unit match.
+
 - **`weft-server import-rows-mode` migrates one 0.1.x subject into a Storage v2 store**
   (legacy lane FRE-14c). A 0.1.x data directory keeps one SQLite database per aspect,
   timestamps in milliseconds, with its ingest queue, pattern stores and `metadata.db` catalog
