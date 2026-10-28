@@ -764,3 +764,32 @@ catalog row degrades provenance rather than stopping the read.
 
 **Not claimed:** the operator route is untouched by this slice — it is PR #128's, on
 main already — and no unit conversion happens, as the 2026-10-27 entry above says.
+
+## 2026-10-28 — EVI-10A: `MAX_KNOTS` stays a `pub` const
+
+**Ambiguous:** ROADMAP's review item ("Reconcile with EVI-10A", 2026-10-19) left
+`interpolate_range::MAX_KNOTS` open: keep it a `pub` const, turn it into an option,
+or drop it. Meanwhile the server's `POST /api/v1/interpolate` gained its own input
+cap (`InterpolateConfig`, env-overridable via `WEFT_MAX_INTERPOLATE_POINTS`).
+
+**Chosen:** keep `MAX_KNOTS` as a `pub` const (4 Mi rows). The two caps bound
+different quantities, so there is nothing to unify: `MAX_KNOTS` bounds the stored
+rows one reconstruction reads (the knots handed to splimes, and the second copy
+built for them — a memory bound), while the server's cap and splimes'
+`max_points` bound the output grid. Unifying them would cap the wrong thing on
+one side or the other. Dropping the const would hide a public, CHANGELOG-
+documented bound for no benefit, and turning it into a per-call option would
+invent library API surface no caller has asked for: a caller that needs a
+different bound already has the documented escape — narrow the window or the
+margin, or interpolate in pieces, which the refusal message itself says. The
+private `stored_window_capped` seam stays test-only.
+
+**Applied:** EVI-10A's ROADMAP line is ticked on this decision plus the
+verification that the two other acceptance criteria already hold on `main`:
+`SegmentStore::interpolate_range` / `interpolate_range_f64` are reachable
+through the store lane via the `types::interpolate_range` child module (one
+`mod` line in `types/mod.rs`), and a window over the cap is refused
+(`a_window_with_more_rows_than_the_cap_is_refused`, including the margin
+counting toward the cap). The review item itself is left unticked here — it
+names this slice, and this entry is its answer — so the loop can flip it
+alongside the line it reviews.
