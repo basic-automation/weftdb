@@ -872,6 +872,11 @@ only the control plane, not the segment frames.
 
 ### Fixed
 
+- **The JSON body's `aggregations` accepts the documented reduction spellings and any letter case.** `POST /api/v1/downsample`
+  read its tokens through the bare lowercase variant names only, so the README's `twa_linear`, `sketch_p99` and aliases such as
+  `median` were rejected as unknown variants, and a name copied from a response (`twa_linear`) could not be sent back. The body
+  now reads the query string's parser (`Aggregation::from_token`), so both surfaces accept the same set; the bare names
+  (`twalinear`, `sketchp99`) still parse. An unknown token is a `400` that names it and lists the accepted spellings (ROADMAP, FRE-5).
 - **Power loss during or after a reconcile or split could lose or tear rows.** Both
   rewrote the segment's frame in place with an unsynced write (a split also wrote its
   suffix that way), so a power cut, even after the call returned, could leave a
