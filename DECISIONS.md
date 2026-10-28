@@ -712,3 +712,98 @@ catalog row degrades provenance rather than stopping the read.
 
 **Not claimed:** the operator route is untouched by this slice — it is PR #128's, on
 main already — and no unit conversion happens, as the 2026-10-27 entry above says.
+
+## 2026-10-27 — what quality pruning is allowed to skip, and where (ROADMAP 4.3)
+
+**Ambiguous:** 4.3 asks for "all-null segment/page skipping" in the read path, and the
+primitives for it already exist (`prune_present_by_time` in `weft-physical-type/src/segment.rs`
+and `src/catalog.rs`, `prune_present_pages_by_time` in `src/page.rs`) — but with test callers
+only. They cannot be called as they stand: they work on a resident `Segment` or page index,
+while the store decides what to read from SQL over `segment_index.db` and then streams values
+out of a frame's blocks. "Wire it in" therefore does not name a call site; it names a decision
+about which readers may treat a null row as "nothing to return".
+
+**Chosen (grounded in the doc comments' own rule — a null row must be part of the answer for
+skipping to change results rather than cost — and in the three readers whose semantics differ
+on exactly that point):**
+
+* **Pruned:** `read_point` and `read_points` (single timestamp, timestamp set). Both already
+  answer "no measurement" when the row is absent, so a null row and an absent row are the same
+  answer. New `SegmentIndexStore::prune_present_descriptors` mirrors
+  `SegmentIndex::prune_present_by_time` in SQL (`null_count < row_count` in the WHERE clause),
+  and the readers additionally skip an `is_all_null()` descriptor — which also keeps them off
+  `read_exact`'s hard error on a zero-row store, an error that is a bug at a point read, not a
+  diagnostic anyone asked for.
+* **Pruned, inside a frame:** fully null frames and fully null pages, tested on the persisted
+  page stats rather than by decoding. The frame's single-block and paged forms stop asserting
+  an exact row count, because not reading a page is the point of the change.
+* **Not pruned:** `read_time_range`, `downsample_range`, the ingest-side bucketing callers, and
+  `read_segment_instant`. The first three *return* null rows, so pruning would drop rows a
+  caller is owed. The instant reader is last-writer-wins: skipping a segment can change which
+  segment wins, which is 4.6's out-of-order reconciliation question, not 4.3's.
+
+**Consequence:** the 4.3 box is ticked with that scope stated in `ROADMAP.md` rather than
+silently, because the honest reading of "wire the test into the read path" is "into the readers
+where it is sound", and a later reader should see that the range readers were considered and
+declined, not missed. No format change: `STORE_FORMAT` stays 2, since `null_count` was already
+in the persisted stats and the segment index.
+
+## 2026-10-27 — what this loop did not build, after rebasing onto a moved main
+
+**Ambiguous:** the operator's wave list gave this loop three items — quality pruning (4.3), the
+seal index write's `Statement::n_change()` accounting (Phase 3), and `GET /bench/runs/:id`. By
+the time the pruning slice was written, main had moved twice (#132, #133), and two of the three
+items were no longer this loop's to do.
+
+**Chosen:** the `n_change()` accounting was **not** rebuilt — #133 closed it (the seal's
+`InsertNew` commit is wrapped in a `control_plane.index.insert` span whose `rows_changed` comes
+from the `TxnApplied` the commit already returns; `weftdb/tests/seal_index_span.rs` asserts it,
+`ROADMAP.md:53` records it). Re-implementing it would have collided with a shipped design over
+metric naming for no behaviour change. `GET /bench/runs/:id` was **not** built either: main now
+records it as deferred pending the exposure matrix and auth work (SEC-6, SEC-8), and because no
+artefact on main carries a run id, building the route would force the run-naming decision that
+main deliberately left open. That is logged as needing a human call on security ordering rather
+than quietly implemented against a recorded decision. The 4.3 slice was kept, rebased, and is
+the only thing this branch proposes. PR #128's red CI (`settings.rs` count and tier-list
+assertions after two new store env vars) was diagnosed and reported on the board rather than
+fixed on another loop's branch, per the one-writer-per-branch rule; it shipped as #133.
+
+## 2026-10-27 — gating a Rust change while the runner is saturated
+
+**Ambiguous:** AGENTS.md says run the project's tests and checks before claiming anything works,
+but the CI-mirroring gate for this slice (`weft-physical-type` + `weftdb`, both feature
+configurations, the denied clippy set, `nightly fmt`) did not finish: it timed out at 4200 s and
+again at 9000 s, with only the `weft-physical-type` steps reaching an exit line.
+
+**Chosen:** keep the gate's scope identical and change how it is run, rather than claim a pass
+that has no run behind it. The runner is saturated by the operator's `strata` inference server
+(264 % CPU, ~85 GB RSS, load average ~150 on 16 cores, running for hours), and both agent loops
+build into one shared `CARGO_TARGET_DIR`, so builds queue behind each other. Every cargo now
+runs `nice -n 19` with `-j 2` (after the subcommand — `cargo +1.99.0 -j 2 test …` is rejected by
+the top-level parser, which cost a whole run), test threads drop to 2, and the script takes
+`QPRUNE_FROM=<n>` so a resumed run keeps the steps already paid for. It also exits non-zero when
+any step fails: a run whose every cargo step returned 1 had itself reported 0, which reads as a
+pass in a completion notification. Three process lessons went into the same script:
+
+* the log path was hardcoded, so a second run truncated the first run's log mid-analysis and its
+  results looked lost — logs are now per-run (`QPRUNE_LOG`);
+* **editing the gate script while it is running corrupted the run.** bash reads a script lazily,
+  by byte offset, so a rewrite made the running process stop after 2 of 5 steps and exit 0. A
+  resumed run now executes a snapshot copy under `/tmp`, never the live file.
+* the runner's default nightly could not build the vendored patch lane at all, which the other
+  loop has since closed by pinning `basic-automation/patches` at `c611862` and dropping
+  `Patches` from `rust-toolchain.toml`, so the release toolchain `+1.99.0` is the one to gate with.
+
+One correction to a claim made earlier in this entry's draft: the recurring `patches/branches`
+cascade finding was **not** stale-and-gone. `patches/branches/src/lib.rs` is a real vendored crate
+(`Cargo.toml:154` patches `branches = { path = "patches/branches" }`), and a fresh probe gives LSP
+clean plus one ast-grep style finding at `patches/branches/src/lib.rs:65` (`redundant-unsafe-function`:
+`unsafe fn` with no `unsafe` block inside). It is left alone: rustc does not flag it, both
+workspaces' `cargo check` are clean under `-D warnings` on both toolchains, the file is vendored
+upstream code whose whole purpose is to differ from `branches` by one line, and the patch lane is
+the other loop's.
+
+**Result:** the gate passed in full on the rebased branch — `weft-physical-type` 307+5+4+3 and
+344+7+4+3 (`--all-features`), `weftdb` 423 lib plus 26+17+8+6+2+2+1+1+1 integration and 1 doc, the
+`bitsliced-codec` configuration 424+1, clippy `-D correctness,suspicious,perf` over both crates'
+`--all-targets`, and `cargo +nightly fmt --all -- --check` — every step `EXIT=0`, no error lines.

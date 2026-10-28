@@ -268,6 +268,44 @@ impl SegmentIndexStore {
 		Self::collect(rows).await
 	}
 
+	/// [`prune_by_time`](Self::prune_by_time) for a query that needs **present values**:
+	/// the overlapping descriptors that also carry at least one non-null row, so an
+	/// [all-null](SegmentDescriptor::is_all_null) segment is never opened.
+	///
+	/// The control-plane form of
+	/// [`prune_present_by_time`](weft_physical_type::prune_present_by_time): the quality
+	/// test rides the same SQL `WHERE` as the time test (`null_count < row_count`, both
+	/// columns written at seal from the frame's own stats), so a fully null segment is
+	/// dropped by libSQL and its `.weftseg` is never read, checksummed or decoded. A
+	/// point lookup returns the same answer with it or without it — a null row is not a
+	/// value — which is what makes the skip safe for
+	/// [`read_point`](crate::SegmentStore::read_point) and
+	/// [`read_points`](crate::SegmentStore::read_points).
+	///
+	/// It is deliberately **not** a drop-in for [`prune_by_time`](Self::prune_by_time):
+	/// a row whose value is null is still a row, so a range read — which returns
+	/// `None`s — must keep the segments this one drops.
+	///
+	/// # Errors
+	///
+	/// As [`prune_by_time`](Self::prune_by_time).
+	pub(crate) async fn prune_present_descriptors(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<SegmentDescriptor>> {
+		let conn = connect(&self.db).await?;
+		// The NULL-spanned (empty) row is rejected twice over: the inequalities already
+		// reject it, and a zero-row row is not "all null" — it is nothing to skip.
+		let rows = conn
+			.query(
+				format!("SELECT {SELECT_COLUMNS}
+					FROM segment_index
+					WHERE aspect = ? AND min_ts IS NOT NULL AND max_ts IS NOT NULL AND min_ts <= ? AND ? <= max_ts
+						AND row_count > 0 AND null_count < row_count
+					ORDER BY id"),
+				turso::params![aspect.to_string(), end, start],
+			)
+			.await?;
+		Ok(Self::collect(rows).await?.into_iter().map(|row| row.desc).collect())
+	}
+
 	/// Every descriptor recorded under `aspect`, in seal (`id`) order.
 	///
 	/// Use this to rebuild the resident [`SegmentIndex`] for finer in-memory pruning
@@ -721,6 +759,28 @@ mod tests {
 		drop(store);
 		assert_eq!(count, 1);
 		assert!(pruned.is_empty());
+	}
+
+	/// The quality prune is the time prune plus "carries a present value": a fully null
+	/// segment never reaches a reader, a partly-null one still does, and
+	/// [`prune_by_time`] keeps both — a null row is a row for a range read.
+	#[tokio::test]
+	async fn prune_present_descriptors_drops_an_all_null_segment() {
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let nulls = Segment::build_nullable(&[10_i64, 20], &[None, None], TimeUnit::Seconds, &bd("0")).expect("builds all-null segment");
+		let partly = Segment::build_nullable(&[30_i64, 40], &[Some(bd("1")), None], TimeUnit::Seconds, &bd("0")).expect("builds partly-null segment");
+		assert!(nulls.is_all_null(), "the first fixture carries no value");
+		assert!(!partly.is_all_null(), "the second fixture carries one");
+		store.insert("a", &SegmentDescriptor::of_segment(0, "null.weftseg", nulls.write_to().len() as u64, &nulls)).await.expect("inserts the null segment");
+		store.insert("a", &SegmentDescriptor::of_segment(1, "part.weftseg", partly.write_to().len() as u64, &partly)).await.expect("inserts the partly-null segment");
+
+		let by_time = store.prune_by_time("a", 0, 100).await.expect("prunes by time");
+		let by_quality = store.prune_present_descriptors("a", 0, 100).await.expect("quality-prunes");
+		let outside = store.prune_present_descriptors("a", 50, 60).await.expect("prunes an empty window");
+		drop(store);
+		assert_eq!(by_time.iter().map(|desc| desc.id).collect::<Vec<_>>(), vec![0, 1], "the time prune keeps both segments");
+		assert_eq!(by_quality.iter().map(|desc| desc.id).collect::<Vec<_>>(), vec![1], "the quality prune keeps only the segment with a value");
+		assert!(outside.is_empty(), "a window no segment spans still prunes to nothing");
 	}
 
 	#[tokio::test]

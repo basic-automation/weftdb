@@ -1417,6 +1417,12 @@ pub fn read_segment_point(bytes: &[u8], t: i64) -> Result<Option<BigDecimal>, We
 		return Err(WeftSegError::UnsupportedVersion { found: version });
 	}
 	let stats = read_segment_stats(&mut r)?;
+	// Quality prune (roadmap Phase 4.3): a segment that carries rows but no present
+	// value cannot answer a point lookup, so neither its timestamp column nor its
+	// value column is decoded. Equal to `value_at`'s `None` for every such frame.
+	if stats.is_all_null() {
+		return Ok(None);
+	}
 	// The value block begins at the current offset; the column region runs from here to the CRC.
 	read_point_from_section(&body[r.pos..], &stats, t)
 }
@@ -1462,6 +1468,11 @@ pub fn read_paged_segment_point(bytes: &[u8], t: i64) -> Result<Option<BigDecima
 		(Some(lo), Some(hi)) if lo <= t && t <= hi => {}
 		_ => return Ok(None),
 	}
+	// Quality bail on the segment stats before the page index is parsed: a frame with no
+	// present value anywhere holds none at `t` either.
+	if seg_stats.is_all_null() {
+		return Ok(None);
+	}
 	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
 	// Parse the per-page index (stats + block length); the page data blocks follow it, so track
 	// the running byte offset of each block within `body`.
@@ -1474,7 +1485,10 @@ pub fn read_paged_segment_point(bytes: &[u8], t: i64) -> Result<Option<BigDecima
 	let mut block_start = r.pos;
 	for (page_stats, block_len) in index {
 		let contains = matches!((page_stats.min_ts, page_stats.max_ts), (Some(lo), Some(hi)) if lo <= t && t <= hi);
-		if contains {
+		// Quality-aware page skip (roadmap Phase 4.3): a page whose every row is null
+		// cannot hold the answer, so its block is skipped from the page index alone — the
+		// on-disk form of [`PagedSegment::prune_present_pages_by_time`].
+		if contains && !page_stats.is_all_null() {
 			// Bound the section to this page's block so read_value_at cannot read past it.
 			let section = body.get(block_start..block_start + block_len).ok_or_else(|| WeftSegError::UnexpectedEof { needed: block_len, remaining: body.len().saturating_sub(block_start) })?;
 			if let Some(value) = read_point_from_section(section, &page_stats, t)? {
@@ -1515,6 +1529,11 @@ pub fn read_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<BigDec
 		return Err(WeftSegError::UnsupportedVersion { found: version });
 	}
 	let stats = read_segment_stats(&mut r)?;
+	// Quality prune, as in [`read_segment_point`]: no present value in the segment means
+	// no present value at any instant of the batch, so the batch resolves from the stats.
+	if stats.is_all_null() {
+		return Ok(vec![None; ts.len()]);
+	}
 	read_points_from_section(&body[r.pos..], &stats, ts)
 }
 
@@ -1554,6 +1573,10 @@ pub fn read_paged_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<
 	if !ts.iter().any(|&t| seg_lo <= t && t <= seg_hi) {
 		return Ok(out);
 	}
+	// Quality bail on the segment stats before the page index is parsed.
+	if seg_stats.is_all_null() {
+		return Ok(out);
+	}
 	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
 	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
 	for _ in 0..page_count {
@@ -1568,6 +1591,12 @@ pub fn read_paged_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<
 			block_start += block_len;
 			continue;
 		};
+		// Quality-aware page skip: a fully null page holds no present value for any
+		// instant, so its block is never decoded (see [`read_paged_segment_point`]).
+		if page_stats.is_all_null() {
+			block_start += block_len;
+			continue;
+		}
 		// Decode the page only if some still-unresolved instant falls in its span (page skipping).
 		if ts.iter().enumerate().any(|(k, &t)| !resolved[k] && page_lo <= t && t <= page_hi) {
 			let section = body.get(block_start..block_start + block_len).ok_or_else(|| WeftSegError::UnexpectedEof { needed: block_len, remaining: body.len().saturating_sub(block_start) })?;
@@ -4024,6 +4053,50 @@ mod tests {
 				assert_eq!(read_paged_segment_point(&bytes, t).expect("reads"), seg.value_at(t), "paged at t={t}");
 			}
 		}
+	}
+
+	#[test]
+	fn point_reads_skip_a_fully_null_page_or_segment() {
+		// Quality pruning from the persisted stats alone (roadmap Phase 4.3): a page whose
+		// every row is null is skipped off the page index, and a frame with no present value
+		// anywhere is answered from its segment stats without decoding a column. The answer
+		// is exactly what a scan would give — a null row is not a value — while a range read
+		// still returns those same rows, because for a range a null row *is* a row.
+		let ts: Vec<i64> = (0..8).map(|i| 1_000 + i64::from(i) * 10).collect();
+		let present = col(&["4", "5", "7"]);
+		let vals: Vec<Option<BigDecimal>> = vec![None, None, None, None, Some(present[0].clone()), Some(present[1].clone()), None, Some(present[2].clone())];
+		let paged = PagedSegment::build_nullable(&ts, &vals, TimeUnit::Millis, &BigDecimal::from(0), 4).expect("builds");
+		assert_eq!(paged.page_count(), 2, "the fixture is two pages");
+		assert!(paged.pages[0].is_all_null(), "page 0 must be the fully-null fixture");
+		assert!(!paged.pages[1].is_all_null(), "page 1 must carry the values");
+		let bytes = paged.write_to();
+		for &t in &[ts[0], ts[3], ts[4], ts[6], ts[7], 999, 1_070] {
+			assert_eq!(read_paged_segment_point(&bytes, t).expect("reads"), paged.value_at(t), "paged point at {t}");
+			assert_eq!(read_frame_point(&bytes, t).expect("reads"), paged.value_at(t), "framed point at {t}");
+		}
+		let batch = read_paged_segment_points(&bytes, &ts).expect("reads");
+		assert_eq!(batch, vals, "the batch gives each row's present value and None for a null row");
+		assert_eq!(read_frame_points(&bytes, &ts).expect("reads"), batch, "the framed batch agrees");
+
+		// A frame that is null throughout, in both layouts: answered as None, and a range
+		// read over the same bytes still returns every row.
+		let null_ts = vec![10_i64, 20, 30];
+		let no_values = [None, None, None];
+		let null_segment = Segment::build_nullable(&null_ts, &no_values, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
+		assert!(null_segment.is_all_null(), "the fixture is all-null");
+		let null_bytes = null_segment.write_to();
+		for &t in &null_ts {
+			assert_eq!(read_segment_point(&null_bytes, t).expect("reads"), None, "all-null single-block point at {t}");
+			assert_eq!(read_frame_point(&null_bytes, t).expect("reads"), None, "all-null framed point at {t}");
+		}
+		assert_eq!(read_segment_points(&null_bytes, &null_ts).expect("reads"), vec![None; 3]);
+		assert_eq!(read_frame_points(&null_bytes, &null_ts).expect("reads"), vec![None; 3]);
+		let null_paged_bytes = PagedSegment::build_nullable(&null_ts, &no_values, TimeUnit::Millis, &BigDecimal::from(0), 2).expect("builds").write_to();
+		assert_eq!(read_paged_segment_point(&null_paged_bytes, 20).expect("reads"), None, "all-null paged point");
+		assert_eq!(read_paged_segment_points(&null_paged_bytes, &null_ts).expect("reads"), vec![None; 3], "all-null paged batch");
+		let (rt, rv) = read_segment_range(&null_bytes, 0, 100).expect("reads");
+		assert_eq!(rt, null_ts, "a range read keeps the null segment's rows");
+		assert_eq!(rv, vec![None; 3], "as null rows, not as a skipped segment");
 	}
 
 	#[test]

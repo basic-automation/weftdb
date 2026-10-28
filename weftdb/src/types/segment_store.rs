@@ -3245,6 +3245,14 @@ impl SegmentStore {
 	/// read-your-writes answer once out-of-order reconciliation (Phase 4.6) can leave
 	/// two segments spanning one instant.
 	///
+	/// **Quality pruning is wired in at both levels of this path** (roadmap Phase 4.3).
+	/// The index prune adds a quality term to its `WHERE` clause — time overlap plus
+	/// `null_count < row_count` — so a segment whose indexed stats say every row is null
+	/// is dropped before its file is ever opened; inside a surviving frame the same test
+	/// on the persisted segment and per-page stats skips the pages a point lookup cannot answer
+	/// ([`read_paged_segment_point`](weft_physical_type::weftseg::read_paged_segment_point)).
+	/// Neither changes the answer: a null row is not a value.
+	///
 	/// # Errors
 	///
 	/// Propagates a libSQL prune failure, a filesystem read error, or a frame-decode
@@ -3253,7 +3261,7 @@ impl SegmentStore {
 	pub async fn read_point(&self, aspect: &str, t: i64) -> Result<Option<BigDecimal>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
-		let descriptors = self.index.prune_by_time(aspect, t, t).await?;
+		let descriptors = self.index.prune_present_descriptors(aspect, t, t).await?;
 		let mut found = None;
 		for descriptor in &descriptors {
 			let bytes = self.read_frame(descriptor).await?;
@@ -3279,7 +3287,9 @@ impl SegmentStore {
 	/// looking up `N` instants that share segments pays one file read + one timestamp decode per
 	/// segment rather than `N`. As with `read_point`, candidates are merged in seal-id order so
 	/// the most recently sealed present value wins per instant (last-writer-wins). An empty `ts`
-	/// yields an empty vector without touching the index.
+	/// yields an empty vector without touching the index. The same quality pruning as
+	/// [`read_point`](SegmentStore::read_point) applies at both levels: fully null segments are
+	/// dropped by the index prune, fully null pages by the frame's page index.
 	///
 	/// # Errors
 	///
@@ -3294,7 +3304,7 @@ impl SegmentStore {
 		}
 		// Prune the index once by the batch's whole span (safe: every instant lies within it).
 		let (lo, hi) = ts.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &t| (lo.min(t), hi.max(t)));
-		let descriptors = self.index.prune_by_time(aspect, lo, hi).await?;
+		let descriptors = self.index.prune_present_descriptors(aspect, lo, hi).await?;
 		let mut found = vec![None; ts.len()];
 		for descriptor in &descriptors {
 			let bytes = self.read_frame(descriptor).await?;
@@ -5344,6 +5354,32 @@ mod tests {
 		assert_eq!(count, 1);
 		assert_eq!(ts, vec![0, 10]);
 		assert_eq!(d.id, 1);
+	}
+
+	/// Quality pruning on the store's point path (roadmap Phase 4.3): a sealed segment that
+	/// carries no value at all is dropped by the index prune, so a point read never opens its
+	/// file. The corrupt bytes left in its place are what prove it — the read can only come
+	/// back clean if that segment was skipped instead of read. A range read, whose contract
+	/// includes null rows, still opens it and reports the damage.
+	#[tokio::test]
+	async fn point_reads_prune_an_all_null_segment_without_opening_it() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let _live = store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("seals the value segment");
+		let nulls = store.seal_nullable("a", &schema(), &[30_i64, 40], &[None, None]).await.expect("seals the all-null segment");
+		assert_eq!(store.segment_count("a").await.expect("counts"), 2, "both segments are indexed");
+		// The all-null segment's file becomes bytes no reader can parse.
+		tokio::fs::write(dir.path().join(&nulls.path), b"not a weftseg frame").await.expect("replaces the null segment file");
+
+		let at = store.read_point("a", 10).await.expect("reads a point in the live segment");
+		let many = store.read_points("a", &[10, 30, 40]).await.expect("reads a batch across both");
+		let ranged = store.read_time_range("a", 0, 100).await;
+		let downsampled = store.downsample_range("a", 0, 100, Resolution::Seconds, &[Aggregation::Avg]).await;
+		drop(store);
+		assert_eq!(at, Some(bd("2")));
+		assert_eq!(many, vec![Some(bd("2")), None, None], "the null instants answer None without their segment being read");
+		assert!(ranged.is_err(), "a range read still reads null rows, so it must hit the corrupt file: {ranged:?}");
+		assert!(downsampled.is_err(), "and so must a downsample over the same window: {downsampled:?}");
 	}
 
 	#[tokio::test]
