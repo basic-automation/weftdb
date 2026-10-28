@@ -671,3 +671,44 @@ migration). Both stay unticked in ROADMAP.md.
 **Not claimed:** no unit conversion happens. 0.1.x's rows-mode path stamped milliseconds where
 its batch path kept seconds, and an aspect already declared in the other unit is refused with
 both schemas printed rather than rescaled, so nothing here says millis became seconds.
+
+## 2026-10-27 — FRE-14c's remainder: the streaming read and the legacy catalog migration — FOR MERGE REVIEW
+
+**Ambiguous:** the 1.0 plan names the Legacy lane only as "FRE-14" (§6, W2), and the
+CHANGELOG's remainder sentence names three parts — the operator route, "the numbered
+migrations that register `metadata.db`'s schema", and "a reading of a tree too big to
+hold one aspect in memory" — without saying what the migrations migrate, or into what.
+The operator route landed as PR #128; the other two are this slice, and the second one
+needed a design before it could be a tick.
+
+**Chosen — the streaming read.** `import_into` no longer holds an aspect: the encoding
+survey streams the aspect's rows through a cursor (one pass for the scale and the
+scale-free candidates, a second for the scaled candidates once the scale is known),
+and the seal streams them again in chunks of `rows_per_segment`, extended past any
+group of rows sharing the chunk's last instant. The decision is exactly
+`recommend_encoding`'s at tolerance 0, because each candidate's exactness is a
+per-value property — "every value exact" in a stream is the same fact as "the column
+encodes exact" whole — and a test pins the survey against the whole-column call on
+ten value sets, including the empty column and the overflows past `i64` and `i128`.
+What one chunk holds is `rows_per_segment` rows plus one instant group, which is the
+bound the instant-group rule forces: a group seals into one segment or not at all.
+
+**Chosen — the catalog migration.** Numbered migration `0003_fre14_legacy_catalog`
+(layout 2, so no layout bump) registers a `legacy_catalog` table in the store's own
+`metadata.db`, and the import writes one row per aspect it carried: the catalog's
+aspect row (legacy id, resolution, creation time, recorded span, compression config)
+under the store's scope. The catalog is now read by `discover` — a `metadata.db`
+without the `database`/`subjects`/`aspects` tables, or with a cell of the wrong type,
+refuses as `NoCatalogSchema` before any store opens — because the migration cannot
+carry state it cannot read. What stays behind, with reasons: the catalog's
+transaction log (1.0 does not replay 0.1.x's log; the import record in `store_meta`
+is the transaction this migration records), the catalog's database and subject rows
+(they reduce to the scope the store already registers on open; their ids, creation
+times and host path have no 1.0 consumer), and the per-aspect dictionaries and
+pipeline/correlation/pattern databases, as before. A series directory with no catalog
+row still reads — the directory names the series and `measurements.db` holds it — it
+just gets no catalog row in the store: the rows are authoritative, so a missing
+catalog row degrades provenance rather than stopping the read.
+
+**Not claimed:** the operator route is untouched by this slice — it is PR #128's, on
+main already — and no unit conversion happens, as the 2026-10-27 entry above says.

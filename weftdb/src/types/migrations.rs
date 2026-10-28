@@ -36,6 +36,12 @@
 //!   `aspect_seq.next_series_id`. Its precheck refuses a store whose index records a
 //!   frame outside `segments/` ([`StoreError::UnsafeLegacyPath`]) before any migration
 //!   applies and before the open raises the marker's floors.
+//! - **`0003_fre14_legacy_catalog`** (layout 2): the table in `metadata.db` that
+//!   carries a 0.1.x tree's catalog state across a rows-mode import (legacy lane
+//!   FRE-14c's remainder). It holds one row per migrated aspect — the catalog row
+//!   0.1.x kept beside the rows — and nothing else: the import writes it, and no
+//!   store open, seal or read touches it, so an older layout-2 build reads the store
+//!   exactly as before with one table it never queries.
 
 use std::collections::BTreeSet;
 
@@ -108,7 +114,7 @@ pub(crate) struct Floors {
 /// Every registered migration, in id order. An id is four digits, an underscore, and a
 /// lower snake_case name: the digits are the ordinal that `pending` and `after` select on,
 /// so the numbering rule is part of the registry's contract and the test below asserts it.
-pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }];
+pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }];
 
 /// The ordinal of a migration id: its leading digits (`0002_s6_s7` → 2). An id without
 /// them sorts first.
@@ -382,6 +388,41 @@ fn s6_s7<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
 	})
 }
 
+/// The table `0003_fre14_legacy_catalog` registers in `metadata.db`: one row per
+/// aspect a rows-mode import carried, holding the 0.1.x catalog row for it — the
+/// aspect's legacy id, the resolution it was declared with, when it was created, the
+/// span its catalog recorded, and its compression config. The scope columns repeat
+/// the store's own scope so the row reads without a join, and so a store root holding
+/// several scopes keeps each import's rows apart. `database` is a column name here
+/// as it is in `aspect_catalog.db`'s `aspect_schema`, not a statement.
+///
+/// What it deliberately does not hold: the catalog's database and subject rows, which
+/// reduce to the scope the store already registers on open (their ids, creation times
+/// and the catalog's host path have no 1.0 consumer), and the catalog's transaction
+/// log, which 1.0 does not replay — the import record in `store_meta` is the
+/// transaction this migration records.
+const LEGACY_CATALOG_TABLE: &str = "CREATE TABLE IF NOT EXISTS legacy_catalog (
+	database TEXT NOT NULL,
+	subject TEXT NOT NULL,
+	aspect TEXT NOT NULL,
+	legacy_aspect_id TEXT,
+	resolution TEXT,
+	created_at INTEGER,
+	earliest_measurement TEXT,
+	latest_measurement TEXT,
+	compression_config TEXT,
+	PRIMARY KEY (database, subject, aspect)
+)";
+
+/// `0003_fre14_legacy_catalog`: the legacy catalog table in `metadata.db`.
+fn fre14_legacy_catalog<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
+	Box::pin(async move {
+		let Some(metadata) = cp.metadata else { return Ok(()) };
+		let conn = connect(metadata.db).await.with_context(|| format!("{}: connecting", metadata.name))?;
+		ddl(&conn, metadata.name, LEGACY_CATALOG_TABLE).await
+	})
+}
+
 /// `0002_s6_s7`'s precheck: refuse a store whose index records a legacy frame outside
 /// `segments/` (see [`legacy_path_is_contained`]), naming its aspects. The frames are
 /// left where they are; nothing is quarantined.
@@ -508,11 +549,12 @@ mod tests {
 	#[test]
 	fn pending_and_after_select_by_applied_set_and_by_ordinal() {
 		let applied: BTreeSet<String> = ["0001_baseline".to_string()].into();
-		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7"]);
+		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog"]);
 		assert_eq!(pending(REGISTRY, &BTreeSet::new()).len(), REGISTRY.len());
 		assert_eq!(after(REGISTRY, None).len(), REGISTRY.len());
-		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7"]);
-		assert!(after(REGISTRY, Some("0002_s6_s7")).is_empty());
+		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog"]);
+		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog"]);
+		assert!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).is_empty());
 		assert!(after(REGISTRY, Some("0009_future")).is_empty(), "a newer marker's ordinal is past everything here");
 		assert_eq!(floors(pending(REGISTRY, &applied)), Some(Floors { layout: 2, min_read: 2, min_write: 2 }));
 		assert_eq!(floors(Vec::<&Migration>::new()), None);

@@ -6,7 +6,7 @@
 //!
 //! ```json
 //! {"kind":"weftdb-store","layout_version":2,"min_read_layout":2,"min_write_layout":2,
-//!  "last_written_layout":2,"migrating_to":null,"applied_through":"0002_s6_s7",
+//!  "last_written_layout":2,"migrating_to":null,"applied_through":"0003_fre14_legacy_catalog",
 //!  "store_uuid":"…","scope":{"database":"default","subject":"default"}}
 //! ```
 //!

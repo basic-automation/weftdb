@@ -723,7 +723,7 @@ read compat/fixtures/v0.1.0/legacy/v010_legacy as 0.1.x database "v010_legacy", 
   flow: 80 row(s) into 1 segment(s) in f32, 1767225600000..1767231540000 millis
   price: 237 row(s) into 1 segment(s) in f32, 0..4070900000000 millis
   temp: 54 row(s) into 1 segment(s) in f32, 1767225600000..1767232680000 millis
-  stays behind: metadata.db — the 0.1.x catalog: its subjects, its aspects and its database row.
+  stays behind: metadata.db — the 0.1.x catalog: its aspect rows cross into the store's metadata.db (migration 0003_fre14_legacy_catalog); its transaction log and host paths stay behind, because 1.0 does not replay 0.1.x's log and the import record is the transaction this migration records.
   stays behind 21 file(s): 0.1.x kept its ingestion, pipeline, correlation and pattern state
     beside the rows; the readable leg reads only `measurements.db`, and 1.0 leaves those
     subsystems behind.
