@@ -266,7 +266,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 - [ ] **W3 · Gate, serve path, input domain**
   - [ ] Store lane
   - [x] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)
-  - [ ] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions
+  - [x] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions
   - [ ] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
   - [ ] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
   - [ ] **ROB-6** Bounded decimals
