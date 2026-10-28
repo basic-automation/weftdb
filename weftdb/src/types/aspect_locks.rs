@@ -16,13 +16,14 @@
 //!   reconcile that read a segment could otherwise write it back after a squash had merged
 //!   it away.
 //!
-//! The allocator hands out ids that are never reissued, so a seal never takes the id (and
-//! with it the `{aspect}-{id}` frame name) of a segment that was deleted, or of a frame a
-//! crashed seal left behind. Its state is seeded the first time an aspect's commit lock is
+//! The allocator hands out ids that are never reissued, so a seal never takes the id
+//! of a segment that was deleted, or of a frame a crashed seal left behind. Its state is seeded the first time an aspect's commit lock is
 //! taken, from the largest of the persisted `aspect_seq.next_id`, `MAX(id) + 1` over the
 //! aspect's rows, and one past the highest id a legacy-named file in `segments/` carries,
 //! and every commit that uses an id raises `aspect_seq.next_id` past it in the same
-//! transaction.
+//! transaction. Since S10 a seal's id is handed out by the commit itself, after its
+//! write-once frame was written; before that the id was handed out before the write,
+//! which is why the seed still counts legacy-named files on disk.
 //!
 //! The locks are in-process: a store root has one owner (its `LOCK`), so nothing else
 //! writes its index.

@@ -4,6 +4,58 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-27 — D-S10 "write-once durable seal with id assigned at commit" (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6 W3, §5 D-S10 amendment) says a seal is
+write-once with its id assigned at commit, and that `segment_path` /
+`sidecar_path` are rewritten to use `aspect_name::encode` with a
+containment check — but it does not say what the seal's frame is named,
+what a sidecar is named by once the id stops naming the frame, or
+whether a seal advances the commit epoch that swaps advance. The
+crash-consistency design §4 (via `frame_name.rs`) says seals take
+write-once names from S10, and `aspect_locks.rs` says seals advance the
+epoch from S10, which grounds the first and third questions; the
+sidecar question is genuinely open.
+
+**Chosen:**
+
+1. A seal frame is `{enc(aspect)}~g{gen}~p{gen}.weftseg`: the generation
+   from the per-aspect counter that never hands a value out twice, with
+   `prec` equal to the generation, as `frame_name`'s doc prescribes for
+   a seal. The id is handed out by `publish_seal` under the commit
+   lock, after the frame is written and fsynced with `segments/`
+   fsynced, and the row carries `gen`, `prec`, the frame's trailer CRC
+   and the commit epoch; the allocator is raised past both the id and
+   the generation in the same transaction.
+2. A sidecar is named by its frame, not by the segment id:
+   `{stem}~g{gen}~p{prec}.weftpart`. An id is assigned at commit and a
+   later output may take it, while a frame name is never reused, so an
+   id-named sidecar would collide across a swap. A sidecar is loaded
+   and removed by deriving it from the frame's own file name (the
+   `.weftseg` extension exchanged for `.weftpart`), which resolves a
+   legacy frame to its legacy sidecar and a write-once frame to its
+   generation-named one without guessing the scheme. The reaper removes
+   a write-once frame's sidecar by frame name once the frame is
+   unlinked; the legacy id check stays for legacy frames.
+3. A seal advances the commit epoch by one, like a swap, and records
+   it as the row's `commit_epoch` — the epoch counter is shared, so a
+   seal and a swap cannot share an epoch.
+4. A seal that stops at a post-write fault point keeps its frame on
+   disk, as before: the durable write runs with no fault points and
+   the `S-frame-written` / `S-frame-synced` / `S-dir-synced` points
+   fire after it, so the crash-matrix orphan (a frame with no row,
+   which S12 recovery classifies) still exists. Routing the write
+   through `write_new_durable`'s fault points instead would delete
+   that frame on an injected error and erase the litter the recovery
+   slice is specified to handle.
+
+**Rejected:** keeping the legacy `{aspect}-{id}` frame name and only
+encoding the aspect (the frame would still be named by an id assigned
+before the write, which is what "id assigned at commit" forbids);
+naming sidecars by segment id (collides when a swap output takes the
+id); and leaving the epoch unadvanced by seals (two commits could
+then share an epoch, which the swap epoch exists to order).
+
 ## 2026-10-27 — SOA-4 "deterministic workload model, lanes, format-exact value grids and body encoders" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** as with SOA-2 and SOA-3, the 1.0 plan (§6, W2) lists SOA-4

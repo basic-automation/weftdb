@@ -473,7 +473,11 @@ async fn verify_recovered(root: &Path, op: Op, point: FaultPoint, label: &str) {
 			(name.to_string(), row.desc.byte_len, std::fs::metadata(root.join("segments").join(name)).map_or(0, |m| m.len()))
 		})
 		.collect();
-	let swapped = index_rows.iter().any(|row| row.gen > 0);
+	// Since S10 the fixture seals are write-once too, occupying generations
+	// 1..=`fixture(op).len()`; only a generation above that can be a swap's
+	// output, so that — not `gen > 0` — is what says the swap committed.
+	let fixture_gens = fixture(op).len() as u64;
+	let swapped = index_rows.iter().any(|row| row.gen > fixture_gens);
 	let rollup = store.aspect_metadata(ASPECT).await.expect("reads the rollup");
 	let derived = crate::AspectMetadata::from_index(&store.index().load_index(ASPECT).await.expect("loads the index"));
 	drop(store);
@@ -497,17 +501,18 @@ async fn verify_recovered(root: &Path, op: Op, point: FaultPoint, label: &str) {
 	run_again(&store, op).await.unwrap_or_else(|e| panic!("{label}: the operation after recovery: {e:#}"));
 	let rows = rows_of(&store).await.unwrap_or_else(|e| panic!("{label}: reads after the second run: {e:#}"));
 	let journal = journal_of(&store).await;
-	let gens: Vec<u64> = store.index().rows(ASPECT).await.expect("reads").iter().map(|row| row.gen).filter(|gen| *gen > 0).collect();
+	let gens: Vec<u64> = store.index().rows(ASPECT).await.expect("reads").iter().map(|row| row.gen).filter(|gen| *gen > fixture_gens).collect();
 	let referenced = referenced_frames(&store).await;
 	drop(store);
 	assert_eq!(rows, expected, "{label}: and after the second run");
 	assert_eq!(journal, Vec::<(String, String)>::new(), "{label}: the second run reaped what it retired");
 	assert_eq!(frames_in(root), referenced, "{label}: and left no other frame");
 	assert_eq!(gens.len(), usize::try_from(op.outputs()).expect("small"), "{label}: the operation's outputs are in: {gens:?}");
-	// A run that journaled its outputs before the crash took generations 1 to `outputs`;
-	// the persisted counter keeps the second run from naming a frame with one of them.
+	// A run that journaled its outputs before the crash took generations
+	// `fixture_gens + 1` to `fixture_gens + outputs`; the persisted counter
+	// keeps the second run from naming a frame with one of them.
 	let journaled = point != FaultPoint::MPlanned && !swapped_by(point);
-	let floor = if journaled { 1 + op.outputs() } else { 1 };
+	let floor = fixture_gens + 1 + if journaled { op.outputs() } else { 0 };
 	assert!(gens.iter().all(|gen| *gen >= floor), "{label}: generations {gens:?}, none below {floor}");
 }
 
@@ -613,6 +618,12 @@ fn assert_passed(what: &str, out: &std::process::Output) {
 	assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{what}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 }
 
+/// The frame file name of `id`'s row in `store`'s index: since S10 a seal's frame
+/// is generation-named, so no test may assume `{aspect}-{id}.weftseg` for it.
+async fn frame_of(store: &SegmentStore, id: u64) -> String {
+	store.index().rows(ASPECT).await.expect("reads").into_iter().find(|row| row.desc.id == id).map(|row| row.desc.path.rsplit(['/', '\\']).next().expect("a file name").to_string()).expect("the row")
+}
+
 /// Crash-consistency S8 and S9, the process-crash matrix: every maintenance operation (a
 /// reconcile, a split, an overlap merge that rewrites its component and one that splits
 /// it, a squash and a compaction, each merge over a paged lowest-id member) stopped by an
@@ -696,7 +707,7 @@ async fn a_read_in_flight_keeps_a_retired_frame_until_its_future_is_dropped() {
 	let root = dir.path().join("store");
 	let target = seal_fixture(&root, Op::Reconcile).await;
 	let store = Arc::new(SegmentStore::open(&root).await.expect("opens"));
-	let old = format!("{ASPECT}-{target}.weftseg");
+	let old = frame_of(&store, target).await;
 	let (pinned, is_pinned) = tokio::sync::oneshot::channel();
 	let (deadline, expire) = tokio::sync::oneshot::channel::<()>();
 	let read = tokio::spawn({
@@ -741,7 +752,7 @@ async fn a_backup_hold_keeps_retired_frames_until_it_drops() {
 	let root = dir.path().join("store");
 	let target = seal_fixture(&root, Op::Split).await;
 	let store = SegmentStore::open(&root).await.expect("opens");
-	let old = format!("{ASPECT}-{target}.weftseg");
+	let old = frame_of(&store, target).await;
 	let hold = store.hold_reaper();
 	run(&store, Op::Split, target).await.expect("splits");
 	let reaped_while_held = store.reap(super::MaintenanceWait::Skip).await.expect("reaps");
@@ -768,9 +779,9 @@ async fn a_busy_retired_frame_is_retried_later_not_failed() {
 	let root = dir.path().join("store");
 	let target = seal_fixture(&root, Op::Reconcile).await;
 	let fs = Arc::new(crate::types::reaper::testing::BusyFs::default());
-	let old = format!("{ASPECT}-{target}.weftseg");
-	fs.set_busy(&old, true);
 	let store = open_on(fs.clone(), &root).await;
+	let old = frame_of(&store, target).await;
+	fs.set_busy(&old, true);
 	let reconciled = run(&store, Op::Reconcile, target).await;
 	let busy = (frames_in(&root).contains(&old), journal_of(&store).await);
 	let waiting = store.reap(super::MaintenanceWait::Skip).await.expect("reaps");
@@ -861,7 +872,7 @@ async fn generations_start_above_every_frame_on_disk_and_survive_a_reopen() {
 	let gens: Vec<(u64, u64)> = store.index().rows(ASPECT).await.expect("reads").iter().map(|row| (row.desc.id, row.gen)).collect();
 	drop(store);
 	assert_eq!(first, Some(8), "above the stray generation 7");
-	assert_eq!(gens, vec![(0, 0), (target, 8), (second, 9)], "the reopened store goes on from the persisted counter");
+	assert_eq!(gens, vec![(0, 1), (target, 8), (second, 10)], "the reopened store goes on from the persisted counter");
 }
 
 /// An aspect name that encodes past the file-name limit (160 bytes of non-ASCII letters,
@@ -910,7 +921,7 @@ async fn swapped_outputs_get_fresh_sidecars_and_leave_no_temporary_file() {
 	names.sort();
 	assert_eq!(matched, vec![(id, true), (suffix, true)], "each half's sidecar matches its frame");
 	assert!(names.iter().all(|name| !name.starts_with(".tmp-")), "no temporary sidecar is left: {names:?}");
-	assert_eq!(names, vec![format!("{ASPECT}-{id}.weftpart"), format!("{ASPECT}-{suffix}.weftpart"), format!("{ASPECT}~g2~p0.weftseg"), format!("{ASPECT}~g3~p0.weftseg")], "only the halves and their sidecars");
+	assert_eq!(names, vec![format!("{ASPECT}~g3~p1.weftpart"), format!("{ASPECT}~g3~p1.weftseg"), format!("{ASPECT}~g4~p1.weftpart"), format!("{ASPECT}~g4~p1.weftseg")], "only the halves and their sidecars");
 }
 
 /// Seal `rows` into the aspect of `store`, as one segment.
@@ -1409,5 +1420,5 @@ async fn a_merge_leaves_a_fresh_sidecar_for_its_output_and_none_for_the_members_
 	names.sort();
 	assert_eq!(before.len(), 3, "each seal wrote a sidecar");
 	assert!(matched, "the output's sidecar matches its frame");
-	assert_eq!(names, vec![format!("{ASPECT}-0.weftpart"), format!("{ASPECT}~g1~p0.weftseg")], "only the output and its sidecar are left");
+	assert_eq!(names, vec![format!("{ASPECT}~g4~p3.weftpart"), format!("{ASPECT}~g4~p3.weftseg")], "only the output and its sidecar are left");
 }

@@ -821,9 +821,10 @@ impl PreparedPlan {
 		self.members.iter().map(|member| member.desc.id).chain(self.fresh.iter().copied()).take(self.outputs.len()).collect()
 	}
 
-	/// The members no output takes the id of, which the swap deletes.
-	fn deleted_ids(&self) -> Vec<u64> {
-		self.members.iter().skip(self.outputs.len()).map(|member| member.desc.id).collect()
+	/// The members no output takes the id of, which the swap deletes: their frame
+	/// paths, whose sidecars a merge removes by frame name.
+	fn deleted_frames(&self) -> Vec<String> {
+		self.members.iter().skip(self.outputs.len()).map(|member| member.desc.path.clone()).collect()
 	}
 
 	/// Step M5's ops for this plan, committing in aspect epoch `epoch` (design section 5.3):
@@ -911,11 +912,11 @@ impl Drop for PendingOutputs<'_> {
 }
 
 /// The [`IndexOp::SeqBump`] that persists the allocator `commit` holds for `aspect`: past
-/// every id handed out so far, including those of seals still writing their frames.
-fn seq_bump(aspect: &str, commit: &CommitGuard) -> IndexOp {
+/// every id handed out so far, and past every generation a frame this commit names, in
+/// `epoch`. A seal raises the generations past its own frame (S10); a swap past its outputs'.
+fn seq_bump(aspect: &str, commit: &CommitGuard, next_gen: u64, epoch: u64) -> IndexOp {
 	let state = commit.state();
-	// A seal names no write-once frame yet (S10), so it leaves the generations as they are.
-	IndexOp::SeqBump { aspect: aspect.to_string(), next_id: state.next_id, next_gen: 0, epoch: state.epoch }
+	IndexOp::SeqBump { aspect: aspect.to_string(), next_id: state.next_id, next_gen, epoch }
 }
 
 /// The aspect and id a legacy-named file carries: a frame `{aspect}-{id}.weftseg` or its
@@ -1803,13 +1804,6 @@ impl SegmentStore {
 		Ok(AspectState { next_id, epoch: seed.epoch })
 	}
 
-	/// Hand out a segment id for `aspect` that no segment, live or deleted, and no frame
-	/// on disk has had, and that will never be handed out again, even if the caller never
-	/// commits it.
-	async fn allocate_id(&self, aspect: &str) -> Result<u64> {
-		self.commit_lock(aspect).await?.allocate()
-	}
-
 	/// Take `aspect`'s maintenance lock for a per-aspect maintenance entry point, waiting
 	/// up to [`maintenance_wait`](Self::maintenance_wait).
 	async fn maintain(&self, aspect: &str) -> Result<MaintGuard> {
@@ -1828,21 +1822,31 @@ impl SegmentStore {
 		}
 	}
 
-	/// Commit a freshly sealed frame's row (generation 0) under `aspect`'s commit lock:
-	/// a plain insert of its allocated id, which no other row can hold, with the
-	/// persisted allocator raised past it in the same transaction; then, under the same
-	/// lock, fold it into the rollup, which no other writer of the aspect can be reading
-	/// or writing meanwhile.
-	async fn publish_seal(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
-		let commit = self.commit_lock(aspect).await?;
+	/// Commit a freshly sealed write-once frame's row under `aspect`'s commit lock, and
+	/// return its descriptor with the id that commit assigned it: the id is handed out
+	/// here, inside the commit, never before the frame was written, so a seal that
+	/// crashes while writing its frame consumes no id and leaves no id-shaped litter
+	/// behind — only its generation-named frame, which no later seal reuses. The row
+	/// carries the frame's generation, its adoption order (`prec`, its own generation
+	/// for a seal), its trailer CRC and the commit epoch, which a seal advances like a
+	/// swap does; the persisted allocator is raised past both the id and the
+	/// generation in the same transaction. The rollup fold then runs under the same
+	/// lock, as before.
+	async fn publish_seal(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, frame_crc: u32) -> Result<SegmentDescriptor> {
+		let mut commit = self.commit_lock(aspect).await?;
+		let id = commit.allocate()?;
+		let epoch = commit.state().epoch.saturating_add(1);
+		let descriptor = SegmentDescriptor { id, ..descriptor.clone() };
+		let row = IndexRow { desc: descriptor.clone(), gen, prec: Some(gen), frame_crc: Some(frame_crc), commit_epoch: Some(epoch), series_id: 0 };
 		// The seal's index write, spanned like `SegmentIndexStore::insert` (roadmap Phase 3). Its
 		// `rows_changed` is the affected-row count of the first op, the `InsertNew`.
 		let span = tracing::debug_span!("control_plane.index.insert", aspect, id = descriptor.id, rows_changed = tracing::field::Empty);
-		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }, seq_bump(aspect, &commit)])).instrument(span.clone()).await?;
+		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row }, seq_bump(aspect, &commit, gen.saturating_add(1), epoch)])).instrument(span.clone()).await?;
 		span.record("rows_changed", applied.changes.first().copied().unwrap_or(0));
-		self.metadata.record_seal(aspect, descriptor).await?;
+		self.metadata.record_seal(aspect, &descriptor).await?;
+		commit.set_epoch(epoch);
 		drop(commit);
-		Ok(())
+		Ok(descriptor)
 	}
 
 	/// Where `aspect`'s generation counter starts: above every generation the aspect can
@@ -2170,7 +2174,7 @@ impl SegmentStore {
 		for (i, plan) in prepared.iter_mut().enumerate().filter(|(i, _)| committed.contains(i)) {
 			pending.swapped(&plan.output_names());
 			let ids = plan.output_ids();
-			deleted.extend(plan.deleted_ids());
+			deleted.extend(plan.deleted_frames());
 			outcomes[i] = Some(Ok(Swapped { ids: ids.clone() }));
 			outputs.extend(ids.into_iter().zip(std::mem::take(&mut plan.outputs)));
 		}
@@ -2293,10 +2297,10 @@ impl SegmentStore {
 	/// What follows a swap's commit (design section 5.3, steps 4-6): rebuild the aspect's
 	/// rollup under the commit lock (the interim until S11 folds it into the swap itself),
 	/// release the lock, refresh the outputs' sidecars (each `(id, output)`), remove the
-	/// id-named sidecars of the `deleted` members, and hand the retired frames to the
+	/// sidecars beside the `deleted` members' frames, and hand the retired frames to the
 	/// reaper. The swap is done whatever these do, so their failures are logged, not
 	/// returned; only an error injected at `M-swapped` is.
-	async fn finish_swap(&self, held: &MaintGuard, commit: CommitGuard, outputs: Vec<(u64, WrittenOutput)>, deleted: &[u64]) -> Result<()> {
+	async fn finish_swap(&self, held: &MaintGuard, commit: CommitGuard, outputs: Vec<(u64, WrittenOutput)>, deleted: &[String]) -> Result<()> {
 		let aspect = held.aspect();
 		if let Err(e) = self.rebuild_rollup_locked(aspect, &commit).await {
 			tracing::warn!(aspect, error = %e, "could not rebuild the rollup after a maintenance swap; it is stale until rebuild_aspect_metadata runs");
@@ -2305,11 +2309,11 @@ impl SegmentStore {
 		fault::hit(FaultPoint::MSwapped).await?;
 		for (id, output) in outputs {
 			let descriptor = SegmentDescriptor { id, ..output.descriptor };
-			self.refresh_output_sidecar(aspect, &descriptor, output.timestamps, output.values).await;
+			self.refresh_output_sidecar(aspect, &descriptor, output.gen, output.prec, output.timestamps, output.values).await;
 		}
-		for &id in deleted {
-			if let Err(e) = self.remove_sidecar(aspect, id).await {
-				tracing::warn!(aspect, id, error = %e, "could not remove the partial sidecar of a segment a merge deleted");
+		for frame in deleted {
+			if let Err(e) = self.remove_sidecar(frame).await {
+				tracing::warn!(aspect, frame, error = %e, "could not remove the partial sidecar of a segment a merge deleted");
 			}
 		}
 		if let Err(e) = self.reap_held(held).await {
@@ -2902,30 +2906,30 @@ impl SegmentStore {
 	/// Write a freshly sealed segment to disk and record its descriptor. Shared by
 	/// the dense and nullable seal paths.
 	///
-	/// The id comes from the aspect's allocator, under its commit lock, so concurrent seals
-	/// never share an id or a frame name, and no seal takes the id of a deleted segment or
-	/// of a frame a crashed seal left behind. The frame is written outside the lock, so
-	/// seals of one aspect write their frames in parallel; the row, the allocator's raise
-	/// and the rollup fold then commit under it ([`publish_seal`](Self::publish_seal)).
+	/// The frame is write-once: it goes to a never-used generation-named frame
+	/// (`{enc(aspect)}~g{gen}~p{gen}.weftseg`), created with `create_new` and fsynced
+	/// with `segments/` fsynced after it, all before anything points at it — nothing
+	/// ever truncates or replaces it. The frame is written outside the commit lock,
+	/// so seals of one aspect write their frames in parallel; the id, the row, the
+	/// allocator's raise and the rollup fold then commit under it
+	/// ([`publish_seal`](Self::publish_seal)), which is where the id is assigned.
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
 		aspect_name::validate(aspect)?;
-		let id = self.allocate_id(aspect).await?;
 		// Both opt-in layouts are applied here: the timestamp checkpoint index only when
 		// configured AND the segment's shape actually benefits (sorted + irregular + big
 		// enough), and the transposed value codec only when configured AND within its overhead
 		// ceiling. With neither configured this writes the historical frame byte-for-byte, and
 		// every combination reads identically.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
-		let path = self.segment_path(aspect, id)?;
-		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
-		fault::hit(FaultPoint::SFrameWritten).await?;
-		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
-		self.publish_seal(aspect, &descriptor).await?;
+		let byte_len = bytes.len() as u64;
+		let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await?;
+		let descriptor = SegmentDescriptor::of_segment(0, path.to_string_lossy().into_owned(), byte_len, segment);
+		let descriptor = self.publish_seal(aspect, &descriptor, gen, frame_crc).await?;
 		// Per-segment partial sidecar (opt-in) — a pure read accelerator, so decode only
 		// when the policy actually wants one, and never fail the seal on a sidecar error.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, ts, vs).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
@@ -2934,58 +2938,98 @@ impl SegmentStore {
 
 	/// Write a freshly sealed **paged** segment to disk (format-version-3 frame) and
 	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist), with
-	/// the same id allocation and commit.
+	/// the same write-once frame and id-at-commit.
 	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
 		aspect_name::validate(aspect)?;
-		let id = self.allocate_id(aspect).await?;
 		// As `persist`, though the checkpoint win is far smaller here — page pruning already
 		// bounds a probe's decode to `rows_per_page`.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
-		let path = self.segment_path(aspect, id)?;
-		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
-		fault::hit(FaultPoint::SFrameWritten).await?;
-		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
-		self.publish_seal(aspect, &descriptor).await?;
+		let byte_len = bytes.len() as u64;
+		let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await?;
+		let descriptor = SegmentDescriptor::of_paged_segment(0, path.to_string_lossy().into_owned(), byte_len, segment);
+		let descriptor = self.publish_seal(aspect, &descriptor, gen, frame_crc).await?;
 		// As `persist`: opt-in per-segment partial sidecar, never failing the seal.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, ts, vs).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
 		Ok(descriptor)
 	}
 
-	/// The on-disk path a freshly sealed segment of the given `aspect`/`id` takes.
-	///
-	/// # Errors
-	///
-	/// As [`aspect_file_path`](Self::aspect_file_path).
-	fn segment_path(&self, aspect: &str, id: u64) -> Result<PathBuf> {
-		self.aspect_file_path(aspect, id, "weftseg")
+	/// Write `bytes` as `aspect`'s next write-once seal frame and make it durable,
+	/// returning its generation, its trailer CRC and its path. The generation comes
+	/// from the per-aspect counter that never hands a value out twice, so the name is
+	/// never reused; the file is created with `create_new` (a name already taken fails
+	/// rather than truncating another writer's frame) and fsynced in full, and
+	/// `segments/` is fsynced after it, before the commit that names it runs. The
+	/// fault points fire after the durable write, so a seal that stops at one leaves
+	/// its frame behind as crash litter for recovery (S12) to classify — the durable
+	/// write itself never removes a frame it wrote.
+	async fn write_seal_frame(&self, aspect: &str, bytes: Vec<u8>) -> Result<(u64, u32, PathBuf)> {
+		let gen = self.allocate_gens(aspect, 1).await?;
+		let name = frame_name::frame_name(aspect, gen, gen);
+		let path = self.segment_path(aspect, gen, gen)?;
+		let frame_crc = write_new_durable(self.fs.as_ref(), &self.root.join("segments"), &name, bytes, SyncPolicy::Full, WritePoints::NONE).await.with_context(|| format!("writing segment {}", path.display()))?;
+		fault::hit(FaultPoint::SFrameWritten).await?;
+		fault::hit(FaultPoint::SFrameSynced).await?;
+		self.sync_segments().await?;
+		fault::hit(FaultPoint::SDirSynced).await?;
+		Ok((gen, frame_crc, path))
 	}
 
-	/// The on-disk path of the partial-reduction sidecar beside an `aspect`/`id` segment
-	/// (`{aspect}-{id}.weftpart`, alongside the `.weftseg`).
-	///
-	/// # Errors
-	///
-	/// As [`aspect_file_path`](Self::aspect_file_path).
-	fn sidecar_path(&self, aspect: &str, id: u64) -> Result<PathBuf> {
-		self.aspect_file_path(aspect, id, "weftpart")
-	}
-
-	/// The path of the `{aspect}-{id}.{extension}` file under `segments/`: the one place
-	/// an aspect name becomes a path.
+	/// The on-disk path of `aspect`'s write-once frame of generation `gen` and adoption
+	/// order `prec` — the contained frame path builder (1.0 plan §5, D-S10): the name
+	/// comes from [`frame_name::frame_name`], which carries the aspect through
+	/// [`aspect_name::encode`], and the join is refused unless the result is a direct
+	/// child of `segments/`. Every frame a seal or a maintenance output creates, and
+	/// every frame the reaper unlinks, goes through this builder or
+	/// [`output_path`](Self::output_path); nothing is created or unlinked anywhere
+	/// else under the store root except under `segments/quarantine/`, which only
+	/// recovery (S12) writes.
 	///
 	/// # Errors
 	///
 	/// An [`InvalidAspectName`](crate::InvalidAspectName) when `aspect` fails
 	/// [`aspect_name::validate`], or an error when the joined path is somehow not a
 	/// direct child of `segments/` (defence in depth behind the name check).
-	fn aspect_file_path(&self, aspect: &str, id: u64, extension: &str) -> Result<PathBuf> {
+	fn segment_path(&self, aspect: &str, gen: u64, prec: u64) -> Result<PathBuf> {
 		aspect_name::validate(aspect)?;
-		contained_file(&self.root.join("segments"), &format!("{aspect}-{id}.{extension}"))
+		contained_file(&self.root.join("segments"), &frame_name::frame_name(aspect, gen, prec))
+	}
+
+	/// The on-disk path of the partial-reduction sidecar beside `aspect`'s write-once
+	/// frame of generation `gen` and adoption order `prec`: the same stem, generation
+	/// and precedence as the frame, with the `.weftpart` extension, directly under
+	/// `segments/` through the same containment check as
+	/// [`segment_path`](Self::segment_path). A sidecar is named by its frame, not by
+	/// the segment id — an id is assigned at commit and may be taken by a later
+	/// output, while a frame name is never reused.
+	///
+	/// # Errors
+	///
+	/// As [`segment_path`](Self::segment_path).
+	fn sidecar_path(&self, aspect: &str, gen: u64, prec: u64) -> Result<PathBuf> {
+		aspect_name::validate(aspect)?;
+		contained_file(&self.root.join("segments"), &frame_name::sidecar_name(aspect, gen, prec))
+	}
+
+	/// The on-disk path of the sidecar beside the frame at `frame_path`: the frame's
+	/// own file name with its `.weftseg` extension exchanged for `.weftpart`, directly
+	/// under `segments/` through the same containment check. This is how a sidecar is
+	/// found for a segment whose generation the caller does not know — a legacy frame
+	/// resolves to its legacy `{aspect}-{id}.weftpart`, a write-once frame to its
+	/// generation-named one — so a reader never has to guess which scheme wrote it.
+	///
+	/// # Errors
+	///
+	/// An error when `frame_path` has no file name, is not a `.weftseg` frame,
+	/// or the sidecar is somehow not a direct child of `segments/`.
+	fn sidecar_path_for_frame(&self, frame_path: &str) -> Result<PathBuf> {
+		let name = Path::new(frame_path).file_name().and_then(OsStr::to_str).ok_or_else(|| anyhow::anyhow!("segment {frame_path} has no frame file name"))?;
+		let stem = name.strip_suffix(".weftseg").ok_or_else(|| anyhow::anyhow!("segment {frame_path} is not a .weftseg frame"))?;
+		contained_file(&self.root.join("segments"), &format!("{stem}.weftpart"))
 	}
 
 	/// Materialize a per-segment partial-reduction sidecar for a just-sealed segment, when
@@ -2997,10 +3041,10 @@ impl SegmentStore {
 	///
 	/// A sidecar is a *pure acceleration*: a failure to write one must never fail the seal,
 	/// so the persist paths call this and log-and-ignore any error rather than propagating.
-	async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
+	async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
 		let Some(bytes) = self.partial_sidecar_bytes(descriptor, timestamps, values)? else { return Ok(()) };
-		let path = self.sidecar_path(aspect, descriptor.id)?;
-		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
+		let path = self.sidecar_path(aspect, gen, prec)?;
+		self.fs.create_new_write(&path, bytes, SyncPolicy::None, WritePoints::NONE).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
 		Ok(())
 	}
 
@@ -3027,14 +3071,14 @@ impl SegmentStore {
 	}
 
 	/// Give a maintenance output that a swap has just committed under `descriptor` the
-	/// sidecar the policy wants for its rows, or remove the stale one its id may carry
+	/// sidecar the policy wants for its rows, or remove the stale one its frame may carry
 	/// (design section 5.3, M6). Through the store's filesystem: the new sidecar is written
-	/// under a `.tmp-*` name and renamed over the id's, so a reader never sees half of one;
+	/// under a `.tmp-*` name and renamed over the frame's, so a reader never sees half of one;
 	/// nothing is fsynced, since a sidecar is an accelerator a reader checks against the
 	/// frame. Best effort: a failure is logged, never returned.
-	async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
+	async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
 		let result = async {
-			let path = self.sidecar_path(aspect, descriptor.id)?;
+			let path = self.sidecar_path(aspect, gen, prec)?;
 			let Some(bytes) = self.partial_sidecar_bytes(descriptor, timestamps, values)? else {
 				self.fs.remove_file(&path).await.with_context(|| format!("removing stale partial sidecar {}", path.display()))?;
 				return Ok(());
@@ -3067,7 +3111,8 @@ impl SegmentStore {
 	///
 	/// Propagates a filesystem read error other than "not found".
 	pub async fn load_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<Option<PartialSidecar>> {
-		let path = self.sidecar_path(aspect, descriptor.id)?;
+		aspect_name::validate(aspect)?;
+		let path = self.sidecar_path_for_frame(&descriptor.path)?;
 		let bytes = match tokio::fs::read(&path).await {
 			Ok(bytes) => bytes,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3092,8 +3137,16 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// Propagates a filesystem error other than "not found".
-	async fn remove_sidecar(&self, aspect: &str, id: u64) -> Result<()> {
-		let path = self.sidecar_path(aspect, id)?;
+	/// Delete the partial sidecar beside the frame at `frame_path`, if one exists,
+	/// through the store's filesystem: what a merge does for each member it deletes.
+	/// A missing sidecar is success, since the aim is only that no orphaned
+	/// `.weftpart` is left behind.
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem error other than "not found".
+	async fn remove_sidecar(&self, frame_path: &str) -> Result<()> {
+		let path = self.sidecar_path_for_frame(frame_path)?;
 		self.fs.remove_file(&path).await.with_context(|| format!("removing partial sidecar {}", path.display()))
 	}
 
@@ -4776,6 +4829,40 @@ mod tests {
 		let (rt, rv) = Segment::read_from(&on_disk).expect("decodes").decode();
 		assert_eq!(rt, ts);
 		assert_eq!(rv, vs);
+	}
+
+	/// D-S10: a seal writes a write-once frame named by its generation, not by its
+	/// id, and the id is assigned by the commit that publishes it: two seals of one
+	/// aspect take consecutive ids in commit order under generation-named frames
+	/// that no later seal reuses, and the frame and sidecar builders name those
+	/// frames through `aspect_name::encode` directly under `segments/`.
+	#[tokio::test]
+	async fn a_seal_is_write_once_with_its_id_assigned_at_commit() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// The builders themselves: an encoded name, contained in `segments/`.
+		let frame = store.segment_path("Room-A.temp", 3, 3).expect("frame path");
+		assert_eq!(frame, dir.path().join("segments").join("%52oom%2D%41%2Etemp~g3~p3.weftseg"), "the frame name encodes the aspect");
+		let sidecar = store.sidecar_path("Room-A.temp", 3, 3).expect("sidecar path");
+		assert_eq!(sidecar, dir.path().join("segments").join("%52oom%2D%41%2Etemp~g3~p3.weftpart"), "the sidecar shares the frame's encoded stem");
+		assert!(store.segment_path("../x", 1, 1).is_err(), "a traversing aspect is refused by the builder");
+		// Two seals: ids in commit order, frames named by generation, never by id.
+		let first = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let second = store.seal("price", &schema(), &[20, 30], &[bd("3"), bd("4")]).await.expect("seals");
+		assert_eq!((first.id, second.id), (0, 1), "ids are assigned in commit order");
+		let first_file = std::path::Path::new(&first.path).file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+		let second_file = std::path::Path::new(&second.path).file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+		assert_eq!(first_file, "price~g1~p1.weftseg", "the first seal's frame is generation-named");
+		assert_eq!(second_file, "price~g2~p2.weftseg", "the second seal's frame is generation-named");
+		assert!(!first_file.contains("-0") && !second_file.contains("-1"), "no frame is named by its id");
+		// The rows read back under the committed ids, and the frames they name are
+		// the ones on disk: the row's path is the frame's, not an id-derived alias.
+		let descriptors = store.index().all("price").await.expect("reads the index");
+		assert_eq!(descriptors.iter().map(|desc| desc.id).collect::<Vec<_>>(), vec![0, 1]);
+		assert_eq!(descriptors.iter().map(|desc| desc.path.clone()).collect::<Vec<_>>(), vec![first.path.clone(), second.path.clone()]);
+		let (ts, vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		assert_eq!(ts, vec![0, 10, 20, 30]);
+		assert_eq!(vs.into_iter().flatten().map(|v| v.to_plain_string()).collect::<Vec<_>>(), vec!["1", "2", "3", "4"]);
 	}
 
 	/// Every `.weftseg`/`.weftpart` file anywhere under `dir`.
@@ -8493,7 +8580,7 @@ mod tests {
 		assert_eq!(point, Some(bd("5")));
 		assert_eq!(count, 2, "no refused write added a segment");
 		assert_eq!(declared, vec!["price".to_string()], "the refused declare declared nothing");
-		assert_eq!(names_in(&dir.path().join("segments")), vec!["price-0.weftseg", "price-1.weftseg"], "no refused write left a frame behind");
+		assert_eq!(names_in(&dir.path().join("segments")), vec!["price-1.weftseg", "price~g1~p1.weftseg"], "no refused write left a frame behind");
 
 		let reopened = SegmentStore::open(dir.path()).await.expect("reopens");
 		let healthy = reopened.poisoned();
@@ -8802,7 +8889,8 @@ mod tests {
 				assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{spec}: the child's seal stopped at the injected error: {out:?}");
 			}
 			let segments = dir.path().join("segments");
-			let orphans: Vec<String> = names_in(&segments).into_iter().filter(|name| name != "price-0.weftseg").collect();
+			let first_file = std::path::Path::new(&first.path).file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+			let orphans: Vec<String> = names_in(&segments).into_iter().filter(|name| *name != first_file).collect();
 			let [orphan] = orphans.as_slice() else { panic!("{spec}: the crashed seal left exactly one frame behind: {orphans:?}") };
 			let orphan_bytes = std::fs::read(segments.join(orphan)).expect("reads the orphan");
 
