@@ -65,6 +65,15 @@ pub fn frame_name(aspect: &str, gen: u64, prec: u64) -> String {
 	format!("{}~g{gen}~p{prec}{EXTENSION}", stem(aspect))
 }
 
+/// The file name of the partial-reduction sidecar beside that frame: the same stem,
+/// generation and precedence, with the `.weftpart` extension. A sidecar is named by
+/// its frame, not by the segment id the commit assigns — the frame name is never
+/// reused, while an id may be taken by a later output.
+#[must_use]
+pub fn sidecar_name(aspect: &str, gen: u64, prec: u64) -> String {
+	format!("{}~g{gen}~p{prec}.weftpart", stem(aspect))
+}
+
 /// A parsed write-once frame name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameName {
@@ -134,6 +143,16 @@ mod tests {
 		assert_eq!(frame_name("price", 3, 0), "price~g3~p0.weftseg");
 		assert_eq!(frame_name("Room-A.temp", 12, 7), "%52oom%2D%41%2Etemp~g12~p7.weftseg");
 		assert_eq!(frame_name("job:rate", u64::MAX, u64::MAX), format!("job%3Arate~g{}~p{}.weftseg", u64::MAX, u64::MAX));
+	}
+
+	#[test]
+	fn a_sidecar_shares_its_frames_stem_generation_and_precedence() {
+		assert_eq!(sidecar_name("price", 3, 0), "price~g3~p0.weftpart");
+		assert_eq!(sidecar_name("Room-A.temp", 12, 7), "%52oom%2D%41%2Etemp~g12~p7.weftpart");
+		for aspect in ["price", "Room-A.temp", "温度"] {
+			let frame = frame_name(aspect, 5, 5);
+			assert_eq!(sidecar_name(aspect, 5, 5), frame.replace(".weftseg", ".weftpart"), "{aspect:?}");
+		}
 	}
 
 	#[test]

@@ -148,7 +148,7 @@ async fn sidecars_with_unscaled_zeros_are_served_at_the_column_scale() {
 			let points: Vec<Point> = ts.iter().zip(vs).map(|(t, v)| Point::new(DateTime::from_timestamp(*t, 0).expect("instant"), if v.is_zero() { BigDecimal::from(0) } else { v })).collect();
 			let partial = reduce_partial(&points, BASE, None, None, &SIDECAR_AGGREGATIONS).expect("reduces");
 			let sidecar = PartialSidecar::materialize(BASE, descriptor, partial, &TIERS).expect("materializes");
-			std::fs::write(store.sidecar_path(ASPECT, descriptor.id).expect("path"), sidecar.to_bytes().expect("encodes")).expect("writes the sidecar");
+			std::fs::write(store.sidecar_path_for_frame(&descriptor.path).expect("path"), sidecar.to_bytes().expect("encodes")).expect("writes the sidecar");
 		}
 		remove_frames(&descriptors);
 		assert_matches(&store, &expected, &format!("scale {scale}, unscaled sidecars")).await;
