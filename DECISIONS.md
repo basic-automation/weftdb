@@ -807,3 +807,40 @@ the other loop's.
 344+7+4+3 (`--all-features`), `weftdb` 423 lib plus 26+17+8+6+2+2+1+1+1 integration and 1 doc, the
 `bitsliced-codec` configuration 424+1, clippy `-D correctness,suspicious,perf` over both crates'
 `--all-targets`, and `cargo +nightly fmt --all -- --check` — every step `EXIT=0`, no error lines.
+(The sentence above was first written while that run was still going, which is how it came to be
+unverified at the time; the numbers are its terminal output, from the seventh run of the script,
+background task `bd2e7b318`, against commit `40e61f7`.)
+
+
+## 2026-10-28 — extend the open pruning PR rather than open a second store-lane slice
+
+**Ambiguity.** ROADMAP 4.3's pruning item was ticked as landed for the point-read path, and 4.6's
+"reconciliation — configurable upsert keys + skip-identical" is the last unchecked W3/W4 store item
+whose table already exists (`ingest_ledger` in `segment_index.db`, `weftdb/src/types/migrations.rs:334`,
+provisioned with a `fingerprint` column and touched by no code). The board also carries a store-lane
+hold from `w2/fre-14c-legacy-seal`, whose work is in the seal path.
+
+**Choice.** Wire `downsample_range` into the quality prune first, as a second commit on the open
+pruning branch, and leave the ingest ledger for a slice of its own.
+
+**Why.** The ledger's whole value is atomicity with the seal: the fingerprint check and the ledger
+insert have to live inside the same commit transaction as `InsertNew` (`weftdb/src/types/index_txn.rs:135`),
+which is exactly the region the legacy-seal lane is editing. Extending my own branch touches only
+`downsample_range` and its tests — files no other lane is in — and it finishes the roadmap item
+instead of leaving half of the read path on the table. Sequencing beats overlapping here: the ledger
+slice starts after #134 merges.
+
+**The boundary, which is the actual decision.** A null row is part of a range read's answer and not
+of a bucket's. `read_time_range` returns rows, so pruning an all-null segment would delete timestamps
+the caller asked for; `downsample_range` folds values, and a row carrying no value enters no sum,
+count, min, max, first or last — and a partial holding nothing is dropped when buckets merge, so a
+window covered only by nulls answers empty rather than emitting a run of empty buckets. That last
+point is what makes the prune safe, and it is pinned empirically (`an_all_null_segment_changes_no_bucket_of_a_downsample`
+compares against the single-pass `reduce` at two resolutions over seven aggregations, including a
+window the null segment covers alone) rather than argued from the merge code.
+
+**Also on the record.** `patches/branches` is tracked in this repository but is not a workspace
+member, and its `src/lib.rs` does not compile on the current toolchain (`core::intrinsics::transmute`
+is not a public path). Nothing in the workspace build touches it, so it fails silently for any tool
+that scans the tree — pi-lens reports it as a blocker against any session in this directory. It
+belongs to the patches lane; recorded here so the next agent does not spend a turn discovering it.

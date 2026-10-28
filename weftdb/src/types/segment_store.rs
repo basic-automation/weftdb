@@ -3158,7 +3158,14 @@ impl SegmentStore {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		let schema = self.require_schema(aspect).await?;
-		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
+		// Quality prune, not time prune alone (roadmap Phase 4.3): a segment whose every row
+		// is null cannot move a bucket. Its rows contribute to no sum, count, min, max, first
+		// or last, and a partial that holds nothing is dropped when buckets merge, so the
+		// buckets this fold produces are the same with the segment in or out — and its frame
+		// is never opened. `read_time_range` right above deliberately keeps the time-only
+		// prune: its answer *is* the rows, nulls included, so dropping that segment there
+		// would delete timestamps the caller asked for.
+		let descriptors = self.index.prune_present_descriptors(aspect, start, end).await?;
 
 		// A persisted per-segment partial can *substitute* for decoding a segment only when
 		// it can answer this exact query: every requested reduction must be one the sidecar
@@ -5360,11 +5367,18 @@ mod tests {
 	/// carries no value at all is dropped by the index prune, so a point read never opens its
 	/// file. The corrupt bytes left in its place are what prove it — the read can only come
 	/// back clean if that segment was skipped instead of read. A range read, whose contract
-	/// includes null rows, still opens it and reports the damage.
+	/// includes null rows, still opens it and reports the damage; a downsample, whose contract
+	/// is the buckets, does not.
 	#[tokio::test]
 	async fn point_reads_prune_an_all_null_segment_without_opening_it() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// A downsample resolves the aspect's schema before it reads anything, so the fixture has
+		// to declare it: without this line `downsample_range` failed on "no declared schema"
+		// instead of on the file, which is exactly the vacuous pass the old `is_err()` assertion
+		// was accepting here. `read_time_range` never looked at the schema, which is why the same
+		// vacuity hid behind its corrupt-file assertion.
+		store.declare("a", &schema()).await.expect("declares");
 		let _live = store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("seals the value segment");
 		let nulls = store.seal_nullable("a", &schema(), &[30_i64, 40], &[None, None]).await.expect("seals the all-null segment");
 		assert_eq!(store.segment_count("a").await.expect("counts"), 2, "both segments are indexed");
@@ -5379,7 +5393,43 @@ mod tests {
 		assert_eq!(at, Some(bd("2")));
 		assert_eq!(many, vec![Some(bd("2")), None, None], "the null instants answer None without their segment being read");
 		assert!(ranged.is_err(), "a range read still reads null rows, so it must hit the corrupt file: {ranged:?}");
-		assert!(downsampled.is_err(), "and so must a downsample over the same window: {downsampled:?}");
+		// The schema is declared and the live segment reads clean, so the only thing left for a
+		// range read to fail on is the frame the point read skipped.
+		let buckets = downsampled.expect("a downsample answers from the live segment alone");
+		assert_eq!(buckets.len(), 3, "the live segment's three instants are three one-second buckets, and the null segment adds none");
+	}
+
+	/// The bucket-level claim the prune rests on, stated where the merge happens: an all-null
+	/// segment folded in must leave every bucket of every aggregation exactly as it was,
+	/// including a window the null segment covers on its own (a bucket holding nothing is
+	/// dropped, not emitted empty). The reference is the single-pass `reduce` over the live
+	/// rows only, so a prune that changed a bucket would show as a mismatch rather than as an
+	/// assertion the fixture was built to satisfy.
+	#[tokio::test]
+	async fn an_all_null_segment_changes_no_bucket_of_a_downsample() {
+		use splimes::Point;
+		use weft_reduce::{reduce, Aggregation};
+
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("temp", &schema()).await.expect("declares");
+		let live: Vec<(i64, BigDecimal)> = (0..40).map(|i| (i * 15, bd(&format!("{}", i % 7)))).collect();
+		let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = live.iter().cloned().unzip();
+		store.seal("temp", &schema(), &ts, &vs).await.expect("seals the live segment");
+		// The null segment covers 600..=899, a stretch of the window no live row reaches.
+		store.seal_nullable("temp", &schema(), &[600_i64, 660, 720, 780, 840], &[None, None, None, None, None]).await.expect("seals the all-null segment");
+		assert_eq!(store.segment_count("temp").await.expect("counts"), 2, "both segments are indexed");
+
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P99];
+		let points: Vec<Point> = live.iter().map(|(t, v)| Point::new(DateTime::<Utc>::from_timestamp(*t, 0).expect("instant"), v.clone())).collect();
+		for resolution in [Resolution::Minutes, Resolution::Hours] {
+			let pruned = store.downsample_range("temp", 0, 1_000, resolution, &aggs).await.expect("downsamples");
+			let single_pass = reduce(&points, resolution, None, None, &aggs).expect("reduces");
+			assert!(!pruned.is_empty(), "the fixture must produce buckets");
+			assert_eq!(pruned, single_pass, "the all-null segment must not move a bucket at {resolution:?}");
+		}
+		// A window the null segment covers alone answers empty, not a run of empty buckets.
+		assert!(store.downsample_range("temp", 600, 899, Resolution::Minutes, &aggs).await.expect("downsamples the null-only window").is_empty(), "a window of nothing but nulls yields no buckets");
 	}
 
 	#[tokio::test]

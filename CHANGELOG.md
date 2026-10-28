@@ -64,7 +64,8 @@ only the control plane, not the segment frames.
   read it follows; the Arrow and Parquet handlers split their encode out of the read to do it. A
   seal's index write closes a `control_plane.index.insert` span carrying `rows_changed`, the
   affected-row count of the insert.
-- **A point read no longer opens a segment that holds no value** (roadmap 4.3). Quality
+- **A point read or a downsample no longer opens a segment that holds no value**
+  (roadmap 4.3). Quality
   pruning is wired into the read path at both levels it applies to. The segment index prune
   drops a segment whose recorded stats say every row is null — `SegmentIndexStore::prune_present_descriptors`,
   the SQL mirror of the resident `SegmentIndex::prune_present_by_time` — so a fully null
@@ -73,9 +74,13 @@ only the control plane, not the segment frames.
   drops pages a point lookup cannot answer. `weftdb::SegmentStore::read_point` and
   `read_points` are the callers, and `weft_physical_type::weftseg::read_frame_point`,
   `read_frame_points` with their single-block and paged forms do the skipping. The answers do
-  not change — a null row is not a value — only the work done to reach them. Range and
-  downsample reads deliberately still read every time-overlapping segment: a null row is part
-  of *their* answer, so pruning there would change results rather than cost.
+  not change — a null row is not a value — only the work done to reach them.
+  `SegmentStore::downsample_range` prunes the same way: a row carrying no value enters no sum,
+  count, min, max, first or last, and a partial holding nothing is dropped when buckets merge,
+  so a window covered only by nulls yields no buckets rather than a run of empty ones — pinned
+  against the single-pass `reduce` over the live rows. `read_time_range` deliberately still
+  reads every time-overlapping segment: a null row is part of *its* answer, the timestamps the
+  caller asked for, so pruning there would change results rather than cost.
 - **Every README performance figure now has a registry entry** (evidence track EVI-2).
   `bench/claims.json` names, per figure, the bench or the local corpus behind it, the date it was
   measured, and whether a clone can re-run it; `tools/check_claims.py` runs in CI and pairs each
