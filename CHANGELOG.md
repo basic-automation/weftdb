@@ -42,6 +42,22 @@ only the control plane, not the segment frames.
   the reason for each, and records the run in the store — a second run against the same tree
   refuses rather than doubling the rows. The migrated tree reads back under its own name
   through `WEFT_STORE_DATABASE` and `WEFT_STORE_SUBJECT`.
+- **A rows-mode tree too big to hold one aspect in memory, and its catalog's non-row
+  state, cross with the rows** (legacy lane FRE-14c remainder). The import no longer
+  buffers an aspect: the encoding survey streams its rows through a cursor (one pass
+  for the scale and the scale-free candidates, a second for the scaled candidates once
+  the scale is known) and the seal streams them again in chunks of
+  `--rows-per-segment`, extended past any group of rows sharing the chunk's last
+  instant, so a chunk holds at most the chunk size plus one instant group. The encoding
+  decided is exactly the whole-column recommendation at tolerance zero, and a tree whose
+  `metadata.db` is not the catalog 0.1.x wrote is refused before anything is sealed.
+  Numbered migration `0003_fre14_legacy_catalog` registers a `legacy_catalog` table in
+  the store's own `metadata.db`, and the import writes one row per aspect it carried —
+  the catalog's aspect row (legacy id, resolution, creation time, recorded span,
+  compression config) under the store's scope. The catalog's transaction log and host
+  paths stay behind, as do the dictionaries and pipeline/correlation/pattern databases:
+  1.0 does not replay 0.1.x's log, and the import record in `store_meta` is the
+  transaction this migration records.
 - **Stage spans for every stored read, and an index-write span on the seal** (roadmap Phase 3).
   Each stored read (CSV, Arrow, Parquet, JSON, point and at-multi) now closes a
   `storage.<stage>.serialize` span tagged with its `format`, so the encode is timed apart from the

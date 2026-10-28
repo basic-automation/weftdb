@@ -26,7 +26,7 @@ pub use partial_sidecar::{PartialSidecar, PartialSidecarPolicy, DEFAULT_PARTIAL_
 pub use pattern::{Pattern, PatternID};
 pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};
 pub use relative::Relative;
-pub use rows_mode::{discover, import_into, read_import_record, record_key, ImportRecord, ImportedAspect, LegacyAspect, LegacyTree, NotCarried, RowsModeError, DEFAULT_ROWS_PER_SEGMENT, IMPORT_RECORD_KEY, MEASUREMENTS_FILE, TIMESTAMP_COLUMN, TIMESTAMP_TIME_UNIT, TIMESTAMP_UNIT};
+pub use rows_mode::{discover, import_into, read_import_record, record_key, ImportRecord, ImportedAspect, LegacyAspect, LegacyCatalogAspect, LegacyTree, NotCarried, RowsModeError, DEFAULT_ROWS_PER_SEGMENT, IMPORT_RECORD_KEY, MEASUREMENTS_FILE, TIMESTAMP_COLUMN, TIMESTAMP_TIME_UNIT, TIMESTAMP_UNIT};
 pub use segment_index::SegmentIndexStore;
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
