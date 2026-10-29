@@ -205,19 +205,89 @@ Ask about the past, not about WeftDB. Do not pitch before question 6.
 Record answers per interview in a dated note. A confirm needs evidence from questions 2, 3 and 7,
 not enthusiasm at question 6.
 
+## Recommended boundary and opening prices (2026-10-29, not yet decided)
+
+Researched against what comparable products gate and charge. These are recommendations for the
+operator to accept or change. Nothing is for sale yet (see Decided, below).
+
+### What comparable products gate
+
+| Product | Free | Paid | Price published? |
+| --- | --- | --- | --- |
+| QuestDB | Apache-2.0 single node; basic auth, **no TLS** | TLS, RBAC down to columns, replication, multi-primary, HA ([comparison](https://questdb.com/enterprise)) | No: AWS Marketplace private offers only |
+| InfluxDB 3 | Core: MIT/Apache single node, no compaction; Enterprise free "at home" on 2 cores | Enterprise: HA, read replicas, compaction, security; cores sold in 8/16/32/64/128 batches ([licence docs](https://docs.influxdata.com/influxdb3/enterprise/admin/license)) | No: contact sales |
+| TimescaleDB | Apache-2 edition; most features under the source-available TSL, free unless resold as a hosted DB ([editions](https://www.tigerdata.com/docs/about/latest/timescaledb-editions)) | Tiger Cloud (hosted), tens of dollars a month to start | Cloud yes, self-hosted n/a |
+| Canary historian | — | 3,500 tags: about $3,000/yr subscription or $8,730 perpetual ([pricing](https://info.canarylabs.com/pricing)) | Yes |
+| Ignition | — | Per server, unlimited tags: platform about $1,200 plus modules, about $12–15k per bundle (secondhand, [G2](https://www.g2.com/products/inductive-automation-ignition/pricing)) | Partly |
+| AVEVA PI | — | Mid-size deployments reported at about $108–162k/yr; one city's award came to $108,570/yr (secondhand) | No |
+
+The pattern: database vendors keep single-node engines open and charge for what a team or a
+company needs and an individual does not (HA, replication, fine-grained access, audit), with
+prices behind a sales call. Historians charge per tag or per server, from a few thousand dollars
+a year (Canary) to six figures (PI). Ignition's "unlimited tags per server" is its main selling
+point against per-tag pricing.
+
+### Recommended boundary
+
+**Free and MIT/Apache, permanently:** everything one engineer needs on one node. That covers the
+engine, every interpolation and fill method, the raw/interpolated/extrapolated marking, ingest,
+storage, the compute and storage endpoints, the GPU backend, `weft-bench`, **and TLS plus basic
+token auth**.
+
+- The differentiator has to be free, or there is nothing to benchmark in public, and no H1 or H2
+  team will put it beside a historian.
+- TLS and auth are already in the 1.0 release criteria. Gating them, as QuestDB does, would
+  contradict the roadmap and make every pilot a security exception.
+- Existing code stays under MIT/Apache. Relicensing what is already open is the Elastic/HashiCorp
+  move, and it would cost the trust a benchmark-first project depends on.
+
+**Paid, when there is an entity to sell it (buyer-based: what a team or company needs):**
+
+1. **HA and replication** (read replicas, failover) and scheduled, verified backup and restore.
+2. **Enterprise access:** SSO (OIDC/SAML/LDAP), fine-grained RBAC and audit logs.
+3. **Historian connectors** that map a historian's quality flags onto WeftDB's provenance
+   (OPC UA, PI and Canary export import). This is H1-specific, and it is where the marking turns
+   into money.
+4. **Support with an SLA**, plus **benchmark engagements** (H6).
+
+Mechanically: paid features live in separate crates, the way Timescale keeps its `tsl/` tree
+apart. The CLA, which names Justin Icenhour as recipient, is what allows contributed code to sit
+beside proprietary modules later. That is for a lawyer to confirm when the entity is formed.
+
+**Not recommended:** per-tag or per-aspect pricing (it invites the PI comparison and loses to
+Ignition's unlimited model); hosted or $/point pricing before a hosted service exists; gating any
+interpolation method.
+
+### Recommended opening prices (for discovery calls, not published)
+
+| Offer | Opening price | Anchor |
+| --- | --- | --- |
+| Design-partner pilot | Free during the pilot; 50% off the first two years if they convert | Pays for the data and the reference |
+| Support only, one node | $3,000/yr | Canary's 3,500-tag subscription is about $3,000/yr |
+| Production, per node (HA, SSO/RBAC/audit, connectors, business-hours support) | $12,000/yr | Inside H1's $10–40k band; about one Ignition bundle a year; far under PI |
+| Site / plant (unlimited nodes and tags, 24×7) | $30,000/yr | The top of H1, the bottom of H2, a fraction of a mid-size PI deployment |
+| Benchmark report on the buyer's data | $7,500 fixed | Inside H6's $5–20k; one engineer-week of a consultant |
+
+Quote the per-node price first and ask what they pay today (question 7). A team that names a
+historian bill will anchor against it, and that answer is the evidence H1 needs. Revisit after
+five calls; move a price only on evidence from the calls, not on comparables.
+
+## Decided (2026-10-29)
+
+- **Who makes contact:** the operator, as **Basic Automation**. Basic Automation is not yet a
+  company and will not be incorporated for now. Until it is, calls are discovery only. Use the
+  question script, ask what they pay today, and quote prices as "what would you say if…". No
+  quotes, invoices, contracts or paid pilots until there is an entity to sign them.
+- **Pilots without TLS or auth:** acceptable now as an isolated technical test (for example,
+  `weft-bench` on a partner's exported data, or a server on their network with no outside
+  exposure), and **not** acceptable for 1.0, where TLS and auth are release criteria.
+
 ## Needs human
 
-- **Open-core boundary.** What, if anything, is not MIT/Apache? Every price band above assumes the
-  paid part is support, hardening or hosting. If a paid tier is intended (GPU, compression,
-  security), the hypotheses need restating.
+- **Accept, change or reject the recommended boundary and prices above.**
 - **Whether to offer hosting at all.** H4's natural metric is per output point, which implies a
   hosted service the project does not have and the README says does not exist.
-- **Who runs the discovery calls,** under what name and entity, and whether design partners get
-  founding pricing (and what it is).
-- **The price bands.** They are placeholders chosen by an agent from incumbent categories, not from
-  any buyer conversation. A human should set the opening numbers before any call.
-- **Pre-1.0 deployment risk.** No TLS, auth or RBAC: any pilot must run on an isolated network.
-  Whether that is acceptable for a paid pilot is a judgement call.
+- **Whether design partners get founding pricing,** and whether 50% for two years is the number.
 - **Benchmark-publication terms.** H5 and H6 publish comparisons against commercial engines; each
   vendor's terms (kdb+ in particular) need checking before anything is published.
 - **Where this document lives.** `docs/` was removed from `main` in #99 and the prose moved to

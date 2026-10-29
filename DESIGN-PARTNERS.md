@@ -148,7 +148,7 @@ conversation rather than a partner. This is a suggestion, not a selection.
 
 ## Process
 
-1. Operator picks candidates and decides who reaches out and under what entity.
+1. Operator picks candidates and reaches out as Basic Automation (discovery only until it is incorporated).
 2. First contact asks for the workload, not a meeting about WeftDB: what they resample, how, and
    whether a sample dataset is public.
 3. Score against the checklist after the first call; record score and date.
@@ -162,11 +162,11 @@ Record each step as a dated entry. Do not record personal contact details in the
 ## Needs human
 
 - Choose the 3–5 candidates, and whether any listed archetype should be dropped or added.
-- Who makes contact, from which entity, and whether a partner agreement or NDA is needed for data.
+- Whether a partner agreement or NDA is needed for data. (Decided: the operator makes contact as Basic Automation, which is not yet incorporated, so calls are discovery only; see WILLINGNESS-TO-PAY.md.)
 - Whether partners are offered anything commercial (founding pricing, paid support credit).
 - Where partner data may be stored: it must not enter this repository; `.gitignore` covers
   `database/datasets`, but a policy should say so.
 - Whether to publish anonymised partner results, and the review step before publishing.
-- Whether a pre-1.0 pilot without TLS/auth is acceptable to offer at all.
+- (Decided) A pilot without TLS or auth is acceptable as an isolated technical test now, not for 1.0.
 - Where this document should live: at the root until the site has a page for it, as for
   WILLINGNESS-TO-PAY.md (DECISIONS.md, 2026-10-29).
