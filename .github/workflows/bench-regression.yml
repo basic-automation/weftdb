@@ -92,13 +92,13 @@ jobs:
             --decimals 6 \
             --no-gpu-calibrate \
             --out-dir "$BENCH_DIR"
-          echo "candidate=$BENCH_DIR/$WORKLOAD_NAME__weftdb.json" >> "$GITHUB_ENV"
+          echo "candidate=$BENCH_DIR/${WORKLOAD_NAME}__weftdb.json" >> "$GITHUB_ENV"
       # The run manifest is the evidence record (EVI-3): the toolchain, build profile,
       # hardware and report hash. A candidate whose own manifest will not verify is not
       # evidence, whatever its numbers say.
       - name: Verify the run manifest
         shell: bash
-        run: ./target/release/weft-bench verify "$BENCH_DIR/$WORKLOAD_NAME__weftdb.manifest.json"
+        run: ./target/release/weft-bench verify "$BENCH_DIR/${WORKLOAD_NAME}__weftdb.manifest.json"
 
       - name: Find the baseline run
         id: baseline
