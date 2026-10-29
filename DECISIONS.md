@@ -4,6 +4,56 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — SOA-12: procfs over a crate, deltas over totals, and a check that cannot run
+
+**Ambiguous:** the roadmap line and issue #258 name three things - Linux system
+samplers, contamination flags, the strict-mode flush check - and say nothing about
+what a sampler reads, which numbers are contamination, or what makes a run "flushed".
+
+**Chosen:**
+
+1. **`/proc` text readers, no `sysinfo`.** PSI (`/proc/pressure/*`), mount sources
+   (`/proc/self/mountinfo`), device write counters (`/proc/diskstats`), `Dirty` /
+   `SwapCached` / `oom_kill` (`/proc/meminfo`, `/proc/vmstat`) are half of what this
+   item needs and no crate reports them. Reading the same kernel twice through two
+   abstractions invites two answers to one question, so the module reads procfs
+   through a `ProcRoot` whose path is a parameter: the tests point it at a fixture
+   tree, and a host without a file gets `None` rather than a fabricated zero.
+2. **Device counters are a window delta.** `diskstats` is cumulative since boot;
+   reporting the total would credit a ten-minute run with every byte the machine
+   ever wrote, which on this host reads as a huge foreign writer. The ledger keeps
+   first and last and subtracts, and `None` (device unreadable, or a name that
+   changed mid-run) stays unknown instead of becoming zero.
+3. **Device naming prefers `/proc/partitions`.** `mountinfo` carries `major:minor`,
+   which `partitions` names authoritatively whatever the mount source looked like
+   (`/dev/mapper/vg-root`, a by-uuid link). The source basename is the fallback only.
+   A multi-device filesystem (btrfs across disks) reports one source, so its
+   counters cover that device alone - recorded in the doc comment, not silently
+   averaged.
+4. **Flags are recorded, and only strict mode screens.** Contamination is a property
+   of the machine, not a verdict on the run: a `ContaminationVerdict` always comes
+   back with what was seen, and the tolerance vector in `ContaminationPolicy` decides
+   what fails, and only under `StrictMode::Strict`. That is also why the sampler
+   never writes to the store directory: it resolves the device from the path and
+   leaves the filesystem alone, so the harness cannot launder its own writes.
+5. **The flush check measures, it does not force.** It compares what the store's
+   device wrote during the run against what the server acknowledged, plus a slack
+   for WAL and metadata, and screens residual `Dirty`. There is no `fsync` of the
+   store here - that is the server's durability contract, not the harness's job, and
+   forcing it would make an unflushed server look flushed. A run with no durability
+   acknowledgment returns a skipped check with the reason; `blocks(strict)` fails it
+   under strict mode, because a run that cannot show it flushed is exactly the run
+   strict mode exists to reject.
+6. **Clock honesty.** Offsets between `CLOCK_MONOTONIC` and wall clock cannot drift
+   60 s, so a step in `wall - monotonic` (default 250 ms) flags `ClockStep` and
+   invalidates the intervals across it; a sample gap over 30 s flags `SampleGap`.
+   Both defaults live in `ContaminationPolicy::default`, so a soak config can move
+   them.
+7. **Artifacts carry numbers, not paths.** The verdict and flush JSON hold the device
+   basename and the counters, never the store path or mount point: a published soak
+   artifact should not leak a developer's directory layout. A test writes a store
+   path containing a canary string and asserts the artifact does not contain it.
+
 ## 2026-10-29 — EVI-8B: what "retires v1" means, and why the report schema stays at v23
 
 **Ambiguous:** EVI-8A's entry (2026-10-26, item 5) defines Part II as "ports the
