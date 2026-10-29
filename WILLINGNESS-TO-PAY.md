@@ -280,16 +280,53 @@ five calls; move a price only on evidence from the calls, not on comparables.
   company and will not be incorporated for now. Until it is, calls are discovery only. Use the
   question script, ask what they pay today, and quote prices as "what would you say if…". No
   quotes, invoices, contracts or paid pilots until there is an entity to sign them.
+- **Hosting is a viable offer.** It sits on the paid side of the boundary and is not built. When it
+  exists it is priced on use, H4's metric (dollars per billion interpolated output points), and
+  that price is set from `weft-bench`'s published cost figure, not before. Until then the per-node
+  and per-site prices above are the only ones quoted.
+- **Benchmark-publication policy:** adopted as recommended; see the next section.
 - **Pilots without TLS or auth:** acceptable now as an isolated technical test (for example,
   `weft-bench` on a partner's exported data, or a server on their network with no outside
   exposure), and **not** acceptable for 1.0, where TLS and auth are release criteria.
 
+## Benchmark-publication policy (decided 2026-10-29)
+
+A published comparison is only worth something if the other side was allowed to be measured and
+could reproduce it. Licences checked on 2026-10-29:
+
+| Engine | Licence on benchmarking | Policy |
+| --- | --- | --- |
+| kdb+ (KX) | The Personal/On Demand licence (§1.3) bars giving any third party "any report regarding the performance" of the software, and the Insights evaluation licence (§1.3) bars disclosing "any benchmark, test or performance information", without KX's prior written consent ([on demand](https://kx.com/?p=3890), [evaluation](https://kx.com/legal/kdb-insights-enterprise-evaluation-license/)) | **Do not run or publish.** Ask KX in writing only if H5 is ever confirmed. Audited kdb+ figures exist as STAC-M3 reports and may be cited, not re-measured |
+| AVEVA PI System | AVEVA's general terms (v6.0, 31 March 2026) bar benchmark testing of any product without AVEVA's prior written consent ([terms](https://www.aveva.com/content/dam/aveva/documents/legal/policies/AVEVA-GTC-Website-and-Clickwrap-version_v6-0_31March2026.pdf)) | **Do not run or publish.** Compare only published capabilities and prices |
+| Oracle, SQL Server and other "DeWitt clause" licences | Historically require written approval before results go to third parties ([background](https://www.databricks.com/blog/2021/11/08/eliminating-the-dewitt-clause-for-database-benchmarking.html)) | Out of scope; not time-series competitors |
+| QuestDB OSS, InfluxDB 3 Core, TimescaleDB, DuckDB, ClickHouse | Open-source licences with no benchmark restriction. TimescaleDB's TSL edition: read the licence before including it | **Publish**, under the rules below |
+| QuestDB Enterprise, InfluxDB 3 Enterprise (any licence tier) | Commercial terms not read | Compare open-source editions only until each licence has been read and recorded |
+
+**Rules for every published comparison:**
+
+1. **Allowed to measure.** The engine's licence is read, and the licence and version are recorded
+   with the result, before anything is published.
+2. **Reproducible.** One script installs, loads, runs and collects, ClickBench-style, with engine
+   versions, configuration, hardware and data pinned in the run manifest. A comparison that cannot
+   be re-run from the repository is not published.
+3. **Tuned per the vendor's own documentation**, with the settings in the report. Defaults are
+   reported as defaults, not as the engine's best.
+4. **The vendor sees it first.** Each vendor gets the report and the script 14 days before
+   publication. Corrections that hold up are applied and credited, and objections are printed
+   beside the result.
+5. **Losses are published.** Every workload run is reported, including the ones WeftDB loses, as
+   the spline-vs-linear result already is.
+6. **Corrections are logged** with a date, in the claims registry beside the figure they change.
+
+**Paid benchmark reports (H6)** on a buyer's data follow the same rules but are delivered privately.
+If the buyer runs a licensed commercial engine (PI, kdb+), the buyer's own licence decides whether
+it may be benchmarked at all. The engagement starts with the buyer confirming that in writing, and
+Basic Automation never publishes those results.
+
 ## Needs human
 
-- **Whether to offer hosting at all.** H4's natural metric is per output point, which implies a
-  hosted service the project does not have and the README says does not exist.
-- **Benchmark-publication terms.** H5 and H6 publish comparisons against commercial engines; each
-  vendor's terms (kdb+ in particular) need checking before anything is published.
+- **The enterprise-edition licences** of QuestDB and InfluxDB 3, and TimescaleDB's TSL: read and
+  recorded before any of them appears in a published comparison.
 - **Where this document lives.** `docs/` was removed from `main` in #99 and the prose moved to
   basicautomation.io, which this repository cannot write to. It sits at the root beside
   `ROADMAP.md` and `DECISIONS.md` until it has a page on the site (DECISIONS.md, 2026-10-29).

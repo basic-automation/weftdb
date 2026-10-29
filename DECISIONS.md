@@ -31,7 +31,11 @@ adopted as written. The single-node engine stays MIT/Apache, TLS and basic auth 
 replication, SSO/RBAC/audit, historian connectors and SLA support are paid, at $3k support / $12k
 per node / $30k per site per year, with a $7.5k benchmark report and free pilots at 50% off for two
 years. Contact is made as Basic Automation, discovery only until it is incorporated. A pilot
-without TLS or auth is fine as an isolated test now, not for 1.0.
+without TLS or auth is fine as an isolated test now, not for 1.0. Hosting is a viable paid offer, priced on use once
+`weft-bench` publishes a cost figure. Benchmark publication: kdb+ and AVEVA PI are not benchmarked or
+published (their licences bar it without written consent); open-source engines are, under six rules
+(licence read, reproducible script, vendor-documented tuning, 14 days of vendor preview, losses
+published, corrections logged); paid reports stay private and the buyer confirms their own licence.
 
 ## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means
 
