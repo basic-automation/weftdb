@@ -1228,7 +1228,7 @@ mod tests {
 		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["segment_count"], 2);
-		// The rollup fold path (record_seal) surfaced the out-of-order segment at the endpoint.
+		// The seal's rollup fold surfaced the out-of-order segment at the endpoint.
 		assert_eq!(body["unsorted_segments"], 1, "body: {body}");
 		// The two segments cover disjoint windows, so there is no cross-segment overlap.
 		assert_eq!(body["overlapping_segments"], 0, "body: {body}");

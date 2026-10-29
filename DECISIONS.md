@@ -793,3 +793,57 @@ through the store lane via the `types::interpolate_range` child module (one
 counting toward the cap). The review item itself is left unticked here — it
 names this slice, and this entry is its answer — so the loop can flip it
 alongside the line it reviews.
+
+## 2026-10-28 — D-S11: the rollup moves to `segment_index.db`
+
+**Spec:** 1.0-plan.md §6 W3 store lane (D-S10 → EVI-10A hook → D-S11) plus
+ROADMAP line 269, and the code's own anticipation of it: the layout-2 migration
+already creates `aspect_metadata` in `segment_index.db` "with metadata.db's
+columns, folded inside the seal transaction from S11", and `finish_swap` called
+its post-swap rebuild "the interim until S11 folds it into the swap itself".
+No §5 amendment names D-S11, and the queue's open question — the exact source
+rows — resolves from `metadata.rs`: the rollup is `AspectMetadata`, derived
+from the segment index (`from_index`) or folded one descriptor at a time
+(`folded`).
+
+**Chosen:** the `segment_index.db` `aspect_metadata` row is the rollup, and
+both writers fold it in their own transaction. A seal reads that row, folds its
+fresh descriptor, and commits `InsertNew` + `SeqBump` + `PutRollup` (a new
+`IndexOp`, `INSERT OR REPLACE` on the aspect key) in one `IndexTxn`. A swap
+derives the rollup from its post-swap rows — the current rows under the commit
+lock, with each plan op applied in memory — and commits it with the swap's ops,
+so a swap that deletes members without replacing them (a narrowing squash)
+stays exact, where a per-output fold would not. Rebuilds write the same row
+through a single-op `IndexTxn`. `PutRollup` counts as guarded for retries only
+because its callers hold the aspect's commit lock across the whole transaction,
+retries included, so no other writer of that row can commit between attempts.
+
+**Not moved:** `metadata.db` stays a control-plane file — the FRE-14
+`legacy_catalog` table lives there — and `AspectMetadataStore` stays a public
+type with its own tests, but the store no longer writes its rollup table and
+`SegmentStore::metadata()` now says so. Readers (`aspect_metadata`,
+`store_stats`, the fragmentation guard) read `segment_index.db`; the journal
+replay keeps its re-derive as a no-op reconciliation for pre-S11 or clobbered
+rows.
+
+## 2026-10-28 — D-S11 fix: open backfills the rollup rows the replay never writes
+
+**Correction to the entry above:** the journal replay does NOT reconcile
+pre-S11 rows in general — it re-derives only the aspects its journal names.
+A clean pre-S11 store (no journal rows) therefore opens with no
+`segment_index.db` rollup rows at all, and `aspect_metadata` reads default
+zeros for every aspect. The v0.1.0 compat gate caught it: a migrated `price`
+aspect read 0 nulls against the 14 v0.1.0 counted, while its segment count,
+rows and bytes — which come from the live segment scan, not the rollup — still
+matched. The re-derive itself is sound: `rebuild_aspect_metadata` on the
+migrated store returns the true 14, so the descriptors carry the null counts
+and only the rows are missing.
+
+**Fix:** open backfills exactly the missing rows (`backfill_missing_rollups`,
+step 13 of the open), after the journal replay and only for stores this build
+may write. Rebuilding every row on every open would rescan the whole index
+for stores that already have rows; deriving on read would change the
+materialized-rollup contract and pay a full index scan per read. Missing-only
+keeps an S11-native open at one `SELECT` per aspect and makes a pre-S11 store
+read correctly from its first open; a later seal or swap keeps the row current
+by folding, as usual.

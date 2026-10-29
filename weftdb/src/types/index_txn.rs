@@ -4,6 +4,10 @@
 //! Every state change of the write-once design commits exactly one `segment_index.db`
 //! transaction: a seal inserts its rows together with the allocator and ledger rows, a
 //! maintenance swap replaces and deletes its members together with its journal rows.
+//! Since S11 each of those transactions also writes the aspect's segment-set rollup
+//! row (`aspect_metadata`) in the same transaction, so the rollup can never lag the
+//! index it summarizes: a seal folds its segment in, a swap writes the rollup its
+//! post-swap rows derive.
 //! [`IndexTxn`] is that commit point. It applies a list of [`IndexOp`]s in one
 //! `BEGIN CONCURRENT … COMMIT`, so a crash, an error or a failed precondition between
 //! any two of them leaves none of them behind.
@@ -49,7 +53,7 @@
 //! transaction holding any of them is retried only when its conflict came before any op
 //! ran (a `Busy` at `BEGIN`, which used no snapshot), and is otherwise reported at its
 //! first conflict, as every segment-index write was before this type existed. Seals
-//! (`InsertNew` and `SeqBump`, since S7) get the retries, and so do the write-once swaps
+//! (`InsertNew` and `SeqBump`, since S7, plus the rollup fold, since S11) get the retries, and so do the write-once swaps
 //! of every maintenance operation (reconcile and split since S8, the overlap merge,
 //! squash and compaction since S9), whose ops are all guarded: `ReplaceExpected`,
 //! `DeleteExpected`, `InsertNew`, the journal ops and `SeqBump`.
@@ -64,8 +68,10 @@ use std::{fmt, time::Duration};
 use turso::Value;
 use weft_physical_type::SegmentDescriptor;
 
-use crate::types::durable::{
-	control_plane::connect, fault::{self, FaultPoint}
+use crate::types::{
+	durable::{
+		control_plane::connect, fault::{self, FaultPoint}
+	}, metadata::AspectMetadata
 };
 
 /// How many times a [`TxnErrorKind::Retryable`] failure is retried before it is
@@ -176,6 +182,11 @@ pub enum IndexOp {
 	/// Record that migration `id` (of release layout `layout`) applied, at `applied_ms`;
 	/// a migration already recorded keeps its first record.
 	RecordMigration { id: String, layout: u32, applied_ms: i64 },
+	/// Write `aspect`'s segment-set rollup row (`aspect_metadata`, S11): a seal folds
+	/// its fresh segment into the row it read, a swap writes the rollup its post-swap
+	/// rows derive, a rebuild writes the rollup the index derives. `INSERT OR REPLACE`
+	/// on the aspect key, so writing the same rollup twice changes nothing.
+	PutRollup { aspect: String, meta: AspectMetadata },
 }
 
 impl IndexOp {
@@ -191,7 +202,13 @@ impl IndexOp {
 			// A journal insert finds a taken name a conflict, as `InsertNew` does a taken id,
 			// and a journal delete removes the row of a name that is never reused, so
 			// running it again removes nothing another writer made.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::ClearJournal { .. } => true,
+			//
+			// A rollup write is guarded only because its callers hold the aspect's
+			// commit lock across the whole transaction, retries included, so no other
+			// writer of that aspect's rollup row can commit between attempts: a retry
+			// re-runs the same fold over the same index state. An `IndexTxn` run
+			// without that lock must not rely on it.
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } => true,
 			// `MetaSet` replaces the value, so a retry would overwrite what another writer
 			// committed in between. (Its one writer today is the open, under the root's
 			// LOCK, which nothing races.)
@@ -480,6 +497,19 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 			Ok(changed)
 		}
 		IndexOp::RecordMigration { id, layout, applied_ms } => conn.execute("INSERT OR IGNORE INTO store_migrations (id, layout, applied_ms) VALUES (?, ?, ?)", vec![Value::Text(id.clone()), Value::Integer(i64::from(*layout)), Value::Integer(*applied_ms)]).await.map_err(|e| statement_error(&format!("recording migration {id}"), &e)),
+		IndexOp::PutRollup { aspect, meta } => {
+			let (min_ts, max_ts) = meta.time_range.map_or((Value::Null, Value::Null), |(lo, hi)| (Value::Integer(lo), Value::Integer(hi)));
+			let decimal = |value: Option<&bigdecimal::BigDecimal>| value.map_or(Value::Null, |v| Value::Text(v.to_plain_string()));
+			let (min_value, max_value) = meta.value_range.as_ref().map_or((Value::Null, Value::Null), |(lo, hi)| (decimal(Some(lo)), decimal(Some(hi))));
+			conn.execute(
+				"INSERT OR REPLACE INTO aspect_metadata
+				(aspect, segment_count, total_rows, total_nulls, total_bytes, unsorted_segments, min_ts, max_ts, min_value, max_value)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				vec![Value::Text(aspect.clone()), integer(meta.segment_count as u64), integer(meta.total_rows), integer(meta.total_nulls), integer(meta.total_bytes), integer(meta.unsorted_segments as u64), min_ts, max_ts, min_value, max_value],
+			)
+			.await
+			.map_err(|e| statement_error(&format!("writing the {aspect:?} rollup"), &e))
+		}
 	}
 }
 
@@ -845,6 +875,28 @@ mod tests {
 		assert_eq!(seen, vec![(Some(5), Some(1), 2), (Some(5), Some(4), 2), (Some(9), Some(4), 2), (Some(9), Some(7), 4)], "no value moves back, and a new row's next_gen is at least 1");
 		assert_eq!((other.next_id, other.next_gen, other.epoch), (Some(1), Some(1), 0), "each aspect has a row of its own");
 		assert!(IndexOp::SeqBump { aspect: ASPECT.to_string(), next_id: 0, next_gen: 0, epoch: 0 }.is_guarded() && insert(row(0, 0, None)).is_guarded(), "a seal's transaction is retried on a conflict");
+	}
+
+	/// The rollup op (S11): writing an aspect's rollup row inserts it, and writing it
+	/// again replaces it rather than adding a row, so a seal's fold and a swap's
+	/// rebuild land in the same table the index lives in. It is retry-safe under the
+	/// aspect's commit lock (see [`IndexOp::is_guarded`]).
+	#[tokio::test]
+	async fn put_rollup_writes_and_overwrites_the_aspect_row() {
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let meta = AspectMetadata { segment_count: 2, total_rows: 20, total_nulls: 3, total_bytes: 256, unsorted_segments: 1, time_range: Some((0, 190)), value_range: Some((BigDecimal::from(0), BigDecimal::from(109))) };
+		let first = index.apply(&IndexTxn::new(vec![IndexOp::PutRollup { aspect: ASPECT.to_string(), meta: meta.clone() }])).await.expect("writes");
+		let overwrite = index.apply(&IndexTxn::new(vec![IndexOp::PutRollup { aspect: ASPECT.to_string(), meta: meta.clone() }])).await.expect("rewrites");
+		let mut rows = index.database().connect().expect("connects").query("SELECT segment_count, total_rows, total_nulls, total_bytes, unsorted_segments, min_ts, max_ts, min_value, max_value FROM aspect_metadata WHERE aspect = ?", [Value::Text(ASPECT.to_string())]).await.expect("reads");
+		let row = rows.next().await.expect("reads").expect("one rollup row");
+		let kept = (row.get_value(0).expect("count"), row.get_value(1).expect("rows"), row.get_value(2).expect("nulls"), row.get_value(3).expect("bytes"), row.get_value(4).expect("unsorted"), row.get_value(5).expect("min_ts"), row.get_value(6).expect("max_ts"), row.get_value(7).expect("min_value").as_text().cloned(), row.get_value(8).expect("max_value").as_text().cloned());
+		assert!(rows.next().await.expect("reads").is_none(), "the overwrite did not add a row");
+		drop(rows);
+		drop(index);
+		assert_eq!(first.changes, vec![1], "a fresh rollup write affects one row");
+		assert_eq!(overwrite.changes, vec![1], "an INSERT OR REPLACE on the same key still affects one row");
+		assert_eq!(kept, (Value::Integer(2), Value::Integer(20), Value::Integer(3), Value::Integer(256), Value::Integer(1), Value::Integer(0), Value::Integer(190), Some("0".to_string()), Some("109".to_string())));
+		assert!(IndexOp::PutRollup { aspect: ASPECT.to_string(), meta }.is_guarded(), "a rollup write is retried under its aspect's commit lock");
 	}
 
 	/// The journal ops (design section 5.3): a pending and a retired row record what they
