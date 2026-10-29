@@ -4,6 +4,48 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — Phase 0: where the willingness-to-pay hypotheses live, and what ticks the box
+
+**Ambiguous:** Phase 0 asks to "document willingness-to-pay hypotheses" and to "identify 3–5 design
+partners", but `docs/` was removed in #99 with the prose moved to basicautomation.io, and the
+2026-10-24 entry rejects re-adding it. The site is not writable from this repository.
+
+**Chosen:**
+
+1. Both documents sit at the repository root, beside `ROADMAP.md` and `DECISIONS.md` — the files
+   #99 kept — and the ROADMAP's Phase 0 lines link to them. When the site has a page for them, they
+   move there and the links follow.
+2. **Willingness-to-pay is ticked:** the deliverable is the documented hypotheses, and
+   `WILLINGNESS-TO-PAY.md` states six, each falsifiable, with a kill signal and a cheapest test,
+   every one marked untested. Its price bands are placeholders an agent derived from incumbent
+   categories, and it says so; the figures it leans on (spline vs linear on BTC, GPU vs rayon,
+   exact-decimal cost) were checked against the README's measured claims.
+3. **Design partners stays unticked.** `DESIGN-PARTNERS.md` is the profile, checklist and an
+   archetype shortlist with public corpora as stand-ins; nobody has been contacted, and choosing
+   and contacting partners is the operator's.
+
+**Rejected:** re-creating `docs/`; ticking the design-partner line on a shortlist alone.
+
+**Later the same day (operator):** the boundary and the opening prices in `WILLINGNESS-TO-PAY.md` are
+adopted as written. The single-node engine stays MIT/Apache, TLS and basic auth included. HA and
+replication, SSO/RBAC/audit, historian connectors and SLA support are paid, at $3k support / $12k
+per node / $30k per site per year, with a $7.5k benchmark report and free pilots at 50% off for two
+years. Contact is made as Basic Automation, discovery only until it is incorporated. A pilot
+without TLS or auth is fine as an isolated test now, not for 1.0. Hosting is a viable paid offer, priced on use once
+`weft-bench` publishes a cost figure. Benchmark publication: kdb+ and AVEVA PI are not benchmarked or
+published (their licences bar it without written consent); open-source engines are, under six rules
+(licence read, reproducible script, vendor-documented tuning, 14 days of vendor preview, losses
+published, corrections logged); paid reports stay private and the buyer confirms their own licence. Licences read the same day: TimescaleDB's TSL has no
+benchmark clause and is published as "TimescaleDB Community Edition" (its §2.4). QuestDB Enterprise's trial
+terms bar direct competitors (§3.6), and InfluxDB 3 Enterprise's licences allow only personal (At-Home) or
+internal (SLSA) use, so neither enterprise edition is benchmarked; their open-source editions are.
+
+**Reframed the same day (operator):** the design-partner line becomes "identify 3–5 open datasets
+with interpolation-heavy workloads" and is ticked on five selected in `DESIGN-PARTNERS.md`: UCI Beijing,
+NOAA NDBC, PhysioNet 2012, Petrobras 3W, BDG2. This is because Basic Automation is not incorporated and
+cannot sign partners yet. Recorded cost: datasets test the bench, not the market, so every
+willingness-to-pay hypothesis stays untested until buyer calls happen.
+
 ## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means
 
 **Ambiguous:** EVI-11 (#266) survives only as its title, in `ROADMAP.md` and in the 1.0 plan
