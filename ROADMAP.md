@@ -84,7 +84,7 @@ Interpolation and extrapolation run on the GPU, supported by a size-tiered LRU b
 - [ ] 5.7 Multi-GPU *(deferred until single-GPU wins are proven)*
 - [ ] Memory-mapped GPU I/O *(only after transfer bottlenecks are measured)*
 - [ ] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
-  - [x] **FOUND (2026-10-11, runtime) — `POST /api/v1/downsample` rejected the documented multi-word tokens. Closed 2026-10-28 (FRE-5, the spelling half):** the JSON body reads `Aggregation::from_token`, so `twa_linear`, `sketch_p99`, the aliases and any letter case parse as they do in a query string, and the bare lowercase names still parse. The rest of FRE-5, "no silent narrowing", stays open.
+  - [x] **FOUND (2026-10-11, runtime) — `POST /api/v1/downsample` rejected the documented multi-word tokens. Closed 2026-10-28 (FRE-5, the spelling half):** the JSON body reads `Aggregation::from_token`, so `twa_linear`, `sketch_p99` and the aliases parse as they do in a query string, and the bare lowercase names still parse. Tokens are exact-case as of 2026-10-29 (FRE-5's first clause, which breaks v0.1.0's case folding; see the CHANGELOG): `Min` and `MEDIAN` are a `400`. The rest of FRE-5, "no silent narrowing", stays open.
   - [ ] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138` …
   - [ ] **NEXT — the compute endpoints pay the same tax:**
   - [x] **Reconcile with EVI-10A** (2026-10-19: the API now has an input cap, `interpolate_range::MAX_KNOTS`, a `pub` const the review may keep, turn into an option or drop)
