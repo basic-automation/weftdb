@@ -33,6 +33,21 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **Every HTTP route now registers through one sealed registry** (security track
+  SEC-3). `weft-server/src/lib.rs` no longer carries the route chain: each of the
+  55 routes (49 path templates) is registered in `weft-server/src/routes.rs` by a
+  per-area registration function, with a `RouteSpec {scope, audit,
+  operator_detail, tier, admission_class, operation_id}`. The scope table is
+  frozen at eight scopes (`probe`, `metrics`, `read`, `compute`, `ingest`,
+  `declare`, `maintain`, `backup`) alongside six roles with cumulative grants
+  (`anonymous` through `admin`); SEC-6 will enforce the table with API keys. The
+  one registry produces the router, the policy table, the admission-class table
+  and a generated OpenAPI document (`routes::openapi_document()`). The gate is
+  fail-closed: a request to a registered path under an unregistered method is
+  refused `405 method_not_allowed` with an `Allow` header (previously axum's
+  bare 405 with an empty body), and an unregistered path keeps the envelope's
+  `404 route_not_found`. No route changed its method, path or handler.
+
 - **`weft-server import-rows-mode` migrates one 0.1.x subject into a Storage v2 store**
   (legacy lane FRE-14c). A 0.1.x data directory keeps one SQLite database per aspect,
   timestamps in milliseconds, with its ingest queue, pattern stores and `metadata.db` catalog
@@ -552,6 +567,24 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **Reduction tokens are exact-case** (ROADMAP, FRE-5). `Aggregation::from_token` now matches the
+  lowercase wire tokens exactly, so `?agg=`, the JSON body's `aggregations`, the stored-range
+  `agg=` and `weft-bench --ds-aggs` refuse `Min`, `SUM` and `MEDIAN` with a `400` (or a CLI error)
+  that names the token. **This breaks v0.1.0**, whose query string folded case: send `min`,
+  `sum`, `p50`, `twa_linear` and the other lowercase spellings the README lists. The
+  underscore spellings, the aliases and the bare lowercase names are unchanged.
+
+- **The segment-set rollup lives in `segment_index.db`** (1.0 plan D-S11). The
+  rollup row (`aspect_metadata`) was written to `metadata.db` in a second transaction
+  after a seal's index commit, and rebuilt in a second transaction after a swap's —
+  so a crash between the two left the rollup behind the index it summarizes, and a
+  failed rebuild left it stale with only a warning. Now the seal's transaction folds
+  its segment into the rollup row, and the swap's transaction writes the rollup its
+  post-swap rows derive, in the same `segment_index.db` transaction that commits the
+  rows. `SegmentStore::aspect_metadata`, `store_stats` and the fragmentation guard
+  read the rollup from `segment_index.db`; the journal replay still re-derives it as
+  a no-op reconciliation. `metadata.db` keeps the rows-mode legacy catalog, and its
+  rollup table is the pre-S11 home, no longer written by the store.
 - **The README stops promising what no clone can deliver.** No benchmark artifact — manifest or
   result JSON — is committed anywhere in the tree, so its Performance section now distinguishes a
   figure that names the bench it came from from one that is only a dated local measurement, and
@@ -888,6 +921,21 @@ only the control plane, not the segment frames.
   kept for tests.
 
 ### Fixed
+
+- **The JSON body's `aggregations` accepts the documented reduction spellings.** `POST /api/v1/downsample`
+  read its tokens through the bare lowercase variant names only, so the README's `twa_linear`, `sketch_p99` and aliases such as
+  `median` were rejected as unknown variants, and a name copied from a response (`twa_linear`) could not be sent back. The body
+  now reads the query string's parser (`Aggregation::from_token`), so both surfaces accept the same set; the bare names
+  (`twalinear`, `sketchp99`) still parse. An unknown token is a `400` that names it and lists the accepted spellings (ROADMAP, FRE-5).
+
+- **A pre-S11 store read zero metadata until its next seal or swap (D-S11).**
+  Moving the rollup to `segment_index.db` left stores written before S11 with no
+  rollup rows at all, and the journal replay only re-derives the aspects its
+  journal names — so a clean pre-S11 store opened with `aspect_metadata`
+  reading default zeros (the v0.1.0 compat gate caught it: a migrated aspect
+  read 0 nulls against the 14 v0.1.0 counted). Open now backfills exactly the
+  missing rows after the journal replay; S11-native stores, whose rows exist,
+  pay one `SELECT` per aspect and nothing more.
 
 - **Power loss during or after a reconcile or split could lose or tear rows.** Both
   rewrote the segment's frame in place with an unsynced write (a split also wrote its

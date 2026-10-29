@@ -567,12 +567,14 @@ mod tests {
 		for uri in ["/api/v1/storage/reconcile", "/api/v1/storage/reconcile?hot_cold=true", "/api/v1/storage/reconcile?overlaps=true", "/api/v1/storage/reconcile?overlaps=true&split_min_bytes=1"] {
 			let dir = TempDir::new().unwrap();
 			let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+			let mut damaged_frame: Option<String> = None;
 			for aspect in ["s1", "s2", "s3", "s4", "s5", "s6"] {
 				store.declare(aspect, &sc).await.expect("declares");
 				let first = store.seal(aspect, &sc, &[100_i64, 130, 110], &[v("1"), v("3"), v("2")]).await.expect("seal 0");
 				store.seal(aspect, &sc, &[120_i64, 150, 125], &[v("4"), v("6"), v("5")]).await.expect("seal 1");
 				store.seal(aspect, &sc, &[140_i64, 170, 145], &[v("7"), v("9"), v("8")]).await.expect("seal 2");
 				if aspect == "s2" {
+					damaged_frame = Some(first.path.clone());
 					let file = std::fs::OpenOptions::new().write(true).open(&first.path).expect("opens frame");
 					let len = file.metadata().expect("stats frame").len();
 					file.set_len(len / 2).expect("truncates frame");
@@ -591,7 +593,7 @@ mod tests {
 			let failed = json["failed"].as_array().unwrap_or_else(|| panic!("{uri}: failed is a list: {json}"));
 			assert_eq!(failed.len(), 1, "{uri}: only the damaged aspect fails: {json}");
 			assert_eq!(failed[0]["aspect"], "s2", "{uri}");
-			assert!(failed[0]["error"].as_str().unwrap_or_default().contains("s2-0.weftseg"), "{uri}: the error names the damaged frame: {json}");
+			assert!(failed[0]["error"].as_str().unwrap_or_default().contains(std::path::Path::new(damaged_frame.as_ref().unwrap()).file_name().and_then(|name| name.to_str()).unwrap_or_default()), "{uri}: the error names the damaged frame: {json}");
 			let reached = if uri.contains("overlaps") { s6.overlapping_segments == 0 } else { s6.unsorted_segments == 0 };
 			assert!(reached, "{uri}: the last aspect in name order is still reached: {s6:?}");
 		}
