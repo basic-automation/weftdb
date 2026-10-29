@@ -1,4 +1,6 @@
 [workspace]
+# weft-xbench builds DuckDB from C++ source; it is its own workspace (see its Cargo.toml).
+exclude = ["weft-xbench"]
 resolver = "2"
 members = [
 	"weftdb",

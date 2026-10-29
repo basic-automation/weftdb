@@ -18,6 +18,14 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **`weft-xbench`: the cross-engine benchmark, WeftDB against DuckDB** (evidence track EVI-13).
+  A separate workspace (it builds DuckDB from C++) whose lock is seeded from the workspace's and
+  checked for drift in CI. It times **load** (WeftDB seal vs DuckDB appender + `CHECKPOINT`) and
+  **linear interpolation** for four arms: WeftDB in-memory, stored, stored `f64`, and DuckDB `DOUBLE`
+  via `ASOF JOIN` SQL that follows splimes' extrapolation rule. Datasets are MCAR and block
+  missingness at three scales, plus UCI with `--uci`. Every arm is gated against the in-memory grid
+  and scored against the ground truth; any disagreement exits 1. Run with
+  `TMPDIR=<fast disk> cargo run --release --manifest-path weft-xbench/Cargo.toml`.
 - **Stored WeftDB benchmark adapter in `weft-bench`** (evidence track EVI-11). `--stored` adds a
   `weftdb-stored` result to an interpolation run: the dataset is sealed into a temporary
   `SegmentStore` (1024-row segments, the narrowest lossless value type, nanosecond timestamps)

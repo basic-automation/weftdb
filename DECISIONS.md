@@ -4,6 +4,69 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — EVI-13: what "weft-xbench crate, seeded lock, load and interpolation arms" means
+
+**Ambiguous:** EVI-13 (#275) survives as one line, "DuckDB adapter I: weft-xbench crate, seeded lock,
+load and interpolation arms". The 1.0 plan's decision 18 (`f085f84:docs/release/1.0-plan.md:540`)
+gives the report's scope (WeftDB stored, in-memory and `f64` against DuckDB `DOUBLE` and `DECIMAL`, on
+MCAR, block-missingness and UCI household-power data at three scales), and the 2026-10-09 ROADMAP note
+says the `duckdb` crate belongs behind an off-by-default switch because of its C++ build. Nothing says
+what "seeded lock" is, how DuckDB should interpolate, or which arms are EVI-13's and which EVI-14's.
+
+**Chosen:**
+
+1. **A separate workspace, not a feature.** `weft-xbench/` has an empty `[workspace]` table and the
+   root `Cargo.toml` excludes it. An off-by-default feature still compiles under CI's
+   `clippy --workspace --all-features` on every push; a separate workspace never does.
+2. **"Seeded lock" = its own `Cargo.lock`, copied from the workspace's.** Every dependency the two
+   share resolves to the same version, so the WeftDB being benchmarked is the one the workspace
+   ships. `scripts/xbench/check-lock.py` fails on drift (same name and semver-compatible class, at
+   another version). A new major that only DuckDB pulls in is a separate package and is allowed. It
+   runs in CI as `weft-xbench lock`. `duckdb` 1.20000.1 now uses `arrow` 60, the workspace's
+   major, and a direct `arrow = "=60.0.0"` pin keeps the minor equal too.
+3. **Arms.** EVI-13 has four: `weftdb-memory` (the reference), `weftdb-stored` (EVI-11's adapter),
+   `weftdb-stored-f64` (`interpolate_range_f64`, decision 18's `f64` arm, which EVI-11 left here), and
+   `duckdb-double`. `DECIMAL`, downsampling and storage bytes are EVI-14's. **Load** times getting the
+   data into durable storage: a WeftDB seal against DuckDB's appender plus `CHECKPOINT`, both in
+   `TMPDIR`. **Interpolation** is piecewise-linear, the one method all four implement.
+4. **DuckDB interpolates in SQL, as a user would:** `range()` for the grid, two `ASOF JOIN`s for the
+   knots either side, and the first or last segment's line extended past the data. That is splimes'
+   `Linear` rule, so the two engines answer the same question. Duplicate instants keep the last row,
+   as splimes does. Both engines' synchronous work runs on tokio's blocking pool, so the hand-off is in
+   every arm's timing alike.
+5. **Every arm is gated against the in-memory WeftDB grid** (relative tolerance 1e-9), and synthetic
+   datasets are also scored against their analytic ground truth. A disagreement fails the gate, is
+   reported beside its timing, and makes the binary exit 1.
+6. **Datasets.** MCAR and block missingness come from the same seeded one-day profile (20% missing;
+   blocks are 1/200 of the series), reconstructed per second, so input grows with scale and the grid
+   stays at 86,401 points. UCI takes the first `point_count` rows, reconstructed per minute. Default
+   scales are `tiny`, `small` and `medium`.
+
+**Rejected:** a `duckdb` feature on `weft-bench` (still built by `--all-features`); a DuckDB arm that
+pulls rows out and interpolates in Rust (that measures Rust, not DuckDB); comparing only interior grid
+points (the edges are where a hand-written SQL fill usually goes wrong, so they are gated too).
+
+**Load is not like-for-like yet, and the first run says so.** The WeftDB arms seal 1,024-row
+segments, EVI-11's layout chosen for the read side, so `medium` is about 590 durable seals. DuckDB
+does one bulk append and one `CHECKPOINT`. The first run (2026-10-29, `/mnt/weftbench`, 5 reps)
+measured WeftDB load at 4–5 s against DuckDB's 150–175 ms at `medium`. The interpolation figures were:
+
+| `medium` p50 | MCAR | block |
+| --- | --- | --- |
+| `weftdb-memory` | 139.7 ms | 113.2 ms |
+| `weftdb-stored` | 174.6 ms | 138.9 ms |
+| `weftdb-stored-f64` | 52.3 ms | 37.6 ms |
+| `duckdb-double` | 45.8 ms | 39.2 ms |
+
+At `small`, `weftdb-stored-f64` beat DuckDB (6.6 ms against 24.3 ms MCAR); at `medium` DuckDB is level
+or ahead. These are recorded as found, not tuned. A load arm that seals one segment per load (the
+same shape as DuckDB's single transaction) is EVI-14's to add beside this one, so the report can show
+both layouts.
+
+**Not run here:** the UCI datasets. The corpus is not on this machine, and `--uci FILE` adds them.
+Building on the shared rotational target directory stalled at link time under I/O pressure;
+`CARGO_TARGET_DIR` and `TMPDIR` on `/mnt/weftbench` (decision 19's SSD) build and run cleanly.
+
 ## 2026-10-29 — Phase 0: where the willingness-to-pay hypotheses live, and what ticks the box
 
 **Ambiguous:** Phase 0 asks to "document willingness-to-pay hypotheses" and to "identify 3–5 design
