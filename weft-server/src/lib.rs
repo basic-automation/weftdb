@@ -8,9 +8,12 @@
 //!
 //! ## Shape (this is the skeleton)
 //!
-//! - [`app`] builds the [`axum::Router`] for the whole service. It is the single
-//!   place routes are registered, so tests exercise the exact router the binary
-//!   serves (no divergence between test and production wiring).
+//! - [`app`] builds the [`axum::Router`] for the whole service from the sealed
+//!   route registry in [`routes`] (SEC-3): the registry is the single place
+//!   routes are registered, so tests exercise the exact router the binary
+//!   serves (no divergence between test and production wiring), and the same
+//!   registry produces the policy table, the class table and the OpenAPI
+//!   document.
 //! - Liveness vs readiness are kept distinct, matching standard orchestration
 //!   probes: `health` reports the process is up (`GET /health`), `ready`
 //!   reports the service is ready to accept traffic (`GET /ready`). Today
@@ -48,6 +51,7 @@ pub mod maintain;
 pub mod metrics;
 pub mod panic_hook;
 pub mod reconcile_daemon;
+pub mod routes;
 pub mod settings;
 pub mod state;
 pub mod storage;
@@ -58,9 +62,7 @@ mod test_fs;
 mod test_support;
 pub mod trace;
 
-use axum::{
-	http::{Method, Uri}, middleware, routing::{get, post}, Json, Router
-};
+use axum::{middleware, Router};
 pub use backup_daemon::{backup_tick, list_generated_backups, prune_generated_backups, spawn_backup_daemon, BackupDaemonConfig};
 pub use downsample::{downsample, downsample_arrow, downsample_csv, downsample_ilp, downsample_ilp_arrow, downsample_ilp_csv, downsample_ilp_parquet, downsample_parquet, Aggregation, DownsampleRequest, DownsampleResponse};
 pub use error::{ApiError, Code};
@@ -68,6 +70,7 @@ pub use host_guard::{HostGuard, ALLOW_ANY_HOST_ENV};
 pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpolate_ilp, interpolate_ilp_arrow, interpolate_ilp_csv, interpolate_ilp_parquet, interpolate_parquet, interpolate_point, InterpolateConfig, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse, MAX_INTERPOLATE_OUTPUT_POINTS, MAX_INTERPOLATE_POINTS_ENV};
 pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyHistogram, LatencyHistogramSnapshot, LatencyProfile, Metrics, MetricsSnapshot, ProfileReport, SharedMetrics};
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
+pub use routes::{AdmissionClass, Audit, ClassEntry, PolicyEntry, Role, RouteEntry, RouteSpec, RouteTable, Routes, Scope, SealedRoutes};
 use serde::Serialize;
 pub use state::AppState;
 pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_downsample, storage_downsample_arrow, storage_downsample_csv, storage_downsample_parquet, storage_point, storage_points, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, MultiPointParams, PointParams, StorageDownsampleParams, StoreStatsResponse, StoredPoint, StoredPointEntry, StoredPointResponse, StoredPointsResponse, StoredRangeResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};
@@ -159,37 +162,15 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 
 /// Build the application router over a fully-formed [`AppState`].
 ///
-/// This is the single place routes are registered. The state carries the metrics
-/// handle (projected to the capability handlers via [`axum::extract::FromRef`]),
-/// an optional segment store backing the storage-query endpoints, and the request
-/// guard ([`host_guard`]) applied to every route, inside the per-request trace span.
+/// The router is built by the sealed route registry ([`routes::build_registry`]):
+/// every route it serves is a registry entry with a [`RouteSpec`], and the
+/// registry's fail-closed gate is part of that router. The state carries the
+/// metrics handle (projected to the capability handlers via
+/// [`axum::extract::FromRef`]), an optional segment store backing the
+/// storage-query endpoints, and the request guard ([`host_guard`]) applied to
+/// every route, inside the per-request trace span.
 pub fn app_with_state(state: AppState) -> Router {
-	Router::new().route("/health", get(health)).route("/ready", get(ready)).route("/metrics", get(metrics::metrics)).route("/debug/profile/current", get(metrics::profile_current)).route("/api/v1/interpolate", post(interpolate)).route("/api/v1/interpolate/csv", post(interpolate_csv)).route("/api/v1/interpolate/arrow", post(interpolate_arrow)).route("/api/v1/interpolate/parquet", post(interpolate_parquet)).route("/api/v1/interpolate/ilp", post(interpolate_ilp)).route("/api/v1/interpolate/ilp/csv", post(interpolate_ilp_csv)).route("/api/v1/interpolate/ilp/arrow", post(interpolate_ilp_arrow)).route("/api/v1/interpolate/ilp/parquet", post(interpolate_ilp_parquet)).route("/api/v1/interpolate/point", post(interpolate_point)).route("/api/v1/downsample", post(downsample)).route("/api/v1/downsample/csv", post(downsample_csv)).route("/api/v1/downsample/arrow", post(downsample_arrow)).route("/api/v1/downsample/parquet", post(downsample_parquet)).route("/api/v1/downsample/ilp", post(downsample_ilp)).route("/api/v1/downsample/ilp/csv", post(downsample_ilp_csv)).route("/api/v1/downsample/ilp/arrow", post(downsample_ilp_arrow)).route("/api/v1/downsample/ilp/parquet", post(downsample_ilp_parquet)).route("/api/v1/storage/aspects", get(storage_aspects).post(declare::declare_aspect)).route("/api/v1/storage/catalog", get(storage_catalog)).route("/api/v1/storage/stats", get(storage_stats)).route("/api/v1/storage/reconcile", post(maintain::reconcile_store)).route("/api/v1/storage/backup", post(backup_routes::backup_store)).route("/api/v1/storage/restore/drill", post(backup_routes::restore_drill)).route("/api/v1/storage/{aspect}/range", get(storage_time_range)).route("/api/v1/storage/{aspect}/range.parquet", get(storage_time_range_parquet)).route("/api/v1/storage/{aspect}/range.csv", get(storage_time_range_csv)).route("/api/v1/storage/{aspect}/points", get(storage_time_range_json).post(ingest::ingest_points)).route("/api/v1/storage/{aspect}/downsample", get(storage_downsample).post(storage_downsample)).route("/api/v1/storage/{aspect}/downsample.csv", get(storage_downsample_csv).post(storage_downsample_csv)).route("/api/v1/storage/{aspect}/downsample.arrow", get(storage_downsample_arrow).post(storage_downsample_arrow)).route("/api/v1/storage/{aspect}/downsample.parquet", get(storage_downsample_parquet).post(storage_downsample_parquet)).route("/api/v1/storage/{aspect}/at", get(storage_point)).route("/api/v1/storage/{aspect}/at-multi", get(storage_points)).route("/api/v1/storage/{aspect}/reconcile", post(maintain::reconcile_aspect)).route("/api/v1/storage/{aspect}/squash", post(maintain::squash_aspect)).route("/api/v1/storage/{aspect}/compact", post(maintain::compact_aspect)).route("/api/v1/storage/{aspect}/ilp", post(ingest::ingest_ilp)).route("/api/v1/storage/{aspect}/csv", post(ingest::ingest_csv)).route("/api/v1/storage/{aspect}/value-range", get(storage_value_range)).route("/api/v1/storage/{aspect}/value-range.parquet", get(storage_value_range_parquet)).route("/api/v1/storage/{aspect}/value-range.csv", get(storage_value_range_csv)).route("/api/v1/storage/{aspect}/value-points", get(storage_value_range_json)).route("/api/v1/storage/{aspect}/parquet", post(ingest::ingest_parquet)).route("/api/v1/storage/{aspect}/stats", get(storage_aspect_stats)).route("/api/v1/storage/{aspect}/schema", get(storage_aspect_schema)).fallback(route_not_found).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(trace::request_span)).with_state(state)
-}
-
-/// A path no route matches.
-///
-/// Before X-ERR an unmatched path got axum's bare `404` with an empty body, so a client
-/// that mistyped a route could not tell that from a route that exists and refused it: the
-/// code and the sentence together say "there is no such endpoint", which is the one 404
-/// class no handler can report for itself. The method is named because every route here is
-/// method-specific — `GET /api/v1/storage/price/points` exists, `DELETE` there does not,
-/// and the message is where that difference shows.
-async fn route_not_found(method: Method, uri: Uri) -> ApiError {
-	ApiError::new(Code::RouteNotFound, format!("no route matches {method} `{}`; `GET /api/v1/storage/aspects` lists the aspects, and the API guide at `docs/INTEGRATION.md` lists the endpoints", uri.path()))
-}
-
-/// Liveness probe: the process is up and can serve a request.
-async fn health() -> Json<HealthResponse> {
-	Json(HealthResponse::default())
-}
-
-/// Readiness probe: the service is ready to accept traffic. Reports whether a
-/// segment store is configured so an operator can confirm the storage endpoints
-/// are live, and whether that store is write-poisoned and needs a restart.
-async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> Json<ReadyResponse> {
-	let poison = state.store().and_then(|store| store.poisoned());
-	Json(ReadyResponse { segment_store: state.store().is_some(), ..ReadyResponse::default() }.with_poison(poison))
+	routes::build_registry().router().layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(trace::request_span)).with_state(state)
 }
 
 #[cfg(test)]

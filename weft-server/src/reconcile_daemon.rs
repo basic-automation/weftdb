@@ -647,7 +647,7 @@ mod tests {
 		assert_eq!(lines.len(), 1, "exactly one failure line: {lines:#?}");
 		assert!(lines[0].contains("aspect=s2"), "the line names the bad aspect: {}", lines[0]);
 		assert!(lines[0].contains("sweep=\"threshold\""), "the line names the sweep kind: {}", lines[0]);
-		assert!(lines[0].contains("s2-0.weftseg"), "the line carries the error chain down to the frame: {}", lines[0]);
+		assert!(lines[0].contains("s2~g1~p1.weftseg"), "the line carries the error chain down to the frame: {}", lines[0]);
 		assert_eq!(sweep.aspects_reconciled, 5, "every healthy aspect is reconciled");
 		assert_eq!(sweep.failed.len(), 1);
 		assert_eq!(s6_unsorted, 0, "the last aspect in name order is still reached");

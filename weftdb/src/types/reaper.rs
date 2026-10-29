@@ -23,9 +23,12 @@
 //! - **G1.** It takes the retired names no pin or hold protects any more.
 //! - **G2.** It never unlinks a name a live row references. That cannot happen by
 //!   construction; it is the guard that keeps a bug elsewhere from deleting data.
-//! - **G3.** It unlinks the frame (a missing file counts as unlinked) and, for a legacy
-//!   `{aspect}-{id}` frame, the id-named sidecar, but only when no live row has that id
-//!   any more (until S15, sidecars are named by id, which a swap's output may keep).
+//! - **G3.** It unlinks the frame (a missing file counts as unlinked) and its sidecar:
+//!   for a legacy `{aspect}-{id}` frame, the id-named sidecar, but only when no live
+//!   row has that id any more (a swap's output may keep the id and refresh that
+//!   sidecar); for a write-once frame, the sidecar beside its own name, which no
+//!   live row references once the frame itself is unlinked, since frame names are
+//!   never reused.
 //! - **G4.** The store fsyncs `segments/` once.
 //! - **G5.** The store deletes the processed journal rows in one commit.
 //!
@@ -56,7 +59,7 @@ use std::{
 
 use crate::{
 	aspect_name, types::{
-		durable::{DirSyncer, StoreFs}, index_txn::IndexRow, segment_store::{contained_file, legacy_file_id}
+		durable::{DirSyncer, StoreFs}, frame_name, index_txn::IndexRow, segment_store::{contained_file, legacy_file_id}
 	}
 };
 
@@ -393,20 +396,29 @@ impl Reaper {
 		swept
 	}
 
-	/// G3's sidecar half: the id-named sidecar of a retired legacy `{aspect}-{id}` frame,
-	/// once no live row of the aspect has that id (a swap that kept the id refreshes the
-	/// sidecar for its output instead). Best effort: a sidecar is an accelerator.
+	/// G3's sidecar half: the sidecar of a retired frame, once no live row references
+	/// the frame any more. A legacy `{aspect}-{id}` frame's sidecar is id-named, so it
+	/// goes only when no live row of the aspect has that id (a swap that kept the id
+	/// refreshes the sidecar for its output instead). A write-once frame's sidecar
+	/// sits beside its own name, which no live row can reference once the frame is
+	/// unlinked, since frame names are never reused.
 	async fn remove_orphan_sidecar(&self, entry: &JournalEntry, live: &LiveFrames) {
-		let Some((aspect, id)) = legacy_file_id(&entry.name) else { return };
-		if aspect != entry.aspect || live.ids.contains(&id) || aspect_name::validate(aspect).is_err() {
+		let sidecar = if let Some((aspect, id)) = legacy_file_id(&entry.name) {
+			if aspect != entry.aspect || live.ids.contains(&id) || aspect_name::validate(aspect).is_err() {
+				return;
+			}
+			format!("{aspect}-{id}.weftpart")
+		} else if let Some(parsed) = frame_name::parse(&entry.name) {
+			format!("{}~g{}~p{}.weftpart", parsed.stem, parsed.gen, parsed.prec)
+		} else {
 			return;
-		}
-		let removed = match contained_file(&self.segments, &format!("{aspect}-{id}.weftpart")) {
+		};
+		let removed = match contained_file(&self.segments, &sidecar) {
 			Ok(path) => self.fs.remove_file(&path).await.map_err(anyhow::Error::from),
 			Err(e) => Err(e),
 		};
 		if let Err(e) = removed {
-			tracing::warn!(aspect, id, error = %e, "could not remove the sidecar of a reaped segment");
+			tracing::warn!(aspect = entry.aspect, frame = entry.name, error = %e, "could not remove the sidecar of a reaped segment");
 		}
 	}
 }
