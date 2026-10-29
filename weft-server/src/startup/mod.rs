@@ -113,5 +113,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// After the bind and in the background, so serving never waits for it.
 	daemons::spawn_gpu_calibration_if_enabled();
 
-	serve::run(listener, state, otel_provider, limits, &mut shutdown).await
+	serve::run(listener, state.clone(), otel_provider, limits, &mut shutdown).await?;
+	// Serving stopped cleanly (including a signal before serving, which exits 0
+	// without accepting a connection): record the clean shutdown, so the next
+	// open's `/ready` can report `previous_clean_shutdown: true` (D-S12). A
+	// serve failure is not a clean shutdown, and leaves the flag at the `0`
+	// the open wrote.
+	if let Some(store) = state.store() {
+		store.mark_clean_shutdown().await?;
+	}
+	Ok(())
 }

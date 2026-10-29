@@ -78,7 +78,7 @@ pub use state::AppState;
 pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_downsample, storage_downsample_arrow, storage_downsample_csv, storage_downsample_parquet, storage_point, storage_points, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, MultiPointParams, PointParams, StorageDownsampleParams, StoreStatsResponse, StoredPoint, StoredPointEntry, StoredPointResponse, StoredPointsResponse, StoredRangeResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};
 
 pub use crate::{
-	declare::{declare_aspect, DeclareAspectRequest, DeclareAspectResponse}, ingest::{ingest_csv, ingest_ilp, ingest_parquet, ingest_points, CsvIngestParams, IlpIngestParams, IngestPoint, IngestRequest, IngestResponse, ParquetIngestParams}, maintain::{reconcile_aspect, reconcile_store, ReconcileResponse, ReconcileStoreResponse, SweepFailure}
+	declare::{declare_aspect, DeclareAspectRequest, DeclareAspectResponse}, ingest::{ingest_csv, ingest_ilp, ingest_parquet, ingest_points, CsvIngestParams, IlpIngestParams, IngestPoint, IngestRequest, IngestResponse, ParquetIngestParams}, maintain::{fsck_store, purge_expired_quarantine, quarantine_list, quarantine_purge, quarantine_release, reconcile_aspect, reconcile_store, PurgeExpiredResponse, QuarantineParams, ReconcileResponse, ReconcileStoreResponse, SweepFailure}
 };
 
 /// The server's package version, surfaced in probe responses so a deployed
@@ -111,7 +111,9 @@ impl Default for HealthResponse {
 pub struct ReadyResponse {
 	/// `true` once the service can accept traffic. The stateless API is always
 	/// ready; this gains further dependency checks as more of the control plane is
-	/// wired in.
+	/// wired in. `false` — answered with `503` — exactly when the store reports
+	/// `incompatible_store` (D-S12): a newer-format frame means this build must
+	/// not serve this store.
 	pub ready: bool,
 	/// Logical service name ([`SERVICE`]).
 	pub service: &'static str,
@@ -130,11 +132,28 @@ pub struct ReadyResponse {
 	pub restart_required: bool,
 	/// Why the store is poisoned, while it is.
 	pub poison_reason: Option<String>,
+	/// The store's identity (`store_uuid` of its `STORE_FORMAT` marker), when a
+	/// store is configured. D-S12.
+	pub store_uuid: Option<String>,
+	/// The store's durability class (`full`, or `process-crash-only` on Windows),
+	/// when a store is configured. D-S12.
+	pub durability_class: Option<&'static str>,
+	/// Whether the previous process that held the store shut down cleanly, when a
+	/// store is configured. D-S12.
+	pub previous_clean_shutdown: Option<bool>,
+	/// Corrupt quarantine records the last recovery pass left, counted only (SEC:
+	/// `/ready` carries counts, never segment contents). D-S12.
+	pub quarantined: usize,
+	/// Suspect quarantine records the last recovery pass left, counted only. D-S12.
+	pub suspect: usize,
+	/// Whether any suspect record's cause is a frame version this build predates:
+	/// the store holds data written by a newer server, and `ready` is `false`. D-S12.
+	pub incompatible_store: bool,
 }
 
 impl Default for ReadyResponse {
 	fn default() -> Self {
-		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false, poisoned: false, restart_required: false, poison_reason: None }
+		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false, poisoned: false, restart_required: false, poison_reason: None, store_uuid: None, durability_class: None, previous_clean_shutdown: None, quarantined: 0, suspect: 0, incompatible_store: false }
 	}
 }
 
@@ -171,8 +190,31 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// [`axum::extract::FromRef`]), an optional segment store backing the
 /// storage-query endpoints, and the request guard ([`host_guard`]) applied to
 /// every route, inside the per-request trace span.
+///
+/// The `Weft-Incomplete` layer runs after the handlers: when the store holds a
+/// suspect quarantine record, stored-data reads are incomplete (the suspect
+/// segments are removed from reads), and their responses carry the header (D-S12).
 pub fn app_with_state(state: AppState) -> Router {
-	routes::build_registry().router().layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(trace::request_span)).with_state(state)
+	routes::build_registry().router().layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(trace::request_span)).with_state(state)
+}
+
+/// Mark stored-data reads incomplete when the store holds suspect segments
+/// (D-S12, C5): a suspect segment is removed from reads, so a range, point or
+/// downsample answer over a store holding one is missing data the store still
+/// holds on disk. The header rides on stored-data reads only — `GET`
+/// `/api/v1/storage/...` and the POST downsample reads — never on ingest,
+/// declare, maintenance or the probes, whose answers are not segment reads.
+async fn incomplete_header(axum::extract::State(state): axum::extract::State<AppState>, request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next) -> axum::response::Response {
+	let is_storage_read = {
+		let path = request.uri().path();
+		let method = request.method();
+		path.starts_with("/api/v1/storage/") && (method == axum::http::Method::GET || (method == axum::http::Method::POST && path.contains("/downsample")))
+	};
+	let mut response = next.run(request).await;
+	if is_storage_read && state.store().is_some_and(|store| store.has_suspect_segments()) {
+		response.headers_mut().insert("Weft-Incomplete", axum::http::HeaderValue::from_static("true"));
+	}
+	response
 }
 
 #[cfg(test)]

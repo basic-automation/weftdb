@@ -42,6 +42,10 @@
 //!   0.1.x kept beside the rows — and nothing else: the import writes it, and no
 //!   store open, seal or read touches it, so an older layout-2 build reads the store
 //!   exactly as before with one table it never queries.
+//! - **`0004_d_s12`** (layout 2): the C5 quarantine columns (plan §5 D-S12):
+//!   `segment_quarantine.class`, `min_ts`, `max_ts` and `series_id`. A store that
+//!   predates it keeps its records, which read back as class `corrupt` with no
+//!   time span and series 0, the same defaults the new table shape declares.
 
 use std::collections::BTreeSet;
 
@@ -114,7 +118,7 @@ pub(crate) struct Floors {
 /// Every registered migration, in id order. An id is four digits, an underscore, and a
 /// lower snake_case name: the digits are the ordinal that `pending` and `after` select on,
 /// so the numbering rule is part of the registry's contract and the test below asserts it.
-pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }];
+pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }];
 
 /// The ordinal of a migration id: its leading digits (`0002_s6_s7` → 2). An id without
 /// them sorts first.
@@ -332,7 +336,7 @@ const V2_INDEX_TABLES: [&str; 6] = [
 	// state is 'pending' (an output not yet swapped in) or 'retired' (awaiting the reaper).
 	"CREATE TABLE IF NOT EXISTS frame_journal (name TEXT NOT NULL PRIMARY KEY, aspect TEXT NOT NULL, state TEXT NOT NULL, retire_epoch INTEGER, created_ms INTEGER NOT NULL)",
 	"CREATE TABLE IF NOT EXISTS ingest_ledger (aspect TEXT NOT NULL, key TEXT NOT NULL, fingerprint INTEGER NOT NULL, row_count INTEGER NOT NULL, min_ts INTEGER, max_ts INTEGER, id_lo INTEGER, id_hi INTEGER, receipt_json TEXT NOT NULL, commit_epoch INTEGER NOT NULL, created_ms INTEGER NOT NULL, PRIMARY KEY (aspect, key))",
-	"CREATE TABLE IF NOT EXISTS segment_quarantine (aspect TEXT NOT NULL, id INTEGER NOT NULL, gen INTEGER NOT NULL, name TEXT NOT NULL, reason TEXT NOT NULL, descriptor_json TEXT, quarantined_ms INTEGER NOT NULL, PRIMARY KEY (aspect, id, gen))",
+	"CREATE TABLE IF NOT EXISTS segment_quarantine (aspect TEXT NOT NULL, id INTEGER NOT NULL, gen INTEGER NOT NULL, name TEXT NOT NULL, reason TEXT NOT NULL, descriptor_json TEXT, quarantined_ms INTEGER NOT NULL, class TEXT NOT NULL DEFAULT 'corrupt', min_ts INTEGER, max_ts INTEGER, series_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (aspect, id, gen))",
 	// The rollup, with metadata.db's columns, folded inside the seal transaction from S11.
 	"CREATE TABLE IF NOT EXISTS aspect_metadata (aspect TEXT NOT NULL, segment_count INTEGER NOT NULL, total_rows INTEGER NOT NULL, total_nulls INTEGER NOT NULL, total_bytes INTEGER NOT NULL, unsorted_segments INTEGER NOT NULL DEFAULT 0, min_ts INTEGER, max_ts INTEGER, min_value TEXT, max_value TEXT, PRIMARY KEY (aspect))",
 	"CREATE TABLE IF NOT EXISTS segment_changes (aspect TEXT NOT NULL, epoch INTEGER NOT NULL, min_ts INTEGER, max_ts INTEGER, row_count INTEGER NOT NULL, PRIMARY KEY (aspect, epoch))",
@@ -420,6 +424,24 @@ fn fre14_legacy_catalog<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()
 		let Some(metadata) = cp.metadata else { return Ok(()) };
 		let conn = connect(metadata.db).await.with_context(|| format!("{}: connecting", metadata.name))?;
 		ddl(&conn, metadata.name, LEGACY_CATALOG_TABLE).await
+	})
+}
+
+/// The columns `0004_d_s12` adds to `segment_quarantine`, in order, with their
+/// declarations. A pre-D-S12 record reads back as class `corrupt` (the only class
+/// the old table could ever have held, before suspect existed), with no time span
+/// and series 0 — the defaults the new table shape declares for a fresh store.
+const QUARANTINE_COLUMNS: [(&str, &str); 4] = [("class", "TEXT NOT NULL DEFAULT 'corrupt'"), ("min_ts", "INTEGER"), ("max_ts", "INTEGER"), ("series_id", "INTEGER NOT NULL DEFAULT 0")];
+
+/// `0004_d_s12`: the C5 quarantine columns in `segment_index.db`.
+fn d_s12<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
+	Box::pin(async move {
+		let Some(index) = cp.index else { return Ok(()) };
+		let conn = connect(index.db).await.with_context(|| format!("{}: connecting", index.name))?;
+		for (column, declaration) in QUARANTINE_COLUMNS {
+			add_column(&conn, index.name, "segment_quarantine", column, declaration).await?;
+		}
+		Ok(())
 	})
 }
 
@@ -549,12 +571,13 @@ mod tests {
 	#[test]
 	fn pending_and_after_select_by_applied_set_and_by_ordinal() {
 		let applied: BTreeSet<String> = ["0001_baseline".to_string()].into();
-		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog"]);
+		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12"]);
 		assert_eq!(pending(REGISTRY, &BTreeSet::new()).len(), REGISTRY.len());
 		assert_eq!(after(REGISTRY, None).len(), REGISTRY.len());
-		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog"]);
-		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog"]);
-		assert!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).is_empty());
+		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12"]);
+		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog", "0004_d_s12"]);
+		assert_eq!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0004_d_s12"]);
+		assert!(after(REGISTRY, Some("0004_d_s12")).is_empty());
 		assert!(after(REGISTRY, Some("0009_future")).is_empty(), "a newer marker's ordinal is past everything here");
 		assert_eq!(floors(pending(REGISTRY, &applied)), Some(Floors { layout: 2, min_read: 2, min_write: 2 }));
 		assert_eq!(floors(Vec::<&Migration>::new()), None);

@@ -138,7 +138,7 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
 - [ ] **7.2 WAL & crash consistency.**
   - [x] **S10** Write-once durable seal with id assigned at commit *(~8 h; after S9)*
   - [ ] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
-  - [ ] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
+  - [x] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
   - [ ] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
   - [ ] **S14** HTTP ingest wiring
   - [ ] **S15** Partial sidecar v4

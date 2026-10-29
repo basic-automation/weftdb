@@ -625,10 +625,21 @@ async fn health() -> axum::Json<HealthResponse> {
 /// Readiness probe: the service is ready to accept traffic. Reports
 /// whether a segment store is configured so an operator can confirm the
 /// storage endpoints are live, and whether that store is write-poisoned
-/// and needs a restart.
-async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> axum::Json<ReadyResponse> {
-	let poison = state.store().and_then(|store| store.poisoned());
-	axum::Json(ReadyResponse { segment_store: state.store().is_some(), ..ReadyResponse::default() }.with_poison(poison))
+/// and needs a restart. With a store, it also carries the store's identity,
+/// durability class, previous clean shutdown and the last recovery pass's
+/// counts (D-S12) — and answers `503` when that pass reports
+/// `incompatible_store`: a newer-format frame means this build must not serve
+/// this store. Without a store the stateless API is ready, as before.
+async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> (axum::http::StatusCode, axum::Json<ReadyResponse>) {
+	let Some(store) = state.store() else {
+		return (axum::http::StatusCode::OK, axum::Json(ReadyResponse::default()));
+	};
+	let poison = store.poisoned();
+	let report = store.recovery_report();
+	let ready = !report.incompatible_store;
+	let status = if ready { axum::http::StatusCode::OK } else { axum::http::StatusCode::SERVICE_UNAVAILABLE };
+	let body = ReadyResponse { ready, segment_store: true, store_uuid: Some(store.store_uuid().to_string()), durability_class: Some(weftdb::SegmentStore::durability_class()), previous_clean_shutdown: Some(store.previous_clean_shutdown()), quarantined: report.quarantined, suspect: report.suspected, incompatible_store: report.incompatible_store, ..ReadyResponse::default() }.with_poison(poison);
+	(status, axum::Json(body))
 }
 
 /// Operational telemetry: the Prometheus surface and the operator's
@@ -714,6 +725,11 @@ fn register_maintenance_routes(routes: &mut Routes) {
 	routes.route(Method::POST, "/api/v1/storage/{aspect}/reconcile", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_reconcile_aspect"), post(maintain::reconcile_aspect));
 	routes.route(Method::POST, "/api/v1/storage/{aspect}/squash", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_squash_aspect"), post(maintain::squash_aspect));
 	routes.route(Method::POST, "/api/v1/storage/{aspect}/compact", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_compact_aspect"), post(maintain::compact_aspect));
+	routes.route(Method::POST, "/api/v1/storage/fsck", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_fsck"), post(maintain::fsck_store));
+	routes.route(Method::GET, "/api/v1/storage/quarantine", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_quarantine_list"), get(maintain::quarantine_list));
+	routes.route(Method::POST, "/api/v1/storage/quarantine/purge-expired", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_quarantine_purge_expired"), post(maintain::purge_expired_quarantine));
+	routes.route(Method::POST, "/api/v1/storage/quarantine/{aspect}/{id}/{gen}/release", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_quarantine_release"), post(maintain::quarantine_release));
+	routes.route(Method::POST, "/api/v1/storage/quarantine/{aspect}/{id}/{gen}/purge", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_quarantine_purge"), post(maintain::quarantine_purge));
 }
 
 /// Backup and the restore drill: whole-store operator routes.
@@ -760,15 +776,16 @@ mod tests {
 
 	/// Every registered route is one the pre-SEC-3 router served: the
 	/// registry must not lose (or invent) a route in the move. The count
-	/// is 55 method routes over 49 path templates.
+	/// is 60 method routes over 54 path templates (55/49 before D-S12
+	/// added the fsck and quarantine routes).
 	#[test]
 	fn registry_covers_the_whole_surface() {
 		let table = build_registry().table();
-		assert_eq!(table.entries().len(), 55, "the registry must carry every route the old lib.rs chain served");
+		assert_eq!(table.entries().len(), 60, "the registry must carry every route the old lib.rs chain served");
 		let mut operations: Vec<&str> = table.entries().iter().map(|entry| entry.spec.operation_id).collect();
 		operations.sort_unstable();
 		operations.dedup();
-		assert_eq!(operations.len(), 55, "operation ids are unique");
+		assert_eq!(operations.len(), 60, "operation ids are unique");
 		// Every scope in the frozen table is used by at least one route:
 		// an unused scope in a frozen table is a scope nobody can hold.
 		for scope in Scope::ALL {
@@ -795,7 +812,7 @@ mod tests {
 		let document = table.openapi_document();
 		assert_eq!(document["openapi"], "3.1.0");
 		let paths = document["paths"].as_object().unwrap();
-		assert_eq!(paths.len(), 49, "one path item per template");
+		assert_eq!(paths.len(), 54, "one path item per template");
 		let health = &paths["/health"]["get"];
 		assert_eq!(health["operationId"], "get_health");
 		assert_eq!(health["x-weft-scope"], "probe");

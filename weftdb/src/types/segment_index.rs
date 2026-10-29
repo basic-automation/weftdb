@@ -592,6 +592,65 @@ impl SegmentIndexStore {
 		}
 		meta_value(&conn, key).await
 	}
+
+	/// The `segment_quarantine` rows (D-S12), of one aspect for `Some`, or of every
+	/// aspect for `None`, in quarantine order. A row whose class text this build
+	/// does not know is an error, not a guess: misclassifying it could purge a
+	/// file another build meant to keep.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or a row this build cannot decode.
+	pub(crate) async fn quarantine(&self, aspect: Option<&str>) -> Result<Vec<crate::types::quarantine::QuarantineRecord>> {
+		let conn = connect(&self.db).await?;
+		if !migrations::table_exists(&conn, "segment_quarantine").await? {
+			return Ok(Vec::new());
+		}
+		let mut rows = match aspect {
+			Some(aspect) => conn.query("SELECT aspect, id, gen, name, reason, descriptor_json, quarantined_ms, class, min_ts, max_ts, series_id FROM segment_quarantine WHERE aspect = ? ORDER BY quarantined_ms, aspect, id, gen", turso::params![aspect.to_string()]).await?,
+			None => conn.query("SELECT aspect, id, gen, name, reason, descriptor_json, quarantined_ms, class, min_ts, max_ts, series_id FROM segment_quarantine ORDER BY quarantined_ms, aspect, id, gen", ()).await?,
+		};
+		let mut out = Vec::new();
+		while let Some(row) = rows.next().await? {
+			out.push(decode_quarantine_row(&row)?);
+		}
+		Ok(out)
+	}
+}
+
+/// Decode one `segment_quarantine` row in the column order [`SegmentIndexStore::quarantine`] selects.
+fn decode_quarantine_row(row: &turso::Row) -> Result<crate::types::quarantine::QuarantineRecord> {
+	use crate::types::quarantine::{QuarantineClass, QuarantineRecord};
+	let text = |idx: usize| -> Result<String> {
+		match row.get_value(idx)? {
+			Value::Text(text) => Ok(text),
+			other => bail!("segment_quarantine holds {other:?} where it records text"),
+		}
+	};
+	let opt_text = |idx: usize| -> Result<Option<String>> {
+		match row.get_value(idx)? {
+			Value::Text(text) => Ok(Some(text)),
+			Value::Null => Ok(None),
+			other => bail!("segment_quarantine holds {other:?} where it records text or NULL"),
+		}
+	};
+	let integer = |idx: usize| -> Result<i64> {
+		match row.get_value(idx)? {
+			Value::Integer(n) => Ok(n),
+			other => bail!("segment_quarantine holds {other:?} where it records an integer"),
+		}
+	};
+	let opt_integer = |idx: usize| -> Result<Option<i64>> {
+		match row.get_value(idx)? {
+			Value::Integer(n) => Ok(Some(n)),
+			Value::Null => Ok(None),
+			other => bail!("segment_quarantine holds {other:?} where it records an integer or NULL"),
+		}
+	};
+	let unsigned = |idx: usize| -> Result<u64> { Ok(u64::try_from(integer(idx)?).unwrap_or(0)) };
+	let class_text = text(7)?;
+	let class = QuarantineClass::from_str(&class_text).ok_or_else(|| anyhow::anyhow!("segment_quarantine holds class {class_text:?}, which this build does not know"))?;
+	Ok(QuarantineRecord { aspect: text(0)?, id: unsigned(1)?, gen: unsigned(2)?, name: text(3)?, reason: text(4)?, descriptor_json: opt_text(5)?, quarantined_ms: integer(6)?, class, min_ts: opt_integer(8)?, max_ts: opt_integer(9)?, series_id: unsigned(10)? })
 }
 
 /// What an aspect's id allocator is seeded from in `segment_index.db`
