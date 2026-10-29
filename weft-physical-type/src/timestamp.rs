@@ -22,6 +22,9 @@
 //! Bit-packing and RLE (the other two codecs Phase 4.2 names) build on these
 //! difference streams and are a later increment; the varint estimate already
 //! captures the dominant saving for benchmark reporting.
+//!
+//! The calendar rules these encodings assume — what zone an epoch is in, and what
+//! happens to a leap second — are stated on [`TimeUnit`].
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +34,39 @@ use serde::{Deserialize, Serialize};
 /// column so a value's `i64` is unambiguous (and so the right unit can be chosen
 /// to keep the range within `i64` — nanoseconds since the Unix epoch overflow
 /// `i64` only past the year 2262).
+///
+/// # Time zone and leap-second policy (roadmap **4.1**)
+///
+/// An epoch is a count of ticks since `1970-01-01T00:00:00Z` measured in **UTC**
+/// under the POSIX rule, and that is the whole policy:
+///
+/// - **No zone is stored, and none is needed.** The column holds instants, not
+///   local times, so a segment means the same thing whatever the writer's offset.
+///   Reading `TimeUnit::Millis` as "wall time in the reader's zone" is a display
+///   choice made above the store; nothing in the encoding depends on it, and no
+///   offset is applied on the way in or out ([`TimeUnit::to_nanos`],
+///   [`TimeUnit::from_nanos`] and `instant_from_epoch` in the store's segment layer
+///   are pure unit arithmetic).
+/// - **No leap seconds.** POSIX time is a fixed-length day of exactly `86_400`
+///   seconds, so a stored day is `86_400 × nanos_per_unit()` ticks whatever the
+///   calendar said — the two historical moments when UTC inserted a second are
+///   represented by counting that second twice (`23:59:59` then `23:59:60` become
+///   one and the same epoch), never by a discontinuity or a renumbering. WeftDB
+///   does not carry a leap-second table, does not smear, and cannot answer "what
+///   was the TAI-UTC offset at this instant"; it answers "how many ticks since the
+///   epoch", which is what a monotonic series needs and what makes delta and
+///   delta-of-delta (see this module's codecs) exact across a boundary a
+///   calendar-aware clock would stutter on. Interpolating or downsampling across a
+///   real leap second therefore sees the interval as one second long.
+/// - **Coarse units truncate toward minus infinity** ([`TimeUnit::from_nanos`]) so a
+///   bucket boundary lands on the same instant whether the epoch is before or after
+///   1970 — truncating toward zero would make `-0.5 s` and `+0.5 s` both land in
+///   second 0 while a full second either side of them lands elsewhere.
+///
+/// The consequence to know at the API boundary: an instant supplied as a UTC
+/// `DateTime` (chrono's `Utc`, the only zone the crate's public API speaks) is
+/// converted by unit arithmetic alone, and an epoch too coarse to survive the lift
+/// to nanoseconds is refused rather than wrapped — see [`TimeUnit::to_nanos`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeUnit {
@@ -53,6 +89,44 @@ impl TimeUnit {
 			Self::Millis => "millis",
 			Self::Micros => "micros",
 			Self::Nanos => "nanos",
+		}
+	}
+
+	/// Ticks of this unit in one second: multiply an epoch by it to reach epoch
+	/// nanoseconds. `86_400 ×` this is a stored day, always — see the
+	/// [leap-second policy](Self#time-zone-and-leap-second-policy-roadmap-41).
+	#[must_use]
+	pub const fn nanos_per_unit(self) -> i64 {
+		match self {
+			Self::Seconds => 1_000_000_000,
+			Self::Millis => 1_000_000,
+			Self::Micros => 1_000,
+			Self::Nanos => 1,
+		}
+	}
+
+	/// Lift an epoch in this unit to epoch nanoseconds, or `None` when the value is
+	/// outside the `i64` nanosecond range (a coarse unit near either end of `i64`).
+	///
+	/// A store that holds a nanosecond-scale instant — a merge of two units, a
+	/// window boundary, a sort key across segments — uses this and refuses the row
+	/// on `None` rather than wrapping: `TimeUnit::Seconds.to_nanos(i64::MAX)` is the
+	/// year 292 billion, and a wrapped value would sort into the wrong segment.
+	#[must_use]
+	pub const fn to_nanos(self, epoch: i64) -> Option<i64> {
+		epoch.checked_mul(self.nanos_per_unit())
+	}
+
+	/// Truncate epoch nanoseconds into this unit, rounding **toward minus
+	/// infinity** so a pre-1970 epoch buckets like a post-1970 one.
+	#[must_use]
+	pub const fn from_nanos(self, nanos: i64) -> i64 {
+		let unit = self.nanos_per_unit();
+		let q = nanos / unit;
+		if nanos % unit != 0 && nanos < 0 {
+			q - 1
+		} else {
+			q
 		}
 	}
 }
@@ -1897,6 +1971,49 @@ mod tests {
 	fn time_unit_names_are_stable() {
 		assert_eq!(TimeUnit::Seconds.name(), "seconds");
 		assert_eq!(TimeUnit::Nanos.name(), "nanos");
+	}
+
+	/// The 4.1 policy, pinned: a stored day is exactly `86_400` seconds in every unit,
+	/// so a leap second in the real calendar is a counted-twice second here rather
+	/// than a discontinuity, and unit arithmetic round-trips a day boundary exactly.
+	#[test]
+	fn a_stored_day_is_exactly_86_400_seconds_in_every_unit() {
+		for unit in [TimeUnit::Seconds, TimeUnit::Millis, TimeUnit::Micros, TimeUnit::Nanos] {
+			let day_in_unit = 86_400 * (1_000_000_000 / unit.nanos_per_unit());
+			assert_eq!(unit.to_nanos(day_in_unit), Some(86_400_000_000_000), "{} stores a day as 86_400 seconds of ticks", unit.name());
+			assert_eq!(unit.from_nanos(86_400_000_000_000), day_in_unit, "the day boundary round-trips in {}", unit.name());
+		}
+	}
+
+	/// A coarse unit at the end of `i64` cannot be lifted to nanoseconds: the lift
+	/// fails instead of wrapping into an unrelated (and wrongly sorted) instant.
+	#[test]
+	fn to_nanos_refuses_to_wrap_past_the_nanosecond_range() {
+		assert_eq!(TimeUnit::Nanos.to_nanos(i64::MAX), Some(i64::MAX), "nanos is the identity");
+		assert_eq!(TimeUnit::Nanos.to_nanos(i64::MIN), Some(i64::MIN));
+		assert_eq!(TimeUnit::Seconds.to_nanos(i64::MAX / 1_000_000_000), Some(i64::MAX / 1_000_000_000 * 1_000_000_000), "the last representable second still lifts");
+		assert_eq!(TimeUnit::Seconds.to_nanos(i64::MAX), None, "and one past it does not");
+		assert_eq!(TimeUnit::Millis.to_nanos(i64::MAX), None);
+		assert_eq!(TimeUnit::Micros.to_nanos(i64::MAX), None);
+	}
+
+	/// Truncation is toward minus infinity, so the half-open bucket `[t, t + unit)`
+	/// means the same thing on both sides of the epoch.
+	#[test]
+	fn from_nanos_buckets_symmetrically_around_the_epoch() {
+		assert_eq!(TimeUnit::Seconds.from_nanos(999_999_999), 0);
+		assert_eq!(TimeUnit::Seconds.from_nanos(1_000_000_000), 1);
+		assert_eq!(TimeUnit::Seconds.from_nanos(-1), -1, "a tick before the epoch is in second -1");
+		assert_eq!(TimeUnit::Seconds.from_nanos(-1_000_000_000), -1);
+		assert_eq!(TimeUnit::Seconds.from_nanos(-1_000_000_001), -2);
+		assert_eq!(TimeUnit::Millis.from_nanos(-1_000), -1);
+		assert_eq!(TimeUnit::Nanos.from_nanos(-1), -1, "nanos truncates nothing");
+		for unit in [TimeUnit::Seconds, TimeUnit::Millis, TimeUnit::Micros, TimeUnit::Nanos] {
+			for nanos in [-9_000_000_000_i64, -1, 0, 1, 7_000_000_003] {
+				let bucket = unit.from_nanos(nanos);
+				assert!(unit.to_nanos(bucket).is_some_and(|base| base <= nanos && nanos - base < unit.nanos_per_unit()), "{}: {nanos} falls in the bucket {bucket}", unit.name());
+			}
+		}
 	}
 
 	/// Every FIRE fixture must round-trip exactly (the predictor is a deterministic wrapping

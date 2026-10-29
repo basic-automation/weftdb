@@ -242,7 +242,8 @@ impl TransposedPolicy {
 }
 
 /// Lift a stored integer epoch in `unit` to an absolute instant — the inverse of the
-/// ingest path's `epoch_in_unit`. `None` if the epoch falls outside the representable
+/// ingest path's unit arithmetic (`TimeUnit::from_nanos`, which truncates toward minus
+/// infinity). `None` if the epoch falls outside the representable
 /// range (only reachable for coarse units at absurd magnitudes).
 const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>> {
 	match unit {
@@ -257,12 +258,7 @@ const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>>
 /// mantissas, scale)`, when every present value is a `ScaledI64` at one shared scale and every
 /// instant fits in epoch nanoseconds. `None` sends the caller to the `BigDecimal` path.
 fn scaled_rows(ts: &[i64], vs: &[Option<PhysicalValue>], start: i64, end: i64, unit: TimeUnit) -> Option<(Vec<i64>, Vec<i64>, u8)> {
-	let per_unit: i64 = match unit {
-		TimeUnit::Seconds => 1_000_000_000,
-		TimeUnit::Millis => 1_000_000,
-		TimeUnit::Micros => 1_000,
-		TimeUnit::Nanos => 1,
-	};
+	let per_unit: i64 = unit.nanos_per_unit();
 	let (mut nanos, mut mantissas) = (Vec::with_capacity(ts.len()), Vec::with_capacity(ts.len()));
 	let mut shared_scale: Option<u8> = None;
 	for (&t, v) in ts.iter().zip(vs) {
