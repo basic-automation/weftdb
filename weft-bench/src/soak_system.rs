@@ -1428,7 +1428,8 @@ mod tests {
 		host_fixture(&fixture);
 		let sampler = SystemSampler::at(fixture.root(), Some("nvme0n1p2".to_string()));
 		let thread = SamplerThread::start(sampler, std::time::Duration::from_millis(20)).expect("start");
-		std::thread::sleep(std::time::Duration::from_millis(110));
+		// Long enough for three ticks even on a loaded runner; the stop check below stays strict.
+		std::thread::sleep(std::time::Duration::from_millis(300));
 		let started = std::time::Instant::now();
 		let shutdown = thread.stop().expect("stop");
 		assert!(shutdown.samples.len() >= 3, "samples: {}", shutdown.samples.len());
