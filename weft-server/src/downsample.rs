@@ -569,6 +569,38 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn json_body_accepts_the_documented_reduction_spellings() {
+		// The README's underscore spellings and aliases, a mixed-case token, and a
+		// bucket-end name, all in one body. The response names each reduction in the
+		// spelling the README documents, so a client can send those names back unchanged.
+		let body = serde_json::json!({
+			"resolution": "seconds",
+			"aggregations": ["Min", "median", "twa_linear", "sketch_p99", "twa_bucket_end"],
+			"points": [
+				{ "timestamp": ts(0), "value": 2.0 },
+				{ "timestamp": ts(1), "value": 4.0 },
+			],
+		});
+		let (status, resp) = post_json("/api/v1/downsample", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {resp}");
+		assert_eq!(resp["aggregations"], serde_json::json!(["min", "p50", "twa_linear", "sketch_p99", "twa_bucket_end"]));
+		assert_eq!(resp["series"][0]["aggregations"]["min"], 2.0);
+	}
+
+	#[tokio::test]
+	async fn json_body_rejects_an_unknown_reduction_by_name() {
+		let body = serde_json::json!({
+			"resolution": "seconds",
+			"aggregations": ["twa_lineer"],
+			"points": [{ "timestamp": ts(0), "value": 2.0 }],
+		});
+		let response = app().oneshot(Request::builder().method("POST").uri("/api/v1/downsample").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		assert!(String::from_utf8_lossy(&bytes).contains("unknown aggregation `twa_lineer`"));
+	}
+
+	#[tokio::test]
 	async fn out_of_range_samples_are_excluded() {
 		// Only the sample at t=15 falls inside the inclusive [10, 20] window.
 		let body = serde_json::json!({

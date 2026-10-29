@@ -883,6 +883,12 @@ only the control plane, not the segment frames.
 
 ### Fixed
 
+- **The JSON body's `aggregations` accepts the documented reduction spellings and any letter case.** `POST /api/v1/downsample`
+  read its tokens through the bare lowercase variant names only, so the README's `twa_linear`, `sketch_p99` and aliases such as
+  `median` were rejected as unknown variants, and a name copied from a response (`twa_linear`) could not be sent back. The body
+  now reads the query string's parser (`Aggregation::from_token`), so both surfaces accept the same set; the bare names
+  (`twalinear`, `sketchp99`) still parse. An unknown token is a `400` that names it and lists the accepted spellings (ROADMAP, FRE-5).
+
 - **A pre-S11 store read zero metadata until its next seal or swap (D-S11).**
   Moving the rollup to `segment_index.db` left stores written before S11 with no
   rollup rows at all, and the journal replay only re-derives the aspects its
