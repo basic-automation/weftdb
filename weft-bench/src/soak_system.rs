@@ -10,7 +10,7 @@
 //! can be published or refused on evidence rather than on the operator's memory.
 //!
 //! **Three parts, one artifact.** [`SystemSampler`] reads Linux procfs and turns
-//! it into a [`SystemSample`]; [`SystemLedger`] folds a run's samples into
+//! it into a [`SystemSample`]; [`ContaminationLedger`] folds a run's samples into
 //! [`ContaminationFlag`]s against a [`ContaminationPolicy`]; [`evaluate_flush_check`] answers
 //! the one question a durability claim depends on — did the bytes the run was told
 //! were durable ever reach the device. Together they serialize as one JSON
@@ -30,10 +30,9 @@
 //!
 //! **Flags, not thresholds nobody wrote down.** Every threshold that can turn a
 //! number into a contamination flag is a named field of [`ContaminationPolicy`]
-//! with a default and a comment saying why it is that number, and
-//! [`ContaminationPolicy::validate`] refuses an incoherent one. The ledger reports
-//! flags with the evidence that raised them ([`ContaminationFlag::evidence`]), so a
-//! reviewer can disagree with a threshold without re-running anything. Nothing here
+//! with a default and a comment saying why it is that number. The ledger reports
+//! each flag beside the [`WorstValues`] that raised it, so a reviewer can disagree
+//! with a threshold without re-running anything. Nothing here
 //! grades a *latency*: latency verdicts belong to SOA-13's SLO evaluator, which
 //! reads these flags as a precondition.
 //!
@@ -171,9 +170,11 @@ fn pressure_avg10(field: Option<&str>) -> Option<f64> {
 pub struct DeviceCounters {
 	/// Kernel device name the line matched (e.g. `nvme0n1p2`, `dm-0`).
 	pub name: String,
-	/// Sectors read since boot, in [`DISKSTATS_SECTOR_BYTES`]-byte units.
+	/// Sectors read since boot, in the kernel's fixed 512-byte units, whatever the
+	/// device's real sector size is.
 	pub sectors_read: u64,
-	/// Sectors written since boot, in [`DISKSTATS_SECTOR_BYTES`]-byte units.
+	/// Sectors written since boot, in the kernel's fixed 512-byte units, whatever
+	/// the device's real sector size is.
 	pub sectors_written: u64,
 	/// Requests currently in flight.
 	pub in_progress: u64,
@@ -238,7 +239,7 @@ impl CpuJiffies {
 /// and is what a duration is measured on; `wall_unix_ms` is the clock the interval
 /// log buckets by, and the difference between their deltas across one sample step
 /// is how a clock adjustment becomes visible
-/// ([`ContaminationKind::ClockStep`]). The sample carries no path, no hostname and
+/// ([`ContaminationFlag::ClockStep`]). The sample carries no path, no hostname and
 /// no free text: an artifact built from samples needs no redaction pass to be safe
 /// to publish, and the fields stay that way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -364,11 +365,6 @@ fn parse_partitions(text: &str) -> BTreeMap<String, String> {
 		map.insert(format!("{}:{}", fields[0], fields[1]), fields[3].to_string());
 	}
 	map
-}
-
-/// True when `device` appears as a name in `/proc/diskstats`.
-fn diskstats_lists(text: &str, device: &str) -> bool {
-	text.lines().any(|line| line.split_whitespace().nth(2) == Some(device))
 }
 
 /// `/proc/self/mountinfo` escapes space, tab, newline and backslash octally.
