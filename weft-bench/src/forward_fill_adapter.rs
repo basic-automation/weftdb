@@ -34,7 +34,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution, Spline};
 
-use crate::adapter::{grid_timestamps, SystemAdapter};
+use crate::adapter::{grid_timestamps, AdapterInfo, SystemAdapter};
 
 /// Adapter that reconstructs a dense regular grid by carrying the most recent
 /// sample forward (LOCF) — the portable mirror of native TSDB `FILL(previous)`.
@@ -53,6 +53,14 @@ impl ForwardFillAdapter {
 impl SystemAdapter for ForwardFillAdapter {
 	fn name(&self) -> &'static str {
 		"baseline-forward-fill"
+	}
+
+	fn adapter_info(&self) -> AdapterInfo {
+		// Same two facts as the linear baseline, read off the implementation
+		// below: no engine behind it, and the `spline` argument is discarded —
+		// a carried-forward value is copied, never interpolated, whatever was
+		// asked for.
+		AdapterInfo { interface_version: 2, engine: "weft-bench (in-process)".to_string(), method: "last-observation-carried-forward step (LOCF); the requested spline is ignored".to_string(), native_engine: false, honours_requested_spline: false }
 	}
 
 	async fn interpolate_range(&self, points: &mut [Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, _spline: Spline) -> anyhow::Result<Vec<Point>> {

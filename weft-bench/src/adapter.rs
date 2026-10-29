@@ -33,10 +33,25 @@ pub fn grid_timestamps(start: DateTime<Utc>, end: DateTime<Utc>, resolution: Res
 ///
 /// Implementations must be cheap to construct and safe to call repeatedly; the
 /// harness times `interpolate_range` across many reps.
+///
+/// Every adapter must also report what produced its numbers through
+/// [`adapter_info`](SystemAdapter::adapter_info). There is no default
+/// implementation on purpose: a result without provenance cannot be published
+/// under the roadmap's governing rule, so the compiler, not a reviewer, is what
+/// makes an adapter say what it ran.
 #[async_trait]
 pub trait SystemAdapter: Send + Sync {
 	/// Short, stable identifier recorded in results (e.g. `weftdb`).
 	fn name(&self) -> &'static str;
+
+	/// This adapter's capability/provenance report, recorded in every result it
+	/// produces (report-schema field `adapter_info`).
+	///
+	/// Both kinds of fact must be read off the adapter's own code rather than
+	/// claimed at runtime: what engine and method produced the numbers, and
+	/// whether the requested [`Spline`] is the one actually run. A test in the
+	/// crate root re-checks `honours_requested_spline` against observed output.
+	fn adapter_info(&self) -> AdapterInfo;
 
 	/// Reconstruct a dense regular grid over `[start, end)` at `resolution`
 	/// using `spline`, given the (possibly irregular, gap-containing) input
@@ -53,14 +68,13 @@ pub trait SystemAdapter: Send + Sync {
 	async fn interpolate_range(&self, points: &mut [Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline: Spline) -> anyhow::Result<Vec<Point>>;
 }
 
-/// What a v2 adapter reports about itself, recorded in the result (schema v23).
+/// What an adapter reports about itself, recorded in the result (schema v23).
 ///
-/// v1 adapters report nothing: the harness cannot know, from `interpolate_range`
-/// alone, which engine produced a number or whether the requested spline was the
-/// one actually used — and the baselines prove the gap matters, since they
-/// deliberately ignore the requested spline. v2 closes it with two kinds of
-/// fact, both checkable from the adapter's own code rather than claimed at
-/// runtime:
+/// The harness cannot know, from `interpolate_range` alone, which engine produced
+/// a number or whether the requested spline was the one actually used — and the
+/// baselines prove the gap matters, since they deliberately ignore the requested
+/// spline. Every adapter therefore reports two kinds of fact, both checkable from
+/// the adapter's own code rather than claimed at runtime:
 ///
 /// * **provenance** — `engine` (the library or system behind the numbers) and
 ///   `method` (how it reconstructs), so a reader can tell a native-engine
@@ -70,8 +84,12 @@ pub trait SystemAdapter: Send + Sync {
 ///   an in-process reimplementation) and `honours_requested_spline` (the
 ///   requested [`Spline`] is the one run, not silently replaced).
 ///
-/// `interface_version` is 2 for every v2 adapter; it is the field a future v3
-/// bumps, not the report schema version.
+/// `interface_version` is 2 for every adapter: it is the version of the adapter
+/// interface that introduced this report, the field a future v3 bumps, not the
+/// report schema version. v1 — the same trait with no `adapter_info`, whose
+/// results carried no provenance — was retired in EVI-8B; nothing in this
+/// workspace can produce a v1-shaped result any more, though artifacts written
+/// while it existed still deserialize (the field stays optional for that reason).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdapterInfo {
 	/// Adapter-interface version this report was produced under (2 for v2).
@@ -87,21 +105,6 @@ pub struct AdapterInfo {
 	pub native_engine: bool,
 	/// True when the requested [`Spline`] is the one actually run.
 	pub honours_requested_spline: bool,
-}
-
-/// Second version of the bench adapter interface.
-///
-/// v2 is v1 plus self-reporting: an adapter that implements this trait tells
-/// the harness what produced its numbers, and [`run_profile_v2`](crate::run_profile_v2)
-/// records that report in the result. Adapters that stay on v1 keep working
-/// unchanged through [`run_profile`](crate::run_profile) — their results carry
-/// no `adapter_info`, exactly as before — and v2 is deliberately additive: no
-/// v1 method changes, so no v1 adapter needs a port. Part I ports only
-/// [`WeftAdapter`](crate::WeftAdapter); the remaining adapters move in EVI-8B,
-/// which retires v1.
-pub trait SystemAdapterV2: SystemAdapter {
-	/// This adapter's capability/provenance report.
-	fn adapter_info(&self) -> AdapterInfo;
 }
 
 #[cfg(test)]
