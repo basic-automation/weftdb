@@ -33,6 +33,21 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **The `TimeUnit` calendar policy, stated and pinned** (roadmap 4.1). A timestamp column
+  holds ticks since `1970-01-01T00:00:00Z` in UTC under the POSIX rule: no zone is stored —
+  the column holds instants, so a segment means the same thing whatever the writer's offset —
+  and no leap second is modelled: a stored day is exactly `86_400 × nanos_per_unit()` ticks,
+  which means the two moments the real calendar inserted a second are represented by counting
+  that second twice rather than by a discontinuity or a renumbering. WeftDB carries no
+  leap-second table, does not smear, and cannot answer "what was the TAI-UTC offset here"; a
+  downsample or interpolation across a real leap second sees the interval as one second long.
+  The arithmetic the policy implies moved off the call sites and onto the type:
+  `TimeUnit::nanos_per_unit`, `TimeUnit::to_nanos` (checked — a coarse unit near either end of
+  `i64` is refused rather than wrapped into a wrongly sorted instant) and
+  `TimeUnit::from_nanos` (truncates toward minus infinity, so `-0.5 s` and `+0.5 s` no longer
+  share a bucket that a full second either side misses). `scaled_rows` in
+  `weftdb/src/types/segment_store.rs` now calls it instead of repeating the per-unit match.
+
 - **Every HTTP route now registers through one sealed registry** (security track
   SEC-3). `weft-server/src/lib.rs` no longer carries the route chain: each of the
   55 routes (49 path templates) is registered in `weft-server/src/routes.rs` by a

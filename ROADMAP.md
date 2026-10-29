@@ -62,7 +62,8 @@ The physical-type groundwork is done: integer-epoch `TimeUnit` with lossless del
 Out-of-order data is fully handled (4.6): in-place per-segment sort, cross-segment merge, the split-not-rewrite optimisation, threshold-triggered background reconciliation, and a hot/cold split in the background sweep. Reads skip work by pruning on time and value at segment level, and on pages within a segment. Quality pruning of all-null segments and pages is wired into the point-read and downsample paths (see 4.3): the index prune drops a fully null segment before its file is opened, and a frame's persisted stats drop fully null pages. A range read still reads every time-overlapping segment, because a null row is part of its answer; a downsample is not, because a row that carries no value moves no bucket.
 
 - [x] **4.1 Physical numeric encodings**
-  - [ ] Explicit tz + leap-second policy
+  - [x] Explicit tz + leap-second policy
+    - *Landed 2026-10-28 (`w2/tz-policy`). Stated on `TimeUnit` (`weft-physical-type/src/timestamp.rs`) and pinned by three tests: epochs are UTC ticks since the Unix epoch under the POSIX rule, no zone is stored, no leap second is modelled (a stored day is exactly `86_400 × nanos_per_unit()`, so a real leap second is a counted-twice second, not a discontinuity — no table, no smearing, no TAI-UTC answer). The unit arithmetic the policy implies is now `TimeUnit::{nanos_per_unit, to_nanos, from_nanos}` — `to_nanos` fails rather than wrapping past the nanosecond range, `from_nanos` truncates toward minus infinity — and `scaled_rows` in `weftdb/src/types/segment_store.rs` uses it instead of its own per-unit match. The chrono API boundary is unchanged: an instant enters and leaves as a UTC `DateTime` and only unit arithmetic is applied.*
 - [x] **4.3 Columnar segment store**
   - [x] Quality pruning wired into the read path (all-null segment/page skipping)
     - *Landed 2026-10-27 (`w2/qprune-read-path`). Three levels, each at the layer that owns the decision: `SegmentIndexStore::prune_present_descriptors` (`weftdb/src/types/segment_index.rs`) is the SQL mirror of `SegmentIndex::prune_present_by_time` (`weft-physical-type/src/catalog.rs:395`) and is what `SegmentStore::read_point`/`read_points` now prune with, so a segment indexed as all-null never has its file opened; `read_segment_point(s)`/`read_paged_segment_point(s)` (`weft-physical-type/src/weftseg.rs`) drop a fully null frame and fully null pages from the persisted stats, reached through `read_frame_point(s)`.*
@@ -273,7 +274,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
   - [ ] **ROB-6** Bounded decimals
   - [ ] **EVI-8B** Benchmark adapter v2 II
-  - [ ] **SOA-5** Soak ingest client
+  - [x] **SOA-5** Soak ingest client
   - [ ] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
 - [ ] **W4 · Auth, config, ILP fix**
   - [ ] Store lane
