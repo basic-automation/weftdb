@@ -954,3 +954,15 @@ materialized-rollup contract and pay a full index scan per read. Missing-only
 keeps an S11-native open at one `SELECT` per aspect and makes a pre-S11 store
 read correctly from its first open; a later seal or swap keeps the row current
 by folding, as usual.
+
+## 2026-10-29 — FRE-5: reduction tokens are exact-case — FOR MERGE REVIEW
+
+**Ambiguous:** ROADMAP's FRE-5 box reads "Compute vocabulary, exact-case tokens and no silent narrowing". `Aggregation::from_token` folded case, so `MEDIAN`, `Min` and `SKETCH_P99` parsed, and v0.1.0 shipped that on the query string. The spelling slice (#239, merged 2026-10-29) carried the folding into the JSON body and described it as part of the closed item, which the FRE-5 box does not say.
+
+**Chosen:** exact-case. The roadmap names exact-case as the deliverable. The wire tokens are the compatibility surface, and the nearest precedent, `ValueKind` (`weftdb/src/types/value_kind.rs`), is case-sensitive and pins that by test. The defect the FOUND bullet names was the multi-word spellings, not case. Trimming surrounding whitespace stays, since it is not a case rule.
+
+**Cost:** a v0.1.0 client that sends `?agg=Min` or `agg=MEDIAN` gets a `400`. Pre-1.0 minor versions may break, and the CHANGELOG records it under Changed with the lowercase spellings to send. A case-folding shim on the query string alone would keep v0.1.0 working, but it would leave the query string and the JSON body on two parsers, which the spelling fix removed.
+
+**Not changed:** `Fill::from_token` (`weft-reduce/src/fill.rs`) still folds case. It is a separate vocabulary (`--gf-fill`, the interpolation fill), and the FRE-5 box does not name it. It needs its own decision.
+
+**Applied:** `from_token` matches the trimmed token exactly. Tests refuse `Min`, `MEDIAN`, `SKETCH_P99` and `Twa_Linear` on both surfaces. The README and the CHANGELOG are updated, and the FOUND bullet no longer claims letter-case folding. FRE-5's "no silent narrowing" clause stays open.
