@@ -14,8 +14,10 @@ use std::{num::NonZeroUsize, time::Duration};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::oneshot
 };
+#[cfg(unix)]
+use weft_server::ShutdownSignals;
 use weft_server::{
-	app, serve::{self, ServeLimits}, ShutdownSignals
+	app, serve::{self, ServeLimits}
 };
 
 /// Spawn `serve::run` on an ephemeral port with `limits`; the returned
