@@ -40,7 +40,7 @@ use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 
 use crate::{
 	types::{
-		durable::control_plane::connect, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied}, migrations, reaper::{JournalEntry, JournalState}
+		durable::control_plane::connect, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied}, metadata::AspectMetadata, migrations, reaper::{JournalEntry, JournalState}
 	}, StoreError, SUPPORTED_LAYOUT
 };
 
@@ -302,9 +302,81 @@ impl SegmentIndexStore {
 		Ok(index)
 	}
 
+	/// The materialized segment-set rollup for `aspect` in this database's
+	/// `aspect_metadata` table (S11: the rollup lives in `segment_index.db`, folded
+	/// into the seal and swap transactions), or [`None`] when no rollup row has been
+	/// written for it — including a store whose table predates the rollup move, or
+	/// one that has no such table yet.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or a value bound that cannot be decoded.
+	pub(crate) async fn rollup(&self, aspect: &str) -> Result<Option<AspectMetadata>> {
+		let conn = connect(&self.db).await?;
+		if !migrations::table_exists(&conn, "aspect_metadata").await? {
+			return Ok(None);
+		}
+		let mut rows = conn
+			.query(
+				"SELECT segment_count, total_rows, total_nulls, total_bytes, min_ts, max_ts, min_value, max_value, unsorted_segments
+				FROM aspect_metadata WHERE aspect = ?",
+				turso::params![aspect.to_string()],
+			)
+			.await?;
+		match rows.next().await? {
+			Some(row) => Ok(Some(Self::decode_rollup_row(&row)?)),
+			None => Ok(None),
+		}
+	}
+
+	/// Every aspect with a rollup row in this database, in name order — the aspects
+	/// whose seals or swaps have folded a rollup into `segment_index.db`.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub(crate) async fn rollup_aspects(&self) -> Result<Vec<String>> {
+		let conn = connect(&self.db).await?;
+		if !migrations::table_exists(&conn, "aspect_metadata").await? {
+			return Ok(Vec::new());
+		}
+		let mut rows = conn.query("SELECT aspect FROM aspect_metadata ORDER BY aspect", turso::params![]).await?;
+		let mut out = Vec::new();
+		while let Some(row) = rows.next().await? {
+			if let Value::Text(s) = row.get_value(0)? {
+				out.push(s);
+			}
+		}
+		Ok(out)
+	}
+
+	/// Decode one rollup row (columns in [`rollup`](Self::rollup)'s query order) into
+	/// an [`AspectMetadata`], mirroring the `metadata.db` row's encoding: counts as
+	/// integers, value bounds as plain-text decimals.
+	fn decode_rollup_row(row: &turso::Row) -> Result<AspectMetadata> {
+		let segment_count = usize::try_from(*row.get_value(0)?.as_integer().unwrap_or(&0)).unwrap_or(0);
+		let total_rows = u64::try_from(*row.get_value(1)?.as_integer().unwrap_or(&0)).unwrap_or(0);
+		let total_nulls = u64::try_from(*row.get_value(2)?.as_integer().unwrap_or(&0)).unwrap_or(0);
+		let total_bytes = u64::try_from(*row.get_value(3)?.as_integer().unwrap_or(&0)).unwrap_or(0);
+		let min_ts = Self::opt_integer(row, 4);
+		let max_ts = Self::opt_integer(row, 5);
+		let time_range = match (min_ts, max_ts) {
+			(Some(lo), Some(hi)) => Some((lo, hi)),
+			_ => None,
+		};
+		let min_value = Self::opt_decimal(row, 6)?;
+		let max_value = Self::opt_decimal(row, 7)?;
+		let value_range = match (min_value, max_value) {
+			(Some(lo), Some(hi)) => Some((lo, hi)),
+			_ => None,
+		};
+		let unsorted_segments = usize::try_from(*row.get_value(8)?.as_integer().unwrap_or(&0)).unwrap_or(0);
+		Ok(AspectMetadata { segment_count, total_rows, total_nulls, total_bytes, unsorted_segments, time_range, value_range })
+	}
+
 	/// Every aspect with at least one indexed segment, in name order — the
 	/// authoritative list of what the index actually holds (e.g. for rebuilding the
-	/// per-aspect `metadata.db` rollups from the durable index).
+	/// per-aspect rollups from the durable index).
 	///
 	/// # Errors
 	///
