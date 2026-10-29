@@ -84,6 +84,19 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
 
+  # weft-xbench is its own workspace (it builds DuckDB from C++), so nothing else builds it on
+  # every push. Its lock is seeded from the workspace's; this fails when a shared dependency
+  # resolves differently in the two, which would benchmark a WeftDB the workspace does not ship.
+  xbench-lock:
+    name: weft-xbench lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 scripts/xbench/check-lock.py
+      - run: python3 -m unittest discover -s scripts/xbench -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
   # The MSRV is a published promise in Cargo.toml (rust-version); prove it still holds.
   # Pinned here on purpose, not read from .github/release-toolchain: this job tests the
   # oldest supported compiler, not the release one.

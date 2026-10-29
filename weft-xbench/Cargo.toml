@@ -1,0 +1,36 @@
+# Cross-engine benchmark: WeftDB against external engines (EVI-13).
+#
+# Deliberately *not* a workspace member. The `duckdb` crate compiles DuckDB's C++ amalgamation
+# (`bundled`), which would put a multi-minute C++ build into every workspace `cargo build`,
+# `clippy --all-features` and test job on three operating systems. The crate keeps its own
+# `Cargo.lock`, seeded from the workspace's, so every dependency the two share resolves to the
+# same version; `scripts/xbench/check-lock.sh` fails when they drift apart.
+[package]
+name = "weft-xbench"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Cross-engine interpolation benchmark: WeftDB against DuckDB"
+
+# An empty workspace table: this crate is its own workspace root, not a member of the parent's.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+bigdecimal = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+# Not used directly: pins the `arrow` that `duckdb` pulls in to the workspace's version, so the
+# seeded lock resolves DuckDB against the same arrow crates WeftDB is built with.
+arrow = { version = "=60.0.0", default-features = false }
+duckdb = { version = "1.20000.1", features = ["bundled"] }
+rand = "0.10"
+rand_chacha = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+splimes = { version = "1", default-features = false, features = ["serde", "tokio"] }
+tokio = { version = "1", features = ["full"] }
+weft-bench = { path = "../weft-bench" }
+weft-physical-type = { path = "../weft-physical-type" }
+weftdb = { path = "../weftdb" }
