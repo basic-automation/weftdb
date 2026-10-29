@@ -4,6 +4,56 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — EVI-8B: what "retires v1" means, and why the report schema stays at v23
+
+**Ambiguous:** EVI-8A's entry (2026-10-26, item 5) defines Part II as "ports the
+remaining adapters to v2 and retires v1" without saying what retirement is: whether
+`SystemAdapterV2` survives as the only interface, whether `run_profile_v2` stays as
+the entry point, and whether retiring v1 bumps the report schema — §3 reserves a
+number per schema change, and v23 exists precisely because of adapter v2.
+
+**Chosen:**
+
+1. One interface, not a rename: `adapter_info()` becomes a required method of
+   `SystemAdapter` and `SystemAdapterV2` is deleted. A default implementation would
+   have let a future adapter skip reporting silently, which is the exact gap v2
+   exists to close; the compiler is now what makes an adapter say what it ran.
+2. One entry point: `run_profile_v2` and the private `run_profile_with_info`
+   collapse into `run_profile`, which always records the adapter's own report.
+   Keeping both names would leave two run paths where the roadmap asks for one.
+3. **No schema bump: the report stays v23.** The JSON shape is unchanged —
+   `BenchResult.adapter_info` is still `Option` and still `skip_serializing_if`,
+   because artifacts written while v1 existed, and the workloads that do not drive
+   an adapter at all (ingest, compression, downsample, range fetch, point lookup,
+   sparse, gpu_memory), still legitimately carry no report. §3 numbers a schema when
+   its shape changes; nothing here changes shape, so v23 stands and
+   `MANIFEST_SCHEMA_VERSION` does not move.
+4. Provenance in `compare`: now that every adapter reports itself,
+   `compare_reports` names both sides' engines in its notes (engine, method,
+   native-vs-in-process, spline honoured or ignored), and calls a missing report
+   `[no adapter report]`. This is a note, never a `hard:` refusal — pairing WeftDB
+   with another engine is the point of a competitor comparison. What must not
+   happen is a table that reads like a like-for-like race while one side ran a
+   native engine and the other an in-process baseline.
+5. The honesty check moves from comment to test:
+   `reported_spline_honour_matches_the_output_the_adapter_produces` rebuilds the
+   same dataset under `Spline::Linear` and `Spline::Cubic` and asserts the outputs
+   differ exactly when the adapter claims `honours_requested_spline`. A report that
+   flatters its adapter now fails CI instead of merely being untrue.
+6. Out of scope, recorded so it is not lost: the non-adapter workloads still write
+   `adapter_info: None`. Their `adapter` column is the literal `"weftdb"` and they
+   measure WeftDB's own storage paths, not a foreign engine, so there is no second
+   party to report; if a competitor is ever driven through one of them, that
+   workload needs its own report before its numbers are publishable.
+
+**Rejected:** keeping `SystemAdapterV2` as the sole trait with `SystemAdapter` as a
+supertrait alias (two names for one interface, and the unreported one still
+importable); a default `adapter_info()` returning a placeholder (silence would look
+like compliance); bumping the report schema to 24 for the retirement (no shape
+change, and it would refuse comparison against every v23 artifact already on main
+for no information gain); and leaving `run_profile` unreported "for compatibility"
+(its only callers are `main.rs` and this crate's tests).
+
 ## 2026-10-29 — SOA-5: the soak ingest client fills SOA-3's seam, and stops at the ingest lane
 
 **Ambiguous:** ROADMAP line 274 names "Soak ingest client" with no acceptance list, and the plan

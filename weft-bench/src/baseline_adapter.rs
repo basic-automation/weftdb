@@ -27,7 +27,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution, Spline};
 
-use crate::adapter::{grid_timestamps, SystemAdapter};
+use crate::adapter::{grid_timestamps, AdapterInfo, SystemAdapter};
 
 /// Adapter that reconstructs a dense regular grid with piecewise-linear
 /// interpolation — the portable client-side baseline WeftDB is compared against.
@@ -46,6 +46,14 @@ impl BaselineLinearAdapter {
 impl SystemAdapter for BaselineLinearAdapter {
 	fn name(&self) -> &'static str {
 		"baseline-linear"
+	}
+
+	fn adapter_info(&self) -> AdapterInfo {
+		// The two facts a reader needs to place this number: nothing but this
+		// crate produced it, and the `spline` argument is discarded — the
+		// implementation below never reads it, which is exactly what
+		// `honours_requested_spline: false` records.
+		AdapterInfo { interface_version: 2, engine: "weft-bench (in-process)".to_string(), method: "piecewise-linear reconstruction in BigDecimal; the requested spline is ignored".to_string(), native_engine: false, honours_requested_spline: false }
 	}
 
 	async fn interpolate_range(&self, points: &mut [Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, _spline: Spline) -> anyhow::Result<Vec<Point>> {

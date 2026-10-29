@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use splimes::{Interpolator, Point, Resolution, Spline};
 
-use crate::adapter::{AdapterInfo, SystemAdapter, SystemAdapterV2};
+use crate::adapter::{AdapterInfo, SystemAdapter};
 
 /// Adapter that benchmarks WeftDB's native interpolation path.
 #[derive(Debug, Default, Clone, Copy)]
@@ -29,6 +29,14 @@ impl SystemAdapter for WeftAdapter {
 		"weftdb"
 	}
 
+	fn adapter_info(&self) -> AdapterInfo {
+		// Both facts are read off the implementation below, not asserted:
+		// it drives splimes' `Interpolator` (a native engine, not an in-process
+		// reimplementation) and passes the requested `spline` straight through
+		// to `Interpolator::new`, unlike the baselines, which ignore it.
+		AdapterInfo { interface_version: 2, engine: "splimes".to_string(), method: "native interpolation via splimes Interpolator (Backend::Auto)".to_string(), native_engine: true, honours_requested_spline: true }
+	}
+
 	async fn interpolate_range(&self, points: &mut [Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline: Spline) -> anyhow::Result<Vec<Point>> {
 		// splimes is synchronous and CPU-bound, so it runs on tokio's blocking pool, as it
 		// does behind weft-server; the measured latency includes that hand-off. The blocking
@@ -39,22 +47,12 @@ impl SystemAdapter for WeftAdapter {
 	}
 }
 
-impl SystemAdapterV2 for WeftAdapter {
-	fn adapter_info(&self) -> AdapterInfo {
-		// Both facts are read off the v1 implementation above, not asserted:
-		// it drives splimes' `Interpolator` (a native engine, not an in-process
-		// reimplementation) and passes the requested `spline` straight through
-		// to `Interpolator::new`, unlike the baselines, which ignore it.
-		AdapterInfo { interface_version: 2, engine: "splimes".to_string(), method: "native interpolation via splimes Interpolator (Backend::Auto)".to_string(), native_engine: true, honours_requested_spline: true }
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	#[test]
-	fn v2_report_names_the_engine_and_the_facts_the_code_shows() {
+	fn report_names_the_engine_and_the_facts_the_code_shows() {
 		let info = WeftAdapter::new().adapter_info();
 		assert_eq!(info.interface_version, 2);
 		assert_eq!(info.engine, "splimes");
