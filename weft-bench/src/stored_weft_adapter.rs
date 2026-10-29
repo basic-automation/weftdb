@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Interpolator, Point, Resolution, Spline};
-use weft_physical_type::{AspectSchema, TimeUnit};
+use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use weftdb::SegmentStore;
 
 use crate::{
@@ -157,26 +157,38 @@ impl SystemAdapter for StoredWeftAdapter {
 		let root = std::env::temp_dir().join(format!("weft-bench-stored-{}-{}", std::process::id(), NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed)));
 		std::fs::create_dir_all(&root).map_err(|e| anyhow::anyhow!("cannot create stored-adapter dir {}: {e}", root.display()))?;
 		let dir = TempStoreDir(root.clone());
-		let store = SegmentStore::open(&root).await.map_err(|e| anyhow::anyhow!("cannot open stored-adapter store in {}: {e:#}", root.display()))?;
-		store.declare(ASPECT, &AspectSchema::new(physical_type, BigDecimal::from(0), TimeUnit::Nanos)).await.map_err(|e| anyhow::anyhow!("cannot declare aspect {ASPECT}: {e:#}"))?;
-		for (chunk_ts, chunk_values) in timestamps.chunks(self.batch_rows).zip(values.chunks(self.batch_rows)) {
-			store.seal_declared(ASPECT, chunk_ts, chunk_values).await.map_err(|e| anyhow::anyhow!("cannot seal {} rows into aspect {ASPECT}: {e:#}", chunk_ts.len()))?;
-		}
-
-		let prepared = Arc::new(Prepared { store, signature, dir });
-		*self.prepared.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepared);
+		let store = seal(&root, physical_type, &timestamps, &values, self.batch_rows).await?;
+		*self.prepared.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(Prepared { store, signature, dir }));
 		Ok(())
 	}
 
 	async fn interpolate_range(&self, points: &mut [Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, spline: Spline) -> anyhow::Result<Vec<Point>> {
 		// Ingest is never timed here: a call for points that were not prepared is refused, not
 		// quietly stored, so a missing `prepare` cannot turn a read benchmark into a write one.
-		let prepared = self.current().ok_or_else(|| anyhow::anyhow!("stored adapter: interpolate_range called before prepare"))?;
-		anyhow::ensure!(Signature::of(points).as_ref() == Some(&prepared.signature), "stored adapter: the request's points are not the ones prepared");
+		self.current().ok_or_else(|| anyhow::anyhow!("stored adapter: interpolate_range called before prepare"))?.interpolate(points, start, end, Interpolator::new(spline, resolution)).await
+	}
+}
+
+/// Open a store in `root`, declare the bench aspect as `physical_type` with nanosecond
+/// timestamps, and seal the rows in `batch_rows`-row segments.
+async fn seal(root: &std::path::Path, physical_type: PhysicalType, timestamps: &[i64], values: &[BigDecimal], batch_rows: usize) -> anyhow::Result<SegmentStore> {
+	let store = SegmentStore::open(root).await.map_err(|e| anyhow::anyhow!("cannot open stored-adapter store in {}: {e:#}", root.display()))?;
+	store.declare(ASPECT, &AspectSchema::new(physical_type, BigDecimal::from(0), TimeUnit::Nanos)).await.map_err(|e| anyhow::anyhow!("cannot declare aspect {ASPECT}: {e:#}"))?;
+	for (chunk_ts, chunk_values) in timestamps.chunks(batch_rows).zip(values.chunks(batch_rows)) {
+		store.seal_declared(ASPECT, chunk_ts, chunk_values).await.map_err(|e| anyhow::anyhow!("cannot seal {} rows into aspect {ASPECT}: {e:#}", chunk_ts.len()))?;
+	}
+	Ok(store)
+}
+
+impl Prepared {
+	/// Reconstruct `[start, end]` from the stored rows, refusing `points` that are not the ones
+	/// stored.
+	async fn interpolate(&self, points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, interpolator: Interpolator) -> anyhow::Result<Vec<Point>> {
+		anyhow::ensure!(Signature::of(points).as_ref() == Some(&self.signature), "stored adapter: the request's points are not the ones prepared");
 		let (lo, hi) = (nanos(start)?, nanos(end)?);
 		// Read every stored row, as the in-memory adapter sees every request point.
-		let margin = lo.saturating_sub(prepared.signature.first.0).max(prepared.signature.last.0.saturating_sub(hi)).max(0);
-		Ok(prepared.store.interpolate_range(ASPECT, lo, hi, margin, Interpolator::new(spline, resolution)).await?.into_points())
+		let margin = lo.saturating_sub(self.signature.first.0).max(self.signature.last.0.saturating_sub(hi)).max(0);
+		Ok(self.store.interpolate_range(ASPECT, lo, hi, margin, interpolator).await?.into_points())
 	}
 }
 
@@ -217,6 +229,7 @@ mod tests {
 				assert_eq!((g.timestamp, &g.value), (e.timestamp, &e.value), "{spline:?}");
 			}
 		}
+		drop(stored);
 	}
 
 	#[tokio::test]
@@ -228,6 +241,7 @@ mod tests {
 		let mut other = input();
 		other.pop();
 		let err = stored.interpolate_range(&mut other, ts(0), ts(31), Resolution::Seconds, Spline::Linear).await.expect_err("different points");
+		drop(stored);
 		assert!(err.to_string().contains("not the ones prepared"), "{err}");
 	}
 

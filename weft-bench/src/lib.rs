@@ -460,6 +460,8 @@ cpu,host=h0 usage=14.0 600\n";
 			assert_eq!(result.schema_version, SCHEMA_VERSION, "{label}: one report schema for every adapter");
 			assert!(result.correctness.passed(), "{label}: reporting must not change the measurement: {:?}", result.correctness);
 		}
+		// The stored adapter's temporary store goes as soon as the comparison is done.
+		drop(stored);
 	}
 
 	/// What each adapter *claims* about the requested spline, checked against what
@@ -488,5 +490,6 @@ cpu,host=h0 usage=14.0 600\n";
 
 			assert_eq!(differs, info.honours_requested_spline, "{label}: reports honours_requested_spline={}, but the two splines {} on this dataset", info.honours_requested_spline, if differs { "produced different grids" } else { "produced the same grid" });
 		}
+		drop(stored);
 	}
 }
