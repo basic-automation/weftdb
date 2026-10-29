@@ -156,6 +156,22 @@ impl SegmentStats {
 		let time_sorted = timestamps.windows(2).all(|w| w[0] <= w[1]);
 		Self { row_count: timestamps.len(), null_count, time_sorted, min_ts: timestamps.iter().copied().min(), max_ts: timestamps.iter().copied().max(), min_value: present_values.iter().min().cloned(), max_value: present_values.iter().max().cloned() }
 	}
+
+	/// **The quality predicate every skip in the read path tests** (roadmap Phase 4.3):
+	/// this column holds rows but not one present value, so a query that needs values
+	/// gets nothing from it.
+	///
+	/// An empty column is deliberately [`false`] — there is nothing to skip, and the
+	/// distinction matters where the caller reads the count back from an index row that
+	/// defaults a damaged pair to zeros. Every quality skip in the crate asks this one
+	/// question of the stats it has to hand: [`Segment::is_all_null`],
+	/// [`Page::is_all_null`](crate::Page::is_all_null),
+	/// [`SegmentDescriptor::is_all_null`](crate::SegmentDescriptor::is_all_null), and the
+	/// on-disk page/segment skips in [`crate::weftseg`]'s point readers — which reach it
+	/// from the persisted stats alone, without decoding a column.
+	pub const fn is_all_null(&self) -> bool {
+		self.row_count > 0 && self.null_count == self.row_count
+	}
 }
 
 /// An in-memory typed columnar segment: a timestamp column, a value column, and
@@ -412,7 +428,7 @@ impl Segment {
 	/// An empty segment is **not** all-null (it has no rows at all).
 	#[must_use]
 	pub const fn is_all_null(&self) -> bool {
-		self.stats.row_count > 0 && self.stats.null_count == self.stats.row_count
+		self.stats.is_all_null()
 	}
 
 	/// **Quality data skipping** (roadmap Phase 4.4): the number of **present**
