@@ -87,7 +87,7 @@ Interpolation and extrapolation run on the GPU, supported by a size-tiered LRU b
   - [ ] **FOUND (2026-10-11, runtime) — `POST /api/v1/downsample` rejects the documented multi-word
   - [ ] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138` …
   - [ ] **NEXT — the compute endpoints pay the same tax:**
-  - [ ] **Reconcile with EVI-10A** (2026-10-19: the API now has an input cap, `interpolate_range::MAX_KNOTS`, a `pub` const the review may keep, turn into an option or drop)
+  - [x] **Reconcile with EVI-10A** (2026-10-19: the API now has an input cap, `interpolate_range::MAX_KNOTS`, a `pub` const the review may keep, turn into an option or drop)
   - [ ] **NEXT (post-1.0 per decision 18) — the HTTP endpoint:**
 - [x] **DONE (2026-10-09) — GPU memory-stability + pool-eviction benchmark** (`weft-bench --gpu-memory`, `gpu_pool` in schema v22)
   - [ ] **NEXT — device memory, not just pool bytes:**
