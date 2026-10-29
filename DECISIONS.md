@@ -934,6 +934,44 @@ catalog row degrades provenance rather than stopping the read.
 **Not claimed:** the operator route is untouched by this slice — it is PR #128's, on
 main already — and no unit conversion happens, as the 2026-10-27 entry above says.
 
+## 2026-10-28 — 4.1 time-zone and leap-second policy: POSIX fixed-day, stated rather than implemented
+
+**Ambiguous:** roadmap 4.1's last open sub-item was the words "Explicit tz + leap-second policy" and
+nothing else. No code, comment or test in the workspace said what an epoch column means when the
+writer's offset is not UTC, or what happens on a calendar that inserts a second. The encodings
+already behave in one specific way; the item asked for that behaviour to be *said*, which left open
+which of several defensible policies to state.
+
+**Chose:** UTC epochs under the POSIX rule — a fixed-length day of exactly `86_400` seconds, no zone
+stored, no leap second modelled — documented on `TimeUnit` and pinned by three tests. A leap second
+is a *counted-twice second*, not a discontinuity, a smear or a renumbering, and the doc states
+plainly that the crate carries no table, cannot answer a TAI-UTC offset question, and will see a real
+leap second as one second long when interpolating or downsampling across it.
+
+**Why:** every alternative needs data or a mechanism the store does not have. A TZif-backed policy
+cannot be evaluated without a zone database the encoding crate must not depend on, and a stored
+*instant* needs no offset to be correct — only a display does, which belongs above the store.
+UTC-TAI smoothing needs a table that changes by announcement. Storing local times would make a
+segment's meaning depend on the writer, the one thing a columnar file that outlives its writer cannot
+afford. And delta / delta-of-delta over integer epochs are exact precisely because the tick spacing
+is uniform; a leap-aware clock stutters exactly where a monitored series would then show a
+1-second spike.
+
+**Also decided — two arithmetic rules worth naming.** The unit arithmetic moves from call sites onto
+the type (`TimeUnit::{nanos_per_unit, to_nanos, from_nanos}`). `to_nanos` is checked and returns
+`None` past the `i64` nanosecond range rather than wrapping: `Seconds` at `i64::MAX` is the year 292
+billion, and a wrapped value sorts into the wrong segment. The store's point-read scaling path keeps
+its own *saturating* form, because there the total order is what matters and saturation preserves it
+while a wrap does not — a read that gives up on the far tail of the key space still answers
+everywhere a segment can exist. `from_nanos` truncates toward minus infinity so `[t, t + unit)` means
+the same thing on both sides of 1970; truncating toward zero would put `-0.5 s` and `+0.5 s` in one
+bucket while a full second either side sits elsewhere.
+
+**Rejected:** a `chrono::DateTime`-typed column (chrono is a dependency of `weftdb`, not of
+`weft-physical-type`, and the encoding must not pay for a calendar); a per-column zone string
+(display metadata presented as data); leap smearing (rewrites real timestamps and is only correct
+with an announcement).
+
 ## 2026-10-28 — EVI-10A: `MAX_KNOTS` stays a `pub` const
 
 **Ambiguous:** ROADMAP's review item ("Reconcile with EVI-10A", 2026-10-19) left
