@@ -4,6 +4,51 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means
+
+**Ambiguous:** EVI-11 (#266) survives only as its title, in `ROADMAP.md` and in the 1.0 plan
+(`f085f84:docs/release/1.0-plan.md`); the evidence-track design that defined it is not in history. Two readings fit the title: an adapter that runs the bench's flagship workload against
+data *read from a `SegmentStore`*, or one that drives a running `weft-server` over HTTP. And the
+`SystemAdapter` trait hands an adapter its points on every rep, which a stored adapter can only use
+by writing them — turning a read benchmark into a write benchmark.
+
+**Chosen:**
+
+1. **Stored means the library store, not the server.** `StoredWeftAdapter`
+   (`weft-bench/src/stored_weft_adapter.rs`, adapter name `weftdb-stored`) seals the dataset into a
+   temporary `SegmentStore` and times `SegmentStore::interpolate_range` — the EVI-10A API, which
+   decision 18 ships as the 1.0 surface for stored interpolation with the HTTP route deferred past
+   1.0. An HTTP adapter would measure a route that does not exist yet.
+2. **Ingest is untimed, through a new `SystemAdapter::prepare` hook.** `prepare(&points)` has a
+   no-op default, so the in-process adapters are unchanged; `run_profile` and `measure_accuracy` call
+   it once before the timed reps, its span counting toward `end_to_end_ns` and never `measured_ns`.
+   A call for points that were not prepared is *refused* (an O(1) signature: row count and both end
+   rows), not quietly stored, so a missing `prepare` cannot put a write inside a timed rep.
+3. **The stored knots are the request's knots.** The aspect is declared with the narrowest lossless
+   physical type for the values (the type the run's storage estimate already costs) and
+   nanosecond timestamps (the synthetic profiles jitter instants below the microsecond, and
+   nanoseconds are chrono's own precision), and the read margin is widened to every stored row. The
+   output therefore equals `WeftAdapter`'s point for point (tested for linear and cubic), and the
+   latency gap between the two results is the storage read path alone. Input outside the `i64`
+   nanosecond range (about 1677–2262), or unsorted input, is refused rather than clamped or reordered.
+4. **Segments are sealed in 1024-row batches** (`DEFAULT_INGEST_BATCH_ROWS`, the ingest workload's),
+   so a window spans many frames as it would in a store fed by ingest; `with_batch_rows` changes it.
+5. **Opt-in on the CLI (`--stored`).** Adding a result to every default run would rename the nightly
+   artifact (`<profile>__weftdb+weftdb-stored.json`) and add an unpaired workload to EVI-5's
+   comparison; the nightly can opt in when a baseline exists.
+
+**Rejected:** ingesting inside `interpolate_range` on the first rep and relying on `cold_warm` to
+separate it (the first rep would carry a write, and the cold figure would stop meaning first-touch
+read); a server-backed adapter; adding `--stored` to the nightly workflow in the same PR.
+
+**Settled by the plan:** decision 18 (`f085f84:docs/release/1.0-plan.md:540`) scopes the first report
+as "WeftDB (stored, in-memory, f64) against DuckDB `DOUBLE` and `DECIMAL`", with stored interpolation
+shipping "as a library API (EVI-10A); the HTTP route is deferred". So the stored arm is the library
+store, as built here. The `f64` arm (`interpolate_range_f64`) is not part of this adapter: the
+`SystemAdapter` contract returns `BigDecimal` points, so converting back would put a per-point cost
+into the timing that the arm exists to avoid. It belongs in EVI-13's cross-engine harness, which owns
+its own arms.
+
 ## 2026-10-29 — SEC-4 "one HTTP/1.1 serve path with pre-auth listener limits" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§3 SEC-4 row, §4 C9, §6 W3) fixes *what* SEC-4

@@ -18,6 +18,13 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **Stored WeftDB benchmark adapter in `weft-bench`** (evidence track EVI-11). `--stored` adds a
+  `weftdb-stored` result to an interpolation run: the dataset is sealed into a temporary
+  `SegmentStore` (1024-row segments, the narrowest lossless value type, nanosecond timestamps)
+  before timing, and each rep runs `SegmentStore::interpolate_range` over it, so the gap to the
+  `weftdb` result is the cost of interpolating on read from storage. The output equals the
+  in-memory adapter's point for point. `SystemAdapter` gains an untimed `prepare` hook (no-op by
+  default) that `run_profile` and `measure_accuracy` call once before the timed reps.
 - **Block missingness and size presets in `weft-bench`** (evidence track EVI-9). `--sparse` is a
   workload of its own: a seeded grid of `--sp-series` series × `--sp-blocks` blocks of `--sp-rows`
   rows is opened cell by cell at `--sp-density` percent, held as one nullable `f64` column per

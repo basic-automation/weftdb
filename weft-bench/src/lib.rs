@@ -89,6 +89,7 @@ pub mod soak_system;
 pub mod soak_workload;
 pub mod sparse;
 pub mod stats;
+pub mod stored_weft_adapter;
 pub mod uci;
 pub mod weft_adapter;
 
@@ -98,7 +99,7 @@ use bigdecimal::ToPrimitive;
 
 use crate::adapter::grid_timestamps;
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter}, baseline_adapter::BaselineLinearAdapter, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_on, IngestProfile, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{PreflightCheck, ResolvedDevice, SoakConfig, SoakHarness, SoakPreflight, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_client::{IngestClient, IngestFlow, IngestTarget, DEFAULT_SOAK_ASPECT, MAX_RESPONSE_BYTES, SOAK_CLIENT_FIELD, SOAK_CLIENT_PHYSICAL_TYPE, SOAK_CLIENT_PRECISION, SOAK_CLIENT_TIMESTAMP_UNIT}, soak_hdr::HdrHistogram, soak_null::{NullServer, SoakServer}, soak_sched::{IntervalLog, IntervalRecord, OpenLoopScheduler, SchedulerConfig, SchedulerReport, SelfMonitor, TickDecision}, soak_system::{evaluate_flush_check, resolve_store_device, ContaminationFlag, ContaminationLedger, ContaminationPolicy, ContaminationVerdict, DeviceCounters, FlushCheckResult, FlushEvidence, FlushFailureKind, PressureStall, ProcRoot, SamplerShutdown, SamplerThread, StoreDevice, StrictMode, SystemSample, SystemSampler, DEFAULT_PROC_ROOT}, soak_workload::{GridValue, LaneWeights, ValueFormat, ValueGrid, WorkloadLane, WorkloadModel, WorkloadParams, WorkloadStep, SOAK_WORKLOAD_EPOCH_NS, SOAK_WORKLOAD_MEASUREMENT}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter}, baseline_adapter::BaselineLinearAdapter, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_on, IngestProfile, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{PreflightCheck, ResolvedDevice, SoakConfig, SoakHarness, SoakPreflight, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_client::{IngestClient, IngestFlow, IngestTarget, DEFAULT_SOAK_ASPECT, MAX_RESPONSE_BYTES, SOAK_CLIENT_FIELD, SOAK_CLIENT_PHYSICAL_TYPE, SOAK_CLIENT_PRECISION, SOAK_CLIENT_TIMESTAMP_UNIT}, soak_hdr::HdrHistogram, soak_null::{NullServer, SoakServer}, soak_sched::{IntervalLog, IntervalRecord, OpenLoopScheduler, SchedulerConfig, SchedulerReport, SelfMonitor, TickDecision}, soak_system::{evaluate_flush_check, resolve_store_device, ContaminationFlag, ContaminationLedger, ContaminationPolicy, ContaminationVerdict, DeviceCounters, FlushCheckResult, FlushEvidence, FlushFailureKind, PressureStall, ProcRoot, SamplerShutdown, SamplerThread, StoreDevice, StrictMode, SystemSample, SystemSampler, DEFAULT_PROC_ROOT}, soak_workload::{GridValue, LaneWeights, ValueFormat, ValueGrid, WorkloadLane, WorkloadModel, WorkloadParams, WorkloadStep, SOAK_WORKLOAD_EPOCH_NS, SOAK_WORKLOAD_MEASUREMENT}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, stored_weft_adapter::StoredWeftAdapter, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -140,6 +141,9 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	let input_points = dataset.len();
 	let (start, end) = (profile.start(), profile.end());
 	let expected_output_points = grid_timestamps(start, end, profile.resolution).len();
+	// Untimed: a stored adapter loads the dataset here, so the reps time its read path.
+	// The span still counts toward `end_to_end_ns`, never toward `measured_ns`.
+	adapter.prepare(&dataset).await?;
 
 	let mut samples_ns: Vec<u64> = Vec::with_capacity(reps);
 	let mut last_output: Vec<splimes::Point> = Vec::new();
@@ -215,6 +219,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 pub async fn measure_accuracy<A: SystemAdapter + ?Sized>(adapter: &A, profile: &InterpolationProfile) -> anyhow::Result<AccuracyMetrics> {
 	let truth = accuracy::synthetic_ground_truth(profile)?;
 	let mut points = profile.generate();
+	adapter.prepare(&points).await?;
 	let (start, end) = (profile.start(), profile.end());
 	let output = adapter.interpolate_range(&mut points, start, end, profile.resolution, profile.spline).await?;
 	Ok(AccuracyMetrics::from_aligned(&output, &truth)?)
@@ -445,7 +450,8 @@ cpu,host=h0 usage=14.0 600\n";
 		let weft = WeftAdapter::new();
 		let linear_baseline = BaselineLinearAdapter::new();
 		let forward_fill = ForwardFillAdapter::new();
-		let adapters: [(&str, &dyn SystemAdapter); 3] = [("weftdb", &weft), ("baseline-linear", &linear_baseline), ("baseline-forward-fill", &forward_fill)];
+		let stored = StoredWeftAdapter::new();
+		let adapters: [(&str, &dyn SystemAdapter); 4] = [("weftdb", &weft), ("baseline-linear", &linear_baseline), ("baseline-forward-fill", &forward_fill), ("weftdb-stored", &stored)];
 		for (label, adapter) in adapters {
 			let own_report = adapter.adapter_info();
 			let result = run_profile(adapter, &profile, 2).await.expect("every adapter completes the same profile");
@@ -454,6 +460,8 @@ cpu,host=h0 usage=14.0 600\n";
 			assert_eq!(result.schema_version, SCHEMA_VERSION, "{label}: one report schema for every adapter");
 			assert!(result.correctness.passed(), "{label}: reporting must not change the measurement: {:?}", result.correctness);
 		}
+		// The stored adapter's temporary store goes as soon as the comparison is done.
+		drop(stored);
 	}
 
 	/// What each adapter *claims* about the requested spline, checked against what
@@ -469,9 +477,11 @@ cpu,host=h0 usage=14.0 600\n";
 		let weft = WeftAdapter::new();
 		let linear_baseline = BaselineLinearAdapter::new();
 		let forward_fill = ForwardFillAdapter::new();
-		let adapters: [(&str, &dyn SystemAdapter); 3] = [("weftdb", &weft), ("baseline-linear", &linear_baseline), ("baseline-forward-fill", &forward_fill)];
+		let stored = StoredWeftAdapter::new();
+		let adapters: [(&str, &dyn SystemAdapter); 4] = [("weftdb", &weft), ("baseline-linear", &linear_baseline), ("baseline-forward-fill", &forward_fill), ("weftdb-stored", &stored)];
 		for (label, adapter) in adapters {
 			let info = adapter.adapter_info();
+			adapter.prepare(&dataset).await.expect("prepares");
 			let mut linear_input = dataset.clone();
 			let linear = adapter.interpolate_range(&mut linear_input, start, end, resolution, splimes::Spline::Linear).await.expect("linear reconstruction");
 			let mut cubic_input = dataset.clone();
@@ -480,5 +490,6 @@ cpu,host=h0 usage=14.0 600\n";
 
 			assert_eq!(differs, info.honours_requested_spline, "{label}: reports honours_requested_spline={}, but the two splines {} on this dataset", info.honours_requested_spline, if differs { "produced different grids" } else { "produced the same grid" });
 		}
+		drop(stored);
 	}
 }

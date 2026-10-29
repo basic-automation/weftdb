@@ -285,7 +285,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **PAC-5b** Strict server configuration and store filesystem check (the bind guard moves to SEC-8)
   - [ ] **TAG-0** Fix ILP series merging
   - [ ] L-FMT: **ROB-8** Frame decode hardening
-  - [ ] **EVI-11** Stored WeftDB benchmark adapter
+  - [x] **EVI-11** Stored WeftDB benchmark adapter
   - [ ] **SOA-6** Soak oracle core
 - [ ] **W5 · Ingest wiring, whole-store backup, legacy seal**
   - [ ] Store lane

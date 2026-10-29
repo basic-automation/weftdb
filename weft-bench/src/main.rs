@@ -33,7 +33,7 @@ use std::{
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_ingest_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
+	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_ingest_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
 };
 
 /// Program name used in usage / error output.
@@ -151,12 +151,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	// too — linear (fair-protocol class C) and forward-fill/LOCF (class B, the
 	// in-process mirror of native TSDB `FILL(previous)`) — so the report carries a
 	// real multi-system comparison rather than a lone number.
-	let mut results: Vec<BenchResult> = Vec::with_capacity(if cli.compare { 3 } else { 1 });
+	let mut results: Vec<BenchResult> = Vec::with_capacity(1 + usize::from(cli.stored) + if cli.compare { 2 } else { 0 });
 	// Every adapter here reports itself, so each result carries the capability and
 	// provenance of the thing that produced it — including the one fact that
 	// separates WeftDB from the baselines: whether the requested spline was run.
 	let weft_result = run_profile(&WeftAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("WeftDB benchmark run failed: {e}"))?;
 	results.push(weft_result);
+	// `--stored`: the same profile served from a `SegmentStore` (sealed before timing), so
+	// the gap to the line above is the cost of interpolating on read from storage.
+	if cli.stored {
+		let stored = run_profile(&StoredWeftAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("stored WeftDB benchmark run failed: {e}"))?;
+		results.push(stored);
+	}
 	if cli.compare {
 		let linear = run_profile(&BaselineLinearAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("linear baseline run failed: {e}"))?;
 		results.push(linear);
@@ -782,6 +788,9 @@ struct Cli {
 	/// Also run the portable baseline suite (linear + forward-fill) and emit a
 	/// comparison report.
 	compare: bool,
+	/// Also run the stored WeftDB adapter: the same reconstruction read back from a
+	/// `SegmentStore` the dataset is sealed into before timing.
+	stored: bool,
 	/// Also write a human-readable HTML report alongside the JSON artifact.
 	html: bool,
 	/// Also write the flat Parquet results table beside the JSON artifact.
@@ -920,6 +929,7 @@ impl Cli {
 		let mut out_dir = PathBuf::from("reports").join("json");
 		let mut name: Option<String> = None;
 		let mut compare = false;
+		let mut stored = false;
 		let (mut html, mut parquet, mut ds_scaled) = (false, false, false);
 		let mut gpu_calibrate = true;
 		let (mut manifest, mut claim, mut labels): (bool, Option<String>, Vec<(String, String)>) = (true, None, Vec::new());
@@ -997,6 +1007,7 @@ impl Cli {
 				"--out-dir" => out_dir = PathBuf::from(take_value(&key)?),
 				"--name" => name = Some(take_value(&key)?),
 				"-c" | "--compare" => compare = true,
+				"--stored" => stored = true,
 				"--html" => html = true,
 				"--parquet" => parquet = true,
 				"--ds-scaled" => ds_scaled = true,
@@ -1021,11 +1032,14 @@ impl Cli {
 			apply_scale_preset(preset, &mut ds_points, &mut gap_fill, &mut sparse);
 		}
 		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
+		if let Some(mode_flag) = self_generating_mode_flag(mode).filter(|_| stored) {
+			return Err(format!("`--stored` has no meaning in `{mode_flag}` mode"));
+		}
 		if mode == InputMode::Ingest && uci.is_none() {
 			return Err("`--ingest` requires `--uci <household_power_consumption.txt>`".to_string());
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1616,6 +1630,9 @@ OPTIONS:
         --name <NAME>        Profile name      [default: input stem / flagship name]
     -c, --compare            Also run the portable baseline suite (linear +
                              forward-fill) for comparison
+        --stored             Also run the stored WeftDB adapter: the dataset is
+                             sealed into a SegmentStore before timing and each
+                             rep interpolates on read from it
         --html               Also write a human-readable HTML report alongside
                              the JSON artifact
         --parquet            Also write the results as a flat Parquet table (one
@@ -2013,6 +2030,14 @@ mod tests {
 		assert!(expect_run(&["data.lp", "-f", "v", "--compare"]).compare);
 		assert!(expect_run(&["data.lp", "-f", "v", "-c"]).compare);
 		assert!(!expect_run(&["data.lp", "-f", "v"]).compare);
+	}
+
+	#[test]
+	fn stored_flag_is_parsed_for_interpolation_and_refused_elsewhere() {
+		assert!(expect_run(&["data.lp", "-f", "v", "--stored"]).stored);
+		assert!(expect_run(&["-s", "--stored"]).stored);
+		assert!(!expect_run(&["-s"]).stored);
+		assert!(run_cli(&["--range-fetch", "--stored"]).unwrap_err().contains("`--stored` has no meaning"));
 	}
 
 	#[test]
