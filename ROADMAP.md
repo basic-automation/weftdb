@@ -268,7 +268,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)
   - [x] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions
   - [x] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
-  - [ ] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
+  - [x] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
   - [ ] **ROB-6** Bounded decimals
   - [ ] **EVI-8B** Benchmark adapter v2 II
   - [ ] **SOA-5** Soak ingest client

@@ -33,6 +33,20 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **One HTTP/1.1 serve path with pre-auth listener limits** (security track
+  SEC-4, absorbing ROB-23's caps). All serving now goes through
+  `weft_server::serve::run` (hyper's HTTP/1.1 server) instead of a bare
+  `axum::serve`: a connection cap taken before `accept` (default half the
+  process's `RLIMIT_NOFILE` soft limit, clamped to 16..=65,536;
+  `WEFT_MAX_CONNECTIONS` overrides), a 30 s header deadline
+  (`WEFT_HEADER_READ_TIMEOUT_SECS`), a 30 s keep-alive/read-idle deadline
+  (`WEFT_KEEP_ALIVE_TIMEOUT_SECS`) and a 10 s write-stall timeout
+  (`WEFT_WRITE_STALL_TIMEOUT_SECS`) — all enforced before any route or auth
+  code runs. SIGINT/SIGTERM handlers are installed before every other
+  startup phase, so a signal that arrives before serving starts is recorded
+  and the server exits 0 without accepting; while serving, a signal stops
+  the accept loop and live connections drain for up to 5 s.
+
 - **Every HTTP route now registers through one sealed registry** (security track
   SEC-3). `weft-server/src/lib.rs` no longer carries the route chain: each of the
   55 routes (49 path templates) is registered in `weft-server/src/routes.rs` by a
