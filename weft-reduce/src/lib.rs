@@ -155,15 +155,16 @@ impl Aggregation {
 		}
 	}
 
-	/// Parse a reduction from its wire token (case-insensitive), the inverse of
-	/// [`as_str`](Self::as_str). Accepts `median` as an alias for `p50`, and the bare
-	/// lowercase variant names (`twalinear`, `sketchp99`) that a JSON body accepted before
-	/// this parser did, so a client that sent them keeps working. Returns `None` for an
-	/// unknown token. Shared so every surface (HTTP query params, the JSON body, the bench
-	/// CLI) parses the same set the reduction supports.
+	/// Parse a reduction from its wire token, the inverse of [`as_str`](Self::as_str). The
+	/// match is exact-case: the wire tokens are lowercase, so `Min` and `MEDIAN` are unknown,
+	/// not folded to a reduction. Surrounding whitespace is ignored. Accepts `median` as an
+	/// alias for `p50`, and the bare lowercase variant names (`twalinear`, `sketchp99`) that
+	/// a JSON body accepted before this parser did, so a client that sent them keeps working.
+	/// Returns `None` for an unknown token. Shared so every surface (HTTP query params, the
+	/// JSON body, the bench CLI) parses the same set the reduction supports.
 	#[must_use]
 	pub fn from_token(token: &str) -> Option<Self> {
-		match token.trim().to_ascii_lowercase().as_str() {
+		match token.trim() {
 			"min" => Some(Self::Min),
 			"max" => Some(Self::Max),
 			"avg" => Some(Self::Avg),
@@ -247,8 +248,8 @@ impl Aggregation {
 pub struct UnknownAggregation(pub String);
 
 /// The JSON body's reader for [`Aggregation`]: the same spellings as
-/// [`from_token`](Aggregation::from_token), so `twa_linear`, `median` and `Min` parse in a
-/// body as they do in a query string.
+/// [`from_token`](Aggregation::from_token), so `twa_linear` and `median` parse in a body as
+/// they do in a query string, and `Min` is refused in both.
 impl TryFrom<String> for Aggregation {
 	type Error = UnknownAggregation;
 
@@ -871,12 +872,20 @@ mod tests {
 
 	#[test]
 	fn json_and_query_spellings_name_the_same_reductions() {
-		// The documented spellings and aliases, the bare lowercase names a body sent before
-		// `from_token` read it, and the case-insensitive form a query string already accepted.
-		let spellings = [("twa_linear", Aggregation::TwaLinear), ("twalinear", Aggregation::TwaLinear), ("time_weighted_avg_linear", Aggregation::TwaLinear), ("twa_bucket_end", Aggregation::TwaBucketEnd), ("twabucketend", Aggregation::TwaBucketEnd), ("sketch_p99", Aggregation::SketchP99), ("sketchp99", Aggregation::SketchP99), ("sketch_median", Aggregation::SketchP50), ("median", Aggregation::P50), ("Min", Aggregation::Min), (" avg ", Aggregation::Avg)];
+		// The documented spellings and aliases, and the bare lowercase names a body sent
+		// before `from_token` read it. Every spelling is lowercase, as the wire tokens are.
+		let spellings = [("twa_linear", Aggregation::TwaLinear), ("twalinear", Aggregation::TwaLinear), ("time_weighted_avg_linear", Aggregation::TwaLinear), ("twa_bucket_end", Aggregation::TwaBucketEnd), ("twabucketend", Aggregation::TwaBucketEnd), ("sketch_p99", Aggregation::SketchP99), ("sketchp99", Aggregation::SketchP99), ("sketch_median", Aggregation::SketchP50), ("median", Aggregation::P50), (" avg ", Aggregation::Avg)];
 		for (token, expected) in spellings {
 			assert_eq!(read_json_token(token).expect(token), expected, "JSON `{token}`");
 			assert_eq!(Aggregation::from_token(token), Some(expected), "query `{token}`");
+		}
+	}
+
+	#[test]
+	fn json_and_query_refuse_a_name_that_is_not_lowercase() {
+		for token in ["Min", "MEDIAN", "Twa_Linear", "SKETCH_P99"] {
+			assert!(read_json_token(token).is_err(), "JSON `{token}` must be refused");
+			assert_eq!(Aggregation::from_token(token), None, "query `{token}` must be refused");
 		}
 	}
 
@@ -1034,7 +1043,7 @@ mod tests {
 		for agg in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear] {
 			assert_eq!(Aggregation::from_token(agg.as_str()), Some(agg), "{} must round-trip", agg.as_str());
 		}
-		assert_eq!(Aggregation::from_token("MEDIAN"), Some(Aggregation::P50), "median is a case-insensitive p50 alias");
+		assert_eq!(Aggregation::from_token("MEDIAN"), None, "tokens are exact-case, so an upper-case alias is unknown");
 		assert_eq!(Aggregation::from_token(" avg "), Some(Aggregation::Avg), "surrounding whitespace is trimmed");
 		assert_eq!(Aggregation::from_token("twa_locf"), Some(Aggregation::Twa), "twa_locf names the LOCF method explicitly");
 		assert_eq!(Aggregation::from_token("time_weighted_avg_linear"), Some(Aggregation::TwaLinear), "the long-form linear alias parses");
@@ -1179,7 +1188,7 @@ mod tests {
 			assert_eq!(Aggregation::from_token(agg.as_str()), Some(agg), "{} round-trips", agg.as_str());
 		}
 		assert_eq!(Aggregation::from_token("sketch_median"), Some(Aggregation::SketchP50), "sketch_median aliases sketch_p50");
-		assert_eq!(Aggregation::from_token("SKETCH_P99"), Some(Aggregation::SketchP99), "sketch tokens are case-insensitive");
+		assert_eq!(Aggregation::from_token("SKETCH_P99"), None, "sketch tokens are exact-case, so an upper-case token is unknown");
 	}
 
 	#[test]

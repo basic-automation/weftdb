@@ -535,6 +535,13 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **Reduction tokens are exact-case** (ROADMAP, FRE-5). `Aggregation::from_token` now matches the
+  lowercase wire tokens exactly, so `?agg=`, the JSON body's `aggregations`, the stored-range
+  `agg=` and `weft-bench --ds-aggs` refuse `Min`, `SUM` and `MEDIAN` with a `400` (or a CLI error)
+  that names the token. **This breaks v0.1.0**, whose query string folded case: send `min`,
+  `sum`, `p50`, `twa_linear` and the other lowercase spellings the README lists. The
+  underscore spellings, the aliases and the bare lowercase names are unchanged.
+
 - **The segment-set rollup lives in `segment_index.db`** (1.0 plan D-S11). The
   rollup row (`aspect_metadata`) was written to `metadata.db` in a second transaction
   after a seal's index commit, and rebuilt in a second transaction after a swap's —
@@ -883,7 +890,7 @@ only the control plane, not the segment frames.
 
 ### Fixed
 
-- **The JSON body's `aggregations` accepts the documented reduction spellings and any letter case.** `POST /api/v1/downsample`
+- **The JSON body's `aggregations` accepts the documented reduction spellings.** `POST /api/v1/downsample`
   read its tokens through the bare lowercase variant names only, so the README's `twa_linear`, `sketch_p99` and aliases such as
   `median` were rejected as unknown variants, and a name copied from a response (`twa_linear`) could not be sent back. The body
   now reads the query string's parser (`Aggregation::from_token`), so both surfaces accept the same set; the bare names
