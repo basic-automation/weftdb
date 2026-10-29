@@ -4,6 +4,58 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-27 — D-S10 "write-once durable seal with id assigned at commit" (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6 W3, §5 D-S10 amendment) says a seal is
+write-once with its id assigned at commit, and that `segment_path` /
+`sidecar_path` are rewritten to use `aspect_name::encode` with a
+containment check — but it does not say what the seal's frame is named,
+what a sidecar is named by once the id stops naming the frame, or
+whether a seal advances the commit epoch that swaps advance. The
+crash-consistency design §4 (via `frame_name.rs`) says seals take
+write-once names from S10, and `aspect_locks.rs` says seals advance the
+epoch from S10, which grounds the first and third questions; the
+sidecar question is genuinely open.
+
+**Chosen:**
+
+1. A seal frame is `{enc(aspect)}~g{gen}~p{gen}.weftseg`: the generation
+   from the per-aspect counter that never hands a value out twice, with
+   `prec` equal to the generation, as `frame_name`'s doc prescribes for
+   a seal. The id is handed out by `publish_seal` under the commit
+   lock, after the frame is written and fsynced with `segments/`
+   fsynced, and the row carries `gen`, `prec`, the frame's trailer CRC
+   and the commit epoch; the allocator is raised past both the id and
+   the generation in the same transaction.
+2. A sidecar is named by its frame, not by the segment id:
+   `{stem}~g{gen}~p{prec}.weftpart`. An id is assigned at commit and a
+   later output may take it, while a frame name is never reused, so an
+   id-named sidecar would collide across a swap. A sidecar is loaded
+   and removed by deriving it from the frame's own file name (the
+   `.weftseg` extension exchanged for `.weftpart`), which resolves a
+   legacy frame to its legacy sidecar and a write-once frame to its
+   generation-named one without guessing the scheme. The reaper removes
+   a write-once frame's sidecar by frame name once the frame is
+   unlinked; the legacy id check stays for legacy frames.
+3. A seal advances the commit epoch by one, like a swap, and records
+   it as the row's `commit_epoch` — the epoch counter is shared, so a
+   seal and a swap cannot share an epoch.
+4. A seal that stops at a post-write fault point keeps its frame on
+   disk, as before: the durable write runs with no fault points and
+   the `S-frame-written` / `S-frame-synced` / `S-dir-synced` points
+   fire after it, so the crash-matrix orphan (a frame with no row,
+   which S12 recovery classifies) still exists. Routing the write
+   through `write_new_durable`'s fault points instead would delete
+   that frame on an injected error and erase the litter the recovery
+   slice is specified to handle.
+
+**Rejected:** keeping the legacy `{aspect}-{id}` frame name and only
+encoding the aspect (the frame would still be named by an id assigned
+before the write, which is what "id assigned at commit" forbids);
+naming sidecars by segment id (collides when a swap output takes the
+id); and leaving the epoch unadvanced by seals (two commits could
+then share an epoch, which the swap epoch exists to order).
+
 ## 2026-10-27 — SOA-4 "deterministic workload model, lanes, format-exact value grids and body encoders" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** as with SOA-2 and SOA-3, the 1.0 plan (§6, W2) lists SOA-4
@@ -712,3 +764,86 @@ catalog row degrades provenance rather than stopping the read.
 
 **Not claimed:** the operator route is untouched by this slice — it is PR #128's, on
 main already — and no unit conversion happens, as the 2026-10-27 entry above says.
+
+## 2026-10-28 — EVI-10A: `MAX_KNOTS` stays a `pub` const
+
+**Ambiguous:** ROADMAP's review item ("Reconcile with EVI-10A", 2026-10-19) left
+`interpolate_range::MAX_KNOTS` open: keep it a `pub` const, turn it into an option,
+or drop it. Meanwhile the server's `POST /api/v1/interpolate` gained its own input
+cap (`InterpolateConfig`, env-overridable via `WEFT_MAX_INTERPOLATE_POINTS`).
+
+**Chosen:** keep `MAX_KNOTS` as a `pub` const (4 Mi rows). The two caps bound
+different quantities, so there is nothing to unify: `MAX_KNOTS` bounds the stored
+rows one reconstruction reads (the knots handed to splimes, and the second copy
+built for them — a memory bound), while the server's cap and splimes'
+`max_points` bound the output grid. Unifying them would cap the wrong thing on
+one side or the other. Dropping the const would hide a public, CHANGELOG-
+documented bound for no benefit, and turning it into a per-call option would
+invent library API surface no caller has asked for: a caller that needs a
+different bound already has the documented escape — narrow the window or the
+margin, or interpolate in pieces, which the refusal message itself says. The
+private `stored_window_capped` seam stays test-only.
+
+**Applied:** EVI-10A's ROADMAP line is ticked on this decision plus the
+verification that the two other acceptance criteria already hold on `main`:
+`SegmentStore::interpolate_range` / `interpolate_range_f64` are reachable
+through the store lane via the `types::interpolate_range` child module (one
+`mod` line in `types/mod.rs`), and a window over the cap is refused
+(`a_window_with_more_rows_than_the_cap_is_refused`, including the margin
+counting toward the cap). The review item itself is left unticked here — it
+names this slice, and this entry is its answer — so the loop can flip it
+alongside the line it reviews.
+
+## 2026-10-28 — D-S11: the rollup moves to `segment_index.db`
+
+**Spec:** 1.0-plan.md §6 W3 store lane (D-S10 → EVI-10A hook → D-S11) plus
+ROADMAP line 269, and the code's own anticipation of it: the layout-2 migration
+already creates `aspect_metadata` in `segment_index.db` "with metadata.db's
+columns, folded inside the seal transaction from S11", and `finish_swap` called
+its post-swap rebuild "the interim until S11 folds it into the swap itself".
+No §5 amendment names D-S11, and the queue's open question — the exact source
+rows — resolves from `metadata.rs`: the rollup is `AspectMetadata`, derived
+from the segment index (`from_index`) or folded one descriptor at a time
+(`folded`).
+
+**Chosen:** the `segment_index.db` `aspect_metadata` row is the rollup, and
+both writers fold it in their own transaction. A seal reads that row, folds its
+fresh descriptor, and commits `InsertNew` + `SeqBump` + `PutRollup` (a new
+`IndexOp`, `INSERT OR REPLACE` on the aspect key) in one `IndexTxn`. A swap
+derives the rollup from its post-swap rows — the current rows under the commit
+lock, with each plan op applied in memory — and commits it with the swap's ops,
+so a swap that deletes members without replacing them (a narrowing squash)
+stays exact, where a per-output fold would not. Rebuilds write the same row
+through a single-op `IndexTxn`. `PutRollup` counts as guarded for retries only
+because its callers hold the aspect's commit lock across the whole transaction,
+retries included, so no other writer of that row can commit between attempts.
+
+**Not moved:** `metadata.db` stays a control-plane file — the FRE-14
+`legacy_catalog` table lives there — and `AspectMetadataStore` stays a public
+type with its own tests, but the store no longer writes its rollup table and
+`SegmentStore::metadata()` now says so. Readers (`aspect_metadata`,
+`store_stats`, the fragmentation guard) read `segment_index.db`; the journal
+replay keeps its re-derive as a no-op reconciliation for pre-S11 or clobbered
+rows.
+
+## 2026-10-28 — D-S11 fix: open backfills the rollup rows the replay never writes
+
+**Correction to the entry above:** the journal replay does NOT reconcile
+pre-S11 rows in general — it re-derives only the aspects its journal names.
+A clean pre-S11 store (no journal rows) therefore opens with no
+`segment_index.db` rollup rows at all, and `aspect_metadata` reads default
+zeros for every aspect. The v0.1.0 compat gate caught it: a migrated `price`
+aspect read 0 nulls against the 14 v0.1.0 counted, while its segment count,
+rows and bytes — which come from the live segment scan, not the rollup — still
+matched. The re-derive itself is sound: `rebuild_aspect_metadata` on the
+migrated store returns the true 14, so the descriptors carry the null counts
+and only the rows are missing.
+
+**Fix:** open backfills exactly the missing rows (`backfill_missing_rollups`,
+step 13 of the open), after the journal replay and only for stores this build
+may write. Rebuilding every row on every open would rescan the whole index
+for stores that already have rows; deriving on read would change the
+materialized-rollup contract and pay a full index scan per read. Missing-only
+keeps an S11-native open at one `SELECT` per aspect and makes a pre-S11 store
+read correctly from its first open; a later seal or swap keeps the row current
+by folding, as usual.

@@ -38,9 +38,10 @@
 //! aspect and guards its id allocator: a seal takes its id from the allocator, writes its
 //! frame with the lock released, then inserts its row (a plain `INSERT`, which cannot
 //! replace another), raises the persisted allocator (`aspect_seq`) and folds the rollup
-//! under it again; maintenance row rewrites, member deletes and rollup rebuilds run under
-//! it too. So ids are never shared or reissued (not after a delete, a crash or a restart),
-//! and no rollup update is lost to a concurrent one. Its *maintenance* lock is held for a
+//! into `segment_index.db` in the same transaction; maintenance row rewrites, member
+//! deletes and rollup rebuilds run under it too. So ids are never shared or reissued
+//! (not after a delete, a crash or a restart), and no rollup update is lost to a
+//! concurrent one. Its *maintenance* lock is held for a
 //! whole maintenance operation, so two never interleave on one aspect. A per-aspect
 //! maintenance entry point waits for it up to [`SegmentStore::maintenance_wait`] and then
 //! fails with [`MaintenanceBusy`]; a store-wide sweep skips or waits for a busy aspect as
@@ -85,7 +86,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
 use tracing::Instrument as _;
-use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SplitDecision, SplitPolicy, TimeUnit};
+use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SegmentIndex, SplitDecision, SplitPolicy, TimeUnit};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
@@ -821,9 +822,10 @@ impl PreparedPlan {
 		self.members.iter().map(|member| member.desc.id).chain(self.fresh.iter().copied()).take(self.outputs.len()).collect()
 	}
 
-	/// The members no output takes the id of, which the swap deletes.
-	fn deleted_ids(&self) -> Vec<u64> {
-		self.members.iter().skip(self.outputs.len()).map(|member| member.desc.id).collect()
+	/// The members no output takes the id of, which the swap deletes: their frame
+	/// paths, whose sidecars a merge removes by frame name.
+	fn deleted_frames(&self) -> Vec<String> {
+		self.members.iter().skip(self.outputs.len()).map(|member| member.desc.path.clone()).collect()
 	}
 
 	/// Step M5's ops for this plan, committing in aspect epoch `epoch` (design section 5.3):
@@ -911,11 +913,11 @@ impl Drop for PendingOutputs<'_> {
 }
 
 /// The [`IndexOp::SeqBump`] that persists the allocator `commit` holds for `aspect`: past
-/// every id handed out so far, including those of seals still writing their frames.
-fn seq_bump(aspect: &str, commit: &CommitGuard) -> IndexOp {
+/// every id handed out so far, and past every generation a frame this commit names, in
+/// `epoch`. A seal raises the generations past its own frame (S10); a swap past its outputs'.
+fn seq_bump(aspect: &str, commit: &CommitGuard, next_gen: u64, epoch: u64) -> IndexOp {
 	let state = commit.state();
-	// A seal names no write-once frame yet (S10), so it leaves the generations as they are.
-	IndexOp::SeqBump { aspect: aspect.to_string(), next_id: state.next_id, next_gen: 0, epoch: state.epoch }
+	IndexOp::SeqBump { aspect: aspect.to_string(), next_id: state.next_id, next_gen, epoch }
 }
 
 /// The aspect and id a legacy-named file carries: a frame `{aspect}-{id}.weftseg` or its
@@ -1054,9 +1056,9 @@ pub struct SegmentStore {
 	root: PathBuf,
 	/// The libSQL segment index (`root/segment_index.db`).
 	index: SegmentIndexStore,
-	/// The libSQL per-aspect segment-set rollup (`root/metadata.db`) — one
-	/// materialized [`AspectMetadata`] row per aspect, folded forward on every seal,
-	/// so the aspect-wide summary is an O(1) read rather than a full index scan.
+	/// The `metadata.db` store (`root/metadata.db`): since S11 the segment-set
+	/// rollup lives in `segment_index.db`, and this holds the rows-mode legacy
+	/// catalog instead (its rollup table is the pre-S11 home, no longer written).
 	metadata: AspectMetadataStore,
 	/// The libSQL aspect-schema catalog (`root/aspect_catalog.db`) — the declared
 	/// [`AspectSchema`] for each aspect, so a seal need not be handed the schema.
@@ -1405,6 +1407,10 @@ impl SegmentStore {
 	///     its swap and every frame a swap retired that no live row references, fsync
 	///     `segments/`, and delete the journal rows, so the store starts with an empty
 	///     journal.
+	/// 13. backfill the rollup rows the journal replay did not write (D-S11): a pre-S11
+	///     store has no `segment_index.db` rows, and the replay only re-derives the
+	///     aspects its journal names, so a clean pre-S11 store would otherwise read
+	///     default zeros until its next seal or swap.
 	///
 	/// The lock is held until the store drops.
 	///
@@ -1566,8 +1572,12 @@ impl SegmentStore {
 		let store = Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), frame_gens: tokio::sync::OnceCell::new(), reaper, maintenance_wait: DEFAULT_MAINTENANCE_WAIT, index_conflicts: AtomicU64::new(0), _root_lock: root_lock };
 		// 12. The frame journal's replay (R6), before anything is served: unless recovery
 		// must only report what it finds, a newer WeftDB's store.
+		// 13. Backfill the rollup rows the journal replay did not write: a pre-S11
+		// store has none, and the replay only re-derives the aspects its journal
+		// names, so without this a clean pre-S11 store would read default zeros.
 		if !newer {
 			store.replay_journal().await.context(replaying)?;
+			store.backfill_missing_rollups().await.context("backfilling the rollup rows the journal replay did not write")?;
 		}
 		Ok(store)
 	}
@@ -1803,13 +1813,6 @@ impl SegmentStore {
 		Ok(AspectState { next_id, epoch: seed.epoch })
 	}
 
-	/// Hand out a segment id for `aspect` that no segment, live or deleted, and no frame
-	/// on disk has had, and that will never be handed out again, even if the caller never
-	/// commits it.
-	async fn allocate_id(&self, aspect: &str) -> Result<u64> {
-		self.commit_lock(aspect).await?.allocate()
-	}
-
 	/// Take `aspect`'s maintenance lock for a per-aspect maintenance entry point, waiting
 	/// up to [`maintenance_wait`](Self::maintenance_wait).
 	async fn maintain(&self, aspect: &str) -> Result<MaintGuard> {
@@ -1828,21 +1831,36 @@ impl SegmentStore {
 		}
 	}
 
-	/// Commit a freshly sealed frame's row (generation 0) under `aspect`'s commit lock:
-	/// a plain insert of its allocated id, which no other row can hold, with the
-	/// persisted allocator raised past it in the same transaction; then, under the same
-	/// lock, fold it into the rollup, which no other writer of the aspect can be reading
-	/// or writing meanwhile.
-	async fn publish_seal(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<()> {
-		let commit = self.commit_lock(aspect).await?;
+	/// Commit a freshly sealed write-once frame's row under `aspect`'s commit lock, and
+	/// return its descriptor with the id that commit assigned it: the id is handed out
+	/// here, inside the commit, never before the frame was written, so a seal that
+	/// crashes while writing its frame consumes no id and leaves no id-shaped litter
+	/// behind — only its generation-named frame, which no later seal reuses. The row
+	/// carries the frame's generation, its adoption order (`prec`, its own generation
+	/// for a seal), its trailer CRC and the commit epoch, which a seal advances like a
+	/// swap does; the persisted allocator is raised past both the id and the
+	/// generation in the same transaction. Since S11 that transaction also folds the
+	/// segment into the aspect's rollup row in `segment_index.db` (the rollup the
+	/// transaction commits over, folded forward — never a second transaction, so a
+	/// crash between the row insert and the fold cannot leave the rollup behind the
+	/// index). The commit lock makes the read-fold-write atomic against every other
+	/// writer of the aspect, and is held across the transaction's retries, which is
+	/// what makes the fold retry-safe.
+	async fn publish_seal(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, frame_crc: u32) -> Result<SegmentDescriptor> {
+		let mut commit = self.commit_lock(aspect).await?;
+		let id = commit.allocate()?;
+		let epoch = commit.state().epoch.saturating_add(1);
+		let descriptor = SegmentDescriptor { id, ..descriptor.clone() };
+		let row = IndexRow { desc: descriptor.clone(), gen, prec: Some(gen), frame_crc: Some(frame_crc), commit_epoch: Some(epoch), series_id: 0 };
+		let rollup = self.index.rollup(aspect).await?.unwrap_or_default().folded(&descriptor);
 		// The seal's index write, spanned like `SegmentIndexStore::insert` (roadmap Phase 3). Its
 		// `rows_changed` is the affected-row count of the first op, the `InsertNew`.
 		let span = tracing::debug_span!("control_plane.index.insert", aspect, id = descriptor.id, rows_changed = tracing::field::Empty);
-		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow::legacy(descriptor.clone()) }, seq_bump(aspect, &commit)])).instrument(span.clone()).await?;
+		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row }, seq_bump(aspect, &commit, gen.saturating_add(1), epoch), IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup }])).instrument(span.clone()).await?;
 		span.record("rows_changed", applied.changes.first().copied().unwrap_or(0));
-		self.metadata.record_seal(aspect, descriptor).await?;
+		commit.set_epoch(epoch);
 		drop(commit);
-		Ok(())
+		Ok(descriptor)
 	}
 
 	/// Where `aspect`'s generation counter starts: above every generation the aspect can
@@ -1893,13 +1911,55 @@ impl SegmentStore {
 		self.reaper.epochs().hold()
 	}
 
-	/// Recompute `aspect`'s rollup from the index and write it, under its commit lock,
-	/// which `_commit` shows the caller holds.
+	/// Recompute `aspect`'s rollup from the index and write it into `segment_index.db`,
+	/// under its commit lock, which `_commit` shows the caller holds. The write is a
+	/// single-op [`IndexTxn`], applied directly (not through [`commit_index`](Self::commit_index)):
+	/// the journal replay at open calls this before the store is writable, and a
+	/// rebuild must not be refused by a poison another writer set.
 	async fn rebuild_rollup_locked(&self, aspect: &str, _commit: &CommitGuard) -> Result<AspectMetadata> {
 		let index = self.index.load_index(aspect).await?;
 		let meta = AspectMetadata::from_index(&index);
-		self.metadata.put(aspect, &meta).await?;
+		self.index.apply(&IndexTxn::new(vec![IndexOp::PutRollup { aspect: aspect.to_string(), meta: meta.clone() }])).await?;
 		Ok(meta)
+	}
+
+	/// The rollup the swap transaction of `ops` commits over: `rows` (the aspect's
+	/// rows under the commit lock, so no other writer of the aspect can move them)
+	/// with each row op applied — an insert adds its row, a replace swaps its row
+	/// in, a delete removes it — then derived from the rows that remain. Journal,
+	/// allocator and rollup ops carry no rows and are skipped. Deriving from the
+	/// post-swap rows, rather than folding each output forward, keeps the rollup
+	/// exact when a swap deletes members without replacing them (a squash that
+	/// narrows an aspect) as well as when it replaces them.
+	fn post_swap_rollup(rows: &[IndexRow], ops: &[IndexOp]) -> AspectMetadata {
+		use std::collections::HashMap;
+		let mut by_id: HashMap<u64, SegmentDescriptor> = rows.iter().map(|row| (row.desc.id, row.desc.clone())).collect();
+		for op in ops {
+			match op {
+				IndexOp::InsertNew { row, .. } | IndexOp::Upsert { row, .. } => {
+					by_id.insert(row.desc.id, row.desc.clone());
+				}
+				IndexOp::ReplaceExpected { row, .. } => {
+					by_id.insert(row.desc.id, row.desc.clone());
+				}
+				IndexOp::DeleteExpected { expected, .. } => {
+					by_id.remove(&expected.id);
+				}
+				IndexOp::Delete { id, .. } => {
+					by_id.remove(id);
+				}
+				_ => {}
+			}
+		}
+		let mut index = SegmentIndex::new();
+		let mut ids: Vec<u64> = by_id.keys().copied().collect();
+		ids.sort_unstable();
+		for id in ids {
+			if let Some(desc) = by_id.remove(&id) {
+				index.push(desc);
+			}
+		}
+		AspectMetadata::from_index(&index)
 	}
 
 	/// The path of `aspect`'s frame file `name` directly under `segments/`: the one place
@@ -2090,8 +2150,9 @@ impl SegmentStore {
 	///   allocator raise. Preconditions are per member row: a `Conflict` rolls back every
 	///   plan, and each is then retried alone (tags amendment A5), so one stale plan does
 	///   not hold up the others.
-	/// - M6: the aspect's rollup is rebuilt, the outputs get their sidecars and the deleted
-	///   members lose theirs, and the reaper takes the retired frames.
+	/// - M6: the outputs get their sidecars and the deleted
+	///   members lose theirs, and the reaper takes the retired frames (the rollup was
+	///   already folded into the swap's transaction at M5, S11).
 	///
 	/// Up to [`MAX_PLANS_PER_TXN`] plans, independent of each other (no member in two).
 	/// Every caller today swaps one at a time; per-series maintenance batches them.
@@ -2170,7 +2231,7 @@ impl SegmentStore {
 		for (i, plan) in prepared.iter_mut().enumerate().filter(|(i, _)| committed.contains(i)) {
 			pending.swapped(&plan.output_names());
 			let ids = plan.output_ids();
-			deleted.extend(plan.deleted_ids());
+			deleted.extend(plan.deleted_frames());
 			outcomes[i] = Some(Ok(Swapped { ids: ids.clone() }));
 			outputs.extend(ids.into_iter().zip(std::mem::take(&mut plan.outputs)));
 		}
@@ -2269,10 +2330,14 @@ impl SegmentStore {
 	}
 
 	/// Step M5's transaction for the plans `which` of `prepared`, under the caller's
-	/// commit lock: their ops and one allocator raise, in aspect epoch `epoch + 1`, hitting
-	/// `M-swap-begun` once it has begun and `M-swap-phantom` once COMMIT returned. **This is
+	/// commit lock: their ops, one allocator raise, and — since S11 — the rollup the
+	/// post-swap rows derive, in aspect epoch `epoch + 1`, hitting `M-swap-begun`
+	/// once it has begun and `M-swap-phantom` once COMMIT returned. **This is
 	/// the swap's commit point.** Once it committed, the epoch is advanced and the retired
-	/// frames are handed to the reclaim epochs.
+	/// frames are handed to the reclaim epochs. The rollup is computed from the rows
+	/// the commit lock holds still (see [`post_swap_rollup`](Self::post_swap_rollup)),
+	/// so it is the swap's own rows it summarizes, in the same transaction that
+	/// commits them — never a rebuild after, which a crash could have stopped.
 	async fn commit_plans(&self, aspect: &str, commit: &mut CommitGuard, prepared: &[PreparedPlan], which: &[usize]) -> Result<()> {
 		let epoch = commit.state().epoch.saturating_add(1);
 		let created_ms = now_ms();
@@ -2282,7 +2347,10 @@ impl SegmentStore {
 			plan.ops(aspect, epoch, created_ms, &mut ops);
 			next_gen = plan.outputs.iter().map(|output| output.gen.saturating_add(1)).fold(next_gen, u64::max);
 		}
+		let current = self.index.rows(aspect).await.with_context(|| format!("reading the {aspect:?} rows a swap folds its rollup over"))?;
+		let rollup = Self::post_swap_rollup(&current, &ops);
 		ops.push(IndexOp::SeqBump { aspect: aspect.to_string(), next_id: commit.state().next_id, next_gen, epoch });
+		ops.push(IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup });
 		let txn = IndexTxn::new(ops).with_points(TxnPoints { begun: Some(FaultPoint::MSwapBegun), after_op: None, phantom: Some(FaultPoint::MSwapPhantom) });
 		self.commit_index(&txn).await.with_context(|| format!("swapping the maintenance outputs of aspect {aspect:?} in"))?;
 		commit.set_epoch(epoch);
@@ -2290,26 +2358,23 @@ impl SegmentStore {
 		Ok(())
 	}
 
-	/// What follows a swap's commit (design section 5.3, steps 4-6): rebuild the aspect's
-	/// rollup under the commit lock (the interim until S11 folds it into the swap itself),
-	/// release the lock, refresh the outputs' sidecars (each `(id, output)`), remove the
-	/// id-named sidecars of the `deleted` members, and hand the retired frames to the
+	/// What follows a swap's commit (design section 5.3, steps 4-6): the rollup is
+	/// already folded into the swap's transaction (S11), so this releases the lock,
+	/// refreshes the outputs' sidecars (each `(id, output)`), removes the
+	/// sidecars beside the `deleted` members' frames, and hands the retired frames to the
 	/// reaper. The swap is done whatever these do, so their failures are logged, not
 	/// returned; only an error injected at `M-swapped` is.
-	async fn finish_swap(&self, held: &MaintGuard, commit: CommitGuard, outputs: Vec<(u64, WrittenOutput)>, deleted: &[u64]) -> Result<()> {
+	async fn finish_swap(&self, held: &MaintGuard, commit: CommitGuard, outputs: Vec<(u64, WrittenOutput)>, deleted: &[String]) -> Result<()> {
 		let aspect = held.aspect();
-		if let Err(e) = self.rebuild_rollup_locked(aspect, &commit).await {
-			tracing::warn!(aspect, error = %e, "could not rebuild the rollup after a maintenance swap; it is stale until rebuild_aspect_metadata runs");
-		}
 		drop(commit);
 		fault::hit(FaultPoint::MSwapped).await?;
 		for (id, output) in outputs {
 			let descriptor = SegmentDescriptor { id, ..output.descriptor };
-			self.refresh_output_sidecar(aspect, &descriptor, output.timestamps, output.values).await;
+			self.refresh_output_sidecar(aspect, &descriptor, output.gen, output.prec, output.timestamps, output.values).await;
 		}
-		for &id in deleted {
-			if let Err(e) = self.remove_sidecar(aspect, id).await {
-				tracing::warn!(aspect, id, error = %e, "could not remove the partial sidecar of a segment a merge deleted");
+		for frame in deleted {
+			if let Err(e) = self.remove_sidecar(frame).await {
+				tracing::warn!(aspect, frame, error = %e, "could not remove the partial sidecar of a segment a merge deleted");
 			}
 		}
 		if let Err(e) = self.reap_held(held).await {
@@ -2405,8 +2470,10 @@ impl SegmentStore {
 	/// committed) and every retired frame no row references (its swap did), never a frame
 	/// a live row references; `segments/` is fsynced once; the processed rows are deleted
 	/// in one commit. Nothing can be reading yet, so no pin is consulted. An aspect whose
-	/// retired frames it processed had a swap commit, which a crash may have stopped
-	/// before its rollup rebuild, so that rollup is rebuilt. An unlink that fails stays
+	/// retired frames it processed had a swap commit, whose transaction already folded
+	/// its rollup in (S11); the rollup is still re-derived here, as a no-op
+	/// reconciliation for those aspects, so a rollup that predates S11 (or was
+	/// clobbered) is repaired at open. An unlink that fails stays
 	/// journaled for the reaper, and is logged.
 	async fn replay_journal(&self) -> Result<()> {
 		let entries = self.index.journal(None).await.context("reading the frame journal")?;
@@ -2525,11 +2592,15 @@ impl SegmentStore {
 		&self.catalog
 	}
 
-	/// The per-aspect segment-set rollup store backing this store, for the materialized
-	/// aspect-wide summary ([`get`](AspectMetadataStore::get),
-	/// [`list_aspects`](AspectMetadataStore::list_aspects)).
+	/// The `metadata.db` store backing this store: since S11 the segment-set rollup
+	/// lives in `segment_index.db` (see [`aspect_metadata`](Self::aspect_metadata)),
+	/// and this store's seals and swaps no longer write it. What `metadata.db` still
+	/// holds is the rows-mode legacy catalog; the rollup table it
+	/// also carries is the pre-S11 home, kept by the migration registry but no longer
+	/// written by the store.
 	///
-	/// For reads. Its writers ([`put`](AspectMetadataStore::put),
+	/// For reads of that legacy catalog. Its writers
+	/// ([`put`](AspectMetadataStore::put),
 	/// [`record_seal`](AspectMetadataStore::record_seal),
 	/// [`remove`](AspectMetadataStore::remove)) bypass this store's write poison; rebuild
 	/// a rollup through [`rebuild_aspect_metadata`](Self::rebuild_aspect_metadata) instead.
@@ -2902,30 +2973,30 @@ impl SegmentStore {
 	/// Write a freshly sealed segment to disk and record its descriptor. Shared by
 	/// the dense and nullable seal paths.
 	///
-	/// The id comes from the aspect's allocator, under its commit lock, so concurrent seals
-	/// never share an id or a frame name, and no seal takes the id of a deleted segment or
-	/// of a frame a crashed seal left behind. The frame is written outside the lock, so
-	/// seals of one aspect write their frames in parallel; the row, the allocator's raise
-	/// and the rollup fold then commit under it ([`publish_seal`](Self::publish_seal)).
+	/// The frame is write-once: it goes to a never-used generation-named frame
+	/// (`{enc(aspect)}~g{gen}~p{gen}.weftseg`), created with `create_new` and fsynced
+	/// with `segments/` fsynced after it, all before anything points at it — nothing
+	/// ever truncates or replaces it. The frame is written outside the commit lock,
+	/// so seals of one aspect write their frames in parallel; the id, the row, the
+	/// allocator's raise and the rollup fold then commit under it
+	/// ([`publish_seal`](Self::publish_seal)), which is where the id is assigned.
 	async fn persist(&self, aspect: &str, segment: &Segment) -> Result<SegmentDescriptor> {
 		aspect_name::validate(aspect)?;
-		let id = self.allocate_id(aspect).await?;
 		// Both opt-in layouts are applied here: the timestamp checkpoint index only when
 		// configured AND the segment's shape actually benefits (sorted + irregular + big
 		// enough), and the transposed value codec only when configured AND within its overhead
 		// ceiling. With neither configured this writes the historical frame byte-for-byte, and
 		// every combination reads identically.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
-		let path = self.segment_path(aspect, id)?;
-		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
-		fault::hit(FaultPoint::SFrameWritten).await?;
-		let descriptor = SegmentDescriptor::of_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
-		self.publish_seal(aspect, &descriptor).await?;
+		let byte_len = bytes.len() as u64;
+		let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await?;
+		let descriptor = SegmentDescriptor::of_segment(0, path.to_string_lossy().into_owned(), byte_len, segment);
+		let descriptor = self.publish_seal(aspect, &descriptor, gen, frame_crc).await?;
 		// Per-segment partial sidecar (opt-in) — a pure read accelerator, so decode only
 		// when the policy actually wants one, and never fail the seal on a sidecar error.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, ts, vs).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
@@ -2934,58 +3005,98 @@ impl SegmentStore {
 
 	/// Write a freshly sealed **paged** segment to disk (format-version-3 frame) and
 	/// record its descriptor. The paged analogue of [`persist`](SegmentStore::persist), with
-	/// the same id allocation and commit.
+	/// the same write-once frame and id-at-commit.
 	async fn persist_paged(&self, aspect: &str, segment: &PagedSegment) -> Result<SegmentDescriptor> {
 		aspect_name::validate(aspect)?;
-		let id = self.allocate_id(aspect).await?;
 		// As `persist`, though the checkpoint win is far smaller here — page pruning already
 		// bounds a probe's decode to `rows_per_page`.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
-		let path = self.segment_path(aspect, id)?;
-		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing segment {}", path.display()))?;
-		fault::hit(FaultPoint::SFrameWritten).await?;
-		let descriptor = SegmentDescriptor::of_paged_segment(id, path.to_string_lossy().into_owned(), bytes.len() as u64, segment);
-		self.publish_seal(aspect, &descriptor).await?;
+		let byte_len = bytes.len() as u64;
+		let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await?;
+		let descriptor = SegmentDescriptor::of_paged_segment(0, path.to_string_lossy().into_owned(), byte_len, segment);
+		let descriptor = self.publish_seal(aspect, &descriptor, gen, frame_crc).await?;
 		// As `persist`: opt-in per-segment partial sidecar, never failing the seal.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, ts, vs).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
 		Ok(descriptor)
 	}
 
-	/// The on-disk path a freshly sealed segment of the given `aspect`/`id` takes.
-	///
-	/// # Errors
-	///
-	/// As [`aspect_file_path`](Self::aspect_file_path).
-	fn segment_path(&self, aspect: &str, id: u64) -> Result<PathBuf> {
-		self.aspect_file_path(aspect, id, "weftseg")
+	/// Write `bytes` as `aspect`'s next write-once seal frame and make it durable,
+	/// returning its generation, its trailer CRC and its path. The generation comes
+	/// from the per-aspect counter that never hands a value out twice, so the name is
+	/// never reused; the file is created with `create_new` (a name already taken fails
+	/// rather than truncating another writer's frame) and fsynced in full, and
+	/// `segments/` is fsynced after it, before the commit that names it runs. The
+	/// fault points fire after the durable write, so a seal that stops at one leaves
+	/// its frame behind as crash litter for recovery (S12) to classify — the durable
+	/// write itself never removes a frame it wrote.
+	async fn write_seal_frame(&self, aspect: &str, bytes: Vec<u8>) -> Result<(u64, u32, PathBuf)> {
+		let gen = self.allocate_gens(aspect, 1).await?;
+		let name = frame_name::frame_name(aspect, gen, gen);
+		let path = self.segment_path(aspect, gen, gen)?;
+		let frame_crc = write_new_durable(self.fs.as_ref(), &self.root.join("segments"), &name, bytes, SyncPolicy::Full, WritePoints::NONE).await.with_context(|| format!("writing segment {}", path.display()))?;
+		fault::hit(FaultPoint::SFrameWritten).await?;
+		fault::hit(FaultPoint::SFrameSynced).await?;
+		self.sync_segments().await?;
+		fault::hit(FaultPoint::SDirSynced).await?;
+		Ok((gen, frame_crc, path))
 	}
 
-	/// The on-disk path of the partial-reduction sidecar beside an `aspect`/`id` segment
-	/// (`{aspect}-{id}.weftpart`, alongside the `.weftseg`).
-	///
-	/// # Errors
-	///
-	/// As [`aspect_file_path`](Self::aspect_file_path).
-	fn sidecar_path(&self, aspect: &str, id: u64) -> Result<PathBuf> {
-		self.aspect_file_path(aspect, id, "weftpart")
-	}
-
-	/// The path of the `{aspect}-{id}.{extension}` file under `segments/`: the one place
-	/// an aspect name becomes a path.
+	/// The on-disk path of `aspect`'s write-once frame of generation `gen` and adoption
+	/// order `prec` — the contained frame path builder (1.0 plan §5, D-S10): the name
+	/// comes from [`frame_name::frame_name`], which carries the aspect through
+	/// [`aspect_name::encode`], and the join is refused unless the result is a direct
+	/// child of `segments/`. Every frame a seal or a maintenance output creates, and
+	/// every frame the reaper unlinks, goes through this builder or
+	/// [`output_path`](Self::output_path); nothing is created or unlinked anywhere
+	/// else under the store root except under `segments/quarantine/`, which only
+	/// recovery (S12) writes.
 	///
 	/// # Errors
 	///
 	/// An [`InvalidAspectName`](crate::InvalidAspectName) when `aspect` fails
 	/// [`aspect_name::validate`], or an error when the joined path is somehow not a
 	/// direct child of `segments/` (defence in depth behind the name check).
-	fn aspect_file_path(&self, aspect: &str, id: u64, extension: &str) -> Result<PathBuf> {
+	fn segment_path(&self, aspect: &str, gen: u64, prec: u64) -> Result<PathBuf> {
 		aspect_name::validate(aspect)?;
-		contained_file(&self.root.join("segments"), &format!("{aspect}-{id}.{extension}"))
+		contained_file(&self.root.join("segments"), &frame_name::frame_name(aspect, gen, prec))
+	}
+
+	/// The on-disk path of the partial-reduction sidecar beside `aspect`'s write-once
+	/// frame of generation `gen` and adoption order `prec`: the same stem, generation
+	/// and precedence as the frame, with the `.weftpart` extension, directly under
+	/// `segments/` through the same containment check as
+	/// [`segment_path`](Self::segment_path). A sidecar is named by its frame, not by
+	/// the segment id — an id is assigned at commit and may be taken by a later
+	/// output, while a frame name is never reused.
+	///
+	/// # Errors
+	///
+	/// As [`segment_path`](Self::segment_path).
+	fn sidecar_path(&self, aspect: &str, gen: u64, prec: u64) -> Result<PathBuf> {
+		aspect_name::validate(aspect)?;
+		contained_file(&self.root.join("segments"), &frame_name::sidecar_name(aspect, gen, prec))
+	}
+
+	/// The on-disk path of the sidecar beside the frame at `frame_path`: the frame's
+	/// own file name with its `.weftseg` extension exchanged for `.weftpart`, directly
+	/// under `segments/` through the same containment check. This is how a sidecar is
+	/// found for a segment whose generation the caller does not know — a legacy frame
+	/// resolves to its legacy `{aspect}-{id}.weftpart`, a write-once frame to its
+	/// generation-named one — so a reader never has to guess which scheme wrote it.
+	///
+	/// # Errors
+	///
+	/// An error when `frame_path` has no file name, is not a `.weftseg` frame,
+	/// or the sidecar is somehow not a direct child of `segments/`.
+	fn sidecar_path_for_frame(&self, frame_path: &str) -> Result<PathBuf> {
+		let name = Path::new(frame_path).file_name().and_then(OsStr::to_str).ok_or_else(|| anyhow::anyhow!("segment {frame_path} has no frame file name"))?;
+		let stem = name.strip_suffix(".weftseg").ok_or_else(|| anyhow::anyhow!("segment {frame_path} is not a .weftseg frame"))?;
+		contained_file(&self.root.join("segments"), &format!("{stem}.weftpart"))
 	}
 
 	/// Materialize a per-segment partial-reduction sidecar for a just-sealed segment, when
@@ -2997,10 +3108,10 @@ impl SegmentStore {
 	///
 	/// A sidecar is a *pure acceleration*: a failure to write one must never fail the seal,
 	/// so the persist paths call this and log-and-ignore any error rather than propagating.
-	async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
+	async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
 		let Some(bytes) = self.partial_sidecar_bytes(descriptor, timestamps, values)? else { return Ok(()) };
-		let path = self.sidecar_path(aspect, descriptor.id)?;
-		tokio::fs::write(&path, &bytes).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
+		let path = self.sidecar_path(aspect, gen, prec)?;
+		self.fs.create_new_write(&path, bytes, SyncPolicy::None, WritePoints::NONE).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
 		Ok(())
 	}
 
@@ -3027,14 +3138,14 @@ impl SegmentStore {
 	}
 
 	/// Give a maintenance output that a swap has just committed under `descriptor` the
-	/// sidecar the policy wants for its rows, or remove the stale one its id may carry
+	/// sidecar the policy wants for its rows, or remove the stale one its frame may carry
 	/// (design section 5.3, M6). Through the store's filesystem: the new sidecar is written
-	/// under a `.tmp-*` name and renamed over the id's, so a reader never sees half of one;
+	/// under a `.tmp-*` name and renamed over the frame's, so a reader never sees half of one;
 	/// nothing is fsynced, since a sidecar is an accelerator a reader checks against the
 	/// frame. Best effort: a failure is logged, never returned.
-	async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
+	async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
 		let result = async {
-			let path = self.sidecar_path(aspect, descriptor.id)?;
+			let path = self.sidecar_path(aspect, gen, prec)?;
 			let Some(bytes) = self.partial_sidecar_bytes(descriptor, timestamps, values)? else {
 				self.fs.remove_file(&path).await.with_context(|| format!("removing stale partial sidecar {}", path.display()))?;
 				return Ok(());
@@ -3067,7 +3178,8 @@ impl SegmentStore {
 	///
 	/// Propagates a filesystem read error other than "not found".
 	pub async fn load_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<Option<PartialSidecar>> {
-		let path = self.sidecar_path(aspect, descriptor.id)?;
+		aspect_name::validate(aspect)?;
+		let path = self.sidecar_path_for_frame(&descriptor.path)?;
 		let bytes = match tokio::fs::read(&path).await {
 			Ok(bytes) => bytes,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3092,8 +3204,16 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// Propagates a filesystem error other than "not found".
-	async fn remove_sidecar(&self, aspect: &str, id: u64) -> Result<()> {
-		let path = self.sidecar_path(aspect, id)?;
+	/// Delete the partial sidecar beside the frame at `frame_path`, if one exists,
+	/// through the store's filesystem: what a merge does for each member it deletes.
+	/// A missing sidecar is success, since the aim is only that no orphaned
+	/// `.weftpart` is left behind.
+	///
+	/// # Errors
+	///
+	/// Propagates a filesystem error other than "not found".
+	async fn remove_sidecar(&self, frame_path: &str) -> Result<()> {
+		let path = self.sidecar_path_for_frame(frame_path)?;
 		self.fs.remove_file(&path).await.with_context(|| format!("removing partial sidecar {}", path.display()))
 	}
 
@@ -4203,7 +4323,7 @@ impl SegmentStore {
 	///
 	/// The cheap-first guard the background daemon uses so it does not scan every aspect's
 	/// segment list on every tick. Reads the **O(1)** per-aspect rollup
-	/// ([`AspectMetadataStore`](super::AspectMetadataStore)) for the segment count and total
+	/// ([`aspect_metadata`](Self::aspect_metadata)) for the segment count and total
 	/// rows, computes the minimum segments needed to hold that many rows at `target_rows`
 	/// (`ideal = ⌈total_rows / target_rows⌉`), and runs
 	/// [`squash_aspect_to_target_rows`](SegmentStore::squash_aspect_to_target_rows) **only when
@@ -4231,7 +4351,7 @@ impl SegmentStore {
 		self.writable()?;
 		aspect_name::validate(held.aspect())?;
 		let target_rows = target_rows.max(1);
-		let Some(meta) = self.metadata.get(held.aspect()).await? else { return Ok(None) };
+		let Some(meta) = self.index.rollup(held.aspect()).await? else { return Ok(None) };
 		// Minimum segments to hold total_rows at the target; a fully-compacted aspect sits at
 		// exactly this count (or below), so more than this means there is fragmentation to fold.
 		let ideal = meta.total_rows.div_ceil(target_rows as u64).max(1);
@@ -4353,7 +4473,7 @@ impl SegmentStore {
 
 	/// The **materialized** segment-set rollup for `aspect` — the same aspect-wide
 	/// summary as [`aspect_stats`](SegmentStore::aspect_stats), but read as a single
-	/// `metadata.db` row (O(1)) rather than scanning the whole segment index. An aspect
+	/// `segment_index.db` row (O(1)) rather than scanning the whole segment index. An aspect
 	/// with no sealed segments yields the empty rollup
 	/// ([`AspectMetadata::default`]). The rollup also carries the aspect-wide value
 	/// span, which the per-segment-scan stats do not.
@@ -4362,18 +4482,20 @@ impl SegmentStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn aspect_metadata(&self, aspect: &str) -> Result<AspectMetadata> {
-		Ok(self.metadata.get(aspect).await?.unwrap_or_default())
+		Ok(self.index.rollup(aspect).await?.unwrap_or_default())
 	}
 
-	/// Re-derive `aspect`'s materialized `metadata.db` rollup from the durable segment
+	/// Re-derive `aspect`'s materialized `segment_index.db` rollup from the durable segment
 	/// index and write it back, returning the reconciled rollup — the **authoritative**
 	/// recovery path.
 	///
 	/// Where each seal folds one descriptor forward (O(1), but assumes it never sees the
 	/// same segment twice), this recomputes the rollup from scratch via
 	/// [`AspectMetadata::from_index`] over the whole index, so it is correct regardless
-	/// of how the row got out of step (a crash between the index insert and the rollup
-	/// fold, a re-seal of an id, a metadata.db restored from an older snapshot). The
+	/// of how the row got out of step (a re-seal of an id, a rollup restored from an
+	/// older snapshot). Since S11 the seal and swap transactions fold the rollup in
+	/// themselves, so there is no longer a crash window between the index commit and
+	/// the fold for a row to get out of step through. The
 	/// segment index is the source of truth; this makes the rollup match it.
 	///
 	/// It reads the index and writes the rollup under the aspect's commit lock, where a
@@ -4392,7 +4514,7 @@ impl SegmentStore {
 	}
 
 	/// Re-derive **every** aspect's rollup from the durable segment index, returning the
-	/// number of aspects reconciled. Rebuilds the whole `metadata.db` from the index —
+	/// number of aspects reconciled. Rebuilds every `segment_index.db` rollup row from the index —
 	/// the recovery path for a lost or stale rollup DB beside an intact index.
 	///
 	/// The aspect set comes from the index itself
@@ -4412,12 +4534,41 @@ impl SegmentStore {
 		Ok(count)
 	}
 
+	/// Backfill the materialized `segment_index.db` rollup rows that are missing, and
+	/// only those — the open-time repair for stores written before S11.
+	///
+	/// Before S11 the rollup lived in `metadata.db`, so a pre-S11 store has no
+	/// `segment_index.db` rows at all, and the journal replay only re-derives the
+	/// aspects its journal names: a clean pre-S11 store opens with every rollup
+	/// missing, and [`aspect_metadata`](Self::aspect_metadata) reads default zeros
+	/// for it (the v0.1.0 compat gate caught this: a migrated aspect read 0 nulls
+	/// against the 14 v0.1.0 counted). Rebuilding just the missing rows keeps the
+	/// open cheap for S11-native stores, whose rows already exist, while a pre-S11
+	/// store reads correctly from its first open; a later seal or swap keeps its
+	/// row current by folding, as usual. An aspect with no index rows has no
+	/// segments, so it needs no row and its default-zero read is correct.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read or write failure.
+	pub async fn backfill_missing_rollups(&self) -> Result<usize> {
+		self.writable()?;
+		let mut backfilled = 0;
+		for aspect in self.index.list_aspects().await? {
+			if self.index.rollup(&aspect).await?.is_none() {
+				self.rebuild_aspect_metadata(&aspect).await?;
+				backfilled += 1;
+			}
+		}
+		Ok(backfilled)
+	}
+
 	/// Aggregate every aspect's materialized rollup into one **store-wide** summary —
 	/// the subject-wide north-star **bytes/point** (priority #1 in the commercial
 	/// thesis) across all of this store's aspects, plus the rolled-up segment/row/null
 	/// counts and the union of the aspects' time spans.
 	///
-	/// Built from the per-aspect `metadata.db` rows (one O(1) read per aspect), so it
+	/// Built from the per-aspect `segment_index.db` rollup rows (one O(1) read per aspect), so it
 	/// never opens a segment file or scans the segment index. The value span is
 	/// deliberately omitted — a min/max across aspects of unrelated physical meaning
 	/// would not be a useful number.
@@ -4426,10 +4577,10 @@ impl SegmentStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn store_stats(&self) -> Result<StoreStorageStats> {
-		let aspects = self.metadata.list_aspects().await?;
+		let aspects = self.index.rollup_aspects().await?;
 		let mut stats = StoreStorageStats { aspect_count: aspects.len(), ..StoreStorageStats::default() };
 		for aspect in &aspects {
-			let meta = self.metadata.get(aspect).await?.unwrap_or_default();
+			let meta = self.index.rollup(aspect).await?.unwrap_or_default();
 			stats.segment_count += meta.segment_count;
 			stats.total_rows += meta.total_rows;
 			stats.total_nulls += meta.total_nulls;
@@ -4463,7 +4614,7 @@ impl SegmentStore {
 	///
 	/// Propagates any libSQL read failure (the aspect list or a per-aspect index load).
 	pub async fn store_overlapping_segments(&self) -> Result<usize> {
-		let aspects = self.metadata.list_aspects().await?;
+		let aspects = self.index.list_aspects().await?;
 		let mut total = 0;
 		for aspect in &aspects {
 			total += self.index.load_index(aspect).await?.overlapping_count();
@@ -4637,7 +4788,8 @@ pub struct ControlPlaneBackup {
 	pub dir: PathBuf,
 	/// Verified snapshot of `segment_index.db` (the per-segment data-skipping index).
 	pub segment_index: crate::SnapshotReport,
-	/// Verified snapshot of `metadata.db` (the per-aspect segment-set rollup).
+	/// Verified snapshot of `metadata.db` (the rows-mode legacy catalog; the
+	/// segment-set rollup lives in `segment_index.db` since S11).
 	pub metadata: crate::SnapshotReport,
 	/// Verified snapshot of `aspect_catalog.db` (the per-aspect declared schema).
 	pub aspect_catalog: crate::SnapshotReport,
@@ -4776,6 +4928,40 @@ mod tests {
 		let (rt, rv) = Segment::read_from(&on_disk).expect("decodes").decode();
 		assert_eq!(rt, ts);
 		assert_eq!(rv, vs);
+	}
+
+	/// D-S10: a seal writes a write-once frame named by its generation, not by its
+	/// id, and the id is assigned by the commit that publishes it: two seals of one
+	/// aspect take consecutive ids in commit order under generation-named frames
+	/// that no later seal reuses, and the frame and sidecar builders name those
+	/// frames through `aspect_name::encode` directly under `segments/`.
+	#[tokio::test]
+	async fn a_seal_is_write_once_with_its_id_assigned_at_commit() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// The builders themselves: an encoded name, contained in `segments/`.
+		let frame = store.segment_path("Room-A.temp", 3, 3).expect("frame path");
+		assert_eq!(frame, dir.path().join("segments").join("%52oom%2D%41%2Etemp~g3~p3.weftseg"), "the frame name encodes the aspect");
+		let sidecar = store.sidecar_path("Room-A.temp", 3, 3).expect("sidecar path");
+		assert_eq!(sidecar, dir.path().join("segments").join("%52oom%2D%41%2Etemp~g3~p3.weftpart"), "the sidecar shares the frame's encoded stem");
+		assert!(store.segment_path("../x", 1, 1).is_err(), "a traversing aspect is refused by the builder");
+		// Two seals: ids in commit order, frames named by generation, never by id.
+		let first = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let second = store.seal("price", &schema(), &[20, 30], &[bd("3"), bd("4")]).await.expect("seals");
+		assert_eq!((first.id, second.id), (0, 1), "ids are assigned in commit order");
+		let first_file = std::path::Path::new(&first.path).file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+		let second_file = std::path::Path::new(&second.path).file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+		assert_eq!(first_file, "price~g1~p1.weftseg", "the first seal's frame is generation-named");
+		assert_eq!(second_file, "price~g2~p2.weftseg", "the second seal's frame is generation-named");
+		assert!(!first_file.contains("-0") && !second_file.contains("-1"), "no frame is named by its id");
+		// The rows read back under the committed ids, and the frames they name are
+		// the ones on disk: the row's path is the frame's, not an id-derived alias.
+		let descriptors = store.index().all("price").await.expect("reads the index");
+		assert_eq!(descriptors.iter().map(|desc| desc.id).collect::<Vec<_>>(), vec![0, 1]);
+		assert_eq!(descriptors.iter().map(|desc| desc.path.clone()).collect::<Vec<_>>(), vec![first.path.clone(), second.path.clone()]);
+		let (ts, vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		assert_eq!(ts, vec![0, 10, 20, 30]);
+		assert_eq!(vs.into_iter().flatten().map(|v| v.to_plain_string()).collect::<Vec<_>>(), vec!["1", "2", "3", "4"]);
 	}
 
 	/// Every `.weftseg`/`.weftpart` file anywhere under `dir`.
@@ -5223,8 +5409,12 @@ mod tests {
 	async fn backup_control_plane_snapshots_and_verifies_every_db() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open_scoped(dir.path(), "market", "btc").await.expect("opens");
-		// Declare a schema and seal two aspects, so all four control-plane DBs hold rows:
-		// aspect_catalog (declare), segment_index + metadata (seal), catalog (open registers).
+		// Declare a schema and seal two aspects, so the control-plane DBs hold rows:
+		// aspect_catalog (declare), segment_index (seal, including the S11 rollup rows
+		// folded into its seal transactions), catalog (open registers). `metadata.db`
+		// holds no rollup rows any more: since S11 the rollup lives in
+		// `segment_index.db`, and `metadata.db` carries only the rows-mode legacy
+		// catalog, which this fixture never imports.
 		store.declare("price", &schema()).await.expect("declares");
 		for aspect in ["price", "volume"] {
 			let ts: Vec<i64> = (0..4).map(|i| 100 + i * 10).collect();
@@ -5241,7 +5431,7 @@ mod tests {
 			assert!(backup_dir.join(name).exists(), "{name} was written");
 		}
 		assert!(backup.segment_index.rows >= 2, "two sealed segments indexed");
-		assert!(backup.metadata.rows >= 2, "two aspect rollups");
+		assert_eq!(backup.metadata.rows, 0, "no rollup rows in metadata.db since S11");
 		assert!(backup.aspect_catalog.rows >= 1, "at least the declared schema");
 		assert!(backup.registry.rows >= 1, "the (database, subject) registration");
 		assert_eq!(backup.total_rows(), backup.reports().iter().map(|r| r.rows).sum::<i64>());
@@ -5257,7 +5447,7 @@ mod tests {
 		let restored = SegmentStore::open_scoped(&backup_dir, "market", "btc").await.expect("reopens copy");
 		assert_eq!(restored.segment_count("price").await.expect("counts"), 1);
 		assert_eq!(restored.segment_count("volume").await.expect("counts"), 1);
-		let mut aspects = restored.metadata().list_aspects().await.expect("lists");
+		let mut aspects = restored.index().rollup_aspects().await.expect("lists");
 		aspects.sort();
 		assert_eq!(aspects, vec!["price".to_string(), "volume".to_string()]);
 	}
@@ -7006,8 +7196,10 @@ mod tests {
 			let vs: Vec<BigDecimal> = (0..5).map(|i| BigDecimal::from(base + i)).collect();
 			store.seal("a", &schema(), &ts, &vs).await.expect("seals");
 		}
-		// Force a wrong rollup, then remove another aspect's row entirely.
-		store.metadata().put("a", &AspectMetadata { segment_count: 99, total_rows: 1, total_nulls: 7, total_bytes: 3, unsorted_segments: 42, time_range: Some((-5, -1)), value_range: Some((bd("-9"), bd("-8"))) }).await.expect("clobbers");
+		// Force a wrong rollup, then remove another aspect's row entirely: the
+		// clobber writes the `segment_index.db` rollup row directly, behind the
+		// store's back, the way a stale pre-S11 copy or a bad restore would.
+		store.index().apply(&IndexTxn::new(vec![IndexOp::PutRollup { aspect: "a".to_string(), meta: AspectMetadata { segment_count: 99, total_rows: 1, total_nulls: 7, total_bytes: 3, unsorted_segments: 42, time_range: Some((-5, -1)), value_range: Some((bd("-9"), bd("-8"))) } }])).await.expect("clobbers");
 		let diverged = store.aspect_metadata("a").await.expect("metadata");
 		// Rebuilding from the durable index restores the truth.
 		let reconciled = store.rebuild_aspect_metadata("a").await.expect("rebuilds");
@@ -7032,12 +7224,14 @@ mod tests {
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
 		store.seal("temp", &schema(), &[0_i64, 10], &[bd("1"), bd("2")]).await.expect("seals");
 		store.seal("humidity", &schema(), &[0_i64, 10, 20], &[bd("5"), bd("6"), bd("7")]).await.expect("seals");
-		// Wipe the whole rollup DB, as if metadata.db were lost beside an intact index.
-		store.metadata().remove("temp").await.expect("removes");
-		store.metadata().remove("humidity").await.expect("removes");
-		let before = store.metadata().list_aspects().await.expect("lists");
+		// Wipe the whole rollup table, as if the `segment_index.db` rollup rows were
+		// lost beside an intact index.
+		let conn = store.index().database().connect().expect("connects");
+		conn.execute("DELETE FROM aspect_metadata", ()).await.expect("wipes the rollup rows");
+		drop(conn);
+		let before = store.index().rollup_aspects().await.expect("lists");
 		let rebuilt = store.rebuild_all_metadata().await.expect("rebuilds");
-		let after = store.metadata().list_aspects().await.expect("lists");
+		let after = store.index().rollup_aspects().await.expect("lists");
 		let temp = store.aspect_metadata("temp").await.expect("metadata");
 		let humidity = store.aspect_metadata("humidity").await.expect("metadata");
 		drop(store);
@@ -7047,6 +7241,30 @@ mod tests {
 		assert_eq!(temp.total_rows, 2);
 		assert_eq!(humidity.total_rows, 3);
 		assert_eq!(humidity.value_range, Some((bd("5"), bd("7"))));
+	}
+
+	#[tokio::test]
+	async fn aspect_metadata_backfilled_on_open_after_rollup_wipe() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.seal("temp", &schema(), &[0_i64, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		store.seal_nullable("humidity", &schema(), &[0_i64, 10, 20], &[Some(bd("5")), None, Some(bd("7"))]).await.expect("seals nullable");
+		let temp = store.aspect_metadata("temp").await.expect("metadata");
+		let humidity = store.aspect_metadata("humidity").await.expect("metadata");
+		// Wipe the whole rollup table, as a pre-S11 store has no rows at all.
+		let conn = store.index().database().connect().expect("connects");
+		conn.execute("DELETE FROM aspect_metadata", ()).await.expect("wipes the rollup rows");
+		drop(conn);
+		drop(store);
+		// Reopen backfills exactly the missing rows: no explicit rebuild call.
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		let temp_after = store.aspect_metadata("temp").await.expect("metadata");
+		let humidity_after = store.aspect_metadata("humidity").await.expect("metadata");
+		assert_eq!(temp_after.total_rows, temp.total_rows);
+		assert_eq!(temp_after.total_nulls, temp.total_nulls);
+		assert_eq!(humidity_after.total_rows, humidity.total_rows);
+		assert_eq!(humidity_after.total_nulls, 1);
+		assert_eq!(humidity_after.value_range, humidity.value_range);
 	}
 
 	#[tokio::test]
@@ -7067,6 +7285,24 @@ mod tests {
 		assert_eq!(after.total_rows, 4);
 		assert_eq!(after.time_range, Some((0, 30)));
 		assert_eq!(after.value_range, Some((bd("1"), bd("4"))));
+	}
+
+	/// D-S11: a seal folds its segment into the rollup row in `segment_index.db`
+	/// itself, in the seal's transaction — not into `metadata.db` afterwards. The
+	/// rollup the index store reads back equals the rollup the index derives, and
+	/// the pre-S11 `metadata.db` copy is never written.
+	#[tokio::test]
+	async fn seal_folds_the_rollup_into_segment_index_db() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.seal("a", &schema(), &[0_i64, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		store.seal("a", &schema(), &[20_i64, 30], &[bd("3"), bd("4")]).await.expect("seals");
+		let rollup = store.index().rollup("a").await.expect("reads the index rollup");
+		let derived = crate::AspectMetadata::from_index(&store.index().load_index("a").await.expect("loads the index"));
+		let legacy = store.metadata().get("a").await.expect("reads the legacy copy");
+		drop(store);
+		assert_eq!(rollup, Some(derived), "the segment_index.db rollup is the index's own summary");
+		assert_eq!(legacy, None, "the seal wrote no rollup row into metadata.db");
 	}
 
 	/// The policy decides on shape + size, and `DISABLED` is the default — the guarantee
@@ -8466,7 +8702,7 @@ mod tests {
 		assert!(poisoned.reason.contains("injected fault at S-commit-phantom"), "{poisoned}");
 
 		// Every write entry point, each with arguments under which it would write
-		// something: frames for the seals, metadata.db for the rollup rebuilds, a squash
+		// something: frames for the seals, segment_index.db for the rollup rebuilds, a squash
 		// of the two segments. The refusal must come first, so no file of the root
 		// changes (a seal refused only by `commit_index` would leave its frame behind, and
 		// a rollup rebuild never reaches `commit_index` at all).
@@ -8493,7 +8729,7 @@ mod tests {
 		assert_eq!(point, Some(bd("5")));
 		assert_eq!(count, 2, "no refused write added a segment");
 		assert_eq!(declared, vec!["price".to_string()], "the refused declare declared nothing");
-		assert_eq!(names_in(&dir.path().join("segments")), vec!["price-0.weftseg", "price-1.weftseg"], "no refused write left a frame behind");
+		assert_eq!(names_in(&dir.path().join("segments")), vec!["price-1.weftseg", "price~g1~p1.weftseg"], "no refused write left a frame behind");
 
 		let reopened = SegmentStore::open(dir.path()).await.expect("reopens");
 		let healthy = reopened.poisoned();
@@ -8802,7 +9038,8 @@ mod tests {
 				assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{spec}: the child's seal stopped at the injected error: {out:?}");
 			}
 			let segments = dir.path().join("segments");
-			let orphans: Vec<String> = names_in(&segments).into_iter().filter(|name| name != "price-0.weftseg").collect();
+			let first_file = std::path::Path::new(&first.path).file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+			let orphans: Vec<String> = names_in(&segments).into_iter().filter(|name| *name != first_file).collect();
 			let [orphan] = orphans.as_slice() else { panic!("{spec}: the crashed seal left exactly one frame behind: {orphans:?}") };
 			let orphan_bytes = std::fs::read(segments.join(orphan)).expect("reads the orphan");
 

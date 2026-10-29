@@ -535,6 +535,17 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **The segment-set rollup lives in `segment_index.db`** (1.0 plan D-S11). The
+  rollup row (`aspect_metadata`) was written to `metadata.db` in a second transaction
+  after a seal's index commit, and rebuilt in a second transaction after a swap's —
+  so a crash between the two left the rollup behind the index it summarizes, and a
+  failed rebuild left it stale with only a warning. Now the seal's transaction folds
+  its segment into the rollup row, and the swap's transaction writes the rollup its
+  post-swap rows derive, in the same `segment_index.db` transaction that commits the
+  rows. `SegmentStore::aspect_metadata`, `store_stats` and the fragmentation guard
+  read the rollup from `segment_index.db`; the journal replay still re-derives it as
+  a no-op reconciliation. `metadata.db` keeps the rows-mode legacy catalog, and its
+  rollup table is the pre-S11 home, no longer written by the store.
 - **The README stops promising what no clone can deliver.** No benchmark artifact — manifest or
   result JSON — is committed anywhere in the tree, so its Performance section now distinguishes a
   figure that names the bench it came from from one that is only a dated local measurement, and
@@ -877,6 +888,16 @@ only the control plane, not the segment frames.
   `median` were rejected as unknown variants, and a name copied from a response (`twa_linear`) could not be sent back. The body
   now reads the query string's parser (`Aggregation::from_token`), so both surfaces accept the same set; the bare names
   (`twalinear`, `sketchp99`) still parse. An unknown token is a `400` that names it and lists the accepted spellings (ROADMAP, FRE-5).
+
+- **A pre-S11 store read zero metadata until its next seal or swap (D-S11).**
+  Moving the rollup to `segment_index.db` left stores written before S11 with no
+  rollup rows at all, and the journal replay only re-derives the aspects its
+  journal names — so a clean pre-S11 store opened with `aspect_metadata`
+  reading default zeros (the v0.1.0 compat gate caught it: a migrated aspect
+  read 0 nulls against the 14 v0.1.0 counted). Open now backfills exactly the
+  missing rows after the journal replay; S11-native stores, whose rows exist,
+  pay one `SELECT` per aspect and nothing more.
+
 - **Power loss during or after a reconcile or split could lose or tear rows.** Both
   rewrote the segment's frame in place with an unsynced write (a split also wrote its
   suffix that way), so a power cut, even after the call returned, could leave a

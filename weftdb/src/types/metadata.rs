@@ -37,8 +37,8 @@ use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 ///
 /// Derive one from a resident [`SegmentIndex`] with [`AspectMetadata::from_index`]
 /// (the authoritative, idempotent path), or fold a single freshly sealed segment into
-/// an existing rollup with [`AspectMetadata::folded`] (the O(1) incremental path the
-/// store uses on each seal).
+/// an existing rollup with [`AspectMetadata::folded`] (the O(1) incremental path a
+/// seal folds into its `segment_index.db` transaction).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AspectMetadata {
 	/// Number of sealed segments recorded for the aspect.
@@ -138,8 +138,10 @@ fn value_span<'a>(descriptors: impl Iterator<Item = &'a SegmentDescriptor>) -> O
 /// A [`SegmentStore`](crate::SegmentStore) opens one over its root's `metadata.db` and
 /// hands it out with [`SegmentStore::metadata`](crate::SegmentStore::metadata); it cannot
 /// be opened on its own, since its schema is the store's migration registry's, which runs
-/// only behind the store's `STORE_FORMAT` gate. Materialize an aspect's rollup with
-/// [`put`](AspectMetadataStore::put) (or fold a fresh seal in with
+/// only behind the store's `STORE_FORMAT` gate. Since S11 the store's live rollup
+/// lives in `segment_index.db` instead (folded into the seal and swap transactions),
+/// and this store is the pre-S11 `metadata.db` home: materialize an aspect's rollup
+/// with [`put`](AspectMetadataStore::put) (or fold a fresh seal in with
 /// [`record_seal`](AspectMetadataStore::record_seal)); read it back with
 /// [`get`](AspectMetadataStore::get).
 pub struct AspectMetadataStore {
@@ -255,15 +257,15 @@ impl AspectMetadataStore {
 	/// Fold a freshly sealed segment's `descriptor` into `aspect`'s rollup — read the
 	/// current row (an empty rollup if none), [`fold`](AspectMetadata::folded) the
 	/// descriptor in, and write it back. The O(1)-per-seal incremental update the
-	/// segment store uses.
+	/// segment store used before S11 folded the same fold into the seal's
+	/// `segment_index.db` transaction.
 	///
 	/// The read and the write are two transactions, so two calls for one aspect that run
 	/// at once can both read the same rollup, and the fold of whichever writes first is
 	/// lost (or the second write fails on an MVCC conflict). Calls for one aspect must
-	/// therefore not overlap: [`SegmentStore`](crate::SegmentStore) makes them under the
-	/// aspect's commit lock, together with the seal's index commit, where its rollup
-	/// rebuilds run too. Any other caller must serialize them per aspect the same way, or
-	/// re-derive the rollup with [`AspectMetadata::from_index`].
+	/// therefore not overlap: serialize them per aspect the same way the store's
+	/// commit lock does, or re-derive the rollup with
+	/// [`AspectMetadata::from_index`].
 	///
 	/// # Errors
 	///
