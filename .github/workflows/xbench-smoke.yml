@@ -1,0 +1,74 @@
+name: cross-engine smoke
+
+# The nightly smoke run of the cross-engine benchmark (EVI-14). It builds weft-xbench — its own
+# workspace, because DuckDB compiles from C++ — runs every arm at the `tiny` scale, and fails
+# when any arm disagrees with WeftDB's in-memory reference or the build no longer links.
+#
+# A smoke test, not a measurement: hosted runners are not reference hardware (decision 19), and a
+# `tiny` dataset finishes in milliseconds. The rendered report is uploaded so a failure can be
+# read, but its timings are not cited. Like bench-regression.yml, it is a separate workflow so a
+# red night cannot veto a release (scripts/release/verify.sh reads only ci.yml), and it runs on no
+# push or pull request.
+
+on:
+  schedule:
+    # 06:30 UTC daily, after bench-regression.yml, so the two do not share a runner wait.
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  smoke:
+    name: weft-xbench tiny
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: weft-xbench
+
+      - name: Check the seeded lock
+        run: python3 scripts/xbench/check-lock.py
+
+      # `--locked`: the lock is the seeded one the check above just verified.
+      - name: Build
+        run: cargo build --locked --release --manifest-path weft-xbench/Cargo.toml
+
+      - name: Run every arm at the tiny scale
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/xbench-scratch"
+          TMPDIR="$RUNNER_TEMP/xbench-scratch" weft-xbench/target/release/weft-xbench \
+            --scales tiny --reps 3 --load-reps 2 --out xbench-out
+
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          if [ -f xbench-out/report.md ]; then cat xbench-out/report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: xbench-smoke
+          path: xbench-out
+          if-no-files-found: warn
+          retention-days: 30

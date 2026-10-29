@@ -33,4 +33,5 @@ splimes = { version = "1", default-features = false, features = ["serde", "tokio
 tokio = { version = "1", features = ["full"] }
 weft-bench = { path = "../weft-bench" }
 weft-physical-type = { path = "../weft-physical-type" }
+weft-reduce = { path = "../weft-reduce" }
 weftdb = { path = "../weftdb" }

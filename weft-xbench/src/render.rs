@@ -21,7 +21,7 @@ const EXPECTED_KINDS: [DatasetKind; 3] = [DatasetKind::Mcar, DatasetKind::Block,
 /// How many scales decision 18 asks for.
 const EXPECTED_SCALES: usize = 3;
 /// Arms decision 18 asks for: WeftDB stored, in-memory and `f64`; `DuckDB` `DOUBLE` and `DECIMAL`.
-const EXPECTED_ARMS: [&str; 5] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "duckdb-double", "duckdb-decimal"];
+const EXPECTED_ARMS: [&str; 6] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal"];
 /// Below this many reps the bootstrap intervals are too coarse to separate much.
 const FEW_REPS: usize = 10;
 
@@ -127,6 +127,16 @@ const fn phase(p: Phase) -> &'static str {
 	match p {
 		Phase::Load => "load",
 		Phase::Interpolate => "interpolate",
+		Phase::Downsample => "downsample",
+	}
+}
+
+/// Bytes per stored point, for a load result that recorded its size.
+fn bytes_per_point(r: &ArmResult) -> String {
+	match r.storage_bytes {
+		#[allow(clippy::cast_precision_loss)]
+		Some(bytes) if r.input_points > 0 => format!("{:.2}", bytes as f64 / r.input_points as f64),
+		_ => "—".into(),
 	}
 }
 
@@ -152,17 +162,17 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	}
 
 	b.push(Block::Heading(2, "Results".into()));
-	b.push(Block::Para("Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets.".into()));
+	b.push(Block::Para("Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets. B/pt is the store's size on disk after a load, divided by the points loaded (whole files: indexes and headers included).".into()));
 	let rows = report
 		.results
 		.iter()
 		.map(|r| {
 			let gate = r.correctness.as_ref().map_or_else(|| "—".into(), |c| if c.passed { "PASS".into() } else { format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference) });
 			let rmse = r.accuracy.as_ref().map_or_else(|| "—".into(), |a| format!("{:.4}", a.rmse));
-			vec![r.dataset.clone(), phase(r.phase).into(), r.arm.arm.clone(), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse]
+			vec![r.dataset.clone(), phase(r.phase).into(), r.arm.arm.clone(), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse, bytes_per_point(r)]
 		})
 		.collect();
-	b.push(Block::Table(["dataset", "phase", "arm", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE"].map(String::from).to_vec(), rows));
+	b.push(Block::Table(["dataset", "phase", "arm", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE", "B/pt"].map(String::from).to_vec(), rows));
 
 	b.push(Block::Heading(2, "Honesty".into()));
 	b.push(Block::Para("Generated from the results above. A WeftDB arm wins or loses only when its p50 interval does not overlap the fastest other engine's; overlapping intervals are within noise.".into()));
@@ -205,7 +215,10 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	b.push(Block::Heading(3, "Known limitations".into()));
 	let mut limits = vec!["DuckDB has no interpolation function. Its arm is hand-written SQL (two `ASOF JOIN`s and the first/last segment extended), which is what a DuckDB user would write, and it is gated against WeftDB's grid.".to_string(), "WeftDB has no last-observation-carried-forward fill on stored data in 1.0, so no LOCF comparison is made.".to_string(), "Every dataset is a single series; the grid is fixed per dataset, so input size grows with scale while output size does not.".to_string()];
 	if report.results.iter().any(|r| r.phase == Phase::Load && is_weft(r)) && report.results.iter().any(|r| r.phase == Phase::Load && !is_weft(r)) {
-		limits.push("Load is not like-for-like: WeftDB seals 1,024-row durable segments (the layout its read path is measured on), DuckDB does one bulk append and one CHECKPOINT.".into());
+		limits.push(if report.results.iter().any(|r| r.arm.arm == "weftdb-stored-bulk") { "Load layouts differ by arm: `weftdb-stored` and `weftdb-stored-f64` seal 1,024-row durable segments (the layout the stored read path is measured on), `weftdb-stored-bulk` seals one segment per load, and DuckDB does one bulk append and one CHECKPOINT. `weftdb-stored-bulk` is the like-for-like load comparison.".into() } else { "Load is not like-for-like: WeftDB seals 1,024-row durable segments (the layout its read path is measured on), DuckDB does one bulk append and one CHECKPOINT.".into() });
+	}
+	if report.results.iter().any(|r| r.arm.arm == "duckdb-decimal") {
+		limits.push("`duckdb-decimal` stores the knots exactly as `DECIMAL(18, s)`, but its interpolation line is computed in `DOUBLE` (DuckDB's `DECIMAL × DOUBLE` is `DOUBLE`), as is WeftDB's (splimes computes in `f64`). Neither engine interpolates in exact decimal arithmetic.".into());
 	}
 	b.push(Block::List(limits));
 
@@ -340,7 +353,7 @@ mod tests {
 	fn result(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
 		let (latency, latency_ci) = latency(samples, 1);
 		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed });
-		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None }
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None }
 	}
 
 	fn report(results: Vec<ArmResult>) -> XbenchReport {

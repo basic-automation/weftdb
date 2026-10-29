@@ -31,6 +31,13 @@ only the control plane, not the segment frames.
   overlap is reported as noise), correctness failures first, what did not run, known limitations,
   caveats read off the run (disk, `TMPDIR`, debug build, few reps) and how to reproduce it. The
   report schema is v2 (`invocation`, `scratch_dir`, `optimized`); v1 reports still render.
+- **`weft-xbench` part II: downsampling, storage bytes, `DECIMAL`, a bulk-load arm and a nightly
+  smoke run** (evidence track EVI-14). Every arm now also reduces into epoch-aligned buckets
+  (count, min, max, avg), gated against `weft_reduce`, and every load reports its bytes on disk.
+  `duckdb-decimal` stores the knots exactly as `DECIMAL(18, s)`, and `weftdb-stored-bulk` seals one
+  segment per load, the like-for-like comparison with DuckDB's single transaction. A new
+  `cross-engine smoke` workflow builds and runs every arm at `tiny` nightly, failing on any gate.
+  Report schema v3.
 - **`weft-xbench`: the cross-engine benchmark, WeftDB against DuckDB** (evidence track EVI-13).
   A separate workspace (it builds DuckDB from C++) whose lock is seeded from the workspace's and
   checked for drift in CI. It times **load** (WeftDB seal vs DuckDB appender + `CHECKPOINT`) and
