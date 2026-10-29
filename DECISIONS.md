@@ -4,6 +4,25 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — EVI-16: one honesty document at the root, and what it may claim
+
+**Ambiguous:** EVI-16 (#277) is "Honesty pages I: not the right tool, benchmark and accuracy
+methodology, precision". The pages were meant for basicautomation.io, which this repository cannot
+write to. `docs/` was removed in #99. The ROADMAP marks the narrative as the owner's to "write or
+approve" (beside EVI-17).
+
+**Chosen:** one `HONESTY.md` at the root, as for WILLINGNESS-TO-PAY.md, linked from the README's
+*Is WeftDB right for you?*. It has four sections, and EVI-17 adds the other two. Every claim links
+to the code, benchmark or measurement behind it, and the page says that the link wins when they
+disagree. The first cross-engine losses (EVI-13's run) are stated as losses, with the load layout
+caveat beside them rather than in place of them. The precision page separates what is exact
+(stored values, raw points, reductions) from what is not (interpolated values are computed in
+`f64`), because "exact decimals" is the claim most easily over-read. The page says it awaits the
+owner's approval before being published elsewhere.
+
+**Rejected:** four separate files (they cross-reference constantly); re-creating `docs/`; quoting
+cross-engine figures without the run date and caveat.
+
 ## 2026-10-29 — EVI-15R: how the honesty section decides a win
 
 **Ambiguous:** EVI-15R (#276) is "Report renderer with honesty-section generation". The only text

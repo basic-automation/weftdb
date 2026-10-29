@@ -18,6 +18,12 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **`HONESTY.md`: four honesty pages** (evidence track EVI-16): when WeftDB is not the right tool
+  (with the measured losses: bulk load and large exact-decimal grids against DuckDB, splines on
+  prices, the GPU on stored reads), the benchmark methodology (correctness gates, seeds and
+  manifests, bootstrap intervals, licence-checked fair comparison), the interpolation-accuracy
+  methodology, and precision. The precision page says plainly that interpolated values are computed
+  in `f64`; the exact-decimal guarantee covers stored values and reductions.
 - **Cross-engine report with a generated honesty section** (evidence track EVI-15R). Every
   `weft-xbench` run now writes `report.md` and a self-contained `report.html` beside
   `xbench.json`, and `weft-xbench render REPORT.json` re-renders one. The honesty section is

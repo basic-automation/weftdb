@@ -165,7 +165,9 @@ pandas, Polars or DuckDB.
 
 ## Is WeftDB right for you?
 
-Being honest about this saves you an evaluation.
+Being honest about this saves you an evaluation. [`HONESTY.md`](HONESTY.md) has the longer
+version, with the measured losses, how every benchmark figure is produced and checked, and what
+"exact" does and does not cover.
 
 ### A good fit
 
