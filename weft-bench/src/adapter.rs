@@ -53,6 +53,20 @@ pub trait SystemAdapter: Send + Sync {
 	/// crate root re-checks `honours_requested_spline` against observed output.
 	fn adapter_info(&self) -> AdapterInfo;
 
+	/// Untimed setup for the input every following call will be given: the harness calls it
+	/// once per run with the dataset, before the first timed [`interpolate_range`](SystemAdapter::interpolate_range).
+	///
+	/// An adapter that serves reads from storage loads `points` here, so its timed calls
+	/// measure the read rather than the write. The default does nothing: an in-process
+	/// adapter has nothing to load.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the adapter cannot load `points`.
+	async fn prepare(&self, _points: &[Point]) -> anyhow::Result<()> {
+		Ok(())
+	}
+
 	/// Reconstruct a dense regular grid over `[start, end)` at `resolution`
 	/// using `spline`, given the (possibly irregular, gap-containing) input
 	/// `points`.
