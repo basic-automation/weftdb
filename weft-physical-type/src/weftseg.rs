@@ -54,6 +54,14 @@ pub enum WeftSegError {
 	/// A stored `BigDecimal` text block (a value or a min/max stat) did not parse as
 	/// a decimal — a corrupt or misframed stream.
 	InvalidDecimal,
+	/// A stored decimal text block parses, but its plain form is outside the
+	/// one decimal domain (ROB-6: over [`crate::MAX_PLAIN_DIGITS`] digits) —
+	/// no writer in the domain produces it, so the frame is treated as damage
+	/// (an integrity fault), like [`InvalidDecimal`](Self::InvalidDecimal).
+	DecimalOutOfRange {
+		/// How many digits the stored decimal's plain form carries.
+		digits: usize,
+	},
 	/// The frame did not start with the expected `.weftseg` magic bytes.
 	BadMagic,
 	/// The frame's format version is not one this reader understands.
@@ -123,6 +131,7 @@ impl std::fmt::Display for WeftSegError {
 			Self::VarintTooLong => f.write_str("malformed varint: did not terminate within 10 bytes"),
 			Self::InvalidUtf8 => f.write_str("length-prefixed block is not valid UTF-8"),
 			Self::InvalidDecimal => f.write_str("stored decimal text did not parse"),
+			Self::DecimalOutOfRange { digits } => write!(f, "stored decimal's plain form has {digits} digits, over the {}-digit decimal domain bound", crate::MAX_PLAIN_DIGITS),
 			Self::BadMagic => f.write_str("not a .weftseg frame: bad magic bytes"),
 			Self::UnsupportedVersion { found } => write!(f, "unsupported .weftseg format version {found}"),
 			Self::InvalidTag { kind, value } => write!(f, "invalid {kind} tag byte {value:#04x}"),
@@ -571,13 +580,21 @@ fn read_physical_value(r: &mut ByteReader, physical_type: PhysicalType) -> Resul
 		PhysicalType::ScaledI64 { scale } => PhysicalValue::ScaledI64 { mantissa: r.read_svarint()?, scale },
 		PhysicalType::ScaledI128 { scale } => PhysicalValue::ScaledI128 { mantissa: r.read_i128_le()?, scale },
 		PhysicalType::Decimal128 => PhysicalValue::Decimal128 { mantissa: r.read_i128_le()?, scale: r.read_svarint()? },
-		PhysicalType::BigDecimalText => PhysicalValue::BigDecimalText(r.read_str()?.to_owned()),
+		PhysicalType::BigDecimalText => {
+			let text = r.read_str()?;
+			crate::check_decimal_domain(&BigDecimal::from_str(text).map_err(|_| WeftSegError::InvalidDecimal)?).map_err(|e| WeftSegError::DecimalOutOfRange { digits: e.digits })?;
+			PhysicalValue::BigDecimalText(text.to_owned())
+		}
 	})
 }
 
-/// Parse a stored decimal-text block back into a [`BigDecimal`].
+/// Parse a stored decimal-text block back into a [`BigDecimal`], enforcing
+/// the one decimal domain (ROB-6) on the way in: a stored decimal no writer
+/// in the domain could have written is damage, not a value.
 fn read_decimal(r: &mut ByteReader) -> Result<BigDecimal, WeftSegError> {
-	BigDecimal::from_str(r.read_str()?).map_err(|_| WeftSegError::InvalidDecimal)
+	let value = BigDecimal::from_str(r.read_str()?).map_err(|_| WeftSegError::InvalidDecimal)?;
+	crate::check_decimal_domain(&value).map_err(|e| WeftSegError::DecimalOutOfRange { digits: e.digits })?;
+	Ok(value)
 }
 
 /// Value-column codec selector (self-describing byte in a v4+ value block).
@@ -2603,7 +2620,8 @@ pub const fn frame_fault_of(error: &WeftSegError) -> FrameFault {
 		WeftSegError::UnsupportedVersion { found } => FrameFault::Undecodable { newer_format: *found > FRAME_VERSION_MAX_KNOWN },
 		WeftSegError::CodecNotEnabled { .. } | WeftSegError::UnknownCriticalExtension { .. } => FrameFault::Undecodable { newer_format: false },
 		// BadMagic, ChecksumMismatch, UnexpectedEof, VarintTooLong, TrailingBytes,
-		// InvalidUtf8, InvalidDecimal, InvalidNullMask, EnvelopeBodyMismatch: the file
+		// InvalidUtf8, InvalidDecimal, DecimalOutOfRange, InvalidNullMask,
+		// EnvelopeBodyMismatch: the file
 		// does not agree with itself. InvalidTag is counted with them because a tag this
 		// build does not know arrives with a new frame or body version, not inside a
 		// version it already understands.
@@ -3205,6 +3223,28 @@ mod tests {
 		let bytes = [0x80_u8; 11];
 		let mut r = ByteReader::new(&bytes);
 		assert_eq!(r.read_uvarint(), Err(WeftSegError::VarintTooLong));
+	}
+
+	#[test]
+	fn stored_decimal_outside_the_domain_is_rejected() {
+		// ROB-6: a stored decimal whose plain form is over 1,024 digits is
+		// damage no in-domain writer produces — refused at both decimal read
+		// sites (the stat reader and the BigDecimalText value arm).
+		let over = format!("1{}", "0".repeat(1024));
+		let mut w = ByteWriter::new();
+		w.put_str(&over);
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_decimal(&mut r), Err(WeftSegError::DecimalOutOfRange { digits: 1025 }));
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_physical_value(&mut r, PhysicalType::BigDecimalText), Err(WeftSegError::DecimalOutOfRange { digits: 1025 }));
+		// At the bound the same sites read fine.
+		let at = format!("1{}", "0".repeat(1023));
+		let mut w = ByteWriter::new();
+		w.put_str(&at);
+		let bytes = w.into_vec();
+		let mut r = ByteReader::new(&bytes);
+		assert_eq!(read_decimal(&mut r).expect("reads").to_plain_string(), at);
 	}
 
 	#[test]

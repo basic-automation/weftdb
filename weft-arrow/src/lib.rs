@@ -170,6 +170,13 @@ pub enum ConvertError {
 	UnknownTimeUnit(String),
 	/// A value cell held text that does not parse as a `BigDecimal`.
 	BadValue(String),
+	/// A value cell's decimal is outside the one decimal domain (ROB-6): its
+	/// plain form carries more than [`weft_physical_type::MAX_PLAIN_DIGITS`]
+	/// digits.
+	DecimalOutOfRange {
+		/// How many digits the value's plain form carries.
+		digits: usize,
+	},
 	/// The two columns disagreed on height, or re-sealing the segment failed.
 	Segment(SegmentError),
 	/// Reading or writing the Arrow IPC stream failed (carries the Arrow message).
@@ -189,6 +196,7 @@ impl std::fmt::Display for ConvertError {
 			Self::MissingMetadata(k) => write!(f, "record batch schema is missing required metadata `{k}`"),
 			Self::UnknownTimeUnit(s) => write!(f, "unrecognized time unit `{s}` in schema metadata"),
 			Self::BadValue(s) => write!(f, "value cell `{s}` does not parse as a decimal"),
+			Self::DecimalOutOfRange { digits } => write!(f, "value's plain form has {digits} digits, over the {}-digit decimal domain bound", weft_physical_type::MAX_PLAIN_DIGITS),
 			Self::Segment(e) => write!(f, "could not rebuild segment from columns: {e}"),
 			Self::Ipc(e) => write!(f, "arrow IPC stream error: {e}"),
 			Self::EmptyBatchSet => write!(f, "cannot write from zero batches (no schema)"),
@@ -464,6 +472,12 @@ pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Opt
 		}
 		_ => return Err(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Utf8, Float64, Float32, or Decimal128" }),
 	};
+	// The one decimal domain (ROB-6), enforced once for every column type:
+	// a batch is an ingest parse site, so a value no sink could write is
+	// refused here rather than at the seal.
+	for value in values.iter().flatten() {
+		weft_physical_type::check_decimal_domain(value).map_err(|e| ConvertError::DecimalOutOfRange { digits: e.digits })?;
+	}
 	Ok((timestamps, values))
 }
 
@@ -921,6 +935,16 @@ mod tests {
 		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
 		assert_eq!(back.decode(), (timestamps, values));
 		assert_eq!(back.time_unit(), TimeUnit::Micros);
+	}
+
+	#[test]
+	fn record_batch_value_outside_the_decimal_domain_is_refused() {
+		// ROB-6: the batch lift is an ingest parse site — a text value whose
+		// plain form is over 1,024 digits is refused, not lifted.
+		let over = format!("1{}", "0".repeat(1024));
+		let values: Vec<Option<BigDecimal>> = vec![Some(bd(&over))];
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1], &values);
+		assert_eq!(record_batch_to_columns(&batch), Err(ConvertError::DecimalOutOfRange { digits: 1025 }));
 	}
 
 	#[test]

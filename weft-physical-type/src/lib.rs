@@ -28,6 +28,9 @@
 //! - [`PhysicalValue`] — one value held in its encoded physical form.
 //! - [`PhysicalType::encode`] — `BigDecimal` -> [`Encoded`] (`PhysicalValue` +
 //!   [`Exactness`]).
+//! - The **one decimal domain** (ROB-6) — every value's plain form is at most
+//!   [`MAX_PLAIN_DIGITS`] digits, enforced by [`parse_decimal`] at parse sites
+//!   and by [`PhysicalType::encode`] at the sink.
 //! - [`PhysicalValue::to_logical`] — the always-available inverse, reconstructing
 //!   the `BigDecimal` the encoding represents.
 //! - [`PhysicalType::profile`] — declarative per-encoding metadata
@@ -117,6 +120,8 @@ pub mod split;
 pub mod tags;
 pub mod timestamp;
 pub mod weftseg;
+
+use std::str::FromStr;
 
 use bigdecimal::{
 	num_bigint::{BigInt, Sign}, BigDecimal, FromPrimitive, ToPrimitive
@@ -275,6 +280,12 @@ pub enum EncodeError {
 	/// The value could not be represented as a finite `f64` (its magnitude
 	/// exceeds the binary64 range) for [`PhysicalType::F64`].
 	NotFinite,
+	/// The value is outside the one decimal domain (ROB-6): its plain
+	/// (non-exponent) form carries more than [`MAX_PLAIN_DIGITS`] digits.
+	DecimalOutOfRange {
+		/// How many digits the value's plain form carries.
+		digits: usize,
+	},
 }
 
 impl std::fmt::Display for EncodeError {
@@ -282,11 +293,121 @@ impl std::fmt::Display for EncodeError {
 		match self {
 			Self::Overflow => f.write_str("value magnitude overflows the target integer encoding"),
 			Self::NotFinite => f.write_str("value is not representable as a finite f64"),
+			Self::DecimalOutOfRange { digits } => write!(f, "value's plain form has {digits} digits, over the {MAX_PLAIN_DIGITS}-digit decimal domain bound"),
 		}
 	}
 }
 
 impl std::error::Error for EncodeError {}
+
+/// The one decimal domain every WeftDB value lives in (1.0 plan **decision 10**,
+/// slice **ROB-6**, resolving conflict **C13**): a value's **plain**
+/// (non-exponent) form — the form every sink writes, see
+/// [`PhysicalType::BigDecimalText`]'s `to_plain_string` — carries at most
+/// [`MAX_PLAIN_DIGITS`] digits.
+///
+/// This is the *only* decimal bound. It supersedes the freeze track's FRE-8a
+/// rule (≤1,000 significant digits and |exp| ≤ 6,144), which is **not** kept
+/// alongside: that rule still allowed ~7 KB per value precisely because sinks
+/// write the plain form, so plain length is the quantity to bound. The bound
+/// covers the full `f64` range: the largest finite `f64` needs 309 plain
+/// digits, the smallest subnormal's shortest round-trip form (`5e-324`) needs
+/// 325, and the exact decimal expansion of `f64::MIN_POSITIVE` needs 1,023.
+pub const MAX_PLAIN_DIGITS: usize = 1_024;
+
+/// How many digits the plain (non-exponent) form of `value` carries: the digit
+/// characters of `value.to_plain_string()` (sign and decimal point excluded).
+///
+/// Computed from the `(mantissa, scale)` pair without materialising the plain
+/// string, so a hostile exponent (`1e100000000`) is measured arithmetically
+/// rather than by allocating the expansion it names. A zero mantissa follows
+/// `to_plain_string`'s own spelling (`0.000` is 4 digits, `0e5` writes
+/// `000000`, 6 digits).
+#[must_use]
+pub fn plain_digit_count(value: &BigDecimal) -> usize {
+	let (bigint, scale) = value.as_bigint_and_exponent();
+	let mantissa = bigint.to_string();
+	let mantissa_digits = u128::try_from(mantissa.len() - usize::from(mantissa.starts_with('-'))).unwrap_or(u128::MAX);
+	let count = if scale >= 0 {
+		let scale = u128::from(u64::try_from(scale).unwrap_or(u64::MAX));
+		if mantissa_digits > scale {
+			mantissa_digits
+		} else {
+			scale + 1
+		}
+	} else {
+		mantissa_digits + u128::from(scale.unsigned_abs())
+	};
+	usize::try_from(count).unwrap_or(usize::MAX)
+}
+
+/// A value is outside the one decimal domain: its plain form carries more
+/// than [`MAX_PLAIN_DIGITS`] digits (ROB-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecimalOutOfRange {
+	/// How many digits the value's plain form carries.
+	pub digits: usize,
+	/// The bound it exceeded ([`MAX_PLAIN_DIGITS`]).
+	pub max: usize,
+}
+
+impl std::fmt::Display for DecimalOutOfRange {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "decimal's plain form has {} digits, over the {}-digit bound", self.digits, self.max)
+	}
+}
+
+impl std::error::Error for DecimalOutOfRange {}
+
+/// Check `value` against the one decimal domain (ROB-6).
+///
+/// # Errors
+///
+/// Returns [`DecimalOutOfRange`] when the value's plain form carries more
+/// than [`MAX_PLAIN_DIGITS`] digits.
+pub fn check_decimal_domain(value: &BigDecimal) -> Result<(), DecimalOutOfRange> {
+	let digits = plain_digit_count(value);
+	if digits > MAX_PLAIN_DIGITS {
+		return Err(DecimalOutOfRange { digits, max: MAX_PLAIN_DIGITS });
+	}
+	Ok(())
+}
+
+/// Why a decimal text could not enter the domain (ROB-6): it either does not
+/// parse as a decimal at all, or it parses to a value outside the domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseDecimalError {
+	/// The text is not a decimal literal.
+	Invalid,
+	/// The text parses, but its plain form exceeds the domain bound.
+	OutOfRange(DecimalOutOfRange),
+}
+
+impl std::fmt::Display for ParseDecimalError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Invalid => f.write_str("text is not a decimal"),
+			Self::OutOfRange(e) => write!(f, "{e}"),
+		}
+	}
+}
+
+impl std::error::Error for ParseDecimalError {}
+
+/// Parse a decimal literal straight into the one decimal domain (ROB-6): the
+/// parse every parse site uses, so no site can accept a value the sinks would
+/// refuse to write.
+///
+/// # Errors
+///
+/// [`ParseDecimalError::Invalid`] when `text` does not parse as a decimal, or
+/// [`ParseDecimalError::OutOfRange`] when its plain form carries more than
+/// [`MAX_PLAIN_DIGITS`] digits.
+pub fn parse_decimal(text: &str) -> Result<BigDecimal, ParseDecimalError> {
+	let value = BigDecimal::from_str(text).map_err(|_| ParseDecimalError::Invalid)?;
+	check_decimal_domain(&value).map_err(ParseDecimalError::OutOfRange)?;
+	Ok(value)
+}
 
 /// `10^n` as a `BigDecimal`, built without a `Pow` trait import.
 fn pow10(n: u8) -> BigDecimal {
@@ -377,15 +498,18 @@ impl PhysicalType {
 	///
 	/// # Errors
 	///
-	/// Returns [`EncodeError::Overflow`] if the value does not fit a
-	/// [`ScaledI64`](Self::ScaledI64) / [`ScaledI128`](Self::ScaledI128)
-	/// mantissa, or [`EncodeError::NotFinite`] if it has no finite
-	/// [`F64`](Self::F64) / [`F32`](Self::F32) representation. The
-	/// [`Decimal128`](Self::Decimal128) and [`BigDecimalText`](Self::BigDecimalText)
-	/// encodings never error. Lossy-but-representable conversions are **not**
-	/// errors — they succeed with [`Exactness::Lossy`] so the caller decides
-	/// whether the residual is acceptable.
+	/// Returns [`EncodeError::DecimalOutOfRange`] if the value is outside the
+	/// one decimal domain (ROB-6: plain form over [`MAX_PLAIN_DIGITS`]
+	/// digits) — checked first, for every encoding, because every sink writes
+	/// the plain form. Returns [`EncodeError::Overflow`] if the value does not
+	/// fit a [`ScaledI64`](Self::ScaledI64) /
+	/// [`ScaledI128`](Self::ScaledI128) mantissa, or
+	/// [`EncodeError::NotFinite`] if it has no finite [`F64`](Self::F64) /
+	/// [`F32`](Self::F32) representation. Lossy-but-representable conversions
+	/// are **not** errors — they succeed with [`Exactness::Lossy`] so the
+	/// caller decides whether the residual is acceptable.
 	pub fn encode(self, value: &BigDecimal) -> Result<Encoded, EncodeError> {
+		check_decimal_domain(value).map_err(|e| EncodeError::DecimalOutOfRange { digits: e.digits })?;
 		match self {
 			Self::F64 => {
 				let f = value.to_f64().filter(|f| f.is_finite()).ok_or(EncodeError::NotFinite)?;
@@ -470,6 +594,65 @@ mod tests {
 
 	fn bd(s: &str) -> BigDecimal {
 		BigDecimal::from_str(s).expect("test literal parses")
+	}
+
+	#[test]
+	fn plain_digit_count_matches_to_plain_string() {
+		// The arithmetic count must agree with the literal plain form on every
+		// shape: integers, fractions, exponent forms, signed values and zeros.
+		for lit in ["0", "0.000", "0e5", "1.20", "0.5", "12.34", "-987.650", "1e1023", "1e-1023", "5e-324", "1234567890e1000", "9.99e1023", "0.001", "1000"] {
+			let v = bd(lit);
+			let literal = v.to_plain_string().chars().filter(char::is_ascii_digit).count();
+			assert_eq!(plain_digit_count(&v), literal, "count for {lit}");
+		}
+	}
+
+	#[test]
+	fn decimal_domain_boundary_is_1024_plain_digits() {
+		// Exactly at the bound: accepted. One digit over, on either side of
+		// the decimal point: refused. (FRE-8a's significant-digit/exponent
+		// rule would judge these differently — it is superseded, not kept.)
+		assert!(check_decimal_domain(&bd("1e1023")).is_ok(), "1 followed by 1023 zeros is 1024 digits");
+		assert!(check_decimal_domain(&bd("1e-1023")).is_ok(), "0. then 1022 zeros then 1 is 1024 digits");
+		assert_eq!(check_decimal_domain(&bd("1e1024")), Err(DecimalOutOfRange { digits: 1025, max: MAX_PLAIN_DIGITS }));
+		assert_eq!(check_decimal_domain(&bd("1e-1024")), Err(DecimalOutOfRange { digits: 1025, max: MAX_PLAIN_DIGITS }));
+		// A long *significant* digit string is refused by plain length too.
+		let long = format!("{}.{}", "1".repeat(700), "2".repeat(400));
+		assert_eq!(check_decimal_domain(&bd(&long)), Err(DecimalOutOfRange { digits: 1100, max: MAX_PLAIN_DIGITS }));
+	}
+
+	#[test]
+	fn decimal_domain_covers_the_full_f64_range() {
+		// The extremes of the f64 range, as the shortest round-trip text a
+		// float input enters as (decision 11) and as exact `from_f64` values.
+		for lit in ["1.7976931348623157e308", "-1.7976931348623157e308", "2.2250738585072014e-308", "5e-324", "-5e-324"] {
+			assert!(check_decimal_domain(&bd(lit)).is_ok(), "{lit} is inside the domain");
+		}
+		for f in [f64::MAX, f64::MIN, f64::MIN_POSITIVE, -f64::MIN_POSITIVE] {
+			let v = BigDecimal::from_f64(f).expect("finite");
+			assert!(check_decimal_domain(&v).is_ok(), "from_f64({f}) is inside the domain");
+		}
+	}
+
+	#[test]
+	fn parse_decimal_enforces_the_domain_at_the_parse_site() {
+		assert_eq!(parse_decimal("42.5"), Ok(bd("42.5")));
+		assert_eq!(parse_decimal("not-a-decimal"), Err(ParseDecimalError::Invalid));
+		assert_eq!(parse_decimal("1e1024"), Err(ParseDecimalError::OutOfRange(DecimalOutOfRange { digits: 1025, max: MAX_PLAIN_DIGITS })));
+		// The exponent is measured, not materialised: this must return, not
+		// try to allocate a billion-digit string.
+		assert!(matches!(parse_decimal("1e1000000000"), Err(ParseDecimalError::OutOfRange(_))));
+	}
+
+	#[test]
+	fn encode_refuses_out_of_domain_values_for_every_encoding() {
+		let over = bd("1e1024");
+		for pt in [PhysicalType::F64, PhysicalType::F32, PhysicalType::ScaledI64 { scale: 2 }, PhysicalType::ScaledI128 { scale: 2 }, PhysicalType::Decimal128, PhysicalType::BigDecimalText] {
+			assert_eq!(pt.encode(&over), Err(EncodeError::DecimalOutOfRange { digits: 1025 }), "{pt:?} must refuse an out-of-domain value");
+		}
+		// At the bound every encoding still encodes.
+		let at = bd("1e1023");
+		assert!(PhysicalType::BigDecimalText.encode(&at).expect("encodes").exactness.is_exact());
 	}
 
 	#[test]

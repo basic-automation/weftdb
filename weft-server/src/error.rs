@@ -537,6 +537,7 @@ pub fn classify_ingest(err: &anyhow::Error) -> ApiError {
 			weft_arrow::ConvertError::MissingMetadata(k) => ApiError::bad_request(format!("the batch schema carries no `{k}` metadata, which says how to read its timestamps")),
 			weft_arrow::ConvertError::UnknownTimeUnit(s) => ApiError::bad_request(format!("the batch schema names time unit `{s}`, which WeftDB does not use (the units are s, ms, us, ns)")),
 			weft_arrow::ConvertError::BadValue(_) | weft_arrow::ConvertError::Ipc(_) | weft_arrow::ConvertError::Parquet(_) => ApiError::bad_request(e.to_string()),
+			weft_arrow::ConvertError::DecimalOutOfRange { digits } => decimal_out_of_range_refusal(*digits),
 			// An empty batch set is a request that carried a schema-less body, and a failed
 			// segment rebuild means the two columns disagreed — both are the batch's doing.
 			_ => ApiError::bad_request(e.to_string()),
@@ -553,6 +554,24 @@ pub fn classify_ingest(err: &anyhow::Error) -> ApiError {
 		return ApiError::bad_request(message);
 	}
 	ApiError::internal(err)
+}
+
+/// The §4 `decimal_out_of_range` refusal (ROB-6): a decimal whose plain form
+/// exceeds the one decimal domain ([`weft_physical_type::MAX_PLAIN_DIGITS`]
+/// digits). The digit count travels in `details` and the bound in `limit`,
+/// so a client fixes the value without parsing a sentence.
+pub(crate) fn decimal_out_of_range_refusal(digits: usize) -> ApiError {
+	ApiError::new(Code::DecimalOutOfRange, format!("a decimal's plain form has {digits} digits, over the {}-digit bound", weft_physical_type::MAX_PLAIN_DIGITS)).with_details(serde_json::json!({ "digits": digits })).with_limit(u64::try_from(weft_physical_type::MAX_PLAIN_DIGITS).unwrap_or(u64::MAX))
+}
+
+/// Map a failed [`weft_physical_type::parse_decimal`] at a parse site: the
+/// caller's own `invalid` error for text that is not a decimal at all, and
+/// the `decimal_out_of_range` refusal for a decimal outside the domain.
+pub(crate) fn decimal_error(error: weft_physical_type::ParseDecimalError, invalid: ApiError) -> ApiError {
+	match error {
+		weft_physical_type::ParseDecimalError::Invalid => invalid,
+		weft_physical_type::ParseDecimalError::OutOfRange(e) => decimal_out_of_range_refusal(e.digits),
+	}
 }
 
 /// The §4 `invalid_aspect_name` refusal: the offending name and the rule it broke travel in
@@ -629,6 +648,7 @@ pub fn from_seal_error(e: &weft_physical_type::SealError) -> ApiError {
 		SealError::Encode(ColumnEncodeError { index, source }) => match source {
 			EncodeError::NotFinite => ApiError::new(Code::NotFinite, format!("the value at row {index} is not a finite number, and this aspect stores values as floats")).with_details(serde_json::json!({ "row": index })),
 			EncodeError::Overflow => ApiError::new(Code::ValueNotRepresentable, format!("the value at row {index} does not fit this aspect's declared encoding")).with_details(serde_json::json!({ "row": index })),
+			EncodeError::DecimalOutOfRange { digits } => ApiError::new(Code::DecimalOutOfRange, format!("the value at row {index} has a plain form of {digits} digits, over the {}-digit decimal bound", weft_physical_type::MAX_PLAIN_DIGITS)).with_details(serde_json::json!({ "row": index, "digits": digits })).with_limit(u64::try_from(weft_physical_type::MAX_PLAIN_DIGITS).unwrap_or(u64::MAX)),
 			// No wildcard arm: `EncodeError` names every way a value can fail to encode, and a new
 			// one is meant to stop the build here, where someone has to decide which §4 code it is.
 		},

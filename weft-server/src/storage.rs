@@ -38,6 +38,13 @@ use crate::{
 	error::{self, ApiError, StrictQuery}, state::AppState
 };
 
+/// Parse a `lo`/`hi` value-range bound into the one decimal domain (ROB-6):
+/// not-a-decimal is the caller's `400 bad_request` as before, and a decimal
+/// whose plain form is over the bound is `400 decimal_out_of_range`.
+fn parse_value_bound(name: &str, text: &str) -> Result<BigDecimal, ApiError> {
+	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
+}
+
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.
 const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
@@ -162,8 +169,8 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
-	let lo: BigDecimal = params.lo.parse().map_err(|_| ApiError::bad_request(format!("`lo` is not a decimal: {:?}", params.lo)))?;
-	let hi: BigDecimal = params.hi.parse().map_err(|_| ApiError::bad_request(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	let lo = parse_value_bound("lo", &params.lo)?;
+	let hi = parse_value_bound("hi", &params.hi)?;
 	require_schema(&store, &aspect).await?;
 	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await;
 	drop(store);
@@ -205,8 +212,8 @@ pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Pat
 pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
-	let lo: BigDecimal = params.lo.parse().map_err(|_| ApiError::bad_request(format!("`lo` is not a decimal: {:?}", params.lo)))?;
-	let hi: BigDecimal = params.hi.parse().map_err(|_| ApiError::bad_request(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	let lo = parse_value_bound("lo", &params.lo)?;
+	let hi = parse_value_bound("hi", &params.hi)?;
 	let batch = weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await;
 	drop(store);
 	let batch = batch.map_err(|err| error::classify_read(&err))?;
@@ -248,8 +255,8 @@ pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspe
 pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
-	let lo: BigDecimal = params.lo.parse().map_err(|_| ApiError::bad_request(format!("`lo` is not a decimal: {:?}", params.lo)))?;
-	let hi: BigDecimal = params.hi.parse().map_err(|_| ApiError::bad_request(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	let lo = parse_value_bound("lo", &params.lo)?;
+	let hi = parse_value_bound("hi", &params.hi)?;
 	let batch = weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
 	drop(store);
 	let batch = batch.map_err(|err| error::classify_read(&err))?;
@@ -480,8 +487,8 @@ pub struct ValuePointsParams {
 pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValuePointsParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
-	let lo: BigDecimal = params.lo.parse().map_err(|_| ApiError::bad_request(format!("`lo` is not a decimal: {:?}", params.lo)))?;
-	let hi: BigDecimal = params.hi.parse().map_err(|_| ApiError::bad_request(format!("`hi` is not a decimal: {:?}", params.hi)))?;
+	let lo = parse_value_bound("lo", &params.lo)?;
+	let hi = parse_value_bound("hi", &params.hi)?;
 	let schema = store.schema_for(&aspect).await.map_err(|err| ApiError::internal(err.to_string()))?;
 	let Some(schema) = schema else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));

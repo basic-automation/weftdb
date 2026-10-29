@@ -1385,3 +1385,52 @@ by folding, as usual.
 **Not changed:** `Fill::from_token` (`weft-reduce/src/fill.rs`) still folds case. It is a separate vocabulary (`--gf-fill`, the interpolation fill), and the FRE-5 box does not name it. It needs its own decision.
 
 **Applied:** `from_token` matches the trimmed token exactly. Tests refuse `Min`, `MEDIAN`, `SKETCH_P99` and `Twa_Linear` on both surfaces. The README and the CHANGELOG are updated, and the FOUND bullet no longer claims letter-case folding. FRE-5's "no silent narrowing" clause stays open.
+
+## 2026-10-29 — ROB-6: the one decimal domain is the plain-form bound (1,024 digits)
+
+**Spec:** 1.0 plan §6 W3 + §3 ROB-6 row (absorbs FRE-8a; one decimal domain,
+decision 10) + §4 C13 + §9. Decision 10 fixes the bound and its enforcement
+points — "plain (non-exponent) form at most 1,024 digits, enforced at every
+parse site and in `PhysicalType::encode`" — so there is no open question to
+guess at; the choices below are mechanism only.
+
+**Chosen:** `weft-physical-type` owns the domain: `MAX_PLAIN_DIGITS = 1_024`,
+`plain_digit_count` (computed from the `(mantissa, scale)` pair, never by
+materialising the plain string, so `1e1000000000` is measured arithmetically),
+`check_decimal_domain`, and `parse_decimal` (parse + check in one call, so a
+parse site cannot forget the check). Digit count is the digit characters of
+`to_plain_string()` — sign and point excluded, leading fractional zeros
+included — which is the form every sink writes (C13). Enforcement points:
+`PhysicalType::encode` (every encoding, first, as the new
+`EncodeError::DecimalOutOfRange`; this is what every seal flows through via
+`encode_column`), the `.weftseg` readers (`read_decimal` and the
+`BigDecimalText` value arm, as `WeftSegError::DecimalOutOfRange`, an
+integrity fault — no in-domain writer produces one), the server parse sites
+(JSON/CSV ingest values, ILP values after the line-protocol lift, the declare
+`value_tolerance`, and the `lo`/`hi` value-range bounds — all answering the
+§4 table's existing `400 decimal_out_of_range` code), and
+`weft-arrow::record_batch_to_columns` (the Parquet/Arrow ingest lift, as
+`ConvertError::DecimalOutOfRange`, classified to the same code). A seal that
+hits the bound classifies through `SealError::Encode` to
+`decimal_out_of_range`, not `value_not_representable`: the value is outside
+the input domain, not merely unrepresentable under one aspect's encoding.
+
+**Superseded, not kept:** FRE-8a's ≤1,000-significant-digit / |exp| ≤ 6,144
+rule exists nowhere in the tree (it never landed as code) and is not
+implemented alongside; a 1,100-digit value with few significant digits is
+refused, and `1e1023` (one significant digit, exponent under the old cap but
+1,024 plain digits) is accepted — both pinned by tests.
+
+**Full f64 range:** the bound covers it, as C13 asserts — `f64::MAX` needs
+309 plain digits, the smallest subnormal's shortest round-trip form
+(`5e-324`, the form decision 11 says float inputs enter as) needs 325, and
+the exact expansion of `f64::MIN_POSITIVE` needs 1,023, all pinned by tests.
+One consequence worth naming: an *exact-expansion* subnormal (e.g. a
+`BigDecimal::from_f64(5e-324)`, 1,075 plain digits, or an ILP float field
+that lifts to one) is outside the domain and refused — its plain form is
+what a sink would have to write, and the bound is on that form.
+
+**Not in this slice:** the legacy rows-mode `weftdb` parse sites
+(`database/outputs.rs`, `dictionary.rs`) read the legacy store's own text,
+not the Storage-v2 input domain, and stay as they are; query-time numeric
+parameters that are not decimals (timestamps, limits) are untouched.
