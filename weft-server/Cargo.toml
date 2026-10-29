@@ -51,6 +51,9 @@ weft-arrow-store = { workspace = true }  # stored range -> Arrow IPC bytes (keep
 weft-line-protocol = { workspace = true }
 weft-physical-type = { workspace = true }  # AspectSchema / PhysicalType / TimeUnit for the catalog-management write path
 weft-reduce = { workspace = true }  # canonical downsample reduction (Aggregation / reduce / bucket_start)
+hyper = { version = "1", features = ["http1", "server"] }  # the one HTTP/1.1 serve path (serve.rs, SEC-4): per-connection serving under the pre-auth limits
+hyper-util = { version = "0.1", features = ["tokio", "service"] }  # TokioIo/TokioTimer + TowerToHyperService for serve.rs
+libc = { workspace = true }  # getrlimit(RLIMIT_NOFILE) for the derived connection-cap default in serve.rs
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 # The GPU backend is this binary's decision, not the libraries': `weft-server/src/gpu.rs`
@@ -81,6 +84,7 @@ required-features = ["fault-injection"]
 
 [dev-dependencies]
 async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
+libc = { workspace = true }  # raise(SIGTERM) for the signal-before-serving test in tests/serve_path.rs
 tower = { workspace = true, features = ["util"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }

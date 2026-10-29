@@ -16,6 +16,12 @@
 //! 4. [`daemons`] — the background reconcile/backup/GPU-calibration tasks.
 //! 5. [`serve`] — bind, print the banner, serve until shutdown.
 //!
+//! The shutdown signal handlers are installed before phase 2 (right after
+//! [`hooks`], whose tracing they report through): plan C9's "handlers first".
+//! A signal that arrives at any point after that — including while the store
+//! is still opening, before serving starts — is recorded, and the serve phase
+//! sees it on entry and exits 0 without accepting a connection.
+//!
 //! ## Request guard
 //!
 //! When the bound address is a loopback address, every request must be addressed to a
@@ -88,8 +94,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// Immediately after tracing, so the panic hook reports through the subscriber it chains.
 	hooks::init_panic_hook();
 
+	// Handlers first (C9): SIGINT/SIGTERM are registered before any phase that
+	// can block, so a signal before serving is recorded rather than killing
+	// the process mid-startup, and serve::run observes it on entry.
+	let mut shutdown = weft_server::ShutdownSignals::install()?;
+
 	let addr = config::bind_addr()?;
 	let interpolate = config::interpolate_config()?;
+	let limits = config::serve_limits()?;
 	let state = state::build().await?.with_interpolate_config(interpolate);
 
 	daemons::spawn_reconcile_if_configured(&state)?;
@@ -101,5 +113,5 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// After the bind and in the background, so serving never waits for it.
 	daemons::spawn_gpu_calibration_if_enabled();
 
-	serve::run(listener, state, otel_provider).await
+	serve::run(listener, state, otel_provider, limits, &mut shutdown).await
 }

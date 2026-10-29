@@ -4,6 +4,59 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — SEC-4 "one HTTP/1.1 serve path with pre-auth listener limits" (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§3 SEC-4 row, §4 C9, §6 W3) fixes *what* SEC-4
+must bound — a connection cap and a write-stall timeout absorbed from ROB-23,
+a NOFILE-derived default for the cap, header and keep-alive deadlines, one
+serve path (`serve::run`), signal handlers installed first, a signal before
+serving exiting 0, and the drain order serve → SEC-9 → D-S14 → runtime
+`shutdown_timeout(5 s)` — but names no numbers, no derivation formula, and no
+mechanism. The queue records no open question for SEC-4, so these choices are
+made here, grounded in the plan's constraints, and flagged for merge review.
+
+**Chosen:**
+
+1. **The serve path is a hand-rolled accept loop over hyper's HTTP/1.1
+   server** (`weft_server::serve::run`), not `axum::serve`: the cap must be
+   held *before* `accept` (a semaphore permit precedes each accept, so
+   excess connections wait unread in the kernel backlog — the pre-auth
+   property), and `axum::serve` exposes neither that hook nor per-connection
+   IO. The router is the same `app_with_state` router, carried per
+   connection by `TowerToHyperService`. HTTP/1.1 only, per decision 17.
+2. **Cap derivation: half the `RLIMIT_NOFILE` soft limit**, clamped to
+   16..=65,536, falling back to 1,024 when the limit cannot be read. Half,
+   because connection sockets share the one descriptor budget with the
+   store's segment/index files: a cap that could take every descriptor
+   would let unauthenticated peers starve the store of file handles. The
+   ceiling exists because a ~1M container soft limit halved is not a
+   meaningful pre-auth bound. `WEFT_MAX_CONNECTIONS` (Tuning) overrides.
+3. **Deadlines: header 30 s, keep-alive 30 s, write-stall 10 s**, each a
+   Tuning `WEFT_*_SECS` variable, each refusing non-positive values at
+   startup. 30 s is hyper's own header-read default, made explicit. The
+   header deadline is hyper's `header_read_timeout` (tokio timer); the
+   keep-alive and write-stall deadlines are progress deadlines on the
+   connection's IO (available input is always taken first, so they fire
+   only when no bytes move — between requests, no-progress *is* the
+   keep-alive idle bound).
+4. **Handlers first, literally:** `ShutdownSignals::install()` runs in
+   startup immediately after the hooks phase and before config/state/bind,
+   replacing terminate-on-signal from that point on. A signal delivered
+   during store open is recorded by tokio's signal stream and observed on
+   `serve::run`'s entry, which drains nothing and returns `Ok` — the
+   process exits 0. While serving, a signal stops accepting and live
+   connections drain for up to 5 s (C9's figure) before abort. The rest of
+   C9's drain order (SEC-9's tracker, D-S14's `store.shutdown()`) belongs
+   to those slices and slots in after `run` returns.
+
+**Rejected:** capping by counting connections *after* accept inside a
+middleware (post-read, so not pre-auth, and the accepted-but-unserved
+sockets still consume descriptors); an overall per-connection lifetime
+timeout instead of progress deadlines (it would kill long legitimate
+downloads and idle-but-valid keep-alive alike on the same clock); and
+leaving the second `axum::serve`-shaped path in the binary for tests
+(the tests drive `serve::run` itself, over real TCP).
+
 ## 2026-10-29 — SOA-12: procfs over a crate, deltas over totals, and a check that cannot run
 
 **Ambiguous:** the roadmap line and issue #258 name three things - Linux system

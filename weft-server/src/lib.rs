@@ -52,6 +52,7 @@ pub mod metrics;
 pub mod panic_hook;
 pub mod reconcile_daemon;
 pub mod routes;
+pub mod serve;
 pub mod settings;
 pub mod state;
 pub mod storage;
@@ -72,6 +73,7 @@ pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyH
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
 pub use routes::{AdmissionClass, Audit, ClassEntry, PolicyEntry, Role, RouteEntry, RouteSpec, RouteTable, Routes, Scope, SealedRoutes};
 use serde::Serialize;
+pub use serve::{ServeLimits, ShutdownSignals, HEADER_READ_TIMEOUT_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, WRITE_STALL_TIMEOUT_ENV};
 pub use state::AppState;
 pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_downsample, storage_downsample_arrow, storage_downsample_csv, storage_downsample_parquet, storage_point, storage_points, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, MultiPointParams, PointParams, StorageDownsampleParams, StoreStatsResponse, StoredPoint, StoredPointEntry, StoredPointResponse, StoredPointsResponse, StoredRangeResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};
 
