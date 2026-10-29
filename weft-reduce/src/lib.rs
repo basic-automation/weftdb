@@ -40,9 +40,10 @@ use splimes::{Point, Resolution};
 ///
 /// The wire tokens are vendor-neutral lowercase (`"min"`, `"max"`, `"avg"`, `"sum"`,
 /// `"first"`, `"last"`); the bucket count is always reported separately (see
-/// [`Bucket::count`]) and so is not a member here.
+/// [`Bucket::count`]) and so is not a member here. A JSON body reads its tokens through
+/// [`from_token`](Self::from_token), the same parser as a query string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase", try_from = "String")]
 pub enum Aggregation {
 	/// Smallest value in the bucket.
 	Min,
@@ -154,13 +155,16 @@ impl Aggregation {
 		}
 	}
 
-	/// Parse a reduction from its wire token (case-insensitive), the inverse of
-	/// [`as_str`](Self::as_str). Accepts `median` as an alias for `p50`. Returns `None`
-	/// for an unknown token. Shared so every surface (HTTP query params, the bench CLI)
-	/// parses the same set the reduction supports.
+	/// Parse a reduction from its wire token, the inverse of [`as_str`](Self::as_str). The
+	/// match is exact-case: the wire tokens are lowercase, so `Min` and `MEDIAN` are unknown,
+	/// not folded to a reduction. Surrounding whitespace is ignored. Accepts `median` as an
+	/// alias for `p50`, and the bare lowercase variant names (`twalinear`, `sketchp99`) that
+	/// a JSON body accepted before this parser did, so a client that sent them keeps working.
+	/// Returns `None` for an unknown token. Shared so every surface (HTTP query params, the
+	/// JSON body, the bench CLI) parses the same set the reduction supports.
 	#[must_use]
 	pub fn from_token(token: &str) -> Option<Self> {
-		match token.trim().to_ascii_lowercase().as_str() {
+		match token.trim() {
 			"min" => Some(Self::Min),
 			"max" => Some(Self::Max),
 			"avg" => Some(Self::Avg),
@@ -172,12 +176,12 @@ impl Aggregation {
 			"p95" => Some(Self::P95),
 			"p99" => Some(Self::P99),
 			"twa" | "time_weighted_avg" | "twa_locf" => Some(Self::Twa),
-			"twa_linear" | "time_weighted_avg_linear" => Some(Self::TwaLinear),
-			"twa_bucket_end" | "twa_locf_end" => Some(Self::TwaBucketEnd),
-			"sketch_p50" | "sketch_median" => Some(Self::SketchP50),
-			"sketch_p90" => Some(Self::SketchP90),
-			"sketch_p95" => Some(Self::SketchP95),
-			"sketch_p99" => Some(Self::SketchP99),
+			"twa_linear" | "twalinear" | "time_weighted_avg_linear" => Some(Self::TwaLinear),
+			"twa_bucket_end" | "twabucketend" | "twa_locf_end" => Some(Self::TwaBucketEnd),
+			"sketch_p50" | "sketchp50" | "sketch_median" => Some(Self::SketchP50),
+			"sketch_p90" | "sketchp90" => Some(Self::SketchP90),
+			"sketch_p95" | "sketchp95" => Some(Self::SketchP95),
+			"sketch_p99" | "sketchp99" => Some(Self::SketchP99),
 			_ => None,
 		}
 	}
@@ -235,6 +239,22 @@ impl Aggregation {
 	#[must_use]
 	pub const fn is_sidecar_materializable(self) -> bool {
 		!self.needs_full_bucket()
+	}
+}
+
+/// A JSON `aggregations` entry that [`Aggregation::from_token`] does not recognise.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown aggregation `{0}` (use min/max/avg/sum/first/last/p50/p90/p95/p99/twa/twa_linear/twa_bucket_end/sketch_p50/sketch_p90/sketch_p95/sketch_p99)")]
+pub struct UnknownAggregation(pub String);
+
+/// The JSON body's reader for [`Aggregation`]: the same spellings as
+/// [`from_token`](Aggregation::from_token), so `twa_linear` and `median` parse in a body as
+/// they do in a query string, and `Min` is refused in both.
+impl TryFrom<String> for Aggregation {
+	type Error = UnknownAggregation;
+
+	fn try_from(token: String) -> Result<Self, Self::Error> {
+		Self::from_token(&token).ok_or(UnknownAggregation(token))
 	}
 }
 
@@ -845,6 +865,47 @@ mod tests {
 		b.values.get(agg.as_str()).expect("aggregation present").to_f64().expect("finite")
 	}
 
+	/// Reads one token through the derived `Deserialize`, the way a JSON body's array does.
+	fn read_json_token(token: &str) -> Result<Aggregation, serde::de::value::Error> {
+		serde::Deserialize::deserialize(serde::de::IntoDeserializer::<serde::de::value::Error>::into_deserializer(token))
+	}
+
+	#[test]
+	fn json_and_query_spellings_name_the_same_reductions() {
+		// The documented spellings and aliases, and the bare lowercase names a body sent
+		// before `from_token` read it. Every spelling is lowercase, as the wire tokens are.
+		let spellings = [("twa_linear", Aggregation::TwaLinear), ("twalinear", Aggregation::TwaLinear), ("time_weighted_avg_linear", Aggregation::TwaLinear), ("twa_bucket_end", Aggregation::TwaBucketEnd), ("twabucketend", Aggregation::TwaBucketEnd), ("sketch_p99", Aggregation::SketchP99), ("sketchp99", Aggregation::SketchP99), ("sketch_median", Aggregation::SketchP50), ("median", Aggregation::P50), (" avg ", Aggregation::Avg)];
+		for (token, expected) in spellings {
+			assert_eq!(read_json_token(token).expect(token), expected, "JSON `{token}`");
+			assert_eq!(Aggregation::from_token(token), Some(expected), "query `{token}`");
+		}
+	}
+
+	#[test]
+	fn json_and_query_refuse_a_name_that_is_not_lowercase() {
+		for token in ["Min", "MEDIAN", "Twa_Linear", "SKETCH_P99"] {
+			assert!(read_json_token(token).is_err(), "JSON `{token}` must be refused");
+			assert_eq!(Aggregation::from_token(token), None, "query `{token}` must be refused");
+		}
+	}
+
+	#[test]
+	fn every_reduction_name_reads_back_from_its_own_response_key() {
+		// The response lists reductions by `as_str`, so a client that copies those names into
+		// its next request must get the same reductions back.
+		let every = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd, Aggregation::SketchP50, Aggregation::SketchP90, Aggregation::SketchP95, Aggregation::SketchP99];
+		for agg in every {
+			assert_eq!(read_json_token(agg.as_str()).expect(agg.as_str()), agg);
+		}
+	}
+
+	#[test]
+	fn unknown_json_token_names_itself_and_the_accepted_set() {
+		let err = read_json_token("twa_lineer").expect_err("not a reduction");
+		assert!(err.to_string().contains("unknown aggregation `twa_lineer`"), "{err}");
+		assert!(err.to_string().contains("twa_bucket_end"), "{err}");
+	}
+
 	#[test]
 	fn reduces_into_minute_buckets_with_every_aggregation() {
 		// Two minute-buckets: 00:00 holds t=0,30 (10, 20); 00:01 holds t=60,90 (30, 5).
@@ -982,7 +1043,7 @@ mod tests {
 		for agg in [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear] {
 			assert_eq!(Aggregation::from_token(agg.as_str()), Some(agg), "{} must round-trip", agg.as_str());
 		}
-		assert_eq!(Aggregation::from_token("MEDIAN"), Some(Aggregation::P50), "median is a case-insensitive p50 alias");
+		assert_eq!(Aggregation::from_token("MEDIAN"), None, "tokens are exact-case, so an upper-case alias is unknown");
 		assert_eq!(Aggregation::from_token(" avg "), Some(Aggregation::Avg), "surrounding whitespace is trimmed");
 		assert_eq!(Aggregation::from_token("twa_locf"), Some(Aggregation::Twa), "twa_locf names the LOCF method explicitly");
 		assert_eq!(Aggregation::from_token("time_weighted_avg_linear"), Some(Aggregation::TwaLinear), "the long-form linear alias parses");
@@ -1127,7 +1188,7 @@ mod tests {
 			assert_eq!(Aggregation::from_token(agg.as_str()), Some(agg), "{} round-trips", agg.as_str());
 		}
 		assert_eq!(Aggregation::from_token("sketch_median"), Some(Aggregation::SketchP50), "sketch_median aliases sketch_p50");
-		assert_eq!(Aggregation::from_token("SKETCH_P99"), Some(Aggregation::SketchP99), "sketch tokens are case-insensitive");
+		assert_eq!(Aggregation::from_token("SKETCH_P99"), None, "sketch tokens are exact-case, so an upper-case token is unknown");
 	}
 
 	#[test]

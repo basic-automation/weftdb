@@ -54,6 +54,60 @@ what a sampler reads, which numbers are contamination, or what makes a run "flus
    artifact should not leak a developer's directory layout. A test writes a store
    path containing a canary string and asserts the artifact does not contain it.
 
+## 2026-10-29 — SEC-3 "sealed route registry, frozen scope table and fail-closed gate" (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§3 SEC-3/SEC-6 row, §2 L-ROUTER, C4, C10) fixes the
+`RouteSpec` field set (`scope, audit, operator_detail, tier, admission_class,
+operation_id`), says FRE's four roles are replaced by SEC's 8 scopes and 6 roles,
+and says one registry produces the router, the policy table, the class table and
+the OpenAPI document — but it never enumerates the eight scope names, the six
+roles, or the admission classes. Two scope names are stated elsewhere in the
+plan: `maintain` (§5, D-S12: fsck and quarantine routes register "with scope
+`maintain`") and `metrics` (§11 decision 17: "`/metrics` needs the metrics scope
+when auth is on").
+
+**Chosen:**
+
+1. The eight scopes are `probe, metrics, read, compute, ingest, declare,
+   maintain, backup` — the two plan-named scopes plus one scope per route area
+   the server already has (probes, storage reads, the stateless interpolate /
+   downsample compute endpoints, point ingest, aspect declaration, backup).
+   Declaration is its own scope, apart from ingest, so a pure ingest key cannot
+   reshape the catalog; backup is its own scope, apart from maintenance,
+   because a backup reads the whole store. The table is frozen in
+   `weft-server/src/routes.rs` and pinned by the `scope_table_is_frozen` test.
+2. The six roles are `anonymous, reader, writer, declarer, maintainer, admin`,
+   with cumulative scope grants (each role holds everything the previous one
+   holds; admin holds all eight). SEC-3 defines only the grants; SEC-6 decides
+   which API key holds which role.
+3. The admission classes are `probe` (never shed), `query` (reads and stateless
+   compute), `write` (ingest and declaration, admitted against the body cap)
+   and `maintenance` (maintenance and backup). This is ROB-10's per-route class
+   table folded into the registry, per §3.
+4. `tier` reuses the configuration registry's `Tier` vocabulary
+   (`settings::Tier`); every route shipped today is `Stable`, because the whole
+   surface is the frozen 1.0 surface.
+5. The OpenAPI document is generated from the registry itself (one operation
+   per route, keyed by `operation_id`, the rest of the spec as `x-weft-*`
+   extensions). FRE-9a (W8) later feeds utoipa-axum's `routes!()` output *into*
+   `Routes::route`, per §3 — the document's producer changes then, its shape
+   does not.
+6. The fail-closed gate is a layer on the registry-built router: a matched
+   path with no (method, path) entry is refused `405 method_not_allowed` with
+   `Allow` (FRE-6a's 405 fallback, absorbed by the §3 row), and an unmatched
+   path is refused `404 route_not_found` by a fallback that decides from the
+   same sealed table (a concrete path matching a template under another method
+   also gets the 405).
+
+**Rejected:** blocking the slice until the scope names are enumerated (the
+queue records no open question for SEC-3, unlike its neighbours; the two
+plan-named scopes anchor the table and the rest follow the server's existing
+area split, and the whole table is reversible at merge review); keeping
+`lib.rs`'s route chain and adding the tables beside it (that is exactly the
+four-registries drift C4 resolves against); and adding a `utoipa` dependency
+now (FRE-9a owns that integration in W8; the registry must exist first, in W3,
+before D-S14 — C10).
+
 ## 2026-10-27 — D-S10 "write-once durable seal with id assigned at commit" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6 W3, §5 D-S10 amendment) says a seal is
@@ -843,3 +897,69 @@ through the store lane via the `types::interpolate_range` child module (one
 counting toward the cap). The review item itself is left unticked here — it
 names this slice, and this entry is its answer — so the loop can flip it
 alongside the line it reviews.
+
+## 2026-10-28 — D-S11: the rollup moves to `segment_index.db`
+
+**Spec:** 1.0-plan.md §6 W3 store lane (D-S10 → EVI-10A hook → D-S11) plus
+ROADMAP line 269, and the code's own anticipation of it: the layout-2 migration
+already creates `aspect_metadata` in `segment_index.db` "with metadata.db's
+columns, folded inside the seal transaction from S11", and `finish_swap` called
+its post-swap rebuild "the interim until S11 folds it into the swap itself".
+No §5 amendment names D-S11, and the queue's open question — the exact source
+rows — resolves from `metadata.rs`: the rollup is `AspectMetadata`, derived
+from the segment index (`from_index`) or folded one descriptor at a time
+(`folded`).
+
+**Chosen:** the `segment_index.db` `aspect_metadata` row is the rollup, and
+both writers fold it in their own transaction. A seal reads that row, folds its
+fresh descriptor, and commits `InsertNew` + `SeqBump` + `PutRollup` (a new
+`IndexOp`, `INSERT OR REPLACE` on the aspect key) in one `IndexTxn`. A swap
+derives the rollup from its post-swap rows — the current rows under the commit
+lock, with each plan op applied in memory — and commits it with the swap's ops,
+so a swap that deletes members without replacing them (a narrowing squash)
+stays exact, where a per-output fold would not. Rebuilds write the same row
+through a single-op `IndexTxn`. `PutRollup` counts as guarded for retries only
+because its callers hold the aspect's commit lock across the whole transaction,
+retries included, so no other writer of that row can commit between attempts.
+
+**Not moved:** `metadata.db` stays a control-plane file — the FRE-14
+`legacy_catalog` table lives there — and `AspectMetadataStore` stays a public
+type with its own tests, but the store no longer writes its rollup table and
+`SegmentStore::metadata()` now says so. Readers (`aspect_metadata`,
+`store_stats`, the fragmentation guard) read `segment_index.db`; the journal
+replay keeps its re-derive as a no-op reconciliation for pre-S11 or clobbered
+rows.
+
+## 2026-10-28 — D-S11 fix: open backfills the rollup rows the replay never writes
+
+**Correction to the entry above:** the journal replay does NOT reconcile
+pre-S11 rows in general — it re-derives only the aspects its journal names.
+A clean pre-S11 store (no journal rows) therefore opens with no
+`segment_index.db` rollup rows at all, and `aspect_metadata` reads default
+zeros for every aspect. The v0.1.0 compat gate caught it: a migrated `price`
+aspect read 0 nulls against the 14 v0.1.0 counted, while its segment count,
+rows and bytes — which come from the live segment scan, not the rollup — still
+matched. The re-derive itself is sound: `rebuild_aspect_metadata` on the
+migrated store returns the true 14, so the descriptors carry the null counts
+and only the rows are missing.
+
+**Fix:** open backfills exactly the missing rows (`backfill_missing_rollups`,
+step 13 of the open), after the journal replay and only for stores this build
+may write. Rebuilding every row on every open would rescan the whole index
+for stores that already have rows; deriving on read would change the
+materialized-rollup contract and pay a full index scan per read. Missing-only
+keeps an S11-native open at one `SELECT` per aspect and makes a pre-S11 store
+read correctly from its first open; a later seal or swap keeps the row current
+by folding, as usual.
+
+## 2026-10-29 — FRE-5: reduction tokens are exact-case — FOR MERGE REVIEW
+
+**Ambiguous:** ROADMAP's FRE-5 box reads "Compute vocabulary, exact-case tokens and no silent narrowing". `Aggregation::from_token` folded case, so `MEDIAN`, `Min` and `SKETCH_P99` parsed, and v0.1.0 shipped that on the query string. The spelling slice (#239, merged 2026-10-29) carried the folding into the JSON body and described it as part of the closed item, which the FRE-5 box does not say.
+
+**Chosen:** exact-case. The roadmap names exact-case as the deliverable. The wire tokens are the compatibility surface, and the nearest precedent, `ValueKind` (`weftdb/src/types/value_kind.rs`), is case-sensitive and pins that by test. The defect the FOUND bullet names was the multi-word spellings, not case. Trimming surrounding whitespace stays, since it is not a case rule.
+
+**Cost:** a v0.1.0 client that sends `?agg=Min` or `agg=MEDIAN` gets a `400`. Pre-1.0 minor versions may break, and the CHANGELOG records it under Changed with the lowercase spellings to send. A case-folding shim on the query string alone would keep v0.1.0 working, but it would leave the query string and the JSON body on two parsers, which the spelling fix removed.
+
+**Not changed:** `Fill::from_token` (`weft-reduce/src/fill.rs`) still folds case. It is a separate vocabulary (`--gf-fill`, the interpolation fill), and the FRE-5 box does not name it. It needs its own decision.
+
+**Applied:** `from_token` matches the trimmed token exactly. Tests refuse `Min`, `MEDIAN`, `SKETCH_P99` and `Twa_Linear` on both surfaces. The README and the CHANGELOG are updated, and the FOUND bullet no longer claims letter-case folding. FRE-5's "no silent narrowing" clause stays open.
