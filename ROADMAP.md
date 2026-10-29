@@ -275,7 +275,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **ROB-6** Bounded decimals
   - [x] **EVI-8B** Benchmark adapter v2 II
   - [x] **SOA-5** Soak ingest client
-  - [ ] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
+  - [x] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
 - [ ] **W4 · Auth, config, ILP fix**
   - [ ] Store lane
   - [ ] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
