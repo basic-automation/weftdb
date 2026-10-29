@@ -300,7 +300,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **FRE-7b** Immutable declarations, scale rules and schema read-back
   - [x] **EVI-13** DuckDB adapter I
   - [x] **EVI-15R** Report renderer with honesty-section generation
-  - [ ] **EVI-16** Honesty pages I
+  - [x] **EVI-16** Honesty pages I
   - [ ] **SOA-7** Window digests and the oracle self-test
   - [ ] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
 - [ ] **W6 · Durability CI, store split, scheduler**
