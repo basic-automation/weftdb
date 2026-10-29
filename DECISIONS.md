@@ -4,6 +4,60 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — SEC-3 "sealed route registry, frozen scope table and fail-closed gate" (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§3 SEC-3/SEC-6 row, §2 L-ROUTER, C4, C10) fixes the
+`RouteSpec` field set (`scope, audit, operator_detail, tier, admission_class,
+operation_id`), says FRE's four roles are replaced by SEC's 8 scopes and 6 roles,
+and says one registry produces the router, the policy table, the class table and
+the OpenAPI document — but it never enumerates the eight scope names, the six
+roles, or the admission classes. Two scope names are stated elsewhere in the
+plan: `maintain` (§5, D-S12: fsck and quarantine routes register "with scope
+`maintain`") and `metrics` (§11 decision 17: "`/metrics` needs the metrics scope
+when auth is on").
+
+**Chosen:**
+
+1. The eight scopes are `probe, metrics, read, compute, ingest, declare,
+   maintain, backup` — the two plan-named scopes plus one scope per route area
+   the server already has (probes, storage reads, the stateless interpolate /
+   downsample compute endpoints, point ingest, aspect declaration, backup).
+   Declaration is its own scope, apart from ingest, so a pure ingest key cannot
+   reshape the catalog; backup is its own scope, apart from maintenance,
+   because a backup reads the whole store. The table is frozen in
+   `weft-server/src/routes.rs` and pinned by the `scope_table_is_frozen` test.
+2. The six roles are `anonymous, reader, writer, declarer, maintainer, admin`,
+   with cumulative scope grants (each role holds everything the previous one
+   holds; admin holds all eight). SEC-3 defines only the grants; SEC-6 decides
+   which API key holds which role.
+3. The admission classes are `probe` (never shed), `query` (reads and stateless
+   compute), `write` (ingest and declaration, admitted against the body cap)
+   and `maintenance` (maintenance and backup). This is ROB-10's per-route class
+   table folded into the registry, per §3.
+4. `tier` reuses the configuration registry's `Tier` vocabulary
+   (`settings::Tier`); every route shipped today is `Stable`, because the whole
+   surface is the frozen 1.0 surface.
+5. The OpenAPI document is generated from the registry itself (one operation
+   per route, keyed by `operation_id`, the rest of the spec as `x-weft-*`
+   extensions). FRE-9a (W8) later feeds utoipa-axum's `routes!()` output *into*
+   `Routes::route`, per §3 — the document's producer changes then, its shape
+   does not.
+6. The fail-closed gate is a layer on the registry-built router: a matched
+   path with no (method, path) entry is refused `405 method_not_allowed` with
+   `Allow` (FRE-6a's 405 fallback, absorbed by the §3 row), and an unmatched
+   path is refused `404 route_not_found` by a fallback that decides from the
+   same sealed table (a concrete path matching a template under another method
+   also gets the 405).
+
+**Rejected:** blocking the slice until the scope names are enumerated (the
+queue records no open question for SEC-3, unlike its neighbours; the two
+plan-named scopes anchor the table and the rest follow the server's existing
+area split, and the whole table is reversible at merge review); keeping
+`lib.rs`'s route chain and adding the tables beside it (that is exactly the
+four-registries drift C4 resolves against); and adding a `utoipa` dependency
+now (FRE-9a owns that integration in W8; the registry must exist first, in W3,
+before D-S14 — C10).
+
 ## 2026-10-27 — D-S10 "write-once durable seal with id assigned at commit" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6 W3, §5 D-S10 amendment) says a seal is

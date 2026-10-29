@@ -33,6 +33,21 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **Every HTTP route now registers through one sealed registry** (security track
+  SEC-3). `weft-server/src/lib.rs` no longer carries the route chain: each of the
+  55 routes (49 path templates) is registered in `weft-server/src/routes.rs` by a
+  per-area registration function, with a `RouteSpec {scope, audit,
+  operator_detail, tier, admission_class, operation_id}`. The scope table is
+  frozen at eight scopes (`probe`, `metrics`, `read`, `compute`, `ingest`,
+  `declare`, `maintain`, `backup`) alongside six roles with cumulative grants
+  (`anonymous` through `admin`); SEC-6 will enforce the table with API keys. The
+  one registry produces the router, the policy table, the admission-class table
+  and a generated OpenAPI document (`routes::openapi_document()`). The gate is
+  fail-closed: a request to a registered path under an unregistered method is
+  refused `405 method_not_allowed` with an `Allow` header (previously axum's
+  bare 405 with an empty body), and an unregistered path keeps the envelope's
+  `404 route_not_found`. No route changed its method, path or handler.
+
 - **`weft-server import-rows-mode` migrates one 0.1.x subject into a Storage v2 store**
   (legacy lane FRE-14c). A 0.1.x data directory keeps one SQLite database per aspect,
   timestamps in milliseconds, with its ingest queue, pattern stores and `metadata.db` catalog
