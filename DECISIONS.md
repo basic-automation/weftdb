@@ -4,6 +4,28 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — Phase 0: where the willingness-to-pay hypotheses live, and what ticks the box
+
+**Ambiguous:** Phase 0 asks to "document willingness-to-pay hypotheses" and to "identify 3–5 design
+partners", but `docs/` was removed in #99 with the prose moved to basicautomation.io, and the
+2026-10-24 entry rejects re-adding it. The site is not writable from this repository.
+
+**Chosen:**
+
+1. Both documents sit at the repository root, beside `ROADMAP.md` and `DECISIONS.md` — the files
+   #99 kept — and the ROADMAP's Phase 0 lines link to them. When the site has a page for them, they
+   move there and the links follow.
+2. **Willingness-to-pay is ticked:** the deliverable is the documented hypotheses, and
+   `WILLINGNESS-TO-PAY.md` states six, each falsifiable, with a kill signal and a cheapest test,
+   every one marked untested. Its price bands are placeholders an agent derived from incumbent
+   categories, and it says so; the figures it leans on (spline vs linear on BTC, GPU vs rayon,
+   exact-decimal cost) were checked against the README's measured claims.
+3. **Design partners stays unticked.** `DESIGN-PARTNERS.md` is the profile, checklist and an
+   archetype shortlist with public corpora as stand-ins; nobody has been contacted, and choosing
+   and contacting partners is the operator's.
+
+**Rejected:** re-creating `docs/`; ticking the design-partner line on a shortlist alone.
+
 ## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means
 
 **Ambiguous:** EVI-11 (#266) survives only as its title, in `ROADMAP.md` and in the 1.0 plan

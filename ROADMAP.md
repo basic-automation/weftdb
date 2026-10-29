@@ -10,8 +10,8 @@
 
 The performance thesis and the first benchmark-claim list are written, and the decision about what WeftDB is not chasing first is made; both live in the docs. What is left is finding design partners and writing down the willingness-to-pay hypotheses.
 
-- [ ] Identify 3–5 design partners with interpolation-heavy workloads
-- [ ] Document willingness-to-pay hypotheses
+- [ ] Identify 3–5 design partners with interpolation-heavy workloads (profile and shortlist: [DESIGN-PARTNERS.md](DESIGN-PARTNERS.md); none contacted)
+- [x] Document willingness-to-pay hypotheses ([WILLINGNESS-TO-PAY.md](WILLINGNESS-TO-PAY.md); every hypothesis untested)
 
 ### Phase 1 — Build `Weft-Bench` · *Highest priority*
 
