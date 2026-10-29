@@ -4,10 +4,10 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
-## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means (FLAGGED FOR MERGE REVIEW)
+## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means
 
-**Ambiguous:** EVI-11 (#266) survives only as its title; the 1.0 plan's row for it is not in the
-repository. Two readings fit the title: an adapter that runs the bench's flagship workload against
+**Ambiguous:** EVI-11 (#266) survives only as its title, in `ROADMAP.md` and in the 1.0 plan
+(`f085f84:docs/release/1.0-plan.md`); the evidence-track design that defined it is not in history. Two readings fit the title: an adapter that runs the bench's flagship workload against
 data *read from a `SegmentStore`*, or one that drives a running `weft-server` over HTTP. And the
 `SystemAdapter` trait hands an adapter its points on every rep, which a stored adapter can only use
 by writing them — turning a read benchmark into a write benchmark.
@@ -41,8 +41,13 @@ by writing them — turning a read benchmark into a write benchmark.
 separate it (the first rep would carry a write, and the cold figure would stop meaning first-touch
 read); a server-backed adapter; adding `--stored` to the nightly workflow in the same PR.
 
-**Needs human:** whether this is the EVI-11 the plan meant. If the plan's row asked for the HTTP
-path, this adapter still stands as the library-level figure and the server one becomes a new slice.
+**Settled by the plan:** decision 18 (`f085f84:docs/release/1.0-plan.md:540`) scopes the first report
+as "WeftDB (stored, in-memory, f64) against DuckDB `DOUBLE` and `DECIMAL`", with stored interpolation
+shipping "as a library API (EVI-10A); the HTTP route is deferred". So the stored arm is the library
+store, as built here. The `f64` arm (`interpolate_range_f64`) is not part of this adapter: the
+`SystemAdapter` contract returns `BigDecimal` points, so converting back would put a per-point cost
+into the timing that the arm exists to avoid. It belongs in EVI-13's cross-engine harness, which owns
+its own arms.
 
 ## 2026-10-29 — SEC-4 "one HTTP/1.1 serve path with pre-auth listener limits" (FLAGGED FOR MERGE REVIEW)
 
