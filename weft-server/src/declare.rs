@@ -96,7 +96,7 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 	let physical_type = parse_physical_type(&request.physical_type, request.scale).map_err(ApiError::bad_request)?;
 	let timestamp_unit = parse_time_unit(&request.timestamp_unit).map_err(ApiError::bad_request)?;
 	let tolerance_text = request.value_tolerance.as_deref().unwrap_or("0");
-	let value_tolerance: BigDecimal = tolerance_text.parse().map_err(|_| ApiError::bad_request(format!("`value_tolerance` is not a decimal: {tolerance_text:?}")))?;
+	let value_tolerance: BigDecimal = weft_physical_type::parse_decimal(tolerance_text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("`value_tolerance` is not a decimal: {tolerance_text:?}"))))?;
 	Ok(AspectSchema::new(physical_type, value_tolerance, timestamp_unit))
 }
 

@@ -174,7 +174,7 @@ async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metr
 					values.push(None);
 				}
 				Some(text) => {
-					let parsed: BigDecimal = text.parse().map_err(|_| ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp)))?;
+					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
 					values.push(Some(parsed));
 				}
 			}
@@ -267,7 +267,7 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 			any_null = true;
 			values.push(None);
 		} else {
-			let parsed: BigDecimal = value_text.parse().map_err(|_| ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1)))?;
+			let parsed: BigDecimal = weft_physical_type::parse_decimal(value_text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1))))?;
 			values.push(Some(parsed));
 		}
 		timestamps.push(timestamp);
@@ -446,6 +446,11 @@ async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics
 		let mut values = Vec::with_capacity(points.len());
 		for point in points {
 			let epoch = epoch_in_unit(point.timestamp, schema.timestamp_unit).ok_or_else(|| ApiError::bad_request(format!("timestamp {} is outside the range of the declared `{}` unit", point.timestamp, schema.timestamp_unit.name())))?;
+			// The one decimal domain (ROB-6) at this parse site too: an ILP
+			// float enters as its exact `f64` expansion, whose plain form a
+			// subnormal can push past the bound — refused here with the
+			// domain's code rather than later, as a seal failure.
+			weft_physical_type::check_decimal_domain(&point.value).map_err(|e| error::decimal_out_of_range_refusal(e.digits))?;
 			timestamps.push(epoch);
 			values.push(point.value);
 		}
@@ -610,6 +615,20 @@ mod tests {
 		let body = serde_json::json!({ "points": [{ "timestamp": 1, "value": "1" }] });
 		let (status, body) = post_json(router, "/api/v1/storage/ghost/points", &body).await;
 		assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn ingest_out_of_domain_value_is_decimal_out_of_range() {
+		// ROB-6: a value whose plain form is over 1,024 digits is refused at
+		// the parse site with the domain's own code, before any seal runs.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let over = format!("1{}", "0".repeat(1024));
+		let body = serde_json::json!({ "points": [{ "timestamp": 1, "value": over }] });
+		let (status, body) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert_eq!(body["code"], "decimal_out_of_range", "body: {body}");
+		assert_eq!(body["limit"], 1024, "body: {body}");
 	}
 
 	#[tokio::test]

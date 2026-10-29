@@ -272,7 +272,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions
   - [x] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
   - [x] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
-  - [ ] **ROB-6** Bounded decimals
+  - [x] **ROB-6** Bounded decimals
   - [x] **EVI-8B** Benchmark adapter v2 II
   - [x] **SOA-5** Soak ingest client
   - [x] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
