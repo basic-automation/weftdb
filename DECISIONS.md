@@ -54,6 +54,68 @@ change, and it would refuse comparison against every v23 artifact already on mai
 for no information gain); and leaving `run_profile` unreported "for compatibility"
 (its only callers are `main.rs` and this crate's tests).
 
+## 2026-10-29 — SOA-5: the soak ingest client fills SOA-3's seam, and stops at the ingest lane
+
+**Ambiguous:** ROADMAP line 274 names "Soak ingest client" with no acceptance list, and the plan
+text does not say whether it is a CLI mode or a library component, whether it drives the read lanes
+too, whether it may add an HTTP client dependency, or what it does when a POST fails. Each of those
+changes what a published 24 h run (SOA-18) would mean.
+
+**Chosen:**
+
+1. **Library module, no CLI flag**: `weft-bench/src/soak_client.rs`, exported from the crate. The
+   slices that own how a soak is launched are later ones — SOA-14 (server hooks), SOA-15 (`soak.yml`
+   nightly workflow), SOA-17 (`scripts/crash-soak.sh`) — so a `--soak` flag added here would be a
+   second entry point for those slices to remove.
+2. **Fills the seam SOA-3 left**, implementing `SoakServer` rather than inventing a second trait:
+   `OpenLoopScheduler::run_with_server` drives a live server exactly as it drives `NullServer`, so
+   the difference between a null run and a live run is the server, not two harnesses.
+3. **Ingest lane only, refused at construction.** `IngestClient::new` rejects a `WorkloadModel`
+   whose lane weights can produce a `point_lookup` or `range_scan` tick, and `handle` errors on such
+   a tick rather than doing nothing. The reason is the interval log: the scheduler times every tick
+   it executes, so a silently skipped read would enter the histogram as a sub-microsecond step and a
+   published run would claim read latency it never measured. Reads belong with the oracle and the
+   derived-read checks (SOA-6, SOA-10), which are what make a read result verifiable at all.
+4. **Its own HTTP/1.1 over a blocking `std::net::TcpStream`, no new dependency.**
+   `SoakServer::handle` is a synchronous call inside the scheduler's tick loop, so an async runtime
+   cannot be driven from a `&mut self` method; and the workspace gates build `--locked`, so hyper
+   plus rustls plus a runtime is a large graph — and a feature-unification risk for a crate that
+   otherwise never opens a socket — in exchange for one POST per tick to a loopback port. Connect and
+   I/O timeouts are explicit (`DEFAULT_CONNECT_TIMEOUT` 2 s, `DEFAULT_IO_TIMEOUT` 30 s). Note for the
+   next editor: a read timeout on a `TcpStream` surfaces as `EAGAIN`/`WouldBlock`, not as a timeout.
+5. **The body is the model's, byte for byte.** The client regenerates the tick's `WorkloadStep` —
+   pure in the seed and the tick, so any tick replays without its predecessors — and writes
+   `WorkloadStep::body` unchanged: no tags added, no lines reordered, no cells filtered. The server
+   seals the numeric subset of the named field and reports the count, recorded beside the count
+   offered (`IngestFlow::lines_offered` against `IngestFlow::points_sealed`), so what the server
+   declined to keep stays visible instead of being hidden by a client-side filter.
+6. **No retry once a byte is written.** ILP ingest is not idempotent: a second POST of the same body
+   seals those points again. Only a connect failure — nothing sent, no duplicate possible — is
+   retried, and those are counted (`connect_retries` against `ticks_posted`). A failed step fails the
+   tick, the scheduler aborts the harness, and the operator sees a short run; a silently duplicated
+   seal would surface much later as an oracle mismatch with no trace of its cause here.
+7. **One kept-alive connection, and a server that ends it is a failed tick.** A socket per tick would
+   put the connect into every latency sample, which is the number the run is published for.
+   `Connection: keep-alive` is not a transaction, so reconnect-and-retry after a partially written
+   request would risk the duplicate seal of point 6. `declare_aspect` therefore runs on a connection
+   of its own, so a schema write is not charged to the first tick.
+8. **Bounded, framed, redacted.** The response is read under `MAX_RESPONSE_BYTES` (64 KiB): a server
+   that answers more is refused rather than downloaded. Both `Content-Length` and chunked framing are
+   decoded, and a body cut short by a closed connection is an error, never a short tick. Anything the
+   server said that is quoted into an error passes through EVI-3's redaction first.
+9. **Refused before tick zero.** `IngestTarget`'s defaults (aspect `soak`, field `value`, physical
+   type `f64`, timestamp unit `ns`) are validated at construction, so a target the server would
+   reject fails there instead of hours into a run.
+
+**Rejected:** pulling `tokio`/`hyper` into `weft-bench` (point 4); a `--soak` CLI mode now (point 1);
+retrying a POST after the request was written (points 6 and 7); filtering the model's body down to
+the values the aspect can hold, which makes the offered/sealed delta invisible; and stubbing the read
+lanes to succeed, which the interval log would report as excellent latency.
+
+**Verification:** the crate's `--lib` tests, including a real listener on `127.0.0.1` that asserts the
+request line, headers and body byte for byte, keep-alive reuse across ticks, chunked decoding, the
+response cap, a body closed mid-answer, a refused declaration, and that a read-lane tick fails.
+
 ## 2026-10-29 — SEC-3 "sealed route registry, frozen scope table and fail-closed gate" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§3 SEC-3/SEC-6 row, §2 L-ROUTER, C4, C10) fixes the
@@ -868,6 +930,44 @@ catalog row degrades provenance rather than stopping the read.
 
 **Not claimed:** the operator route is untouched by this slice — it is PR #128's, on
 main already — and no unit conversion happens, as the 2026-10-27 entry above says.
+
+## 2026-10-28 — 4.1 time-zone and leap-second policy: POSIX fixed-day, stated rather than implemented
+
+**Ambiguous:** roadmap 4.1's last open sub-item was the words "Explicit tz + leap-second policy" and
+nothing else. No code, comment or test in the workspace said what an epoch column means when the
+writer's offset is not UTC, or what happens on a calendar that inserts a second. The encodings
+already behave in one specific way; the item asked for that behaviour to be *said*, which left open
+which of several defensible policies to state.
+
+**Chose:** UTC epochs under the POSIX rule — a fixed-length day of exactly `86_400` seconds, no zone
+stored, no leap second modelled — documented on `TimeUnit` and pinned by three tests. A leap second
+is a *counted-twice second*, not a discontinuity, a smear or a renumbering, and the doc states
+plainly that the crate carries no table, cannot answer a TAI-UTC offset question, and will see a real
+leap second as one second long when interpolating or downsampling across it.
+
+**Why:** every alternative needs data or a mechanism the store does not have. A TZif-backed policy
+cannot be evaluated without a zone database the encoding crate must not depend on, and a stored
+*instant* needs no offset to be correct — only a display does, which belongs above the store.
+UTC-TAI smoothing needs a table that changes by announcement. Storing local times would make a
+segment's meaning depend on the writer, the one thing a columnar file that outlives its writer cannot
+afford. And delta / delta-of-delta over integer epochs are exact precisely because the tick spacing
+is uniform; a leap-aware clock stutters exactly where a monitored series would then show a
+1-second spike.
+
+**Also decided — two arithmetic rules worth naming.** The unit arithmetic moves from call sites onto
+the type (`TimeUnit::{nanos_per_unit, to_nanos, from_nanos}`). `to_nanos` is checked and returns
+`None` past the `i64` nanosecond range rather than wrapping: `Seconds` at `i64::MAX` is the year 292
+billion, and a wrapped value sorts into the wrong segment. The store's point-read scaling path keeps
+its own *saturating* form, because there the total order is what matters and saturation preserves it
+while a wrap does not — a read that gives up on the far tail of the key space still answers
+everywhere a segment can exist. `from_nanos` truncates toward minus infinity so `[t, t + unit)` means
+the same thing on both sides of 1970; truncating toward zero would put `-0.5 s` and `+0.5 s` in one
+bucket while a full second either side sits elsewhere.
+
+**Rejected:** a `chrono::DateTime`-typed column (chrono is a dependency of `weftdb`, not of
+`weft-physical-type`, and the encoding must not pay for a calendar); a per-column zone string
+(display metadata presented as data); leap smearing (rewrites real timestamps and is only correct
+with an announcement).
 
 ## 2026-10-28 — EVI-10A: `MAX_KNOTS` stays a `pub` const
 
