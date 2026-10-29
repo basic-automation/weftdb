@@ -77,8 +77,12 @@ use crate::{
 /// `metadata.engine.gpu_driver` (the GPU driver's name and version, beside the adapter in
 /// `metadata.engine.gpu`). v21 added `cold_warm` (the first timed rep apart from the rest,
 /// [`ColdWarm`]). v22 added `gpu_pool`, the GPU buffer pool's behaviour over a `gpu_memory` run.
-/// v23 added `adapter_info`, the v2 adapter's capability/provenance report
-/// ([`crate::adapter::AdapterInfo`]); `None` for v1 adapters and pre-v23 artifacts.
+/// v23 added `adapter_info`, the adapter's capability/provenance report
+/// ([`crate::adapter::AdapterInfo`]); still `None` for artifacts written before
+/// it existed, and for the workloads that do not drive an adapter. Every
+/// interpolation result carries one: the adapter interface has no unreported
+/// variant since EVI-8B retired v1, so the field is optional for reading old
+/// artifacts, not for writing new ones.
 /// (v23 on this report line is independent of the manifest line's v23 in
 /// [`crate::manifest::MANIFEST_SCHEMA_VERSION`]: EVI-3's 23 landed on the manifest
 /// line, so 23 is the report line's next free number.)
@@ -451,10 +455,12 @@ pub struct BenchResult {
 	/// other workload and for older artifacts.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub gpu_pool: Option<crate::gpu_memory::GpuPoolSummary>,
-	/// What the adapter reported about itself (schema v23, adapter v2 only):
-	/// which engine produced the numbers and which capabilities it claims.
-	/// `None` for v1 adapters — the baselines and every pre-v23 artifact — whose
-	/// interface has no reporting method.
+	/// What the adapter reported about itself (schema v23): which engine produced
+	/// the numbers and which capabilities it claims. Every interpolation result
+	/// carries one; `None` only for artifacts written before v23 and for the
+	/// workloads that do not drive an adapter (ingest, compression, downsample,
+	/// range fetch, point lookup, sparse, GPU pool), which measure WeftDB's own
+	/// storage paths and name the system in `adapter` instead.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub adapter_info: Option<crate::adapter::AdapterInfo>,
 }
@@ -653,25 +659,27 @@ mod tests {
 	}
 
 	#[test]
-	fn v22_artifact_without_adapter_info_still_deserializes_and_v1_omits_it() {
-		// A pre-v23 artifact has no `adapter_info` key; serde's default must fill
-		// `None` rather than failing the parse — the v1 adapters' results keep
-		// reading exactly as before. Conversely a v1-shaped result (no report)
-		// must omit the key entirely, as `storage` does above.
+	fn pre_v23_artifact_without_adapter_info_still_deserializes_and_its_absence_is_omitted() {
+		// An artifact written before v23 has no `adapter_info` key; serde's default
+		// must fill `None` rather than failing the parse — those runs recorded no
+		// provenance and must still load. A result with no report (the shape such
+		// an artifact has, and what the non-adapter workloads still write) must
+		// omit the key entirely, as `storage` does above.
 		let mut json = serde_json::to_value(sample_result()).expect("serializes");
 		json.as_object_mut().expect("object").remove("adapter_info");
-		let parsed: BenchResult = serde_json::from_value(json).expect("v22 artifact must still parse");
+		let parsed: BenchResult = serde_json::from_value(json).expect("pre-v23 artifact must still parse");
 		assert_eq!(parsed.adapter_info, None);
 
-		let mut v1 = sample_result();
-		v1.adapter_info = None;
-		let json = serde_json::to_string(&v1).expect("serialize");
+		let mut unreported = sample_result();
+		unreported.adapter_info = None;
+		let json = serde_json::to_string(&unreported).expect("serialize");
 		assert!(!json.contains("adapter_info"), "absent adapter_info must be omitted, got: {json}");
 
-		let mut v2 = sample_result();
-		v2.adapter_info = Some(crate::adapter::AdapterInfo { interface_version: 2, engine: "splimes".to_string(), method: "native interpolation".to_string(), native_engine: true, honours_requested_spline: true });
-		let back: BenchResult = serde_json::from_str(&serde_json::to_string(&v2).expect("serialize")).expect("deserialize");
-		assert_eq!(back, v2, "a v2 report round-trips");
+		let mut reported = sample_result();
+		reported.adapter_info = Some(crate::adapter::AdapterInfo { interface_version: 2, engine: "splimes".to_string(), method: "native interpolation".to_string(), native_engine: true, honours_requested_spline: true });
+		let back: BenchResult = serde_json::from_str(&serde_json::to_string(&reported).expect("serialize")).expect("deserialize");
+		assert_eq!(back, reported, "an adapter report round-trips");
+		let _ = sample_result();
 	}
 
 	#[test]
