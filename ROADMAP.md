@@ -8,9 +8,9 @@
 
 ### Phase 0 — Benchmark thesis & buyer wedge · *Immediate*
 
-The performance thesis and the first benchmark-claim list are written, and the decision about what WeftDB is not chasing first is made; both live in the docs. What is left is finding design partners and writing down the willingness-to-pay hypotheses.
+The performance thesis and the first benchmark-claim list are written, and the decision about what WeftDB is not chasing first is made; both live in the docs. Five open datasets now stand in for design partners, and the willingness-to-pay hypotheses are written down. They stay untested until buyer calls happen.
 
-- [ ] Identify 3–5 design partners with interpolation-heavy workloads (profile and shortlist: [DESIGN-PARTNERS.md](DESIGN-PARTNERS.md); none contacted)
+- [x] Identify 3–5 open datasets with interpolation-heavy workloads, standing in for design partners until Basic Automation is incorporated ([DESIGN-PARTNERS.md](DESIGN-PARTNERS.md); no partner contacted)
 - [x] Document willingness-to-pay hypotheses ([WILLINGNESS-TO-PAY.md](WILLINGNESS-TO-PAY.md); every hypothesis untested)
 
 ### Phase 1 — Build `Weft-Bench` · *Highest priority*

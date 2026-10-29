@@ -1,10 +1,17 @@
 # Design-partner programme
 
-Phase 0 deliverable: *Identify 3–5 design partners with interpolation-heavy workloads*
-([ROADMAP](ROADMAP.md), Phase 0). Drafted 2026-10-29. Companion:
+Phase 0 deliverable, reframed on 2026-10-29: *identify 3–5 open datasets with
+interpolation-heavy workloads*, standing in for design partners until Basic Automation is
+incorporated ([ROADMAP](ROADMAP.md), Phase 0). The five chosen are under
+[Selected open datasets](#selected-open-datasets-the-phase-0-deliverable). The partner programme
+below is kept for when there is an entity to sign with. Companion:
 [WILLINGNESS-TO-PAY.md](WILLINGNESS-TO-PAY.md).
 
-**Status: nobody has been contacted.** The shortlist below is a set of archetypes with public
+**What the reframe gives up.** A dataset shows that the bench works on real interpolation-heavy
+data. It cannot confirm or kill a willingness-to-pay hypothesis: every confirm signal there needs a
+buyer who can name a cost. So H1–H6 stay untested until the discovery calls happen.
+
+**Status of the partner programme: nobody has been contacted.** The shortlist below is a set of archetypes with public
 organisations or open-source projects that *plausibly* have the workload, chosen from public
 documentation. It records no contacts, no names, and no expression of interest from anyone.
 Choosing the 3–5 to approach, and approaching them, is the operator's call.
@@ -129,15 +136,33 @@ give `weft-bench --gap-fill` real gappy series of the kinds above. Licences were
 | Corpus | Shape | Licence | Stands in for |
 | --- | --- | --- | --- |
 | [UCI Beijing Multi-Site Air Quality](https://archive.ics.uci.edu/dataset/501/beijing+multi+site+air+quality+data) | Hourly, 12 sites, 2013–2017, 420,768 rows, real `NA` gaps | CC BY 4.0 (UCI page) | Monitoring networks (#5); closest format to the UCI loader the bench already has |
-| [NOAA NDBC standard met](https://www.ndbc.noaa.gov/historical_data.shtml) ([cleaned](https://data.ioos.us/dataset/ndbc-standard-meteorological-buoy-data-1970-present)) | Hourly / 10-min per buoy, 1970– | US federal; licence not stated on the pages read | Smooth physical signal (water temperature, pressure) for the spline test |
+| [NOAA NDBC standard met](https://www.ndbc.noaa.gov/historical_data.shtml) ([cleaned](https://data.ioos.us/dataset/ndbc-standard-meteorological-buoy-data-1970-present)) | Hourly / 10-min per buoy, 1970– | Free to use and redistribute, per NOAA ERD's catalogue metadata for the NDBC data; NOAA's own NDBC pages not read | Smooth physical signal (water temperature, pressure) for the spline test |
 | [USGS NWIS instantaneous values](https://nwis.waterservices.usgs.gov/docs/instantaneous-values/) | Usually 15-min, 2007–, outage gaps | US federal; licence not stated on the pages read | Hydrology (#4); smooth streamflow and water temperature |
 | [NREL SRRL BMS](https://catalog.data.gov/dataset/nrel-solar-radiation-research-laboratory-srrl-baseline-measurement-system-bms-golden-color-4ffaa) | 1-min irradiance, 130+ channels, 1981– | Catalog records disagree (CC BY vs CC0) | Smooth on clear days, not on cloudy ones: both sides of the spline claim |
 | [PhysioNet Challenge 2012](https://physionet.org/content/challenge-2012/1.0.0/) | 12,000 ICU stays, 37 variables, irregular | ODC-By 1.0, open access (PhysioNet page) | Truly irregular sampling (#11) without credentialed access |
-| [Petrobras 3W](https://github.com/petrobras/3W) | 1 Hz well sensors, frozen/missing variables left in | CC BY 4.0 for v2 per secondary sources; older fork is MIT | Industrial historian exports (#2) |
+| [Petrobras 3W](https://github.com/petrobras/3W) | 1 Hz well sensors, frozen/missing variables left in | Data CC BY 4.0, code Apache-2.0 (repository README) | Industrial historian exports (#2) |
 | [Building Data Genome 2](https://github.com/buds-lab/building-data-genome-project-2) | Hourly, 3,053 meters, 2016–2017 | CC BY-SA 4.0 (repository LICENSE) | Metering (#3); share-alike binds any derived corpus that ships |
 
 Suggested order: UCI Beijing first (permissive, near-zero loader work), NDBC water temperature as
 the smooth-signal test, 3W for H1.
+
+## Selected open datasets (the Phase 0 deliverable)
+
+Five from the table above. Each is chosen for one archetype, and each licence was read on the
+publisher's own page or in the repository, except NDBC (catalogue metadata).
+
+| # | Dataset | Archetype it stands in for | Interpolation-heavy because | Licence |
+| --- | --- | --- | --- | --- |
+| 1 | UCI Beijing Multi-Site Air Quality | Monitoring networks (#5) | Real `NA` gaps across pollutant and weather channels at 12 sites; hourly grid alignment | CC BY 4.0 |
+| 2 | NOAA NDBC standard meteorological | Smooth physical signals (#4, #6) | Water and air temperature and pressure are smooth, with outages; the spline-vs-linear test the ROADMAP still needs | Free use and redistribution (NOAA ERD metadata) |
+| 3 | PhysioNet Challenge 2012 | Irregular sampling (#11) | 37 variables sampled hourly, daily or ad hoc per ICU stay; nothing shares a grid | ODC-By 1.0 |
+| 4 | Petrobras 3W | Industrial historians (#2, H1) | 1 Hz PIMS exports with frozen and missing variables left in | CC BY 4.0 (data) |
+| 5 | Building Data Genome 2 | Metering (#3, H2) | 3,053 hourly meters, raw and cleaned, with meter dropouts | CC BY-SA 4.0: a derived corpus that ships must carry it |
+
+Selecting them ticks the ROADMAP line. Running them is Phase 1 work: a loader per corpus and a
+`weft-bench --gap-fill` run scored against held-out real values. UCI Beijing is the cheapest start,
+since the bench already reads UCI's household-power file.
+
 
 ## Suggested mix (operator decides)
 

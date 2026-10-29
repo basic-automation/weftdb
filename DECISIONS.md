@@ -40,6 +40,12 @@ benchmark clause and is published as "TimescaleDB Community Edition" (its §2.4)
 terms bar direct competitors (§3.6), and InfluxDB 3 Enterprise's licences allow only personal (At-Home) or
 internal (SLSA) use, so neither enterprise edition is benchmarked; their open-source editions are.
 
+**Reframed the same day (operator):** the design-partner line becomes "identify 3–5 open datasets
+with interpolation-heavy workloads" and is ticked on five selected in `DESIGN-PARTNERS.md`: UCI Beijing,
+NOAA NDBC, PhysioNet 2012, Petrobras 3W, BDG2. This is because Basic Automation is not incorporated and
+cannot sign partners yet. Recorded cost: datasets test the bench, not the market, so every
+willingness-to-pay hypothesis stays untested until buyer calls happen.
+
 ## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means
 
 **Ambiguous:** EVI-11 (#266) survives only as its title, in `ROADMAP.md` and in the 1.0 plan
