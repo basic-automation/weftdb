@@ -4,6 +4,43 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — EVI-15R: how the honesty section decides a win
+
+**Ambiguous:** EVI-15R (#276) is "Report renderer with honesty-section generation". The only text
+for the honesty section is the pre-#99 ROADMAP's report requirements: "where WeftDB wins, where it
+loses, workloads not tested, known limitations, config caveats, reproduction instructions". Nothing
+says what counts as a win, which report is rendered, or in what format.
+
+**Chosen:**
+
+1. **It renders `weft-xbench`'s report,** the cross-engine one, in `weft-xbench/src/render.rs`.
+   `weft-bench` already writes HTML for its single-engine runs, and only the cross-engine report can
+   have a "where WeftDB loses". `weft-xbench render REPORT.json [--out DIR]` writes `report.md` and
+   `report.html`, and every run writes both beside `xbench.json`.
+2. **A win needs disjoint p50 bootstrap intervals,** WeftDB's wholly below the fastest other
+   engine's. A loss is the mirror image, and overlap is reported as "within noise" rather than
+   dropped. This is the same rule as EVI-5's regression gate, so a point estimate never decides.
+   Every WeftDB arm is compared, not just the fastest one. Otherwise the exact-decimal arms' losses
+   at `medium` would hide behind the `f64` arm's tie.
+3. **A result that failed its correctness gate is never compared.** Failures are listed first, and
+   a banner at the top of the report says the run has one.
+4. **"Not tested" is computed, not written.** Missing dataset kinds, scales short of three, and
+   decision 18 arms absent from the run (`duckdb-decimal` until EVI-14) are listed, followed by a
+   fixed list of workloads and engines outside this report, including the licence exclusions from
+   WILLINGNESS-TO-PAY.md.
+5. **Caveats come from the run's metadata:** the hardware, the working directory's disk, where the
+   engines wrote (`TMPDIR`), a debug build, and fewer than 10 reps.
+6. **Markdown and HTML come from the same blocks,** so they cannot disagree. The HTML is
+   self-contained: inline CSS, a dark-mode rule, no scripts and no external assets.
+7. **Report schema v2** adds `invocation`, `scratch_dir` and `optimized`. A v1 report still renders,
+   and says those facts were not recorded rather than guessing them.
+
+**Rejected:** a template engine (one more dependency for six fixed sections); deciding wins on p50
+alone; a hand-written honesty section beside a generated one.
+
+**Noticed, not fixed here:** `RunMetadata` records the working directory's disk, not `TMPDIR`'s,
+and reported the 7950X3D as 16 logical cores. The second belongs to `weft-bench`'s capture.
+
 ## 2026-10-29 — EVI-13: what "weft-xbench crate, seeded lock, load and interpolation arms" means
 
 **Ambiguous:** EVI-13 (#275) survives as one line, "DuckDB adapter I: weft-xbench crate, seeded lock,

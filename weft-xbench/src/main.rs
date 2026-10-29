@@ -7,13 +7,16 @@
 //!
 //! Without `--uci` the UCI datasets are skipped and the report says which datasets ran. The
 //! process exits 1 when any result fails its correctness gate, after writing the report.
+//!
+//! `weft-xbench render REPORT.json [--out DIR]` writes `report.md` and `report.html` from a
+//! report, with the generated honesty section (EVI-15R).
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 use std::path::PathBuf;
 
 use weft_bench::{load_uci_corpus, scale::ScalePreset, RunMetadata, DEFAULT_UCI_COLUMN};
-use weft_xbench::{run, Dataset, DatasetKind, DEFAULT_SEED};
+use weft_xbench::{render, run, Dataset, DatasetKind, XbenchReport, DEFAULT_SEED};
 
 const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--out DIR]";
 
@@ -53,9 +56,31 @@ fn source_commit() -> Option<String> {
 	out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// `render REPORT.json [--out DIR]`: the report's Markdown and HTML, beside it by default.
+fn render_command(args: &[String]) -> anyhow::Result<()> {
+	let (path, out) = match args {
+		[path] => (PathBuf::from(path), None),
+		[path, flag, dir] if flag == "--out" => (PathBuf::from(path), Some(PathBuf::from(dir))),
+		_ => anyhow::bail!("usage: weft-xbench render REPORT.json [--out DIR]"),
+	};
+	let report: XbenchReport = serde_json::from_slice(&std::fs::read(&path)?).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+	let out = out.unwrap_or_else(|| path.parent().map(PathBuf::from).unwrap_or_default());
+	std::fs::create_dir_all(&out)?;
+	let blocks = render::blocks(&report);
+	std::fs::write(out.join("report.md"), render::to_markdown(&blocks))?;
+	std::fs::write(out.join("report.html"), render::to_html(&blocks))?;
+	println!("wrote {} and {}", out.join("report.md").display(), out.join("report.html").display());
+	Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	let cli = match parse(std::env::args().skip(1)) {
+	let args: Vec<String> = std::env::args().skip(1).collect();
+	if args.first().map(String::as_str) == Some("render") {
+		return render_command(&args[1..]);
+	}
+	let invocation: Vec<String> = std::iter::once("weft-xbench".to_string()).chain(args.iter().cloned()).collect();
+	let cli = match parse(args.into_iter()) {
 		Ok(cli) => cli,
 		Err(message) => {
 			eprintln!("{message}");
@@ -76,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 	}
 	eprintln!("weft-xbench: {} datasets, scratch in {}", datasets.len(), std::env::temp_dir().display());
 	let metadata = RunMetadata::capture(chrono::Utc::now().to_rfc3339());
-	let report = run(&datasets, cli.load_reps, cli.reps, cli.seed, metadata, source_commit()).await?;
+	let report = run(&datasets, cli.load_reps, cli.reps, cli.seed, metadata, source_commit(), invocation).await?;
 
 	std::fs::create_dir_all(&cli.out)?;
 	let path = cli.out.join("xbench.json");
@@ -87,7 +112,10 @@ async fn main() -> anyhow::Result<()> {
 		let p50_ms = r.latency.p50_ns as f64 / 1e6;
 		println!("{:<14} {:<18} {:<11} p50 {:>10.3} ms{gate}", r.dataset, r.arm.arm, format!("{:?}", r.phase).to_lowercase(), p50_ms);
 	}
-	println!("report: {}", path.display());
+	let blocks = render::blocks(&report);
+	std::fs::write(cli.out.join("report.md"), render::to_markdown(&blocks))?;
+	std::fs::write(cli.out.join("report.html"), render::to_html(&blocks))?;
+	println!("report: {} (+ report.md, report.html)", path.display());
 	if !report.all_correct() {
 		eprintln!("weft-xbench: at least one arm disagrees with the reference; see the report");
 		std::process::exit(1);
