@@ -299,8 +299,10 @@ could reproduce it. Licences checked on 2026-10-29:
 | kdb+ (KX) | The Personal/On Demand licence (§1.3) bars giving any third party "any report regarding the performance" of the software, and the Insights evaluation licence (§1.3) bars disclosing "any benchmark, test or performance information", without KX's prior written consent ([on demand](https://kx.com/?p=3890), [evaluation](https://kx.com/legal/kdb-insights-enterprise-evaluation-license/)) | **Do not run or publish.** Ask KX in writing only if H5 is ever confirmed. Audited kdb+ figures exist as STAC-M3 reports and may be cited, not re-measured |
 | AVEVA PI System | AVEVA's general terms (v6.0, 31 March 2026) bar benchmark testing of any product without AVEVA's prior written consent ([terms](https://www.aveva.com/content/dam/aveva/documents/legal/policies/AVEVA-GTC-Website-and-Clickwrap-version_v6-0_31March2026.pdf)) | **Do not run or publish.** Compare only published capabilities and prices |
 | Oracle, SQL Server and other "DeWitt clause" licences | Historically require written approval before results go to third parties ([background](https://www.databricks.com/blog/2021/11/08/eliminating-the-dewitt-clause-for-database-benchmarking.html)) | Out of scope; not time-series competitors |
-| QuestDB OSS, InfluxDB 3 Core, TimescaleDB, DuckDB, ClickHouse | Open-source licences with no benchmark restriction. TimescaleDB's TSL edition: read the licence before including it | **Publish**, under the rules below |
-| QuestDB Enterprise, InfluxDB 3 Enterprise (any licence tier) | Commercial terms not read | Compare open-source editions only until each licence has been read and recorded |
+| QuestDB OSS, InfluxDB 3 Core, TimescaleDB Apache-2 edition, DuckDB, ClickHouse | Open-source licences with no benchmark restriction | **Publish**, under the rules below |
+| TimescaleDB Community Edition (TSL) | The [TSL](https://www.tigerdata.com/legal/licenses) (effective 17 June 2025) has no benchmark clause. §2.2 bars offering it as a hosted database service, which does not apply here. §2.4 requires calling it "TimescaleDB Community Edition" in any communication | **Publish**, under that name, under the rules below |
+| QuestDB Enterprise | The [trial terms](https://questdb.com/legal/enterprise_trial_terms/) (updated 23 September 2026) §3.6 *allow* comparative testing and publication with version, configuration, hardware, dataset and method disclosed, but a direct competitor "may not access the Trial Materials". The subscription terms are available only on request from legal@questdb.com ([terms](https://questdb.com/terms/)) | **Do not run or publish.** WeftDB is a direct competitor, so it cannot take the trial |
+| InfluxDB 3 Enterprise | The At-Home [EULA](https://www.influxdata.com/legal/influxdata-end-user-software-license-agreement/) has no benchmark clause, but limits use to hobbyist, personal, non-commercial use on two cores and one node. Trial and commercial licences fall under the [SLSA](https://www.influxdata.com/legal/slsa/) (rev 2.1.3), which allows internal business use only, with trials limited to "internal, non-production purposes" (§2.1, §2.3). Neither mentions publication | **Do not run or publish.** A comparison published by a competitor is neither personal nor internal use |
 
 **Rules for every published comparison:**
 
@@ -325,8 +327,6 @@ Basic Automation never publishes those results.
 
 ## Needs human
 
-- **The enterprise-edition licences** of QuestDB and InfluxDB 3, and TimescaleDB's TSL: read and
-  recorded before any of them appears in a published comparison.
 - **Where this document lives.** `docs/` was removed from `main` in #99 and the prose moved to
   basicautomation.io, which this repository cannot write to. It sits at the root beside
   `ROADMAP.md` and `DECISIONS.md` until it has a page on the site (DECISIONS.md, 2026-10-29).

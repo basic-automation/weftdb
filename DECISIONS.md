@@ -35,7 +35,10 @@ without TLS or auth is fine as an isolated test now, not for 1.0. Hosting is a v
 `weft-bench` publishes a cost figure. Benchmark publication: kdb+ and AVEVA PI are not benchmarked or
 published (their licences bar it without written consent); open-source engines are, under six rules
 (licence read, reproducible script, vendor-documented tuning, 14 days of vendor preview, losses
-published, corrections logged); paid reports stay private and the buyer confirms their own licence.
+published, corrections logged); paid reports stay private and the buyer confirms their own licence. Licences read the same day: TimescaleDB's TSL has no
+benchmark clause and is published as "TimescaleDB Community Edition" (its §2.4). QuestDB Enterprise's trial
+terms bar direct competitors (§3.6), and InfluxDB 3 Enterprise's licences allow only personal (At-Home) or
+internal (SLSA) use, so neither enterprise edition is benchmarked; their open-source editions are.
 
 ## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means
 
