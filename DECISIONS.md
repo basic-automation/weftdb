@@ -4,6 +4,68 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — SOA-5: the soak ingest client fills SOA-3's seam, and stops at the ingest lane
+
+**Ambiguous:** ROADMAP line 274 names "Soak ingest client" with no acceptance list, and the plan
+text does not say whether it is a CLI mode or a library component, whether it drives the read lanes
+too, whether it may add an HTTP client dependency, or what it does when a POST fails. Each of those
+changes what a published 24 h run (SOA-18) would mean.
+
+**Chosen:**
+
+1. **Library module, no CLI flag**: `weft-bench/src/soak_client.rs`, exported from the crate. The
+   slices that own how a soak is launched are later ones — SOA-14 (server hooks), SOA-15 (`soak.yml`
+   nightly workflow), SOA-17 (`scripts/crash-soak.sh`) — so a `--soak` flag added here would be a
+   second entry point for those slices to remove.
+2. **Fills the seam SOA-3 left**, implementing `SoakServer` rather than inventing a second trait:
+   `OpenLoopScheduler::run_with_server` drives a live server exactly as it drives `NullServer`, so
+   the difference between a null run and a live run is the server, not two harnesses.
+3. **Ingest lane only, refused at construction.** `IngestClient::new` rejects a `WorkloadModel`
+   whose lane weights can produce a `point_lookup` or `range_scan` tick, and `handle` errors on such
+   a tick rather than doing nothing. The reason is the interval log: the scheduler times every tick
+   it executes, so a silently skipped read would enter the histogram as a sub-microsecond step and a
+   published run would claim read latency it never measured. Reads belong with the oracle and the
+   derived-read checks (SOA-6, SOA-10), which are what make a read result verifiable at all.
+4. **Its own HTTP/1.1 over a blocking `std::net::TcpStream`, no new dependency.**
+   `SoakServer::handle` is a synchronous call inside the scheduler's tick loop, so an async runtime
+   cannot be driven from a `&mut self` method; and the workspace gates build `--locked`, so hyper
+   plus rustls plus a runtime is a large graph — and a feature-unification risk for a crate that
+   otherwise never opens a socket — in exchange for one POST per tick to a loopback port. Connect and
+   I/O timeouts are explicit (`DEFAULT_CONNECT_TIMEOUT` 2 s, `DEFAULT_IO_TIMEOUT` 30 s). Note for the
+   next editor: a read timeout on a `TcpStream` surfaces as `EAGAIN`/`WouldBlock`, not as a timeout.
+5. **The body is the model's, byte for byte.** The client regenerates the tick's `WorkloadStep` —
+   pure in the seed and the tick, so any tick replays without its predecessors — and writes
+   `WorkloadStep::body` unchanged: no tags added, no lines reordered, no cells filtered. The server
+   seals the numeric subset of the named field and reports the count, recorded beside the count
+   offered (`IngestFlow::lines_offered` against `IngestFlow::points_sealed`), so what the server
+   declined to keep stays visible instead of being hidden by a client-side filter.
+6. **No retry once a byte is written.** ILP ingest is not idempotent: a second POST of the same body
+   seals those points again. Only a connect failure — nothing sent, no duplicate possible — is
+   retried, and those are counted (`connect_retries` against `ticks_posted`). A failed step fails the
+   tick, the scheduler aborts the harness, and the operator sees a short run; a silently duplicated
+   seal would surface much later as an oracle mismatch with no trace of its cause here.
+7. **One kept-alive connection, and a server that ends it is a failed tick.** A socket per tick would
+   put the connect into every latency sample, which is the number the run is published for.
+   `Connection: keep-alive` is not a transaction, so reconnect-and-retry after a partially written
+   request would risk the duplicate seal of point 6. `declare_aspect` therefore runs on a connection
+   of its own, so a schema write is not charged to the first tick.
+8. **Bounded, framed, redacted.** The response is read under `MAX_RESPONSE_BYTES` (64 KiB): a server
+   that answers more is refused rather than downloaded. Both `Content-Length` and chunked framing are
+   decoded, and a body cut short by a closed connection is an error, never a short tick. Anything the
+   server said that is quoted into an error passes through EVI-3's redaction first.
+9. **Refused before tick zero.** `IngestTarget`'s defaults (aspect `soak`, field `value`, physical
+   type `f64`, timestamp unit `ns`) are validated at construction, so a target the server would
+   reject fails there instead of hours into a run.
+
+**Rejected:** pulling `tokio`/`hyper` into `weft-bench` (point 4); a `--soak` CLI mode now (point 1);
+retrying a POST after the request was written (points 6 and 7); filtering the model's body down to
+the values the aspect can hold, which makes the offered/sealed delta invisible; and stubbing the read
+lanes to succeed, which the interval log would report as excellent latency.
+
+**Verification:** the crate's `--lib` tests, including a real listener on `127.0.0.1` that asserts the
+request line, headers and body byte for byte, keep-alive reuse across ticks, chunked decoding, the
+response cap, a body closed mid-answer, a refused declaration, and that a read-lane tick fails.
+
 ## 2026-10-27 — D-S10 "write-once durable seal with id assigned at commit" (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6 W3, §5 D-S10 amendment) says a seal is
