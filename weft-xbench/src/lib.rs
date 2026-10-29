@@ -25,6 +25,7 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 pub mod duck;
+pub mod render;
 pub mod weft;
 
 use std::time::Instant;
@@ -40,7 +41,10 @@ use weft_bench::{
 };
 
 /// Version of the report this crate writes. Separate from `weft-bench`'s schema: the shapes differ.
-pub const XBENCH_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (EVI-15R) adds `invocation`, `scratch_dir` and `optimized`, which the renderer's
+/// reproduction and caveat sections read; a v1 report deserializes with them empty.
+pub const XBENCH_SCHEMA_VERSION: u32 = 2;
 
 /// Seed for every generated dataset unless the caller gives another.
 pub const DEFAULT_SEED: u64 = 0x5EED_E713;
@@ -313,6 +317,15 @@ pub struct XbenchReport {
 	pub seed: u64,
 	/// The repository commit the WeftDB arms were built from, when the run could read it.
 	pub source_commit: Option<String>,
+	/// The command line that produced the report, for the reproduction section.
+	#[serde(default)]
+	pub invocation: Vec<String>,
+	/// Where both engines wrote their files (`TMPDIR`).
+	#[serde(default)]
+	pub scratch_dir: Option<String>,
+	/// Whether the binary was an optimised build (`None` in a v1 report, which did not record it).
+	#[serde(default)]
+	pub optimized: Option<bool>,
 	/// Every arm × dataset × phase.
 	pub results: Vec<ArmResult>,
 }
@@ -408,7 +421,7 @@ pub async fn reference(ds: &Dataset) -> anyhow::Result<Vec<f64>> {
 /// # Errors
 ///
 /// If any arm fails outright; a wrong answer is not an error, it fails that result's gate.
-pub async fn run(datasets: &[Dataset], load_reps: usize, reps: usize, seed: u64, metadata: RunMetadata, source_commit: Option<String>) -> anyhow::Result<XbenchReport> {
+pub async fn run(datasets: &[Dataset], load_reps: usize, reps: usize, seed: u64, metadata: RunMetadata, source_commit: Option<String>, invocation: Vec<String>) -> anyhow::Result<XbenchReport> {
 	let mut results = Vec::new();
 	for ds in datasets {
 		let reference = reference(ds).await?;
@@ -418,7 +431,7 @@ pub async fn run(datasets: &[Dataset], load_reps: usize, reps: usize, seed: u64,
 		results.extend(measure(&mut duck::DuckDouble::default(), ds, &reference, load_reps, reps, seed).await?);
 	}
 	let engines = vec![EngineVersion { engine: "weftdb".into(), version: metadata.weft_bench_version.clone() }, EngineVersion { engine: "duckdb".into(), version: duck::duckdb_version()? }];
-	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed, source_commit, results })
+	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), results })
 }
 
 #[cfg(test)]
@@ -492,7 +505,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_tiny_run_reports_both_phases_for_storing_arms_and_passes() {
 		let datasets = [Dataset::synthetic(DatasetKind::Mcar, ScalePreset::Tiny, DEFAULT_SEED).expect("builds")];
-		let report = run(&datasets, 1, 2, DEFAULT_SEED, RunMetadata::capture("test".into()), None).await.expect("runs");
+		let report = run(&datasets, 1, 2, DEFAULT_SEED, RunMetadata::capture("test".into()), None, vec![]).await.expect("runs");
 		// memory: interpolate only; stored, stored-f64, duckdb: load + interpolate.
 		assert_eq!(report.results.len(), 7);
 		assert!(report.all_correct(), "{:#?}", report.results.iter().filter_map(|r| r.correctness.as_ref()).collect::<Vec<_>>());

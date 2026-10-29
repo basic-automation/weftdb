@@ -18,6 +18,13 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **Cross-engine report with a generated honesty section** (evidence track EVI-15R). Every
+  `weft-xbench` run now writes `report.md` and a self-contained `report.html` beside
+  `xbench.json`, and `weft-xbench render REPORT.json` re-renders one. The honesty section is
+  computed from the results: where WeftDB wins and loses (disjoint p50 bootstrap intervals only;
+  overlap is reported as noise), correctness failures first, what did not run, known limitations,
+  caveats read off the run (disk, `TMPDIR`, debug build, few reps) and how to reproduce it. The
+  report schema is v2 (`invocation`, `scratch_dir`, `optimized`); v1 reports still render.
 - **`weft-xbench`: the cross-engine benchmark, WeftDB against DuckDB** (evidence track EVI-13).
   A separate workspace (it builds DuckDB from C++) whose lock is seeded from the workspace's and
   checked for drift in CI. It times **load** (WeftDB seal vs DuckDB appender + `CHECKPOINT`) and
