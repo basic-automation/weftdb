@@ -205,10 +205,10 @@ Ask about the past, not about WeftDB. Do not pitch before question 6.
 Record answers per interview in a dated note. A confirm needs evidence from questions 2, 3 and 7,
 not enthusiasm at question 6.
 
-## Recommended boundary and opening prices (2026-10-29, not yet decided)
+## Boundary and opening prices (decided 2026-10-29)
 
-Researched against what comparable products gate and charge. These are recommendations for the
-operator to accept or change. Nothing is for sale yet (see Decided, below).
+Researched against what comparable products gate and charge, then adopted by the operator as
+written. Nothing is for sale yet: Basic Automation is not incorporated (see Decided, below).
 
 ### What comparable products gate
 
@@ -227,7 +227,7 @@ prices behind a sales call. Historians charge per tag or per server, from a few 
 a year (Canary) to six figures (PI). Ignition's "unlimited tags per server" is its main selling
 point against per-tag pricing.
 
-### Recommended boundary
+### Boundary
 
 **Free and MIT/Apache, permanently:** everything one engineer needs on one node. That covers the
 engine, every interpolation and fill method, the raw/interpolated/extrapolated marking, ingest,
@@ -258,7 +258,7 @@ beside proprietary modules later. That is for a lawyer to confirm when the entit
 Ignition's unlimited model); hosted or $/point pricing before a hosted service exists; gating any
 interpolation method.
 
-### Recommended opening prices (for discovery calls, not published)
+### Opening prices (for discovery calls, not published)
 
 | Offer | Opening price | Anchor |
 | --- | --- | --- |
@@ -274,6 +274,8 @@ five calls; move a price only on evidence from the calls, not on comparables.
 
 ## Decided (2026-10-29)
 
+- **The free/paid boundary and the opening prices** above are adopted as written. The prices are
+  for discovery calls and move only on evidence from those calls.
 - **Who makes contact:** the operator, as **Basic Automation**. Basic Automation is not yet a
   company and will not be incorporated for now. Until it is, calls are discovery only. Use the
   question script, ask what they pay today, and quote prices as "what would you say if…". No
@@ -284,10 +286,8 @@ five calls; move a price only on evidence from the calls, not on comparables.
 
 ## Needs human
 
-- **Accept, change or reject the recommended boundary and prices above.**
 - **Whether to offer hosting at all.** H4's natural metric is per output point, which implies a
   hosted service the project does not have and the README says does not exist.
-- **Whether design partners get founding pricing,** and whether 50% for two years is the number.
 - **Benchmark-publication terms.** H5 and H6 publish comparisons against commercial engines; each
   vendor's terms (kdb+ in particular) need checking before anything is published.
 - **Where this document lives.** `docs/` was removed from `main` in #99 and the prose moved to

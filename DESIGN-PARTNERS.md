@@ -163,7 +163,7 @@ Record each step as a dated entry. Do not record personal contact details in the
 
 - Choose the 3–5 candidates, and whether any listed archetype should be dropped or added.
 - Whether a partner agreement or NDA is needed for data. (Decided: the operator makes contact as Basic Automation, which is not yet incorporated, so calls are discovery only; see WILLINGNESS-TO-PAY.md.)
-- Whether partners are offered anything commercial (founding pricing, paid support credit).
+- (Decided) Partners pilot free and get 50% off for two years if they convert; see WILLINGNESS-TO-PAY.md.
 - Where partner data may be stored: it must not enter this repository; `.gitignore` covers
   `database/datasets`, but a policy should say so.
 - Whether to publish anonymised partner results, and the review step before publishing.

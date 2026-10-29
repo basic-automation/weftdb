@@ -26,6 +26,13 @@ partners", but `docs/` was removed in #99 with the prose moved to basicautomatio
 
 **Rejected:** re-creating `docs/`; ticking the design-partner line on a shortlist alone.
 
+**Later the same day (operator):** the boundary and the opening prices in `WILLINGNESS-TO-PAY.md` are
+adopted as written. The single-node engine stays MIT/Apache, TLS and basic auth included. HA and
+replication, SSO/RBAC/audit, historian connectors and SLA support are paid, at $3k support / $12k
+per node / $30k per site per year, with a $7.5k benchmark report and free pilots at 50% off for two
+years. Contact is made as Basic Automation, discovery only until it is incorporated. A pilot
+without TLS or auth is fine as an isolated test now, not for 1.0.
+
 ## 2026-10-29 — EVI-11: what "stored WeftDB benchmark adapter" means
 
 **Ambiguous:** EVI-11 (#266) survives only as its title, in `ROADMAP.md` and in the 1.0 plan
