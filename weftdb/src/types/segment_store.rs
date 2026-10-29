@@ -242,7 +242,8 @@ impl TransposedPolicy {
 }
 
 /// Lift a stored integer epoch in `unit` to an absolute instant — the inverse of the
-/// ingest path's `epoch_in_unit`. `None` if the epoch falls outside the representable
+/// ingest path's unit arithmetic (`TimeUnit::from_nanos`, which truncates toward minus
+/// infinity). `None` if the epoch falls outside the representable
 /// range (only reachable for coarse units at absurd magnitudes).
 const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>> {
 	match unit {
@@ -257,12 +258,7 @@ const fn instant_from_epoch(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>>
 /// mantissas, scale)`, when every present value is a `ScaledI64` at one shared scale and every
 /// instant fits in epoch nanoseconds. `None` sends the caller to the `BigDecimal` path.
 fn scaled_rows(ts: &[i64], vs: &[Option<PhysicalValue>], start: i64, end: i64, unit: TimeUnit) -> Option<(Vec<i64>, Vec<i64>, u8)> {
-	let per_unit: i64 = match unit {
-		TimeUnit::Seconds => 1_000_000_000,
-		TimeUnit::Millis => 1_000_000,
-		TimeUnit::Micros => 1_000,
-		TimeUnit::Nanos => 1,
-	};
+	let per_unit: i64 = unit.nanos_per_unit();
 	let (mut nanos, mut mantissas) = (Vec::with_capacity(ts.len()), Vec::with_capacity(ts.len()));
 	let mut shared_scale: Option<u8> = None;
 	for (&t, v) in ts.iter().zip(vs) {
@@ -3278,7 +3274,14 @@ impl SegmentStore {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		let schema = self.require_schema(aspect).await?;
-		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
+		// Quality prune, not time prune alone (roadmap Phase 4.3): a segment whose every row
+		// is null cannot move a bucket. Its rows contribute to no sum, count, min, max, first
+		// or last, and a partial that holds nothing is dropped when buckets merge, so the
+		// buckets this fold produces are the same with the segment in or out — and its frame
+		// is never opened. `read_time_range` right above deliberately keeps the time-only
+		// prune: its answer *is* the rows, nulls included, so dropping that segment there
+		// would delete timestamps the caller asked for.
+		let descriptors = self.index.prune_present_descriptors(aspect, start, end).await?;
 
 		// A persisted per-segment partial can *substitute* for decoding a segment only when
 		// it can answer this exact query: every requested reduction must be one the sidecar
@@ -3365,6 +3368,14 @@ impl SegmentStore {
 	/// read-your-writes answer once out-of-order reconciliation (Phase 4.6) can leave
 	/// two segments spanning one instant.
 	///
+	/// **Quality pruning is wired in at both levels of this path** (roadmap Phase 4.3).
+	/// The index prune adds a quality term to its `WHERE` clause — time overlap plus
+	/// `null_count < row_count` — so a segment whose indexed stats say every row is null
+	/// is dropped before its file is ever opened; inside a surviving frame the same test
+	/// on the persisted segment and per-page stats skips the pages a point lookup cannot answer
+	/// ([`read_paged_segment_point`](weft_physical_type::weftseg::read_paged_segment_point)).
+	/// Neither changes the answer: a null row is not a value.
+	///
 	/// # Errors
 	///
 	/// Propagates a libSQL prune failure, a filesystem read error, or a frame-decode
@@ -3373,7 +3384,7 @@ impl SegmentStore {
 	pub async fn read_point(&self, aspect: &str, t: i64) -> Result<Option<BigDecimal>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
-		let descriptors = self.index.prune_by_time(aspect, t, t).await?;
+		let descriptors = self.index.prune_present_descriptors(aspect, t, t).await?;
 		let mut found = None;
 		for descriptor in &descriptors {
 			let bytes = self.read_frame(descriptor).await?;
@@ -3399,7 +3410,9 @@ impl SegmentStore {
 	/// looking up `N` instants that share segments pays one file read + one timestamp decode per
 	/// segment rather than `N`. As with `read_point`, candidates are merged in seal-id order so
 	/// the most recently sealed present value wins per instant (last-writer-wins). An empty `ts`
-	/// yields an empty vector without touching the index.
+	/// yields an empty vector without touching the index. The same quality pruning as
+	/// [`read_point`](SegmentStore::read_point) applies at both levels: fully null segments are
+	/// dropped by the index prune, fully null pages by the frame's page index.
 	///
 	/// # Errors
 	///
@@ -3414,7 +3427,7 @@ impl SegmentStore {
 		}
 		// Prune the index once by the batch's whole span (safe: every instant lies within it).
 		let (lo, hi) = ts.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &t| (lo.min(t), hi.max(t)));
-		let descriptors = self.index.prune_by_time(aspect, lo, hi).await?;
+		let descriptors = self.index.prune_present_descriptors(aspect, lo, hi).await?;
 		let mut found = vec![None; ts.len()];
 		for descriptor in &descriptors {
 			let bytes = self.read_frame(descriptor).await?;
@@ -5534,6 +5547,75 @@ mod tests {
 		assert_eq!(count, 1);
 		assert_eq!(ts, vec![0, 10]);
 		assert_eq!(d.id, 1);
+	}
+
+	/// Quality pruning on the store's point path (roadmap Phase 4.3): a sealed segment that
+	/// carries no value at all is dropped by the index prune, so a point read never opens its
+	/// file. The corrupt bytes left in its place are what prove it — the read can only come
+	/// back clean if that segment was skipped instead of read. A range read, whose contract
+	/// includes null rows, still opens it and reports the damage; a downsample, whose contract
+	/// is the buckets, does not.
+	#[tokio::test]
+	async fn point_reads_prune_an_all_null_segment_without_opening_it() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		// A downsample resolves the aspect's schema before it reads anything, so the fixture has
+		// to declare it: without this line `downsample_range` failed on "no declared schema"
+		// instead of on the file, which is exactly the vacuous pass the old `is_err()` assertion
+		// was accepting here. `read_time_range` never looked at the schema, which is why the same
+		// vacuity hid behind its corrupt-file assertion.
+		store.declare("a", &schema()).await.expect("declares");
+		let _live = store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("seals the value segment");
+		let nulls = store.seal_nullable("a", &schema(), &[30_i64, 40], &[None, None]).await.expect("seals the all-null segment");
+		assert_eq!(store.segment_count("a").await.expect("counts"), 2, "both segments are indexed");
+		// The all-null segment's file becomes bytes no reader can parse.
+		tokio::fs::write(dir.path().join(&nulls.path), b"not a weftseg frame").await.expect("replaces the null segment file");
+
+		let at = store.read_point("a", 10).await.expect("reads a point in the live segment");
+		let many = store.read_points("a", &[10, 30, 40]).await.expect("reads a batch across both");
+		let ranged = store.read_time_range("a", 0, 100).await;
+		let downsampled = store.downsample_range("a", 0, 100, Resolution::Seconds, &[Aggregation::Avg]).await;
+		drop(store);
+		assert_eq!(at, Some(bd("2")));
+		assert_eq!(many, vec![Some(bd("2")), None, None], "the null instants answer None without their segment being read");
+		assert!(ranged.is_err(), "a range read still reads null rows, so it must hit the corrupt file: {ranged:?}");
+		// The schema is declared and the live segment reads clean, so the only thing left for a
+		// range read to fail on is the frame the point read skipped.
+		let buckets = downsampled.expect("a downsample answers from the live segment alone");
+		assert_eq!(buckets.len(), 3, "the live segment's three instants are three one-second buckets, and the null segment adds none");
+	}
+
+	/// The bucket-level claim the prune rests on, stated where the merge happens: an all-null
+	/// segment folded in must leave every bucket of every aggregation exactly as it was,
+	/// including a window the null segment covers on its own (a bucket holding nothing is
+	/// dropped, not emitted empty). The reference is the single-pass `reduce` over the live
+	/// rows only, so a prune that changed a bucket would show as a mismatch rather than as an
+	/// assertion the fixture was built to satisfy.
+	#[tokio::test]
+	async fn an_all_null_segment_changes_no_bucket_of_a_downsample() {
+		use splimes::Point;
+		use weft_reduce::{reduce, Aggregation};
+
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("temp", &schema()).await.expect("declares");
+		let live: Vec<(i64, BigDecimal)> = (0..40).map(|i| (i * 15, bd(&format!("{}", i % 7)))).collect();
+		let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = live.iter().cloned().unzip();
+		store.seal("temp", &schema(), &ts, &vs).await.expect("seals the live segment");
+		// The null segment covers 600..=899, a stretch of the window no live row reaches.
+		store.seal_nullable("temp", &schema(), &[600_i64, 660, 720, 780, 840], &[None, None, None, None, None]).await.expect("seals the all-null segment");
+		assert_eq!(store.segment_count("temp").await.expect("counts"), 2, "both segments are indexed");
+
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P99];
+		let points: Vec<Point> = live.iter().map(|(t, v)| Point::new(DateTime::<Utc>::from_timestamp(*t, 0).expect("instant"), v.clone())).collect();
+		for resolution in [Resolution::Minutes, Resolution::Hours] {
+			let pruned = store.downsample_range("temp", 0, 1_000, resolution, &aggs).await.expect("downsamples");
+			let single_pass = reduce(&points, resolution, None, None, &aggs).expect("reduces");
+			assert!(!pruned.is_empty(), "the fixture must produce buckets");
+			assert_eq!(pruned, single_pass, "the all-null segment must not move a bucket at {resolution:?}");
+		}
+		// A window the null segment covers alone answers empty, not a run of empty buckets.
+		assert!(store.downsample_range("temp", 600, 899, Resolution::Minutes, &aggs).await.expect("downsamples the null-only window").is_empty(), "a window of nothing but nulls yields no buckets");
 	}
 
 	#[tokio::test]

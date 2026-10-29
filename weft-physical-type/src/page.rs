@@ -144,7 +144,7 @@ impl Page {
 	/// value-bearing query can skip entirely (it yields only `None`s).
 	#[must_use]
 	pub const fn is_all_null(&self) -> bool {
-		self.stats.row_count > 0 && self.stats.null_count == self.stats.row_count
+		self.stats.is_all_null()
 	}
 
 	/// The number of **present** (non-null) rows whose timestamp falls in the

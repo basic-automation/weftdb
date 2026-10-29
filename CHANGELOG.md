@@ -33,6 +33,21 @@ only the control plane, not the segment frames.
 
 ### Added
 
+- **The `TimeUnit` calendar policy, stated and pinned** (roadmap 4.1). A timestamp column
+  holds ticks since `1970-01-01T00:00:00Z` in UTC under the POSIX rule: no zone is stored —
+  the column holds instants, so a segment means the same thing whatever the writer's offset —
+  and no leap second is modelled: a stored day is exactly `86_400 × nanos_per_unit()` ticks,
+  which means the two moments the real calendar inserted a second are represented by counting
+  that second twice rather than by a discontinuity or a renumbering. WeftDB carries no
+  leap-second table, does not smear, and cannot answer "what was the TAI-UTC offset here"; a
+  downsample or interpolation across a real leap second sees the interval as one second long.
+  The arithmetic the policy implies moved off the call sites and onto the type:
+  `TimeUnit::nanos_per_unit`, `TimeUnit::to_nanos` (checked — a coarse unit near either end of
+  `i64` is refused rather than wrapped into a wrongly sorted instant) and
+  `TimeUnit::from_nanos` (truncates toward minus infinity, so `-0.5 s` and `+0.5 s` no longer
+  share a bucket that a full second either side misses). `scaled_rows` in
+  `weftdb/src/types/segment_store.rs` now calls it instead of repeating the per-unit match.
+
 - **Every HTTP route now registers through one sealed registry** (security track
   SEC-3). `weft-server/src/lib.rs` no longer carries the route chain: each of the
   55 routes (49 path templates) is registered in `weft-server/src/routes.rs` by a
@@ -79,6 +94,23 @@ only the control plane, not the segment frames.
   read it follows; the Arrow and Parquet handlers split their encode out of the read to do it. A
   seal's index write closes a `control_plane.index.insert` span carrying `rows_changed`, the
   affected-row count of the insert.
+- **A point read or a downsample no longer opens a segment that holds no value**
+  (roadmap 4.3). Quality
+  pruning is wired into the read path at both levels it applies to. The segment index prune
+  drops a segment whose recorded stats say every row is null — `SegmentIndexStore::prune_present_descriptors`,
+  the SQL mirror of the resident `SegmentIndex::prune_present_by_time` — so a fully null
+  segment costs one index row instead of a file open, a footer read and a timestamp decode;
+  inside a surviving frame the same test on the frame's own persisted segment and page stats
+  drops pages a point lookup cannot answer. `weftdb::SegmentStore::read_point` and
+  `read_points` are the callers, and `weft_physical_type::weftseg::read_frame_point`,
+  `read_frame_points` with their single-block and paged forms do the skipping. The answers do
+  not change — a null row is not a value — only the work done to reach them.
+  `SegmentStore::downsample_range` prunes the same way: a row carrying no value enters no sum,
+  count, min, max, first or last, and a partial holding nothing is dropped when buckets merge,
+  so a window covered only by nulls yields no buckets rather than a run of empty ones — pinned
+  against the single-pass `reduce` over the live rows. `read_time_range` deliberately still
+  reads every time-overlapping segment: a null row is part of *its* answer, the timestamps the
+  caller asked for, so pruning there would change results rather than cost.
 - **Every README performance figure now has a registry entry** (evidence track EVI-2).
   `bench/claims.json` names, per figure, the bench or the local corpus behind it, the date it was
   measured, and whether a clone can re-run it; `tools/check_claims.py` runs in CI and pairs each

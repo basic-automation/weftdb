@@ -54,6 +54,56 @@ what a sampler reads, which numbers are contamination, or what makes a run "flus
    artifact should not leak a developer's directory layout. A test writes a store
    path containing a canary string and asserts the artifact does not contain it.
 
+## 2026-10-29 — EVI-8B: what "retires v1" means, and why the report schema stays at v23
+
+**Ambiguous:** EVI-8A's entry (2026-10-26, item 5) defines Part II as "ports the
+remaining adapters to v2 and retires v1" without saying what retirement is: whether
+`SystemAdapterV2` survives as the only interface, whether `run_profile_v2` stays as
+the entry point, and whether retiring v1 bumps the report schema — §3 reserves a
+number per schema change, and v23 exists precisely because of adapter v2.
+
+**Chosen:**
+
+1. One interface, not a rename: `adapter_info()` becomes a required method of
+   `SystemAdapter` and `SystemAdapterV2` is deleted. A default implementation would
+   have let a future adapter skip reporting silently, which is the exact gap v2
+   exists to close; the compiler is now what makes an adapter say what it ran.
+2. One entry point: `run_profile_v2` and the private `run_profile_with_info`
+   collapse into `run_profile`, which always records the adapter's own report.
+   Keeping both names would leave two run paths where the roadmap asks for one.
+3. **No schema bump: the report stays v23.** The JSON shape is unchanged —
+   `BenchResult.adapter_info` is still `Option` and still `skip_serializing_if`,
+   because artifacts written while v1 existed, and the workloads that do not drive
+   an adapter at all (ingest, compression, downsample, range fetch, point lookup,
+   sparse, gpu_memory), still legitimately carry no report. §3 numbers a schema when
+   its shape changes; nothing here changes shape, so v23 stands and
+   `MANIFEST_SCHEMA_VERSION` does not move.
+4. Provenance in `compare`: now that every adapter reports itself,
+   `compare_reports` names both sides' engines in its notes (engine, method,
+   native-vs-in-process, spline honoured or ignored), and calls a missing report
+   `[no adapter report]`. This is a note, never a `hard:` refusal — pairing WeftDB
+   with another engine is the point of a competitor comparison. What must not
+   happen is a table that reads like a like-for-like race while one side ran a
+   native engine and the other an in-process baseline.
+5. The honesty check moves from comment to test:
+   `reported_spline_honour_matches_the_output_the_adapter_produces` rebuilds the
+   same dataset under `Spline::Linear` and `Spline::Cubic` and asserts the outputs
+   differ exactly when the adapter claims `honours_requested_spline`. A report that
+   flatters its adapter now fails CI instead of merely being untrue.
+6. Out of scope, recorded so it is not lost: the non-adapter workloads still write
+   `adapter_info: None`. Their `adapter` column is the literal `"weftdb"` and they
+   measure WeftDB's own storage paths, not a foreign engine, so there is no second
+   party to report; if a competitor is ever driven through one of them, that
+   workload needs its own report before its numbers are publishable.
+
+**Rejected:** keeping `SystemAdapterV2` as the sole trait with `SystemAdapter` as a
+supertrait alias (two names for one interface, and the unreported one still
+importable); a default `adapter_info()` returning a placeholder (silence would look
+like compliance); bumping the report schema to 24 for the retirement (no shape
+change, and it would refuse comparison against every v23 artifact already on main
+for no information gain); and leaving `run_profile` unreported "for compatibility"
+(its only callers are `main.rs` and this crate's tests).
+
 ## 2026-10-29 — SOA-5: the soak ingest client fills SOA-3's seam, and stops at the ingest lane
 
 **Ambiguous:** ROADMAP line 274 names "Soak ingest client" with no acceptance list, and the plan
@@ -930,6 +980,176 @@ catalog row degrades provenance rather than stopping the read.
 
 **Not claimed:** the operator route is untouched by this slice — it is PR #128's, on
 main already — and no unit conversion happens, as the 2026-10-27 entry above says.
+
+## 2026-10-27 — what quality pruning is allowed to skip, and where (ROADMAP 4.3)
+
+**Ambiguous:** 4.3 asks for "all-null segment/page skipping" in the read path, and the
+primitives for it already exist (`prune_present_by_time` in `weft-physical-type/src/segment.rs`
+and `src/catalog.rs`, `prune_present_pages_by_time` in `src/page.rs`) — but with test callers
+only. They cannot be called as they stand: they work on a resident `Segment` or page index,
+while the store decides what to read from SQL over `segment_index.db` and then streams values
+out of a frame's blocks. "Wire it in" therefore does not name a call site; it names a decision
+about which readers may treat a null row as "nothing to return".
+
+**Chosen (grounded in the doc comments' own rule — a null row must be part of the answer for
+skipping to change results rather than cost — and in the three readers whose semantics differ
+on exactly that point):**
+
+* **Pruned:** `read_point` and `read_points` (single timestamp, timestamp set). Both already
+  answer "no measurement" when the row is absent, so a null row and an absent row are the same
+  answer. New `SegmentIndexStore::prune_present_descriptors` mirrors
+  `SegmentIndex::prune_present_by_time` in SQL (`null_count < row_count` in the WHERE clause),
+  and the readers additionally skip an `is_all_null()` descriptor — which also keeps them off
+  `read_exact`'s hard error on a zero-row store, an error that is a bug at a point read, not a
+  diagnostic anyone asked for.
+* **Pruned, inside a frame:** fully null frames and fully null pages, tested on the persisted
+  page stats rather than by decoding. The frame's single-block and paged forms stop asserting
+  an exact row count, because not reading a page is the point of the change.
+* **Not pruned:** `read_time_range`, `downsample_range`, the ingest-side bucketing callers, and
+  `read_segment_instant`. The first three *return* null rows, so pruning would drop rows a
+  caller is owed. The instant reader is last-writer-wins: skipping a segment can change which
+  segment wins, which is 4.6's out-of-order reconciliation question, not 4.3's.
+
+**Consequence:** the 4.3 box is ticked with that scope stated in `ROADMAP.md` rather than
+silently, because the honest reading of "wire the test into the read path" is "into the readers
+where it is sound", and a later reader should see that the range readers were considered and
+declined, not missed. No format change: `STORE_FORMAT` stays 2, since `null_count` was already
+in the persisted stats and the segment index.
+
+## 2026-10-27 — what this loop did not build, after rebasing onto a moved main
+
+**Ambiguous:** the operator's wave list gave this loop three items — quality pruning (4.3), the
+seal index write's `Statement::n_change()` accounting (Phase 3), and `GET /bench/runs/:id`. By
+the time the pruning slice was written, main had moved twice (#132, #133), and two of the three
+items were no longer this loop's to do.
+
+**Chosen:** the `n_change()` accounting was **not** rebuilt — #133 closed it (the seal's
+`InsertNew` commit is wrapped in a `control_plane.index.insert` span whose `rows_changed` comes
+from the `TxnApplied` the commit already returns; `weftdb/tests/seal_index_span.rs` asserts it,
+`ROADMAP.md:53` records it). Re-implementing it would have collided with a shipped design over
+metric naming for no behaviour change. `GET /bench/runs/:id` was **not** built either: main now
+records it as deferred pending the exposure matrix and auth work (SEC-6, SEC-8), and because no
+artefact on main carries a run id, building the route would force the run-naming decision that
+main deliberately left open. That is logged as needing a human call on security ordering rather
+than quietly implemented against a recorded decision. The 4.3 slice was kept, rebased, and is
+the only thing this branch proposes. PR #128's red CI (`settings.rs` count and tier-list
+assertions after two new store env vars) was diagnosed and reported on the board rather than
+fixed on another loop's branch, per the one-writer-per-branch rule; it shipped as #133.
+
+## 2026-10-27 — gating a Rust change while the runner is saturated
+
+**Ambiguous:** AGENTS.md says run the project's tests and checks before claiming anything works,
+but the CI-mirroring gate for this slice (`weft-physical-type` + `weftdb`, both feature
+configurations, the denied clippy set, `nightly fmt`) did not finish: it timed out at 4200 s and
+again at 9000 s, with only the `weft-physical-type` steps reaching an exit line.
+
+**Chosen:** keep the gate's scope identical and change how it is run, rather than claim a pass
+that has no run behind it. The runner is saturated by the operator's `strata` inference server
+(264 % CPU, ~85 GB RSS, load average ~150 on 16 cores, running for hours), and both agent loops
+build into one shared `CARGO_TARGET_DIR`, so builds queue behind each other. Every cargo now
+runs `nice -n 19` with `-j 2` (after the subcommand — `cargo +1.99.0 -j 2 test …` is rejected by
+the top-level parser, which cost a whole run), test threads drop to 2, and the script takes
+`QPRUNE_FROM=<n>` so a resumed run keeps the steps already paid for. It also exits non-zero when
+any step fails: a run whose every cargo step returned 1 had itself reported 0, which reads as a
+pass in a completion notification. Three process lessons went into the same script:
+
+* the log path was hardcoded, so a second run truncated the first run's log mid-analysis and its
+  results looked lost — logs are now per-run (`QPRUNE_LOG`);
+* **editing the gate script while it is running corrupted the run.** bash reads a script lazily,
+  by byte offset, so a rewrite made the running process stop after 2 of 5 steps and exit 0. A
+  resumed run now executes a snapshot copy under `/tmp`, never the live file.
+* the runner's default nightly could not build the vendored patch lane at all, which the other
+  loop has since closed by pinning `basic-automation/patches` at `c611862` and dropping
+  `Patches` from `rust-toolchain.toml`, so the release toolchain `+1.99.0` is the one to gate with.
+
+One correction to a claim made earlier in this entry's draft: the recurring `patches/branches`
+cascade finding was **not** stale-and-gone. `patches/branches/src/lib.rs` is a real vendored crate
+(`Cargo.toml:154` patches `branches = { path = "patches/branches" }`), and a fresh probe gives LSP
+clean plus one ast-grep style finding at `patches/branches/src/lib.rs:65` (`redundant-unsafe-function`:
+`unsafe fn` with no `unsafe` block inside). It is left alone: rustc does not flag it, both
+workspaces' `cargo check` are clean under `-D warnings` on both toolchains, the file is vendored
+upstream code whose whole purpose is to differ from `branches` by one line, and the patch lane is
+the other loop's.
+
+**Result:** the gate passed in full on the rebased branch — `weft-physical-type` 307+5+4+3 and
+344+7+4+3 (`--all-features`), `weftdb` 423 lib plus 26+17+8+6+2+2+1+1+1 integration and 1 doc, the
+`bitsliced-codec` configuration 424+1, clippy `-D correctness,suspicious,perf` over both crates'
+`--all-targets`, and `cargo +nightly fmt --all -- --check` — every step `EXIT=0`, no error lines.
+(The sentence above was first written while that run was still going, which is how it came to be
+unverified at the time; the numbers are its terminal output, from the seventh run of the script,
+background task `bd2e7b318`, against commit `40e61f7`.)
+
+
+## 2026-10-28 — extend the open pruning PR rather than open a second store-lane slice
+
+**Ambiguity.** ROADMAP 4.3's pruning item was ticked as landed for the point-read path, and 4.6's
+"reconciliation — configurable upsert keys + skip-identical" is the last unchecked W3/W4 store item
+whose table already exists (`ingest_ledger` in `segment_index.db`, `weftdb/src/types/migrations.rs:334`,
+provisioned with a `fingerprint` column and touched by no code). The board also carries a store-lane
+hold from `w2/fre-14c-legacy-seal`, whose work is in the seal path.
+
+**Choice.** Wire `downsample_range` into the quality prune first, as a second commit on the open
+pruning branch, and leave the ingest ledger for a slice of its own.
+
+**Why.** The ledger's whole value is atomicity with the seal: the fingerprint check and the ledger
+insert have to live inside the same commit transaction as `InsertNew` (`weftdb/src/types/index_txn.rs:135`),
+which is exactly the region the legacy-seal lane is editing. Extending my own branch touches only
+`downsample_range` and its tests — files no other lane is in — and it finishes the roadmap item
+instead of leaving half of the read path on the table. Sequencing beats overlapping here: the ledger
+slice starts after #134 merges.
+
+**The boundary, which is the actual decision.** A null row is part of a range read's answer and not
+of a bucket's. `read_time_range` returns rows, so pruning an all-null segment would delete timestamps
+the caller asked for; `downsample_range` folds values, and a row carrying no value enters no sum,
+count, min, max, first or last — and a partial holding nothing is dropped when buckets merge, so a
+window covered only by nulls answers empty rather than emitting a run of empty buckets. That last
+point is what makes the prune safe, and it is pinned empirically (`an_all_null_segment_changes_no_bucket_of_a_downsample`
+compares against the single-pass `reduce` at two resolutions over seven aggregations, including a
+window the null segment covers alone) rather than argued from the merge code.
+
+**Also on the record.** `patches/branches` is tracked in this repository but is not a workspace
+member, and its `src/lib.rs` does not compile on the current toolchain (`core::intrinsics::transmute`
+is not a public path). Nothing in the workspace build touches it, so it fails silently for any tool
+that scans the tree — pi-lens reports it as a blocker against any session in this directory. It
+belongs to the patches lane; recorded here so the next agent does not spend a turn discovering it.
+
+## 2026-10-28 — 4.1 time-zone and leap-second policy: POSIX fixed-day, stated rather than implemented
+
+**Ambiguous:** roadmap 4.1's last open sub-item was the words "Explicit tz + leap-second policy" and
+nothing else. No code, comment or test in the workspace said what an epoch column means when the
+writer's offset is not UTC, or what happens on a calendar that inserts a second. The encodings
+already behave in one specific way; the item asked for that behaviour to be *said*, which left open
+which of several defensible policies to state.
+
+**Chose:** UTC epochs under the POSIX rule — a fixed-length day of exactly `86_400` seconds, no zone
+stored, no leap second modelled — documented on `TimeUnit` and pinned by three tests. A leap second
+is a *counted-twice second*, not a discontinuity, a smear or a renumbering, and the doc states
+plainly that the crate carries no table, cannot answer a TAI-UTC offset question, and will see a real
+leap second as one second long when interpolating or downsampling across it.
+
+**Why:** every alternative needs data or a mechanism the store does not have. A TZif-backed policy
+cannot be evaluated without a zone database the encoding crate must not depend on, and a stored
+*instant* needs no offset to be correct — only a display does, which belongs above the store.
+UTC-TAI smoothing needs a table that changes by announcement. Storing local times would make a
+segment's meaning depend on the writer, the one thing a columnar file that outlives its writer cannot
+afford. And delta / delta-of-delta over integer epochs are exact precisely because the tick spacing
+is uniform; a leap-aware clock stutters exactly where a monitored series would then show a
+1-second spike.
+
+**Also decided — two arithmetic rules worth naming.** The unit arithmetic moves from call sites onto
+the type (`TimeUnit::{nanos_per_unit, to_nanos, from_nanos}`). `to_nanos` is checked and returns
+`None` past the `i64` nanosecond range rather than wrapping: `Seconds` at `i64::MAX` is the year 292
+billion, and a wrapped value sorts into the wrong segment. The store's point-read scaling path keeps
+its own *saturating* form, because there the total order is what matters and saturation preserves it
+while a wrap does not — a read that gives up on the far tail of the key space still answers
+everywhere a segment can exist. `from_nanos` truncates toward minus infinity so `[t, t + unit)` means
+the same thing on both sides of 1970; truncating toward zero would put `-0.5 s` and `+0.5 s` in one
+bucket while a full second either side sits elsewhere.
+
+**Rejected:** a `chrono::DateTime`-typed column (chrono is a dependency of `weftdb`, not of
+`weft-physical-type`, and the encoding must not pay for a calendar); a per-column zone string
+(display metadata presented as data); leap smearing (rewrites real timestamps and is only correct
+with an announcement).
 
 ## 2026-10-28 — EVI-10A: `MAX_KNOTS` stays a `pub` const
 

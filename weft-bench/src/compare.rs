@@ -462,7 +462,7 @@ fn move_of(metric: String, before: f64, after: f64, higher_is_better: bool, nois
 mod tests {
 	use super::*;
 	use crate::{
-		report::RunMetadata, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown}, stats::{ConfidenceInterval, LatencyCis, LatencyStats}
+		adapter::SystemAdapter, report::RunMetadata, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown}, stats::{ConfidenceInterval, LatencyCis, LatencyStats}
 	};
 
 	fn meta(os: &str, arch: &str) -> RunMetadata {
@@ -612,6 +612,41 @@ mod tests {
 	}
 
 	#[test]
+	fn a_different_adapter_is_a_note_that_names_both_engines() {
+		// The nightly gate runs the same adapters on both sides, so it says nothing
+		// about them: the note only appears when the engines actually differ.
+		let baseline = report("linux", "x86_64", vec![reported("query", 1_000, 2_000, 3_000)]);
+		let unchanged = compare_reports(&baseline, &baseline, DEFAULT_THRESHOLD_PCT, false).expect("comparable");
+		assert!(unchanged.notes.iter().all(|n| !n.starts_with("adapter:")), "{:?}", unchanged.notes);
+
+		// Pairing WeftDB with another engine is the point of a competitor
+		// comparison, so it is allowed -- but the note has to name both engines and
+		// what each does with the requested spline, or the table reads as a
+		// like-for-like race when it is not one.
+		let mut competitor = report("linux", "x86_64", vec![result("query", 1_000, 2_000, 3_000, 1e6, None)]);
+		competitor.results[0].adapter = "duckdb".into();
+		competitor.results[0].adapter_info = Some(crate::adapter::AdapterInfo { interface_version: 2, engine: "duckdb".into(), method: "native interpolation".into(), native_engine: true, honours_requested_spline: false });
+		let comparison = compare_reports(&baseline, &competitor, DEFAULT_THRESHOLD_PCT, false).expect("a cross-engine comparison is allowed");
+		let note = comparison.notes.iter().find(|n| n.starts_with("adapter:")).expect("the adapters differ").clone();
+		assert!(note.contains("weft [engine splimes") && note.contains("honours the requested spline"), "weftdb side of: {note}");
+		assert!(note.contains("duckdb [engine duckdb") && note.contains("ignores the requested spline"), "competitor side of: {note}");
+
+		// An artifact written before adapters reported themselves is distinguishable
+		// from one that carries a report, and says so.
+		let legacy = report("linux", "x86_64", vec![result("query", 1_000, 2_000, 3_000, 1e6, None)]);
+		let comparison = compare_reports(&baseline, &legacy, DEFAULT_THRESHOLD_PCT, false).expect("comparable");
+		let note = comparison.notes.iter().find(|n| n.starts_with("adapter:")).expect("one side reports, the other cannot").clone();
+		assert!(note.contains("[no adapter report]"), "{note}");
+	}
+
+	/// The same result as [`result`], with the report WeftDB's own adapter gives.
+	fn reported(workload: &str, p50: u64, p95: u64, p99: u64) -> BenchResult {
+		let mut result = result(workload, p50, p95, p99, 1e6, None);
+		result.adapter_info = Some(crate::WeftAdapter::new().adapter_info());
+		result
+	}
+
+	#[test]
 	fn only_results_present_in_both_runs_are_compared() {
 		let baseline = report("linux", "x86_64", vec![result("query", 1_000, 2_000, 3_000, 1e6, None), result("ingest", 1_000, 2_000, 3_000, 1e6, None)]);
 		let candidate = report("linux", "x86_64", vec![result("query", 1_000, 2_000, 3_000, 1e6, None), result("compaction", 1_000, 2_000, 3_000, 1e6, None)]);
@@ -756,7 +791,53 @@ fn provenance(baseline: &BenchReport, candidate: &BenchReport) -> Vec<String> {
 		// same column, so this is a refusal and not a caveat -- `--ignore-provenance` is the override.
 		notes.push(format!("hard: report schema v{} vs v{}", baseline.schema_version, candidate.schema_version));
 	}
+	// Which adapters produced the numbers is provenance too, and now that every
+	// adapter reports itself it is recorded rather than assumed. It is a caveat and
+	// never a refusal: pairing WeftDB with another engine is the point of a
+	// competitor comparison. What must not happen is a table that reads like a
+	// like-for-like race while one side ran a native engine and the other an
+	// in-process baseline, or like a machine difference that is really an
+	// interface difference.
+	let baseline_adapters = adapters_of(baseline);
+	let candidate_adapters = adapters_of(candidate);
+	if baseline_adapters != candidate_adapters {
+		notes.push(format!("adapter: {} vs {}", baseline_adapters.join(" + "), candidate_adapters.join(" + ")));
+	}
 	notes
+}
+
+/// The distinct engines behind a report's results, each spelled out with what it
+/// reported, as one sorted set so two reports compare by content. A result with
+/// no report is named as such: that shape only exists in artifacts written before
+/// the reporting interface, and in the workloads that do not drive an adapter.
+fn adapters_of(report: &BenchReport) -> Vec<String> {
+	let mut adapters: Vec<String> = report
+		.results
+		.iter()
+		.map(|result| match &result.adapter_info {
+			Some(info) => format!("{} [engine {}; {}; {}; {}]", result.adapter, info.engine, info.method, engine_kind(info.native_engine), spline_honour(info.honours_requested_spline)),
+			None => format!("{} [no adapter report]", result.adapter),
+		})
+		.collect();
+	adapters.sort_unstable();
+	adapters.dedup();
+	adapters
+}
+
+fn engine_kind(native_engine: bool) -> &'static str {
+	if native_engine {
+		"native engine"
+	} else {
+		"in-process baseline"
+	}
+}
+
+fn spline_honour(honours_requested_spline: bool) -> &'static str {
+	if honours_requested_spline {
+		"honours the requested spline"
+	} else {
+		"ignores the requested spline"
+	}
 }
 
 fn note_diff(notes: &mut Vec<String>, label: &str, before: &Option<String>, after: &Option<String>) {
