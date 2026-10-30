@@ -248,7 +248,7 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	}
 	let questdb = report.results.iter().any(|r| r.arm.arm.starts_with("questdb"));
 	if questdb {
-		limits.push("QuestDB's `SAMPLE BY … FILL(LINEAR)` fills between bucket aggregates, not between the knots, so its arm interpolates with the native `ASOF JOIN` onto knots that carry their neighbours, gated like every arm.".into());
+		limits.push("QuestDB's `SAMPLE BY … FILL(LINEAR)` fills between bucket aggregates, not between the knots, so its arm builds segments with the native `LT JOIN` and finds each grid instant's segment with an `ASOF JOIN`, gated like every arm.".into());
 		limits.push("Open-source QuestDB acknowledges that a write was received, not that it is durable (a durable acknowledgement needs Enterprise). Its load is timed from the first QWP frame until the WAL is applied and the rows are visible, and the engine line records the server's `cairo.commit.mode`; under `sync` each commit is synced to disk. In `questdb-decimal` the bucket mean is `avg(v::double)`: QuestDB's own `avg` of a `DECIMAL` column rounds the mean to the column's scale. Its bytes on disk are `table_partitions()`'s, which include the space QuestDB reserves ahead in the active partition, so small tables report far more than they hold.".into());
 	}
 	b.push(Block::List(limits));

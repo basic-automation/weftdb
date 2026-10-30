@@ -15,16 +15,17 @@
 //! `cairo.commit.mode=sync`, under which each commit is synced to disk, and the arm records the mode
 //! it found.
 //!
-//! The interpolation is `QuestDB`'s native `ASOF JOIN`, which finds the last knot at or before each
-//! grid instant. Each deduplicated knot carries its neighbours, attached by `row_number()` and two
-//! self-joins, so the line to the next knot, and past the last knot the last segment's line, need no
-//! second `ASOF JOIN`. The first segment stands in before the first knot. Times are carried as
-//! `LONG` nanoseconds; only the join key is a timestamp.
+//! The interpolation uses only `QuestDB`'s native time joins. An `LT JOIN` of the deduplicated knots
+//! onto themselves pairs each knot with the one before it: one row per segment, keyed by the
+//! segment's start. An `ASOF JOIN` from the grid then finds, for each instant, the segment that
+//! starts at the last knot at or before it, whose end is the next knot; past the last knot that is
+//! the last segment, extended, which is splimes' rule. Before the first knot the first segment
+//! stands in. Times are carried as `LONG` nanoseconds; only the join keys are timestamps.
 //!
-//! The neighbours are not `lead`/`lag`: on `QuestDB` 10.1 a window function's columns on the right
-//! of an `ASOF JOIN` came back shifted (the knot's own time read as the next knot's), which left
-//! every interior grid instant `NULL` and failed the gate. The self-joins give the same columns
-//! through ordinary joins. Duplicate instants keep their last value
+//! Two shapes were tried first and are recorded in `DECISIONS.md`: `lead`/`lag` on the right of an
+//! `ASOF JOIN` came back shifted on `QuestDB` 10.1 (a knot's own time read as the next knot's), and
+//! neighbours attached by `row_number()` self-joins on `rn ± 1` ran as a nested loop that hit the
+//! server's 60 s query timeout on the smallest dataset. Duplicate instants keep their last value
 //! (`last(v)` per instant), as splimes does. Downsampling is the native `SAMPLE BY … ALIGN TO
 //! CALENDAR` in nanoseconds, which is epoch-aligned like `weft_reduce`'s buckets.
 
@@ -56,18 +57,15 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(600);
 /// substituted. See the module notes for the shape.
 const INTERPOLATE_SQL: &str = "
 WITH
-k AS (SELECT t, last(v)::double v FROM {table} GROUP BY t ORDER BY t),
-r AS (SELECT t, t::long tl, v, row_number() OVER (ORDER BY t) rn FROM k),
-n AS (SELECT a.t, a.tl, a.v, p.tl pt, p.v pv, x.tl nt, x.v nv FROM r a LEFT JOIN r p ON p.rn = a.rn - 1 LEFT JOIN r x ON x.rn = a.rn + 1 ORDER BY a.t),
-kw AS (SELECT * FROM n TIMESTAMP(t)),
-f AS (SELECT tl ft, v fv, nt fnt, nv fnv FROM n WHERE pt IS NULL),
+k AS ((SELECT t, last(v)::double v FROM {table} GROUP BY t ORDER BY t) TIMESTAMP(t)),
+s AS (SELECT b.t st, b.t::long sl, b.v sv, a.t::long el, a.v ev FROM k a LT JOIN k b),
+seg AS ((SELECT * FROM s WHERE sl IS NOT NULL ORDER BY st) TIMESTAMP(st)),
+f AS (SELECT sl fs, sv fsv, el fe, ev fev FROM seg LIMIT 1),
 g AS ((SELECT ({start} + (x - 1) * {step})::timestamp_ns gt FROM long_sequence({n})) TIMESTAMP(gt)),
-j AS (SELECT g.gt::long gl, kw.tl lt, kw.v lv, kw.pt, kw.pv, kw.nt, kw.nv FROM g ASOF JOIN kw)
+j AS (SELECT g.gt::long gl, seg.sl, seg.sv, seg.el, seg.ev FROM g ASOF JOIN seg)
 SELECT CASE
-	WHEN lt IS NULL THEN fv + (fnv - fv) * ((gl - ft)::double / (fnt - ft)::double)
-	WHEN gl = lt THEN lv
-	WHEN nt IS NULL THEN pv + (lv - pv) * ((gl - pt)::double / (lt - pt)::double)
-	ELSE lv + (nv - lv) * ((gl - lt)::double / (nt - lt)::double)
+	WHEN sl IS NULL THEN fsv + (fev - fsv) * ((gl - fs)::double / (fe - fs)::double)
+	ELSE sv + (ev - sv) * ((gl - sl)::double / (el - sl)::double)
 END v
 FROM j CROSS JOIN f ORDER BY gl
 ";
@@ -302,7 +300,7 @@ impl Arm for QuestDb {
 			QdbValue::Double => ("questdb-double", "DOUBLE", ""),
 			QdbValue::Decimal => ("questdb-decimal", "DECIMAL(18, s)", "; stored exactly, the interpolation line computed in DOUBLE"),
 		};
-		ArmInfo { arm: arm.into(), engine: format!("questdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: long_sequence() grid, native ASOF JOIN onto knots carrying their neighbours, first/last segment extended; downsample via SAMPLE BY … ALIGN TO CALENDAR; WAL table partitioned by year, load acknowledged over QWP and timed until applied; QWP both ways over loopback WebSocket{note}") }
+		ArmInfo { arm: arm.into(), engine: format!("questdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: long_sequence() grid, native LT JOIN into segments, then ASOF JOIN from the grid, first/last segment extended; downsample via SAMPLE BY … ALIGN TO CALENDAR; WAL table partitioned by year, load acknowledged over QWP and timed until applied; QWP both ways over loopback WebSocket{note}") }
 	}
 
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {

@@ -23,12 +23,15 @@ answers comparable was not settled.
   `wal_tables()` shows every sequenced transaction applied, so the rows are visible. Open-source
   QuestDB acknowledges receipt, not durability (a durable ack is Enterprise-only), so the reference
   server runs with `cairo.commit.mode=sync`, and the engine line records the mode it found.
-- **Interpolation** is QuestDB's native `ASOF JOIN` onto deduplicated knots that carry their
-  neighbours, attached with `row_number()` and two self-joins. `SAMPLE BY … FILL(LINEAR)` fills
-  between bucket aggregates and does not answer jittered knots. The first draft attached the
-  neighbours with `lead`/`lag`; on QuestDB 10.1 a window function's columns on the right of an
-  `ASOF JOIN` came back shifted (a knot's own time read as the next knot's), every interior
-  instant came out `NULL`, and the live test caught it.
+- **Interpolation** uses only QuestDB's native time joins: an `LT JOIN` of the deduplicated knots
+  onto themselves makes one row per segment, keyed by its start, and an `ASOF JOIN` from the grid
+  finds each instant's segment (past the last knot, the last segment, extended). 2,000,000 knots
+  onto a 2,000,000-point grid took 3.5 s over HTTP. `SAMPLE BY … FILL(LINEAR)` fills between
+  bucket aggregates and does not answer jittered knots. Two earlier shapes failed and are kept
+  here: `lead`/`lag` on the right of an `ASOF JOIN` came back shifted on QuestDB 10.1 (a knot's own
+  time read as the next knot's; every interior instant `NULL`, caught by the live test), and
+  neighbours attached by `row_number()` self-joins on `rn ± 1` ran as a nested loop that hit the
+  server's 60 s query timeout on the smallest dataset.
 - **Downsample** is native `SAMPLE BY … ALIGN TO CALENDAR`, the width in its largest exact unit
   (QuestDB refuses `60000000000n`). The decimal arm's mean is `avg(v::double)`: QuestDB's `avg` of
   a `DECIMAL(18, s)` column rounds the mean to `s` places (2.804 for 2.80357… at `s = 3`), a real
@@ -41,9 +44,8 @@ answers comparable was not settled.
 **Rejected:**
 
 - PG Wire: #393 rules it out as a deprecated path.
-- Reporting the window-function result as a QuestDB failure: the self-join answers the same
-  question through ordinary joins, and an engine is measured on a correct query, not the first one
-  tried. Whether to report the `ASOF JOIN` behaviour upstream is left to the owner.
+- Reporting either failed shape as QuestDB's result: an engine is measured on a correct query a
+  QuestDB user would write, not on the first one tried. Whether to report the `ASOF JOIN` behaviour upstream is left to the owner.
 
 ## 2026-10-30 — External engines II: how the TimescaleDB arm is measured
 
