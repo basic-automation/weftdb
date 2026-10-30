@@ -335,7 +335,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **PAC-9** Docker image and container smoke test (with a mounted keys file)
   - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
   - [x] **EVI-15** First cross-engine report
-  - [ ] Write or approve the cross-engine report narrative *(owner)*
+  - [x] Write or approve the cross-engine report narrative *(owner)*
   - [ ] **EVI-19** Documented RPO/RTO
   - [ ] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
 - [ ] **W8 · Tags core, memory budget**
