@@ -42,6 +42,66 @@ lives.
   several independent runs per report, which is fair-protocol depth (roadmap 1.1), not a renderer
   change.
 - Waiting for cloud hardware: the operator chose this host, and the report says what it lacks.
+## 2026-10-30 — D-S13: the ingest entry point's shapes (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§5 D-S13, §4 C1, §3 X-ERR) fixes what D-S13 must do — an
+idempotent atomic library ingest, `IngestBatch.groups` accepting only the empty `TagSet`
+before the gate flips, `ingest_ledger.series_ids`, `#[non_exhaustive]` typed errors
+including `UnknownAspect`, a fingerprint over the bounded plain form,
+`IngestPhase::Committing` set just before COMMIT, and a 128 MiB encoded-frame target
+(ROB D12) — but names no Rust shapes: no batch/receipt types, no fingerprint algorithm,
+no ledger encoding for `series_ids`, and no statement of how a multi-frame batch commits.
+
+**Chosen:**
+
+1. **One transaction, modelled on `publish_seal`.** `SegmentStore::ingest` validates,
+   looks the key up, encodes, writes every frame durably, then — under the aspect's
+   commit lock, with the ledger re-checked there — commits one `IndexTxn`: an
+   `InsertNew` per segment, the `SeqBump`, the S11 rollup fold over all segments, and a
+   new guarded `IndexOp::RecordIngest` (plain `INSERT`; a taken `(aspect, key)` is a
+   conflict, never a replace). The ledger row therefore exists if and only if the
+   segments do. A replay found by the second check returns the recorded receipt and
+   leaves its just-written frames as crash litter for S12 recovery, exactly like a seal
+   that crashes before its commit.
+2. **The receipt is the ledger's payload.** `IngestReceipt` (aspect, key, fingerprint,
+   row count, span, segment ids, series ids, commit epoch, `duplicate`) serialises into
+   `receipt_json`; a replay — in-process or after a restart — returns it with
+   `duplicate` set. `id_lo`/`id_hi` name the segment run (ids are consecutive under the
+   commit lock).
+3. **`series_ids` is a comma-joined text column** (migration `0005_d_s13`, layout 2),
+   matching `store_meta`'s text convention; a pre-D-S13 row reads back with none. Until
+   the tags gate flips it always records `0`, the empty group, and every segment row of
+   the batch carries `series_id` 0.
+4. **Fingerprint: FNV-1a over length-prefixed fields** — the groups' canonical series
+   key, the row count, then per row the timestamp and either a null marker or the
+   value's plain form. Plain form is ROB-6's bounded form (plan: "fingerprint over the
+   bounded plain form"); the domain check runs first, arithmetically
+   (`plain_digit_count`), so a hostile exponent is refused as the typed
+   `StoreError::IngestValueOutOfRange` before any plain string is allocated. The
+   idempotency key itself is not fingerprinted: the ledger keys on it.
+5. **Typed errors land in `StoreError`** (already `#[non_exhaustive]`): `UnknownAspect`
+   (now returned by `SegmentStore::require_schema`, replacing the anyhow sentence),
+   `IdempotencyConflict`, `GroupsUnsupported`, `EmptyIngestBatch`,
+   `IngestLengthMismatch`, `IngestValueOutOfRange`. In `weft-server`, `classify_typed`
+   maps them to their §4 codes (`aspect_not_found` 404, `idempotency_conflict` 409,
+   `tags_unsupported` 400, `decimal_out_of_range` 400, the rest `bad_request`) instead
+   of the generic `incompatible_store`; the read path's message rule stays, now only
+   for `weft-arrow-store`'s still-untyped lookup.
+6. **The 128 MiB cut is by rows, proven per chunk.** A batch whose whole frame exceeds
+   `MAX_ENCODED_FRAME_BYTES` is cut at timestamp boundaries (never inside a run of
+   equal timestamps) by a conservative per-row estimate (24 bytes + the value's plain
+   digit count, computed arithmetically); each chunk's real encoded frame is then
+   checked against the target before any frame is written, and
+   `FaultPoint::SBetweenFrames` fires between frame writes. A single timestamp run
+   whose frame alone exceeds the target still seals — a frame is the smallest cut.
+   Ingest seals nullable (the quality-column form), so dense and null rows share one
+   entry point; D-S14's HTTP wiring decides how its formats map onto it.
+
+**Rejected:** a second transaction for the ledger (a crash between them is precisely
+the duplicate-commit window idempotency exists to close); hashing the encoded frame
+bytes instead of the plain form (the plan names the plain form, and frame bytes would
+change with codec options for the same batch); allocating series ids for non-empty
+groups now (the gate has not flipped; TAG-5 owns the `series` table).
 
 ## 2026-10-29 — EVI-14: what the second DuckDB slice adds, and the arms it changes
 

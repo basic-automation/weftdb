@@ -616,6 +616,52 @@ impl SegmentIndexStore {
 		}
 		Ok(out)
 	}
+
+	/// The `ingest_ledger` row for `(aspect, key)` (D-S13), or `None` when
+	/// no batch has committed under that key: the lookup an ingest makes
+	/// before it writes anything, which decides whether the offered batch
+	/// is a first commit, a replay, or a conflict.
+	///
+	/// A ledger written before D-S13 has no `series_ids` column value to
+	/// read (the migration adds it with an empty default); such a row reads
+	/// back with no series ids.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or a row this build cannot
+	/// decode.
+	pub(crate) async fn ledger_entry(&self, aspect: &str, key: &str) -> Result<Option<crate::types::ingest::LedgerEntry>> {
+		let conn = connect(&self.db).await?;
+		if !migrations::table_exists(&conn, "ingest_ledger").await? {
+			return Ok(None);
+		}
+		let has_series_ids = migrations::column_names(&conn, "ingest_ledger").await?.iter().any(|name| name == "series_ids");
+		let sql = if has_series_ids { "SELECT aspect, key, fingerprint, row_count, min_ts, max_ts, id_lo, id_hi, receipt_json, commit_epoch, created_ms, series_ids FROM ingest_ledger WHERE aspect = ? AND key = ?" } else { "SELECT aspect, key, fingerprint, row_count, min_ts, max_ts, id_lo, id_hi, receipt_json, commit_epoch, created_ms, '' FROM ingest_ledger WHERE aspect = ? AND key = ?" };
+		let mut rows = conn.query(sql, turso::params![aspect.to_string(), key.to_string()]).await?;
+		let Some(row) = rows.next().await? else { return Ok(None) };
+		let text = |idx: usize| -> Result<String> {
+			match row.get_value(idx)? {
+				Value::Text(text) => Ok(text),
+				other => bail!("ingest_ledger holds {other:?} where it records text"),
+			}
+		};
+		let integer = |idx: usize| -> Result<i64> {
+			match row.get_value(idx)? {
+				Value::Integer(n) => Ok(n),
+				other => bail!("ingest_ledger holds {other:?} where it records an integer"),
+			}
+		};
+		let opt_integer = |idx: usize| -> Result<Option<i64>> {
+			match row.get_value(idx)? {
+				Value::Integer(n) => Ok(Some(n)),
+				Value::Null => Ok(None),
+				other => bail!("ingest_ledger holds {other:?} where it records an integer or NULL"),
+			}
+		};
+		let opt_unsigned = |idx: usize| -> Result<Option<u64>> { Ok(opt_integer(idx)?.map(|n| u64::try_from(n).unwrap_or(0))) };
+		let series_ids = text(11)?.split(',').filter(|part| !part.is_empty()).map(str::parse::<u64>).collect::<Result<Vec<_>, _>>().with_context(|| format!("ingest_ledger records series_ids for {aspect:?} key {key:?} that do not parse"))?;
+		Ok(Some(crate::types::ingest::LedgerEntry { aspect: text(0)?, key: text(1)?, fingerprint: integer(2)?, row_count: usize::try_from(integer(3)?).unwrap_or(0), min_ts: opt_integer(4)?, max_ts: opt_integer(5)?, id_lo: opt_unsigned(6)?, id_hi: opt_unsigned(7)?, receipt_json: text(8)?, commit_epoch: u64::try_from(integer(9)?).unwrap_or(0), created_ms: integer(10)?, series_ids }))
+	}
 }
 
 /// Decode one `segment_quarantine` row in the column order [`SegmentIndexStore::quarantine`] selects.

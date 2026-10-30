@@ -139,7 +139,7 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
   - [x] **S10** Write-once durable seal with id assigned at commit *(~8 h; after S9)*
   - [ ] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
   - [x] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
-  - [ ] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
+  - [x] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
   - [ ] **S14** HTTP ingest wiring
   - [ ] **S15** Partial sidecar v4
   - [ ] **S16** Whole-store backup with hard-linked frames
@@ -278,7 +278,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
 - [ ] **W4 · Auth, config, ILP fix**
   - [ ] Store lane
-  - [ ] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
+  - [x] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
   - [ ] **SEC-5** TLS listener (rustls with ring) on the shared serve path
   - [ ] **SEC-6** API keys, Bearer authentication, keys file and keygen
   - [ ] **ROB-3** Panic containment, daemon supervision, Daemons registry, `weftdb::exec`

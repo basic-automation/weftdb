@@ -199,6 +199,14 @@ pub enum IndexOp {
 	/// (R10, D-S12), creating the row if the aspect has none, and never lowering
 	/// it: a series id, once handed out, is never handed out again.
 	SeedSeries { aspect: String, next_series_id: u64 },
+	/// Record an ingest batch in `ingest_ledger` (D-S13): a plain `INSERT`
+	/// on the `(aspect, key)` primary key, never `OR REPLACE` — a key already
+	/// recorded is a [`TxnErrorKind::Conflict`], because the ledger row is
+	/// the proof that the batch committed exactly once, and replacing it
+	/// would rewrite that proof. The batch's segment rows, allocator raise
+	/// and rollup fold travel in the same transaction, so the ledger row
+	/// exists if and only if the batch's segments do.
+	RecordIngest { entry: crate::types::ingest::LedgerEntry },
 }
 
 impl IndexOp {
@@ -220,7 +228,7 @@ impl IndexOp {
 			// writer of that aspect's rollup row can commit between attempts: a retry
 			// re-runs the same fold over the same index state. An `IndexTxn` run
 			// without that lock must not rely on it.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } => true,
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } => true,
 			// `QuarantineInsert` replaces a record of the same key and
 			// `QuarantineDelete` deletes one if it exists, so neither re-checks
 			// what its caller decided from, like `Upsert` and `Delete`.
@@ -532,6 +540,10 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 		}
 		IndexOp::QuarantineDelete { aspect, id, gen } => conn.execute("DELETE FROM segment_quarantine WHERE aspect = ? AND id = ? AND gen = ?", vec![Value::Text(aspect.clone()), integer(*id), integer(*gen)]).await.map_err(|e| statement_error(&format!("deleting the quarantine record of {aspect:?} segment {id}"), &e)),
 		IndexOp::SeedSeries { aspect, next_series_id } => conn.execute("INSERT INTO aspect_seq (aspect, next_id, next_gen, epoch, next_series_id) VALUES (?, 1, 0, 0, ?) ON CONFLICT (aspect) DO UPDATE SET next_series_id = MAX(next_series_id, excluded.next_series_id)", vec![Value::Text(aspect.clone()), integer(*next_series_id)]).await.map_err(|e| statement_error(&format!("seeding the {aspect:?} next_series_id"), &e)),
+		IndexOp::RecordIngest { entry } => {
+			let series_ids = entry.series_ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+			conn.execute("INSERT INTO ingest_ledger (aspect, key, fingerprint, row_count, min_ts, max_ts, id_lo, id_hi, receipt_json, commit_epoch, created_ms, series_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", vec![Value::Text(entry.aspect.clone()), Value::Text(entry.key.clone()), Value::Integer(entry.fingerprint), integer(entry.row_count as u64), entry.min_ts.map_or(Value::Null, Value::Integer), entry.max_ts.map_or(Value::Null, Value::Integer), entry.id_lo.map_or(Value::Null, integer), entry.id_hi.map_or(Value::Null, integer), Value::Text(entry.receipt_json.clone()), integer(entry.commit_epoch), Value::Integer(entry.created_ms), Value::Text(series_ids)]).await.map_err(|e| statement_error(&format!("recording the ingest of {:?} under key {:?}", entry.aspect, entry.key), &e))
+		}
 	}
 }
 
