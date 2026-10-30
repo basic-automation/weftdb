@@ -256,8 +256,8 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	}
 	let influx = report.results.iter().any(|r| r.arm.arm.starts_with("influxdb3"));
 	if influx {
-		limits.push("InfluxDB 3 has no decimal type, so it has one arm, `influxdb3-double`, and no exact-decimal comparison. Its SQL engine (DataFusion) has no `ASOF JOIN` and `date_bin_gapfill`'s `interpolate()` fills between bucket aggregates, so the arm merges the grid with the knots and reads the neighbours with `last_value`/`first_value … IGNORE NULLS` windows, gated like every arm.".into());
-		limits.push("InfluxDB 3's write answers once the WAL file holding the rows is persisted (`no_sync=false`, its default). A series and an instant are its key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none). Its bytes on disk are not reported: the rows sit in the WAL until the server snapshots them to Parquet on its own schedule.".into());
+		limits.push("InfluxDB 3 has no decimal type, so it has one arm, `influxdb3-double`, and no exact-decimal comparison. Its SQL engine (DataFusion) has no `ASOF JOIN` and `date_bin_gapfill`'s `interpolate()` fills between bucket aggregates, so the arm merges the grid with the knots and finds each grid row's neighbouring knots with running `max`/`min` windows over the knot instants, gated like every arm.".into());
+		limits.push("InfluxDB 3's write answers once the WAL file holding the rows is persisted (`no_sync=false`, its default); a load is sent as concurrent writes of at most 8 MiB, under the server's 10 MiB request cap, so they share the WAL flush. A series and an instant are its key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none). Its bytes on disk are not reported: the rows sit in the WAL until the server snapshots them to Parquet on its own schedule.".into());
 	}
 	b.push(Block::List(limits));
 

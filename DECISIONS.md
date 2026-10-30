@@ -20,9 +20,12 @@ storage, were not settled.
   the server answers once the WAL file holding the rows is persisted. **Reads:** SQL over HTTP with
   `format=parquet`, decoded with the workspace's own `parquet` 60 reader: columnar, like the other
   servers' binary paths, without Flight's gRPC stack.
-- **Interpolation:** the grid merged with the knots, and each grid row's neighbours read with
-  `last_value`/`first_value … IGNORE NULLS` windows; the first and last segments stand in past the
-  data. `date_bin_gapfill` with `interpolate()` fills between bucket aggregates and does not answer
+- **Interpolation:** the grid merged with the knots; each grid row's neighbouring knot instants are
+  a running `max` and a reversed running `min` (knot instants only increase), their values joined
+  back by instant; the first and last segments stand in past the data. `last_value`/`first_value …
+  IGNORE NULLS` gave the same answers but DataFusion re-scanned their frames: 6 min 25 s at the
+  `medium` scale against 0.79 s. A load is sent as concurrent writes of at most 8 MiB, under the
+  server's 10 MiB request cap, so they share one WAL flush rather than waiting for one each. `date_bin_gapfill` with `interpolate()` fills between bucket aggregates and does not answer
   jittered knots. **Downsample:** native `date_bin`.
 - **Duplicates:** a second write at an instant replaces the first. Interpolation matches splimes
   (the last value wins); bucket counts would differ from `weft_reduce`, which counts every row. The

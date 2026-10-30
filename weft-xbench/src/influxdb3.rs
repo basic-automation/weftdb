@@ -13,8 +13,8 @@
 //! The query engine is `DataFusion`, which has no `ASOF JOIN`, and `InfluxDB`'s own
 //! `date_bin_gapfill` with `interpolate()` fills between bucket aggregates, not between the knots. The
 //! interpolation therefore merges the grid with the knots into one ordered stream and reads, for
-//! every grid row, the last knot at or before it (`last_value … IGNORE NULLS`) and the first after it
-//! (`first_value … IGNORE NULLS`); the first and last segments stand in past the data. Downsampling
+//! every grid row, the last knot at or before it and the first after it (running `max` and `min` of
+//! the knot instants, then their values by equality join); the first and last segments stand in past the data. Downsampling
 //! is the native `date_bin`.
 //!
 //! A series and a timestamp are `InfluxDB`'s key, so a second write at the same instant replaces the
@@ -38,8 +38,17 @@ static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 /// The measurement every load writes its knots to.
 const TABLE: &str = "knots";
 
+/// The largest write body sent at once. The server refuses a request over 10 MiB (its default
+/// `--max-http-request-size`), and the larger datasets' line protocol is several times that.
+const MAX_WRITE_BYTES: usize = 8 << 20;
+
 /// The grid reconstruction, with `{start}`, `{end}` (inclusive) and `{step}` in epoch nanoseconds.
 /// `o` orders a knot before a grid row at the same instant, so the knot counts as "at or before".
+/// Knot instants only increase, so the last knot at or before a row is a running `max` of the knot
+/// instants, and the first after it a running `min` over the stream reversed; their values come
+/// back by equality joins on the instant, which `InfluxDB` keeps unique. Both windows are linear.
+/// `last_value`/`first_value … IGNORE NULLS` gave the same answers but re-scanned their frames:
+/// 6 min 25 s at the `medium` scale against 0.79 s for this.
 const INTERPOLATE_SQL: &str = "
 WITH
 k AS (SELECT CAST(time AS BIGINT) t, v FROM knots),
@@ -48,19 +57,18 @@ e AS (SELECT
 	(SELECT t FROM k ORDER BY t LIMIT 1 OFFSET 1) f1t, (SELECT v FROM k ORDER BY t LIMIT 1 OFFSET 1) f1v,
 	(SELECT t FROM k ORDER BY t DESC LIMIT 1 OFFSET 1) l0t, (SELECT v FROM k ORDER BY t DESC LIMIT 1 OFFSET 1) l0v,
 	(SELECT t FROM k ORDER BY t DESC LIMIT 1) l1t, (SELECT v FROM k ORDER BY t DESC LIMIT 1) l1v),
-u AS (SELECT t, 0 o, t kt, v kv FROM k UNION ALL SELECT value t, 1 o, CAST(NULL AS BIGINT) kt, CAST(NULL AS DOUBLE) kv FROM generate_series({start}, {end}, {step})),
+u AS (SELECT t, 0 o, t kt FROM k UNION ALL SELECT value t, 1 o, CAST(NULL AS BIGINT) kt FROM generate_series({start}, {end}, {step})),
 w AS (SELECT t, o,
-	last_value(kt) IGNORE NULLS OVER (ORDER BY t, o ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) lt,
-	last_value(kv) IGNORE NULLS OVER (ORDER BY t, o ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) lv,
-	first_value(kt) IGNORE NULLS OVER (ORDER BY t, o ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) nt,
-	first_value(kv) IGNORE NULLS OVER (ORDER BY t, o ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) nv
+	max(kt) OVER (ORDER BY t, o ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) lt,
+	min(kt) OVER (ORDER BY t DESC, o DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) nt
 	FROM u),
-s AS (SELECT w.t,
+n AS (SELECT w.t, w.lt, kl.v lv, w.nt, kn.v nv FROM w LEFT JOIN k kl ON kl.t = w.lt LEFT JOIN k kn ON kn.t = w.nt WHERE w.o = 1),
+s AS (SELECT n.t,
 	CASE WHEN lt IS NULL THEN f0t WHEN nt IS NULL THEN l0t ELSE lt END a_t,
 	CASE WHEN lt IS NULL THEN f0v WHEN nt IS NULL THEN l0v ELSE lv END a_v,
 	CASE WHEN lt IS NULL THEN f1t WHEN nt IS NULL THEN l1t ELSE nt END b_t,
 	CASE WHEN lt IS NULL THEN f1v WHEN nt IS NULL THEN l1v ELSE nv END b_v
-	FROM w CROSS JOIN e WHERE w.o = 1)
+	FROM n CROSS JOIN e)
 SELECT CASE WHEN b_t = a_t OR t = a_t THEN a_v ELSE a_v + (b_v - a_v) * (CAST(t - a_t AS DOUBLE) / CAST(b_t - a_t AS DOUBLE)) END v
 FROM s ORDER BY t
 ";
@@ -215,18 +223,39 @@ fn parse_buckets(parquet: bytes::Bytes) -> anyhow::Result<Vec<BucketRow>> {
 	Ok(out)
 }
 
-fn load_db(server: Server, name: String, body: &[u8]) -> anyhow::Result<Db> {
+/// `body` cut at line ends into pieces of at most `max` bytes (a single longer line stands alone).
+fn chunks(body: &str, max: usize) -> Vec<&str> {
+	let mut out = Vec::new();
+	let mut rest = body;
+	while rest.len() > max {
+		let cut = rest[..max].rfind('\n').map_or_else(|| rest.find('\n').map_or(rest.len(), |i| i + 1), |i| i + 1);
+		out.push(&rest[..cut]);
+		rest = &rest[cut..];
+	}
+	if !rest.is_empty() {
+		out.push(rest);
+	}
+	out
+}
+
+fn load_db(server: Server, name: String, body: &str) -> anyhow::Result<Db> {
 	server.create_db(&name)?;
 	// From here on, dropping `db` removes the database whatever fails next.
 	let db = Db { server, name };
-	db.server.write(&db.name, body)?;
+	// Every write is answered at the server's next WAL flush (once a second by default), so the
+	// pieces go concurrently, as a bulk loader's batches would, and share that flush instead of
+	// waiting for one each in turn.
+	std::thread::scope(|scope| {
+		let writes: Vec<_> = chunks(body, MAX_WRITE_BYTES).into_iter().map(|piece| scope.spawn(|| db.server.write(&db.name, piece.as_bytes()))).collect();
+		writes.into_iter().try_for_each(|w| w.join().map_err(|_| anyhow::anyhow!("influxdb3: a write thread panicked"))?)
+	})?;
 	Ok(db)
 }
 
 impl Arm for Influx {
 	fn info(&self) -> ArmInfo {
 		let version = self.server.version().unwrap_or_else(|_| "unknown".into());
-		ArmInfo { arm: "influxdb3-double".into(), engine: format!("influxdb3 {version}"), value_type: "float field".into(), method: "linear interpolation in SQL: generate_series() grid merged with the knots, last_value/first_value IGNORE NULLS windows, first/last segment extended; downsample via date_bin; one line-protocol write answered once the WAL file is persisted (no_sync=false); SQL over HTTP read as Parquet, on loopback".into() }
+		ArmInfo { arm: "influxdb3-double".into(), engine: format!("influxdb3 {version}"), value_type: "float field".into(), method: "linear interpolation in SQL: generate_series() grid merged with the knots, running max/min of the knot instants joined back to their values, first/last segment extended; downsample via date_bin; line-protocol writes of at most 8 MiB sent concurrently, each answered once the WAL file is persisted (no_sync=false); SQL over HTTP read as Parquet, on loopback".into() }
 	}
 
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
@@ -236,7 +265,7 @@ impl Arm for Influx {
 		let body = line_protocol(&timestamps, &values)?;
 		let name = format!("weft_xbench_{}_{}", std::process::id(), NEXT_DB.fetch_add(1, Ordering::Relaxed));
 		let server = self.server.clone();
-		self.db = Some(tokio::task::spawn_blocking(move || load_db(server, name, body.as_bytes())).await??);
+		self.db = Some(tokio::task::spawn_blocking(move || load_db(server, name, &body)).await??);
 		Ok(())
 	}
 
@@ -264,6 +293,16 @@ impl Arm for Influx {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_body_is_cut_only_at_line_ends_and_under_the_cap() {
+		let body = "aaaa\nbb\ncccccc\nd\n";
+		let pieces = chunks(body, 8);
+		assert_eq!(pieces.concat(), body);
+		assert!(pieces.iter().all(|p| p.ends_with('\n')));
+		assert_eq!(pieces, ["aaaa\nbb\n", "cccccc\n", "d\n"]);
+		assert_eq!(chunks("a-very-long-line\nx\n", 4), ["a-very-long-line\n", "x\n"], "a line longer than the cap goes alone");
+	}
 
 	#[test]
 	fn line_protocol_is_one_line_per_knot_with_exact_floats() {
