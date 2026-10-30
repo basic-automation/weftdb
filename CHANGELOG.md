@@ -18,6 +18,11 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **ClickHouse in the cross-engine benchmark** (#413, first of the remaining external engines):
+  `weft-xbench --clickhouse URL` adds `clickhouse-double` and `clickhouse-decimal` arms (load with
+  bytes on disk, linear interpolation in SQL, bucketed downsample) against a ClickHouse server,
+  gated against WeftDB's in-memory reference like every arm. The nightly smoke run starts a pinned
+  ClickHouse server and runs them.
 - **First cross-engine report** (evidence track EVI-15), in `bench/reports/evi-15/`: WeftDB
   against DuckDB `DOUBLE` and `DECIMAL` on load, storage bytes, linear interpolation and bucketed
   downsampling, over MCAR, block missingness and the UCI household-power corpus at three scales,

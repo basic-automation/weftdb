@@ -24,6 +24,7 @@
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
+pub mod clickhouse;
 pub mod duck;
 pub mod render;
 pub mod weft;
@@ -501,12 +502,20 @@ pub async fn reference(ds: &Dataset) -> anyhow::Result<Reference> {
 	Ok(Reference { grid, buckets })
 }
 
+/// The engine servers a run compares against, beside the in-process engines. An engine left
+/// `None` is not run, and the report's engine list says which ran.
+#[derive(Debug, Clone, Default)]
+pub struct Servers {
+	/// A `ClickHouse` HTTP endpoint (`--clickhouse URL`).
+	pub clickhouse: Option<clickhouse::Server>,
+}
+
 /// Run every arm over every dataset.
 ///
 /// # Errors
 ///
 /// If any arm fails outright; a wrong answer is not an error, it fails that result's gate.
-pub async fn run(datasets: &[Dataset], load_reps: usize, reps: usize, seed: u64, metadata: RunMetadata, source_commit: Option<String>, invocation: Vec<String>) -> anyhow::Result<XbenchReport> {
+pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps: usize, seed: u64, metadata: RunMetadata, source_commit: Option<String>, invocation: Vec<String>) -> anyhow::Result<XbenchReport> {
 	let mut results = Vec::new();
 	for ds in datasets {
 		let reference = reference(ds).await?;
@@ -516,8 +525,15 @@ pub async fn run(datasets: &[Dataset], load_reps: usize, reps: usize, seed: u64,
 		results.extend(measure(&mut weft::WeftStore::stored_bulk(), ds, &reference, load_reps, reps, seed).await?);
 		results.extend(measure(&mut duck::Duck::double(), ds, &reference, load_reps, reps, seed).await?);
 		results.extend(measure(&mut duck::Duck::decimal(), ds, &reference, load_reps, reps, seed).await?);
+		if let Some(server) = &servers.clickhouse {
+			results.extend(measure(&mut clickhouse::ClickHouse::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+			results.extend(measure(&mut clickhouse::ClickHouse::decimal(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+		}
 	}
-	let engines = vec![EngineVersion { engine: "weftdb".into(), version: metadata.weft_bench_version.clone() }, EngineVersion { engine: "duckdb".into(), version: duck::duckdb_version()? }];
+	let mut engines = vec![EngineVersion { engine: "weftdb".into(), version: metadata.weft_bench_version.clone() }, EngineVersion { engine: "duckdb".into(), version: duck::duckdb_version()? }];
+	if let Some(server) = &servers.clickhouse {
+		engines.push(EngineVersion { engine: "clickhouse".into(), version: server.version()? });
+	}
 	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), results })
 }
 
@@ -568,6 +584,26 @@ mod tests {
 		assert!(Correctness::check(&values, &reference, ds.grid_len()).passed, "got {values:?}\nwant {reference:?}");
 	}
 
+	/// The `ClickHouse` arms against a live server, when `WEFT_XBENCH_CLICKHOUSE` names one
+	/// (`http://127.0.0.1:8123`); without it there is nothing to test against and this passes.
+	#[tokio::test]
+	async fn clickhouse_matches_the_reference_on_edges_and_duplicates_when_a_server_is_given() {
+		let Ok(url) = std::env::var("WEFT_XBENCH_CLICKHOUSE") else { return };
+		let server = clickhouse::Server::new(&url);
+		let mut ds = edge_dataset();
+		ds.points.insert(3, Point::new(ts(14), "9".parse().expect("decimal")));
+		let reference = reference(&ds).await.expect("reference");
+		for mut arm in [clickhouse::ClickHouse::double(server.clone()), clickhouse::ClickHouse::decimal(server.clone())] {
+			let name = arm.info().arm;
+			let values = values_of(&mut arm, &ds).await;
+			let gate = Correctness::check(&values, &reference.grid, ds.grid_len());
+			assert!(gate.passed, "{name}: {gate:?}\n got {values:?}\nwant {:?}", reference.grid);
+			assert!(arm.storage_bytes().is_some_and(|b| b > 0), "{name}: bytes on disk");
+			let buckets = arm.downsample(&ds, ds.points.clone()).await.expect("downsamples");
+			assert!(Correctness::check_buckets(&buckets, &reference.buckets).passed, "{name}: got {buckets:?}\nwant {:?}", reference.buckets);
+		}
+	}
+
 	#[test]
 	fn block_removal_takes_contiguous_runs_near_the_target_share() {
 		let ds = Dataset::synthetic(DatasetKind::Block, ScalePreset::Tiny, DEFAULT_SEED).expect("builds");
@@ -603,7 +639,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_tiny_run_reports_both_phases_for_storing_arms_and_passes() {
 		let datasets = [Dataset::synthetic(DatasetKind::Mcar, ScalePreset::Tiny, DEFAULT_SEED).expect("builds")];
-		let report = run(&datasets, 1, 2, DEFAULT_SEED, RunMetadata::capture("test".into()), None, vec![]).await.expect("runs");
+		let report = run(&datasets, &Servers::default(), 1, 2, DEFAULT_SEED, RunMetadata::capture("test".into()), None, vec![]).await.expect("runs");
 		// memory: interpolate + downsample; stored, stored-bulk, duckdb-double, duckdb-decimal:
 		// load + interpolate + downsample; stored-f64: load + interpolate.
 		assert_eq!(report.results.len(), 16);

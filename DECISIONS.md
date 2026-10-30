@@ -4,6 +4,44 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — External engines I: how the ClickHouse arm is measured
+
+**Ambiguous:** #413 / #140 ask for ClickHouse, InfluxDB 3, QuestDB and TimescaleDB adapters, and
+the fairness notes (#393) ask that each engine be measured on the path its users actually take.
+ClickHouse is the first engine that is a server rather than a library, and it has a native gap
+fill. Nothing says which of its interfaces to time, whether its native fill counts as the
+interpolation answer, or how durable its load must be to compare with a WeftDB seal.
+
+**Chosen:**
+
+- **Two arms, `clickhouse-double` (`Float64`) and `clickhouse-decimal` (`Decimal64(s)`)**, mirroring
+  the DuckDB pair, in `weft-xbench/src/clickhouse.rs`, run only when `--clickhouse URL` names a
+  server. A run without one lists both arms under "not tested" with the flag to pass.
+- **HTTP on loopback, `RowBinary` both ways**, through a blocking client on tokio's blocking pool
+  like the DuckDB calls. That is what ClickHouse's own drivers use; the report says the server's
+  timings include the round trip the in-process engines do not pay.
+- **The same `ASOF JOIN` interpolation SQL as DuckDB's.** `WITH FILL … INTERPOLATE` carries the
+  previous row's expression forward; it does not draw a line between neighbours, so it does not
+  compute this benchmark's answer and would fail the gate. The report says so.
+- **Durable load:** one `INSERT` into a `MergeTree ORDER BY t` table with `fsync_after_insert` and
+  `fsync_part_directory` on, the counterpart of a WeftDB seal and DuckDB's `CHECKPOINT`. Bytes on
+  disk are `system.parts.bytes_on_disk` for the active parts.
+- **The server is pinned** to `clickhouse/clickhouse-server:26.10.3.7` by digest in the nightly
+  smoke run, which now starts it as a service container and runs the live arm test there; `ci.yml`
+  is unchanged, so no pull request needs a database server.
+- **No report yet.** One full run on the reference SSD passed all 135 gates. A published comparison
+  waits for the second run EVI-15's decision requires, and for the other engines, so the next
+  cross-engine report covers them together.
+
+**Rejected:**
+
+- The official `clickhouse` Rust crate: it pulls in hyper and its own TLS stack for what `ureq`,
+  already in the lock through DuckDB, does in a few lines.
+- Timing ClickHouse's native `WITH FILL` as a "class A" native arm: it computes a different answer.
+  It belongs in the native-fill comparison (roadmap 1.2), labelled as LOCF, not here.
+- Running the live ClickHouse test in `ci.yml`: a database service on three operating systems for
+  every pull request, for a crate outside the workspace.
+
 ## 2026-10-30 — EVI-15: the owner approved the report narrative
 
 **Ambiguous:** ROADMAP W7 has an owner-only line, "Write or approve the cross-engine report
