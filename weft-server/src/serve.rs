@@ -3,8 +3,9 @@
 //! [`run`] is the only place this crate serves HTTP. It replaces the bare
 //! `axum::serve` call the binary used before SEC-4, which accepted without
 //! limit, waited on headers and on keep-alive peers forever, and had no
-//! shutdown signal at all. Every listener — today the main listener, later
-//! SEC-5's TLS listener on this same path — goes through here, so the
+//! shutdown signal at all. Every listener goes through here — the plaintext
+//! listener via [`run`], SEC-5's TLS listener via [`run_tls`], which is the
+//! same loop with a rustls handshake in front of each connection — so the
 //! pre-auth limits below apply before any route, gate or auth code runs:
 //! a connection is counted at accept time, before a single byte is read.
 //!
@@ -55,6 +56,9 @@ use hyper_util::{
 use tokio::{
 	net::TcpListener, sync::Semaphore, task::JoinSet, time::{Instant, Sleep}
 };
+use tokio_rustls::TlsAcceptor;
+
+use crate::tls::TlsConfig;
 
 /// Environment variable that sets the connection cap directly, replacing the
 /// `RLIMIT_NOFILE`-derived default: a positive integer, read once at startup.
@@ -339,6 +343,40 @@ impl ShutdownSignals {
 /// `Arc` for the whole call and is never closed, so acquiring a permit
 /// from it cannot fail.
 pub async fn run(listener: TcpListener, router: Router, limits: ServeLimits, shutdown: impl Future<Output = ()>) -> io::Result<()> {
+	serve(listener, router, limits, shutdown, Transport::Plain).await
+}
+
+/// Serve `router` on `listener` exactly as [`run`] does, except that each
+/// accepted connection first completes a TLS handshake with `tls`
+/// (SEC-5: rustls with the ring provider; see [`crate::tls`]).
+///
+/// The handshake runs inside the connection task, after the cap permit is
+/// taken, and is bounded by the keep-alive deadline: a peer that stalls
+/// mid-handshake (or never speaks) is cut exactly like a peer that stalls
+/// mid-request, and after the handshake the same keep-alive/write-stall
+/// deadlines as [`run`] apply to the encrypted connection. A failed
+/// handshake ends only that connection; it is logged like any other
+/// connection error.
+///
+/// # Errors
+///
+/// As [`run`]: the listener failed to accept.
+pub async fn run_tls(listener: TcpListener, router: Router, limits: ServeLimits, tls: &TlsConfig, shutdown: impl Future<Output = ()>) -> io::Result<()> {
+	serve(listener, router, limits, shutdown, Transport::Tls(tls.acceptor())).await
+}
+
+/// How an accepted connection's bytes are read: as they arrive, or through
+/// a TLS session first. The accept loop is shared, so the two listeners
+/// can never drift apart in their limits or their shutdown behaviour.
+#[derive(Clone)]
+enum Transport {
+	Plain,
+	Tls(TlsAcceptor),
+}
+
+/// The accept loop behind [`run`] and [`run_tls`]; see [`run`] for the
+/// contract.
+async fn serve(listener: TcpListener, router: Router, limits: ServeLimits, shutdown: impl Future<Output = ()>, transport: Transport) -> io::Result<()> {
 	tokio::pin!(shutdown);
 	let permits = Arc::new(Semaphore::new(limits.max_connections()));
 	let mut connections = JoinSet::new();
@@ -354,12 +392,25 @@ pub async fn run(listener: TcpListener, router: Router, limits: ServeLimits, shu
 			accepted = listener.accept() => accepted?,
 		};
 		let service = TowerToHyperService::new(router.clone());
+		let transport = transport.clone();
 		connections.spawn(async move {
 			// The permit moves into the connection task: the slot is held
 			// for the connection's whole life and freed when it closes.
 			let _permit = permit;
-			let io = DeadlineIo::new(stream, limits.keep_alive_timeout(), limits.write_stall_timeout());
-			let served = http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(limits.header_read_timeout()).serve_connection(io, service).await;
+			let served = match transport {
+				Transport::Plain => {
+					let io = DeadlineIo::new(stream, limits.keep_alive_timeout(), limits.write_stall_timeout());
+					http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(limits.header_read_timeout()).serve_connection(io, service).await.map_err(io::Error::other)
+				}
+				Transport::Tls(acceptor) => match tokio::time::timeout(limits.keep_alive_timeout(), acceptor.accept(stream)).await {
+					Ok(Ok(tls_stream)) => {
+						let io = DeadlineIo::new(tls_stream, limits.keep_alive_timeout(), limits.write_stall_timeout());
+						http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(limits.header_read_timeout()).serve_connection(io, service).await.map_err(io::Error::other)
+					}
+					Ok(Err(err)) => Err(err),
+					Err(_elapsed) => Err(io::Error::new(io::ErrorKind::TimedOut, "the TLS handshake made no progress within the keep-alive deadline")),
+				},
+			};
 			if let Err(err) = served {
 				tracing::debug!(error = %err, "connection closed with an error");
 			}
