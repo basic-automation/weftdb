@@ -281,7 +281,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
   - [x] **SEC-5** TLS listener (rustls with ring) on the shared serve path
   - [x] **SEC-6** API keys, Bearer authentication, keys file and keygen
-  - [ ] **ROB-3** Panic containment, daemon supervision, Daemons registry, `weftdb::exec`
+  - [x] **ROB-3** Panic containment, daemon supervision, Daemons registry, `weftdb::exec`
   - [ ] **PAC-5b** Strict server configuration and store filesystem check (the bind guard moves to SEC-8)
   - [ ] **TAG-0** Fix ILP series merging
   - [ ] L-FMT: **ROB-8** Frame decode hardening

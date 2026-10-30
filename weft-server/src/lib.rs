@@ -37,6 +37,9 @@
 pub mod auth;
 pub mod backup_daemon;
 pub mod backup_routes;
+/// ROB-3's Daemons registry: supervised background tasks and the shared
+/// shutdown watch (see [`daemons`]).
+pub mod daemons;
 pub mod declare;
 pub mod downsample;
 pub mod error;
@@ -54,6 +57,8 @@ pub mod interpolate;
 pub mod keygen;
 pub mod maintain;
 pub mod metrics;
+/// ROB-3's single panic-catch layer (see [`panic_catch`]).
+pub mod panic_catch;
 pub mod panic_hook;
 pub mod reconcile_daemon;
 pub mod routes;
@@ -72,6 +77,7 @@ pub mod trace;
 pub use auth::{AuthConfig, GeneratedKey, KeyStore, Principal, AUTH_KEYS_MODE, TOKEN_PREFIX};
 use axum::{middleware, Router};
 pub use backup_daemon::{backup_tick, list_generated_backups, prune_generated_backups, spawn_backup_daemon, BackupDaemonConfig};
+pub use daemons::{DaemonSnapshot, DaemonState, Daemons, RESTART_DELAY};
 pub use downsample::{downsample, downsample_arrow, downsample_csv, downsample_ilp, downsample_ilp_arrow, downsample_ilp_csv, downsample_ilp_parquet, downsample_parquet, Aggregation, DownsampleRequest, DownsampleResponse};
 pub use error::{ApiError, Code};
 pub use host_guard::{HostGuard, ALLOW_ANY_HOST_ENV};
@@ -207,8 +213,16 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// registry's gate, so it decides from the `RouteSpec` the gate matched and
 /// inserts, and a refused request never reaches a handler. With no keys
 /// configured in the state it is a pass-through.
+///
+/// The panic-catch layer ([`panic_catch::catch_panic`], ROB-3) sits inside
+/// the trace layer (so a caught panic's envelope still gets its
+/// `request_id`) and outside every other layer: it is the one layer that
+/// catches panics, and a handler panic becomes the §4 envelope — by
+/// `IngestPhase` on ingest routes — instead of a dropped connection. A
+/// panic inside a control-plane write never reaches it: ROB-2's hook
+/// aborts during the unwind first.
 pub fn app_with_state(state: AppState) -> Router {
-	routes::build_registry().router().layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(trace::request_span)).with_state(state)
+	routes::build_registry().router().layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
 }
 
 /// Mark stored-data reads incomplete when the store holds suspect segments
