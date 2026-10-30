@@ -4026,6 +4026,7 @@ dependencies = [
  "serde_json",
  "splimes",
  "tokio",
+ "ureq",
  "weft-bench",
  "weft-physical-type",
  "weft-reduce",

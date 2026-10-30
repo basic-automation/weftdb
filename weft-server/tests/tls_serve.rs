@@ -148,6 +148,19 @@ fn run_binary(env: &[(&str, &str)], wait: Duration) -> (bool, String) {
 	let scratch = tempfile::tempdir().expect("scratch dir");
 	let mut cmd = Command::new(env!("CARGO_BIN_EXE_weft-server"));
 	cmd.env_clear().env("PATH", std::env::var("PATH").unwrap_or_default()).env("HOME", scratch.path()).envs(env.iter().copied()).stdout(Stdio::piped()).stderr(Stdio::piped());
+	// Windows cannot start Winsock without `SYSTEMROOT`, so a cleared environment
+	// made every bind fail there and the "keeps serving" cases saw an exit. Keep
+	// the two system variables, and give the home directory the scratch dir under
+	// the name Windows reads it from.
+	#[cfg(windows)]
+	{
+		for name in ["SYSTEMROOT", "WINDIR"] {
+			if let Ok(value) = std::env::var(name) {
+				cmd.env(name, value);
+			}
+		}
+		cmd.env("USERPROFILE", scratch.path());
+	}
 	let mut child = cmd.spawn().expect("spawn weft-server");
 	let deadline = std::time::Instant::now() + wait;
 	while std::time::Instant::now() < deadline {
@@ -177,8 +190,8 @@ fn a_non_loopback_plaintext_bind_without_an_opt_in_is_refused() {
 
 #[test]
 fn auth_disabled_lets_a_non_loopback_plaintext_bind_start() {
-	let (exited, _) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_AUTH", "disabled")], Duration::from_secs(5));
-	assert!(!exited, "with WEFT_AUTH=disabled the server starts and keeps serving");
+	let (exited, output) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_AUTH", "disabled")], Duration::from_secs(5));
+	assert!(!exited, "with WEFT_AUTH=disabled the server starts and keeps serving; it exited:\n{output}");
 }
 
 #[test]
@@ -187,8 +200,8 @@ fn a_mounted_keys_file_with_the_plaintext_opt_in_starts() {
 	let keys = scratch.path().join("keys.json");
 	std::fs::write(&keys, "{}").expect("write the keys file");
 	let keys = keys.to_str().expect("utf8 path").to_string();
-	let (exited, _) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_KEYS_FILE", &keys), ("WEFT_ALLOW_PLAINTEXT", "1")], Duration::from_secs(5));
-	assert!(!exited, "keys file + WEFT_ALLOW_PLAINTEXT=1 starts and keeps serving");
+	let (exited, output) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_KEYS_FILE", &keys), ("WEFT_ALLOW_PLAINTEXT", "1")], Duration::from_secs(5));
+	assert!(!exited, "keys file + WEFT_ALLOW_PLAINTEXT=1 starts and keeps serving; it exited:\n{output}");
 }
 
 #[test]
@@ -201,6 +214,6 @@ fn a_tls_bind_starts_without_any_plaintext_opt_in() {
 	std::fs::write(&key, certified.signing_key.serialize_pem()).expect("write key");
 	let cert = cert.to_str().expect("utf8 path").to_string();
 	let key = key.to_str().expect("utf8 path").to_string();
-	let (exited, _) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_TLS_CERT_FILE", &cert), ("WEFT_TLS_KEY_FILE", &key)], Duration::from_secs(5));
-	assert!(!exited, "a TLS bind starts and keeps serving");
+	let (exited, output) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_TLS_CERT_FILE", &cert), ("WEFT_TLS_KEY_FILE", &key)], Duration::from_secs(5));
+	assert!(!exited, "a TLS bind starts and keeps serving; it exited:\n{output}");
 }

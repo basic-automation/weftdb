@@ -2,10 +2,11 @@
 //!
 //! ```text
 //! TMPDIR=/mnt/weftbench weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N]
-//!                                   [--seed N] [--uci FILE] [--out DIR]
+//!                                   [--seed N] [--uci FILE] [--clickhouse URL] [--out DIR]
 //! ```
 //!
-//! Without `--uci` the UCI datasets are skipped and the report says which datasets ran. The
+//! Without `--uci` the UCI datasets are skipped and the report says which datasets ran; without
+//! `--clickhouse` (an HTTP endpoint such as `http://127.0.0.1:8123`) the `ClickHouse` arms are. The
 //! process exits 1 when any result fails its correctness gate, after writing the report.
 //!
 //! `weft-xbench render REPORT.json [--out DIR]` writes `report.md` and `report.html` from a
@@ -16,9 +17,9 @@
 use std::path::PathBuf;
 
 use weft_bench::{load_uci_corpus, scale::ScalePreset, RunMetadata, DEFAULT_UCI_COLUMN};
-use weft_xbench::{render, run, Dataset, DatasetKind, XbenchReport, DEFAULT_SEED};
+use weft_xbench::{clickhouse, render, run, Dataset, DatasetKind, Servers, XbenchReport, DEFAULT_SEED};
 
-const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--out DIR]";
+const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--clickhouse URL] [--out DIR]";
 
 struct Cli {
 	scales: Vec<ScalePreset>,
@@ -26,11 +27,12 @@ struct Cli {
 	load_reps: usize,
 	seed: u64,
 	uci: Option<PathBuf>,
+	clickhouse: Option<String>,
 	out: PathBuf,
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, out: PathBuf::from("reports/xbench") };
+	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, clickhouse: None, out: PathBuf::from("reports/xbench") };
 	let mut args = args;
 	while let Some(flag) = args.next() {
 		let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
@@ -40,6 +42,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 			"--load-reps" => cli.load_reps = value()?.parse().map_err(|e| format!("--load-reps: {e}"))?,
 			"--seed" => cli.seed = value()?.parse().map_err(|e| format!("--seed: {e}"))?,
 			"--uci" => cli.uci = Some(PathBuf::from(value()?)),
+			"--clickhouse" => cli.clickhouse = Some(value()?),
 			"--out" => cli.out = PathBuf::from(value()?),
 			"-h" | "--help" => return Err(USAGE.to_string()),
 			other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
@@ -101,7 +104,11 @@ async fn main() -> anyhow::Result<()> {
 	}
 	eprintln!("weft-xbench: {} datasets, scratch in {}", datasets.len(), std::env::temp_dir().display());
 	let metadata = RunMetadata::capture(chrono::Utc::now().to_rfc3339());
-	let report = run(&datasets, cli.load_reps, cli.reps, cli.seed, metadata, source_commit(), invocation).await?;
+	let servers = Servers { clickhouse: cli.clickhouse.as_deref().map(clickhouse::Server::new) };
+	if let Some(server) = &servers.clickhouse {
+		eprintln!("weft-xbench: clickhouse {} at {}", server.version()?, cli.clickhouse.as_deref().unwrap_or_default());
+	}
+	let report = run(&datasets, &servers, cli.load_reps, cli.reps, cli.seed, metadata, source_commit(), invocation).await?;
 
 	std::fs::create_dir_all(&cli.out)?;
 	let path = cli.out.join("xbench.json");
@@ -135,12 +142,13 @@ mod tests {
 	fn defaults_are_three_scales_and_no_uci() {
 		let c = cli(&[]).expect("parses");
 		assert_eq!(c.scales, vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium]);
-		assert!(c.uci.is_none());
+		assert!(c.uci.is_none() && c.clickhouse.is_none());
 	}
 
 	#[test]
 	fn flags_parse_and_bad_values_are_refused() {
-		let c = cli(&["--scales", "tiny", "--reps", "2", "--load-reps", "1", "--uci", "x.txt"]).expect("parses");
+		let c = cli(&["--scales", "tiny", "--reps", "2", "--load-reps", "1", "--uci", "x.txt", "--clickhouse", "http://127.0.0.1:8123"]).expect("parses");
+		assert_eq!(c.clickhouse.as_deref(), Some("http://127.0.0.1:8123"));
 		assert_eq!((c.scales.len(), c.reps, c.load_reps), (1, 2, 1));
 		assert!(cli(&["--scales", "huge"]).is_err());
 		assert!(cli(&["--reps", "0"]).is_err());

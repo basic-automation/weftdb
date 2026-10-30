@@ -1,7 +1,8 @@
 name: cross-engine smoke
 
 # The nightly smoke run of the cross-engine benchmark (EVI-14). It builds weft-xbench — its own
-# workspace, because DuckDB compiles from C++ — runs every arm at the `tiny` scale, and fails
+# workspace, because DuckDB compiles from C++ — runs every arm at the `tiny` scale (ClickHouse
+# against a service container), and fails
 # when any arm disagrees with WeftDB's in-memory reference or the build no longer links.
 #
 # A smoke test, not a measurement: hosted runners are not reference hardware (decision 19), and a
@@ -28,6 +29,19 @@ jobs:
     name: weft-xbench tiny
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # The ClickHouse arms need a server. Pinned to the version the arm was written against; a
+    # newer one is a deliberate bump here, not a silent drift.
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.10.3.7@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
+        ports:
+          - 8123:8123
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping || exit 1"
+          --health-interval 5s --health-retries 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,13 +64,20 @@ jobs:
       - name: Build
         run: cargo build --locked --release --manifest-path weft-xbench/Cargo.toml
 
+      # The live ClickHouse test (edges, duplicate instants, buckets) is skipped without a server,
+      # so it runs here, not in ci.yml.
+      - name: Test against the ClickHouse server
+        env:
+          WEFT_XBENCH_CLICKHOUSE: http://127.0.0.1:8123
+        run: cargo test --locked --release --manifest-path weft-xbench/Cargo.toml
+
       - name: Run every arm at the tiny scale
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/xbench-scratch"
           TMPDIR="$RUNNER_TEMP/xbench-scratch" weft-xbench/target/release/weft-xbench \
-            --scales tiny --reps 3 --load-reps 2 --out xbench-out
+            --scales tiny --reps 3 --load-reps 2 --clickhouse http://127.0.0.1:8123 --out xbench-out
 
       - name: Summarise
         if: always()
