@@ -2,7 +2,7 @@ name: cross-engine smoke
 
 # The nightly smoke run of the cross-engine benchmark (EVI-14). It builds weft-xbench — its own
 # workspace, because DuckDB compiles from C++ — runs every arm at the `tiny` scale (ClickHouse
-# against a service container), and fails
+# and TimescaleDB against service containers), and fails
 # when any arm disagrees with WeftDB's in-memory reference or the build no longer links.
 #
 # A smoke test, not a measurement: hosted runners are not reference hardware (decision 19), and a
@@ -29,8 +29,8 @@ jobs:
     name: weft-xbench tiny
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # The ClickHouse arms need a server. Pinned to the version the arm was written against; a
-    # newer one is a deliberate bump here, not a silent drift.
+    # The ClickHouse and TimescaleDB arms need servers. Each is pinned to the version its arm was
+    # written against; a newer one is a deliberate bump here, not a silent drift.
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:26.10.3.7@sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce
@@ -41,6 +41,18 @@ jobs:
         options: >-
           --ulimit nofile=262144:262144
           --health-cmd "wget -qO- http://127.0.0.1:8123/ping || exit 1"
+          --health-interval 5s --health-retries 30
+      timescale:
+        image: timescale/timescaledb:2.31.0-pg17@sha256:b56a3f51991df1f79d0c1a0841cad5c5fa8058fdd6a3ee6886394a6d4c174538
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: xbench
+          POSTGRES_DB: xbench
+          # No telemetry from a CI runner.
+          TIMESCALEDB_TELEMETRY: "off"
+        options: >-
+          --health-cmd "pg_isready -U postgres -d xbench"
           --health-interval 5s --health-retries 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,11 +76,12 @@ jobs:
       - name: Build
         run: cargo build --locked --release --manifest-path weft-xbench/Cargo.toml
 
-      # The live ClickHouse test (edges, duplicate instants, buckets) is skipped without a server,
-      # so it runs here, not in ci.yml.
-      - name: Test against the ClickHouse server
+      # The live ClickHouse and TimescaleDB tests (edges, duplicate instants, buckets) are skipped
+      # without a server, so they run here, not in ci.yml.
+      - name: Test against the database servers
         env:
           WEFT_XBENCH_CLICKHOUSE: http://127.0.0.1:8123
+          WEFT_XBENCH_TIMESCALE: postgresql://postgres:xbench@127.0.0.1:5432/xbench
         run: cargo test --locked --release --manifest-path weft-xbench/Cargo.toml
 
       - name: Run every arm at the tiny scale
@@ -77,7 +90,8 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/xbench-scratch"
           TMPDIR="$RUNNER_TEMP/xbench-scratch" weft-xbench/target/release/weft-xbench \
-            --scales tiny --reps 3 --load-reps 2 --clickhouse http://127.0.0.1:8123 --out xbench-out
+            --scales tiny --reps 3 --load-reps 2 --clickhouse http://127.0.0.1:8123 \
+            --timescale postgresql://postgres:xbench@127.0.0.1:5432/xbench --out xbench-out
 
       - name: Summarise
         if: always()
