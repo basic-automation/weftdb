@@ -30,8 +30,9 @@
 //! pages from non-loopback origins, open in a local browser, cannot drive the server
 //! ([`weft_server::host_guard`]).
 //! `WEFT_ALLOW_ANY_HOST=1` turns this off for a local reverse proxy that forwards a
-//! different `Host` or a browser UI's non-loopback `Origin`. A non-loopback bind is not guarded: there is no authentication yet,
-//! so such a server must not be reachable from an untrusted network.
+//! different `Host` or a browser UI's non-loopback `Origin`. A non-loopback bind is not guarded by it:
+//! the guard is a loopback stop-gap, and authentication (below) is what a
+//! non-loopback deployment relies on.
 //!
 //! ## Transport (SEC-5)
 //!
@@ -42,6 +43,18 @@
 //! (`WEFT_KEYS_FILE`) plus `WEFT_ALLOW_PLAINTEXT=1`, or `WEFT_AUTH=disabled`
 //! behind a gateway — otherwise startup refuses. Loopback plaintext is
 //! ungated. See [`weft_server::tls`].
+//!
+//! ## Authentication (SEC-6)
+//!
+//! With `WEFT_KEYS_FILE` naming a keys file (or `WEFT_AUTH=keys`, which
+//! requires one), every request is authenticated with
+//! `Authorization: Bearer <key>` against the file's key hashes, and the
+//! key's role is checked against the scope the sealed registry assigns
+//! the route ([`weft_server::auth`]). The probes stay open to the
+//! anonymous principal; everything else needs a key. `WEFT_AUTH=disabled`
+//! turns authentication explicitly off, and with no keys file mounted
+//! the server runs unauthenticated, as it did before SEC-6.
+//! `weft-server keygen` mints a key and records its hash in the file.
 //!
 //! ## Optional segment store
 //!
@@ -116,7 +129,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// plaintext gate against the address about to be bound, before the
 	// store opens — a refused exposure starts nothing at all.
 	let tls = config::transport(addr)?;
-	let state = state::build().await?.with_interpolate_config(interpolate);
+	// SEC-6: load the keys file (when one is mounted) before the store
+	// opens — a keys file that cannot be loaded stops startup, and the
+	// server never comes up unauthenticated by accident.
+	let auth = config::auth()?;
+	let state = state::build().await?.with_interpolate_config(interpolate).with_auth(auth);
 
 	daemons::spawn_reconcile_if_configured(&state)?;
 	daemons::spawn_backup_if_configured(&state)?;

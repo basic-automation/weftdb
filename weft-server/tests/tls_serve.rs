@@ -185,7 +185,11 @@ fn auth_disabled_lets_a_non_loopback_plaintext_bind_start() {
 fn a_mounted_keys_file_with_the_plaintext_opt_in_starts() {
 	let scratch = tempfile::tempdir().expect("scratch dir");
 	let keys = scratch.path().join("keys.json");
-	std::fs::write(&keys, "{}").expect("write the keys file");
+	// A real SEC-6 keys file: since SEC-6 the server loads and validates
+	// the file at startup, so the placeholder `{}` SEC-5's gate accepted
+	// (it read presence only) no longer starts a server.
+	let document = format!("{{\"version\": 1, \"keys\": [{{\"id\": \"operator\", \"role\": \"admin\", \"key_hash\": \"{}\"}}]}}", weft_server::auth::format_key_hash("weft_keys_file_fixture_key"));
+	std::fs::write(&keys, document).expect("write the keys file");
 	let keys = keys.to_str().expect("utf8 path").to_string();
 	let (exited, _) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_KEYS_FILE", &keys), ("WEFT_ALLOW_PLAINTEXT", "1")], Duration::from_secs(5));
 	assert!(!exited, "keys file + WEFT_ALLOW_PLAINTEXT=1 starts and keeps serving");

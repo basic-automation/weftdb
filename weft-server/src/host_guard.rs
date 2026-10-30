@@ -1,7 +1,7 @@
 //! Loopback request guard: keep web pages and DNS rebinding away from a loopback-bound
 //! server.
 //!
-//! `weft-server` has no authentication yet and binds `127.0.0.1:8080` by default, so
+//! `weft-server` binds `127.0.0.1:8080` by default, so
 //! that only local processes can reach it. A web browser on the same machine is a local
 //! process too. A page it shows can send a cross-origin request to the server without a
 //! CORS preflight (a `POST` whose parameters are all in the query string, or whose body
