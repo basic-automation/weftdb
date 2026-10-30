@@ -187,6 +187,18 @@ pub enum IndexOp {
 	/// rows derive, a rebuild writes the rollup the index derives. `INSERT OR REPLACE`
 	/// on the aspect key, so writing the same rollup twice changes nothing.
 	PutRollup { aspect: String, meta: AspectMetadata },
+	/// Record a quarantined segment (D-S12): `INSERT OR REPLACE` on the
+	/// `(aspect, id, gen)` key, so re-running a recovery pass over a record it
+	/// already wrote changes nothing. The row's delete travels in the same
+	/// transaction, as a [`DeleteExpected`](Self::DeleteExpected).
+	QuarantineInsert { record: crate::types::quarantine::QuarantineRecord },
+	/// Delete a quarantine record, if any: an operator release or purge, or the
+	/// TTL purge's per-record delete.
+	QuarantineDelete { aspect: String, id: u64, gen: u64 },
+	/// Raise `aspect`'s `aspect_seq.next_series_id` to at least `next_series_id`
+	/// (R10, D-S12), creating the row if the aspect has none, and never lowering
+	/// it: a series id, once handed out, is never handed out again.
+	SeedSeries { aspect: String, next_series_id: u64 },
 }
 
 impl IndexOp {
@@ -208,7 +220,11 @@ impl IndexOp {
 			// writer of that aspect's rollup row can commit between attempts: a retry
 			// re-runs the same fold over the same index state. An `IndexTxn` run
 			// without that lock must not rely on it.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } => true,
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } => true,
+			// `QuarantineInsert` replaces a record of the same key and
+			// `QuarantineDelete` deletes one if it exists, so neither re-checks
+			// what its caller decided from, like `Upsert` and `Delete`.
+			Self::QuarantineInsert { .. } | Self::QuarantineDelete { .. } => false,
 			// `MetaSet` replaces the value, so a retry would overwrite what another writer
 			// committed in between. (Its one writer today is the open, under the root's
 			// LOCK, which nothing races.)
@@ -510,6 +526,12 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 			.await
 			.map_err(|e| statement_error(&format!("writing the {aspect:?} rollup"), &e))
 		}
+		IndexOp::QuarantineInsert { record } => {
+			let (min_ts, max_ts) = (record.min_ts.map_or(Value::Null, Value::Integer), record.max_ts.map_or(Value::Null, Value::Integer));
+			conn.execute("INSERT OR REPLACE INTO segment_quarantine (aspect, id, gen, name, reason, descriptor_json, quarantined_ms, class, min_ts, max_ts, series_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", vec![Value::Text(record.aspect.clone()), integer(record.id), integer(record.gen), Value::Text(record.name.clone()), Value::Text(record.reason.clone()), record.descriptor_json.clone().map_or(Value::Null, Value::Text), Value::Integer(record.quarantined_ms), Value::Text(record.class.as_str().to_string()), min_ts, max_ts, integer(record.series_id)]).await.map_err(|e| statement_error(&format!("quarantining {} segment {}", record.aspect, record.id), &e))
+		}
+		IndexOp::QuarantineDelete { aspect, id, gen } => conn.execute("DELETE FROM segment_quarantine WHERE aspect = ? AND id = ? AND gen = ?", vec![Value::Text(aspect.clone()), integer(*id), integer(*gen)]).await.map_err(|e| statement_error(&format!("deleting the quarantine record of {aspect:?} segment {id}"), &e)),
+		IndexOp::SeedSeries { aspect, next_series_id } => conn.execute("INSERT INTO aspect_seq (aspect, next_id, next_gen, epoch, next_series_id) VALUES (?, 1, 0, 0, ?) ON CONFLICT (aspect) DO UPDATE SET next_series_id = MAX(next_series_id, excluded.next_series_id)", vec![Value::Text(aspect.clone()), integer(*next_series_id)]).await.map_err(|e| statement_error(&format!("seeding the {aspect:?} next_series_id"), &e)),
 	}
 }
 

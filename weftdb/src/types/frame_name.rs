@@ -89,7 +89,6 @@ impl FrameName {
 	/// The aspect the frame belongs to, when its stem names it (`None` for a hashed
 	/// stem; compare [`stem`] of a known aspect instead).
 	#[must_use]
-	#[cfg_attr(not(test), expect(dead_code, reason = "recovery (S12) classifies the frames it lists by aspect; until then only the tests do"))]
 	pub fn aspect(&self) -> Option<String> {
 		aspect_name::decode(&self.stem)
 	}

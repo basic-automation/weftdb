@@ -1613,3 +1613,98 @@ what a sink would have to write, and the bound is on that form.
 (`database/outputs.rs`, `dictionary.rs`) read the legacy store's own text,
 not the Storage-v2 input domain, and stay as they are; query-time numeric
 parameters that are not decimals (timestamps, limits) are untouched.
+
+## 2026-10-29 — D-S12: startup recovery, quarantine with TTL, fsck endpoint, /ready report — FOR MERGE REVIEW
+
+**Spec:** 1.0 plan §6 W4 store lane (first) + §5 D-S12 amendment + §4 C5 fault
+policy + §4 C1 (`segment_quarantine.series_id`) + ROADMAP line 141 (S12).
+C5 is fully specified; the choices below are mechanism and two parameters the
+plan names but does not number.
+
+**Chosen:**
+- Migration `0004_d_s12` (layout 2) adds `segment_quarantine.class`,
+  `min_ts`, `max_ts`, `series_id`; fresh stores create the table with them.
+  A pre-D-S12 record reads back as class `corrupt`, no time span, series 0.
+- Classification follows C5's text, not X-FRAME's mapping, in one named case:
+  a failure on a frame whose trailing CRC-32 verifies is post-CRC, hence
+  suspect, whatever the decoder said; otherwise the causes C5 names outright
+  (newer version, codec this build lacks, unknown critical extension, unknown
+  codec tag) are suspect and everything else is corrupt. X-FRAME counts an
+  unknown tag as integrity; quarantine follows C5 here, and the read path
+  keeps X-FRAME's mapping. `WeftSegError` variants are the evidence: the
+  classifier takes the typed source under `FrameFaultError`, never the message.
+- Quarantine is one transaction per segment (record insert + row delete), the
+  file then moves to `segments/quarantine/`; reads lose the segment the moment
+  the row is gone. Suspect and corrupt files both move there; only the purge
+  differs. A missing indexed file quarantines with no move. A row whose path
+  escapes `segments/` is skipped, never moved.
+- Identity mismatch re-binds the row to the frame's key: the aspect the frame's
+  file name names, its generation and adoption order, and the frame's CRC
+  trailer when the row's `frame_crc` is unset or disagrees. A frame file
+  carries no aspect id beyond its name, so there is no deeper key to re-bind to.
+- R10 seeds `aspect_seq.next_series_id` past the largest series id the aspect's
+  rows hold (at least 1), once per aspect per pass, via a monotonic upsert.
+- **TTL: 30 days from `quarantined_ms`.** The plan names the TTL but no
+  duration; thirty days is this slice's choice, long enough for an operator
+  triaging a bad seal, and recorded here so merge review can change one
+  constant (`QUARANTINE_TTL_MS`). Only corrupt records ever TTL-purge; the
+  TTL purge runs at the end of every repair pass, and an operator purge of one
+  record is the only purge a suspect record ever gets.
+- **Durability class:** `full` where a seal fsyncs file and directory entry,
+  `process-crash-only` on Windows, where `StoreFs::sync_dir` is a no-op — the
+  distinction the `sync_dir` documentation already draws for `/ready`.
+- **previous_clean_shutdown:** `store_meta.clean_shutdown`, read at open and
+  reset to `0` by the same open (a crash must not inherit a clean verdict);
+  the server sets it to `1` after serving stops cleanly. A store no process
+  ever marked clean reads `false`.
+- **/ready:** `503` exactly when the last recovery pass reports
+  `incompatible_store` (a newer-format suspect cause); poisoned stores stay
+  ready, as before, and a store-less server stays ready. `/ready` carries
+  counts only — quarantined, suspect, incompatible — never records. The fsck
+  and quarantine endpoints carry the records themselves (operator routes,
+  `operator_detail: true`).
+- **Weft-Incomplete:** a response header, not a body field, set by a layer on
+  stored-data reads (`GET /api/v1/storage/...`, POST downsample reads) while
+  the store holds any suspect record. The store tracks that as an atomic flag
+  refreshed by every quarantine change, so reads pay no query for it.
+- **Report-only:** the startup pass on a newer-layout store counts what it
+  would do and changes nothing — no record, row delete, move, seed, purge or
+  rollup rebuild. The fsck endpoint always repairs; an operator asking for
+  fsck is asking for the repair.
+
+**Not in this slice:** adopting a decodable orphan (no row, no id to adopt
+under — a later slice's job); ledger invalidation beyond the row delete (the
+ingest ledger is keyed by batch, not by segment, so there is no per-segment
+ledger row to invalidate — the quarantine record is the invalidation trail);
+C5 verification by TAG-9/ROB-22, which the plan assigns to later slices.
+
+**Salvage fix (parent, loop run timed out):** two pre-existing tests encoded the
+pre-D-S12 contract and failed on the salvaged tree. `frame_fault.rs` expected
+read-time `500`/`503` for damaged/newer frames; D-S12 moves the fault to startup
+recovery, so the tests now assert quarantine at open (read `200` empty,
+`/ready` counts, `Weft-Incomplete` for suspect only). The registry-count tests
+in `routes.rs` hard-coded 55 routes / 49 templates; D-S12 adds 5 routes (fsck +
+quarantine list, purge-expired, release, purge), so the counts are now 60 / 54.
+Both fixes are expectation updates for spec'd behaviour, not behaviour changes.
+
+**Salvage fix 2 (parent):** the third bar's 6 `weftdb` lib failures share three
+roots. (1) The fsck re-bind built `[DeleteExpected, ReplaceExpected]` for a
+same-aspect row; the delete removes the row the replace must match, so every
+re-bind failed with "matched 0" (phantom commit, ambiguous commit, and the
+agent's own `fsck_binds_an_unset_frame_crc`). Same-aspect re-bind is now one
+guarded `ReplaceExpected`; only a move to a different aspect deletes then
+inserts. (2) Startup recovery moves an undecodable orphan to
+`segments/quarantine/`, so `frame_gens_on_disk` no longer saw the stray gen-7
+frame and the I6 floor fell to 3; it now scans `segments/quarantine/` too, so a
+quarantined frame still floors its generation. (3) Two stale test details: the
+agent's own classify test paired sound bytes with a checksum error (sound
+bytes are post-CRC by construction — the test now damages the bytes per case),
+and the pre-v2 test counted 3 migrations while asserting 4 (now 4).
+
+**Post-publish fix (parent, Windows CI on PR #459):** `test
+(windows-latest)` failed on exactly one test: the agent's
+`ready_reports_incompatible_store_and_reads_carry_weft_incomplete` asserted
+`durability_class == "full"`, but the class is platform-defined —
+`process-crash-only` on Windows, where directory fsync is a no-op — so the
+expectation is now `cfg!(windows)`-gated. No production code changed; this is
+the Windows-only test-expectation class the Linux bar cannot catch.

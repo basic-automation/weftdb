@@ -76,7 +76,7 @@
 //! only at timestamp boundaries, so a run of equal timestamps is never split between two.
 
 use std::{
-	collections::HashMap, ffi::OsStr, future::Future, path::{Component, Path, PathBuf}, sync::{
+	collections::{HashMap, HashSet}, ffi::OsStr, future::Future, path::{Component, Path, PathBuf}, sync::{
 		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Arc, OnceLock, PoisonError, RwLock
 	}, time::Duration
 };
@@ -93,7 +93,7 @@ use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, write_new_durable, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind, TxnPoints}, migrations, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
+		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind, TxnPoints}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
@@ -944,15 +944,24 @@ async fn legacy_file_ids(segments: PathBuf) -> Result<HashMap<String, u64>> {
 	Ok(ids)
 }
 
-/// The highest generation each write-once frame stem directly under `segments` carries
+/// The highest generation each write-once frame stem under `segments` carries
 /// (see [`frame_name::parse`]): the floor of each aspect's generation counter, so that a
-/// frame a crashed maintenance operation left behind is never named again.
+/// frame a crashed maintenance operation left behind is never named again. A quarantined
+/// frame is still on disk, just relocated to `segments/quarantine/` by D-S12 recovery, so
+/// that directory counts too: otherwise a moved stray's generation could be reissued.
 async fn frame_gens_on_disk(fs: &dyn StoreFs, segments: &Path) -> Result<HashMap<String, u64>> {
 	let mut gens: HashMap<String, u64> = HashMap::new();
-	for entry in fs.read_dir(segments).await.with_context(|| format!("listing {}", segments.display()))? {
-		if let Some(parsed) = entry.name.to_str().and_then(frame_name::parse) {
-			let max = gens.entry(parsed.stem).or_insert(parsed.gen);
-			*max = (*max).max(parsed.gen);
+	for dir in [segments.to_path_buf(), segments.join("quarantine")] {
+		let entries = match fs.read_dir(&dir).await {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+			Err(error) => return Err(error).with_context(|| format!("listing {}", dir.display())),
+		};
+		for entry in entries {
+			if let Some(parsed) = entry.name.to_str().and_then(frame_name::parse) {
+				let max = gens.entry(parsed.stem).or_insert(parsed.gen);
+				*max = (*max).max(parsed.gen);
+			}
 		}
 	}
 	Ok(gens)
@@ -1094,6 +1103,16 @@ pub struct SegmentStore {
 	store_uuid: String,
 	/// What the open found and did.
 	report: OpenReport,
+	/// What the last recovery pass found and did (startup, or the fsck endpoint):
+	/// what `/ready` reports, counts only.
+	recovery: RwLock<RecoveryReport>,
+	/// Whether any suspect quarantine record exists right now: reads of a store
+	/// holding one are incomplete, and their responses carry `Weft-Incomplete`.
+	suspect_present: AtomicBool,
+	/// Whether the previous process that held this store shut down cleanly: the
+	/// `clean_shutdown` flag in `store_meta` as this open found it, before this
+	/// open reset it. A store no process ever marked clean reads `false`.
+	previous_clean_shutdown: bool,
 	/// Each aspect's commit lock (around every control-plane transaction of the aspect,
 	/// guarding its id allocator) and maintenance lock (around a whole maintenance
 	/// operation); see `aspect_locks`.
@@ -1407,6 +1426,12 @@ impl SegmentStore {
 	///     store has no `segment_index.db` rows, and the replay only re-derives the
 	///     aspects its journal names, so a clean pre-S11 store would otherwise read
 	///     default zeros until its next seal or swap.
+	/// 14. run startup recovery (D-S12, [`SegmentStore::fsck`]): classify every
+	///     indexed frame and every orphan under `segments/`, quarantine the
+	///     corrupt and the suspect, re-bind rows to their frames' keys, seed
+	///     `next_series_id` (R10) and purge TTL-expired corrupt records — unless
+	///     the layout is newer than this build's, in which case the same pass runs
+	///     report-only: it counts what it finds and changes nothing.
 	///
 	/// The lock is held until the store drops.
 	///
@@ -1565,7 +1590,10 @@ impl SegmentStore {
 		let ControlPlaneDbs { index, metadata, catalog, registry } = databases;
 		let reaper = Reaper::new(fs.clone(), segments_dir);
 		let replaying = opening();
-		let store = Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), frame_gens: tokio::sync::OnceCell::new(), reaper, maintenance_wait: DEFAULT_MAINTENANCE_WAIT, index_conflicts: AtomicU64::new(0), _root_lock: root_lock };
+		// The previous process's clean-shutdown flag, as this open finds it, before
+		// this open resets it: a later crash must not inherit a clean verdict.
+		let previous_clean_shutdown = index.meta("clean_shutdown").await.with_context(|| format!("{}: reading the previous clean-shutdown flag", names[0]))?.as_deref() == Some("1");
+		let store = Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, recovery: RwLock::new(RecoveryReport::default()), suspect_present: AtomicBool::new(false), previous_clean_shutdown, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), frame_gens: tokio::sync::OnceCell::new(), reaper, maintenance_wait: DEFAULT_MAINTENANCE_WAIT, index_conflicts: AtomicU64::new(0), _root_lock: root_lock };
 		// 12. The frame journal's replay (R6), before anything is served: unless recovery
 		// must only report what it finds, a newer WeftDB's store.
 		// 13. Backfill the rollup rows the journal replay did not write: a pre-S11
@@ -1574,7 +1602,12 @@ impl SegmentStore {
 		if !newer {
 			store.replay_journal().await.context(replaying)?;
 			store.backfill_missing_rollups().await.context("backfilling the rollup rows the journal replay did not write")?;
+			// This open has not shut down cleanly yet: say so now, so a crash
+			// before any clean shutdown is never mistaken for one.
+			store.commit_index(&IndexTxn::new(vec![IndexOp::MetaSet { key: "clean_shutdown".to_string(), value: "0".to_string() }])).await.context("recording that this open has not shut down cleanly yet")?;
 		}
+		// 14. Startup recovery, report-only exactly when the layout is newer.
+		store.fsck(newer).await.context("running startup recovery")?;
 		Ok(store)
 	}
 
@@ -4575,8 +4608,395 @@ impl SegmentStore {
 		}
 		Ok(backfilled)
 	}
+}
 
-	/// Aggregate every aspect's materialized rollup into one **store-wide** summary —
+impl SegmentStore {
+	/// The durability class `/ready` reports (design section 2, via the directory
+	/// sync it rests on): `full` where a seal fsyncs its file and its directory
+	/// entry, and `process-crash-only` where the platform cannot fsync a directory
+	/// at all (Windows: [`StoreFs::sync_dir`](crate::types::durable::StoreFs::sync_dir)
+	/// is a no-op there), so a power cut, but not a process crash, can lose the entry.
+	#[must_use]
+	pub const fn durability_class() -> &'static str {
+		if cfg!(windows) {
+			"process-crash-only"
+		} else {
+			"full"
+		}
+	}
+
+	/// What the last recovery pass found and did, counts only.
+	#[must_use]
+	pub fn recovery_report(&self) -> RecoveryReport {
+		self.recovery.read().unwrap_or_else(PoisonError::into_inner).clone()
+	}
+
+	/// Whether the previous process that held this store shut down cleanly (see the
+	/// field documentation on the struct): `false` for a store no process ever
+	/// marked clean, and for every open after a crash.
+	#[must_use]
+	pub const fn previous_clean_shutdown(&self) -> bool {
+		self.previous_clean_shutdown
+	}
+
+	/// Whether any suspect quarantine record exists right now: reads of such a
+	/// store are incomplete, and their responses carry `Weft-Incomplete`.
+	#[must_use]
+	pub fn has_suspect_segments(&self) -> bool {
+		self.suspect_present.load(Ordering::Relaxed)
+	}
+
+	/// Record that this process is shutting down cleanly, so the next open's
+	/// `/ready` can report `previous_clean_shutdown: true`. The server calls this
+	/// after serving stops; a process that dies any other way leaves the flag at
+	/// the `0` its open wrote, and the next open reports the crash.
+	///
+	/// # Errors
+	///
+	/// Propagates a control-plane write failure.
+	pub async fn mark_clean_shutdown(&self) -> Result<()> {
+		self.commit_index(&IndexTxn::new(vec![IndexOp::MetaSet { key: "clean_shutdown".to_string(), value: "1".to_string() }])).await?;
+		Ok(())
+	}
+
+	/// The quarantine records, of one aspect for `Some`, or of every aspect for `None`.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn quarantine_list(&self, aspect: Option<&str>) -> Result<Vec<QuarantineRecord>> {
+		self.index.quarantine(aspect).await
+	}
+
+	/// Release one quarantine record back into reads: its file moves from
+	/// `segments/quarantine/` to `segments/`, and its index row is re-inserted
+	/// exactly as quarantine recorded it. An operator decision, for either class:
+	/// a corrupt file released this way will fail its next fsck again, and a
+	/// suspect file released this way reads again on a build that understands it.
+	///
+	/// # Errors
+	///
+	/// A record that does not exist, a record with no row behind it (crash litter
+	/// has no segment to restore), a taken segment id, a missing quarantined file
+	/// (the row is still restored: the next fsck classifies the missing file), or
+	/// a control-plane or rollup failure.
+	pub async fn quarantine_release(&self, aspect: &str, id: u64, gen: u64) -> Result<QuarantineRecord> {
+		let record = self.quarantine_list(Some(aspect)).await?.into_iter().find(|record| record.id == id && record.gen == gen).ok_or_else(|| anyhow::anyhow!("no quarantine record for {aspect} segment {id} generation {gen}"))?;
+		let Some(json) = record.descriptor_json.as_deref() else {
+			bail!("quarantine record for {aspect} segment {id} has no row to restore: it quarantined crash litter, not an indexed segment");
+		};
+		let row = QuarantinedRow::from_json(json).ok_or_else(|| anyhow::anyhow!("quarantine record for {aspect} segment {id} holds a row this build cannot read"))?;
+		let restored = IndexRow { desc: row.desc, gen: row.gen, prec: row.prec, frame_crc: row.frame_crc, commit_epoch: row.commit_epoch, series_id: row.series_id };
+		self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineDelete { aspect: aspect.to_string(), id, gen }, IndexOp::InsertNew { aspect: aspect.to_string(), row: restored }])).await?;
+		let segments = self.root.join("segments");
+		let from = contained_file(&segments.join("quarantine"), &record.name)?;
+		let to = contained_file(&segments, &record.name)?;
+		if tokio::fs::try_exists(&from).await.unwrap_or(false) {
+			self.fs.rename(&from, &to).await.with_context(|| format!("moving quarantined {} back to {}", from.display(), to.display()))?;
+			self.sync_segments().await?;
+		}
+		self.rebuild_aspect_metadata(aspect).await?;
+		self.refresh_suspect_present().await?;
+		Ok(record)
+	}
+
+	/// Purge one quarantine record, of either class: its file under
+	/// `segments/quarantine/` is unlinked (a missing file counts as already gone)
+	/// and its record deleted. The operator's explicit purge: unlike the TTL purge,
+	/// this one also purges suspect records, which nothing automatic ever does.
+	///
+	/// # Errors
+	///
+	/// A record that does not exist, or a control-plane or filesystem failure.
+	pub async fn quarantine_purge(&self, aspect: &str, id: u64, gen: u64) -> Result<QuarantineRecord> {
+		let record = self.quarantine_list(Some(aspect)).await?.into_iter().find(|record| record.id == id && record.gen == gen).ok_or_else(|| anyhow::anyhow!("no quarantine record for {aspect} segment {id} generation {gen}"))?;
+		self.purge_record(&record).await?;
+		Ok(record)
+	}
+
+	/// Purge every corrupt quarantine record whose TTL has passed
+	/// ([`QUARANTINE_TTL_MS`]): unlink its file and delete its record. Suspect
+	/// records are never purged here, however old they are — only an operator
+	/// purge ([`quarantine_purge`](Self::quarantine_purge)) removes one.
+	///
+	/// # Errors
+	///
+	/// Propagates a control-plane or filesystem failure.
+	pub async fn purge_expired_quarantine(&self) -> Result<usize> {
+		let now_ms = now_ms();
+		let mut purged = 0;
+		for record in self.quarantine_list(None).await? {
+			if record.class == QuarantineClass::Corrupt && record.quarantined_ms.saturating_add(QUARANTINE_TTL_MS) <= now_ms {
+				self.purge_record(&record).await?;
+				purged += 1;
+			}
+		}
+		self.refresh_suspect_present().await?;
+		Ok(purged)
+	}
+
+	/// Unlink one quarantine record's file and delete its record, in that order:
+	/// a record whose file is already gone still gets deleted, and a record whose
+	/// unlink fails keeps its record, so the next purge retries it.
+	async fn purge_record(&self, record: &QuarantineRecord) -> Result<()> {
+		let path = contained_file(&self.root.join("segments").join("quarantine"), &record.name)?;
+		self.fs.remove_file(&path).await.with_context(|| format!("unlinking quarantined {}", path.display()))?;
+		self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineDelete { aspect: record.aspect.clone(), id: record.id, gen: record.gen }])).await?;
+		Ok(())
+	}
+
+	/// Recompute [`has_suspect_segments`](Self::has_suspect_segments) from the
+	/// records on disk, after a quarantine change.
+	async fn refresh_suspect_present(&self) -> Result<()> {
+		let suspect = self.quarantine_list(None).await?.iter().any(|record| record.class == QuarantineClass::Suspect);
+		self.suspect_present.store(suspect, Ordering::Relaxed);
+		Ok(())
+	}
+
+	/// Startup recovery and the fsck pass, in one: classify every indexed frame
+	/// and every orphan under `segments/`, under the C5 policy.
+	///
+	/// For each indexed row, in aspect order:
+	/// - a row whose path escapes `segments/` is left exactly where it is and
+	///   counted as skipped: recovery never moves a file it cannot contain
+	///   (the migration precheck already refuses such a store at open, so this
+	///   is defence in depth for a row written after the open);
+	/// - a row whose file is missing is corrupt-quarantined: the record is
+	///   written and the row deleted, and there is no file to move;
+	/// - a row whose file fails to decode is quarantined under
+	///   [`classify_decode_failure`]: corrupt files move to
+	///   `segments/quarantine/` and their rows are deleted, suspect files move
+	///   the same way and are never TTL-purged, and a newer-format cause also
+	///   sets `incompatible_store` on the report;
+	/// - a row whose file decodes is re-bound to its frame's key where it
+	///   differs: its generation and adoption order from the frame's file name,
+	///   and the frame's own CRC trailer when the row's `frame_crc` is unset or
+	///   disagrees with it. An aspect re-bind moves the row to the aspect the
+	///   frame's name names. A row that already matches its frame is untouched.
+	///
+	/// Then, for each aspect, R10 seeds `aspect_seq.next_series_id` past the
+	/// largest series id any row holds, and the aspect's rollup is rebuilt when
+	/// the pass changed its rows. Orphan `.weftseg` files — no index row and no
+	/// journal entry claims them — are counted; one that fails to decode is
+	/// quarantined the same way (a decodable orphan is left where it is: with
+	/// no row behind it there is no id to adopt it under, and adoption is a
+	/// later slice's job). Finally the TTL purge runs over pre-existing corrupt
+	/// records.
+	///
+	/// With `report_only` the pass counts everything it would do and changes
+	/// nothing: no record, no row delete, no move, no seed, no purge, no rollup
+	/// rebuild. That is the pass a newer-layout store gets at open, where
+	/// recovery must not quarantine, adopt or purge anything a newer WeftDB
+	/// might understand — and the pass the fsck endpoint never uses, since an
+	/// operator asking for fsck is asking for the repair.
+	///
+	/// The report replaces the store's last one, so `/ready` reports the latest
+	/// pass, and `has_suspect_segments` follows the records left behind.
+	///
+	/// # Errors
+	///
+	/// A control-plane failure, a filesystem failure listing or moving a file, or
+	/// a rollup rebuild failure. A failure part-way leaves the store consistent —
+	/// every quarantine commits its record and its row delete together — but the
+	/// report is not stored, so `/ready` keeps reporting the previous pass.
+	pub async fn fsck(&self, report_only: bool) -> Result<RecoveryReport> {
+		let segments_dir = self.root.join("segments");
+		let quarantine_dir = segments_dir.join("quarantine");
+		let mut report = RecoveryReport { report_only, ..RecoveryReport::default() };
+		let journal_names: HashSet<String> = self.index.journal(None).await?.into_iter().map(|entry| entry.name).collect();
+		let mut live_names: HashSet<String> = HashSet::new();
+		let mut moved = false;
+		let mut changed_aspects: Vec<String> = Vec::new();
+		for aspect in self.index.list_aspects().await? {
+			let rows = self.index.rows(&aspect).await?;
+			let mut max_series_id = 0u64;
+			let mut aspect_changed = false;
+			for row in &rows {
+				report.checked += 1;
+				max_series_id = max_series_id.max(row.series_id);
+				let desc = &row.desc;
+				let Some(file_name) = Path::new(&desc.path).file_name().and_then(|name| name.to_str()) else {
+					report.skipped_outside_segments += 1;
+					continue;
+				};
+				// Containment: the row's file must be a direct child of segments/.
+				let Ok(path) = contained_file(&segments_dir, file_name) else {
+					report.skipped_outside_segments += 1;
+					continue;
+				};
+				if path != Path::new(&desc.path) {
+					// The row names its file through a different spelling (a
+					// symlinked parent, a redundant separator): recovery acts
+					// only on the contained form, and leaves such a row alone
+					// rather than moving a file it did not resolve itself.
+					report.skipped_outside_segments += 1;
+					continue;
+				}
+				live_names.insert(file_name.to_string());
+				let bytes = match tokio::fs::read(&path).await {
+					Ok(bytes) => bytes,
+					Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+						let record = QuarantineRecord { aspect: aspect.clone(), id: desc.id, gen: row.gen, name: file_name.to_string(), class: QuarantineClass::Corrupt, reason: "missing: the indexed frame is not under segments/".to_string(), min_ts: desc.min_ts, max_ts: desc.max_ts, series_id: row.series_id, quarantined_ms: now_ms(), descriptor_json: Some(QuarantinedRow { desc: desc.clone(), gen: row.gen, prec: row.prec, frame_crc: row.frame_crc, commit_epoch: row.commit_epoch, series_id: row.series_id }.to_json()) };
+						if !report_only {
+							self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineInsert { record }, IndexOp::DeleteExpected { aspect: aspect.clone(), expected: row.version() }])).await?;
+							aspect_changed = true;
+						}
+						report.quarantined += 1;
+						continue;
+					}
+					Err(error) => return Err(error).with_context(|| format!("reading segment {}", path.display())),
+				};
+				match frame_read::read_full(file_name, &bytes) {
+					Ok(_) => {
+						let computed_crc = bytes.len().checked_sub(4).map(|body| {
+							let trailer = &bytes[body..];
+							u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]])
+						});
+						let mut rebound = row.clone();
+						let mut changed = false;
+						let mut new_aspect: Option<String> = None;
+						if let Some(parsed) = frame_name::parse(file_name) {
+							if let Some(frame_aspect) = parsed.aspect() {
+								if frame_aspect != aspect {
+									// Identity mismatch: re-bind the row to the
+									// frame's key. The file stays where it is;
+									// only the row moves, to the aspect the
+									// frame's own name names.
+									new_aspect = Some(frame_aspect);
+									changed = true;
+								}
+							}
+							if parsed.gen != row.gen {
+								rebound.gen = parsed.gen;
+								changed = true;
+							}
+							if parsed.prec != row.prec.unwrap_or(0) && !(row.prec.is_none() && parsed.prec == 0) {
+								rebound.prec = Some(parsed.prec);
+								changed = true;
+							}
+						}
+						if row.frame_crc != computed_crc {
+							rebound.frame_crc = computed_crc;
+							changed = true;
+						}
+						if changed {
+							if !report_only {
+								// Same-aspect re-bind is one guarded replace: a
+								// DeleteExpected first would remove the row the
+								// ReplaceExpected then has to match, and the
+								// transaction fails with "matched 0". Only a
+								// move to a different aspect deletes then
+								// inserts.
+								let ops = match new_aspect.as_deref() {
+									Some(new_aspect) if new_aspect != aspect => vec![IndexOp::DeleteExpected { aspect: aspect.clone(), expected: row.version() }, IndexOp::InsertNew { aspect: new_aspect.to_string(), row: rebound }],
+									_ => vec![IndexOp::ReplaceExpected { aspect: aspect.clone(), expected: row.version(), row: rebound }],
+								};
+								self.commit_index(&IndexTxn::new(ops)).await?;
+								aspect_changed = true;
+							}
+							report.rebound += 1;
+						}
+					}
+					Err(error) => {
+						let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
+						let (class, newer) = match &source {
+							Some(source) => (classify_decode_failure(&bytes, source), is_newer_format(source)),
+							None => (QuarantineClass::Corrupt, false),
+						};
+						if newer {
+							report.incompatible_store = true;
+						}
+						let record = QuarantineRecord { aspect: aspect.clone(), id: desc.id, gen: row.gen, name: file_name.to_string(), class, reason: format!("{error:#}"), min_ts: desc.min_ts, max_ts: desc.max_ts, series_id: row.series_id, quarantined_ms: now_ms(), descriptor_json: Some(QuarantinedRow { desc: desc.clone(), gen: row.gen, prec: row.prec, frame_crc: row.frame_crc, commit_epoch: row.commit_epoch, series_id: row.series_id }.to_json()) };
+						if !report_only {
+							self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineInsert { record }, IndexOp::DeleteExpected { aspect: aspect.clone(), expected: row.version() }])).await?;
+							aspect_changed = true;
+							if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+								tokio::fs::create_dir_all(&quarantine_dir).await.with_context(|| format!("creating {}", quarantine_dir.display()))?;
+								let to = contained_file(&quarantine_dir, file_name)?;
+								self.fs.rename(&path, &to).await.with_context(|| format!("quarantining {} to {}", path.display(), to.display()))?;
+								moved = true;
+							}
+						}
+						match class {
+							QuarantineClass::Corrupt => report.quarantined += 1,
+							QuarantineClass::Suspect => report.suspected += 1,
+						}
+					}
+				}
+			}
+			// R10: seed next_series_id past every series id the aspect holds.
+			if !report_only {
+				self.commit_index(&IndexTxn::new(vec![IndexOp::SeedSeries { aspect: aspect.clone(), next_series_id: max_series_id.saturating_add(1).max(1) }])).await?;
+			}
+			report.seeded += 1;
+			if aspect_changed {
+				changed_aspects.push(aspect);
+			}
+		}
+		for aspect in &changed_aspects {
+			if !report_only {
+				self.rebuild_aspect_metadata(aspect).await?;
+			}
+		}
+		// Orphans: files no row and no journal entry claims.
+		let entries = self.fs.read_dir(&segments_dir).await.with_context(|| format!("listing {}", segments_dir.display()))?;
+		for entry in entries {
+			if entry.is_dir {
+				continue;
+			}
+			let name = entry.name.to_string_lossy().into_owned();
+			if !name.ends_with(".weftseg") || live_names.contains(&name) || journal_names.contains(&name) {
+				continue;
+			}
+			report.orphans += 1;
+			let path = match contained_file(&segments_dir, &name) {
+				Ok(path) => path,
+				Err(_) => continue,
+			};
+			let Ok(bytes) = tokio::fs::read(&path).await else { continue };
+			if let Err(error) = frame_read::read_full(&name, &bytes) {
+				let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
+				let (class, newer) = match &source {
+					Some(source) => (classify_decode_failure(&bytes, source), is_newer_format(source)),
+					None => (QuarantineClass::Corrupt, false),
+				};
+				if newer {
+					report.incompatible_store = true;
+				}
+				let (aspect, id, gen) = match frame_name::parse(&name).and_then(|parsed| parsed.aspect().map(|aspect| (aspect, parsed.gen))) {
+					Some((aspect, gen)) => (aspect, 0, gen),
+					None => match legacy_file_id(&name) {
+						Some((aspect, id)) => (aspect.to_string(), id, 0),
+						None => continue,
+					},
+				};
+				let record = QuarantineRecord { aspect, id, gen, name: name.clone(), class, reason: format!("orphan: no index row claims this frame: {error:#}"), min_ts: None, max_ts: None, series_id: 0, quarantined_ms: now_ms(), descriptor_json: None };
+				if !report_only {
+					self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineInsert { record }])).await?;
+					tokio::fs::create_dir_all(&quarantine_dir).await.with_context(|| format!("creating {}", quarantine_dir.display()))?;
+					let to = contained_file(&quarantine_dir, &name)?;
+					self.fs.rename(&path, &to).await.with_context(|| format!("quarantining orphan {} to {}", path.display(), to.display()))?;
+					moved = true;
+				}
+				match class {
+					QuarantineClass::Corrupt => report.quarantined += 1,
+					QuarantineClass::Suspect => report.suspected += 1,
+				}
+			}
+		}
+		if moved {
+			self.sync_segments().await?;
+		}
+		if !report_only {
+			report.purged = self.purge_expired_quarantine().await?;
+		}
+		*self.recovery.write().unwrap_or_else(PoisonError::into_inner) = report.clone();
+		self.refresh_suspect_present().await?;
+		Ok(report)
+	}
+}
+
+impl SegmentStore {
 	/// the subject-wide north-star **bytes/point** (priority #1 in the commercial
 	/// thesis) across all of this store's aspects, plus the rolled-up segment/row/null
 	/// counts and the union of the aspects' time spans.
@@ -8015,11 +8435,11 @@ mod tests {
 		assert_eq!(schemas[1], schemas[0], "the second open changes nothing the first did not");
 		assert_eq!(schemas[2], schemas[0], "nor does the third");
 
-		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into()], recovery_report_only: false };
+		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false };
 		let settled = OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: false };
 		assert_eq!(reports, vec![migrated, settled.clone(), settled], "the first open migrates from layout 1 through the registry, and the later ones find nothing pending");
 		let (format, uuid) = formats[0].clone();
-		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0003_fre14_legacy_catalog".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
+		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0004_d_s12".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
 		assert!(formats.iter().all(|seen| seen == &formats[0]), "the marker and the store's identity stay put: {formats:?}");
 		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads the marker"), Some(format));
 
@@ -8035,13 +8455,13 @@ mod tests {
 			assert!(row.contains("/var/tmp/weft-pre-v2-fixture/root/segments/"), "the stored path is left as the pre-v2 build wrote it: {row}");
 			assert!(row.ends_with(" Integer(0) Null Null Null Integer(0)"), "a legacy row is generation 0 and series 0, with no prec, frame_crc or commit_epoch: {row}");
 		}
-		for (key, value) in [("applied_through", "0003_fre14_legacy_catalog"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
+		for (key, value) in [("applied_through", "0004_d_s12"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
 			assert!(schema.contains(&format!("meta Text(\"{key}\") Text(\"{value}\")\n")), "store_meta mirrors the marker's {key}:\n{schema}");
 		}
 		assert!(uuid::Uuid::parse_str(&uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
 		let migrations: Vec<&str> = schema.lines().filter_map(|line| line.strip_prefix("migration ")).collect();
-		assert_eq!(migrations.len(), 3, "{schema}");
-		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) "), "{migrations:?}");
+		assert_eq!(migrations.len(), 4, "{schema}");
+		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) "), "{migrations:?}");
 	}
 
 	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
@@ -8115,9 +8535,9 @@ mod tests {
 		let (last, databases) = &markers[1];
 		assert_eq!(databases, &CONTROL_PLANE_FILES.to_vec(), "the final marker follows the databases");
 		assert_eq!(last, &format);
-		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0003_fre14_legacy_catalog".into()), ..first.clone() }, "the final marker is the first, settled");
+		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0004_d_s12".into()), ..first.clone() }, "the final marker is the first, settled");
 		assert_eq!((format.store_uuid.as_str(), &format.scope), (uuid.as_str(), &StoreScope { database: "market".into(), subject: "BTCUSD".into() }));
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false });
 		let reopened = SegmentStore::open_scoped(&root, "market", "BTCUSD").await.expect("reopens");
 		let again = (reopened.open_report().created_new, reopened.store_uuid().to_string());
 		drop(reopened);
@@ -8179,7 +8599,7 @@ mod tests {
 		let applied = store.open_report().applied.clone();
 		let reads = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
-		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog"]);
+		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12"]);
 		assert!(before.contains("store_migrations") && before.contains("0002_s6_s7"), "{before}");
 		assert_eq!(after, before, "a second run of every migration changed nothing");
 		assert!(applied.is_empty(), "nothing is pending: {applied:?}");
@@ -8358,7 +8778,7 @@ mod tests {
 				let settled = store.store_format();
 				let reads = if legacy { Some(fixture_reads(&store).await) } else { None };
 				drop(store);
-				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0003_fre14_legacy_catalog")), "{}", image.display());
+				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0004_d_s12")), "{}", image.display());
 				if let Some(reads) = reads {
 					assert_eq!(reads, expected_reads, "{}: the image reads what the fixture holds", image.display());
 				}
@@ -8520,7 +8940,7 @@ mod tests {
 		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
 		let schema = index_schema(&root).await;
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false });
 		assert_eq!(kept, uuid, "the S6 store_uuid is kept");
 		assert!(schema.contains("| Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains series_id (NOT NULL DEFAULT 0):\n{schema}");
 		assert!(schema.contains("| Text(\"next_series_id\") Text(\"INTEGER\") Integer(1) Text(\"1\") Integer(0)\n"), "aspect_seq gains next_series_id (NOT NULL DEFAULT 1):\n{schema}");
@@ -8545,7 +8965,7 @@ mod tests {
 		let store = SegmentStore::open(&root).await.expect("finishes the creation");
 		let (report, uuid) = (store.open_report().clone(), store.store_uuid().to_string());
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false });
 		assert_eq!(uuid, format.store_uuid);
 
 		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
@@ -8556,7 +8976,7 @@ mod tests {
 		let store = SegmentStore::open(&legacy).await.expect("finishes the upgrade");
 		let report = store.open_report().clone();
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false });
 	}
 
 	/// FRE-12a's `ensure_floor`: raising a floor writes the marker first, fsynced, and
@@ -9352,6 +9772,181 @@ mod tests {
 		for other in ["price.weftseg", "price-.weftseg", "-3.weftseg", "price-1x.weftseg", "price-1.weftseg.tmp", "price-1.txt", "price~g1~p1.weftseg", "LOCK"] {
 			assert_eq!(legacy_file_id(other), None, "{other}");
 		}
+	}
+
+	/// D-S12: startup recovery quarantines a frame damaged after its seal: the row
+	/// is gone from reads, the file is under `segments/quarantine/`, and the record
+	/// says corrupt with the segment's time span and series id.
+	#[tokio::test]
+	async fn startup_recovery_quarantines_a_corrupt_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let descriptor = store.seal("price", &schema(), &[0, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("seals");
+		let frame = PathBuf::from(&descriptor.path);
+		drop(store);
+		// Damage a value byte mid-frame, leaving the trailer stale: CRC fails.
+		let mut bytes = std::fs::read(&frame).expect("reads frame");
+		let middle = bytes.len() / 2;
+		bytes[middle] ^= 0xff;
+		std::fs::write(&frame, &bytes).expect("damages frame");
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!(report.checked, 1, "one row examined");
+		assert_eq!(report.quarantined, 1, "the damaged frame quarantines as corrupt");
+		assert_eq!(report.suspected, 0);
+		assert!(!report.incompatible_store);
+		let records = store.quarantine_list(Some("price")).await.expect("lists");
+		assert_eq!(records.len(), 1);
+		assert_eq!(records[0].class, crate::QuarantineClass::Corrupt);
+		assert_eq!((records[0].min_ts, records[0].max_ts), (Some(0), Some(20)));
+		assert_eq!(records[0].series_id, 0);
+		assert_eq!(store.segment_count("price").await.expect("counts"), 0, "the row is gone from reads");
+		assert!(dir.path().join("segments/quarantine").join(frame.file_name().unwrap()).exists(), "the file moved under segments/quarantine/");
+		assert!(!frame.exists(), "the file no longer sits in segments/");
+	}
+
+	/// D-S12: a frame whose CRC verifies but whose version this build predates is
+	/// suspect, never auto-purged, and makes the report incompatible: the version
+	/// field is re-stamped with its trailer, so the CRC verifies while the version
+	/// check is what fails.
+	#[tokio::test]
+	async fn startup_recovery_suspects_a_newer_format_frame_and_never_ttl_purges_it() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let descriptor = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let frame = PathBuf::from(&descriptor.path);
+		drop(store);
+		let mut bytes = std::fs::read(&frame).expect("reads frame");
+		// A frame header is 7 magic bytes, then the u16 version; re-stamp the
+		// trailer so the CRC verifies and the version check is what fails.
+		bytes[7..9].copy_from_slice(&99u16.to_le_bytes());
+		let body = bytes.len() - 4;
+		let checksum = weft_physical_type::crc32(&bytes[..body]);
+		bytes[body..].copy_from_slice(&checksum.to_le_bytes());
+		std::fs::write(&frame, &bytes).expect("rewrites frame");
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!(report.suspected, 1, "a newer-format frame is suspect, not corrupt");
+		assert_eq!(report.quarantined, 0);
+		assert!(report.incompatible_store, "a newer-format cause reports incompatible_store");
+		assert!(store.has_suspect_segments());
+		// TTL purge must not touch a suspect record, however old it is: age it by
+		// rewriting its record, then purge.
+		let mut record = store.quarantine_list(Some("price")).await.expect("lists").into_iter().next().expect("one record");
+		record.quarantined_ms = 0;
+		store.commit_index(&crate::types::index_txn::IndexTxn::new(vec![crate::types::index_txn::IndexOp::QuarantineInsert { record }])).await.expect("ages record");
+		assert_eq!(store.purge_expired_quarantine().await.expect("purges"), 0, "suspect records never TTL-purge");
+		assert_eq!(store.quarantine_list(Some("price")).await.expect("lists").len(), 1);
+	}
+
+	/// D-S12: a missing indexed file quarantines as corrupt and reads as gone, and
+	/// its record carries the row back for a release.
+	#[tokio::test]
+	async fn startup_recovery_quarantines_a_missing_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let descriptor = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let frame = PathBuf::from(&descriptor.path);
+		drop(store);
+		std::fs::remove_file(&frame).expect("deletes frame");
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		assert_eq!(store.recovery_report().quarantined, 1);
+		let records = store.quarantine_list(Some("price")).await.expect("lists");
+		assert_eq!(records.len(), 1);
+		assert!(records[0].descriptor_json.is_some(), "the record carries the row back");
+		assert_eq!(store.segment_count("price").await.expect("counts"), 0);
+	}
+
+	/// D-S12: report-only recovery counts but changes nothing — no record, no row
+	/// delete, no move — while the repair pass on the same damage quarantines.
+	#[tokio::test]
+	async fn report_only_recovery_counts_without_changing_anything() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let descriptor = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let frame = PathBuf::from(&descriptor.path);
+		let mut bytes = std::fs::read(&frame).expect("reads frame");
+		let middle = bytes.len() / 2;
+		bytes[middle] ^= 0xff;
+		std::fs::write(&frame, &bytes).expect("damages frame");
+		let report = store.fsck(true).await.expect("report-only fsck");
+		assert!(report.report_only);
+		assert_eq!(report.quarantined, 1, "report-only counts the corrupt frame");
+		assert_eq!(store.segment_count("price").await.expect("counts"), 1, "report-only deletes no row");
+		assert_eq!(store.quarantine_list(Some("price")).await.expect("lists").len(), 0, "report-only writes no record");
+		assert!(frame.exists(), "report-only moves no file");
+		let report = store.fsck(false).await.expect("repair fsck");
+		assert_eq!(report.quarantined, 1, "the repair pass quarantines the same frame");
+		assert_eq!(store.segment_count("price").await.expect("counts"), 0);
+	}
+
+	/// D-S12: fsck binds a row's frame_crc when it is unset, and the next pass
+	/// finds nothing to re-bind.
+	#[tokio::test]
+	async fn fsck_binds_an_unset_frame_crc() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let rows = store.index().rows("price").await.expect("rows");
+		assert_eq!(rows.len(), 1);
+		// Clear the bound CRC through a guarded replace, to simulate a row from
+		// before binding, then fsck must re-bind it to the frame's trailer.
+		let mut row = rows.into_iter().next().expect("row");
+		let expected = row.version();
+		row.frame_crc = None;
+		store.commit_index(&crate::types::index_txn::IndexTxn::new(vec![crate::types::index_txn::IndexOp::ReplaceExpected { aspect: "price".to_string(), expected, row }])).await.expect("clears crc");
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!(report.rebound, 1, "the unset CRC is re-bound to the frame's trailer");
+		let rows = store.index().rows("price").await.expect("rows");
+		assert!(rows[0].frame_crc.is_some());
+		let report = store.fsck(false).await.expect("fsck again");
+		assert_eq!(report.rebound, 0, "a bound row is untouched");
+	}
+
+	/// D-S12: a clean shutdown marks the flag the next open reports, and a
+	/// second open after no clean shutdown reports the crash.
+	#[tokio::test]
+	async fn clean_shutdown_flag_survives_one_reopen_only() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		assert!(!store.previous_clean_shutdown(), "no process ever marked this store clean");
+		store.mark_clean_shutdown().await.expect("marks clean");
+		drop(store);
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		assert!(store.previous_clean_shutdown(), "the clean shutdown is reported once");
+		drop(store);
+		let store = SegmentStore::open(dir.path()).await.expect("reopens again");
+		assert!(!store.previous_clean_shutdown(), "an open without a clean shutdown resets the flag");
+	}
+
+	/// D-S12: the TTL purge removes an expired corrupt record and its file, and
+	/// leaves a fresh corrupt record alone.
+	#[tokio::test]
+	async fn ttl_purge_removes_only_expired_corrupt_records() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let first = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let second = store.seal("price", &schema(), &[20, 30], &[bd("3"), bd("4")]).await.expect("seals");
+		for descriptor in [&first, &second] {
+			let frame = PathBuf::from(&descriptor.path);
+			let mut bytes = std::fs::read(&frame).expect("reads frame");
+			let middle = bytes.len() / 2;
+			bytes[middle] ^= 0xff;
+			std::fs::write(&frame, &bytes).expect("damages frame");
+		}
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!(report.quarantined, 2);
+		// Age only the first record past the TTL.
+		let mut records = store.quarantine_list(Some("price")).await.expect("lists");
+		assert_eq!(records.len(), 2);
+		records[0].quarantined_ms = 0;
+		store.commit_index(&crate::types::index_txn::IndexTxn::new(vec![crate::types::index_txn::IndexOp::QuarantineInsert { record: records[0].clone() }])).await.expect("ages record");
+		let purged = store.purge_expired_quarantine().await.expect("purges");
+		assert_eq!(purged, 1, "only the expired record purges");
+		let remaining = store.quarantine_list(Some("price")).await.expect("lists");
+		assert_eq!(remaining.len(), 1);
+		assert!(!dir.path().join("segments/quarantine").join(Path::new(&first.path).file_name().unwrap()).exists(), "the purged file is unlinked");
+		assert!(dir.path().join("segments/quarantine").join(Path::new(&second.path).file_name().unwrap()).exists(), "the fresh record's file stays");
 	}
 }
 

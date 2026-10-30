@@ -439,6 +439,80 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 	Ok((StatusCode::OK, Json(CompactResponse { aspect, removed, segment_count })).into_response())
 }
 
+/// Query parameters for `GET /api/v1/storage/quarantine`: restrict the listing to
+/// one aspect when present, list every aspect when absent.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct QuarantineParams {
+	/// The aspect to list, when present.
+	pub aspect: Option<String>,
+}
+
+/// Handle `POST /api/v1/storage/fsck`: run the recovery pass now, with repair
+/// (never report-only: an operator asking for fsck is asking for the repair),
+/// and answer with its counts. The same pass runs at startup, where a
+/// newer-layout store gets the report-only form instead.
+pub async fn fsck_store(State(state): State<AppState>) -> Result<Json<weftdb::RecoveryReport>, ApiError> {
+	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	drop(state);
+	let report = store.fsck(false).await.map_err(|err| maintenance_error(&err))?;
+	drop(store);
+	Ok(Json(report))
+}
+
+/// Handle `GET /api/v1/storage/quarantine`: list the quarantine records, of one
+/// aspect for `?aspect=` or of every aspect without it. Records, not segment
+/// contents: the listing names what recovery removed and why, and the file
+/// under `segments/quarantine/` is what an operator inspects.
+pub async fn quarantine_list(State(state): State<AppState>, StrictQuery(params): StrictQuery<QuarantineParams>) -> Result<Json<Vec<weftdb::QuarantineRecord>>, ApiError> {
+	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	drop(state);
+	let records = store.quarantine_list(params.aspect.as_deref()).await.map_err(|err| maintenance_error(&err))?;
+	drop(store);
+	Ok(Json(records))
+}
+
+/// Handle `POST /api/v1/storage/quarantine/{aspect}/{id}/{gen}/release`: put one
+/// quarantined segment back into reads, exactly as quarantine recorded it. A
+/// record that does not exist is a 404, following the backup routes' precedent
+/// for a missing named resource.
+pub async fn quarantine_release(State(state): State<AppState>, Path((aspect, id, gen)): Path<(String, u64, u64)>) -> Result<Json<weftdb::QuarantineRecord>, ApiError> {
+	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	drop(state);
+	let record = store.quarantine_release(&aspect, id, gen).await.map_err(|err| if err.to_string().starts_with("no quarantine record") { ApiError::aspect_not_found(err.to_string()) } else { maintenance_error(&err) })?;
+	drop(store);
+	Ok(Json(record))
+}
+
+/// Handle `POST /api/v1/storage/quarantine/{aspect}/{id}/{gen}/purge`: delete one
+/// quarantine record and unlink its file, of either class. The operator's
+/// explicit purge is the only purge a suspect record ever gets.
+pub async fn quarantine_purge(State(state): State<AppState>, Path((aspect, id, gen)): Path<(String, u64, u64)>) -> Result<Json<weftdb::QuarantineRecord>, ApiError> {
+	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	drop(state);
+	let record = store.quarantine_purge(&aspect, id, gen).await.map_err(|err| if err.to_string().starts_with("no quarantine record") { ApiError::aspect_not_found(err.to_string()) } else { maintenance_error(&err) })?;
+	drop(store);
+	Ok(Json(record))
+}
+
+/// Response body for `POST /api/v1/storage/quarantine/purge-expired`: how many
+/// corrupt records passed their TTL and were purged. Suspect records are never
+/// counted here, however old they are.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurgeExpiredResponse {
+	/// Corrupt quarantine records purged by this call.
+	pub purged: usize,
+}
+
+/// Handle `POST /api/v1/storage/quarantine/purge-expired`: purge every corrupt
+/// quarantine record whose TTL has passed, and report how many went.
+pub async fn purge_expired_quarantine(State(state): State<AppState>) -> Result<Json<PurgeExpiredResponse>, ApiError> {
+	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	drop(state);
+	let purged = store.purge_expired_quarantine().await.map_err(|err| maintenance_error(&err))?;
+	drop(store);
+	Ok(Json(PurgeExpiredResponse { purged }))
+}
+
 #[cfg(test)]
 
 mod tests {
@@ -863,5 +937,110 @@ mod tests {
 		let router = app_with_state(AppState::new());
 		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/reconcile").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	/// D-S12, end to end: a newer-format frame quarantines as suspect at startup,
+	/// `/ready` answers 503 with the store report, reads carry `Weft-Incomplete`,
+	/// and an operator release puts the segment back.
+	#[tokio::test]
+	async fn ready_reports_incompatible_store_and_reads_carry_weft_incomplete() {
+		use std::str::FromStr as _;
+
+		use bigdecimal::BigDecimal;
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("price", &weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, BigDecimal::from_str("0").unwrap(), weft_physical_type::TimeUnit::Seconds)).await.expect("declares");
+		let descriptor = store.seal("price", &weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, BigDecimal::from_str("0").unwrap(), weft_physical_type::TimeUnit::Seconds), &[0, 10], &[BigDecimal::from_str("1").unwrap(), BigDecimal::from_str("2").unwrap()]).await.expect("seals");
+		let frame = std::path::PathBuf::from(&descriptor.path);
+		drop(store);
+		// Re-stamp the version with a valid trailer: CRC verifies, version fails.
+		let mut bytes = std::fs::read(&frame).unwrap();
+		bytes[7..9].copy_from_slice(&99u16.to_le_bytes());
+		let body = bytes.len() - 4;
+		let checksum = weft_physical_type::crc32(&bytes[..body]);
+		bytes[body..].copy_from_slice(&checksum.to_le_bytes());
+		std::fs::write(&frame, &bytes).unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("reopens"));
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let (status, body) = crate::test_support::get_json(router.clone(), "/ready").await;
+		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "a newer-format store is not ready");
+		assert_eq!(body["ready"], false);
+		assert_eq!(body["incompatible_store"], true);
+		assert_eq!(body["suspect"], 1);
+		assert_eq!(body["segment_store"], true);
+		// The durability class is platform-defined: "full" where a seal can
+		// fsync its directory entry, "process-crash-only" on Windows, where
+		// directory fsync is a no-op. A hard-coded "full" fails Windows CI.
+		let expected_class = if cfg!(windows) { "process-crash-only" } else { "full" };
+		assert_eq!(body["durability_class"], expected_class);
+		assert_eq!(body["previous_clean_shutdown"], false);
+		assert!(body["store_uuid"].is_string(), "the report carries the store identity");
+		let (status, body) = crate::test_support::get_json(router.clone(), "/api/v1/storage/quarantine").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body.as_array().map(Vec::len), Some(1));
+		assert_eq!(body[0]["class"], "suspect");
+		// The suspect segment is removed from reads, so the range answer carries
+		// the incomplete header.
+		let response = router.clone().oneshot(Request::builder().uri("/api/v1/storage/price/range?start=0&end=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		assert_eq!(response.headers().get("Weft-Incomplete").and_then(|value| value.to_str().ok()), Some("true"));
+		// Release puts the row back: the record is gone, and the next read no
+		// longer carries the header — though this build still cannot decode the
+		// newer-format frame itself, which is the operator's bargain in
+		// releasing a suspect segment.
+		let (status, _) = crate::test_support::post_empty(router.clone(), "/api/v1/storage/quarantine/price/0/1/release").await;
+		assert_eq!(status, StatusCode::OK, "release restores the segment");
+		let (status, body) = crate::test_support::get_json(router.clone(), "/api/v1/storage/quarantine").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body.as_array().map(Vec::len), Some(0), "the record is gone after release");
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/price/range?start=0&end=100").body(Body::empty()).unwrap()).await.unwrap();
+		assert!(response.headers().get("Weft-Incomplete").is_none(), "no suspect record, no header");
+		drop(store);
+	}
+
+	/// D-S12: the fsck endpoint repairs a damaged frame on demand, and the
+	/// quarantine listing then names it.
+	#[tokio::test]
+	async fn fsck_endpoint_quarantines_a_damaged_frame() {
+		use std::str::FromStr as _;
+
+		use bigdecimal::BigDecimal;
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		let schema = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, BigDecimal::from_str("0").unwrap(), weft_physical_type::TimeUnit::Seconds);
+		store.declare("price", &schema).await.expect("declares");
+		let descriptor = store.seal("price", &schema, &[0, 10], &[BigDecimal::from_str("1").unwrap(), BigDecimal::from_str("2").unwrap()]).await.expect("seals");
+		let frame = std::path::PathBuf::from(&descriptor.path);
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let mut bytes = std::fs::read(&frame).unwrap();
+		let middle = bytes.len() / 2;
+		bytes[middle] ^= 0xff;
+		std::fs::write(&frame, &bytes).unwrap();
+		let (status, body) = crate::test_support::post_empty(router.clone(), "/api/v1/storage/fsck").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body["quarantined"], 1, "fsck quarantines the damaged frame");
+		assert_eq!(body["report_only"], false, "the endpoint repairs, never report-only");
+		let (status, body) = crate::test_support::get_json(router.clone(), "/api/v1/storage/quarantine?aspect=price").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body.as_array().map(Vec::len), Some(1));
+		assert_eq!(body[0]["class"], "corrupt");
+		let (status, _) = crate::test_support::post_empty(router, "/api/v1/storage/quarantine/price/0/1/purge").await;
+		assert_eq!(status, StatusCode::OK, "an operator purge removes a corrupt record");
+		drop(store);
+	}
+
+	/// D-S12: fsck and quarantine routes without a store are unavailable, and a
+	/// release of a record that does not exist is a 404.
+	#[tokio::test]
+	async fn quarantine_routes_without_store_are_unavailable_and_missing_release_is_not_found() {
+		let router = app_with_state(AppState::new());
+		let response = router.clone().oneshot(Request::builder().method("POST").uri("/api/v1/storage/fsck").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+		let response = router.clone().oneshot(Request::builder().uri("/api/v1/storage/quarantine").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+		let dir = TempDir::new().unwrap();
+		let router = router_with_empty_store(&dir).await;
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/quarantine/price/0/1/release").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::NOT_FOUND);
 	}
 }

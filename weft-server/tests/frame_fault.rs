@@ -1,18 +1,18 @@
 //! What a client gets when a frame on disk cannot be decoded.
 //!
-//! X-ERR gave `frame_undecodable` a sentence and X-FRAME gave it a producer, and this file is
-//! where the two meet. It cannot be a unit test: `weftdb::FrameFaultError` has no public
+//! It cannot be a unit test: `weftdb::FrameFaultError` has no public
 //! constructor and `WeftSegError` is `#[non_exhaustive]`, precisely so that a status cannot be
 //! invented here — the only way to reach these branches is a real file the store cannot read.
 //!
-//! The two cases are the two halves of plan `C5`. Damage is the store's problem and not the
-//! caller's, so it is `500 frame_undecodable` with the `integrity` class: the request was fine,
-//! the file is not, and quarantining it is a storage-layer decision that belongs to the slice
-//! which verifies frames on read. A frame written by a newer build is the *binary's* problem, so
-//! it is `503 incompatible_store` with the `newer_format` class — the same store answers as soon
-//! as the server is updated, which is why the code is the one `/ready` already uses to say "this
-//! store needs a newer server". Neither answer is derived from the decoder's wording: the class
-//! comes from the fault object, and the sentence stays the fixed one X-ERR chose.
+//! Before D-S12 these two cases answered at read time (`500 frame_undecodable` for damage,
+//! `503 incompatible_store` for a newer build). D-S12 supersedes that contract: startup
+//! recovery (plan `C5`, §5 D-S12) quarantines the frame when the store opens, so the read
+//! itself no longer meets the fault. Damage quarantines as corrupt and the read answers
+//! `200` with the segment gone; a newer build quarantines as suspect, the read answers
+//! `200` carrying `Weft-Incomplete`, and `/ready` answers `503 incompatible_store` — the
+//! store answers as soon as the server is updated, which is why that code is the one
+//! `/ready` uses to say "this store needs a newer server". Neither classification is
+//! derived from the decoder's wording: the class comes from the fault object.
 
 use std::{
 	fs, path::{Path, PathBuf}, sync::Arc
@@ -57,18 +57,24 @@ fn write_frame(path: &Path, bytes: &[u8]) {
 	fs::write(path, bytes).expect("writes the frame back");
 }
 
-/// `GET` the range that covers the sealed points, and return the status plus the JSON body.
-async fn read_range(dir: &Path) -> (StatusCode, serde_json::Value) {
+/// Re-open the store (running startup recovery) and serve it: the router the
+/// tests below share, so `/ready` and the read see the same recovery pass.
+async fn serve(dir: &Path) -> axum::Router {
 	let store = SegmentStore::open(dir).await.expect("re-opens the store");
-	let router = app_with_state(AppState::new().with_store(Arc::new(store)));
-	let response = router.oneshot(Request::builder().method("GET").uri("/api/v1/storage/price/points?start=0&end=100").body(Body::empty()).expect("builds the request")).await.expect("answers");
+	app_with_state(AppState::new().with_store(Arc::new(store)))
+}
+
+/// `GET` a path on `router`, returning status, headers and the JSON body.
+async fn get(router: &axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+	let response = router.clone().oneshot(Request::builder().method("GET").uri(uri).body(Body::empty()).expect("builds the request")).await.expect("answers");
 	let status = response.status();
+	let headers = response.headers().clone();
 	let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("reads the body");
-	(status, serde_json::from_slice(&bytes).expect("a JSON body"))
+	(status, headers, serde_json::from_slice(&bytes).expect("a JSON body"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frame_that_fails_its_checksum_answers_500_frame_undecodable() {
+async fn a_frame_that_fails_its_checksum_is_quarantined_at_startup_and_reads_empty() {
 	let dir = tempfile::TempDir::new().expect("tempdir");
 	seal_one_frame(dir.path()).await;
 	let frame = only_frame(dir.path());
@@ -80,18 +86,26 @@ async fn a_frame_that_fails_its_checksum_answers_500_frame_undecodable() {
 	bytes[middle] ^= 0xff;
 	write_frame(&frame, &bytes);
 
-	let (status, body) = read_range(dir.path()).await;
-	assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "damaged data on disk is a server fault, not a bad request: {body}");
-	assert_eq!(body["code"], "frame_undecodable", "{body}");
-	assert_eq!(body["details"]["fault"], "integrity", "the fault class is what the caller branches on: {body}");
-	assert_eq!(body["error"], "the server could not decode data it has on disk", "the sentence is X-ERR's fixed one, not the decoder's: {body}");
-	// The decoder's own words are kept for the log, and the envelope's `error` field is not the
-	// place they leak: this asserts the sanitisation rule holds on this path too.
-	assert!(!body["error"].as_str().unwrap_or_default().contains("weftseg"), "the path does not belong in the body: {body}");
+	// Startup recovery quarantines the corrupt segment, so the read no longer
+	// meets the fault: it answers 200 with the segment gone.
+	let router = serve(dir.path()).await;
+	let (status, headers, body) = get(&router, "/api/v1/storage/price/points?start=0&end=100").await;
+	assert_eq!(status, StatusCode::OK, "a quarantined segment is gone from reads: {body}");
+	assert_eq!(body["points"], serde_json::json!([]), "{body}");
+	assert_eq!(body["total"], 0, "{body}");
+	assert!(headers.get("Weft-Incomplete").is_none(), "corrupt-only quarantine carries no incomplete header");
+	// `/ready` counts the quarantine and stays ready: corruption is not a
+	// version condition.
+	let (status, _, body) = get(&router, "/ready").await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["quarantined"], 1, "{body}");
+	assert_eq!(body["suspect"], 0, "{body}");
+	assert_eq!(body["incompatible_store"], false, "{body}");
+	assert_eq!(body["ready"], true, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_frame_from_a_newer_build_answers_503_incompatible_store() {
+async fn a_frame_from_a_newer_build_is_suspect_at_startup_and_ready_reports_incompatible() {
 	let dir = tempfile::TempDir::new().expect("tempdir");
 	seal_one_frame(dir.path()).await;
 	let frame = only_frame(dir.path());
@@ -108,8 +122,17 @@ async fn a_frame_from_a_newer_build_answers_503_incompatible_store() {
 	bytes[end..].copy_from_slice(&stamped);
 	write_frame(&frame, &bytes);
 
-	let (status, body) = read_range(dir.path()).await;
+	// Startup recovery quarantines the newer-format frame as suspect: the read
+	// answers 200 with the segment gone and carries `Weft-Incomplete`, and
+	// `/ready` answers 503 with the store report.
+	let router = serve(dir.path()).await;
+	let (status, headers, body) = get(&router, "/api/v1/storage/price/points?start=0&end=100").await;
+	assert_eq!(status, StatusCode::OK, "a quarantined segment is gone from reads: {body}");
+	assert_eq!(body["points"], serde_json::json!([]), "{body}");
+	assert_eq!(headers.get("Weft-Incomplete").and_then(|value| value.to_str().ok()), Some("true"), "a suspect record makes reads incomplete");
+	let (status, _, body) = get(&router, "/ready").await;
 	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "a store this binary cannot read is a store/version condition: {body}");
-	assert_eq!(body["code"], "incompatible_store", "{body}");
-	assert_eq!(body["details"]["fault"], "newer_format", "the class says the binary is what is behind: {body}");
+	assert_eq!(body["ready"], false, "{body}");
+	assert_eq!(body["incompatible_store"], true, "{body}");
+	assert_eq!(body["suspect"], 1, "{body}");
 }
