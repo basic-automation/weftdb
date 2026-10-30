@@ -4,6 +4,45 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — EVI-15: where the first cross-engine report ran, and what it may claim
+
+**Ambiguous:** EVI-15 (#244) is "First cross-engine report". Decision 18 fixes the matrix (WeftDB
+stored, in-memory and `f64` against DuckDB `DOUBLE` and `DECIMAL`, on MCAR, block missingness and
+UCI, at three scales), and decision 19 recommends a priced cloud NVMe instance for the report.
+Nothing says what to do when a run is disturbed, how many runs make a report, or where the report
+lives.
+
+**Chosen:**
+
+- **The reference SSD, not cloud.** At the operator's direction the report ran on `/mnt/weftbench`
+  on the project machine. It has no hourly-cost field, so the report makes no cost-per-query claim;
+  a priced rerun is a later report, not a condition of this one.
+- **The report is committed** at `bench/reports/evi-15/`: `xbench.json`, the rendered `report.md`
+  and `report.html`, a README with host, commit, input checksum and reproduction, and
+  `scripts/xbench/fetch-uci.py` to fetch the UCI zip against its SHA-256. The UCI data is not
+  redistributed.
+- **A disturbed run is re-run whole and disclosed, not patched.** The first run's
+  `mcar-medium` / `weftdb-stored-f64` load took 5.3, 61 and 140 s for a load that took 5.2 s
+  ± 0.1 on the identical arm beside it; with three load reps the stall was the median. The whole
+  matrix was re-run once with 5 load reps, and the first run is kept beside the report as
+  `discarded-run-1.json`.
+- **What may be claimed is what two runs agree on.** Comparing the runs showed that the within-run
+  bootstrap intervals understate run-to-run variation: 53 of 144 rows had disjoint p50 intervals
+  between runs. 79 of 90 verdicts agreed, none crossed between win and loss, and the 11 that changed
+  all had margins of 1.4× or less. `HONESTY.md` quotes only verdicts that held in both runs, and says
+  that WeftDB's wins hold only at `tiny` and `small` scale.
+- **Renderer fix.** The "not tested" list still named downsampling as WeftDB-only; EVI-14 added a
+  cross-engine downsample, so it now names gap fill and point and range reads only.
+
+**Rejected:**
+
+- Reporting the first run with the stalled row dropped or replaced: choosing which reps count after
+  seeing them is the cherry-picking the honesty section exists to prevent.
+- Widening the renderer's intervals to cover between-run variation in this slice: that needs
+  several independent runs per report, which is fair-protocol depth (roadmap 1.1), not a renderer
+  change.
+- Waiting for cloud hardware: the operator chose this host, and the report says what it lacks.
+
 ## 2026-10-29 — EVI-14: what the second DuckDB slice adds, and the arms it changes
 
 **Ambiguous:** EVI-14 (#293) is "DuckDB adapter II: downsample, storage bytes, DECIMAL arm, nightly

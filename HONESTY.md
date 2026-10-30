@@ -5,8 +5,8 @@ not mean. Each claim below links to the code, benchmark or measurement it rests 
 sentence disagree, the link wins and this page is wrong; please open an issue.
 
 These are the first four of the six honesty pages in the commercial thesis (evidence track
-EVI-16). *When WeftDB beats general TSDBs* and *GPU tuning and economics* follow in EVI-17, once the
-cross-engine report has a run on the reference host. The narrative is the project owner's to
+EVI-16). *When WeftDB beats general TSDBs* and *GPU tuning and economics* follow in EVI-17, built
+on the first cross-engine report ([`bench/reports/evi-15/`](bench/reports/evi-15/README.md)). The narrative is the project owner's to
 approve before it is published anywhere else.
 
 - [When WeftDB is not the right tool](#when-weftdb-is-not-the-right-tool)
@@ -26,22 +26,28 @@ no authentication, no RBAC and no audit log. They are 1.0 release criteria, not 
 (see the README's *Project status* and `ROADMAP.md`). Pre-1.0, WeftDB should run only on an
 isolated network.
 
-**Your workload is bulk loading.** On the cross-engine runs (2026-10-29, `weft-xbench`, see
-`DECISIONS.md` EVI-13 and EVI-14), DuckDB loaded the same series faster at every scale. At `medium`
-(about 600k rows), WeftDB sealing **one segment** (the like-for-like shape of DuckDB's single bulk
-append and checkpoint) took 959 ms against DuckDB's 202 ms, **about 5× slower**. In the 1,024-row
-segments WeftDB's stored read path is measured on, it took 5.1 s, about 25× slower. WeftDB's store
-did come out about 15–25% smaller on disk: 6.7–7.2 bytes per point against 8.2–8.7.
+**Your workload is bulk loading.** In the first cross-engine report (EVI-15,
+[`bench/reports/evi-15/`](bench/reports/evi-15/README.md), run on the reference SSD), DuckDB loaded
+the same series faster on every dataset at every scale. At `medium` (about 600k rows of MCAR data),
+WeftDB sealing **one segment** (the like-for-like shape of DuckDB's single bulk append and
+checkpoint) took 964 ms against DuckDB's 204 ms, **about 5× slower**. In the 1,024-row segments
+WeftDB's stored read path is measured on, it took 5.6 s, about 27× slower. WeftDB's store did come
+out smaller on disk: 6.6–7.2 bytes per point against 8.2–8.7 on the synthetic series, and 1.4–1.9
+against 3.1 on the real UCI household-power series, about half of DuckDB's.
 
-**Your workload is bucketed aggregation over stored data.** In the same run, DuckDB computed
-per-minute count, min, max and avg over the `medium` series in 4.5 ms, against 13.5 ms for WeftDB's
-stored downsample (7.5 ms in memory), **about 3× slower**.
+**Your workload is bucketed aggregation over stored data.** In the same report, DuckDB computed
+per-minute count, min, max and avg over the `medium` MCAR series in 5.4 ms, against 17.9 ms for
+WeftDB's stored downsample (7.9 ms in memory), **about 3× slower**. WeftDB's stored downsample lost
+on every `small` and `medium` dataset.
 
-**Your series are large and you need exact-decimal output.** In the same run, at `medium` scale
-(about 600k input points into an 86,401-point grid), DuckDB's hand-written linear interpolation in
-SQL was **about 3–4× faster** than WeftDB returning `BigDecimal` points: 45.8 ms against 139.7 ms
-in memory and 174.6 ms from storage. WeftDB's `f64` output path was level with DuckDB there and
-ahead at smaller sizes. If you need exact decimals on very large grids, budget for that cost.
+**Your series are large and you need exact-decimal output.** In the same report, at `medium`
+scale (about 600k input points into an 86,401-point grid), DuckDB's hand-written linear
+interpolation in SQL was **about 3–4× faster** than WeftDB returning `BigDecimal` points: 50.9 ms
+against 142.8 ms in memory and 198.3 ms from storage. WeftDB's `f64` output path came within about
+1.4× of DuckDB either way at `medium` (behind on MCAR, level on block missingness, ahead on UCI),
+and the MCAR and UCI verdicts were both within noise in a second run; it was clearly ahead at `tiny`
+and `small`.
+If you need exact decimals on very large grids, budget for that cost.
 
 **You want generic OLAP over wide tables.** WeftDB does not compete with ClickHouse or DuckDB on
 broad analytical scans, and has no SQL.
@@ -112,6 +118,12 @@ never dropped.
   the two p50 intervals do not overlap. Overlap is reported as noise, not as a small win. The
   nightly regression gate (EVI-5) is stricter: it needs both a move past its threshold (10% by
   default) and disjoint intervals.
+- Those intervals come from the repetitions within one run, and they understate run-to-run
+  variation. Two full runs of the EVI-15 matrix on the same host had non-overlapping p50 intervals
+  on 53 of 144 rows. The verdicts held better: 79 of 90 were the same in both runs, none flipped
+  between win and loss, and every one that changed had a margin of 1.4× or less
+  ([`bench/reports/evi-15/`](bench/reports/evi-15/README.md)). Read a margin under about 1.5× from a
+  single run as unsettled.
 
 **Fair comparison.**
 
@@ -129,10 +141,11 @@ never dropped.
 - kdb+, AVEVA PI, and the enterprise editions of QuestDB and InfluxDB 3 are excluded on licence
   grounds (`WILLINGNESS-TO-PAY.md`, *Benchmark-publication policy*).
 
-**What is not yet measured.** The cross-engine report covers DuckDB `DOUBLE` and `DECIMAL` on load,
-storage bytes, linear interpolation and bucketed downsampling (EVI-13, EVI-14). The UCI corpus at
-three scales and a run on priced reference hardware are still to come (EVI-15). Until then, no
-cross-engine figure is a headline.
+**What is not yet measured.** The first cross-engine report (EVI-15) covers DuckDB `DOUBLE` and
+`DECIMAL` on load, storage bytes, linear interpolation and bucketed downsampling, over MCAR, block
+missingness and the UCI corpus at three scales. It ran on the project's reference SSD, not on priced
+cloud hardware, so it has no cost-per-query figure. Other engines, spline methods, concurrency and
+many-series workloads are not compared. Its wins hold only at `tiny` and `small` scale.
 
 **Kept negative results.** The bit-sliced value codec, the GPU on stored interpolation, splines on
 prices, and the approximate percentile were all measured slower or no better than the obvious

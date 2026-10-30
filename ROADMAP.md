@@ -221,7 +221,7 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 ### Claims & documentation
 
 - [ ] Every performance claim in the README links to a benchmark artifact (the [governing rule](#weftdb-roadmap))
-- [ ] First cross-engine report
+- [x] First cross-engine report
 - [ ] Honesty pages shipped (see [Commercial thesis](https://basicautomation.io/projects/weftdb/docs/commercial-thesis))
 - [ ] Legal review of competitor benchmark-publication terms + codec licenses (see [Legal review](#legal-review))
 - [ ] README *Project status* table updated to reflect 1.0 and the status badge changed from `pre-beta`
@@ -334,7 +334,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **SEC-13** Security acceptance
   - [ ] **PAC-9** Docker image and container smoke test (with a mounted keys file)
   - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
-  - [ ] **EVI-15** First cross-engine report
+  - [x] **EVI-15** First cross-engine report
   - [ ] Write or approve the cross-engine report narrative *(owner)*
   - [ ] **EVI-19** Documented RPO/RTO
   - [ ] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
