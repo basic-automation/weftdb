@@ -46,10 +46,6 @@ static NEXT_TABLE: AtomicU64 = AtomicU64::new(0);
 /// The widest `DECIMAL` whose mantissa fits the `i64` [`DecimalView`] is built from here.
 const DECIMAL_WIDTH: u8 = 18;
 
-/// Rows per QWP flush. One frame per load would exceed the client's frame cap on the larger
-/// datasets; 100,000 rows is a few megabytes.
-const FLUSH_ROWS: usize = 100_000;
-
 /// How long a load may wait for its acknowledgement and for the WAL to be applied.
 const APPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -248,6 +244,9 @@ fn load_table(server: Server, table: String, column_type: &str, scale: u8, times
 	let db = Db { server, table, reader };
 	let mut sender = Sender::from_conf(db.server.conf())?;
 	let mut buffer = sender.new_buffer();
+	// Flush at half the per-frame cap the server advertises (2 MiB on 10.1): a fixed 100,000-row
+	// batch encoded to 2.4 MB and was refused. Half leaves room for the frame's own encoding.
+	let flush_at = sender.effective_frame_cap()?.0 / 2;
 	for (seq, (t, v)) in timestamps.iter().zip(values).enumerate() {
 		buffer.table(db.table.as_str())?.column_i64("seq", i64::try_from(seq)?)?;
 		match v {
@@ -255,7 +254,7 @@ fn load_table(server: Server, table: String, column_type: &str, scale: u8, times
 			Value::Decimal(m) => buffer.column_dec64("v", DecimalView::try_new_scaled(u32::from(scale), m.to_be_bytes().to_vec())?)?,
 		};
 		buffer.at(TimestampNanos::new(*t))?;
-		if (seq + 1) % FLUSH_ROWS == 0 {
+		if buffer.len() >= flush_at {
 			sender.flush(&mut buffer)?;
 		}
 	}
