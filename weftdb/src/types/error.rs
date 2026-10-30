@@ -94,11 +94,14 @@ mod tests {
 	}
 }
 
-/// Why a [`SegmentStore`](crate::SegmentStore) refused to open its root (freeze design
-/// §4.3, FRE-12a), before it wrote anything a newer or damaged store could not survive.
+/// Why a [`SegmentStore`](crate::SegmentStore) refused an operation: an open it
+/// would not perform (freeze design §4.3, FRE-12a), or — since D-S13 — an ingest
+/// it would not commit. The ingest variants are the typed errors the 1.0 plan
+/// (§3 X-ERR, §5 D-S13) assigns to this lane: they land here, in the store's one
+/// typed error, rather than in sentences a caller must re-recognise.
 ///
 /// It arrives inside an [`anyhow::Error`]; `downcast_ref::<StoreError>()` recovers it,
-/// whatever context the open added.
+/// whatever context the operation added.
 #[derive(Debug, Clone, PartialEq, Eq, ThisError)]
 #[non_exhaustive]
 pub enum StoreError {
@@ -165,5 +168,66 @@ pub enum StoreError {
 		/// The `<subject>/<aspect>` directories holding a `measurements.db`, in path order,
 		/// each once.
 		aspects: Vec<String>,
+	},
+	/// An operation named `aspect`, which has no declared schema in this store
+	/// (1.0 plan §3 X-ERR: `require_schema`'s typed `UnknownAspect`, landing with
+	/// D-S13 because it is a store-lane edit). Nothing was written.
+	#[error("aspect {aspect:?} has no declared schema in this store")]
+	UnknownAspect {
+		/// The aspect that was named.
+		aspect: String,
+	},
+	/// An ingest offered a batch under an idempotency key that this aspect's
+	/// ledger already holds for a **different** batch: the recorded fingerprint
+	/// is not the offered one (D-S13). Replaying the recorded batch under the
+	/// key returns its receipt; a different batch under the same key is a
+	/// conflict (the plan §4 code `idempotency_conflict`), and nothing was
+	/// written.
+	#[error("aspect {aspect:?} already holds idempotency key {key:?} for a different batch (recorded fingerprint {recorded_fingerprint}, offered {offered_fingerprint}); nothing was written")]
+	IdempotencyConflict {
+		/// The aspect the batch was offered to.
+		aspect: String,
+		/// The idempotency key, as offered.
+		key: String,
+		/// The fingerprint the ledger recorded for the key.
+		recorded_fingerprint: i64,
+		/// The fingerprint of the batch just offered.
+		offered_fingerprint: i64,
+	},
+	/// An ingest batch carried a non-empty `groups` tag set before the tags
+	/// gate flips (1.0 plan §5 D-S13, §4 C1/A4): until then the only group an
+	/// ingest may name is the empty [`TagSet`](crate::TagSet), series 0.
+	/// Nothing was written.
+	#[error("aspect {aspect:?}: ingest groups are not accepted yet (only the empty tag set, series 0, before the tags gate flips); nothing was written")]
+	GroupsUnsupported {
+		/// The aspect the batch was offered to.
+		aspect: String,
+	},
+	/// An ingest batch held no rows. Nothing was written, and the key is not
+	/// recorded: an empty batch has no receipt to replay.
+	#[error("aspect {aspect:?}: an ingest batch must hold at least one row; nothing was written")]
+	EmptyIngestBatch {
+		/// The aspect the batch was offered to.
+		aspect: String,
+	},
+	/// An ingest batch's timestamp and value columns differ in length.
+	/// Nothing was written.
+	#[error("an ingest batch holds {timestamps} timestamps but {values} values; nothing was written")]
+	IngestLengthMismatch {
+		/// How many timestamps the batch holds.
+		timestamps: usize,
+		/// How many values the batch holds.
+		values: usize,
+	},
+	/// A value in an ingest batch is outside the one decimal domain (ROB-6):
+	/// its plain form carries `digits` digits, over the bound. The fingerprint
+	/// is taken over the bounded plain form, so such a value is refused before
+	/// any plain form is materialised. Nothing was written.
+	#[error("a value in the ingest batch has a plain form of {digits} digits, over the {max}-digit decimal domain bound; nothing was written")]
+	IngestValueOutOfRange {
+		/// How many digits the value's plain form carries.
+		digits: usize,
+		/// The bound it exceeded.
+		max: usize,
 	},
 }

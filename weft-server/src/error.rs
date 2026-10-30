@@ -510,11 +510,10 @@ pub fn classify_read(err: &anyhow::Error) -> ApiError {
 	if let Some(api) = classify_typed(err) {
 		return api;
 	}
-	// The last message-matching rule on the read path. `SegmentStore::require_schema` and
-	// `weft-arrow-store`'s schema lookup report an undeclared aspect as an `anyhow` sentence
-	// rather than a typed error, so there is nothing to downcast. **D-S13** owns that typing
-	// (it is a store-lane edit) and this line goes with it; the plan keeps D-S13 scheduled
-	// precisely so that this is temporary rather than permanent.
+	// The last message-matching rule on the read path. `SegmentStore::require_schema`
+	// is typed since D-S13 (`StoreError::UnknownAspect`, classified above), so this
+	// line remains only for `weft-arrow-store`'s schema lookup, which still reports
+	// an undeclared aspect as an `anyhow` sentence rather than a typed error.
 	if err.to_string().contains("no declared schema") {
 		return ApiError::aspect_not_found(err.to_string());
 	}
@@ -599,10 +598,20 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 	if let Some(e) = err.downcast_ref::<weftdb::FrameFaultError>() {
 		return Some(from_frame_fault(e));
 	}
-	// A store on disk this binary cannot open: exit `65` for a CLI, `503 incompatible_store`
-	// here, and the same code for every reason (newer layout, unreadable `STORE_FORMAT`).
+	// The store's typed errors (X-ERR, with D-S13's ingest variants). The
+	// ingest conditions have their own §4 codes; what remains is a store on
+	// disk this binary cannot open: exit `65` for a CLI, `503
+	// incompatible_store` here, and the same code for every such reason
+	// (newer layout, unreadable `STORE_FORMAT`).
 	if let Some(e) = err.downcast_ref::<weftdb::StoreError>() {
-		return Some(ApiError::server(Code::IncompatibleStore, e.to_string()));
+		return Some(match e {
+			weftdb::StoreError::UnknownAspect { .. } => ApiError::aspect_not_found(e.to_string()),
+			weftdb::StoreError::IdempotencyConflict { .. } => ApiError::new(Code::IdempotencyConflict, e.to_string()),
+			weftdb::StoreError::GroupsUnsupported { .. } => ApiError::new(Code::TagsUnsupported, e.to_string()),
+			weftdb::StoreError::IngestValueOutOfRange { digits, .. } => decimal_out_of_range_refusal(*digits),
+			weftdb::StoreError::EmptyIngestBatch { .. } | weftdb::StoreError::IngestLengthMismatch { .. } => ApiError::bad_request(e.to_string()),
+			_ => ApiError::server(Code::IncompatibleStore, e.to_string()),
+		});
 	}
 	if let Some(e) = err.downcast_ref::<weft_physical_type::SealError>() {
 		return Some(from_seal_error(e));

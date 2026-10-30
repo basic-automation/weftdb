@@ -93,7 +93,7 @@ use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, write_new_durable, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind, TxnPoints}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
+		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
@@ -663,6 +663,41 @@ fn seal_failed(error: weft_physical_type::SealError) -> anyhow::Error {
 fn paged_seal_failed(error: weft_physical_type::SealError) -> anyhow::Error {
 	let shown = error.to_string();
 	anyhow::Error::from(error).context(format!("paged seal failed: {shown}"))
+}
+
+/// Cut an ingest batch's rows into chunks of at most
+/// [`MAX_ENCODED_FRAME_BYTES`](crate::MAX_ENCODED_FRAME_BYTES) of encoded
+/// frame, by a conservative per-row estimate (D-S13): each row is charged
+/// 24 bytes plus its value's bounded plain-form length (at most
+/// [`MAX_PLAIN_DIGITS`](weft_physical_type::MAX_PLAIN_DIGITS) digits, so
+/// the estimate can be computed arithmetically, without materialising the
+/// plain form). A cut never divides a run of equal timestamps: the chunk
+/// holding a run holds all of it, so a chunk may exceed the estimate —
+/// the caller proves each chunk's real frame against the target, and a
+/// single timestamp run is the smallest cut there is.
+fn chunk_ingest_rows(timestamps: &[i64], values: &[Option<BigDecimal>]) -> Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+	let target = usize::try_from(crate::MAX_ENCODED_FRAME_BYTES).unwrap_or(usize::MAX);
+	let mut chunks: Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::new();
+	let mut start = 0usize;
+	while start < timestamps.len() {
+		let mut end = start;
+		let mut estimate = 0usize;
+		while end < timestamps.len() {
+			let row_cost = 24 + values[end].as_ref().map_or(0, weft_physical_type::plain_digit_count);
+			// A cut is allowed only at a timestamp boundary: the next row
+			// starts a new timestamp. A run of equal timestamps is charged
+			// row by row like everything else, but never divided — so a
+			// run that alone exceeds the target stays whole.
+			if end > start && estimate.saturating_add(row_cost) > target && timestamps[end] != timestamps[end - 1] {
+				break;
+			}
+			estimate = estimate.saturating_add(row_cost);
+			end += 1;
+		}
+		chunks.push((timestamps[start..end].to_vec(), values[start..end].to_vec()));
+		start = end;
+	}
+	chunks
 }
 
 /// The span of `timestamps`, or `None` when it is empty.
@@ -2892,7 +2927,171 @@ impl SegmentStore {
 	/// The declared schema for `aspect`, or an error naming the aspect if it has not
 	/// been declared.
 	async fn require_schema(&self, aspect: &str) -> Result<AspectSchema> {
-		self.schema_for(aspect).await?.ok_or_else(|| anyhow::anyhow!("aspect {aspect:?} has no declared schema in {}/{}", self.database, self.subject))
+		self.schema_for(aspect).await?.ok_or_else(|| anyhow::Error::new(StoreError::UnknownAspect { aspect: aspect.to_string() }).context(format!("aspect {aspect:?} has no declared schema in {}/{}", self.database, self.subject)))
+	}
+
+	/// Ingest `batch` into `aspect` — the idempotent atomic ingest entry
+	/// point (1.0 plan §5, slice D-S13).
+	///
+	/// **Atomic.** The batch's segments, the allocator raise, the rollup
+	/// fold and the ledger row commit in one `segment_index.db` transaction:
+	/// the batch is in the store whole, or not at all. A batch too large for
+	/// one encoded frame is first cut into segments at timestamp boundaries
+	/// (see [`IngestBatch`]), and all of them travel in that same
+	/// transaction.
+	///
+	/// **Idempotent.** Before anything is written, the batch's
+	/// [`fingerprint`](IngestBatch::fingerprint) is looked up in
+	/// `ingest_ledger` under `(aspect, batch.key)`. A recorded key with the
+	/// same fingerprint is a replay: the recorded [`IngestReceipt`] is
+	/// returned with `duplicate` set, and nothing is written again — the
+	/// same batch twice commits once. A recorded key with a different
+	/// fingerprint is a typed
+	/// [`StoreError::IdempotencyConflict`]. Because the ledger row commits
+	/// in the same transaction as the segments, a crash cannot leave one
+	/// without the other; a replay after a restart answers from the ledger.
+	///
+	/// **Phases.** The ingest advances through [`IngestPhase`] as it goes,
+	/// and sets [`IngestPhase::Committing`] just before its COMMIT, so a
+	/// failure is attributable to the phase that raised it (plan C12/D21).
+	///
+	/// # Errors
+	///
+	/// Typed [`StoreError`]s, recovered with `downcast_ref::<StoreError>()`:
+	/// [`UnknownAspect`](StoreError::UnknownAspect) when `aspect` has no
+	/// declared schema; [`GroupsUnsupported`](StoreError::GroupsUnsupported)
+	/// for a non-empty `batch.groups`;
+	/// [`EmptyIngestBatch`](StoreError::EmptyIngestBatch) for a batch with
+	/// no rows; [`IngestLengthMismatch`](StoreError::IngestLengthMismatch)
+	/// when the timestamp and value columns differ in length;
+	/// [`IngestValueOutOfRange`](StoreError::IngestValueOutOfRange) for a
+	/// value outside the decimal domain;
+	/// [`IdempotencyConflict`](StoreError::IdempotencyConflict) for a
+	/// different batch under a recorded key. Otherwise a
+	/// [`SealError`](weft_physical_type::SealError) from encoding, a
+	/// filesystem write error, or a libSQL index failure (an ambiguous
+	/// COMMIT poisons the store, as for every write).
+	pub async fn ingest(&self, aspect: &str, batch: &IngestBatch) -> Result<IngestReceipt> {
+		self.writable()?;
+		aspect_name::validate(aspect)?;
+		let mut phase = IngestPhase::Validating;
+		let schema = self.require_schema(aspect).await.map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
+		if !batch.groups.is_empty() {
+			return Err(StoreError::GroupsUnsupported { aspect: aspect.to_string() }.into());
+		}
+		if batch.timestamps.len() != batch.values.len() {
+			return Err(StoreError::IngestLengthMismatch { timestamps: batch.timestamps.len(), values: batch.values.len() }.into());
+		}
+		if batch.timestamps.is_empty() {
+			return Err(StoreError::EmptyIngestBatch { aspect: aspect.to_string() }.into());
+		}
+		let fingerprint = batch.fingerprint()?;
+		if let Some(entry) = self.index.ledger_entry(aspect, &batch.key).await? {
+			if entry.fingerprint != fingerprint {
+				return Err(StoreError::IdempotencyConflict { aspect: aspect.to_string(), key: batch.key.clone(), recorded_fingerprint: entry.fingerprint, offered_fingerprint: fingerprint }.into());
+			}
+			let mut receipt = IngestReceipt::from_json(&entry.receipt_json).with_context(|| format!("reading the recorded receipt of ingest key {:?} of aspect {aspect:?}", batch.key))?;
+			receipt.duplicate = true;
+			return Ok(receipt);
+		}
+		phase = IngestPhase::Encoding;
+		// Encode the whole batch once, then cut the encoded run at
+		// timestamp boundaries so no frame exceeds the target: the cut is
+		// over rows, and each chunk re-seals from its own rows, so a chunk
+		// boundary is a segment boundary and nothing else.
+		let whole = schema.seal_nullable(&batch.timestamps, &batch.values).map_err(seal_failed).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
+		let chunks = if whole.write_to_with(&self.frame_options(whole.stats.row_count, false, 0.0)).len() as u64 <= crate::MAX_ENCODED_FRAME_BYTES {
+			vec![(batch.timestamps.clone(), batch.values.clone())]
+		} else {
+			let mut chunks: Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::new();
+			for (timestamps, values) in chunk_ingest_rows(&batch.timestamps, &batch.values) {
+				// Prove each chunk's frame fits before any frame is
+				// written: a chunk that still exceeds the target holds a
+				// single timestamp run, the smallest cut there is.
+				let segment = schema.seal_nullable(&timestamps, &values).map_err(seal_failed)?;
+				let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, false, 0.0));
+				if bytes.len() as u64 > crate::MAX_ENCODED_FRAME_BYTES && timestamps.len() > 1 {
+					bail!("an ingest chunk of {} rows still encodes past the {}-byte frame target", timestamps.len(), crate::MAX_ENCODED_FRAME_BYTES);
+				}
+				chunks.push((timestamps, values));
+			}
+			chunks
+		};
+		phase = IngestPhase::WritingFrames;
+		let mut written: Vec<(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::with_capacity(chunks.len());
+		for (timestamps, values) in &chunks {
+			let segment = schema.seal_nullable(timestamps, values).map_err(seal_failed).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
+			let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
+			let byte_len = bytes.len() as u64;
+			let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await.with_context(|| format!("ingest of aspect {aspect:?} failed while {phase}"))?;
+			if written.len() + 1 < chunks.len() {
+				fault::hit(FaultPoint::SBetweenFrames).await?;
+			}
+			let descriptor = SegmentDescriptor::of_segment(0, path.to_string_lossy().into_owned(), byte_len, &segment);
+			written.push((descriptor, gen, frame_crc, timestamps.clone(), values.clone()));
+		}
+		phase = IngestPhase::Committing;
+		let receipt = self.publish_ingest(aspect, batch, fingerprint, &written).await.with_context(|| format!("ingest of aspect {aspect:?} failed while {phase}"))?;
+		// Per-segment partial sidecars (opt-in), as in `persist`: a pure
+		// read accelerator, never failing the ingest.
+		for (descriptor, gen, _crc, timestamps, values) in &written {
+			if self.partials.base_for(descriptor.row_count).is_some() {
+				if let Err(e) = self.write_partial_sidecar(aspect, descriptor, *gen, *gen, timestamps.clone(), values.clone()).await {
+					tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
+				}
+			}
+		}
+		Ok(receipt)
+	}
+
+	/// Commit an ingest's written frames in one index transaction (see
+	/// [`ingest`](Self::ingest)): one [`InsertNew`](IndexOp::InsertNew) per
+	/// segment, the allocator raise, the rollup folded over every segment,
+	/// and the [`RecordIngest`](IndexOp::RecordIngest) ledger row — under
+	/// the aspect's commit lock, which is what makes the ledger check, the
+	/// ids and the fold atomic against every other writer of the aspect.
+	/// The caller has set its phase to
+	/// [`IngestPhase::Committing`] before calling this.
+	async fn publish_ingest(&self, aspect: &str, batch: &IngestBatch, fingerprint: i64, written: &[(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)]) -> Result<IngestReceipt> {
+		let mut commit = self.commit_lock(aspect).await?;
+		// The ledger is re-checked under the commit lock: a commit of the
+		// same key that landed while this ingest wrote its frames is a
+		// replay or a conflict, never a second commit. (The frames just
+		// written stay behind as crash litter for recovery to classify,
+		// exactly like a seal that crashes before its commit.)
+		if let Some(entry) = self.index.ledger_entry(aspect, &batch.key).await? {
+			if entry.fingerprint != fingerprint {
+				return Err(StoreError::IdempotencyConflict { aspect: aspect.to_string(), key: batch.key.clone(), recorded_fingerprint: entry.fingerprint, offered_fingerprint: fingerprint }.into());
+			}
+			let mut receipt = IngestReceipt::from_json(&entry.receipt_json).context("reading the recorded ingest receipt")?;
+			receipt.duplicate = true;
+			return Ok(receipt);
+		}
+		let epoch = commit.state().epoch.saturating_add(1);
+		let mut ops: Vec<IndexOp> = Vec::with_capacity(written.len() + 3);
+		let mut descriptors: Vec<SegmentDescriptor> = Vec::with_capacity(written.len());
+		let mut max_gen = 0u64;
+		for (descriptor, gen, frame_crc, _ts, _vs) in written {
+			let id = commit.allocate()?;
+			let descriptor = SegmentDescriptor { id, ..descriptor.clone() };
+			max_gen = max_gen.max(*gen);
+			ops.push(IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow { desc: descriptor.clone(), gen: *gen, prec: Some(*gen), frame_crc: Some(*frame_crc), commit_epoch: Some(epoch), series_id: 0 } });
+			descriptors.push(descriptor);
+		}
+		let mut rollup = self.index.rollup(aspect).await?.unwrap_or_default();
+		for descriptor in &descriptors {
+			rollup = rollup.folded(descriptor);
+		}
+		let (min_ts, max_ts) = span_of(&batch.timestamps).map_or((None, None), |(lo, hi)| (Some(lo), Some(hi)));
+		let receipt = IngestReceipt { aspect: aspect.to_string(), key: batch.key.clone(), fingerprint, row_count: batch.timestamps.len(), min_ts, max_ts, segment_ids: descriptors.iter().map(|d| d.id).collect(), series_ids: batch.series_ids(), commit_epoch: epoch, duplicate: false };
+		let entry = LedgerEntry { aspect: aspect.to_string(), key: batch.key.clone(), fingerprint, row_count: batch.timestamps.len(), min_ts, max_ts, id_lo: receipt.segment_ids.first().copied(), id_hi: receipt.segment_ids.last().copied(), receipt_json: receipt.to_json(), series_ids: batch.series_ids(), commit_epoch: epoch, created_ms: now_ms() };
+		ops.push(seq_bump(aspect, &commit, max_gen.saturating_add(1), epoch));
+		ops.push(IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup });
+		ops.push(IndexOp::RecordIngest { entry });
+		self.commit_index(&IndexTxn::new(ops)).await?;
+		commit.set_epoch(epoch);
+		drop(commit);
+		Ok(receipt)
 	}
 
 	/// Seal a dense `(timestamp, value)` batch under `aspect`'s **declared** schema —
@@ -5361,6 +5560,114 @@ mod tests {
 		let (rt, rv) = Segment::read_from(&on_disk).expect("decodes").decode();
 		assert_eq!(rt, ts);
 		assert_eq!(rv, vs);
+	}
+
+	/// D-S13: the same batch twice commits once. The first ingest returns
+	/// its receipt; the second — and a third after a restart, answered from
+	/// the ledger — return the same receipt marked duplicate, and the store
+	/// holds exactly one segment with the batch's rows.
+	#[tokio::test]
+	async fn ingest_commits_once_for_the_same_batch_twice() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("price", &schema()).await.expect("declares");
+		let batch = IngestBatch::dense("batch-1", vec![0, 10, 20], vec![bd("1"), bd("2"), bd("3")]);
+		let first = store.ingest("price", &batch).await.expect("ingests");
+		assert!(!first.duplicate, "the first commit is not a duplicate");
+		assert_eq!(first.segment_ids.len(), 1, "one segment for a small batch");
+		assert_eq!(first.series_ids, vec![0], "the empty group is series 0");
+		assert_eq!((first.row_count, first.min_ts, first.max_ts), (3, Some(0), Some(20)));
+		let second = store.ingest("price", &batch).await.expect("replays");
+		assert!(second.duplicate, "the replay is marked duplicate");
+		assert_eq!(
+			{
+				let mut r = second.clone();
+				r.duplicate = false;
+				r
+			},
+			first,
+			"a replay returns the recorded receipt"
+		);
+		assert_eq!(store.segment_count("price").await.expect("counts"), 1, "the same batch twice commits once");
+		let entry = store.index.ledger_entry("price", "batch-1").await.expect("reads the ledger").expect("a ledger row");
+		assert_eq!(entry.fingerprint, first.fingerprint);
+		assert_eq!(entry.series_ids, vec![0], "the ledger records series_ids (C1)");
+		assert_eq!((entry.id_lo, entry.id_hi), (Some(first.segment_ids[0]), Some(first.segment_ids[0])));
+		let (ts, vs) = store.read_time_range("price", 0, 20).await.expect("reads");
+		assert_eq!(ts, vec![0, 10, 20]);
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2")), Some(bd("3"))]);
+		drop(store);
+		// After a restart the replay is answered from the ledger, not memory.
+		let reopened = SegmentStore::open(dir.path()).await.expect("reopens");
+		let third = reopened.ingest("price", &batch).await.expect("replays after restart");
+		assert!(third.duplicate);
+		assert_eq!(third.segment_ids, first.segment_ids);
+		assert_eq!(reopened.segment_count("price").await.expect("counts"), 1);
+	}
+
+	/// D-S13: a different batch under a recorded key is a typed conflict,
+	/// and nothing more is written.
+	#[tokio::test]
+	async fn ingest_refuses_a_different_batch_under_a_recorded_key() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("price", &schema()).await.expect("declares");
+		store.ingest("price", &IngestBatch::dense("k", vec![0], vec![bd("1")])).await.expect("ingests");
+		let err = store.ingest("price", &IngestBatch::dense("k", vec![0], vec![bd("2")])).await.expect_err("a different batch under the key conflicts");
+		assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::IdempotencyConflict { aspect, key, .. }) if aspect == "price" && key == "k"), "{err:#}");
+		assert_eq!(store.segment_count("price").await.expect("counts"), 1, "the conflict wrote nothing");
+		// A different key for the same rows is a new batch, and commits.
+		let other = store.ingest("price", &IngestBatch::dense("other", vec![0], vec![bd("1")])).await.expect("a new key commits");
+		assert!(!other.duplicate);
+		assert_eq!(store.segment_count("price").await.expect("counts"), 2);
+	}
+
+	/// D-S13: the ingest refusals are typed (`#[non_exhaustive]`
+	/// [`StoreError`] variants), including X-ERR's `UnknownAspect` from
+	/// `require_schema`, which every declared-schema entry point now shares.
+	#[tokio::test]
+	async fn ingest_refusals_are_typed() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let batch = IngestBatch::dense("k", vec![0], vec![bd("1")]);
+		let err = store.ingest("undeclared", &batch).await.expect_err("no declared schema");
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::UnknownAspect { aspect: "undeclared".to_string() }), "{err:#}");
+		let err = store.seal_declared("undeclared", &[0], &[bd("1")]).await.expect_err("seal_declared shares require_schema");
+		assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::UnknownAspect { .. })), "{err:#}");
+		store.declare("price", &schema()).await.expect("declares");
+		let grouped = batch.clone().with_groups(crate::TagSet::from_pairs([("host", "a")]).expect("valid tags"));
+		let err = store.ingest("price", &grouped).await.expect_err("non-empty groups before the gate flips");
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::GroupsUnsupported { aspect: "price".to_string() }), "{err:#}");
+		let err = store.ingest("price", &IngestBatch::dense("k", vec![], vec![])).await.expect_err("an empty batch");
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::EmptyIngestBatch { aspect: "price".to_string() }), "{err:#}");
+		let err = store.ingest("price", &IngestBatch::new("k", vec![0, 10], vec![Some(bd("1"))])).await.expect_err("mismatched columns");
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::IngestLengthMismatch { timestamps: 2, values: 1 }), "{err:#}");
+		assert_eq!(store.segment_count("price").await.expect("counts"), 0, "every refusal wrote nothing");
+	}
+
+	/// D-S13: the frame-target cut never divides a run of equal timestamps
+	/// and never loses or reorders a row.
+	#[test]
+	fn chunk_ingest_rows_never_splits_a_timestamp_run() {
+		// Each value's plain form is ~200k digits, so the estimate charges
+		// ~200 KB a row and a 128 MiB chunk holds a few hundred rows. The
+		// exponent form keeps the mantissa tiny, so the arithmetic digit
+		// count is cheap.
+		let big = bd("1e200000");
+		let timestamps: Vec<i64> = (0..2_000).map(|i| i / 3).collect();
+		let values: Vec<Option<BigDecimal>> = (0..2_000).map(|_| Some(big.clone())).collect();
+		let chunks = chunk_ingest_rows(&timestamps, &values);
+		assert!(chunks.len() >= 3, "a ~400 MB batch is cut: {} chunk(s)", chunks.len());
+		let mut flat_ts: Vec<i64> = Vec::new();
+		for (chunk_ts, chunk_vs) in &chunks {
+			assert_eq!(chunk_ts.len(), chunk_vs.len());
+			assert!(chunk_ts.len() <= 700, "a chunk holds {} rows, over the estimate's few hundred", chunk_ts.len());
+			if let (Some(last), Some(_)) = (flat_ts.last(), chunk_ts.first()) {
+				assert_ne!(last, chunk_ts.first().expect("non-empty"), "a chunk boundary divides a run of equal timestamps");
+			}
+			flat_ts.extend(chunk_ts.iter().copied());
+		}
+		assert_eq!(flat_ts, timestamps, "the cut loses and reorders nothing");
 	}
 
 	/// D-S10: a seal writes a write-once frame named by its generation, not by its
@@ -8435,11 +8742,11 @@ mod tests {
 		assert_eq!(schemas[1], schemas[0], "the second open changes nothing the first did not");
 		assert_eq!(schemas[2], schemas[0], "nor does the third");
 
-		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false };
+		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false };
 		let settled = OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: false };
 		assert_eq!(reports, vec![migrated, settled.clone(), settled], "the first open migrates from layout 1 through the registry, and the later ones find nothing pending");
 		let (format, uuid) = formats[0].clone();
-		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0004_d_s12".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
+		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0005_d_s13".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
 		assert!(formats.iter().all(|seen| seen == &formats[0]), "the marker and the store's identity stay put: {formats:?}");
 		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads the marker"), Some(format));
 
@@ -8455,13 +8762,13 @@ mod tests {
 			assert!(row.contains("/var/tmp/weft-pre-v2-fixture/root/segments/"), "the stored path is left as the pre-v2 build wrote it: {row}");
 			assert!(row.ends_with(" Integer(0) Null Null Null Integer(0)"), "a legacy row is generation 0 and series 0, with no prec, frame_crc or commit_epoch: {row}");
 		}
-		for (key, value) in [("applied_through", "0004_d_s12"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
+		for (key, value) in [("applied_through", "0005_d_s13"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
 			assert!(schema.contains(&format!("meta Text(\"{key}\") Text(\"{value}\")\n")), "store_meta mirrors the marker's {key}:\n{schema}");
 		}
 		assert!(uuid::Uuid::parse_str(&uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
 		let migrations: Vec<&str> = schema.lines().filter_map(|line| line.strip_prefix("migration ")).collect();
-		assert_eq!(migrations.len(), 4, "{schema}");
-		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) "), "{migrations:?}");
+		assert_eq!(migrations.len(), 5, "{schema}");
+		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) "), "{migrations:?}");
 	}
 
 	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
@@ -8535,9 +8842,9 @@ mod tests {
 		let (last, databases) = &markers[1];
 		assert_eq!(databases, &CONTROL_PLANE_FILES.to_vec(), "the final marker follows the databases");
 		assert_eq!(last, &format);
-		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0004_d_s12".into()), ..first.clone() }, "the final marker is the first, settled");
+		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0005_d_s13".into()), ..first.clone() }, "the final marker is the first, settled");
 		assert_eq!((format.store_uuid.as_str(), &format.scope), (uuid.as_str(), &StoreScope { database: "market".into(), subject: "BTCUSD".into() }));
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
 		let reopened = SegmentStore::open_scoped(&root, "market", "BTCUSD").await.expect("reopens");
 		let again = (reopened.open_report().created_new, reopened.store_uuid().to_string());
 		drop(reopened);
@@ -8599,7 +8906,7 @@ mod tests {
 		let applied = store.open_report().applied.clone();
 		let reads = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
-		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12"]);
+		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13"]);
 		assert!(before.contains("store_migrations") && before.contains("0002_s6_s7"), "{before}");
 		assert_eq!(after, before, "a second run of every migration changed nothing");
 		assert!(applied.is_empty(), "nothing is pending: {applied:?}");
@@ -8778,7 +9085,7 @@ mod tests {
 				let settled = store.store_format();
 				let reads = if legacy { Some(fixture_reads(&store).await) } else { None };
 				drop(store);
-				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0004_d_s12")), "{}", image.display());
+				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0005_d_s13")), "{}", image.display());
 				if let Some(reads) = reads {
 					assert_eq!(reads, expected_reads, "{}: the image reads what the fixture holds", image.display());
 				}
@@ -8940,7 +9247,7 @@ mod tests {
 		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
 		let schema = index_schema(&root).await;
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
 		assert_eq!(kept, uuid, "the S6 store_uuid is kept");
 		assert!(schema.contains("| Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains series_id (NOT NULL DEFAULT 0):\n{schema}");
 		assert!(schema.contains("| Text(\"next_series_id\") Text(\"INTEGER\") Integer(1) Text(\"1\") Integer(0)\n"), "aspect_seq gains next_series_id (NOT NULL DEFAULT 1):\n{schema}");
@@ -8965,7 +9272,7 @@ mod tests {
 		let store = SegmentStore::open(&root).await.expect("finishes the creation");
 		let (report, uuid) = (store.open_report().clone(), store.store_uuid().to_string());
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
 		assert_eq!(uuid, format.store_uuid);
 
 		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
@@ -8976,7 +9283,7 @@ mod tests {
 		let store = SegmentStore::open(&legacy).await.expect("finishes the upgrade");
 		let report = store.open_report().clone();
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
 	}
 
 	/// FRE-12a's `ensure_floor`: raising a floor writes the marker first, fsynced, and
