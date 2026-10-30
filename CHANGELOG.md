@@ -18,6 +18,10 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **InfluxDB 3 Core in the cross-engine benchmark** (#413): `weft-xbench --influxdb3 URL` adds an
+  `influxdb3-double` arm (line-protocol load answered once the WAL is persisted, SQL read back as
+  Parquet, window-function interpolation, `date_bin` downsample), gated like every arm; InfluxDB 3
+  has no decimal type, so there is no exact-decimal arm. The nightly smoke starts a pinned server.
 - **QuestDB in the cross-engine benchmark** (#413): `weft-xbench --questdb host:port` adds
   `questdb-double` and `questdb-decimal` arms over QWP both ways (load timed until the WAL is
   applied, interpolation through the native `ASOF JOIN`, `SAMPLE BY` downsample), gated like every

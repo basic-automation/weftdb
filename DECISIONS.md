@@ -4,6 +4,43 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — External engines IV: how the InfluxDB 3 Core arm is measured
+
+**Ambiguous:** InfluxDB 3 Core has no decimal type, no `ASOF JOIN` in its SQL engine (DataFusion),
+a key of series plus instant that replaces duplicate writes, and rows that live in a WAL until the
+server snapshots them to Parquet. Which of the decision-18 arms it can have, and how to read its
+storage, were not settled.
+
+**Chosen:**
+
+- **One arm, `influxdb3-double`**, in `weft-xbench/src/influxdb3.rs`, run only with
+  `--influxdb3 URL`, against InfluxDB 3 Core 3.12.2. No decimal arm: the engine has no decimal type,
+  and the report says so rather than storing scaled integers no InfluxDB user would.
+- **Writes:** line protocol over HTTP at nanosecond precision, `no_sync` at its default `false`, so
+  the server answers once the WAL file holding the rows is persisted. **Reads:** SQL over HTTP with
+  `format=parquet`, decoded with the workspace's own `parquet` 60 reader: columnar, like the other
+  servers' binary paths, without Flight's gRPC stack.
+- **Interpolation:** the grid merged with the knots, and each grid row's neighbours read with
+  `last_value`/`first_value … IGNORE NULLS` windows; the first and last segments stand in past the
+  data. `date_bin_gapfill` with `interpolate()` fills between bucket aggregates and does not answer
+  jittered knots. **Downsample:** native `date_bin`.
+- **Duplicates:** a second write at an instant replaces the first. Interpolation matches splimes
+  (the last value wins); bucket counts would differ from `weft_reduce`, which counts every row. The
+  benchmark datasets have no duplicate instants, the live test pins both behaviours, and the report
+  states it.
+- **No bytes on disk.** The rows sit in the WAL until a snapshot on the server's own schedule, and
+  the server reports neither size per database; the load row shows no storage figure rather than a
+  WAL size that would mislead.
+- **Telemetry upload off** on the reference host and in the nightly smoke, which configures
+  `influxdb3 serve` by environment because a service container takes no command.
+  `WEFT_XBENCH_INFLUXDB3` is registered in the Test tier.
+
+**Rejected:**
+
+- Flight SQL: it adds `arrow-flight` and tonic to the crate for the same Arrow batches the Parquet
+  answer carries.
+- A scaled-integer "decimal" arm: not something an InfluxDB user stores.
+
 ## 2026-10-30 — External engines III: how the QuestDB arm is measured
 
 **Ambiguous:** #393's first rule says a QuestDB adapter must use QWP, QuestDB 10's columnar
