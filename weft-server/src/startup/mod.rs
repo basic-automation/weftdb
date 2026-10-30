@@ -33,6 +33,16 @@
 //! different `Host` or a browser UI's non-loopback `Origin`. A non-loopback bind is not guarded: there is no authentication yet,
 //! so such a server must not be reachable from an untrusted network.
 //!
+//! ## Transport (SEC-5)
+//!
+//! With `WEFT_TLS_CERT_FILE` and `WEFT_TLS_KEY_FILE` set, the listener speaks
+//! TLS (rustls, ring provider) on the same serve path; the banner says
+//! `https`. Without them the listener is plaintext, and a non-loopback bind
+//! must pass the C8 gate before anything is served: a mounted keys file
+//! (`WEFT_KEYS_FILE`) plus `WEFT_ALLOW_PLAINTEXT=1`, or `WEFT_AUTH=disabled`
+//! behind a gateway — otherwise startup refuses. Loopback plaintext is
+//! ungated. See [`weft_server::tls`].
+//!
 //! ## Optional segment store
 //!
 //! Set `WEFT_SEGMENT_STORE_ROOT` to a directory to open a
@@ -102,18 +112,22 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	let addr = config::bind_addr()?;
 	let interpolate = config::interpolate_config()?;
 	let limits = config::serve_limits()?;
+	// SEC-5: resolve the transport (TLS when configured) and run the C8
+	// plaintext gate against the address about to be bound, before the
+	// store opens — a refused exposure starts nothing at all.
+	let tls = config::transport(addr)?;
 	let state = state::build().await?.with_interpolate_config(interpolate);
 
 	daemons::spawn_reconcile_if_configured(&state)?;
 	daemons::spawn_backup_if_configured(&state)?;
 
-	let listener = serve::bind(addr).await?;
+	let listener = serve::bind(addr, tls.is_some()).await?;
 	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
 
 	// After the bind and in the background, so serving never waits for it.
 	daemons::spawn_gpu_calibration_if_enabled();
 
-	serve::run(listener, state.clone(), otel_provider, limits, &mut shutdown).await?;
+	serve::run(listener, state.clone(), otel_provider, limits, tls, &mut shutdown).await?;
 	// Serving stopped cleanly (including a signal before serving, which exits 0
 	// without accepting a connection): record the clean shutdown, so the next
 	// open's `/ready` can report `previous_clean_shutdown: true` (D-S12). A
