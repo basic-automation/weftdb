@@ -968,7 +968,11 @@ mod tests {
 		assert_eq!(body["incompatible_store"], true);
 		assert_eq!(body["suspect"], 1);
 		assert_eq!(body["segment_store"], true);
-		assert_eq!(body["durability_class"], "full");
+		// The durability class is platform-defined: "full" where a seal can
+		// fsync its directory entry, "process-crash-only" on Windows, where
+		// directory fsync is a no-op. A hard-coded "full" fails Windows CI.
+		let expected_class = if cfg!(windows) { "process-crash-only" } else { "full" };
+		assert_eq!(body["durability_class"], expected_class);
 		assert_eq!(body["previous_clean_shutdown"], false);
 		assert!(body["store_uuid"].is_string(), "the report carries the store identity");
 		let (status, body) = crate::test_support::get_json(router.clone(), "/api/v1/storage/quarantine").await;

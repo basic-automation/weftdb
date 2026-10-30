@@ -1521,3 +1521,11 @@ quarantined frame still floors its generation. (3) Two stale test details: the
 agent's own classify test paired sound bytes with a checksum error (sound
 bytes are post-CRC by construction — the test now damages the bytes per case),
 and the pre-v2 test counted 3 migrations while asserting 4 (now 4).
+
+**Post-publish fix (parent, Windows CI on PR #459):** `test
+(windows-latest)` failed on exactly one test: the agent's
+`ready_reports_incompatible_store_and_reads_carry_weft_incomplete` asserted
+`durability_class == "full"`, but the class is platform-defined —
+`process-crash-only` on Windows, where directory fsync is a no-op — so the
+expectation is now `cfg!(windows)`-gated. No production code changed; this is
+the Windows-only test-expectation class the Linux bar cannot catch.
