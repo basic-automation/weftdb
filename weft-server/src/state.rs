@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{host_guard::HostGuard, interpolate::InterpolateConfig, metrics::SharedMetrics};
+use crate::{auth::AuthConfig, host_guard::HostGuard, interpolate::InterpolateConfig, metrics::SharedMetrics};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -57,6 +57,9 @@ pub struct AppState {
 	interpolate: InterpolateConfig,
 	/// The `Host`/`Origin` checks applied to every request (off unless set).
 	host_guard: HostGuard,
+	/// The Bearer authentication in force (SEC-6): off unless the binary
+	/// resolved a keys file at startup ([`AuthConfig`]).
+	auth: AuthConfig,
 }
 
 impl AppState {
@@ -72,7 +75,7 @@ impl AppState {
 	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off() }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -119,6 +122,20 @@ impl AppState {
 	#[must_use]
 	pub const fn host_guard(&self) -> HostGuard {
 		self.host_guard
+	}
+
+	/// Set the Bearer authentication in force (SEC-6); the binary passes
+	/// the [`AuthConfig`] it resolved from `WEFT_AUTH`/`WEFT_KEYS_FILE`.
+	#[must_use]
+	pub fn with_auth(mut self, auth: AuthConfig) -> Self {
+		self.auth = auth;
+		self
+	}
+
+	/// The Bearer authentication the router enforces.
+	#[must_use]
+	pub const fn auth(&self) -> &AuthConfig {
+		&self.auth
 	}
 }
 

@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use weft_server::{
-	host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, InterpolateConfig, ServeLimits, TlsConfig, HEADER_READ_TIMEOUT_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, MAX_INTERPOLATE_POINTS_ENV, WRITE_STALL_TIMEOUT_ENV
+	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, InterpolateConfig, ServeLimits, TlsConfig, AUTH_KEYS_MODE, HEADER_READ_TIMEOUT_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, MAX_INTERPOLATE_POINTS_ENV, WRITE_STALL_TIMEOUT_ENV
 };
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
@@ -76,6 +76,29 @@ pub(crate) fn transport(addr: SocketAddr) -> anyhow::Result<Option<TlsConfig>> {
 	Ok(tls)
 }
 
+/// Resolve the Bearer authentication in force (SEC-6, [`AuthConfig`]):
+/// the keys file `WEFT_KEYS_FILE` names is loaded once, here, so a
+/// malformed keys file stops startup before anything is served — a
+/// server that cannot load its keys must not come up unauthenticated
+/// by accident. Logs which mode is in force.
+///
+/// # Errors
+///
+/// An unrecognised `WEFT_AUTH` value, `WEFT_AUTH=keys` with no keys
+/// file mounted, or a keys file that cannot be loaded.
+pub(crate) fn auth() -> anyhow::Result<AuthConfig> {
+	let auth = AuthConfig::from_env().map_err(anyhow::Error::msg)?;
+	match &auth {
+		AuthConfig::Keys(store) => {
+			let from = store.path().map_or_else(|| KEYS_FILE_ENV.to_string(), |path| format!("{}={}", KEYS_FILE_ENV, path.display()));
+			println!("auth: Bearer API keys from {from} ({} key(s)); each key's role in the file grants its scopes on every route (SEC-6)", store.len());
+		}
+		AuthConfig::Off if weft_server::tls::auth_disabled_from_env(std::env::var(AUTH_ENV).ok().as_deref()) => println!("auth: explicitly disabled ({AUTH_ENV}=disabled); a gateway in front of this server owns authentication"),
+		AuthConfig::Off => println!("auth: off (no keys file mounted; set {KEYS_FILE_ENV} to a keys file, or {AUTH_ENV}={AUTH_KEYS_MODE} to require one)"),
+	}
+	Ok(auth)
+}
+
 /// Pick the request guard for the bound address `local` ([`HostGuard::for_bind`],
 /// honouring `WEFT_ALLOW_ANY_HOST`) and log which one is in force.
 pub(crate) fn host_guard_for(local: SocketAddr) -> HostGuard {
@@ -84,7 +107,7 @@ pub(crate) fn host_guard_for(local: SocketAddr) -> HostGuard {
 	match guard {
 		HostGuard::Loopback => println!("request guard: loopback only (Host must be localhost, 127.0.0.0/8 or [::1]; state-changing requests from non-loopback web origins are refused; set {ALLOW_ANY_HOST_ENV}=1 behind a local reverse proxy that rewrites Host or forwards a non-loopback Origin)"),
 		HostGuard::Off if local.ip().to_canonical().is_loopback() => println!("request guard: off ({ALLOW_ANY_HOST_ENV} is set)"),
-		HostGuard::Off => println!("request guard: off (bound to the non-loopback address {local}; there is no authentication, so keep this server off untrusted networks)"),
+		HostGuard::Off => println!("request guard: off (bound to the non-loopback address {local}; the guard is a loopback stop-gap, so this bind relies on authentication and the network it sits on)"),
 	}
 	guard
 }

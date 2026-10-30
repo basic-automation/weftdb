@@ -123,6 +123,76 @@ interpolation answer, or how durable its load must be to compare with a WeftDB s
   It belongs in the native-fill comparison (roadmap 1.2), labelled as LOCF, not here.
 - Running the live ClickHouse test in `ci.yml`: a database service on three operating systems for
   every pull request, for a crate outside the workspace.
+## 2026-10-30 — SEC-6: keys-file format, auth modes and the C10 namespace (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan (§6 W4, §3 SEC-3/SEC-6 row, §4 C10) fixes what SEC-6 must do — API keys
+with Bearer auth enforced through SEC-3's gate, a keys file and a keygen tool, and a key
+namespace that is per aspect and shared by all principals — but the queue records the
+keys-file format as an open question: no source names a format, a hash, a token shape, or the
+`WEFT_AUTH` values that turn auth on. SEC-3's decision entry likewise left "which API key
+holds which role" to this slice. These choices are the best-guess set the owner authorized
+for grounded slices (2026-10-26), recorded here for merge review and reversible there.
+
+**Chosen:**
+
+1. **Keys file: versioned JSON, hashes only.** `WEFT_KEYS_FILE` (the name SEC-5's gate
+   already reads) names `{"version": 1, "keys": [{"id", "role", "key_hash"}]}`, where
+   `key_hash` is `sha256:` plus the hex SHA-256 of the key. The file therefore holds no
+   working credential. Entries are validated whole at startup — unknown fields, an unknown
+   or `anonymous` role, a blank or duplicate id, a malformed hash, a hash shared by two
+   ids, an empty key list, or a version other than 1 are startup errors, never a partially
+   enforced table (the settings registry's fail-loud rule, applied to this file). A key's
+   role is one of SEC-3's frozen six; per §10 per-aspect grants are deferred past 1.0, so a
+   role grants its scopes on every aspect alike. Reload without restart is SEC-7's, not
+   this slice's: the file is read once at startup.
+2. **Tokens and keygen.** A minted key is `weft_` plus the hex of 32 bytes from the ring
+   provider's secure random (SEC-5's provider; no new entropy source, no process-global
+   provider). Lookup hashes the presented token and compares digests against every entry
+   in constant time per entry, with no early exit. `weft-server keygen [--id] [--role]
+   [--keys-file]` mints a key, prints it once, and appends only its hash (creating the
+   file at mode 0600 on Unix); with no `--keys-file` it prints the entry to paste. Its
+   defaults are the operator's own first key (`operator`/`admin`); a duplicate id or hash
+   is refused rather than redefined.
+3. **Modes.** `WEFT_AUTH=disabled` is off (SEC-5's value, and it wins over a mounted
+   file, as in the plaintext gate); `WEFT_AUTH=keys` is on and *requires* the file;
+   unset is on exactly when a file is mounted, off otherwise — so a keyless server behaves
+   as it did before this slice, and the exposure matrix that refuses some keyless binds
+   stays SEC-8's. Any other `WEFT_AUTH` value is a startup error: neither opt-in nor
+   opt-out may be spelled by accident (decision 7).
+4. **Enforcement through the gate, anonymous probes.** The check is a layer in
+   `app_with_state` deciding from the sealed registry's own policy table (cached once;
+   the registry is frozen), so the scope enforced is the scope the route registered.
+   No header means the anonymous principal of SEC-3's role table — probes serve, every
+   other scope is `401 unauthenticated` with `WWW-Authenticate: Bearer`. A malformed
+   header or an unknown key is the same 401 on every route, probes included (a failed
+   authentication is never silently demoted to anonymous); a known key whose role lacks
+   the scope is `403 forbidden` naming the key id, its role and the needed scope. The
+   gate's own refusals keep their shape: an unregistered path or wrong method defers to
+   the gate/fallback, keyed or not. An authenticated request carries its `Principal`
+   (id + role) in its extensions for SEC-9's audit.
+5. **Credentials travel in the header only.** With auth on, a query parameter named
+   `api_key`, `apikey`, `access_token` or `auth_token` is refused `400
+   credentials_in_query` — the §4 code X-ERR reserved, produced here for the first time —
+   because query strings are what proxies and logs record.
+6. **C10's namespace is the idempotency namespace, and this slice keeps it that way.**
+   Read in its §4 context, "the key namespace is per aspect and shared by all principals"
+   governs the `Idempotency-Key` handling that sits behind this gate (landing with
+   D-S14): D-S13's ledger is keyed by `(aspect, key)` with no principal component, and
+   SEC-6 adds none — authentication answers who a key is and what its role may do, on
+   every aspect alike, so a second principal replaying an ingest meets the first
+   principal's ledger row. Partitioning that namespace by API key would break the rule;
+   nothing here does.
+
+**Rejected:** plaintext keys in the file (a mounted file must be safe to back up; the
+keygen exists precisely so nobody hashes a self-chosen secret by hand); scopes listed per
+key instead of a role (SEC-3 froze the role as the grant unit, and a per-key scope list
+would be a seventh, unfrozen vocabulary); refusing non-probe routes for the anonymous
+principal with 403 instead of 401 (the caller has not authenticated at all, and the §4
+table pairs 401 with the `WWW-Authenticate` challenge that tells them how to); and blocking
+the slice until the format is specified (the queue's open question is real, but the
+owner's best-guess authorization covers exactly this class of decision when it is grounded
+and recorded, as SEC-3's scope table and SEC-5's configuration shape were).
+
 ## 2026-10-30 — SEC-5: TLS configuration shape and the C8 gate's scope (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the plan (§6 W4, §4 C8, decision 7) fixes what SEC-5 must do — a TLS
