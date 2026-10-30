@@ -18,6 +18,10 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **QuestDB in the cross-engine benchmark** (#413): `weft-xbench --questdb host:port` adds
+  `questdb-double` and `questdb-decimal` arms over QWP both ways (load timed until the WAL is
+  applied, interpolation through the native `ASOF JOIN`, `SAMPLE BY` downsample), gated like every
+  arm; the nightly smoke starts a pinned QuestDB server with telemetry off.
 - **TimescaleDB in the cross-engine benchmark** (#413): `weft-xbench --timescale URL` adds
   `timescaledb-double` and `timescaledb-numeric` arms (hypertable load by `COPY`, linear
   interpolation in SQL, `time_bucket` downsample), gated like every arm; the nightly smoke starts a

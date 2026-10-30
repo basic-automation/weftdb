@@ -4,6 +4,47 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — External engines III: how the QuestDB arm is measured
+
+**Ambiguous:** #393's first rule says a QuestDB adapter must use QWP, QuestDB 10's columnar
+WebSocket protocol, not PG Wire. Open-source QuestDB's acknowledgement also says less than the
+other engines' commits do, and its native fills work on buckets. How to keep the load and the
+answers comparable was not settled.
+
+**Chosen:**
+
+- **Two arms, `questdb-double` and `questdb-decimal` (`DECIMAL(18, s)`)**, in
+  `weft-xbench/src/questdb.rs`, run only with `--questdb host:port`. Writes and reads go over
+  **QWP** through `questdb-rs` 7.2, QuestDB's own client; DDL, the applied check and cleanup over
+  HTTP `/exec` on the same port. The client's Arrow feature is off: its `arrow` range excludes the
+  workspace's 60, and nothing here needs Arrow.
+- **Load:** a WAL table partitioned by year (the coarsest a WAL table allows, after TimescaleDB's
+  420-chunk lesson), rows sent over QWP, the server's acknowledgement awaited, then timed until
+  `wal_tables()` shows every sequenced transaction applied, so the rows are visible. Open-source
+  QuestDB acknowledges receipt, not durability (a durable ack is Enterprise-only), so the reference
+  server runs with `cairo.commit.mode=sync`, and the engine line records the mode it found.
+- **Interpolation** is QuestDB's native `ASOF JOIN` onto deduplicated knots that carry their
+  neighbours, attached with `row_number()` and two self-joins. `SAMPLE BY … FILL(LINEAR)` fills
+  between bucket aggregates and does not answer jittered knots. The first draft attached the
+  neighbours with `lead`/`lag`; on QuestDB 10.1 a window function's columns on the right of an
+  `ASOF JOIN` came back shifted (a knot's own time read as the next knot's), every interior
+  instant came out `NULL`, and the live test caught it.
+- **Downsample** is native `SAMPLE BY … ALIGN TO CALENDAR`, the width in its largest exact unit
+  (QuestDB refuses `60000000000n`). The decimal arm's mean is `avg(v::double)`: QuestDB's `avg` of
+  a `DECIMAL(18, s)` column rounds the mean to `s` places (2.804 for 2.80357… at `s = 3`), a real
+  semantic the report names, not one an `f64` reference can gate.
+- **Bytes on disk** are `table_partitions()`' `diskSize`, which counts the space QuestDB reserves
+  ahead in the active partition; the report says small tables read far larger than they hold.
+- **`WEFT_XBENCH_QUESTDB`** is registered in the Test tier; the nightly smoke starts a
+  digest-pinned QuestDB 10.1.0 with telemetry off and sync commits.
+
+**Rejected:**
+
+- PG Wire: #393 rules it out as a deprecated path.
+- Reporting the window-function result as a QuestDB failure: the self-join answers the same
+  question through ordinary joins, and an engine is measured on a correct query, not the first one
+  tried. Whether to report the `ASOF JOIN` behaviour upstream is left to the owner.
+
 ## 2026-10-30 — External engines II: how the TimescaleDB arm is measured
 
 **Ambiguous:** TimescaleDB is the one engine in #413 with a native linear interpolation,

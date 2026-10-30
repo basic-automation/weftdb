@@ -26,6 +26,7 @@
 
 pub mod clickhouse;
 pub mod duck;
+pub mod questdb;
 pub mod render;
 pub mod timescale;
 pub mod weft;
@@ -511,6 +512,8 @@ pub struct Servers {
 	pub clickhouse: Option<clickhouse::Server>,
 	/// A `PostgreSQL` connection string for a server with `TimescaleDB` (`--timescale URL`).
 	pub timescale: Option<String>,
+	/// A `QuestDB` server's `host:port` (`--questdb ADDR`), QWP and HTTP on the one port.
+	pub questdb: Option<questdb::Server>,
 }
 
 /// Run every arm over every dataset.
@@ -536,6 +539,10 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps
 			results.extend(measure(&mut timescale::Timescale::double(url), ds, &reference, load_reps, reps, seed).await?);
 			results.extend(measure(&mut timescale::Timescale::numeric(url), ds, &reference, load_reps, reps, seed).await?);
 		}
+		if let Some(server) = &servers.questdb {
+			results.extend(measure(&mut questdb::QuestDb::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+			results.extend(measure(&mut questdb::QuestDb::decimal(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+		}
 	}
 	let mut engines = vec![EngineVersion { engine: "weftdb".into(), version: metadata.weft_bench_version.clone() }, EngineVersion { engine: "duckdb".into(), version: duck::duckdb_version()? }];
 	if let Some(server) = &servers.clickhouse {
@@ -543,6 +550,9 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps
 	}
 	if let Some(url) = &servers.timescale {
 		engines.push(EngineVersion { engine: "timescaledb".into(), version: timescale::version(url).await? });
+	}
+	if let Some(server) = &servers.questdb {
+		engines.push(EngineVersion { engine: "questdb".into(), version: server.version()? });
 	}
 	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), results })
 }
@@ -623,6 +633,26 @@ mod tests {
 		ds.points.insert(3, Point::new(ts(14), "9".parse().expect("decimal")));
 		let reference = reference(&ds).await.expect("reference");
 		for mut arm in [timescale::Timescale::double(&url), timescale::Timescale::numeric(&url)] {
+			let name = arm.info().arm;
+			let values = values_of(&mut arm, &ds).await;
+			let gate = Correctness::check(&values, &reference.grid, ds.grid_len());
+			assert!(gate.passed, "{name}: {gate:?}\n got {values:?}\nwant {:?}", reference.grid);
+			assert!(arm.storage_bytes().is_some_and(|b| b > 0), "{name}: bytes on disk");
+			let buckets = arm.downsample(&ds, ds.points.clone()).await.expect("downsamples");
+			assert!(Correctness::check_buckets(&buckets, &reference.buckets).passed, "{name}: got {buckets:?}\nwant {:?}", reference.buckets);
+		}
+	}
+
+	/// The `QuestDB` arms against a live server, when `WEFT_XBENCH_QUESTDB` names one
+	/// (`127.0.0.1:9000`); without it this passes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn questdb_matches_the_reference_on_edges_and_duplicates_when_a_server_is_given() {
+		let Ok(addr) = std::env::var("WEFT_XBENCH_QUESTDB") else { return };
+		let server = questdb::Server::new(&addr);
+		let mut ds = edge_dataset();
+		ds.points.insert(3, Point::new(ts(14), "9".parse().expect("decimal")));
+		let reference = reference(&ds).await.expect("reference");
+		for mut arm in [questdb::QuestDb::double(server.clone()), questdb::QuestDb::decimal(server.clone())] {
 			let name = arm.info().arm;
 			let values = values_of(&mut arm, &ds).await;
 			let gate = Correctness::check(&values, &reference.grid, ds.grid_len());

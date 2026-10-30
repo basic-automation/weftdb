@@ -3,13 +3,14 @@
 //! ```text
 //! TMPDIR=/mnt/weftbench weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N]
 //!                                   [--seed N] [--uci FILE] [--clickhouse URL] [--timescale URL]
-//!                                   [--out DIR]
+//!                                   [--questdb ADDR] [--out DIR]
 //! ```
 //!
 //! Without `--uci` the UCI datasets are skipped and the report says which datasets ran; without
 //! `--clickhouse` (an HTTP endpoint such as `http://127.0.0.1:8123`) the `ClickHouse` arms are,
 //! and without `--timescale` (a `PostgreSQL` connection string for a server with `TimescaleDB`)
-//! the `TimescaleDB` arms are. The
+//! the `TimescaleDB` arms are, and without `--questdb` (a `QuestDB` server's `host:port`) the
+//! `QuestDB` arms are. The
 //! process exits 1 when any result fails its correctness gate, after writing the report.
 //!
 //! `weft-xbench render REPORT.json [--out DIR]` writes `report.md` and `report.html` from a
@@ -22,7 +23,7 @@ use std::path::PathBuf;
 use weft_bench::{load_uci_corpus, scale::ScalePreset, RunMetadata, DEFAULT_UCI_COLUMN};
 use weft_xbench::{clickhouse, render, run, Dataset, DatasetKind, Servers, XbenchReport, DEFAULT_SEED};
 
-const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--clickhouse URL] [--timescale URL] [--out DIR]";
+const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--out DIR]";
 
 struct Cli {
 	scales: Vec<ScalePreset>,
@@ -32,11 +33,12 @@ struct Cli {
 	uci: Option<PathBuf>,
 	clickhouse: Option<String>,
 	timescale: Option<String>,
+	questdb: Option<String>,
 	out: PathBuf,
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, clickhouse: None, timescale: None, out: PathBuf::from("reports/xbench") };
+	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, clickhouse: None, timescale: None, questdb: None, out: PathBuf::from("reports/xbench") };
 	let mut args = args;
 	while let Some(flag) = args.next() {
 		let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
@@ -48,6 +50,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 			"--uci" => cli.uci = Some(PathBuf::from(value()?)),
 			"--clickhouse" => cli.clickhouse = Some(value()?),
 			"--timescale" => cli.timescale = Some(value()?),
+			"--questdb" => cli.questdb = Some(value()?),
 			"--out" => cli.out = PathBuf::from(value()?),
 			"-h" | "--help" => return Err(USAGE.to_string()),
 			other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
@@ -109,12 +112,15 @@ async fn main() -> anyhow::Result<()> {
 	}
 	eprintln!("weft-xbench: {} datasets, scratch in {}", datasets.len(), std::env::temp_dir().display());
 	let metadata = RunMetadata::capture(chrono::Utc::now().to_rfc3339());
-	let servers = Servers { clickhouse: cli.clickhouse.as_deref().map(clickhouse::Server::new), timescale: cli.timescale.clone() };
+	let servers = Servers { clickhouse: cli.clickhouse.as_deref().map(clickhouse::Server::new), timescale: cli.timescale.clone(), questdb: cli.questdb.as_deref().map(weft_xbench::questdb::Server::new) };
 	if let Some(server) = &servers.clickhouse {
 		eprintln!("weft-xbench: clickhouse {} at {}", server.version()?, cli.clickhouse.as_deref().unwrap_or_default());
 	}
 	if let Some(url) = &servers.timescale {
 		eprintln!("weft-xbench: timescaledb {}", weft_xbench::timescale::version(url).await?);
+	}
+	if let Some(server) = &servers.questdb {
+		eprintln!("weft-xbench: questdb {}", server.version()?);
 	}
 	let report = run(&datasets, &servers, cli.load_reps, cli.reps, cli.seed, metadata, source_commit(), invocation).await?;
 

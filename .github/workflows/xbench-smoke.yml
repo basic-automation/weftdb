@@ -1,8 +1,8 @@
 name: cross-engine smoke
 
 # The nightly smoke run of the cross-engine benchmark (EVI-14). It builds weft-xbench — its own
-# workspace, because DuckDB compiles from C++ — runs every arm at the `tiny` scale (ClickHouse
-# and TimescaleDB against service containers), and fails
+# workspace, because DuckDB compiles from C++ — runs every arm at the `tiny` scale (ClickHouse,
+# TimescaleDB and QuestDB against service containers), and fails
 # when any arm disagrees with WeftDB's in-memory reference or the build no longer links.
 #
 # A smoke test, not a measurement: hosted runners are not reference hardware (decision 19), and a
@@ -29,7 +29,7 @@ jobs:
     name: weft-xbench tiny
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # The ClickHouse and TimescaleDB arms need servers. Each is pinned to the version its arm was
+    # The ClickHouse, TimescaleDB and QuestDB arms need servers. Each is pinned to the version its arm was
     # written against; a newer one is a deliberate bump here, not a silent drift.
     services:
       clickhouse:
@@ -54,6 +54,14 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres -d xbench"
           --health-interval 5s --health-retries 30
+      questdb:
+        image: questdb/questdb:10.1.0@sha256:3b11dc5f77aa299c7c9191b10cf50124c9e97663ce93bc50df5040374e87efc9
+        ports:
+          - 9000:9000
+        env:
+          # No telemetry from a CI runner; every commit synced, as on the reference host.
+          QDB_TELEMETRY_ENABLED: "false"
+          QDB_CAIRO_COMMIT_MODE: sync
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,12 +84,13 @@ jobs:
       - name: Build
         run: cargo build --locked --release --manifest-path weft-xbench/Cargo.toml
 
-      # The live ClickHouse and TimescaleDB tests (edges, duplicate instants, buckets) are skipped
+      # The live ClickHouse, TimescaleDB and QuestDB tests (edges, duplicate instants, buckets) are skipped
       # without a server, so they run here, not in ci.yml.
       - name: Test against the database servers
         env:
           WEFT_XBENCH_CLICKHOUSE: http://127.0.0.1:8123
           WEFT_XBENCH_TIMESCALE: postgresql://postgres:xbench@127.0.0.1:5432/xbench
+          WEFT_XBENCH_QUESTDB: 127.0.0.1:9000
         run: cargo test --locked --release --manifest-path weft-xbench/Cargo.toml
 
       - name: Run every arm at the tiny scale
@@ -91,7 +100,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/xbench-scratch"
           TMPDIR="$RUNNER_TEMP/xbench-scratch" weft-xbench/target/release/weft-xbench \
             --scales tiny --reps 3 --load-reps 2 --clickhouse http://127.0.0.1:8123 \
-            --timescale postgresql://postgres:xbench@127.0.0.1:5432/xbench --out xbench-out
+            --timescale postgresql://postgres:xbench@127.0.0.1:5432/xbench \
+            --questdb 127.0.0.1:9000 --out xbench-out
 
       - name: Summarise
         if: always()
