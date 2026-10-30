@@ -18,6 +18,14 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **First cross-engine report** (evidence track EVI-15), in `bench/reports/evi-15/`: WeftDB
+  against DuckDB `DOUBLE` and `DECIMAL` on load, storage bytes, linear interpolation and bucketed
+  downsampling, over MCAR, block missingness and the UCI household-power corpus at three scales,
+  on the reference SSD. All 99 correctness gates passed. DuckDB loads about 4–27× faster and downsamples
+  about 3× faster at `medium`; WeftDB's store is smaller (about half of DuckDB's on the UCI data)
+  and its interpolation wins hold only at `tiny` and `small` scale. A second run is kept beside the
+  report, and the README records which verdicts held across both. `scripts/xbench/fetch-uci.py`
+  fetches the UCI input against its checksum.
 - **`HONESTY.md`: four honesty pages** (evidence track EVI-16): when WeftDB is not the right tool
   (with the measured losses: bulk load and large exact-decimal grids against DuckDB, splines on
   prices, the GPU on stored reads), the benchmark methodology (correctness gates, seeds and

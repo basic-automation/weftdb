@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WeftDB cross-engine benchmark</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:72rem;margin:2rem auto;padding:0 1rem;color:#1b1b1b;background:#fff}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #ccc;padding:.25rem .5rem;text-align:left}th{background:#f3f3f3}
+code{font:13px ui-monospace,monospace;background:#f3f3f3;padding:0 .2rem}
+@media (prefers-color-scheme:dark){body{color:#e8e8e8;background:#161616}th,code{background:#262626}th,td{border-color:#444}}
+</style>
+</head>
+<body>
+<h1>WeftDB cross-engine benchmark</h1>
+<p>Generated 2026-10-30T03:17:22.424188325+00:00 on AMD Ryzen 9 7950X3D 16-Core Processor (linux x86_64). Engines: weftdb 0.1.0, duckdb v2.0.0. Source commit: 9903465fe0a3f286787957da7fa135d23ac04a72. Seed: 1592649491.</p>
+<h2>Results</h2>
+<p>Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets. B/pt is the store's size on disk after a load, divided by the points loaded (whole files: indexes and headers included).</p>
+<table>
+<thead><tr><th>dataset</th><th>phase</th><th>arm</th><th>input</th><th>p50 [CI]</th><th>p95</th><th>reps</th><th>gate</th><th>RMSE</th><th>B/pt</th></tr></thead>
+<tbody>
+<tr><td>mcar-tiny</td><td>interpolate</td><td>weftdb-memory</td><td>3560</td><td>6.734 [4.722, 11.723]</td><td>17.603</td><td>10</td><td>PASS</td><td>0.9453</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>downsample</td><td>weftdb-memory</td><td>3560</td><td>0.972 [0.969, 0.982]</td><td>0.999</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>load</td><td>weftdb-stored</td><td>3560</td><td>211.690 [205.989, 222.578]</td><td>222.578</td><td>5</td><td>—</td><td>—</td><td>20.70</td></tr>
+<tr><td>mcar-tiny</td><td>interpolate</td><td>weftdb-stored</td><td>3560</td><td>4.620 [3.905, 5.168]</td><td>6.311</td><td>10</td><td>PASS</td><td>0.9453</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>downsample</td><td>weftdb-stored</td><td>3560</td><td>1.231 [1.188, 1.337]</td><td>1.740</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>load</td><td>weftdb-stored-f64</td><td>3560</td><td>200.596 [200.011, 204.061]</td><td>204.061</td><td>5</td><td>—</td><td>—</td><td>20.70</td></tr>
+<tr><td>mcar-tiny</td><td>interpolate</td><td>weftdb-stored-f64</td><td>3560</td><td>1.236 [1.142, 1.314]</td><td>1.691</td><td>10</td><td>PASS</td><td>0.9453</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>load</td><td>weftdb-stored-bulk</td><td>3560</td><td>183.503 [181.764, 184.641]</td><td>184.641</td><td>5</td><td>—</td><td>—</td><td>20.27</td></tr>
+<tr><td>mcar-tiny</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>3560</td><td>3.695 [3.499, 3.888]</td><td>4.554</td><td>10</td><td>PASS</td><td>0.9453</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>downsample</td><td>weftdb-stored-bulk</td><td>3560</td><td>1.286 [1.260, 1.353]</td><td>1.519</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>load</td><td>duckdb-double</td><td>3560</td><td>19.545 [18.964, 24.960]</td><td>24.960</td><td>5</td><td>—</td><td>—</td><td>150.72</td></tr>
+<tr><td>mcar-tiny</td><td>interpolate</td><td>duckdb-double</td><td>3560</td><td>18.837 [16.950, 19.630]</td><td>22.874</td><td>10</td><td>PASS</td><td>0.9453</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>downsample</td><td>duckdb-double</td><td>3560</td><td>1.014 [0.959, 1.418]</td><td>2.464</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>load</td><td>duckdb-decimal</td><td>3560</td><td>20.506 [20.063, 23.075]</td><td>23.075</td><td>5</td><td>—</td><td>—</td><td>150.72</td></tr>
+<tr><td>mcar-tiny</td><td>interpolate</td><td>duckdb-decimal</td><td>3560</td><td>17.330 [16.702, 18.773]</td><td>23.902</td><td>10</td><td>PASS</td><td>0.9453</td><td>—</td></tr>
+<tr><td>mcar-tiny</td><td>downsample</td><td>duckdb-decimal</td><td>3560</td><td>1.107 [1.035, 1.783]</td><td>3.006</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>interpolate</td><td>weftdb-memory</td><td>2864</td><td>4.156 [4.087, 4.385]</td><td>4.780</td><td>10</td><td>PASS</td><td>0.9965</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>downsample</td><td>weftdb-memory</td><td>2864</td><td>0.857 [0.825, 0.875]</td><td>0.876</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>load</td><td>weftdb-stored</td><td>2864</td><td>200.161 [197.605, 201.256]</td><td>201.256</td><td>5</td><td>—</td><td>—</td><td>23.87</td></tr>
+<tr><td>block-tiny</td><td>interpolate</td><td>weftdb-stored</td><td>2864</td><td>4.726 [4.585, 5.440]</td><td>5.671</td><td>10</td><td>PASS</td><td>0.9965</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>downsample</td><td>weftdb-stored</td><td>2864</td><td>1.206 [1.148, 1.404]</td><td>1.663</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>load</td><td>weftdb-stored-f64</td><td>2864</td><td>203.540 [194.064, 208.797]</td><td>208.797</td><td>5</td><td>—</td><td>—</td><td>23.88</td></tr>
+<tr><td>block-tiny</td><td>interpolate</td><td>weftdb-stored-f64</td><td>2864</td><td>1.516 [1.448, 1.933]</td><td>2.334</td><td>10</td><td>PASS</td><td>0.9965</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>load</td><td>weftdb-stored-bulk</td><td>2864</td><td>191.349 [187.388, 193.028]</td><td>193.028</td><td>5</td><td>—</td><td>—</td><td>23.52</td></tr>
+<tr><td>block-tiny</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>2864</td><td>4.667 [4.374, 4.796]</td><td>6.006</td><td>10</td><td>PASS</td><td>0.9965</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>downsample</td><td>weftdb-stored-bulk</td><td>2864</td><td>0.996 [0.990, 1.017]</td><td>1.922</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>load</td><td>duckdb-double</td><td>2864</td><td>21.205 [19.971, 26.202]</td><td>26.202</td><td>5</td><td>—</td><td>—</td><td>187.35</td></tr>
+<tr><td>block-tiny</td><td>interpolate</td><td>duckdb-double</td><td>2864</td><td>18.890 [17.914, 19.266]</td><td>24.048</td><td>10</td><td>PASS</td><td>0.9965</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>downsample</td><td>duckdb-double</td><td>2864</td><td>1.138 [1.038, 1.368]</td><td>2.195</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>load</td><td>duckdb-decimal</td><td>2864</td><td>22.021 [21.088, 24.593]</td><td>24.593</td><td>5</td><td>—</td><td>—</td><td>187.35</td></tr>
+<tr><td>block-tiny</td><td>interpolate</td><td>duckdb-decimal</td><td>2864</td><td>18.558 [17.503, 19.094]</td><td>23.578</td><td>10</td><td>PASS</td><td>0.9965</td><td>—</td></tr>
+<tr><td>block-tiny</td><td>downsample</td><td>duckdb-decimal</td><td>2864</td><td>1.203 [1.030, 1.557]</td><td>2.055</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>weftdb-memory</td><td>86245</td><td>24.087 [22.707, 25.842]</td><td>26.416</td><td>10</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>weftdb-memory</td><td>86245</td><td>1.745 [1.715, 1.806]</td><td>2.026</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>weftdb-stored</td><td>86245</td><td>927.833 [898.741, 970.632]</td><td>970.632</td><td>5</td><td>—</td><td>—</td><td>7.97</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>weftdb-stored</td><td>86245</td><td>29.203 [28.728, 30.917]</td><td>31.914</td><td>10</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>weftdb-stored</td><td>86245</td><td>4.334 [3.954, 4.795]</td><td>5.081</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>weftdb-stored-f64</td><td>86245</td><td>901.611 [892.678, 937.217]</td><td>937.217</td><td>5</td><td>—</td><td>—</td><td>7.98</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>weftdb-stored-f64</td><td>86245</td><td>8.396 [8.140, 10.702]</td><td>11.221</td><td>10</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>weftdb-stored-bulk</td><td>86245</td><td>297.364 [292.523, 300.177]</td><td>300.177</td><td>5</td><td>—</td><td>—</td><td>7.48</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>86245</td><td>27.648 [26.668, 28.391]</td><td>30.394</td><td>10</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>weftdb-stored-bulk</td><td>86245</td><td>4.827 [4.596, 5.210]</td><td>8.094</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>duckdb-double</td><td>86245</td><td>57.071 [50.738, 60.939]</td><td>60.939</td><td>5</td><td>—</td><td>—</td><td>12.30</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>duckdb-double</td><td>86245</td><td>24.978 [24.524, 29.384]</td><td>34.029</td><td>10</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>duckdb-double</td><td>86245</td><td>2.221 [1.944, 2.277]</td><td>3.272</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>duckdb-decimal</td><td>86245</td><td>57.675 [54.793, 61.221]</td><td>61.221</td><td>5</td><td>—</td><td>—</td><td>12.30</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>duckdb-decimal</td><td>86245</td><td>23.617 [23.349, 27.139]</td><td>32.896</td><td>10</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>duckdb-decimal</td><td>86245</td><td>1.975 [1.835, 2.108]</td><td>3.014</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>weftdb-memory</td><td>68751</td><td>19.509 [18.973, 20.088]</td><td>21.377</td><td>10</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>weftdb-memory</td><td>68751</td><td>1.406 [1.362, 1.452]</td><td>1.582</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>weftdb-stored</td><td>68751</td><td>766.492 [761.953, 785.240]</td><td>785.240</td><td>5</td><td>—</td><td>—</td><td>8.04</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>weftdb-stored</td><td>68751</td><td>24.026 [23.821, 25.774]</td><td>29.206</td><td>10</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>weftdb-stored</td><td>68751</td><td>3.217 [2.989, 3.291]</td><td>3.834</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>weftdb-stored-f64</td><td>68751</td><td>766.026 [744.657, 818.548]</td><td>818.548</td><td>5</td><td>—</td><td>—</td><td>8.05</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>weftdb-stored-f64</td><td>68751</td><td>6.134 [5.936, 6.836]</td><td>7.303</td><td>10</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>weftdb-stored-bulk</td><td>68751</td><td>267.073 [263.952, 281.353]</td><td>281.353</td><td>5</td><td>—</td><td>—</td><td>7.56</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>68751</td><td>22.696 [22.142, 24.016]</td><td>25.538</td><td>10</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>weftdb-stored-bulk</td><td>68751</td><td>3.577 [3.305, 4.041]</td><td>5.800</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>duckdb-double</td><td>68751</td><td>49.848 [45.079, 59.449]</td><td>59.449</td><td>5</td><td>—</td><td>—</td><td>15.43</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>duckdb-double</td><td>68751</td><td>21.747 [21.001, 23.286]</td><td>28.457</td><td>10</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>duckdb-double</td><td>68751</td><td>1.799 [1.755, 1.839]</td><td>3.173</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>duckdb-decimal</td><td>68751</td><td>49.987 [48.533, 54.878]</td><td>54.878</td><td>5</td><td>—</td><td>—</td><td>15.43</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>duckdb-decimal</td><td>68751</td><td>22.574 [20.808, 24.093]</td><td>26.511</td><td>10</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>duckdb-decimal</td><td>68751</td><td>1.880 [1.796, 2.193]</td><td>2.988</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>weftdb-memory</td><td>604689</td><td>142.803 [140.749, 147.496]</td><td>153.335</td><td>10</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>weftdb-memory</td><td>604689</td><td>7.919 [7.722, 8.300]</td><td>8.802</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>weftdb-stored</td><td>604689</td><td>5555.821 [5176.703, 5710.144]</td><td>5710.144</td><td>5</td><td>—</td><td>—</td><td>7.17</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>weftdb-stored</td><td>604689</td><td>198.326 [190.333, 205.275]</td><td>214.569</td><td>10</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>weftdb-stored</td><td>604689</td><td>17.879 [17.166, 20.408]</td><td>21.378</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>weftdb-stored-f64</td><td>604689</td><td>5535.440 [5307.294, 5612.711]</td><td>5612.711</td><td>5</td><td>—</td><td>—</td><td>7.17</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>weftdb-stored-f64</td><td>604689</td><td>67.711 [59.144, 71.727]</td><td>95.536</td><td>10</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>weftdb-stored-bulk</td><td>604689</td><td>964.127 [960.843, 973.511]</td><td>973.511</td><td>5</td><td>—</td><td>—</td><td>6.66</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>604689</td><td>210.524 [187.510, 216.460]</td><td>224.594</td><td>10</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>weftdb-stored-bulk</td><td>604689</td><td>44.466 [43.010, 45.543]</td><td>47.430</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>duckdb-double</td><td>604689</td><td>204.262 [199.480, 225.541]</td><td>225.541</td><td>5</td><td>—</td><td>—</td><td>8.26</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>duckdb-double</td><td>604689</td><td>50.859 [49.692, 52.716]</td><td>58.176</td><td>10</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>duckdb-double</td><td>604689</td><td>5.371 [4.958, 5.834]</td><td>6.522</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>duckdb-decimal</td><td>604689</td><td>277.870 [250.354, 281.253]</td><td>281.253</td><td>5</td><td>—</td><td>—</td><td>8.26</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>duckdb-decimal</td><td>604689</td><td>53.428 [48.399, 58.519]</td><td>60.382</td><td>10</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>duckdb-decimal</td><td>604689</td><td>6.517 [6.116, 7.226]</td><td>8.274</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>weftdb-memory</td><td>481252</td><td>112.244 [109.839, 115.776]</td><td>119.110</td><td>10</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>weftdb-memory</td><td>481252</td><td>5.774 [5.493, 5.885]</td><td>6.309</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>weftdb-stored</td><td>481252</td><td>4246.923 [4175.948, 4274.915]</td><td>4274.915</td><td>5</td><td>—</td><td>—</td><td>7.13</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>weftdb-stored</td><td>481252</td><td>152.038 [148.639, 157.709]</td><td>167.179</td><td>10</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>weftdb-stored</td><td>481252</td><td>13.111 [12.244, 13.698]</td><td>14.096</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>weftdb-stored-f64</td><td>481252</td><td>4272.610 [4191.821, 4336.625]</td><td>4336.625</td><td>5</td><td>—</td><td>—</td><td>7.13</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>weftdb-stored-f64</td><td>481252</td><td>45.520 [41.619, 50.892]</td><td>53.425</td><td>10</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>weftdb-stored-bulk</td><td>481252</td><td>802.981 [798.111, 803.356]</td><td>803.356</td><td>5</td><td>—</td><td>—</td><td>6.62</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>481252</td><td>149.209 [143.379, 150.548]</td><td>168.751</td><td>10</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>weftdb-stored-bulk</td><td>481252</td><td>35.164 [35.009, 35.905]</td><td>36.365</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>duckdb-double</td><td>481252</td><td>180.401 [168.778, 184.803]</td><td>184.803</td><td>5</td><td>—</td><td>—</td><td>8.74</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>duckdb-double</td><td>481252</td><td>42.999 [41.513, 46.615]</td><td>52.851</td><td>10</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>duckdb-double</td><td>481252</td><td>4.148 [3.843, 4.557]</td><td>4.879</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>duckdb-decimal</td><td>481252</td><td>203.652 [200.852, 231.695]</td><td>231.695</td><td>5</td><td>—</td><td>—</td><td>8.20</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>duckdb-decimal</td><td>481252</td><td>46.368 [43.907, 48.103]</td><td>52.684</td><td>10</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>duckdb-decimal</td><td>481252</td><td>4.392 [3.769, 5.222]</td><td>6.714</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>interpolate</td><td>weftdb-memory</td><td>3600</td><td>1.038 [0.981, 1.045]</td><td>1.129</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>downsample</td><td>weftdb-memory</td><td>3600</td><td>0.082 [0.076, 0.096]</td><td>0.180</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>load</td><td>weftdb-stored</td><td>3600</td><td>214.496 [211.830, 232.521]</td><td>232.521</td><td>5</td><td>—</td><td>—</td><td>14.23</td></tr>
+<tr><td>uci-tiny</td><td>interpolate</td><td>weftdb-stored</td><td>3600</td><td>1.386 [1.272, 1.438]</td><td>1.718</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>downsample</td><td>weftdb-stored</td><td>3600</td><td>0.306 [0.258, 0.335]</td><td>0.417</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>load</td><td>weftdb-stored-f64</td><td>3600</td><td>225.491 [209.395, 227.809]</td><td>227.809</td><td>5</td><td>—</td><td>—</td><td>14.23</td></tr>
+<tr><td>uci-tiny</td><td>interpolate</td><td>weftdb-stored-f64</td><td>3600</td><td>0.553 [0.519, 0.674]</td><td>1.276</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>load</td><td>weftdb-stored-bulk</td><td>3600</td><td>190.931 [189.376, 193.680]</td><td>193.680</td><td>5</td><td>—</td><td>—</td><td>13.82</td></tr>
+<tr><td>uci-tiny</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>3600</td><td>1.146 [1.125, 1.256]</td><td>2.112</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>downsample</td><td>weftdb-stored-bulk</td><td>3600</td><td>0.269 [0.264, 0.323]</td><td>0.379</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>load</td><td>duckdb-double</td><td>3600</td><td>24.724 [21.387, 25.196]</td><td>25.196</td><td>5</td><td>—</td><td>—</td><td>149.05</td></tr>
+<tr><td>uci-tiny</td><td>interpolate</td><td>duckdb-double</td><td>3600</td><td>8.425 [8.239, 9.109]</td><td>11.689</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>downsample</td><td>duckdb-double</td><td>3600</td><td>0.900 [0.839, 1.065]</td><td>3.022</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>load</td><td>duckdb-decimal</td><td>3600</td><td>23.562 [21.091, 25.182]</td><td>25.182</td><td>5</td><td>—</td><td>—</td><td>149.05</td></tr>
+<tr><td>uci-tiny</td><td>interpolate</td><td>duckdb-decimal</td><td>3600</td><td>9.208 [8.944, 9.625]</td><td>11.733</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-tiny</td><td>downsample</td><td>duckdb-decimal</td><td>3600</td><td>1.021 [0.956, 1.129]</td><td>1.836</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>weftdb-memory</td><td>86400</td><td>20.481 [20.004, 21.078]</td><td>24.073</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>weftdb-memory</td><td>86400</td><td>1.835 [1.679, 2.478]</td><td>3.450</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>weftdb-stored</td><td>86400</td><td>907.852 [903.712, 919.786]</td><td>919.786</td><td>5</td><td>—</td><td>—</td><td>2.38</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>weftdb-stored</td><td>86400</td><td>28.044 [26.222, 28.413]</td><td>28.697</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>weftdb-stored</td><td>86400</td><td>3.040 [2.800, 3.955]</td><td>4.640</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>weftdb-stored-f64</td><td>86400</td><td>915.667 [904.163, 922.542]</td><td>922.542</td><td>5</td><td>—</td><td>—</td><td>2.38</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>weftdb-stored-f64</td><td>86400</td><td>9.612 [8.474, 10.554]</td><td>12.075</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>weftdb-stored-bulk</td><td>86400</td><td>297.612 [296.375, 300.291]</td><td>300.291</td><td>5</td><td>—</td><td>—</td><td>1.90</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>86400</td><td>23.474 [23.173, 24.088]</td><td>24.641</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>weftdb-stored-bulk</td><td>86400</td><td>3.753 [3.336, 4.299]</td><td>4.690</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>duckdb-double</td><td>86400</td><td>53.643 [49.707, 55.680]</td><td>55.680</td><td>5</td><td>—</td><td>—</td><td>6.21</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>duckdb-double</td><td>86400</td><td>25.714 [24.298, 27.412]</td><td>31.031</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>duckdb-double</td><td>86400</td><td>2.184 [2.021, 2.331]</td><td>3.118</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>duckdb-decimal</td><td>86400</td><td>57.510 [55.835, 60.774]</td><td>60.774</td><td>5</td><td>—</td><td>—</td><td>6.21</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>duckdb-decimal</td><td>86400</td><td>25.776 [24.130, 27.188]</td><td>36.209</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>duckdb-decimal</td><td>86400</td><td>2.237 [2.102, 2.581]</td><td>3.199</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>weftdb-memory</td><td>600863</td><td>140.672 [139.271, 145.495]</td><td>158.541</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>weftdb-memory</td><td>600863</td><td>15.807 [15.711, 16.138]</td><td>16.475</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>weftdb-stored</td><td>600863</td><td>5294.161 [5194.205, 5333.021]</td><td>5333.021</td><td>5</td><td>—</td><td>—</td><td>1.89</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>weftdb-stored</td><td>600863</td><td>191.404 [175.784, 204.923]</td><td>226.802</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>weftdb-stored</td><td>600863</td><td>21.966 [21.204, 22.582]</td><td>24.460</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>weftdb-stored-f64</td><td>600863</td><td>5303.131 [5233.251, 5366.054]</td><td>5366.054</td><td>5</td><td>—</td><td>—</td><td>1.89</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>weftdb-stored-f64</td><td>600863</td><td>58.268 [54.710, 62.768]</td><td>68.553</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>weftdb-stored-bulk</td><td>600863</td><td>923.009 [919.847, 932.248]</td><td>932.248</td><td>5</td><td>—</td><td>—</td><td>1.39</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>600863</td><td>169.015 [168.115, 172.180]</td><td>209.250</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>weftdb-stored-bulk</td><td>600863</td><td>35.885 [35.024, 36.409]</td><td>37.194</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>duckdb-double</td><td>600863</td><td>196.959 [194.965, 200.416]</td><td>200.416</td><td>5</td><td>—</td><td>—</td><td>3.07</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>duckdb-double</td><td>600863</td><td>81.883 [76.907, 86.922]</td><td>87.680</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>duckdb-double</td><td>600863</td><td>6.370 [5.877, 6.837]</td><td>9.160</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>duckdb-decimal</td><td>600863</td><td>237.258 [235.584, 238.054]</td><td>238.054</td><td>5</td><td>—</td><td>—</td><td>3.07</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>duckdb-decimal</td><td>600863</td><td>83.414 [80.226, 88.046]</td><td>92.822</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>duckdb-decimal</td><td>600863</td><td>6.275 [6.156, 6.940]</td><td>7.111</td><td>10</td><td>PASS</td><td>—</td><td>—</td></tr>
+</tbody>
+</table>
+<h2>Honesty</h2>
+<p>Generated from the results above. A WeftDB arm wins or loses only when its p50 interval does not overlap the fastest other engine's; overlapping intervals are within noise.</p>
+<h3>Where WeftDB wins</h3>
+<ul>
+<li><code>mcar-tiny</code> interpolate: <code>weftdb-memory</code> p50 6.734 ms vs <code>duckdb-decimal</code> 17.330 ms (weftdb-memory 2.6× faster).</li>
+<li><code>mcar-tiny</code> interpolate: <code>weftdb-stored</code> p50 4.620 ms vs <code>duckdb-decimal</code> 17.330 ms (weftdb-stored 3.8× faster).</li>
+<li><code>mcar-tiny</code> interpolate: <code>weftdb-stored-f64</code> p50 1.236 ms vs <code>duckdb-decimal</code> 17.330 ms (weftdb-stored-f64 14.0× faster).</li>
+<li><code>mcar-tiny</code> interpolate: <code>weftdb-stored-bulk</code> p50 3.695 ms vs <code>duckdb-decimal</code> 17.330 ms (weftdb-stored-bulk 4.7× faster).</li>
+<li><code>block-tiny</code> interpolate: <code>weftdb-memory</code> p50 4.156 ms vs <code>duckdb-decimal</code> 18.558 ms (weftdb-memory 4.5× faster).</li>
+<li><code>block-tiny</code> downsample: <code>weftdb-memory</code> p50 0.857 ms vs <code>duckdb-double</code> 1.138 ms (weftdb-memory 1.3× faster).</li>
+<li><code>block-tiny</code> interpolate: <code>weftdb-stored</code> p50 4.726 ms vs <code>duckdb-decimal</code> 18.558 ms (weftdb-stored 3.9× faster).</li>
+<li><code>block-tiny</code> interpolate: <code>weftdb-stored-f64</code> p50 1.516 ms vs <code>duckdb-decimal</code> 18.558 ms (weftdb-stored-f64 12.2× faster).</li>
+<li><code>block-tiny</code> interpolate: <code>weftdb-stored-bulk</code> p50 4.667 ms vs <code>duckdb-decimal</code> 18.558 ms (weftdb-stored-bulk 4.0× faster).</li>
+<li><code>block-tiny</code> downsample: <code>weftdb-stored-bulk</code> p50 0.996 ms vs <code>duckdb-double</code> 1.138 ms (weftdb-stored-bulk 1.1× faster).</li>
+<li><code>mcar-small</code> downsample: <code>weftdb-memory</code> p50 1.745 ms vs <code>duckdb-decimal</code> 1.975 ms (weftdb-memory 1.1× faster).</li>
+<li><code>mcar-small</code> interpolate: <code>weftdb-stored-f64</code> p50 8.396 ms vs <code>duckdb-decimal</code> 23.617 ms (weftdb-stored-f64 2.8× faster).</li>
+<li><code>block-small</code> interpolate: <code>weftdb-memory</code> p50 19.509 ms vs <code>duckdb-double</code> 21.747 ms (weftdb-memory 1.1× faster).</li>
+<li><code>block-small</code> downsample: <code>weftdb-memory</code> p50 1.406 ms vs <code>duckdb-double</code> 1.799 ms (weftdb-memory 1.3× faster).</li>
+<li><code>block-small</code> interpolate: <code>weftdb-stored-f64</code> p50 6.134 ms vs <code>duckdb-double</code> 21.747 ms (weftdb-stored-f64 3.5× faster).</li>
+<li><code>uci-tiny</code> interpolate: <code>weftdb-memory</code> p50 1.038 ms vs <code>duckdb-double</code> 8.425 ms (weftdb-memory 8.1× faster).</li>
+<li><code>uci-tiny</code> downsample: <code>weftdb-memory</code> p50 0.082 ms vs <code>duckdb-double</code> 0.900 ms (weftdb-memory 11.0× faster).</li>
+<li><code>uci-tiny</code> interpolate: <code>weftdb-stored</code> p50 1.386 ms vs <code>duckdb-double</code> 8.425 ms (weftdb-stored 6.1× faster).</li>
+<li><code>uci-tiny</code> downsample: <code>weftdb-stored</code> p50 0.306 ms vs <code>duckdb-double</code> 0.900 ms (weftdb-stored 2.9× faster).</li>
+<li><code>uci-tiny</code> interpolate: <code>weftdb-stored-f64</code> p50 0.553 ms vs <code>duckdb-double</code> 8.425 ms (weftdb-stored-f64 15.2× faster).</li>
+<li><code>uci-tiny</code> interpolate: <code>weftdb-stored-bulk</code> p50 1.146 ms vs <code>duckdb-double</code> 8.425 ms (weftdb-stored-bulk 7.4× faster).</li>
+<li><code>uci-tiny</code> downsample: <code>weftdb-stored-bulk</code> p50 0.269 ms vs <code>duckdb-double</code> 0.900 ms (weftdb-stored-bulk 3.3× faster).</li>
+<li><code>uci-small</code> interpolate: <code>weftdb-memory</code> p50 20.481 ms vs <code>duckdb-double</code> 25.714 ms (weftdb-memory 1.3× faster).</li>
+<li><code>uci-small</code> interpolate: <code>weftdb-stored-f64</code> p50 9.612 ms vs <code>duckdb-double</code> 25.714 ms (weftdb-stored-f64 2.7× faster).</li>
+<li><code>uci-small</code> interpolate: <code>weftdb-stored-bulk</code> p50 23.474 ms vs <code>duckdb-double</code> 25.714 ms (weftdb-stored-bulk 1.1× faster).</li>
+<li><code>uci-medium</code> interpolate: <code>weftdb-stored-f64</code> p50 58.268 ms vs <code>duckdb-double</code> 81.883 ms (weftdb-stored-f64 1.4× faster).</li>
+</ul>
+<h3>Where WeftDB loses</h3>
+<ul>
+<li><code>mcar-tiny</code> load: <code>weftdb-stored</code> p50 211.690 ms vs <code>duckdb-double</code> 19.545 ms (duckdb-double 10.8× faster).</li>
+<li><code>mcar-tiny</code> load: <code>weftdb-stored-f64</code> p50 200.596 ms vs <code>duckdb-double</code> 19.545 ms (duckdb-double 10.3× faster).</li>
+<li><code>mcar-tiny</code> load: <code>weftdb-stored-bulk</code> p50 183.503 ms vs <code>duckdb-double</code> 19.545 ms (duckdb-double 9.4× faster).</li>
+<li><code>block-tiny</code> load: <code>weftdb-stored</code> p50 200.161 ms vs <code>duckdb-double</code> 21.205 ms (duckdb-double 9.4× faster).</li>
+<li><code>block-tiny</code> load: <code>weftdb-stored-f64</code> p50 203.540 ms vs <code>duckdb-double</code> 21.205 ms (duckdb-double 9.6× faster).</li>
+<li><code>block-tiny</code> load: <code>weftdb-stored-bulk</code> p50 191.349 ms vs <code>duckdb-double</code> 21.205 ms (duckdb-double 9.0× faster).</li>
+<li><code>mcar-small</code> load: <code>weftdb-stored</code> p50 927.833 ms vs <code>duckdb-double</code> 57.071 ms (duckdb-double 16.3× faster).</li>
+<li><code>mcar-small</code> interpolate: <code>weftdb-stored</code> p50 29.203 ms vs <code>duckdb-decimal</code> 23.617 ms (duckdb-decimal 1.2× faster).</li>
+<li><code>mcar-small</code> downsample: <code>weftdb-stored</code> p50 4.334 ms vs <code>duckdb-decimal</code> 1.975 ms (duckdb-decimal 2.2× faster).</li>
+<li><code>mcar-small</code> load: <code>weftdb-stored-f64</code> p50 901.611 ms vs <code>duckdb-double</code> 57.071 ms (duckdb-double 15.8× faster).</li>
+<li><code>mcar-small</code> load: <code>weftdb-stored-bulk</code> p50 297.364 ms vs <code>duckdb-double</code> 57.071 ms (duckdb-double 5.2× faster).</li>
+<li><code>mcar-small</code> downsample: <code>weftdb-stored-bulk</code> p50 4.827 ms vs <code>duckdb-decimal</code> 1.975 ms (duckdb-decimal 2.4× faster).</li>
+<li><code>block-small</code> load: <code>weftdb-stored</code> p50 766.492 ms vs <code>duckdb-double</code> 49.848 ms (duckdb-double 15.4× faster).</li>
+<li><code>block-small</code> interpolate: <code>weftdb-stored</code> p50 24.026 ms vs <code>duckdb-double</code> 21.747 ms (duckdb-double 1.1× faster).</li>
+<li><code>block-small</code> downsample: <code>weftdb-stored</code> p50 3.217 ms vs <code>duckdb-double</code> 1.799 ms (duckdb-double 1.8× faster).</li>
+<li><code>block-small</code> load: <code>weftdb-stored-f64</code> p50 766.026 ms vs <code>duckdb-double</code> 49.848 ms (duckdb-double 15.4× faster).</li>
+<li><code>block-small</code> load: <code>weftdb-stored-bulk</code> p50 267.073 ms vs <code>duckdb-double</code> 49.848 ms (duckdb-double 5.4× faster).</li>
+<li><code>block-small</code> downsample: <code>weftdb-stored-bulk</code> p50 3.577 ms vs <code>duckdb-double</code> 1.799 ms (duckdb-double 2.0× faster).</li>
+<li><code>mcar-medium</code> interpolate: <code>weftdb-memory</code> p50 142.803 ms vs <code>duckdb-double</code> 50.859 ms (duckdb-double 2.8× faster).</li>
+<li><code>mcar-medium</code> downsample: <code>weftdb-memory</code> p50 7.919 ms vs <code>duckdb-double</code> 5.371 ms (duckdb-double 1.5× faster).</li>
+<li><code>mcar-medium</code> load: <code>weftdb-stored</code> p50 5555.821 ms vs <code>duckdb-double</code> 204.262 ms (duckdb-double 27.2× faster).</li>
+<li><code>mcar-medium</code> interpolate: <code>weftdb-stored</code> p50 198.326 ms vs <code>duckdb-double</code> 50.859 ms (duckdb-double 3.9× faster).</li>
+<li><code>mcar-medium</code> downsample: <code>weftdb-stored</code> p50 17.879 ms vs <code>duckdb-double</code> 5.371 ms (duckdb-double 3.3× faster).</li>
+<li><code>mcar-medium</code> load: <code>weftdb-stored-f64</code> p50 5535.440 ms vs <code>duckdb-double</code> 204.262 ms (duckdb-double 27.1× faster).</li>
+<li><code>mcar-medium</code> interpolate: <code>weftdb-stored-f64</code> p50 67.711 ms vs <code>duckdb-double</code> 50.859 ms (duckdb-double 1.3× faster).</li>
+<li><code>mcar-medium</code> load: <code>weftdb-stored-bulk</code> p50 964.127 ms vs <code>duckdb-double</code> 204.262 ms (duckdb-double 4.7× faster).</li>
+<li><code>mcar-medium</code> interpolate: <code>weftdb-stored-bulk</code> p50 210.524 ms vs <code>duckdb-double</code> 50.859 ms (duckdb-double 4.1× faster).</li>
+<li><code>mcar-medium</code> downsample: <code>weftdb-stored-bulk</code> p50 44.466 ms vs <code>duckdb-double</code> 5.371 ms (duckdb-double 8.3× faster).</li>
+<li><code>block-medium</code> interpolate: <code>weftdb-memory</code> p50 112.244 ms vs <code>duckdb-double</code> 42.999 ms (duckdb-double 2.6× faster).</li>
+<li><code>block-medium</code> downsample: <code>weftdb-memory</code> p50 5.774 ms vs <code>duckdb-double</code> 4.148 ms (duckdb-double 1.4× faster).</li>
+<li><code>block-medium</code> load: <code>weftdb-stored</code> p50 4246.923 ms vs <code>duckdb-double</code> 180.401 ms (duckdb-double 23.5× faster).</li>
+<li><code>block-medium</code> interpolate: <code>weftdb-stored</code> p50 152.038 ms vs <code>duckdb-double</code> 42.999 ms (duckdb-double 3.5× faster).</li>
+<li><code>block-medium</code> downsample: <code>weftdb-stored</code> p50 13.111 ms vs <code>duckdb-double</code> 4.148 ms (duckdb-double 3.2× faster).</li>
+<li><code>block-medium</code> load: <code>weftdb-stored-f64</code> p50 4272.610 ms vs <code>duckdb-double</code> 180.401 ms (duckdb-double 23.7× faster).</li>
+<li><code>block-medium</code> load: <code>weftdb-stored-bulk</code> p50 802.981 ms vs <code>duckdb-double</code> 180.401 ms (duckdb-double 4.5× faster).</li>
+<li><code>block-medium</code> interpolate: <code>weftdb-stored-bulk</code> p50 149.209 ms vs <code>duckdb-double</code> 42.999 ms (duckdb-double 3.5× faster).</li>
+<li><code>block-medium</code> downsample: <code>weftdb-stored-bulk</code> p50 35.164 ms vs <code>duckdb-double</code> 4.148 ms (duckdb-double 8.5× faster).</li>
+<li><code>uci-tiny</code> load: <code>weftdb-stored</code> p50 214.496 ms vs <code>duckdb-decimal</code> 23.562 ms (duckdb-decimal 9.1× faster).</li>
+<li><code>uci-tiny</code> load: <code>weftdb-stored-f64</code> p50 225.491 ms vs <code>duckdb-decimal</code> 23.562 ms (duckdb-decimal 9.6× faster).</li>
+<li><code>uci-tiny</code> load: <code>weftdb-stored-bulk</code> p50 190.931 ms vs <code>duckdb-decimal</code> 23.562 ms (duckdb-decimal 8.1× faster).</li>
+<li><code>uci-small</code> load: <code>weftdb-stored</code> p50 907.852 ms vs <code>duckdb-double</code> 53.643 ms (duckdb-double 16.9× faster).</li>
+<li><code>uci-small</code> downsample: <code>weftdb-stored</code> p50 3.040 ms vs <code>duckdb-double</code> 2.184 ms (duckdb-double 1.4× faster).</li>
+<li><code>uci-small</code> load: <code>weftdb-stored-f64</code> p50 915.667 ms vs <code>duckdb-double</code> 53.643 ms (duckdb-double 17.1× faster).</li>
+<li><code>uci-small</code> load: <code>weftdb-stored-bulk</code> p50 297.612 ms vs <code>duckdb-double</code> 53.643 ms (duckdb-double 5.5× faster).</li>
+<li><code>uci-small</code> downsample: <code>weftdb-stored-bulk</code> p50 3.753 ms vs <code>duckdb-double</code> 2.184 ms (duckdb-double 1.7× faster).</li>
+<li><code>uci-medium</code> interpolate: <code>weftdb-memory</code> p50 140.672 ms vs <code>duckdb-double</code> 81.883 ms (duckdb-double 1.7× faster).</li>
+<li><code>uci-medium</code> downsample: <code>weftdb-memory</code> p50 15.807 ms vs <code>duckdb-decimal</code> 6.275 ms (duckdb-decimal 2.5× faster).</li>
+<li><code>uci-medium</code> load: <code>weftdb-stored</code> p50 5294.161 ms vs <code>duckdb-double</code> 196.959 ms (duckdb-double 26.9× faster).</li>
+<li><code>uci-medium</code> interpolate: <code>weftdb-stored</code> p50 191.404 ms vs <code>duckdb-double</code> 81.883 ms (duckdb-double 2.3× faster).</li>
+<li><code>uci-medium</code> downsample: <code>weftdb-stored</code> p50 21.966 ms vs <code>duckdb-decimal</code> 6.275 ms (duckdb-decimal 3.5× faster).</li>
+<li><code>uci-medium</code> load: <code>weftdb-stored-f64</code> p50 5303.131 ms vs <code>duckdb-double</code> 196.959 ms (duckdb-double 26.9× faster).</li>
+<li><code>uci-medium</code> load: <code>weftdb-stored-bulk</code> p50 923.009 ms vs <code>duckdb-double</code> 196.959 ms (duckdb-double 4.7× faster).</li>
+<li><code>uci-medium</code> interpolate: <code>weftdb-stored-bulk</code> p50 169.015 ms vs <code>duckdb-double</code> 81.883 ms (duckdb-double 2.1× faster).</li>
+<li><code>uci-medium</code> downsample: <code>weftdb-stored-bulk</code> p50 35.885 ms vs <code>duckdb-decimal</code> 6.275 ms (duckdb-decimal 5.7× faster).</li>
+</ul>
+<h3>Within noise</h3>
+<ul>
+<li><code>mcar-tiny</code> downsample: <code>weftdb-memory</code> p50 0.972 ms vs <code>duckdb-double</code> 1.014 ms (intervals overlap).</li>
+<li><code>mcar-tiny</code> downsample: <code>weftdb-stored</code> p50 1.231 ms vs <code>duckdb-double</code> 1.014 ms (intervals overlap).</li>
+<li><code>mcar-tiny</code> downsample: <code>weftdb-stored-bulk</code> p50 1.286 ms vs <code>duckdb-double</code> 1.014 ms (intervals overlap).</li>
+<li><code>block-tiny</code> downsample: <code>weftdb-stored</code> p50 1.206 ms vs <code>duckdb-double</code> 1.138 ms (intervals overlap).</li>
+<li><code>mcar-small</code> interpolate: <code>weftdb-memory</code> p50 24.087 ms vs <code>duckdb-decimal</code> 23.617 ms (intervals overlap).</li>
+<li><code>mcar-small</code> interpolate: <code>weftdb-stored-bulk</code> p50 27.648 ms vs <code>duckdb-decimal</code> 23.617 ms (intervals overlap).</li>
+<li><code>block-small</code> interpolate: <code>weftdb-stored-bulk</code> p50 22.696 ms vs <code>duckdb-double</code> 21.747 ms (intervals overlap).</li>
+<li><code>block-medium</code> interpolate: <code>weftdb-stored-f64</code> p50 45.520 ms vs <code>duckdb-double</code> 42.999 ms (intervals overlap).</li>
+<li><code>uci-small</code> downsample: <code>weftdb-memory</code> p50 1.835 ms vs <code>duckdb-double</code> 2.184 ms (intervals overlap).</li>
+<li><code>uci-small</code> interpolate: <code>weftdb-stored</code> p50 28.044 ms vs <code>duckdb-double</code> 25.714 ms (intervals overlap).</li>
+</ul>
+<h3>Not tested</h3>
+<ul>
+<li>Gap fill, point and range reads: measured by <code>weft-bench</code> against WeftDB's own baselines, not against another engine.</li>
+<li>Spline (quadratic, cubic) reconstruction: DuckDB has no spline, so only linear interpolation is compared.</li>
+<li>Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.</li>
+<li>QuestDB, InfluxDB 3 Core, TimescaleDB and ClickHouse: no adapter yet. Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).</li>
+<li>kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.</li>
+<li>GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report.</li>
+</ul>
+<h3>Known limitations</h3>
+<ul>
+<li>DuckDB has no interpolation function. Its arm is hand-written SQL (two <code>ASOF JOIN</code>s and the first/last segment extended), which is what a DuckDB user would write, and it is gated against WeftDB's grid.</li>
+<li>WeftDB has no last-observation-carried-forward fill on stored data in 1.0, so no LOCF comparison is made.</li>
+<li>Every dataset is a single series; the grid is fixed per dataset, so input size grows with scale while output size does not.</li>
+<li>Load layouts differ by arm: <code>weftdb-stored</code> and <code>weftdb-stored-f64</code> seal 1,024-row durable segments (the layout the stored read path is measured on), <code>weftdb-stored-bulk</code> seals one segment per load, and DuckDB does one bulk append and one CHECKPOINT. <code>weftdb-stored-bulk</code> is the like-for-like load comparison.</li>
+<li><code>duckdb-decimal</code> stores the knots exactly as <code>DECIMAL(18, s)</code>, but its interpolation line is computed in <code>DOUBLE</code> (DuckDB's <code>DECIMAL × DOUBLE</code> is <code>DOUBLE</code>), as is WeftDB's (splimes computes in <code>f64</code>). Neither engine interpolates in exact decimal arithmetic.</li>
+</ul>
+<h3>Configuration caveats</h3>
+<ul>
+<li>Hardware: AMD Ryzen 9 7950X3D 16-Core Processor (16 physical / 16 logical cores, 125 GiB memory). The working directory was on a hdd btrfs disk at /mnt/deepmem.</li>
+<li>Both engines wrote their stores to <code>/mnt/weftbench/tmp</code> (<code>TMPDIR</code>), which may be a different disk from the working directory.</li>
+<li>Some results have only 5 reps, so their intervals are wide and fewer comparisons can separate from noise.</li>
+</ul>
+<h3>Reproduction</h3>
+<ul>
+<li>Check out commit <code>9903465fe0a3f286787957da7fa135d23ac04a72</code>.</li>
+<li>Build: <code>cargo build --release --manifest-path weft-xbench/Cargo.toml</code> (DuckDB compiles from C++; put <code>CARGO_TARGET_DIR</code> on a fast local disk).</li>
+<li>Run: <code>TMPDIR=&lt;scratch on the disk under test&gt; weft-xbench --scales tiny,small,medium --reps 10 --load-reps 5 --uci /mnt/weftbench/data/uci-household-power/household_power_consumption.txt --out /mnt/weftbench/reports/evi15-r2</code>.</li>
+<li>Render: <code>weft-xbench render &lt;xbench.json&gt; --out &lt;dir&gt;</code>. The synthetic datasets are regenerated from seed 1592649491.</li>
+</ul>
+</body>
+</html>
