@@ -44,7 +44,13 @@ use weft_bench::{
 ///
 /// v2 (EVI-15R) adds `invocation`, `scratch_dir` and `optimized`, which the renderer's
 /// reproduction and caveat sections read; a v1 report deserializes with them empty.
-pub const XBENCH_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (EVI-14) adds the `downsample` phase, the `storage_bytes` of a load, and three arms
+/// (`weftdb-stored-bulk`, `duckdb-decimal`, and a store-backed `weftdb-stored`).
+pub const XBENCH_SCHEMA_VERSION: u32 = 3;
+
+/// The reductions the downsample phase computes per bucket.
+pub const DOWNSAMPLE_AGGREGATIONS: [weft_reduce::Aggregation; 3] = [weft_reduce::Aggregation::Min, weft_reduce::Aggregation::Max, weft_reduce::Aggregation::Avg];
 
 /// Seed for every generated dataset unless the caller gives another.
 pub const DEFAULT_SEED: u64 = 0x5EED_E713;
@@ -89,6 +95,39 @@ pub struct Dataset {
 	pub truth: Option<Vec<f64>>,
 	/// Share of the source series that is missing.
 	pub missingness_fraction: f64,
+	/// Bucket width for the downsample phase.
+	pub bucket: Resolution,
+}
+
+/// One downsample bucket, as `f64` for comparison across engines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketRow {
+	/// The bucket's epoch-aligned start, in nanoseconds.
+	pub start_ns: i64,
+	/// Rows in the bucket.
+	pub count: u64,
+	/// Smallest value.
+	pub min: f64,
+	/// Largest value.
+	pub max: f64,
+	/// Mean.
+	pub avg: f64,
+}
+
+impl BucketRow {
+	/// `weft_reduce`'s buckets as rows.
+	///
+	/// # Errors
+	///
+	/// If a bucket lacks one of [`DOWNSAMPLE_AGGREGATIONS`] or its start is out of range.
+	pub fn from_weft(buckets: &[weft_reduce::Bucket]) -> anyhow::Result<Vec<Self>> {
+		buckets.iter()
+			.map(|b| {
+				let get = |k: &str| b.values.get(k).and_then(ToPrimitive::to_f64).ok_or_else(|| anyhow::anyhow!("bucket at {} has no {k}", b.timestamp));
+				Ok(Self { start_ns: b.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("bucket start {} out of range", b.timestamp))?, count: b.count as u64, min: get("min")?, max: get("max")?, avg: get("avg")? })
+			})
+			.collect()
+	}
 }
 
 impl Dataset {
@@ -127,7 +166,7 @@ impl Dataset {
 			(generated, MISSINGNESS)
 		};
 		let truth = synthetic_ground_truth(&profile)?;
-		Ok(Self { name, kind, scale, points, start: profile.start(), end: profile.end(), resolution: profile.resolution, truth: Some(truth), missingness_fraction })
+		Ok(Self { name, kind, scale, points, start: profile.start(), end: profile.end(), resolution: profile.resolution, truth: Some(truth), missingness_fraction, bucket: Resolution::Minutes })
 	}
 
 	/// The first `scale.point_count()` rows of a UCI corpus, reconstructed per minute (the corpus'
@@ -141,7 +180,7 @@ impl Dataset {
 		anyhow::ensure!(rows >= 2, "the UCI corpus needs at least two rows, found {rows}");
 		let points = corpus.timestamps[..rows].iter().zip(&corpus.values[..rows]).map(|(&t, v)| DateTime::<Utc>::from_timestamp(t, 0).map(|at| Point::new(at, v.clone())).ok_or_else(|| anyhow::anyhow!("UCI instant {t} is out of range"))).collect::<anyhow::Result<Vec<_>>>()?;
 		let (start, end) = (points[0].timestamp, points[rows - 1].timestamp);
-		Ok(Self { name: format!("uci-{}", scale.as_str()), kind: DatasetKind::Uci, scale, points, start, end, resolution: Resolution::Minutes, truth: None, missingness_fraction: corpus.missingness_fraction() })
+		Ok(Self { name: format!("uci-{}", scale.as_str()), kind: DatasetKind::Uci, scale, points, start, end, resolution: Resolution::Minutes, truth: None, missingness_fraction: corpus.missingness_fraction(), bucket: Resolution::Hours })
 	}
 }
 
@@ -247,6 +286,9 @@ pub struct ArmResult {
 	pub correctness: Option<Correctness>,
 	/// Error against the analytic ground truth (synthetic datasets, interpolation phase).
 	pub accuracy: Option<AccuracyMetrics>,
+	/// Bytes on disk after the load (load phase of a storing arm).
+	#[serde(default)]
+	pub storage_bytes: Option<u64>,
 }
 
 /// Which phase a result times.
@@ -257,6 +299,8 @@ pub enum Phase {
 	Load,
 	/// Reconstructing the grid from loaded data.
 	Interpolate,
+	/// Reducing loaded data into buckets (count, min, max, avg).
+	Downsample,
 }
 
 /// Agreement of an arm's grid with the in-memory WeftDB reference.
@@ -283,6 +327,22 @@ pub struct Correctness {
 pub const RELATIVE_TOLERANCE: f64 = 1e-9;
 
 impl Correctness {
+	/// Compare buckets with the reference's: the same buckets, with the same counts, and min, max
+	/// and avg within tolerance. A missing, extra or shifted bucket fails outright.
+	#[must_use]
+	pub fn check_buckets(rows: &[BucketRow], reference: &[BucketRow]) -> Self {
+		let same_shape = rows.len() == reference.len() && rows.iter().zip(reference).all(|(a, b)| a.start_ns == b.start_ns && a.count == b.count);
+		let flat = |rs: &[BucketRow]| rs.iter().flat_map(|r| [r.min, r.max, r.avg]).collect::<Vec<f64>>();
+		let mut gate = Self::check(&flat(rows), &flat(reference), reference.len() * 3);
+		gate.expected_points = reference.len();
+		gate.actual_points = rows.len();
+		if !same_shape {
+			gate.max_abs_diff_vs_reference = f64::INFINITY;
+			gate.passed = false;
+		}
+		gate
+	}
+
 	/// Compare `values` with `reference` on a grid of `expected` instants.
 	#[must_use]
 	pub fn check(values: &[f64], reference: &[f64], expected: usize) -> Self {
@@ -371,14 +431,14 @@ pub fn accuracy(values: &[f64], ds: &Dataset, truth: &[f64]) -> Option<AccuracyM
 /// # Errors
 ///
 /// If `reps` or `load_reps` is zero, or the arm fails to load or reconstruct.
-pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &[f64], load_reps: usize, reps: usize, seed: u64) -> anyhow::Result<Vec<ArmResult>> {
+pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Reference, load_reps: usize, reps: usize, seed: u64) -> anyhow::Result<Vec<ArmResult>> {
 	anyhow::ensure!(reps > 0 && load_reps > 0, "reps and load reps must be > 0");
 	let info = arm.info();
-	let row = |phase, output_points, reps, samples: &[u64], correctness, accuracy| {
+	let row = |phase, output_points, reps, samples: &[u64], correctness, accuracy, storage_bytes| {
 		let (latency, latency_ci) = latency(samples, seed);
-		ArmResult { dataset: ds.name.clone(), kind: ds.kind, scale: ds.scale.as_str().to_string(), input_points: ds.points.len(), output_points, missingness_fraction: ds.missingness_fraction, arm: info.clone(), phase, reps, latency, latency_ci, correctness, accuracy }
+		ArmResult { dataset: ds.name.clone(), kind: ds.kind, scale: ds.scale.as_str().to_string(), input_points: ds.points.len(), output_points, missingness_fraction: ds.missingness_fraction, arm: info.clone(), phase, reps, latency, latency_ci, correctness, accuracy, storage_bytes }
 	};
-	let mut results = Vec::with_capacity(2);
+	let mut results = Vec::with_capacity(3);
 
 	let mut load_samples = Vec::with_capacity(load_reps);
 	for _ in 0..if arm.loads() { load_reps } else { 1 } {
@@ -387,7 +447,7 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &[f64],
 		load_samples.push(span_ns(t0));
 	}
 	if arm.loads() {
-		results.push(row(Phase::Load, ds.points.len(), load_reps, &load_samples, None, None));
+		results.push(row(Phase::Load, ds.points.len(), load_reps, &load_samples, None, None, arm.storage_bytes()));
 	}
 
 	let mut samples = Vec::with_capacity(reps);
@@ -400,10 +460,33 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &[f64],
 		last = Some(output);
 	}
 	let values = last.map(|o| o.to_f64()).unwrap_or_default();
-	let correctness = Correctness::check(&values, reference, ds.grid_len());
+	let correctness = Correctness::check(&values, &reference.grid, ds.grid_len());
 	let accuracy = ds.truth.as_deref().and_then(|truth| accuracy(&values, ds, truth));
-	results.push(row(Phase::Interpolate, values.len(), reps, &samples, Some(correctness), accuracy));
+	results.push(row(Phase::Interpolate, values.len(), reps, &samples, Some(correctness), accuracy, None));
+
+	if arm.downsamples() {
+		let mut samples = Vec::with_capacity(reps);
+		let mut last = Vec::new();
+		for _ in 0..reps {
+			let knots = ds.points.clone();
+			let t0 = Instant::now();
+			let buckets = arm.downsample(ds, knots).await?;
+			samples.push(span_ns(t0));
+			last = buckets;
+		}
+		let correctness = Correctness::check_buckets(&last, &reference.buckets);
+		results.push(row(Phase::Downsample, last.len(), reps, &samples, Some(correctness), None, None));
+	}
 	Ok(results)
+}
+
+/// What every arm is checked against: WeftDB's in-memory grid (`f64`) and `weft_reduce`'s buckets.
+#[derive(Debug, Clone)]
+pub struct Reference {
+	/// The in-memory reconstruction, in grid order.
+	pub grid: Vec<f64>,
+	/// The in-memory reduction, in bucket order.
+	pub buckets: Vec<BucketRow>,
 }
 
 /// The in-memory WeftDB reconstruction of `ds`, in `f64`: the reference every arm is checked against.
@@ -411,9 +494,11 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &[f64],
 /// # Errors
 ///
 /// If splimes refuses the dataset.
-pub async fn reference(ds: &Dataset) -> anyhow::Result<Vec<f64>> {
+pub async fn reference(ds: &Dataset) -> anyhow::Result<Reference> {
 	use weft::Arm;
-	Ok(weft::WeftMemory.interpolate(ds, ds.points.clone()).await?.to_f64())
+	let grid = weft::WeftMemory.interpolate(ds, ds.points.clone()).await?.to_f64();
+	let buckets = weft::WeftMemory.downsample(ds, ds.points.clone()).await?;
+	Ok(Reference { grid, buckets })
 }
 
 /// Run every arm over every dataset.
@@ -426,9 +511,11 @@ pub async fn run(datasets: &[Dataset], load_reps: usize, reps: usize, seed: u64,
 	for ds in datasets {
 		let reference = reference(ds).await?;
 		results.extend(measure(&mut weft::WeftMemory, ds, &reference, load_reps, reps, seed).await?);
-		results.extend(measure(&mut weft::WeftStored::default(), ds, &reference, load_reps, reps, seed).await?);
-		results.extend(measure(&mut weft::WeftStoredF64::default(), ds, &reference, load_reps, reps, seed).await?);
-		results.extend(measure(&mut duck::DuckDouble::default(), ds, &reference, load_reps, reps, seed).await?);
+		results.extend(measure(&mut weft::WeftStore::stored(), ds, &reference, load_reps, reps, seed).await?);
+		results.extend(measure(&mut weft::WeftStore::stored_f64(), ds, &reference, load_reps, reps, seed).await?);
+		results.extend(measure(&mut weft::WeftStore::stored_bulk(), ds, &reference, load_reps, reps, seed).await?);
+		results.extend(measure(&mut duck::Duck::double(), ds, &reference, load_reps, reps, seed).await?);
+		results.extend(measure(&mut duck::Duck::decimal(), ds, &reference, load_reps, reps, seed).await?);
 	}
 	let engines = vec![EngineVersion { engine: "weftdb".into(), version: metadata.weft_bench_version.clone() }, EngineVersion { engine: "duckdb".into(), version: duck::duckdb_version()? }];
 	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), results })
@@ -450,7 +537,7 @@ mod tests {
 	/// both extrapolation edges and exact knot hits are exercised.
 	fn edge_dataset() -> Dataset {
 		let points = [(10, "1.5"), (13, "2.25"), (14, "-0.75"), (20, "4.125"), (27, "3"), (31, "0.5")].iter().map(|&(t, v)| Point::new(ts(t), v.parse().expect("decimal"))).collect();
-		Dataset { name: "edge".into(), kind: DatasetKind::Mcar, scale: ScalePreset::Tiny, points, start: ts(5), end: ts(36), resolution: Resolution::Seconds, truth: None, missingness_fraction: 0.0 }
+		Dataset { name: "edge".into(), kind: DatasetKind::Mcar, scale: ScalePreset::Tiny, points, start: ts(5), end: ts(36), resolution: Resolution::Seconds, truth: None, missingness_fraction: 0.0, bucket: Resolution::Minutes }
 	}
 
 	async fn values_of<A: Arm>(arm: &mut A, ds: &Dataset) -> Vec<f64> {
@@ -461,9 +548,9 @@ mod tests {
 	#[tokio::test]
 	async fn every_arm_matches_the_reference_including_both_extrapolation_edges() {
 		let ds = edge_dataset();
-		let reference = reference(&ds).await.expect("reference");
+		let reference = reference(&ds).await.expect("reference").grid;
 		assert_eq!(reference.len(), ds.grid_len());
-		for (name, values) in [("stored", values_of(&mut weft::WeftStored::default(), &ds).await), ("stored-f64", values_of(&mut weft::WeftStoredF64::default(), &ds).await), ("duckdb", values_of(&mut duck::DuckDouble::default(), &ds).await)] {
+		for (name, values) in [("stored", values_of(&mut weft::WeftStore::stored(), &ds).await), ("stored-f64", values_of(&mut weft::WeftStore::stored_f64(), &ds).await), ("stored-bulk", values_of(&mut weft::WeftStore::stored_bulk(), &ds).await), ("duckdb", values_of(&mut duck::Duck::double(), &ds).await), ("duckdb-decimal", values_of(&mut duck::Duck::decimal(), &ds).await)] {
 			let gate = Correctness::check(&values, &reference, ds.grid_len());
 			assert!(gate.passed, "{name}: {gate:?}\n got {values:?}\nwant {reference:?}");
 		}
@@ -476,8 +563,8 @@ mod tests {
 	async fn duckdb_keeps_the_last_of_duplicate_instants_as_splimes_does() {
 		let mut ds = edge_dataset();
 		ds.points.insert(3, Point::new(ts(14), "9".parse().expect("decimal")));
-		let reference = reference(&ds).await.expect("reference");
-		let values = values_of(&mut duck::DuckDouble::default(), &ds).await;
+		let reference = reference(&ds).await.expect("reference").grid;
+		let values = values_of(&mut duck::Duck::double(), &ds).await;
 		assert!(Correctness::check(&values, &reference, ds.grid_len()).passed, "got {values:?}\nwant {reference:?}");
 	}
 
@@ -494,6 +581,17 @@ mod tests {
 	}
 
 	#[test]
+	fn a_shifted_missing_or_wrong_bucket_fails_the_gate() {
+		let row = |start_ns, count, avg| BucketRow { start_ns, count, min: 0.0, max: 2.0, avg };
+		let reference = [row(0, 3, 1.0), row(60, 2, 1.5)];
+		assert!(Correctness::check_buckets(&reference, &reference).passed);
+		assert!(!Correctness::check_buckets(&[row(0, 3, 1.0), row(120, 2, 1.5)], &reference).passed, "shifted");
+		assert!(!Correctness::check_buckets(&[row(0, 3, 1.0), row(60, 1, 1.5)], &reference).passed, "count differs");
+		assert!(!Correctness::check_buckets(&[row(0, 3, 1.0)], &reference).passed, "missing");
+		assert!(!Correctness::check_buckets(&[row(0, 3, 1.0), row(60, 2, 1.6)], &reference).passed, "wrong avg");
+	}
+
+	#[test]
 	fn a_wrong_or_short_grid_fails_the_gate() {
 		let reference = [1.0, 2.0, 3.0];
 		assert!(Correctness::check(&[1.0, 2.0, 3.0], &reference, 3).passed);
@@ -506,8 +604,10 @@ mod tests {
 	async fn a_tiny_run_reports_both_phases_for_storing_arms_and_passes() {
 		let datasets = [Dataset::synthetic(DatasetKind::Mcar, ScalePreset::Tiny, DEFAULT_SEED).expect("builds")];
 		let report = run(&datasets, 1, 2, DEFAULT_SEED, RunMetadata::capture("test".into()), None, vec![]).await.expect("runs");
-		// memory: interpolate only; stored, stored-f64, duckdb: load + interpolate.
-		assert_eq!(report.results.len(), 7);
+		// memory: interpolate + downsample; stored, stored-bulk, duckdb-double, duckdb-decimal:
+		// load + interpolate + downsample; stored-f64: load + interpolate.
+		assert_eq!(report.results.len(), 16);
+		assert!(report.results.iter().filter(|r| r.phase == Phase::Load).all(|r| r.storage_bytes.is_some_and(|b| b > 0)), "every load reports its bytes on disk");
 		assert!(report.all_correct(), "{:#?}", report.results.iter().filter_map(|r| r.correctness.as_ref()).collect::<Vec<_>>());
 		assert!(report.results.iter().filter(|r| r.phase == Phase::Interpolate).all(|r| r.accuracy.is_some()));
 		assert!(report.engines.iter().any(|e| e.engine == "duckdb" && !e.version.is_empty()));

@@ -26,11 +26,16 @@ no authentication, no RBAC and no audit log. They are 1.0 release criteria, not 
 (see the README's *Project status* and `ROADMAP.md`). Pre-1.0, WeftDB should run only on an
 isolated network.
 
-**Your workload is bulk loading.** On the first cross-engine run (2026-10-29, `weft-xbench`, see
-`DECISIONS.md` EVI-13), DuckDB loaded the same series **10–29× faster** at every scale: 174 ms
-against 5.1 s for about 600k rows. That comparison is not like-for-like. WeftDB sealed about 590
-durable 1,024-row segments, while DuckDB did one bulk append and one checkpoint. But it is the
-layout WeftDB's read path was measured on, so it is reported as a loss.
+**Your workload is bulk loading.** On the cross-engine runs (2026-10-29, `weft-xbench`, see
+`DECISIONS.md` EVI-13 and EVI-14), DuckDB loaded the same series faster at every scale. At `medium`
+(about 600k rows), WeftDB sealing **one segment** (the like-for-like shape of DuckDB's single bulk
+append and checkpoint) took 959 ms against DuckDB's 202 ms, **about 5× slower**. In the 1,024-row
+segments WeftDB's stored read path is measured on, it took 5.1 s, about 25× slower. WeftDB's store
+did come out about 15–25% smaller on disk: 6.7–7.2 bytes per point against 8.2–8.7.
+
+**Your workload is bucketed aggregation over stored data.** In the same run, DuckDB computed
+per-minute count, min, max and avg over the `medium` series in 4.5 ms, against 13.5 ms for WeftDB's
+stored downsample (7.5 ms in memory), **about 3× slower**.
 
 **Your series are large and you need exact-decimal output.** In the same run, at `medium` scale
 (about 600k input points into an 86,401-point grid), DuckDB's hand-written linear interpolation in
@@ -124,10 +129,10 @@ never dropped.
 - kdb+, AVEVA PI, and the enterprise editions of QuestDB and InfluxDB 3 are excluded on licence
   grounds (`WILLINGNESS-TO-PAY.md`, *Benchmark-publication policy*).
 
-**What is not yet measured.** The cross-engine report covers DuckDB `DOUBLE` on load and linear
-interpolation. The DuckDB `DECIMAL` arm, downsampling, storage bytes, the UCI corpus at three
-scales, and a run on dedicated reference hardware are still to come (EVI-14 and EVI-15). Until
-then, no cross-engine figure is a headline.
+**What is not yet measured.** The cross-engine report covers DuckDB `DOUBLE` and `DECIMAL` on load,
+storage bytes, linear interpolation and bucketed downsampling (EVI-13, EVI-14). The UCI corpus at
+three scales and a run on priced reference hardware are still to come (EVI-15). Until then, no
+cross-engine figure is a headline.
 
 **Kept negative results.** The bit-sliced value codec, the GPU on stored interpolation, splines on
 prices, and the approximate percentile were all measured slower or no better than the obvious

@@ -4,6 +4,66 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-29 — EVI-14: what the second DuckDB slice adds, and the arms it changes
+
+**Ambiguous:** EVI-14 (#293) is "DuckDB adapter II: downsample, storage bytes, DECIMAL arm, nightly
+smoke". EVI-13's entry left it a like-for-like load arm. Nothing says which reductions the
+downsample covers, what "storage bytes" measures, or what a `DECIMAL` arm computes in.
+
+**Chosen:**
+
+1. **Downsample is count, min, max and avg per epoch-aligned bucket:** minute buckets for the
+   per-second synthetic data, hour buckets for UCI's per-minute data. That is `weft_reduce`'s grid.
+   WeftDB reduces from the store (`SegmentStore::downsample_range`) and in memory
+   (`weft_reduce::reduce`, the reference). DuckDB runs a `GROUP BY (t // width) * width`. Every row
+   counts, duplicates included, in both engines. The gate needs identical buckets with identical
+   counts, and min, max and avg within the 1e-9 relative tolerance.
+2. **Storage bytes are whole files after a load:** the store directory for WeftDB (segments, index,
+   catalog) and the database file plus WAL for DuckDB. They are reported per load as bytes per
+   point. This is what a disk holds, not a codec estimate. `weft-bench` already reports the codec
+   figure.
+3. **`duckdb-decimal` stores `DECIMAL(18, s)` exactly,** with `s` the dataset's most fractional
+   digits. A value that would round is refused, so the knots are the same exact numbers WeftDB
+   stores. Its interpolation line is computed in `DOUBLE` (DuckDB's `DECIMAL × DOUBLE` is
+   `DOUBLE`), and so is WeftDB's (splimes computes in `f64`). The report says neither engine
+   interpolates in exact arithmetic. `min` and `max` stay exact in both, and `avg` is each engine's
+   own, read as `f64` for the gate.
+4. **`weftdb-stored-bulk` seals one segment per load,** the shape of DuckDB's single bulk
+   transaction. It is the like-for-like load comparison EVI-13 promised. The 1,024-row arms stay,
+   because they are the layout the stored read path is measured on.
+5. **The stored arms now own their `SegmentStore`** (`WeftStore`), so they can downsample and
+   report bytes. The store is configured as `StoredWeftAdapter`'s is (narrowest lossless type,
+   nanosecond timestamps, a margin that reads every row), and the in-memory gate still checks they
+   agree. `weftdb-stored-f64` reports no downsample of its own, since it would repeat
+   `weftdb-stored`'s over the same store.
+6. **The nightly smoke run is a separate workflow** (`xbench-smoke.yml`, 06:30 UTC and on
+   dispatch). It checks the seeded lock, builds with `--locked`, runs every arm at `tiny`, puts the
+   rendered report in the job summary, and uploads it. It fails on any gate. Its timings are not
+   cited, because hosted runners are not reference hardware (decision 19).
+
+**First run** (2026-10-29, `/mnt/weftbench`, 10 reps, 3 load reps; every arm and phase passed its
+gate at all three scales). At `medium` (604,689 MCAR / 481,252 block rows), p50:
+
+| | load | B/pt | interpolate | downsample |
+| --- | --- | --- | --- | --- |
+| `weftdb-memory` | — | — | 139.0 / 110.7 ms | 7.5 / 5.9 ms |
+| `weftdb-stored` (1,024-row) | 5,136 / 4,088 ms | 7.17 / 7.13 | 173.0 / 137.5 ms | 13.5 / 10.2 ms |
+| `weftdb-stored-f64` | 5,154 / 4,073 ms | 7.17 / 7.13 | 52.0 / 37.8 ms | — |
+| `weftdb-stored-bulk` (one segment) | 959 / 806 ms | 6.66 / 6.62 | 172.4 / 130.2 ms | 28.9 / 21.0 ms |
+| `duckdb-double` | 202 / 165 ms | 8.26 / 8.74 | 46.4 / 38.8 ms | 4.5 / 3.8 ms |
+| `duckdb-decimal` | 253 / 193 ms | 8.26 / 8.20 | 48.1 / 40.9 ms | 4.4 / 3.4 ms |
+
+What it says:
+- **Storage:** WeftDB's store is about 15–25% smaller than DuckDB's file.
+- **Load:** like for like, WeftDB is still about 5× slower to load (`stored-bulk` against DuckDB).
+- **Downsample:** DuckDB is 2–3× faster, and a single large segment downsamples about 2× slower
+  than 1,024-row segments. That last one is worth a look in the store lane.
+
+**Rejected:** percentiles in the downsample (DuckDB's `quantile_disc` and WeftDB's nearest-rank need
+a rank-convention argument first, which is a separate comparison); a DuckDB `DECIMAL(38)` column
+(it would leave the `i64` fast path that `DECIMAL(18)` keeps); adding the smoke run to
+`bench-regression.yml` (a C++ build failure would then read as a performance regression).
+
 ## 2026-10-29 — EVI-16: one honesty document at the root, and what it may claim
 
 **Ambiguous:** EVI-16 (#277) is "Honesty pages I: not the right tool, benchmark and accuracy
