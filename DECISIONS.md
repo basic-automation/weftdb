@@ -4,6 +4,38 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — SEC-5: TLS configuration shape and the C8 gate's scope (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan (§6 W4, §4 C8, decision 7) fixes what SEC-5 must do — a TLS
+listener (rustls with ring) on SEC-4's shared serve path, and plaintext only under an
+explicit opt-in — but names no configuration surface and does not say which binds the
+plaintext refusal applies to.
+
+**Chosen:**
+
+1. **Configuration by environment pair.** `WEFT_TLS_CERT_FILE` + `WEFT_TLS_KEY_FILE`
+   name the PEM chain and key, read once at startup and registered in the settings
+   registry alongside the gate's variables. Naming exactly one is a startup error:
+   half a TLS configuration silently ignored would serve plaintext an operator
+   believes is encrypted. The rustls provider is ring, built explicitly per config —
+   no process-global provider is installed, so a library consumer's rustls choices
+   cannot change what this server negotiates. ALPN offers `http/1.1` only (decision
+   17; HTTP/2 is deferred past 1.0 by §10). The handshake runs inside the connection
+   task on the shared serve path, under SEC-4's connection cap and keep-alive
+   deadline, so a stalled handshake holds a cap slot for at most that deadline.
+2. **The gate refuses only non-loopback plaintext.** Loopback binds are ungated
+   (decision 7's protected mode serves loopback under the Host/Origin guard with no
+   keys), and TLS binds are ungated (the traffic is encrypted whatever the auth
+   story). A non-loopback plaintext bind starts only with a mounted keys file
+   (`WEFT_KEYS_FILE` names it and the file exists) **plus** `WEFT_ALLOW_PLAINTEXT=1`,
+   or with `WEFT_AUTH=disabled`. SEC-5 reads the keys file's *presence* only; SEC-6
+   defines its format and enforces it. The full exposure matrix (proxied-request
+   refusal, metrics scope, guard interplay) remains SEC-8's.
+
+**Salvage note:** the implementing run hit its time cap before the ROADMAP tick and
+this entry; the parent added both, plus one rustfmt import reformat in
+`tests/tls_serve.rs`, and re-ran the full verification bar on the final tree.
+
 ## 2026-10-30 — EVI-15: the owner approved the report narrative
 
 **Ambiguous:** ROADMAP W7 has an owner-only line, "Write or approve the cross-engine report
