@@ -4,6 +4,18 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — EVI-15: the owner approved the report narrative
+
+**Ambiguous:** ROADMAP W7 has an owner-only line, "Write or approve the cross-engine report
+narrative". EVI-15 (#463) shipped the narrative in `bench/reports/evi-15/README.md` and the
+EVI-15 figures in `HONESTY.md`, and left the line open.
+
+**Chosen:** The owner approved the narrative as merged (2026-10-30), so the line is ticked. The
+approval covers the EVI-15 report and its figures in `HONESTY.md`; EVI-17's pages (*When WeftDB
+beats general TSDBs*, *GPU tuning and economics*) still need their own approval.
+
+**Rejected:** Treating this approval as covering EVI-17: those pages do not exist yet.
+
 ## 2026-10-29 — EVI-15: where the first cross-engine report ran, and what it may claim
 
 **Ambiguous:** EVI-15 (#244) is "First cross-engine report". Decision 18 fixes the matrix (WeftDB
