@@ -34,6 +34,11 @@ storage, were not settled.
 - **No bytes on disk.** The rows sit in the WAL until a snapshot on the server's own schedule, and
   the server reports neither size per database; the load row shows no storage figure rather than a
   WAL size that would mislead.
+- **`--query-file-limit 5000`.** InfluxDB 3 Core refuses a query that would read more than 432
+  Parquet files; it writes one per day, so the four-year UCI series exceeds it once snapshotted and
+  the second full run failed there. The cap is a documented server setting and Core's recent-data
+  design; raising it, and saying so in the report, keeps InfluxDB on the UCI rows instead of
+  dropping it from them.
 - **Telemetry upload off** on the reference host and in the nightly smoke, which configures
   `influxdb3 serve` by environment because a service container takes no command.
   `WEFT_XBENCH_INFLUXDB3` is registered in the Test tier.
