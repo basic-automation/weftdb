@@ -4,6 +4,45 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — External engines II: how the TimescaleDB arm is measured
+
+**Ambiguous:** TimescaleDB is the one engine in #413 with a native linear interpolation,
+`time_bucket_gapfill(…)` with `interpolate(…)`. The fairness notes (#393, roadmap 1.2) prefer an
+engine's native path where it exists. Whether that native fill answers this benchmark's question
+was not settled.
+
+**Chosen:**
+
+- **Two arms, `timescaledb-double` and `timescaledb-numeric`**, in `weft-xbench/src/timescale.rs`,
+  run only when `--timescale URL` gives a PostgreSQL connection string for a server with the
+  extension. `tokio-postgres` over loopback, the async client a Rust user would use.
+- **Not the native fill, for this phase.** `interpolate()` draws its line between *bucket
+  aggregates* at bucket boundaries, and leaves the edges past the data empty. The datasets' knots
+  are jittered off the grid (the synthetic generator's 0.6 jitter, UCI's own timestamps), so it
+  answers a different question and would fail the gate on every row. The arm runs the SQL a
+  PostgreSQL user writes without `ASOF JOIN`: a `generate_series` grid and two index-backed
+  `LATERAL … LIMIT 1` lookups per instant, gated like every arm. The native fill belongs in roadmap
+  1.2's native-fill comparison, scored as what it is.
+- **Load:** one hypertable on `t` whose single chunk spans the dataset, filled by one text `COPY`
+  committed with the default `synchronous_commit = on`. Each dataset fits in memory many times
+  over, the size TimescaleDB's guidance picks a chunk for, and one chunk is the counterpart of
+  `weftdb-stored-bulk`'s one segment. A one-day interval was tried first and is recorded as the
+  wrong configuration: the four-year UCI series became 420 chunks, every per-instant index lookup
+  walked all of them, and the same 20,001-point query took 6.6 s against 0.11 s with one chunk. The hypertable stays in the row store; the columnstore is a
+  separate configuration, and the report says the bytes on disk are uncompressed.
+- **Telemetry off.** The image ships with `timescaledb.telemetry_level = basic`, which reports to
+  Timescale. The reference run starts the server with it off, and the nightly smoke sets
+  `TIMESCALEDB_TELEMETRY=off`.
+- **`WEFT_XBENCH_TIMESCALE`**, the live test's server, is registered in the Test tier of
+  `weft-server`'s environment registry, beside `WEFT_XBENCH_CLICKHOUSE`.
+
+**Rejected:**
+
+- Aligning the knots to the grid so the native fill passes: it would change the dataset for one
+  engine.
+- Enabling the columnstore in this arm: a second TimescaleDB configuration is fair-protocol depth
+  (roadmap 1.1), not this slice; one honest configuration first.
+
 ## 2026-10-30 — External engines I: how the ClickHouse arm is measured
 
 **Ambiguous:** #413 / #140 ask for ClickHouse, InfluxDB 3, QuestDB and TimescaleDB adapters, and

@@ -12,7 +12,7 @@ edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Cross-engine interpolation benchmark: WeftDB against DuckDB and ClickHouse"
+description = "Cross-engine interpolation benchmark: WeftDB against DuckDB, ClickHouse and TimescaleDB"
 
 # An empty workspace table: this crate is its own workspace root, not a member of the parent's.
 [workspace]
@@ -34,6 +34,10 @@ tokio = { version = "1", features = ["full"] }
 # The ClickHouse arms' HTTP client. Already in the lock through `duckdb`; blocking, so it runs on
 # tokio's blocking pool like the DuckDB calls.
 ureq = { version = "3", default-features = false }
+# The TimescaleDB arms' client: PostgreSQL's wire protocol, async, as a Rust user would use it.
+tokio-postgres = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+bytes = "1"
 weft-bench = { path = "../weft-bench" }
 weft-physical-type = { path = "../weft-physical-type" }
 weft-reduce = { path = "../weft-reduce" }

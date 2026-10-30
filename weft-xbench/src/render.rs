@@ -21,14 +21,15 @@ const EXPECTED_KINDS: [DatasetKind; 3] = [DatasetKind::Mcar, DatasetKind::Block,
 /// How many scales decision 18 asks for.
 const EXPECTED_SCALES: usize = 3;
 /// Arms decision 18 asks for: WeftDB stored, in-memory and `f64`; `DuckDB` `DOUBLE` and `DECIMAL`;
-/// and, from the second external engine on, `ClickHouse` `Float64` and `Decimal64`.
-const EXPECTED_ARMS: [&str; 8] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "clickhouse-double", "clickhouse-decimal"];
+/// and, from the second external engine on, `ClickHouse` `Float64` and `Decimal64` and
+/// `TimescaleDB` `double precision` and `numeric`.
+const EXPECTED_ARMS: [&str; 10] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "clickhouse-double", "clickhouse-decimal", "timescaledb-double", "timescaledb-numeric"];
 /// Below this many reps the bootstrap intervals are too coarse to separate much.
 const FEW_REPS: usize = 10;
 
 /// Workloads and engines outside this benchmark, listed in every report so a reader does not take
 /// silence for coverage.
-const NOT_IN_SCOPE: [&str; 6] = ["Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: neither DuckDB nor ClickHouse has a spline, so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "QuestDB, InfluxDB 3 Core, TimescaleDB and IoTDB: no adapter yet. Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
+const NOT_IN_SCOPE: [&str; 6] = ["Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse and TimescaleDB has a spline, so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "QuestDB, InfluxDB 3 Core and IoTDB: no adapter yet. Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
 
 /// How one WeftDB arm compares with the fastest other engine on one dataset and phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +208,16 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	}
 	for arm in EXPECTED_ARMS {
 		if !report.results.iter().any(|r| r.arm.arm == arm) {
-			missing.push(format!("The `{arm}` arm is not in this run{}.", if arm.starts_with("clickhouse") { " (pass `--clickhouse URL`)" } else { "" }));
+			missing.push(format!(
+				"The `{arm}` arm is not in this run{}.",
+				if arm.starts_with("clickhouse") {
+					" (pass `--clickhouse URL`)"
+				} else if arm.starts_with("timescaledb") {
+					" (pass `--timescale URL`)"
+				} else {
+					""
+				}
+			));
 		}
 	}
 	missing.extend(NOT_IN_SCOPE.iter().map(|s| (*s).to_string()));
@@ -229,12 +239,20 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	if report.results.iter().any(|r| r.arm.arm == "clickhouse-decimal") {
 		limits.push("`clickhouse-decimal` stores the knots exactly as `Decimal64(s)`; its interpolation line is computed in `Float64`, since ClickHouse refuses `Decimal × Float64` without a cast.".into());
 	}
+	let timescale = report.results.iter().any(|r| r.arm.arm.starts_with("timescaledb"));
+	if timescale {
+		limits.push("TimescaleDB's `time_bucket_gapfill` with `interpolate()` draws its line between bucket aggregates at bucket boundaries, not between the knots, and does not extend past the data, so on jittered knots it computes a different answer. Its arm is the SQL a PostgreSQL user writes without `ASOF JOIN`: two index-backed `LATERAL … LIMIT 1` lookups per grid instant, gated like every arm.".into());
+		limits.push("TimescaleDB is a PostgreSQL server; its timings include the loopback wire protocol, and its load is one text `COPY` committed with `synchronous_commit` on, into a hypertable whose one chunk spans the dataset. The hypertable stays in the row store: TimescaleDB's columnstore (compression) is not enabled, so its bytes on disk are uncompressed.".into());
+	}
 	b.push(Block::List(limits));
 
 	b.push(Block::Heading(3, "Configuration caveats".into()));
 	let mut caveats = vec![format!("Hardware: {} ({} physical / {} logical cores, {} GiB memory). The working directory was on a {} {} disk at {}.", m.cpu_model.as_deref().unwrap_or("CPU not reported"), m.cpu_cores_physical.map_or_else(|| "?".into(), |c| c.to_string()), m.cpu_cores_logical.map_or_else(|| "?".into(), |c| c.to_string()), m.total_memory_bytes.map_or_else(|| "?".into(), |b| format!("{:.0}", ns(b) / f64::from(1u32 << 30))), m.work_disk_kind.as_deref().unwrap_or("unknown"), m.work_disk_file_system.as_deref().unwrap_or("unknown file system"), m.work_disk_mount_point.as_deref().unwrap_or("an unreported mount point"),)];
 	if let Some(scratch) = &report.scratch_dir {
 		caveats.push(format!("The in-process engines wrote their stores to `{scratch}` (`TMPDIR`), which may be a different disk from the working directory."));
+	}
+	if timescale {
+		caveats.push("The TimescaleDB server stored its data in its own data directory, which this report cannot see; check the reproduction notes for where it was mounted.".into());
 	}
 	if clickhouse {
 		caveats.push("The ClickHouse server stored its data in its own data directory, which this report cannot see; check the reproduction notes for where it was mounted.".into());
@@ -252,7 +270,7 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 
 	b.push(Block::Heading(3, "Reproduction".into()));
 	let invocation = if report.invocation.is_empty() { "weft-xbench".to_string() } else { report.invocation.join(" ") };
-	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
+	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
 	b
 }
 
@@ -408,6 +426,16 @@ mod tests {
 		assert!(!without.contains("ClickHouse is a server"), "no server caveat without a ClickHouse arm");
 		let with = to_markdown(&blocks(&report(vec![result("a", "weftdb-stored", Phase::Load, &SLOW[..5], true), result("a", "clickhouse-decimal", Phase::Load, &FAST[..5], true)])));
 		for needle in ["ClickHouse is a server", "`WITH FILL … INTERPOLATE`", "`clickhouse-decimal` stores the knots exactly", "its own data directory"] {
+			assert!(with.contains(needle), "missing {needle:?} in\n{with}");
+		}
+	}
+
+	#[test]
+	fn timescaledb_is_named_as_missing_or_carries_its_caveats() {
+		let without = to_markdown(&blocks(&report(vec![])));
+		assert!(without.contains("The `timescaledb-numeric` arm is not in this run (pass `--timescale URL`)"), "{without}");
+		let with = to_markdown(&blocks(&report(vec![result("a", "timescaledb-double", Phase::Load, &FAST[..5], true)])));
+		for needle in ["`time_bucket_gapfill`", "columnstore (compression) is not enabled", "The TimescaleDB server stored its data"] {
 			assert!(with.contains(needle), "missing {needle:?} in\n{with}");
 		}
 	}

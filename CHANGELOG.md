@@ -18,6 +18,10 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **TimescaleDB in the cross-engine benchmark** (#413): `weft-xbench --timescale URL` adds
+  `timescaledb-double` and `timescaledb-numeric` arms (hypertable load by `COPY`, linear
+  interpolation in SQL, `time_bucket` downsample), gated like every arm; the nightly smoke starts a
+  pinned TimescaleDB server with telemetry off.
 - **ClickHouse in the cross-engine benchmark** (#413, first of the remaining external engines):
   `weft-xbench --clickhouse URL` adds `clickhouse-double` and `clickhouse-decimal` arms (load with
   bytes on disk, linear interpolation in SQL, bucketed downsample) against a ClickHouse server,
