@@ -120,6 +120,101 @@ pub fn store_root_from_env() -> anyhow::Result<std::path::PathBuf> {
 	Ok(std::path::PathBuf::from(root))
 }
 
+/// Why the store filesystem check (PAC-5b) refuses a root before the store is
+/// opened: the root is not a usable directory on a filesystem this build can be
+/// durable on. Every variant is a filesystem refusal in plan C7's terms, so the
+/// server exits it with [`crate::settings::CONFIG_EXIT_CODE`] (78).
+#[derive(Debug)]
+pub enum StoreRootProblem {
+	/// The root exists and is not a directory.
+	NotDirectory(std::path::PathBuf),
+	/// The root (or the parent a missing root would be created under) cannot be
+	/// created, listed, written or synced.
+	Unusable(std::path::PathBuf, std::io::Error),
+}
+
+impl std::fmt::Display for StoreRootProblem {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::NotDirectory(root) => write!(f, "store root {} exists and is not a directory", root.display()),
+			Self::Unusable(root, error) => write!(f, "store root {} is not usable by this server: {error}", root.display()),
+		}
+	}
+}
+
+impl std::error::Error for StoreRootProblem {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::NotDirectory(_) => None,
+			Self::Unusable(_, error) => Some(error),
+		}
+	}
+}
+
+/// The store filesystem check (PAC-5b): refuse `root` before the store opens when
+/// the filesystem cannot hold a store — the root exists as a file, cannot be
+/// created or listed, is not writable, or (on Unix) its directory entry cannot be
+/// synced, which is the durability every store write assumes. A missing root is
+/// created, as the open itself would create it, and then probed. The probe file
+/// is removed before this returns, success or failure.
+///
+/// # Errors
+///
+/// [`StoreRootProblem`] naming the root and the failing operation.
+pub fn check_store_root(root: &Path) -> Result<(), StoreRootProblem> {
+	let unusable = |error: std::io::Error| StoreRootProblem::Unusable(root.to_path_buf(), error);
+	match std::fs::metadata(root) {
+		Ok(metadata) if !metadata.is_dir() => return Err(StoreRootProblem::NotDirectory(root.to_path_buf())),
+		Ok(_) => {}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(root).map_err(unusable)?,
+		Err(error) => return Err(unusable(error)),
+	}
+	// Listing is how the open reads the root; writing plus a file sync is how it
+	// creates the marker and control planes; a directory sync is what makes a
+	// rename inside it durable.
+	std::fs::read_dir(root).map_err(unusable)?.next().transpose().map_err(unusable)?;
+	let probe = root.join(format!(".weft-fs-check-{}", std::process::id()));
+	let probe_result = (|| -> std::io::Result<()> {
+		{
+			let mut file = std::fs::File::create(&probe)?;
+			std::io::Write::write_all(&mut file, b"weftdb store filesystem check")?;
+			file.sync_all()?;
+		}
+		sync_directory(root)
+	})();
+	let _ = std::fs::remove_file(&probe);
+	probe_result.map_err(unusable)
+}
+
+/// Sync a directory's entry to disk. Unix only: opening a directory as a file is
+/// how its fsync is spelled there, and Windows has no equivalent this check can
+/// portably perform, so there the write probe above stands on its own.
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> std::io::Result<()> {
+	std::fs::File::open(dir)?.sync_all()
+}
+
+/// See [`sync_directory`].
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> std::io::Result<()> {
+	Ok(())
+}
+
+/// The exit status (plan C7) a store-open failure maps to, when it maps to one:
+/// [`crate::settings::ROOT_LOCKED_EXIT_CODE`] (75) for a root another process
+/// holds, [`crate::settings::STORE_EXIT_CODE`] (65) for a [`weftdb::StoreError`]
+/// — the store needs operator action. Anything else keeps the caller's default.
+#[must_use]
+pub fn exit_code_for_store_error(error: &anyhow::Error) -> Option<i32> {
+	if error.downcast_ref::<weftdb::StoreLocked>().is_some() {
+		return Some(crate::settings::ROOT_LOCKED_EXIT_CODE);
+	}
+	if error.downcast_ref::<weftdb::StoreError>().is_some() {
+		return Some(crate::settings::STORE_EXIT_CODE);
+	}
+	None
+}
+
 /// Open the segment store at `root` as `weft-server` does.
 ///
 /// It opens with the options the environment describes ([`store_options_from_env`]),
@@ -230,6 +325,26 @@ mod tests {
 		// A server with no scope set must land in the same namespace as `SegmentStore::open`,
 		// or every store written before this variable existed reads as empty.
 		assert_eq!((DEFAULT_SCOPE_DATABASE, DEFAULT_SCOPE_SUBJECT), ("default", "default"));
+	}
+
+	#[test]
+	fn the_filesystem_check_accepts_a_usable_root_and_creates_a_missing_one() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let root = dir.path().join("store");
+		check_store_root(&root).expect("a missing root under a usable parent checks out");
+		assert!(root.is_dir(), "the check creates the root, as the open would");
+		check_store_root(&root).expect("an existing empty root checks out");
+		assert_eq!(std::fs::read_dir(&root).expect("lists").count(), 0, "the probe file is removed");
+	}
+
+	#[test]
+	fn the_filesystem_check_refuses_a_root_that_is_a_file() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let file = dir.path().join("not-a-store");
+		std::fs::write(&file, b"data").expect("write");
+		assert!(matches!(check_store_root(&file), Err(StoreRootProblem::NotDirectory(_))), "a file cannot hold a store");
+		let under_file = file.join("store");
+		assert!(check_store_root(&under_file).is_err(), "nor can a root be created under a file");
 	}
 
 	#[test]

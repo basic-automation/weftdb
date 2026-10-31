@@ -12,8 +12,9 @@
 //!   (SIGABRT) instead of an HTTP response (FRE-6a); the restart that follows opens the
 //!   store under the engine's own crash recovery, which is the component that actually
 //!   knows whether a commit was torn;
-//! - any other panic is reported and left unwinding — ROB-3's catch layer (wave 6) is the
-//!   only layer that catches panics, and it needs unwinding to stay reachable.
+//! - any other panic is reported and left unwinding — ROB-3's catch layer
+//!   ([`crate::panic_catch`]) is the only layer that catches panics, and it
+//!   needs unwinding to stay reachable.
 //!
 //! Two things this deliberately is not:
 //!

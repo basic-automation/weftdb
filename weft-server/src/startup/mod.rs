@@ -13,7 +13,9 @@
 //!    and (once the address is known) the request guard.
 //! 3. [`state`] — the router state, which means opening the segment store when
 //!    one is configured.
-//! 4. [`daemons`] — the background reconcile/backup/GPU-calibration tasks.
+//! 4. [`daemons`] — the background reconcile/backup/GPU-calibration tasks,
+//!    registered in the Daemons registry (ROB-3), which supervises them and
+//!    stops them on its shared shutdown watch when serving ends.
 //! 5. [`serve`] — bind, print the banner, serve until shutdown.
 //!
 //! The shutdown signal handlers are installed before phase 2 (right after
@@ -30,8 +32,9 @@
 //! pages from non-loopback origins, open in a local browser, cannot drive the server
 //! ([`weft_server::host_guard`]).
 //! `WEFT_ALLOW_ANY_HOST=1` turns this off for a local reverse proxy that forwards a
-//! different `Host` or a browser UI's non-loopback `Origin`. A non-loopback bind is not guarded: there is no authentication yet,
-//! so such a server must not be reachable from an untrusted network.
+//! different `Host` or a browser UI's non-loopback `Origin`. A non-loopback bind is not guarded by it:
+//! the guard is a loopback stop-gap, and authentication (below) is what a
+//! non-loopback deployment relies on.
 //!
 //! ## Transport (SEC-5)
 //!
@@ -42,6 +45,18 @@
 //! (`WEFT_KEYS_FILE`) plus `WEFT_ALLOW_PLAINTEXT=1`, or `WEFT_AUTH=disabled`
 //! behind a gateway — otherwise startup refuses. Loopback plaintext is
 //! ungated. See [`weft_server::tls`].
+//!
+//! ## Authentication (SEC-6)
+//!
+//! With `WEFT_KEYS_FILE` naming a keys file (or `WEFT_AUTH=keys`, which
+//! requires one), every request is authenticated with
+//! `Authorization: Bearer <key>` against the file's key hashes, and the
+//! key's role is checked against the scope the sealed registry assigns
+//! the route ([`weft_server::auth`]). The probes stay open to the
+//! anonymous principal; everything else needs a key. `WEFT_AUTH=disabled`
+//! turns authentication explicitly off, and with no keys file mounted
+//! the server runs unauthenticated, as it did before SEC-6.
+//! `weft-server keygen` mints a key and records its hash in the file.
 //!
 //! ## Optional segment store
 //!
@@ -73,11 +88,14 @@
 //! with splimes' default thresholds. A CPU/software adapter (llvmpipe, lavapipe, WARP) is
 //! not calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips
 //! calibration altogether. It never stops the server from starting.
-//! Before the first phase, [`weft_server::settings::report`] checks the environment against the
-//! registry of every variable the workspace reads: a `WEFT_` name no crate reads, or a test
-//! harness's own channel set on a real server, prints one line there. It runs first so an
-//! operator's typo is the first thing they read, rather than a missing behaviour they
-//! deduce three screens down.
+//! Before the first phase, strict configuration (PAC-5b) checks the environment against
+//! the registry of every variable the workspace reads: a `WEFT_` name no crate reads, a
+//! test harness's own channel set on a real server, or a value outside the shape its
+//! registry entry accepts refuses the start with exit 78 (plan C7), one line per problem.
+//! It runs first so an operator's typo is the first thing they read, rather than a missing
+//! behaviour they deduce three screens down. Phase 3 likewise checks the store root's
+//! filesystem before opening it, and a store-open refusal that needs operator action
+//! exits 65 (75 for a locked root).
 
 pub(crate) mod config;
 pub(crate) mod daemons;
@@ -92,10 +110,31 @@ pub(crate) mod state;
 /// Any phase that refuses to start the server: a malformed address, a malformed
 /// operator setting, a segment store that cannot be opened, or a listener that
 /// cannot be bound. A background task failing does not fail startup.
+/// Refuse startup for a configuration problem (PAC-5b): print every problem,
+/// then exit with the plan C7 status for invalid configuration (78). Startup
+/// phases that validate operator settings route their errors here, so a bad
+/// address, cap, TLS pair, keys file or daemon setting is the same class of
+/// refusal as a bad variable name or value.
+fn exit_config(error: &anyhow::Error) -> ! {
+	eprintln!("weft-server: invalid configuration: {error:#}");
+	std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
+}
+
 pub(crate) async fn run() -> anyhow::Result<()> {
-	// First, before any phase reads a setting or opens a store: what the environment got
-	// wrong, answered from the registry in [`crate::settings`].
-	weft_server::settings::report();
+	// First, before any phase reads a setting or opens a store: strict
+	// configuration (PAC-5b). What PAC-5a's registry only warned about — an
+	// unknown `WEFT_` name, a test-harness channel set on a real server, a
+	// value outside the shape its registry entry accepts — now refuses the
+	// start, exit 78, because a silently ignored setting is the most
+	// expensive kind of configuration bug.
+	let strict_errors = weft_server::settings::strict_errors_from_env();
+	if !strict_errors.is_empty() {
+		for error in &strict_errors {
+			eprintln!("weft-server: {error}");
+		}
+		eprintln!("weft-server: refusing to start: {} configuration problem(s) above (exit {})", strict_errors.len(), weft_server::settings::CONFIG_EXIT_CODE);
+		std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
+	}
 
 	// The OTLP provider (when configured) is held for the process lifetime: dropping it
 	// early would tear down the batch span processor and stop export. It is shut down on
@@ -109,25 +148,48 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// the process mid-startup, and serve::run observes it on entry.
 	let mut shutdown = weft_server::ShutdownSignals::install()?;
 
-	let addr = config::bind_addr()?;
-	let interpolate = config::interpolate_config()?;
-	let limits = config::serve_limits()?;
+	let addr = config::bind_addr().unwrap_or_else(|error| exit_config(&error));
+	let interpolate = config::interpolate_config().unwrap_or_else(|error| exit_config(&error));
+	let limits = config::serve_limits().unwrap_or_else(|error| exit_config(&error));
 	// SEC-5: resolve the transport (TLS when configured) and run the C8
 	// plaintext gate against the address about to be bound, before the
 	// store opens — a refused exposure starts nothing at all.
-	let tls = config::transport(addr)?;
-	let state = state::build().await?.with_interpolate_config(interpolate);
+	let tls = config::transport(addr).unwrap_or_else(|error| exit_config(&error));
+	// SEC-6: load the keys file (when one is mounted) before the store
+	// opens — a keys file that cannot be loaded stops startup, and the
+	// server never comes up unauthenticated by accident.
+	let auth = config::auth().unwrap_or_else(|error| exit_config(&error));
+	let state = match state::build().await {
+		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth),
+		Err(error) => match weft_server::store_open::exit_code_for_store_error(&error) {
+			// A store that needs operator action (65) or a locked root (75):
+			// the plan C7 class, not a generic failure.
+			Some(code) => {
+				eprintln!("weft-server: the segment store cannot be opened: {error:#}");
+				std::process::exit(code);
+			}
+			None => return Err(error),
+		},
+	};
 
-	daemons::spawn_reconcile_if_configured(&state)?;
-	daemons::spawn_backup_if_configured(&state)?;
+	// ROB-3: the Daemons registry owns every background task this process
+	// runs — supervised, and stopped on its shared shutdown watch (the
+	// watch D-S14's amendment shares with this registry) once serving ends.
+	let daemons = weft_server::Daemons::new();
+
+	daemons::spawn_reconcile_if_configured(&state, &daemons)?;
+	daemons::spawn_backup_if_configured(&state, &daemons)?;
 
 	let listener = serve::bind(addr, tls.is_some()).await?;
 	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
 
 	// After the bind and in the background, so serving never waits for it.
-	daemons::spawn_gpu_calibration_if_enabled();
+	daemons::spawn_gpu_calibration_if_enabled(&daemons);
 
 	serve::run(listener, state.clone(), otel_provider, limits, tls, &mut shutdown).await?;
+	// Serving is over: raise the registry's shutdown watch so no daemon
+	// outlives the server it maintains, and none restarts from here.
+	daemons.shutdown();
 	// Serving stopped cleanly (including a signal before serving, which exits 0
 	// without accepting a connection): record the clean shutdown, so the next
 	// open's `/ready` can report `previous_clean_shutdown: true` (D-S12). A

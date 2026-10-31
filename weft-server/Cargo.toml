@@ -58,6 +58,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 libc = { workspace = true }  # getrlimit(RLIMIT_NOFILE) for the derived connection-cap default in serve.rs
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }  # SEC-6's API-key digests: the keys file stores SHA-256 hashes of keys, never the keys (auth.rs)
 # The GPU backend is this binary's decision, not the libraries': `weft-server/src/gpu.rs`
 # calibrates splimes' backends at startup. PAC-3.
 splimes = { workspace = true, features = ["tokio", "gpu"] }

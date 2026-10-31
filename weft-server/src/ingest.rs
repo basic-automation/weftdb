@@ -403,8 +403,9 @@ const fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 /// [`ApiError::unconfigured`] (no store), [`ApiError::aspect_not_found`] (aspect
 /// undeclared), [`ApiError::bad_request`] (unknown precision token, malformed
 /// payload, no points carrying the field, a timestamp outside the declared unit's
-/// range, or values unrepresentable under the declared encoding/tolerance), and
-/// [`ApiError::internal`] on a filesystem/control-plane failure.
+/// range, or values unrepresentable under the declared encoding/tolerance),
+/// `ambiguous_series` (the field's points span more than one series; TAG-0),
+/// and [`ApiError::internal`] on a filesystem/control-plane failure.
 pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<IlpIngestParams>, body: String) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
@@ -432,7 +433,7 @@ async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics
 	};
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the line-protocol text →
 	// typed points, timed apart from the timestamp normalization and the seal.
-	let points = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field).in_scope(|| weft_line_protocol::parse_points(body, &params.field, precision)).map_err(|err| ApiError::bad_request(err.to_string()))?;
+	let points = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field).in_scope(|| weft_line_protocol::parse_points(body, &params.field, precision)).map_err(|err| error::from_line_protocol_error(&err))?;
 	if points.is_empty() {
 		return Err(ApiError::bad_request(format!("no points carrying field `{}` with a timestamp in the payload", params.field)));
 	}

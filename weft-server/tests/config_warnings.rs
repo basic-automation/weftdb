@@ -1,14 +1,14 @@
-//! What the server says about the environment it was handed (1.0 plan PAC-5a).
+//! What the server says about the environment it was handed (1.0 plan PAC-5a,
+//! made strict by PAC-5b).
 //!
 //! Before any startup phase reads a setting, the process checks its own environment
 //! against the variable registry in `weft_server::settings`: a `WEFT_` name no crate reads
 //! names itself, with the nearest real spelling when there is one, and a test harness's own
-//! channel says what it is. The server starts either way — a warning is not a decision, and
-//! refusing to start on an unknown variable is PAC-5b's change to make, not this slice's.
+//! channel says what it is. PAC-5a only warned; PAC-5b refuses: the server exits with
+//! status 78 (plan C7, invalid configuration) and never reaches its listening banner.
 //!
-//! `settings::report` writes to stderr, ahead of the tracing subscriber, so these
-//! assertions read stderr; a reader's own warning about a value it cannot use comes from
-//! tracing and lands on stdout.
+//! The strict check writes to stderr, ahead of the tracing subscriber, so these
+//! assertions read stderr.
 
 use std::{
 	io::{BufRead, BufReader, Read}, process::{Child, Command, Stdio}, sync::mpsc, thread, time::{Duration, Instant}
@@ -109,6 +109,20 @@ fn start_server(extra: &[(&str, &str)]) -> Started {
 	Started { stdout: stdout_lines.join("\n"), stderr }
 }
 
+/// Start a server PAC-5b must refuse, and return what it wrote and how it exited:
+/// it must exit on its own, promptly, with the configuration status 78.
+fn run_refused(extra: &[(&str, &str)]) -> (String, String) {
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_weft-server"));
+	cmd.env("WEFT_SERVER_ADDR", "127.0.0.1:0");
+	for name in NEUTRALIZED {
+		cmd.env_remove(*name);
+	}
+	cmd.envs(extra.iter().copied());
+	let output = cmd.stdin(Stdio::null()).output().expect("runs weft-server");
+	assert_eq!(output.status.code(), Some(78), "PAC-5b refuses with exit 78: {output:?}");
+	(String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
 /// Read `stream` to its end on a thread, so the server never blocks on a full pipe. The
 /// handle yields the text once the server has exited.
 fn drain(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<String> {
@@ -136,30 +150,31 @@ fn a_misspelled_variable_names_itself_and_the_nearest_real_one() {
 		extra.push(("weft_server_addr", "0.0.0.0:9000"));
 		expected.push(("weft_server_addr", "WEFT_SERVER_ADDR"));
 	}
-	let started = start_server(&extra);
+	let (_stdout, stderr) = run_refused(&extra);
 	for (mistyped, intended) in &expected {
 		let line = format!("weft-server: {mistyped} is not a WeftDB variable; did you mean {intended}?");
-		assert!(started.stderr.contains(&line), "{line:?} is one of the lines it prints: {stderr}", stderr = started.stderr);
+		assert!(stderr.contains(&line), "{line:?} is one of the lines it prints: {stderr}");
 	}
-	assert_eq!(started.complaints().len(), expected.len(), "one line per mistyped name, and no others: {stderr}", stderr = started.stderr);
+	let complaints: Vec<&str> = stderr.lines().filter(|line| line.starts_with("weft-server: ")).collect();
+	assert_eq!(complaints.len(), expected.len() + 1, "one line per mistyped name, plus the refusal line, and no others: {stderr}");
+	assert!(complaints.last().is_some_and(|line| line.contains("refusing to start")), "the last line is the refusal: {stderr}");
 }
 
 /// A name in our namespace that is nobody's variable is reported as itself. Guessing would
 /// send the operator to change a setting that was never the problem.
 #[test]
 fn an_unknown_variable_with_no_near_spelling_is_reported_without_a_guess() {
-	let started = start_server(&[("WEFT_LOG_LEVEL", "debug")]);
-	assert_eq!(started.complaints(), ["weft-server: WEFT_LOG_LEVEL is not a WeftDB variable — no setting of it changes anything, and nothing in this build reads it"], "it says so, and does not guess: {stderr}", stderr = started.stderr);
+	let (_stdout, stderr) = run_refused(&[("WEFT_LOG_LEVEL", "debug")]);
+	assert!(stderr.contains("weft-server: WEFT_LOG_LEVEL is not a WeftDB variable — no setting of it changes anything, and nothing in this build reads it"), "it says so, and does not guess: {stderr}");
 }
 
 /// A test harness's channel that leaked into a deployment: registered, real, and not
 /// configuration.
 #[test]
 fn a_test_channel_set_on_a_real_server_says_so() {
-	let started = start_server(&[("WEFT_TEST_SWAP_MATRIX", "swap:seal")]);
-	assert_eq!(started.complaints().len(), 1, "one line: {stderr}", stderr = started.stderr);
-	assert!(started.complaints()[0].contains("WEFT_TEST_SWAP_MATRIX is a test-harness channel"), "it says what it is: {stderr}", stderr = started.stderr);
-	assert!(started.complaints()[0].contains("not configuration"), "and what it is not: {stderr}", stderr = started.stderr);
+	let (_stdout, stderr) = run_refused(&[("WEFT_TEST_SWAP_MATRIX", "swap:seal")]);
+	assert!(stderr.contains("WEFT_TEST_SWAP_MATRIX is a test-harness channel"), "it says what it is: {stderr}");
+	assert!(stderr.contains("not configuration"), "and what it is not: {stderr}");
 }
 
 /// The point an operator cares about: a correctly configured server has nothing to say
@@ -173,13 +188,38 @@ fn a_configured_environment_prints_nothing_about_the_environment() {
 	assert!(started.stdout.contains("request guard: off"), "and so does the next one: {stdout}", stdout = started.stdout);
 }
 
-/// The registry describes reads; it does not add one or move one. A value an existing
-/// reader cannot use still comes from that reader, in the place it always printed.
+/// PAC-5b strictness reaches values, not just names: a registered variable holding
+/// a value outside the shape its registry entry accepts — the case PAC-5a's reader
+/// used to warn about and keep serving through — now refuses the start.
 #[test]
-fn reading_a_registered_variable_still_configures_the_thing_it_always_configured() {
-	let store_root = tempfile::tempdir().expect("tempdir");
-	let started = start_server(&[("WEFT_SEGMENT_STORE_ROOT", store_root.path().to_str().expect("utf-8 path")), ("WEFT_ON_AMBIGUOUS_COMMIT", "nonsense")]);
-	assert!(started.complaints().is_empty(), "WEFT_ON_AMBIGUOUS_COMMIT is registered, so the registry says nothing about it being set: {stderr}", stderr = started.stderr);
-	assert!(started.stdout.contains("WEFT_ON_AMBIGUOUS_COMMIT is neither `poison` nor `exit`"), "its reader does, as it always did: {stdout}", stdout = started.stdout);
-	assert!(started.stdout.contains("segment store: created at"), "and the store opened anyway: {stdout}", stdout = started.stdout);
+fn a_value_outside_the_registered_shape_refuses_the_start() {
+	let (_stdout, stderr) = run_refused(&[("WEFT_ON_AMBIGUOUS_COMMIT", "nonsense")]);
+	assert!(stderr.contains("WEFT_ON_AMBIGUOUS_COMMIT=\"nonsense\" is neither `poison` nor `exit`"), "it names the value and the shape: {stderr}");
+	let (_stdout, stderr) = run_refused(&[("WEFT_BACKUP_KEEP", "three")]);
+	assert!(stderr.contains("WEFT_BACKUP_KEEP=\"three\" is not a non-negative whole number"), "a malformed daemon number refuses too, even with its daemon off: {stderr}");
+}
+
+/// The store filesystem check (PAC-5b): a store root that is a file is refused
+/// with exit 78 before anything is opened, and a store whose `STORE_FORMAT`
+/// marker cannot be read is refused with exit 65 (plan C7: the store needs
+/// operator action).
+#[test]
+fn a_store_root_that_is_a_file_refuses_with_78_and_an_unreadable_marker_with_65() {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let file_root = dir.path().join("a-file");
+	std::fs::write(&file_root, b"not a store").expect("write the file root");
+	let (_stdout, stderr) = run_refused(&[("WEFT_SEGMENT_STORE_ROOT", file_root.to_str().expect("utf-8 path"))]);
+	assert!(stderr.contains("exists and is not a directory"), "the filesystem check names it: {stderr}");
+
+	let bad_store = dir.path().join("bad-store");
+	std::fs::create_dir(&bad_store).expect("create the store root");
+	std::fs::write(bad_store.join("STORE_FORMAT"), b"{torn").expect("write the torn marker");
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_weft-server"));
+	cmd.env("WEFT_SERVER_ADDR", "127.0.0.1:0").env("WEFT_SEGMENT_STORE_ROOT", bad_store.to_str().expect("utf-8 path"));
+	for name in NEUTRALIZED {
+		cmd.env_remove(*name);
+	}
+	let output = cmd.stdin(Stdio::null()).output().expect("runs weft-server");
+	assert_eq!(output.status.code(), Some(65), "an unreadable marker is exit 65: {output:?}");
+	assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be read"), "and it says why: {output:?}");
 }
