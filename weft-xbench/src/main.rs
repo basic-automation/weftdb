@@ -3,7 +3,7 @@
 //! ```text
 //! TMPDIR=/mnt/weftbench weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N]
 //!                                   [--seed N] [--uci FILE] [--clickhouse URL] [--timescale URL]
-//!                                   [--questdb ADDR] [--influxdb3 URL] [--out DIR]
+//!                                   [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--out DIR]
 //! ```
 //!
 //! Without `--uci` the UCI datasets are skipped and the report says which datasets ran; without
@@ -11,8 +11,7 @@
 //! and without `--timescale` (a `PostgreSQL` connection string for a server with `TimescaleDB`)
 //! the `TimescaleDB` arms are, and without `--questdb` (a `QuestDB` server's `host:port`) the
 //! `QuestDB` arms are, and without `--influxdb3` (an `InfluxDB` 3 HTTP endpoint) the `InfluxDB` 3
-//! arm is. The
-//! process exits 1 when any result fails its correctness gate, after writing the report.
+//! arm is, and without `--iotdb` (an Apache `IoTDB` REST service) the `IoTDB` arm is. The process exits 1 when any result fails its correctness gate, after writing the report.
 //!
 //! `weft-xbench render REPORT.json [--out DIR]` writes `report.md` and `report.html` from a
 //! report, with the generated honesty section (EVI-15R).
@@ -24,7 +23,7 @@ use std::path::PathBuf;
 use weft_bench::{load_uci_corpus, scale::ScalePreset, RunMetadata, DEFAULT_UCI_COLUMN};
 use weft_xbench::{clickhouse, render, run, Dataset, DatasetKind, Servers, XbenchReport, DEFAULT_SEED};
 
-const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--influxdb3 URL] [--out DIR]";
+const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--out DIR]";
 
 struct Cli {
 	scales: Vec<ScalePreset>,
@@ -36,11 +35,12 @@ struct Cli {
 	timescale: Option<String>,
 	questdb: Option<String>,
 	influxdb3: Option<String>,
+	iotdb: Option<String>,
 	out: PathBuf,
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, out: PathBuf::from("reports/xbench") };
+	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, out: PathBuf::from("reports/xbench") };
 	let mut args = args;
 	while let Some(flag) = args.next() {
 		let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
@@ -54,6 +54,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 			"--timescale" => cli.timescale = Some(value()?),
 			"--questdb" => cli.questdb = Some(value()?),
 			"--influxdb3" => cli.influxdb3 = Some(value()?),
+			"--iotdb" => cli.iotdb = Some(value()?),
 			"--out" => cli.out = PathBuf::from(value()?),
 			"-h" | "--help" => return Err(USAGE.to_string()),
 			other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
@@ -115,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
 	}
 	eprintln!("weft-xbench: {} datasets, scratch in {}", datasets.len(), std::env::temp_dir().display());
 	let metadata = RunMetadata::capture(chrono::Utc::now().to_rfc3339());
-	let servers = Servers { clickhouse: cli.clickhouse.as_deref().map(clickhouse::Server::new), timescale: cli.timescale.clone(), questdb: cli.questdb.as_deref().map(weft_xbench::questdb::Server::new), influxdb3: cli.influxdb3.as_deref().map(weft_xbench::influxdb3::Server::new) };
+	let servers = Servers { clickhouse: cli.clickhouse.as_deref().map(clickhouse::Server::new), timescale: cli.timescale.clone(), questdb: cli.questdb.as_deref().map(weft_xbench::questdb::Server::new), influxdb3: cli.influxdb3.as_deref().map(weft_xbench::influxdb3::Server::new), iotdb: cli.iotdb.as_deref().map(weft_xbench::iotdb::Server::new) };
 	if let Some(server) = &servers.clickhouse {
 		eprintln!("weft-xbench: clickhouse {} at {}", server.version()?, cli.clickhouse.as_deref().unwrap_or_default());
 	}
@@ -127,6 +128,9 @@ async fn main() -> anyhow::Result<()> {
 	}
 	if let Some(server) = &servers.influxdb3 {
 		eprintln!("weft-xbench: influxdb3 {}", server.version()?);
+	}
+	if let Some(server) = &servers.iotdb {
+		eprintln!("weft-xbench: iotdb {}", server.version()?);
 	}
 	let report = run(&datasets, &servers, cli.load_reps, cli.reps, cli.seed, metadata, source_commit(), invocation).await?;
 

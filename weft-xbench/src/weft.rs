@@ -30,6 +30,11 @@ pub trait Arm {
 		true
 	}
 
+	/// Release whatever an earlier [`load`](Arm::load) stored: drop its database, table or store.
+	/// The runner calls it before starting each load's clock, so a load's time is the load alone
+	/// and not also the teardown of the last one (`IoTDB`'s `DROP DATABASE` takes a second).
+	fn unload(&mut self);
+
 	/// Load `ds` into fresh storage, replacing whatever an earlier call loaded. This is the
 	/// timed load phase.
 	///
@@ -75,6 +80,8 @@ impl Arm for WeftMemory {
 	fn loads(&self) -> bool {
 		false
 	}
+
+	fn unload(&mut self) {}
 
 	/// Nothing to load: the points go to splimes on every call.
 	fn load(&mut self, _ds: &Dataset) -> impl Future<Output = anyhow::Result<()>> {
@@ -228,6 +235,10 @@ impl Arm for WeftStore {
 
 	fn downsamples(&self) -> bool {
 		self.downsamples
+	}
+
+	fn unload(&mut self) {
+		self.stored = None;
 	}
 
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {

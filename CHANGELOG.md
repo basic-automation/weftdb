@@ -18,6 +18,14 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **Cross-engine load timing no longer includes the previous load's teardown**: `weft-xbench`
+  now releases each rep's database or store before starting the next load's clock. Load rows
+  measured before this (the EVI-15 report among them) counted the drop of the previous rep.
+- **Apache IoTDB in the cross-engine benchmark** (#413): `weft-xbench --iotdb URL` adds an
+  `iotdb-double` arm over IoTDB's table-model REST API (`insertTablet` in time order answered once
+  the WAL entry is synced, `lead` segments joined to a `date_bin_gapfill` grid by native `ASOF LEFT
+  JOIN`, `date_bin` downsample), gated like every arm; IoTDB has no decimal type, so there is no
+  exact-decimal arm. The nightly smoke starts a pinned server.
 - **InfluxDB 3 Core in the cross-engine benchmark** (#413): `weft-xbench --influxdb3 URL` adds an
   `influxdb3-double` arm (line-protocol load answered once the WAL is persisted, SQL read back as
   Parquet, window-function interpolation, `date_bin` downsample), gated like every arm; InfluxDB 3
