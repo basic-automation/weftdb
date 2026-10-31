@@ -122,6 +122,31 @@ pub enum WeftSegError {
 		/// The version the wrapped frame names in its own header.
 		found: u16,
 	},
+	/// A count declared in the frame exceeds the decode limits (ROB-8,
+	/// [`crate::DecodeLimits`]): the frame claims more rows, pages or
+	/// envelope extensions than any writer produces, so the claim is refused
+	/// before it sizes an allocation. It is damage, not a newer format — the
+	/// limits bound what any build may ask this one to materialise.
+	DecodeLimit {
+		/// Which limit was exceeded (`row_count`, `page_count`, …).
+		limit: &'static str,
+		/// The count the frame declared.
+		found: usize,
+		/// The bound it exceeded.
+		max: usize,
+	},
+	/// Two counts inside one frame disagree: a column's decoded length is
+	/// not the length the segment header (or the column's own header)
+	/// declares for it (ROB-8). No writer produces such a frame; the parts
+	/// were edited, or a writer has a bug.
+	ColumnLengthMismatch {
+		/// Which column disagrees (`value_column`, `timestamp_column`, …).
+		column: &'static str,
+		/// The length the frame's headers declare.
+		expected: usize,
+		/// The length actually decoded.
+		found: usize,
+	},
 }
 
 impl std::fmt::Display for WeftSegError {
@@ -141,6 +166,8 @@ impl std::fmt::Display for WeftSegError {
 			Self::CodecNotEnabled { codec, feature } => write!(f, "segment uses the {codec} codec, which this build does not include; rebuild with the `{feature}` cargo feature (weft-physical-type; forwarded by weftdb and weft-server) to read it"),
 			Self::UnknownCriticalExtension { id } => write!(f, "frame carries critical extension {id}, which this build does not implement; the frame is left intact because a build that implements it can read it"),
 			Self::EnvelopeBodyMismatch { declared, found } => write!(f, "v7 envelope declares a {declared} body but the frame inside it names version {found}; the envelope's own checksum is correct, so this file was written or edited inconsistently"),
+			Self::DecodeLimit { limit, found, max } => write!(f, "frame declares {found} for {limit}, over the decode limit of {max}"),
+			Self::ColumnLengthMismatch { column, expected, found } => write!(f, "{column} decodes to {found} entries, but the frame declares {expected}"),
 		}
 	}
 }
@@ -534,8 +561,88 @@ use std::str::FromStr;
 use bigdecimal::BigDecimal;
 
 use crate::{
-	timestamp::{DeltaOfDeltaColumn, DodCheckpoint, DodCheckpoints, TimeUnit}, CascadeInner, ColumnEncoding, PhysicalType, PhysicalValue
+	frame_registry::DecodeLimits, timestamp::{DeltaOfDeltaColumn, DodCheckpoint, DodCheckpoints, TimeUnit}, CascadeInner, ColumnEncoding, PhysicalType, PhysicalValue
 };
+
+/// The decode limits every frame reader in this module enforces (ROB-8).
+const LIMITS: DecodeLimits = DecodeLimits::DEFAULT;
+
+/// Refuse a declared count that exceeds its decode limit, before the count
+/// sizes an allocation or a loop (ROB-8).
+fn check_decode_limit(limit: &'static str, found: usize, max: usize) -> Result<(), WeftSegError> {
+	if found > max {
+		return Err(WeftSegError::DecodeLimit { limit, found, max });
+	}
+	Ok(())
+}
+
+/// Refuse a per-element stream whose declared count cannot fit in the bytes
+/// remaining: every element of such a stream costs at least one byte on
+/// disk, so a count past `remaining` is a claim the frame itself refutes,
+/// and it is refused before the allocation the count would size (ROB-8).
+fn check_count_fits(count: usize, remaining: usize) -> Result<(), WeftSegError> {
+	if count > remaining {
+		return Err(WeftSegError::UnexpectedEof { needed: count, remaining });
+	}
+	Ok(())
+}
+
+/// The total length a run-length stream expands to, checked: `None` when
+/// the run lengths overflow `usize`, which no frame a writer produces does
+/// (ROB-8). Computed before [`crate::timestamp::rle_decode`] is allowed to
+/// allocate on the sum.
+fn checked_rle_total(runs: &[(i64, usize)]) -> Option<usize> {
+	runs.iter().try_fold(0_usize, |total, (_, len)| total.checked_add(*len))
+}
+
+/// Refuse a paged frame's declared page count before it sizes the page
+/// index (ROB-8): past the decode limit outright, and past what the
+/// remaining bytes could hold — each index entry costs at least eight
+/// bytes (two count varints, the sorted flag, four presence flags and the
+/// block-length varint).
+fn check_page_count(r: &ByteReader, page_count: usize) -> Result<(), WeftSegError> {
+	check_decode_limit("page_count", page_count, LIMITS.max_pages)?;
+	if page_count > r.remaining() / 8 {
+		return Err(WeftSegError::UnexpectedEof { needed: page_count.saturating_mul(8), remaining: r.remaining() });
+	}
+	Ok(())
+}
+
+/// The row count a decoded timestamp column reconstructs to, from the two
+/// facts the column itself carries. The column alone is ambiguous between
+/// zero and one row (both store no first delta and no dods — the ambiguity
+/// [`Segment::decode_timestamps`] documents), so `None` means *either* of
+/// those, and the caller accepts a declared count of 0 or 1.
+fn implied_timestamp_rows(column: &DeltaOfDeltaColumn) -> Option<usize> {
+	match column.first_delta {
+		None if column.dods.is_empty() => None,
+		// `decode_delta_of_delta` returns just the anchor when there is no
+		// first delta, whatever dods ride along.
+		None => Some(1),
+		Some(_) => Some(column.dods.len() + 2),
+	}
+}
+
+/// Cross-check one decoded segment (or one page) against its header stats
+/// (ROB-8): the value column must hold exactly the present rows, and the
+/// timestamp column must reconstruct to exactly the declared row count. A
+/// frame whose columns disagree with its header was edited or miswritten;
+/// serving it would hand callers columns of different heights.
+fn check_segment_columns(stats: &SegmentStats, values: &ColumnEncoding, timestamps: &DeltaOfDeltaColumn) -> Result<(), WeftSegError> {
+	let present = stats.row_count - stats.null_count;
+	if values.values.len() != present {
+		return Err(WeftSegError::ColumnLengthMismatch { column: "value_column", expected: present, found: values.values.len() });
+	}
+	match implied_timestamp_rows(timestamps) {
+		Some(rows) if rows != stats.row_count => {
+			return Err(WeftSegError::ColumnLengthMismatch { column: "timestamp_column", expected: stats.row_count, found: rows });
+		}
+		None if stats.row_count > 1 => {
+			return Err(WeftSegError::ColumnLengthMismatch { column: "timestamp_column", expected: stats.row_count, found: 1 });
+		}
+		_ => Ok(()),
+	}
+}
 
 const TAG_F64: u8 = 0;
 const TAG_F32: u8 = 1;
@@ -852,10 +959,15 @@ pub fn read_value_column(r: &mut ByteReader) -> Result<ColumnEncoding, WeftSegEr
 		other => return Err(WeftSegError::InvalidTag { kind: "physical_type", value: other }),
 	};
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_decode_limit("value_count", count, LIMITS.max_rows)?;
 	let lossy_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	if lossy_count > count {
+		return Err(WeftSegError::ColumnLengthMismatch { column: "lossy_count", expected: count, found: lossy_count });
+	}
 	let max_abs_error = read_decimal(r)?;
 	let values = match r.read_u8()? {
 		VAL_CODEC_VARINT => {
+			check_count_fits(count, r.remaining())?;
 			let mut values = Vec::with_capacity(count);
 			for _ in 0..count {
 				values.push(read_physical_value(r, physical_type)?);
@@ -923,6 +1035,7 @@ fn read_cascade_value_column(r: &mut ByteReader, physical_type: PhysicalType, ta
 	let delta_count = count.saturating_sub(1);
 	let deltas = match r.read_u8()? {
 		CASCADE_INNER_VARINT => {
+			check_count_fits(delta_count, r.remaining())?;
 			let mut deltas = Vec::with_capacity(delta_count);
 			for _ in 0..delta_count {
 				deltas.push(r.read_svarint()?);
@@ -947,13 +1060,27 @@ fn read_cascade_value_column(r: &mut ByteReader, physical_type: PhysicalType, ta
 		}
 		CASCADE_INNER_RLE => {
 			let run_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+			// Each run costs at least two bytes on disk (a value varint and a
+			// length varint), so a run count past half the remaining bytes is
+			// refused before it sizes the runs vector (ROB-8).
+			check_count_fits(run_count, r.remaining() / 2)?;
 			let mut runs = Vec::with_capacity(run_count);
 			for _ in 0..run_count {
 				let value = r.read_svarint()?;
 				let run_len = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
 				runs.push((value, run_len));
 			}
-			crate::timestamp::rle_decode(&runs)
+			// The runs may expand short of the delta stream's length — the
+			// block layer tolerates a short decode, and the frame layer's
+			// cross-checks refuse a segment built on one — but never past
+			// it: the total is checked before the expansion allocates on
+			// it, so one run cannot expand a few bytes into an unbounded
+			// stream (ROB-8).
+			match checked_rle_total(&runs) {
+				Some(total) if total <= delta_count => crate::timestamp::rle_decode(&runs),
+				Some(total) => return Err(WeftSegError::ColumnLengthMismatch { column: "value_column_cascade_rle", expected: delta_count, found: total }),
+				None => return Err(WeftSegError::DecodeLimit { limit: "value_column_cascade_rle", found: usize::MAX, max: delta_count }),
+			}
 		}
 		other => return Err(WeftSegError::InvalidTag { kind: "value_codec_cascade_inner", value: other }),
 	};
@@ -999,6 +1126,7 @@ pub fn read_value_at(bytes: &[u8], index: usize) -> Result<Option<PhysicalValue>
 		other => return Err(WeftSegError::InvalidTag { kind: "physical_type", value: other }),
 	};
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_decode_limit("value_count", count, LIMITS.max_rows)?;
 	let _lossy_count = r.read_uvarint()?;
 	let _max_abs_error = read_decimal(&mut r)?;
 	if index >= count {
@@ -1085,6 +1213,7 @@ pub fn read_values_at(bytes: &[u8], indices: &[usize]) -> Result<Vec<Option<Phys
 		other => return Err(WeftSegError::InvalidTag { kind: "physical_type", value: other }),
 	};
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_decode_limit("value_count", count, LIMITS.max_rows)?;
 	let _lossy_count = r.read_uvarint()?;
 	let _max_abs_error = read_decimal(&mut r)?;
 	if indices.iter().all(|&i| i >= count) {
@@ -1154,6 +1283,7 @@ pub fn read_value_range(bytes: &[u8], start: usize, len: usize) -> Result<Vec<Ph
 		other => return Err(WeftSegError::InvalidTag { kind: "physical_type", value: other }),
 	};
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_decode_limit("value_count", count, LIMITS.max_rows)?;
 	let _lossy_count = r.read_uvarint()?;
 	let _max_abs_error = read_decimal(&mut r)?;
 	let end = start.saturating_add(len).min(count);
@@ -1246,6 +1376,7 @@ fn skip_random_access_value_column(r: &mut ByteReader) -> Result<(), WeftSegErro
 		r.read_u8()?; // scale
 	}
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_decode_limit("value_count", count, LIMITS.max_rows)?;
 	r.read_uvarint()?; // lossy_count
 	read_decimal(r)?; // max_abs_error
 	if r.read_u8()? == VAL_CODEC_BITPACK {
@@ -1491,6 +1622,7 @@ pub fn read_paged_segment_point(bytes: &[u8], t: i64) -> Result<Option<BigDecima
 		return Ok(None);
 	}
 	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_page_count(&r, page_count)?;
 	// Parse the per-page index (stats + block length); the page data blocks follow it, so track
 	// the running byte offset of each block within `body`.
 	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
@@ -1595,6 +1727,7 @@ pub fn read_paged_segment_points(bytes: &[u8], ts: &[i64]) -> Result<Vec<Option<
 		return Ok(out);
 	}
 	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_page_count(&r, page_count)?;
 	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
 	for _ in 0..page_count {
 		let page_stats = read_segment_stats(&mut r)?;
@@ -1828,6 +1961,7 @@ fn read_paged_segment_range_with<V>(bytes: &[u8], start: i64, end: i64, map: &dy
 		_ => return Ok((timestamps, values)),
 	}
 	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_page_count(&r, page_count)?;
 	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
 	for _ in 0..page_count {
 		let page_stats = read_segment_stats(&mut r)?;
@@ -2068,6 +2202,7 @@ pub fn read_timestamp_column(r: &mut ByteReader) -> Result<DeltaOfDeltaColumn, W
 		_ => Some(r.read_svarint()?),
 	};
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_decode_limit("timestamp_count", count, LIMITS.max_rows)?;
 	let (dods, _) = read_dod_codec(r, count)?;
 	Ok(DeltaOfDeltaColumn { first, first_delta, dods, unit })
 }
@@ -2090,6 +2225,7 @@ pub fn read_timestamp_column_with_checkpoints(r: &mut ByteReader) -> Result<(Del
 		_ => Some(r.read_svarint()?),
 	};
 	let count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_decode_limit("timestamp_count", count, LIMITS.max_rows)?;
 	let (dods, checkpoints) = read_dod_codec(r, count)?;
 	Ok((DeltaOfDeltaColumn { first, first_delta, dods, unit }, checkpoints))
 }
@@ -2179,6 +2315,10 @@ fn read_lazy_checkpointed_ts<'a>(r: &mut ByteReader<'a>) -> Result<Option<LazyCh
 	}
 	let stride = usize::try_from(probe.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
 	let entries = usize::try_from(probe.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	// Each checkpoint entry costs at least three bytes on disk (row, timestamp
+	// and delta varints), so an entry count past a third of the remaining
+	// bytes is refused before it sizes the points vector (ROB-8).
+	check_count_fits(entries, probe.remaining() / 3)?;
 	let mut points = Vec::with_capacity(entries);
 	let (mut row, mut timestamp) = (0_usize, 0_i64);
 	for _ in 0..entries {
@@ -2212,6 +2352,7 @@ fn read_dod_codec(r: &mut ByteReader, count: usize) -> Result<(Vec<i64>, Option<
 			// nested wrapper, so a malformed frame cannot recurse.
 			let stride = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
 			let entries = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+			check_count_fits(entries, r.remaining() / 3)?;
 			let mut points = Vec::with_capacity(entries);
 			let (mut row, mut timestamp) = (0_usize, 0_i64);
 			for _ in 0..entries {
@@ -2230,6 +2371,7 @@ fn read_dod_codec(r: &mut ByteReader, count: usize) -> Result<(Vec<i64>, Option<
 			return Ok((dods, Some(DodCheckpoints { stride: stride.max(1), points, rows })));
 		}
 		TS_CODEC_VARINT => {
+			check_count_fits(count, r.remaining())?;
 			let mut dods = Vec::with_capacity(count);
 			for _ in 0..count {
 				dods.push(r.read_svarint()?);
@@ -2253,13 +2395,23 @@ fn read_dod_codec(r: &mut ByteReader, count: usize) -> Result<(Vec<i64>, Option<
 		}
 		TS_CODEC_RLE => {
 			let run_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+			check_count_fits(run_count, r.remaining() / 2)?;
 			let mut runs = Vec::with_capacity(run_count);
 			for _ in 0..run_count {
 				let value = r.read_svarint()?;
 				let run_len = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
 				runs.push((value, run_len));
 			}
-			crate::timestamp::rle_decode(&runs)
+			// As the value column's RLE: a short expansion is the block
+			// layer's tolerated malformation (the frame layer's
+			// cross-checks refuse a segment built on one), an expansion
+			// past the declared count is refused before it allocates
+			// (ROB-8).
+			match checked_rle_total(&runs) {
+				Some(total) if total <= count => crate::timestamp::rle_decode(&runs),
+				Some(total) => return Err(WeftSegError::ColumnLengthMismatch { column: "timestamp_column_rle", expected: count, found: total }),
+				None => return Err(WeftSegError::DecodeLimit { limit: "timestamp_column_rle", found: usize::MAX, max: count }),
+			}
 		}
 		other => return Err(WeftSegError::InvalidTag { kind: "timestamp_codec", value: other }),
 	};
@@ -2383,7 +2535,11 @@ fn write_segment_stats(w: &mut ByteWriter, stats: &SegmentStats) {
 /// [`write_segment_stats`].
 fn read_segment_stats(r: &mut ByteReader) -> Result<SegmentStats, WeftSegError> {
 	let row_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_decode_limit("row_count", row_count, LIMITS.max_rows)?;
 	let null_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	if null_count > row_count {
+		return Err(WeftSegError::ColumnLengthMismatch { column: "null_count", expected: row_count, found: null_count });
+	}
 	let time_sorted = r.read_u8()? != 0;
 	let min_ts = read_opt_i64(r)?;
 	let max_ts = read_opt_i64(r)?;
@@ -2487,6 +2643,11 @@ fn frame_parts(bytes: &[u8]) -> Result<FrameParts<'_>, WeftSegError> {
 	let mut r = ByteReader::new(rest);
 	let body_version = r.read_u16_le()?;
 	let count = r.read_uvarint()?;
+	// The table's height is capped before it is walked (ROB-8): no writer
+	// produces a table past the decode limit, whatever the count claims.
+	if count > u64::try_from(LIMITS.max_extensions).unwrap_or(u64::MAX) {
+		return Err(WeftSegError::DecodeLimit { limit: "extension_count", found: usize::try_from(count).unwrap_or(usize::MAX), max: LIMITS.max_extensions });
+	}
 	// The count is not trusted as a size hint: entries are parsed one at a time and
 	// each needs bytes that must actually be present, so a count invented by damage
 	// stops at the first entry that is not there instead of reserving anything.
@@ -2621,7 +2782,7 @@ pub const fn frame_fault_of(error: &WeftSegError) -> FrameFault {
 		WeftSegError::CodecNotEnabled { .. } | WeftSegError::UnknownCriticalExtension { .. } => FrameFault::Undecodable { newer_format: false },
 		// BadMagic, ChecksumMismatch, UnexpectedEof, VarintTooLong, TrailingBytes,
 		// InvalidUtf8, InvalidDecimal, DecimalOutOfRange, InvalidNullMask,
-		// EnvelopeBodyMismatch: the file
+		// EnvelopeBodyMismatch, DecodeLimit, ColumnLengthMismatch: the file
 		// does not agree with itself. InvalidTag is counted with them because a tag this
 		// build does not know arrives with a new frame or body version, not inside a
 		// version it already understands.
@@ -2945,6 +3106,7 @@ pub fn read_segment(bytes: &[u8]) -> Result<Segment, WeftSegError> {
 	let values = read_value_column(&mut r)?;
 	let timestamps = read_timestamp_column(&mut r)?;
 	let nulls = read_null_column(&mut r, stats.row_count, stats.null_count)?;
+	check_segment_columns(&stats, &values, &timestamps)?;
 	if !r.is_empty() {
 		return Err(WeftSegError::TrailingBytes { remaining: r.remaining() });
 	}
@@ -3087,6 +3249,7 @@ pub fn read_paged_segment(bytes: &[u8]) -> Result<PagedSegment, WeftSegError> {
 	let rows_per_page = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
 	let stats = read_segment_stats(&mut r)?;
 	let page_count = usize::try_from(r.read_uvarint()?).map_err(|_| WeftSegError::VarintTooLong)?;
+	check_page_count(&r, page_count)?;
 	// Read the index: each page's stats and the length of its column block.
 	let mut index: Vec<(SegmentStats, usize)> = Vec::with_capacity(page_count);
 	for _ in 0..page_count {
@@ -3102,10 +3265,26 @@ pub fn read_paged_segment(bytes: &[u8]) -> Result<PagedSegment, WeftSegError> {
 		let values = read_value_column(&mut pr)?;
 		let timestamps = read_timestamp_column(&mut pr)?;
 		let nulls = read_null_column(&mut pr, page_stats.row_count, page_stats.null_count)?;
+		check_segment_columns(&page_stats, &values, &timestamps)?;
 		if !pr.is_empty() {
 			return Err(WeftSegError::TrailingBytes { remaining: pr.remaining() });
 		}
 		pages.push(Page { values, timestamps, nulls, stats: page_stats });
+	}
+	// The segment-level header must be the rollup of its pages (ROB-8): a
+	// header that disagrees with the pages it indexes was edited or
+	// miswritten, and pruning decisions are made from the header.
+	let rolled_rows = pages.iter().try_fold(0_usize, |total, page| total.checked_add(page.stats.row_count));
+	let rolled_nulls = pages.iter().try_fold(0_usize, |total, page| total.checked_add(page.stats.null_count));
+	match (rolled_rows, rolled_nulls) {
+		(Some(rows), Some(nulls)) if rows == stats.row_count && nulls == stats.null_count => {}
+		(Some(rows), _) if rows != stats.row_count => {
+			return Err(WeftSegError::ColumnLengthMismatch { column: "page_rollup_row_count", expected: stats.row_count, found: rows });
+		}
+		(_, Some(nulls)) if nulls != stats.null_count => {
+			return Err(WeftSegError::ColumnLengthMismatch { column: "page_rollup_null_count", expected: stats.null_count, found: nulls });
+		}
+		_ => return Err(WeftSegError::DecodeLimit { limit: "page_rollup_row_count", found: usize::MAX, max: LIMITS.max_rows }),
 	}
 	if !r.is_empty() {
 		return Err(WeftSegError::TrailingBytes { remaining: r.remaining() });
@@ -4719,6 +4898,153 @@ mod tests {
 		assert_eq!(wrapped.len(), inner.len() + 16, "an envelope with an empty extension table costs 16 bytes");
 		assert_eq!(frame_version(&wrapped).expect("version"), FRAME_ENVELOPE);
 		assert_eq!(unwrap_frame_envelope(&wrapped).expect("unwraps"), &inner[..]);
+	}
+
+	/// Build a complete single-block frame around caller-supplied stats and
+	/// column blocks, with a correct CRC: the shape a hostile or damaged
+	/// file takes once its checksum is made to agree (ROB-8's threat model —
+	/// the CRC is an integrity check, not a signature).
+	fn crafted_frame(stats: &SegmentStats, values: &[u8], timestamps: &[u8]) -> Vec<u8> {
+		let mut w = ByteWriter::new();
+		w.put_raw(MAGIC);
+		w.put_u16_le(SEGMENT_FORMAT_VERSION);
+		write_segment_stats(&mut w, stats);
+		w.put_raw(values);
+		w.put_raw(timestamps);
+		write_null_column(&mut w, &NullMask::all_present(stats.row_count));
+		let crc = crc32(w.as_slice());
+		w.put_u32_le(crc);
+		w.into_vec()
+	}
+
+	fn column_block(col: &ColumnEncoding) -> Vec<u8> {
+		let mut w = ByteWriter::new();
+		write_value_column(&mut w, col);
+		w.into_vec()
+	}
+
+	fn timestamp_block(col: &DeltaOfDeltaColumn) -> Vec<u8> {
+		let mut w = ByteWriter::new();
+		write_timestamp_column(&mut w, col);
+		w.into_vec()
+	}
+
+	#[test]
+	fn decode_refuses_a_row_count_past_the_limit() {
+		// The header alone claims more rows than any writer produces; the
+		// refusal is the decode limit, classified integrity, and it lands
+		// before any column is read (ROB-8).
+		let seg = single_block_segment();
+		let mut stats = seg.stats.clone();
+		stats.row_count = crate::MAX_FRAME_ROWS + 1;
+		let frame = crafted_frame(&stats, &column_block(&seg.values), &timestamp_block(&seg.timestamps));
+		let err = read_segment(&frame).expect_err("refuses");
+		assert_eq!(err, WeftSegError::DecodeLimit { limit: "row_count", found: crate::MAX_FRAME_ROWS + 1, max: crate::MAX_FRAME_ROWS });
+		assert_eq!(frame_fault_of(&err), FrameFault::Integrity);
+		assert_eq!(read_frame_segment(&frame).expect_err("refuses through the frame reader"), err);
+	}
+
+	#[test]
+	fn decode_refuses_a_value_count_the_frame_cannot_hold() {
+		// A varint value column claiming a million values in a frame with a
+		// handful of bytes left: each value costs at least one byte, so the
+		// claim is refuted by the frame itself, before it sizes the Vec.
+		let mut w = ByteWriter::new();
+		w.put_u8(TAG_F64);
+		w.put_uvarint(1_000_000);
+		w.put_uvarint(0);
+		w.put_str("0");
+		w.put_u8(VAL_CODEC_VARINT);
+		let err = read_value_column(&mut ByteReader::new(&w.into_vec())).expect_err("refuses");
+		assert_eq!(err, WeftSegError::UnexpectedEof { needed: 1_000_000, remaining: 0 });
+		assert_eq!(frame_fault_of(&err), FrameFault::Integrity);
+	}
+
+	#[test]
+	fn decode_refuses_an_rle_run_that_expands_past_the_declared_count() {
+		// One run of a billion zeros against a declared count of three: the
+		// expansion total is checked before `rle_decode` allocates on it.
+		let mut w = ByteWriter::new();
+		w.put_u8(0); // time-unit tag (seconds)
+		w.put_i64_le(1_000);
+		w.put_u8(1); // first delta present
+		w.put_svarint(10);
+		w.put_uvarint(3); // dod count
+		w.put_u8(TS_CODEC_RLE);
+		w.put_uvarint(1); // one run
+		w.put_svarint(0);
+		w.put_uvarint(1_000_000_000); // of a billion
+		let err = read_timestamp_column(&mut ByteReader::new(&w.into_vec())).expect_err("refuses");
+		assert_eq!(err, WeftSegError::ColumnLengthMismatch { column: "timestamp_column_rle", expected: 3, found: 1_000_000_000 });
+		assert_eq!(frame_fault_of(&err), FrameFault::Integrity);
+	}
+
+	#[test]
+	fn decode_refuses_columns_that_disagree_with_the_header() {
+		// Stats claim four rows; the columns carry three. Each column is
+		// well formed and the CRC agrees — the frame contradicts itself.
+		let ts: Vec<i64> = (0..3).map(|i| 1_000 + i * 10).collect();
+		let vs: Vec<BigDecimal> = (0..3).map(BigDecimal::from).collect();
+		let seg = Segment::build(&ts, &vs, TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
+		let mut stats = seg.stats.clone();
+		stats.row_count = 4;
+		stats.null_count = 0;
+		let frame = crafted_frame(&stats, &column_block(&seg.values), &timestamp_block(&seg.timestamps));
+		let err = read_segment(&frame).expect_err("refuses");
+		assert!(matches!(err, WeftSegError::ColumnLengthMismatch { .. }), "got {err:?}");
+		assert_eq!(frame_fault_of(&err), FrameFault::Integrity);
+	}
+
+	#[test]
+	fn decode_refuses_a_paged_rollup_that_disagrees_with_its_pages() {
+		// The segment header of a paged frame is the rollup of its pages; a
+		// header edited after sealing (CRC re-stamped) is refused.
+		let seg = paged_segment();
+		// Re-seal a segment whose header stats were tampered with: the
+		// header's row_count is one more than the pages hold.
+		let mut tampered = seg.clone();
+		tampered.stats.row_count += 1;
+		let frame = write_paged_segment(&tampered);
+		let err = read_paged_segment(&frame).expect_err("refuses");
+		assert!(matches!(err, WeftSegError::ColumnLengthMismatch { column: "page_rollup_row_count", .. }), "got {err:?}");
+		assert_eq!(frame_fault_of(&err), FrameFault::Integrity);
+	}
+
+	#[test]
+	fn decode_refuses_an_envelope_extension_table_past_the_limit() {
+		let inner = single_block_frame();
+		let mut w = ByteWriter::new();
+		w.put_raw(MAGIC);
+		w.put_u16_le(FRAME_ENVELOPE);
+		w.put_u16_le(FRAME_SINGLE_BLOCK);
+		w.put_uvarint(u64::try_from(crate::MAX_FRAME_EXTENSIONS + 1).expect("fits"));
+		w.put_raw(&inner);
+		let crc = crc32(w.as_slice());
+		w.put_u32_le(crc);
+		let frame = w.into_vec();
+		let err = unwrap_frame_envelope(&frame).expect_err("refuses");
+		assert!(matches!(err, WeftSegError::DecodeLimit { limit: "extension_count", .. }), "got {err:?}");
+		assert_eq!(frame_fault_of(&err), FrameFault::Integrity);
+		assert_eq!(describe_frame(&frame), Err(FrameFault::Integrity));
+	}
+
+	#[test]
+	fn decode_refuses_a_page_count_the_frame_cannot_hold() {
+		// A paged header claiming a million pages in a frame with no index
+		// bytes: refused before the index Vec is sized.
+		let seg = paged_segment();
+		let mut w = ByteWriter::new();
+		w.put_raw(MAGIC);
+		w.put_u16_le(PAGED_SEGMENT_FORMAT_VERSION);
+		w.put_uvarint(seg.rows_per_page as u64);
+		write_segment_stats(&mut w, &seg.stats);
+		w.put_uvarint(1_000_000);
+		let crc = crc32(w.as_slice());
+		w.put_u32_le(crc);
+		let frame = w.into_vec();
+		let err = read_paged_segment(&frame).expect_err("refuses");
+		assert!(matches!(err, WeftSegError::UnexpectedEof { .. } | WeftSegError::DecodeLimit { .. }), "got {err:?}");
+		assert_eq!(frame_fault_of(&err), FrameFault::Integrity);
 	}
 
 	#[test]
