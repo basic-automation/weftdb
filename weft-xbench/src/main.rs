@@ -69,9 +69,15 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 	Ok(cli)
 }
 
+/// `HEAD`, with `+dirty` when the checkout has changes or new files, so a report never names a
+/// commit its binary was not built from.
 fn source_commit() -> Option<String> {
-	let out = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(env!("CARGO_MANIFEST_DIR")).output().ok()?;
-	out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+	let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(env!("CARGO_MANIFEST_DIR")).output().ok().filter(|out| out.status.success()).map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+	let head = git(&["rev-parse", "HEAD"])?;
+	Some(match git(&["status", "--porcelain"]) {
+		Some(changes) if changes.is_empty() => head,
+		_ => format!("{head}+dirty"),
+	})
 }
 
 /// `render REPORT.json [--out DIR]`: the report's Markdown and HTML, beside it by default.

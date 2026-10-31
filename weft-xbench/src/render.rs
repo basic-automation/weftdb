@@ -281,6 +281,9 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 
 	b.push(Block::Heading(3, "Configuration caveats".into()));
 	let mut caveats = vec![format!("Hardware: {} ({} physical / {} logical cores, {} GiB memory). The working directory was on a {} {} disk at {}.", m.cpu_model.as_deref().unwrap_or("CPU not reported"), m.cpu_cores_physical.map_or_else(|| "?".into(), |c| c.to_string()), m.cpu_cores_logical.map_or_else(|| "?".into(), |c| c.to_string()), m.total_memory_bytes.map_or_else(|| "?".into(), |b| format!("{:.0}", ns(b) / f64::from(1u32 << 30))), m.work_disk_kind.as_deref().unwrap_or("unknown"), m.work_disk_file_system.as_deref().unwrap_or("unknown file system"), m.work_disk_mount_point.as_deref().unwrap_or("an unreported mount point"),)];
+	if report.source_commit.as_deref().is_some_and(|c| c.ends_with("+dirty")) {
+		caveats.push("**The binary was built from a checkout with uncommitted changes** (`+dirty` on the source commit), so that commit alone does not reproduce it.".into());
+	}
 	if let Some(scratch) = &report.scratch_dir {
 		caveats.push(format!("The in-process engines wrote their stores to `{scratch}` (`TMPDIR`), which may be a different disk from the working directory."));
 	}
@@ -524,6 +527,14 @@ mod tests {
 		let with = to_markdown(&blocks(&report(vec![tsbs])));
 		assert!(with.contains("one host's (`host_0`) `usage_user`"), "{with}");
 		assert!(!with.contains("The `tsbs` datasets did not run"), "{with}");
+	}
+
+	#[test]
+	fn a_dirty_checkout_is_flagged() {
+		let mut r = report(vec![]);
+		assert!(!to_markdown(&blocks(&r)).contains("uncommitted changes"));
+		r.source_commit = Some("abc123+dirty".into());
+		assert!(to_markdown(&blocks(&r)).contains("uncommitted changes"));
 	}
 
 	#[test]

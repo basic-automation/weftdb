@@ -18,6 +18,9 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **Cross-engine reports flag a dirty build**: `weft-xbench` records its source commit as
+  `<sha>+dirty` when the checkout has changes, and the report says that commit alone does not
+  reproduce the binary.
 - **TSBS data in the cross-engine benchmark** (#141): `weft-xbench --tsbs FILE` reads a
   `tsbs_generate_data --use-case=cpu-only --format=influx` file, keeps `host_0`'s `usage_user`,
   and adds `tsbs-tiny`, `tsbs-small` and `tsbs-medium` datasets: knots every ten seconds over the

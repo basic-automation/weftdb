@@ -140,6 +140,6 @@ cpu,hostname=host_1,region=us-west-1 usage_user=83i,usage_system=12i 14516064200
 		assert!(load_from_reader(backwards.as_bytes(), DEFAULT_HOST, DEFAULT_FIELD, 3600).is_err());
 		let retagged = "cpu,hostname=host_0,rack=1 usage_user=1i 10\ncpu,hostname=host_0,rack=2 usage_user=2i 20\n";
 		assert!(load_from_reader(retagged.as_bytes(), DEFAULT_HOST, DEFAULT_FIELD, 3600).expect_err("two tag sets").to_string().contains("changed its tag set"));
-		assert!(load_from_reader("cpu,hostname=host_0 usage_user=\n".as_bytes(), DEFAULT_HOST, DEFAULT_FIELD, 3600).is_err());
+		assert!(load_from_reader(&b"cpu,hostname=host_0 usage_user=\n"[..], DEFAULT_HOST, DEFAULT_FIELD, 3600).is_err());
 	}
 }
