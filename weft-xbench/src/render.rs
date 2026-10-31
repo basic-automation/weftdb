@@ -22,14 +22,15 @@ const EXPECTED_KINDS: [DatasetKind; 3] = [DatasetKind::Mcar, DatasetKind::Block,
 const EXPECTED_SCALES: usize = 3;
 /// Arms decision 18 asks for: WeftDB stored, in-memory and `f64`; `DuckDB` `DOUBLE` and `DECIMAL`;
 /// and, from the second external engine on, `ClickHouse` `Float64` and `Decimal64` and
-/// `TimescaleDB` `double precision` and `numeric`; `QuestDB` `DOUBLE` and `DECIMAL`.
-const EXPECTED_ARMS: [&str; 12] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "clickhouse-double", "clickhouse-decimal", "timescaledb-double", "timescaledb-numeric", "questdb-double", "questdb-decimal"];
+/// `TimescaleDB` `double precision` and `numeric`; `QuestDB` `DOUBLE` and `DECIMAL`; `InfluxDB` 3's
+/// `float` field (it has no decimal type).
+const EXPECTED_ARMS: [&str; 13] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "clickhouse-double", "clickhouse-decimal", "timescaledb-double", "timescaledb-numeric", "questdb-double", "questdb-decimal", "influxdb3-double"];
 /// Below this many reps the bootstrap intervals are too coarse to separate much.
 const FEW_REPS: usize = 10;
 
 /// Workloads and engines outside this benchmark, listed in every report so a reader does not take
 /// silence for coverage.
-const NOT_IN_SCOPE: [&str; 6] = ["Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB and QuestDB has a spline, so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "InfluxDB 3 Core and IoTDB: no adapter yet. Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
+const NOT_IN_SCOPE: [&str; 6] = ["Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB, QuestDB and InfluxDB 3 has a spline, so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "IoTDB: no adapter yet. Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
 
 /// How one WeftDB arm compares with the fastest other engine on one dataset and phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +217,8 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 					" (pass `--timescale URL`)"
 				} else if arm.starts_with("questdb") {
 					" (pass `--questdb ADDR`)"
+				} else if arm.starts_with("influxdb3") {
+					" (pass `--influxdb3 URL`)"
 				} else {
 					""
 				}
@@ -251,12 +254,20 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		limits.push("QuestDB's `SAMPLE BY … FILL(LINEAR)` fills between bucket aggregates, not between the knots, so its arm builds segments with the native `LT JOIN` and finds each grid instant's segment with an `ASOF JOIN`, gated like every arm.".into());
 		limits.push("Open-source QuestDB acknowledges that a write was received, not that it is durable (a durable acknowledgement needs Enterprise). Its load is timed from the first QWP frame until the WAL is applied and the rows are visible, and the engine line records the server's `cairo.commit.mode`; under `sync` each commit is synced to disk. In `questdb-decimal` the bucket mean is `avg(v::double)`: QuestDB's own `avg` of a `DECIMAL` column rounds the mean to the column's scale. Its bytes on disk are `table_partitions()`'s, which include the space QuestDB reserves ahead in the active partition, so small tables report far more than they hold.".into());
 	}
+	let influx = report.results.iter().any(|r| r.arm.arm.starts_with("influxdb3"));
+	if influx {
+		limits.push("InfluxDB 3 has no decimal type, so it has one arm, `influxdb3-double`, and no exact-decimal comparison. Its SQL engine (DataFusion) has no `ASOF JOIN` and `date_bin_gapfill`'s `interpolate()` fills between bucket aggregates, so the arm merges the grid with the knots and finds each grid row's neighbouring knots with running `max`/`min` windows over the knot instants, gated like every arm.".into());
+		limits.push("InfluxDB 3's write answers once the WAL file holding the rows is persisted (`no_sync=false`, its default), and the server flushes its WAL every second (`--wal-flush-interval`, default `1s`), so a load takes about a second however small it is; a load is sent as concurrent writes of at most 8 MiB, under the server's 10 MiB request cap, so they share the WAL flush. A series and an instant are its key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none). Its bytes on disk are not reported: the rows sit in the WAL until the server snapshots them to Parquet on its own schedule. InfluxDB 3 Core refuses a query that would read more than 432 Parquet files, and it writes a file per ten minutes of data time with no compaction, so the four-year UCI series is about 200,000 files once snapshotted; the reference server raises that cap with `--query-file-limit 300000`, and the UCI interpolation times show the cost of reading that many files.".into());
+	}
 	b.push(Block::List(limits));
 
 	b.push(Block::Heading(3, "Configuration caveats".into()));
 	let mut caveats = vec![format!("Hardware: {} ({} physical / {} logical cores, {} GiB memory). The working directory was on a {} {} disk at {}.", m.cpu_model.as_deref().unwrap_or("CPU not reported"), m.cpu_cores_physical.map_or_else(|| "?".into(), |c| c.to_string()), m.cpu_cores_logical.map_or_else(|| "?".into(), |c| c.to_string()), m.total_memory_bytes.map_or_else(|| "?".into(), |b| format!("{:.0}", ns(b) / f64::from(1u32 << 30))), m.work_disk_kind.as_deref().unwrap_or("unknown"), m.work_disk_file_system.as_deref().unwrap_or("unknown file system"), m.work_disk_mount_point.as_deref().unwrap_or("an unreported mount point"),)];
 	if let Some(scratch) = &report.scratch_dir {
 		caveats.push(format!("The in-process engines wrote their stores to `{scratch}` (`TMPDIR`), which may be a different disk from the working directory."));
+	}
+	if influx {
+		caveats.push("The InfluxDB 3 server stored its data in its own object-store directory, which this report cannot see; check the reproduction notes for where it was mounted.".into());
 	}
 	if questdb {
 		caveats.push("The QuestDB server stored its data in its own data directory, which this report cannot see; check the reproduction notes for where it was mounted.".into());
@@ -280,7 +291,7 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 
 	b.push(Block::Heading(3, "Reproduction".into()));
 	let invocation = if report.invocation.is_empty() { "weft-xbench".to_string() } else { report.invocation.join(" ") };
-	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), "For the QuestDB arms: `docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v <disk under test>/questdb:/var/lib/questdb questdb/questdb:<version above>`, then `--questdb 127.0.0.1:9000`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
+	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), "For the QuestDB arms: `docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v <disk under test>/questdb:/var/lib/questdb questdb/questdb:<version above>`, then `--questdb 127.0.0.1:9000`.".into(), "For the InfluxDB 3 arm: `docker run -d -p 127.0.0.1:8181:8181 -v <disk under test>/influxdb3:/var/lib/influxdb3 influxdb:<version above> influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000`, then `--influxdb3 http://127.0.0.1:8181`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
 	b
 }
 
@@ -456,6 +467,16 @@ mod tests {
 		assert!(without.contains("The `questdb-decimal` arm is not in this run (pass `--questdb ADDR`)"), "{without}");
 		let with = to_markdown(&blocks(&report(vec![result("a", "questdb-double", Phase::Load, &FAST[..5], true)])));
 		for needle in ["`SAMPLE BY … FILL(LINEAR)`", "durable acknowledgement needs Enterprise", "The QuestDB server stored its data"] {
+			assert!(with.contains(needle), "missing {needle:?} in\n{with}");
+		}
+	}
+
+	#[test]
+	fn influxdb3_is_named_as_missing_or_carries_its_caveats() {
+		let without = to_markdown(&blocks(&report(vec![])));
+		assert!(without.contains("The `influxdb3-double` arm is not in this run (pass `--influxdb3 URL`)"), "{without}");
+		let with = to_markdown(&blocks(&report(vec![result("a", "influxdb3-double", Phase::Interpolate, &FAST, true)])));
+		for needle in ["InfluxDB 3 has no decimal type", "`no_sync=false`", "The InfluxDB 3 server stored its data"] {
 			assert!(with.contains(needle), "missing {needle:?} in\n{with}");
 		}
 	}

@@ -12,7 +12,7 @@ edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Cross-engine interpolation benchmark: WeftDB against DuckDB, ClickHouse, TimescaleDB and QuestDB"
+description = "Cross-engine interpolation benchmark: WeftDB against DuckDB, ClickHouse, TimescaleDB, QuestDB and InfluxDB 3"
 
 # An empty workspace table: this crate is its own workspace root, not a member of the parent's.
 [workspace]
@@ -40,6 +40,8 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 bytes = "1"
 # The QuestDB arms' client, QuestDB's own: QWP over WebSocket both ways (the fairness notes in
 # #393 rule out PG Wire). No Arrow feature: its `arrow` range excludes the workspace's.
+# The InfluxDB 3 arm reads its SQL answers as Parquet, with the workspace's own reader.
+parquet = { version = "=60.0.0", default-features = false, features = ["arrow", "snap", "zstd"] }
 questdb-rs = { version = "7.2", default-features = false, features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws", "ring-crypto", "tls-webpki-certs"] }
 weft-bench = { path = "../weft-bench" }
 weft-physical-type = { path = "../weft-physical-type" }

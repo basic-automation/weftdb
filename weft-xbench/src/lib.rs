@@ -26,6 +26,7 @@
 
 pub mod clickhouse;
 pub mod duck;
+pub mod influxdb3;
 pub mod questdb;
 pub mod render;
 pub mod timescale;
@@ -514,6 +515,8 @@ pub struct Servers {
 	pub timescale: Option<String>,
 	/// A `QuestDB` server's `host:port` (`--questdb ADDR`), QWP and HTTP on the one port.
 	pub questdb: Option<questdb::Server>,
+	/// An `InfluxDB` 3 HTTP endpoint (`--influxdb3 URL`).
+	pub influxdb3: Option<influxdb3::Server>,
 }
 
 /// Run every arm over every dataset.
@@ -543,6 +546,9 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps
 			results.extend(measure(&mut questdb::QuestDb::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
 			results.extend(measure(&mut questdb::QuestDb::decimal(server.clone()), ds, &reference, load_reps, reps, seed).await?);
 		}
+		if let Some(server) = &servers.influxdb3 {
+			results.extend(measure(&mut influxdb3::Influx::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+		}
 	}
 	let mut engines = vec![EngineVersion { engine: "weftdb".into(), version: metadata.weft_bench_version.clone() }, EngineVersion { engine: "duckdb".into(), version: duck::duckdb_version()? }];
 	if let Some(server) = &servers.clickhouse {
@@ -553,6 +559,9 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps
 	}
 	if let Some(server) = &servers.questdb {
 		engines.push(EngineVersion { engine: "questdb".into(), version: server.version()? });
+	}
+	if let Some(server) = &servers.influxdb3 {
+		engines.push(EngineVersion { engine: "influxdb3".into(), version: server.version()? });
 	}
 	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), results })
 }
@@ -661,6 +670,32 @@ mod tests {
 			let buckets = arm.downsample(&ds, ds.points.clone()).await.expect("downsamples");
 			assert!(Correctness::check_buckets(&buckets, &reference.buckets).passed, "{name}: got {buckets:?}\nwant {:?}", reference.buckets);
 		}
+	}
+
+	/// The `InfluxDB` 3 arm against a live server, when `WEFT_XBENCH_INFLUXDB3` names one
+	/// (`http://127.0.0.1:8181`); without it this passes. A series and an instant are `InfluxDB`'s
+	/// key, so the duplicate instant is checked for interpolation (the last value wins, as in
+	/// splimes) and the buckets on the dataset without it, where every row counts once anyway.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn influxdb3_matches_the_reference_on_edges_and_duplicates_when_a_server_is_given() {
+		let Ok(url) = std::env::var("WEFT_XBENCH_INFLUXDB3") else { return };
+		let mut arm = influxdb3::Influx::double(influxdb3::Server::new(&url));
+		let plain = edge_dataset();
+		let mut dup = edge_dataset();
+		dup.points.insert(3, Point::new(ts(14), "9".parse().expect("decimal")));
+		let reference = reference(&dup).await.expect("reference");
+		let values = values_of(&mut arm, &dup).await;
+		let gate = Correctness::check(&values, &reference.grid, dup.grid_len());
+		assert!(gate.passed, "{gate:?}\n got {values:?}\nwant {:?}", reference.grid);
+		let reference = reference_of(&plain).await;
+		arm.load(&plain).await.expect("loads");
+		let buckets = arm.downsample(&plain, plain.points.clone()).await.expect("downsamples");
+		assert!(Correctness::check_buckets(&buckets, &reference.buckets).passed, "got {buckets:?}\nwant {:?}", reference.buckets);
+		assert!(arm.storage_bytes().is_none(), "the WAL's bytes are not reported as storage");
+	}
+
+	async fn reference_of(ds: &Dataset) -> Reference {
+		reference(ds).await.expect("reference")
 	}
 
 	#[test]

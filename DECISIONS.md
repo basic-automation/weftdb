@@ -4,6 +4,55 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — External engines IV: how the InfluxDB 3 Core arm is measured
+
+**Ambiguous:** InfluxDB 3 Core has no decimal type, no `ASOF JOIN` in its SQL engine (DataFusion),
+a key of series plus instant that replaces duplicate writes, and rows that live in a WAL until the
+server snapshots them to Parquet. Which of the decision-18 arms it can have, and how to read its
+storage, were not settled.
+
+**Chosen:**
+
+- **One arm, `influxdb3-double`**, in `weft-xbench/src/influxdb3.rs`, run only with
+  `--influxdb3 URL`, against InfluxDB 3 Core 3.12.2. No decimal arm: the engine has no decimal type,
+  and the report says so rather than storing scaled integers no InfluxDB user would.
+- **Writes:** line protocol over HTTP at nanosecond precision, `no_sync` at its default `false`, so
+  the server answers once the WAL file holding the rows is persisted. **Reads:** SQL over HTTP with
+  `format=parquet`, decoded with the workspace's own `parquet` 60 reader: columnar, like the other
+  servers' binary paths, without Flight's gRPC stack.
+- **Interpolation:** the grid merged with the knots; each grid row's neighbouring knot instants are
+  a running `max` and a reversed running `min` (knot instants only increase), their values joined
+  back by instant; the first and last segments stand in past the data. `last_value`/`first_value …
+  IGNORE NULLS` gave the same answers but DataFusion re-scanned their frames: 6 min 25 s at the
+  `medium` scale against 0.79 s. The one-row edge table is the build (left) side of its `CROSS
+  JOIN`: with the grid on the left, DataFusion emitted one batch per grid row, 5.7 s against 0.08 s
+  for 86,401 instants with identical answers, and run 4's numbers were discarded for it. A load is sent as concurrent writes of at most 8 MiB, under the
+  server's 10 MiB request cap, so they share one WAL flush rather than waiting for one each. That flush runs every `--wal-flush-interval` (default `1s`, left at its default), so every load measures about one second; the report says so. `date_bin_gapfill` with `interpolate()` fills between bucket aggregates and does not answer
+  jittered knots. **Downsample:** native `date_bin`.
+- **Duplicates:** a second write at an instant replaces the first. Interpolation matches splimes
+  (the last value wins); bucket counts would differ from `weft_reduce`, which counts every row. The
+  benchmark datasets have no duplicate instants, the live test pins both behaviours, and the report
+  states it.
+- **No bytes on disk.** The rows sit in the WAL until a snapshot on the server's own schedule, and
+  the server reports neither size per database; the load row shows no storage figure rather than a
+  WAL size that would mislead.
+- **`--query-file-limit 300000`.** InfluxDB 3 Core refuses a query that would read more than 432
+  Parquet files. It writes one file per ten minutes of data time (`--gen1-duration` accepts only
+  1m, 5m or 10m; compaction is an Enterprise feature), so the four-year UCI series becomes about
+  200,000 files. 5,000 still failed on the third run. The cap is a documented server setting;
+  raising it, and saying so in the report, keeps InfluxDB on the UCI rows instead of dropping it
+  from them. The cost shows in the numbers: a medium UCI interpolation took 295 s on the trial run
+  against about 5 s for the same-size synthetic series spanning days.
+- **Telemetry upload off** on the reference host and in the nightly smoke, which configures
+  `influxdb3 serve` by environment because a service container takes no command.
+  `WEFT_XBENCH_INFLUXDB3` is registered in the Test tier.
+
+**Rejected:**
+
+- Flight SQL: it adds `arrow-flight` and tonic to the crate for the same Arrow batches the Parquet
+  answer carries.
+- A scaled-integer "decimal" arm: not something an InfluxDB user stores.
+
 ## 2026-10-30 — ROB-8: the decode limit set, and why oversized is integrity (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the plan names ROB-8 only as "Frame decode hardening" (§6 W4,
@@ -254,7 +303,7 @@ answers comparable was not settled.
 
 - PG Wire: #393 rules it out as a deprecated path.
 - Reporting either failed shape as QuestDB's result: an engine is measured on a correct query a
-  QuestDB user would write, not on the first one tried. Whether to report the `ASOF JOIN` behaviour upstream is left to the owner.
+  QuestDB user would write, not on the first one tried. The owner decided (2026-10-30) not to report the `ASOF JOIN` behaviour upstream.
 
 ## 2026-10-30 — External engines II: how the TimescaleDB arm is measured
 

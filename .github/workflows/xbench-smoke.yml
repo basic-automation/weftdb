@@ -2,7 +2,7 @@ name: cross-engine smoke
 
 # The nightly smoke run of the cross-engine benchmark (EVI-14). It builds weft-xbench — its own
 # workspace, because DuckDB compiles from C++ — runs every arm at the `tiny` scale (ClickHouse,
-# TimescaleDB and QuestDB against service containers), and fails
+# TimescaleDB, QuestDB and InfluxDB 3 against service containers), and fails
 # when any arm disagrees with WeftDB's in-memory reference or the build no longer links.
 #
 # A smoke test, not a measurement: hosted runners are not reference hardware (decision 19), and a
@@ -29,7 +29,7 @@ jobs:
     name: weft-xbench tiny
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # The ClickHouse, TimescaleDB and QuestDB arms need servers. Each is pinned to the version its arm was
+    # The ClickHouse, TimescaleDB, QuestDB and InfluxDB 3 arms need servers. Each is pinned to the version its arm was
     # written against; a newer one is a deliberate bump here, not a silent drift.
     services:
       clickhouse:
@@ -62,6 +62,22 @@ jobs:
           # No telemetry from a CI runner; every commit synced, as on the reference host.
           QDB_TELEMETRY_ENABLED: "false"
           QDB_CAIRO_COMMIT_MODE: sync
+      influxdb3:
+        image: influxdb:3.12.2-core@sha256:26875ba5ae6e843fdbd208b1ac4a55fa1d2ec3aa7faf2d0d1b5035cb1f998990
+        ports:
+          - 8181:8181
+        # A service container takes no command, so `influxdb3 serve` is configured by environment.
+        env:
+          INFLUXDB3_NODE_ID: xbench
+          INFLUXDB3_OBJECT_STORE: file
+          INFLUXDB3_DATA_DIR: /var/lib/influxdb3
+          INFLUXDB3_START_WITHOUT_AUTH: "true"
+          INFLUXDB3_DISABLE_TELEMETRY_UPLOAD: "true"
+          # As on the reference host: Core's 432-file query cap is below a multi-year series.
+          INFLUXDB3_QUERY_FILE_LIMIT: "300000"
+        options: >-
+          --health-cmd "curl -sf http://127.0.0.1:8181/health"
+          --health-interval 5s --health-retries 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -84,13 +100,14 @@ jobs:
       - name: Build
         run: cargo build --locked --release --manifest-path weft-xbench/Cargo.toml
 
-      # The live ClickHouse, TimescaleDB and QuestDB tests (edges, duplicate instants, buckets) are skipped
+      # The live ClickHouse, TimescaleDB, QuestDB and InfluxDB 3 tests (edges, duplicate instants, buckets) are skipped
       # without a server, so they run here, not in ci.yml.
       - name: Test against the database servers
         env:
           WEFT_XBENCH_CLICKHOUSE: http://127.0.0.1:8123
           WEFT_XBENCH_TIMESCALE: postgresql://postgres:xbench@127.0.0.1:5432/xbench
           WEFT_XBENCH_QUESTDB: 127.0.0.1:9000
+          WEFT_XBENCH_INFLUXDB3: http://127.0.0.1:8181
         run: cargo test --locked --release --manifest-path weft-xbench/Cargo.toml
 
       - name: Run every arm at the tiny scale
@@ -101,7 +118,7 @@ jobs:
           TMPDIR="$RUNNER_TEMP/xbench-scratch" weft-xbench/target/release/weft-xbench \
             --scales tiny --reps 3 --load-reps 2 --clickhouse http://127.0.0.1:8123 \
             --timescale postgresql://postgres:xbench@127.0.0.1:5432/xbench \
-            --questdb 127.0.0.1:9000 --out xbench-out
+            --questdb 127.0.0.1:9000 --influxdb3 http://127.0.0.1:8181 --out xbench-out
 
       - name: Summarise
         if: always()
