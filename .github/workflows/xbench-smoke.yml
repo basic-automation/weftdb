@@ -74,7 +74,7 @@ jobs:
           INFLUXDB3_START_WITHOUT_AUTH: "true"
           INFLUXDB3_DISABLE_TELEMETRY_UPLOAD: "true"
           # As on the reference host: Core's 432-file query cap is below a multi-year series.
-          INFLUXDB3_QUERY_FILE_LIMIT: "5000"
+          INFLUXDB3_QUERY_FILE_LIMIT: "300000"
         options: >-
           --health-cmd "curl -sf http://127.0.0.1:8181/health"
           --health-interval 5s --health-retries 30
