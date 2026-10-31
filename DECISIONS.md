@@ -52,6 +52,78 @@ storage, were not settled.
 - Flight SQL: it adds `arrow-flight` and tonic to the crate for the same Arrow batches the Parquet
   answer carries.
 - A scaled-integer "decimal" arm: not something an InfluxDB user stores.
+## 2026-10-31 — SOA-6: the oracle judges read-backs exactly, and its verdict lives on the run record (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W4) lists SOA-6 by name only — "Soak oracle
+core" — and the queue recorded its open question plainly: the oracle's verdict
+semantics (what it checks; pass/fail thresholds — cf. SOA-2's refusal to invent
+thresholds) are unspecified. What the sources do fix: SOA-4's workload is a
+pure function of the config seed, so expected values are regenerable exactly;
+SOA-5's DECISIONS entry assigns reads to "the oracle and the derived-read
+checks (SOA-6, SOA-10), which are what make a read result verifiable at all",
+and names the duplicated seal as the failure that "would surface much later
+as an oracle mismatch"; SOA-7 (W5) is "Window digests and the oracle
+self-test", so digests and the self-test follow this slice rather than being
+part of it; and §3 says EVI-3 owns the shared run metadata while SOA keeps
+its own `soak_schema_version`. The queue's acceptance fixes two outcomes: the
+oracle judges a run's results against expected values, and its verdict is
+recorded in run metadata.
+
+**Chosen (grounded in SOA-4's model, SOA-5's seam, and §3's ownership rules;
+if merge review disagrees, this decision is revisited there):**
+
+1. **Library module, no read client, no CLI flag**: `weft-bench/src/soak_oracle.rs`,
+   exported from the crate, on the SOA-5 precedent (the slices that own how a
+   soak is launched are later ones). The caller supplies `ObservedPoint`s from
+   whatever read path it used; the oracle performs no read itself. The
+   endpoint-level derived-read checks are SOA-10's, not this core's.
+2. **Exact comparison, classified.** Each observation names its tick's grid
+   cell by (series, row); the oracle regenerates that tick's grid from the
+   model and compares value, timestamp, and presence for equality. The
+   workload is format-exact (SOA-4) and its numeric values are exact in the
+   `f64` the server seals (SOA-5), so no tolerance exists to invent. A
+   difference is one of `Missing`, `Unexpected`, `WrongValue`,
+   `WrongTimestamp` (checked before the value: a point at the wrong instant
+   is a different point), or `Duplicate` (a cell observed twice in one tick —
+   the duplicated seal of SOA-5 point 6, surfaced here by construction).
+3. **Pass is zero mismatches, not a threshold.** The verdict counts what was
+   judged (ticks, cells checked, cells present, points observed) and lists
+   mismatches with both sides of each comparison; `passed()` is
+   `mismatch_count == 0`. No rate, tolerance, or latency bound is introduced
+   — latency verdicts are SOA-13's SLO evaluator, and SOA-2/SOA-3's refusal
+   to invent pass/fail numbers governs here. A verdict that judged nothing
+   passes vacuously, so publishers check `ticks_judged` beside it (the
+   SOA-12 skipped-check rule).
+4. **The mismatch list is capped, the count is not.** `MAX_REPORTED_MISMATCHES
+   = 1024` bounds the artifact a broken run produces (a lost segment in a
+   24 h run could otherwise mint a mismatch per point for hours); the total
+   always lands in `mismatch_count`, and `truncated()` says when the list
+   was cut.
+5. **The verdict is recorded on the run record, and the soak schema takes
+   v2.** `SoakRun.oracle: Option<OracleVerdict>` (`#[serde(default)]`,
+   skipped when absent, so v1 artifacts still deserialize) is set exactly
+   once by `SoakHarness::record_oracle_verdict`, only while `Running` — a
+   verdict that can be quietly replaced is not evidence. Adding a field to
+   the record bumps `SOAK_SCHEMA_VERSION` 1 → 2 per SOA-1's bump rule, on
+   SOA's own line (§3); the bench and manifest schema lines do not move.
+   The verdict carries no free text, so `SoakRun::redacted_json` emits it
+   unchanged and no new redaction path exists. One visible consequence:
+   `SoakRun` drops its derived `Eq` — a record that can carry float grid
+   values has no total equality; `PartialEq` is unchanged.
+6. **Out of scope, recorded so it is not lost:** window digests and the
+   oracle self-test (SOA-7), derived-read checks (SOA-10), SLO/latency
+   verdicts (SOA-13), and any read client that produces observations from a
+   live server (no slice names one yet; SOA-5's client owns the ingest lane
+   only).
+
+**Rejected:** a tolerance-based float comparison (the format-exact workload
+makes exactness attainable, and a tolerance would be an invented threshold);
+a separate verdict artifact beside the run record instead of a field on it
+(the queue's acceptance says the verdict is recorded in run metadata, and
+SOA-1's bump rule exists precisely for this change); judging latency or
+scheduler warnings in the oracle (SOA-3's monitor and SOA-13 own those); and
+folding SOA-7's window digests into this slice (the plan sequences them as
+separate slices, digests after the core they digest).
 
 ## 2026-10-30 — ROB-8: the decode limit set, and why oversized is integrity (FLAGGED FOR MERGE REVIEW)
 
