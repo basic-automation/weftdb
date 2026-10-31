@@ -33,14 +33,15 @@
 //!   ([`crate::manifest::MANIFEST_SCHEMA_VERSION`]): it versions the soak run
 //!   record only, so a soak-record change never renumbers bench artifacts and
 //!   vice versa. SOA-2 adds no field to [`SoakRun`] or [`SoakConfig`], so
-//!   the version stays at v1.
+//!   the version stays at v1 until SOA-6 records the oracle verdict on the
+//!   run record and takes v2.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	redaction, report::{DiskInfo, RunMetadata}
+	redaction, report::{DiskInfo, RunMetadata}, soak_oracle::OracleVerdict
 };
 
 /// Version of the soak run record. Bump on any breaking field change to
@@ -49,8 +50,9 @@ use crate::{
 /// v1 is the SOA-1 skeleton: a config, a lifecycle state, and a run record
 /// carrying EVI-3's [`RunMetadata`] beside the soak's own fields. SOA-2 adds
 /// preflight and redacted output beside the record, not fields on it, so v1
-/// stands.
-pub const SOAK_SCHEMA_VERSION: u32 = 1;
+/// stands. v2 (SOA-6) adds the optional oracle verdict field on [`SoakRun`]
+/// — a field on the record, so the version moves, on this line only.
+pub const SOAK_SCHEMA_VERSION: u32 = 2;
 
 /// Configuration for one soak run.
 ///
@@ -113,7 +115,11 @@ pub enum SoakState {
 /// Serialized as the soak run artifact. Older artifacts still deserialize:
 /// every field added after v1 must be `#[serde(default)]` (and
 /// `skip_serializing_if` when optional), as the bench result schema does.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` but not `Eq` since SOA-6: the oracle verdict a record can
+/// carry holds [`GridValue`](crate::soak_workload::GridValue)s, whose float
+/// variant has no total equality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SoakRun {
 	/// Soak schema version this record was written with (mirrors
 	/// [`SOAK_SCHEMA_VERSION`]).
@@ -127,6 +133,12 @@ pub struct SoakRun {
 	pub state: SoakState,
 	/// Number of steps recorded against this run (SOA-3's scheduler ticks).
 	pub steps: u64,
+	/// The soak oracle's verdict on this run (SOA-6), recorded through
+	/// [`SoakHarness::record_oracle_verdict`] once the run's read-back has
+	/// been judged. `None` until then — and forever for a run nobody
+	/// judged, which must never read as a passed verdict.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub oracle: Option<OracleVerdict>,
 }
 
 impl SoakRun {
@@ -291,7 +303,7 @@ impl SoakHarness {
 	/// [`RunMetadata::capture`]), not a second probe.
 	#[must_use]
 	pub const fn new(config: SoakConfig, metadata: RunMetadata) -> Self {
-		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0 } }
+		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None } }
 	}
 
 	/// Current lifecycle state.
@@ -371,6 +383,26 @@ impl SoakHarness {
 	pub fn record_step(&mut self) -> anyhow::Result<()> {
 		anyhow::ensure!(self.run.state == SoakState::Running, "soak steps can only be recorded while Running, not {:?}", self.run.state);
 		self.run.steps = self.run.steps.saturating_add(1);
+		Ok(())
+	}
+
+	/// Record the soak oracle's verdict on this run (SOA-6): the judgement
+	/// of the run's read-back against the workload model, kept in the run
+	/// record's metadata so a published run carries its verdict with it.
+	///
+	/// Recorded exactly once, while `Running` — the driver judges the
+	/// read-back, records the verdict, and then finishes the run. A second
+	/// recording is refused rather than overwriting the first: a verdict
+	/// that can be quietly replaced is not evidence.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when a
+	/// verdict has already been recorded.
+	pub fn record_oracle_verdict(&mut self, verdict: OracleVerdict) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak oracle verdict can only be recorded while Running, not {:?}", self.run.state);
+		anyhow::ensure!(self.run.oracle.is_none(), "soak oracle verdict has already been recorded for this run");
+		self.run.oracle = Some(verdict);
 		Ok(())
 	}
 
@@ -461,7 +493,7 @@ mod tests {
 		harness.start().expect("start");
 		let record = harness.run_record();
 		assert_eq!(record.soak_schema_version, SOAK_SCHEMA_VERSION);
-		assert_eq!(record.soak_schema_version, 1, "the soak's own schema line starts at 1, independent of the bench schema");
+		assert_eq!(record.soak_schema_version, 2, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, independent of the bench schema");
 		// Reuse, not redefinition: the record's metadata is EVI-3's capture,
 		// with the same crate version / OS / arch / timestamp it was built from.
 		assert!(!record.metadata.weft_bench_version.is_empty(), "metadata must carry the bench crate version");

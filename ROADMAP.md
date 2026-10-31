@@ -286,7 +286,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **TAG-0** Fix ILP series merging
   - [x] L-FMT: **ROB-8** Frame decode hardening
   - [x] **EVI-11** Stored WeftDB benchmark adapter
-  - [ ] **SOA-6** Soak oracle core
+  - [x] **SOA-6** Soak oracle core
 - [ ] **W5 · Ingest wiring, whole-store backup, legacy seal**
   - [ ] Store lane
   - [ ] → **D-S15** Partial sidecar v4
