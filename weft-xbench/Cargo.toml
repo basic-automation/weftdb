@@ -44,6 +44,7 @@ bytes = "1"
 parquet = { version = "=60.0.0", default-features = false, features = ["arrow", "snap", "zstd"] }
 questdb-rs = { version = "7.2", default-features = false, features = ["sync-sender-qwp-ws", "sync-reader-qwp-ws", "ring-crypto", "tls-webpki-certs"] }
 weft-bench = { path = "../weft-bench" }
+weft-line-protocol = { path = "../weft-line-protocol" }
 weft-physical-type = { path = "../weft-physical-type" }
 weft-reduce = { path = "../weft-reduce" }
 weftdb = { path = "../weftdb" }

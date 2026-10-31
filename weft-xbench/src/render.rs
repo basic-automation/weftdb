@@ -16,8 +16,8 @@ use weft_bench::stats::ConfidenceInterval;
 
 use crate::{ArmResult, DatasetKind, Phase, XbenchReport};
 
-/// Datasets the first report's scope (decision 18) asks for.
-const EXPECTED_KINDS: [DatasetKind; 3] = [DatasetKind::Mcar, DatasetKind::Block, DatasetKind::Uci];
+/// Datasets the first report's scope (decision 18) asks for, and TSBS's (#141).
+const EXPECTED_KINDS: [DatasetKind; 4] = [DatasetKind::Mcar, DatasetKind::Block, DatasetKind::Uci, DatasetKind::Tsbs];
 /// How many scales decision 18 asks for.
 const EXPECTED_SCALES: usize = 3;
 /// Arms decision 18 asks for: WeftDB stored, in-memory and `f64`; `DuckDB` `DOUBLE` and `DECIMAL`;
@@ -30,7 +30,7 @@ const FEW_REPS: usize = 10;
 
 /// Workloads and engines outside this benchmark, listed in every report so a reader does not take
 /// silence for coverage.
-const NOT_IN_SCOPE: [&str; 6] = ["Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB, QuestDB, InfluxDB 3 and IoTDB has a built-in spline in the SQL these arms use (IoTDB's optional UDF library has one for its tree model, not loaded here), so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
+const NOT_IN_SCOPE: [&str; 7] = ["TSBS's query suite (`cpu-max-all`, `high-cpu`, `groupby-orderby-limit`, `lastpoint` and the rest): those queries group many hosts' series by tag, which WeftDB stores only once tagged ingest lands (TAG-11); the `tsbs` datasets run TSBS's data through this benchmark's own phases, one host at a time.", "Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB, QuestDB, InfluxDB 3 and IoTDB has a built-in spline in the SQL these arms use (IoTDB's optional UDF library has one for its tree model, not loaded here), so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
 
 /// How one WeftDB arm compares with the fastest other engine on one dataset and phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +202,15 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	for kind in EXPECTED_KINDS {
 		let scales: std::collections::BTreeSet<&str> = report.results.iter().filter(|r| r.kind == kind).map(|r| r.scale.as_str()).collect();
 		if scales.is_empty() {
-			missing.push(format!("The `{}` datasets did not run{}.", kind.as_str(), if kind == DatasetKind::Uci { " (pass `--uci FILE`)" } else { "" }));
+			missing.push(format!(
+				"The `{}` datasets did not run{}.",
+				kind.as_str(),
+				match kind {
+					DatasetKind::Uci => " (pass `--uci FILE`)",
+					DatasetKind::Tsbs => " (pass `--tsbs FILE`)",
+					DatasetKind::Mcar | DatasetKind::Block => "",
+				}
+			));
 		} else if scales.len() < EXPECTED_SCALES {
 			missing.push(format!("`{}` ran at {} of {EXPECTED_SCALES} scales ({}).", kind.as_str(), scales.len(), scales.into_iter().collect::<Vec<_>>().join(", ")));
 		}
@@ -266,6 +274,9 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		limits.push("IoTDB has no decimal type, so it has one arm, `iotdb-double`, and no exact-decimal comparison. Its SQL has no series generator, so the grid comes from `date_bin_gapfill` over the grid's span; segments are paired by `lead` and found by a native `ASOF LEFT JOIN`. A device and an instant are IoTDB's key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none).".into());
 		limits.push("IoTDB is reached through its table-model REST API, which answers in JSON; its own clients speak Thrift, which has no Rust client, so its reads carry a text encoding the binary paths of the other servers do not. Writes are `insertTablet` requests of 100,000 rows in time order, each answered once its WAL entry is synced (`wal_mode=SYNC`, which the reference server sets; IoTDB's default is `ASYNC`). Its bytes on disk are the table's TsFiles after a `FLUSH` issued once the timed loads are done.".into());
 	}
+	if report.results.iter().any(|r| r.kind == DatasetKind::Tsbs) {
+		limits.push("The `tsbs` datasets are one host's (`host_0`) `usage_user` from TSBS's `cpu-only` generator: an integer random walk read every ten seconds with no gaps, over the synthetic datasets' span, reconstructed per second. So each grid instant falls between knots ten seconds apart, and nine in ten instants are interpolated; there is no ground truth, so only the reference gate applies.".into());
+	}
 	b.push(Block::List(limits));
 
 	b.push(Block::Heading(3, "Configuration caveats".into()));
@@ -301,7 +312,7 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 
 	b.push(Block::Heading(3, "Reproduction".into()));
 	let invocation = if report.invocation.is_empty() { "weft-xbench".to_string() } else { report.invocation.join(" ") };
-	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), "For the QuestDB arms: `docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v <disk under test>/questdb:/var/lib/questdb questdb/questdb:<version above>`, then `--questdb 127.0.0.1:9000`.".into(), "For the InfluxDB 3 arm: `docker run -d -p 127.0.0.1:8181:8181 -v <disk under test>/influxdb3:/var/lib/influxdb3 influxdb:<version above> influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000`, then `--influxdb3 http://127.0.0.1:8181`.".into(), "For the IoTDB arm: `docker run -d -p 127.0.0.1:18080:18080 -e enable_rest_service=true -e timestamp_precision=ns -e wal_mode=SYNC -e rest_query_default_row_size_limit=10000000 -v <disk under test>/iotdb:/iotdb/data apache/iotdb:<version above>-standalone` (the precision must be set before the first start), then `--iotdb http://127.0.0.1:18080`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
+	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), "For the QuestDB arms: `docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v <disk under test>/questdb:/var/lib/questdb questdb/questdb:<version above>`, then `--questdb 127.0.0.1:9000`.".into(), "For the InfluxDB 3 arm: `docker run -d -p 127.0.0.1:8181:8181 -v <disk under test>/influxdb3:/var/lib/influxdb3 influxdb:<version above> influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000`, then `--influxdb3 http://127.0.0.1:8181`.".into(), "For the IoTDB arm: `docker run -d -p 127.0.0.1:18080:18080 -e enable_rest_service=true -e timestamp_precision=ns -e wal_mode=SYNC -e rest_query_default_row_size_limit=10000000 -v <disk under test>/iotdb:/iotdb/data apache/iotdb:<version above>-standalone` (the precision must be set before the first start), then `--iotdb http://127.0.0.1:18080`.".into(), "For the `tsbs` datasets: build TSBS's generator at the pinned commit, `GOBIN=<dir> go install github.com/timescale/tsbs/cmd/tsbs_generate_data@8323e59c74027b108f4ad5ec5d3e498b0101a02e`, write a week of `cpu-only` data, `tsbs_generate_data --use-case=cpu-only --seed=123 --scale=10 --log-interval=10s --timestamp-start=2016-01-01T00:00:00Z --timestamp-end=2016-01-08T00:00:10Z --format=influx > cpu-only.lp`, then `--tsbs cpu-only.lp`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
 	b
 }
 
@@ -499,6 +510,20 @@ mod tests {
 		for needle in ["IoTDB has no decimal type", "`wal_mode=SYNC`", "The IoTDB server stored its data"] {
 			assert!(with.contains(needle), "missing {needle:?} in\n{with}");
 		}
+	}
+
+	#[test]
+	fn tsbs_is_named_as_missing_or_carries_its_shape() {
+		let without = to_markdown(&blocks(&report(vec![])));
+		for needle in ["The `tsbs` datasets did not run (pass `--tsbs FILE`)", "TSBS's query suite", "tsbs_generate_data@8323e59"] {
+			assert!(without.contains(needle), "missing {needle:?} in\n{without}");
+		}
+		assert!(!without.contains("one host's (`host_0`)"), "no TSBS limitation without a TSBS dataset");
+		let mut tsbs = result("tsbs-tiny", "weftdb-memory", Phase::Interpolate, &FAST, true);
+		tsbs.kind = DatasetKind::Tsbs;
+		let with = to_markdown(&blocks(&report(vec![tsbs])));
+		assert!(with.contains("one host's (`host_0`) `usage_user`"), "{with}");
+		assert!(!with.contains("The `tsbs` datasets did not run"), "{with}");
 	}
 
 	#[test]

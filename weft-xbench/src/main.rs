@@ -2,11 +2,12 @@
 //!
 //! ```text
 //! TMPDIR=/mnt/weftbench weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N]
-//!                                   [--seed N] [--uci FILE] [--clickhouse URL] [--timescale URL]
+//!                                   [--seed N] [--uci FILE] [--tsbs FILE] [--clickhouse URL] [--timescale URL]
 //!                                   [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--out DIR]
 //! ```
 //!
-//! Without `--uci` the UCI datasets are skipped and the report says which datasets ran; without
+//! Without `--uci` the UCI datasets are skipped and the report says which datasets ran, and without
+//! `--tsbs` (a `tsbs_generate_data --use-case=cpu-only --format=influx` file) the TSBS ones are; without
 //! `--clickhouse` (an HTTP endpoint such as `http://127.0.0.1:8123`) the `ClickHouse` arms are,
 //! and without `--timescale` (a `PostgreSQL` connection string for a server with `TimescaleDB`)
 //! the `TimescaleDB` arms are, and without `--questdb` (a `QuestDB` server's `host:port`) the
@@ -21,9 +22,9 @@
 use std::path::PathBuf;
 
 use weft_bench::{load_uci_corpus, scale::ScalePreset, RunMetadata, DEFAULT_UCI_COLUMN};
-use weft_xbench::{clickhouse, render, run, Dataset, DatasetKind, Servers, XbenchReport, DEFAULT_SEED};
+use weft_xbench::{clickhouse, render, run, tsbs, Dataset, DatasetKind, Servers, XbenchReport, DEFAULT_SEED};
 
-const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--out DIR]";
+const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--tsbs FILE] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--out DIR]";
 
 struct Cli {
 	scales: Vec<ScalePreset>,
@@ -31,6 +32,7 @@ struct Cli {
 	load_reps: usize,
 	seed: u64,
 	uci: Option<PathBuf>,
+	tsbs: Option<PathBuf>,
 	clickhouse: Option<String>,
 	timescale: Option<String>,
 	questdb: Option<String>,
@@ -40,7 +42,7 @@ struct Cli {
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, out: PathBuf::from("reports/xbench") };
+	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, tsbs: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, out: PathBuf::from("reports/xbench") };
 	let mut args = args;
 	while let Some(flag) = args.next() {
 		let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
@@ -50,6 +52,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 			"--load-reps" => cli.load_reps = value()?.parse().map_err(|e| format!("--load-reps: {e}"))?,
 			"--seed" => cli.seed = value()?.parse().map_err(|e| format!("--seed: {e}"))?,
 			"--uci" => cli.uci = Some(PathBuf::from(value()?)),
+			"--tsbs" => cli.tsbs = Some(PathBuf::from(value()?)),
 			"--clickhouse" => cli.clickhouse = Some(value()?),
 			"--timescale" => cli.timescale = Some(value()?),
 			"--questdb" => cli.questdb = Some(value()?),
@@ -114,6 +117,14 @@ async fn main() -> anyhow::Result<()> {
 			datasets.push(Dataset::uci(&corpus, scale)?);
 		}
 	}
+	if let Some(path) = &cli.tsbs {
+		let span = cli.scales.iter().map(|s| s.point_count()).max().unwrap_or(0);
+		let series = tsbs::load(path, tsbs::DEFAULT_HOST, tsbs::DEFAULT_FIELD, i64::try_from(span)?)?;
+		eprintln!("weft-xbench: tsbs {} {} from {} ({} readings, {} hosts seen)", series.host, series.field, path.display(), series.points.len(), series.hosts);
+		for &scale in &cli.scales {
+			datasets.push(Dataset::tsbs(&series, scale)?);
+		}
+	}
 	eprintln!("weft-xbench: {} datasets, scratch in {}", datasets.len(), std::env::temp_dir().display());
 	let metadata = RunMetadata::capture(chrono::Utc::now().to_rfc3339());
 	let servers = Servers { clickhouse: cli.clickhouse.as_deref().map(clickhouse::Server::new), timescale: cli.timescale.clone(), questdb: cli.questdb.as_deref().map(weft_xbench::questdb::Server::new), influxdb3: cli.influxdb3.as_deref().map(weft_xbench::influxdb3::Server::new), iotdb: cli.iotdb.as_deref().map(weft_xbench::iotdb::Server::new) };
@@ -166,12 +177,13 @@ mod tests {
 	fn defaults_are_three_scales_and_no_uci() {
 		let c = cli(&[]).expect("parses");
 		assert_eq!(c.scales, vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium]);
-		assert!(c.uci.is_none() && c.clickhouse.is_none());
+		assert!(c.uci.is_none() && c.tsbs.is_none() && c.clickhouse.is_none());
 	}
 
 	#[test]
 	fn flags_parse_and_bad_values_are_refused() {
-		let c = cli(&["--scales", "tiny", "--reps", "2", "--load-reps", "1", "--uci", "x.txt", "--clickhouse", "http://127.0.0.1:8123"]).expect("parses");
+		let c = cli(&["--scales", "tiny", "--reps", "2", "--load-reps", "1", "--uci", "x.txt", "--tsbs", "cpu.lp", "--clickhouse", "http://127.0.0.1:8123"]).expect("parses");
+		assert_eq!(c.tsbs, Some(PathBuf::from("cpu.lp")));
 		assert_eq!(c.clickhouse.as_deref(), Some("http://127.0.0.1:8123"));
 		assert_eq!((c.scales.len(), c.reps, c.load_reps), (1, 2, 1));
 		assert!(cli(&["--scales", "huge"]).is_err());
