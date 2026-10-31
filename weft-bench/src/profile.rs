@@ -286,7 +286,8 @@ impl InterpolationProfile {
 	/// # Errors
 	///
 	/// Returns [`LineProtocolProfileError::Parse`] if the payload is structurally
-	/// malformed, [`LineProtocolProfileError::TooFewPoints`] if fewer than two
+	/// malformed or its points span more than one series (TAG-0: `parse_points`
+	/// projects a single series and refuses to pool), [`LineProtocolProfileError::TooFewPoints`] if fewer than two
 	/// records carry the field and a timestamp, or [`LineProtocolProfileError::ZeroSpan`]
 	/// if every usable point shares a single instant (no grid to interpolate onto).
 	pub fn from_line_protocol(name: impl Into<String>, payload: &str, field: &str, precision: TimestampPrecision, spline: Spline, resolution: Resolution) -> Result<Self, LineProtocolProfileError> {

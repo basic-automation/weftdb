@@ -4,6 +4,52 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — TAG-0: what "fix ILP series merging" means (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the queue recorded TAG-0 as the weakest grounding in W3/W4 — no
+source named the broken merge case, and no merge logic exists in
+`interpolate.rs`/`downsample.rs`. The failing case is in the plan itself (§1,
+"Live defects that the merged slices fix"): **"ILP silently pools series.
+`parse_points` sorts every matching record together
+(weft-line-protocol/src/lib.rs:208-212)."** Projecting field `load` from
+`cpu,host=a` and `cpu,host=b` rows interleaved in one payload returned one
+sorted stream alternating between the two hosts' samples — one fictitious
+series fed to interpolation, downsampling and single-aspect ingest alike.
+
+**Chosen (grounded in plan §1 + decision 15 + the §4 code table, flagged for
+merge review):**
+
+- **The fix lives in `parse_points`, where the defect is named.** The
+  projection is a single series: every record that contributes a point must
+  share one series identity — measurement plus tag set, tags canonicalized by
+  sorting (`LineRecord::series_key`), so the same tag set in a different wire
+  order is still the one series. A second contributing series is an error at
+  that record's line, naming both series. Records that contribute no point
+  (missing field/timestamp/non-numeric) do not count: they cannot pollute
+  the stream, and interleaved foreign measurements remain skippable as
+  before.
+- **The refusal is typed, not a message convention.** `ParseError` gains a
+  `kind: ParseErrorKind` (`Malformed` / `AmbiguousSeries`, `#[non_exhaustive]`)
+  — this module's own doctrine is classification by type, and the old
+  substring-matching style is what X-ERR removed. `weft-server` maps the kind
+  through `error::from_line_protocol_error`: malformed stays `bad_request`,
+  multi-series becomes the §4 table's existing `ambiguous_series` (400),
+  which decision 15 already prescribes for multi-series reads. No envelope
+  change — the code existed since X-ERR; TAG-0's envelope part was absorbed
+  there, as the queue said.
+- **All three single-series callers get the refusal**: `interpolate/ilp`,
+  `downsample/ilp` (the L-COMPUTE lane, TAG-0's lane per §2) and
+  `storage/{aspect}/ilp` ingest, which seals the projected points into one
+  aspect and would otherwise store the pooled fiction. `weft-bench`'s
+  line-protocol profile inherits the refusal through its existing
+  `From<ParseError>`.
+
+**Rejected:** returning grouped per-series points from `parse_points`
+(changes every caller's shape and invents a multi-series contract no source
+asks for — per-series reads are the TAG-5+ selector work), and fixing only
+the compute handlers (leaves ingest pooling into the store, the worst of
+the three).
+
 ## 2026-10-30 — PAC-5b: the strict knob set and the store filesystem check (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the plan names PAC-5b's two halves — strict server configuration and a

@@ -460,7 +460,7 @@ fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json
 	let aggregations = parse_aggregations(params.agg.as_deref())?;
 
 	// `parse_points` returns points sorted ascending by timestamp.
-	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::bad_request(err.to_string()))?;
+	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| crate::error::from_line_protocol_error(&err))?;
 	if points.is_empty() {
 		return Err(ApiError::bad_request(format!("no points carry field `{}` with a timestamp", params.field)));
 	}
