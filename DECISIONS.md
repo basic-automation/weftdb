@@ -235,7 +235,7 @@ answers comparable was not settled.
 
 - PG Wire: #393 rules it out as a deprecated path.
 - Reporting either failed shape as QuestDB's result: an engine is measured on a correct query a
-  QuestDB user would write, not on the first one tried. Whether to report the `ASOF JOIN` behaviour upstream is left to the owner.
+  QuestDB user would write, not on the first one tried. The owner decided (2026-10-30) not to report the `ASOF JOIN` behaviour upstream.
 
 ## 2026-10-30 — External engines II: how the TimescaleDB arm is measured
 
