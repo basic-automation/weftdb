@@ -624,7 +624,9 @@ impl IlpParams {
 ///
 /// Returns `bad_request` (`400`) for an unknown precision/spline/resolution
 /// token, a malformed payload, fewer than two usable points, a zero-span series,
-/// or an output grid above [`InterpolateConfig::max_output_points`], and
+/// or an output grid above [`InterpolateConfig::max_output_points`];
+/// `ambiguous_series` (`400`) when the field's points span more than one
+/// series (TAG-0: the projection is a single series and never pools); and
 /// `internal` (`500`) if the engine fails.
 pub async fn interpolate_ilp(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<IlpParams>, body: String) -> Result<Json<InterpolateResponse>, ApiError> {
 	let start = std::time::Instant::now();
@@ -693,7 +695,7 @@ async fn interpolate_ilp_inner(params: &IlpParams, body: &str, config: Interpola
 	let spline = parse_spline_token(params.spline_token())?;
 	let resolution = parse_resolution_token(params.resolution.as_deref())?;
 
-	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| ApiError::bad_request(err.to_string()))?;
+	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| crate::error::from_line_protocol_error(&err))?;
 
 	// `parse_points` returns points sorted ascending by timestamp, and the range is their
 	// own span: ILP has no `start`/`end` parameters. splimes 1.0 itself accepts one point
@@ -1002,6 +1004,18 @@ mod tests {
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 		// A parse error carries a line number.
 		assert!(body["error"].as_str().unwrap().contains("line 1"));
+	}
+
+	#[tokio::test]
+	async fn ilp_endpoint_refuses_a_multi_series_payload() {
+		// TAG-0 regression: interleaved host=a / host=b rows used to be pooled
+		// into one fictitious series and interpolated. The projection is a
+		// single series, so the answer is the table's `ambiguous_series`.
+		let payload = "cpu,host=a load=0 1000000000\ncpu,host=b load=30 1000000030\ncpu,host=a load=60 1000000060\ncpu,host=b load=90 1000000090\n";
+		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=linear&resolution=seconds", payload).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert_eq!(body["code"], "ambiguous_series", "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("cpu,host=b"), "body: {body}");
 	}
 
 	#[test]

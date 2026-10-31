@@ -283,7 +283,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SEC-6** API keys, Bearer authentication, keys file and keygen
   - [x] **ROB-3** Panic containment, daemon supervision, Daemons registry, `weftdb::exec`
   - [x] **PAC-5b** Strict server configuration and store filesystem check (the bind guard moves to SEC-8)
-  - [ ] **TAG-0** Fix ILP series merging
+  - [x] **TAG-0** Fix ILP series merging
   - [ ] L-FMT: **ROB-8** Frame decode hardening
   - [x] **EVI-11** Stored WeftDB benchmark adapter
   - [ ] **SOA-6** Soak oracle core

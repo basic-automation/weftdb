@@ -681,6 +681,19 @@ pub fn from_reduce_error(e: &weft_reduce::ReduceError) -> ApiError {
 	}
 }
 
+/// A line-protocol payload the shared parser refused, by kind (TAG-0): a
+/// malformed line is the generic `400 bad_request`, and a payload whose
+/// projected field spans more than one series is the table's
+/// `400 ambiguous_series` — the ILP compute and ingest routes project a
+/// single series, so pooling the points (the pre-TAG-0 behaviour) would
+/// silently merge distinct series into one stream.
+pub fn from_line_protocol_error(e: &weft_line_protocol::ParseError) -> ApiError {
+	match e.kind {
+		weft_line_protocol::ParseErrorKind::AmbiguousSeries => ApiError::new(Code::AmbiguousSeries, e.to_string()),
+		_ => ApiError::bad_request(e.to_string()),
+	}
+}
+
 /// A quantile sketch that could not be built or fed. An accuracy or bucket budget came from
 /// the request; two sketches the server built disagreeing is the server's.
 pub fn from_sketch_error(e: &weft_reduce::SketchError) -> ApiError {

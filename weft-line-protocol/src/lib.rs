@@ -131,6 +131,11 @@ pub struct LineRecord {
 	pub timestamp: Option<i64>,
 }
 
+/// The identity of one series: a measurement plus its tag set, canonicalized
+/// with the tags sorted, so the same tag set in a different wire order is the
+/// same key. Produced by [`LineRecord::series_key`].
+pub type SeriesKey = (String, Vec<(String, String)>);
+
 impl LineRecord {
 	/// The value of tag `key`, if present.
 	#[must_use]
@@ -155,15 +160,75 @@ impl LineRecord {
 		let value = self.field(field)?.as_big_decimal()?;
 		Some(Point { timestamp, value })
 	}
+
+	/// The identity of the series this record belongs to: its measurement plus
+	/// its tag set, with the tags sorted so two lines that name the same tag
+	/// set in a different wire order share one key.
+	///
+	/// A series is what a single-series projection like [`parse_points`] may
+	/// draw from; points from two different keys are two different series and
+	/// must never be merged into one point stream.
+	#[must_use]
+	pub fn series_key(&self) -> SeriesKey {
+		let mut tags = self.tags.clone();
+		tags.sort();
+		(self.measurement.clone(), tags)
+	}
+
+	/// This record's series in wire form (`measurement,k=v,...`), for messages
+	/// that need to name the series to the caller.
+	#[must_use]
+	pub fn describe_series(&self) -> String {
+		let mut out = self.measurement.clone();
+		for (key, value) in &self.tags {
+			out.push(',');
+			out.push_str(key);
+			out.push('=');
+			out.push_str(value);
+		}
+		out
+	}
 }
 
-/// What went wrong parsing a single line, with the 1-based line number.
+/// Which kind of failure a [`ParseError`] reports, so a caller can classify
+/// by type rather than by matching on the message text.
+///
+/// `#[non_exhaustive]`: a later projection may need a refusal kind of its own,
+/// and downstream matches are meant to grow a fallback arm rather than break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParseErrorKind {
+	/// A line is structurally malformed (bad shape, empty measurement, a
+	/// field without a value, an unparseable field or timestamp).
+	Malformed,
+	/// The input is well-formed but a single-series projection would have to
+	/// merge points from more than one series (see [`parse_points`]).
+	AmbiguousSeries,
+}
+
+/// What went wrong parsing a document, with the 1-based line number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
 	/// 1-based line number within the input the error occurred on.
 	pub line: usize,
 	/// Human-readable reason.
 	pub message: String,
+	/// Which kind of failure this is.
+	pub kind: ParseErrorKind,
+}
+
+impl ParseError {
+	/// A malformed-line error at `line`.
+	const fn malformed(line: usize, message: String) -> Self {
+		Self { line, message, kind: ParseErrorKind::Malformed }
+	}
+
+	/// An ambiguous-series error: the record at `line` belongs to a different
+	/// series than the one a single-series projection was already drawing
+	/// from.
+	const fn ambiguous_series(line: usize, message: String) -> Self {
+		Self { line, message, kind: ParseErrorKind::AmbiguousSeries }
+	}
 }
 
 impl std::fmt::Display for ParseError {
@@ -184,13 +249,20 @@ impl std::error::Error for ParseError {}
 /// Returns the first [`ParseError`] encountered (malformed structure, empty
 /// measurement, a field without a value, or an unparseable field/timestamp).
 pub fn parse(input: &str) -> Result<Vec<LineRecord>, ParseError> {
+	Ok(parse_indexed(input)?.into_iter().map(|(_, record)| record).collect())
+}
+
+/// [`parse`], keeping each record's 1-based line number alongside it, for the
+/// projections whose errors need to point at the offending line.
+fn parse_indexed(input: &str) -> Result<Vec<(usize, LineRecord)>, ParseError> {
 	let mut records = Vec::new();
 	for (idx, raw_line) in input.lines().enumerate() {
 		let line = raw_line.trim_end_matches('\r');
 		if is_blank_or_comment(line) {
 			continue;
 		}
-		records.push(parse_line(line).map_err(|message| ParseError { line: idx + 1, message })?);
+		let record = parse_line(line).map_err(|message| ParseError::malformed(idx + 1, message))?;
+		records.push((idx + 1, record));
 	}
 	Ok(records)
 }
@@ -198,15 +270,46 @@ pub fn parse(input: &str) -> Result<Vec<LineRecord>, ParseError> {
 /// Parse a line-protocol document and project it straight into `Point`s using a
 /// chosen numeric field — the primary on-ramp for TSBS-style data.
 ///
+/// The projection is a *single series*: every record that contributes a point
+/// must belong to the same series (same measurement and tag set, see
+/// [`LineRecord::series_key`]). Before TAG-0 this function silently pooled
+/// every matching record into one sorted stream, so an interleaved two-host
+/// payload came back as one fictitious series whose samples alternate between
+/// hosts. Now a second contributing series is an
+/// [`AmbiguousSeries`](ParseErrorKind::AmbiguousSeries) error naming both
+/// series, and splitting the payload per series is the caller's move.
+///
 /// Records lacking a timestamp or the named numeric field are skipped (not an
-/// error: an ILP file may interleave many fields/measurements). The result is
-/// sorted by timestamp, matching what the interpolation profiles expect.
+/// error: an ILP file may interleave many fields/measurements) and do not
+/// count towards the series check — a record that contributes no point cannot
+/// pollute the stream. The result is sorted by timestamp, matching what the
+/// interpolation profiles expect.
 ///
 /// # Errors
 ///
-/// Returns a [`ParseError`] if any line is structurally malformed.
+/// Returns a [`ParseError`] if any line is structurally malformed
+/// ([`ParseErrorKind::Malformed`]), or if the records carrying `field` span
+/// more than one series ([`ParseErrorKind::AmbiguousSeries`], reported at the
+/// first line of the second series).
 pub fn parse_points(input: &str, field: &str, precision: TimestampPrecision) -> Result<Vec<Point>, ParseError> {
-	let mut points: Vec<Point> = parse(input)?.iter().filter_map(|r| r.to_point(field, precision)).collect();
+	let mut points: Vec<Point> = Vec::new();
+	// The one series the projection may draw from: its key, the line it first
+	// contributed on, and its wire form for the refusal message.
+	let mut series: Option<(SeriesKey, usize, String)> = None;
+	for (line, record) in parse_indexed(input)? {
+		let Some(point) = record.to_point(field, precision) else {
+			continue;
+		};
+		let key = record.series_key();
+		match &series {
+			None => series = Some((key, line, record.describe_series())),
+			Some((first_key, first_line, first_series)) if *first_key != key => {
+				return Err(ParseError::ambiguous_series(line, format!("field `{field}` carries points from more than one series: `{first_series}` (line {first_line}) and `{}` (line {line}); a single-series projection cannot merge them — split the payload by series", record.describe_series())));
+			}
+			Some(_) => {}
+		}
+		points.push(point);
+	}
 	points.sort_by_key(|p| p.timestamp);
 	Ok(points)
 }
@@ -448,6 +551,62 @@ mod tests {
 		assert!(points[0].timestamp < points[1].timestamp);
 		assert_eq!(points[0].value, BigDecimal::from_f64(0.1).unwrap());
 		assert_eq!(points[1].value, BigDecimal::from_f64(0.9).unwrap());
+	}
+
+	#[test]
+	fn parse_points_refuses_to_pool_two_tag_sets() {
+		// TAG-0 regression: this payload used to come back as one sorted
+		// four-point stream alternating between host=a and host=b samples —
+		// one fictitious series. Two tag sets are two series, and merging
+		// them is a refusal, reported at the first line of the second series.
+		let input = concat!("cpu,host=a load=0.1 1000000000\n", "cpu,host=b load=0.2 2000000000\n", "cpu,host=a load=0.3 3000000000\n", "cpu,host=b load=0.4 4000000000\n");
+		let err = parse_points(input, "load", TimestampPrecision::Nanoseconds).expect_err("two series must not pool");
+		assert_eq!(err.kind, ParseErrorKind::AmbiguousSeries);
+		assert_eq!(err.line, 2);
+		assert!(err.message.contains("cpu,host=a"), "names the first series: {}", err.message);
+		assert!(err.message.contains("cpu,host=b"), "names the second series: {}", err.message);
+	}
+
+	#[test]
+	fn parse_points_refuses_to_pool_two_measurements() {
+		// Same field name on two measurements is still two series.
+		let input = "cpu load=0.1 1000000000\nmem load=0.2 2000000000\n";
+		let err = parse_points(input, "load", TimestampPrecision::Nanoseconds).expect_err("two measurements must not pool");
+		assert_eq!(err.kind, ParseErrorKind::AmbiguousSeries);
+		assert_eq!(err.line, 2);
+	}
+
+	#[test]
+	fn parse_points_treats_tag_order_as_the_same_series() {
+		// A tag set is a set: the same pairs in a different wire order are
+		// the one series, not a second one.
+		let input = concat!("cpu,host=a,region=us load=0.2 2000000000\n", "cpu,region=us,host=a load=0.1 1000000000\n");
+		let points = parse_points(input, "load", TimestampPrecision::Nanoseconds).expect("one series, reordered tags");
+		assert_eq!(points.len(), 2);
+		assert_eq!(points[0].value, BigDecimal::from_f64(0.1).unwrap());
+		assert_eq!(points[1].value, BigDecimal::from_f64(0.2).unwrap());
+	}
+
+	#[test]
+	fn parse_points_ignores_series_that_contribute_no_point() {
+		// A record from another series that lacks the projected field (or a
+		// timestamp) contributes nothing, so it cannot pollute — or block —
+		// the projection.
+		let input = concat!("cpu,host=a load=0.1 1000000000\n", "cpu,host=b other=5i 2000000000\n", "mem,host=b load=0.9\n", "cpu,host=a load=0.3 3000000000\n");
+		let points = parse_points(input, "load", TimestampPrecision::Nanoseconds).expect("only host=a contributes");
+		assert_eq!(points.len(), 2);
+		assert_eq!(points[0].value, BigDecimal::from_f64(0.1).unwrap());
+		assert_eq!(points[1].value, BigDecimal::from_f64(0.3).unwrap());
+	}
+
+	#[test]
+	fn series_key_canonicalizes_tag_order() {
+		let a = &parse("cpu,host=a,region=us load=1 1").expect("parse")[0];
+		let b = &parse("cpu,region=us,host=a load=1 1").expect("parse")[0];
+		let c = &parse("cpu,host=b,region=us load=1 1").expect("parse")[0];
+		assert_eq!(a.series_key(), b.series_key());
+		assert_ne!(a.series_key(), c.series_key());
+		assert_eq!(a.describe_series(), "cpu,host=a,region=us");
 	}
 
 	#[test]
