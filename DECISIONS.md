@@ -4,6 +4,48 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-31 — External engines V: how the Apache IoTDB arm is measured
+
+**Ambiguous:** IoTDB 2.0 has two data models (tree and table), native clients over Thrift only,
+no decimal type, no series generator, millisecond timestamps and an asynchronous WAL by default,
+and a key of device plus instant that replaces duplicate writes. Which model, protocol, settings
+and arms the benchmark uses were not settled.
+
+**Chosen:**
+
+- **One arm, `iotdb-double`**, in `weft-xbench/src/iotdb.rs`, run only with `--iotdb URL`, against
+  IoTDB 2.0.11 standalone. No decimal arm: the engine has no decimal type.
+- **The table model over its REST API** (`/rest/table/v1`, JSON, Basic auth as `root`). The table
+  model is IoTDB 2.0's SQL surface, with window functions and `ASOF JOIN`; the tree model's
+  path-based queries have no joins. Thrift has no Rust client, so the REST service is the protocol
+  available; the report names the JSON encoding as a cost the binary paths of the other servers do
+  not carry.
+- **Server settings:** `timestamp_precision=ns` (fixed at first start; the datasets are
+  nanosecond), `wal_mode=SYNC` so a write answers once its WAL entry is on disk, as the other
+  durable arms do (IoTDB's default `ASYNC` would not), and `rest_query_default_row_size_limit`
+  raised above the largest grid. Set by environment on the reference host and in the nightly smoke.
+- **Writes:** `insertTablet` requests of 100,000 rows sent in time order, one table
+  `knots (v DOUBLE FIELD)` with no tags, so one device. Not concurrently: IoTDB keeps rows that
+  arrive behind ones already written in separate unsequence files that every query merges.
+- **Interpolation:** `lead` pairs each knot with the next into segments; `date_bin_gapfill` with
+  the grid's start as origin emits the grid (there is no `generate_series` and no `VALUES`); a native
+  `ASOF LEFT JOIN` finds each instant's segment, the first and last segments standing in past the
+  data. `date_bin_gapfill` left out the bucket at the grid's end when no knot fell in it, under
+  `<= end` and `< end + step` alike, and emitted one past it under `<= end + step`; the grid is
+  filled over the span widened by a step each way and cut back, which the `mcar-small` gate caught.
+  **Downsample:** native `date_bin`, epoch-aligned.
+- **Bytes on disk:** a `FLUSH` once the timed loads are done, then the table's TsFile bytes from
+  `information_schema.table_disk_usage`.
+- `WEFT_XBENCH_IOTDB` is registered in the Test tier.
+
+**Rejected:**
+
+- The tree model with `FILL(LINEAR)`: it fills `NULL`s between bucket aggregates of a `GROUP BY`
+  time window, not at instants between jittered knots.
+- Writing the grid into a second table to join against: a write the other engines do not make,
+  inside the timed query.
+- Concurrent writes, as the InfluxDB arm sends: out-of-order arrival lands in unsequence files.
+
 ## 2026-10-30 — External engines IV: how the InfluxDB 3 Core arm is measured
 
 **Ambiguous:** InfluxDB 3 Core has no decimal type, no `ASOF JOIN` in its SQL engine (DataFusion),
@@ -41,8 +83,9 @@ storage, were not settled.
   1m, 5m or 10m; compaction is an Enterprise feature), so the four-year UCI series becomes about
   200,000 files. 5,000 still failed on the third run. The cap is a documented server setting;
   raising it, and saying so in the report, keeps InfluxDB on the UCI rows instead of dropping it
-  from them. The cost shows in the numbers: a medium UCI interpolation took 295 s on the trial run
-  against about 5 s for the same-size synthetic series spanning days.
+  from them. The cost shows in the numbers: on run 5 a medium UCI interpolation took 15.5 s against
+  0.3 s for the same-size synthetic series spanning a week. (The 295 s first measured for it was
+  mostly the `CROSS JOIN` defect recorded above.)
 - **Telemetry upload off** on the reference host and in the nightly smoke, which configures
   `influxdb3 serve` by environment because a service container takes no command.
   `WEFT_XBENCH_INFLUXDB3` is registered in the Test tier.
