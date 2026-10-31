@@ -262,6 +262,18 @@ impl Arm for Influx {
 		self.db = None;
 	}
 
+	/// A fresh agent, since the old one pools connections the restart closed, once the server
+	/// answers.
+	async fn reopen(&mut self) -> anyhow::Result<()> {
+		let db = self.db.as_mut().ok_or_else(|| anyhow::anyhow!("influxdb3: nothing loaded"))?;
+		let server = Server::new(&self.server.url);
+		let probe = server.clone();
+		crate::await_ready("influxdb3", move || probe.version()).await?;
+		db.server = server.clone();
+		self.server = server;
+		Ok(())
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;

@@ -18,6 +18,12 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **OS-cold and post-restart reps in the cross-engine benchmark** (#146): `weft-xbench
+  --cold-hook CMD [--cold-reps N]` times each read phase again after the OS page cache is dropped
+  (`os-cold`) and after the engine restarts as well (`restarted`), gated like the warm reps and
+  compared only with each other. `scripts/xbench/cold-hook.sh` restarts the reference host's
+  engine containers and drops the page cache from a privileged container. The report (schema v4)
+  records each result's `warmth` and the hook.
 - **Cross-engine reports flag a dirty build**: `weft-xbench` records its source commit as
   `<sha>+dirty` when the checkout has changes, and the report says that commit alone does not
   reproduce the binary.

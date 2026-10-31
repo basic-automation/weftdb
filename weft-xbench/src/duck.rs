@@ -206,6 +206,19 @@ impl Arm for Duck {
 		self.db = None;
 	}
 
+	async fn reopen(&mut self) -> anyhow::Result<()> {
+		let mut db = self.db.take().ok_or_else(|| anyhow::anyhow!("duckdb: nothing loaded"))?;
+		let db = tokio::task::spawn_blocking(move || -> anyhow::Result<Db> {
+			// Close the file's connection before opening it again: one database instance per file.
+			drop(std::mem::replace(&mut db.conn, Connection::open_in_memory()?));
+			db.conn = Connection::open(&db.path)?;
+			Ok(db)
+		})
+		.await??;
+		self.db = Some(db);
+		Ok(())
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;

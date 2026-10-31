@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 use weft_bench::stats::ConfidenceInterval;
 
-use crate::{ArmResult, DatasetKind, Phase, XbenchReport};
+use crate::{ArmResult, DatasetKind, Phase, Warmth, XbenchReport};
 
 /// Datasets the first report's scope (decision 18) asks for, and TSBS's (#141).
 const EXPECTED_KINDS: [DatasetKind; 4] = [DatasetKind::Mcar, DatasetKind::Block, DatasetKind::Uci, DatasetKind::Tsbs];
@@ -91,13 +91,15 @@ pub const fn compare(weft: &ConfidenceInterval, other: &ConfidenceInterval) -> O
 	}
 }
 
-/// Every passing WeftDB result against the fastest passing other-engine result on the same dataset
-/// and phase. Datasets and phases with no other engine produce no verdict.
+/// Every passing WeftDB result against the fastest passing other-engine result.
+///
+/// The other result shares the dataset, the phase and the warmth, so a cold WeftDB read is held
+/// against cold reads only. Datasets and phases with no other engine produce no verdict.
 #[must_use]
 pub fn verdicts(report: &XbenchReport) -> Vec<Verdict<'_>> {
 	let mut out = Vec::new();
 	for weft in report.results.iter().filter(|r| is_weft(r) && passed(r)) {
-		let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.dataset == weft.dataset && r.phase == weft.phase).min_by_key(|r| r.latency_ci.p50.point_ns);
+		let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.dataset == weft.dataset && r.phase == weft.phase && r.warmth == weft.warmth).min_by_key(|r| r.latency_ci.p50.point_ns);
 		if let Some(other) = other {
 			out.push(Verdict { weft, other, outcome: compare(&weft.latency_ci.p50, &other.latency_ci.p50) });
 		}
@@ -134,6 +136,14 @@ const fn phase(p: Phase) -> &'static str {
 	}
 }
 
+/// The phase, with its warmth when it is not warm (`interpolate (os-cold)`).
+fn phase_of(r: &ArmResult) -> String {
+	match r.warmth {
+		Warmth::Warm => phase(r.phase).into(),
+		w => format!("{} ({})", phase(r.phase), w.as_str()),
+	}
+}
+
 /// Bytes per stored point, for a load result that recorded its size.
 fn bytes_per_point(r: &ArmResult) -> String {
 	match r.storage_bytes {
@@ -149,7 +159,7 @@ fn verdict_line(v: &Verdict<'_>) -> String {
 		Outcome::Loss => format!("{} {:.1}× faster", v.other.arm.arm, v.ratio()),
 		Outcome::Noise => "intervals overlap".to_string(),
 	};
-	format!("`{}` {}: `{}` p50 {} ms vs `{}` {} ms ({tail}).", v.weft.dataset, phase(v.weft.phase), v.weft.arm.arm, ms(v.weft.latency_ci.p50.point_ns), v.other.arm.arm, ms(v.other.latency_ci.p50.point_ns))
+	format!("`{}` {}: `{}` p50 {} ms vs `{}` {} ms ({tail}).", v.weft.dataset, phase_of(v.weft), v.weft.arm.arm, ms(v.weft.latency_ci.p50.point_ns), v.other.arm.arm, ms(v.other.latency_ci.p50.point_ns))
 }
 
 /// The report as blocks: header, results, honesty section.
@@ -165,14 +175,14 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	}
 
 	b.push(Block::Heading(2, "Results".into()));
-	b.push(Block::Para("Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets. B/pt is the store's size on disk after a load, divided by the points loaded (whole files: indexes and headers included).".into()));
+	b.push(Block::Para("Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets. B/pt is the store's size on disk after a load, divided by the points loaded (whole files: indexes and headers included). A phase marked `os-cold` ran each rep after the OS page cache was dropped, and one marked `restarted` after the engine restarted as well; unmarked phases are warm, back-to-back reps.".into()));
 	let rows = report
 		.results
 		.iter()
 		.map(|r| {
 			let gate = r.correctness.as_ref().map_or_else(|| "—".into(), |c| if c.passed { "PASS".into() } else { format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference) });
 			let rmse = r.accuracy.as_ref().map_or_else(|| "—".into(), |a| format!("{:.4}", a.rmse));
-			vec![r.dataset.clone(), phase(r.phase).into(), r.arm.arm.clone(), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse, bytes_per_point(r)]
+			vec![r.dataset.clone(), phase_of(r), r.arm.arm.clone(), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse, bytes_per_point(r)]
 		})
 		.collect();
 	b.push(Block::Table(["dataset", "phase", "arm", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE", "B/pt"].map(String::from).to_vec(), rows));
@@ -180,7 +190,7 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	b.push(Block::Heading(2, "Honesty".into()));
 	b.push(Block::Para("Generated from the results above. A WeftDB arm wins or loses only when its p50 interval does not overlap the fastest other engine's; overlapping intervals are within noise.".into()));
 
-	let failures: Vec<String> = report.results.iter().filter(|r| !passed(r)).map(|r| format!("`{}` {} `{}` disagrees with the in-memory reference: {:?}.", r.dataset, phase(r.phase), r.arm.arm, r.correctness)).collect();
+	let failures: Vec<String> = report.results.iter().filter(|r| !passed(r)).map(|r| format!("`{}` {} `{}` disagrees with the in-memory reference: {:?}.", r.dataset, phase_of(r), r.arm.arm, r.correctness)).collect();
 	if !failures.is_empty() {
 		b.push(Block::Heading(3, "Correctness failures".into()));
 		b.push(Block::List(failures));
@@ -235,6 +245,9 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 			));
 		}
 	}
+	if !report.results.iter().any(|r| r.warmth != Warmth::Warm) {
+		missing.push("OS-cold and post-restart reads: every rep in this run was warm (pass `--cold-hook` for cold ones).".into());
+	}
 	missing.extend(NOT_IN_SCOPE.iter().map(|s| (*s).to_string()));
 	b.push(Block::List(missing));
 
@@ -276,6 +289,10 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	}
 	if report.results.iter().any(|r| r.kind == DatasetKind::Tsbs) {
 		limits.push("The `tsbs` datasets are one host's (`host_0`) `usage_user` from TSBS's `cpu-only` generator: an integer random walk read every ten seconds with no gaps, over the synthetic datasets' span, reconstructed per second. So each grid instant falls between knots ten seconds apart, and nine in ten instants are interpolated; there is no ground truth, so only the reference gate applies.".into());
+	}
+	if report.results.iter().any(|r| r.warmth != Warmth::Warm) {
+		let hook = report.cold_hook.as_deref().unwrap_or("not recorded");
+		limits.push(format!("Cold reps (`{hook}`): before each `os-cold` rep the hook drops the OS page cache and the engine keeps running, its own caches intact; before each `restarted` rep a server engine's container restarts, the harness reconnects and waits for it to answer, and the page cache drops after that, so the reconnection's reads are not cached either. The in-process engines (WeftDB's stored arms and DuckDB) cannot restart apart from the harness: they close their files and open them again, so the process's own memory (allocator, loaded code) stays warm. The reconnection is outside the clock; TimescaleDB's prepared statements belong to the old connection, so its first rep after a restart prepares them again, inside the clock."));
 	}
 	b.push(Block::List(limits));
 
@@ -428,11 +445,11 @@ mod tests {
 	fn result(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
 		let (latency, latency_ci) = latency(samples, 1);
 		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed });
-		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None }
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm }
 	}
 
 	fn report(results: Vec<ArmResult>) -> XbenchReport {
-		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-10-29T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: Some("abc123".into()), invocation: vec!["weft-xbench".into(), "--scales".into(), "tiny".into()], scratch_dir: Some("/mnt/weftbench/tmp".into()), optimized: Some(true), results }
+		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-10-29T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: Some("abc123".into()), invocation: vec!["weft-xbench".into(), "--scales".into(), "tiny".into()], scratch_dir: Some("/mnt/weftbench/tmp".into()), optimized: Some(true), cold_hook: None, results }
 	}
 
 	const FAST: [u64; 12] = [100, 101, 99, 100, 102, 98, 100, 101, 99, 100, 100, 101];
@@ -527,6 +544,20 @@ mod tests {
 		let with = to_markdown(&blocks(&report(vec![tsbs])));
 		assert!(with.contains("one host's (`host_0`) `usage_user`"), "{with}");
 		assert!(!with.contains("The `tsbs` datasets did not run"), "{with}");
+	}
+
+	#[test]
+	fn cold_reps_are_compared_only_with_cold_reps_and_explained() {
+		let warm = to_markdown(&blocks(&report(vec![result("a", "weftdb-stored", Phase::Interpolate, &FAST, true)])));
+		assert!(warm.contains("every rep in this run was warm"), "{warm}");
+		let cold = |arm: &str, samples: &[u64]| ArmResult { warmth: Warmth::Restarted, ..result("a", arm, Phase::Interpolate, samples, true) };
+		let mut r = report(vec![result("a", "weftdb-stored", Phase::Interpolate, &SLOW, true), result("a", "duckdb-double", Phase::Interpolate, &FAST, true), cold("weftdb-stored", &FAST), cold("duckdb-double", &SLOW)]);
+		r.cold_hook = Some("scripts/xbench/cold-hook.sh".into());
+		let v = verdicts(&r);
+		assert_eq!(v.iter().map(|v| (v.weft.warmth, v.other.warmth, v.outcome)).collect::<Vec<_>>(), [(Warmth::Warm, Warmth::Warm, Outcome::Loss), (Warmth::Restarted, Warmth::Restarted, Outcome::Win)]);
+		let md = to_markdown(&blocks(&r));
+		assert!(md.contains("interpolate (restarted)") && md.contains("`scripts/xbench/cold-hook.sh`"), "{md}");
+		assert!(!md.contains("every rep in this run was warm"));
 	}
 
 	#[test]

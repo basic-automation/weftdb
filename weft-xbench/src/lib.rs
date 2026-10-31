@@ -53,7 +53,10 @@ use weft_bench::{
 ///
 /// v3 (EVI-14) adds the `downsample` phase, the `storage_bytes` of a load, and three arms
 /// (`weftdb-stored-bulk`, `duckdb-decimal`, and a store-backed `weftdb-stored`).
-pub const XBENCH_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 (#146) adds each result's `warmth` (warm, OS-cold or restarted) and the report's
+/// `cold_hook`; a v3 report deserializes with every result warm.
+pub const XBENCH_SCHEMA_VERSION: u32 = 4;
 
 /// The reductions the downsample phase computes per bucket.
 pub const DOWNSAMPLE_AGGREGATIONS: [weft_reduce::Aggregation; 3] = [weft_reduce::Aggregation::Min, weft_reduce::Aggregation::Max, weft_reduce::Aggregation::Avg];
@@ -263,6 +266,15 @@ pub struct ArmInfo {
 	pub method: String,
 }
 
+impl ArmInfo {
+	/// The engine the arm runs on, as the cold hook names it: the arm name's first word
+	/// (`clickhouse` for `clickhouse-double`).
+	#[must_use]
+	pub fn engine_key(&self) -> &str {
+		self.arm.split('-').next().unwrap_or(&self.arm)
+	}
+}
+
 /// An arm's reconstruction in the type its engine returns; converted to `f64` only after timing.
 #[derive(Debug)]
 pub enum Output {
@@ -315,6 +327,74 @@ pub struct ArmResult {
 	/// Bytes on disk after the load (load phase of a storing arm).
 	#[serde(default)]
 	pub storage_bytes: Option<u64>,
+	/// What was warm when the reps ran (`warm` in a v3 report, which timed only warm reps).
+	#[serde(default)]
+	pub warmth: Warmth,
+}
+
+/// What was warm when a result's reps ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Warmth {
+	/// Back-to-back reps: the engine's caches and the OS page cache hold what the last rep read.
+	#[default]
+	Warm,
+	/// The OS page cache dropped before each rep; the engine kept running, its own caches intact.
+	OsCold,
+	/// The engine restarted (an in-process arm closed and reopened its files) and the OS page
+	/// cache dropped before each rep: the first query after a restart.
+	Restarted,
+}
+
+impl Warmth {
+	/// The name the report and the console use.
+	#[must_use]
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::Warm => "warm",
+			Self::OsCold => "os-cold",
+			Self::Restarted => "restarted",
+		}
+	}
+}
+
+/// The command that makes a rep cold.
+///
+/// It runs as `sh -c 'HOOK "$@"' sh ACTION ENGINE` outside the clock: `drop-caches ENGINE` empties the OS page cache, `restart ENGINE` restarts that engine's
+/// server (the in-process engines, `weftdb` and `duckdb`, have none to restart; the arm reopens
+/// its files itself). `scripts/xbench/cold-hook.sh` is the reference host's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cold {
+	/// The hook command line.
+	pub hook: String,
+	/// Cold reps per phase and warmth.
+	pub reps: usize,
+}
+
+impl Cold {
+	/// Run the hook for `action` on `engine`.
+	///
+	/// # Errors
+	///
+	/// If the hook cannot start or exits unsuccessfully.
+	pub async fn run(&self, action: &str, engine: &str) -> anyhow::Result<()> {
+		let status = tokio::process::Command::new("sh").arg("-c").arg(format!("{} \"$@\"", self.hook)).arg("sh").arg(action).arg(engine).status().await?;
+		anyhow::ensure!(status.success(), "cold hook `{} {action} {engine}` exited with {status}", self.hook);
+		Ok(())
+	}
+}
+
+/// How many reps of each kind a run times.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Protocol {
+	/// Timed loads per arm and dataset.
+	pub load_reps: usize,
+	/// Warm reps per phase.
+	pub reps: usize,
+	/// Seed for the synthetic datasets and the bootstrap.
+	pub seed: u64,
+	/// OS-cold and post-restart reps, when the run has a hook to make them.
+	pub cold: Option<Cold>,
 }
 
 /// Which phase a result times.
@@ -412,7 +492,10 @@ pub struct XbenchReport {
 	/// Whether the binary was an optimised build (`None` in a v1 report, which did not record it).
 	#[serde(default)]
 	pub optimized: Option<bool>,
-	/// Every arm × dataset × phase.
+	/// The hook that made the cold reps, when the run had any.
+	#[serde(default)]
+	pub cold_hook: Option<String>,
+	/// Every arm × dataset × phase × warmth.
 	pub results: Vec<ArmResult>,
 }
 
@@ -422,6 +505,29 @@ impl XbenchReport {
 	pub fn all_correct(&self) -> bool {
 		self.results.iter().filter_map(|r| r.correctness.as_ref()).all(|c| c.passed)
 	}
+}
+
+/// How long a restarted server gets to answer again.
+pub const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Call `probe` on the blocking pool until it succeeds, for up to [`RESTART_TIMEOUT`]: a
+/// restarted server refuses connections, then errors, for a while before it answers.
+///
+/// # Errors
+///
+/// The probe's last error, once the timeout passes.
+pub async fn await_ready<T: Send + 'static>(engine: &'static str, mut probe: impl FnMut() -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+	tokio::task::spawn_blocking(move || {
+		let deadline = Instant::now() + RESTART_TIMEOUT;
+		loop {
+			match probe() {
+				Ok(value) => return Ok(value),
+				Err(e) if Instant::now() >= deadline => return Err(e.context(format!("{engine} did not answer within {RESTART_TIMEOUT:?} of a restart"))),
+				Err(_) => std::thread::sleep(std::time::Duration::from_millis(250)),
+			}
+		}
+	})
+	.await?
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
@@ -454,17 +560,29 @@ pub fn accuracy(values: &[f64], ds: &Dataset, truth: &[f64]) -> Option<AccuracyM
 ///
 /// Knot copies for the arms that take points per call are made before the timer starts.
 ///
+/// With [`Protocol::cold`], an arm that loads then times `cold.reps` more of each phase OS-cold and
+/// as many after a restart, each gated like the warm reps; the hook and the reopen run outside the
+/// clock.
+///
 /// # Errors
 ///
-/// If `reps` or `load_reps` is zero, or the arm fails to load or reconstruct.
-pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Reference, load_reps: usize, reps: usize, seed: u64) -> anyhow::Result<Vec<ArmResult>> {
+/// If `reps` or `load_reps` is zero, or the arm fails to load or reconstruct, or the cold hook
+/// fails.
+pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Reference, protocol: &Protocol) -> anyhow::Result<Vec<ArmResult>> {
+	let Protocol { load_reps, reps, seed, ref cold } = *protocol;
 	anyhow::ensure!(reps > 0 && load_reps > 0, "reps and load reps must be > 0");
+	anyhow::ensure!(cold.as_ref().is_none_or(|c| c.reps > 0), "cold reps must be > 0");
 	let info = arm.info();
-	let row = |phase, output_points, reps, samples: &[u64], correctness, accuracy, storage_bytes| {
+	let row = |phase, warmth, output_points, reps, samples: &[u64], correctness, accuracy, storage_bytes| {
 		let (latency, latency_ci) = latency(samples, seed);
-		ArmResult { dataset: ds.name.clone(), kind: ds.kind, scale: ds.scale.as_str().to_string(), input_points: ds.points.len(), output_points, missingness_fraction: ds.missingness_fraction, arm: info.clone(), phase, reps, latency, latency_ci, correctness, accuracy, storage_bytes }
+		ArmResult { dataset: ds.name.clone(), kind: ds.kind, scale: ds.scale.as_str().to_string(), input_points: ds.points.len(), output_points, missingness_fraction: ds.missingness_fraction, arm: info.clone(), phase, reps, latency, latency_ci, correctness, accuracy, storage_bytes, warmth }
 	};
-	let mut results = Vec::with_capacity(3);
+	// An arm with nothing loaded keeps nothing to go cold.
+	let warmths: &[Warmth] = match cold {
+		Some(_) if arm.loads() => &[Warmth::Warm, Warmth::OsCold, Warmth::Restarted],
+		_ => &[Warmth::Warm],
+	};
+	let mut results = Vec::with_capacity(3 * warmths.len());
 
 	let mut load_samples = Vec::with_capacity(load_reps);
 	for _ in 0..if arm.loads() { load_reps } else { 1 } {
@@ -475,37 +593,58 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Refere
 		load_samples.push(span_ns(t0));
 	}
 	if arm.loads() {
-		results.push(row(Phase::Load, ds.points.len(), load_reps, &load_samples, None, None, arm.storage_bytes()));
+		results.push(row(Phase::Load, Warmth::Warm, ds.points.len(), load_reps, &load_samples, None, None, arm.storage_bytes()));
 	}
 
-	let mut samples = Vec::with_capacity(reps);
-	let mut last = None;
-	for _ in 0..reps {
-		let knots = ds.points.clone();
-		let t0 = Instant::now();
-		let output = arm.interpolate(ds, knots).await?;
-		samples.push(span_ns(t0));
-		last = Some(output);
-	}
-	let values = last.map(|o| o.to_f64()).unwrap_or_default();
-	let correctness = Correctness::check(&values, &reference.grid, ds.grid_len());
-	let accuracy = ds.truth.as_deref().and_then(|truth| accuracy(&values, ds, truth));
-	results.push(row(Phase::Interpolate, values.len(), reps, &samples, Some(correctness), accuracy, None));
-
-	if arm.downsamples() {
+	let engine = info.engine_key();
+	for &warmth in warmths {
+		let reps = if warmth == Warmth::Warm { reps } else { cold.as_ref().map_or(reps, |c| c.reps) };
 		let mut samples = Vec::with_capacity(reps);
-		let mut last = Vec::new();
+		let mut last = None;
 		for _ in 0..reps {
+			chill(arm, cold.as_ref(), warmth, engine).await?;
 			let knots = ds.points.clone();
 			let t0 = Instant::now();
-			let buckets = arm.downsample(ds, knots).await?;
+			let output = arm.interpolate(ds, knots).await?;
 			samples.push(span_ns(t0));
-			last = buckets;
+			last = Some(output);
 		}
-		let correctness = Correctness::check_buckets(&last, &reference.buckets);
-		results.push(row(Phase::Downsample, last.len(), reps, &samples, Some(correctness), None, None));
+		let values = last.map(|o| o.to_f64()).unwrap_or_default();
+		let correctness = Correctness::check(&values, &reference.grid, ds.grid_len());
+		let accuracy = ds.truth.as_deref().and_then(|truth| accuracy(&values, ds, truth));
+		results.push(row(Phase::Interpolate, warmth, values.len(), reps, &samples, Some(correctness), accuracy, None));
+
+		if arm.downsamples() {
+			let mut samples = Vec::with_capacity(reps);
+			let mut last = Vec::new();
+			for _ in 0..reps {
+				chill(arm, cold.as_ref(), warmth, engine).await?;
+				let knots = ds.points.clone();
+				let t0 = Instant::now();
+				let buckets = arm.downsample(ds, knots).await?;
+				samples.push(span_ns(t0));
+				last = buckets;
+			}
+			let correctness = Correctness::check_buckets(&last, &reference.buckets);
+			results.push(row(Phase::Downsample, warmth, last.len(), reps, &samples, Some(correctness), None, None));
+		}
 	}
 	Ok(results)
+}
+
+/// Make the next rep `warmth`: restart the engine and reopen the arm's handle on it, then drop the
+/// OS page cache, so nothing the reopen read stays cached. A warm rep needs nothing.
+async fn chill<A: weft::Arm>(arm: &mut A, cold: Option<&Cold>, warmth: Warmth, engine: &str) -> anyhow::Result<()> {
+	let Some(cold) = cold else { return Ok(()) };
+	match warmth {
+		Warmth::Warm => return Ok(()),
+		Warmth::OsCold => {}
+		Warmth::Restarted => {
+			cold.run("restart", engine).await?;
+			arm.reopen().await?;
+		}
+	}
+	cold.run("drop-caches", engine).await
 }
 
 /// What every arm is checked against: WeftDB's in-memory grid (`f64`) and `weft_reduce`'s buckets.
@@ -550,33 +689,33 @@ pub struct Servers {
 /// # Errors
 ///
 /// If any arm fails outright; a wrong answer is not an error, it fails that result's gate.
-pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps: usize, seed: u64, metadata: RunMetadata, source_commit: Option<String>, invocation: Vec<String>) -> anyhow::Result<XbenchReport> {
+pub async fn run(datasets: &[Dataset], servers: &Servers, protocol: &Protocol, metadata: RunMetadata, source_commit: Option<String>, invocation: Vec<String>) -> anyhow::Result<XbenchReport> {
 	let mut results = Vec::new();
 	for ds in datasets {
 		let reference = reference(ds).await?;
-		results.extend(measure(&mut weft::WeftMemory, ds, &reference, load_reps, reps, seed).await?);
-		results.extend(measure(&mut weft::WeftStore::stored(), ds, &reference, load_reps, reps, seed).await?);
-		results.extend(measure(&mut weft::WeftStore::stored_f64(), ds, &reference, load_reps, reps, seed).await?);
-		results.extend(measure(&mut weft::WeftStore::stored_bulk(), ds, &reference, load_reps, reps, seed).await?);
-		results.extend(measure(&mut duck::Duck::double(), ds, &reference, load_reps, reps, seed).await?);
-		results.extend(measure(&mut duck::Duck::decimal(), ds, &reference, load_reps, reps, seed).await?);
+		results.extend(measure(&mut weft::WeftMemory, ds, &reference, protocol).await?);
+		results.extend(measure(&mut weft::WeftStore::stored(), ds, &reference, protocol).await?);
+		results.extend(measure(&mut weft::WeftStore::stored_f64(), ds, &reference, protocol).await?);
+		results.extend(measure(&mut weft::WeftStore::stored_bulk(), ds, &reference, protocol).await?);
+		results.extend(measure(&mut duck::Duck::double(), ds, &reference, protocol).await?);
+		results.extend(measure(&mut duck::Duck::decimal(), ds, &reference, protocol).await?);
 		if let Some(server) = &servers.clickhouse {
-			results.extend(measure(&mut clickhouse::ClickHouse::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
-			results.extend(measure(&mut clickhouse::ClickHouse::decimal(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+			results.extend(measure(&mut clickhouse::ClickHouse::double(server.clone()), ds, &reference, protocol).await?);
+			results.extend(measure(&mut clickhouse::ClickHouse::decimal(server.clone()), ds, &reference, protocol).await?);
 		}
 		if let Some(url) = &servers.timescale {
-			results.extend(measure(&mut timescale::Timescale::double(url), ds, &reference, load_reps, reps, seed).await?);
-			results.extend(measure(&mut timescale::Timescale::numeric(url), ds, &reference, load_reps, reps, seed).await?);
+			results.extend(measure(&mut timescale::Timescale::double(url), ds, &reference, protocol).await?);
+			results.extend(measure(&mut timescale::Timescale::numeric(url), ds, &reference, protocol).await?);
 		}
 		if let Some(server) = &servers.questdb {
-			results.extend(measure(&mut questdb::QuestDb::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
-			results.extend(measure(&mut questdb::QuestDb::decimal(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+			results.extend(measure(&mut questdb::QuestDb::double(server.clone()), ds, &reference, protocol).await?);
+			results.extend(measure(&mut questdb::QuestDb::decimal(server.clone()), ds, &reference, protocol).await?);
 		}
 		if let Some(server) = &servers.influxdb3 {
-			results.extend(measure(&mut influxdb3::Influx::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+			results.extend(measure(&mut influxdb3::Influx::double(server.clone()), ds, &reference, protocol).await?);
 		}
 		if let Some(server) = &servers.iotdb {
-			results.extend(measure(&mut iotdb::IoTdb::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+			results.extend(measure(&mut iotdb::IoTdb::double(server.clone()), ds, &reference, protocol).await?);
 		}
 	}
 	let mut engines = vec![EngineVersion { engine: "weftdb".into(), version: metadata.weft_bench_version.clone() }, EngineVersion { engine: "duckdb".into(), version: duck::duckdb_version()? }];
@@ -595,7 +734,7 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps
 	if let Some(server) = &servers.iotdb {
 		engines.push(EngineVersion { engine: "iotdb".into(), version: server.version()? });
 	}
-	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), results })
+	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed: protocol.seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), cold_hook: protocol.cold.as_ref().map(|c| c.hook.clone()), results })
 }
 
 #[cfg(test)]
@@ -761,6 +900,10 @@ mod tests {
 			std::thread::sleep(std::time::Duration::from_millis(200));
 		}
 
+		async fn reopen(&mut self) -> anyhow::Result<()> {
+			Ok(())
+		}
+
 		async fn load(&mut self, _ds: &Dataset) -> anyhow::Result<()> {
 			Ok(())
 		}
@@ -778,9 +921,67 @@ mod tests {
 	async fn a_load_is_timed_without_the_previous_loads_teardown() {
 		let ds = edge_dataset();
 		let reference = reference_of(&ds).await;
-		let results = measure(&mut SlowTeardown, &ds, &reference, 3, 1, DEFAULT_SEED).await.expect("measures");
+		let results = measure(&mut SlowTeardown, &ds, &reference, &Protocol { load_reps: 3, reps: 1, seed: DEFAULT_SEED, cold: None }).await.expect("measures");
 		let load = results.iter().find(|r| r.phase == Phase::Load).expect("a load row");
 		assert!(load.latency.max_ns < 100_000_000, "a 200 ms teardown leaked into the load clock: {:?}", load.latency);
+	}
+
+	/// The reference with a load phase that counts its reopens.
+	#[derive(Default)]
+	struct Reopens(usize);
+
+	impl Arm for Reopens {
+		fn info(&self) -> ArmInfo {
+			ArmInfo { arm: "probe-arm".into(), ..weft::WeftMemory.info() }
+		}
+
+		fn unload(&mut self) {}
+
+		async fn load(&mut self, _ds: &Dataset) -> anyhow::Result<()> {
+			Ok(())
+		}
+
+		async fn reopen(&mut self) -> anyhow::Result<()> {
+			self.0 += 1;
+			Ok(())
+		}
+
+		async fn interpolate(&mut self, ds: &Dataset, knots: Vec<splimes::Point>) -> anyhow::Result<Output> {
+			weft::WeftMemory.interpolate(ds, knots).await
+		}
+
+		async fn downsample(&mut self, ds: &Dataset, knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {
+			weft::WeftMemory.downsample(ds, knots).await
+		}
+	}
+
+	#[tokio::test]
+	async fn cold_reps_restart_and_drop_caches_before_each_rep_and_are_gated() {
+		let ds = edge_dataset();
+		let reference = reference_of(&ds).await;
+		let log = std::env::temp_dir().join(format!("weft-xbench-cold-hook-{}.log", std::process::id()));
+		let _ = std::fs::remove_file(&log);
+		let protocol = Protocol { load_reps: 1, reps: 1, seed: DEFAULT_SEED, cold: Some(Cold { hook: format!("echo >>{} ", log.display()), reps: 2 }) };
+		let mut arm = Reopens::default();
+		let results = measure(&mut arm, &ds, &reference, &protocol).await.expect("measures");
+		let rows: Vec<(Phase, Warmth, usize, bool)> = results.iter().map(|r| (r.phase, r.warmth, r.reps, r.correctness.as_ref().is_none_or(|c| c.passed))).collect();
+		assert_eq!(rows, [(Phase::Load, Warmth::Warm, 1, true), (Phase::Interpolate, Warmth::Warm, 1, true), (Phase::Downsample, Warmth::Warm, 1, true), (Phase::Interpolate, Warmth::OsCold, 2, true), (Phase::Downsample, Warmth::OsCold, 2, true), (Phase::Interpolate, Warmth::Restarted, 2, true), (Phase::Downsample, Warmth::Restarted, 2, true)]);
+		assert_eq!(arm.0, 4, "one reopen per post-restart rep");
+		let calls = std::fs::read_to_string(&log).expect("the hook ran");
+		let _ = std::fs::remove_file(&log);
+		let os = "drop-caches probe\n".repeat(4);
+		let restarted = "restart probe\ndrop-caches probe\n".repeat(4);
+		assert_eq!(calls, format!("{os}{restarted}"), "the engine key is the arm name's first word");
+	}
+
+	#[tokio::test]
+	async fn a_failing_cold_hook_stops_the_run_and_an_unloaded_arm_stays_warm() {
+		let ds = edge_dataset();
+		let reference = reference_of(&ds).await;
+		let failing = Protocol { load_reps: 1, reps: 1, seed: DEFAULT_SEED, cold: Some(Cold { hook: "false".into(), reps: 1 }) };
+		assert!(measure(&mut Reopens::default(), &ds, &reference, &failing).await.is_err());
+		let results = measure(&mut weft::WeftMemory, &ds, &reference, &failing).await.expect("the in-memory arm has nothing to chill");
+		assert!(results.iter().all(|r| r.warmth == Warmth::Warm));
 	}
 
 	async fn reference_of(ds: &Dataset) -> Reference {
@@ -820,9 +1021,23 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn the_in_process_arms_reopen_their_files_and_still_pass_cold() {
+		let datasets = [Dataset::synthetic(DatasetKind::Mcar, ScalePreset::Tiny, DEFAULT_SEED).expect("builds")];
+		// A hook that does nothing: what is tested is that a reopened store or database file
+		// answers as the loaded one did.
+		let protocol = Protocol { load_reps: 1, reps: 1, seed: DEFAULT_SEED, cold: Some(Cold { hook: "true".into(), reps: 2 }) };
+		let report = run(&datasets, &Servers::default(), &protocol, RunMetadata::capture("test".into()), None, vec![]).await.expect("runs");
+		// The 16 warm rows, and the 9 read rows of the five storing arms again OS-cold and restarted.
+		assert_eq!(report.results.len(), 16 + 2 * 9);
+		assert_eq!(report.results.iter().filter(|r| r.warmth == Warmth::Restarted && r.arm.arm.starts_with("weftdb-memory")).count(), 0);
+		assert_eq!(report.cold_hook.as_deref(), Some("true"));
+		assert!(report.all_correct(), "{:#?}", report.results.iter().filter(|r| !r.correctness.as_ref().is_none_or(|c| c.passed)).collect::<Vec<_>>());
+	}
+
+	#[tokio::test]
 	async fn a_tiny_run_reports_both_phases_for_storing_arms_and_passes() {
 		let datasets = [Dataset::synthetic(DatasetKind::Mcar, ScalePreset::Tiny, DEFAULT_SEED).expect("builds")];
-		let report = run(&datasets, &Servers::default(), 1, 2, DEFAULT_SEED, RunMetadata::capture("test".into()), None, vec![]).await.expect("runs");
+		let report = run(&datasets, &Servers::default(), &Protocol { load_reps: 1, reps: 2, seed: DEFAULT_SEED, cold: None }, RunMetadata::capture("test".into()), None, vec![]).await.expect("runs");
 		// memory: interpolate + downsample; stored, stored-bulk, duckdb-double, duckdb-decimal:
 		// load + interpolate + downsample; stored-f64: load + interpolate.
 		assert_eq!(report.results.len(), 16);
