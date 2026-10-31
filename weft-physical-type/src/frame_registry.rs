@@ -171,6 +171,83 @@ pub enum FrameFault {
 	},
 }
 
+/// The most rows one frame may decode to (ROB-8).
+///
+/// A frame is a segment: the writer side cuts encoded frames to the 128 MiB
+/// target (D-S13, ROB D12), and the largest row cap named anywhere in the
+/// release plan is the read/export cap of decision 12 (5,000,000 rows), with
+/// `MAX_KNOTS` at 4 Mi rows behind it. This bound sits above both — four
+/// times the interpolation cap — so no frame a writer produces comes near
+/// it, while a header that claims more rows than it can be refused before
+/// the claim sizes an allocation.
+pub const MAX_FRAME_ROWS: usize = 16_777_216;
+
+/// The most pages one paged frame may declare (ROB-8).
+///
+/// At the default 1,024 rows per page a frame at the row bound holds
+/// 16,384 pages; this allows sixty-four times that, for frames sealed with
+/// a far smaller page height, and still refuses a page count whose index
+/// alone would dwarf the frame that carries it.
+pub const MAX_FRAME_PAGES: usize = 1_048_576;
+
+/// The most extension entries one v7 envelope may declare (ROB-8).
+///
+/// The envelope ships with no extensions at all ([`KNOWN_EXTENSIONS`] is
+/// empty), so any table a real writer produces today has zero entries;
+/// this leaves room for a later writer's table while refusing a count the
+/// frame's own bytes could never back.
+pub const MAX_FRAME_EXTENSIONS: usize = 1_024;
+
+/// The limits a frame decode enforces (ROB-8; the `DecodeLimits` the plan's
+/// D-S15 amendment names for the v4 sidecar reader).
+///
+/// A `.weftseg` frame is untrusted input: every count in it is a claim the
+/// decoder would otherwise spend memory on before discovering the bytes
+/// are not there — a value-column count of 2^40 sizes a `Vec` before the
+/// first value is read, and one RLE run can expand a few bytes into an
+/// unbounded stream. Decode therefore checks each claim against these
+/// limits (and, where a codec has a minimum bytes-per-element, against
+/// the bytes actually remaining) *before* allocating on it, and refuses
+/// the frame as an integrity fault — C5 counts a length that does not add
+/// up as damage, and a claim past these limits is exactly that: no build's
+/// writer produces one, so the file is damaged or hostile, never merely
+/// ahead of this build. That is why an oversized frame is
+/// [`FrameFault::Integrity`], not `Undecodable`: the limits bound what any
+/// build may ask this one to materialise, not a format feature a newer
+/// build could add.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+	/// Most rows in one frame (a segment, or one page of a paged frame).
+	pub max_rows: usize,
+	/// Most pages in one paged frame.
+	pub max_pages: usize,
+	/// Most extension entries in one v7 envelope.
+	pub max_extensions: usize,
+}
+
+impl DecodeLimits {
+	/// The limits every frame reader in this crate applies.
+	pub const DEFAULT: Self = Self { max_rows: MAX_FRAME_ROWS, max_pages: MAX_FRAME_PAGES, max_extensions: MAX_FRAME_EXTENSIONS };
+
+	/// Whether `found` rows stay within the row limit.
+	#[must_use]
+	pub const fn rows_ok(&self, found: usize) -> bool {
+		found <= self.max_rows
+	}
+
+	/// Whether `found` pages stay within the page limit.
+	#[must_use]
+	pub const fn pages_ok(&self, found: usize) -> bool {
+		found <= self.max_pages
+	}
+
+	/// Whether `found` extension entries stay within the extension limit.
+	#[must_use]
+	pub const fn extensions_ok(&self, found: usize) -> bool {
+		found <= self.max_extensions
+	}
+}
+
 impl FrameFault {
 	/// The fault class name, for logs and for the operator-facing quarantine reason:
 	/// `integrity`, `newer_format`, or `undecodable`.
@@ -226,6 +303,23 @@ mod tests {
 		for (i, spec) in KNOWN_EXTENSIONS.iter().enumerate() {
 			assert!(!KNOWN_EXTENSIONS[i + 1..].iter().any(|later| later.id == spec.id), "extension number {} claimed twice", spec.id);
 		}
+	}
+
+	#[test]
+	fn decode_limits_default_to_the_named_bounds() {
+		assert_eq!(DecodeLimits::DEFAULT.max_rows, MAX_FRAME_ROWS);
+		assert_eq!(DecodeLimits::DEFAULT.max_pages, MAX_FRAME_PAGES);
+		assert_eq!(DecodeLimits::DEFAULT.max_extensions, MAX_FRAME_EXTENSIONS);
+		// The row bound must stay above the plan's own row caps, so a frame a
+		// writer can produce is never refused for its height alone: decision
+		// 12's read/export cap is 5,000,000 rows.
+		assert!(MAX_FRAME_ROWS > 5_000_000);
+		assert!(DecodeLimits::DEFAULT.rows_ok(MAX_FRAME_ROWS));
+		assert!(!DecodeLimits::DEFAULT.rows_ok(MAX_FRAME_ROWS + 1));
+		assert!(DecodeLimits::DEFAULT.pages_ok(MAX_FRAME_PAGES));
+		assert!(!DecodeLimits::DEFAULT.pages_ok(MAX_FRAME_PAGES + 1));
+		assert!(DecodeLimits::DEFAULT.extensions_ok(0));
+		assert!(!DecodeLimits::DEFAULT.extensions_ok(MAX_FRAME_EXTENSIONS + 1));
 	}
 
 	#[test]
