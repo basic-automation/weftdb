@@ -7,16 +7,23 @@ use std::{
 	io::{BufRead, BufReader, Read}, path::Path, process::{Child, Command, ExitStatus, Stdio}, sync::mpsc, thread, time::{Duration, Instant}
 };
 
+use weft_server::settings::{Tier, VARS};
+
 /// How long a server may take to start listening, or to give up on a held root.
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// Spawn a `weft-server` serving the store at `root` on an ephemeral port, with every
-/// optional daemon and exporter off and both output streams piped.
+/// optional daemon and exporter off and both output streams piped. Every test-harness channel
+/// the runner may carry (CI sets `SKIP_SLOW_TESTS`) is unset too: since PAC-5b a server refuses
+/// to start with one set.
 fn spawn_server(root: &Path) -> Child {
 	let mut cmd = Command::new(env!("CARGO_BIN_EXE_weft-server"));
 	cmd.env("WEFT_SEGMENT_STORE_ROOT", root).env("WEFT_SERVER_ADDR", "127.0.0.1:0");
 	for var in ["WEFT_RECONCILE_INTERVAL_SECS", "WEFT_BACKUP_INTERVAL_SECS", "OTEL_EXPORTER_OTLP_ENDPOINT"] {
 		cmd.env_remove(var);
+	}
+	for spec in VARS.iter().filter(|spec| spec.tier == Tier::Test) {
+		cmd.env_remove(spec.name);
 	}
 	cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawns weft-server")
 }
