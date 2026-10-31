@@ -27,7 +27,7 @@ storage, were not settled.
   `medium` scale against 0.79 s. The one-row edge table is the build (left) side of its `CROSS
   JOIN`: with the grid on the left, DataFusion emitted one batch per grid row, 5.7 s against 0.08 s
   for 86,401 instants with identical answers, and run 4's numbers were discarded for it. A load is sent as concurrent writes of at most 8 MiB, under the
-  server's 10 MiB request cap, so they share one WAL flush rather than waiting for one each. `date_bin_gapfill` with `interpolate()` fills between bucket aggregates and does not answer
+  server's 10 MiB request cap, so they share one WAL flush rather than waiting for one each. That flush runs every `--wal-flush-interval` (default `1s`, left at its default), so every load measures about one second; the report says so. `date_bin_gapfill` with `interpolate()` fills between bucket aggregates and does not answer
   jittered knots. **Downsample:** native `date_bin`.
 - **Duplicates:** a second write at an instant replaces the first. Interpolation matches splimes
   (the last value wins); bucket counts would differ from `weft_reduce`, which counts every row. The
