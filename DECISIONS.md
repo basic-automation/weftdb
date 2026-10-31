@@ -24,7 +24,9 @@ storage, were not settled.
   a running `max` and a reversed running `min` (knot instants only increase), their values joined
   back by instant; the first and last segments stand in past the data. `last_value`/`first_value …
   IGNORE NULLS` gave the same answers but DataFusion re-scanned their frames: 6 min 25 s at the
-  `medium` scale against 0.79 s. A load is sent as concurrent writes of at most 8 MiB, under the
+  `medium` scale against 0.79 s. The one-row edge table is the build (left) side of its `CROSS
+  JOIN`: with the grid on the left, DataFusion emitted one batch per grid row, 5.7 s against 0.08 s
+  for 86,401 instants with identical answers, and run 4's numbers were discarded for it. A load is sent as concurrent writes of at most 8 MiB, under the
   server's 10 MiB request cap, so they share one WAL flush rather than waiting for one each. `date_bin_gapfill` with `interpolate()` fills between bucket aggregates and does not answer
   jittered knots. **Downsample:** native `date_bin`.
 - **Duplicates:** a second write at an instant replaces the first. Interpolation matches splimes

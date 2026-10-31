@@ -68,7 +68,7 @@ s AS (SELECT n.t,
 	CASE WHEN lt IS NULL THEN f0v WHEN nt IS NULL THEN l0v ELSE lv END a_v,
 	CASE WHEN lt IS NULL THEN f1t WHEN nt IS NULL THEN l1t ELSE nt END b_t,
 	CASE WHEN lt IS NULL THEN f1v WHEN nt IS NULL THEN l1v ELSE nv END b_v
-	FROM n CROSS JOIN e)
+	FROM e CROSS JOIN n)
 SELECT CASE WHEN b_t = a_t OR t = a_t THEN a_v ELSE a_v + (b_v - a_v) * (CAST(t - a_t AS DOUBLE) / CAST(b_t - a_t AS DOUBLE)) END v
 FROM s ORDER BY t
 ";
