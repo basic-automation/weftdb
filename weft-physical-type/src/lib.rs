@@ -110,7 +110,8 @@ pub mod column;
 #[cfg(feature = "experimental-codecs")]
 pub mod floatcodec;
 /// The `.weftseg` frame version registry, and the two classes of frame-fault a read
-/// can fail with (1.0 plan X-FRAME, resolution C5).
+/// can fail with (1.0 plan X-FRAME, resolution C5). Also the
+/// [`DecodeLimits`] a frame decode enforces (ROB-8).
 pub mod frame_registry;
 pub mod nulls;
 pub mod page;
@@ -130,7 +131,7 @@ pub use catalog::{SegmentDescriptor, SegmentIndex};
 pub use column::{encode_column, recommend_encoding, CascadeInner, ColumnEncodeError, ColumnEncoding, DeltaCascadePlan};
 #[cfg(feature = "experimental-codecs")]
 pub use floatcodec::{best_f64_bytes, best_f64_codec, chimp128_f64_bytes, chimp128_f64_decode, chimp128_f64_encode, chimp_f64_bytes, chimp_f64_decode, chimp_f64_encode, elf_f64_bytes, elf_f64_decode, elf_f64_encode, xor_f64_bytes, xor_f64_decode, xor_f64_encode};
-pub use frame_registry::{is_known_extension, layout_of, FrameExtension, FrameExtensionSpec, FrameFault, FrameInfo, FrameLayout, FRAME_ENVELOPE, FRAME_PAGED, FRAME_SINGLE_BLOCK, FRAME_VERSION_MAX_KNOWN, KNOWN_EXTENSIONS};
+pub use frame_registry::{is_known_extension, layout_of, DecodeLimits, FrameExtension, FrameExtensionSpec, FrameFault, FrameInfo, FrameLayout, FRAME_ENVELOPE, FRAME_PAGED, FRAME_SINGLE_BLOCK, FRAME_VERSION_MAX_KNOWN, KNOWN_EXTENSIONS, MAX_FRAME_EXTENSIONS, MAX_FRAME_PAGES, MAX_FRAME_ROWS};
 pub use nulls::{NullMask, NullMaskError};
 pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
 pub use schema::{AspectSchema, SealError};

@@ -53,6 +53,72 @@ storage, were not settled.
   answer carries.
 - A scaled-integer "decimal" arm: not something an InfluxDB user stores.
 
+## 2026-10-30 — ROB-8: the decode limit set, and why oversized is integrity (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan names ROB-8 only as "Frame decode hardening" (§6 W4,
+L-FMT lane after X-FRAME) and "ROB-8 (decode limits)" in §9, and the queue
+recorded its open question plainly: the exact limit set (sizes, extension
+policy) is not specified anywhere. What the sources do fix is the shape:
+§5's D-S15 amendment names a `DecodeLimits` the sidecar reader will sit
+under, X-FRAME absorbed only ROB-8's `fault_class` naming, and C5 counts a
+*length* failure as **Integrity**. The choices below are the best-guess set
+the owner authorized for grounded slices (2026-10-26), recorded here for
+merge review and reversible there.
+
+**Chosen:**
+
+1. **`DecodeLimits` lives in `weft-physical-type`'s frame registry**, beside
+   the fault classes it feeds, with the defaults every frame reader in
+   `weftseg` applies: `MAX_FRAME_ROWS = 16,777,216` per frame (or per page),
+   `MAX_FRAME_PAGES = 1,048,576`, `MAX_FRAME_EXTENSIONS = 1,024`. The row
+   bound sits above every row cap the plan names — decision 12's 5,000,000
+   read/export rows and EVI-10A's 4 Mi `MAX_KNOTS` — and writers cut encoded
+   frames to D-S13's 128 MiB target, so no produced frame comes near any of
+   the three; they refuse claims, not data. D-S15's sidecar reader inherits
+   the same type when it lands.
+2. **A claim is checked before it allocates.** Each declared count is
+   refused past its limit (`WeftSegError::DecodeLimit`, new) and, where the
+   codec has a minimum bytes-per-element, against the bytes remaining
+   (varint value/dod streams at one byte per element, checkpoint entries at
+   three, RLE runs at two, paged index entries at eight) — a count the
+   frame's own bytes refute is `UnexpectedEof`, never a `Vec` sized by the
+   claim. The CRC is verified first, as before, but it is an integrity
+   check, not a signature: a hostile file carries a correct one, so no
+   count behind it was ever trustworthy.
+3. **Expansions are totalled before they expand.** An RLE stream (timestamp
+   dods, cascade deltas) whose runs sum past the declared count is refused
+   (`ColumnLengthMismatch`, new) before `rle_decode` allocates on the sum;
+   a short expansion stays the block layer's tolerated malformation, as the
+   pre-existing short-block test pins — the frame layer is where short
+   becomes refusal (point 4).
+4. **A decoded frame must agree with itself.** `read_segment` /
+   `read_paged_segment` cross-check the columns against the header: the
+   value column holds exactly the present rows (`row_count - null_count`,
+   with `null_count <= row_count` and `lossy_count <= count` checked at
+   their own reads), the timestamp column reconstructs to exactly
+   `row_count`, and a paged header is the rollup of its pages' row/null
+   counts. A disagreement is `ColumnLengthMismatch` — damage, because no
+   writer produces one and serving it would hand callers columns of
+   different heights.
+5. **Oversized is Integrity, never Undecodable.** The limits bound what any
+   build may ask this one to materialise; they are not a format feature a
+   newer build adds, so a frame past them is not "ahead of this build" —
+   it is a length that does not add up, which is C5's own wording for
+   Integrity. `frame_fault_of` maps both new variants there, so D-S12's
+   quarantine treats an oversized frame as corrupt (TTL-purgeable) and
+   never as suspect. X-FRAME's naming is untouched, as the queue required.
+
+**Rejected:** a total frame-byte cap at the decode entry points (the byte
+slice is already resident when a reader is called — the store layer, which
+knows the file's size and its index `byte_len`, owns file-size policy; the
+decoder's job is to stop a small resident frame from expanding into an
+unbounded allocation, which points 2–3 do); per-call limit overrides in
+this slice (no caller asks for one; D-S15 can add a `_with_limits` form
+when it has a reader that needs it); and refusing short RLE expansions at
+the block layer (a tested, deliberate tolerance — random-access readers
+already agree on the short prefix, and point 4 refuses such a frame whole
+at the segment layer).
+
 ## 2026-10-30 — TAG-0: what "fix ILP series merging" means (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the queue recorded TAG-0 as the weakest grounding in W3/W4 — no
