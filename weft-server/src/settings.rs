@@ -116,7 +116,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_LEGACY_INGEST_CRASH_CHILD", tier: Tier::Test, summary: "Names the stage the legacy-queue ingest crash child dies at — the other half of the same crash matrix.", accepts: "a stage name from the test's own list", default: "unset", read_by: "weft-orchestration/tests/legacy_queue_crash.rs (test child)" },
 	VarSpec { name: "WEFT_MAX_CONNECTIONS", tier: Tier::Tuning, summary: "The most connections the serve path holds at once; a connection beyond the cap waits in the listen backlog, unread, until one in service closes (SEC-4, pre-auth).", accepts: "a positive whole number of connections", default: "half the process's `RLIMIT_NOFILE` soft limit, clamped to 16..=65,536 (1,024 when the limit cannot be read)", read_by: "weft-server/serve.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_MAX_INTERPOLATE_POINTS", tier: Tier::Tuning, summary: "The cap on how many output points one `/api/v1/interpolate*` request may produce.", accepts: "a positive whole number of points", default: "10,000,000 (`MAX_INTERPOLATE_OUTPUT_POINTS`); anything else stops the server from starting", read_by: "weft-server/interpolate.rs, read in startup/config.rs" },
-	VarSpec { name: "WEFT_ON_AMBIGUOUS_COMMIT", tier: Tier::Stable, summary: "What the server does once its store is write-poisoned by an ambiguous COMMIT: keep serving, or exit and let a supervisor restart into the recovery that settles the commit.", accepts: "`poison` (or unset) keeps serving; `exit` exits with status 70", default: "serve; an unknown value warns and keeps serving, the safe default that keeps reads up", read_by: "weft-server/store_open.rs (the name itself is `weftdb::AMBIGUOUS_COMMIT_ENV`)" },
+	VarSpec { name: "WEFT_ON_AMBIGUOUS_COMMIT", tier: Tier::Stable, summary: "What the server does once its store is write-poisoned by an ambiguous COMMIT: keep serving, or exit and let a supervisor restart into the recovery that settles the commit.", accepts: "`poison` (or unset) keeps serving; `exit` exits with status 70", default: "serve; an unknown value stops the server from starting (PAC-5b strict configuration)", read_by: "weft-server/store_open.rs (the name itself is `weftdb::AMBIGUOUS_COMMIT_ENV`)" },
 	VarSpec { name: "WEFT_RECONCILE_HOT_COLD", tier: Tier::Tuning, summary: "Reconcile sweep mode: sweep every aspect's cold segments each tick and defer only the hot tail, instead of the all-or-nothing threshold sweep.", accepts: "`1`/`true`/`yes`/`on` (case-insensitive)", default: "unset or falsey: threshold sweep", read_by: "weft-server/startup/daemons.rs" },
 	VarSpec { name: "WEFT_RECONCILE_INTERVAL_SECS", tier: Tier::Tuning, summary: "How often the reconcile daemon sweeps for out-of-order segments — and, with the other `WEFT_RECONCILE_*` settings, for overlaps, squash and compaction.", accepts: "a whole number of seconds; `0` disables the daemon", default: "unset or `0`: no reconcile daemon; a non-numeric value stops the server from starting", read_by: "weft-server/startup/daemons.rs" },
 	VarSpec { name: "WEFT_RECONCILE_MAX_SPLITS", tier: Tier::Tuning, summary: "Adds a squash pass to the reconcile daemon: any aspect holding more than this many segments is folded into one, bounding split-path fragmentation.", accepts: "a positive whole number of segments", default: "unset: no squash pass", read_by: "weft-server/startup/daemons.rs" },
@@ -250,12 +250,88 @@ pub fn warnings_from_env() -> Vec<String> {
 ///
 /// It runs before the store is opened, so a mistyped name is the first thing an operator
 /// reads rather than a behaviour they deduce from a log line three screens down. It never
-/// fails startup: an unknown variable is a warning, not a decision, until PAC-5b makes the
-/// surface strict.
+/// fails startup: an unknown variable is a warning, not a decision. The server's startup
+/// does not call this any more — PAC-5b made the surface strict ([`strict_errors_from_env`]
+/// refuses, exit [`CONFIG_EXIT_CODE`]); this remains for callers that only want the report.
 pub fn report() {
 	for warning in warnings_from_env() {
 		eprintln!("weft-server: {warning}");
 	}
+}
+
+/// The `EX_CONFIG` exit status (plan C7): invalid configuration or an unsupported
+/// deployment, including filesystem refusals.
+pub const CONFIG_EXIT_CODE: i32 = 78;
+
+/// The `EX_DATAERR`-class exit status (plan C7): the store needs operator action —
+/// a layout or `min_write_layout` newer than this binary, an unreadable
+/// `STORE_FORMAT`, a scope mismatch, an incomplete restore, or frames without a
+/// control plane.
+pub const STORE_EXIT_CODE: i32 = 65;
+
+/// The exit status (plan C7) for a store root already locked by another process.
+pub const ROOT_LOCKED_EXIT_CODE: i32 = 75;
+
+/// Variables whose registry `accepts` shape is a non-negative whole number. A value
+/// outside that shape was, before PAC-5b, refused by some readers and silently
+/// defaulted by others; strict validation refuses it wherever it appears.
+const NON_NEGATIVE_INTS: &[&str] = &["WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_RECONCILE_THRESHOLD", "WEFT_RECONCILE_SPLIT_MIN_BYTES", "WEFT_SEGMENT_CHECKPOINT_STRIDE"];
+
+/// Variables whose registry `accepts` shape is a positive whole number.
+const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
+
+/// One line per *value* the operator should hear about, in the order the environment
+/// lists them: a registered numeric variable holding a value outside the shape its
+/// registry entry accepts, or the one closed enum whose reader used to warn and keep
+/// serving (`WEFT_ON_AMBIGUOUS_COMMIT`: `poison` or `exit`). Variables whose readers
+/// define open shapes (paths, endpoints, truthy flags where anything else is simply
+/// "off") are not judged here — their own startup phase refuses what it cannot use.
+#[must_use]
+pub fn value_errors_for(entries: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+	let mut errors = Vec::new();
+	for (name, value) in entries {
+		let trimmed = value.trim();
+		if NON_NEGATIVE_INTS.contains(&name.as_str()) {
+			if trimmed.parse::<u64>().is_err() {
+				errors.push(format!("{name}={value:?} is not a non-negative whole number, which is the only shape it accepts"));
+			}
+		} else if POSITIVE_INTS.contains(&name.as_str()) {
+			if trimmed.parse::<u64>().ok().filter(|n| *n > 0).is_none() {
+				errors.push(format!("{name}={value:?} is not a positive whole number, which is the only shape it accepts"));
+			}
+		} else if name == "WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD" {
+			if trimmed.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 1.0).is_none() {
+				errors.push(format!("{name}={value:?} is not a finite number at or above 1.0, which is the only shape it accepts"));
+			}
+		} else if name == "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD" {
+			if trimmed.parse::<f64>().ok().filter(|n| n.is_finite() && *n > 0.0).is_none() {
+				errors.push(format!("{name}={value:?} is not a finite number above 0, which is the only shape it accepts"));
+			}
+		} else if name == "WEFT_ON_AMBIGUOUS_COMMIT" {
+			if !(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("poison") || trimmed.eq_ignore_ascii_case("exit")) {
+				errors.push(format!("{name}={value:?} is neither `poison` nor `exit`, the only values it accepts"));
+			}
+		}
+	}
+	errors
+}
+
+/// Every reason strict server configuration (PAC-5b) refuses this environment: the
+/// name problems [`warnings_for`] reports (an unknown `WEFT_` name, a `Test`-tier
+/// channel set on a real server) plus the value problems [`value_errors_for`]
+/// reports. An empty result is a configuration the server will start with; anything
+/// else is refused before any phase reads a setting, with exit [`CONFIG_EXIT_CODE`].
+#[must_use]
+pub fn strict_errors_for(entries: Vec<(String, String)>) -> Vec<String> {
+	let mut errors = warnings_for(entries.iter().cloned());
+	errors.extend(value_errors_for(entries));
+	errors
+}
+
+/// [`strict_errors_for`] over this process's actual environment.
+#[must_use]
+pub fn strict_errors_from_env() -> Vec<String> {
+	strict_errors_for(std::env::vars_os().filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?))).collect())
 }
 
 /// The Levenshtein distance between two names, both already lowercased, stopping as soon
@@ -448,6 +524,19 @@ mod tests {
 	#[test]
 	fn somebody_elses_variable_says_nothing() {
 		assert!(warnings_for([("PATH".to_string(), "/usr/bin".to_string()), ("RUST_LOG".to_string(), "info".to_string()), ("TEST_HOST".to_string(), "127.0.0.1".to_string()), ("SKIP_LOCK_CHECK".to_string(), "1".to_string())]).is_empty(), "none of these is ours to comment on");
+	}
+
+	/// PAC-5b strictness: the name problems and the value problems are both refusals,
+	/// and a correctly shaped value is not one.
+	#[test]
+	fn strict_errors_cover_bad_names_and_bad_values() {
+		assert!(strict_errors_for(vec![("WEFT_BACKUP_KEEP".into(), "3".into()), ("WEFT_ON_AMBIGUOUS_COMMIT".into(), " EXIT ".into()), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD".into(), "1.25".into())]).is_empty());
+		for (name, value) in [("WEFT_BACKUP_KEEP", "-1"), ("WEFT_BACKUP_KEEP", "three"), ("WEFT_MAX_INTERPOLATE_POINTS", "0"), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD", "0.5"), ("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD", "0"), ("WEFT_ON_AMBIGUOUS_COMMIT", "nonsense")] {
+			let errors = strict_errors_for(vec![(name.into(), value.into())]);
+			assert_eq!(errors.len(), 1, "{name}={value}: {errors:?}");
+			assert!(errors[0].starts_with(name), "{errors:?}");
+		}
+		assert_eq!(strict_errors_for(vec![("WEFT_LOG_LEVEL".into(), "debug".into())]).len(), 1, "an unknown name is a strict error too");
 	}
 
 	/// A registered name set correctly is silent — no noise about a configured server — and

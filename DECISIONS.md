@@ -4,6 +4,53 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — PAC-5b: the strict knob set and the store filesystem check (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan names PAC-5b's two halves — strict server configuration and a
+store filesystem check — and C7's exit table (65 for a store needing operator action,
+78 for invalid configuration or an unsupported deployment, including filesystem
+refusals), but no source enumerates the exact strict knob set (the queue recorded
+this as PAC-5b's open question; decision 21's wording lives in the W8 docs). The
+bind guard is explicitly NOT here: §3 moves it to SEC-8, with
+`WEFT_ALLOW_INSECURE_BIND` dropped for `WEFT_AUTH=disabled`.
+
+**Chosen (best guess, grounded in PAC-5a's code, flagged for merge review):**
+
+- **Strict names.** PAC-5a's `settings::report` said it "never fails startup …
+  until PAC-5b makes the surface strict", and its test file said refusing on an
+  unknown variable is "PAC-5b's change to make". So the name half is exactly
+  `warnings_for`'s list, now fatal: an unknown `WEFT_` name (with the nearest
+  spelling) or a `Test`-tier channel set on a real server refuses the start,
+  exit 78, before any phase reads a setting.
+- **Strict values.** The value half is the registered variables whose `accepts`
+  shape is closed and checkable without opening anything —
+  `settings::value_errors_for`: the non-negative and positive whole-number
+  knobs, the two finite-ratio knobs (`WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD`
+  ≥ 1.0, `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` > 0), and
+  `WEFT_ON_AMBIGUOUS_COMMIT` (`poison`/`exit`), the one enum whose reader used
+  to warn and keep serving. Validation runs whether or not the daemon or policy
+  the knob feeds is enabled — a malformed `WEFT_BACKUP_KEEP` refuses even with
+  backups off. Open shapes (paths, endpoints, truthy flags where anything else
+  is simply "off") are not judged centrally; their startup phases already
+  refuse what they cannot use, and PAC-5b routes those phase errors
+  (bind address, interpolation cap, serve limits, TLS, auth) to the same
+  exit 78 instead of a generic failure.
+- **Store filesystem check.** Before the open, `store_open::check_store_root`
+  refuses a root that exists as a file, cannot be created/listed/written, or
+  whose directory entry cannot be synced on Unix (the durability every store
+  write assumes) — exit 78 as a C7 filesystem refusal, with a probe file that
+  is always removed. The open's own refusals keep their classes through
+  `exit_code_for_store_error`: `StoreError` → 65, `StoreLocked` → 75.
+- **The library is unchanged in kind.** `weftdb` still never exits (C-1) and
+  its `from_env` policies still default as before; strictness is the server's
+  layer, checked before the library reads anything. `settings::report` remains
+  as the warning-only printer for other callers.
+
+**Rejected:** inventing a broader knob set (validating path existence for every
+path variable, or resolution tokens for `WEFT_SEGMENT_PARTIAL_*`) — no source
+grounds those shapes as startup refusals, and PAC-6/W8 own the configuration
+documentation pass that can widen this list deliberately.
+
 ## 2026-10-30 — ROB-3: the panic mapping, the supervision policy, and where `weftdb::exec` grows
 
 **Ambiguous:** plan C12 names the parts — ROB-2's hook aborts turso-origin panics, ROB-3's catch

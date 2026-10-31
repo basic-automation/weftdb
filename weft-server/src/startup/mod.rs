@@ -88,11 +88,14 @@
 //! with splimes' default thresholds. A CPU/software adapter (llvmpipe, lavapipe, WARP) is
 //! not calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips
 //! calibration altogether. It never stops the server from starting.
-//! Before the first phase, [`weft_server::settings::report`] checks the environment against the
-//! registry of every variable the workspace reads: a `WEFT_` name no crate reads, or a test
-//! harness's own channel set on a real server, prints one line there. It runs first so an
-//! operator's typo is the first thing they read, rather than a missing behaviour they
-//! deduce three screens down.
+//! Before the first phase, strict configuration (PAC-5b) checks the environment against
+//! the registry of every variable the workspace reads: a `WEFT_` name no crate reads, a
+//! test harness's own channel set on a real server, or a value outside the shape its
+//! registry entry accepts refuses the start with exit 78 (plan C7), one line per problem.
+//! It runs first so an operator's typo is the first thing they read, rather than a missing
+//! behaviour they deduce three screens down. Phase 3 likewise checks the store root's
+//! filesystem before opening it, and a store-open refusal that needs operator action
+//! exits 65 (75 for a locked root).
 
 pub(crate) mod config;
 pub(crate) mod daemons;
@@ -107,10 +110,31 @@ pub(crate) mod state;
 /// Any phase that refuses to start the server: a malformed address, a malformed
 /// operator setting, a segment store that cannot be opened, or a listener that
 /// cannot be bound. A background task failing does not fail startup.
+/// Refuse startup for a configuration problem (PAC-5b): print every problem,
+/// then exit with the plan C7 status for invalid configuration (78). Startup
+/// phases that validate operator settings route their errors here, so a bad
+/// address, cap, TLS pair, keys file or daemon setting is the same class of
+/// refusal as a bad variable name or value.
+fn exit_config(error: &anyhow::Error) -> ! {
+	eprintln!("weft-server: invalid configuration: {error:#}");
+	std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
+}
+
 pub(crate) async fn run() -> anyhow::Result<()> {
-	// First, before any phase reads a setting or opens a store: what the environment got
-	// wrong, answered from the registry in [`crate::settings`].
-	weft_server::settings::report();
+	// First, before any phase reads a setting or opens a store: strict
+	// configuration (PAC-5b). What PAC-5a's registry only warned about — an
+	// unknown `WEFT_` name, a test-harness channel set on a real server, a
+	// value outside the shape its registry entry accepts — now refuses the
+	// start, exit 78, because a silently ignored setting is the most
+	// expensive kind of configuration bug.
+	let strict_errors = weft_server::settings::strict_errors_from_env();
+	if !strict_errors.is_empty() {
+		for error in &strict_errors {
+			eprintln!("weft-server: {error}");
+		}
+		eprintln!("weft-server: refusing to start: {} configuration problem(s) above (exit {})", strict_errors.len(), weft_server::settings::CONFIG_EXIT_CODE);
+		std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
+	}
 
 	// The OTLP provider (when configured) is held for the process lifetime: dropping it
 	// early would tear down the batch span processor and stop export. It is shut down on
@@ -124,18 +148,29 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// the process mid-startup, and serve::run observes it on entry.
 	let mut shutdown = weft_server::ShutdownSignals::install()?;
 
-	let addr = config::bind_addr()?;
-	let interpolate = config::interpolate_config()?;
-	let limits = config::serve_limits()?;
+	let addr = config::bind_addr().unwrap_or_else(|error| exit_config(&error));
+	let interpolate = config::interpolate_config().unwrap_or_else(|error| exit_config(&error));
+	let limits = config::serve_limits().unwrap_or_else(|error| exit_config(&error));
 	// SEC-5: resolve the transport (TLS when configured) and run the C8
 	// plaintext gate against the address about to be bound, before the
 	// store opens — a refused exposure starts nothing at all.
-	let tls = config::transport(addr)?;
+	let tls = config::transport(addr).unwrap_or_else(|error| exit_config(&error));
 	// SEC-6: load the keys file (when one is mounted) before the store
 	// opens — a keys file that cannot be loaded stops startup, and the
 	// server never comes up unauthenticated by accident.
-	let auth = config::auth()?;
-	let state = state::build().await?.with_interpolate_config(interpolate).with_auth(auth);
+	let auth = config::auth().unwrap_or_else(|error| exit_config(&error));
+	let state = match state::build().await {
+		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth),
+		Err(error) => match weft_server::store_open::exit_code_for_store_error(&error) {
+			// A store that needs operator action (65) or a locked root (75):
+			// the plan C7 class, not a generic failure.
+			Some(code) => {
+				eprintln!("weft-server: the segment store cannot be opened: {error:#}");
+				std::process::exit(code);
+			}
+			None => return Err(error),
+		},
+	};
 
 	// ROB-3: the Daemons registry owns every background task this process
 	// runs — supervised, and stopped on its shared shutdown watch (the

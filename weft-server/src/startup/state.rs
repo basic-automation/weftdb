@@ -25,6 +25,13 @@ const STORE_ROOT_ENV: &str = "WEFT_SEGMENT_STORE_ROOT";
 pub(crate) async fn build() -> anyhow::Result<AppState> {
 	match std::env::var(STORE_ROOT_ENV) {
 		Ok(root) => {
+			// PAC-5b's store filesystem check: a root the filesystem cannot
+			// hold a store on is refused here, exit 78 (a filesystem refusal,
+			// plan C7), before the open writes anything into it.
+			if let Err(problem) = store_open::check_store_root(std::path::Path::new(&root)) {
+				eprintln!("weft-server: {problem}");
+				std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
+			}
 			let store = Arc::new(store_open::open_from_env(&root).await?);
 			let report = store.open_report();
 			let how = if report.created_new { "created".to_string() } else { report.migrated_from.map_or_else(|| "opened".to_string(), |layout| format!("migrated from layout {layout}")) };
