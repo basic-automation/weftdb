@@ -4,6 +4,56 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-30 — ROB-3: the panic mapping, the supervision policy, and where `weftdb::exec` grows
+
+**Ambiguous:** plan C12 names the parts — ROB-2's hook aborts turso-origin panics, ROB-3's catch
+is the only layer, ingest routes map by `IngestPhase` (D21) — and D-S14's amendment says its
+`JoinError` is "mapped by `IngestPhase`" and its shutdown watch is "shared with ROB-3's Daemons
+registry", but no source spells out the phase-to-envelope table, a restart policy for daemons, or
+whether `weftdb::exec` (today only ROB-2's control-plane scope) is where the catch lives.
+
+**Chosen:**
+
+- **The mapping, from the §4 code table's own definitions.** Before `IngestPhase::Committing`
+  the batch's one index COMMIT has not run, so a panic there is `500 commit_failed` with
+  `committed: false` ("the write did not commit and the store was not modified" — frames already
+  written are crash litter, as after a crash at the same point). At `Committing` the COMMIT may
+  or may not have landed, which is exactly `503 outcome_unknown` ("the server cannot say whether
+  the write committed"), with no `committed` field claimed either way. Every non-ingest panic is
+  `500 internal`. The panic's message and phase are logged server-side only; the wire gets the
+  code's redacted sentence, per the §4 5xx rule.
+- **`weftdb::exec` is the entry point.** It gains `catch` (a future run under `catch_unwind`,
+  returning a `CaughtPanic` with the safely-rendered message and the phase reached), the
+  `INGEST_PHASE` task-local (`ingest_phase_scope` / `set_ingest_phase` / `current_ingest_phase`),
+  and `SegmentStore::ingest` mirrors each of its phase advances into that task-local. The HTTP
+  layer (`weft-server/src/panic_catch.rs`) is the single catch layer built on it — installed once
+  in `app_with_state`, no `tower-http` CatchPanicLayer anywhere (X-ERR dropped FRE-6a's for this).
+  ROB-2's abort is preserved mechanically: the hook fires during the unwind, before
+  `catch_unwind` can observe the panic, so a control-plane panic never becomes a response.
+- **Supervision restarts on panic only.** `weft-server/src/daemons.rs`' `Daemons` registry owns a
+  `tokio::sync::watch` shutdown flag — the watch §5 D-S14 shares — and supervises each registered
+  daemon: a `JoinError::is_panic` restarts it from its factory after 100 ms, with the restart
+  counted in the registry snapshot; a clean finish is `Stopped`, never restarted; a one-shot
+  (`spawn_once`, GPU calibration) is tracked but never restarted. Startup registers reconcile,
+  backup and calibration through it and raises the watch when serving ends. SEC-9's audited
+  routes catching `is_panic` inside their own tasks remains SEC-9's, a task boundary, not a
+  second layer here.
+
+**Rejected:** mapping a pre-commit ingest panic to `internal` (it would hide the one fact the
+caller needs — that a retry is safe — which `commit_failed`'s envelope exists to state); and a
+restart cap on supervised daemons (no source names one, and a capped-out daemon is the old
+silent-death shape returning with extra steps — the 100 ms delay bounds a panic loop's spin, and
+the snapshot's restart count makes it visible).
+
+*Parent salvage note (2026-10-30): the loop run hit its implement cap with this tree
+uncommitted; the parent verification bar caught one defect class the run's own checks
+missed — nine call sites (the three startup registrations in `startup/daemons.rs` and
+six in this module's own tests) ignored the `#[must_use]` supervisor handles, which
+`-D warnings` rejects. Those sites now drop the handles explicitly (`drop(...)`,
+which detaches without stopping the daemon): the registry's shutdown watch, not
+per-daemon joining, is what stops these daemons, as this entry's supervision design
+states.*
+
 ## 2026-10-30 — External engines III: how the QuestDB arm is measured
 
 **Ambiguous:** #393's first rule says a QuestDB adapter must use QWP, QuestDB 10's columnar

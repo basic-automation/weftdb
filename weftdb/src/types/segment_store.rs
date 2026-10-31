@@ -2954,6 +2954,11 @@ impl SegmentStore {
 	/// **Phases.** The ingest advances through [`IngestPhase`] as it goes,
 	/// and sets [`IngestPhase::Committing`] just before its COMMIT, so a
 	/// failure is attributable to the phase that raised it (plan C12/D21).
+	/// Each advance is also mirrored into the task-local phase
+	/// ([`crate::exec::set_ingest_phase`], ROB-3), so a panic caught by
+	/// [`crate::exec::catch`] inside an
+	/// [`ingest_phase_scope`](crate::exec::ingest_phase_scope) reports the
+	/// phase it reached, not just the error path's context string.
 	///
 	/// # Errors
 	///
@@ -2975,6 +2980,7 @@ impl SegmentStore {
 		self.writable()?;
 		aspect_name::validate(aspect)?;
 		let mut phase = IngestPhase::Validating;
+		crate::exec::set_ingest_phase(phase);
 		let schema = self.require_schema(aspect).await.map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
 		if !batch.groups.is_empty() {
 			return Err(StoreError::GroupsUnsupported { aspect: aspect.to_string() }.into());
@@ -2995,6 +3001,7 @@ impl SegmentStore {
 			return Ok(receipt);
 		}
 		phase = IngestPhase::Encoding;
+		crate::exec::set_ingest_phase(phase);
 		// Encode the whole batch once, then cut the encoded run at
 		// timestamp boundaries so no frame exceeds the target: the cut is
 		// over rows, and each chunk re-seals from its own rows, so a chunk
@@ -3018,6 +3025,7 @@ impl SegmentStore {
 			chunks
 		};
 		phase = IngestPhase::WritingFrames;
+		crate::exec::set_ingest_phase(phase);
 		let mut written: Vec<(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::with_capacity(chunks.len());
 		for (timestamps, values) in &chunks {
 			let segment = schema.seal_nullable(timestamps, values).map_err(seal_failed).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
@@ -3031,6 +3039,7 @@ impl SegmentStore {
 			written.push((descriptor, gen, frame_crc, timestamps.clone(), values.clone()));
 		}
 		phase = IngestPhase::Committing;
+		crate::exec::set_ingest_phase(phase);
 		let receipt = self.publish_ingest(aspect, batch, fingerprint, &written).await.with_context(|| format!("ingest of aspect {aspect:?} failed while {phase}"))?;
 		// Per-segment partial sidecars (opt-in), as in `persist`: a pure
 		// read accelerator, never failing the ingest.

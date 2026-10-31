@@ -13,7 +13,9 @@
 //!    and (once the address is known) the request guard.
 //! 3. [`state`] — the router state, which means opening the segment store when
 //!    one is configured.
-//! 4. [`daemons`] — the background reconcile/backup/GPU-calibration tasks.
+//! 4. [`daemons`] — the background reconcile/backup/GPU-calibration tasks,
+//!    registered in the Daemons registry (ROB-3), which supervises them and
+//!    stops them on its shared shutdown watch when serving ends.
 //! 5. [`serve`] — bind, print the banner, serve until shutdown.
 //!
 //! The shutdown signal handlers are installed before phase 2 (right after
@@ -135,16 +137,24 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	let auth = config::auth()?;
 	let state = state::build().await?.with_interpolate_config(interpolate).with_auth(auth);
 
-	daemons::spawn_reconcile_if_configured(&state)?;
-	daemons::spawn_backup_if_configured(&state)?;
+	// ROB-3: the Daemons registry owns every background task this process
+	// runs — supervised, and stopped on its shared shutdown watch (the
+	// watch D-S14's amendment shares with this registry) once serving ends.
+	let daemons = weft_server::Daemons::new();
+
+	daemons::spawn_reconcile_if_configured(&state, &daemons)?;
+	daemons::spawn_backup_if_configured(&state, &daemons)?;
 
 	let listener = serve::bind(addr, tls.is_some()).await?;
 	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
 
 	// After the bind and in the background, so serving never waits for it.
-	daemons::spawn_gpu_calibration_if_enabled();
+	daemons::spawn_gpu_calibration_if_enabled(&daemons);
 
 	serve::run(listener, state.clone(), otel_provider, limits, tls, &mut shutdown).await?;
+	// Serving is over: raise the registry's shutdown watch so no daemon
+	// outlives the server it maintains, and none restarts from here.
+	daemons.shutdown();
 	// Serving stopped cleanly (including a signal before serving, which exits 0
 	// without accepting a connection): record the clean shutdown, so the next
 	// open's `/ready` can report `previous_clean_shutdown: true` (D-S12). A
