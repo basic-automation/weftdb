@@ -223,7 +223,7 @@ impl Arm for IoTdb {
 		Ok(())
 	}
 
-	/// The database's TsFile bytes once flushed: `FLUSH` writes the memtable out, as the server
+	/// The database's `TsFile` bytes once flushed: `FLUSH` writes the memtable out, as the server
 	/// would on its own once it filled, and `information_schema.table_disk_usage` then reports the
 	/// table's files. Taken after the timed loads, so the flush is not in the load time.
 	fn storage_bytes(&self) -> Option<u64> {
