@@ -258,6 +258,10 @@ impl Arm for Influx {
 		ArmInfo { arm: "influxdb3-double".into(), engine: format!("influxdb3 {version}"), value_type: "float field".into(), method: "linear interpolation in SQL: generate_series() grid merged with the knots, running max/min of the knot instants joined back to their values, first/last segment extended; downsample via date_bin; line-protocol writes of at most 8 MiB sent concurrently, each answered once the WAL file is persisted (no_sync=false); SQL over HTTP read as Parquet, on loopback".into() }
 	}
 
+	fn unload(&mut self) {
+		self.db = None;
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;

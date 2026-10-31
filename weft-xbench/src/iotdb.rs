@@ -213,6 +213,10 @@ impl Arm for IoTdb {
 		ArmInfo { arm: "iotdb-double".into(), engine: format!("iotdb {version}"), value_type: "DOUBLE field".into(), method: format!("linear interpolation in SQL: lead() into segments, date_bin_gapfill() grid, ASOF LEFT JOIN from the grid, first/last segment extended; downsample via date_bin; table model, one device; insertTablet of {ROWS_PER_INSERT} rows in time order, answered once the WAL entry is synced (wal_mode=SYNC); table REST API (JSON) on loopback") }
 	}
 
+	fn unload(&mut self) {
+		self.db = None;
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;

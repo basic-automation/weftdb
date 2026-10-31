@@ -447,6 +447,8 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Refere
 
 	let mut load_samples = Vec::with_capacity(load_reps);
 	for _ in 0..if arm.loads() { load_reps } else { 1 } {
+		// Outside the clock: the previous rep's teardown is not part of this load.
+		arm.unload();
 		let t0 = Instant::now();
 		arm.load(ds).await?;
 		load_samples.push(span_ns(t0));
@@ -723,6 +725,41 @@ mod tests {
 		let buckets = arm.downsample(&plain, plain.points.clone()).await.expect("downsamples");
 		assert!(Correctness::check_buckets(&buckets, &reference.buckets).passed, "got {buckets:?}\nwant {:?}", reference.buckets);
 		assert!(arm.storage_bytes().is_some_and(|b| b > 0), "the flushed TsFiles are reported as storage");
+	}
+
+	/// An arm whose teardown is slow and whose load is instant: the in-memory reference with a
+	/// load phase, so its answers pass the gates.
+	struct SlowTeardown;
+
+	impl Arm for SlowTeardown {
+		fn info(&self) -> ArmInfo {
+			ArmInfo { arm: "slow-teardown".into(), ..weft::WeftMemory.info() }
+		}
+
+		fn unload(&mut self) {
+			std::thread::sleep(std::time::Duration::from_millis(200));
+		}
+
+		async fn load(&mut self, _ds: &Dataset) -> anyhow::Result<()> {
+			Ok(())
+		}
+
+		async fn interpolate(&mut self, ds: &Dataset, knots: Vec<splimes::Point>) -> anyhow::Result<Output> {
+			weft::WeftMemory.interpolate(ds, knots).await
+		}
+
+		async fn downsample(&mut self, ds: &Dataset, knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {
+			weft::WeftMemory.downsample(ds, knots).await
+		}
+	}
+
+	#[tokio::test]
+	async fn a_load_is_timed_without_the_previous_loads_teardown() {
+		let ds = edge_dataset();
+		let reference = reference_of(&ds).await;
+		let results = measure(&mut SlowTeardown, &ds, &reference, 3, 1, DEFAULT_SEED).await.expect("measures");
+		let load = results.iter().find(|r| r.phase == Phase::Load).expect("a load row");
+		assert!(load.latency.max_ns < 100_000_000, "a 200 ms teardown leaked into the load clock: {:?}", load.latency);
 	}
 
 	async fn reference_of(ds: &Dataset) -> Reference {

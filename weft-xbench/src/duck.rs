@@ -202,6 +202,10 @@ impl Arm for Duck {
 		ArmInfo { arm: arm.into(), engine: format!("duckdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: range() grid, two ASOF JOINs, first/last segment extended; downsample via GROUP BY on the epoch bucket; on-disk database{note}") }
 	}
 
+	fn unload(&mut self) {
+		self.db = None;
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;

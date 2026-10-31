@@ -4,6 +4,28 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-10-31 — Load timing excludes the previous load's teardown
+
+**Ambiguous:** `weft-xbench` times each load rep from the start of `Arm::load`, and every arm's
+`load` began by dropping what the previous rep stored (`self.db = None` / `self.stored = None`),
+whose `Drop` removes the server-side database or the store directory. Whether that teardown
+belongs to a load's time was never decided; it was simply inside the clock.
+
+**Chosen:** it does not. `Arm` has a required `unload`, which releases the previous load, and
+the runner calls it before starting each load's clock; a test with a 200 ms teardown pins it.
+Found when IoTDB's loads measured about 1.2 s on every dataset, tiny ones included, against
+0.2 s for the same load on a fresh server: its `DROP DATABASE` answers in 1.0 s. InfluxDB 3's
+1 s loads are its own (its write waits for the WAL flush; a drop takes under 1 ms), so #471's
+figures stand.
+
+**Consequence:** every load row measured before this, in the committed EVI-15 report and in the
+ClickHouse, TimescaleDB and QuestDB runs, includes the previous rep's teardown in reps 2 to 5,
+so in its median. Interpolation and downsample rows are unaffected. The EVI-15 report keeps its
+numbers with a note in its README; the combined cross-engine rerun supersedes them.
+
+**Rejected:** dropping at the end of each rep instead: the last load's data must stay loaded for
+the interpolation and downsample phases that follow it.
+
 ## 2026-10-31 — External engines V: how the Apache IoTDB arm is measured
 
 **Ambiguous:** IoTDB 2.0 has two data models (tree and table), native clients over Thrift only,
