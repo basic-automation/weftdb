@@ -1642,7 +1642,25 @@ impl SegmentStore {
 			store.commit_index(&IndexTxn::new(vec![IndexOp::MetaSet { key: "clean_shutdown".to_string(), value: "0".to_string() }])).await.context("recording that this open has not shut down cleanly yet")?;
 		}
 		// 14. Startup recovery, report-only exactly when the layout is newer.
-		store.fsck(newer).await.context("running startup recovery")?;
+		// A root carrying a restore intent marker (D-S16, C-7) is opened in
+		// restore mode instead: its orphans are adopted via describe_frame,
+		// and the marker is removed once that recovery completes, so the
+		// restore is a one-open event. A newer layout still only reports.
+		let intent = if newer { None } else { crate::read_restore_intent(&store.root).await.context("reading the restore intent marker")? };
+		match intent {
+			Some(_) => {
+				store.fsck_restore().await.context("running restore-mode recovery")?;
+				let marker = store.root.join(crate::RESTORE_INTENT_FILE);
+				if let Err(e) = store.fs.remove_file(&marker).await {
+					tracing::warn!(root = %store.root.display(), error = %e, "could not remove the restore intent marker after restore-mode recovery; the next open runs it again (adoption is idempotent: adopted frames have rows then)");
+				} else {
+					store.fs.sync_dir(&store.root).await.context("syncing the restore intent marker's removal")?;
+				}
+			}
+			None => {
+				store.fsck(newer).await.context("running startup recovery")?;
+			}
+		}
 		Ok(store)
 	}
 
@@ -1969,8 +1987,8 @@ impl SegmentStore {
 	}
 
 	/// Hold the reaper off every retired frame until the returned hold drops, as a backup
-	/// that links frames does (design section 9, B1-B4).
-	#[cfg_attr(not(test), expect(dead_code, reason = "the whole-store backup (S16) holds the reaper off while it links frames; until then only the tests do"))]
+	/// that links frames does (design section 9, B1-B4; used by the whole-store
+	/// backup in `build_backup`).
 	pub(crate) fn hold_reaper(&self) -> crate::types::reaper::GcHold<'_> {
 		self.reaper.epochs().hold()
 	}
@@ -2800,7 +2818,7 @@ impl SegmentStore {
 		let partial = base.join(crate::types::backup::staging_name(crate::PARTIAL_PREFIX, &label));
 		fs.create_dir(&partial).await.with_context(|| format!("creating backup build directory {}", partial.display()))?;
 
-		let [mut segment_index, mut metadata, mut aspect_catalog, mut registry] = match self.build_backup(fs, &partial, &dir, mode).await {
+		let ([mut segment_index, mut metadata, mut aspect_catalog, mut registry], _) = match self.build_backup(fs, &partial, &dir, mode, None).await {
 			Ok(reports) => reports,
 			Err(err) => {
 				// An error, unlike a crash, can clean up after itself. The build directory
@@ -2822,35 +2840,181 @@ impl SegmentStore {
 		Ok(ControlPlaneBackup { dir, segment_index, metadata, aspect_catalog, registry })
 	}
 
+	/// Take a **whole-store** backup (D-S16; design section 9, B1-B6): the
+	/// control plane of [`backup_control_plane`](SegmentStore::backup_control_plane)
+	/// plus every `.weftseg` frame its `segment_index.db` snapshot references,
+	/// hard-linked (or copied, per `mode` and what the filesystem allows) into
+	/// `dest_dir/segments/`, under a whole-store `MANIFEST.json` that also
+	/// embeds this store's `STORE_FORMAT` and its per-aspect allocators.
+	///
+	/// No ingest barrier: the reaper is held off by an RAII `gc_hold` from
+	/// before the first snapshot until the frames are linked, frames are
+	/// immutable, and swaps are single transactions, so the snapshot's frame
+	/// set is exactly the set linked. `segment_index.db` is vacuumed first —
+	/// it is the authority the frame set is read from.
+	///
+	/// The headroom a backup needs depends on `mode`
+	/// ([`check_backup_headroom`](crate::check_backup_headroom)): linked frames
+	/// cost no space, copied frames cost their bytes; where the destination's
+	/// free space can be read, the check runs before anything is built.
+	///
+	/// # Errors
+	///
+	/// As [`backup_control_plane`](SegmentStore::backup_control_plane), or the
+	/// headroom check, or a frame the snapshot references that cannot be read,
+	/// linked or copied.
+	pub async fn backup_store(&self, dest_dir: impl AsRef<Path>, mode: crate::BackupMode) -> Result<WholeStoreBackup> {
+		self.backup_store_via(&RealFs, dest_dir, crate::VerifyMode::SnapshotOnly, mode).await
+	}
+
+	/// [`backup_store`](SegmentStore::backup_store) through `fs`.
+	///
+	/// # Errors
+	///
+	/// As [`backup_store`](SegmentStore::backup_store).
+	pub async fn backup_store_via(&self, fs: &dyn StoreFs, dest_dir: impl AsRef<Path>, verify: crate::VerifyMode, mode: crate::BackupMode) -> Result<WholeStoreBackup> {
+		let dir = dest_dir.as_ref().to_path_buf();
+		let (base, label) = crate::types::backup::split_dir(&dir).with_context(|| format!("choosing where to build backup {}", dir.display()))?;
+		if fs.metadata(&dir).await.is_ok() {
+			bail!("backup destination {} already exists (a backup is published under a fresh name)", dir.display());
+		}
+		// The headroom check, before anything is built: the control plane is
+		// estimated from the live files, the frames from the live index (the
+		// snapshot taken under the gc-hold is authoritative for what is
+		// actually linked; the estimate only sizes the check).
+		let mut control_plane_bytes = 0u64;
+		for name in crate::CONTROL_PLANE_FILES {
+			if let Ok(meta) = fs.metadata(&self.root.join(name)).await {
+				control_plane_bytes = control_plane_bytes.saturating_add(meta.len);
+			}
+		}
+		let mut frame_bytes = 0u64;
+		for aspect in self.index.list_aspects().await? {
+			for row in self.index.rows(&aspect).await? {
+				frame_bytes = frame_bytes.saturating_add(row.desc.byte_len);
+			}
+		}
+		if let Some(free) = crate::free_bytes_at(&base) {
+			crate::check_backup_headroom(mode, control_plane_bytes, frame_bytes, free)?;
+		}
+		create_dir_all_durable(fs, &base).await.with_context(|| format!("creating backup base {}", base.display()))?;
+		let partial = base.join(crate::types::backup::staging_name(crate::PARTIAL_PREFIX, &label));
+		fs.create_dir(&partial).await.with_context(|| format!("creating backup build directory {}", partial.display()))?;
+		let (mut reports, whole) = match self.build_backup(fs, &partial, &dir, verify, Some(mode)).await {
+			Ok(pair) => pair,
+			Err(err) => {
+				if let Err(cleanup) = fs.remove_dir_all(&partial).await {
+					tracing::warn!(dir = %partial.display(), error = %cleanup, cause = %format!("{err:#}"), "could not remove a failed whole-store backup's build directory; the backup daemon's sweep removes it once stale, if the daemon is enabled");
+				}
+				return Err(err);
+			}
+		};
+		fault::hit(FaultPoint::BRenamed).await?;
+		fs.sync_dir(&base).await.with_context(|| format!("syncing backup base {}", base.display()))?;
+		for (report, name) in reports.iter_mut().zip(crate::CONTROL_PLANE_FILES) {
+			report.dest = dir.join(name);
+		}
+		let [segment_index, metadata, aspect_catalog, registry] = reports;
+		let (frames, linked_bytes, copied_bytes) = whole.expect("a whole-store build reports its frames");
+		Ok(WholeStoreBackup { dir, segment_index, metadata, aspect_catalog, registry, frames, linked_bytes, copied_bytes })
+	}
+
 	/// The steps of [`backup_control_plane_via`](SegmentStore::backup_control_plane_via)
 	/// from the freshly created build directory `partial` up to its rename to `dir`:
 	/// everything an error can still undo by removing `partial`. Returns the four
 	/// snapshots' reports in [`CONTROL_PLANE_FILES`](crate::CONTROL_PLANE_FILES) order,
 	/// still naming the files under `partial`.
-	async fn build_backup(&self, fs: &dyn StoreFs, partial: &Path, dir: &Path, mode: crate::VerifyMode) -> Result<[SnapshotReport; 4]> {
+	async fn build_backup(&self, fs: &dyn StoreFs, partial: &Path, dir: &Path, mode: crate::VerifyMode, whole: Option<crate::BackupMode>) -> Result<([SnapshotReport; 4], Option<(Vec<crate::ManifestFrame>, u64, u64)>)> {
 		fault::hit(FaultPoint::BPartialCreated).await?;
+		// B1 (whole-store only): hold the reaper off for the whole snapshot +
+		// link window. The hold is RAII: any return path releases it.
+		let gc_hold = whole.map(|_| self.hold_reaper());
 
+		// B2: segment_index.db first — it is the authority the frame set is
+		// read from — then the other three, declarations only grow.
 		let segment_index = snapshot_into(fs, 0, self.index.backup_to_with(&partial.join("segment_index.db"), mode)).await.context("backing up segment_index.db")?;
 		let metadata = snapshot_into(fs, 1, self.metadata.backup_to_with(&partial.join("metadata.db"), mode)).await.context("backing up metadata.db")?;
 		let aspect_catalog = snapshot_into(fs, 2, self.catalog.backup_to_with(&partial.join("aspect_catalog.db"), mode)).await.context("backing up aspect_catalog.db")?;
 		let registry = snapshot_into(fs, 3, self.registry.backup_to_with(&partial.join("catalog.db"), mode)).await.context("backing up catalog.db")?;
-		// A control-plane backup links no frames (the whole-store backup, S16, links them
-		// here); the point keeps the crash matrix's `B-*` sequence whole.
-		fault::hit(FaultPoint::BLinks).await?;
 
+		// B3 (whole-store only): open the snapshot copy and link or copy every
+		// frame it references into the build directory's segments/.
+		let mut whole_frames = None;
+		if let Some(backup_mode) = whole {
+			let snapshot_path = partial.join("segment_index.db");
+			let snapshot = crate::SegmentIndexStore::open_unmigrated(snapshot_path.to_str().with_context(|| format!("snapshot path {} is not UTF-8", snapshot_path.display()))?).await.context("opening the backup's segment_index snapshot")?;
+			let mut frames = Vec::new();
+			let mut allocators = Vec::new();
+			let mut linked_bytes = 0u64;
+			let mut copied_bytes = 0u64;
+			let segments_partial = partial.join("segments");
+			fs.create_dir(&segments_partial).await.with_context(|| format!("creating {}", segments_partial.display()))?;
+			for aspect in snapshot.list_aspects().await? {
+				let seed = snapshot.allocator_seed(&aspect).await?;
+				allocators.push(crate::ManifestAllocator { aspect: aspect.clone(), next_id: seed.next_id, next_gen: seed.next_gen, epoch: seed.epoch });
+				for row in snapshot.rows(&aspect).await? {
+					let Some(file_name) = Path::new(&row.desc.path).file_name().and_then(|name| name.to_str()).map(str::to_string) else { bail!("snapshot row for aspect {aspect:?} names a frame outside segments/: {:?}", row.desc.path) };
+					let src = contained_file(&self.root.join("segments"), &file_name)?;
+					let dest = segments_partial.join(&file_name);
+					if frames.iter().any(|frame: &crate::ManifestFrame| frame.name == file_name) {
+						continue;
+					}
+					let bytes = tokio::fs::read(&src).await.with_context(|| format!("reading frame {} for the backup", src.display()))?;
+					// The CRC the manifest binds: the row's, or the frame's own
+					// trailer for a legacy row (B5).
+					let trailer = bytes.len().checked_sub(4).map(|body| u32::from_le_bytes([bytes[body], bytes[body + 1], bytes[body + 2], bytes[body + 3]]));
+					let frame_crc = row.frame_crc.or(trailer);
+					let linked = match backup_mode {
+						crate::BackupMode::Copy => {
+							fs.copy_new(&src, &dest, SyncPolicy::Full).await.with_context(|| format!("copying frame {} into the backup", src.display()))?;
+							copied_bytes += bytes.len() as u64;
+							false
+						}
+						crate::BackupMode::Linked => match fs.hard_link(&src, &dest).await {
+							Ok(()) => {
+								linked_bytes += bytes.len() as u64;
+								true
+							}
+							// EXDEV (another filesystem) or any other link
+							// refusal: copy and sync instead (B3).
+							Err(_) => {
+								fs.copy_new(&src, &dest, SyncPolicy::Full).await.with_context(|| format!("copying frame {} into the backup after linking failed", src.display()))?;
+								copied_bytes += bytes.len() as u64;
+								false
+							}
+						},
+					};
+					frames.push(crate::ManifestFrame { name: file_name, bytes: bytes.len() as u64, frame_crc, linked });
+				}
+			}
+			drop(snapshot);
+			fs.sync_dir(&segments_partial).await.with_context(|| format!("syncing {}", segments_partial.display()))?;
+			whole_frames = Some((frames, allocators, linked_bytes, copied_bytes));
+		}
+		fault::hit(FaultPoint::BLinks).await?;
+		// B4: the gc-hold is released before the manifest is written.
+		drop(gc_hold);
+
+		// B5: the MANIFEST — DB files, frames, allocators, store_uuid (inside
+		// the embedded STORE_FORMAT for a whole-store backup). Then fsync.
 		let created_ms = u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()).unwrap_or(u64::MAX);
-		let manifest = crate::BackupManifest::new(created_ms, &[("segment_index.db", &segment_index), ("metadata.db", &metadata), ("aspect_catalog.db", &aspect_catalog), ("catalog.db", &registry)]);
+		let reports: [(&str, &SnapshotReport); 4] = [("segment_index.db", &segment_index), ("metadata.db", &metadata), ("aspect_catalog.db", &aspect_catalog), ("catalog.db", &registry)];
+		let (manifest, whole_out) = match whole_frames {
+			Some((frames, allocators, linked_bytes, copied_bytes)) => (crate::BackupManifest::whole_store(created_ms, &reports, frames.clone(), self.store_format(), allocators), Some((frames, linked_bytes, copied_bytes))),
+			None => (crate::BackupManifest::new(created_ms, &reports), None),
+		};
 		let manifest_bytes = serde_json::to_vec_pretty(&manifest).context("encoding the backup manifest")?;
 		fs.create_new_write(&partial.join(crate::BACKUP_MANIFEST), manifest_bytes, SyncPolicy::Full, WritePoints::NONE).await.context("writing the backup manifest")?;
 		fault::hit(FaultPoint::BManifest).await?;
 		fs.sync_dir(partial).await.with_context(|| format!("syncing backup build directory {}", partial.display()))?;
 
-		// Publish. The rename is the instant the backup appears under its label, whole.
+		// B6 / publish. The rename is the instant the backup appears under its
+		// label, whole.
 		if fs.metadata(dir).await.is_ok() {
 			bail!("backup destination {} appeared while the backup was being built", dir.display());
 		}
 		fs.rename(partial, dir).await.with_context(|| format!("publishing backup {} -> {}", partial.display(), dir.display()))?;
-		Ok([segment_index, metadata, aspect_catalog, registry])
+		Ok(([segment_index, metadata, aspect_catalog, registry], whole_out))
 	}
 
 	/// Declare `aspect`'s [`AspectSchema`] in this store's catalog, so later
@@ -4961,6 +5125,42 @@ impl SegmentStore {
 		Ok(())
 	}
 
+	/// Adopt one orphan frame in restore mode (R8): rebuild its descriptor
+	/// from the frame itself and insert its row under a fresh id above every
+	/// id the aspect's restored rows and allocator hold, seeding the
+	/// allocator past it in the same transaction. Returns the aspect, or
+	/// `None` when the frame's name names no aspect, the aspect has no
+	/// declared schema in this store's scope (its data has no home here), or
+	/// the frame holds no rows. The caller has already classified the frame
+	/// through `describe_frame`: decodable, no `SERIES_KEY` extension.
+	async fn adopt_orphan(&self, name: &str, bytes: &[u8]) -> Result<Option<String>> {
+		let (aspect, gen, prec) = match frame_name::parse(name) {
+			Some(parsed) => match parsed.aspect() {
+				Some(aspect) => (aspect, parsed.gen, Some(parsed.prec)),
+				None => return Ok(None),
+			},
+			None => match legacy_file_id(name) {
+				Some((aspect, _)) => (aspect.to_string(), 0, None),
+				None => return Ok(None),
+			},
+		};
+		if self.schema_for(&aspect).await?.is_none() {
+			return Ok(None);
+		}
+		let frame = frame_read::read_full(name, bytes)?;
+		if frame.descriptor(0, String::new(), 0).row_count == 0 {
+			return Ok(None);
+		}
+		let seed = self.index.allocator_seed(&aspect).await?;
+		let id = seed.next_id.unwrap_or(1).max(seed.max_id.map_or(1, |max| max + 1)).max(1);
+		let path = self.root.join("segments").join(name).to_string_lossy().into_owned();
+		let desc = frame.descriptor(id, path, bytes.len() as u64);
+		let trailer = bytes.len().checked_sub(4).map(|body| u32::from_le_bytes([bytes[body], bytes[body + 1], bytes[body + 2], bytes[body + 3]]));
+		let row = IndexRow { desc, gen, prec, frame_crc: trailer, commit_epoch: None, series_id: 0 };
+		self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.clone(), row }, IndexOp::SeqBump { aspect: aspect.clone(), next_id: id + 1, next_gen: gen + 1, epoch: seed.epoch }])).await?;
+		Ok(Some(aspect))
+	}
+
 	/// Startup recovery and the fsck pass, in one: classify every indexed frame
 	/// and every orphan under `segments/`, under the C5 policy.
 	///
@@ -5008,6 +5208,22 @@ impl SegmentStore {
 	/// every quarantine commits its record and its row delete together — but the
 	/// report is not stored, so `/ready` keeps reporting the previous pass.
 	pub async fn fsck(&self, report_only: bool) -> Result<RecoveryReport> {
+		self.fsck_inner(report_only, false).await
+	}
+
+	/// [`fsck`](Self::fsck) in restore mode (D-S16, design section 6 R8): the
+	/// pass a root carrying a restore intent marker gets at its first open.
+	/// Orphans are classified through
+	/// [`describe_frame`](weft_physical_type::describe_frame) (tags A3): a
+	/// decodable orphan is **adopted** — descriptor rebuilt from the frame,
+	/// fresh id above every restored id — and one carrying a `SERIES_KEY`
+	/// extension is journaled `held` until TAG-9, never adopted and never
+	/// reaped. Invalid orphans quarantine as in a normal pass.
+	async fn fsck_restore(&self) -> Result<RecoveryReport> {
+		self.fsck_inner(false, true).await
+	}
+
+	async fn fsck_inner(&self, report_only: bool, restore_mode: bool) -> Result<RecoveryReport> {
 		let segments_dir = self.root.join("segments");
 		let quarantine_dir = segments_dir.join("quarantine");
 		let mut report = RecoveryReport { report_only, ..RecoveryReport::default() };
@@ -5032,6 +5248,11 @@ impl SegmentStore {
 					report.skipped_outside_segments += 1;
 					continue;
 				};
+				// The name is claimed by a row whatever spelling its path
+				// uses, so the orphan pass below never treats a live frame
+				// as unclaimed — a restored root's rows name the old root's
+				// paths, and their frames are live, not orphans (D-S16).
+				live_names.insert(file_name.to_string());
 				if path != Path::new(&desc.path) {
 					// The row names its file through a different spelling (a
 					// symlinked parent, a redundant separator): recovery acts
@@ -5040,7 +5261,6 @@ impl SegmentStore {
 					report.skipped_outside_segments += 1;
 					continue;
 				}
-				live_names.insert(file_name.to_string());
 				let bytes = match tokio::fs::read(&path).await {
 					Ok(bytes) => bytes,
 					Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -5147,7 +5367,22 @@ impl SegmentStore {
 			}
 		}
 		// Orphans: files no row and no journal entry claims.
-		let entries = self.fs.read_dir(&segments_dir).await.with_context(|| format!("listing {}", segments_dir.display()))?;
+		let mut entries = self.fs.read_dir(&segments_dir).await.with_context(|| format!("listing {}", segments_dir.display()))?;
+		if restore_mode {
+			// R8's order: legacy-named orphans first, in id order; then
+			// write-once orphans in ascending (prec, gen) order, so
+			// happens-before is preserved among the adopted.
+			let key = |name: &str| -> (u8, u64, u64) {
+				if let Some((_, id)) = legacy_file_id(name) {
+					(0, id, 0)
+				} else if let Some(parsed) = frame_name::parse(name) {
+					(1, parsed.prec, parsed.gen)
+				} else {
+					(2, 0, 0)
+				}
+			};
+			entries.sort_by(|a, b| key(&a.name.to_string_lossy()).cmp(&key(&b.name.to_string_lossy())));
+		}
 		for entry in entries {
 			if entry.is_dir {
 				continue;
@@ -5162,6 +5397,28 @@ impl SegmentStore {
 				Err(_) => continue,
 			};
 			let Ok(bytes) = tokio::fs::read(&path).await else { continue };
+			if restore_mode && !report_only {
+				match weft_physical_type::describe_frame(&bytes) {
+					Ok(info) if info.extensions.iter().any(|ext| ext.id == weft_physical_type::EXT_SERIES_KEY) => {
+						let aspect = frame_name::parse(&name).and_then(|parsed| parsed.aspect()).or_else(|| legacy_file_id(&name).map(|(aspect, _)| aspect.to_string()));
+						if let Some(aspect) = aspect {
+							self.commit_index(&IndexTxn::new(vec![IndexOp::JournalHeld { aspect, name: name.clone(), created_ms: now_ms() }])).await?;
+							report.held += 1;
+						}
+						continue;
+					}
+					Ok(info) if info.decodable() => {
+						if let Some(aspect) = self.adopt_orphan(&name, &bytes).await? {
+							report.adopted += 1;
+							if !changed_aspects.contains(&aspect) {
+								changed_aspects.push(aspect);
+							}
+						}
+						continue;
+					}
+					_ => {}
+				}
+			}
 			if let Err(error) = frame_read::read_full(&name, &bytes) {
 				let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
 				let (class, newer) = match &source {
@@ -5436,6 +5693,28 @@ pub struct ControlPlaneBackup {
 	pub aspect_catalog: crate::SnapshotReport,
 	/// Verified snapshot of `catalog.db` (the database/subject registry).
 	pub registry: crate::SnapshotReport,
+}
+
+/// The outcome of a [`SegmentStore::backup_store`] run (D-S16): the control
+/// plane plus every frame it references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WholeStoreBackup {
+	/// The directory the backup was published under.
+	pub dir: PathBuf,
+	/// Verified snapshot of `segment_index.db`.
+	pub segment_index: crate::SnapshotReport,
+	/// Verified snapshot of `metadata.db`.
+	pub metadata: crate::SnapshotReport,
+	/// Verified snapshot of `aspect_catalog.db`.
+	pub aspect_catalog: crate::SnapshotReport,
+	/// Verified snapshot of `catalog.db`.
+	pub registry: crate::SnapshotReport,
+	/// The frames carried, as the manifest records them.
+	pub frames: Vec<crate::ManifestFrame>,
+	/// Bytes carried by hard links (no extra space while the store keeps them).
+	pub linked_bytes: u64,
+	/// Bytes carried by copies.
+	pub copied_bytes: u64,
 }
 
 impl ControlPlaneBackup {
@@ -5837,6 +6116,116 @@ mod tests {
 		assert_eq!(stats.segment_count, live_stats.segment_count, "same segment count as the live store");
 		assert_eq!(times, vec![0_i64, 10, 20], "the measurements read back through the restored control plane");
 		assert_eq!(values.into_iter().flatten().count(), 3, "every value materialized from the restored store");
+	}
+
+	/// D-S16: a whole-store backup links the frames its snapshot references,
+	/// its manifest embeds the store's STORE_FORMAT and allocators, a
+	/// control-plane restore refuses it, and `restore_store` round-trips it
+	/// into a fresh root that opens and reads — with the live root gone.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn whole_store_backup_links_frames_and_restores() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("whole");
+		let backup = store.backup_store(&backup_dir, crate::BackupMode::Linked).await.expect("whole-store backup");
+		assert_eq!(backup.frames.len(), 1, "one sealed frame is carried");
+		assert!(backup.frames[0].linked, "same-filesystem frames are linked");
+		assert_eq!(backup.linked_bytes, backup.frames[0].bytes);
+		assert_eq!(backup.copied_bytes, 0);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::MetadataExt;
+			let live = std::fs::metadata(root.join("segments").join(&backup.frames[0].name)).unwrap();
+			let linked = std::fs::metadata(backup_dir.join("segments").join(&backup.frames[0].name)).unwrap();
+			assert_eq!(live.ino(), linked.ino(), "a linked frame shares the store frame's inode");
+		}
+		let manifest = crate::BackupManifest::read(&backup_dir).await.expect("reads").expect("a manifest");
+		assert!(manifest.is_whole_store());
+		assert_eq!(manifest.store_format.as_ref().expect("embedded").store_uuid, store.store_uuid(), "the manifest embeds the store's STORE_FORMAT");
+		assert_eq!(manifest.allocators.len(), 1, "the aspect's allocator is recorded");
+		assert_eq!(manifest.frames.len(), 1);
+		let uuid = store.store_uuid().to_string();
+		drop(store);
+		// A control-plane restore refuses a whole-store backup.
+		let err = crate::restore_control_plane(&backup_dir, &dir.path().join("cp")).await.unwrap_err();
+		assert!(err.to_string().contains("whole-store"), "got: {err}");
+		// The whole-store restore, then the live root is gone (disk loss).
+		let restored_root = dir.path().join("restored");
+		let report = crate::restore_store(&backup_dir, &restored_root).await.expect("restores");
+		assert_eq!(report.frames, 1);
+		assert_eq!(report.intent.store_uuid, uuid);
+		assert!(restored_root.join(crate::RESTORE_INTENT_FILE).exists(), "the intent marker is published with the root (C-7)");
+		tokio::fs::remove_dir_all(&root).await.unwrap();
+		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		assert!(!restored_root.join(crate::RESTORE_INTENT_FILE).exists(), "the first open completes the restore and removes the intent marker");
+		let (times, values) = reopened.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads back");
+		assert_eq!(times, vec![0, 10, 20]);
+		assert_eq!(values.into_iter().flatten().map(|v| v.to_plain_string()).collect::<Vec<_>>(), vec!["1", "2", "3"]);
+		drop(reopened);
+	}
+
+	/// D-S16: a backup whose embedded STORE_FORMAT floor is newer than this
+	/// build is refused before anything is staged.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn whole_store_restore_refuses_a_newer_floor() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("whole");
+		store.backup_store(&backup_dir, crate::BackupMode::Copy).await.expect("whole-store backup");
+		drop(store);
+		let manifest_path = backup_dir.join(crate::BACKUP_MANIFEST);
+		let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+		json["store_format"]["min_write_layout"] = serde_json::json!(99);
+		std::fs::write(&manifest_path, serde_json::to_vec(&json).unwrap()).unwrap();
+		let err = crate::restore_store(&backup_dir, &dir.path().join("restored")).await.unwrap_err();
+		assert!(format!("{err:#}").contains("newer"), "got: {err:#}");
+		assert!(!dir.path().join("restored").exists(), "a refused restore publishes nothing");
+	}
+
+	/// D-S16, R8: at the restored root's first open, a post-backup orphan is
+	/// adopted via describe_frame under a fresh id, and an orphan carrying a
+	/// SERIES_KEY extension is journaled held instead — never adopted, never
+	/// reaped.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn restore_mode_adopts_orphans_and_holds_series_key_frames() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("whole");
+		store.backup_store(&backup_dir, crate::BackupMode::Linked).await.expect("whole-store backup");
+		drop(store);
+		let restored_root = dir.path().join("restored");
+		crate::restore_store(&backup_dir, &restored_root).await.expect("restores");
+		// Two post-backup frames appear beside the restored ones (the
+		// restore-beside-newer-frames case): one plain, one SERIES_KEY.
+		write_frame(&restored_root, "price", 7, &[(30, "4"), (40, "5")]);
+		let segment = schema().seal(&[50, 60], &[bd("6"), bd("7")]).expect("encodes");
+		let wrapped = weft_physical_type::wrap_frame_envelope(&segment.write_to(), &[weft_physical_type::FrameExtension { id: weft_physical_type::EXT_SERIES_KEY, critical: false, payload: b"price|a=1".to_vec() }]).expect("wraps");
+		std::fs::write(restored_root.join("segments").join("price-8.weftseg"), wrapped).unwrap();
+
+		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		let report = reopened.recovery_report();
+		assert_eq!(report.adopted, 1, "the plain orphan is adopted: {report:?}");
+		assert_eq!(report.held, 1, "the SERIES_KEY orphan is held: {report:?}");
+		let (times, _) = reopened.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		assert_eq!(times, vec![0, 10, 20, 30, 40], "the adopted frame's rows are readable; the held frame's are not served");
+		let journal = reopened.index().journal(None).await.expect("journal");
+		let held: Vec<_> = journal.iter().filter(|entry| entry.state == crate::types::reaper::JournalState::Held).collect();
+		assert_eq!(held.len(), 1);
+		assert_eq!(held[0].name, "price-8.weftseg");
+		assert!(restored_root.join("segments").join("price-8.weftseg").exists(), "a held frame stays on disk");
+		drop(reopened);
+		// A second open keeps the held frame and its journal row.
+		let reopened = SegmentStore::open(&restored_root).await.expect("reopens");
+		let journal = reopened.index().journal(None).await.expect("journal");
+		assert_eq!(journal.iter().filter(|entry| entry.state == crate::types::reaper::JournalState::Held).count(), 1, "held survives the journal replay");
+		assert!(restored_root.join("segments").join("price-8.weftseg").exists());
+		drop(reopened);
 	}
 
 	#[tokio::test]

@@ -142,7 +142,7 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
   - [x] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
   - [ ] **S14** HTTP ingest wiring
   - [ ] **S15** Partial sidecar v4
-  - [ ] **S16** Whole-store backup with hard-linked frames
+  - [x] **S16** Whole-store backup with hard-linked frames
   - [ ] **S17** Relaxed durability mode with synced_epoch watermark (optional for 1.0) *(~6 h; after S12)*
   - [ ] **S19** Seal-backed legacy aspects
   - [ ] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*

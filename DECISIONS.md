@@ -2370,3 +2370,47 @@ and the pre-v2 test counted 3 migrations while asserting 4 (now 4).
 `process-crash-only` on Windows, where directory fsync is a no-op — so the
 expectation is now `cfg!(windows)`-gated. No production code changed; this is
 the Windows-only test-expectation class the Linux bar cannot catch.
+
+## 2026-10-31 — D-S16 whole-store backup shapes — FLAGGED FOR MERGE REVIEW
+
+**Ambiguous:** plan §5's D-S16 amendment is seven clauses with no shapes: the
+manifest's new fields, the `SERIES_KEY` extension's number (the frame
+registry shipped empty), and the restore intent marker's name and contents
+(the crash design calls the in-place marker `RESTORED`; plan C19/C-7 only
+says "restore intent marker written first").
+
+**Chosen:**
+1. **Manifest.** `BackupManifest` gains `frames`, `store_format` and
+   `allocators` (serde-defaulted, so control-plane manifests are unchanged),
+   and whole-store backups write the new format string
+   `weftdb-whole-store-backup/1` — the shape backup.rs already prefigured
+   ("a backup a newer release writes (with frames, S16) is never restored as
+   if it were control plane only"). A control-plane restore refuses the new
+   format; a whole-store restore refuses the old.
+2. **SERIES_KEY = extension 1**, registered in `KNOWN_EXTENSIONS` with the
+   payload defined as the canonical series-key bytes. Frames carrying it are
+   journaled `held` (a new `frame_journal` state and `IndexOp::JournalHeld`;
+   the reaper and the open's replay skip held rows entirely) until TAG-9.
+3. **Intent marker.** Named `RESTORE_INTENT`, JSON
+   `{format, store_uuid, backup_created_ms, restore_started_ms}`: written
+   first into the restore staging directory, published with the root,
+   removed by the first open once restore-mode recovery completes.
+4. **Link fallback.** B3 says copy on EXDEV; any `hard_link` error falls
+   back to copy + `sync_all`, and the manifest records which happened per
+   frame (`linked`), since a backup that silently copied is still correct
+   and one that silently failed to link is not a space surprise either way.
+5. **Headroom.** `check_backup_headroom(mode, …)`: Linked needs only the
+   control plane's bytes, Copy needs the whole store. Free space is read by
+   `statvfs` on Unix (`libc` promoted from a unix dev-dependency to a unix
+   dependency); where it cannot be read, the check is skipped rather than
+   faked.
+6. **Adoption scope.** Restore-mode adoption (R8, via `describe_frame`)
+   requires the aspect to have a declared schema in the restored store's
+   scope; an orphan whose aspect is undeclared is left in place, neither
+   adopted nor quarantined.
+
+**Not in this slice:** `restore_in_place` (the design's second restore
+shape) and the `weft-server restore` CLI — plan C19 assigns the one CLI to
+PAC-13 (W7), and the queue's D-S16 acceptance names backup, adoption,
+`held`, the intent marker, the embedded format, the floor refusal, the RAII
+hold and the headroom check, not the in-place shape.

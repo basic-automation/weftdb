@@ -111,6 +111,16 @@ impl FullFrame {
 			Self::Paged(segment) => segment.decode_nullable(),
 		}
 	}
+
+	/// The descriptor this frame describes itself with (R8 adoption rebuilds
+	/// an index row from the frame, not from anything that claims to speak
+	/// for it).
+	pub(crate) fn descriptor(&self, id: u64, path: String, byte_len: u64) -> weft_physical_type::SegmentDescriptor {
+		match self {
+			Self::SingleBlock(segment) => weft_physical_type::SegmentDescriptor::of_segment(id, path, byte_len, segment),
+			Self::Paged(segment) => weft_physical_type::SegmentDescriptor::of_paged_segment(id, path, byte_len, segment),
+		}
+	}
 }
 
 /// Turns a decoder failure into the chain the store has always returned, with the typed
