@@ -18,7 +18,7 @@
 //!   value outside the domain is refused before its plain form is
 //!   materialised — the digit count is arithmetic, never an allocation the
 //!   value's exponent names. The fingerprint covers the groups' canonical
-//!   series key, the row count, and every timestamp and value in order, so
+//!   series key, the paged shape when one is set, the row count, and every timestamp and value in order, so
 //!   two batches with the same fingerprint are the same batch for the
 //!   ledger's purposes, and any difference — a moved timestamp, a changed
 //!   digit, a null where a value stood — is a different batch.
@@ -104,6 +104,13 @@ pub struct IngestBatch {
 	/// flips only the empty set is accepted — series 0 — and a non-empty set
 	/// is refused with [`GroupsUnsupported`](StoreError::GroupsUnsupported).
 	pub groups: TagSet,
+	/// The page height the batch's segments seal with, when the caller asked
+	/// for paged frames (crash-consistency §8: the HTTP layer's
+	/// `rows_per_page` travels on the batch, D-S14). `None` seals
+	/// single-block frames, as every pre-D-S14 batch did. A paged batch and
+	/// the same rows unpaged are different batches to the ledger: the shape
+	/// is part of what a replay must reproduce.
+	pub rows_per_page: Option<usize>,
 	/// The rows' timestamps, in the order offered. A batch is sealed in the
 	/// order given; rows are never reordered by ingest.
 	pub timestamps: Vec<i64>,
@@ -117,7 +124,7 @@ impl IngestBatch {
 	/// A batch of nullable rows under `key`, in the empty group.
 	#[must_use]
 	pub fn new(key: impl Into<String>, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Self {
-		Self { key: key.into(), groups: TagSet::new(), timestamps, values }
+		Self { key: key.into(), groups: TagSet::new(), rows_per_page: None, timestamps, values }
 	}
 
 	/// A batch of dense rows under `key`, in the empty group.
@@ -131,6 +138,14 @@ impl IngestBatch {
 	#[must_use]
 	pub fn with_groups(mut self, groups: TagSet) -> Self {
 		self.groups = groups;
+		self
+	}
+
+	/// The same batch sealing into paged frames of `rows_per_page` rows
+	/// (D-S14; see [`rows_per_page`](Self::rows_per_page)).
+	#[must_use]
+	pub const fn with_rows_per_page(mut self, rows_per_page: Option<usize>) -> Self {
+		self.rows_per_page = rows_per_page;
 		self
 	}
 
@@ -156,6 +171,14 @@ impl IngestBatch {
 	pub fn fingerprint(&self) -> Result<i64, StoreError> {
 		let mut hash = Fnv1a::new();
 		hash.bytes(self.groups.series_key().as_bytes());
+		// The paged shape is part of the batch (crash-consistency §5.2's
+		// fingerprint names `rows_per_page`). Fed only when set, so an
+		// unpaged batch fingerprints exactly as it did before D-S14 — a
+		// ledger row a pre-D-S14 build recorded still replays.
+		if let Some(rows_per_page) = self.rows_per_page {
+			hash.byte(2);
+			hash.u64(u64::try_from(rows_per_page).unwrap_or(u64::MAX));
+		}
 		hash.u64(u64::try_from(self.timestamps.len()).unwrap_or(u64::MAX));
 		for (timestamp, value) in self.timestamps.iter().zip(&self.values) {
 			hash.i64(*timestamp);
@@ -317,6 +340,9 @@ mod tests {
 		assert_ne!(batch.fingerprint().unwrap(), IngestBatch::dense("k", vec![10, 0, 20], vec![bd("2.5"), bd("1"), bd("-3")]).fingerprint().unwrap(), "a reordering");
 		let grouped = batch.clone().with_groups(TagSet::from_pairs([("host", "a")]).expect("valid tags"));
 		assert_ne!(batch.fingerprint().unwrap(), grouped.fingerprint().unwrap(), "different groups");
+		let paged = batch.clone().with_rows_per_page(Some(2));
+		assert_ne!(batch.fingerprint().unwrap(), paged.fingerprint().unwrap(), "a paged shape is a different batch (D-S14)");
+		assert_eq!(paged.fingerprint().unwrap(), IngestBatch::dense("k", vec![0, 10, 20], vec![bd("1"), bd("2.5"), bd("-3")]).with_rows_per_page(Some(2)).fingerprint().unwrap(), "the same paged batch fingerprints the same");
 	}
 
 	#[test]

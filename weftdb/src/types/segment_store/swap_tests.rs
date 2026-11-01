@@ -914,7 +914,7 @@ async fn swapped_outputs_get_fresh_sidecars_and_leave_no_temporary_file() {
 	let suffix = store.split_segment(ASPECT, id, SPLIT_AT).await.expect("splits").expect("a real split");
 	let mut matched = Vec::new();
 	for descriptor in store.index().all(ASPECT).await.expect("reads") {
-		matched.push((descriptor.id, store.load_partial_sidecar(ASPECT, &descriptor).await.expect("reads the sidecar").is_some_and(|sidecar| sidecar.matches(&descriptor))));
+		matched.push((descriptor.id, store.load_partial_sidecar(ASPECT, &descriptor, None).await.expect("reads the sidecar").is_some_and(|sidecar| sidecar.matches(&descriptor, None))));
 	}
 	drop(store);
 	let mut names: Vec<String> = std::fs::read_dir(dir.path().join("segments")).expect("lists").map(|e| e.expect("entry").file_name().to_string_lossy().into_owned()).collect();
@@ -1414,7 +1414,7 @@ async fn a_merge_leaves_a_fresh_sidecar_for_its_output_and_none_for_the_members_
 	let before: Vec<String> = std::fs::read_dir(dir.path().join("segments")).expect("lists").map(|e| e.expect("entry").file_name().to_string_lossy().into_owned()).filter(|name| name.ends_with(".weftpart")).collect();
 	assert_eq!(store.squash_aspect(ASPECT).await.expect("squashes"), 2);
 	let descriptor = store.index().all(ASPECT).await.expect("reads").pop().expect("the output");
-	let matched = store.load_partial_sidecar(ASPECT, &descriptor).await.expect("reads the sidecar").is_some_and(|sidecar| sidecar.matches(&descriptor));
+	let matched = store.load_partial_sidecar(ASPECT, &descriptor, None).await.expect("reads the sidecar").is_some_and(|sidecar| sidecar.matches(&descriptor, None));
 	drop(store);
 	let mut names: Vec<String> = std::fs::read_dir(dir.path().join("segments")).expect("lists").map(|e| e.expect("entry").file_name().to_string_lossy().into_owned()).collect();
 	names.sort();

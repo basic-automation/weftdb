@@ -284,6 +284,23 @@ impl Inputs for Database {
 	/// - if aspect not found
 	/// - if unable to insert measurement into database
 	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
+		// Seal-backed aspects (slice D-S19): a one-row ingest through the
+		// seal store, followed by the store's O(1) fragmentation gate. The
+		// queue enqueue keeps the S18 write-ahead shape until D-S20.
+		if self.is_seal_backed(aspect_id).await? {
+			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
+			let data_timestamp = measurement.timestamp();
+			self.enqueue_retrying(aspect_id, &[data_timestamp]).await?;
+			let rows = vec![(data_timestamp.timestamp_millis(), measurement.value().clone())];
+			let store = self.seal_store().await?;
+			let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
+			self.forget_cached_earliest_measurement(aspect_id).await;
+			self.requeue_committed(aspect_id, &[data_timestamp]).await;
+			if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&crate::legacy_seal::aspect_key(aspect_id), crate::legacy_seal::SQUASH_TARGET_ROWS).await {
+				tracing::debug!("Failed to run the fragmentation gate after capturing a measurement of aspect {aspect_id}; it is sealed: {e}");
+			}
+			return Ok(tx_ids.into_iter().next().unwrap_or_default());
+		}
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let tx_id = TxId::new();
@@ -400,6 +417,26 @@ impl Inputs for Database {
 	async fn batch_capture_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
 		if input_measurements.is_empty() {
 			return Ok(Vec::new());
+		}
+
+		// Seal-backed aspects (slice D-S19): the whole call is one ingest
+		// transaction in the seal store under its derived key, so it is
+		// all-or-nothing and a retry replays it. The queue enqueue keeps
+		// the S18 write-ahead shape until D-S20 replaces the queue.
+		if self.is_seal_backed(&aspect_id).await? {
+			let min_new = input_measurements.iter().map(InputMeasurement::timestamp).min().unwrap();
+			let max_new = input_measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
+			let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
+			self.enqueue_retrying(&aspect_id, &all_timestamps).await?;
+			let rows: Vec<(i64, bigdecimal::BigDecimal)> = input_measurements.iter().map(|m| (m.timestamp().timestamp_millis(), m.value().clone())).collect();
+			let store = self.seal_store().await?;
+			let tx_ids = crate::legacy_seal::ingest_batch(&store, &aspect_id, &dataset_id, &rows).await?;
+			self.forget_cached_earliest_measurement(&aspect_id).await;
+			self.requeue_committed(&aspect_id, &all_timestamps).await;
+			if let Err(e) = self.update_aspect_timestamps(&aspect_id, min_new, max_new).await {
+				tracing::warn!("[batch_capture] Failed to update aspect timestamps for {aspect_id}; the measurements are sealed: {e}");
+			}
+			return Ok(tx_ids);
 		}
 
 		// Compute min/max upfront

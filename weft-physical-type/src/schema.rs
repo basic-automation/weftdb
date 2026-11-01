@@ -112,6 +112,33 @@ impl std::error::Error for SealError {
 	}
 }
 
+/// The value encoding an aspect must widen to for `values`, given the encoding
+/// it is declared under today (1.0 plan §5, D-S19/D-S20: widening goes through
+/// FRE-7b's `widen_value_encoding`).
+///
+/// Widening is one-way and lossless-only: if every value encodes under
+/// `current` exactly (within a zero tolerance — this helper is for aspects
+/// that declared zero tolerance, as the legacy seal adapter does), `current`
+/// is returned unchanged. If any value is unrepresentable under `current` or
+/// would lose precision there, the aspect widens to
+/// [`PhysicalType::BigDecimalText`], the one encoding that reconstructs every
+/// finite value exactly. Frames sealed under the old encoding self-describe,
+/// so widening the declaration changes only later frames; nothing already
+/// sealed is rewritten or silently downcast.
+#[must_use]
+pub fn widen_value_encoding(current: PhysicalType, values: &[BigDecimal]) -> PhysicalType {
+	if matches!(current, PhysicalType::BigDecimalText) {
+		return current;
+	}
+	for value in values {
+		match current.encode(value) {
+			Ok(encoded) if encoded.exactness.is_exact() => {}
+			_ => return PhysicalType::BigDecimalText,
+		}
+	}
+	current
+}
+
 impl AspectSchema {
 	/// Declare an aspect's storage: the physical value encoding, the per-value error
 	/// bound it must honour, and the timestamp resolution.
@@ -670,6 +697,17 @@ mod tests {
 			SealError::Encode(e) => assert_eq!(e.index, 5, "global row past the page's null and the prior page"),
 			other => panic!("expected Encode, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn widen_value_encoding_keeps_exact_and_widens_lossy() {
+		let exact = col(&["1.5", "-2", "123456789012345678901234.567890"]);
+		assert_eq!(widen_value_encoding(PhysicalType::Decimal128, &exact), PhysicalType::Decimal128, "values that fit Decimal128 exactly do not widen");
+		// 50 significant digits cannot fit Decimal128's i128 mantissa exactly.
+		let lossy = col(&["12345678901234567890123456789012345678901234567890"]);
+		assert_eq!(widen_value_encoding(PhysicalType::Decimal128, &lossy), PhysicalType::BigDecimalText, "a lossy value widens to the lossless text encoding");
+		assert_eq!(widen_value_encoding(PhysicalType::BigDecimalText, &lossy), PhysicalType::BigDecimalText, "text never narrows");
+		assert_eq!(widen_value_encoding(PhysicalType::Decimal128, &[]), PhysicalType::Decimal128, "an empty batch widens nothing");
 	}
 
 	#[test]
