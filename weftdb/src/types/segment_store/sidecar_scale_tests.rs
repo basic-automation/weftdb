@@ -7,15 +7,15 @@
 
 use std::str::FromStr;
 
-use bigdecimal::{num_bigint::BigInt, BigDecimal, Zero};
+use bigdecimal::{num_bigint::BigInt, BigDecimal};
 use chrono::DateTime;
 use splimes::{Point, Resolution};
 use tempfile::TempDir;
 use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType, SegmentDescriptor};
-use weft_reduce::{reduce, reduce_partial, Bucket};
+use weft_reduce::{reduce, Bucket};
 
 use super::SegmentStore;
-use crate::{PartialSidecar, PartialSidecarPolicy, SIDECAR_AGGREGATIONS};
+use crate::{PartialSidecarPolicy, SIDECAR_AGGREGATIONS};
 
 const ASPECT: &str = "flow";
 
@@ -102,7 +102,7 @@ async fn fixture(dir: &TempDir, physical: PhysicalType, scale: i64) -> (SegmentS
 		descriptors.push(store.seal(ASPECT, &schema, &ts, &vs).await.expect("seals"));
 	}
 	for descriptor in &descriptors {
-		assert!(store.load_partial_sidecar(ASPECT, descriptor).await.expect("loads").is_some(), "segment {} has a sidecar", descriptor.id);
+		assert!(store.load_partial_sidecar(ASPECT, descriptor, None).await.expect("loads").is_some(), "segment {} has a sidecar", descriptor.id);
 	}
 	let expected = decode_then_reduce(&store).await;
 	// The fixture has zeros to lose: at least one zero in each streaming reduction. (A sum
@@ -131,27 +131,6 @@ async fn sidecar_served_downsample_keeps_the_column_scale() {
 		assert_matches(&store, &expected, &format!("scale {scale}, frames present")).await;
 		remove_frames(&descriptors);
 		assert_matches(&store, &expected, &format!("scale {scale}, sidecars only")).await;
-	}
-}
-
-/// Sidecars written before the fix stored every zero as `"0"`, which reads back at
-/// exponent 0. Loading one for a fixed-scale segment restores the segment's scale, so
-/// those sidecars serve the same answer as new ones.
-#[tokio::test]
-async fn sidecars_with_unscaled_zeros_are_served_at_the_column_scale() {
-	for scale in [3, 4, 6] {
-		let dir = TempDir::new().expect("tempdir");
-		let (store, descriptors, expected) = fixture(&dir, PhysicalType::ScaledI64 { scale }, i64::from(scale)).await;
-		// Rewrite each sidecar as an older version read it back: every zero at exponent 0.
-		for (seg, descriptor) in SEGMENTS.iter().zip(&descriptors) {
-			let (ts, vs) = rows(seg, i64::from(scale));
-			let points: Vec<Point> = ts.iter().zip(vs).map(|(t, v)| Point::new(DateTime::from_timestamp(*t, 0).expect("instant"), if v.is_zero() { BigDecimal::from(0) } else { v })).collect();
-			let partial = reduce_partial(&points, BASE, None, None, &SIDECAR_AGGREGATIONS).expect("reduces");
-			let sidecar = PartialSidecar::materialize(BASE, descriptor, partial, &TIERS).expect("materializes");
-			std::fs::write(store.sidecar_path_for_frame(&descriptor.path).expect("path"), sidecar.to_bytes().expect("encodes")).expect("writes the sidecar");
-		}
-		remove_frames(&descriptors);
-		assert_matches(&store, &expected, &format!("scale {scale}, unscaled sidecars")).await;
 	}
 }
 

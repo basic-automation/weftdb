@@ -70,6 +70,11 @@ pub(crate) enum JournalState {
 	Pending,
 	/// A frame a committed swap took out of the index, awaiting the reaper.
 	Retired,
+	/// A frame held out of every reclaim path until a later slice releases it
+	/// (D-S16: a restored frame carrying a `SERIES_KEY` extension, held until
+	/// TAG-9 binds series keys). The reaper never unlinks it and never drops
+	/// its journal row.
+	Held,
 }
 
 impl JournalState {
@@ -82,6 +87,7 @@ impl JournalState {
 		match state {
 			"pending" => Ok(Self::Pending),
 			"retired" => Ok(Self::Retired),
+			"held" => Ok(Self::Held),
 			other => anyhow::bail!("unknown frame_journal state {other:?}"),
 		}
 	}
@@ -346,6 +352,11 @@ impl Reaper {
 		let none = LiveFrames::default();
 		let mut swept = Swept::default();
 		for entry in entries {
+			if entry.state == JournalState::Held {
+				// Held frames are out of the reclaim protocol entirely: not
+				// unlinked, not processed, their journal row stays (D-S16).
+				continue;
+			}
 			let retired = entry.state == JournalState::Retired;
 			if retired && respect_pins && !self.epochs.reclaimable(&entry.name) {
 				swept.waiting += 1;
@@ -528,6 +539,7 @@ mod tests {
 	use weft_physical_type::{timestamp::TimeUnit, Segment, SegmentDescriptor};
 
 	use super::*;
+	use crate::durable::RealFs;
 
 	/// A live row of `aspect`'s segment `id` whose frame is `segments/{name}`.
 	fn live_row(segments: &std::path::Path, id: u64, name: &str) -> IndexRow {
@@ -639,6 +651,21 @@ mod tests {
 		assert!(epochs.reclaimable("old"));
 	}
 
+	/// D-S16: a held journal entry is out of the reclaim protocol — the sweep
+	/// neither unlinks its frame nor processes its row.
+	#[tokio::test]
+	async fn a_held_frame_is_never_swept() {
+		let dir = tempfile::tempdir().unwrap();
+		let segments = dir.path().join("segments");
+		std::fs::create_dir_all(&segments).unwrap();
+		std::fs::write(segments.join("price-8.weftseg"), b"held").unwrap();
+		let reaper = Reaper::new(std::sync::Arc::new(RealFs), segments.clone());
+		let entries = [entry("price-8.weftseg", JournalState::Held)];
+		let swept = reaper.sweep(&entries, &HashMap::new(), true).await;
+		assert!(swept.processed.is_empty() && swept.unlinked == 0, "held entries are skipped whole: {swept:?}");
+		assert!(segments.join("price-8.weftseg").exists(), "the held frame stays on disk");
+	}
+
 	/// The release plan's D-S8 amendment: a pin is RAII, so a read future that a timeout
 	/// drops half way releases its pin, and the frames it protected become reclaimable.
 	#[tokio::test]
@@ -704,6 +731,7 @@ mod tests {
 	fn journal_states_parse() {
 		assert_eq!(JournalState::parse("pending").unwrap(), JournalState::Pending);
 		assert_eq!(JournalState::parse("retired").unwrap(), JournalState::Retired);
-		assert!(JournalState::parse("held").is_err());
+		assert_eq!(JournalState::parse("held").unwrap(), JournalState::Held);
+		assert!(JournalState::parse("bogus").is_err());
 	}
 }

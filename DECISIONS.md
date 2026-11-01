@@ -4,6 +4,40 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — D-S15: what the v4 sidecar reader checks, and what went with the v3 reader (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the crash-consistency design (§4) fixes the v4 shape — magic last byte `0x03`, a
+CRC-32 trailer over magic and body, the stamp widened to `(row_count, byte_len, frame_crc)`, v3
+files failing the magic check and treated as absent — and the 1.0 plan's §5 amendment adds only
+that the reader sits under `DecodeLimits` and that v4 goldens join FRE-3's set. Three points the
+sources do not pin, chosen here:
+
+1. **Where `DecodeLimits` bites.** The trailer is verified before the postcard decode, so a torn
+   or zero-filled file never reaches the decoder. The decoded claims are then refused past the
+   limits: the stamp's row count past `max_rows`, any materialized grid holding more buckets than
+   the segment has rows (a bucket is a non-empty cell, so the segment itself refutes the claim)
+   or past `max_rows`, and a rollup chain past `MAX_SIDECAR_TIERS`, the most a writer produces.
+   `PartialSidecar::from_bytes` uses `DecodeLimits::DEFAULT`; `from_bytes_with_limits` is the
+   override form ROB-8's entry anticipated. Rejected: parsing postcard's varint length prefixes
+   by hand to refuse before allocation — the format's own structure (each grid entry consumes
+   body bytes) plus the CRC-first order bounds what a damaged file can make the reader do, and a
+   hand-rolled pre-parser would be a second decoder to keep in sync.
+2. **An unbound CRC does not refuse a sidecar.** `matches` takes the index row's `frame_crc` as
+   an `Option`: legacy rows carry NULL until a backup/scrub binds it (design §4), and for those
+   the `(row_count, byte_len)` pair alone decides, exactly as v3 did. Every frame this build
+   writes has its CRC bound at commit, so the widened stamp guards every sidecar v4 writes.
+3. **The v3 zero-rescale goes with the v3 reader.** `PartialSidecar::rescale_zeros_to` and
+   `weft_reduce`'s `rescale_zeros` existed only to read 0.1.0-era v3 files whose zeros lost the
+   column's scale; the weft-reduce doc already said the helper "goes with the v3 reader". Both
+   are removed, and the scale test that simulated a pre-fix file by hand-rewriting one
+   (`sidecars_with_unscaled_zeros_are_served_at_the_column_scale`) is retired with them: its
+   subject is a file v4 treats as absent. Scale preservation for v4-written sidecars is still
+   pinned by the remaining scale tests, whose sidecars the current serializer writes.
+
+**Goldens:** `sidecar_v4_hours.bin` and `sidecar_v4_minutes_tiered.bin` join FRE-3's set in
+`weftdb/tests/golden/`; the v3 pair stays committed as negative fixtures the v4 reader must
+refuse.
+
 ## 2026-10-31 — What "OS-cold and post-restart runs" measure, and how (#146)
 
 **Ambiguous:** the roadmap line is a heading with nothing under it. `weft-bench` already splits the
@@ -197,6 +231,78 @@ storage, were not settled.
 - Flight SQL: it adds `arrow-flight` and tonic to the crate for the same Arrow batches the Parquet
   answer carries.
 - A scaled-integer "decimal" arm: not something an InfluxDB user stores.
+## 2026-10-31 — SOA-6: the oracle judges read-backs exactly, and its verdict lives on the run record (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W4) lists SOA-6 by name only — "Soak oracle
+core" — and the queue recorded its open question plainly: the oracle's verdict
+semantics (what it checks; pass/fail thresholds — cf. SOA-2's refusal to invent
+thresholds) are unspecified. What the sources do fix: SOA-4's workload is a
+pure function of the config seed, so expected values are regenerable exactly;
+SOA-5's DECISIONS entry assigns reads to "the oracle and the derived-read
+checks (SOA-6, SOA-10), which are what make a read result verifiable at all",
+and names the duplicated seal as the failure that "would surface much later
+as an oracle mismatch"; SOA-7 (W5) is "Window digests and the oracle
+self-test", so digests and the self-test follow this slice rather than being
+part of it; and §3 says EVI-3 owns the shared run metadata while SOA keeps
+its own `soak_schema_version`. The queue's acceptance fixes two outcomes: the
+oracle judges a run's results against expected values, and its verdict is
+recorded in run metadata.
+
+**Chosen (grounded in SOA-4's model, SOA-5's seam, and §3's ownership rules;
+if merge review disagrees, this decision is revisited there):**
+
+1. **Library module, no read client, no CLI flag**: `weft-bench/src/soak_oracle.rs`,
+   exported from the crate, on the SOA-5 precedent (the slices that own how a
+   soak is launched are later ones). The caller supplies `ObservedPoint`s from
+   whatever read path it used; the oracle performs no read itself. The
+   endpoint-level derived-read checks are SOA-10's, not this core's.
+2. **Exact comparison, classified.** Each observation names its tick's grid
+   cell by (series, row); the oracle regenerates that tick's grid from the
+   model and compares value, timestamp, and presence for equality. The
+   workload is format-exact (SOA-4) and its numeric values are exact in the
+   `f64` the server seals (SOA-5), so no tolerance exists to invent. A
+   difference is one of `Missing`, `Unexpected`, `WrongValue`,
+   `WrongTimestamp` (checked before the value: a point at the wrong instant
+   is a different point), or `Duplicate` (a cell observed twice in one tick —
+   the duplicated seal of SOA-5 point 6, surfaced here by construction).
+3. **Pass is zero mismatches, not a threshold.** The verdict counts what was
+   judged (ticks, cells checked, cells present, points observed) and lists
+   mismatches with both sides of each comparison; `passed()` is
+   `mismatch_count == 0`. No rate, tolerance, or latency bound is introduced
+   — latency verdicts are SOA-13's SLO evaluator, and SOA-2/SOA-3's refusal
+   to invent pass/fail numbers governs here. A verdict that judged nothing
+   passes vacuously, so publishers check `ticks_judged` beside it (the
+   SOA-12 skipped-check rule).
+4. **The mismatch list is capped, the count is not.** `MAX_REPORTED_MISMATCHES
+   = 1024` bounds the artifact a broken run produces (a lost segment in a
+   24 h run could otherwise mint a mismatch per point for hours); the total
+   always lands in `mismatch_count`, and `truncated()` says when the list
+   was cut.
+5. **The verdict is recorded on the run record, and the soak schema takes
+   v2.** `SoakRun.oracle: Option<OracleVerdict>` (`#[serde(default)]`,
+   skipped when absent, so v1 artifacts still deserialize) is set exactly
+   once by `SoakHarness::record_oracle_verdict`, only while `Running` — a
+   verdict that can be quietly replaced is not evidence. Adding a field to
+   the record bumps `SOAK_SCHEMA_VERSION` 1 → 2 per SOA-1's bump rule, on
+   SOA's own line (§3); the bench and manifest schema lines do not move.
+   The verdict carries no free text, so `SoakRun::redacted_json` emits it
+   unchanged and no new redaction path exists. One visible consequence:
+   `SoakRun` drops its derived `Eq` — a record that can carry float grid
+   values has no total equality; `PartialEq` is unchanged.
+6. **Out of scope, recorded so it is not lost:** window digests and the
+   oracle self-test (SOA-7), derived-read checks (SOA-10), SLO/latency
+   verdicts (SOA-13), and any read client that produces observations from a
+   live server (no slice names one yet; SOA-5's client owns the ingest lane
+   only).
+
+**Rejected:** a tolerance-based float comparison (the format-exact workload
+makes exactness attainable, and a tolerance would be an invented threshold);
+a separate verdict artifact beside the run record instead of a field on it
+(the queue's acceptance says the verdict is recorded in run metadata, and
+SOA-1's bump rule exists precisely for this change); judging latency or
+scheduler warnings in the oracle (SOA-3's monitor and SOA-13 own those); and
+folding SOA-7's window digests into this slice (the plan sequences them as
+separate slices, digests after the core they digest).
 
 ## 2026-10-30 — ROB-8: the decode limit set, and why oversized is integrity (FLAGGED FOR MERGE REVIEW)
 
@@ -2443,3 +2549,47 @@ and the pre-v2 test counted 3 migrations while asserting 4 (now 4).
 `process-crash-only` on Windows, where directory fsync is a no-op — so the
 expectation is now `cfg!(windows)`-gated. No production code changed; this is
 the Windows-only test-expectation class the Linux bar cannot catch.
+
+## 2026-10-31 — D-S16 whole-store backup shapes — FLAGGED FOR MERGE REVIEW
+
+**Ambiguous:** plan §5's D-S16 amendment is seven clauses with no shapes: the
+manifest's new fields, the `SERIES_KEY` extension's number (the frame
+registry shipped empty), and the restore intent marker's name and contents
+(the crash design calls the in-place marker `RESTORED`; plan C19/C-7 only
+says "restore intent marker written first").
+
+**Chosen:**
+1. **Manifest.** `BackupManifest` gains `frames`, `store_format` and
+   `allocators` (serde-defaulted, so control-plane manifests are unchanged),
+   and whole-store backups write the new format string
+   `weftdb-whole-store-backup/1` — the shape backup.rs already prefigured
+   ("a backup a newer release writes (with frames, S16) is never restored as
+   if it were control plane only"). A control-plane restore refuses the new
+   format; a whole-store restore refuses the old.
+2. **SERIES_KEY = extension 1**, registered in `KNOWN_EXTENSIONS` with the
+   payload defined as the canonical series-key bytes. Frames carrying it are
+   journaled `held` (a new `frame_journal` state and `IndexOp::JournalHeld`;
+   the reaper and the open's replay skip held rows entirely) until TAG-9.
+3. **Intent marker.** Named `RESTORE_INTENT`, JSON
+   `{format, store_uuid, backup_created_ms, restore_started_ms}`: written
+   first into the restore staging directory, published with the root,
+   removed by the first open once restore-mode recovery completes.
+4. **Link fallback.** B3 says copy on EXDEV; any `hard_link` error falls
+   back to copy + `sync_all`, and the manifest records which happened per
+   frame (`linked`), since a backup that silently copied is still correct
+   and one that silently failed to link is not a space surprise either way.
+5. **Headroom.** `check_backup_headroom(mode, …)`: Linked needs only the
+   control plane's bytes, Copy needs the whole store. Free space is read by
+   `statvfs` on Unix (`libc` promoted from a unix dev-dependency to a unix
+   dependency); where it cannot be read, the check is skipped rather than
+   faked.
+6. **Adoption scope.** Restore-mode adoption (R8, via `describe_frame`)
+   requires the aspect to have a declared schema in the restored store's
+   scope; an orphan whose aspect is undeclared is left in place, neither
+   adopted nor quarantined.
+
+**Not in this slice:** `restore_in_place` (the design's second restore
+shape) and the `weft-server restore` CLI — plan C19 assigns the one CLI to
+PAC-13 (W7), and the queue's D-S16 acceptance names backup, adoption,
+`held`, the intent marker, the embedded format, the floor refusal, the RAII
+hold and the headroom check, not the in-place shape.

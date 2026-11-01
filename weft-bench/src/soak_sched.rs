@@ -46,8 +46,8 @@
 //! **No schema bump.** The scheduler's report ([`SchedulerReport`]) is its
 //! own artifact, beside the run record, not a field on [`crate::soak::SoakRun`]: SOA-1's
 //! bump rule says a field on the run record would move
-//! [`crate::soak::SOAK_SCHEMA_VERSION`], and the scheduler adds none, so the soak
-//! schema stays at v1. The report carries no free text — no label, no
+//! [`crate::soak::SOAK_SCHEMA_VERSION`], and the scheduler adds none, so it
+//! does not move the soak schema. The report carries no free text — no label, no
 //! path — so it needs no redaction pass.
 
 use std::time::{Duration, Instant};
@@ -464,7 +464,7 @@ mod tests {
 			assert_eq!(interval.p50_ns, Some(500));
 		}
 		assert_eq!(harness.run_record().steps, 20);
-		assert_eq!(harness.run_record().soak_schema_version, SOAK_SCHEMA_VERSION, "the scheduler adds no run-record field, so the soak schema stays at v1");
+		assert_eq!(harness.run_record().soak_schema_version, SOAK_SCHEMA_VERSION, "the scheduler adds no run-record field, so it does not move the soak schema");
 	}
 
 	#[test]
