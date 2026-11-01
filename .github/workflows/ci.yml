@@ -363,6 +363,10 @@ jobs:
         run: scripts/release/test-stage.sh
       - name: bench stage-artifacts.sh tests
         run: bash scripts/bench/test-stage-artifacts.sh
+      - name: bench ndbc_to_csv.py tests
+        run: python3 -m unittest discover -s scripts/bench -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
       # The glibc floor the release promises is asserted by scripts/check-glibc.sh, which
       # runs only in the release workflow — no CI job otherwise touches it. Its tests stub
       # objdump and readelf so the floor logic is checked here instead, including that the

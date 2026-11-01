@@ -57,8 +57,9 @@ WeftDB's core advantage does not apply, and a conventional TSDB is the simpler c
 
 **You expect splines to beat straight lines on market data.** On real BTC/USD closes, a cubic gap
 fill had MAE $55.34 against linear's $49.27 (hourly buckets), and $8.37 against $6.79 at
-one-minute buckets, at about 14% more time. Prices move close to a random walk. The spline wins
-only on smooth signals (README, *Where it doesn't pay off*).
+one-minute buckets, at about 14% more time. Prices move close to a random walk. On real smooth
+signals (NOAA buoy temperature and pressure) the spline wins only on short outages: with outages
+averaging a day, linear is more accurate on 8 of 9 series (README, *Where it doesn't pay off*).
 
 **You expect a GPU to make every query faster.** Reconstructing about 1M points from 100k stored
 knots took 14.1–16.3 ms on CPU threads (rayon) and 17.0–29.8 ms on an RTX 4070 Ti SUPER
@@ -175,9 +176,10 @@ block missingness (contiguous outages) are separate datasets. A method that does
 gaps can fail across an outage.
 
 **Real held-out values.** `weft-bench --gap-fill --gf-csv` cuts outages out of a real series and
-scores each fill against the real values it removed. This is where the spline-versus-linear result
-on prices came from. A real smooth-signal corpus is the open item before WeftDB makes any "spline
-is more accurate" claim on real data. The candidates, all openly licensed, are listed in
+scores each fill against the real values it removed. This is where the spline-versus-linear results
+came from: on prices linear wins; on NOAA NDBC buoy temperature and pressure (#144) cubic wins on
+outages averaging two hours and linear wins on outages averaging a day. WeftDB may claim the
+first only together with the second. Other candidate corpora, all openly licensed, are listed in
 `DESIGN-PARTNERS.md`.
 
 **Point provenance.** Every reconstructed point is marked raw, interpolated or extrapolated, so an

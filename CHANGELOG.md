@@ -18,6 +18,10 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **A real smooth-signal corpus for the spline-fill claim** (#144): `scripts/bench/ndbc_to_csv.py`
+  turns NOAA NDBC buoy history into a `weft-bench --gf-csv` corpus. On nine buoy temperature and
+  pressure series a cubic fill beats linear across short outages and loses across day-long ones;
+  README, HONESTY.md and WILLINGNESS-TO-PAY.md now say so.
 - **OS-cold and post-restart reps in the cross-engine benchmark** (#146): `weft-xbench
   --cold-hook CMD [--cold-reps N]` times each read phase again after the OS page cache is dropped
   (`os-cold`) and after the engine restarts as well (`restarted`), gated like the warm reps and
