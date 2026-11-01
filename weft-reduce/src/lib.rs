@@ -28,7 +28,7 @@ pub mod sketch;
 
 use std::collections::BTreeMap;
 
-use bigdecimal::{num_bigint::BigInt, BigDecimal, Zero};
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 pub use fill::{fill, Fill, FillError};
 pub use scaled::{reduce_partial_scaled, reduce_scaled};
@@ -407,18 +407,6 @@ impl BucketAcc {
 		Ok(())
 	}
 
-	/// Set the scale of every zero this bucket holds to `scale` (see
-	/// [`PartialReduction::rescale_zeros`]).
-	fn rescale_zeros(&mut self, scale: u32) {
-		let scale = i64::from(scale);
-		let values = std::iter::once(&mut self.sum).chain(self.min.as_mut()).chain(self.max.as_mut()).chain(self.first.as_mut().map(|(_, v)| v)).chain(self.last.as_mut().map(|(_, v)| v)).chain(self.samples.iter_mut().map(|(_, v)| v));
-		for value in values {
-			if value.is_zero() && value.fractional_digit_count() != scale {
-				*value = BigDecimal::new(BigInt::from(0), scale);
-			}
-		}
-	}
-
 	/// Materialize the requested reductions and the grid-aligned bucket start.
 	fn finish(self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
 		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
@@ -636,25 +624,6 @@ impl PartialReduction {
 		Ok(())
 	}
 
-	/// Set the scale of every zero this partial holds to `scale`, so that
-	/// `as_bigint_and_exponent` reads `(0, scale)`, and leave every other value as it is.
-	///
-	/// For a partial of a fixed-scale column, whose values are all `mantissa × 10^-scale`,
-	/// so every decimal a reduction of it holds, sums included, has that scale. WeftDB
-	/// 0.1.0 serialized a zero as `"0"` whatever its scale, so a partial it persisted reads
-	/// its zeros back at scale 0; this gives them the scale a reduction of the decoded
-	/// values does. The values are equal either way: the scale only shows in exact-decimal
-	/// output (`0` against `0.000`).
-	///
-	/// Hidden because it only exists to read weftdb's v3 `.weftpart` sidecars, which its v4
-	/// sidecars (D-S15) replace; it goes with the v3 reader.
-	#[doc(hidden)]
-	pub fn rescale_zeros(&mut self, scale: u32) {
-		for acc in self.buckets.values_mut() {
-			acc.rescale_zeros(scale);
-		}
-	}
-
 	/// Whether no points landed in this partial.
 	#[must_use]
 	pub fn is_empty(&self) -> bool {
@@ -852,7 +821,7 @@ pub const fn grids_nest(from: Resolution, to: Resolution) -> bool {
 mod tests {
 	use std::str::FromStr;
 
-	use bigdecimal::ToPrimitive;
+	use bigdecimal::{num_bigint::BigInt, ToPrimitive, Zero};
 	use chrono::TimeZone;
 
 	use super::*;
@@ -1334,21 +1303,6 @@ mod tests {
 			let read: BigDecimal = postcard::from_bytes(&bytes).expect("reads");
 			assert_eq!(read.as_bigint_and_exponent(), decimal.as_bigint_and_exponent(), "{value} reads back exactly");
 		}
-	}
-
-	/// `rescale_zeros` gives the zeros of a partial that an older version persisted (written
-	/// `"0"`, so read back at exponent 0) the column's scale, and leaves every other value
-	/// alone: the partial then finishes exactly as a single pass over the scaled values.
-	#[test]
-	fn rescale_zeros_restores_the_scale_of_an_unscaled_zero() {
-		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP50];
-		let points = zero_points(3);
-		let whole = reduce(&points, Resolution::Minutes, None, None, &aggs).expect("reduces");
-		// What a 0.1.0 sidecar reads back as: every zero at exponent 0.
-		let unscaled: Vec<Point> = points.iter().map(|p| if p.value.is_zero() { Point { value: BigDecimal::from(0), ..p.clone() } } else { p.clone() }).collect();
-		let mut partial = reduce_partial(&unscaled, Resolution::Minutes, None, None, &aggs).expect("partial");
-		partial.rescale_zeros(3);
-		assert_same_representation(&partial.finish(Resolution::Minutes, &aggs).expect("finishes"), &whole, "rescaled");
 	}
 
 	/// Re-keying a partial from a fine base to a coarser nesting resolution equals reducing

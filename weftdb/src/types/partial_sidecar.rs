@@ -18,12 +18,15 @@
 //! materialized, so they stay a decode-time reduction and are deliberately absent here.
 //!
 //! **Staleness is handled by construction, not by a refresh policy.** The frame records
-//! the `(row_count, byte_len)` of the exact segment bytes it was built from; a reader
-//! ([`PartialSidecar::matches`]) compares that against the live [`SegmentDescriptor`] and
-//! ignores the sidecar on any mismatch, falling back to a full decode. So a segment that
-//! is later rewritten (an out-of-order reconcile, a dedup merge) simply stops matching its
-//! stale sidecar — the read is always correct, at worst un-accelerated, until the sidecar
-//! is regenerated.
+//! the `(row_count, byte_len, frame_crc)` of the exact segment bytes it was built from; a
+//! reader ([`PartialSidecar::matches`]) compares that against the live
+//! [`SegmentDescriptor`] and the index row's bound frame CRC, and ignores the sidecar on
+//! any mismatch, falling back to a full decode. So a segment that is later rewritten (an
+//! out-of-order reconcile, a dedup merge) simply stops matching its stale sidecar — the
+//! read is always correct, at worst un-accelerated, until the sidecar is regenerated.
+//! The `frame_crc` third of the stamp (v4, D-S15) closes the collision the pair left
+//! open: two different frames with the same row count and byte length no longer share a
+//! stamp, so a sidecar can never serve the partial of a frame it was not built from.
 //!
 //! *(src: partials stored + finalized at query time —
 //! <https://www.tigerdata.com/learn/continuous-aggregates-timescaledb>)*
@@ -31,12 +34,12 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use splimes::Resolution;
-use weft_physical_type::{PhysicalType, SegmentDescriptor};
+use weft_physical_type::{crc32, DecodeLimits, SegmentDescriptor};
 use weft_reduce::{grids_nest, Aggregation, PartialReduction, ReduceError};
 
 /// Magic prefix identifying a `.weftpart` frame — guards against feeding a foreign or
 /// truncated file to [`PartialSidecar::from_bytes`].
-const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"WEFTPRT\x02";
+const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"WEFTPRT\x03";
 
 /// The frame layout version. Bumped if the on-disk shape changes incompatibly; a reader
 /// that sees a newer version treats the sidecar as absent rather than misreading it.
@@ -50,7 +53,14 @@ const PARTIAL_SIDECAR_MAGIC: &[u8; 8] = b"WEFTPRT\x02";
 /// `postcard`, whose wire format is frozen for its 1.x line. The magic's last byte moved
 /// with it (`\x01` → `\x02`), so a bincode-era frame fails the magic check and is treated
 /// as absent instead of being fed to the wrong decoder.
-pub const PARTIAL_SIDECAR_VERSION: u16 = 3;
+///
+/// **v4** (D-S15) adds a CRC-32 trailer over the magic and body, and binds the staleness
+/// stamp to the frame's own CRC (`seg_frame_crc`). The magic's last byte moved with it
+/// (`\x02` → `\x03`), so a v3 frame fails the magic check and is treated as absent: a
+/// sidecar is a pure accelerator, so stranding every v3 file costs a decode, never data.
+/// The trailer is what a torn or zero-filled write cannot survive — v3 checked only the
+/// magic, the postcard decode and the version, so a zero-filled tail could be served.
+pub const PARTIAL_SIDECAR_VERSION: u16 = 4;
 
 /// The **bounded** reductions a sidecar materializes — every [`Aggregation`] whose
 /// per-bucket state stays constant-sized ([`Aggregation::is_sidecar_materializable`]).
@@ -122,10 +132,15 @@ pub struct PartialSidecar {
 	pub base: Resolution,
 	/// Total rows in the segment this partial was built from — half the staleness stamp.
 	pub seg_row_count: u64,
-	/// On-disk byte length of the `.weftseg` frame this partial was built from — the other
-	/// half of the staleness stamp. Together with `seg_row_count` it pins the sidecar to
-	/// the exact segment bytes.
+	/// On-disk byte length of the `.weftseg` frame this partial was built from — the
+	/// second third of the staleness stamp.
 	pub seg_byte_len: u64,
+	/// The trailing CRC-32 of the `.weftseg` frame this partial was built from (the
+	/// `frame_crc` the segment index binds to the frame) — the last third of the
+	/// staleness stamp. Together with `seg_row_count` and `seg_byte_len` it pins the
+	/// sidecar to the exact segment bytes: a rewrite that happens to keep the same row
+	/// count and byte length still changes the frame's CRC.
+	pub seg_frame_crc: u32,
 	/// The materialized mergeable partial at [`base`](Self::base) resolution (built with
 	/// [`SIDECAR_AGGREGATIONS`]).
 	pub partial: PartialReduction,
@@ -143,15 +158,16 @@ impl PartialSidecar {
 	/// historical single-base sidecar). Use [`with_rollups`](Self::with_rollups) to
 	/// materialize a tier hierarchy.
 	#[must_use]
-	pub const fn new(base: Resolution, descriptor: &SegmentDescriptor, partial: PartialReduction) -> Self {
-		Self { version: PARTIAL_SIDECAR_VERSION, base, seg_row_count: descriptor.row_count as u64, seg_byte_len: descriptor.byte_len, partial, rollups: Vec::new() }
+	pub const fn new(base: Resolution, descriptor: &SegmentDescriptor, frame_crc: u32, partial: PartialReduction) -> Self {
+		Self { version: PARTIAL_SIDECAR_VERSION, base, seg_row_count: descriptor.row_count as u64, seg_byte_len: descriptor.byte_len, seg_frame_crc: frame_crc, partial, rollups: Vec::new() }
 	}
 
 	/// Wrap a freshly built base `partial` (at `base`) together with its coarser `rollups`
-	/// (fine→coarse, built by `build_rollups`) and the staleness stamp for `descriptor`.
+	/// (fine→coarse, built by `build_rollups`) and the staleness stamp for `descriptor`
+	/// and its frame's trailing CRC `frame_crc`.
 	#[must_use]
-	pub const fn with_rollups(base: Resolution, descriptor: &SegmentDescriptor, partial: PartialReduction, rollups: Vec<(Resolution, PartialReduction)>) -> Self {
-		Self { version: PARTIAL_SIDECAR_VERSION, base, seg_row_count: descriptor.row_count as u64, seg_byte_len: descriptor.byte_len, partial, rollups }
+	pub const fn with_rollups(base: Resolution, descriptor: &SegmentDescriptor, frame_crc: u32, partial: PartialReduction, rollups: Vec<(Resolution, PartialReduction)>) -> Self {
+		Self { version: PARTIAL_SIDECAR_VERSION, base, seg_row_count: descriptor.row_count as u64, seg_byte_len: descriptor.byte_len, seg_frame_crc: frame_crc, partial, rollups }
 	}
 
 	/// Build a sidecar for `descriptor`'s segment from its base `partial`, materializing the
@@ -161,9 +177,9 @@ impl PartialSidecar {
 	/// # Errors
 	///
 	/// Propagates a [`ReduceError`] from building a rollup tier.
-	pub fn materialize(base: Resolution, descriptor: &SegmentDescriptor, partial: PartialReduction, tiers: &[Resolution]) -> Result<Self, ReduceError> {
+	pub fn materialize(base: Resolution, descriptor: &SegmentDescriptor, frame_crc: u32, partial: PartialReduction, tiers: &[Resolution]) -> Result<Self, ReduceError> {
 		let rollups = build_rollups(base, &partial, tiers)?;
-		Ok(Self::with_rollups(base, descriptor, partial, rollups))
+		Ok(Self::with_rollups(base, descriptor, frame_crc, partial, rollups))
 	}
 
 	/// The [`PartialReduction`] this sidecar contributes to a downsample at `resolution`, or
@@ -199,57 +215,94 @@ impl PartialSidecar {
 		best.map(|(res, partial)| partial.rebucket(res, resolution)).transpose().map(Option::flatten)
 	}
 
-	/// Serialize to a `.weftpart` frame: the magic prefix followed by the postcard body.
+	/// Serialize to a `.weftpart` frame: the magic prefix, the postcard body, and a
+	/// CRC-32 trailer over the magic and body (little-endian, the `.weftseg` frame
+	/// trailer's convention).
 	///
 	/// # Errors
 	///
 	/// Propagates a postcard encoding failure (in practice unreachable for this type).
 	pub fn to_bytes(&self) -> Result<Vec<u8>> {
 		let body = postcard::to_allocvec(self).context("serializing a partial sidecar")?;
-		let mut out = Vec::with_capacity(PARTIAL_SIDECAR_MAGIC.len() + body.len());
+		let mut out = Vec::with_capacity(PARTIAL_SIDECAR_MAGIC.len() + body.len() + 4);
 		out.extend_from_slice(PARTIAL_SIDECAR_MAGIC);
 		out.extend_from_slice(&body);
+		out.extend_from_slice(&crc32(&out).to_le_bytes());
 		Ok(out)
 	}
 
-	/// Parse a `.weftpart` frame, validating the magic prefix and version.
+	/// Parse a `.weftpart` frame under the default [`DecodeLimits`], validating the
+	/// magic prefix, the CRC-32 trailer and the version.
 	///
 	/// # Errors
 	///
-	/// Errors on a missing/wrong magic prefix, a postcard decode failure, or a frame whose
-	/// recorded version is not [`PARTIAL_SIDECAR_VERSION`] (a reader never misreads a
-	/// newer/foreign frame — the caller treats the error as "no usable sidecar").
+	/// As [`from_bytes_with_limits`](Self::from_bytes_with_limits).
 	pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-		let body = bytes.strip_prefix(PARTIAL_SIDECAR_MAGIC.as_slice()).context("not a .weftpart frame (bad magic)")?;
+		Self::from_bytes_with_limits(bytes, DecodeLimits::DEFAULT)
+	}
+
+	/// Parse a `.weftpart` frame under `limits` — the v4 reader sits under the same
+	/// [`DecodeLimits`] the `.weftseg` frame readers enforce (ROB-8), as the 1.0 plan's
+	/// D-S15 amendment names.
+	///
+	/// The CRC-32 trailer is verified **before** the body is decoded: a torn or
+	/// zero-filled write fails there and is never fed to the decoder. The decoded
+	/// claims are then checked against the limits before the caller can act on them:
+	/// the stamp's row count must fit `limits.max_rows`, no materialized grid may hold
+	/// more buckets than the segment has rows (a bucket is a non-empty grid cell, so a
+	/// grid past the row count is a claim the segment refutes) or than `limits.max_rows`,
+	/// and the rollup chain may not exceed [`MAX_SIDECAR_TIERS`] — the most a writer
+	/// can produce.
+	///
+	/// # Errors
+	///
+	/// Errors on a missing/wrong magic prefix (a v3 frame fails here and is treated as
+	/// absent), a CRC mismatch, a postcard decode failure, a frame whose recorded
+	/// version is not [`PARTIAL_SIDECAR_VERSION`], or a decoded claim past `limits`
+	/// (a reader never misreads a newer/foreign/damaged frame — the caller treats the
+	/// error as "no usable sidecar").
+	pub fn from_bytes_with_limits(bytes: &[u8], limits: DecodeLimits) -> Result<Self> {
+		if !bytes.starts_with(PARTIAL_SIDECAR_MAGIC.as_slice()) {
+			bail!("not a .weftpart frame (bad magic)");
+		}
+		let (covered, trailer) = bytes.split_at(bytes.len().checked_sub(4).context("a .weftpart frame is too short for its CRC trailer")?);
+		let stored = u32::from_le_bytes(trailer.try_into().expect("the trailer slice is four bytes"));
+		if crc32(covered) != stored {
+			bail!("partial sidecar CRC mismatch: the frame is torn or damaged");
+		}
+		let body = &covered[PARTIAL_SIDECAR_MAGIC.len()..];
 		let sidecar: Self = postcard::from_bytes(body).context("decoding a partial sidecar")?;
 		if sidecar.version != PARTIAL_SIDECAR_VERSION {
 			bail!("partial sidecar version {} is not the supported {PARTIAL_SIDECAR_VERSION}", sidecar.version);
 		}
+		let rows = usize::try_from(sidecar.seg_row_count).unwrap_or(usize::MAX);
+		if !limits.rows_ok(rows) {
+			bail!("partial sidecar claims {rows} segment rows, over the decode limit of {}", limits.max_rows);
+		}
+		if sidecar.rollups.len() > MAX_SIDECAR_TIERS {
+			bail!("partial sidecar claims {} rollup tiers, over the maximum {MAX_SIDECAR_TIERS}", sidecar.rollups.len());
+		}
+		for (resolution, grid) in std::iter::once((sidecar.base, &sidecar.partial)).chain(sidecar.rollups.iter().map(|(r, p)| (*r, p))) {
+			if grid.len() > rows || !limits.rows_ok(grid.len()) {
+				bail!("partial sidecar's {resolution:?} grid claims {} buckets for a {rows}-row segment, over what the segment or the decode limit allows", grid.len());
+			}
+		}
 		Ok(sidecar)
 	}
 
-	/// Whether this sidecar was built from exactly the segment `descriptor` names — the
-	/// staleness check. A reader that gets `false` ignores the sidecar and decodes the
-	/// segment instead (correct, just un-accelerated).
+	/// Whether this sidecar was built from exactly the segment `descriptor` names, with
+	/// the frame CRC the index has bound to it — the staleness check. `frame_crc` is
+	/// `None` only for a legacy row the index has not bound a CRC to yet; the row/byte
+	/// pair alone decides there, as it did for v3. A reader that gets `false` ignores
+	/// the sidecar and decodes the segment instead (correct, just un-accelerated).
 	#[must_use]
-	pub const fn matches(&self, descriptor: &SegmentDescriptor) -> bool {
-		self.seg_row_count == descriptor.row_count as u64 && self.seg_byte_len == descriptor.byte_len
-	}
-
-	/// Give the zeros of every materialized grid the scale of `descriptor`'s fixed-scale
-	/// column (`ScaledI64` or `ScaledI128`); a no-op for any other physical type.
-	///
-	/// WeftDB 0.1.0 wrote every zero into a sidecar as `"0"`, so a sidecar it built for a
-	/// `ScaledI64 { scale: 3 }` segment reads its zeros back at scale 0, not 3 (a sidecar
-	/// written since keeps them at 3: see `weft_reduce`'s `exact` serializers). This
-	/// restores the scale a decode of the segment gives them. Remove it with the v3
-	/// reader: v4 sidecars (D-S15) ignore every v3 file.
-	pub(crate) fn rescale_zeros_to(&mut self, descriptor: &SegmentDescriptor) {
-		let Some(PhysicalType::ScaledI64 { scale } | PhysicalType::ScaledI128 { scale }) = descriptor.physical_type else { return };
-		self.partial.rescale_zeros(u32::from(scale));
-		for (_, rollup) in &mut self.rollups {
-			rollup.rescale_zeros(u32::from(scale));
-		}
+	pub const fn matches(&self, descriptor: &SegmentDescriptor, frame_crc: Option<u32>) -> bool {
+		self.seg_row_count == descriptor.row_count as u64
+			&& self.seg_byte_len == descriptor.byte_len
+			&& match frame_crc {
+				None => true,
+				Some(crc) => crc == self.seg_frame_crc,
+			}
 	}
 }
 
@@ -342,6 +395,8 @@ mod tests {
 		Point { timestamp: Utc.timestamp_opt(secs, 0).single().expect("valid instant"), value: BigDecimal::from_str(value).expect("valid decimal") }
 	}
 
+	const FRAME_CRC: u32 = 0x0BAD_F00D;
+
 	fn descriptor(row_count: usize, byte_len: u64) -> SegmentDescriptor {
 		SegmentDescriptor { id: 1, path: "x-1.weftseg".to_string(), format_version: 1, physical_type: None, time_unit: None, row_count, null_count: 0, time_sorted: true, min_ts: Some(0), max_ts: Some(100), min_value: None, max_value: None, byte_len }
 	}
@@ -352,7 +407,7 @@ mod tests {
 		let partial = reduce_partial(&points, Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");
 		let expected = reduce_partial(&points, Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial").finish(Resolution::Hours, &SIDECAR_AGGREGATIONS).expect("finishes");
 
-		let sidecar = PartialSidecar::new(Resolution::Hours, &descriptor(600, 12_345), partial);
+		let sidecar = PartialSidecar::new(Resolution::Hours, &descriptor(600, 12_345), FRAME_CRC, partial);
 		let bytes = sidecar.to_bytes().expect("serializes");
 		let reloaded = PartialSidecar::from_bytes(&bytes).expect("reloads");
 
@@ -367,10 +422,10 @@ mod tests {
 	#[test]
 	fn matches_only_the_exact_segment_bytes() {
 		let partial = reduce_partial(&[pt(0, "1"), pt(30, "2")], Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");
-		let sidecar = PartialSidecar::new(Resolution::Hours, &descriptor(600, 12_345), partial);
-		assert!(sidecar.matches(&descriptor(600, 12_345)), "the exact segment matches");
-		assert!(!sidecar.matches(&descriptor(600, 12_346)), "a different byte length (a rewrite) does not match");
-		assert!(!sidecar.matches(&descriptor(599, 12_345)), "a different row count (a dedup merge) does not match");
+		let sidecar = PartialSidecar::new(Resolution::Hours, &descriptor(600, 12_345), FRAME_CRC, partial);
+		assert!(sidecar.matches(&descriptor(600, 12_345), Some(FRAME_CRC)), "the exact segment matches");
+		assert!(!sidecar.matches(&descriptor(600, 12_346), Some(FRAME_CRC)), "a different byte length (a rewrite) does not match");
+		assert!(!sidecar.matches(&descriptor(599, 12_345), Some(FRAME_CRC)), "a different row count (a dedup merge) does not match");
 	}
 
 	#[test]
@@ -410,7 +465,7 @@ mod tests {
 	fn materialize_builds_the_coarser_rollup_chain() {
 		let points = multi_day_points();
 		let base = reduce_partial(&points, Resolution::Minutes, None, None, &SIDECAR_AGGREGATIONS).expect("base partial");
-		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(600, 1), base, &[Resolution::Hours, Resolution::Days]).expect("materializes tiers");
+		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(600, 1), FRAME_CRC, base, &[Resolution::Hours, Resolution::Days]).expect("materializes tiers");
 		let tiers: Vec<Resolution> = sidecar.rollups.iter().map(|(r, _)| *r).collect();
 		assert_eq!(tiers, vec![Resolution::Hours, Resolution::Days], "both coarser tiers materialized, fine→coarse");
 	}
@@ -421,7 +476,7 @@ mod tests {
 		let base = reduce_partial(&points, Resolution::Minutes, None, None, &SIDECAR_AGGREGATIONS).expect("base partial");
 		// `seconds` is finer than the `minutes` base (skip); `hours` nests (keep); a second
 		// `minutes` is finer than the `hours` we're now at (skip); `days` nests in `hours` (keep).
-		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(600, 1), base, &[Resolution::Seconds, Resolution::Hours, Resolution::Minutes, Resolution::Days]).expect("materializes");
+		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(600, 1), FRAME_CRC, base, &[Resolution::Seconds, Resolution::Hours, Resolution::Minutes, Resolution::Days]).expect("materializes");
 		let tiers: Vec<Resolution> = sidecar.rollups.iter().map(|(r, _)| *r).collect();
 		assert_eq!(tiers, vec![Resolution::Hours, Resolution::Days], "only the strictly-coarsening nesting tiers survive");
 	}
@@ -430,7 +485,7 @@ mod tests {
 	fn partial_for_serves_every_materialized_and_rekeyed_resolution() {
 		let points = multi_day_points();
 		let base = reduce_partial(&points, Resolution::Minutes, None, None, &SIDECAR_AGGREGATIONS).expect("base partial");
-		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(600, 1), base, &[Resolution::Hours, Resolution::Days]).expect("materializes");
+		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(600, 1), FRAME_CRC, base, &[Resolution::Hours, Resolution::Days]).expect("materializes");
 
 		// For each of {base, a materialized tier, a re-keyed-from-a-tier resolution} the
 		// sidecar must finish to exactly what a fresh single-pass reduce at that resolution
@@ -448,7 +503,7 @@ mod tests {
 	fn tiered_sidecar_round_trips_the_rollup_chain() {
 		let points = multi_day_points();
 		let base = reduce_partial(&points, Resolution::Minutes, None, None, &SIDECAR_AGGREGATIONS).expect("base partial");
-		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(600, 4_242), base, &[Resolution::Hours, Resolution::Days]).expect("materializes");
+		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(600, 4_242), FRAME_CRC, base, &[Resolution::Hours, Resolution::Days]).expect("materializes");
 		let reloaded = PartialSidecar::from_bytes(&sidecar.to_bytes().expect("serializes")).expect("reloads");
 
 		assert_eq!(reloaded.version, PARTIAL_SIDECAR_VERSION);
@@ -457,5 +512,72 @@ mod tests {
 		let truth = reduce_partial(&points, Resolution::Days, None, None, &SIDECAR_AGGREGATIONS).expect("truth").finish(Resolution::Days, &SIDECAR_AGGREGATIONS).expect("finishes");
 		let served = reloaded.partial_for(Resolution::Days).expect("serves").expect("a tier serves days").finish(Resolution::Days, &SIDECAR_AGGREGATIONS).expect("finishes");
 		assert_eq!(served, truth, "a reloaded tiered sidecar answers days exactly");
+	}
+
+	/// A small v4 frame for the damage tests: one hour bucket, stamped with FRAME_CRC.
+	fn v4_bytes() -> Vec<u8> {
+		let partial = reduce_partial(&[pt(0, "1"), pt(30, "2")], Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");
+		PartialSidecar::new(Resolution::Hours, &descriptor(2, 12_345), FRAME_CRC, partial).to_bytes().expect("serializes")
+	}
+
+	#[test]
+	fn a_v3_frame_is_treated_as_absent() {
+		// A v3 file is exactly the v4 shape's predecessor: magic last byte \x02 and no
+		// CRC trailer. The v4 reader refuses it at the magic check, so the caller falls
+		// back to a full decode — the sidecar is stranded, never misread.
+		let mut v3 = v4_bytes();
+		v3[7] = 0x02;
+		v3.truncate(v3.len() - 4);
+		assert!(PartialSidecar::from_bytes(&v3).is_err(), "a v3 frame fails the v4 magic check");
+	}
+
+	#[test]
+	fn every_truncation_and_single_byte_flip_is_rejected() {
+		// The crash design's S15 unit gate: every truncation length and every damaged
+		// offset must be refused. A single-byte flip is a CRC-32-detectable error at
+		// every offset, so the trailer refuses them all deterministically.
+		let bytes = v4_bytes();
+		for len in 0..bytes.len() {
+			assert!(PartialSidecar::from_bytes(&bytes[..len]).is_err(), "a frame truncated to {len} bytes is rejected");
+		}
+		for offset in 0..bytes.len() {
+			let mut damaged = bytes.clone();
+			damaged[offset] ^= 0xFF;
+			assert!(PartialSidecar::from_bytes(&damaged).is_err(), "a frame flipped at offset {offset} is rejected");
+		}
+		// A zero-filled tail (the power-loss shape) is a flip the CRC also catches.
+		let mut zero_tail = bytes.clone();
+		for byte in &mut zero_tail[bytes.len() / 2..] {
+			*byte = 0;
+		}
+		assert!(PartialSidecar::from_bytes(&zero_tail).is_err(), "a zero-filled tail is rejected");
+	}
+
+	#[test]
+	fn the_stamp_binds_the_frame_crc() {
+		let partial = reduce_partial(&[pt(0, "1"), pt(30, "2")], Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");
+		let sidecar = PartialSidecar::new(Resolution::Hours, &descriptor(2, 12_345), FRAME_CRC, partial);
+		assert!(sidecar.matches(&descriptor(2, 12_345), Some(FRAME_CRC)), "the exact frame matches");
+		assert!(!sidecar.matches(&descriptor(2, 12_345), Some(FRAME_CRC ^ 1)), "same rows and bytes under a different frame CRC (a rewrite) does not match");
+		assert!(sidecar.matches(&descriptor(2, 12_345), None), "an index row with no bound CRC falls back to the row/byte pair");
+		assert_eq!(sidecar.seg_frame_crc, FRAME_CRC, "the stamp records the frame CRC it was built from");
+	}
+
+	#[test]
+	fn the_reader_refuses_claims_past_the_decode_limits() {
+		// A stamp claiming more rows than any frame may hold is refused, not decoded
+		// into a partial the caller would trust.
+		let partial = reduce_partial(&[pt(0, "1"), pt(30, "2")], Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");
+		let huge = PartialSidecar::new(Resolution::Hours, &descriptor(weft_physical_type::MAX_FRAME_ROWS + 1, 12_345), FRAME_CRC, partial.clone());
+		assert!(PartialSidecar::from_bytes(&huge.to_bytes().expect("serializes")).is_err(), "a row claim past MAX_FRAME_ROWS is refused");
+		// A grid claiming more buckets than the segment has rows is self-refuting.
+		let two_buckets = reduce_partial(&[pt(0, "1"), pt(3600, "2")], Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");
+		let lying = PartialSidecar::new(Resolution::Hours, &descriptor(1, 12_345), FRAME_CRC, two_buckets);
+		assert!(PartialSidecar::from_bytes(&lying.to_bytes().expect("serializes")).is_err(), "a two-bucket grid for a one-row segment is refused");
+		// The same frame under a tighter caller-supplied limit is refused too.
+		let honest = v4_bytes();
+		let tight = DecodeLimits { max_rows: 1, ..DecodeLimits::DEFAULT };
+		assert!(PartialSidecar::from_bytes_with_limits(&honest, tight).is_err(), "a two-row sidecar is over a one-row limit");
+		assert!(PartialSidecar::from_bytes_with_limits(&honest, DecodeLimits::DEFAULT).is_ok(), "the honest frame passes the default limits");
 	}
 }

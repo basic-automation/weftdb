@@ -160,6 +160,11 @@ pub struct RecoveryReport {
 	/// Files under `segments/` no index row or journal entry claims, counted
 	/// whether or not the pass quarantined them.
 	pub orphans: usize,
+	/// Orphan frames a restore-mode pass adopted into the index (D-S16, R8).
+	pub adopted: usize,
+	/// Orphan frames a restore-mode pass journaled `held` because they carry
+	/// a `SERIES_KEY` extension, until TAG-9 binds series keys (D-S16).
+	pub held: usize,
 	/// Rows whose indexed path escapes `segments/` and were left exactly where
 	/// they are: recovery never moves a file it cannot contain.
 	pub skipped_outside_segments: usize,
