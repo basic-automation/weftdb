@@ -360,6 +360,12 @@ pub struct OnlinePoint {
 	pub rows_verified: u64,
 	/// Queries whose rows differed from the corpus in any way (missing, extra, or changed).
 	pub mismatched_queries: usize,
+	/// Queries the store answered with an error instead of rows, across both phases.
+	#[serde(default)]
+	pub failed_queries: usize,
+	/// The first such error, verbatim.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub first_error: Option<String>,
 }
 
 /// Workload class label recorded for the online ingest + query workload.
@@ -386,6 +392,8 @@ struct ReaderTally {
 	rows_verified: u64,
 	rows_read: u64,
 	mismatched_queries: usize,
+	failed_queries: usize,
+	first_error: Option<String>,
 	finite: bool,
 }
 
@@ -413,7 +421,8 @@ struct ReaderTally {
 /// Returns an error if the corpus has fewer than two rows, mismatched columns or timestamps
 /// that do not strictly rise, if `batch_rows`, `readers` or `window_rows` is zero, if
 /// `params.rows < 2` or a copy would leave the timestamp range, or if any store operation
-/// fails. A query that reads the wrong rows is not an error: it fails the correctness gate.
+/// fails. A query that reads the wrong rows, or that the store refuses (a read can meet the
+/// writer's lock), is not an error: it is counted and fails the correctness gate.
 #[allow(clippy::cast_precision_loss)]
 pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: OnlineParams) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
@@ -448,6 +457,7 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 	let idle_latency = LatencyStats::from_samples(&idle.samples_ns);
 	let accounted = stats.0 == rows && stats.1;
 	let mismatched_queries = online.mismatched_queries + idle.mismatched_queries;
+	let failed_queries = online.failed_queries + idle.failed_queries;
 	let point = OnlinePoint {
 		readers: params.readers,
 		window_rows: params.window_rows,
@@ -459,8 +469,10 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 		idle_p99_ns: idle_latency.p99_ns,
 		rows_verified: online.rows_verified + idle.rows_verified,
 		mismatched_queries,
+		failed_queries,
+		first_error: online.first_error.or(idle.first_error),
 	};
-	let correctness = CorrectnessReport { output_count_ok: accounted && mismatched_queries == 0, expected_output_points: usize::try_from(point.rows_verified)?, actual_output_points: usize::try_from(online.rows_read + idle.rows_read)?, values_finite: online.finite && idle.finite };
+	let correctness = CorrectnessReport { output_count_ok: accounted && mismatched_queries == 0 && failed_queries == 0, expected_output_points: usize::try_from(point.rows_verified)?, actual_output_points: usize::try_from(online.rows_read + idle.rows_read)?, values_finite: online.finite && idle.finite };
 	let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns: online_ns, end_to_end_ns: span_ns(run_start).saturating_add(generation_ns) };
 	Ok(BenchResult {
 		schema_version: SCHEMA_VERSION,
@@ -513,11 +525,20 @@ async fn seal_tiled(store: &SegmentStore, aspect: &str, tiled: &Tiled<'_>, rows:
 	Ok(seal_ns)
 }
 
-/// One query: rows `from..to`, which lie within one copy, read back and compared exactly.
+/// One query: rows `from..to`, which lie within one copy, read back and compared exactly. A
+/// read the store refuses is counted in the tally, not returned as an error.
 async fn query(store: &SegmentStore, aspect: &str, tiled: &Tiled<'_>, from: u64, to: u64, tally: &mut ReaderTally) -> anyhow::Result<()> {
 	let (start, end) = (tiled.timestamp(from)?, tiled.timestamp(to - 1)?);
 	let t0 = Instant::now();
-	let (read_ts, read_values) = store.read_time_range(aspect, start, end).await.map_err(|e| anyhow::anyhow!("cannot query aspect {aspect}: {e:#}"))?;
+	let (read_ts, read_values) = match store.read_time_range(aspect, start, end).await {
+		Ok(rows) => rows,
+		Err(e) => {
+			// A refused read is a result, not the end of the run: count it and fail the gate.
+			tally.failed_queries += 1;
+			tally.first_error.get_or_insert_with(|| format!("{e:#}"));
+			return Ok(());
+		}
+	};
 	tally.samples_ns.push(span_ns(t0));
 	let (expected_ts, expected_values) = tiled.window(from, to)?;
 	if read_ts != expected_ts || !read_values.iter().map(Option::as_ref).eq(expected_values.iter().map(Some)) {
@@ -590,6 +611,8 @@ fn merge(tallies: Vec<ReaderTally>) -> ReaderTally {
 		all.rows_verified += t.rows_verified;
 		all.rows_read += t.rows_read;
 		all.mismatched_queries += t.mismatched_queries;
+		all.failed_queries += t.failed_queries;
+		all.first_error = all.first_error.take().or(t.first_error);
 		all.finite &= t.finite;
 		all
 	})
@@ -622,7 +645,7 @@ async fn online_phases(profile: &IngestProfile, corpus: Arc<(Vec<i64>, Vec<BigDe
 	for handle in readers {
 		tallies.push(handle.await.map_err(|e| anyhow::anyhow!("an online reader failed: {e}"))??);
 	}
-	let idle_handles: Vec<_> = tallies.iter().enumerate().map(|(i, t)| tokio::spawn(reader(Arc::clone(&shared), i, Some(t.samples_ns.len().max(64))))).collect();
+	let idle_handles: Vec<_> = tallies.iter().enumerate().map(|(i, t)| tokio::spawn(reader(Arc::clone(&shared), i, Some((t.samples_ns.len() + t.failed_queries).max(64))))).collect();
 	let online = merge(tallies);
 	let mut idle = Vec::with_capacity(idle_handles.len());
 	for handle in idle_handles {

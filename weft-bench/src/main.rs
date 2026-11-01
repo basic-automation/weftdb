@@ -398,7 +398,10 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 			let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
 			println!("online   : {} rows, {} readers x {}-row windows", o.rows, o.readers, o.window_rows);
 			println!("ingest   : {:>12.0} rows/s alone  {:>12.0} rows/s with queries", o.ingest_alone_rows_per_sec, result.throughput_points_per_sec);
-			println!("queries  : during ingest {:>8} (p50 {:>8.3} ms p99 {:>8.3} ms)  idle {:>8} (p50 {:>8.3} ms p99 {:>8.3} ms)  {} mismatched", result.reps, ms(result.latency.p50_ns), ms(result.latency.p99_ns), o.idle_queries, ms(o.idle_p50_ns), ms(o.idle_p99_ns), o.mismatched_queries);
+			println!("queries  : during ingest {:>8} (p50 {:>8.3} ms p99 {:>8.3} ms)  idle {:>8} (p50 {:>8.3} ms p99 {:>8.3} ms)  {} mismatched, {} failed", result.reps, ms(result.latency.p50_ns), ms(result.latency.p99_ns), o.idle_queries, ms(o.idle_p50_ns), ms(o.idle_p99_ns), o.mismatched_queries, o.failed_queries);
+			if let Some(error) = &o.first_error {
+				println!("first failure: {error}");
+			}
 		}
 		return finish(cli, &BenchReport::with_results(RunMetadata::capture(Utc::now().to_rfc3339()), vec![result]));
 	}
