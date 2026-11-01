@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{auth::AuthConfig, host_guard::HostGuard, interpolate::InterpolateConfig, metrics::SharedMetrics};
+use crate::{auth::AuthConfig, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -60,6 +60,10 @@ pub struct AppState {
 	/// The Bearer authentication in force (SEC-6): off unless the binary
 	/// resolved a keys file at startup ([`AuthConfig`]).
 	auth: AuthConfig,
+	/// The ingest wiring's limits (D-S14): the one body cap and the
+	/// in-flight byte budget the registry builds the ingest routes and
+	/// their gate admission from.
+	ingest: IngestConfig,
 }
 
 impl AppState {
@@ -75,7 +79,7 @@ impl AppState {
 	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off() }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -136,6 +140,21 @@ impl AppState {
 	#[must_use]
 	pub const fn auth(&self) -> &AuthConfig {
 		&self.auth
+	}
+
+	/// Set the ingest wiring's limits (D-S14); the binary passes the
+	/// [`IngestConfig`] it resolved from `WEFT_MAX_INGEST_BYTES` /
+	/// `WEFT_INGEST_MAX_INFLIGHT_BYTES`.
+	#[must_use]
+	pub const fn with_ingest_config(mut self, config: IngestConfig) -> Self {
+		self.ingest = config;
+		self
+	}
+
+	/// The ingest wiring's limits the router is built with.
+	#[must_use]
+	pub const fn ingest_config(&self) -> IngestConfig {
+		self.ingest
 	}
 }
 

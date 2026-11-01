@@ -66,6 +66,21 @@ fn is_ingest_route(request: &Request<Body>) -> bool {
 	matches!(suffix, "points" | "ilp" | "csv" | "parquet")
 }
 
+/// Map an ingest panic to its envelope by the phase it reached (plan
+/// D21): at [`IngestPhase::Committing`] the COMMIT may or may not have
+/// landed, which is `503 outcome_unknown` with no `committed` claim;
+/// before it, the write did not commit, which is `500 commit_failed`
+/// with `committed: false`. The one mapping, shared by this layer (a
+/// panic that unwinds in place) and by D-S14's detached ingest task (a
+/// panic that comes back as a caught panic or a `JoinError`), so the two
+/// paths can never disagree about what a phase costs the caller.
+pub(crate) fn map_ingest_panic(phase: Option<IngestPhase>, message: &str) -> ApiError {
+	match phase {
+		Some(IngestPhase::Committing) => ApiError::server(Code::OutcomeUnknown, format!("panic while committing an ingest: {message}")),
+		_ => ApiError::commit_failed(format!("panic before the ingest committed (phase {phase:?}): {message}")),
+	}
+}
+
 /// The panic-catch middleware: install it once, around the whole router
 /// ([`crate::app_with_state`] does), and every handler panic becomes an
 /// envelope. See the module docs for the mapping.
@@ -77,10 +92,7 @@ pub async fn catch_panic(request: Request<Body>, next: Next) -> Response {
 			Ok(response) => response,
 			Err(caught) => {
 				tracing::error!(panic = %caught.message, phase = ?caught.ingest_phase, "ingest handler panicked; mapped by IngestPhase (ROB-3, D21)");
-				match caught.ingest_phase {
-					Some(IngestPhase::Committing) => ApiError::server(Code::OutcomeUnknown, format!("panic while committing an ingest: {}", caught.message)).into_response(),
-					_ => ApiError::commit_failed(format!("panic before the ingest committed (phase {:?}): {}", caught.ingest_phase, caught.message)).into_response(),
-				}
+				map_ingest_panic(caught.ingest_phase, &caught.message).into_response()
 			}
 		}
 	} else {

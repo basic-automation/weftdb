@@ -140,7 +140,7 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
   - [ ] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
   - [x] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
   - [x] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
-  - [ ] **S14** HTTP ingest wiring
+  - [x] **S14** HTTP ingest wiring
   - [ ] **S15** Partial sidecar v4
   - [x] **S16** Whole-store backup with hard-linked frames
   - [ ] **S17** Relaxed durability mode with synced_epoch watermark (optional for 1.0) *(~6 h; after S12)*
@@ -290,7 +290,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 - [ ] **W5 · Ingest wiring, whole-store backup, legacy seal**
   - [ ] Store lane
   - [x] → **D-S15** Partial sidecar v4
-  - [ ] → **D-S19** Seal-backed legacy aspects
+  - [x] → **D-S19** Seal-backed legacy aspects
   - [ ] L-INGEST
   - [ ] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
   - [ ] **ROB-10** Admission I
