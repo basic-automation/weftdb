@@ -4,6 +4,62 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — D-S14: how the HTTP surface wires onto the ingest entry point (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan's §5 D-S14 amendment and resolutions C9–C11, plus the crash-consistency
+design §8/§5.2/§2(g): routes through SEC-3's `Routes`; the one body cap is
+`WEFT_MAX_INGEST_BYTES` (256 MiB default) on the ingest routes only; admission sits inside the
+gate; the idempotency key (header or `batch_id`, visible ASCII ≤128 bytes, per aspect, shared by
+all principals) is handled behind the gate; all four formats commit through
+`SegmentStore::ingest` from a detached task whose JoinHandle the handler awaits; a panic is
+mapped by `IngestPhase` (D21); the response gains `segment_ids` and `replayed`, a replay
+answering 200 with `Idempotency-Replayed: true`; a `weft_audit` ingest event follows COMMIT;
+the shutdown future goes to `serve::run` with handlers installed first; the drain is
+`WEFT_SHUTDOWN_GRACE_SECS` (C-2); the shutdown watch is ROB-3's Daemons registry. The points the
+sources do not pin, chosen here:
+
+1. **Keyless requests commit under an ephemeral key.** The one entry point requires a key, so a
+   request that supplies none gets a fresh unique key (`http-ephemeral:{pid}:{counter}:{nanos}`)
+   minted per request. A keyless retry therefore stays the documented at-least-once — it cannot
+   replay, because it cannot name its batch — and no format keeps a private seal path.
+2. **Paged batches ride the entry point.** `IngestBatch` gains `rows_per_page`; the store's
+   ingest seals a paged (v6) frame for a paged batch instead of the HTTP layer refusing the
+   combination or bypassing the ledger. The fingerprint feeds the page height only when one is
+   set, so an unpaged batch fingerprints byte-identically to before this slice and pre-D-S14
+   ledger rows still replay.
+3. **The in-flight budget defaults to the body cap.** `WEFT_INGEST_MAX_INFLIGHT_BYTES` is named
+   by crash §8 with no default; it defaults to 256 MiB — one maximum body in flight. The gate
+   charges `Content-Length` when present (a chunked body is charged 1 byte; the body cap still
+   bounds it) and refuses with 503 `overloaded` + `Retry-After: 1`. The permit rides in the
+   request extensions and is released when the request drops.
+4. **The audit event is a tracing event, for now.** SEC-9's fsynced audit file is the consumer
+   the design names, but SEC-9 is a W6 slice; the event is emitted on the reserved
+   `weft_audit` target with the §5 fields (`aspect`, `format`, `rows`, `segments`,
+   `commit_epoch`, `keyed`) so SEC-9 can subscribe without the emitters changing. It fires only
+   on a fresh COMMIT — a replay commits nothing and emits none.
+5. **`SegmentStore::shutdown()`** is the C9/§5.5 closing sequence as one call: a best-effort
+   reaper pass (`MaintenanceWait::Skip`; busy/failed aspects are logged, never propagated — the
+   shutdown must still land) and then the clean-shutdown commit. Startup calls it after the
+   Daemons watch is raised, in place of the bare `mark_clean_shutdown()`.
+6. **Parquet keeps only its decode in `weft-arrow-store`.** `decode_parquet_columns` is the
+   decode half of `ingest_parquet_into_aspect` (which keeps its own seal behaviour for its
+   library callers); the HTTP handler decodes, then commits like the other three formats.
+7. **Response descriptor fields** come from the first committed segment's index row when it
+   reads back; `null_count` uses the descriptor only for a single-segment commit (the receipt
+   carries no null count), falling back to the request's own columns otherwise.
+8. **Not in this slice, deliberately.** SEAL-2's `spawn_blocking` threshold
+   (`WEFT_SEAL_BLOCKING_ROWS`, `WEFT_INGEST_MAX_SEGMENT_ROWS`) belongs to the seal engine's own
+   amendment line, not D-S14's; and no `WEFT_IDEMPOTENCY_TTL_SECS` is registered, because
+   nothing would read it yet — the ledger TTL/prune policy (crash §10.2's open default) lands
+   with the slice that implements pruning.
+9. **Fix-forward, not this slice's work:** D-S19 landed `WEFT_LEGACY_DEFAULT_STORAGE`
+   (weftdb/types/legacy_seal.rs) without a registry entry, so
+   `every_environment_name_the_workspace_reads_is_registered` was already red on main before
+   this slice. The entry is registered here (and the asserted registry size moves 68 → 72: this
+   slice's three, plus that one) because the C-2 registry is the surface this slice extends and
+   the wave's end-of-wave CI would otherwise inherit the failure. Revert this entry with D-S19's
+   own follow-up if its wording should differ.
+
 ## 2026-11-01 — D-S15: what the v4 sidecar reader checks, and what went with the v3 reader (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the crash-consistency design (§4) fixes the v4 shape — magic last byte `0x03`, a
@@ -2548,3 +2604,64 @@ shape) and the `weft-server restore` CLI — plan C19 assigns the one CLI to
 PAC-13 (W7), and the queue's D-S16 acceptance names backup, adoption,
 `held`, the intent marker, the embedded format, the floor refusal, the RAII
 hold and the headroom check, not the in-place shape.
+
+## 2026-11-01 — D-S19 seal-backed legacy aspects: the shapes the design left open — FOR MERGE REVIEW
+
+**Ambiguous:** the crash-consistency design (§8, S19) and the 1.0 plan (§5
+D-S19/D-S20 amendment) name what a seal-backed legacy aspect must do, but
+leave several shapes open: where `widen_value_encoding` lives (FRE-7b is a
+separate, still-pending W5 slice), which registry registers the legacy
+DDL, what target the post-capture squash gate uses, and what identity a
+measurement read back from a seal frame carries (frames hold no per-row id
+or dataset id).
+
+**Chosen:**
+1. **Widening.** `widen_value_encoding(current, values)` is implemented in
+   `weft-physical-type::schema` — the minimal FRE-7b helper this slice's
+   widening needs: an encoding that encodes every offered value exactly is
+   kept; anything lossy or unrepresentable widens to `BigDecimalText`, the
+   one universally lossless encoding. FRE-7b's other parts (immutable
+   declarations, scale rules, schema read-back) are not built here and its
+   ROADMAP line stays unticked. The legacy adapter declares `Decimal128`
+   at zero tolerance in milliseconds on first use and widens the
+   declaration through this helper; frames self-describe, so earlier
+   frames stay readable.
+2. **Legacy DDL.** `aspects.storage_mode` follows the legacy metadata
+   pattern the codebase already uses for `compression_config` (in the
+   wireframe CREATE for new databases, plus an idempotent
+   `ALTER … ADD COLUMN` for existing ones, its duplicate-column error
+   ignored), because the legacy `metadata.db` is not one of the seal
+   store's four control-plane databases. The seal store the aspect's
+   frames live in (`{db}/segments_v2/`, scope `(db, 'legacy')`, keyed by
+   the AspectId UUID) is a normal Storage-v2 root: all of its DDL is the
+   registered migration registry (FRE-14's `0003` included), and no new
+   DDL was added there.
+3. **Mode choice.** Recorded once at `track_aspect`: a compression config
+   forces rows mode (compression deletes ranges; the seal store cannot),
+   otherwise `WEFT_LEGACY_DEFAULT_STORAGE=segments` makes the new aspect
+   seal-backed, otherwise rows. Existing rows are never switched and there
+   are no union reads; a pre-S19 row (`NULL`/no column) reads as rows.
+4. **Writes and the queue.** `batch_capture_measurements` is one
+   `SegmentStore::ingest` under the design's derived key
+   (`legacy:{dataset_id}:{payload_crc:08x}:{n}`, CRC-32 over the canonical
+   rows, `n` the row count); TxIds are synthetic UUIDv5 over key and row
+   index, with SHA-1 computed in `legacy_seal` because this build of
+   `uuid` does not enable its `v5` feature. `capture_measurement` is a
+   one-row ingest followed by
+   `squash_aspect_to_target_rows_if_fragmented` at a 100,000-row target.
+   Until D-S20, seal-backed ingest still enqueues its timestamps in the
+   per-timestamp queue with the S18 write-ahead shape, so the queue
+   consumer works unchanged; D-S20 is the slice that drops the queue.
+5. **Read-back identity.** The readers the design names (raw, chunk,
+   range, count, boundary, earliest/latest) go through the seal store.
+   A returned `Measurement` synthesises its id deterministically (UUIDv5
+   over aspect, timestamp, value and occurrence — two reads of one stored
+   row agree, which the boundary reader's de-duplication needs) and
+   carries the nil dataset id, because a frame stores neither.
+
+**Not in this slice:** D-S20's `segment_changes` queue replacement (its
+own W7 seal-lane slice; the `:780` gate tick lands with D-S19 + D-S20
+together, per plan §6 W7 — this slice ticks only the W5 D-S19 line), the
+other legacy capture variants (`capture_new_measurement` and the chunk
+helpers, which the design does not name), and compression on seal-backed
+aspects (deferred by the design itself).

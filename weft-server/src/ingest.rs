@@ -3,29 +3,149 @@
 //! batch into one `.weftseg` frame.
 //!
 //! Every ingest path is the same three steps: parse the body into timestamps and
-//! values, check the ordering the aspect's contract asks for, then
-//! [`weftdb::SegmentStore::seal_declared`] the batch as one segment. That is the
-//! only seal path the HTTP surface has, so an ingest cannot slip past the
-//! encoding/tolerance constraint (hard constraint #4 — a value that cannot be
-//! represented under the declared encoding within tolerance is rejected, never
-//! silently downcast).
+//! values, check the ordering the aspect's contract asks for, then commit the
+//! batch through the store's one idempotent entry point,
+//! [`weftdb::SegmentStore::ingest`] (D-S13), as one or more segments. That is
+//! the only commit path the HTTP surface has (D-S14, crash-consistency §8), so
+//! an ingest cannot slip past the encoding/tolerance constraint (hard
+//! constraint #4 — a value that cannot be represented under the declared
+//! encoding within tolerance is rejected, never silently downcast), and every
+//! format shares the ledger, the phases and the receipt.
+//!
+//! The commit runs in a detached task the handler awaits (crash-consistency
+//! §5.2, SEAL-1): a client disconnect cannot cancel a batch mid-commit, and a
+//! panic inside the task comes back as a `JoinError`/caught panic the handler
+//! maps by [`weftdb::IngestPhase`] (plan D21), exactly as ROB-3's catch layer
+//! maps a panic that unwinds in place. The caller's idempotency key — the
+//! `Idempotency-Key` header (visible ASCII, at most 128 bytes), or the JSON
+//! body's `batch_id` — is scoped per aspect and shared by all principals
+//! (plan C10); a request with no key commits under a fresh ephemeral key, so
+//! its retry is the documented at-least-once of a keyless retry, never a
+//! silent replay of an unrelated batch.
 //!
 //! The Parquet ingest lives here rather than in [`crate::storage`] so that every
-//! way a batch can arrive shares one ordering gate and one seal.
+//! way a batch can arrive shares one ordering gate and one commit.
+
+use std::sync::{
+	atomic::{AtomicU64, Ordering}, Arc
+};
 
 use axum::{
-	body::Bytes, extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json
+	body::Bytes, extract::{Path, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
-use weft_physical_type::{first_order_violation, AspectSchema, SegmentDescriptor, TimeUnit};
+use weft_physical_type::{first_order_violation, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION};
 
 use crate::{
-	error::{self, ApiError, StrictJson, StrictQuery}, state::AppState
+	error::{self, ApiError, StrictBody, StrictJson, StrictQuery, StrictText}, panic_catch, state::AppState
 };
+
+/// Environment variable naming the one body cap for the ingest routes
+/// (plan C11, crash-consistency §8): a positive whole number of bytes,
+/// read once at startup. Every other route keeps its own limits — this
+/// cap applies to the four ingest routes only, as a
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) the registry
+/// installs at registration.
+pub const MAX_INGEST_BYTES_ENV: &str = "WEFT_MAX_INGEST_BYTES";
+
+/// Environment variable naming the ingest routes' in-flight byte budget
+/// (crash-consistency §8): the byte-weighted admission the registry's
+/// gate enforces inside itself (plan C10). A request whose body would
+/// push the in-flight total past the budget is refused
+/// `503 overloaded` with `Retry-After`, instead of queueing without
+/// bound behind the ingests already running.
+pub const INGEST_MAX_INFLIGHT_BYTES_ENV: &str = "WEFT_INGEST_MAX_INFLIGHT_BYTES";
+
+/// The default body cap when `WEFT_MAX_INGEST_BYTES` is unset:
+/// 256 MiB (crash-consistency §8).
+pub const DEFAULT_MAX_INGEST_BYTES: usize = 256 * 1024 * 1024;
+
+/// The ingest wiring's two limits (D-S14), read once at startup and
+/// carried on the router state, so the registry the binary serves and a
+/// test's registry can carry different caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestConfig {
+	max_body_bytes: usize,
+	max_inflight_bytes: u64,
+}
+
+impl IngestConfig {
+	/// The defaults: a 256 MiB body cap, and an in-flight budget of the
+	/// same 256 MiB — one max-size body in flight by default, or any
+	/// number of smaller ones whose bodies sum under it.
+	pub const DEFAULT: Self = Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64 };
+
+	/// A configuration with an explicit body cap and the default
+	/// in-flight budget (tests, embedders).
+	#[must_use]
+	pub const fn with_max_body_bytes(max_body_bytes: usize) -> Self {
+		Self { max_body_bytes, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64 }
+	}
+
+	/// A configuration with an explicit in-flight byte budget and the
+	/// default body cap (tests, embedders).
+	#[must_use]
+	pub const fn with_max_inflight_bytes(max_inflight_bytes: u64) -> Self {
+		Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes }
+	}
+
+	/// The limits the two `WEFT_*` values describe (`None` for an unset
+	/// variable, which leaves that limit at its default).
+	///
+	/// # Errors
+	///
+	/// A message naming the variable when a value is not a positive
+	/// whole number, so a malformed setting fails startup instead of
+	/// silently falling back to a default the operator did not ask for.
+	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>) -> Result<Self, String> {
+		let mut config = Self::DEFAULT;
+		if let Some(raw) = max_body_bytes {
+			config.max_body_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.max_body_bytes == 0 {
+				return Err(format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest body"));
+			}
+		}
+		if let Some(raw) = max_inflight_bytes {
+			config.max_inflight_bytes = raw.parse().map_err(|e| format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.max_inflight_bytes == 0 {
+				return Err(format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest"));
+			}
+		}
+		Ok(config)
+	}
+
+	/// The limits the process environment describes; see
+	/// [`from_env_values`](Self::from_env_values).
+	///
+	/// # Errors
+	///
+	/// A set variable whose value is not a positive whole number.
+	pub fn from_env() -> Result<Self, String> {
+		Self::from_env_values(std::env::var(MAX_INGEST_BYTES_ENV).ok().as_deref(), std::env::var(INGEST_MAX_INFLIGHT_BYTES_ENV).ok().as_deref())
+	}
+
+	/// The one body cap for the ingest routes, in bytes.
+	#[must_use]
+	pub const fn max_body_bytes(self) -> usize {
+		self.max_body_bytes
+	}
+
+	/// The ingest routes' in-flight byte budget, in bytes.
+	#[must_use]
+	pub const fn max_inflight_bytes(self) -> u64 {
+		self.max_inflight_bytes
+	}
+}
+
+impl Default for IngestConfig {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
 
 /// One point in an ingest batch: an integer epoch timestamp (in the aspect's
 /// declared [`TimeUnit`]) and its value as lossless decimal text, or `null` for an
@@ -60,6 +180,12 @@ pub struct IngestRequest {
 	/// reconciliation path). Equal adjacent timestamps are in order.
 	#[serde(default)]
 	pub require_sorted: bool,
+	/// The caller's idempotency key, as the body's own spelling of the
+	/// `Idempotency-Key` header (crash-consistency §8: the key comes from
+	/// the header *or from `batch_id`*). The header wins when both are
+	/// sent. Same rule as the header: visible ASCII, at most 128 bytes.
+	#[serde(default)]
+	pub batch_id: Option<String>,
 }
 
 /// Response body for a successful ingest: the sealed segment's descriptor summary,
@@ -88,6 +214,17 @@ pub struct IngestResponse {
 	/// batch stored in ordered form. Always `true` for a batch accepted under
 	/// `require_sorted`.
 	pub time_sorted: bool,
+	/// Every segment id the batch's commit assigned, in time order
+	/// (crash-consistency §8). A batch under the encoded-frame target
+	/// commits exactly one segment, so this is usually `[segment_id]`;
+	/// `segment_id` stays as the first id for the clients that predate
+	/// the list.
+	pub segment_ids: Vec<u64>,
+	/// Whether this response is a replay: the request's idempotency key
+	/// was already committed with the same batch, so nothing was written
+	/// again and the recorded receipt is answered back (with status
+	/// `200` and the `Idempotency-Replayed: true` header, §2(g)).
+	pub replayed: bool,
 }
 
 /// Enforce monotonic non-decreasing timestamps when a request opts in
@@ -108,6 +245,141 @@ fn enforce_order_if_required(require_sorted: bool, timestamps: &[i64]) -> Result
 	Ok(())
 }
 
+/// The most bytes an idempotency key may carry (crash-consistency §8:
+/// visible ASCII, at most 128 bytes).
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+
+/// Validate one caller-supplied idempotency key.
+///
+/// # Errors
+///
+/// [`ApiError::bad_request`] when the key is empty, over
+/// [`MAX_IDEMPOTENCY_KEY_BYTES`], or not visible ASCII.
+fn validate_idempotency_key(key: &str) -> Result<String, ApiError> {
+	if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+		return Err(ApiError::bad_request(format!("an idempotency key must be visible ASCII of 1..={MAX_IDEMPOTENCY_KEY_BYTES} bytes, got {} byte(s)", key.len())));
+	}
+	Ok(key.to_string())
+}
+
+/// The idempotency key a request commits under: the `Idempotency-Key`
+/// header when it carries one, else the body's own key (`batch_id`, JSON
+/// format only), else a fresh ephemeral key. The header sits behind the
+/// registry's gate and the auth layer (plan C10) — this function only
+/// ever runs inside a handler both have already passed.
+///
+/// # Errors
+///
+/// [`ApiError::bad_request`] for a supplied key that is not visible
+/// ASCII of at most 128 bytes (a non-ASCII header value cannot even be
+/// read as text, which is the same refusal).
+fn resolve_idempotency_key(headers: &HeaderMap, body_key: Option<&str>) -> Result<(String, bool), ApiError> {
+	if let Some(value) = headers.get("idempotency-key") {
+		let key = value.to_str().map_err(|_| ApiError::bad_request("the `Idempotency-Key` header is not visible ASCII".to_string()))?;
+		return validate_idempotency_key(key).map(|key| (key, true));
+	}
+	if let Some(key) = body_key {
+		return validate_idempotency_key(key).map(|key| (key, true));
+	}
+	Ok((ephemeral_key(), false))
+}
+
+/// A one-off ledger key for a request that supplied none: unique per
+/// request (process id, a process-wide counter, and the wall clock), so
+/// a keyless batch commits exactly once for this request and a keyless
+/// retry — which cannot name the batch — stays at-least-once, as
+/// documented (crash-consistency §2).
+fn ephemeral_key() -> String {
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+	let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+	format!("http-ephemeral:{}:{count}:{nanos}", std::process::id())
+}
+
+/// Emit the `weft_audit` ingest event for a batch that just committed
+/// (plan §5, D-S14: the event is emitted *after* COMMIT — a replay,
+/// which commits nothing, emits none, and neither does a refusal).
+/// SEC-9's fsynced audit file consumes this target when it lands; until
+/// then the event rides the normal tracing pipeline under its own
+/// target, so a subscriber can route it apart from the request log.
+fn emit_ingest_audit(aspect: &str, format: &str, keyed: bool, receipt: &weftdb::IngestReceipt) {
+	tracing::info!(target: "weft_audit", event = "ingest", aspect, format, keyed, rows = receipt.row_count, segments = receipt.segment_ids.len(), commit_epoch = receipt.commit_epoch, "ingest committed");
+}
+
+/// Commit one parsed batch through the store's ingest entry point, in a
+/// detached task, and build the response every format answers with.
+///
+/// The detached task is SEAL-1 (crash-consistency §5.2): the handler
+/// awaits its `JoinHandle`, so dropping the handler future — a client
+/// disconnect — detaches the task instead of cancelling the commit. A
+/// panic inside the task is caught by [`weftdb::exec::catch`] inside an
+/// ingest-phase scope and mapped by [`IngestPhase`](weftdb::IngestPhase)
+/// (plan D21, the ROB-3 table); a panic that still escapes as a
+/// `JoinError` is mapped the same way, with no phase to key on (the
+/// pre-commit arm: nothing the task could have committed is claimed).
+async fn commit_ingest(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, format: &'static str, keyed: bool, batch: weftdb::IngestBatch, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<Response, ApiError> {
+	// An undeclared aspect is a clean 404 (its encoding is unknown),
+	// answered here as the handlers always answered it — the store's
+	// entry point would also refuse, but only after its name check,
+	// which would call a path-escaping name malformed (400) instead of
+	// undeclared (404).
+	if store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))?.is_none() {
+		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
+	}
+	let rows_per_page = batch.rows_per_page;
+	let task_store = Arc::clone(store);
+	let task_aspect = aspect.to_string();
+	let handle = tokio::spawn(async move { weftdb::exec::ingest_phase_scope(weftdb::exec::catch(async move { task_store.ingest(&task_aspect, &batch).await })).await });
+	let receipt = match handle.await {
+		Ok(Ok(Ok(receipt))) => receipt,
+		Ok(Ok(Err(error))) => return Err(error::classify_ingest(&error)),
+		Ok(Err(caught)) => {
+			tracing::error!(panic = %caught.message, phase = ?caught.ingest_phase, "ingest task panicked; mapped by IngestPhase (D-S14, D21)");
+			return Err(panic_catch::map_ingest_panic(caught.ingest_phase, &caught.message));
+		}
+		Err(join) if join.is_panic() => {
+			let message = weftdb::exec::panic_message(&*join.into_panic());
+			tracing::error!(panic = %message, "ingest task panicked outside its phase catch; mapped by IngestPhase (D-S14, D21)");
+			return Err(panic_catch::map_ingest_panic(None, &message));
+		}
+		Err(join) => {
+			tracing::error!(error = %join, "ingest task ended without an outcome");
+			return Err(ApiError::internal(format!("the ingest task ended without an outcome: {join}")));
+		}
+	};
+	if !receipt.duplicate {
+		emit_ingest_audit(aspect, format, keyed, &receipt);
+		metrics.record_ingest_seal(u64::try_from(receipt.row_count).unwrap_or(u64::MAX));
+		if receipt.segment_ids.len() > 1 {
+			metrics.record_ingest_extra_segments(u64::try_from(receipt.segment_ids.len() - 1).unwrap_or(u64::MAX));
+		}
+	}
+	Ok(ingest_response(store, aspect, &receipt, timestamps, values, rows_per_page).await)
+}
+
+/// Build an ingest response from a commit's receipt: the additive shape
+/// of crash-consistency §8 — `segment_id` stays as the first id, and
+/// `segment_ids`/`replayed` join it. The remaining descriptor fields
+/// come from the first committed segment's index row when it can be
+/// read back; a row that cannot be read (quarantined between commit and
+/// answer, say) falls back to the values the request itself determines,
+/// because the commit has already happened and its receipt is the
+/// answer that matters.
+async fn ingest_response(store: &Arc<weftdb::SegmentStore>, aspect: &str, receipt: &weftdb::IngestReceipt, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Response {
+	let first_id = receipt.segment_ids.first().copied();
+	let descriptor = match first_id {
+		Some(id) => store.index().all(aspect).await.ok().and_then(|descriptors| descriptors.into_iter().find(|d| d.id == id)),
+		None => None,
+	};
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: first_id.unwrap_or(0), format_version: descriptor.as_ref().map_or(if rows_per_page.is_some() { PAGED_SEGMENT_FORMAT_VERSION } else { SEGMENT_FORMAT_VERSION }, |d| d.format_version), row_count: receipt.row_count, null_count: descriptor.as_ref().filter(|_| receipt.segment_ids.len() == 1).map_or_else(|| values.iter().filter(|v| v.is_none()).count(), |d| d.null_count), byte_len: descriptor.as_ref().map_or(0, |d| d.byte_len), min_ts: receipt.min_ts, max_ts: receipt.max_ts, time_sorted: first_order_violation(timestamps).is_none(), segment_ids: receipt.segment_ids.clone(), replayed: receipt.duplicate };
+	let status = if receipt.duplicate { StatusCode::OK } else { StatusCode::CREATED };
+	let mut response = (status, Json(response)).into_response();
+	if receipt.duplicate {
+		response.headers_mut().insert("Idempotency-Replayed", axum::http::HeaderValue::from_static("true"));
+	}
+	response
+}
+
 /// Handle `POST /api/v1/storage/{aspect}/points`: seal a batch of points into
 /// `aspect`'s declared schema.
 ///
@@ -122,7 +394,7 @@ fn enforce_order_if_required(require_sorted: bool, timestamps: &[i64]) -> Result
 /// undeclared), [`ApiError::bad_request`] (empty batch, an unparseable value, or
 /// values unrepresentable under the declared encoding/tolerance), and
 /// [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, StrictJson(request): StrictJson<IngestRequest>) -> Result<Response, ApiError> {
+pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictJson(request): StrictJson<IngestRequest>) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
@@ -130,10 +402,10 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 		ApiError::unconfigured()
 	})?;
 	drop(state);
-	// Time the seal path (not the store-unconfigured fast-fail above): this is the
+	// Time the commit path (not the store-unconfigured fast-fail above): this is the
 	// ingest side of the north-star "predictable p95/p99 under ingest + query".
 	let start = std::time::Instant::now();
-	let result = ingest_points_inner(&store, &metrics, &aspect, request).await;
+	let result = ingest_points_inner(&store, &metrics, &aspect, &headers, request).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -144,35 +416,24 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 
 /// The body of [`ingest_points`], split out so the handler can record an error
 /// metric for any failure path uniformly.
-async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, request: IngestRequest) -> Result<Response, ApiError> {
+async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, headers: &HeaderMap, request: IngestRequest) -> Result<Response, ApiError> {
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("no points to ingest (`points` is empty)".to_string()));
 	}
-	// An undeclared aspect is a clean 404 (its encoding is unknown) rather than the
-	// seal's generic error; fetching the schema here also lets the nullable/paged
-	// seal variants take it directly. A store that refuses the name, or a root this binary will
-	// not open, is classified by its type rather than reported as a `500`.
-	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
-		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
-	};
-
+	let (key, keyed) = resolve_idempotency_key(headers, request.batch_id.as_deref())?;
 	let point_count = request.points.len();
 	let mut timestamps = Vec::with_capacity(point_count);
 	let mut values = Vec::with_capacity(point_count);
-	let mut any_null = false;
 	// `storage.ingest.parse` child span (roadmap Phase 3 — the write-path analogue of
 	// the compute-path parse span): the decimal-text → `BigDecimal` value lift of the
-	// batch, timed apart from the seal so a `RUST_LOG` run attributes ingest value
+	// batch, timed apart from the commit so a `RUST_LOG` run attributes ingest value
 	// parsing separately from the segment write.
 	{
 		let _parse = tracing::info_span!("storage.ingest.parse", point_count, format = "json").entered();
 		for point in &request.points {
 			timestamps.push(point.timestamp);
 			match &point.value {
-				None => {
-					any_null = true;
-					values.push(None);
-				}
+				None => values.push(None),
 				Some(text) => {
 					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
 					values.push(Some(parsed));
@@ -185,28 +446,8 @@ async fn ingest_points_inner(store: &weftdb::SegmentStore, metrics: &crate::metr
 	// `storage.ingest.seal` child span (roadmap Phase 3): the typed-column encode +
 	// `.weftseg` write + control-plane index update — the write stage timed apart from
 	// value parsing.
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, request.rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "json")).await.map_err(|err| error::classify_ingest(&err))?;
-	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
-	Ok((StatusCode::CREATED, Json(response)).into_response())
-}
-
-/// Dispatch the right seal path for the batch: nullable vs dense × paged vs
-/// single-block. Kept as a free async fn taking `&SegmentStore` so the handler can
-/// drop its store handle before building the response.
-async fn seal_batch(store: &weftdb::SegmentStore, aspect: &str, schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>], any_null: bool, rows_per_page: Option<usize>) -> anyhow::Result<SegmentDescriptor> {
-	match (rows_per_page, any_null) {
-		(Some(rows_per_page), true) => store.seal_paged_nullable(aspect, schema, timestamps, values, rows_per_page).await,
-		(Some(rows_per_page), false) => store.seal_paged(aspect, schema, timestamps, &present_values(values), rows_per_page).await,
-		(None, true) => store.seal_nullable(aspect, schema, timestamps, values).await,
-		(None, false) => store.seal(aspect, schema, timestamps, &present_values(values)).await,
-	}
-}
-
-/// Unwrap an all-present value column to the dense `BigDecimal` slice the dense seal
-/// paths take. Only called when the caller has verified no value is `None`.
-fn present_values(values: &[Option<BigDecimal>]) -> Vec<BigDecimal> {
-	values.iter().map(|value| value.clone().unwrap_or_default()).collect()
+	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(request.rows_per_page);
+	commit_ingest(store, metrics, aspect, "json", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "json")).await
 }
 
 /// Query parameters for the CSV ingest endpoint: an optional page height.
@@ -294,7 +535,7 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 /// undeclared), [`ApiError::bad_request`] (malformed CSV, empty body, or values
 /// unrepresentable under the declared encoding/tolerance), and
 /// [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<CsvIngestParams>, body: String) -> Result<Response, ApiError> {
+pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictQuery(params): StrictQuery<CsvIngestParams>, StrictText(body): StrictText) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
@@ -303,7 +544,7 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 	})?;
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_csv_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_csv_inner(&store, &metrics, &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -313,21 +554,18 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 }
 
 /// The body of [`ingest_csv`], split out so the handler records an error metric for
-/// any failure path uniformly. Shares [`seal_batch`] and `error::classify_ingest` with
-/// the JSON ingest path, so a CSV-sealed batch is byte-identical to a JSON-sealed one.
-async fn ingest_csv_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
-	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
-		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
-	};
+/// any failure path uniformly. Shares the commit path and
+/// `error::classify_ingest` with the JSON ingest path, so a CSV-committed batch
+/// is byte-identical to a JSON-committed one.
+async fn ingest_csv_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
+	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
-	// `(timestamp, value)` columns, timed apart from the seal.
+	// `(timestamp, value)` columns, timed apart from the commit.
 	let ParsedCsv { timestamps, values, any_null } = tracing::info_span!("storage.ingest.parse", format = "csv").in_scope(|| parse_csv_points(body))?;
 	enforce_order_if_required(require_sorted, &timestamps)?;
 	let point_count = timestamps.len();
-	let descriptor = seal_batch(store, aspect, &schema, &timestamps, &values, any_null, rows_per_page).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await.map_err(|err| error::classify_ingest(&err))?;
-	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
-	Ok((StatusCode::CREATED, Json(response)).into_response())
+	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page);
+	commit_ingest(store, metrics, aspect, "csv", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await
 }
 
 /// Query parameters for the ILP ingest endpoint: which field to seal, the wire
@@ -406,7 +644,7 @@ const fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 /// range, or values unrepresentable under the declared encoding/tolerance),
 /// `ambiguous_series` (the field's points span more than one series; TAG-0),
 /// and [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<IlpIngestParams>, body: String) -> Result<Response, ApiError> {
+pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictQuery(params): StrictQuery<IlpIngestParams>, StrictText(body): StrictText) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
@@ -415,7 +653,7 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 	})?;
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_ilp_inner(&store, &metrics, &aspect, &params, &body).await;
+	let result = ingest_ilp_inner(&store, &metrics, &aspect, &headers, &params, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -426,7 +664,8 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 
 /// The body of [`ingest_ilp`], split out so the handler records an error metric for
 /// any failure path uniformly.
-async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
+async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, headers: &HeaderMap, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
+	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(ApiError::bad_request)?;
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
@@ -460,15 +699,11 @@ async fn ingest_ilp_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics
 
 	enforce_order_if_required(params.require_sorted, &timestamps)?;
 	let point_count = timestamps.len();
-	let seal_span = tracing::info_span!("storage.ingest.seal", point_count, format = "ilp");
-	let descriptor = match params.rows_per_page {
-		Some(rows_per_page) => store.seal_paged(aspect, &schema, &timestamps, &values, rows_per_page).instrument(seal_span).await,
-		None => store.seal(aspect, &schema, &timestamps, &values).instrument(seal_span).await,
-	}
-	.map_err(|err| error::classify_ingest(&err))?;
-	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
-	Ok((StatusCode::CREATED, Json(response)).into_response())
+	// ILP fields are always present, so the batch's value column is dense
+	// text widened to the nullable shape the one entry point takes.
+	let nullable_values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
+	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), nullable_values.clone()).with_rows_per_page(params.rows_per_page);
+	commit_ingest(store, metrics, aspect, "ilp", keyed, batch, &timestamps, &nullable_values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "ilp")).await
 }
 
 /// Query parameters for the Parquet ingest endpoint: an optional page height.
@@ -499,7 +734,7 @@ pub struct ParquetIngestParams {
 /// undeclared), [`ApiError::bad_request`] (empty/malformed Parquet body or values
 /// unrepresentable under the declared encoding/tolerance), and
 /// [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ParquetIngestParams>, body: Bytes) -> Result<Response, ApiError> {
+pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictQuery(params): StrictQuery<ParquetIngestParams>, StrictBody(body): StrictBody) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
@@ -508,7 +743,7 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 	})?;
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_parquet_inner(&store, &metrics, &aspect, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_parquet_inner(&store, &metrics, &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -519,19 +754,24 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 
 /// The body of [`ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn ingest_parquet_inner(store: &weftdb::SegmentStore, metrics: &crate::metrics::SharedMetrics, aspect: &str, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
+async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
 	if body.is_empty() {
 		return Err(ApiError::bad_request("empty Parquet body".to_string()));
 	}
+	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	// `storage.ingest.parquet` stage span (roadmap Phase 3 — the Arrow-decode-on-ingest
-	// analogue of the JSON/CSV/ILP `storage.ingest.parse`+`seal` spans). The arrow-store
-	// ingest is atomic (Parquet decode → typed-column seal in one call) and the leaf
-	// `weft-arrow-store` stays tracing-free by design, so decode+seal ride one span here,
-	// carrying the request's byte length and the sort-guard flag.
-	let descriptor = weft_arrow_store::ingest_parquet_into_aspect(store, aspect, body, rows_per_page, require_sorted).instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await.map_err(|err| error::classify_ingest(&err))?;
-	metrics.record_ingest_seal(u64::try_from(descriptor.row_count).unwrap_or(u64::MAX));
-	let response = IngestResponse { aspect: aspect.to_string(), segment_id: descriptor.id, format_version: descriptor.format_version, row_count: descriptor.row_count, null_count: descriptor.null_count, byte_len: descriptor.byte_len, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, time_sorted: descriptor.time_sorted };
-	Ok((StatusCode::CREATED, Json(response)).into_response())
+	// analogue of the JSON/CSV/ILP `storage.ingest.parse`+`seal` spans). The decode
+	// lives in `weft-arrow-store` (so the heavy `arrow-*` tree stays off the lean
+	// core) and the leaf stays tracing-free by design, so decode+commit ride one
+	// span here, carrying the request's byte length and the sort-guard flag. The
+	// decoded columns commit through the same entry point as the other three
+	// formats (D-S14) — the decode is the only Parquet-specific step left.
+	let commit = async {
+		let (timestamps, values) = weft_arrow_store::decode_parquet_columns(body, require_sorted).map_err(|err| error::classify_ingest(&err))?;
+		let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page);
+		commit_ingest(store, metrics, aspect, "parquet", keyed, batch, &timestamps, &values).await
+	};
+	commit.instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await
 }
 #[cfg(test)]
 
@@ -1117,5 +1357,148 @@ mod tests {
 		assert_eq!(snap.ingest.rows_sealed, 3);
 		assert_eq!(snap.ingest.segments_sealed, 1);
 		assert_eq!(metrics.ingest_latency.snapshot().count, 1, "the Parquet ingest leg must observe ingest latency as JSON / CSV / ILP do");
+	}
+
+	/// POST a JSON body with an `Idempotency-Key` header, returning the
+	/// status, the parsed body, and the `Idempotency-Replayed` header.
+	async fn post_keyed(router: axum::Router, uri: &str, key: &str, body: &serde_json::Value) -> (StatusCode, serde_json::Value, Option<String>) {
+		let response = router.oneshot(Request::builder().method("POST").uri(uri).header("content-type", "application/json").header("idempotency-key", key).body(Body::from(serde_json::to_vec(body).unwrap())).unwrap()).await.unwrap();
+		let status = response.status();
+		let replayed = response.headers().get("idempotency-replayed").map(|value| value.to_str().unwrap().to_string());
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null), replayed)
+	}
+
+	fn price_batch() -> serde_json::Value {
+		serde_json::json!({ "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 110, "value": "2.5" },
+			{ "timestamp": 120, "value": "3.5" },
+		] })
+	}
+
+	#[tokio::test]
+	async fn keyed_ingest_replays_the_original_receipt() {
+		// D-S14 / crash §2(g): a keyed batch applies at most once; the
+		// retry is answered with the original receipt as 200 +
+		// `Idempotency-Replayed: true`, and no second copy lands.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body, replayed) = post_keyed(router.clone(), "/api/v1/storage/price/points", "batch-1", &price_batch()).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["replayed"], false);
+		assert_eq!(body["segment_ids"].as_array().unwrap().len(), 1);
+		assert_eq!(replayed, None, "a fresh commit carries no replay header");
+		let segment_ids = body["segment_ids"].clone();
+
+		let (status, body, replayed) = post_keyed(router, "/api/v1/storage/price/points", "batch-1", &price_batch()).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["replayed"], true);
+		assert_eq!(body["segment_ids"], segment_ids, "the replay answers the original receipt");
+		assert_eq!(replayed.as_deref(), Some("true"));
+
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (_, read) = crate::test_support::get_json(router, "/api/v1/storage/price/points?start=100&end=120").await;
+		assert_eq!(read["count"], 3, "the retried batch did not land twice");
+	}
+
+	#[tokio::test]
+	async fn keyed_ingest_with_a_different_batch_conflicts() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, _, _) = post_keyed(router.clone(), "/api/v1/storage/price/points", "batch-1", &price_batch()).await;
+		assert_eq!(status, StatusCode::CREATED);
+		let other = serde_json::json!({ "points": [{ "timestamp": 100, "value": "9.5" }] });
+		let (status, body, _) = post_keyed(router, "/api/v1/storage/price/points", "batch-1", &other).await;
+		assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+		assert_eq!(body["code"], "idempotency_conflict", "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn body_batch_id_is_the_key_when_no_header_is_sent() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let mut batch = price_batch();
+		batch["batch_id"] = serde_json::json!("from-body");
+		let (status, body) = post_json(router.clone(), "/api/v1/storage/price/points", &batch).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		let (status, body, replayed) = post_keyed(router, "/api/v1/storage/price/points", "from-body", &price_batch()).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["replayed"], true);
+		assert_eq!(replayed.as_deref(), Some("true"), "the header retry replays the batch_id commit: one key namespace");
+	}
+
+	#[tokio::test]
+	async fn an_unusable_idempotency_key_is_a_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let long = "k".repeat(129);
+		let (status, body, _) = post_keyed(router, "/api/v1/storage/price/points", &long, &price_batch()).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("idempotency key"), "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn keyed_paged_ingest_seals_a_paged_frame_and_replays() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let batch = serde_json::json!({ "rows_per_page": 2, "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 110, "value": "2.5" },
+			{ "timestamp": 120, "value": "3.5" },
+			{ "timestamp": 130, "value": "4.5" },
+		] });
+		let (status, body, _) = post_keyed(router.clone(), "/api/v1/storage/price/points", "paged-1", &batch).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["format_version"], weft_physical_type::PAGED_SEGMENT_FORMAT_VERSION);
+		let (status, body, _) = post_keyed(router, "/api/v1/storage/price/points", "paged-1", &batch).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["replayed"], true);
+	}
+
+	#[tokio::test]
+	async fn a_body_over_the_configured_cap_is_payload_too_large() {
+		// Crash §11's "a 10 MB CSV body is rejected" regression, at test
+		// scale: the one body cap (C11) refuses the body before the
+		// handler runs, as 413 with the limit.
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let config = super::IngestConfig::with_max_body_bytes(32);
+		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(config));
+		let body = "timestamp,value\n100,1.5\n110,2.5\n120,3.5\n130,4.5\n";
+		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/price/csv", body).await;
+		assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {json}");
+		assert_eq!(json["code"], "payload_too_large", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn admission_refuses_an_ingest_over_the_inflight_budget() {
+		// D-S14, inside the gate (C10): a request whose declared body
+		// alone exceeds the in-flight budget is refused 503 overloaded
+		// with Retry-After, before any handler runs.
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let config = super::IngestConfig::with_max_inflight_bytes(8);
+		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(config));
+		let payload = serde_json::to_vec(&price_batch()).unwrap();
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/points").header("content-type", "application/json").header("content-length", payload.len().to_string()).body(Body::from(payload)).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+		assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(json["code"], "overloaded", "body: {json}");
+	}
+
+	#[test]
+	fn ingest_config_parses_and_refuses_zero() {
+		let config = super::IngestConfig::from_env_values(Some("1024"), Some("2048")).expect("valid");
+		assert_eq!(config.max_body_bytes(), 1024);
+		assert_eq!(config.max_inflight_bytes(), 2048);
+		let defaults = super::IngestConfig::from_env_values(None, None).expect("defaults");
+		assert_eq!(defaults.max_body_bytes(), super::DEFAULT_MAX_INGEST_BYTES);
+		assert!(super::IngestConfig::from_env_values(Some("0"), None).is_err());
+		assert!(super::IngestConfig::from_env_values(None, Some("many")).is_err());
 	}
 }

@@ -19,6 +19,7 @@ pub use event::{Event, EventID, EventName, Events, Manifestation, ManifestationI
 pub use frame_read::FrameFaultError;
 pub use ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry, MAX_ENCODED_FRAME_BYTES};
 pub use input_measurement::InputMeasurement;
+pub use legacy_seal::StorageMode;
 pub use measurement::{Measurement, MeasurementId};
 pub use measurement_vector::MeasurementVector;
 pub use metadata::{AspectMetadata, AspectMetadataStore};
@@ -65,6 +66,7 @@ pub(crate) mod index_txn;
 pub mod ingest;
 pub mod input_measurement;
 pub mod interpolate_range;
+pub mod legacy_seal;
 pub mod measurement;
 pub mod measurement_vector;
 pub mod metadata;
