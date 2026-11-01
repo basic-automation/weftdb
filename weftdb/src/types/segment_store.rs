@@ -2452,7 +2452,7 @@ impl SegmentStore {
 		fault::hit(FaultPoint::MSwapped).await?;
 		for (id, output) in outputs {
 			let descriptor = SegmentDescriptor { id, ..output.descriptor };
-			self.refresh_output_sidecar(aspect, &descriptor, output.gen, output.prec, output.timestamps, output.values).await;
+			self.refresh_output_sidecar(aspect, &descriptor, output.gen, output.prec, output.frame_crc, output.timestamps, output.values).await;
 		}
 		for frame in deleted {
 			if let Err(e) = self.remove_sidecar(frame).await {
@@ -3207,9 +3207,9 @@ impl SegmentStore {
 		let receipt = self.publish_ingest(aspect, batch, fingerprint, &written).await.with_context(|| format!("ingest of aspect {aspect:?} failed while {phase}"))?;
 		// Per-segment partial sidecars (opt-in), as in `persist`: a pure
 		// read accelerator, never failing the ingest.
-		for (descriptor, gen, _crc, timestamps, values) in &written {
+		for (descriptor, gen, crc, timestamps, values) in &written {
 			if self.partials.base_for(descriptor.row_count).is_some() {
-				if let Err(e) = self.write_partial_sidecar(aspect, descriptor, *gen, *gen, timestamps.clone(), values.clone()).await {
+				if let Err(e) = self.write_partial_sidecar(aspect, descriptor, *gen, *gen, *crc, timestamps.clone(), values.clone()).await {
 					tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 				}
 			}
@@ -3397,7 +3397,7 @@ impl SegmentStore {
 		// when the policy actually wants one, and never fail the seal on a sidecar error.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, frame_crc, ts, vs).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
@@ -3419,7 +3419,7 @@ impl SegmentStore {
 		// As `persist`: opt-in per-segment partial sidecar, never failing the seal.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, frame_crc, ts, vs).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
@@ -3509,8 +3509,8 @@ impl SegmentStore {
 	///
 	/// A sidecar is a *pure acceleration*: a failure to write one must never fail the seal,
 	/// so the persist paths call this and log-and-ignore any error rather than propagating.
-	async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
-		let Some(bytes) = self.partial_sidecar_bytes(descriptor, timestamps, values)? else { return Ok(()) };
+	async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, frame_crc: u32, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
+		let Some(bytes) = self.partial_sidecar_bytes(descriptor, frame_crc, timestamps, values)? else { return Ok(()) };
 		let path = self.sidecar_path(aspect, gen, prec)?;
 		self.fs.create_new_write(&path, bytes, SyncPolicy::None, WritePoints::NONE).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
 		Ok(())
@@ -3519,7 +3519,7 @@ impl SegmentStore {
 	/// The partial-reduction sidecar the [`PartialSidecarPolicy`] wants for `descriptor`'s
 	/// rows, encoded, or `None` when it wants none (see
 	/// [`write_partial_sidecar`](Self::write_partial_sidecar)).
-	fn partial_sidecar_bytes(&self, descriptor: &SegmentDescriptor, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<Option<Vec<u8>>> {
+	fn partial_sidecar_bytes(&self, descriptor: &SegmentDescriptor, frame_crc: u32, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<Option<Vec<u8>>> {
 		let Some(base) = self.partials.base_for(descriptor.row_count) else { return Ok(None) };
 		let Some(unit) = descriptor.time_unit else { return Ok(None) };
 		let mut points: Vec<Point> = Vec::with_capacity(timestamps.len());
@@ -3534,7 +3534,7 @@ impl SegmentStore {
 		let partial = weft_reduce::reduce_partial(&points, base, None, None, &SIDECAR_AGGREGATIONS).map_err(|e| anyhow::anyhow!("reducing segment {} for its partial sidecar: {e}", descriptor.path))?;
 		// Materialize the coarser rollup tiers the policy declares (each re-keyed from the
 		// tier below), so a coarse downsample folds a coarse tier rather than the whole base.
-		let sidecar = PartialSidecar::materialize(base, descriptor, partial, &self.partials.tiers()).map_err(|e| anyhow::anyhow!("building rollup tiers for segment {}: {e}", descriptor.path))?;
+		let sidecar = PartialSidecar::materialize(base, descriptor, frame_crc, partial, &self.partials.tiers()).map_err(|e| anyhow::anyhow!("building rollup tiers for segment {}: {e}", descriptor.path))?;
 		Ok(Some(sidecar.to_bytes()?))
 	}
 
@@ -3544,10 +3544,10 @@ impl SegmentStore {
 	/// under a `.tmp-*` name and renamed over the frame's, so a reader never sees half of one;
 	/// nothing is fsynced, since a sidecar is an accelerator a reader checks against the
 	/// frame. Best effort: a failure is logged, never returned.
-	async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
+	async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, frame_crc: u32, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
 		let result = async {
 			let path = self.sidecar_path(aspect, gen, prec)?;
-			let Some(bytes) = self.partial_sidecar_bytes(descriptor, timestamps, values)? else {
+			let Some(bytes) = self.partial_sidecar_bytes(descriptor, frame_crc, timestamps, values)? else {
 				self.fs.remove_file(&path).await.with_context(|| format!("removing stale partial sidecar {}", path.display()))?;
 				return Ok(());
 			};
@@ -3578,7 +3578,7 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// Propagates a filesystem read error other than "not found".
-	pub async fn load_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor) -> Result<Option<PartialSidecar>> {
+	pub async fn load_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, frame_crc: Option<u32>) -> Result<Option<PartialSidecar>> {
 		aspect_name::validate(aspect)?;
 		let path = self.sidecar_path_for_frame(&descriptor.path)?;
 		let bytes = match tokio::fs::read(&path).await {
@@ -3588,12 +3588,10 @@ impl SegmentStore {
 		};
 		// A malformed or version-mismatched frame is not an error the caller must handle —
 		// it just means "no usable sidecar", so the read falls back to a full decode.
-		let Ok(mut sidecar) = PartialSidecar::from_bytes(&bytes) else { return Ok(None) };
-		if !sidecar.matches(descriptor) {
+		let Ok(sidecar) = PartialSidecar::from_bytes(&bytes) else { return Ok(None) };
+		if !sidecar.matches(descriptor, frame_crc) {
 			return Ok(None);
 		}
-		// One written by 0.1.0 reads its zeros back at exponent 0, not the column's scale.
-		sidecar.rescale_zeros_to(descriptor);
 		Ok(Some(sidecar))
 	}
 
@@ -3686,7 +3684,7 @@ impl SegmentStore {
 		// is never opened. `read_time_range` right above deliberately keeps the time-only
 		// prune: its answer *is* the rows, nulls included, so dropping that segment there
 		// would delete timestamps the caller asked for.
-		let descriptors = self.index.prune_present_descriptors(aspect, start, end).await?;
+		let (descriptors, frame_crcs): (Vec<SegmentDescriptor>, Vec<Option<u32>>) = self.index.prune_present_rows(aspect, start, end).await?.into_iter().map(|row| (row.desc, row.frame_crc)).unzip();
 
 		// A persisted per-segment partial can *substitute* for decoding a segment only when
 		// it can answer this exact query: every requested reduction must be one the sidecar
@@ -3705,11 +3703,12 @@ impl SegmentStore {
 		// one frame — so it keeps the inline path.
 		if descriptors.len() == 1 {
 			let descriptor = &descriptors[0];
+			let frame_crc = frame_crcs[0];
 			// The sidecar fast path: no file decode at all when a matching partial serves it —
 			// directly when a materialized grid equals the requested resolution, or re-keyed
 			// from the coarsest tier that nests in it.
 			if sidecar_eligible && window_covers_segment(descriptor, start, end) {
-				if let Some(sidecar) = self.load_partial_sidecar(aspect, descriptor).await? {
+				if let Some(sidecar) = self.load_partial_sidecar(aspect, descriptor, frame_crc).await? {
 					if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
 						return partial.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"));
 					}
@@ -3728,12 +3727,12 @@ impl SegmentStore {
 		// Peak memory is unchanged in kind — a segment's rows are dropped at its partial —
 		// but now bounded by the in-flight segment count rather than by one, which is the
 		// deliberate trade for the parallelism.
-		let tasks = descriptors.into_iter().map(|descriptor| {
+		let tasks = descriptors.into_iter().zip(frame_crcs).map(|(descriptor, frame_crc)| {
 			let aggregations = aggregations.to_vec();
 			let unit = schema.timestamp_unit;
 			async move {
 				if sidecar_eligible && window_covers_segment(&descriptor, start, end) {
-					if let Some(sidecar) = self.load_partial_sidecar(aspect, &descriptor).await? {
+					if let Some(sidecar) = self.load_partial_sidecar(aspect, &descriptor, frame_crc).await? {
 						if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying a sidecar of {aspect:?}: {e}"))? {
 							return Ok::<Option<PartialReduction>, anyhow::Error>(Some(partial));
 						}
@@ -6928,13 +6927,13 @@ mod tests {
 		let vs = vec![bd("6"), bd("1"), bd("4"), bd("3"), bd("2"), bd("5")];
 		let all: Vec<Point> = ts.iter().zip(&vs).map(|(t, v)| Point::new(DateTime::<Utc>::from_timestamp(*t, 0).expect("instant"), v.clone())).collect();
 		let desc = store.seal("a", &schema(), &ts, &vs).await.expect("seals out-of-order");
-		assert!(store.load_partial_sidecar("a", &desc).await.expect("reads").is_some(), "a sidecar is written at seal");
+		assert!(store.load_partial_sidecar("a", &desc, None).await.expect("reads").is_some(), "a sidecar is written at seal");
 
 		// Reconcile rewrites the segment sorted at the same id → new bytes → the old sidecar
 		// stamp is stale, so the reconcile must regenerate it.
 		assert!(store.reconcile_segment("a", desc.id).await.expect("reconciles"), "the out-of-order segment is rewritten");
 		let new_desc = store.index().all("a").await.expect("index").into_iter().find(|d| d.id == desc.id).expect("segment still present");
-		assert!(store.load_partial_sidecar("a", &new_desc).await.expect("reads").is_some_and(|s| s.matches(&new_desc)), "the sidecar was regenerated to match the reconciled bytes");
+		assert!(store.load_partial_sidecar("a", &new_desc, None).await.expect("reads").is_some_and(|s| s.matches(&new_desc, None)), "the sidecar was regenerated to match the reconciled bytes");
 
 		// The decisive proof: delete the reconciled frame; a downsample must still succeed,
 		// which is only possible if the regenerated sidecar's stamp matches (a stale one
@@ -8626,9 +8625,9 @@ mod tests {
 		store.declare("temp", &schema()).await.expect("declares");
 		let descriptor = store.seal("temp", &schema(), &ts, &vs).await.expect("seals");
 
-		let sidecar = store.load_partial_sidecar("temp", &descriptor).await.expect("reads sidecar").expect("a sidecar was written");
+		let sidecar = store.load_partial_sidecar("temp", &descriptor, None).await.expect("reads sidecar").expect("a sidecar was written");
 		assert_eq!(sidecar.base, Resolution::Minutes);
-		assert!(sidecar.matches(&descriptor), "the sidecar's stamp matches the sealed segment");
+		assert!(sidecar.matches(&descriptor, None), "the sidecar's stamp matches the sealed segment");
 
 		// The stored partial finishes to exactly what reducing the segment's rows directly
 		// at the base resolution produces — so a downsample can merge it in place of a decode.
@@ -8639,14 +8638,14 @@ mod tests {
 		// A stale descriptor (a rewrite would change byte_len) is rejected → falls back.
 		let mut stale = descriptor.clone();
 		stale.byte_len += 1;
-		assert!(store.load_partial_sidecar("temp", &stale).await.expect("reads").is_none(), "a mismatched stamp is treated as no sidecar");
+		assert!(store.load_partial_sidecar("temp", &stale, None).await.expect("reads").is_none(), "a mismatched stamp is treated as no sidecar");
 
 		// An unconfigured store writes nothing beside the segment.
 		let plain_dir = TempDir::new().expect("tempdir");
 		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
 		assert_eq!(plain.partial_sidecar_policy(), PartialSidecarPolicy::DISABLED, "off by default");
 		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
-		assert!(plain.load_partial_sidecar("temp", &plain_desc).await.expect("reads").is_none(), "no sidecar without a policy");
+		assert!(plain.load_partial_sidecar("temp", &plain_desc, None).await.expect("reads").is_none(), "no sidecar without a policy");
 	}
 
 	/// `scaled_rows` admits a window to the integer path only when every present in-window

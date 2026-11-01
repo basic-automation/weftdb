@@ -4,6 +4,40 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — D-S15: what the v4 sidecar reader checks, and what went with the v3 reader (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the crash-consistency design (§4) fixes the v4 shape — magic last byte `0x03`, a
+CRC-32 trailer over magic and body, the stamp widened to `(row_count, byte_len, frame_crc)`, v3
+files failing the magic check and treated as absent — and the 1.0 plan's §5 amendment adds only
+that the reader sits under `DecodeLimits` and that v4 goldens join FRE-3's set. Three points the
+sources do not pin, chosen here:
+
+1. **Where `DecodeLimits` bites.** The trailer is verified before the postcard decode, so a torn
+   or zero-filled file never reaches the decoder. The decoded claims are then refused past the
+   limits: the stamp's row count past `max_rows`, any materialized grid holding more buckets than
+   the segment has rows (a bucket is a non-empty cell, so the segment itself refutes the claim)
+   or past `max_rows`, and a rollup chain past `MAX_SIDECAR_TIERS`, the most a writer produces.
+   `PartialSidecar::from_bytes` uses `DecodeLimits::DEFAULT`; `from_bytes_with_limits` is the
+   override form ROB-8's entry anticipated. Rejected: parsing postcard's varint length prefixes
+   by hand to refuse before allocation — the format's own structure (each grid entry consumes
+   body bytes) plus the CRC-first order bounds what a damaged file can make the reader do, and a
+   hand-rolled pre-parser would be a second decoder to keep in sync.
+2. **An unbound CRC does not refuse a sidecar.** `matches` takes the index row's `frame_crc` as
+   an `Option`: legacy rows carry NULL until a backup/scrub binds it (design §4), and for those
+   the `(row_count, byte_len)` pair alone decides, exactly as v3 did. Every frame this build
+   writes has its CRC bound at commit, so the widened stamp guards every sidecar v4 writes.
+3. **The v3 zero-rescale goes with the v3 reader.** `PartialSidecar::rescale_zeros_to` and
+   `weft_reduce`'s `rescale_zeros` existed only to read 0.1.0-era v3 files whose zeros lost the
+   column's scale; the weft-reduce doc already said the helper "goes with the v3 reader". Both
+   are removed, and the scale test that simulated a pre-fix file by hand-rewriting one
+   (`sidecars_with_unscaled_zeros_are_served_at_the_column_scale`) is retired with them: its
+   subject is a file v4 treats as absent. Scale preservation for v4-written sidecars is still
+   pinned by the remaining scale tests, whose sidecars the current serializer writes.
+
+**Goldens:** `sidecar_v4_hours.bin` and `sidecar_v4_minutes_tiered.bin` join FRE-3's set in
+`weftdb/tests/golden/`; the v3 pair stays committed as negative fixtures the v4 reader must
+refuse.
+
 ## 2026-10-30 — External engines IV: how the InfluxDB 3 Core arm is measured
 
 **Ambiguous:** InfluxDB 3 Core has no decimal type, no `ASOF JOIN` in its SQL engine (DataFusion),

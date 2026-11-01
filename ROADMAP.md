@@ -289,7 +289,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-6** Soak oracle core
 - [ ] **W5 · Ingest wiring, whole-store backup, legacy seal**
   - [ ] Store lane
-  - [ ] → **D-S15** Partial sidecar v4
+  - [x] → **D-S15** Partial sidecar v4
   - [ ] → **D-S19** Seal-backed legacy aspects
   - [ ] L-INGEST
   - [ ] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
