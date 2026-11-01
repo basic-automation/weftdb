@@ -151,6 +151,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	let addr = config::bind_addr().unwrap_or_else(|error| exit_config(&error));
 	let interpolate = config::interpolate_config().unwrap_or_else(|error| exit_config(&error));
 	let limits = config::serve_limits().unwrap_or_else(|error| exit_config(&error));
+	// D-S14: the ingest wiring's limits, read once like every other
+	// setting, so the registry the state builds carries the operator's
+	// body cap and in-flight budget rather than the defaults.
+	let ingest = config::ingest_config().unwrap_or_else(|error| exit_config(&error));
 	// SEC-5: resolve the transport (TLS when configured) and run the C8
 	// plaintext gate against the address about to be bound, before the
 	// store opens — a refused exposure starts nothing at all.
@@ -160,7 +164,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// server never comes up unauthenticated by accident.
 	let auth = config::auth().unwrap_or_else(|error| exit_config(&error));
 	let state = match state::build().await {
-		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth),
+		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth).with_ingest_config(ingest),
 		Err(error) => match weft_server::store_open::exit_code_for_store_error(&error) {
 			// A store that needs operator action (65) or a locked root (75):
 			// the plan C7 class, not a generic failure.
@@ -191,12 +195,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// outlives the server it maintains, and none restarts from here.
 	daemons.shutdown();
 	// Serving stopped cleanly (including a signal before serving, which exits 0
-	// without accepting a connection): record the clean shutdown, so the next
+	// without accepting a connection): shut the store down — the closing
+	// reaper pass, then the clean-shutdown commit (D-S14's
+	// `SegmentStore::shutdown`, crash-consistency §5.5) — so the next
 	// open's `/ready` can report `previous_clean_shutdown: true` (D-S12). A
 	// serve failure is not a clean shutdown, and leaves the flag at the `0`
 	// the open wrote.
 	if let Some(store) = state.store() {
-		store.mark_clean_shutdown().await?;
+		store.shutdown().await?;
 	}
 	Ok(())
 }

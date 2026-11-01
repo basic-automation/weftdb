@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use weft_server::{
-	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, InterpolateConfig, ServeLimits, TlsConfig, AUTH_KEYS_MODE, HEADER_READ_TIMEOUT_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, MAX_INTERPOLATE_POINTS_ENV, WRITE_STALL_TIMEOUT_ENV
+	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, IngestConfig, InterpolateConfig, ServeLimits, TlsConfig, AUTH_KEYS_MODE, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
 };
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
@@ -48,8 +48,22 @@ pub(crate) fn interpolate_config() -> anyhow::Result<InterpolateConfig> {
 /// fail loudly at start rather than silently default).
 pub(crate) fn serve_limits() -> anyhow::Result<ServeLimits> {
 	let limits = ServeLimits::from_env().map_err(anyhow::Error::msg)?;
-	println!("listener limits: at most {} connections (set {MAX_CONNECTIONS_ENV} to change; the default is half the RLIMIT_NOFILE soft limit), header deadline {}s (set {HEADER_READ_TIMEOUT_ENV}), keep-alive deadline {}s (set {KEEP_ALIVE_TIMEOUT_ENV}), write-stall timeout {}s (set {WRITE_STALL_TIMEOUT_ENV})", limits.max_connections(), limits.header_read_timeout().as_secs(), limits.keep_alive_timeout().as_secs(), limits.write_stall_timeout().as_secs());
+	println!("listener limits: at most {} connections (set {MAX_CONNECTIONS_ENV} to change; the default is half the RLIMIT_NOFILE soft limit), header deadline {}s (set {HEADER_READ_TIMEOUT_ENV}), keep-alive deadline {}s (set {KEEP_ALIVE_TIMEOUT_ENV}), write-stall timeout {}s (set {WRITE_STALL_TIMEOUT_ENV}), shutdown grace {}s (set {SHUTDOWN_GRACE_SECS_ENV})", limits.max_connections(), limits.header_read_timeout().as_secs(), limits.keep_alive_timeout().as_secs(), limits.write_stall_timeout().as_secs(), limits.shutdown_grace().as_secs());
 	Ok(limits)
+}
+
+/// Read the ingest wiring's limits ([`IngestConfig`], D-S14) from the
+/// environment, once, and log the limits in force: the one body cap for
+/// the ingest routes and their in-flight byte budget.
+///
+/// # Errors
+///
+/// A value that is not a positive integer (a malformed operator config
+/// should fail loudly at start rather than silently default).
+pub(crate) fn ingest_config() -> anyhow::Result<IngestConfig> {
+	let config = IngestConfig::from_env().map_err(anyhow::Error::msg)?;
+	println!("ingest limits: body cap {} bytes (set {MAX_INGEST_BYTES_ENV} to change), in-flight budget {} bytes (set {INGEST_MAX_INFLIGHT_BYTES_ENV})", config.max_body_bytes(), config.max_inflight_bytes());
+	Ok(config)
 }
 
 /// Resolve the listener's transport for `addr` (SEC-5): TLS when a

@@ -47,7 +47,7 @@
 use std::borrow::Cow;
 
 use axum::{
-	extract::{rejection::JsonRejection, FromRequest, FromRequestParts, Query, Request}, http::{request::Parts, HeaderName, StatusCode}, response::{IntoResponse, Response}, Json
+	body::Bytes, extract::{rejection::JsonRejection, FromRequest, FromRequestParts, Query, Request}, http::{request::Parts, HeaderName, StatusCode}, response::{IntoResponse, Response}, Json
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -452,18 +452,97 @@ where
 			Ok(Json(value)) => return Ok(Self(value)),
 			Err(rejection) => rejection,
 		};
-		// Two different complaints from one extractor, and the table keeps them apart: the
-		// client either sent the wrong kind of document, or sent a document it cannot read.
+		// Three different complaints from one extractor, and the table keeps them apart: the
+		// client either sent the wrong kind of document, sent a document it cannot read —
+		// or sent more document than the route accepts.
 		//
 		// `JsonRejection` is a non-exhaustive composite enum upstream, so every case that is not
 		// a content-type complaint — a syntax error, a body that does not match this endpoint's
-		// shape, a body the connection cut short — is reported as a bad body. The server-side
-		// byte cap arrives with D-S14's `WEFT_MAX_INGEST_BYTES` and owns 413 from then on.
+		// shape, a body the connection cut short — is reported as a bad body. The length-limit
+		// case is D-S14's: the ingest routes' `WEFT_MAX_INGEST_BYTES` cap (the one body cap,
+		// C11) rides on them as a body limit, and §4 pairs an over-limit body with
+		// `413 payload_too_large` and the limit that refused it.
+		if let JsonRejection::BytesRejection(bytes) = &rejection {
+			if error_chain_has_length_limit(bytes) {
+				let limit = request_limit(&rejection);
+				let mut error = ApiError::new(Code::PayloadTooLarge, rejection.body_text());
+				if let Some(limit) = limit {
+					error = error.with_limit(limit);
+				}
+				return Err(error);
+			}
+		}
 		let code = match rejection {
 			JsonRejection::MissingJsonContentType(_) => Code::UnsupportedMediaType,
 			_ => Code::InvalidJson,
 		};
 		Err(ApiError::new(code, rejection.body_text()))
+	}
+}
+
+/// Whether a body rejection's error chain bottoms out in axum's
+/// length-limit rejection (the composite rejections wrap it two levels
+/// deep: `BytesRejection` → `FailedToBufferBody` → `LengthLimitError`).
+fn error_chain_has_length_limit(error: &(dyn std::error::Error + 'static)) -> bool {
+	let mut current = Some(error);
+	while let Some(link) = current {
+		if link.is::<axum::extract::rejection::LengthLimitError>() {
+			return true;
+		}
+		current = link.source();
+	}
+	false
+}
+
+/// The byte limit a length-limit rejection names, when the rejection's
+/// own text carries it (axum renders the limit into the message). The
+/// envelope's `limit` field is optional in §4, so an unparseable text
+/// simply omits it rather than inventing a number.
+fn request_limit(rejection: &JsonRejection) -> Option<u64> {
+	let text = rejection.body_text();
+	let start = text.find("maximum of ")? + "maximum of ".len();
+	let digits: String = text[start..].chars().take_while(char::is_ascii_digit).collect();
+	digits.parse().ok()
+}
+
+/// A raw-body extractor that answers an unbufferable body with the
+/// envelope (D-S14).
+///
+/// The CSV/ILP/Parquet ingest handlers take the body raw, and axum's own
+/// `Bytes`/`String` rejection is plain text — including its `413` for a
+/// body over the route's limit, which under X-ERR must be the
+/// `413 payload_too_large` envelope like every other refusal on the
+/// surface. Handlers take `StrictBody(bytes): StrictBody` (or
+/// [`StrictText`] for a text body) so the refusal binds exactly as
+/// before, in the envelope.
+#[derive(Debug)]
+pub struct StrictBody(pub Bytes);
+
+impl<S> FromRequest<S> for StrictBody
+where
+	S: Send + Sync,
+{
+	type Rejection = ApiError;
+
+	async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+		Bytes::from_request(request, state).await.map(Self).map_err(|rejection| if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE { ApiError::new(Code::PayloadTooLarge, "the request body exceeds this route's byte limit (the ingest routes' limit is `WEFT_MAX_INGEST_BYTES`)".to_string()) } else { ApiError::new(Code::BadRequest, rejection.body_text()) })
+	}
+}
+
+/// A UTF-8 text body extractor with [`StrictBody`]'s envelope refusals,
+/// plus the envelope for a body that is not UTF-8 text.
+#[derive(Debug)]
+pub struct StrictText(pub String);
+
+impl<S> FromRequest<S> for StrictText
+where
+	S: Send + Sync,
+{
+	type Rejection = ApiError;
+
+	async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+		let StrictBody(bytes) = StrictBody::from_request(request, state).await?;
+		String::from_utf8(bytes.to_vec()).map(Self).map_err(|_| ApiError::new(Code::BadRequest, "the request body is not valid UTF-8 text".to_string()))
 	}
 }
 

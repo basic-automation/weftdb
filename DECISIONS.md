@@ -4,6 +4,62 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — D-S14: how the HTTP surface wires onto the ingest entry point (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan's §5 D-S14 amendment and resolutions C9–C11, plus the crash-consistency
+design §8/§5.2/§2(g): routes through SEC-3's `Routes`; the one body cap is
+`WEFT_MAX_INGEST_BYTES` (256 MiB default) on the ingest routes only; admission sits inside the
+gate; the idempotency key (header or `batch_id`, visible ASCII ≤128 bytes, per aspect, shared by
+all principals) is handled behind the gate; all four formats commit through
+`SegmentStore::ingest` from a detached task whose JoinHandle the handler awaits; a panic is
+mapped by `IngestPhase` (D21); the response gains `segment_ids` and `replayed`, a replay
+answering 200 with `Idempotency-Replayed: true`; a `weft_audit` ingest event follows COMMIT;
+the shutdown future goes to `serve::run` with handlers installed first; the drain is
+`WEFT_SHUTDOWN_GRACE_SECS` (C-2); the shutdown watch is ROB-3's Daemons registry. The points the
+sources do not pin, chosen here:
+
+1. **Keyless requests commit under an ephemeral key.** The one entry point requires a key, so a
+   request that supplies none gets a fresh unique key (`http-ephemeral:{pid}:{counter}:{nanos}`)
+   minted per request. A keyless retry therefore stays the documented at-least-once — it cannot
+   replay, because it cannot name its batch — and no format keeps a private seal path.
+2. **Paged batches ride the entry point.** `IngestBatch` gains `rows_per_page`; the store's
+   ingest seals a paged (v6) frame for a paged batch instead of the HTTP layer refusing the
+   combination or bypassing the ledger. The fingerprint feeds the page height only when one is
+   set, so an unpaged batch fingerprints byte-identically to before this slice and pre-D-S14
+   ledger rows still replay.
+3. **The in-flight budget defaults to the body cap.** `WEFT_INGEST_MAX_INFLIGHT_BYTES` is named
+   by crash §8 with no default; it defaults to 256 MiB — one maximum body in flight. The gate
+   charges `Content-Length` when present (a chunked body is charged 1 byte; the body cap still
+   bounds it) and refuses with 503 `overloaded` + `Retry-After: 1`. The permit rides in the
+   request extensions and is released when the request drops.
+4. **The audit event is a tracing event, for now.** SEC-9's fsynced audit file is the consumer
+   the design names, but SEC-9 is a W6 slice; the event is emitted on the reserved
+   `weft_audit` target with the §5 fields (`aspect`, `format`, `rows`, `segments`,
+   `commit_epoch`, `keyed`) so SEC-9 can subscribe without the emitters changing. It fires only
+   on a fresh COMMIT — a replay commits nothing and emits none.
+5. **`SegmentStore::shutdown()`** is the C9/§5.5 closing sequence as one call: a best-effort
+   reaper pass (`MaintenanceWait::Skip`; busy/failed aspects are logged, never propagated — the
+   shutdown must still land) and then the clean-shutdown commit. Startup calls it after the
+   Daemons watch is raised, in place of the bare `mark_clean_shutdown()`.
+6. **Parquet keeps only its decode in `weft-arrow-store`.** `decode_parquet_columns` is the
+   decode half of `ingest_parquet_into_aspect` (which keeps its own seal behaviour for its
+   library callers); the HTTP handler decodes, then commits like the other three formats.
+7. **Response descriptor fields** come from the first committed segment's index row when it
+   reads back; `null_count` uses the descriptor only for a single-segment commit (the receipt
+   carries no null count), falling back to the request's own columns otherwise.
+8. **Not in this slice, deliberately.** SEAL-2's `spawn_blocking` threshold
+   (`WEFT_SEAL_BLOCKING_ROWS`, `WEFT_INGEST_MAX_SEGMENT_ROWS`) belongs to the seal engine's own
+   amendment line, not D-S14's; and no `WEFT_IDEMPOTENCY_TTL_SECS` is registered, because
+   nothing would read it yet — the ledger TTL/prune policy (crash §10.2's open default) lands
+   with the slice that implements pruning.
+9. **Fix-forward, not this slice's work:** D-S19 landed `WEFT_LEGACY_DEFAULT_STORAGE`
+   (weftdb/types/legacy_seal.rs) without a registry entry, so
+   `every_environment_name_the_workspace_reads_is_registered` was already red on main before
+   this slice. The entry is registered here (and the asserted registry size moves 68 → 72: this
+   slice's three, plus that one) because the C-2 registry is the surface this slice extends and
+   the wave's end-of-wave CI would otherwise inherit the failure. Revert this entry with D-S19's
+   own follow-up if its wording should differ.
+
 ## 2026-11-01 — D-S15: what the v4 sidecar reader checks, and what went with the v3 reader (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the crash-consistency design (§4) fixes the v4 shape — magic last byte `0x03`, a

@@ -84,15 +84,15 @@ pub use host_guard::{HostGuard, ALLOW_ANY_HOST_ENV};
 pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpolate_ilp, interpolate_ilp_arrow, interpolate_ilp_csv, interpolate_ilp_parquet, interpolate_parquet, interpolate_point, InterpolateConfig, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse, MAX_INTERPOLATE_OUTPUT_POINTS, MAX_INTERPOLATE_POINTS_ENV};
 pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyHistogram, LatencyHistogramSnapshot, LatencyProfile, Metrics, MetricsSnapshot, ProfileReport, SharedMetrics};
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
-pub use routes::{AdmissionClass, Audit, ClassEntry, PolicyEntry, Role, RouteEntry, RouteSpec, RouteTable, Routes, Scope, SealedRoutes};
+pub use routes::{build_registry_with_ingest_config, AdmissionClass, Audit, ClassEntry, IngestAdmission, PolicyEntry, Role, RouteEntry, RouteSpec, RouteTable, Routes, Scope, SealedRoutes};
 use serde::Serialize;
-pub use serve::{ServeLimits, ShutdownSignals, HEADER_READ_TIMEOUT_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, WRITE_STALL_TIMEOUT_ENV};
+pub use serve::{ServeLimits, ShutdownSignals, HEADER_READ_TIMEOUT_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV};
 pub use state::AppState;
 pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_downsample, storage_downsample_arrow, storage_downsample_csv, storage_downsample_parquet, storage_point, storage_points, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, MultiPointParams, PointParams, StorageDownsampleParams, StoreStatsResponse, StoredPoint, StoredPointEntry, StoredPointResponse, StoredPointsResponse, StoredRangeResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};
 pub use tls::{PlaintextGate, TlsConfig, ALLOW_PLAINTEXT_ENV, AUTH_DISABLED, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV};
 
 pub use crate::{
-	declare::{declare_aspect, DeclareAspectRequest, DeclareAspectResponse}, ingest::{ingest_csv, ingest_ilp, ingest_parquet, ingest_points, CsvIngestParams, IlpIngestParams, IngestPoint, IngestRequest, IngestResponse, ParquetIngestParams}, maintain::{fsck_store, purge_expired_quarantine, quarantine_list, quarantine_purge, quarantine_release, reconcile_aspect, reconcile_store, PurgeExpiredResponse, QuarantineParams, ReconcileResponse, ReconcileStoreResponse, SweepFailure}
+	declare::{declare_aspect, DeclareAspectRequest, DeclareAspectResponse}, ingest::{ingest_csv, ingest_ilp, ingest_parquet, ingest_points, CsvIngestParams, IlpIngestParams, IngestConfig, IngestPoint, IngestRequest, IngestResponse, ParquetIngestParams, DEFAULT_MAX_INGEST_BYTES, INGEST_MAX_INFLIGHT_BYTES_ENV, MAX_INGEST_BYTES_ENV}, maintain::{fsck_store, purge_expired_quarantine, quarantine_list, quarantine_purge, quarantine_release, reconcile_aspect, reconcile_store, PurgeExpiredResponse, QuarantineParams, ReconcileResponse, ReconcileStoreResponse, SweepFailure}
 };
 
 /// The server's package version, surfaced in probe responses so a deployed
@@ -222,7 +222,7 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// panic inside a control-plane write never reaches it: ROB-2's hook
 /// aborts during the unwind first.
 pub fn app_with_state(state: AppState) -> Router {
-	routes::build_registry().router().layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
+	routes::build_registry_with_ingest_config(state.ingest_config()).router().layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
 }
 
 /// Mark stored-data reads incomplete when the store holds suspect segments
