@@ -4,6 +4,42 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — ROB-4: the lint's scope, and the Result API's two new errors (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan names ROB-4 only as "Enforced no-panic lint (including asserts) and the
+weft-arrow Result API" (§6 W5) and lists ROB-2/3/4 panic handling as required (§9); issue #269
+repeats the one-liner. The points the sources do not pin, chosen here under the owner's
+best-guess authorization (2026-10-26), recorded for merge review and reversible there:
+
+1. **Scope is `weft-arrow`.** It is the only crate the slice names, and the only one whose public
+   API panicked: its batch builders asserted on mismatched column lengths and expected
+   `RecordBatch::try_new` to succeed. A workspace-wide ban is hundreds of sites across crates
+   other slices own (ROB-5 owns the legacy queue-consumer panics, for one), so the lint lands
+   where the Result API makes it satisfiable, and other crates opt in as their APIs go fallible.
+2. **Every batch builder now returns `Result<_, ConvertError>`** (`ConvertResult<T>` is the
+   alias): `segment_to_record_batch`, `segment_to_record_batch_typed`, `columns_to_record_batch`,
+   `columns_to_record_batch_typed`, `paged_segment_to_record_batch(s)`,
+   `reconstructed_series_to_record_batch`, `reduction_table_to_record_batch`. The IPC/Parquet
+   convenience wrappers already returned `Result` and now propagate the builders' errors
+   instead of panicking inside them. Callers in `weft-arrow-store` (anyhow `?`),
+   `weft-server` tests and `weft-arrow`'s own tests were updated; no other production caller
+   used the panicking forms.
+3. **Two new `ConvertError` variants** (the enum is `#[non_exhaustive]`, so this is additive):
+   `LengthMismatch { column, expected, actual }` for the former assertions, and `Batch(String)`
+   for an Arrow assembly refusal after the lengths were checked. `weft-server`'s ingest
+   classifier already falls through to `400` for unlisted variants, so a mismatched-columns
+   body is a client error there, as before in spirit.
+4. **Enforcement is two-layered.** The crate denies the panic-family clippy lints
+   (`panic`, `unwrap_used`, `expect_used`, `unreachable`, `todo`, `unimplemented`,
+   `panic_in_result_fn`) at its root — restriction lints, so the workspace clippy gate's
+   denied groups are unchanged and the denial travels with the crate. Clippy has no lint for
+   the assertion macros, so "including asserts" is enforced by a source-scan test over the
+   production half of `src/lib.rs` (the `weftdb` backup.rs precedent), banning `assert!` /
+   `assert_eq!` / `assert_ne!` / `debug_assert` alongside the panic tokens. Test code is
+   exempt in both layers: an assertion failure there is the point.
+5. **The three `#[should_panic]` tests became error assertions** on `LengthMismatch`, pinning
+   the exact column/expected/actual values the assertions used to hide.
+
 ## 2026-11-01 — D-S14: how the HTTP surface wires onto the ingest entry point (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan's §5 D-S14 amendment and resolutions C9–C11, plus the crash-consistency
