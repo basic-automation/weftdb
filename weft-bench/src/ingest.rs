@@ -24,12 +24,22 @@
 //! so reps never see each other's segments, and the directory is removed when
 //! the rep ends. The report goes through the same [`BenchResult`] / manifest
 //! path as every other workload, via the binary's shared `finish` tail.
+//!
+//! [`run_ingest_growth`] is the growth curve (#145): one store ingests up to each of a rising
+//! set of checkpoints (1M → 10M → 100M → 1B rows), and each stage reports its own seal
+//! throughput and per-batch latency together with what the store then holds. A real corpus is
+//! far smaller than a billion rows, so it is laid end to end, each copy shifted past the last
+//! one's span. The values stay the corpus's own: the generated ingest corpus is known to
+//! flatter WeftDB (ROADMAP, "Benchmark hygiene"). A billion rows cannot be read back into
+//! memory, so each checkpoint is gated on the store's own accounting (row count, time span,
+//! segment order) and on an exact read-back of the first and last [`GROWTH_VERIFY_ROWS`].
 
 use std::{
 	sync::atomic::{AtomicU64, Ordering}, time::Instant
 };
 
 use bigdecimal::{BigDecimal, ToPrimitive};
+use serde::{Deserialize, Serialize};
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use weftdb::SegmentStore;
 
@@ -39,6 +49,12 @@ use crate::{
 
 /// Workload class label recorded for the ingest workload.
 pub const WORKLOAD_INGEST: &str = "ingest";
+
+/// Workload class label recorded for each checkpoint of the ingest growth curve.
+pub const WORKLOAD_INGEST_GROWTH: &str = "ingest_growth";
+
+/// Rows read back exactly at each end of the store at every growth checkpoint.
+pub const GROWTH_VERIFY_ROWS: usize = 65_536;
 
 /// Default batch size: rows sealed per [`SegmentStore::seal_declared`] call.
 pub const DEFAULT_INGEST_BATCH_ROWS: usize = 1024;
@@ -150,7 +166,177 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None })
+}
+
+/// What the store held at one checkpoint of an ingest growth curve (schema v24).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrowthPoint {
+	/// Rows in the store when the stage ended: the checkpoint.
+	pub rows_total: u64,
+	/// Rows this stage sealed: the checkpoint minus the one before it.
+	pub rows_stage: u64,
+	/// Copies of the source corpus laid end to end so far (fractional while one is partial).
+	pub corpus_copies: f64,
+	/// Segments the aspect holds.
+	pub segments: usize,
+	/// Realized `.weftseg` bytes across those segments, headers and indexes included.
+	pub segment_bytes: u64,
+	/// `segment_bytes` per stored row.
+	pub bytes_per_point: f64,
+	/// Rows read back and compared exactly (the first and last windows).
+	pub rows_verified: usize,
+	/// Wall time to read those windows back, in nanoseconds.
+	pub verify_read_ns: u64,
+}
+
+/// The `index`th row of `copies` of a corpus laid end to end: copy `k` is the corpus shifted
+/// by `k` periods, where a period is the corpus span plus its first stride, so the copies
+/// neither overlap nor touch.
+struct Tiled<'a> {
+	timestamps: &'a [i64],
+	values: &'a [BigDecimal],
+	period: i64,
+}
+
+impl Tiled<'_> {
+	fn timestamp(&self, index: u64) -> anyhow::Result<i64> {
+		let n = self.timestamps.len() as u64;
+		let copy = i64::try_from(index / n)?;
+		let shift = copy.checked_mul(self.period).ok_or_else(|| anyhow::anyhow!("copy {copy} of the corpus overflows the timestamp range"))?;
+		self.timestamps[usize::try_from(index % n)?].checked_add(shift).ok_or_else(|| anyhow::anyhow!("copy {copy} of the corpus overflows the timestamp range"))
+	}
+
+	/// Rows `start..end`, which must lie within one copy.
+	fn window(&self, start: u64, end: u64) -> anyhow::Result<(Vec<i64>, &[BigDecimal])> {
+		let n = self.timestamps.len() as u64;
+		let at = usize::try_from(start % n)?;
+		let len = usize::try_from(end - start)?;
+		let timestamps = (start..end).map(|i| self.timestamp(i)).collect::<anyhow::Result<_>>()?;
+		Ok((timestamps, &self.values[at..at + len]))
+	}
+}
+
+/// Run the ingest growth curve: one store ingests the corpus, laid end to end, up to each checkpoint.
+///
+/// Every checkpoint becomes one [`BenchResult`] (workload [`WORKLOAD_INGEST_GROWTH`]) for the
+/// stage that reached it.
+///
+/// A stage's latency samples are its per-batch seal times, so the report shows whether a seal
+/// slows as the store grows; its throughput is the stage's rows over their summed seal time.
+/// Building each batch's timestamps and the checks at a checkpoint are outside the timing. A
+/// stage passes when the store reports exactly the rows and time span ingested so far, no
+/// unsorted or overlapping segment, and the first and last [`GROWTH_VERIFY_ROWS`] rows read
+/// back exactly. There is no bootstrap interval: a stage can hold a million batches.
+///
+/// # Errors
+///
+/// Returns an error if the corpus has fewer than two rows or mismatched columns, if
+/// `batch_rows == 0`, if `checkpoints` is empty or not strictly rising, if a copy would leave
+/// the timestamp range, or if any store operation fails. A failed check is not an error: it
+/// fails that checkpoint's correctness gate.
+#[allow(clippy::cast_precision_loss)]
+pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, checkpoints: &[u64]) -> anyhow::Result<Vec<BenchResult>> {
+	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
+	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
+	anyhow::ensure!(profile.batch_rows > 0, "ingest batch_rows must be > 0");
+	anyhow::ensure!(!checkpoints.is_empty() && checkpoints[0] >= 2 && checkpoints.windows(2).all(|w| w[0] < w[1]), "growth checkpoints must be at least 2 and strictly rising");
+
+	let stride = timestamps[1] - timestamps[0];
+	anyhow::ensure!(stride > 0 && timestamps.windows(2).all(|w| w[0] < w[1]), "a growth corpus must have strictly rising timestamps");
+	let tiled = Tiled { timestamps, values, period: timestamps[timestamps.len() - 1] - timestamps[0] + stride };
+	tiled.timestamp(checkpoints[checkpoints.len() - 1] - 1)?;
+	let n = timestamps.len() as u64;
+	let batch = profile.batch_rows as u64;
+
+	let root = std::env::temp_dir().join(format!("weft-bench-growth-{}-{}", std::process::id(), NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed)));
+	std::fs::create_dir_all(&root).map_err(|e| anyhow::anyhow!("cannot create ingest store dir {}: {e}", root.display()))?;
+	let _store_dir = TempStoreDir(root.clone());
+	let store = SegmentStore::open(&root).await.map_err(|e| anyhow::anyhow!("cannot open ingest store in {}: {e:#}", root.display()))?;
+	let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: value_scale }, BigDecimal::from(0), TimeUnit::Seconds);
+	store.declare(&profile.aspect, &schema).await.map_err(|e| anyhow::anyhow!("cannot declare aspect {}: {e:#}", profile.aspect))?;
+	let irregular = timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]);
+
+	let mut results = Vec::with_capacity(checkpoints.len());
+	let mut sealed = 0_u64;
+	for &checkpoint in checkpoints {
+		let stage_start = Instant::now();
+		let rows_stage = checkpoint - sealed;
+		let mut samples_ns = Vec::with_capacity(usize::try_from(rows_stage.div_ceil(batch))?);
+		while sealed < checkpoint {
+			// A batch never spans two copies, so its values are one slice of the corpus.
+			let end = (sealed + batch).min(checkpoint).min((sealed / n + 1) * n);
+			let (chunk_ts, chunk_values) = tiled.window(sealed, end)?;
+			let t0 = Instant::now();
+			store.seal_declared(&profile.aspect, &chunk_ts, chunk_values).await.map_err(|e| anyhow::anyhow!("cannot seal {} rows into aspect {}: {e:#}", chunk_ts.len(), profile.aspect))?;
+			samples_ns.push(span_ns(t0));
+			sealed = end;
+		}
+
+		let stats = store.aspect_stats(&profile.aspect).await.map_err(|e| anyhow::anyhow!("cannot read the stats of aspect {}: {e:#}", profile.aspect))?;
+		let accounted = stats.total_rows == checkpoint && stats.time_range == Some((tiled.timestamp(0)?, tiled.timestamp(checkpoint - 1)?)) && stats.unsorted_segments == 0 && stats.overlapping_segments == 0;
+		let verify_start = Instant::now();
+		let mut rows_verified = 0;
+		let mut exact = true;
+		let mut finite = true;
+		let window = (GROWTH_VERIFY_ROWS as u64).min(checkpoint);
+		for (from, to) in [(0, window), (checkpoint - window, checkpoint)] {
+			// The window at the end may cross a copy boundary: compare it one copy at a time.
+			let (read_ts, read_values) = store.read_time_range(&profile.aspect, tiled.timestamp(from)?, tiled.timestamp(to - 1)?).await.map_err(|e| anyhow::anyhow!("cannot read back aspect {}: {e:#}", profile.aspect))?;
+			let mut expected_ts = Vec::new();
+			let mut expected_values: Vec<&BigDecimal> = Vec::new();
+			let mut at = from;
+			while at < to {
+				let end = to.min((at / n + 1) * n);
+				let (ts, vals) = tiled.window(at, end)?;
+				expected_ts.extend(ts);
+				expected_values.extend(vals);
+				at = end;
+			}
+			exact &= read_ts == expected_ts && read_values.iter().map(Option::as_ref).eq(expected_values.into_iter().map(Some));
+			finite &= read_values.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite));
+			rows_verified += read_ts.len();
+		}
+		let verify_read_ns = span_ns(verify_start);
+
+		let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
+		let throughput_points_per_sec = if measured_ns > 0 { rows_stage as f64 / (measured_ns as f64 / 1e9) } else { 0.0 };
+		let growth = GrowthPoint { rows_total: checkpoint, rows_stage, corpus_copies: checkpoint as f64 / n as f64, segments: stats.segment_count, segment_bytes: stats.total_bytes, bytes_per_point: stats.bytes_per_point, rows_verified, verify_read_ns };
+		let correctness = CorrectnessReport { output_count_ok: accounted && exact, expected_output_points: usize::try_from(checkpoint)?, actual_output_points: usize::try_from(stats.total_rows)?, values_finite: finite };
+		let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(stage_start) };
+		results.push(BenchResult {
+			schema_version: SCHEMA_VERSION,
+			profile: format!("{}-{}", profile.name, count_label(checkpoint)),
+			adapter: "weftdb".to_string(),
+			workload: WORKLOAD_INGEST_GROWTH.to_string(),
+			reps: samples_ns.len(),
+			dataset: DatasetMeta { input_points: usize::try_from(checkpoint)?, output_points: usize::try_from(stats.total_rows)?, irregular, missingness_fraction, seed: 0, signal_shape: None },
+			latency: LatencyStats::from_samples(&samples_ns),
+			latency_ci: None,
+			throughput_points_per_sec,
+			timing,
+			correctness,
+			accuracy: None,
+			storage: None,
+			cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns),
+			gpu_pool: None,
+			adapter_info: None,
+			growth: Some(growth),
+		});
+	}
+	drop(store);
+	Ok(results)
+}
+
+/// `1000000` as `1M`, `1000000000` as `1B`; anything not a round thousand stays a number.
+#[must_use]
+pub fn count_label(n: u64) -> String {
+	match n {
+		n if n >= 1_000_000_000 && n % 1_000_000_000 == 0 => format!("{}B", n / 1_000_000_000),
+		n if n >= 1_000_000 && n % 1_000_000 == 0 => format!("{}M", n / 1_000_000),
+		n if n >= 1_000 && n % 1_000 == 0 => format!("{}k", n / 1_000),
+		n => n.to_string(),
+	}
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
@@ -195,6 +381,43 @@ mod tests {
 			let profile = IngestProfile::new("ingest-uci-batches", "global_active_power", batch_rows);
 			let result = run_ingest_on(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, 1).await.expect("ingest runs");
 			assert!(result.correctness.passed(), "batch_rows={batch_rows}: {:?}", result.correctness);
+		}
+	}
+
+	#[tokio::test]
+	async fn the_growth_curve_lays_the_corpus_end_to_end_and_gates_each_checkpoint() {
+		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
+		let profile = IngestProfile::new("growth", "global_active_power", 3);
+		let results = run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, &[6, 10]).await.expect("growth runs");
+		assert_eq!(results.iter().map(|r| r.profile.as_str()).collect::<Vec<_>>(), ["growth-6", "growth-10"]);
+		for result in &results {
+			assert!(result.correctness.passed(), "{}: {:?}", result.profile, result.correctness);
+			assert_eq!(result.workload, "ingest_growth");
+			assert!(result.latency_ci.is_none());
+		}
+		let (first, second) = (results[0].growth.as_ref().expect("growth"), results[1].growth.as_ref().expect("growth"));
+		assert_eq!((first.rows_total, first.rows_stage, first.rows_verified), (6, 6, 12), "both windows cover all six rows");
+		assert_eq!((second.rows_total, second.rows_stage), (10, 4));
+		assert!((second.corpus_copies - 2.5).abs() < 1e-12);
+		assert_eq!(results[0].reps, 3, "rows 0..3, 3..4 and 4..6: a batch never spans two copies");
+		assert!(second.segments >= results[0].growth.as_ref().expect("growth").segments);
+		assert!(second.bytes_per_point > 0.0);
+	}
+
+	#[test]
+	fn copies_are_shifted_past_the_previous_span_and_counts_are_labelled() {
+		let tiled = Tiled { timestamps: &[100, 160, 220], values: &[BigDecimal::from(1), BigDecimal::from(2), BigDecimal::from(3)], period: 180 };
+		assert_eq!((0..7).map(|i| tiled.timestamp(i).expect("in range")).collect::<Vec<_>>(), [100, 160, 220, 280, 340, 400, 460]);
+		assert!(Tiled { timestamps: &[0, 1], values: &[BigDecimal::from(1), BigDecimal::from(2)], period: i64::MAX }.timestamp(4).is_err(), "an overflowing copy is refused");
+		assert_eq!([1_000_000, 10_000_000, 1_000_000_000, 5_000, 1_234].map(count_label), ["1M", "10M", "1B", "5k", "1234"]);
+	}
+
+	#[tokio::test]
+	async fn growth_checkpoints_must_rise() {
+		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
+		let profile = IngestProfile::new("growth", "global_active_power", 2);
+		for bad in [&[][..], &[8, 8][..], &[8, 4][..], &[1][..]] {
+			assert!(run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, bad).await.is_err(), "{bad:?}");
 		}
 	}
 
