@@ -26,6 +26,8 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
   - [ ] **NEXT — arbitrary bucket widths** (`5s`, `15m`)
   - [x] **DONE (2026-11-01) — a real smooth-signal corpus for the spline-fill claim** (#144): NOAA NDBC buoy temperature and pressure (`scripts/bench/ndbc_to_csv.py`); cubic beats linear on 7 of 9 series at a two-hour mean outage and loses on 8 of 9 at a day
 - [ ] Remaining workloads
+  - [x] **DONE (2026-11-01) — bulk-ingest growth curves** (`weft-bench --ingest --ingest-growth 1M,10M,100M,1B`, #145): 64k-row batches hold 3.9M → 3.2M rows/s to 1B; 1,024-row batches fall 141k → 107k rows/s by 100M as segments pile up
+  - [ ] **NEXT — online ingest + query, compressed query, analytics pipeline**
 - [x] **DONE (2026-10-09) — first-rep/warm separation** (`BenchResult.cold_warm`, schema v21, every workload; console + Parquet)
   - [x] **DONE (2026-10-31) — OS-cold and post-restart runs** (`weft-xbench --cold-hook CMD --cold-reps N`, #146): each read phase also runs with the page cache dropped and after an engine restart, every rep gated; schema v4 `warmth`
 - [ ] Fair-protocol depth (Phase 1.1)

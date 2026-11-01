@@ -220,7 +220,8 @@ impl Tiled<'_> {
 /// Run the ingest growth curve: one store ingests the corpus, laid end to end, up to each checkpoint.
 ///
 /// Every checkpoint becomes one [`BenchResult`] (workload [`WORKLOAD_INGEST_GROWTH`]) for the
-/// stage that reached it.
+/// stage that reached it, handed to `on_checkpoint` as soon as the stage is checked, so a long
+/// curve keeps the stages it finished if it is stopped before the last one.
 ///
 /// A stage's latency samples are its per-batch seal times, so the report shows whether a seal
 /// slows as the store grows; its throughput is the stage's rows over their summed seal time.
@@ -233,10 +234,10 @@ impl Tiled<'_> {
 ///
 /// Returns an error if the corpus has fewer than two rows or mismatched columns, if
 /// `batch_rows == 0`, if `checkpoints` is empty or not strictly rising, if a copy would leave
-/// the timestamp range, or if any store operation fails. A failed check is not an error: it
-/// fails that checkpoint's correctness gate.
-#[allow(clippy::cast_precision_loss)]
-pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, checkpoints: &[u64]) -> anyhow::Result<Vec<BenchResult>> {
+/// the timestamp range, if any store operation fails, or if `on_checkpoint` fails. A failed
+/// check is not an error: it fails that checkpoint's correctness gate.
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, checkpoints: &[u64], mut on_checkpoint: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
 	anyhow::ensure!(profile.batch_rows > 0, "ingest batch_rows must be > 0");
@@ -257,7 +258,6 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 	store.declare(&profile.aspect, &schema).await.map_err(|e| anyhow::anyhow!("cannot declare aspect {}: {e:#}", profile.aspect))?;
 	let irregular = timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]);
 
-	let mut results = Vec::with_capacity(checkpoints.len());
 	let mut sealed = 0_u64;
 	for &checkpoint in checkpoints {
 		let stage_start = Instant::now();
@@ -304,7 +304,7 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 		let growth = GrowthPoint { rows_total: checkpoint, rows_stage, corpus_copies: checkpoint as f64 / n as f64, segments: stats.segment_count, segment_bytes: stats.total_bytes, bytes_per_point: stats.bytes_per_point, rows_verified, verify_read_ns };
 		let correctness = CorrectnessReport { output_count_ok: accounted && exact, expected_output_points: usize::try_from(checkpoint)?, actual_output_points: usize::try_from(stats.total_rows)?, values_finite: finite };
 		let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(stage_start) };
-		results.push(BenchResult {
+		on_checkpoint(BenchResult {
 			schema_version: SCHEMA_VERSION,
 			profile: format!("{}-{}", profile.name, count_label(checkpoint)),
 			adapter: "weftdb".to_string(),
@@ -322,10 +322,10 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 			gpu_pool: None,
 			adapter_info: None,
 			growth: Some(growth),
-		});
+		})?;
 	}
 	drop(store);
-	Ok(results)
+	Ok(())
 }
 
 /// `1000000` as `1M`, `1000000000` as `1B`; anything not a round thousand stays a number.
@@ -388,7 +388,13 @@ mod tests {
 	async fn the_growth_curve_lays_the_corpus_end_to_end_and_gates_each_checkpoint() {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("growth", "global_active_power", 3);
-		let results = run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, &[6, 10]).await.expect("growth runs");
+		let mut results = Vec::new();
+		run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, &[6, 10], |r| {
+			results.push(r);
+			Ok(())
+		})
+		.await
+		.expect("growth runs");
 		assert_eq!(results.iter().map(|r| r.profile.as_str()).collect::<Vec<_>>(), ["growth-6", "growth-10"]);
 		for result in &results {
 			assert!(result.correctness.passed(), "{}: {:?}", result.profile, result.correctness);
@@ -417,7 +423,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("growth", "global_active_power", 2);
 		for bad in [&[][..], &[8, 8][..], &[8, 4][..], &[1][..]] {
-			assert!(run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, bad).await.is_err(), "{bad:?}");
+			assert!(run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, bad, |_| Ok(())).await.is_err(), "{bad:?}");
 		}
 	}
 

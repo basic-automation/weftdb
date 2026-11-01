@@ -18,6 +18,10 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **Ingest growth curves** (#145): `weft-bench --ingest --ingest-growth 1M,10M,100M,1B` grows
+  one store through those checkpoints over the real UCI corpus laid end to end, reporting each
+  stage's seal throughput, per-batch latency, segments and bytes (report schema v24 `growth`),
+  each checkpoint gated and written as its own report as soon as it passes.
 - **A real smooth-signal corpus for the spline-fill claim** (#144): `scripts/bench/ndbc_to_csv.py`
   turns NOAA NDBC buoy history into a `weft-bench --gf-csv` corpus. On nine buoy temperature and
   pressure series a cubic fill beats linear across short outages and loses across day-long ones;

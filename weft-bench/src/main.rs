@@ -373,21 +373,22 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = cli.name.clone().unwrap_or_else(|| format!("ingest-{}", aspect));
 	let profile = IngestProfile::new(profile_name, aspect, cli.ingest_batch);
 	if !cli.ingest_growth.is_empty() {
-		let results = run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, &cli.ingest_growth).await.map_err(|e| anyhow::anyhow!("ingest growth run failed: {e}"))?;
-		for r in &results {
-			if let Some(g) = &r.growth {
-				println!("growth   : {:>14} rows  {:>12.0} rows/s  batch p50 {:>9.3} ms p99 {:>9.3} ms  {:>8} segments  {:.3} B/pt  {}", g.rows_total, r.throughput_points_per_sec, std::time::Duration::from_nanos(r.latency.p50_ns).as_secs_f64() * 1e3, std::time::Duration::from_nanos(r.latency.p99_ns).as_secs_f64() * 1e3, g.segments, g.bytes_per_point, if r.correctness.passed() { "PASS" } else { "FAIL" });
-			}
-		}
-		// One report per checkpoint, as every other workload writes one result per file: `compare`
-		// matches runs by profile name, and a manifest grades one result's measures.
+		// One report per checkpoint, written as the stage ends, as every other workload writes one
+		// result per file: `compare` matches runs by profile name, a manifest grades one result's
+		// measures, and a curve stopped short keeps the stages it finished.
 		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 		let mut code = ExitCode::SUCCESS;
-		for result in results {
+		run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, &cli.ingest_growth, |result| {
+			if let Some(g) = &result.growth {
+				println!("growth   : {:>14} rows  {:>12.0} rows/s  batch p50 {:>9.3} ms p99 {:>9.3} ms  {:>8} segments  {:.3} B/pt  {}", g.rows_total, result.throughput_points_per_sec, std::time::Duration::from_nanos(result.latency.p50_ns).as_secs_f64() * 1e3, std::time::Duration::from_nanos(result.latency.p99_ns).as_secs_f64() * 1e3, g.segments, g.bytes_per_point, if result.correctness.passed() { "PASS" } else { "FAIL" });
+			}
 			if finish(cli, &BenchReport::with_results(metadata.clone(), vec![result]))? != ExitCode::SUCCESS {
 				code = ExitCode::FAILURE;
 			}
-		}
+			Ok(())
+		})
+		.await
+		.map_err(|e| anyhow::anyhow!("ingest growth run failed: {e}"))?;
 		return Ok(code);
 	}
 	let result = run_ingest_on(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, cli.reps).await.map_err(|e| anyhow::anyhow!("ingest benchmark run failed: {e}"))?;
