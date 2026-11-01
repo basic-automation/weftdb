@@ -63,6 +63,10 @@ splimes = { workspace = true, features = ["gpu"] }
 # Only the tests install a subscriber; the library logs through the `tracing` facades.
 tracing-subscriber = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# statvfs, for the whole-store backup's headroom check (D-S16).
+libc = { workspace = true }
+
 [target.'cfg(unix)'.dev-dependencies]
 # Only to keep the fault tests' deliberately aborted child from dumping core.
 libc = { workspace = true }

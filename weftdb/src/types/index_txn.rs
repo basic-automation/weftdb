@@ -168,6 +168,11 @@ pub enum IndexOp {
 	/// reaper unlinks it once no read that may still open it is running. A plain `INSERT`,
 	/// as for [`JournalPending`](Self::JournalPending).
 	JournalRetire { aspect: String, name: String, retire_epoch: u64, created_ms: i64 },
+	/// Journal `name` as `'held'` from `aspect` (D-S16): a frame restore-mode
+	/// recovery found carrying a `SERIES_KEY` extension, kept on disk and out of
+	/// the reaper until TAG-9 binds series keys. A plain `INSERT`, as for
+	/// [`JournalPending`](Self::JournalPending).
+	JournalHeld { aspect: String, name: String, created_ms: i64 },
 	/// Delete the journal row of `name`, whatever its state, if it has one: a swap clears
 	/// its outputs' `'pending'` rows, the reaper and the open's replay the rows they
 	/// processed.
@@ -228,7 +233,7 @@ impl IndexOp {
 			// writer of that aspect's rollup row can commit between attempts: a retry
 			// re-runs the same fold over the same index state. An `IndexTxn` run
 			// without that lock must not rely on it.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } => true,
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::JournalHeld { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } => true,
 			// `QuarantineInsert` replaces a record of the same key and
 			// `QuarantineDelete` deletes one if it exists, so neither re-checks
 			// what its caller decided from, like `Upsert` and `Delete`.
@@ -508,6 +513,10 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 		IndexOp::JournalRetire { aspect, name, retire_epoch, created_ms } => {
 			let sql = "INSERT INTO frame_journal (name, aspect, state, retire_epoch, created_ms) VALUES (?, ?, 'retired', ?, ?)";
 			conn.execute(sql, vec![Value::Text(name.clone()), Value::Text(aspect.clone()), integer(*retire_epoch), Value::Integer(*created_ms)]).await.map_err(|e| statement_error(&format!("journaling {aspect:?} frame {name} as retired"), &e))
+		}
+		IndexOp::JournalHeld { aspect, name, created_ms } => {
+			let sql = "INSERT INTO frame_journal (name, aspect, state, retire_epoch, created_ms) VALUES (?, ?, 'held', NULL, ?)";
+			conn.execute(sql, vec![Value::Text(name.clone()), Value::Text(aspect.clone()), Value::Integer(*created_ms)]).await.map_err(|e| statement_error(&format!("journaling {aspect:?} frame {name} as held"), &e))
 		}
 		IndexOp::ClearJournal { name } => conn.execute("DELETE FROM frame_journal WHERE name = ?", vec![Value::Text(name.clone())]).await.map_err(|e| statement_error(&format!("clearing the journal row of {name}"), &e)),
 		IndexOp::MetaSet { key, value } => conn.execute("INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)", vec![Value::Text(key.clone()), Value::Text(value.clone())]).await.map_err(|e| statement_error(&format!("recording store_meta {key}"), &e)),
