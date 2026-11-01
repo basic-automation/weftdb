@@ -226,13 +226,7 @@ pub async fn read_value_range_to_parquet_bytes(store: &SegmentStore, aspect: &st
 /// the seal fails (an unrepresentable value, or a filesystem/control-plane failure).
 pub async fn ingest_parquet_into_aspect(store: &SegmentStore, aspect: &str, bytes: &[u8], rows_per_page: Option<usize>, require_sorted: bool) -> Result<SegmentDescriptor> {
 	let schema = aspect_schema(store, aspect).await?;
-	let batches = weft_arrow::read_parquet(bytes)?;
-	let (timestamps, values) = weft_arrow::record_batches_to_columns(&batches)?;
-	if require_sorted {
-		if let Some((index, previous, current)) = first_order_violation(&timestamps) {
-			bail!("out-of-order timestamp at row {index}: {current} < previous {previous} (require_sorted was set)");
-		}
-	}
+	let (timestamps, values) = decode_parquet_columns(bytes, require_sorted)?;
 	let any_null = values.iter().any(Option::is_none);
 	let descriptor = match (rows_per_page, any_null) {
 		(Some(rows_per_page), true) => store.seal_paged_nullable(aspect, &schema, &timestamps, &values, rows_per_page).await?,
@@ -241,6 +235,33 @@ pub async fn ingest_parquet_into_aspect(store: &SegmentStore, aspect: &str, byte
 		(None, false) => store.seal(aspect, &schema, &timestamps, &present_values(&values)).await?,
 	};
 	Ok(descriptor)
+}
+
+/// Decode a Parquet ingest body's bytes into the `(timestamp, value)`
+/// columns an ingest seals, without sealing them (D-S14).
+///
+/// This is the decode half of [`ingest_parquet_into_aspect`], split out so
+/// the HTTP ingest wiring can run the decoded columns through the store's
+/// one idempotent ingest entry point (`SegmentStore::ingest`) like the
+/// other three formats, instead of sealing here and bypassing the ledger.
+/// The order gate is the caller's choice, as in
+/// [`ingest_parquet_into_aspect`]: with `require_sorted` set, a body whose
+/// timestamps step backwards is refused before anything is sealed.
+///
+/// # Errors
+///
+/// A [`weft_arrow::ConvertError`] when the bytes are not a valid Parquet
+/// file or carry no WeftDB columns, and the `out-of-order timestamp`
+/// refusal described above.
+pub fn decode_parquet_columns(bytes: &[u8], require_sorted: bool) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+	let batches = weft_arrow::read_parquet(bytes)?;
+	let (timestamps, values) = weft_arrow::record_batches_to_columns(&batches)?;
+	if require_sorted {
+		if let Some((index, previous, current)) = first_order_violation(&timestamps) {
+			bail!("out-of-order timestamp at row {index}: {current} < previous {previous} (require_sorted was set)");
+		}
+	}
+	Ok((timestamps, values))
 }
 
 /// Unwrap an all-present value column to the dense `BigDecimal` slice the dense seal

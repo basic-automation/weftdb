@@ -665,6 +665,72 @@ fn paged_seal_failed(error: weft_physical_type::SealError) -> anyhow::Error {
 	anyhow::Error::from(error).context(format!("paged seal failed: {shown}"))
 }
 
+/// One encoded ingest chunk, in whichever frame shape the batch asked
+/// for (D-S14): a single-block [`Segment`], or a [`PagedSegment`] when the
+/// batch carries `rows_per_page`. The two shapes share everything the
+/// ingest commit needs — stats, frame bytes under a [`FrameOptions`], and
+/// a descriptor — so the encode/write/commit path below is written once
+/// over this sum rather than once per shape.
+enum IngestSegment {
+	/// A single-block frame (the shape every pre-D-S14 ingest sealed).
+	Single(Segment),
+	/// A paged frame, sealed at the batch's page height.
+	Paged(PagedSegment),
+}
+
+impl IngestSegment {
+	/// The segment's row count (present and null rows).
+	fn row_count(&self) -> usize {
+		match self {
+			Self::Single(segment) => segment.stats.row_count,
+			Self::Paged(segment) => segment.stats.row_count,
+		}
+	}
+
+	/// Whether the segment's shape benefits from timestamp checkpoints.
+	fn benefits_from_checkpoints(&self) -> bool {
+		match self {
+			Self::Single(segment) => segment.benefits_from_checkpoints(),
+			Self::Paged(segment) => segment.benefits_from_checkpoints(),
+		}
+	}
+
+	/// The segment's checkpoint codec overhead estimate.
+	fn checkpoint_codec_overhead(&self) -> f64 {
+		match self {
+			Self::Single(segment) => segment.checkpoint_codec_overhead(),
+			Self::Paged(segment) => segment.checkpoint_codec_overhead(),
+		}
+	}
+
+	/// The frame bytes under `options`.
+	fn write_to_with(&self, options: &FrameOptions) -> Vec<u8> {
+		match self {
+			Self::Single(segment) => segment.write_to_with(options),
+			Self::Paged(segment) => segment.write_to_with(options),
+		}
+	}
+
+	/// The descriptor for this frame at `path`, with id 0 (the commit
+	/// assigns the real id).
+	fn descriptor(&self, path: String, byte_len: u64) -> SegmentDescriptor {
+		match self {
+			Self::Single(segment) => SegmentDescriptor::of_segment(0, path, byte_len, segment),
+			Self::Paged(segment) => SegmentDescriptor::of_paged_segment(0, path, byte_len, segment),
+		}
+	}
+}
+
+/// Encode one ingest chunk under `schema`, in the batch's frame shape:
+/// paged when `rows_per_page` is set, single-block otherwise. The error
+/// is the shape's seal failure, worded as the direct seal paths word it.
+fn encode_ingest_chunk(schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<IngestSegment> {
+	match rows_per_page {
+		Some(rows_per_page) => schema.seal_paged_nullable(timestamps, values, rows_per_page).map(IngestSegment::Paged).map_err(paged_seal_failed),
+		None => schema.seal_nullable(timestamps, values).map(IngestSegment::Single).map_err(seal_failed),
+	}
+}
+
 /// Cut an ingest batch's rows into chunks of at most
 /// [`MAX_ENCODED_FRAME_BYTES`](crate::MAX_ENCODED_FRAME_BYTES) of encoded
 /// frame, by a conservative per-row estimate (D-S13): each row is charged
@@ -3170,8 +3236,8 @@ impl SegmentStore {
 		// timestamp boundaries so no frame exceeds the target: the cut is
 		// over rows, and each chunk re-seals from its own rows, so a chunk
 		// boundary is a segment boundary and nothing else.
-		let whole = schema.seal_nullable(&batch.timestamps, &batch.values).map_err(seal_failed).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
-		let chunks = if whole.write_to_with(&self.frame_options(whole.stats.row_count, false, 0.0)).len() as u64 <= crate::MAX_ENCODED_FRAME_BYTES {
+		let whole = encode_ingest_chunk(&schema, &batch.timestamps, &batch.values, batch.rows_per_page).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
+		let chunks = if whole.write_to_with(&self.frame_options(whole.row_count(), false, 0.0)).len() as u64 <= crate::MAX_ENCODED_FRAME_BYTES {
 			vec![(batch.timestamps.clone(), batch.values.clone())]
 		} else {
 			let mut chunks: Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::new();
@@ -3179,8 +3245,8 @@ impl SegmentStore {
 				// Prove each chunk's frame fits before any frame is
 				// written: a chunk that still exceeds the target holds a
 				// single timestamp run, the smallest cut there is.
-				let segment = schema.seal_nullable(&timestamps, &values).map_err(seal_failed)?;
-				let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, false, 0.0));
+				let segment = encode_ingest_chunk(&schema, &timestamps, &values, batch.rows_per_page)?;
+				let bytes = segment.write_to_with(&self.frame_options(segment.row_count(), false, 0.0));
 				if bytes.len() as u64 > crate::MAX_ENCODED_FRAME_BYTES && timestamps.len() > 1 {
 					bail!("an ingest chunk of {} rows still encodes past the {}-byte frame target", timestamps.len(), crate::MAX_ENCODED_FRAME_BYTES);
 				}
@@ -3192,14 +3258,14 @@ impl SegmentStore {
 		crate::exec::set_ingest_phase(phase);
 		let mut written: Vec<(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::with_capacity(chunks.len());
 		for (timestamps, values) in &chunks {
-			let segment = schema.seal_nullable(timestamps, values).map_err(seal_failed).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
-			let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
+			let segment = encode_ingest_chunk(&schema, timestamps, values, batch.rows_per_page).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
+			let bytes = segment.write_to_with(&self.frame_options(segment.row_count(), segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
 			let byte_len = bytes.len() as u64;
 			let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await.with_context(|| format!("ingest of aspect {aspect:?} failed while {phase}"))?;
 			if written.len() + 1 < chunks.len() {
 				fault::hit(FaultPoint::SBetweenFrames).await?;
 			}
-			let descriptor = SegmentDescriptor::of_segment(0, path.to_string_lossy().into_owned(), byte_len, &segment);
+			let descriptor = segment.descriptor(path.to_string_lossy().into_owned(), byte_len);
 			written.push((descriptor, gen, frame_crc, timestamps.clone(), values.clone()));
 		}
 		phase = IngestPhase::Committing;
@@ -5030,6 +5096,39 @@ impl SegmentStore {
 		Ok(())
 	}
 
+	/// Shut the store down cleanly (D-S14; crash-consistency §5.5's
+	/// shutdown sequence, plan C9's drain order): run the reaper over
+	/// whatever the process's swaps retired, then record the clean
+	/// shutdown [`mark_clean_shutdown`](Self::mark_clean_shutdown) writes.
+	///
+	/// The steps before this one are the server's: serving drains first
+	/// (in-flight ingests finish or the grace window ends), then the
+	/// daemons stop on their shared watch. What remains store-side is
+	/// exactly these two: retired frames are reclaimed while the process
+	/// still holds the root, and the flag the next open reports is set
+	/// last, so a failure mid-shutdown still reads as a crash to that
+	/// open. A reaper failure does not block the flag: litter left behind
+	/// is what the next open's recovery classifies, while a missing flag
+	/// would misreport a clean stop as a crash.
+	///
+	/// # Errors
+	///
+	/// Propagates a failure of the clean-shutdown commit itself (a
+	/// reaper failure is logged, not propagated — see above).
+	pub async fn shutdown(&self) -> Result<()> {
+		match self.reap(MaintenanceWait::Skip).await {
+			Ok(sweep) => {
+				if !sweep.busy.is_empty() {
+					tracing::debug!(busy = ?sweep.busy, "store shutdown: the reaper skipped busy aspects; their retired frames stay for the next open's recovery");
+				}
+			}
+			Err(error) => {
+				tracing::warn!(error = %error, "store shutdown: the reaper failed; retired frames stay for the next open's recovery");
+			}
+		}
+		self.mark_clean_shutdown().await
+	}
+
 	/// The quarantine records, of one aspect for `Some`, or of every aspect for `None`.
 	///
 	/// # Errors
@@ -5890,6 +5989,28 @@ mod tests {
 		assert!(third.duplicate);
 		assert_eq!(third.segment_ids, first.segment_ids);
 		assert_eq!(reopened.segment_count("price").await.expect("counts"), 1);
+	}
+
+	/// D-S14: a paged ingest batch seals a paged (format v6) frame through
+	/// the same entry point, and replays like any other keyed batch.
+	#[tokio::test]
+	async fn ingest_with_rows_per_page_seals_a_paged_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		store.declare("price", &schema()).await.expect("declares");
+		let batch = IngestBatch::dense("paged-1", vec![0, 10, 20, 30], vec![bd("1"), bd("2"), bd("3"), bd("4")]).with_rows_per_page(Some(2));
+		let first = store.ingest("price", &batch).await.expect("ingests");
+		assert!(!first.duplicate);
+		let descriptors = store.index.all("price").await.expect("descriptors");
+		assert_eq!(descriptors.len(), 1);
+		assert_eq!(descriptors[0].format_version, weft_physical_type::PAGED_SEGMENT_FORMAT_VERSION, "the paged batch sealed a paged frame");
+		assert_eq!(descriptors[0].id, first.segment_ids[0]);
+		let second = store.ingest("price", &batch).await.expect("replays");
+		assert!(second.duplicate, "the paged batch replays under its key");
+		assert_eq!(second.segment_ids, first.segment_ids);
+		let (ts, vs) = store.read_time_range("price", 0, 30).await.expect("reads");
+		assert_eq!(ts, vec![0, 10, 20, 30]);
+		assert_eq!(vs.len(), 4);
 	}
 
 	/// D-S13: a different batch under a recorded key is a typed conflict,
@@ -10621,6 +10742,19 @@ mod tests {
 		drop(store);
 		let store = SegmentStore::open(dir.path()).await.expect("reopens again");
 		assert!(!store.previous_clean_shutdown(), "an open without a clean shutdown resets the flag");
+	}
+
+	/// D-S14: `shutdown()` is the closing sequence in one call — the
+	/// reaper pass, then the clean-shutdown commit the next open reports.
+	#[tokio::test]
+	async fn shutdown_marks_the_store_clean_for_the_next_open() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		assert!(!store.previous_clean_shutdown(), "no process ever marked this store clean");
+		store.shutdown().await.expect("shuts down");
+		drop(store);
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		assert!(store.previous_clean_shutdown(), "shutdown() committed the clean-shutdown flag");
 	}
 
 	/// D-S12: the TTL purge removes an expired corrupt record and its file, and
