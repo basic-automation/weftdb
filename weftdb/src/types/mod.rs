@@ -1,7 +1,7 @@
 pub use aspect::{Aspect, AspectId};
 pub use aspect_catalog::AspectCatalog;
 pub use aspect_name::InvalidAspectName;
-pub use backup::{count_rows, expected_tables, is_complete_backup, is_staging_name, remove_empty_sidecars, restore_control_plane, restore_control_plane_with, retire_backup, scan_rows, snapshot_and_verify, snapshot_with_verify, sweep_backup_staging, sweep_backup_staging_at, user_tables, vacuum_into, verify_snapshot, BackupManifest, ManifestFile, RestoreReport, SnapshotReport, StagingSweep, VerifyMode, BACKUP_MANIFEST, CONTROL_PLANE_FILES, DELETING_PREFIX, MANIFEST_FORMAT, PARTIAL_PREFIX, RESTORE_DRILL_PREFIX, STAGING_PREFIXES, STAGING_SWEEP_AGE};
+pub use backup::{check_backup_headroom, count_rows, expected_tables, free_bytes_at, is_complete_backup, is_staging_name, read_restore_intent, remove_empty_sidecars, restore_control_plane, restore_control_plane_with, restore_store, restore_store_with, retire_backup, scan_rows, snapshot_and_verify, snapshot_with_verify, sweep_backup_staging, sweep_backup_staging_at, user_tables, vacuum_into, verify_snapshot, write_restore_intent, BackupManifest, BackupMode, ManifestAllocator, ManifestFile, ManifestFrame, RestoreIntent, RestoreReport, SnapshotReport, StagingSweep, VerifyMode, WholeStoreRestoreReport, BACKUP_MANIFEST, CONTROL_PLANE_FILES, DELETING_PREFIX, MANIFEST_FORMAT, PARTIAL_PREFIX, RESTORE_DRILL_PREFIX, RESTORE_INTENT_FILE, STAGING_PREFIXES, STAGING_SWEEP_AGE, WHOLE_STORE_MANIFEST_FORMAT};
 pub use batches::{
 	batched_measurements::{analysis::Analysis, batched_distance::BatchDistance, BatchedMeasurement}, Batch, BatchId, BatchMetatdata, Batches
 };
@@ -19,6 +19,7 @@ pub use event::{Event, EventID, EventName, Events, Manifestation, ManifestationI
 pub use frame_read::FrameFaultError;
 pub use ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry, MAX_ENCODED_FRAME_BYTES};
 pub use input_measurement::InputMeasurement;
+pub use legacy_seal::StorageMode;
 pub use measurement::{Measurement, MeasurementId};
 pub use measurement_vector::MeasurementVector;
 pub use metadata::{AspectMetadata, AspectMetadataStore};
@@ -33,7 +34,7 @@ pub use segment_index::SegmentIndexStore;
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;
-pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_WAIT};
+pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_WAIT};
 pub use signal::{units_between, Distance, ErrVal, Signal, SignalType, Signals};
 pub use store_format::{StoreFormat, StoreScope, LEGACY_LAYOUT, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
 pub use subject::{Subject, SubjectId};
@@ -65,6 +66,7 @@ pub(crate) mod index_txn;
 pub mod ingest;
 pub mod input_measurement;
 pub mod interpolate_range;
+pub mod legacy_seal;
 pub mod measurement;
 pub mod measurement_vector;
 pub mod metadata;

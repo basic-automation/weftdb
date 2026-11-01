@@ -46,13 +46,24 @@ pub mod outputs;
 pub mod pipeline;
 pub mod traits;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Database {
 	id: DatabaseId,
 	name: String,
 	metadata: turso::Database,
 	metadata_path: String,
 	cache: Arc<Mutex<cache::DatabaseCache>>,
+	/// The lazily opened seal store of this database's seal-backed aspects
+	/// (slice D-S19, see [`crate::legacy_seal`]): opened on first use and
+	/// held for the handle's life, because a store root is owned by one
+	/// open at a time.
+	seal_store: Arc<Mutex<Option<Arc<crate::SegmentStore>>>>,
+}
+
+impl fmt::Debug for Database {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Database").field("id", &self.id).field("name", &self.name).field("metadata_path", &self.metadata_path).finish_non_exhaustive()
+	}
 }
 
 #[async_trait::async_trait]
@@ -334,7 +345,8 @@ impl DatabaseStructure for Database {
                         		created_at INTEGER NOT NULL,
                         		earliest_measurement TEXT,
                         		latest_measurement TEXT,
-                        		compression_config TEXT
+                        		compression_config TEXT,
+                        		storage_mode TEXT
                         	)
                 	",
 				turso::params![],
@@ -447,7 +459,7 @@ impl DatabaseStructure for Database {
 		db_info.set_metadata(Some(metadata_turso_db.clone()));
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		let db = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path, cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) };
+		let db = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path, cache: Arc::new(Mutex::new(cache::DatabaseCache::new())), seal_store: Arc::new(Mutex::new(None)) };
 
 		// Fold the build's log into the database file. Best-effort, as after every commit:
 		// the schema and the `database` row are durable once committed (the commit fsyncs
@@ -561,7 +573,7 @@ impl DatabaseStructure for Database {
 
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		Ok(Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.clone(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())) })
+		Ok(Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.clone(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())), seal_store: Arc::new(Mutex::new(None)) })
 	}
 
 	async fn get_database_info(&self) -> Result<DatabaseInfo> {
@@ -937,6 +949,14 @@ impl DatabaseStructure for Database {
 		let compression_config_json = compression_config.as_ref().map(serde_json::to_string).transpose()?;
 		let created_at = chrono::Utc::now().timestamp_millis();
 
+		// The aspect's storage mode is chosen here, at creation, and never
+		// switched afterwards (slice D-S19): a compression config forces
+		// rows mode, and WEFT_LEGACY_DEFAULT_STORAGE=segments makes new
+		// aspects seal-backed. A database created before D-S19 gains the
+		// column first, following the compression_config pattern.
+		self.ensure_storage_mode_column().await;
+		let storage_mode = crate::StorageMode::for_new_aspect(compression_config.is_some(), std::env::var(crate::legacy_seal::LEGACY_DEFAULT_STORAGE_ENV).ok().as_deref());
+
 		// Establish a fresh connection for this attempt while holding the mutex
 		let metadata_db_conn = self.metadata();
 		let metadata_db_path = self.metadata_path.clone();
@@ -946,7 +966,7 @@ impl DatabaseStructure for Database {
 		tracing::trace!("About to execute INSERT INTO aspects (aspect_id={aspect_id_str} table_name={table_name})");
 
 		// Execute the INSERT while holding the mutex
-		conn.as_ref().execute("INSERT INTO aspects (id, name, subject_id, database_id, table_name, resolution, created_at, compression_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![aspect_id_str.clone(), name_str.clone(), subj_id_str.clone(), db_id_str.clone(), table_name.clone(), resolution_json.clone(), created_at, compression_config_json]).await?;
+		conn.as_ref().execute("INSERT INTO aspects (id, name, subject_id, database_id, table_name, resolution, created_at, compression_config, storage_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![aspect_id_str.clone(), name_str.clone(), subj_id_str.clone(), db_id_str.clone(), table_name.clone(), resolution_json.clone(), created_at, compression_config_json, storage_mode.as_str()]).await?;
 
 		tracing::debug!("Aspect inserted successfully");
 
@@ -958,6 +978,7 @@ impl DatabaseStructure for Database {
 
 		// Set compression config on the created aspect
 		aspect.set_compression_config_local(compression_config);
+		aspect.set_storage_mode_local(storage_mode);
 
 		Self::commit_concurrent(&conn).await?;
 
@@ -1095,6 +1116,9 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_latest_measurement(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
+		if self.is_seal_backed(aspect_id).await? {
+			return Ok(self.seal_time_range(aspect_id).await?.1);
+		}
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let _cache_key = format!("measurement_db_{aspect_id}");
@@ -1440,6 +1464,91 @@ impl DatabaseStructure for Database {
 }
 
 impl Database {
+	/// Ensure `aspects.storage_mode` exists on this database's metadata
+	/// (slice D-S19): the column is in the wireframe for new databases, and
+	/// a database created before it gains it here, following the
+	/// `compression_config` pattern — the duplicate-column error of a
+	/// database that already has it is ignored.
+	async fn ensure_storage_mode_column(&self) {
+		if let Ok(conn) = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await {
+			conn.as_ref().execute("ALTER TABLE aspects ADD COLUMN storage_mode TEXT", turso::params![]).await.ok();
+			Self::commit_concurrent(&conn).await.ok();
+		}
+	}
+
+	/// The storage mode recorded for `aspect_id` at its creation (slice
+	/// D-S19): seal-backed aspects read and write through the seal store,
+	/// every other aspect through its `measurements.db`. A missing row or a
+	/// pre-S19 database (no column, or a `NULL` value) is rows mode.
+	///
+	/// # Errors
+	///
+	/// If the metadata database cannot be queried for a reason other than
+	/// the aspect or the column being absent.
+	pub async fn aspect_storage_mode(&self, aspect_id: &AspectId) -> Result<crate::StorageMode> {
+		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
+		let res = conn.as_ref().query("SELECT storage_mode FROM aspects WHERE id = ?", turso::params![aspect_id.as_uuid().to_string()]).await;
+		let mode = match res {
+			Ok(mut rows) => {
+				let value = match rows.next().await? {
+					Some(row) => match row.get_value(0)? {
+						turso::Value::Text(text) => Some(text),
+						_ => None,
+					},
+					None => None,
+				};
+				value.as_deref().map_or(crate::StorageMode::Rows, |text| crate::StorageMode::parse(Some(text)))
+			}
+			// A database created before D-S19 has no column to select.
+			Err(_) => crate::StorageMode::Rows,
+		};
+		Self::commit_concurrent(&conn).await.ok();
+		Ok(mode)
+	}
+
+	/// `true` when `aspect_id` is seal-backed (slice D-S19).
+	///
+	/// # Errors
+	///
+	/// As [`aspect_storage_mode`](Self::aspect_storage_mode).
+	pub async fn is_seal_backed(&self, aspect_id: &AspectId) -> Result<bool> {
+		Ok(self.aspect_storage_mode(aspect_id).await?.is_seal_backed())
+	}
+
+	/// This database's seal store (slice D-S19), opened on first use and
+	/// held by this handle: the root at `{db}/segments_v2/`, scoped
+	/// `(db, 'legacy')`. Clones of this handle share the one open.
+	///
+	/// # Errors
+	///
+	/// As [`crate::legacy_seal::open_store`].
+	pub async fn seal_store(&self) -> Result<Arc<crate::SegmentStore>> {
+		let mut held = self.seal_store.lock().await;
+		if let Some(store) = held.as_ref() {
+			return Ok(store.clone());
+		}
+		let db_dir = Path::new(&self.metadata_path).parent().ok_or_else(|| anyhow::anyhow!("metadata path {} has no parent directory", self.metadata_path))?;
+		let store = Arc::new(crate::legacy_seal::open_store(&self.name, db_dir).await?);
+		*held = Some(store.clone());
+		Ok(store)
+	}
+
+	/// The `(earliest, latest)` timestamps a seal-backed aspect holds, from
+	/// its seal store's rollup (slice D-S19): both `None` when it holds no
+	/// rows.
+	///
+	/// # Errors
+	///
+	/// If the seal store cannot answer for the aspect.
+	pub async fn seal_time_range(&self, aspect_id: &AspectId) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+		let store = self.seal_store().await?;
+		let stats = store.aspect_stats(&crate::legacy_seal::aspect_key(aspect_id)).await?;
+		Ok(match stats.time_range {
+			Some((min, max)) => (DateTime::from_timestamp_millis(min), DateTime::from_timestamp_millis(max)),
+			None => (None, None),
+		})
+	}
+
 	/// The cache key of an aspect's earliest measurement timestamp.
 	fn earliest_measurement_cache_key(aspect_id: &AspectId) -> String {
 		format!("metadata_earliest_measurement_{}", aspect_id.as_uuid())
@@ -1471,6 +1580,9 @@ impl Database {
 	///
 	/// If the aspect's measurement database cannot be opened or queried.
 	pub async fn get_earliest_measurement_uncached(&self, aspect_id: &AspectId) -> Result<Option<DateTime<Utc>>> {
+		if self.is_seal_backed(aspect_id).await? {
+			return Ok(self.seal_time_range(aspect_id).await?.0);
+		}
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
@@ -1566,7 +1678,8 @@ impl Database {
 				created_at INTEGER NOT NULL,
 				earliest_measurement TEXT,
 				latest_measurement TEXT,
-				compression_config TEXT
+				compression_config TEXT,
+				storage_mode TEXT
 			)",
 			turso::params![],
 		)
@@ -1576,6 +1689,9 @@ impl Database {
 
 		// Add compression_config column for existing databases (migration)
 		conn.execute("ALTER TABLE aspects ADD COLUMN compression_config TEXT", turso::params![]).await.ok(); // Ignore error if column already exists
+
+		// Add storage_mode column for existing databases (migration, slice D-S19)
+		conn.execute("ALTER TABLE aspects ADD COLUMN storage_mode TEXT", turso::params![]).await.ok(); // Ignore error if column already exists
 
 		tracing::debug!("Creating unbatched_measurements table...");
 		conn.execute(

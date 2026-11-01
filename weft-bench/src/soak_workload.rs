@@ -48,8 +48,8 @@
 //!
 //! **No schema bump.** The workload model is not part of the run record:
 //! it adds no field to [`SoakRun`](crate::soak::SoakRun) or
-//! [`SoakConfig`], so
-//! [`SOAK_SCHEMA_VERSION`](crate::soak::SOAK_SCHEMA_VERSION) stays at v1
+//! [`SoakConfig`], so it does not move
+//! [`SOAK_SCHEMA_VERSION`](crate::soak::SOAK_SCHEMA_VERSION)
 //! per SOA-1's bump rule. The model and its steps serialize on their own
 //! for artifacts that want them.
 
@@ -666,6 +666,6 @@ mod tests {
 			assert_eq!(body, &expected.body, "tick {tick}'s submitted body must be the model's step");
 			assert!(!parse(body).expect("submitted body must parse").is_empty(), "a submitted body must carry records");
 		}
-		assert_eq!(harness.run_record().soak_schema_version, SOAK_SCHEMA_VERSION, "the workload adds no run-record field, so the soak schema stays at v1");
+		assert_eq!(harness.run_record().soak_schema_version, SOAK_SCHEMA_VERSION, "the workload adds no run-record field, so it does not move the soak schema");
 	}
 }

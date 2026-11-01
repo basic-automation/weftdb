@@ -4,6 +4,96 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — D-S14: how the HTTP surface wires onto the ingest entry point (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan's §5 D-S14 amendment and resolutions C9–C11, plus the crash-consistency
+design §8/§5.2/§2(g): routes through SEC-3's `Routes`; the one body cap is
+`WEFT_MAX_INGEST_BYTES` (256 MiB default) on the ingest routes only; admission sits inside the
+gate; the idempotency key (header or `batch_id`, visible ASCII ≤128 bytes, per aspect, shared by
+all principals) is handled behind the gate; all four formats commit through
+`SegmentStore::ingest` from a detached task whose JoinHandle the handler awaits; a panic is
+mapped by `IngestPhase` (D21); the response gains `segment_ids` and `replayed`, a replay
+answering 200 with `Idempotency-Replayed: true`; a `weft_audit` ingest event follows COMMIT;
+the shutdown future goes to `serve::run` with handlers installed first; the drain is
+`WEFT_SHUTDOWN_GRACE_SECS` (C-2); the shutdown watch is ROB-3's Daemons registry. The points the
+sources do not pin, chosen here:
+
+1. **Keyless requests commit under an ephemeral key.** The one entry point requires a key, so a
+   request that supplies none gets a fresh unique key (`http-ephemeral:{pid}:{counter}:{nanos}`)
+   minted per request. A keyless retry therefore stays the documented at-least-once — it cannot
+   replay, because it cannot name its batch — and no format keeps a private seal path.
+2. **Paged batches ride the entry point.** `IngestBatch` gains `rows_per_page`; the store's
+   ingest seals a paged (v6) frame for a paged batch instead of the HTTP layer refusing the
+   combination or bypassing the ledger. The fingerprint feeds the page height only when one is
+   set, so an unpaged batch fingerprints byte-identically to before this slice and pre-D-S14
+   ledger rows still replay.
+3. **The in-flight budget defaults to the body cap.** `WEFT_INGEST_MAX_INFLIGHT_BYTES` is named
+   by crash §8 with no default; it defaults to 256 MiB — one maximum body in flight. The gate
+   charges `Content-Length` when present (a chunked body is charged 1 byte; the body cap still
+   bounds it) and refuses with 503 `overloaded` + `Retry-After: 1`. The permit rides in the
+   request extensions and is released when the request drops.
+4. **The audit event is a tracing event, for now.** SEC-9's fsynced audit file is the consumer
+   the design names, but SEC-9 is a W6 slice; the event is emitted on the reserved
+   `weft_audit` target with the §5 fields (`aspect`, `format`, `rows`, `segments`,
+   `commit_epoch`, `keyed`) so SEC-9 can subscribe without the emitters changing. It fires only
+   on a fresh COMMIT — a replay commits nothing and emits none.
+5. **`SegmentStore::shutdown()`** is the C9/§5.5 closing sequence as one call: a best-effort
+   reaper pass (`MaintenanceWait::Skip`; busy/failed aspects are logged, never propagated — the
+   shutdown must still land) and then the clean-shutdown commit. Startup calls it after the
+   Daemons watch is raised, in place of the bare `mark_clean_shutdown()`.
+6. **Parquet keeps only its decode in `weft-arrow-store`.** `decode_parquet_columns` is the
+   decode half of `ingest_parquet_into_aspect` (which keeps its own seal behaviour for its
+   library callers); the HTTP handler decodes, then commits like the other three formats.
+7. **Response descriptor fields** come from the first committed segment's index row when it
+   reads back; `null_count` uses the descriptor only for a single-segment commit (the receipt
+   carries no null count), falling back to the request's own columns otherwise.
+8. **Not in this slice, deliberately.** SEAL-2's `spawn_blocking` threshold
+   (`WEFT_SEAL_BLOCKING_ROWS`, `WEFT_INGEST_MAX_SEGMENT_ROWS`) belongs to the seal engine's own
+   amendment line, not D-S14's; and no `WEFT_IDEMPOTENCY_TTL_SECS` is registered, because
+   nothing would read it yet — the ledger TTL/prune policy (crash §10.2's open default) lands
+   with the slice that implements pruning.
+9. **Fix-forward, not this slice's work:** D-S19 landed `WEFT_LEGACY_DEFAULT_STORAGE`
+   (weftdb/types/legacy_seal.rs) without a registry entry, so
+   `every_environment_name_the_workspace_reads_is_registered` was already red on main before
+   this slice. The entry is registered here (and the asserted registry size moves 68 → 72: this
+   slice's three, plus that one) because the C-2 registry is the surface this slice extends and
+   the wave's end-of-wave CI would otherwise inherit the failure. Revert this entry with D-S19's
+   own follow-up if its wording should differ.
+
+## 2026-11-01 — D-S15: what the v4 sidecar reader checks, and what went with the v3 reader (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the crash-consistency design (§4) fixes the v4 shape — magic last byte `0x03`, a
+CRC-32 trailer over magic and body, the stamp widened to `(row_count, byte_len, frame_crc)`, v3
+files failing the magic check and treated as absent — and the 1.0 plan's §5 amendment adds only
+that the reader sits under `DecodeLimits` and that v4 goldens join FRE-3's set. Three points the
+sources do not pin, chosen here:
+
+1. **Where `DecodeLimits` bites.** The trailer is verified before the postcard decode, so a torn
+   or zero-filled file never reaches the decoder. The decoded claims are then refused past the
+   limits: the stamp's row count past `max_rows`, any materialized grid holding more buckets than
+   the segment has rows (a bucket is a non-empty cell, so the segment itself refutes the claim)
+   or past `max_rows`, and a rollup chain past `MAX_SIDECAR_TIERS`, the most a writer produces.
+   `PartialSidecar::from_bytes` uses `DecodeLimits::DEFAULT`; `from_bytes_with_limits` is the
+   override form ROB-8's entry anticipated. Rejected: parsing postcard's varint length prefixes
+   by hand to refuse before allocation — the format's own structure (each grid entry consumes
+   body bytes) plus the CRC-first order bounds what a damaged file can make the reader do, and a
+   hand-rolled pre-parser would be a second decoder to keep in sync.
+2. **An unbound CRC does not refuse a sidecar.** `matches` takes the index row's `frame_crc` as
+   an `Option`: legacy rows carry NULL until a backup/scrub binds it (design §4), and for those
+   the `(row_count, byte_len)` pair alone decides, exactly as v3 did. Every frame this build
+   writes has its CRC bound at commit, so the widened stamp guards every sidecar v4 writes.
+3. **The v3 zero-rescale goes with the v3 reader.** `PartialSidecar::rescale_zeros_to` and
+   `weft_reduce`'s `rescale_zeros` existed only to read 0.1.0-era v3 files whose zeros lost the
+   column's scale; the weft-reduce doc already said the helper "goes with the v3 reader". Both
+   are removed, and the scale test that simulated a pre-fix file by hand-rewriting one
+   (`sidecars_with_unscaled_zeros_are_served_at_the_column_scale`) is retired with them: its
+   subject is a file v4 treats as absent. Scale preservation for v4-written sidecars is still
+   pinned by the remaining scale tests, whose sidecars the current serializer writes.
+
+**Goldens:** `sidecar_v4_hours.bin` and `sidecar_v4_minutes_tiered.bin` join FRE-3's set in
+`weftdb/tests/golden/`; the v3 pair stays committed as negative fixtures the v4 reader must
+refuse.
+
 ## 2026-10-31 — What "OS-cold and post-restart runs" measure, and how (#146)
 
 **Ambiguous:** the roadmap line is a heading with nothing under it. `weft-bench` already splits the
@@ -197,6 +287,78 @@ storage, were not settled.
 - Flight SQL: it adds `arrow-flight` and tonic to the crate for the same Arrow batches the Parquet
   answer carries.
 - A scaled-integer "decimal" arm: not something an InfluxDB user stores.
+## 2026-10-31 — SOA-6: the oracle judges read-backs exactly, and its verdict lives on the run record (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W4) lists SOA-6 by name only — "Soak oracle
+core" — and the queue recorded its open question plainly: the oracle's verdict
+semantics (what it checks; pass/fail thresholds — cf. SOA-2's refusal to invent
+thresholds) are unspecified. What the sources do fix: SOA-4's workload is a
+pure function of the config seed, so expected values are regenerable exactly;
+SOA-5's DECISIONS entry assigns reads to "the oracle and the derived-read
+checks (SOA-6, SOA-10), which are what make a read result verifiable at all",
+and names the duplicated seal as the failure that "would surface much later
+as an oracle mismatch"; SOA-7 (W5) is "Window digests and the oracle
+self-test", so digests and the self-test follow this slice rather than being
+part of it; and §3 says EVI-3 owns the shared run metadata while SOA keeps
+its own `soak_schema_version`. The queue's acceptance fixes two outcomes: the
+oracle judges a run's results against expected values, and its verdict is
+recorded in run metadata.
+
+**Chosen (grounded in SOA-4's model, SOA-5's seam, and §3's ownership rules;
+if merge review disagrees, this decision is revisited there):**
+
+1. **Library module, no read client, no CLI flag**: `weft-bench/src/soak_oracle.rs`,
+   exported from the crate, on the SOA-5 precedent (the slices that own how a
+   soak is launched are later ones). The caller supplies `ObservedPoint`s from
+   whatever read path it used; the oracle performs no read itself. The
+   endpoint-level derived-read checks are SOA-10's, not this core's.
+2. **Exact comparison, classified.** Each observation names its tick's grid
+   cell by (series, row); the oracle regenerates that tick's grid from the
+   model and compares value, timestamp, and presence for equality. The
+   workload is format-exact (SOA-4) and its numeric values are exact in the
+   `f64` the server seals (SOA-5), so no tolerance exists to invent. A
+   difference is one of `Missing`, `Unexpected`, `WrongValue`,
+   `WrongTimestamp` (checked before the value: a point at the wrong instant
+   is a different point), or `Duplicate` (a cell observed twice in one tick —
+   the duplicated seal of SOA-5 point 6, surfaced here by construction).
+3. **Pass is zero mismatches, not a threshold.** The verdict counts what was
+   judged (ticks, cells checked, cells present, points observed) and lists
+   mismatches with both sides of each comparison; `passed()` is
+   `mismatch_count == 0`. No rate, tolerance, or latency bound is introduced
+   — latency verdicts are SOA-13's SLO evaluator, and SOA-2/SOA-3's refusal
+   to invent pass/fail numbers governs here. A verdict that judged nothing
+   passes vacuously, so publishers check `ticks_judged` beside it (the
+   SOA-12 skipped-check rule).
+4. **The mismatch list is capped, the count is not.** `MAX_REPORTED_MISMATCHES
+   = 1024` bounds the artifact a broken run produces (a lost segment in a
+   24 h run could otherwise mint a mismatch per point for hours); the total
+   always lands in `mismatch_count`, and `truncated()` says when the list
+   was cut.
+5. **The verdict is recorded on the run record, and the soak schema takes
+   v2.** `SoakRun.oracle: Option<OracleVerdict>` (`#[serde(default)]`,
+   skipped when absent, so v1 artifacts still deserialize) is set exactly
+   once by `SoakHarness::record_oracle_verdict`, only while `Running` — a
+   verdict that can be quietly replaced is not evidence. Adding a field to
+   the record bumps `SOAK_SCHEMA_VERSION` 1 → 2 per SOA-1's bump rule, on
+   SOA's own line (§3); the bench and manifest schema lines do not move.
+   The verdict carries no free text, so `SoakRun::redacted_json` emits it
+   unchanged and no new redaction path exists. One visible consequence:
+   `SoakRun` drops its derived `Eq` — a record that can carry float grid
+   values has no total equality; `PartialEq` is unchanged.
+6. **Out of scope, recorded so it is not lost:** window digests and the
+   oracle self-test (SOA-7), derived-read checks (SOA-10), SLO/latency
+   verdicts (SOA-13), and any read client that produces observations from a
+   live server (no slice names one yet; SOA-5's client owns the ingest lane
+   only).
+
+**Rejected:** a tolerance-based float comparison (the format-exact workload
+makes exactness attainable, and a tolerance would be an invented threshold);
+a separate verdict artifact beside the run record instead of a field on it
+(the queue's acceptance says the verdict is recorded in run metadata, and
+SOA-1's bump rule exists precisely for this change); judging latency or
+scheduler warnings in the oracle (SOA-3's monitor and SOA-13 own those); and
+folding SOA-7's window digests into this slice (the plan sequences them as
+separate slices, digests after the core they digest).
 
 ## 2026-10-30 — ROB-8: the decode limit set, and why oversized is integrity (FLAGGED FOR MERGE REVIEW)
 
@@ -2443,3 +2605,108 @@ and the pre-v2 test counted 3 migrations while asserting 4 (now 4).
 `process-crash-only` on Windows, where directory fsync is a no-op — so the
 expectation is now `cfg!(windows)`-gated. No production code changed; this is
 the Windows-only test-expectation class the Linux bar cannot catch.
+
+## 2026-10-31 — D-S16 whole-store backup shapes — FLAGGED FOR MERGE REVIEW
+
+**Ambiguous:** plan §5's D-S16 amendment is seven clauses with no shapes: the
+manifest's new fields, the `SERIES_KEY` extension's number (the frame
+registry shipped empty), and the restore intent marker's name and contents
+(the crash design calls the in-place marker `RESTORED`; plan C19/C-7 only
+says "restore intent marker written first").
+
+**Chosen:**
+1. **Manifest.** `BackupManifest` gains `frames`, `store_format` and
+   `allocators` (serde-defaulted, so control-plane manifests are unchanged),
+   and whole-store backups write the new format string
+   `weftdb-whole-store-backup/1` — the shape backup.rs already prefigured
+   ("a backup a newer release writes (with frames, S16) is never restored as
+   if it were control plane only"). A control-plane restore refuses the new
+   format; a whole-store restore refuses the old.
+2. **SERIES_KEY = extension 1**, registered in `KNOWN_EXTENSIONS` with the
+   payload defined as the canonical series-key bytes. Frames carrying it are
+   journaled `held` (a new `frame_journal` state and `IndexOp::JournalHeld`;
+   the reaper and the open's replay skip held rows entirely) until TAG-9.
+3. **Intent marker.** Named `RESTORE_INTENT`, JSON
+   `{format, store_uuid, backup_created_ms, restore_started_ms}`: written
+   first into the restore staging directory, published with the root,
+   removed by the first open once restore-mode recovery completes.
+4. **Link fallback.** B3 says copy on EXDEV; any `hard_link` error falls
+   back to copy + `sync_all`, and the manifest records which happened per
+   frame (`linked`), since a backup that silently copied is still correct
+   and one that silently failed to link is not a space surprise either way.
+5. **Headroom.** `check_backup_headroom(mode, …)`: Linked needs only the
+   control plane's bytes, Copy needs the whole store. Free space is read by
+   `statvfs` on Unix (`libc` promoted from a unix dev-dependency to a unix
+   dependency); where it cannot be read, the check is skipped rather than
+   faked.
+6. **Adoption scope.** Restore-mode adoption (R8, via `describe_frame`)
+   requires the aspect to have a declared schema in the restored store's
+   scope; an orphan whose aspect is undeclared is left in place, neither
+   adopted nor quarantined.
+
+**Not in this slice:** `restore_in_place` (the design's second restore
+shape) and the `weft-server restore` CLI — plan C19 assigns the one CLI to
+PAC-13 (W7), and the queue's D-S16 acceptance names backup, adoption,
+`held`, the intent marker, the embedded format, the floor refusal, the RAII
+hold and the headroom check, not the in-place shape.
+
+## 2026-11-01 — D-S19 seal-backed legacy aspects: the shapes the design left open — FOR MERGE REVIEW
+
+**Ambiguous:** the crash-consistency design (§8, S19) and the 1.0 plan (§5
+D-S19/D-S20 amendment) name what a seal-backed legacy aspect must do, but
+leave several shapes open: where `widen_value_encoding` lives (FRE-7b is a
+separate, still-pending W5 slice), which registry registers the legacy
+DDL, what target the post-capture squash gate uses, and what identity a
+measurement read back from a seal frame carries (frames hold no per-row id
+or dataset id).
+
+**Chosen:**
+1. **Widening.** `widen_value_encoding(current, values)` is implemented in
+   `weft-physical-type::schema` — the minimal FRE-7b helper this slice's
+   widening needs: an encoding that encodes every offered value exactly is
+   kept; anything lossy or unrepresentable widens to `BigDecimalText`, the
+   one universally lossless encoding. FRE-7b's other parts (immutable
+   declarations, scale rules, schema read-back) are not built here and its
+   ROADMAP line stays unticked. The legacy adapter declares `Decimal128`
+   at zero tolerance in milliseconds on first use and widens the
+   declaration through this helper; frames self-describe, so earlier
+   frames stay readable.
+2. **Legacy DDL.** `aspects.storage_mode` follows the legacy metadata
+   pattern the codebase already uses for `compression_config` (in the
+   wireframe CREATE for new databases, plus an idempotent
+   `ALTER … ADD COLUMN` for existing ones, its duplicate-column error
+   ignored), because the legacy `metadata.db` is not one of the seal
+   store's four control-plane databases. The seal store the aspect's
+   frames live in (`{db}/segments_v2/`, scope `(db, 'legacy')`, keyed by
+   the AspectId UUID) is a normal Storage-v2 root: all of its DDL is the
+   registered migration registry (FRE-14's `0003` included), and no new
+   DDL was added there.
+3. **Mode choice.** Recorded once at `track_aspect`: a compression config
+   forces rows mode (compression deletes ranges; the seal store cannot),
+   otherwise `WEFT_LEGACY_DEFAULT_STORAGE=segments` makes the new aspect
+   seal-backed, otherwise rows. Existing rows are never switched and there
+   are no union reads; a pre-S19 row (`NULL`/no column) reads as rows.
+4. **Writes and the queue.** `batch_capture_measurements` is one
+   `SegmentStore::ingest` under the design's derived key
+   (`legacy:{dataset_id}:{payload_crc:08x}:{n}`, CRC-32 over the canonical
+   rows, `n` the row count); TxIds are synthetic UUIDv5 over key and row
+   index, with SHA-1 computed in `legacy_seal` because this build of
+   `uuid` does not enable its `v5` feature. `capture_measurement` is a
+   one-row ingest followed by
+   `squash_aspect_to_target_rows_if_fragmented` at a 100,000-row target.
+   Until D-S20, seal-backed ingest still enqueues its timestamps in the
+   per-timestamp queue with the S18 write-ahead shape, so the queue
+   consumer works unchanged; D-S20 is the slice that drops the queue.
+5. **Read-back identity.** The readers the design names (raw, chunk,
+   range, count, boundary, earliest/latest) go through the seal store.
+   A returned `Measurement` synthesises its id deterministically (UUIDv5
+   over aspect, timestamp, value and occurrence — two reads of one stored
+   row agree, which the boundary reader's de-duplication needs) and
+   carries the nil dataset id, because a frame stores neither.
+
+**Not in this slice:** D-S20's `segment_changes` queue replacement (its
+own W7 seal-lane slice; the `:780` gate tick lands with D-S19 + D-S20
+together, per plan §6 W7 — this slice ticks only the W5 D-S19 line), the
+other legacy capture variants (`capture_new_measurement` and the chunk
+helpers, which the design does not name), and compression on seal-backed
+aspects (deferred by the design itself).

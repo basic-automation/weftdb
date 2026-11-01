@@ -151,6 +151,20 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 	/// Helper function to get boundary measurements (earliest 2 and latest 2 points)
 	/// Used when requested range is outside of available data
 	async fn get_boundary_measurements(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
+		// Seal-backed aspects (slice D-S19): the boundary rows are the seal
+		// store's earliest and latest rows.
+		if self.is_seal_backed(aspect_id).await? {
+			let store = self.seal_store().await?;
+			let all = crate::legacy_seal::read_measurements(&store, aspect_id, None, None).await?;
+			let mut boundary: Vec<Measurement> = all.iter().take(2).cloned().collect();
+			for latest in all.iter().rev().take(2).rev() {
+				if !boundary.iter().any(|m| m.id() == latest.id()) {
+					boundary.push(latest.clone());
+				}
+			}
+			boundary.sort_by_key(|m: &Measurement| m.timestamp());
+			return Ok(Box::pin(futures::stream::iter(boundary.into_iter().map(Ok))));
+		}
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 
@@ -224,6 +238,13 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Get the total count of measurements for an aspect (useful for pagination)
 	async fn get_measurements_count(&self, aspect_id: &AspectId) -> Result<usize> {
+		// Seal-backed aspects (slice D-S19): the count is the seal store's
+		// rollup total.
+		if self.is_seal_backed(aspect_id).await? {
+			let store = self.seal_store().await?;
+			let stats = store.aspect_stats(&crate::legacy_seal::aspect_key(aspect_id)).await?;
+			return usize::try_from(stats.total_rows).map_err(|_| Error::DatabaseError("Seal-backed measurement count does not fit usize".to_string()).into());
+		}
 		let measurement_db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 
@@ -1307,6 +1328,16 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 	}
 
 	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>> {
+		// Seal-backed aspects (slice D-S19): raw rows come from the seal
+		// store, paged in memory exactly as the SQL LIMIT/OFFSET paged
+		// them (the range is the caller's page window already).
+		if self.is_seal_backed(aspect_id).await? {
+			let store = self.seal_store().await?;
+			let all = crate::legacy_seal::read_measurements(&store, aspect_id, start.map(|t| t.timestamp_millis()), end.map(|t| t.timestamp_millis())).await?;
+			let offset = page.saturating_mul(max_per_page);
+			let measurements: Vec<Measurement> = all.into_iter().skip(offset).take(max_per_page).collect();
+			return Ok(Box::pin(futures::stream::iter(measurements.into_iter().map(Ok))));
+		}
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
@@ -1347,6 +1378,11 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 impl Database {
 	/// Inner implementation of `fetch_measurements_for_range` without retry
 	async fn fetch_measurements_for_range_inner_impl(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>> {
+		// Seal-backed aspects (slice D-S19): the range comes from the seal store.
+		if self.is_seal_backed(aspect_id).await? {
+			let store = self.seal_store().await?;
+			return crate::legacy_seal::read_measurements(&store, aspect_id, Some(start.timestamp_millis()), Some(end.timestamp_millis())).await;
+		}
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
@@ -1368,6 +1404,11 @@ impl Database {
 
 	/// Inner implementation of `fetch_measurements_for_chunk` without retry
 	async fn fetch_measurements_for_chunk_inner_impl(&self, aspect_id: &AspectId, chunk_start: DateTime<Utc>, chunk_end: DateTime<Utc>) -> Result<Vec<Measurement>> {
+		// Seal-backed aspects (slice D-S19): the chunk comes from the seal store.
+		if self.is_seal_backed(aspect_id).await? {
+			let store = self.seal_store().await?;
+			return crate::legacy_seal::read_measurements(&store, aspect_id, Some(chunk_start.timestamp_millis()), Some(chunk_end.timestamp_millis())).await;
+		}
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;

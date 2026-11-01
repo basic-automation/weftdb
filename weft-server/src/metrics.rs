@@ -351,6 +351,14 @@ impl Metrics {
 		self.ingest.segments_sealed.fetch_add(1, Ordering::Relaxed);
 	}
 
+	/// Count the further segments of a multi-segment ingest commit
+	/// (D-S14): [`record_ingest_seal`](Self::record_ingest_seal) already
+	/// counted the first segment and every row, so only the extra
+	/// segments land here.
+	pub fn record_ingest_extra_segments(&self, segments: u64) {
+		self.ingest.segments_sealed.fetch_add(segments, Ordering::Relaxed);
+	}
+
 	/// Record one reconciliation pass that actually ran, adding the number of
 	/// out-of-order segments it rewrote. A threshold-gated call that held below its
 	/// threshold must not call this — only a pass that did work is counted.
