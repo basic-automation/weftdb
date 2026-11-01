@@ -61,7 +61,7 @@ use serde::{Deserialize, Serialize};
 use turso::Builder;
 
 use crate::types::durable::{
-	create_dir_all_durable, fault::{self, FaultPoint}, RealFs, StoreFs, SyncPolicy
+	create_dir_all_durable, fault::{self, FaultPoint}, RealFs, StoreFs, SyncPolicy, WritePoints
 };
 
 /// How a snapshot's copy is verified after `VACUUM INTO` writes it.
@@ -405,6 +405,45 @@ pub const BACKUP_MANIFEST: &str = "MANIFEST.json";
 /// if it were control plane only.
 pub const MANIFEST_FORMAT: &str = "weftdb-control-plane-backup/1";
 
+/// The [`BackupManifest::format`] of a whole-store backup (D-S16): the control
+/// plane plus every `.weftseg` frame it references, the store's allocators and
+/// its embedded `STORE_FORMAT`. A control-plane restore refuses it, and a
+/// whole-store restore refuses anything else.
+pub const WHOLE_STORE_MANIFEST_FORMAT: &str = "weftdb-whole-store-backup/1";
+
+/// How a whole-store backup carries its frames (D-S16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackupMode {
+	/// Hard-link each frame into the backup: the frames cost no extra space
+	/// while the store keeps them, and the headroom a backup needs is only the
+	/// control plane's. The links share inodes with the store, so they do not
+	/// protect against media loss (design section 9, Limits).
+	#[default]
+	Linked,
+	/// Copy each frame (what a backup on another filesystem gets, and the
+	/// fallback when a link fails with EXDEV): the headroom a backup needs is
+	/// the whole store.
+	Copy,
+}
+
+/// The bytes a backup in `mode` needs free at its destination: the control
+/// plane always copies (it is `VACUUM INTO` output); frames cost their bytes
+/// only when they are copied, since a hard link is a directory entry.
+///
+/// # Errors
+///
+/// The destination's `free_bytes` are below what `mode` needs.
+pub fn check_backup_headroom(mode: BackupMode, control_plane_bytes: u64, frame_bytes: u64, free_bytes: u64) -> Result<()> {
+	let needed = match mode {
+		BackupMode::Linked => control_plane_bytes,
+		BackupMode::Copy => control_plane_bytes.saturating_add(frame_bytes),
+	};
+	if free_bytes < needed {
+		bail!("insufficient storage for a {mode:?} whole-store backup: it needs {needed} free bytes (control plane {control_plane_bytes}, frames {frame_bytes}) and the destination has {free_bytes}");
+	}
+	Ok(())
+}
+
 /// Prefix of the directory a backup is built in: `.partial-{label}-{nonce}`.
 pub const PARTIAL_PREFIX: &str = ".partial-";
 /// Prefix a backup is renamed to before retention removes its files:
@@ -450,16 +489,57 @@ pub struct ManifestFile {
 	pub rows: i64,
 }
 
+/// One frame of a whole-store [`BackupManifest`], under its `segments/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestFrame {
+	/// The frame's file name, directly under `segments/`.
+	pub name: String,
+	/// Its size in bytes when the backup was published.
+	pub bytes: u64,
+	/// The frame's CRC-32 trailer, bound by the backup (a legacy index row's
+	/// CRC is read from the trailer — design section 9, B5).
+	pub frame_crc: Option<u32>,
+	/// Whether the backup linked the frame (`true`) or copied it (`false`,
+	/// another filesystem or the [`BackupMode::Copy`] mode).
+	pub linked: bool,
+}
+
+/// One aspect's allocator state in a whole-store [`BackupManifest`], as the
+/// snapshot's `segment_index.db` recorded it (design section 9, B5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestAllocator {
+	/// The aspect.
+	pub aspect: String,
+	/// Its next segment id, if its `aspect_seq` row records one.
+	pub next_id: Option<u64>,
+	/// Its next frame generation, if recorded.
+	pub next_gen: Option<u64>,
+	/// Its commit epoch.
+	pub epoch: u64,
+}
+
 /// The `MANIFEST.json` a published backup directory carries: what was verified, so a
 /// restore can check the files are still the ones the backup wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupManifest {
-	/// [`MANIFEST_FORMAT`] for a backup this release writes.
+	/// [`MANIFEST_FORMAT`] for a control-plane backup,
+	/// [`WHOLE_STORE_MANIFEST_FORMAT`] for a whole-store one.
 	pub format: String,
 	/// When the backup was taken, in Unix milliseconds.
 	pub created_ms: u64,
 	/// Every snapshot file in the directory.
 	pub files: Vec<ManifestFile>,
+	/// The frames a whole-store backup carries (empty for a control-plane one).
+	#[serde(default)]
+	pub frames: Vec<ManifestFrame>,
+	/// The backed-up store's `STORE_FORMAT`, embedded by a whole-store backup
+	/// (1.0 plan §5 D-S16): a restore writes it into the restored root and
+	/// refuses a backup whose write floor is newer than this build.
+	#[serde(default)]
+	pub store_format: Option<crate::StoreFormat>,
+	/// The backed-up store's per-aspect allocators (whole-store only).
+	#[serde(default)]
+	pub allocators: Vec<ManifestAllocator>,
 }
 
 impl BackupManifest {
@@ -467,7 +547,22 @@ impl BackupManifest {
 	#[must_use]
 	pub fn new(created_ms: u64, reports: &[(&str, &SnapshotReport)]) -> Self {
 		let files = reports.iter().map(|(name, report)| ManifestFile { name: (*name).to_string(), bytes: report.bytes, tables: report.table_names.clone(), rows: report.rows }).collect();
-		Self { format: MANIFEST_FORMAT.to_string(), created_ms, files }
+		Self { format: MANIFEST_FORMAT.to_string(), created_ms, files, frames: Vec::new(), store_format: None, allocators: Vec::new() }
+	}
+
+	/// The manifest of a whole-store backup: the control-plane `reports`, the
+	/// `frames` linked or copied beside them, the store's `format` and its
+	/// `allocators`.
+	#[must_use]
+	pub fn whole_store(created_ms: u64, reports: &[(&str, &SnapshotReport)], frames: Vec<ManifestFrame>, format: crate::StoreFormat, allocators: Vec<ManifestAllocator>) -> Self {
+		let files = reports.iter().map(|(name, report)| ManifestFile { name: (*name).to_string(), bytes: report.bytes, tables: report.table_names.clone(), rows: report.rows }).collect();
+		Self { format: WHOLE_STORE_MANIFEST_FORMAT.to_string(), created_ms, files, frames, store_format: Some(format), allocators }
+	}
+
+	/// Whether this manifest is a whole-store backup's.
+	#[must_use]
+	pub fn is_whole_store(&self) -> bool {
+		self.format == WHOLE_STORE_MANIFEST_FORMAT
 	}
 
 	/// Read `dir`'s manifest, or `None` if it has none (a backup from before manifests).
@@ -484,12 +579,23 @@ impl BackupManifest {
 			Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
 		};
 		let manifest: Self = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
-		if manifest.format != MANIFEST_FORMAT {
-			bail!("{} declares format {:?}; this release restores only {MANIFEST_FORMAT:?}", path.display(), manifest.format);
+		if manifest.format != MANIFEST_FORMAT && manifest.format != WHOLE_STORE_MANIFEST_FORMAT {
+			bail!("{} declares format {:?}; this release restores only {MANIFEST_FORMAT:?} and {WHOLE_STORE_MANIFEST_FORMAT:?}", path.display(), manifest.format);
 		}
 		let listed: BTreeSet<&str> = manifest.files.iter().map(|file| file.name.as_str()).collect();
 		if listed.len() != manifest.files.len() || listed != CONTROL_PLANE_FILES.into_iter().collect::<BTreeSet<&str>>() {
 			bail!("{} lists {listed:?}, not exactly the control-plane files {CONTROL_PLANE_FILES:?}", path.display());
+		}
+		if manifest.is_whole_store() {
+			if manifest.store_format.is_none() {
+				bail!("{} is a whole-store manifest without an embedded STORE_FORMAT", path.display());
+			}
+			let frames: BTreeSet<&str> = manifest.frames.iter().map(|frame| frame.name.as_str()).collect();
+			if frames.len() != manifest.frames.len() || manifest.frames.iter().any(|frame| !frame.name.ends_with(".weftseg") || frame.name.contains(['/', '\\'])) {
+				bail!("{} lists frame names that are not distinct `.weftseg` files under segments/", path.display());
+			}
+		} else if !manifest.frames.is_empty() || manifest.store_format.is_some() {
+			bail!("{} is a control-plane manifest carrying whole-store fields", path.display());
 		}
 		Ok(Some(manifest))
 	}
@@ -753,6 +859,11 @@ pub async fn restore_control_plane_with(fs: &dyn StoreFs, backup_dir: &Path, roo
 		bail!("{} is an unfinished backup, prune or drill (its name starts with one of {STAGING_PREFIXES:?}), not a backup", backup_dir.display());
 	}
 	let manifest = BackupManifest::read(backup_dir).await?;
+	if let Some(manifest) = &manifest {
+		if manifest.is_whole_store() {
+			bail!("{} is a whole-store backup; restore it with restore_store, not as control plane only", backup_dir.display());
+		}
+	}
 	// Pre-flight both directions before writing anything, so a partial restore cannot
 	// leave a half-populated control plane behind.
 	for name in CONTROL_PLANE_FILES {
@@ -805,6 +916,197 @@ pub async fn restore_control_plane_with(fs: &dyn StoreFs, backup_dir: &Path, roo
 	fault::hit(FaultPoint::RestoreRenamed).await?;
 	fs.sync_dir(root).await.with_context(|| format!("syncing restore root {}", root.display()))?;
 	Ok(RestoreReport { root: root.to_path_buf(), restored })
+}
+
+/// The restore intent marker's file name in a restored root (plan C-7/C19;
+/// design section 9's transient `RESTORED` marker).
+///
+/// A whole-store restore writes it **first** into its staging directory,
+/// before any database or frame, so a restore that stops part-way is never
+/// mistaken for a plain store: the staging directory is discarded, and a
+/// published root still carrying the marker is opened in restore mode by
+/// `SegmentStore` (its orphans are adopted, not quarantined) and the marker
+/// is removed once that recovery completes. A root whose marker names a
+/// restore that never published is exactly the "incomplete restore" the C-7
+/// exit-code table gives code 65.
+pub const RESTORE_INTENT_FILE: &str = "RESTORE_INTENT";
+
+/// Prefix of the sibling directory a whole-store restore stages into:
+/// `{new_root}.restoring-{nonce}`.
+pub const RESTORING_PREFIX: &str = ".restoring-";
+
+/// The contents of a [`RESTORE_INTENT_FILE`] marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreIntent {
+	/// The manifest format of the backup being restored.
+	pub format: String,
+	/// The backed-up store's identity, from its manifest.
+	pub store_uuid: String,
+	/// When the backup was taken, in Unix milliseconds (its manifest's).
+	pub backup_created_ms: u64,
+	/// When the restore started, in Unix milliseconds.
+	pub restore_started_ms: u64,
+}
+
+/// Write `intent` as `dir`'s restore intent marker, durably, before anything
+/// else is staged there (C-7: the marker is written first).
+///
+/// # Errors
+///
+/// The marker already exists, or a write/sync fails.
+pub async fn write_restore_intent(fs: &dyn StoreFs, dir: &Path, intent: &RestoreIntent) -> Result<()> {
+	let bytes = serde_json::to_vec(intent).context("encoding the restore intent marker")?;
+	fs.create_new_write(&dir.join(RESTORE_INTENT_FILE), bytes, SyncPolicy::Full, WritePoints::NONE).await.context("writing the restore intent marker first")?;
+	fs.sync_dir(dir).await.context("syncing the restore intent marker's directory")?;
+	Ok(())
+}
+
+/// Read `root`'s restore intent marker, or `None` if it has none.
+///
+/// # Errors
+///
+/// The marker exists but cannot be read or does not parse.
+pub async fn read_restore_intent(root: &Path) -> Result<Option<RestoreIntent>> {
+	let path = root.join(RESTORE_INTENT_FILE);
+	match tokio::fs::read(&path).await {
+		Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?)),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+		Err(e) => Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+	}
+}
+
+/// What a [`restore_store`] call put back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WholeStoreRestoreReport {
+	/// The root the store was restored into.
+	pub root: PathBuf,
+	/// The per-database verification of each restored control-plane file.
+	pub restored: Vec<SnapshotReport>,
+	/// How many frames the manifest carried and the restore verified.
+	pub frames: usize,
+	/// The intent the restore published with (its marker stays in the root
+	/// until the first open's restore-mode recovery completes it).
+	pub intent: RestoreIntent,
+}
+
+/// Restore a whole-store backup into a fresh root `new_root` (D-S16; design
+/// section 9, `restore_store`).
+///
+/// Refuses a backup that is not whole-store, and — before staging anything —
+/// a backup whose embedded `STORE_FORMAT` has a write floor newer than this
+/// build ([`SUPPORTED_LAYOUT`](crate::SUPPORTED_LAYOUT)): a newer floor is
+/// refused, never restored into a store this build would then break.
+///
+/// Otherwise the restore stages into a `{new_root}.restoring-*` sibling: the
+/// [`RESTORE_INTENT_FILE`] marker is written **first** (C-7), then the four
+/// control-plane files are copied and verified against the manifest at their
+/// staged destination, then every frame is copied into `segments/` and
+/// checked against the manifest (size, CRC trailer, and
+/// [`describe_frame`](weft_physical_type::describe_frame) must describe it as
+/// decodable), then the embedded `STORE_FORMAT` is written as the root's
+/// marker. Every file and directory is fsynced through `fs`; the staging
+/// directory is renamed to `new_root` and its parent fsynced. The first open
+/// of the root runs restore-mode recovery (adoption via `describe_frame`).
+///
+/// # Errors
+///
+/// As above, or any copy, verify, sync or rename failure. An error before the
+/// rename removes the staging directory; `new_root` is never half-published.
+pub async fn restore_store_with(fs: &dyn StoreFs, backup_dir: &Path, new_root: &Path) -> Result<WholeStoreRestoreReport> {
+	if is_staging_dir(backup_dir) {
+		bail!("{} is an unfinished backup, prune or drill (its name starts with one of {STAGING_PREFIXES:?}), not a backup", backup_dir.display());
+	}
+	let Some(manifest) = BackupManifest::read(backup_dir).await? else { bail!("{} has no MANIFEST.json — not a whole-store backup", backup_dir.display()) };
+	if !manifest.is_whole_store() {
+		bail!("{} is a control-plane backup; restore it with restore_control_plane", backup_dir.display());
+	}
+	let format = manifest.store_format.clone().expect("a whole-store manifest embeds STORE_FORMAT (checked by BackupManifest::read)");
+	if format.min_write_layout > crate::SUPPORTED_LAYOUT {
+		bail!("the backup's STORE_FORMAT needs store layout {} or newer to be written, and this WeftDB writes layouts up to {}: a newer WeftDB took this backup — refusing it, nothing was restored", format.min_write_layout, crate::SUPPORTED_LAYOUT);
+	}
+	if fs.metadata(new_root).await.is_ok() {
+		bail!("restore destination {} already exists (a restore publishes under a fresh name)", new_root.display());
+	}
+	let (base, name) = split_dir(new_root)?;
+	create_dir_all_durable(fs, &base).await.with_context(|| format!("creating restore base {}", base.display()))?;
+	let staging = base.join(staging_name(RESTORING_PREFIX, &name));
+	let outcome = restore_store_into(fs, backup_dir, &manifest, &format, &staging).await;
+	let (intent, restored) = match outcome {
+		Ok(pair) => pair,
+		Err(err) => {
+			if let Err(cleanup) = fs.remove_dir_all(&staging).await {
+				tracing::warn!(dir = %staging.display(), error = %cleanup, "could not remove a failed restore's staging directory");
+			}
+			return Err(err);
+		}
+	};
+	fs.rename(&staging, new_root).await.with_context(|| format!("publishing restore {} -> {}", staging.display(), new_root.display()))?;
+	fs.sync_dir(&base).await.with_context(|| format!("syncing restore base {}", base.display()))?;
+	Ok(WholeStoreRestoreReport { root: new_root.to_path_buf(), restored, frames: manifest.frames.len(), intent })
+}
+
+/// The staging half of [`restore_store_with`]: everything an error can still
+/// undo by removing `staging`. Returns the intent it wrote first; the
+/// per-file verification reports are re-derived by the first open, so they
+/// are checked here and not returned.
+async fn restore_store_into(fs: &dyn StoreFs, backup_dir: &Path, manifest: &BackupManifest, format: &crate::StoreFormat, staging: &Path) -> Result<(RestoreIntent, Vec<SnapshotReport>)> {
+	fs.create_dir(staging).await.with_context(|| format!("creating restore staging directory {}", staging.display()))?;
+	// C-7: the intent marker is the first file a restore writes.
+	let started_ms = u64::try_from(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis()).unwrap_or(u64::MAX);
+	let intent = RestoreIntent { format: manifest.format.clone(), store_uuid: format.store_uuid.clone(), backup_created_ms: manifest.created_ms, restore_started_ms: started_ms };
+	write_restore_intent(fs, staging, &intent).await?;
+	let mut restored = Vec::with_capacity(CONTROL_PLANE_FILES.len());
+	for name in CONTROL_PLANE_FILES {
+		let src = backup_dir.join(name);
+		if !is_file(&src).await.with_context(|| format!("checking {}", src.display()))? {
+			bail!("backup dir {} is missing {name} — not a complete whole-store backup", backup_dir.display());
+		}
+		let recorded = manifest.file(name).expect("a manifest lists every control-plane file");
+		let len = tokio::fs::metadata(&src).await.with_context(|| format!("checking {}", src.display()))?.len();
+		if len != recorded.bytes {
+			bail!("backup file {} holds {len} bytes but its manifest recorded {}: the backup was changed after it was taken", src.display(), recorded.bytes);
+		}
+		let dest = staging.join(name);
+		fs.copy_new(&src, &dest, SyncPolicy::Full).await.with_context(|| format!("restoring {} -> {}", src.display(), dest.display()))?;
+		let report = verify_snapshot(&dest, expected_tables(name).unwrap_or_default()).await.with_context(|| format!("verifying restored {name}"))?;
+		if report.rows != recorded.rows {
+			bail!("restored {name} holds {} rows but its manifest recorded {}", report.rows, recorded.rows);
+		}
+		remove_empty_sidecars(&dest).await?;
+		restored.push(report);
+	}
+	let segments = staging.join("segments");
+	fs.create_dir(&segments).await.with_context(|| format!("creating {}", segments.display()))?;
+	for frame in &manifest.frames {
+		let src = backup_dir.join("segments").join(&frame.name);
+		let dest = segments.join(&frame.name);
+		fs.copy_new(&src, &dest, SyncPolicy::Full).await.with_context(|| format!("restoring frame {} -> {}", src.display(), dest.display()))?;
+		let bytes = tokio::fs::read(&dest).await.with_context(|| format!("reading restored frame {}", dest.display()))?;
+		if bytes.len() as u64 != frame.bytes {
+			bail!("restored frame {} holds {} bytes but its manifest recorded {}", frame.name, bytes.len(), frame.bytes);
+		}
+		if let Some(crc) = frame.frame_crc {
+			let trailer = bytes.len().checked_sub(4).map(|body| u32::from_le_bytes([bytes[body], bytes[body + 1], bytes[body + 2], bytes[body + 3]]));
+			if trailer != Some(crc) {
+				bail!("restored frame {} has CRC trailer {trailer:?} but its manifest recorded {crc}", frame.name);
+			}
+		}
+		match weft_physical_type::describe_frame(&bytes) {
+			Ok(info) if info.decodable() => {}
+			Ok(_) => bail!("restored frame {} is not decodable by this build (describe_frame)", frame.name),
+			Err(fault) => bail!("restored frame {} fails describe_frame: {fault:?}", frame.name),
+		}
+	}
+	fs.sync_dir(&segments).await?;
+	// The restored root is a store: its marker is the backup's, embedded.
+	crate::types::store_format::write_marker(fs, staging, format).await.context("writing the restored root's STORE_FORMAT")?;
+	fs.sync_dir(staging).await.with_context(|| format!("syncing restore staging directory {}", staging.display()))?;
+	Ok((intent, restored))
+}
+
+/// [`restore_store_with`] through the real filesystem.
+pub async fn restore_store(backup_dir: &Path, new_root: &Path) -> Result<WholeStoreRestoreReport> {
+	restore_store_with(&RealFs, backup_dir, new_root).await
 }
 
 #[cfg(test)]
@@ -1054,6 +1356,48 @@ mod tests {
 		assert!(format!("{err:#}").contains("missing the table(s)"), "got: {err:#}");
 	}
 
+	/// D-S16: the headroom a backup needs depends on its mode — linked frames
+	/// cost nothing beyond the control plane, copied frames cost their bytes.
+	#[test]
+	fn headroom_depends_on_the_backup_mode() {
+		assert!(check_backup_headroom(BackupMode::Linked, 100, 1_000_000, 100).is_ok(), "linked: only the control plane needs space");
+		assert!(check_backup_headroom(BackupMode::Linked, 100, 1_000_000, 99).is_err());
+		assert!(check_backup_headroom(BackupMode::Copy, 100, 1_000_000, 1_000_099).is_err(), "copied: the frames count too");
+		assert!(check_backup_headroom(BackupMode::Copy, 100, 1_000_000, 1_000_100).is_ok());
+	}
+
+	/// D-S16: a whole-store manifest round-trips with its frames, allocators
+	/// and embedded STORE_FORMAT; a control-plane manifest carrying
+	/// whole-store fields is refused.
+	#[tokio::test]
+	async fn a_whole_store_manifest_round_trips_and_validates() {
+		let dir = tempfile::tempdir().unwrap();
+		let report = |name: &str| SnapshotReport { dest: dir.path().join(name), tables: 1, table_names: vec!["t".into()], rows: 3, bytes: 4096, mode: VerifyMode::SnapshotOnly };
+		let reports: Vec<(&str, SnapshotReport)> = CONTROL_PLANE_FILES.iter().map(|name| (*name, report(name))).collect();
+		let pairs: Vec<(&str, &SnapshotReport)> = reports.iter().map(|(name, report)| (*name, report)).collect();
+		let format = crate::StoreFormat { kind: crate::types::store_format::STORE_KIND.to_string(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: None, store_uuid: "u-1".into(), scope: crate::StoreScope { database: "d".into(), subject: "s".into() } };
+		let frames = vec![ManifestFrame { name: "price~g1~p1.weftseg".into(), bytes: 10, frame_crc: Some(7), linked: true }];
+		let manifest = BackupManifest::whole_store(42, &pairs, frames, format, vec![ManifestAllocator { aspect: "price".into(), next_id: Some(1), next_gen: Some(2), epoch: 0 }]);
+		std::fs::write(dir.path().join(BACKUP_MANIFEST), serde_json::to_vec(&manifest).unwrap()).unwrap();
+		assert_eq!(BackupManifest::read(dir.path()).await.unwrap(), Some(manifest));
+		// The same fields under the control-plane format are a contradiction.
+		let mut bad = BackupManifest::new(42, &pairs);
+		bad.frames = vec![ManifestFrame { name: "x.weftseg".into(), bytes: 1, frame_crc: None, linked: false }];
+		std::fs::write(dir.path().join(BACKUP_MANIFEST), serde_json::to_vec(&bad).unwrap()).unwrap();
+		assert!(BackupManifest::read(dir.path()).await.is_err(), "a control-plane manifest with frames is refused");
+	}
+
+	/// D-S16, C-7: the restore intent marker is written first and reads back.
+	#[tokio::test]
+	async fn a_restore_intent_marker_round_trips() {
+		let dir = tempfile::tempdir().unwrap();
+		assert_eq!(read_restore_intent(dir.path()).await.unwrap(), None);
+		let intent = RestoreIntent { format: WHOLE_STORE_MANIFEST_FORMAT.to_string(), store_uuid: "u-1".into(), backup_created_ms: 1, restore_started_ms: 2 };
+		write_restore_intent(&RealFs, dir.path(), &intent).await.unwrap();
+		assert_eq!(read_restore_intent(dir.path()).await.unwrap(), Some(intent));
+		assert!(write_restore_intent(&RealFs, dir.path(), &RestoreIntent { format: WHOLE_STORE_MANIFEST_FORMAT.to_string(), store_uuid: "u-2".into(), backup_created_ms: 3, restore_started_ms: 4 }).await.is_err(), "a second intent never overwrites the first");
+	}
+
 	#[test]
 	fn every_control_plane_file_has_an_expected_table_set() {
 		for name in CONTROL_PLANE_FILES {
@@ -1278,5 +1622,36 @@ mod tests {
 			let report = snapshot_with_verify(&conn, &dir.path().join(name), mode, &["gadget", "widget"]).await.unwrap();
 			assert_eq!((report.tables, report.rows), (2, 10), "{mode:?} must count the real tables/rows, not a pragma");
 		}
+	}
+}
+
+/// The free bytes on the filesystem holding `path` (or its nearest existing
+/// ancestor), where the platform can say: Unix `statvfs`. `None` where it
+/// cannot, in which case a headroom check has nothing to check against and
+/// the backup itself is the test.
+#[must_use]
+pub fn free_bytes_at(path: &Path) -> Option<u64> {
+	#[cfg(unix)]
+	{
+		let mut probe = path.to_path_buf();
+		loop {
+			if probe.exists() {
+				break;
+			}
+			if !probe.pop() {
+				return None;
+			}
+		}
+		let c_path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).ok()?;
+		let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+		if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+			return None;
+		}
+		Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = path;
+		None
 	}
 }

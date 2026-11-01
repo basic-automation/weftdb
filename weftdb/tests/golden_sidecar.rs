@@ -16,8 +16,10 @@
 //! compared against a reduction recomputed from the corpus. A re-recorded fixture whose contents drifted
 //! fails on the second pin even though the first one was regenerated to match.
 //!
-//! `PARTIAL_SIDECAR_VERSION` is 3 and the magic's last byte is `\x02`; when D-S15 adds the v4 reader
-//! its goldens join this set (1.0 plan, resolution D-S15).
+//! `PARTIAL_SIDECAR_VERSION` is 4 and the magic's last byte is `\x03` (D-S15): the v4 frame adds a
+//! CRC-32 trailer over the magic and body and binds the staleness stamp to the frame's own CRC. The
+//! v4 goldens join this set below; the committed v3 goldens stay as negative fixtures — the v4
+//! reader must refuse every one of them, because a v3 file is treated as absent, never misread.
 //!
 //! Regenerating is `WEFT_UPDATE_GOLDENS=1 cargo test -p weftdb --test golden_sidecar`, and it changes
 //! what every sidecar on disk means: say so in the commit message.
@@ -39,7 +41,7 @@ const UPDATE_VAR: &str = "WEFT_UPDATE_GOLDENS";
 /// The committed magic every `.weftpart` reader looks for. Duplicated here on purpose: the constant in
 /// the crate is private, and a golden suite that reads its own crate's constant cannot notice that
 /// constant changed.
-const EXPECTED_MAGIC: &[u8; 8] = b"WEFTPRT\x02";
+const EXPECTED_MAGIC: &[u8; 8] = b"WEFTPRT\x03";
 
 fn golden_dir() -> PathBuf {
 	Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
@@ -91,6 +93,11 @@ fn corpus() -> Vec<Point> {
 
 /// The descriptor the sidecar is stamped against — the staleness stamp a reader compares with the live
 /// segment, so it is part of what a golden has to pin.
+/// The trailing CRC of the frame the golden descriptor names — the third of the v4 staleness
+/// stamp, pinned like the rest of the stamp. (The descriptor is a fixture, so the value is a
+/// fixed arbitrary CRC, not a computed one.)
+const FRAME_CRC: u32 = 0xCBF4_3926;
+
 fn descriptor() -> SegmentDescriptor {
 	SegmentDescriptor { id: 1, path: "temperature-1.weftseg".to_string(), format_version: 1, physical_type: None, time_unit: None, row_count: 600, null_count: 0, time_sorted: true, min_ts: Some(0), max_ts: Some(599 * 30), min_value: None, max_value: None, byte_len: 12_345 }
 }
@@ -99,15 +106,16 @@ fn descriptor() -> SegmentDescriptor {
 fn sidecar_base_resolution_matches_its_committed_bytes() {
 	let points = corpus();
 	let partial = reduce_partial(&points, Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("a partial reduction of the corpus");
-	let sidecar = PartialSidecar::new(Resolution::Hours, &descriptor(), partial);
+	let sidecar = PartialSidecar::new(Resolution::Hours, &descriptor(), FRAME_CRC, partial);
 	let bytes = sidecar.to_bytes().expect("a sidecar serializes");
 	assert_eq!(&bytes[..EXPECTED_MAGIC.len()], EXPECTED_MAGIC, "the magic prefix is the frame's only self-identification");
-	check_golden("sidecar_v3_hours.bin", &bytes);
+	check_golden("sidecar_v4_hours.bin", &bytes);
 
 	let reloaded = PartialSidecar::from_bytes(&bytes).expect("the pinned bytes decode");
 	assert_eq!(reloaded.version, PARTIAL_SIDECAR_VERSION, "the frame records the version it was written under");
-	assert!(reloaded.matches(&descriptor()), "the staleness stamp still matches the segment it was built from");
-	assert!(!reloaded.matches(&SegmentDescriptor { byte_len: 12_346, ..descriptor() }), "a rewritten segment stops matching");
+	assert!(reloaded.matches(&descriptor(), Some(FRAME_CRC)), "the staleness stamp still matches the segment it was built from");
+	assert!(!reloaded.matches(&SegmentDescriptor { byte_len: 12_346, ..descriptor() }, Some(FRAME_CRC)), "a rewritten segment stops matching");
+	assert!(!reloaded.matches(&descriptor(), Some(FRAME_CRC ^ 1)), "a rewrite that keeps the row count and byte length still stops matching, on the frame CRC");
 
 	// The contents pin: what the bytes decode to must be what the corpus reduces to, so a fixture
 	// re-recorded after a codec change cannot smuggle different numbers through.
@@ -123,9 +131,9 @@ fn sidecar_rollup_tiers_match_their_committed_bytes() {
 	// A minutes base with hours and days rolled up: the shape that makes a coarse query fold a few
 	// stored buckets instead of thousands of minute buckets, and the shape with the most structure
 	// (a chain of `PartialReduction`s) and therefore the most to lose from a layout change.
-	let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(), partial, &[Resolution::Hours, Resolution::Days]).expect("the tiers materialize");
+	let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(), FRAME_CRC, partial, &[Resolution::Hours, Resolution::Days]).expect("the tiers materialize");
 	let bytes = sidecar.to_bytes().expect("a sidecar serializes");
-	check_golden("sidecar_v3_minutes_tiered.bin", &bytes);
+	check_golden("sidecar_v4_minutes_tiered.bin", &bytes);
 
 	let reloaded = PartialSidecar::from_bytes(&bytes).expect("the pinned bytes decode");
 	assert_eq!(reloaded.rollups.len(), 2, "both tiers survive the wire");
@@ -137,4 +145,23 @@ fn sidecar_rollup_tiers_match_their_committed_bytes() {
 	// A grid finer than the base is not served from the sidecar at all — the caller decodes. That the
 	// answer is `None` and not a silent wrong-grid answer is part of what these bytes pin.
 	assert!(reloaded.partial_for(Resolution::Seconds).expect("no re-key needed to say no").is_none(), "a resolution finer than the base must not be served from a tier");
+}
+
+#[test]
+fn the_v4_reader_refuses_the_committed_v3_goldens() {
+	// The v3 set stays committed as negative fixtures: every byte string the old
+	// writer produced must fail the v4 reader (magic first), so an upgraded store
+	// treats its v3 sidecars as absent and falls back to decoding the segment.
+	for name in ["sidecar_v3_hours.bin", "sidecar_v3_minutes_tiered.bin"] {
+		let committed = std::fs::read(golden_dir().join(name)).unwrap_or_else(|error| panic!("{name}: the committed v3 golden is missing: {error}"));
+		assert!(PartialSidecar::from_bytes(&committed).is_err(), "{name}: a v3 frame must not decode under the v4 reader");
+	}
+	// And a v4 golden with a zero-filled tail — the power-loss shape a v3 reader
+	// could serve — is refused on its CRC trailer.
+	let mut damaged = std::fs::read(golden_dir().join("sidecar_v4_hours.bin")).expect("the v4 golden is committed");
+	let half = damaged.len() / 2;
+	for byte in &mut damaged[half..] {
+		*byte = 0;
+	}
+	assert!(PartialSidecar::from_bytes(&damaged).is_err(), "a zero-filled v4 tail must not decode");
 }

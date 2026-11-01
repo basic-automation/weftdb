@@ -111,11 +111,17 @@ pub struct FrameExtensionSpec {
 ///
 /// Append-only, on exactly the rule stated for frame versions at the top of this
 /// module: an extension that has shipped keeps its number, and a new one takes the
-/// next free number. It is empty because the envelope ships with no extensions — the
-/// point of X-FRAME is the *mechanism* that lets a later slice put a block in front of
-/// a frozen body without moving a byte inside it, and a number invented before there
-/// is a writer for it is a number wasted.
-pub const KNOWN_EXTENSIONS: &[FrameExtensionSpec] = &[];
+/// next free number. It held only the *mechanism* until D-S16 named the first
+/// extension, [`EXT_SERIES_KEY`]: the envelope lets a slice put a block in front of
+/// a frozen body without moving a byte inside it.
+/// The extension carrying a frame's tag-set series key (tags A3, 1.0 plan §5
+/// D-S16): the payload is the canonical series-key bytes of the series the
+/// frame's rows belong to. A reader that does not bind series keys yet must
+/// still not adopt or reap such a frame as if it were untagged: D-S16 journals
+/// frames carrying it `held` until TAG-9 binds them.
+pub const EXT_SERIES_KEY: u32 = 1;
+
+pub const KNOWN_EXTENSIONS: &[FrameExtensionSpec] = &[FrameExtensionSpec { id: EXT_SERIES_KEY, name: "SERIES_KEY: the canonical series key of the tag set the frame's rows belong to" }];
 
 /// Whether this build knows what to do with extension `id`.
 ///
@@ -291,12 +297,14 @@ mod tests {
 	}
 
 	#[test]
-	fn no_extension_number_is_claimed_yet() {
+	fn only_the_series_key_extension_is_claimed() {
 		// The envelope mechanism is what X-FRAME ships; the extensions come later, one
 		// per slice that needs a block in front of a frozen body. This assertion is the
 		// place where a new extension becomes visible instead of incidental.
-		assert!(KNOWN_EXTENSIONS.is_empty());
-		for id in 0..=16 {
+		assert_eq!(KNOWN_EXTENSIONS.len(), 1);
+		assert_eq!(EXT_SERIES_KEY, 1);
+		assert!(is_known_extension(EXT_SERIES_KEY));
+		for id in (0..=16).filter(|id| *id != EXT_SERIES_KEY) {
 			assert!(!is_known_extension(id), "extension {id} has no implementation in this build");
 		}
 		// Numbers are a permanent namespace: a table may only ever gain distinct ids.
