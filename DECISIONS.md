@@ -2448,3 +2448,64 @@ shape) and the `weft-server restore` CLI — plan C19 assigns the one CLI to
 PAC-13 (W7), and the queue's D-S16 acceptance names backup, adoption,
 `held`, the intent marker, the embedded format, the floor refusal, the RAII
 hold and the headroom check, not the in-place shape.
+
+## 2026-11-01 — D-S19 seal-backed legacy aspects: the shapes the design left open — FOR MERGE REVIEW
+
+**Ambiguous:** the crash-consistency design (§8, S19) and the 1.0 plan (§5
+D-S19/D-S20 amendment) name what a seal-backed legacy aspect must do, but
+leave several shapes open: where `widen_value_encoding` lives (FRE-7b is a
+separate, still-pending W5 slice), which registry registers the legacy
+DDL, what target the post-capture squash gate uses, and what identity a
+measurement read back from a seal frame carries (frames hold no per-row id
+or dataset id).
+
+**Chosen:**
+1. **Widening.** `widen_value_encoding(current, values)` is implemented in
+   `weft-physical-type::schema` — the minimal FRE-7b helper this slice's
+   widening needs: an encoding that encodes every offered value exactly is
+   kept; anything lossy or unrepresentable widens to `BigDecimalText`, the
+   one universally lossless encoding. FRE-7b's other parts (immutable
+   declarations, scale rules, schema read-back) are not built here and its
+   ROADMAP line stays unticked. The legacy adapter declares `Decimal128`
+   at zero tolerance in milliseconds on first use and widens the
+   declaration through this helper; frames self-describe, so earlier
+   frames stay readable.
+2. **Legacy DDL.** `aspects.storage_mode` follows the legacy metadata
+   pattern the codebase already uses for `compression_config` (in the
+   wireframe CREATE for new databases, plus an idempotent
+   `ALTER … ADD COLUMN` for existing ones, its duplicate-column error
+   ignored), because the legacy `metadata.db` is not one of the seal
+   store's four control-plane databases. The seal store the aspect's
+   frames live in (`{db}/segments_v2/`, scope `(db, 'legacy')`, keyed by
+   the AspectId UUID) is a normal Storage-v2 root: all of its DDL is the
+   registered migration registry (FRE-14's `0003` included), and no new
+   DDL was added there.
+3. **Mode choice.** Recorded once at `track_aspect`: a compression config
+   forces rows mode (compression deletes ranges; the seal store cannot),
+   otherwise `WEFT_LEGACY_DEFAULT_STORAGE=segments` makes the new aspect
+   seal-backed, otherwise rows. Existing rows are never switched and there
+   are no union reads; a pre-S19 row (`NULL`/no column) reads as rows.
+4. **Writes and the queue.** `batch_capture_measurements` is one
+   `SegmentStore::ingest` under the design's derived key
+   (`legacy:{dataset_id}:{payload_crc:08x}:{n}`, CRC-32 over the canonical
+   rows, `n` the row count); TxIds are synthetic UUIDv5 over key and row
+   index, with SHA-1 computed in `legacy_seal` because this build of
+   `uuid` does not enable its `v5` feature. `capture_measurement` is a
+   one-row ingest followed by
+   `squash_aspect_to_target_rows_if_fragmented` at a 100,000-row target.
+   Until D-S20, seal-backed ingest still enqueues its timestamps in the
+   per-timestamp queue with the S18 write-ahead shape, so the queue
+   consumer works unchanged; D-S20 is the slice that drops the queue.
+5. **Read-back identity.** The readers the design names (raw, chunk,
+   range, count, boundary, earliest/latest) go through the seal store.
+   A returned `Measurement` synthesises its id deterministically (UUIDv5
+   over aspect, timestamp, value and occurrence — two reads of one stored
+   row agree, which the boundary reader's de-duplication needs) and
+   carries the nil dataset id, because a frame stores neither.
+
+**Not in this slice:** D-S20's `segment_changes` queue replacement (its
+own W7 seal-lane slice; the `:780` gate tick lands with D-S19 + D-S20
+together, per plan §6 W7 — this slice ticks only the W5 D-S19 line), the
+other legacy capture variants (`capture_new_measurement` and the chunk
+helpers, which the design does not name), and compression on seal-backed
+aspects (deferred by the design itself).

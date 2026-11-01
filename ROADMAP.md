@@ -290,7 +290,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 - [ ] **W5 · Ingest wiring, whole-store backup, legacy seal**
   - [ ] Store lane
   - [x] → **D-S15** Partial sidecar v4
-  - [ ] → **D-S19** Seal-backed legacy aspects
+  - [x] → **D-S19** Seal-backed legacy aspects
   - [ ] L-INGEST
   - [ ] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
   - [ ] **ROB-10** Admission I
