@@ -290,6 +290,13 @@ impl SegmentIndexStore {
 	///
 	/// As [`prune_by_time`](Self::prune_by_time).
 	pub(crate) async fn prune_present_descriptors(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<SegmentDescriptor>> {
+		Ok(self.prune_present_rows(aspect, start, end).await?.into_iter().map(|row| row.desc).collect())
+	}
+
+	/// [`prune_present_descriptors`](Self::prune_present_descriptors), returning whole
+	/// [`IndexRow`]s — the form a reader that must bind a sidecar to its frame's CRC
+	/// (D-S15) prunes by.
+	pub(crate) async fn prune_present_rows(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<IndexRow>> {
 		let conn = connect(&self.db).await?;
 		// The NULL-spanned (empty) row is rejected twice over: the inequalities already
 		// reject it, and a zero-row row is not "all null" — it is nothing to skip.
@@ -303,7 +310,7 @@ impl SegmentIndexStore {
 				turso::params![aspect.to_string(), end, start],
 			)
 			.await?;
-		Ok(Self::collect(rows).await?.into_iter().map(|row| row.desc).collect())
+		Ok(Self::collect(rows).await?)
 	}
 
 	/// Every descriptor recorded under `aspect`, in seal (`id`) order.
