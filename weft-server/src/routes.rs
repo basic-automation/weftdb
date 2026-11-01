@@ -67,12 +67,13 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
-	extract::{Extension, MatchedPath}, http::{header, HeaderValue, Method, Uri}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post, MethodRouter}, Router
+	extract::{DefaultBodyLimit, Extension, MatchedPath}, http::{header, HeaderValue, Method, Uri}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post, MethodRouter}, Router
 };
 use serde_json::{json, Map, Value};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-	backup_routes, declare, downsample, error::{ApiError, Code}, ingest, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
+	backup_routes, declare, downsample, error::{ApiError, Code}, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
 };
 
 /// What a request to a route must hold, from the frozen table above. See the
@@ -240,6 +241,57 @@ impl AdmissionClass {
 			Self::Write => "write",
 			Self::Maintenance => "maintenance",
 		}
+	}
+}
+
+/// The ingest routes' byte-weighted admission (D-S14, plan C10,
+/// crash-consistency §8): a shared in-flight byte budget the registry's
+/// gate charges each ingest request against, inside the gate — after
+/// the route is matched (so the charge knows the route's class) and
+/// before the handler runs (so a refused request never reaches a
+/// handler, and its `Idempotency-Key` is never read: key handling sits
+/// behind the gate, as C10 puts it).
+///
+/// The charge is the request's `Content-Length` when it carries one;
+/// a request without one (a chunked body) is charged a single byte —
+/// its size is still bounded by the routes'
+/// [`DefaultBodyLimit`], the one body
+/// cap (C11), it just cannot be weighed in advance. The permit rides in
+/// the request's extensions and is released when the request is
+/// dropped, after the handler has answered.
+pub struct IngestAdmission {
+	budget_bytes: u64,
+	permits: Arc<Semaphore>,
+}
+
+impl IngestAdmission {
+	/// An admission budget of `budget_bytes` in flight at once.
+	#[must_use]
+	pub fn new(budget_bytes: u64) -> Self {
+		let permits = usize::try_from(budget_bytes).unwrap_or(usize::MAX);
+		Self { budget_bytes, permits: Arc::new(Semaphore::new(permits)) }
+	}
+
+	/// The budget, in bytes.
+	#[must_use]
+	pub const fn budget_bytes(&self) -> u64 {
+		self.budget_bytes
+	}
+
+	/// Charge `weight` bytes against the budget, or refuse: a request
+	/// that would push the in-flight total past the budget — including
+	/// one whose own weight exceeds the whole budget — gets no permit,
+	/// and the gate answers `503 overloaded` instead of queueing it
+	/// without bound behind the ingests already running.
+	fn try_admit(&self, weight: u64) -> Option<OwnedSemaphorePermit> {
+		let weight = u32::try_from(weight.max(1)).ok()?;
+		self.permits.clone().try_acquire_many_owned(weight).ok()
+	}
+
+	/// The bytes currently in flight (the budget minus what is left).
+	#[must_use]
+	pub fn in_flight_bytes(&self) -> u64 {
+		self.budget_bytes.saturating_sub(u64::try_from(self.permits.available_permits()).unwrap_or(u64::MAX))
 	}
 }
 
@@ -489,10 +541,13 @@ impl Routes {
 	/// Freeze the registry. The returned value builds the router and
 	/// serves the tables; this builder no longer exists, so nothing can
 	/// register into a registry that is already being served.
+	/// `admission` is the ingest byte budget the gate enforces (D-S14);
+	/// `None` seals a registry with no admission — a fixture shape,
+	/// never the registry the binary serves.
 	#[must_use]
-	pub fn seal(self) -> SealedRoutes {
+	pub fn seal(self, admission: Option<Arc<IngestAdmission>>) -> SealedRoutes {
 		let table = Arc::new(RouteTable { entries: self.entries });
-		SealedRoutes { table, handlers: self.handlers }
+		SealedRoutes { table, handlers: self.handlers, admission }
 	}
 }
 
@@ -500,6 +555,7 @@ impl Routes {
 pub struct SealedRoutes {
 	table: Arc<RouteTable>,
 	handlers: Vec<(&'static str, MethodRouter<AppState>)>,
+	admission: Option<Arc<IngestAdmission>>,
 }
 
 impl SealedRoutes {
@@ -516,35 +572,61 @@ impl SealedRoutes {
 		self.table.openapi_document()
 	}
 
+	/// The ingest admission this registry's gate enforces, when it
+	/// carries one (D-S14). The binary's registry always does; a
+	/// fixture registry sealed without one admits unconditionally.
+	#[must_use]
+	pub fn admission(&self) -> Option<&Arc<IngestAdmission>> {
+		self.admission.as_ref()
+	}
+
 	/// Build the router from the registry — and only from the registry.
 	/// The fail-closed gate layer and the registry fallback are part
 	/// of the product, so a router built any other way is not this
 	/// registry's router.
 	#[must_use]
 	pub fn router(self) -> Router<AppState> {
+		let gate_state = GateState { table: Arc::clone(&self.table), admission: self.admission };
 		let mut router = Router::new();
 		for (path, handler) in self.handlers {
 			router = router.route(path, handler);
 		}
-		router.fallback(route_not_found).layer(middleware::from_fn_with_state(self.table, gate))
+		router.fallback(route_not_found).layer(middleware::from_fn_with_state(gate_state, gate))
 	}
 }
 
+/// What the gate layer is handed: the frozen table it looks routes up
+/// in, and the ingest admission it enforces inside itself (D-S14).
+#[derive(Clone)]
+struct GateState {
+	table: Arc<RouteTable>,
+	admission: Option<Arc<IngestAdmission>>,
+}
+
 /// The whole surface's registry, assembled from the per-area registration
-/// functions. This is the function [`crate::app_with_state`] builds the
-/// served router from, and the one the table tests read.
+/// functions, with the default ingest limits (D-S14). This is the
+/// registry the table tests read; the served router comes from
+/// [`build_registry_with_ingest_config`] via [`crate::app_with_state`].
 #[must_use]
 pub fn build_registry() -> SealedRoutes {
+	build_registry_with_ingest_config(IngestConfig::DEFAULT)
+}
+
+/// The whole surface's registry, with the ingest wiring's limits
+/// (D-S14): the body cap rides on the ingest routes themselves, and the
+/// in-flight byte budget becomes the admission the gate enforces.
+#[must_use]
+pub fn build_registry_with_ingest_config(config: IngestConfig) -> SealedRoutes {
 	let mut routes = Routes::new();
 	register_probe_routes(&mut routes);
 	register_metrics_routes(&mut routes);
 	register_compute_routes(&mut routes);
 	register_storage_read_routes(&mut routes);
-	register_ingest_routes(&mut routes);
+	register_ingest_routes(&mut routes, config);
 	register_declare_routes(&mut routes);
 	register_maintenance_routes(&mut routes);
 	register_backup_routes(&mut routes);
-	routes.seal()
+	routes.seal(Some(Arc::new(IngestAdmission::new(config.max_inflight_bytes()))))
 }
 
 /// The OpenAPI document for the whole surface, from the one registry.
@@ -559,12 +641,42 @@ pub fn openapi_document() -> Value {
 /// the 405 the code table names; a request with no matched path passes
 /// through to the fallback, which refuses it — the gate's table rides
 /// along in the extensions so the fallback decides from the same table.
-async fn gate(axum::extract::State(table): axum::extract::State<Arc<RouteTable>>, mut request: axum::extract::Request, next: Next) -> Response {
+/// For an ingest route the gate also charges the byte-weighted admission
+/// budget (D-S14) before anything downstream runs.
+async fn gate(axum::extract::State(state): axum::extract::State<GateState>, mut request: axum::extract::Request, next: Next) -> Response {
+	let table = &state.table;
 	let matched = request.extensions().get::<MatchedPath>().map(|matched| matched.as_str().to_string());
-	request.extensions_mut().insert(Arc::clone(&table));
+	request.extensions_mut().insert(Arc::clone(table));
 	if let Some(matched) = matched {
 		if let Some(entry) = table.lookup(request.method(), &matched) {
 			let spec = entry.spec;
+			// Admission lives inside the gate (plan C10, D-S14): the
+			// ingest routes' byte-weighted budget is charged here —
+			// after the match, before the handler — so an over-budget
+			// ingest is refused `503 overloaded` with `Retry-After`
+			// (§4) and never reaches a handler; its idempotency key is
+			// read only behind this gate. The permit rides in the
+			// extensions for the request's life; dropping it when the
+			// request ends releases the charge.
+			if spec.scope == Scope::Ingest {
+				if let Some(admission) = &state.admission {
+					let weight = request.headers().get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok()).unwrap_or(1);
+					match admission.try_admit(weight) {
+						Some(permit) => {
+							// Extensions values must be `Clone`; the
+							// permit itself is not, so it rides in an
+							// `Arc` — the charge is released when the
+							// last extension clone drops, at the end of
+							// the request.
+							request.extensions_mut().insert(Arc::new(permit));
+						}
+						None => {
+							tracing::warn!(route = %matched, weight, budget = admission.budget_bytes(), in_flight = admission.in_flight_bytes(), "ingest admission refused: the in-flight byte budget is exhausted");
+							return ApiError::new(Code::Overloaded, format!("the ingest routes have {} byte(s) in flight of a {}-byte budget; retry after the in-flight ingests drain", admission.in_flight_bytes(), admission.budget_bytes())).with_retry_after(1).into_response();
+						}
+					}
+				}
+			}
 			request.extensions_mut().insert(spec);
 			return next.run(request).await;
 		}
@@ -702,12 +814,16 @@ fn register_storage_read_routes(routes: &mut Routes) {
 }
 
 /// Point writes, one route per wire format. Mutating, so audited;
-/// admission is the write class D-S14 will put inside this gate (C10).
-fn register_ingest_routes(routes: &mut Routes) {
-	routes.route(Method::POST, "/api/v1/storage/{aspect}/points", RouteSpec::stable(Scope::Ingest, Audit::AttemptOutcome, false, AdmissionClass::Write, "storage_ingest_points"), post(ingest::ingest_points));
-	routes.route(Method::POST, "/api/v1/storage/{aspect}/ilp", RouteSpec::stable(Scope::Ingest, Audit::AttemptOutcome, false, AdmissionClass::Write, "storage_ingest_ilp"), post(ingest::ingest_ilp));
-	routes.route(Method::POST, "/api/v1/storage/{aspect}/csv", RouteSpec::stable(Scope::Ingest, Audit::AttemptOutcome, false, AdmissionClass::Write, "storage_ingest_csv"), post(ingest::ingest_csv));
-	routes.route(Method::POST, "/api/v1/storage/{aspect}/parquet", RouteSpec::stable(Scope::Ingest, Audit::AttemptOutcome, false, AdmissionClass::Write, "storage_ingest_parquet"), post(ingest::ingest_parquet));
+/// admission is the write class, enforced inside the gate (C10, D-S14).
+/// The one body cap (C11) rides on the routes themselves as a
+/// `DefaultBodyLimit` — only these four routes carry it, so every other
+/// route keeps the limits it already has.
+fn register_ingest_routes(routes: &mut Routes, config: IngestConfig) {
+	let body_limit = DefaultBodyLimit::max(config.max_body_bytes());
+	routes.route(Method::POST, "/api/v1/storage/{aspect}/points", RouteSpec::stable(Scope::Ingest, Audit::AttemptOutcome, false, AdmissionClass::Write, "storage_ingest_points"), post(ingest::ingest_points).layer(body_limit));
+	routes.route(Method::POST, "/api/v1/storage/{aspect}/ilp", RouteSpec::stable(Scope::Ingest, Audit::AttemptOutcome, false, AdmissionClass::Write, "storage_ingest_ilp"), post(ingest::ingest_ilp).layer(body_limit));
+	routes.route(Method::POST, "/api/v1/storage/{aspect}/csv", RouteSpec::stable(Scope::Ingest, Audit::AttemptOutcome, false, AdmissionClass::Write, "storage_ingest_csv"), post(ingest::ingest_csv).layer(body_limit));
+	routes.route(Method::POST, "/api/v1/storage/{aspect}/parquet", RouteSpec::stable(Scope::Ingest, Audit::AttemptOutcome, false, AdmissionClass::Write, "storage_ingest_parquet"), post(ingest::ingest_parquet).layer(body_limit));
 }
 
 /// Catalog writes: declaring an aspect's schema. Its own scope, apart

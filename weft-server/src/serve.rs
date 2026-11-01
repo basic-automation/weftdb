@@ -101,8 +101,16 @@ pub const MIN_MAX_CONNECTIONS: usize = 16;
 pub const MAX_MAX_CONNECTIONS: usize = 65_536;
 
 /// How long live connections may drain after the shutdown signal before the
-/// remainder are aborted: the 5 s of C9's drain order.
+/// remainder are aborted, when `WEFT_SHUTDOWN_GRACE_SECS` is unset: the
+/// 5 s of C9's drain order.
 pub const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// Environment variable naming the shutdown grace, in seconds
+/// (registered by C-2, given to this drain by D-S14, plan C9): how long
+/// the serve side waits for live connections to finish after the
+/// shutdown future resolves, before startup proceeds to the next drain
+/// step. Positive whole number; default [`SHUTDOWN_DRAIN`].
+pub const SHUTDOWN_GRACE_SECS_ENV: &str = "WEFT_SHUTDOWN_GRACE_SECS";
 
 /// The pre-auth listener limits [`run`] enforces, read once at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,13 +119,14 @@ pub struct ServeLimits {
 	header_read_timeout: Duration,
 	keep_alive_timeout: Duration,
 	write_stall_timeout: Duration,
+	shutdown_grace: Duration,
 }
 
 impl ServeLimits {
 	/// Limits with an explicit connection cap and the default deadlines.
 	#[must_use]
 	pub const fn new(max_connections: NonZeroUsize) -> Self {
-		Self { max_connections, header_read_timeout: DEFAULT_HEADER_READ_TIMEOUT, keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT, write_stall_timeout: DEFAULT_WRITE_STALL_TIMEOUT }
+		Self { max_connections, header_read_timeout: DEFAULT_HEADER_READ_TIMEOUT, keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT, write_stall_timeout: DEFAULT_WRITE_STALL_TIMEOUT, shutdown_grace: SHUTDOWN_DRAIN }
 	}
 
 	/// The defaults: the `RLIMIT_NOFILE`-derived connection cap (see
@@ -148,7 +157,14 @@ impl ServeLimits {
 		self
 	}
 
-	/// The limits the four `WEFT_*` values describe (`None` for an unset
+	/// These limits with a different shutdown grace (tests, embedders).
+	#[must_use]
+	pub const fn with_shutdown_grace(mut self, grace: Duration) -> Self {
+		self.shutdown_grace = grace;
+		self
+	}
+
+	/// The limits the five `WEFT_*` values describe (`None` for an unset
 	/// variable, which leaves that limit at its default).
 	///
 	/// # Errors
@@ -156,7 +172,7 @@ impl ServeLimits {
 	/// A message naming the variable when a value is not a positive integer,
 	/// so a malformed setting fails startup instead of silently falling back
 	/// to a default the operator did not ask for.
-	pub fn from_env_values(max_connections: Option<&str>, header_read_timeout_secs: Option<&str>, keep_alive_timeout_secs: Option<&str>, write_stall_timeout_secs: Option<&str>) -> Result<Self, String> {
+	pub fn from_env_values(max_connections: Option<&str>, header_read_timeout_secs: Option<&str>, keep_alive_timeout_secs: Option<&str>, write_stall_timeout_secs: Option<&str>, shutdown_grace_secs: Option<&str>) -> Result<Self, String> {
 		let mut limits = Self::defaults();
 		if let Some(raw) = max_connections {
 			limits.max_connections = raw.parse().map_err(|e| format!("{MAX_CONNECTIONS_ENV}={raw:?} is not a positive integer: {e}"))?;
@@ -170,6 +186,9 @@ impl ServeLimits {
 		if let Some(raw) = write_stall_timeout_secs {
 			limits.write_stall_timeout = parse_timeout_secs(WRITE_STALL_TIMEOUT_ENV, raw)?;
 		}
+		if let Some(raw) = shutdown_grace_secs {
+			limits.shutdown_grace = parse_timeout_secs(SHUTDOWN_GRACE_SECS_ENV, raw)?;
+		}
 		Ok(limits)
 	}
 
@@ -180,7 +199,7 @@ impl ServeLimits {
 	///
 	/// A set variable whose value is not a positive integer.
 	pub fn from_env() -> Result<Self, String> {
-		Self::from_env_values(std::env::var(MAX_CONNECTIONS_ENV).ok().as_deref(), std::env::var(HEADER_READ_TIMEOUT_ENV).ok().as_deref(), std::env::var(KEEP_ALIVE_TIMEOUT_ENV).ok().as_deref(), std::env::var(WRITE_STALL_TIMEOUT_ENV).ok().as_deref())
+		Self::from_env_values(std::env::var(MAX_CONNECTIONS_ENV).ok().as_deref(), std::env::var(HEADER_READ_TIMEOUT_ENV).ok().as_deref(), std::env::var(KEEP_ALIVE_TIMEOUT_ENV).ok().as_deref(), std::env::var(WRITE_STALL_TIMEOUT_ENV).ok().as_deref(), std::env::var(SHUTDOWN_GRACE_SECS_ENV).ok().as_deref())
 	}
 
 	/// The most connections served at once; a connection beyond this waits
@@ -200,6 +219,14 @@ impl ServeLimits {
 	#[must_use]
 	pub const fn keep_alive_timeout(self) -> Duration {
 		self.keep_alive_timeout
+	}
+
+	/// How long live connections may drain after the shutdown signal
+	/// before the remainder are aborted: `WEFT_SHUTDOWN_GRACE_SECS`,
+	/// five seconds by default.
+	#[must_use]
+	pub const fn shutdown_grace(self) -> Duration {
+		self.shutdown_grace
 	}
 
 	/// How long a connection's writes may make no progress before it is
@@ -424,8 +451,9 @@ async fn serve(listener: TcpListener, router: Router, limits: ServeLimits, shutd
 		}
 	}
 	// Drain (C9): stop accepting (the listener drops with this function),
-	// give live connections the drain window, then abort what is left.
-	if tokio::time::timeout(SHUTDOWN_DRAIN, async { while connections.join_next().await.is_some() {} }).await.is_err() {
+	// give live connections the grace window (`WEFT_SHUTDOWN_GRACE_SECS`,
+	// D-S14), then abort what is left.
+	if tokio::time::timeout(limits.shutdown_grace(), async { while connections.join_next().await.is_some() {} }).await.is_err() {
 		connections.abort_all();
 		while connections.join_next().await.is_some() {}
 	}
@@ -551,22 +579,27 @@ mod tests {
 
 	#[test]
 	fn env_values_override_and_reject_garbage() {
-		let limits = ServeLimits::from_env_values(Some("7"), Some("3"), Some("4"), Some("5")).expect("valid values");
+		let limits = ServeLimits::from_env_values(Some("7"), Some("3"), Some("4"), Some("5"), Some("9")).expect("valid values");
 		assert_eq!(limits.max_connections(), 7);
 		assert_eq!(limits.header_read_timeout(), Duration::from_secs(3));
 		assert_eq!(limits.keep_alive_timeout(), Duration::from_secs(4));
 		assert_eq!(limits.write_stall_timeout(), Duration::from_secs(5));
+		// The shutdown grace is the fifth value (D-S14): set, it is the
+		// drain window; unset, the historical five seconds.
+		assert_eq!(limits.shutdown_grace(), Duration::from_secs(9));
 
-		let unset = ServeLimits::from_env_values(None, None, None, None).expect("defaults");
+		let unset = ServeLimits::from_env_values(None, None, None, None, None).expect("defaults");
 		assert_eq!(unset.header_read_timeout(), DEFAULT_HEADER_READ_TIMEOUT);
 		assert_eq!(unset.keep_alive_timeout(), DEFAULT_KEEP_ALIVE_TIMEOUT);
 		assert_eq!(unset.write_stall_timeout(), DEFAULT_WRITE_STALL_TIMEOUT);
+		assert_eq!(unset.shutdown_grace(), SHUTDOWN_DRAIN);
 
 		for bad in [Some("0"), Some("-1"), Some("many"), Some("1.5")] {
-			assert!(ServeLimits::from_env_values(bad, None, None, None).is_err(), "{bad:?} is refused");
-			assert!(ServeLimits::from_env_values(None, bad, None, None).is_err(), "{bad:?} is refused");
+			assert!(ServeLimits::from_env_values(bad, None, None, None, None).is_err(), "{bad:?} is refused");
+			assert!(ServeLimits::from_env_values(None, bad, None, None, None).is_err(), "{bad:?} is refused");
+			assert!(ServeLimits::from_env_values(None, None, None, None, bad).is_err(), "{bad:?} is refused");
 		}
-		assert!(ServeLimits::from_env_values(None, None, Some("0"), None).is_err(), "a zero keep-alive deadline is refused");
+		assert!(ServeLimits::from_env_values(None, None, Some("0"), None, None).is_err(), "a zero keep-alive deadline is refused");
 	}
 
 	/// A write to a peer that never reads stalls once the buffer fills, and

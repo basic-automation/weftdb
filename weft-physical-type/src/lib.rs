@@ -134,7 +134,7 @@ pub use floatcodec::{best_f64_bytes, best_f64_codec, chimp128_f64_bytes, chimp12
 pub use frame_registry::{is_known_extension, layout_of, DecodeLimits, FrameExtension, FrameExtensionSpec, FrameFault, FrameInfo, FrameLayout, EXT_SERIES_KEY, FRAME_ENVELOPE, FRAME_PAGED, FRAME_SINGLE_BLOCK, FRAME_VERSION_MAX_KNOWN, KNOWN_EXTENSIONS, MAX_FRAME_EXTENSIONS, MAX_FRAME_PAGES, MAX_FRAME_ROWS};
 pub use nulls::{NullMask, NullMaskError};
 pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_VERSION};
-pub use schema::{AspectSchema, SealError};
+pub use schema::{widen_value_encoding, AspectSchema, SealError};
 pub use segment::{prune_by_time, prune_by_value, prune_present_by_time, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 pub use split::{merge_newer_wins, split_index, SplitDecision, SplitPolicy};

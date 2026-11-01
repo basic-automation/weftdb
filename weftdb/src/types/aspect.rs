@@ -103,6 +103,12 @@ pub struct Aspect {
 
 	/// Compression configuration for this aspect (stored in metadata.db).
 	compression_config: Option<CompressionConfig>,
+
+	/// How this aspect stores its measurements (stored in metadata.db as
+	/// `aspects.storage_mode`, slice D-S19). Chosen at creation and never
+	/// switched afterwards; see [`crate::legacy_seal`].
+	#[serde(default)]
+	storage_mode: crate::StorageMode,
 }
 
 #[async_trait::async_trait]
@@ -282,6 +288,7 @@ impl AspectStructure for Aspect {
 			dictionaries: None,
 			dictionaries_paths: HashMap::new(),
 			compression_config: None, // Set via set_compression_config() after creation
+			storage_mode: crate::StorageMode::Rows,
 		})
 	}
 
@@ -360,6 +367,7 @@ impl AspectStructure for Aspect {
 			dictionaries: None,
 			dictionaries_paths,
 			compression_config: None, // Will be loaded from metadata.db separately
+			storage_mode: crate::StorageMode::Rows,
 		})
 	}
 
@@ -1769,6 +1777,21 @@ impl Aspect {
 	/// to persist to the database.
 	pub fn set_compression_config_local(&mut self, config: Option<CompressionConfig>) {
 		self.compression_config = config;
+	}
+
+	/// How this aspect stores its measurements (slice D-S19): rows mode by
+	/// default, seal-backed when it was created that way. The mode is fixed
+	/// at creation; this accessor and its setter only mirror the
+	/// `aspects.storage_mode` row `Database::track_aspect` wrote.
+	#[must_use]
+	pub const fn storage_mode(&self) -> crate::StorageMode {
+		self.storage_mode
+	}
+
+	/// Mirror the storage mode recorded at creation (see
+	/// [`storage_mode`](Self::storage_mode)).
+	pub const fn set_storage_mode_local(&mut self, mode: crate::StorageMode) {
+		self.storage_mode = mode;
 	}
 
 	/// Set the compression configuration and persist it to metadata.db.
