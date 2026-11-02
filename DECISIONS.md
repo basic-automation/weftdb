@@ -2691,3 +2691,48 @@ together, per plan §6 W7 — this slice ticks only the W5 D-S19 line), the
 other legacy capture variants (`capture_new_measurement` and the chunk
 helpers, which the design does not name), and compression on seal-backed
 aspects (deferred by the design itself).
+
+## 2026-11-01 — SEC-10 exposure and secrets hygiene: the shapes the plan left open — FOR MERGE REVIEW
+
+The plan's whole SEC-10 spec is §3's dedup row ("absorbs SOA-14's OTLP
+userinfo redaction", 0.5 h) plus the queue's two acceptance lines
+(exposure hygiene across the server surface; secrets hygiene including
+that redaction). An audit of the surface on main at 33d3353 found the
+rest of the surface already hygienic — request spans record the path
+only (no query, no headers), 5xx bodies are redacted sentences (X-ERR),
+`/ready` carries counts only (D-S12), startup lines print key counts and
+file paths but never key material, and the OpenAPI document is generated
+but not served. Two gaps remained, and this slice closes exactly those:
+
+1. **OTLP userinfo redaction (the absorbed SOA-14 part).**
+   `startup/hooks.rs` printed `OTEL_EXPORTER_OTLP_ENDPOINT` as configured
+   in both its startup lines (the enabled `println!` and the
+   exporter-build-failure `eprintln!`). The endpoint is a URL and can
+   carry userinfo (`https://user:password@collector:4317` — the shape
+   collectors use for basic auth), so a configured password landed in
+   the server's stdout. New `weft_server::redact::redact_url_userinfo`
+   replaces every URL's userinfo with `[redacted]`, mirroring
+   weft-bench's EVI-3/SOA-2 manifest redaction (same marker, same
+   semantics) in a server-local module — weft-bench is not a dependency
+   the server may take. **Redaction is display-only**: the exporter
+   still receives the endpoint exactly as configured, because the
+   collector's basic auth rides on the userinfo.
+2. **Credentials in the query string are now refused in every auth
+   mode.** SEC-6's `400 credentials_in_query` check ran only when a key
+   store was mounted; with auth off (the loopback default) or explicitly
+   disabled, `enforce` returned before the check, so a credential in a
+   query string passed through untouched — into exactly the proxy and
+   access logs the refusal exists to keep it out of. The check now runs
+   first in `enforce`, before the mode branches. Two consequences,
+   accepted deliberately: a proxied auth-off request carrying a
+   credential parameter now gets the 400 instead of SEC-8's 403 (the
+   request shape is refused before the deployment shape is considered),
+   and a gateway deployment with `WEFT_AUTH=disabled` whose clients put
+   tokens in query strings will see 400s — that is the hygiene working
+   as intended, and the parameter-name list is unchanged
+   (`api_key`, `apikey`, `access_token`, `auth_token`).
+
+**Not in this slice:** SEC-9's audit (its own slice), SEC-7 key reload,
+and any change to what `/ready` reports (its build info and store uuid
+are deliberate, per plan §5 D-S12). The keygen subcommand still prints a
+minted key once — that is its documented purpose, not a leak.
