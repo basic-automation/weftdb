@@ -17,7 +17,7 @@
 # names (decision 20), and this script claims nothing about it.
 #
 # Artifacts follow EVI-4's pipeline, not an inline loop: with --stage, the
-# matrix report and its manifest are staged flat through
+# matrix's reports (one per cell) and their manifests are staged flat through
 # scripts/bench/stage-artifacts.sh into one directory, which the caller
 # uploads as the `bench-report` artifact (90-day retention). Run artifacts
 # are never committed; the staged directory is the artifact, and the first
@@ -92,13 +92,19 @@ mkdir -p "$out"
 	--failure-rows "$rows" --failure-reps "$reps" --seed "$seed" \
 	--out-dir "$out"
 
-# The matrix run writes one report (one file per out-dir: the report plus its
-# manifest). The manifest's name is the report's stem with `.manifest.json`,
-# so the report is the JSON file that is not a manifest.
-report="$(find "$out" -maxdepth 1 -name '*.json' ! -name '*.manifest.json' | sort | head -n 1)"
-[ -n "$report" ] || { echo "crash-matrix: no report written to $out" >&2; exit 1; }
+# The matrix run writes one report per cell, each beside its manifest (the
+# report's stem with `.manifest.json`), because a run manifest grades one
+# result. The first report is staged as the report; the rest, and every
+# manifest, go along as extra files.
+mapfile -t reports < <(find "$out" -maxdepth 1 -name '*.json' ! -name '*.manifest.json' | sort)
+[ "${#reports[@]}" -gt 0 ] || { echo "crash-matrix: no report written to $out" >&2; exit 1; }
+report="${reports[0]}"
 manifest="${report%.json}.manifest.json"
 [ -f "$manifest" ] || manifest=""
+extras=()
+for other in "${reports[@]:1}"; do
+	extras+=("$other" "${other%.json}.manifest.json")
+done
 
 if [ "$skip_fault" -eq 0 ]; then
 	# shellcheck disable=SC2086
@@ -111,11 +117,11 @@ fi
 
 if [ -n "$stage" ]; then
 	if [ -n "$manifest" ]; then
-		bash scripts/bench/stage-artifacts.sh --report "$report" --manifest "$manifest" --out "$stage"
+		bash scripts/bench/stage-artifacts.sh --report "$report" --manifest "$manifest" --out "$stage" -- "${extras[@]}"
 	else
-		bash scripts/bench/stage-artifacts.sh --report "$report" --out "$stage"
+		bash scripts/bench/stage-artifacts.sh --report "$report" --out "$stage" -- "${extras[@]}"
 	fi
-	echo "crash-matrix: staged $report into $stage"
+	echo "crash-matrix: staged ${#reports[@]} cell reports into $stage"
 else
-	echo "crash-matrix: report $report"
+	echo "crash-matrix: ${#reports[@]} cell reports in $out"
 fi
