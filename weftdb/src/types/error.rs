@@ -1,4 +1,15 @@
 use thiserror::Error as ThisError;
+use weft_physical_type::AspectSchema;
+
+/// One declaration in the shape a refusal names it: the encoding (with its
+/// scale, where it carries one), the tolerance and the timestamp unit.
+fn describe_schema(schema: &AspectSchema) -> String {
+	let value = match schema.value.scale() {
+		Some(scale) => format!("{}:{scale}", schema.value.name()),
+		None => schema.value.name().to_string(),
+	};
+	format!("{value} (tolerance {}, timestamps in {})", schema.value_tolerance, schema.timestamp_unit.name())
+}
 
 #[derive(Debug, ThisError)]
 pub enum Error {
@@ -176,6 +187,21 @@ pub enum StoreError {
 	UnknownAspect {
 		/// The aspect that was named.
 		aspect: String,
+	},
+	/// A declaration named an aspect that is already declared under a
+	/// different schema (FRE-7b: declarations are immutable once made). The
+	/// only re-declaration a declared aspect accepts is the identical schema
+	/// again, or a widening of the value encoding through
+	/// `widen_value_encoding` (to `BigDecimalText`, tolerance and timestamp
+	/// unit unchanged). Nothing was written; the declared schema stands.
+	#[error("aspect {aspect:?} is already declared as {} and declarations are immutable; the offered {} was refused and nothing was written", describe_schema(declared), describe_schema(offered))]
+	DeclarationConflict {
+		/// The aspect that was re-declared.
+		aspect: String,
+		/// The schema the aspect is declared under.
+		declared: AspectSchema,
+		/// The schema the refused declaration offered.
+		offered: AspectSchema,
 	},
 	/// An ingest offered a batch under an idempotency key that this aspect's
 	/// ledger already holds for a **different** batch: the recorded fingerprint
