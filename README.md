@@ -1,4 +1,9 @@
-# WeftDB
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/weftdb-logo-dark.svg">
+    <img src="docs/assets/weftdb-logo-light.svg" alt="WeftDB" width="240">
+  </picture>
+</h1>
 
 **The time-series database for data that wasn't sampled on a clean grid.**
 
@@ -88,15 +93,15 @@ trusting the build machine. (Releases up to and including v0.1.0 were built on U
 instead, so those archives need glibc 2.34 for `weft-server` and `weft-bench` and 2.39 for
 `weft-tui`.) The macOS and Windows binaries are not signed, so Gatekeeper
 and SmartScreen will warn before running them. Read the release's known limitations
-(v0.1.0's are in its
-[changelog](https://github.com/basic-automation/weftdb/blob/v0.1.0/CHANGELOG.md#known-limitations))
+(v0.2.0's are in its
+[changelog](https://github.com/basic-automation/weftdb/blob/v0.2.0/CHANGELOG.md#known-limitations))
 before you run it.
 
 ### 1. Start the server
 
 ```bash
 WEFT_SEGMENT_STORE_ROOT=./store cargo run --release -p weft-server
-# weft-server v0.1.0 listening on http://127.0.0.1:8080
+# weft-server v0.2.0 listening on http://127.0.0.1:8080
 ```
 
 `WEFT_SEGMENT_STORE_ROOT` is what enables the persistent `/storage` endpoints;
@@ -206,14 +211,13 @@ version, with the measured losses, how every benchmark figure is produced and ch
 benchmarks are real and reproducible — but it has not been hardened for production
 deployment.
 
-**v0.1.0 is the pre-beta baseline release**: pre-built binaries on the
-[GitHub release](https://github.com/basic-automation/weftdb/releases/tag/v0.1.0), and no
-crates on crates.io. Later releases test their upgrade, rollback and compatibility
-against it. Its
-[known limitations](https://github.com/basic-automation/weftdb/blob/v0.1.0/CHANGELOG.md#known-limitations)
-include no
-authentication or TLS, incomplete crash consistency, and a store layout that the next
-release upgrades one way.
+**v0.2.0 is the latest pre-beta release**: pre-built binaries on the
+[GitHub release](https://github.com/basic-automation/weftdb/releases/tag/v0.2.0), and no
+crates on crates.io. It closes roadmap Phase 1, the benchmark suite. Its
+[known limitations](https://github.com/basic-automation/weftdb/blob/v0.2.0/CHANGELOG.md#known-limitations)
+include a security layer that is new and not yet reviewed, unfinished crash consistency, and a one-way store
+upgrade from v0.1.0. [v0.1.0](https://github.com/basic-automation/weftdb/releases/tag/v0.1.0)
+stays the baseline that upgrade, rollback and compatibility checks run against.
 
 | Area | State |
 |---|---|
@@ -221,8 +225,8 @@ release upgrades one way.
 | Backup & restore (control plane) | Working, with verification and a rehearsal drill |
 | Observability — Prometheus metrics, OpenTelemetry traces | Working |
 | Crash consistency — power-loss durability, crash-safe maintenance | In progress ([design](https://basicautomation.io/projects/weftdb/docs/crash-consistency)) |
-| **Security — TLS, auth, RBAC, audit logs** | **Not started** |
-| Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0, on GitHub |
+| Security — TLS, API-key auth with roles, audit logs | TLS and API keys working; key reload and audit logs not started; not yet reviewed |
+| Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0 and v0.2.0, on GitHub |
 | Library crates on crates.io | Not published yet |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
 | Packaging — Helm | Not started |
@@ -932,15 +936,15 @@ the same row back, and re-checks the glibc floor out of the finished image.
 ## Rust library
 
 WeftDB can be used directly as a set of libraries. They are not on crates.io yet
-(v0.1.0 ships binaries only), so depend on them from this repository, pinned to a
+(releases ship binaries only), so depend on them from this repository, pinned to a
 release tag. `splimes`, the interpolation engine, is on crates.io:
 
 ```toml
 [dependencies]
 # the database: capture, query, interpolate
-weftdb = { git = "https://github.com/basic-automation/weftdb", tag = "v0.1.0" }
+weftdb = { git = "https://github.com/basic-automation/weftdb", tag = "v0.2.0" }
 # the analytics pipeline
-weft-orchestration = { git = "https://github.com/basic-automation/weftdb", tag = "v0.1.0" }
+weft-orchestration = { git = "https://github.com/basic-automation/weftdb", tag = "v0.2.0" }
 # the interpolation engine on its own
 splimes = "1"
 ```

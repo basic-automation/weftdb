@@ -8,6 +8,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-02
+
+The second pre-beta release, cut where roadmap Phase 1 (the benchmark suite) closes. Like
+v0.1.0 it ships as pre-built binaries on the GitHub release only; the library crates are not
+on crates.io (build them from the `v0.2.0` tag). WeftDB is still pre-beta: the 1.0 beta bar
+(roadmap Phase 7 and W10–W12) is not met, and this release makes no claim that it is.
+
 ⚠️ **Upgrading a segment store from v0.1.0 is one-way.** The first open by this
 version migrates a v0.1.0 store in place to store layout v2: it writes a
 `STORE_FORMAT` marker, adds columns and tables to `segment_index.db`, and from then on
@@ -18,6 +25,43 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+### Known limitations
+
+- **Pre-beta.** The HTTP API, the Rust API, the configuration and the on-disk format can
+  change in any 0.x release. Nothing is covered by a stability promise before 1.0.
+- **Security is new and not yet reviewed.** `weft-server` now serves TLS and enforces API
+  keys with roles (see Added), and a non-loopback bind refuses to start without a keys file.
+  Keys are read once at startup, so adding or revoking one means a restart; there is no audit
+  log; and the security acceptance review the roadmap requires before 1.0 has not been done.
+  A loopback bind with no keys file, the default, is unauthenticated. See
+  [`SECURITY.md`](https://github.com/basic-automation/weftdb/blob/v0.2.0/SECURITY.md).
+- **Crash consistency is not finished.** Seals are write-once and durable, startup recovery
+  quarantines damaged frames, ingest is idempotent, and a crash-matrix CI job kills the
+  process mid-write. Power-loss durability is so far tested only with the power-cut
+  simulator: the privileged power-loss validation on real hardware has not been run. Several
+  slices remain open, among them the rollup fold (S11), partial sidecar v4 (S15) and
+  seal-backed legacy aspects (S19, S20), so a legacy (rows-mode) database keeps some of its
+  crash windows.
+- **Upgrading a store from v0.1.0 is one-way** (see the warning above), and **v0.1.0 clients
+  that send reduction tokens in another case break**: `?agg=Min` is now a `400` (see Changed).
+- **The macOS and Windows binaries are not signed.** Gatekeeper and SmartScreen warn
+  before running them.
+
+### Added
+
+- **TLS on the server's listener** (security track SEC-5, #468): `WEFT_TLS_CERT_FILE` and
+  `WEFT_TLS_KEY_FILE` (a PEM chain and key, read once at startup) put a rustls handshake
+  (ALPN `http/1.1`) in front of every connection on the shared serve
+  path. Naming only one of the two is a startup error. A non-loopback plaintext bind starts
+  only with a keys file and `WEFT_ALLOW_PLAINTEXT=1`, or with `WEFT_AUTH=disabled`.
+- **API keys and Bearer authentication** (security track SEC-6, #472): `weft-server keygen`
+  mints a `weft_` key, prints it once and appends only its SHA-256 hash to the keys file
+  (`WEFT_KEYS_FILE`, created `0600`, validated whole at startup). Requests carry it as
+  `Authorization: Bearer`, compared in constant time, and the route registry's role table
+  is enforced: without a key only the probes answer (`401` elsewhere), an unknown key is
+  `401` everywhere, a role too low is `403`, and a credential in the query string is
+  refused `400 credentials_in_query`. `WEFT_AUTH=disabled` turns it off, `WEFT_AUTH=keys`
+  requires the file, and unset means on exactly when a keys file is mounted.
 - **`weft-server restore` puts a backup back from the command line** (1.0 plan PAC-13).
   A backup whose restore needs a `main.rs` is no use at 3 a.m., and the server deliberately
   offers no route that touches a live root: `POST /api/v1/storage/restore/drill` rehearses
@@ -53,11 +97,6 @@ only the control plane, not the segment frames.
   every pull request. Nothing is pushed to a registry: the artifact is the proof, and publishing is
   a separate decision. One limitation is documented where it will be read — the health check
   speaks plain HTTP, so a container configured with `WEFT_TLS_CERT_FILE` reads unhealthy.
-- **No silent narrowing in compute responses** (FRE-5): the downsample and interpolate
-  endpoints converted each computed `BigDecimal` to the wire `f64` with a silent `0.0`
-  fallback, so a result outside the `f64` range (for example a `sum` of two `1e308`
-  samples) was returned as `0.0`. Such a value now fails the request with a `400`
-  `not_finite` error. In-range values are unchanged.
 - **Startup ordering, exposure matrix, auth-off guard, metrics auth** (security track SEC-8):
   the startup phase list is now named (`startup::PHASES`) and pinned by a test against the
   binary's actual call order. The exposure matrix (plan C8, decision 7) is complete: a
@@ -75,12 +114,6 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
-- **Range reads no longer slow down as segments pile up, and no longer fail during a seal**:
-  the segment index's time prune names its time index and seeks `min_ts` between
-  `start − widest span` and `end` (the widest span per aspect is loaded once and widened by every
-  index write before it commits), where the planner had walked every segment of the aspect; and
-  its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
-  Write transactions still see `Busy` at once, as their retry protocol requires.
 - **Gap fill on the downsample endpoints** (#142): `POST /api/v1/downsample` (body `fill`), its
   ILP sibling and `GET`/`POST /api/v1/storage/{aspect}/downsample` (`?fill=`), in every output
   format, take `null`, `prev`, `linear`, `quadratic`, `cubic` or a constant. Every grid step
@@ -156,15 +189,6 @@ only the control plane, not the segment frames.
   `run()` after a held-back tail (`--analytics-tail`, `--analytics-batch`), gated on the peak and
   valley detectors finding exactly the extremes the raw rows hold. Report schema v27 adds
   `analytics`.
-- **`analyze_range` stays on its step grid past 50,000 points**: it cut a long range into chunks
-  that were not a whole number of steps, so every chunk after the first was resampled between the
-  steps it should have landed on (20 s off the minute at 100k UCI rows), and the peak detector
-  reported a peak 400 s from the real one. Chunks now span whole steps, and the point two chunks
-  share is returned once.
-- **Opening a legacy `Database` no longer walks `/proc`**: its cache sized itself with
-  `sysinfo::System::new_all()`, which reads every process and thread on the machine; it now reads
-  memory only. On a busy machine that was most of each `Database::existing`, which
-  `analyze_range` calls per chunk — event detection on 3k rows went from 0.9 s to 21 ms.
 - **weft-bench records the revision it was built from**: its build script reran only when
   `build.rs` or `Cargo.lock` changed, so a binary built after a commit named the parent commit
   and called its tree modified, and an edit to another crate could leave a modified build
@@ -201,9 +225,6 @@ only the control plane, not the segment frames.
   and adds `tsbs-tiny`, `tsbs-small` and `tsbs-medium` datasets: knots every ten seconds over the
   synthetic datasets' span, reconstructed per second by every arm and gated against the reference.
   TSBS's tag-grouped query suite is not run; it needs tagged ingest (TAG-12).
-- **Cross-engine load timing no longer includes the previous load's teardown**: `weft-xbench`
-  now releases each rep's database or store before starting the next load's clock. Load rows
-  measured before this (the EVI-15 report among them) counted the drop of the previous rep.
 - **Apache IoTDB in the cross-engine benchmark** (#413): `weft-xbench --iotdb URL` adds an
   `iotdb-double` arm over IoTDB's table-model REST API (`insertTablet` in time order answered once
   the WAL entry is synced, `lead` segments joined to a `date_bin_gapfill` grid by native `ASOF LEFT
@@ -281,8 +302,6 @@ only the control plane, not the segment frames.
   their own data (`--sparse`, `--gap-fill`, `--downsample`), filling only the knobs left at their
   default and writing the preset into the profile name, so grids of different sizes cannot be
   compared as though they were one run.
-
-### Added
 
 - **One HTTP/1.1 serve path with pre-auth listener limits** (security track
   SEC-4, absorbing ROB-23's caps). All serving now goes through
@@ -847,6 +866,11 @@ only the control plane, not the segment frames.
 
 ### Changed
 
+- **No silent narrowing in compute responses** (FRE-5): the downsample and interpolate
+  endpoints converted each computed `BigDecimal` to the wire `f64` with a silent `0.0`
+  fallback, so a result outside the `f64` range (for example a `sum` of two `1e308`
+  samples) was returned as `0.0`. Such a value now fails the request with a `400`
+  `not_finite` error. In-range values are unchanged.
 - **Reduction tokens are exact-case** (ROADMAP, FRE-5). `Aggregation::from_token` now matches the
   lowercase wire tokens exactly, so `?agg=`, the JSON body's `aggregations`, the stored-range
   `agg=` and `weft-bench --ds-aggs` refuse `Min`, `SUM` and `MEDIAN` with a `400` (or a CLI error)
@@ -1202,6 +1226,24 @@ only the control plane, not the segment frames.
 
 ### Fixed
 
+- **Range reads no longer slow down as segments pile up, and no longer fail during a seal**:
+  the segment index's time prune names its time index and seeks `min_ts` between
+  `start − widest span` and `end` (the widest span per aspect is loaded once and widened by every
+  index write before it commits), where the planner had walked every segment of the aspect; and
+  its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
+  Write transactions still see `Busy` at once, as their retry protocol requires.
+- **`analyze_range` stays on its step grid past 50,000 points**: it cut a long range into chunks
+  that were not a whole number of steps, so every chunk after the first was resampled between the
+  steps it should have landed on (20 s off the minute at 100k UCI rows), and the peak detector
+  reported a peak 400 s from the real one. Chunks now span whole steps, and the point two chunks
+  share is returned once.
+- **Opening a legacy `Database` no longer walks `/proc`**: its cache sized itself with
+  `sysinfo::System::new_all()`, which reads every process and thread on the machine; it now reads
+  memory only. On a busy machine that was most of each `Database::existing`, which
+  `analyze_range` calls per chunk — event detection on 3k rows went from 0.9 s to 21 ms.
+- **Cross-engine load timing no longer includes the previous load's teardown**: `weft-xbench`
+  now releases each rep's database or store before starting the next load's clock. Load rows
+  measured before this (the EVI-15 report among them) counted the drop of the previous rep.
 - **The JSON body's `aggregations` accepts the documented reduction spellings.** `POST /api/v1/downsample`
   read its tokens through the bare lowercase variant names only, so the README's `twa_linear`, `sketch_p99` and aliases such as
   `median` were rejected as unknown variants, and a name copied from a response (`twa_linear`) could not be sent back. The body
@@ -1950,5 +1992,6 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/basic-automation/weftdb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/basic-automation/weftdb/releases/tag/v0.1.0
