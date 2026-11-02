@@ -73,7 +73,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-	backup_routes, declare, downsample, error::{ApiError, Code}, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
+	admission::{Admission, AdmissionConfig}, backup_routes, declare, downsample, error::{ApiError, Code}, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
 };
 
 /// What a request to a route must hold, from the frozen table above. See the
@@ -212,8 +212,10 @@ impl Audit {
 }
 
 /// How a route competes for admission when the server is loaded — ROB-10's
-/// per-route classes, folded into this registry by §3. D-S14 puts ingest
-/// admission *inside* the gate (C10); this is the class it will consult.
+/// per-route classes, folded into this registry by §3. Admission lives
+/// *inside* the gate (C10): D-S14 charged the write class's byte budget
+/// there, and ROB-10 (Admission I) generalised the gate to consult this
+/// class for every route — see [`crate::admission`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdmissionClass {
 	/// Probes: never shed. A shed probe reads as a dead process and starts
@@ -225,9 +227,10 @@ pub enum AdmissionClass {
 	/// Point writes and declarations: admitted against the body cap
 	/// (`WEFT_MAX_INGEST_BYTES`, C11) rather than the read limits.
 	Write,
-	/// Maintenance and backup: long, exclusive-flavoured work; a second
-	/// admission while one runs is the `409 busy` the handlers already
-	/// answer.
+	/// Maintenance and backup: long, exclusive-flavoured work; the gate
+	/// admits one at a time (ROB-10), and a second admission while one
+	/// runs is the `409 busy` the handlers also answer for conflicts
+	/// below the whole class.
 	Maintenance,
 }
 
@@ -256,9 +259,9 @@ impl AdmissionClass {
 /// a request without one (a chunked body) is charged a single byte —
 /// its size is still bounded by the routes'
 /// [`DefaultBodyLimit`], the one body
-/// cap (C11), it just cannot be weighed in advance. The permit rides in
-/// the request's extensions and is released when the request is
-/// dropped, after the handler has answered.
+/// cap (C11), it just cannot be weighed in advance. The permit is
+/// held by the gate's future for the handler call's whole life and
+/// released when that call completes.
 pub struct IngestAdmission {
 	budget_bytes: u64,
 	permits: Arc<Semaphore>,
@@ -541,11 +544,12 @@ impl Routes {
 	/// Freeze the registry. The returned value builds the router and
 	/// serves the tables; this builder no longer exists, so nothing can
 	/// register into a registry that is already being served.
-	/// `admission` is the ingest byte budget the gate enforces (D-S14);
+	/// `admission` is the serve path's admission state the gate enforces
+	/// (D-S14's ingest byte budget, ROB-10's per-class budgets);
 	/// `None` seals a registry with no admission — a fixture shape,
 	/// never the registry the binary serves.
 	#[must_use]
-	pub fn seal(self, admission: Option<Arc<IngestAdmission>>) -> SealedRoutes {
+	pub fn seal(self, admission: Option<Arc<Admission>>) -> SealedRoutes {
 		let table = Arc::new(RouteTable { entries: self.entries });
 		SealedRoutes { table, handlers: self.handlers, admission }
 	}
@@ -555,7 +559,7 @@ impl Routes {
 pub struct SealedRoutes {
 	table: Arc<RouteTable>,
 	handlers: Vec<(&'static str, MethodRouter<AppState>)>,
-	admission: Option<Arc<IngestAdmission>>,
+	admission: Option<Arc<Admission>>,
 }
 
 impl SealedRoutes {
@@ -572,11 +576,11 @@ impl SealedRoutes {
 		self.table.openapi_document()
 	}
 
-	/// The ingest admission this registry's gate enforces, when it
-	/// carries one (D-S14). The binary's registry always does; a
+	/// The admission this registry's gate enforces, when it carries
+	/// one (D-S14, ROB-10). The binary's registry always does; a
 	/// fixture registry sealed without one admits unconditionally.
 	#[must_use]
-	pub fn admission(&self) -> Option<&Arc<IngestAdmission>> {
+	pub fn admission(&self) -> Option<&Arc<Admission>> {
 		self.admission.as_ref()
 	}
 
@@ -596,11 +600,11 @@ impl SealedRoutes {
 }
 
 /// What the gate layer is handed: the frozen table it looks routes up
-/// in, and the ingest admission it enforces inside itself (D-S14).
+/// in, and the admission it enforces inside itself (D-S14, ROB-10).
 #[derive(Clone)]
 struct GateState {
 	table: Arc<RouteTable>,
-	admission: Option<Arc<IngestAdmission>>,
+	admission: Option<Arc<Admission>>,
 }
 
 /// The whole surface's registry, assembled from the per-area registration
@@ -614,9 +618,19 @@ pub fn build_registry() -> SealedRoutes {
 
 /// The whole surface's registry, with the ingest wiring's limits
 /// (D-S14): the body cap rides on the ingest routes themselves, and the
-/// in-flight byte budget becomes the admission the gate enforces.
+/// in-flight byte budget becomes the write class's admission the gate
+/// enforces. Admission I's own limits (ROB-10) take their defaults.
 #[must_use]
 pub fn build_registry_with_ingest_config(config: IngestConfig) -> SealedRoutes {
+	build_registry_with_limits(config, AdmissionConfig::DEFAULT)
+}
+
+/// The whole surface's registry, with the ingest wiring's limits
+/// (D-S14) and Admission I's limits (ROB-10): the sealed admission the
+/// gate enforces carries both — the write class's byte budget from
+/// `config`, the query class's cap from `admission_config`.
+#[must_use]
+pub fn build_registry_with_limits(config: IngestConfig, admission_config: AdmissionConfig) -> SealedRoutes {
 	let mut routes = Routes::new();
 	register_probe_routes(&mut routes);
 	register_metrics_routes(&mut routes);
@@ -626,7 +640,7 @@ pub fn build_registry_with_ingest_config(config: IngestConfig) -> SealedRoutes {
 	register_declare_routes(&mut routes);
 	register_maintenance_routes(&mut routes);
 	register_backup_routes(&mut routes);
-	routes.seal(Some(Arc::new(IngestAdmission::new(config.max_inflight_bytes()))))
+	routes.seal(Some(Arc::new(Admission::new(IngestAdmission::new(config.max_inflight_bytes()), admission_config))))
 }
 
 /// The OpenAPI document for the whole surface, from the one registry.
@@ -641,8 +655,9 @@ pub fn openapi_document() -> Value {
 /// the 405 the code table names; a request with no matched path passes
 /// through to the fallback, which refuses it — the gate's table rides
 /// along in the extensions so the fallback decides from the same table.
-/// For an ingest route the gate also charges the byte-weighted admission
-/// budget (D-S14) before anything downstream runs.
+/// For an admitted route the gate also charges the route's
+/// [`AdmissionClass`] budget (D-S14, ROB-10) before anything downstream
+/// runs.
 async fn gate(axum::extract::State(state): axum::extract::State<GateState>, mut request: axum::extract::Request, next: Next) -> Response {
 	let table = &state.table;
 	let matched = request.extensions().get::<MatchedPath>().map(|matched| matched.as_str().to_string());
@@ -650,33 +665,52 @@ async fn gate(axum::extract::State(state): axum::extract::State<GateState>, mut 
 	if let Some(matched) = matched {
 		if let Some(entry) = table.lookup(request.method(), &matched) {
 			let spec = entry.spec;
-			// Admission lives inside the gate (plan C10, D-S14): the
-			// ingest routes' byte-weighted budget is charged here —
-			// after the match, before the handler — so an over-budget
-			// ingest is refused `503 overloaded` with `Retry-After`
-			// (§4) and never reaches a handler; its idempotency key is
-			// read only behind this gate. The permit rides in the
-			// extensions for the request's life; dropping it when the
-			// request ends releases the charge.
-			if spec.scope == Scope::Ingest {
-				if let Some(admission) = &state.admission {
-					let weight = request.headers().get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok()).unwrap_or(1);
-					match admission.try_admit(weight) {
-						Some(permit) => {
-							// Extensions values must be `Clone`; the
-							// permit itself is not, so it rides in an
-							// `Arc` — the charge is released when the
-							// last extension clone drops, at the end of
-							// the request.
-							request.extensions_mut().insert(Arc::new(permit));
-						}
+			// Admission lives inside the gate (plan C10): the matched
+			// route's admission class is charged here — after the match,
+			// before the handler — so a refused request never reaches a
+			// handler, and (on the ingest routes) its idempotency key is
+			// read only behind this gate. The class decides the charge
+			// (ROB-10, Admission I): probes are never shed; queries are
+			// counted against the query cap and shed first; writes are
+			// charged byte-weighted against the ingest budget (D-S14);
+			// maintenance is exclusive. The permit is held by this
+			// future itself, across the handler call: an earlier shape
+			// parked it in the request's extensions (D-S14), but axum
+			// rebuilds the request as it routes, the extensions are
+			// dropped before the handler finishes, and the charge was
+			// released early — ROB-10's gate tests caught exactly that.
+			let _permit = if let Some(admission) = &state.admission {
+				match spec.admission_class {
+					AdmissionClass::Probe => None,
+					AdmissionClass::Query => match admission.try_admit_query() {
+						Some(permit) => Some(permit),
 						None => {
-							tracing::warn!(route = %matched, weight, budget = admission.budget_bytes(), in_flight = admission.in_flight_bytes(), "ingest admission refused: the in-flight byte budget is exhausted");
-							return ApiError::new(Code::Overloaded, format!("the ingest routes have {} byte(s) in flight of a {}-byte budget; retry after the in-flight ingests drain", admission.in_flight_bytes(), admission.budget_bytes())).with_retry_after(1).into_response();
+							tracing::warn!(route = %matched, limit = admission.query_limit(), in_flight = admission.query_in_flight(), "query admission refused: the query class is at its in-flight cap");
+							return ApiError::new(Code::Overloaded, format!("the query routes have {} request(s) in flight of a {}-request cap; retry after the in-flight queries drain", admission.query_in_flight(), admission.query_limit())).with_retry_after(1).into_response();
+						}
+					},
+					AdmissionClass::Write => {
+						let budget = admission.ingest();
+						let weight = request.headers().get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok()).unwrap_or(1);
+						match budget.try_admit(weight) {
+							Some(permit) => Some(permit),
+							None => {
+								tracing::warn!(route = %matched, weight, budget = budget.budget_bytes(), in_flight = budget.in_flight_bytes(), "write admission refused: the in-flight byte budget is exhausted");
+								return ApiError::new(Code::Overloaded, format!("the write routes have {} byte(s) in flight of a {}-byte budget; retry after the in-flight writes drain", budget.in_flight_bytes(), budget.budget_bytes())).with_retry_after(1).into_response();
+							}
 						}
 					}
+					AdmissionClass::Maintenance => match admission.try_admit_maintenance() {
+						Some(permit) => Some(permit),
+						None => {
+							tracing::warn!(route = %matched, "maintenance admission refused: a maintenance-class request is already running");
+							return ApiError::busy(format!("a maintenance-class request is already running; `{matched}` is admitted one at a time, retry after it finishes")).with_retry_after(1).into_response();
+						}
+					},
 				}
-			}
+			} else {
+				None
+			};
 			request.extensions_mut().insert(spec);
 			return next.run(request).await;
 		}
@@ -1006,5 +1040,117 @@ mod tests {
 		let (status, _, body) = send("GET", "/health").await;
 		assert_eq!(status, StatusCode::OK);
 		assert_eq!(body["status"], "ok");
+	}
+
+	/// A handler that announces it has started and then waits to be
+	/// released: the fixture the admission tests hold a class budget
+	/// with, so a second request arrives while the first is in flight.
+	async fn slow_query_handler() -> StatusCode {
+		QUERY_ENTERED.notify_one();
+		QUERY_RELEASE.notified().await;
+		StatusCode::OK
+	}
+
+	/// The maintenance twin of [`slow_query_handler`], with its own
+	/// signals so the two tests may run concurrently. Only its first
+	/// call blocks: the test's third request must be *admitted and
+	/// served*, not held.
+	async fn slow_maintenance_handler() -> StatusCode {
+		if !MAINTENANCE_BLOCKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+			MAINTENANCE_ENTERED.notify_one();
+			MAINTENANCE_RELEASE.notified().await;
+		}
+		StatusCode::OK
+	}
+
+	static MAINTENANCE_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+	static QUERY_ENTERED: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+	static QUERY_RELEASE: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+	static MAINTENANCE_ENTERED: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+	static MAINTENANCE_RELEASE: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+	/// ROB-10, query class: with a cap of one, a second query-class
+	/// request arriving while one is in flight is shed —
+	/// `503 overloaded` with `Retry-After` — not queued behind it; the
+	/// in-flight request completes normally once released.
+	#[tokio::test]
+	async fn query_admission_sheds_beyond_the_cap() {
+		let mut routes = Routes::new();
+		routes.route(Method::GET, "/slow-query", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "slow_query"), get(slow_query_handler));
+		let admission = Admission::new(IngestAdmission::new(1024), AdmissionConfig::with_max_query_inflight(1));
+		let router = routes.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
+
+		let first = tokio::spawn(router.clone().oneshot(Request::builder().uri("/slow-query").body(Body::empty()).unwrap()));
+		QUERY_ENTERED.notified().await;
+		let shed = router.clone().oneshot(Request::builder().uri("/slow-query").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+		assert!(shed.headers().contains_key(header::RETRY_AFTER), "a shed query carries Retry-After (§4)");
+		let bytes = axum::body::to_bytes(shed.into_body(), usize::MAX).await.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(body["code"], "overloaded");
+
+		QUERY_RELEASE.notify_waiters();
+		let served = first.await.unwrap().unwrap();
+		assert_eq!(served.status(), StatusCode::OK, "the admitted query completes");
+	}
+
+	/// ROB-10, maintenance class: exclusive. A second maintenance-class
+	/// request while one runs is refused `409 busy` with `Retry-After`;
+	/// the running one completes, and a later one is admitted.
+	#[tokio::test]
+	async fn maintenance_admission_is_exclusive_at_the_gate() {
+		let mut routes = Routes::new();
+		routes.route(Method::POST, "/slow-maintenance", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "slow_maintenance"), post(slow_maintenance_handler));
+		let admission = Admission::new(IngestAdmission::new(1024), AdmissionConfig::DEFAULT);
+		let router = routes.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
+
+		let first = tokio::spawn(router.clone().oneshot(Request::builder().method("POST").uri("/slow-maintenance").body(Body::empty()).unwrap()));
+		MAINTENANCE_ENTERED.notified().await;
+		let refused = router.clone().oneshot(Request::builder().method("POST").uri("/slow-maintenance").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(refused.status(), StatusCode::CONFLICT);
+		assert!(refused.headers().contains_key(header::RETRY_AFTER), "a busy refusal carries Retry-After (§4)");
+		let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(body["code"], "busy");
+
+		MAINTENANCE_RELEASE.notify_waiters();
+		let served = first.await.unwrap().unwrap();
+		assert_eq!(served.status(), StatusCode::OK, "the admitted maintenance request completes");
+		let after = router.oneshot(Request::builder().method("POST").uri("/slow-maintenance").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(after.status(), StatusCode::OK, "once the running one finishes, the class admits again");
+	}
+
+	/// ROB-10, probe class: never shed. Even with a query cap of zero —
+	/// every query refused — a probe still serves, because a shed probe
+	/// reads as a dead process.
+	#[tokio::test]
+	async fn probe_admission_never_sheds() {
+		let admission = Admission::new(IngestAdmission::new(1024), AdmissionConfig::with_max_query_inflight(0));
+		let mut routes = Routes::new();
+		routes.route(Method::GET, "/health", RouteSpec::stable(Scope::Probe, Audit::None, false, AdmissionClass::Probe, "get_health"), get(health));
+		routes.route(Method::GET, "/slow-query", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "slow_query"), get(slow_query_handler));
+		let router = routes.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
+
+		let probe = router.clone().oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(probe.status(), StatusCode::OK);
+		let query = router.oneshot(Request::builder().uri("/slow-query").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(query.status(), StatusCode::SERVICE_UNAVAILABLE, "a zero query cap sheds every query — and only queries");
+	}
+
+	/// ROB-10, write class: the byte budget is charged by *class*, not
+	/// by scope — the declare route (write class, declare scope) is
+	/// charged exactly as an ingest route is, so an over-budget
+	/// declaration is refused `503 overloaded` at the gate, before its
+	/// handler (which would answer for the missing store) runs.
+	#[tokio::test]
+	async fn write_admission_charges_the_declare_route_by_class() {
+		let router = build_registry_with_limits(IngestConfig::with_max_inflight_bytes(8), AdmissionConfig::DEFAULT).router().with_state(AppState::new());
+		let body = serde_json::to_vec(&serde_json::json!({ "padding": "x".repeat(64) })).unwrap();
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/aspects").header("content-type", "application/json").header("content-length", body.len().to_string()).body(Body::from(body)).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(body["code"], "overloaded");
 	}
 }
