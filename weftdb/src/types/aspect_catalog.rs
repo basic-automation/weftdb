@@ -29,6 +29,8 @@ use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 /// cannot be opened on its own, since its schema is the store's migration registry's,
 /// which runs only behind the store's `STORE_FORMAT` gate. Declare an aspect's schema with
 /// [`declare`](AspectCatalog::declare); look it up with [`get`](AspectCatalog::get).
+/// A declaration is immutable once made (FRE-7b): see
+/// [`declare`](AspectCatalog::declare) for the one widening change it accepts.
 pub struct AspectCatalog {
 	db: turso::Database,
 }
@@ -97,30 +99,82 @@ impl AspectCatalog {
 		crate::types::backup::snapshot_with_verify(&conn, dest, mode, Self::TABLES).await
 	}
 
-	/// Declare (or re-declare) the schema for `(database, subject, aspect)`.
+	/// Declare the schema for `(database, subject, aspect)`.
 	///
-	/// `INSERT OR REPLACE` makes a re-declaration overwrite, so the call is
-	/// idempotent on the aspect key. The `PhysicalType`/`TimeUnit` store as JSON and
-	/// the tolerance as plain text, round-tripping faithfully.
+	/// **Declarations are immutable once made** (FRE-7b). Declaring an aspect
+	/// that has no declaration writes it. Re-declaring with the identical
+	/// schema is a no-op, so the call stays idempotent on the aspect key. The
+	/// one change a declared aspect accepts is a **widening** of its value
+	/// encoding — [`is_value_widening`](weft_physical_type::is_value_widening),
+	/// the declaration-level form of
+	/// [`widen_value_encoding`](weft_physical_type::widen_value_encoding) —
+	/// with the tolerance and timestamp unit unchanged; frames sealed under
+	/// the old encoding self-describe, so widening changes only later frames.
+	/// Any other re-declaration (a different encoding that is not a widening,
+	/// a different tolerance, a different timestamp unit) is refused with
+	/// [`StoreError::DeclarationConflict`](crate::StoreError::DeclarationConflict)
+	/// and nothing is written.
+	///
+	/// The `PhysicalType`/`TimeUnit` store as JSON and the tolerance as plain
+	/// text, round-tripping faithfully.
 	///
 	/// # Errors
 	///
-	/// Propagates any libSQL write failure or a metadata-serialization failure.
+	/// [`StoreError::DeclarationConflict`](crate::StoreError::DeclarationConflict)
+	/// when the aspect is already declared under a schema the offered one does
+	/// not equal or widen; otherwise propagates any libSQL write failure or a
+	/// metadata-serialization failure.
 	pub async fn declare(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema) -> Result<()> {
 		let physical_type = serde_json::to_string(&schema.value)?;
 		let timestamp_unit = serde_json::to_string(&schema.timestamp_unit)?;
 		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
 		conn.execute("BEGIN CONCURRENT", turso::params![]).await?;
-		let res = conn.execute("INSERT OR REPLACE INTO aspect_schema (database, subject, aspect, physical_type, value_tolerance, timestamp_unit) VALUES (?, ?, ?, ?, ?, ?)", turso::params![database.to_string(), subject.to_string(), aspect.to_string(), physical_type, schema.value_tolerance.to_plain_string(), timestamp_unit]).await;
+		// The existing declaration, read inside the transaction so the
+		// immutability decision and the write are one atomic step.
+		let existing = match Self::get_on(&conn, database, subject, aspect).await {
+			Ok(existing) => existing,
+			Err(e) => {
+				conn.execute("ROLLBACK", turso::params![]).await.ok();
+				return Err(e);
+			}
+		};
+		let res = match &existing {
+			None => conn.execute("INSERT INTO aspect_schema (database, subject, aspect, physical_type, value_tolerance, timestamp_unit) VALUES (?, ?, ?, ?, ?, ?)", turso::params![database.to_string(), subject.to_string(), aspect.to_string(), physical_type.clone(), schema.value_tolerance.to_plain_string(), timestamp_unit.clone()]).await.map(|_| ()).map_err(anyhow::Error::from),
+			// The identical declaration again: immutable, and already so.
+			Some(declared) if declared == schema => Ok(()),
+			// A widening of the value encoding alone (FRE-7b's one permitted
+			// change, the move widen_value_encoding performs for D-S19/D-S20).
+			Some(declared) if declared.value_tolerance == schema.value_tolerance && declared.timestamp_unit == schema.timestamp_unit && weft_physical_type::is_value_widening(declared.value, schema.value) => conn.execute("UPDATE aspect_schema SET physical_type = ? WHERE database = ? AND subject = ? AND aspect = ?", turso::params![physical_type, database.to_string(), subject.to_string(), aspect.to_string()]).await.map(|_| ()).map_err(anyhow::Error::from),
+			Some(declared) => Err(anyhow::Error::new(crate::StoreError::DeclarationConflict { aspect: aspect.to_string(), declared: declared.clone(), offered: schema.clone() })),
+		};
 		match res {
-			Ok(_) => {
+			Ok(()) => {
 				conn.execute("COMMIT", turso::params![]).await?;
 				Ok(())
 			}
 			Err(e) => {
 				conn.execute("ROLLBACK", turso::params![]).await.ok();
+				if e.downcast_ref::<crate::StoreError>().is_some() {
+					return Err(e);
+				}
 				bail!("aspect_schema declare failed: {e}")
 			}
+		}
+	}
+
+	/// The declared schema for `(database, subject, aspect)` read on an open
+	/// connection (so [`declare`](Self::declare) can decide inside its
+	/// transaction), or [`None`] if the aspect has no declaration.
+	async fn get_on(conn: &turso::Connection, database: &str, subject: &str, aspect: &str) -> Result<Option<AspectSchema>> {
+		let mut rows = conn.query("SELECT physical_type, value_tolerance, timestamp_unit FROM aspect_schema WHERE database = ? AND subject = ? AND aspect = ?", turso::params![database.to_string(), subject.to_string(), aspect.to_string()]).await?;
+		match rows.next().await? {
+			Some(row) => {
+				let physical_type: PhysicalType = serde_json::from_str(&row.get_value(0)?.as_text().cloned().unwrap_or_default())?;
+				let value_tolerance = BigDecimal::from_str(&row.get_value(1)?.as_text().cloned().unwrap_or_default())?;
+				let timestamp_unit: TimeUnit = serde_json::from_str(&row.get_value(2)?.as_text().cloned().unwrap_or_default())?;
+				Ok(Some(AspectSchema::new(physical_type, value_tolerance, timestamp_unit)))
+			}
+			None => Ok(None),
 		}
 	}
 
@@ -133,16 +187,7 @@ impl AspectCatalog {
 	/// be decoded.
 	pub async fn get(&self, database: &str, subject: &str, aspect: &str) -> Result<Option<AspectSchema>> {
 		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
-		let mut rows = conn.query("SELECT physical_type, value_tolerance, timestamp_unit FROM aspect_schema WHERE database = ? AND subject = ? AND aspect = ?", turso::params![database.to_string(), subject.to_string(), aspect.to_string()]).await?;
-		match rows.next().await? {
-			Some(row) => {
-				let physical_type: PhysicalType = serde_json::from_str(&row.get_value(0)?.as_text().cloned().unwrap_or_default())?;
-				let value_tolerance = BigDecimal::from_str(&row.get_value(1)?.as_text().cloned().unwrap_or_default())?;
-				let timestamp_unit: TimeUnit = serde_json::from_str(&row.get_value(2)?.as_text().cloned().unwrap_or_default())?;
-				Ok(Some(AspectSchema::new(physical_type, value_tolerance, timestamp_unit)))
-			}
-			None => Ok(None),
-		}
+		Self::get_on(&conn, database, subject, aspect).await
 	}
 
 	/// The aspect names declared under `(database, subject)`, in name order.
@@ -213,13 +258,48 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn redeclare_replaces_the_schema() {
+	async fn redeclaring_the_identical_schema_is_a_no_op() {
 		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
-		catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
-		catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::F32, bd("0.01"), TimeUnit::Millis)).await.expect("re-declares");
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 4 }, bd("0.00005"), TimeUnit::Micros);
+		catalog.declare("d", "s", "a", &schema).await.expect("declares");
+		catalog.declare("d", "s", "a", &schema).await.expect("an identical re-declaration is accepted");
 		let got = catalog.get("d", "s", "a").await.expect("reads");
 		drop(catalog);
-		assert_eq!(got, Some(AspectSchema::new(PhysicalType::F32, bd("0.01"), TimeUnit::Millis)));
+		assert_eq!(got, Some(schema));
+	}
+
+	#[tokio::test]
+	async fn redeclaring_with_a_widened_value_encoding_updates_only_the_encoding() {
+		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
+		catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::Decimal128, bd("0"), TimeUnit::Millis)).await.expect("declares");
+		// The D-S19/D-S20 widening move: to BigDecimalText, tolerance and unit unchanged.
+		catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::BigDecimalText, bd("0"), TimeUnit::Millis)).await.expect("a widening re-declaration is accepted");
+		let got = catalog.get("d", "s", "a").await.expect("reads");
+		drop(catalog);
+		assert_eq!(got, Some(AspectSchema::new(PhysicalType::BigDecimalText, bd("0"), TimeUnit::Millis)));
+	}
+
+	#[tokio::test]
+	async fn redeclaring_anything_else_is_a_conflict_and_changes_nothing() {
+		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
+		let declared = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds);
+		catalog.declare("d", "s", "a", &declared).await.expect("declares");
+		// A different encoding that is not a widening.
+		let err = catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::F32, bd("0"), TimeUnit::Seconds)).await.expect_err("a sideways encoding change is refused");
+		assert!(matches!(err.downcast_ref::<crate::StoreError>(), Some(crate::StoreError::DeclarationConflict { aspect, .. }) if aspect == "a"), "{err}");
+		// A widening encoding with a different tolerance is not the widening move.
+		let err = catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::BigDecimalText, bd("0.01"), TimeUnit::Seconds)).await.expect_err("a tolerance change is refused");
+		assert!(matches!(err.downcast_ref::<crate::StoreError>(), Some(crate::StoreError::DeclarationConflict { .. })), "{err}");
+		// A different timestamp unit.
+		let err = catalog.declare("d", "s", "a", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Millis)).await.expect_err("a unit change is refused");
+		assert!(matches!(err.downcast_ref::<crate::StoreError>(), Some(crate::StoreError::DeclarationConflict { .. })), "{err}");
+		// And the narrowing back out of a widened declaration is refused too.
+		catalog.declare("d", "s", "b", &AspectSchema::new(PhysicalType::BigDecimalText, bd("0"), TimeUnit::Seconds)).await.expect("declares");
+		let err = catalog.declare("d", "s", "b", &AspectSchema::new(PhysicalType::Decimal128, bd("0"), TimeUnit::Seconds)).await.expect_err("a narrowing is refused");
+		assert!(matches!(err.downcast_ref::<crate::StoreError>(), Some(crate::StoreError::DeclarationConflict { .. })), "{err}");
+		let got = catalog.get("d", "s", "a").await.expect("reads");
+		drop(catalog);
+		assert_eq!(got, Some(declared), "every refusal left the declaration standing");
 	}
 
 	#[tokio::test]
