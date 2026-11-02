@@ -67,8 +67,19 @@ usage() {
 pass() { printf 'ok: %s\n' "$*"; }
 
 # Run a container/HTTP command, echoing it when asked.
+#
+# The trace goes to stderr in full, and that is load-bearing: `http` captures this function's
+# stdout as the HTTP status code (`got=$(http GET /health)`), so a trace printed to stdout lands
+# inside the value being compared. CI runs `--verbose`; the first version of this function printed
+# the `+ %q` part to stdout and every captured code came back as the command line instead of a
+# number ("wanted HTTP 200, got + curl + --silent …") on the runner while passing locally.
 run() {
-	if ((VERBOSE)); then printf '+ %q ' "$@"; printf '\n' >&2; fi
+	if ((VERBOSE)); then
+		{
+			printf '+ %q ' "$@"
+			printf '\n'
+		} >&2
+	fi
 	# shellcheck disable=SC2086 # $DOCKER is intentionally word-split ("docker --context foo").
 	"$@"
 }
@@ -143,7 +154,8 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/weft-smoke-XXXXXX")
 KEYS=$WORK/keys
 GLIBC_FLOOR=2.28
 
-# shellcheck disable=SC2329 # the EXIT trap below is what invokes this
+# shellcheck disable=SC2317,SC2329 # the EXIT trap below is the only thing that invokes this, which
+# is exactly what SC2317 ("appears to be unreachable") and SC2329 cannot see from the function body.
 cleanup() {
 	local status=$?
 	trap - EXIT
