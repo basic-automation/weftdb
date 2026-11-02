@@ -408,7 +408,7 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		return finish(cli, &BenchReport::with_results(RunMetadata::capture(Utc::now().to_rfc3339()), vec![result]));
 	}
 	if cli.compressed_query > 0 {
-		let params = CompressedQueryParams { rows: cli.compressed_query_rows.unwrap_or(corpus.values.len() as u64), queries: cli.compressed_query, seed: cli.seed };
+		let params = CompressedQueryParams { rows: cli.compressed_query_rows.unwrap_or(corpus.values.len() as u64), queries: cli.compressed_query, seed: cli.seed, compact_to: cli.compressed_query_compact };
 		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 		let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
 		let mut code = ExitCode::SUCCESS;
@@ -925,6 +925,9 @@ struct Cli {
 	compressed_query: usize,
 	/// Ingest mode: rows the compressed-query store holds (`--compressed-query-rows`); `None` for the corpus once.
 	compressed_query_rows: Option<u64>,
+	/// Ingest mode: compact the compressed-query store to segments of this many rows and ask again
+	/// (`--compressed-query-compact`); `None` for no compaction.
+	compressed_query_compact: Option<u64>,
 	/// Ingest mode: operations in a seeded query mix (`--query-mix`); 0 for none.
 	query_mix: usize,
 	/// Ingest mode: rows the query-mix store starts with (`--query-mix-rows`); `None` for the corpus once.
@@ -1144,7 +1147,7 @@ impl Cli {
 		let (mut uci, mut uci_column, mut ingest_rows, mut ingest_batch): (Option<PathBuf>, String, usize, usize) = (None, DEFAULT_UCI_COLUMN.to_string(), usize::MAX, DEFAULT_INGEST_BATCH_ROWS);
 		let mut ingest_growth: Vec<u64> = Vec::new();
 		let (mut ingest_online, mut ingest_online_rows, mut ingest_online_window): (usize, Option<u64>, usize) = (0, None, 1_440);
-		let (mut compressed_query, mut compressed_query_rows): (usize, Option<u64>) = (0, None);
+		let (mut compressed_query, mut compressed_query_rows, mut compressed_query_compact): (usize, Option<u64>, Option<u64>) = (0, None, None);
 		let (mut query_mix, mut query_mix_rows, mut query_mix_range, mut query_mix_weights): (usize, Option<u64>, u64, weft_bench::LaneWeights) = (0, None, 1_440, weft_bench::LaneWeights::default());
 		let (mut analytics_rows, mut analytics_tail, mut analytics_batch): (Option<u64>, Option<u64>, usize) = (None, None, 1_440);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
@@ -1219,6 +1222,7 @@ impl Cli {
 				"--analytics-tail" => analytics_tail = Some(take_value(&key)?.parse::<u64>().map_err(|_| "--analytics-tail needs a row count".to_string())?),
 				"--analytics-batch" => analytics_batch = parse_positive(&key, &take_value(&key)?)?,
 				"--compressed-query" => compressed_query = parse_positive(&key, &take_value(&key)?)?,
+				"--compressed-query-compact" => compressed_query_compact = Some(parse_positive(&key, &take_value(&key)?)? as u64),
 				"--query-mix" => query_mix = parse_positive(&key, &take_value(&key)?)?,
 				"--query-mix-rows" => query_mix_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--query-mix-rows needs one row count of at least 2 (e.g. 10M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--query-mix-rows takes one row count".to_string()) })?),
 				"--query-mix-range" => query_mix_range = parse_positive(&key, &take_value(&key)?)? as u64,
@@ -1301,6 +1305,9 @@ impl Cli {
 		if (compressed_query > 0 || compressed_query_rows.is_some()) && mode != InputMode::Ingest {
 			return Err("`--compressed-query` needs `--ingest`".to_string());
 		}
+		if compressed_query_compact.is_some() && compressed_query == 0 {
+			return Err("`--compressed-query-compact` needs `--compressed-query <QUERIES>`".to_string());
+		}
 		if compressed_query_rows.is_some() && compressed_query == 0 {
 			return Err("`--compressed-query-rows` needs `--compressed-query <QUERIES>`".to_string());
 		}
@@ -1323,7 +1330,7 @@ impl Cli {
 			return Err("`--compressed-query` is a run of its own, apart from `--ingest-online` and `--ingest-growth`".to_string());
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -2007,6 +2014,10 @@ INGEST OPTIONS (with --ingest):
         --compressed-query-rows <N>
                              Rows the compressed-query store holds, the corpus laid end
                              to end (k/M/B suffixes) [default: the corpus once]
+        --compressed-query-compact <ROWS>
+                             Then compact the store to segments of ROWS rows and ask
+                             the same windows again, as `-compacted` results that must
+                             answer exactly as before (post-compaction reads)
         --query-mix <OPS>
                              Seeded query mix instead: seal the corpus, then run OPS
                              operations whose lanes (ingest a batch, look up a point,
@@ -2185,6 +2196,8 @@ mod tests {
 	fn compressed_query_takes_queries_and_rows_and_stands_alone() {
 		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--compressed-query", "200", "--compressed-query-rows", "100M"]);
 		assert_eq!((cli.compressed_query, cli.compressed_query_rows), (200, Some(100_000_000)));
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--compressed-query", "2", "--compressed-query-compact", "1000000"]).compressed_query_compact, Some(1_000_000));
+		assert!(run_cli(&["--ingest", "--uci", "u.txt", "--compressed-query-compact", "1000000"]).is_err());
 		let plain = expect_run(&["--ingest", "--uci", "u.txt"]);
 		assert_eq!((plain.compressed_query, plain.compressed_query_rows), (0, None));
 		for bad in [&["--compressed-query", "0"][..], &["--compressed-query", "2", "--compressed-query-rows", "1M,2M"][..], &["--compressed-query-rows", "1M"][..], &["--compressed-query", "2", "--ingest-online", "2"][..], &["--compressed-query", "2", "--ingest-growth", "1M,2M"][..]] {
