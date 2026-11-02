@@ -18,6 +18,11 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **No silent narrowing in compute responses** (FRE-5): the downsample and interpolate
+  endpoints converted each computed `BigDecimal` to the wire `f64` with a silent `0.0`
+  fallback, so a result outside the `f64` range (for example a `sum` of two `1e308`
+  samples) was returned as `0.0`. Such a value now fails the request with a `400`
+  `not_finite` error. In-range values are unchanged.
 - **Startup ordering, exposure matrix, auth-off guard, metrics auth** (security track SEC-8):
   the startup phase list is now named (`startup::PHASES`) and pinned by a test against the
   binary's actual call order. The exposure matrix (plan C8, decision 7) is complete: a

@@ -943,7 +943,7 @@ async fn storage_downsample_inner(state: AppState, aspect: &str, params: &Storag
 	let result = store.downsample_range(aspect, start, end, resolution, &aggregations).instrument(span.clone()).await;
 	drop(store);
 	let buckets = result.map_err(|err| error::classify_read(&err))?;
-	let response = crate::downsample::buckets_to_response(buckets, resolution, &aggregations);
+	let response = crate::downsample::buckets_to_response(buckets, resolution, &aggregations)?;
 	span.record("buckets", response.buckets);
 	Ok(response)
 }
