@@ -2772,3 +2772,30 @@ but not served. Two gaps remained, and this slice closes exactly those:
 and any change to what `/ready` reports (its build info and store uuid
 are deliberate, per plan §5 D-S12). The keygen subcommand still prints a
 minted key once — that is its documented purpose, not a leak.
+## 2026-11-01 — FRE-5 "no silent narrowing": the shape of the refusal — FLAGGED FOR MERGE REVIEW
+
+**Grounded:** FRE-5's first two clauses landed earlier (spelling half 2026-10-28,
+exact-case tokens 2026-10-29; ROADMAP line 90). The remaining clause names no
+mechanism. In the L-COMPUTE lane the plan assigns to FRE-5
+(`weft-server/src/{interpolate,downsample}.rs`, plan §2), the silent narrowing
+was concrete: every wire conversion did `value.to_f64().unwrap_or_default()`,
+so a computed `BigDecimal` outside the `f64` range (e.g. a `sum` of two 1e308
+samples) came back as `0.0` — a plausible-looking answer the caller never
+asked for, with no signal anywhere.
+
+**Chosen:** one checked conversion (`downsample::wire_value`) at all three
+L-COMPUTE wire sites — downsample bucket values (shared with the stored-range
+endpoint via `buckets_to_response`, which now returns `Result`), interpolate
+series points, and the interpolate single-point response. A value with no
+finite `f64` representation fails the request with the taxonomy's existing
+`not_finite` code (400), matching how produced non-finite values are already
+classified (`from_reduce_error`'s SketchValue arm, splimes' NonFiniteResult).
+`ValueNotRepresentable` was considered and rejected: its documented meaning is
+the aspect's physical type, not the wire type.
+
+**Unchanged:** the documented transport boundary itself. In-range values
+still narrow to `f64` exactly as before (the module docs call the boundary
+deliberate; the precision-preserving representation is Phase 4 work). Only
+the silent substitution is gone. The claim adjudication behind taking this
+slice (the peer's `compute/fre-5-*` branches treated as stale squash
+leftovers) is recorded on board issue #125 and in the loop's queue notes.
