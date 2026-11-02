@@ -40,6 +40,11 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
+- **Online ingest + query** (#145): `weft-bench --ingest --ingest-online READERS` queries a
+  store while it is being sealed, compares every query exactly with the corpus, and reruns the
+  queries on the finished store as a baseline (report schema v25 `online`). It found that a
+  range read's cost grows with the segments the store holds, and that at small batches most
+  concurrent reads are refused with `database is locked`.
 - **Ingest growth curves** (#145): `weft-bench --ingest --ingest-growth 1M,10M,100M,1B` grows
   one store through those checkpoints over the real UCI corpus laid end to end, reporting each
   stage's seal throughput, per-batch latency, segments and bytes (report schema v24 `growth`),

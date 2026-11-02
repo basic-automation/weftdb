@@ -33,7 +33,7 @@ use std::{
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_ingest_growth, run_ingest_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
+	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_ingest_growth, run_ingest_on, run_ingest_online, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, OnlineParams, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
 };
 
 /// Program name used in usage / error output.
@@ -390,6 +390,20 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		.await
 		.map_err(|e| anyhow::anyhow!("ingest growth run failed: {e}"))?;
 		return Ok(code);
+	}
+	if cli.ingest_online > 0 {
+		let params = OnlineParams { rows: cli.ingest_online_rows.unwrap_or(corpus.values.len() as u64), readers: cli.ingest_online, window_rows: cli.ingest_online_window, seed: cli.seed };
+		let result = run_ingest_online(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, params).await.map_err(|e| anyhow::anyhow!("online ingest run failed: {e}"))?;
+		if let Some(o) = &result.online {
+			let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
+			println!("online   : {} rows, {} readers x {}-row windows", o.rows, o.readers, o.window_rows);
+			println!("ingest   : {:>12.0} rows/s alone  {:>12.0} rows/s with queries", o.ingest_alone_rows_per_sec, result.throughput_points_per_sec);
+			println!("queries  : during ingest {:>8} (p50 {:>8.3} ms p99 {:>8.3} ms)  idle {:>8} (p50 {:>8.3} ms p99 {:>8.3} ms)  {} mismatched, {} failed", result.reps, ms(result.latency.p50_ns), ms(result.latency.p99_ns), o.idle_queries, ms(o.idle_p50_ns), ms(o.idle_p99_ns), o.mismatched_queries, o.failed_queries);
+			if let Some(error) = &o.first_error {
+				println!("first failure: {error}");
+			}
+		}
+		return finish(cli, &BenchReport::with_results(RunMetadata::capture(Utc::now().to_rfc3339()), vec![result]));
 	}
 	let result = run_ingest_on(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, cli.reps).await.map_err(|e| anyhow::anyhow!("ingest benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
@@ -759,6 +773,12 @@ struct Cli {
 	ingest_batch: usize,
 	/// Ingest mode: the growth curve's checkpoints (`--ingest-growth`); empty for a plain ingest.
 	ingest_growth: Vec<u64>,
+	/// Ingest mode: reader tasks querying while the corpus is sealed (`--ingest-online`); 0 for none.
+	ingest_online: usize,
+	/// Ingest mode: rows the online run seals (`--ingest-online-rows`); `None` for the corpus once.
+	ingest_online_rows: Option<u64>,
+	/// Ingest mode: rows per online query (`--ingest-online-window`).
+	ingest_online_window: usize,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -934,6 +954,7 @@ impl Cli {
 		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode, mut gpu_memory_mode, mut ingest_mode) = (false, false, false, false, false, false, false, false);
 		let (mut uci, mut uci_column, mut ingest_rows, mut ingest_batch): (Option<PathBuf>, String, usize, usize) = (None, DEFAULT_UCI_COLUMN.to_string(), usize::MAX, DEFAULT_INGEST_BATCH_ROWS);
 		let mut ingest_growth: Vec<u64> = Vec::new();
+		let (mut ingest_online, mut ingest_online_rows, mut ingest_online_window): (usize, Option<u64>, usize) = (0, None, 1_440);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
@@ -999,6 +1020,9 @@ impl Cli {
 				"--ingest-rows" => ingest_rows = parse_points_count(&take_value(&key)?)?,
 				"--ingest-batch" => ingest_batch = parse_points_count(&take_value(&key)?)?.max(1),
 				"--ingest-growth" => ingest_growth = parse_growth_checkpoints(&take_value(&key)?)?,
+				"--ingest-online" => ingest_online = parse_positive(&key, &take_value(&key)?)?,
+				"--ingest-online-rows" => ingest_online_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--ingest-online-rows needs one row count of at least 2 (e.g. 100M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--ingest-online-rows takes one row count".to_string()) })?),
+				"--ingest-online-window" => ingest_online_window = parse_positive(&key, &take_value(&key)?)?,
 				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
@@ -1064,8 +1088,17 @@ impl Cli {
 		if !ingest_growth.is_empty() && mode != InputMode::Ingest {
 			return Err("`--ingest-growth` needs `--ingest`".to_string());
 		}
+		if (ingest_online > 0 || ingest_online_rows.is_some()) && mode != InputMode::Ingest {
+			return Err("`--ingest-online` needs `--ingest`".to_string());
+		}
+		if ingest_online_rows.is_some() && ingest_online == 0 {
+			return Err("`--ingest-online-rows` needs `--ingest-online <READERS>`".to_string());
+		}
+		if ingest_online > 0 && !ingest_growth.is_empty() {
+			return Err("`--ingest-online` and `--ingest-growth` are separate runs".to_string());
+		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1303,6 +1336,11 @@ fn parse_points_count(s: &str) -> Result<usize, String> {
 		return Err("--points must be >= 2".to_string());
 	}
 	Ok(n)
+}
+
+/// Parse a count flag that must be at least 1.
+fn parse_positive(flag: &str, s: &str) -> Result<usize, String> {
+	s.parse::<usize>().ok().filter(|&n| n > 0).ok_or_else(|| format!("invalid {flag} `{s}` (expected a positive integer)"))
 }
 
 /// Parse `--ingest-growth`'s checkpoints: comma-separated row counts, each optionally suffixed
@@ -1655,6 +1693,19 @@ INGEST OPTIONS (with --ingest):
                              seal latency; gated on the store's row count, time span and
                              segment order and an exact read-back of both ends (--reps
                              does not apply)
+        --ingest-online <READERS>
+                             Online ingest + query instead: seal the corpus once alone,
+                             then again while READERS tasks query it without pause (half
+                             at the newest sealed row, half anywhere in what is sealed),
+                             then rerun those queries on the finished store; every query
+                             is compared exactly with the corpus. Latency is the queries
+                             during the ingest; the baselines go in `online` (--seed
+                             picks the windows; --reps does not apply)
+        --ingest-online-rows <N>
+                             Rows the online run seals, the corpus laid end to end
+                             (k/M/B suffixes) [default: the corpus once]
+        --ingest-online-window <ROWS>
+                             Rows per online query [default: 1440, one day of minutes]
 
 GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
         --gm-rounds <N>      Rounds; each calls every size once       [default: 20]
@@ -1746,6 +1797,19 @@ mod tests {
 
 	fn run_cli(args: &[&str]) -> Result<Command, String> {
 		Cli::from_args(args.iter().map(ToString::to_string))
+	}
+
+	#[test]
+	fn ingest_online_takes_readers_rows_and_a_window_and_stands_alone() {
+		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--ingest-online", "4", "--ingest-online-rows", "100M", "--ingest-online-window", "60"]);
+		assert_eq!((cli.ingest_online, cli.ingest_online_rows, cli.ingest_online_window), (4, Some(100_000_000), 60));
+		let plain = expect_run(&["--ingest", "--uci", "u.txt"]);
+		assert_eq!((plain.ingest_online, plain.ingest_online_rows, plain.ingest_online_window), (0, None, 1_440));
+		for bad in [&["--ingest-online", "0"][..], &["--ingest-online", "2", "--ingest-online-rows", "1M,2M"][..], &["--ingest-online", "2", "--ingest-online-window", "0"][..], &["--ingest-online-rows", "1M"][..], &["--ingest-online", "2", "--ingest-growth", "1M,2M"][..]] {
+			let args: Vec<&str> = ["--ingest", "--uci", "u.txt"].into_iter().chain(bad.iter().copied()).collect();
+			assert!(run_cli(&args).is_err(), "{bad:?}");
+		}
+		assert!(run_cli(&["--gap-fill", "--ingest-online", "2"]).unwrap_err().contains("needs `--ingest`"));
 	}
 
 	#[test]

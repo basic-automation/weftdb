@@ -1574,6 +1574,24 @@ What it does today:
   segments), batch p99 8.9 → 17.0 ms, 1.41 B/pt. Small batches cost more as segments pile up:
   a stopped 1B attempt at 1,024 rows was down to about 40k rows/s near 400k segments (counted
   from the store's files, not a gated result). Batch your writes, or compact.
+- **Online ingest + query** (`--ingest --ingest-online READERS`, #145) — seals the corpus (laid
+  end to end to `--ingest-online-rows`) once with nothing else running, then again while
+  READERS tasks query it without pause: half the queries end at the newest sealed row, half
+  start anywhere in what is sealed, each `--ingest-online-window` rows (default 1,440, a day of
+  minutes) and each compared exactly with the corpus. The same queries then rerun on the
+  finished store. A read the store refuses is counted and fails the gate (schema v25 `online`).
+  Measured 2026-11-01 over 100M rows in **65,536-row batches**: ingest holds 6.4M rows/s with
+  one reader and drops to 6.1M with four and 5.6M with eight; query p50 is 1.0–1.8 ms during
+  the ingest and **2.9–5.1 ms on the finished store**, every query exact. That the finished
+  store is the slower one is a finding: a 1,440-row read costs about **1.8 µs per segment the
+  store holds** (p50 0.53 ms at 157 segments, 1.43 ms at 781, 2.89 ms at 1,562), because the
+  time prune walks the index from the oldest segment. At **1,024-row batches** (10M rows) reads
+  during the ingest are **refused with `database is locked`**: one reader was refused 4,567 times
+  while 2,848 reads were answered, four readers 16,452 times against 10,314 (a refused read
+  returns at once and is asked again, so these count attempts, not a share of reads); the
+  segment index's connections set no busy timeout. Both are engine fixes, tracked
+  apart from the bench. (This workload runs on a multi-threaded runtime of its own, so its
+  ingest rates are not comparable with the growth curve's single-threaded ones.)
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a

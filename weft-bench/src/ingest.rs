@@ -35,10 +35,14 @@
 //! segment order) and on an exact read-back of the first and last [`GROWTH_VERIFY_ROWS`].
 
 use std::{
-	sync::atomic::{AtomicU64, Ordering}, time::Instant
+	sync::{
+		atomic::{AtomicBool, AtomicU64, Ordering}, Arc
+	}, time::Instant
 };
 
 use bigdecimal::{BigDecimal, ToPrimitive};
+use rand::{RngExt, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use weftdb::SegmentStore;
@@ -166,7 +170,7 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None })
 }
 
 /// What the store held at one checkpoint of an ingest growth curve (schema v24).
@@ -322,10 +326,338 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 			gpu_pool: None,
 			adapter_info: None,
 			growth: Some(growth),
+			online: None,
 		})?;
 	}
 	drop(store);
 	Ok(())
+}
+
+/// The baselines and query accounting of an online ingest run (schema v25).
+///
+/// The [`BenchResult`] carrying this reports the concurrent half: its latency samples are the
+/// queries answered while the corpus was being sealed, and its throughput is the seal rate with
+/// those queries running. These fields hold what that is compared against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OnlinePoint {
+	/// Reader tasks issuing queries while the writer sealed.
+	pub readers: usize,
+	/// Rows each query asks for (fewer near a copy boundary or the start of the store).
+	pub window_rows: usize,
+	/// Rows sealed, in the run with readers and in the run without.
+	pub rows: u64,
+	/// Seal throughput with no reader running, rows per second.
+	pub ingest_alone_rows_per_sec: f64,
+	/// Queries answered during the ingest whose window ended at the newest sealed row.
+	pub tail_queries: usize,
+	/// Queries answered on the finished store with no ingest running.
+	pub idle_queries: usize,
+	/// Median latency of those idle queries, in nanoseconds.
+	pub idle_p50_ns: u64,
+	/// 99th-percentile latency of those idle queries, in nanoseconds.
+	pub idle_p99_ns: u64,
+	/// Rows compared exactly against the corpus, across every query of both phases.
+	pub rows_verified: u64,
+	/// Queries whose rows differed from the corpus in any way (missing, extra, or changed).
+	pub mismatched_queries: usize,
+	/// Queries the store answered with an error instead of rows, across both phases.
+	#[serde(default)]
+	pub failed_queries: usize,
+	/// The first such error, verbatim.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub first_error: Option<String>,
+}
+
+/// Workload class label recorded for the online ingest + query workload.
+pub const WORKLOAD_INGEST_ONLINE: &str = "ingest_online";
+
+/// The knobs of [`run_ingest_online`].
+#[derive(Debug, Clone, Copy)]
+pub struct OnlineParams {
+	/// Rows to seal; the corpus is laid end to end as the growth curve lays it.
+	pub rows: u64,
+	/// Concurrent reader tasks (`>= 1`).
+	pub readers: usize,
+	/// Rows per query (`>= 1`).
+	pub window_rows: usize,
+	/// Seed for the query windows.
+	pub seed: u64,
+}
+
+/// What one reader saw.
+#[derive(Default)]
+struct ReaderTally {
+	samples_ns: Vec<u64>,
+	tail_queries: usize,
+	rows_verified: u64,
+	rows_read: u64,
+	mismatched_queries: usize,
+	failed_queries: usize,
+	first_error: Option<String>,
+	finite: bool,
+}
+
+/// Run the online ingest + query workload: queries against a store that is being written.
+///
+/// Three phases, each over the corpus laid end to end to `params.rows` rows:
+///
+/// 1. **ingest alone** — seal every row into a fresh store with nothing else running;
+/// 2. **online** — seal every row into a second fresh store while `params.readers` tasks query it
+///    without pause until the writer finishes. Each query picks a window of
+///    `params.window_rows` rows that are already sealed: every other one ends at the newest
+///    sealed row (a dashboard following live data), the rest start anywhere in what is sealed
+///    (history). A row counts as sealed only once its seal returned, so it must be visible;
+///    every query's rows are compared exactly against the corpus;
+/// 3. **idle** — on the finished second store, each reader runs as many queries as it ran
+///    during the ingest (at least 64), now with no writer.
+///
+/// The result's latency samples are the online queries, its throughput the online seal rate;
+/// [`OnlinePoint`] holds the ingest-alone and idle baselines. The runtime is a multi-threaded
+/// one of its own with a worker per reader plus the writer, so the readers and the writer
+/// really run at once even when the caller's runtime is single-threaded.
+///
+/// # Errors
+///
+/// Returns an error if the corpus has fewer than two rows, mismatched columns or timestamps
+/// that do not strictly rise, if `batch_rows`, `readers` or `window_rows` is zero, if
+/// `params.rows < 2` or a copy would leave the timestamp range, or if any store operation
+/// fails. A query that reads the wrong rows, or that the store refuses (a read can meet the
+/// writer's lock), is not an error: it is counted and fails the correctness gate.
+#[allow(clippy::cast_precision_loss)]
+pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: OnlineParams) -> anyhow::Result<BenchResult> {
+	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
+	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
+	anyhow::ensure!(profile.batch_rows > 0, "ingest batch_rows must be > 0");
+	anyhow::ensure!(params.readers > 0 && params.window_rows > 0, "online ingest needs at least one reader and one row per query");
+	anyhow::ensure!(params.rows >= 2, "online ingest needs at least two rows");
+	let stride = timestamps[1] - timestamps[0];
+	anyhow::ensure!(stride > 0 && timestamps.windows(2).all(|w| w[0] < w[1]), "an online ingest corpus must have strictly rising timestamps");
+	let period = timestamps[timestamps.len() - 1] - timestamps[0] + stride;
+	Tiled { timestamps, values, period }.timestamp(params.rows - 1)?;
+
+	// The reader tasks must be 'static, so they share owned copies of the corpus.
+	let corpus: Arc<(Vec<i64>, Vec<BigDecimal>)> = Arc::new((timestamps.to_vec(), values.to_vec()));
+	let profile = profile.clone();
+	let irregular = timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]);
+	let run_start = Instant::now();
+	// The phases run on a runtime of their own, on a thread of their own: a runtime cannot be
+	// entered from inside the caller's.
+	let (alone_ns, online_ns, online, idle, stats) = std::thread::scope(|scope| {
+		scope
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(params.readers + 1).enable_all().build()?;
+				runtime.block_on(online_phases(&profile, corpus, period, value_scale, params))
+			})
+			.join()
+			.map_err(|_| anyhow::anyhow!("the online ingest thread panicked"))?
+	})?;
+
+	let rows = params.rows;
+	let throughput = |ns: u64| if ns > 0 { rows as f64 / (ns as f64 / 1e9) } else { 0.0 };
+	let idle_latency = LatencyStats::from_samples(&idle.samples_ns);
+	let accounted = stats.0 == rows && stats.1;
+	let mismatched_queries = online.mismatched_queries + idle.mismatched_queries;
+	let failed_queries = online.failed_queries + idle.failed_queries;
+	let point = OnlinePoint {
+		readers: params.readers,
+		window_rows: params.window_rows,
+		rows,
+		ingest_alone_rows_per_sec: throughput(alone_ns),
+		tail_queries: online.tail_queries,
+		idle_queries: idle.samples_ns.len(),
+		idle_p50_ns: idle_latency.p50_ns,
+		idle_p99_ns: idle_latency.p99_ns,
+		rows_verified: online.rows_verified + idle.rows_verified,
+		mismatched_queries,
+		failed_queries,
+		first_error: online.first_error.or(idle.first_error),
+	};
+	let correctness = CorrectnessReport { output_count_ok: accounted && mismatched_queries == 0 && failed_queries == 0, expected_output_points: usize::try_from(point.rows_verified)?, actual_output_points: usize::try_from(online.rows_read + idle.rows_read)?, values_finite: online.finite && idle.finite };
+	let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns: online_ns, end_to_end_ns: span_ns(run_start).saturating_add(generation_ns) };
+	Ok(BenchResult {
+		schema_version: SCHEMA_VERSION,
+		profile: profile.name,
+		adapter: "weftdb".to_string(),
+		workload: WORKLOAD_INGEST_ONLINE.to_string(),
+		reps: online.samples_ns.len(),
+		dataset: DatasetMeta { input_points: usize::try_from(rows)?, output_points: usize::try_from(stats.0)?, irregular, missingness_fraction, seed: params.seed, signal_shape: None },
+		latency: LatencyStats::from_samples(&online.samples_ns),
+		latency_ci: None,
+		throughput_points_per_sec: throughput(online_ns),
+		timing,
+		correctness,
+		accuracy: None,
+		storage: None,
+		cold_warm: crate::schema::ColdWarm::from_samples(&online.samples_ns),
+		gpu_pool: None,
+		adapter_info: None,
+		growth: None,
+		online: Some(point),
+	})
+}
+
+/// A fresh store with the aspect declared, in a directory removed when the guard drops.
+async fn fresh_store(label: &str, aspect: &str, value_scale: u8) -> anyhow::Result<(SegmentStore, TempStoreDir)> {
+	let root = std::env::temp_dir().join(format!("weft-bench-{label}-{}-{}", std::process::id(), NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed)));
+	std::fs::create_dir_all(&root).map_err(|e| anyhow::anyhow!("cannot create ingest store dir {}: {e}", root.display()))?;
+	let guard = TempStoreDir(root.clone());
+	let store = SegmentStore::open(&root).await.map_err(|e| anyhow::anyhow!("cannot open ingest store in {}: {e:#}", root.display()))?;
+	let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: value_scale }, BigDecimal::from(0), TimeUnit::Seconds);
+	store.declare(aspect, &schema).await.map_err(|e| anyhow::anyhow!("cannot declare aspect {aspect}: {e:#}"))?;
+	Ok((store, guard))
+}
+
+/// Seal rows `0..rows` of the tiled corpus, publishing each batch's end to `sealed` once its
+/// seal has returned; returns the summed seal time.
+async fn seal_tiled(store: &SegmentStore, aspect: &str, tiled: &Tiled<'_>, rows: u64, batch: u64, sealed: &AtomicU64) -> anyhow::Result<u64> {
+	let n = tiled.timestamps.len() as u64;
+	let mut at = 0;
+	let mut seal_ns = 0_u64;
+	while at < rows {
+		let end = (at + batch).min(rows).min((at / n + 1) * n);
+		let (chunk_ts, chunk_values) = tiled.window(at, end)?;
+		let t0 = Instant::now();
+		store.seal_declared(aspect, &chunk_ts, chunk_values).await.map_err(|e| anyhow::anyhow!("cannot seal {} rows into aspect {aspect}: {e:#}", chunk_ts.len()))?;
+		seal_ns = seal_ns.saturating_add(span_ns(t0));
+		sealed.store(end, Ordering::Release);
+		at = end;
+	}
+	Ok(seal_ns)
+}
+
+/// One query: rows `from..to`, which lie within one copy, read back and compared exactly. A
+/// read the store refuses is counted in the tally, not returned as an error.
+async fn query(store: &SegmentStore, aspect: &str, tiled: &Tiled<'_>, from: u64, to: u64, tally: &mut ReaderTally) -> anyhow::Result<()> {
+	let (start, end) = (tiled.timestamp(from)?, tiled.timestamp(to - 1)?);
+	let t0 = Instant::now();
+	let (read_ts, read_values) = match store.read_time_range(aspect, start, end).await {
+		Ok(rows) => rows,
+		Err(e) => {
+			// A refused read is a result, not the end of the run: count it and fail the gate.
+			tally.failed_queries += 1;
+			tally.first_error.get_or_insert_with(|| format!("{e:#}"));
+			return Ok(());
+		}
+	};
+	tally.samples_ns.push(span_ns(t0));
+	let (expected_ts, expected_values) = tiled.window(from, to)?;
+	if read_ts != expected_ts || !read_values.iter().map(Option::as_ref).eq(expected_values.iter().map(Some)) {
+		tally.mismatched_queries += 1;
+	}
+	tally.finite &= read_values.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite));
+	tally.rows_verified += to - from;
+	tally.rows_read += read_ts.len() as u64;
+	Ok(())
+}
+
+/// A window of `window` rows inside `0..sealed` that does not cross a copy boundary: ending at
+/// `sealed` when `tail`, otherwise starting anywhere.
+fn pick_window(rng: &mut ChaCha8Rng, sealed: u64, n: u64, window: u64, tail: bool) -> (u64, u64) {
+	if tail {
+		let to = sealed;
+		let copy_start = (to - 1) / n * n;
+		(to.saturating_sub(window).max(copy_start), to)
+	} else {
+		let from = rng.random_range(0..sealed);
+		(from, (from + window).min(sealed).min((from / n + 1) * n))
+	}
+}
+
+/// Run one reader: query `sealed` until `done`, or `fixed` queries over a finished store.
+async fn reader(shared: Arc<OnlineShared>, index: usize, fixed: Option<usize>) -> anyhow::Result<ReaderTally> {
+	let (timestamps, values) = &*shared.corpus;
+	let tiled = Tiled { timestamps, values, period: shared.period };
+	let n = timestamps.len() as u64;
+	let mut rng = ChaCha8Rng::seed_from_u64(shared.seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(fixed.is_some()));
+	let mut tally = ReaderTally { finite: true, ..ReaderTally::default() };
+	let mut asked = 0_usize;
+	loop {
+		match fixed {
+			Some(count) if asked == count => break,
+			None if shared.done.load(Ordering::Acquire) => break,
+			_ => {}
+		}
+		let sealed = shared.sealed.load(Ordering::Acquire);
+		if sealed == 0 {
+			tokio::task::yield_now().await;
+			continue;
+		}
+		let tail = asked.is_multiple_of(2);
+		let (from, to) = pick_window(&mut rng, sealed, n, shared.window, tail);
+		query(&shared.store, &shared.aspect, &tiled, from, to, &mut tally).await?;
+		tally.tail_queries += usize::from(tail);
+		asked += 1;
+	}
+	Ok(tally)
+}
+
+/// What the reader tasks share with the writer.
+struct OnlineShared {
+	store: SegmentStore,
+	aspect: String,
+	corpus: Arc<(Vec<i64>, Vec<BigDecimal>)>,
+	period: i64,
+	window: u64,
+	seed: u64,
+	sealed: AtomicU64,
+	done: AtomicBool,
+}
+
+/// Merge reader tallies into one.
+fn merge(tallies: Vec<ReaderTally>) -> ReaderTally {
+	tallies.into_iter().fold(ReaderTally { finite: true, ..ReaderTally::default() }, |mut all, t| {
+		all.samples_ns.extend(t.samples_ns);
+		all.tail_queries += t.tail_queries;
+		all.rows_verified += t.rows_verified;
+		all.rows_read += t.rows_read;
+		all.mismatched_queries += t.mismatched_queries;
+		all.failed_queries += t.failed_queries;
+		all.first_error = all.first_error.take().or(t.first_error);
+		all.finite &= t.finite;
+		all
+	})
+}
+
+/// The three phases of [`run_ingest_online`]: returns the ingest-alone and online seal times,
+/// the online and idle tallies, and whether the online store holds exactly what was sealed.
+async fn online_phases(profile: &IngestProfile, corpus: Arc<(Vec<i64>, Vec<BigDecimal>)>, period: i64, value_scale: u8, params: OnlineParams) -> anyhow::Result<(u64, u64, ReaderTally, ReaderTally, (u64, bool))> {
+	let batch = profile.batch_rows as u64;
+	let alone_ns = {
+		let (store, _dir) = fresh_store("online-alone", &profile.aspect, value_scale).await?;
+		let tiled = Tiled { timestamps: &corpus.0, values: &corpus.1, period };
+		seal_tiled(&store, &profile.aspect, &tiled, params.rows, batch, &AtomicU64::new(0)).await?
+	};
+
+	let (store, _dir) = fresh_store("online", &profile.aspect, value_scale).await?;
+	let shared = Arc::new(OnlineShared { store, aspect: profile.aspect.clone(), corpus, period, window: params.window_rows as u64, seed: params.seed, sealed: AtomicU64::new(0), done: AtomicBool::new(false) });
+	let readers: Vec<_> = (0..params.readers).map(|i| tokio::spawn(reader(Arc::clone(&shared), i, None))).collect();
+	let writer = {
+		let shared = Arc::clone(&shared);
+		tokio::spawn(async move {
+			let tiled = Tiled { timestamps: &shared.corpus.0, values: &shared.corpus.1, period: shared.period };
+			let sealed = seal_tiled(&shared.store, &shared.aspect, &tiled, params.rows, batch, &shared.sealed).await;
+			shared.done.store(true, Ordering::Release);
+			sealed
+		})
+	};
+	let online_ns = writer.await.map_err(|e| anyhow::anyhow!("the online writer failed: {e}"))??;
+	let mut tallies = Vec::with_capacity(readers.len());
+	for handle in readers {
+		tallies.push(handle.await.map_err(|e| anyhow::anyhow!("an online reader failed: {e}"))??);
+	}
+	// A refused read returns at once, so a reader the store keeps refusing asks again and again; sizing the idle
+	// rerun from the answered queries keeps it comparable, where counting the refusals made it run for hours.
+	let idle_handles: Vec<_> = tallies.iter().enumerate().map(|(i, t)| tokio::spawn(reader(Arc::clone(&shared), i, Some(t.samples_ns.len().max(64))))).collect();
+	let online = merge(tallies);
+	let mut idle = Vec::with_capacity(idle_handles.len());
+	for handle in idle_handles {
+		idle.push(handle.await.map_err(|e| anyhow::anyhow!("an idle reader failed: {e}"))??);
+	}
+
+	let stats = shared.store.aspect_stats(&profile.aspect).await.map_err(|e| anyhow::anyhow!("cannot read the stats of aspect {}: {e:#}", profile.aspect))?;
+	let tiled = Tiled { timestamps: &shared.corpus.0, values: &shared.corpus.1, period };
+	let ordered = stats.time_range == Some((tiled.timestamp(0)?, tiled.timestamp(params.rows - 1)?)) && stats.unsorted_segments == 0 && stats.overlapping_segments == 0;
+	Ok((alone_ns, online_ns, online, merge(idle), (stats.total_rows, ordered)))
 }
 
 /// `1000000` as `1M`, `1000000000` as `1B`; anything not a round thousand stays a number.
@@ -408,6 +740,43 @@ mod tests {
 		assert_eq!(results[0].reps, 3, "rows 0..3, 3..4 and 4..6: a batch never spans two copies");
 		assert!(second.segments >= results[0].growth.as_ref().expect("growth").segments);
 		assert!(second.bytes_per_point > 0.0);
+	}
+
+	#[tokio::test]
+	async fn online_queries_run_against_a_store_being_written_and_all_read_back_exactly() {
+		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
+		let profile = IngestProfile::new("online", "global_active_power", 1);
+		let params = OnlineParams { rows: 40, readers: 2, window_rows: 3, seed: 7 };
+		let result = run_ingest_online(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, params).await.expect("online runs");
+		assert!(result.correctness.passed(), "{:?}", result.correctness);
+		assert_eq!(result.workload, "ingest_online");
+		assert_eq!(result.dataset.output_points, 40);
+		let online = result.online.as_ref().expect("online");
+		assert_eq!(online.mismatched_queries, 0);
+		assert!(online.idle_queries >= 2 * 64, "each reader repeats at least 64 queries idle");
+		assert!(online.ingest_alone_rows_per_sec > 0.0 && result.throughput_points_per_sec > 0.0);
+		assert_eq!(online.rows_verified, result.correctness.expected_output_points as u64);
+	}
+
+	#[test]
+	fn query_windows_stay_inside_what_is_sealed_and_inside_one_copy() {
+		let mut rng = ChaCha8Rng::seed_from_u64(1);
+		assert_eq!(pick_window(&mut rng, 10, 4, 3, true), (8, 10), "the tail window ends at the newest row but not before its copy");
+		assert_eq!(pick_window(&mut rng, 9, 4, 3, true), (8, 9));
+		assert_eq!(pick_window(&mut rng, 2, 4, 3, true), (0, 2));
+		for _ in 0..1_000 {
+			let (from, to) = pick_window(&mut rng, 10, 4, 3, false);
+			assert!(from < to && to <= 10 && to - from <= 3 && from / 4 == (to - 1) / 4, "{from}..{to}");
+		}
+	}
+
+	#[tokio::test]
+	async fn online_ingest_refuses_empty_knobs() {
+		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
+		let profile = IngestProfile::new("online", "global_active_power", 2);
+		for params in [OnlineParams { rows: 8, readers: 0, window_rows: 2, seed: 0 }, OnlineParams { rows: 8, readers: 1, window_rows: 0, seed: 0 }, OnlineParams { rows: 1, readers: 1, window_rows: 2, seed: 0 }] {
+			assert!(run_ingest_online(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, params).await.is_err(), "{params:?}");
+		}
 	}
 
 	#[test]
