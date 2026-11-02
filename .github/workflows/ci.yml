@@ -363,10 +363,13 @@ jobs:
         run: scripts/release/test-stage.sh
       - name: bench stage-artifacts.sh tests
         run: bash scripts/bench/test-stage-artifacts.sh
-      - name: bench ndbc_to_csv.py tests
+      - name: bench script tests (ndbc_to_csv.py, check-separation.py)
         run: python3 -m unittest discover -s scripts/bench -p 'test_*.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+      # Anti-Goodhart (#150): no engine crate depends on a benchmark crate or reads a BENCH variable.
+      - name: bench/engine separation
+        run: python3 scripts/bench/check-separation.py
       # The glibc floor the release promises is asserted by scripts/check-glibc.sh, which
       # runs only in the release workflow — no CI job otherwise touches it. Its tests stub
       # objdump and readelf so the floor logic is checked here instead, including that the
