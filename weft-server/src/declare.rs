@@ -82,6 +82,7 @@ fn parse_time_unit(token: &str) -> Result<TimeUnit, String> {
 /// (exact) when omitted. A declaration is immutable once made (FRE-7b): see
 /// [`declare_aspect`].
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeclareAspectRequest {
 	/// The aspect name to declare (unique within the store's `(database, subject)`
 	/// scope). It also names the aspect's files on disk, so

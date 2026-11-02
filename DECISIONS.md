@@ -3359,3 +3359,38 @@ kill soak cannot see a missing fsync, so the privileged power-loss validation
 §9 durability tick waits for it. No nightly compare gate: a cell either holds
 or it does not; the first successful workflow run is the hand-compared
 baseline.
+
+## 2026-11-02 — FRE-6b "strict request parsing": the shape of the refusal — FLAGGED FOR MERGE REVIEW
+
+**Grounded:** FRE-6b's title names no mechanism. The plan assigns the slice to two
+lanes (L-INGEST and L-COMPUTE, §2), lists it among the §9 contract slices required
+for the semver promise, and its sibling half FRE-6a landed as the X-ERR error
+envelope: `StrictJson`/`StrictQuery` already refuse a body or query the server
+cannot *read*. What they still accepted was a request it could read but that named
+something the endpoint does not have — every request type deserialized with serde's
+default leniency, so an unknown JSON field or query parameter was silently ignored
+and the caller got a successful answer to a different request than the one it sent
+(the request-side twin of the silent narrowing FRE-5 removed from responses). The
+codebase already holds the strict shape for a file it parses: SEC-6's keys file
+refuses unknown fields (`auth.rs`, `#[serde(deny_unknown_fields)]`, with the
+rationale spelled out there — a typo'd field silently ignored mints a key with
+defaults the operator never chose).
+
+**Chosen:** `#[serde(deny_unknown_fields)]` on every request type `weft-server`
+extracts — 26 types across `backup_routes`, `declare`, `downsample`, `ingest`,
+`interpolate` (including the `SplineSpec` enum, so the `polynomial` variant's
+fields are strict too), `maintain` and `storage` — covering JSON bodies and query
+parameters, top-level and nested. The refusal is the extractor's existing one, no
+new vocabulary: `400 invalid_json` for a body, `400 bad_request` for a query, each
+naming the unknown field. `weft-server/tests/strict_parsing.rs` pins it twice:
+over HTTP on representative routes from each surface, and per type, enumerating
+every request type so a future endpoint cannot reintroduce a lenient one without
+extending the list.
+
+**Callers:** the slice's "caller updates" half came out empty on evidence, not by
+omission — no in-repo caller (weft-server's own suites, weft-bench's soak client,
+the packaging/compat scripts) sends a field or parameter any endpoint does not
+have; the full workspace bar passing unchanged is the check. The one deliberate
+compatibility note: the B-rest aliases (`take`/`page`, `interpolation=`) are real
+fields of their types, so alias-speaking clients are unaffected; only names no
+endpoint has ever had are refused.
