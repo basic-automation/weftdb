@@ -1585,9 +1585,11 @@ What it does today:
   the ingest and **2.9–5.1 ms on the finished store**, every query exact. That the finished
   store is the slower one is a finding: a 1,440-row read costs about **1.8 µs per segment the
   store holds** (p50 0.53 ms at 157 segments, 1.43 ms at 781, 2.89 ms at 1,562), because the
-  time prune walks the index from the oldest segment. At **1,024-row batches** (10M rows) most
-  reads during the ingest are **refused with `database is locked`** (4,264 of 7,239 with one
-  reader): the segment index's connections set no busy timeout. Both are engine fixes, tracked
+  time prune walks the index from the oldest segment. At **1,024-row batches** (10M rows) reads
+  during the ingest are **refused with `database is locked`**: one reader was refused 4,567 times
+  while 2,848 reads were answered, four readers 16,452 times against 10,314 (a refused read
+  returns at once and is asked again, so these count attempts, not a share of reads); the
+  segment index's connections set no busy timeout. Both are engine fixes, tracked
   apart from the bench. (This workload runs on a multi-threaded runtime of its own, so its
   ingest rates are not comparable with the growth curve's single-threaded ones.)
 - **Vendor-neutral adapters** — every system is driven through the
