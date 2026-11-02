@@ -4,21 +4,29 @@
 //! after that is this list. Each phase is one module, so a later wave edits a
 //! startup behaviour by editing that module rather than by growing a single file.
 //!
-//! The order matters:
+//! The order matters, and since SEC-8 it is enforced, not just
+//! documented: [`PHASES`] names every phase in order, and a test in this
+//! module fails if `run`'s calls drift out of that order. The phases:
 //!
+//! 0. **strict-config** — PAC-5b's environment check, before any phase
+//!    reads a setting (see the last paragraph below).
 //! 1. [`hooks`] — the tracing subscriber and the OTLP exporter when configured, then the
 //!    panic hook that ends the process when a control-plane write panics.
 //!    Installed first so every later phase is observable.
-//! 2. [`config`] — what the operator asked for: bind address, interpolation cap,
-//!    and (once the address is known) the request guard.
-//! 3. [`state`] — the router state, which means opening the segment store when
+//! 2. **signals** — the shutdown signal handlers (C9's "handlers first").
+//! 3. [`config`] — what the operator asked for: bind address, interpolation cap,
+//!    the transport and the exposure matrix's verdict on it, the keys
+//!    file, and (once the address is known) the request guard. The
+//!    exposure and auth resolutions run here, before the store opens:
+//!    a refused exposure starts nothing at all.
+//! 4. [`state`] — the router state, which means opening the segment store when
 //!    one is configured.
-//! 4. [`daemons`] — the background reconcile/backup/GPU-calibration tasks,
+//! 5. [`daemons`] — the background reconcile/backup/GPU-calibration tasks,
 //!    registered in the Daemons registry (ROB-3), which supervises them and
 //!    stops them on its shared shutdown watch when serving ends.
-//! 5. [`serve`] — bind, print the banner, serve until shutdown.
+//! 6. [`serve`] — bind, print the banner, serve until shutdown.
 //!
-//! The shutdown signal handlers are installed before phase 2 (right after
+//! The shutdown signal handlers are installed before the config phase (right after
 //! [`hooks`], whose tracing they report through): plan C9's "handlers first".
 //! A signal that arrives at any point after that — including while the store
 //! is still opening, before serving starts — is recorded, and the serve phase
@@ -36,27 +44,36 @@
 //! the guard is a loopback stop-gap, and authentication (below) is what a
 //! non-loopback deployment relies on.
 //!
-//! ## Transport (SEC-5)
+//! ## Transport (SEC-5) and the exposure matrix (SEC-8)
 //!
 //! With `WEFT_TLS_CERT_FILE` and `WEFT_TLS_KEY_FILE` set, the listener speaks
 //! TLS (rustls, ring provider) on the same serve path; the banner says
-//! `https`. Without them the listener is plaintext, and a non-loopback bind
-//! must pass the C8 gate before anything is served: a mounted keys file
-//! (`WEFT_KEYS_FILE`) plus `WEFT_ALLOW_PLAINTEXT=1`, or `WEFT_AUTH=disabled`
-//! behind a gateway — otherwise startup refuses. Loopback plaintext is
-//! ungated. See [`weft_server::tls`].
+//! `https`. Without them the listener is plaintext. Either way, a
+//! non-loopback bind must pass the exposure matrix (C8, decision 7)
+//! before anything is served: a mounted keys file (`WEFT_KEYS_FILE`) —
+//! plus `WEFT_ALLOW_PLAINTEXT=1` when the transport is plaintext — or
+//! `WEFT_AUTH=disabled` behind a gateway. Non-loopback with no keys and
+//! no gateway statement refuses to start, TLS included; loopback is
+//! ungated at startup. See [`weft_server::tls`].
 //!
-//! ## Authentication (SEC-6)
+//! ## Authentication (SEC-6) and the auth-off guard (SEC-8)
 //!
 //! With `WEFT_KEYS_FILE` naming a keys file (or `WEFT_AUTH=keys`, which
 //! requires one), every request is authenticated with
 //! `Authorization: Bearer <key>` against the file's key hashes, and the
 //! key's role is checked against the scope the sealed registry assigns
-//! the route ([`weft_server::auth`]). The probes stay open to the
+//! the route ([`weft_server::auth`]) — `/metrics` included, under the
+//! registry's `metrics` scope (decision 17). The probes stay open to the
 //! anonymous principal; everything else needs a key. `WEFT_AUTH=disabled`
-//! turns authentication explicitly off, and with no keys file mounted
-//! the server runs unauthenticated, as it did before SEC-6.
-//! `weft-server keygen` mints a key and records its hash in the file.
+//! turns authentication explicitly off for the gateway deployment, where
+//! proxied requests are expected. With no keys file mounted the server
+//! runs unauthenticated, as it did before SEC-6 — but a request that
+//! arrives through a proxy is refused (`403 proxied_request_requires_auth`),
+//! because a proxy in the path breaks the loopback assumption the
+//! keyless mode rests on. `weft-server keygen` mints a key and records
+//! its hash in the file. The packaging track's `WEFT_ALLOW_INSECURE_BIND`
+//! is dropped: it is not a registered variable, so strict configuration
+//! refuses it as unknown; `WEFT_AUTH=disabled` is the spelling.
 //!
 //! ## Optional segment store
 //!
@@ -103,6 +120,12 @@ pub(crate) mod hooks;
 pub(crate) mod serve;
 pub(crate) mod state;
 
+/// The startup phases in the order [`run`] executes them (SEC-8). The
+/// module docs above describe each one; the test below pins this list
+/// against `run`'s actual call order, so reordering a phase means
+/// editing this list and the docs in the same change — never silently.
+pub(crate) const PHASES: [&str; 7] = ["strict-config", "hooks", "signals", "config", "state", "daemons", "serve"];
+
 /// Run every startup phase, in order, until the server stops serving.
 ///
 /// # Errors
@@ -135,6 +158,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 		eprintln!("weft-server: refusing to start: {} configuration problem(s) above (exit {})", strict_errors.len(), weft_server::settings::CONFIG_EXIT_CODE);
 		std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
 	}
+
+	println!("startup phases, in order: {}", PHASES.join(" -> "));
 
 	// The OTLP provider (when configured) is held for the process lifetime: dropping it
 	// early would tear down the batch span processor and stop export. It is shut down on
@@ -209,4 +234,35 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 		store.shutdown().await?;
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::PHASES;
+
+	/// SEC-8: the phase list is enforced. `run`'s body must call each
+	/// phase's entry point in exactly [`PHASES`] order — the strict
+	/// check before tracing, tracing before the signal handlers, the
+	/// handlers before config, config (with the exposure matrix and the
+	/// keys file) before the store opens, daemons before the bind, and
+	/// serving last. The markers are the calls themselves, read from
+	/// this file's own source after `run`'s signature, so a reorder
+	/// that does not also update [`PHASES`] and the module docs fails
+	/// here instead of shipping as a comment that lied.
+	#[test]
+	fn the_phase_list_matches_runs_call_order() {
+		assert_eq!(PHASES, ["strict-config", "hooks", "signals", "config", "state", "daemons", "serve"], "the frozen phase order; changing it is a design change, not a refactor");
+		let source = include_str!("mod.rs");
+		let run_body = source.split("pub(crate) async fn run()").nth(1).expect("run exists in this file");
+		let markers = ["settings::strict_errors_from_env", "hooks::init_tracing", "ShutdownSignals::install", "config::bind_addr", "state::build", "daemons::spawn_reconcile_if_configured", "serve::run("];
+		assert_eq!(markers.len(), PHASES.len(), "one marker per phase");
+		let mut previous: Option<usize> = None;
+		for (phase, marker) in PHASES.iter().zip(markers) {
+			let position = run_body.find(marker).unwrap_or_else(|| panic!("phase {phase}: marker {marker:?} not found in run's body"));
+			if let Some(previous) = previous {
+				assert!(position > previous, "phase {phase} (marker {marker:?}) runs out of order in run's body");
+			}
+			previous = Some(position);
+		}
+	}
 }

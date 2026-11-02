@@ -18,6 +18,16 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **Startup ordering, exposure matrix, auth-off guard, metrics auth** (security track SEC-8):
+  the startup phase list is now named (`startup::PHASES`) and pinned by a test against the
+  binary's actual call order. The exposure matrix (plan C8, decision 7) is complete: a
+  non-loopback bind with no keys file mounted now refuses to start over TLS as well as
+  plaintext (encryption is not authentication), `WEFT_ALLOW_INSECURE_BIND` is dropped for
+  `WEFT_AUTH=disabled` (the name is unregistered, so strict configuration refuses it), and
+  while authentication is off implicitly a proxied request (`Forwarded` / `X-Forwarded-*`)
+  is refused `403 proxied_request_requires_auth` — the gateway deployment
+  (`WEFT_AUTH=disabled`) and key-authenticated requests are unaffected. `/metrics` is
+  pinned by test to the registry's `metrics` scope when auth is on (decision 17).
 - **Admission I** (robustness track ROB-10): the route registry's gate now enforces every
   route's `admission_class`, not only the ingest byte budget D-S14 charged. Probes are never
   shed; query-class requests (reads and stateless compute) are capped in flight by the new
