@@ -9,6 +9,12 @@
 //! The panic hook is installed **after** the subscriber because it reports through it:
 //! [`std::panic::set_hook`] replaces the installed hook and hands the replaced one back, so
 //! the order decides who prints the panic. See [`init_panic_hook`].
+//!
+//! The endpoint is never printed as configured: it is a URL and can carry userinfo
+//! (`https://user:password@collector:4317`), so every line that names it goes through
+//! [`weft_server::redact::redact_url_userinfo`] first (SEC-10, absorbing SOA-14's OTLP
+//! userinfo redaction). The exporter itself receives the endpoint exactly as configured —
+//! redaction is display-only, because the collector's basic auth rides on the userinfo.
 
 use weft_server::SERVICE;
 
@@ -48,7 +54,8 @@ pub(crate) fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvid
 
 	let _ = tracing_subscriber::registry().with(filter).with(fmt_layer).with(otel_layer).try_init();
 	if provider.is_some() {
-		println!("otlp trace export: enabled (exporting spans to {})", std::env::var(OTEL_ENDPOINT_ENV).unwrap_or_default());
+		let endpoint = std::env::var(OTEL_ENDPOINT_ENV).unwrap_or_default();
+		println!("otlp trace export: enabled (exporting spans to {})", weft_server::redact::redact_url_userinfo(&endpoint));
 	}
 	provider
 }
@@ -77,7 +84,7 @@ fn build_otlp_provider() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> 
 	let exporter = match opentelemetry_otlp::SpanExporter::builder().with_tonic().with_endpoint(&endpoint).build() {
 		Ok(exporter) => exporter,
 		Err(err) => {
-			eprintln!("otlp trace export: disabled — could not build the OTLP exporter for {endpoint:?}: {err}");
+			eprintln!("otlp trace export: disabled — could not build the OTLP exporter for {:?}: {err}", weft_server::redact::redact_url_userinfo(&endpoint));
 			return None;
 		}
 	};
