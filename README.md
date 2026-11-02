@@ -1639,8 +1639,13 @@ What it does today:
   `sawtooth` the portable linear baseline out-accuracies the cubic, which
   overshoots sharp discontinuities.
 - **Fair-protocol statistics** — p50/p95/p99 + min/max/mean/stddev with
-  **seeded bootstrap confidence intervals**, and an end-to-end timing breakdown
-  proving the latency distribution times only the adapter call, never setup.
+  **seeded bootstrap confidence intervals** (mean, stddev, p50, p95, p99; the maximum has none,
+  since a resample's maximum can only fall), and an end-to-end timing breakdown
+  proving the latency distribution times only the adapter call, never setup. Every result keeps
+  its **raw samples** (`samples_ns`, schema v28; `weft-xbench` reports v5 do the same), so the
+  summary can be recomputed and runs pooled. `weft-bench verify` refuses a short test — p50 under
+  a minute — resting on fewer than **10 timed samples** (`--accept-advisories` lets it through,
+  as it does a dirty tree); `weft-xbench` now defaults to `--reps 10`.
 - **Storage estimate** — each result carries a `StorageEstimate` (recommended
   encoding + value/timestamp/total **bytes/point**) computed by
   `weft-physical-type` over the actual columns. It also surfaces **advisory

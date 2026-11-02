@@ -56,7 +56,9 @@ use weft_bench::{
 ///
 /// v4 (#146) adds each result's `warmth` (warm, OS-cold or restarted) and the report's
 /// `cold_hook`; a v3 report deserializes with every result warm.
-pub const XBENCH_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 (#147) keeps each result's raw `samples_ns`; an older report deserializes with none.
+pub const XBENCH_SCHEMA_VERSION: u32 = 5;
 
 /// The reductions the downsample phase computes per bucket.
 pub const DOWNSAMPLE_AGGREGATIONS: [weft_reduce::Aggregation; 3] = [weft_reduce::Aggregation::Min, weft_reduce::Aggregation::Max, weft_reduce::Aggregation::Avg];
@@ -330,6 +332,10 @@ pub struct ArmResult {
 	/// What was warm when the reps ran (`warm` in a v3 report, which timed only warm reps).
 	#[serde(default)]
 	pub warmth: Warmth,
+	/// Every timed rep behind [`Self::latency`], in nanoseconds and in the order taken (v5);
+	/// empty in older reports.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub samples_ns: Vec<u64>,
 }
 
 /// What was warm when a result's reps ran.
@@ -575,7 +581,7 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Refere
 	let info = arm.info();
 	let row = |phase, warmth, output_points, reps, samples: &[u64], correctness, accuracy, storage_bytes| {
 		let (latency, latency_ci) = latency(samples, seed);
-		ArmResult { dataset: ds.name.clone(), kind: ds.kind, scale: ds.scale.as_str().to_string(), input_points: ds.points.len(), output_points, missingness_fraction: ds.missingness_fraction, arm: info.clone(), phase, reps, latency, latency_ci, correctness, accuracy, storage_bytes, warmth }
+		ArmResult { dataset: ds.name.clone(), kind: ds.kind, scale: ds.scale.as_str().to_string(), input_points: ds.points.len(), output_points, missingness_fraction: ds.missingness_fraction, arm: info.clone(), phase, reps, latency, latency_ci, correctness, accuracy, storage_bytes, warmth, samples_ns: samples.to_vec() }
 	};
 	// An arm with nothing loaded keeps nothing to go cold.
 	let warmths: &[Warmth] = match cold {

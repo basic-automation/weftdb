@@ -49,7 +49,7 @@ struct Cli {
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, tsbs: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, cold_hook: None, cold_reps: 3, out: PathBuf::from("reports/xbench") };
+	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 10, load_reps: 3, seed: DEFAULT_SEED, uci: None, tsbs: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, cold_hook: None, cold_reps: 3, out: PathBuf::from("reports/xbench") };
 	let mut args = args;
 	while let Some(flag) = args.next() {
 		let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));

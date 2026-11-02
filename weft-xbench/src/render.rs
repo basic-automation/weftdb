@@ -445,7 +445,7 @@ mod tests {
 	fn result(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
 		let (latency, latency_ci) = latency(samples, 1);
 		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed });
-		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm }
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec() }
 	}
 
 	fn report(results: Vec<ArmResult>) -> XbenchReport {

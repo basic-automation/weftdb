@@ -31,6 +31,12 @@ only the control plane, not the segment frames.
   index write before it commits), where the planner had walked every segment of the aspect; and
   its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
   Write transactions still see `Busy` at once, as their retry protocol requires.
+- **Fair protocol, raw samples and sample counts** (#147): every `weft-bench` result keeps the
+  timed samples behind its latency (`samples_ns`, report schema v28), and so does every
+  `weft-xbench` result (report v5). `weft-bench verify` now flags a short result (p50 under a
+  minute) resting on fewer than 10 samples, an advisory like a dirty tree. The bootstrap gains a
+  stddev interval, read off the resamples already drawn, so the existing intervals are unchanged.
+  `weft-xbench --reps` defaults to 10 (was 5).
 - **Analytics pipeline** (#145): `weft-bench --ingest --analytics-pipeline ROWS` captures the
   first rows of the UCI corpus into a legacy minute-resolution aspect and times the orchestration
   pipeline stage by stage (prepare, patterns, events, correlate, signals), then an incremental

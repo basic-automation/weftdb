@@ -204,7 +204,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info, growth: None, online: None, compressed_query: None, analytics: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone() })
 }
 
 /// Measure reconstruction *accuracy*: run `adapter` once over `profile` and score
@@ -246,6 +246,8 @@ mod tests {
 		assert_eq!(result.workload, "upsample_interpolate");
 		assert_eq!(result.reps, 3);
 		assert_eq!(result.latency.count, 3);
+		// The raw samples behind the summary are kept, and the summary is recomputable from them.
+		assert_eq!(LatencyStats::from_samples(&result.samples_ns), result.latency);
 
 		// The WeftDB path must produce a non-empty, finite, correctly-sized grid.
 		assert!(result.dataset.output_points > 0, "interpolation produced no points");

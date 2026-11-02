@@ -480,7 +480,7 @@ mod tests {
 	/// A one-percent band around each centre, so tests can say exactly whether two runs'
 	/// intervals overlap.
 	fn ci(p50: u64, p95: u64, p99: u64) -> LatencyCis {
-		LatencyCis { resamples: 1000, confidence: 0.99, seed: 0xB007_5EED, mean: interval(p50), p50: interval(p50), p95: interval(p95), p99: interval(p99) }
+		LatencyCis { resamples: 1000, confidence: 0.99, seed: 0xB007_5EED, mean: interval(p50), stddev: None, p50: interval(p50), p95: interval(p95), p99: interval(p99) }
 	}
 
 	fn interval(centre: u64) -> ConfidenceInterval {
@@ -491,11 +491,11 @@ mod tests {
 	/// swallow a move that looks real.
 	fn wide_ci(centres: [u64; 3], percent: u64) -> LatencyCis {
 		let band = |centre: u64| ConfidenceInterval { point_ns: centre, lower_ns: centre - centre * percent / 100, upper_ns: centre + centre * percent / 100 };
-		LatencyCis { resamples: 1000, confidence: 0.99, seed: 0xB007_5EED, mean: band(centres[0]), p50: band(centres[0]), p95: band(centres[1]), p99: band(centres[2]) }
+		LatencyCis { resamples: 1000, confidence: 0.99, seed: 0xB007_5EED, mean: band(centres[0]), stddev: None, p50: band(centres[0]), p95: band(centres[1]), p99: band(centres[2]) }
 	}
 
 	fn result(workload: &str, p50: u64, p95: u64, p99: u64, throughput: f64, intervals: Option<LatencyCis>) -> BenchResult {
-		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "standard".into(), adapter: "weft".into(), workload: workload.into(), reps: 3, dataset: dataset(), latency: latency(p50, p95, p99), latency_ci: intervals, throughput_points_per_sec: throughput, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns: 0, end_to_end_ns: 0 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1, actual_output_points: 1, values_finite: true }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None }
+		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "standard".into(), adapter: "weft".into(), workload: workload.into(), reps: 3, dataset: dataset(), latency: latency(p50, p95, p99), latency_ci: intervals, throughput_points_per_sec: throughput, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns: 0, end_to_end_ns: 0 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1, actual_output_points: 1, values_finite: true }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: Vec::new() }
 	}
 
 	fn report(os: &str, arch: &str, results: Vec<BenchResult>) -> BenchReport {

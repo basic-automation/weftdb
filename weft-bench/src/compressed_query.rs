@@ -177,6 +177,7 @@ pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], v
 			growth: None,
 			online: None,
 			compressed_query: Some(point), analytics: None,
+			samples_ns: in_store_ns.clone(),
 		})?;
 	}
 	Ok(())
