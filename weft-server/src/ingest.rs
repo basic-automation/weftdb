@@ -1217,7 +1217,7 @@ mod tests {
 
 		// An out-of-order Parquet batch (row 1: 90 < 100).
 
-		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &[100_i64, 90, 120], &[Some(bd("1")), Some(bd("2")), Some(bd("3"))]);
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &[100_i64, 90, 120], &[Some(bd("1")), Some(bd("2")), Some(bd("3"))]).expect("builds the batch");
 
 		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes parquet");
 

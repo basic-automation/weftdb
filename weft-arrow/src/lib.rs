@@ -50,8 +50,25 @@
 //! corresponding [`PhysicalType`]s) and `PagedSegment` / Parquet export are the
 //! next slices; this one establishes the lossless contract everything else must
 //! preserve.
+//!
+//! ## No panics, only results (ROB-4)
+//!
+//! Every public function in this crate returns a [`Result`] — the batch
+//! builders included. A caller mistake that used to trip an assertion (two
+//! columns of different lengths, say) is now a
+//! [`ConvertError::LengthMismatch`] the caller can handle, and an Arrow
+//! refusal to assemble a batch is a [`ConvertError::Batch`]. Production code
+//! in this crate contains no panic, assertion, unwrap or expect at all: the
+//! crate denies the panic-family clippy lints below, and a source-scan test
+//! covers the assertion macros, which clippy has no lint for.
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+// ROB-4: the no-panic lint, enforced. Production code in this crate must not
+// panic, unwrap, expect, or fall through an unreachable arm; test code is
+// exempted at the test module, where an assertion failure is the point. The
+// assertion macros are covered by the `production_code_carries_no_panic_constructs`
+// source-scan test, since clippy offers no lint that bans them.
+#![deny(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::panic_in_result_fn)]
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -186,7 +203,24 @@ pub enum ConvertError {
 	EmptyBatchSet,
 	/// Reading or writing the Parquet file failed (carries the Parquet message).
 	Parquet(String),
+	/// Two columns that must share a row count did not: `column` held `actual`
+	/// rows where `expected` were required. This is the former assertion on the
+	/// batch builders, returned as a value since ROB-4.
+	LengthMismatch {
+		/// The column whose length disagreed.
+		column: &'static str,
+		/// The row count the column was required to have.
+		expected: usize,
+		/// The row count the column actually had.
+		actual: usize,
+	},
+	/// Arrow refused to assemble a [`RecordBatch`] from columns whose lengths
+	/// had already been checked (carries the Arrow message).
+	Batch(String),
 }
+
+/// The result every fallible conversion in this crate returns (ROB-4).
+pub type ConvertResult<T> = Result<T, ConvertError>;
 
 impl std::fmt::Display for ConvertError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -201,6 +235,8 @@ impl std::fmt::Display for ConvertError {
 			Self::Ipc(e) => write!(f, "arrow IPC stream error: {e}"),
 			Self::EmptyBatchSet => write!(f, "cannot write from zero batches (no schema)"),
 			Self::Parquet(e) => write!(f, "parquet error: {e}"),
+			Self::LengthMismatch { column, expected, actual } => write!(f, "column `{column}` has {actual} rows, expected {expected}"),
+			Self::Batch(e) => write!(f, "could not assemble record batch: {e}"),
 		}
 	}
 }
@@ -225,6 +261,17 @@ fn time_unit_from_name(name: &str) -> Option<TimeUnit> {
 	}
 }
 
+/// Refuse a column whose length disagrees with the row count it must share.
+///
+/// The batch builders' former assertion, as a returned error (ROB-4).
+fn check_len(column: &'static str, expected: usize, actual: usize) -> Result<(), ConvertError> {
+	if actual == expected {
+		Ok(())
+	} else {
+		Err(ConvertError::LengthMismatch { column, expected, actual })
+	}
+}
+
 /// Convert a sealed [`Segment`] into a self-describing, lossless Arrow
 /// [`RecordBatch`].
 ///
@@ -238,13 +285,12 @@ fn time_unit_from_name(name: &str) -> Option<TimeUnit> {
 /// The conversion is lossless: decimal text preserves every digit, so no value is
 /// downcast crossing into Arrow.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Never in practice: both columns are built from the segment's single row count,
-/// so the internal [`RecordBatch::try_new`] cannot see a column-length mismatch. A
-/// panic here would mean a bug in this function, not bad input.
-#[must_use]
-pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
+/// Returns [`ConvertError::Batch`] if Arrow refuses the assembled batch. Both
+/// columns are built from the segment's single row count, so in practice this
+/// does not fail — but since ROB-4 the refusal is a value, not a panic.
+pub fn segment_to_record_batch(seg: &Segment) -> Result<RecordBatch, ConvertError> {
 	let (timestamps, values) = seg.decode_nullable();
 	let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>());
 	assemble_batch(seg, &timestamps, val_array, VALUE_ENCODING_TEXT)
@@ -268,14 +314,16 @@ pub fn segment_to_record_batch(seg: &Segment) -> RecordBatch {
 /// format version is [`LOGICAL_EXPORT_VERSION`]. The conversion is lossless — no
 /// value loses a digit crossing into Arrow (hard constraint #4).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `timestamps` and `values` differ in length: the two Arrow columns
-/// must share a row count. Callers pass columns that are already aligned (the
-/// segment-store readers always do), so this signals a caller bug, not bad data.
-#[must_use]
-pub fn columns_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[Option<BigDecimal>]) -> RecordBatch {
-	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
+/// Returns [`ConvertError::LengthMismatch`] if `timestamps` and `values`
+/// differ in length — the two Arrow columns must share a row count — and
+/// [`ConvertError::Batch`] if Arrow refuses the assembled batch. Before ROB-4
+/// the length check was an assertion; callers pass columns that are already
+/// aligned (the segment-store readers always do), so this signals a caller
+/// bug, now as a value the caller can surface instead of a panic.
+pub fn columns_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<RecordBatch, ConvertError> {
+	check_len(VALUE_COLUMN, timestamps.len(), values.len())?;
 	let (val_array, value_encoding) = text_value_array(values);
 	build_record_batch(unit, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, timestamps, val_array, value_encoding)
 }
@@ -300,13 +348,13 @@ pub fn columns_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[Opt
 /// `f64`. [`record_batch_to_columns`] reads either form back by dispatching on the
 /// value column's Arrow type.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `timestamps` and `values` differ in length (see
-/// [`columns_to_record_batch`]).
-#[must_use]
-pub fn columns_to_record_batch_typed(unit: TimeUnit, physical_type: PhysicalType, timestamps: &[i64], values: &[Option<BigDecimal>]) -> RecordBatch {
-	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
+/// As [`columns_to_record_batch`]: [`ConvertError::LengthMismatch`] if
+/// `timestamps` and `values` differ in length, [`ConvertError::Batch`] if
+/// Arrow refuses the assembled batch.
+pub fn columns_to_record_batch_typed(unit: TimeUnit, physical_type: PhysicalType, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<RecordBatch, ConvertError> {
+	check_len(VALUE_COLUMN, timestamps.len(), values.len())?;
 	let (val_array, value_encoding) = typed_value_array(physical_type, values);
 	build_record_batch(unit, physical_type.name(), LOGICAL_EXPORT_VERSION, timestamps, val_array, value_encoding)
 }
@@ -333,8 +381,11 @@ pub fn columns_to_record_batch_typed(unit: TimeUnit, physical_type: PhysicalType
 /// [`record_batch_to_columns`] reads it back without guessing. The numeric path is
 /// exact: an F64 segment already *stores* its values as `f64`, so emitting them as
 /// Arrow `Float64` reproduces the stored bits — no second downcast.
-#[must_use]
-pub fn segment_to_record_batch_typed(seg: &Segment) -> RecordBatch {
+///
+/// # Errors
+///
+/// Returns [`ConvertError::Batch`] if Arrow refuses the assembled batch.
+pub fn segment_to_record_batch_typed(seg: &Segment) -> Result<RecordBatch, ConvertError> {
 	let (timestamps, values) = seg.decode_nullable();
 	let (val_array, value_encoding) = typed_value_array(seg.physical_type(), &values);
 	assemble_batch(seg, &timestamps, val_array, value_encoding)
@@ -392,7 +443,7 @@ fn try_decimal128_array(values: &[Option<BigDecimal>], scale: u8) -> Option<Arra
 /// Assemble the two-column batch from a prepared value array, reading the
 /// self-describing schema metadata off a [`Segment`]. Shared by the text and typed
 /// segment-export paths.
-fn assemble_batch(seg: &Segment, timestamps: &[i64], val_array: ArrayRef, value_encoding: &str) -> RecordBatch {
+fn assemble_batch(seg: &Segment, timestamps: &[i64], val_array: ArrayRef, value_encoding: &str) -> Result<RecordBatch, ConvertError> {
 	build_record_batch(seg.time_unit(), seg.physical_type().name(), seg.version, timestamps, val_array, value_encoding)
 }
 
@@ -400,12 +451,11 @@ fn assemble_batch(seg: &Segment, timestamps: &[i64], val_array: ArrayRef, value_
 /// value array — the shared core under both the [`Segment`] and [`Page`] export
 /// paths.
 ///
-/// # Panics
-///
-/// Never in practice: the timestamp and value arrays are both built from the same
-/// row count, so the internal [`RecordBatch::try_new`] cannot see a column-length
-/// mismatch. A panic here would mean a bug in this crate, not bad input.
-fn build_record_batch(unit: TimeUnit, physical_type_name: &str, version: u16, timestamps: &[i64], val_array: ArrayRef, value_encoding: &str) -> RecordBatch {
+/// The timestamp and value arrays are both built from the same row count, so
+/// [`RecordBatch::try_new`] cannot see a column-length mismatch in practice;
+/// since ROB-4 its refusal is mapped to [`ConvertError::Batch`] rather than
+/// expected away.
+fn build_record_batch(unit: TimeUnit, physical_type_name: &str, version: u16, timestamps: &[i64], val_array: ArrayRef, value_encoding: &str) -> Result<RecordBatch, ConvertError> {
 	let ts_array = Int64Array::from_iter_values(timestamps.iter().copied());
 	let value_type = val_array.data_type().clone();
 
@@ -417,7 +467,7 @@ fn build_record_batch(unit: TimeUnit, physical_type_name: &str, version: u16, ti
 
 	let schema = Schema::new_with_metadata(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, value_type, true)], metadata);
 
-	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), val_array]).expect("timestamp and value columns share the row count")
+	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), val_array]).map_err(|e| ConvertError::Batch(e.to_string()))
 }
 
 /// Read an exported [`RecordBatch`] back into WeftDB's logical columns.
@@ -518,8 +568,11 @@ fn unit_from_metadata(batch: &RecordBatch) -> Result<TimeUnit, ConvertError> {
 ///
 /// To collapse the whole segment into a single batch instead, use
 /// [`paged_segment_to_record_batch`].
-#[must_use]
-pub fn paged_segment_to_record_batches(seg: &PagedSegment) -> Vec<RecordBatch> {
+///
+/// # Errors
+///
+/// Returns [`ConvertError::Batch`] if Arrow refuses any page's batch.
+pub fn paged_segment_to_record_batches(seg: &PagedSegment) -> Result<Vec<RecordBatch>, ConvertError> {
 	seg.pages.iter().map(|page| page_to_record_batch(page, seg.version)).collect()
 }
 
@@ -531,8 +584,11 @@ pub fn paged_segment_to_record_batches(seg: &PagedSegment) -> Vec<RecordBatch> {
 /// in this form; use [`paged_segment_to_record_batches`] to keep it. The segment's
 /// shared [`TimeUnit`] is taken from its first page; an empty segment produces an
 /// empty `seconds`-unit batch.
-#[must_use]
-pub fn paged_segment_to_record_batch(seg: &PagedSegment) -> RecordBatch {
+///
+/// # Errors
+///
+/// Returns [`ConvertError::Batch`] if Arrow refuses the assembled batch.
+pub fn paged_segment_to_record_batch(seg: &PagedSegment) -> Result<RecordBatch, ConvertError> {
 	let (timestamps, values) = seg.decode_nullable();
 	let unit = seg.pages.first().map_or(TimeUnit::Seconds, |p| p.timestamps.unit);
 	let physical_type_name = seg.pages.first().map_or(PhysicalType::BigDecimalText.name(), |p| p.values.physical_type.name());
@@ -542,7 +598,7 @@ pub fn paged_segment_to_record_batch(seg: &PagedSegment) -> RecordBatch {
 
 /// Build a lossless per-page batch from a [`Page`] and the owning segment's
 /// format version.
-fn page_to_record_batch(page: &Page, version: u16) -> RecordBatch {
+fn page_to_record_batch(page: &Page, version: u16) -> Result<RecordBatch, ConvertError> {
 	let (timestamps, values) = page.decode_nullable();
 	let val_array: ArrayRef = Arc::new(values.iter().map(|opt| opt.as_ref().map(BigDecimal::to_plain_string)).collect::<StringArray>());
 	build_record_batch(page.timestamps.unit, page.values.physical_type.name(), version, &timestamps, val_array, VALUE_ENCODING_TEXT)
@@ -719,14 +775,15 @@ pub fn read_parquet(bytes: &[u8]) -> Result<Vec<RecordBatch>, ConvertError> {
 /// export, not an on-disk segment), so [`reconstructed_series_from_record_batch`]
 /// reads it back without out-of-band information.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the three columns do not share a row count — a caller bug, since the
-/// interpolate output produces the three columns together.
-#[must_use]
-pub fn reconstructed_series_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[f64], kinds: &[&str]) -> RecordBatch {
-	assert_eq!(timestamps.len(), values.len(), "timestamp and value columns must share a row count");
-	assert_eq!(timestamps.len(), kinds.len(), "timestamp and kind columns must share a row count");
+/// Returns [`ConvertError::LengthMismatch`] if the three columns do not share
+/// a row count — a caller bug, since the interpolate output produces the three
+/// columns together — and [`ConvertError::Batch`] if Arrow refuses the batch.
+/// Before ROB-4 these checks were assertions.
+pub fn reconstructed_series_to_record_batch(unit: TimeUnit, timestamps: &[i64], values: &[f64], kinds: &[&str]) -> Result<RecordBatch, ConvertError> {
+	check_len(VALUE_COLUMN, timestamps.len(), values.len())?;
+	check_len(SERIES_KIND_COLUMN, timestamps.len(), kinds.len())?;
 
 	let ts_array = Int64Array::from_iter_values(timestamps.iter().copied());
 	let val_array = Float64Array::from_iter_values(values.iter().copied());
@@ -740,7 +797,7 @@ pub fn reconstructed_series_to_record_batch(unit: TimeUnit, timestamps: &[i64], 
 
 	let schema = Schema::new_with_metadata(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, DataType::Float64, false), Field::new(SERIES_KIND_COLUMN, DataType::Utf8, false)], metadata);
 
-	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), Arc::new(val_array), Arc::new(kind_array)]).expect("timestamp, value, and kind columns share the row count")
+	RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts_array), Arc::new(val_array), Arc::new(kind_array)]).map_err(|e| ConvertError::Batch(e.to_string()))
 }
 
 /// Serialize a reconstructed interpolation series straight to **Arrow IPC stream**
@@ -755,7 +812,7 @@ pub fn reconstructed_series_to_record_batch(unit: TimeUnit, timestamps: &[i64], 
 ///
 /// Propagates any [`ConvertError`] from [`write_ipc_stream`] (an Arrow IPC failure).
 pub fn reconstructed_series_to_ipc_bytes(unit: TimeUnit, timestamps: &[i64], values: &[f64], kinds: &[&str]) -> Result<Vec<u8>, ConvertError> {
-	write_ipc_stream(&[reconstructed_series_to_record_batch(unit, timestamps, values, kinds)])
+	write_ipc_stream(&[reconstructed_series_to_record_batch(unit, timestamps, values, kinds)?])
 }
 
 /// Serialize a reconstructed interpolation series straight to **Apache Parquet**
@@ -770,7 +827,7 @@ pub fn reconstructed_series_to_ipc_bytes(unit: TimeUnit, timestamps: &[i64], val
 ///
 /// Propagates any [`ConvertError`] from [`write_parquet`] (a Parquet failure).
 pub fn reconstructed_series_to_parquet_bytes(unit: TimeUnit, timestamps: &[i64], values: &[f64], kinds: &[&str]) -> Result<Vec<u8>, ConvertError> {
-	write_parquet(&[reconstructed_series_to_record_batch(unit, timestamps, values, kinds)])
+	write_parquet(&[reconstructed_series_to_record_batch(unit, timestamps, values, kinds)?])
 }
 
 /// Read a reconstructed-series batch (as built by
@@ -817,20 +874,21 @@ pub fn reconstructed_series_from_record_batch(batch: &RecordBatch) -> Result<Rec
 /// schema metadata records the [`TimeUnit`], the value wire form
 /// ([`VALUE_ENCODING_F64`]), and [`LOGICAL_EXPORT_VERSION`].
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if any column's length differs from the timestamp column's, or if
-/// `agg_names` and `agg_columns` differ in length — a caller bug, since the
-/// downsample response produces the columns together.
-#[must_use]
-pub fn reduction_table_to_record_batch(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> RecordBatch {
-	assert_eq!(timestamps.len(), counts.len(), "timestamp and count columns must share a row count");
-	assert_eq!(agg_names.len(), agg_columns.len(), "each reduction column must have a name");
+/// Returns [`ConvertError::LengthMismatch`] if any column's length differs
+/// from the timestamp column's, or if `agg_names` and `agg_columns` differ in
+/// length — a caller bug, since the downsample response produces the columns
+/// together — and [`ConvertError::Batch`] if Arrow refuses the batch. Before
+/// ROB-4 these checks were assertions.
+pub fn reduction_table_to_record_batch(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> Result<RecordBatch, ConvertError> {
+	check_len(REDUCTION_COUNT_COLUMN, timestamps.len(), counts.len())?;
+	check_len(VALUE_COLUMN, agg_names.len(), agg_columns.len())?;
 
 	let mut fields = vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(REDUCTION_COUNT_COLUMN, DataType::Int64, false)];
 	let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(timestamps.iter().copied())), Arc::new(Int64Array::from_iter_values(counts.iter().copied()))];
 	for (name, column) in agg_names.iter().zip(agg_columns) {
-		assert_eq!(column.len(), timestamps.len(), "each reduction column must share the row count");
+		check_len(VALUE_COLUMN, timestamps.len(), column.len())?;
 		fields.push(Field::new(*name, DataType::Float64, false));
 		arrays.push(Arc::new(Float64Array::from_iter_values(column.iter().copied())));
 	}
@@ -842,7 +900,7 @@ pub fn reduction_table_to_record_batch(unit: TimeUnit, timestamps: &[i64], count
 	metadata.insert(META_FORMAT_VERSION.to_string(), LOGICAL_EXPORT_VERSION.to_string());
 
 	let schema = Schema::new_with_metadata(fields, metadata);
-	RecordBatch::try_new(Arc::new(schema), arrays).expect("all columns share the row count")
+	RecordBatch::try_new(Arc::new(schema), arrays).map_err(|e| ConvertError::Batch(e.to_string()))
 }
 
 /// Serialize a reduction table straight to **Arrow IPC stream** bytes
@@ -856,7 +914,7 @@ pub fn reduction_table_to_record_batch(unit: TimeUnit, timestamps: &[i64], count
 ///
 /// Propagates any [`ConvertError`] from [`write_ipc_stream`].
 pub fn reduction_table_to_ipc_bytes(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> Result<Vec<u8>, ConvertError> {
-	write_ipc_stream(&[reduction_table_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)])
+	write_ipc_stream(&[reduction_table_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)?])
 }
 
 /// Serialize a reduction table straight to **Apache Parquet** file bytes
@@ -868,7 +926,7 @@ pub fn reduction_table_to_ipc_bytes(unit: TimeUnit, timestamps: &[i64], counts: 
 ///
 /// Propagates any [`ConvertError`] from [`write_parquet`].
 pub fn reduction_table_to_parquet_bytes(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> Result<Vec<u8>, ConvertError> {
-	write_parquet(&[reduction_table_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)])
+	write_parquet(&[reduction_table_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)?])
 }
 
 /// Read a reduction-table batch (as built by [`reduction_table_to_record_batch`])
@@ -903,6 +961,7 @@ pub fn reduction_table_from_record_batch(batch: &RecordBatch) -> Result<Reductio
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::unreachable)]
 mod tests {
 	use std::str::FromStr;
 
@@ -928,7 +987,7 @@ mod tests {
 		let values = col(&["1.25", "2.50", "3.75", "5.00", "6.25"]);
 		let seg = Segment::build(&timestamps, &values, TimeUnit::Micros, &bd("0")).expect("builds");
 
-		let batch = segment_to_record_batch(&seg);
+		let batch = segment_to_record_batch(&seg).expect("builds the batch");
 		assert_eq!(batch.num_columns(), 2);
 		assert_eq!(batch.num_rows(), 5);
 
@@ -943,7 +1002,7 @@ mod tests {
 		// plain form is over 1,024 digits is refused, not lifted.
 		let over = format!("1{}", "0".repeat(1024));
 		let values: Vec<Option<BigDecimal>> = vec![Some(bd(&over))];
-		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1], &values);
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1], &values).expect("builds the batch");
 		assert_eq!(record_batch_to_columns(&batch), Err(ConvertError::DecimalOutOfRange { digits: 1025 }));
 	}
 
@@ -953,7 +1012,7 @@ mod tests {
 		let values = ncol(&[Some("1.5"), None, Some("3.5"), None, Some("5.5")]);
 		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &bd("0")).expect("builds");
 
-		let batch = segment_to_record_batch(&seg);
+		let batch = segment_to_record_batch(&seg).expect("builds the batch");
 		// The Arrow value column carries the two nulls as real validity bits.
 		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<StringArray>().unwrap();
 		assert_eq!(val_array.null_count(), 2);
@@ -972,7 +1031,7 @@ mod tests {
 		let seg = Segment::build(&timestamps, &values, TimeUnit::Nanos, &bd("0")).expect("builds");
 		assert!(seg.is_exact());
 
-		let batch = segment_to_record_batch(&seg);
+		let batch = segment_to_record_batch(&seg).expect("builds the batch");
 		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
 		assert!(back.is_exact(), "decimal text crossing into Arrow loses nothing");
 		assert_eq!(back.decode_values(), values);
@@ -981,7 +1040,7 @@ mod tests {
 	#[test]
 	fn schema_metadata_is_self_describing() {
 		let seg = Segment::build(&[5_i64], &col(&["7.5"]), TimeUnit::Millis, &bd("0")).expect("builds");
-		let batch = segment_to_record_batch(&seg);
+		let batch = segment_to_record_batch(&seg).expect("builds the batch");
 		let md = batch.schema_ref().metadata();
 		assert_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("millis"));
 		assert_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
@@ -992,7 +1051,7 @@ mod tests {
 	#[test]
 	fn empty_segment_round_trips() {
 		let seg = Segment::build(&[], &[], TimeUnit::Seconds, &bd("0")).expect("builds");
-		let batch = segment_to_record_batch(&seg);
+		let batch = segment_to_record_batch(&seg).expect("builds the batch");
 		assert_eq!(batch.num_rows(), 0);
 		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
 		assert!(back.is_empty());
@@ -1032,7 +1091,7 @@ mod tests {
 		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
 		assert_eq!(seg.physical_type(), PhysicalType::F64);
 
-		let batch = segment_to_record_batch_typed(&seg);
+		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
 		// The value column is a real Arrow Float64, not text.
 		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float64);
 		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
@@ -1049,7 +1108,7 @@ mod tests {
 		let seg = AspectSchema::new(PhysicalType::F32, bd("0"), TimeUnit::Millis).seal(&timestamps, &values).expect("seals");
 		assert_eq!(seg.physical_type(), PhysicalType::F32);
 
-		let batch = segment_to_record_batch_typed(&seg);
+		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
 		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float32);
 		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F32));
 
@@ -1063,7 +1122,7 @@ mod tests {
 		let values = ncol(&[Some("0.5"), None, Some("2.25"), None, Some("-8")]);
 		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal_nullable(&timestamps, &values).expect("seals");
 
-		let batch = segment_to_record_batch_typed(&seg);
+		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
 		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
 		assert_eq!(val_array.null_count(), 2);
 		assert!(val_array.is_null(1) && val_array.is_null(3));
@@ -1082,7 +1141,7 @@ mod tests {
 		let seg = Segment::build(&timestamps, &values, TimeUnit::Nanos, &bd("0")).expect("builds");
 		assert_eq!(seg.physical_type(), PhysicalType::BigDecimalText);
 
-		let batch = segment_to_record_batch_typed(&seg);
+		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
 		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
 		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
 		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
@@ -1098,7 +1157,7 @@ mod tests {
 		let seg = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
 		assert_eq!(seg.physical_type(), PhysicalType::ScaledI64 { scale: 2 });
 
-		let batch = segment_to_record_batch_typed(&seg);
+		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
 		// The value column is an exact Arrow Decimal128 at scale 2.
 		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
 		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_DECIMAL128));
@@ -1121,7 +1180,7 @@ mod tests {
 		let seg = AspectSchema::new(PhysicalType::ScaledI128 { scale: 2 }, bd("0"), TimeUnit::Micros).seal(&timestamps, &values).expect("seals");
 		assert_eq!(seg.physical_type(), PhysicalType::ScaledI128 { scale: 2 });
 
-		let batch = segment_to_record_batch_typed(&seg);
+		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
 		assert!(matches!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), DataType::Decimal128(_, 2)));
 		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
 		assert!(back.is_exact());
@@ -1134,7 +1193,7 @@ mod tests {
 		let values = ncol(&[Some("1.25"), None, Some("9.99")]);
 		let seg = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0"), TimeUnit::Seconds).seal_nullable(&timestamps, &values).expect("seals");
 
-		let batch = segment_to_record_batch_typed(&seg);
+		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
 		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<Decimal128Array>().unwrap();
 		assert_eq!(val_array.null_count(), 1);
 		assert!(val_array.is_null(1));
@@ -1150,7 +1209,7 @@ mod tests {
 		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Micros, &bd("0"), 4).expect("builds");
 		assert_eq!(paged.page_count(), 3);
 
-		let batches = paged_segment_to_record_batches(&paged);
+		let batches = paged_segment_to_record_batches(&paged).expect("builds the batch");
 		assert_eq!(batches.len(), 3);
 		assert_eq!(batches[0].num_rows(), 4);
 		assert_eq!(batches[2].num_rows(), 2);
@@ -1175,7 +1234,7 @@ mod tests {
 		let paged = PagedSegment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 3).expect("builds");
 		assert_eq!(paged.page_count(), 3);
 
-		let batch = paged_segment_to_record_batch(&paged);
+		let batch = paged_segment_to_record_batch(&paged).expect("builds the batch");
 		assert_eq!(batch.num_rows(), 7);
 		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
 		assert_eq!(ts, timestamps);
@@ -1186,7 +1245,7 @@ mod tests {
 	fn empty_paged_segment_yields_no_batches() {
 		let paged = PagedSegment::build(&[], &[], TimeUnit::Seconds, &bd("0"), 4).expect("builds");
 		assert_eq!(paged.page_count(), 0);
-		assert!(paged_segment_to_record_batches(&paged).is_empty());
+		assert!(paged_segment_to_record_batches(&paged).expect("builds the batches").is_empty());
 		// Rebuilding from no batches cannot recover the unit, so it is an error.
 		assert_eq!(paged_segment_from_record_batches(&[], &bd("0"), 4), Err(ConvertError::MissingMetadata(META_TIME_UNIT)));
 	}
@@ -1197,7 +1256,7 @@ mod tests {
 		// column and a nullable value column that may have crossed several segments.
 		let timestamps = vec![100_i64, 110, 120, 130, 140];
 		let values = ncol(&[Some("1.5"), None, Some("3.5"), Some("4.0"), None]);
-		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values);
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values).expect("builds the batch");
 
 		assert_eq!(batch.num_columns(), 2);
 		assert_eq!(batch.num_rows(), 5);
@@ -1213,7 +1272,7 @@ mod tests {
 
 	#[test]
 	fn logical_columns_metadata_marks_the_logical_export() {
-		let batch = columns_to_record_batch(TimeUnit::Nanos, &[1_i64], &[Some(bd("2.5"))]);
+		let batch = columns_to_record_batch(TimeUnit::Nanos, &[1_i64], &[Some(bd("2.5"))]).expect("builds the batch");
 		let md = batch.schema_ref().metadata();
 		assert_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("nanos"));
 		assert_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
@@ -1228,30 +1287,29 @@ mod tests {
 		let huge = "123456789012345678901234567890.123456789012345678901234567890";
 		let timestamps = vec![1_i64, 2];
 		let values = vec![Some(bd(huge)), Some(bd("-0.000000000000000000000000000001"))];
-		let batch = columns_to_record_batch(TimeUnit::Nanos, &timestamps, &values);
+		let batch = columns_to_record_batch(TimeUnit::Nanos, &timestamps, &values).expect("builds the batch");
 		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
 		assert_eq!(vs, values);
 	}
 
 	#[test]
 	fn logical_columns_empty_is_a_zero_row_batch() {
-		let batch = columns_to_record_batch(TimeUnit::Seconds, &[], &[]);
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[], &[]).expect("builds the batch");
 		assert_eq!(batch.num_rows(), 0);
 		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
 		assert!(ts.is_empty() && vs.is_empty());
 	}
 
 	#[test]
-	#[should_panic(expected = "share a row count")]
 	fn logical_columns_reject_mismatched_lengths() {
-		let _ = columns_to_record_batch(TimeUnit::Seconds, &[1_i64, 2], &[Some(bd("1.0"))]);
+		assert_eq!(columns_to_record_batch(TimeUnit::Seconds, &[1_i64, 2], &[Some(bd("1.0"))]), Err(ConvertError::LengthMismatch { column: VALUE_COLUMN, expected: 2, actual: 1 }));
 	}
 
 	#[test]
 	fn typed_logical_columns_emit_float64_and_round_trip() {
 		let timestamps = vec![1_i64, 2, 3, 4];
 		let values = ncol(&[Some("0.5"), None, Some("2.25"), Some("-8")]);
-		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values);
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values).expect("builds the batch");
 
 		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float64);
 		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
@@ -1267,7 +1325,7 @@ mod tests {
 	fn typed_logical_columns_emit_exact_decimal128() {
 		let timestamps = vec![1_i64, 2, 3];
 		let values = ncol(&[Some("12.34"), None, Some("-7.50")]);
-		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values);
+		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values).expect("builds the batch");
 
 		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
 		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
@@ -1280,7 +1338,7 @@ mod tests {
 		// BigDecimalText has no fixed-width Arrow array → the typed path stays text.
 		let timestamps = vec![1_i64, 2];
 		let values = vec![Some(bd("123456789012345678901234567890.123")), Some(bd("1"))];
-		let batch = columns_to_record_batch_typed(TimeUnit::Nanos, PhysicalType::BigDecimalText, &timestamps, &values);
+		let batch = columns_to_record_batch_typed(TimeUnit::Nanos, PhysicalType::BigDecimalText, &timestamps, &values).expect("builds the batch");
 
 		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
 		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
@@ -1295,9 +1353,9 @@ mod tests {
 		let values = col(&["0.5", "2.25", "-0.25", "128"]);
 		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
 
-		let from_segment = segment_to_record_batch_typed(&seg);
+		let from_segment = segment_to_record_batch_typed(&seg).expect("builds the batch");
 		let nullable: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
-		let from_columns = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &nullable);
+		let from_columns = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &nullable).expect("builds the batch");
 
 		// Same value column type and same decoded contents (metadata version differs:
 		// a real segment version vs the logical sentinel).
@@ -1309,7 +1367,7 @@ mod tests {
 	fn ipc_stream_round_trips_a_single_batch() {
 		let timestamps = vec![1_i64, 2, 3];
 		let values = ncol(&[Some("1.5"), None, Some("3.5")]);
-		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values);
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values).expect("builds the batch");
 
 		let bytes = write_ipc_stream(std::slice::from_ref(&batch)).expect("writes");
 		assert!(!bytes.is_empty());
@@ -1329,7 +1387,7 @@ mod tests {
 		let timestamps: Vec<i64> = (0..10).map(|i| 100 + i).collect();
 		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
 		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 4).expect("builds");
-		let batches = paged_segment_to_record_batches(&paged);
+		let batches = paged_segment_to_record_batches(&paged).expect("builds the batch");
 		assert_eq!(batches.len(), 3);
 
 		let bytes = write_ipc_stream(&batches).expect("writes");
@@ -1355,7 +1413,7 @@ mod tests {
 	fn parquet_round_trips_a_single_batch() {
 		let timestamps = vec![1_i64, 2, 3];
 		let values = ncol(&[Some("1.5"), None, Some("3.5")]);
-		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values);
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values).expect("builds the batch");
 
 		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
 		// Parquet files start with the "PAR1" magic.
@@ -1375,7 +1433,7 @@ mod tests {
 		// The typed exact-Decimal128 path must stay byte-faithful through Parquet.
 		let timestamps = vec![1_i64, 2, 3];
 		let values = ncol(&[Some("12.34"), None, Some("-7.50")]);
-		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values);
+		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values).expect("builds the batch");
 
 		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
 		let back = read_parquet(&bytes).expect("reads");
@@ -1391,7 +1449,7 @@ mod tests {
 		let timestamps: Vec<i64> = (0..10).map(|i| 100 + i).collect();
 		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
 		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 4).expect("builds");
-		let batches = paged_segment_to_record_batches(&paged);
+		let batches = paged_segment_to_record_batches(&paged).expect("builds the batch");
 		assert_eq!(batches.len(), 3);
 
 		let bytes = write_parquet(&batches).expect("writes");
@@ -1417,7 +1475,7 @@ mod tests {
 		let timestamps = [0_i64, 60, 120];
 		let values = [0.0_f64, 30.0, 60.0];
 		let kinds = ["raw", "interpolated", "raw"];
-		let batch = reconstructed_series_to_record_batch(TimeUnit::Seconds, &timestamps, &values, &kinds);
+		let batch = reconstructed_series_to_record_batch(TimeUnit::Seconds, &timestamps, &values, &kinds).expect("builds the batch");
 
 		assert_eq!(batch.num_columns(), 3);
 		assert_eq!(batch.num_rows(), 3);
@@ -1467,9 +1525,8 @@ mod tests {
 	}
 
 	#[test]
-	#[should_panic(expected = "kind columns must share a row count")]
 	fn reconstructed_series_rejects_ragged_columns() {
-		let _ = reconstructed_series_to_record_batch(TimeUnit::Seconds, &[0, 1], &[0.0, 1.0], &["raw"]);
+		assert_eq!(reconstructed_series_to_record_batch(TimeUnit::Seconds, &[0, 1], &[0.0, 1.0], &["raw"]), Err(ConvertError::LengthMismatch { column: SERIES_KIND_COLUMN, expected: 2, actual: 1 }));
 	}
 
 	#[test]
@@ -1478,7 +1535,7 @@ mod tests {
 		let counts = [3_i64, 2];
 		let names = ["min", "max", "avg"];
 		let columns = vec![vec![0.0_f64, 30.0], vec![20.0, 50.0], vec![10.0, 40.0]];
-		let batch = reduction_table_to_record_batch(TimeUnit::Seconds, &timestamps, &counts, &names, &columns);
+		let batch = reduction_table_to_record_batch(TimeUnit::Seconds, &timestamps, &counts, &names, &columns).expect("builds the batch");
 
 		assert_eq!(batch.num_columns(), 5);
 		assert_eq!(batch.num_rows(), 2);
@@ -1526,8 +1583,21 @@ mod tests {
 	}
 
 	#[test]
-	#[should_panic(expected = "each reduction column must share the row count")]
 	fn reduction_table_rejects_ragged_reduction_column() {
-		let _ = reduction_table_to_record_batch(TimeUnit::Seconds, &[0, 60], &[1, 1], &["min"], &[vec![0.0]]);
+		assert_eq!(reduction_table_to_record_batch(TimeUnit::Seconds, &[0, 60], &[1, 1], &["min"], &[vec![0.0]]), Err(ConvertError::LengthMismatch { column: VALUE_COLUMN, expected: 2, actual: 1 }));
+	}
+
+	#[test]
+	fn production_code_carries_no_panic_constructs() {
+		// ROB-4: clippy has no lint for the assertion macros, so the no-panic
+		// rule — asserts included — is enforced here over the production half
+		// of this file (the backup.rs source-scan precedent in `weftdb`). The
+		// panic / unwrap / expect macros are additionally denied by the crate
+		// attributes at the top of the file.
+		let source = include_str!("lib.rs");
+		let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+		for token in ["panic!", "panic_any", "assert!", "assert_eq!", "assert_ne!", "debug_assert", ".unwrap()", ".expect(", "unreachable!", "todo!", "unimplemented!"] {
+			assert!(!production.contains(token), "production code must not contain `{token}` (ROB-4 no-panic lint, asserts included)");
+		}
 	}
 }

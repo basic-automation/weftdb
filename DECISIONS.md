@@ -4,6 +4,84 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — ROB-10 "Admission I": per-class budgets the gate enforces (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan names ROB-10 only as "Admission I" (§6 W5) and absorbs its parts
+elsewhere: its per-route class table into SEC-3's registry (§3 SEC-3/SEC-6 row — landed as
+`RouteSpec.admission_class` with classes `probe`/`query`/`write`/`maintenance`, the write class
+charged byte-weighted inside the gate by D-S14, plan C10) and its knob registry into the VarSpec
+registry (§3 PAC-5a/PAC-6 row). Issue #270 repeats the one-liner. What remained for this slice —
+and what its queue acceptance states — is that admission *exists on the serve path* driven by the
+registry's `admission_class`, with its knobs in the VarSpec registry. The points the sources do
+not pin, chosen here under the owner's best-guess authorization (2026-10-26), recorded for merge
+review and reversible there:
+
+1. **The gate dispatches on `admission_class`, for every class.** Before this slice the gate
+   charged only `Scope::Ingest` routes against the byte budget. Now: `probe` is never shed (its
+   class rationale: a shed probe reads as a dead process); `query` is counted against an
+   in-flight cap and shed first (`503 overloaded` + `Retry-After`, §4); `write` keeps D-S14's
+   byte-weighted charge, keyed on the class so the declare route — write class, declare scope —
+   is charged exactly as an ingest route is; `maintenance` is admitted one at a time, a second
+   admission refused `409 busy` + `Retry-After` (the answer the class's own doc comment has
+   always promised; the store's per-aspect maintenance locks still answer `409` for conflicts
+   below the whole class). The permit is held by the gate future itself across the handler
+   call — not, as D-S14 left it, parked in the request's extensions: axum rebuilds the
+   request as it routes, the extensions drop before the handler finishes, and this slice's
+   gate tests caught the write charge being released early (a latent D-S14 defect, fixed
+   here for every class by the same move).
+2. **One new knob: `WEFT_QUERY_MAX_INFLIGHT` (Tuning, default 128).** It joins the VarSpec
+   registry (72 → 73 entries) and the strict-config positive-integer list, is read once at
+   startup through `AdmissionConfig` (the `IngestConfig` pattern) and travels on `AppState`
+   beside it. The write budget stays D-S14's `WEFT_INGEST_MAX_INFLIGHT_BYTES`; maintenance
+   exclusivity is the class's definition, not a knob, so it takes no variable. 128 is a
+   judgement number: far under SEC-4's connection cap, far above one client's paging load.
+3. **Admission II (ROB-11, W6) is not pre-empted.** It arrives with PAC-7's runtime builder
+   (§2 L-MAIN) and owns later refinement; this slice adds no queueing, no priorities and no
+   per-route overrides — refusal is immediate, which is what "shed" means in the class table.
+
+**Rejected:** a ROB-10-owned knob registry (the §3 row absorbs it into VarSpec); keying the
+write charge on scope as D-S14 left it (the acceptance names the registry's `admission_class`
+as the input); queueing shed queries (an unbounded queue is the failure the `503` exists to
+avoid); and blocking the slice until the query cap's default is pinned by the plan (the queue
+records no open question for ROB-10, and the number is a Tuning-tier default, reversible at
+merge review).
+
+## 2026-11-01 — ROB-4: the lint's scope, and the Result API's two new errors (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan names ROB-4 only as "Enforced no-panic lint (including asserts) and the
+weft-arrow Result API" (§6 W5) and lists ROB-2/3/4 panic handling as required (§9); issue #269
+repeats the one-liner. The points the sources do not pin, chosen here under the owner's
+best-guess authorization (2026-10-26), recorded for merge review and reversible there:
+
+1. **Scope is `weft-arrow`.** It is the only crate the slice names, and the only one whose public
+   API panicked: its batch builders asserted on mismatched column lengths and expected
+   `RecordBatch::try_new` to succeed. A workspace-wide ban is hundreds of sites across crates
+   other slices own (ROB-5 owns the legacy queue-consumer panics, for one), so the lint lands
+   where the Result API makes it satisfiable, and other crates opt in as their APIs go fallible.
+2. **Every batch builder now returns `Result<_, ConvertError>`** (`ConvertResult<T>` is the
+   alias): `segment_to_record_batch`, `segment_to_record_batch_typed`, `columns_to_record_batch`,
+   `columns_to_record_batch_typed`, `paged_segment_to_record_batch(s)`,
+   `reconstructed_series_to_record_batch`, `reduction_table_to_record_batch`. The IPC/Parquet
+   convenience wrappers already returned `Result` and now propagate the builders' errors
+   instead of panicking inside them. Callers in `weft-arrow-store` (anyhow `?`),
+   `weft-server` tests and `weft-arrow`'s own tests were updated; no other production caller
+   used the panicking forms.
+3. **Two new `ConvertError` variants** (the enum is `#[non_exhaustive]`, so this is additive):
+   `LengthMismatch { column, expected, actual }` for the former assertions, and `Batch(String)`
+   for an Arrow assembly refusal after the lengths were checked. `weft-server`'s ingest
+   classifier already falls through to `400` for unlisted variants, so a mismatched-columns
+   body is a client error there, as before in spirit.
+4. **Enforcement is two-layered.** The crate denies the panic-family clippy lints
+   (`panic`, `unwrap_used`, `expect_used`, `unreachable`, `todo`, `unimplemented`,
+   `panic_in_result_fn`) at its root — restriction lints, so the workspace clippy gate's
+   denied groups are unchanged and the denial travels with the crate. Clippy has no lint for
+   the assertion macros, so "including asserts" is enforced by a source-scan test over the
+   production half of `src/lib.rs` (the `weftdb` backup.rs precedent), banning `assert!` /
+   `assert_eq!` / `assert_ne!` / `debug_assert` alongside the panic tokens. Test code is
+   exempt in both layers: an assertion failure there is the point.
+5. **The three `#[should_panic]` tests became error assertions** on `LengthMismatch`, pinning
+   the exact column/expected/actual values the assertions used to hide.
+
 ## 2026-11-01 — D-S14: how the HTTP surface wires onto the ingest entry point (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan's §5 D-S14 amendment and resolutions C9–C11, plus the crash-consistency
