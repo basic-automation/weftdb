@@ -18,14 +18,18 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	// A word on the command line is a command, and there are exactly two besides serving: a
+	// A word on the command line is a command, and there are exactly three besides serving: a
 	// misspelled `import-rows-mode` must not quietly come up as a server instead of
-	// migrating the tree the operator was pointing at, and `keygen` must not either.
-	if std::env::args().nth(1).is_none() {
-		return startup::run().await;
+	// migrating the tree the operator was pointing at, `keygen` must not either, and above
+	// all a misspelled `restore` must not stand up a live server on the machine that was
+	// meant to be putting a store back. Any other word goes to `import_rows_mode`, which
+	// refuses it rather than serving.
+	let mut args = std::env::args();
+	args.next();
+	match args.next().as_deref() {
+		None => startup::run().await,
+		Some(weft_server::keygen::SUBCOMMAND) => weft_server::keygen::run(std::env::args().skip(1)),
+		Some(weft_server::restore::SUBCOMMAND) => weft_server::restore::run(std::env::args().skip(1)).await,
+		Some(_command) => weft_server::import_rows_mode::run(std::env::args().skip(1)).await,
 	}
-	if std::env::args().nth(1).as_deref() == Some(weft_server::keygen::SUBCOMMAND) {
-		return weft_server::keygen::run(std::env::args().skip(1));
-	}
-	weft_server::import_rows_mode::run(std::env::args().skip(1)).await
 }
