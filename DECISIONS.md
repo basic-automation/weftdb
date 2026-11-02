@@ -4,6 +4,239 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-02 — SOA-8: the failure deck is a validated card deck, recovery is exact, and the maintenance driver is a pure state machine (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W5) lists SOA-8 by name only — "Failure deck,
+phases, recovery windows, SIGTERM verdict and the maintenance driver" — and
+neither the plan nor the queue fixes the deck's contents, the phase set, what
+a recovery window measures, what the SIGTERM verdict judges, or what the
+maintenance driver drives. What the sources do fix: SOA-1's harness doc says
+SOA-8's phases are a finer breakdown *within* `Running` and do not replace
+the lifecycle state; the queue's acceptance fixes three outcomes — a failure
+deck with phases and recovery windows exists, a SIGTERM verdict is produced,
+and a maintenance driver drives the deck; the server's own code fixes the
+failures and maintenance that exist (SEC-4/D-S14's graceful drain with the
+`WEFT_SHUTDOWN_GRACE_SECS` grace and exit 0, a signal before serving exits 0
+per plan C9, `/ready`'s `previous_clean_shutdown`, the store's maintenance
+locks and busy/skipped sweeps, and ROB-3's daemons resuming reconcile,
+squash and backup); SIGKILL is SOA-9's `crash_kill9` (W6); and SOA's standing
+rules govern the shape (exact judgement, no invented tolerance or threshold;
+a field added to `SoakRun` bumps `SOAK_SCHEMA_VERSION` on SOA's own line;
+records carry no free text).
+
+**Chosen (grounded as above, under the owner's best-guess authorization of
+2026-10-26; if merge review disagrees, this decision is revisited there):**
+
+1. **New pure module `weft-bench/src/soak_failure.rs`; no live server.**
+   Like the oracle core (SOA-6), the deck, driver and verdict perform no
+   signal, read or maintenance themselves: the caller applies what the
+   driver's `DeckAction` names and supplies what it observed. The same
+   deck and observations replay identically in tests.
+2. **The deck is validated on construction.** Card ids are slugs (never
+   free text, so no record needs redaction), ids are unique, every
+   recovery window is non-empty, cards are in injection order, and a
+   SIGTERM card is at most one and last (it ends the server). Kinds are
+   `MaintenanceContention`, `ServerRestart` and `Sigterm` — the failures
+   the shipped server has. `FailureDeck::standard()` deals contention,
+   restart, SIGTERM, each recovering under a different sweep.
+3. **Phases are per-card and strictly ordered:**
+   `Baseline → Injection → Recovery → Verification → Complete`, entered
+   through the driver, which refuses gated transitions (recovery must be
+   observed and the card's maintenance run before verification; the
+   SIGTERM verdict must be judged before the SIGTERM card completes).
+   Phase records are recorded on the run record in order; the harness
+   refuses out-of-order, interleaved or tick-regressing phases.
+4. **Recovery windows are tick ranges judged exactly.** A card's window
+   is `inject_tick..inject_tick + recovery_ticks` — the deck author's
+   schedule, not a threshold this slice invents. Recovery observed
+   inside the window recovered; at/after its end, or never, it did not.
+   A card that calls for maintenance counts as recovered only when that
+   maintenance ran during recovery: the driver runs the card's
+   `MaintenanceKind` (reconcile/squash/backup/none) in the recovery
+   phase, because a recovery in which the daemons never resumed is not
+   the recovery a deployment performs.
+5. **The SIGTERM verdict is the exact conjunction** of its observation:
+   signal sent, exit code 0, drained within the grace the *caller*
+   configured (the serve path's grace is an input, never a constant
+   here), and the reopened store reporting a clean previous shutdown.
+   Any missing observation fails — no vacuous pass.
+6. **Records on the run record; soak schema v4.** `SoakRun` gains
+   `phases` and `recoveries` (`#[serde(default)]`, skipped when empty)
+   and `sigterm` (`#[serde(default)]`, skipped when absent), recorded
+   set-once/in-order through the harness while `Running`;
+   `SOAK_SCHEMA_VERSION` 3 → 4 on SOA's own line. v1–v3 artifacts still
+   deserialize.
+
+**Rejected:** a SIGKILL card (SOA-9 owns it, W6); recovery judged by a
+rate or a deadline this slice picks (the window is the deck's, the
+judgement exact); a driver that signals or restarts a real server (no
+slice names a process client, and a pure driver is replayable); phases
+as new `SoakState` variants (SOA-1 fixed them as a breakdown within
+`Running`); and free-text card names or failure descriptions (slugs
+keep every record redaction-free, as SOA-6/SOA-7's records are).
+
+## 2026-11-02 — SOA-7: window digests hash the oracle's own encoding, and the self-test judges the judge (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W5) lists SOA-7 by name only — "Window digests
+and the oracle self-test" — and neither the plan nor the queue fixes the digest
+algorithm, what a window is, where digests live, or what the self-test runs
+against. What the sources do fix: SOA-6's DECISIONS entry scopes this slice
+explicitly ("Out of scope … window digests and the oracle self-test (SOA-7)",
+"digests after the core they digest"); the oracle core's doc calls itself "the
+pure core SOA-7's self-test exercises"; the queue's acceptance fixes two
+outcomes — window digests exist in the soak harness, and the oracle self-test
+runs against SOA-6's oracle core; and SOA-6's own rules govern the shape (exact
+comparison, no invented tolerance or threshold; a field added to `SoakRun`
+bumps `SOAK_SCHEMA_VERSION` on SOA's own line; verdicts and records carry no
+free text, so no new redaction path).
+
+**Chosen (grounded in SOA-6's core and rules, under the owner's best-guess
+authorization of 2026-10-26; if merge review disagrees, this decision is
+revisited there):**
+
+1. **A window is a contiguous tick range; its digest is SHA-256 over a
+   canonical point encoding.** New module `weft-bench/src/soak_digest.rs`.
+   Each point is hashed as one line — tick, series, row, timestamp, and the
+   value's format-exact wire form (`GridValue::encode_field`, SOA-4) — so the
+   digest is over exactly what the workload wrote and the oracle compares.
+   SHA-256 and lowercase hex match the manifest's existing digest form
+   (the run manifest already carries `report_sha256`). The first line
+   hashed is a domain separator naming the algorithm
+   (`weftdb-soak-window-digest/1`): an encoding change is a new algorithm,
+   never a silent change to what an old digest means.
+2. **Two computations, one comparison.** `expected_window_digest` regenerates
+   a window from the model alone (also exposed as
+   `SoakOracle::window_digest`); `observed_window_digest` hashes a read-back
+   in the oracle's own input shape (`&[(u64, Vec<ObservedPoint>)]`).
+   The observed side is canonicalized (tick, series, row, timestamp, encoded
+   value) before hashing, so read-back order is irrelevant; duplicates are
+   hashed as many times as they occur, so a duplicated seal changes the
+   digest — the same failure the oracle classifies as `Duplicate`.
+   `WindowDigest::matches` requires the same range, point count, and hash.
+3. **Digests localize; the oracle still judges.** A matching window states
+   exactly what the oracle's per-cell judgement states for those ticks, at
+   hash-comparison cost; a differing window is re-judged tick by tick with
+   SOA-6's core to classify the damage. No tolerance, rate, or threshold is
+   introduced — equality is the only comparison, per SOA-2/SOA-3/SOA-6's
+   refusal to invent pass/fail numbers.
+4. **Digests are recorded on the run record, in window order, and the soak
+   schema takes v3.** `SoakRun.windows: Vec<WindowDigest>`
+   (`#[serde(default)]`, skipped when empty, so v1/v2 artifacts still
+   deserialize) is appended by `SoakHarness::record_window_digest`, only
+   while `Running`, and a window that overlaps or precedes the last recorded
+   one is refused — a window recorded twice would double-count its evidence.
+   Adding the field bumps `SOAK_SCHEMA_VERSION` 2 → 3 per SOA-1's bump rule,
+   on SOA's own line (§3). A digest carries no free text, so
+   `SoakRun::redacted_json` emits it unchanged.
+5. **The self-test is a pure associated function on the core it tests.**
+   `SoakOracle::self_test()` builds its own small deterministic model (never
+   the caller's — a misconfigured run cannot make it vacuous) and runs nine
+   checks whose correct outcomes are known by construction: a faithful
+   read-back passes exactly; each classified corruption (missing, wrong
+   value, wrong timestamp, unexpected, out-of-grid, duplicate) is caught as
+   exactly that kind, once; and the window digests agree with a faithful
+   read-back and disagree after a dropped point. The report
+   (`OracleSelfTestReport`) is `passed()` only when every check passed and
+   at least one ran (the SOA-12 skipped-check rule). It performs no read and
+   touches no server: a driver runs it before a soak, a publisher before
+   trusting a recorded verdict. Check names are fixed constants of the
+   self-test, so the report needs no redaction.
+
+**Rejected:** a verdict field per window on the run record (the verdict is
+the oracle's, recorded once by SOA-6; windows are evidence, not verdicts);
+a non-cryptographic hash (the digest is published evidence — a collision
+must not be able to hide corruption, and sha2 is already a weft-bench
+dependency); hashing the serialized JSON of points (the wire encoding is
+the format-exact form SOA-4 already pins, and JSON field order would make
+the digest depend on serde rather than on the workload); and a self-test
+that runs against a live server or the caller's run model (no slice names
+a read client, and a self-test that inherits the run's configuration can
+pass vacuously against the wrong expectations).
+
+## 2026-11-01 — FRE-7b: immutable declarations, scale rules and schema read-back — the shapes the plan left open (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan names the slice (§6 W5), fixes that widening goes through
+FRE-7b's `widen_value_encoding` (§5 D-S19/D-S20 — the helper itself landed inside D-S19,
+which recorded that this slice's other parts were not built there), lists re-declare
+overwrite among the live defects (§1), and reserves `409 schema_conflict` in the §4 code
+table. It does not pin the exact re-declaration semantics, the scale rules' shape, or the
+read-back's fields. Chosen here under the owner's best-guess authorization (2026-10-26),
+recorded for merge review and reversible there:
+
+1. **Immutability with exactly one exception.** `AspectCatalog::declare` decides inside
+   its transaction: no declaration → insert; the identical schema → no-op (the call
+   stays idempotent, which rows-mode import and the legacy seal adapter rely on); a
+   value-encoding widening with tolerance and timestamp unit unchanged → update of the
+   encoding alone; anything else → the new typed `StoreError::DeclarationConflict`,
+   nothing written. The widening predicate is `weft_physical_type::is_value_widening`:
+   a change widens exactly when it moves to `BigDecimalText`, because that is the only
+   move `widen_value_encoding` can produce (its other outcome is the current encoding).
+   `ScaledI64 → ScaledI128` and `F32 → F64` are therefore refused as sideways moves,
+   not widenings — no caller performs them, and D-S19's `ensure_declared` (the one
+   widening caller) only ever widens to text. The HTTP surface maps the typed error
+   through the existing `classify_typed` to the §4 table's `409 schema_conflict`.
+2. **Scale rules at the declare surface.** A fixed-point encoding named without a
+   `scale` stays a `400` (pre-existing); a `scale` named for an encoding that carries
+   none (`f64`, `f32`, `decimal128`, `bigdecimal_text`) is now also a `400` instead of
+   being silently dropped — a declaration must read back as it was asked for.
+3. **Read-back returns the whole declared schema.** `AspectInfo` gains `scale`
+   (omitted when the encoding carries none), built by one constructor
+   (`AspectInfo::declared`) from the stored schema at all three sites: the aspects
+   list, `GET …/{aspect}/schema`, and the declare response — which is now the schema
+   read back from the store after the write, not an echo of the request, so a widening
+   re-declaration answers with the widened schema. `PhysicalType::scale()` is the new
+   accessor beside `name()`. Accepted declares keep returning `201`, including the
+   identical re-declaration and the widening one: the status contract pre-dates this
+   slice and nothing in the plan asks to split it.
+
+## 2026-11-01 — SEC-8: the exposure matrix's exact cells, the proxied-header set, and how startup order is enforced (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the plan fixes SEC-8's four parts — startup ordering through the `startup.rs`
+phase list (§2 L-MAIN, §6 W5), the exposure matrix (decision 7, absorbing PAC-5b's bind guard
+per §3, with C8 naming the Docker shape), the auth-off guard, and metrics auth (decision 17:
+"`/metrics` needs the metrics scope when auth is on") — and SEC-5/SEC-6 each recorded the
+remainder as this slice's. The points the sources do not pin, chosen here under the owner's
+best-guess authorization (2026-10-26), recorded for merge review and reversible there:
+
+1. **The matrix refuses keyless non-loopback binds over TLS too.** SEC-5's gate refused only
+   *plaintext* non-loopback binds and let TLS through ungated; decision 7 says "Non-loopback
+   with no keys: refuse to start" with no transport exception, and encryption without
+   authentication still exposes every route. So `PlaintextGate::check` (kept name, widened
+   rule) now reads: loopback → serve; `WEFT_AUTH=disabled` → serve; no mounted keys file →
+   refuse (exit 78, via startup's config-error path); keys + TLS → serve; keys + plaintext →
+   serve only with `WEFT_ALLOW_PLAINTEXT=1`. SEC-5's integration test that started a keyless
+   non-loopback TLS bind is inverted to a refusal, with a keys-mounted twin that starts.
+2. **`WEFT_ALLOW_INSECURE_BIND` is dropped by never existing.** No code ever read it; SEC-8
+   makes the drop explicit rather than implementing a reader: the name is not in the VarSpec
+   registry, so PAC-5b strict configuration refuses it as an unknown `WEFT_` name (a settings
+   test pins that), and `WEFT_AUTH=disabled` is the only spelling of the opt-out.
+3. **Proxied = `Forwarded` or any `X-Forwarded-*` of the common set** (`for`, `host`,
+   `proto`), presence only, values never read. While auth is off *implicitly* such a request
+   is refused `403 proxied_request_requires_auth` (the §4 code X-ERR reserved; this slice is
+   its first producer) on every route, probes included: a proxy in the path voids the
+   loopback assumption decision 7's keyless mode rests on. That required telling the two
+   offs apart, so `AuthConfig` gains a `Disabled` variant (SEC-6 had folded both into `Off`
+   and startup re-read the env var to log the difference; it now matches the variant). The
+   gateway deployment's proxied requests are served; with keys mounted, the key check is
+   the guard and proxied requests authenticate normally.
+4. **Metrics auth needed no new mechanism — so this slice verifies and pins it instead.**
+   `/metrics` already carries the registry's `metrics` scope (SEC-3) and SEC-6's gate
+   enforces scopes; SEC-8 adds the decision-17 test stated as such (anonymous 401, reader
+   403, admin 200; auth off serves), rather than bolting a second check onto the route.
+5. **Startup order is enforced by a source-pinning test.** `startup::PHASES` names the seven
+   phases (`strict-config`, `hooks`, `signals`, `config`, `state`, `daemons`, `serve`); a
+   test in `startup/mod.rs` reads the file's own source after `run`'s signature and asserts
+   each phase's entry-point call appears in that order. Reordering a phase now fails CI
+   unless `PHASES` and the module docs move with it. (The probe-only admin listener of
+   ROB-23r, which §3 says also goes through this matrix, is W7 work and does not exist yet;
+   when it lands it binds through the same gate.)
+
+**Rejected:** a separate `exposure.rs` module duplicating the gate SEC-5 already owned (the
+matrix is the gate's rule, widened in place); refusing proxied requests under
+`WEFT_AUTH=disabled` too (decision 7 assigns that deployment a gateway, whose requests are
+proxied by construction); and treating `X-Real-IP` as a proxy header (it is set by one
+proxy family for its own use and is not part of the de-facto forwarded set).
+
 ## 2026-11-01 — ROB-10 "Admission I": per-class budgets the gate enforces (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan names ROB-10 only as "Admission I" (§6 W5) and absorbs its parts
@@ -2743,3 +2976,75 @@ together, per plan §6 W7 — this slice ticks only the W5 D-S19 line), the
 other legacy capture variants (`capture_new_measurement` and the chunk
 helpers, which the design does not name), and compression on seal-backed
 aspects (deferred by the design itself).
+
+## 2026-11-01 — SEC-10 exposure and secrets hygiene: the shapes the plan left open — FOR MERGE REVIEW
+
+The plan's whole SEC-10 spec is §3's dedup row ("absorbs SOA-14's OTLP
+userinfo redaction", 0.5 h) plus the queue's two acceptance lines
+(exposure hygiene across the server surface; secrets hygiene including
+that redaction). An audit of the surface on main at 33d3353 found the
+rest of the surface already hygienic — request spans record the path
+only (no query, no headers), 5xx bodies are redacted sentences (X-ERR),
+`/ready` carries counts only (D-S12), startup lines print key counts and
+file paths but never key material, and the OpenAPI document is generated
+but not served. Two gaps remained, and this slice closes exactly those:
+
+1. **OTLP userinfo redaction (the absorbed SOA-14 part).**
+   `startup/hooks.rs` printed `OTEL_EXPORTER_OTLP_ENDPOINT` as configured
+   in both its startup lines (the enabled `println!` and the
+   exporter-build-failure `eprintln!`). The endpoint is a URL and can
+   carry userinfo (`https://user:password@collector:4317` — the shape
+   collectors use for basic auth), so a configured password landed in
+   the server's stdout. New `weft_server::redact::redact_url_userinfo`
+   replaces every URL's userinfo with `[redacted]`, mirroring
+   weft-bench's EVI-3/SOA-2 manifest redaction (same marker, same
+   semantics) in a server-local module — weft-bench is not a dependency
+   the server may take. **Redaction is display-only**: the exporter
+   still receives the endpoint exactly as configured, because the
+   collector's basic auth rides on the userinfo.
+2. **Credentials in the query string are now refused in every auth
+   mode.** SEC-6's `400 credentials_in_query` check ran only when a key
+   store was mounted; with auth off (the loopback default) or explicitly
+   disabled, `enforce` returned before the check, so a credential in a
+   query string passed through untouched — into exactly the proxy and
+   access logs the refusal exists to keep it out of. The check now runs
+   first in `enforce`, before the mode branches. Two consequences,
+   accepted deliberately: a proxied auth-off request carrying a
+   credential parameter now gets the 400 instead of SEC-8's 403 (the
+   request shape is refused before the deployment shape is considered),
+   and a gateway deployment with `WEFT_AUTH=disabled` whose clients put
+   tokens in query strings will see 400s — that is the hygiene working
+   as intended, and the parameter-name list is unchanged
+   (`api_key`, `apikey`, `access_token`, `auth_token`).
+
+**Not in this slice:** SEC-9's audit (its own slice), SEC-7 key reload,
+and any change to what `/ready` reports (its build info and store uuid
+are deliberate, per plan §5 D-S12). The keygen subcommand still prints a
+minted key once — that is its documented purpose, not a leak.
+## 2026-11-01 — FRE-5 "no silent narrowing": the shape of the refusal — FLAGGED FOR MERGE REVIEW
+
+**Grounded:** FRE-5's first two clauses landed earlier (spelling half 2026-10-28,
+exact-case tokens 2026-10-29; ROADMAP line 90). The remaining clause names no
+mechanism. In the L-COMPUTE lane the plan assigns to FRE-5
+(`weft-server/src/{interpolate,downsample}.rs`, plan §2), the silent narrowing
+was concrete: every wire conversion did `value.to_f64().unwrap_or_default()`,
+so a computed `BigDecimal` outside the `f64` range (e.g. a `sum` of two 1e308
+samples) came back as `0.0` — a plausible-looking answer the caller never
+asked for, with no signal anywhere.
+
+**Chosen:** one checked conversion (`downsample::wire_value`) at all three
+L-COMPUTE wire sites — downsample bucket values (shared with the stored-range
+endpoint via `buckets_to_response`, which now returns `Result`), interpolate
+series points, and the interpolate single-point response. A value with no
+finite `f64` representation fails the request with the taxonomy's existing
+`not_finite` code (400), matching how produced non-finite values are already
+classified (`from_reduce_error`'s SketchValue arm, splimes' NonFiniteResult).
+`ValueNotRepresentable` was considered and rejected: its documented meaning is
+the aspect's physical type, not the wire type.
+
+**Unchanged:** the documented transport boundary itself. In-range values
+still narrow to `f64` exactly as before (the module docs call the boundary
+deliberate; the precision-preserving representation is Phase 4 work). Only
+the silent substitution is gone. The claim adjudication behind taking this
+slice (the peer's `compute/fre-5-*` branches treated as stale squash
+leftovers) is recorded on board issue #125 and in the loop's queue notes.

@@ -44,7 +44,19 @@
 //!   tick performs.
 //! - [`soak_oracle`] — the soak oracle core (SOA-6): judges a run's
 //!   read-back against the workload model's expected grids, exactly, and
-//!   records its verdict on the [`soak`] run record (soak schema v2).
+//!   records its verdict on the [`soak`] run record (soak schema v2);
+//!   SOA-7 adds the oracle self-test that exercises the core against
+//!   known-good and known-corrupt read-backs.
+//! - [`soak_digest`] — window digests (SOA-7): a SHA-256 over a window's
+//!   canonical point encoding, computed from the model and from a
+//!   read-back, localizing a mismatch to a window the oracle then judges
+//!   tick by tick; recorded on the [`soak`] run record (soak schema v3).
+//! - [`soak_failure`] — failure deck, phases, recovery windows, SIGTERM
+//!   verdict and the maintenance driver (SOA-8): an ordered deck of
+//!   failure cards a run subjects its server to, each moving through
+//!   phases within `Running` and recovering inside its window, driven
+//!   card by card by the maintenance driver; recorded on the [`soak`]
+//!   run record (soak schema v4).
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
 //!   distribution + correctness + dataset metadata + end-to-end timing spans).
 //! - [`stats`] — p50/p95/p99 latency summarization + seeded bootstrap
@@ -85,6 +97,8 @@ pub mod scale;
 pub mod schema;
 pub mod soak;
 pub mod soak_client;
+pub mod soak_digest;
+pub mod soak_failure;
 pub mod soak_hdr;
 pub mod soak_null;
 pub mod soak_oracle;
@@ -103,7 +117,7 @@ use bigdecimal::ToPrimitive;
 
 use crate::adapter::grid_timestamps;
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter}, baseline_adapter::BaselineLinearAdapter, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_on, IngestProfile, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{PreflightCheck, ResolvedDevice, SoakConfig, SoakHarness, SoakPreflight, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_client::{IngestClient, IngestFlow, IngestTarget, DEFAULT_SOAK_ASPECT, MAX_RESPONSE_BYTES, SOAK_CLIENT_FIELD, SOAK_CLIENT_PHYSICAL_TYPE, SOAK_CLIENT_PRECISION, SOAK_CLIENT_TIMESTAMP_UNIT}, soak_hdr::HdrHistogram, soak_null::{NullServer, SoakServer}, soak_oracle::{MismatchKind, ObservedPoint, OracleMismatch, OracleVerdict, SoakOracle, MAX_REPORTED_MISMATCHES}, soak_sched::{IntervalLog, IntervalRecord, OpenLoopScheduler, SchedulerConfig, SchedulerReport, SelfMonitor, TickDecision}, soak_system::{evaluate_flush_check, resolve_store_device, ContaminationFlag, ContaminationLedger, ContaminationPolicy, ContaminationVerdict, DeviceCounters, FlushCheckResult, FlushEvidence, FlushFailureKind, PressureStall, ProcRoot, SamplerShutdown, SamplerThread, StoreDevice, StrictMode, SystemSample, SystemSampler, DEFAULT_PROC_ROOT}, soak_workload::{GridValue, LaneWeights, ValueFormat, ValueGrid, WorkloadLane, WorkloadModel, WorkloadParams, WorkloadStep, SOAK_WORKLOAD_EPOCH_NS, SOAK_WORKLOAD_MEASUREMENT}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, stored_weft_adapter::StoredWeftAdapter, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter}, baseline_adapter::BaselineLinearAdapter, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_on, IngestProfile, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{PreflightCheck, ResolvedDevice, SoakConfig, SoakHarness, SoakPreflight, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_client::{IngestClient, IngestFlow, IngestTarget, DEFAULT_SOAK_ASPECT, MAX_RESPONSE_BYTES, SOAK_CLIENT_FIELD, SOAK_CLIENT_PHYSICAL_TYPE, SOAK_CLIENT_PRECISION, SOAK_CLIENT_TIMESTAMP_UNIT}, soak_digest::{expected_window_digest, observed_window_digest, WindowDigest}, soak_failure::{DeckAction, FailureCard, FailureDeck, FailureKind, MaintenanceDriver, MaintenanceKind, PhaseRecord, RecoveryRecord, RecoveryWindow, SigtermObservation, SigtermVerdict, SoakPhase}, soak_hdr::HdrHistogram, soak_null::{NullServer, SoakServer}, soak_oracle::{MismatchKind, ObservedPoint, OracleMismatch, OracleSelfTestReport, OracleVerdict, SelfTestCheck, SoakOracle, MAX_REPORTED_MISMATCHES}, soak_sched::{IntervalLog, IntervalRecord, OpenLoopScheduler, SchedulerConfig, SchedulerReport, SelfMonitor, TickDecision}, soak_system::{evaluate_flush_check, resolve_store_device, ContaminationFlag, ContaminationLedger, ContaminationPolicy, ContaminationVerdict, DeviceCounters, FlushCheckResult, FlushEvidence, FlushFailureKind, PressureStall, ProcRoot, SamplerShutdown, SamplerThread, StoreDevice, StrictMode, SystemSample, SystemSampler, DEFAULT_PROC_ROOT}, soak_workload::{GridValue, LaneWeights, ValueFormat, ValueGrid, WorkloadLane, WorkloadModel, WorkloadParams, WorkloadStep, SOAK_WORKLOAD_EPOCH_NS, SOAK_WORKLOAD_MEASUREMENT}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, stored_weft_adapter::StoredWeftAdapter, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
 };
 
 /// Workload class label recorded for the interpolation profile.
