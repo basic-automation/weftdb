@@ -6,8 +6,8 @@ WeftDB is pre-1.0. Only the latest published `0.x` release receives fixes.
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | yes       |
-| < 0.1   | no        |
+| 0.2.x   | yes       |
+| < 0.2   | no        |
 
 ## Reporting a vulnerability
 
@@ -24,18 +24,20 @@ than leave you guessing.
 
 ## Scope, honestly
 
-WeftDB is pre-beta and **has no authentication, authorization or transport security
-yet** — `weft-server` exposes an unauthenticated HTTP API. That is a known gap tracked
-on the roadmap, not a vulnerability report we need. Do not expose `weft-server`
-directly to an untrusted network; put it behind something that does terminate TLS and
-authenticate callers.
+WeftDB is pre-beta. `weft-server` can serve TLS (`WEFT_TLS_CERT_FILE`,
+`WEFT_TLS_KEY_FILE`) and authenticate API keys with roles (`WEFT_KEYS_FILE`, minted by
+`weft-server keygen`), and a non-loopback bind refuses to start without a keys file unless
+`WEFT_AUTH=disabled` says a gateway in front does the authenticating. What it does not have
+yet: key reload without a restart, audit logging, and the security review the roadmap
+requires before 1.0. Reports against TLS or authentication are in scope; the missing pieces
+above are known gaps tracked on the roadmap.
 
 Bound to a loopback address (the default), `weft-server` only answers requests
 addressed to a loopback host and refuses state-changing requests from non-loopback
 web origins, so a web page from another site, open in a browser on the same machine,
 cannot drive it. That is a guard for the default deployment, not authentication: any
 local process can still call the API, and a page served by another local web server
-(any loopback origin, on any port) is still trusted until authentication lands. A local
+(any loopback origin, on any port) is still trusted while authentication is off. A local
 reverse proxy that forwards a different `Host`, or a browser UI's
 non-loopback `Origin`, needs `WEFT_ALLOW_ANY_HOST=1`, which turns the guard off.
 
