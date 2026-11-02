@@ -40,6 +40,10 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
+- **A real smooth-signal corpus for the spline-fill claim** (#144): `scripts/bench/ndbc_to_csv.py`
+  turns NOAA NDBC buoy history into a `weft-bench --gf-csv` corpus. On nine buoy temperature and
+  pressure series a cubic fill beats linear across short outages and loses across day-long ones;
+  README, HONESTY.md and WILLINGNESS-TO-PAY.md now say so.
 - **OS-cold and post-restart reps in the cross-engine benchmark** (#146): `weft-xbench
   --cold-hook CMD [--cold-reps N]` times each read phase again after the OS page cache is dropped
   (`os-cold`) and after the engine restarts as well (`restarted`), gated like the warm reps and

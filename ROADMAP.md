@@ -17,14 +17,14 @@ The performance thesis and the first benchmark-claim list are written, and the d
 
 `weft-bench` exists as a first-class workspace member with a CLI runner, a first workload profile, a WeftDB adapter over the vendor-neutral `SystemAdapter` trait, and portable baselines to compare against. Results are scored against analytic ground truth (RMSE, MAE, max error, bias) over selectable synthetic shapes, with latency statistics and a harness-level timing breakdown, and reported as JSON, self-contained HTML and Parquet. Each run records its hardware, disk and GPU/driver versions, and each result carries a storage estimate.
 
-The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill now runs on a real corpus. That run produced a negative result worth keeping: a spline fill does not beat linear on real prices. The compression workload's slow first repetition was explained as first-touch memory rather than lazy initialisation. External-engine adapters, fair-protocol depth and the remaining workloads are still open below.
+The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill now runs on a real corpus. That run produced a negative result worth keeping: a spline fill does not beat linear on real prices. On real buoy temperature and pressure it wins only across short outages (#144). The compression workload's slow first repetition was explained as first-touch memory rather than lazy initialisation. External-engine adapters, fair-protocol depth and the remaining workloads are still open below.
 
 - [ ] External-engine adapters
 - [x] **DONE (2026-10-31) — TSBS-compatible comparison harness, on TSBS's data** (`weft-xbench --tsbs FILE`, #141): the `cpu-only` generator's output runs through every engine arm's load, interpolation and downsample phases, gated against the reference. TSBS's own query suite groups many series by tag, so it waits for tagged ingest and belongs to **TAG-12**.
 - [x] **DONE (2026-10-09) — `gap_fill` workload** (`--gap-fill`)
   - [ ] **NEXT — `?fill=` on the downsample endpoints** (`POST /api/v1/downsample`, `GET …/storage/{aspect}/downsample` and their columnar siblings), with a …
   - [ ] **NEXT — arbitrary bucket widths** (`5s`, `15m`)
-  - [ ] **NEXT — a real smooth-signal corpus for the spline-fill claim.**
+  - [x] **DONE (2026-11-01) — a real smooth-signal corpus for the spline-fill claim** (#144): NOAA NDBC buoy temperature and pressure (`scripts/bench/ndbc_to_csv.py`); cubic beats linear on 7 of 9 series at a two-hour mean outage and loses on 8 of 9 at a day
 - [ ] Remaining workloads
 - [x] **DONE (2026-10-09) — first-rep/warm separation** (`BenchResult.cold_warm`, schema v21, every workload; console + Parquet)
   - [x] **DONE (2026-10-31) — OS-cold and post-restart runs** (`weft-xbench --cold-hook CMD --cold-reps N`, #146): each read phase also runs with the page cache dropped and after an engine restart, every rep gated; schema v4 `warmth`

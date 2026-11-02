@@ -393,8 +393,9 @@ Three more results from 2026-10-09 where the obvious answer was wrong:
   of their time building a decimal per point
   ([`weftdb/benches/interpolate_range.rs`](weftdb/benches/interpolate_range.rs)).
 - **A spline gap fill is less accurate than a straight line on prices.** On real BTC closes a
-  cubic fill's MAE is $55.34 against linear's $49.27 (hourly buckets); the spline wins only on a
-  smooth signal (`weft-bench --gap-fill --gf-fill cubic`, see [Benchmarking](#benchmarking)).
+  cubic fill's MAE is $55.34 against linear's $49.27 (hourly buckets). On real buoy temperature
+  and pressure the spline wins on short outages (~2 h) and loses on day-long ones, with up to 1.9×
+  linear's RMSE (`weft-bench --gap-fill --gf-fill cubic`, see [Benchmarking](#benchmarking)).
 - **The approximate percentile is not faster than the exact one.** `sketch_p99` once measured
   ~2.6× faster than exact `p99`, but only on the old generator's ~50-digit values; on real-shaped
   decimals the two run level (see [Compute endpoints](#compute-endpoints)).
@@ -1541,7 +1542,7 @@ What it does today:
   random walk, linear is more accurate — hourly MAE $49.27 linear vs $55.34 cubic vs $61.32
   quadratic, and at one-minute buckets (187,421 filled minutes, outages averaging three) $6.79
   vs $8.37 — while the spline costs ~14% more time (64.8 vs 56.7 ms hourly; 10 reps,
-  2026-10-09, load average ~6). Reach for the spline on smooth physical signals, not on prices.
+  2026-10-09, load average ~6). On real smooth physical signals the answer depends on the outage. NOAA NDBC buoys 41008, 44013 and 46042, 2022–2024, give nine 10-minute series (water temperature, air temperature, pressure; 72k–154k readings each). Each was cut to hourly buckets with 20% lost to outages, under five outage placements per outage length (540 runs, all PASS). With outages averaging **2 hours**, cubic has lower RMSE than linear on 7 of 9 series, most on pressure (0.78–0.84× linear's RMSE, all five placements). At **6 hours** it is lower on 4 of 9. At **24 hours** linear is lower on 8 of 9, and cubic's RMSE is up to 1.9× linear's, most likely because a spline through a day-long hole overshoots the daily cycle. The spline costs ~15% more time (median p50 23.5 vs 20.4 ms). Reach for the spline on smooth physical signals with short gaps, not on prices or long outages (`scripts/bench/ndbc_to_csv.py` builds the corpus; `weft-bench --gap-fill --gf-csv <corpus> --gf-bucket h --gf-outage-len 2 --gf-fill cubic`).
   WeftDB's grid has only unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
 - **Sparse block scans** (`--sparse`) — the input a presence bitmap is supposed to pay for. A
   seeded grid of `--sp-series` series × `--sp-blocks` blocks of `--sp-rows` rows (default 16 ×
