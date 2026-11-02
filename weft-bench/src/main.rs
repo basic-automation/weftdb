@@ -57,6 +57,7 @@ fn main() -> ExitCode {
 		Command::Run(cli) => *cli,
 		Command::Verify { manifest, accept_advisories } => return verify_manifest(&manifest, accept_advisories),
 		Command::Combine { runs, out, no_manifest } => return combine_runs(&runs, &out, no_manifest),
+		Command::Sweep { knob, values, out_dir, args } => return sweep_runs(&knob, &values, &out_dir, &args),
 		Command::Compare { baseline, candidate, threshold_pct, ignore_provenance, strict, json, markdown } => return compare_runs(&baseline, &candidate, threshold_pct, ignore_provenance, strict, json.as_deref(), markdown.as_deref()),
 	};
 
@@ -424,6 +425,19 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		.map_err(|e| anyhow::anyhow!("compressed-query run failed: {e}"))?;
 		return Ok(code);
 	}
+	if cli.query_mix > 0 {
+		let params = weft_bench::QueryMixParams { rows: cli.query_mix_rows.unwrap_or(corpus.values.len() as u64), ops: cli.query_mix, range_rows: cli.query_mix_range, weights: cli.query_mix_weights, seed: cli.seed };
+		let mut results = Vec::new();
+		weft_bench::run_query_mix(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, params, |result| {
+			let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
+			println!("mix {:<24}: {:>8} ops  {:>12} rows  p50 {:>9.3} ms p99 {:>9.3} ms  {}", result.profile, result.reps, result.dataset.output_points, ms(result.latency.p50_ns), ms(result.latency.p99_ns), if result.correctness.passed() { "PASS" } else { "FAIL" });
+			results.push(result);
+			Ok(())
+		})
+		.await
+		.map_err(|e| anyhow::anyhow!("query-mix run failed: {e}"))?;
+		return finish(cli, &BenchReport::with_results(RunMetadata::capture(Utc::now().to_rfc3339()), results));
+	}
 	if let Some(rows) = cli.analytics_rows {
 		let rows = usize::try_from(rows)?.min(corpus.values.len());
 		let params = AnalyticsParams { rows, tail_rows: cli.analytics_tail.map_or(rows / 10, |t| usize::try_from(t).unwrap_or(usize::MAX)), batch_size: cli.analytics_batch, reps: cli.reps };
@@ -507,6 +521,51 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 ///
 /// The report's own name is `<profile>__<adapters>.json`, so the manifest's stem strip in
 /// [`RunManifest::report_path`] recovers the report from either file alone.
+/// Run the benchmark once per knob value, each in `out_dir/<knob>=<value>`, then write the curves
+/// to `out_dir/sweep.json` and `sweep.md`. Exits non-zero if a run failed or a result failed its gate.
+fn sweep_runs(knob: &str, values: &[String], out_dir: &Path, args: &[String]) -> ExitCode {
+	let result = (|| -> anyhow::Result<ExitCode> {
+		let exe = std::env::current_exe()?;
+		let mut runs = Vec::with_capacity(values.len());
+		let mut code = ExitCode::SUCCESS;
+		for value in values {
+			let dir = out_dir.join(format!("{}={value}", knob.trim_start_matches('-')));
+			std::fs::create_dir_all(&dir)?;
+			let mut command = std::process::Command::new(&exe);
+			command.args(args).arg("--out-dir").arg(&dir);
+			if knob == weft_bench::sweep::THREADS_KNOB {
+				command.env("RAYON_NUM_THREADS", value);
+			} else {
+				command.arg(knob).arg(value);
+			}
+			eprintln!("{PROG}: sweep {knob}={value} -> {}", dir.display());
+			if !command.status()?.success() {
+				eprintln!("{PROG}: sweep {knob}={value}: the run failed; its results, if any, are still laid out");
+				code = ExitCode::FAILURE;
+			}
+			let mut reports = Vec::new();
+			let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "json") && !p.to_string_lossy().ends_with(".manifest.json")).collect();
+			paths.sort();
+			for path in paths {
+				reports.push(serde_json::from_slice::<BenchReport>(&std::fs::read(&path)?).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?);
+			}
+			runs.push((value.clone(), reports));
+		}
+		let sweep = weft_bench::sweep::Sweep::from_runs(knob, args, &runs);
+		std::fs::write(out_dir.join("sweep.json"), serde_json::to_vec_pretty(&sweep)?)?;
+		std::fs::write(out_dir.join("sweep.md"), sweep.to_markdown())?;
+		for curve in &sweep.curves {
+			println!("{:<40} knee {}", format!("{} ({})", curve.profile, curve.workload), curve.knee.as_deref().unwrap_or("none in range"));
+		}
+		println!("sweep: {}", out_dir.join("sweep.md").display());
+		Ok(if sweep.all_passed() { code } else { ExitCode::FAILURE })
+	})();
+	result.unwrap_or_else(|e| {
+		eprintln!("{PROG}: sweep failed: {e:#}");
+		ExitCode::FAILURE
+	})
+}
+
 fn manifest_path_for(report_path: &Path) -> PathBuf {
 	let stem = report_path.file_stem().map_or_else(|| "run".to_string(), |stem| stem.to_string_lossy().into_owned());
 	report_path.with_file_name(format!("{stem}.manifest.json"))
@@ -862,6 +921,14 @@ struct Cli {
 	compressed_query: usize,
 	/// Ingest mode: rows the compressed-query store holds (`--compressed-query-rows`); `None` for the corpus once.
 	compressed_query_rows: Option<u64>,
+	/// Ingest mode: operations in a seeded query mix (`--query-mix`); 0 for none.
+	query_mix: usize,
+	/// Ingest mode: rows the query-mix store starts with (`--query-mix-rows`); `None` for the corpus once.
+	query_mix_rows: Option<u64>,
+	/// Ingest mode: rows a query-mix range scan reads (`--query-mix-range`).
+	query_mix_range: u64,
+	/// Ingest mode: the query mix's lane weights (`--query-mix-weights`).
+	query_mix_weights: weft_bench::LaneWeights,
 	/// Ingest mode: corpus rows an analytics-pipeline run ends with (`--analytics-pipeline`); `None` for none.
 	analytics_rows: Option<u64>,
 	/// Ingest mode: rows the analytics run holds back for its incremental run (`--analytics-tail`); `None` for a tenth.
@@ -990,6 +1057,17 @@ enum Command {
 		/// claim.
 		no_manifest: bool,
 	},
+	/// Run one benchmark once per value of a knob and lay the results out as curves.
+	Sweep {
+		/// The flag (or `threads`) varied.
+		knob: String,
+		/// Its values, in order.
+		values: Vec<String>,
+		/// Where each value's run and the sweep summary go.
+		out_dir: PathBuf,
+		/// The run's own arguments.
+		args: Vec<String>,
+	},
 	/// Decide whether one saved run is slower than another.
 	Compare {
 		/// The stored report the candidate is measured against.
@@ -1039,6 +1117,10 @@ impl Cli {
 			tokens.next();
 			return parse_combine_args(tokens);
 		}
+		if tokens.peek().is_some_and(|token| token == "sweep") {
+			tokens.next();
+			return parse_sweep_args(tokens);
+		}
 		let args = tokens;
 
 		// Synthetic-knob defaults come from the flagship knob set so the CLI never
@@ -1059,6 +1141,7 @@ impl Cli {
 		let mut ingest_growth: Vec<u64> = Vec::new();
 		let (mut ingest_online, mut ingest_online_rows, mut ingest_online_window): (usize, Option<u64>, usize) = (0, None, 1_440);
 		let (mut compressed_query, mut compressed_query_rows): (usize, Option<u64>) = (0, None);
+		let (mut query_mix, mut query_mix_rows, mut query_mix_range, mut query_mix_weights): (usize, Option<u64>, u64, weft_bench::LaneWeights) = (0, None, 1_440, weft_bench::LaneWeights::default());
 		let (mut analytics_rows, mut analytics_tail, mut analytics_batch): (Option<u64>, Option<u64>, usize) = (None, None, 1_440);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
@@ -1132,6 +1215,10 @@ impl Cli {
 				"--analytics-tail" => analytics_tail = Some(take_value(&key)?.parse::<u64>().map_err(|_| "--analytics-tail needs a row count".to_string())?),
 				"--analytics-batch" => analytics_batch = parse_positive(&key, &take_value(&key)?)?,
 				"--compressed-query" => compressed_query = parse_positive(&key, &take_value(&key)?)?,
+				"--query-mix" => query_mix = parse_positive(&key, &take_value(&key)?)?,
+				"--query-mix-rows" => query_mix_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--query-mix-rows needs one row count of at least 2 (e.g. 10M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--query-mix-rows takes one row count".to_string()) })?),
+				"--query-mix-range" => query_mix_range = parse_positive(&key, &take_value(&key)?)? as u64,
+				"--query-mix-weights" => query_mix_weights = parse_lane_weights(&take_value(&key)?)?,
 				"--compressed-query-rows" => compressed_query_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--compressed-query-rows needs one row count of at least 2 (e.g. 100M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--compressed-query-rows takes one row count".to_string()) })?),
 				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
@@ -1222,11 +1309,17 @@ impl Cli {
 		if analytics_rows.is_some() && (compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty()) {
 			return Err("`--analytics-pipeline` is a run of its own".to_string());
 		}
+		if query_mix_rows.is_some() && query_mix == 0 {
+			return Err("`--query-mix-rows` needs `--query-mix <OPS>`".to_string());
+		}
+		if query_mix > 0 && (mode != InputMode::Ingest || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some()) {
+			return Err("`--query-mix` needs `--ingest` and is a run of its own".to_string());
+		}
 		if compressed_query > 0 && (ingest_online > 0 || !ingest_growth.is_empty()) {
 			return Err("`--compressed-query` is a run of its own, apart from `--ingest-online` and `--ingest-growth`".to_string());
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1247,6 +1340,42 @@ fn parse_combine_args(args: impl IntoIterator<Item = String>) -> Result<Command,
 		return Err("combine needs at least two runs: weft-bench combine --out <FILE.json> <RUN.json> <RUN.json>...".to_string());
 	}
 	Ok(Command::Combine { runs, out: out.ok_or("combine needs --out <FILE.json>")?, no_manifest })
+}
+
+/// Parse `weft-bench sweep KNOB=v1,v2,… [--out-dir DIR] -- RUN ARGS…`.
+fn parse_sweep_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+	let mut args = args.into_iter();
+	let (mut spec, mut out_dir) = (None, PathBuf::from("reports/sweep"));
+	for token in args.by_ref() {
+		match token.as_str() {
+			"--" => break,
+			"-h" | "--help" => return Ok(Command::Help),
+			_ if token.starts_with("--out-dir=") => out_dir = PathBuf::from(&token["--out-dir=".len()..]),
+			_ if spec.is_none() => spec = Some(token),
+			other => return Err(format!("sweep: unexpected `{other}` before `--`")),
+		}
+	}
+	let (knob, values) = weft_bench::sweep::parse_spec(&spec.ok_or("sweep needs KNOB=v1,v2,…: weft-bench sweep --ingest-batch=1k,64k -- --ingest --uci FILE")?)?;
+	let args: Vec<String> = args.collect();
+	if args.iter().any(|a| a == &knob || a.starts_with(&format!("{knob}="))) {
+		return Err(format!("sweep: the run arguments already set {knob}"));
+	}
+	if args.iter().any(|a| a == "--out-dir" || a.starts_with("--out-dir=")) {
+		return Err("sweep: give --out-dir=DIR before `--`; each value's run goes in a directory of its own under it".to_string());
+	}
+	// The run's own parser checks its arguments now, with each value, rather than after a long run.
+	for value in &values {
+		let mut trial = args.clone();
+		if knob != weft_bench::sweep::THREADS_KNOB {
+			trial.extend([knob.clone(), value.clone()]);
+		}
+		match Cli::from_args(trial) {
+			Ok(Command::Run(_)) => {}
+			Ok(_) => return Err("sweep: the run arguments must be a benchmark run".to_string()),
+			Err(e) => return Err(format!("sweep {knob}={value}: {e}")),
+		}
+	}
+	Ok(Command::Sweep { knob, values, out_dir, args })
 }
 
 /// Parse the arguments of `weft-bench verify <MANIFEST> [--accept-advisories]`.
@@ -1486,6 +1615,15 @@ fn parse_points_count(s: &str) -> Result<usize, String> {
 }
 
 /// Parse a count flag that must be at least 1.
+/// `INGEST,POINT,RANGE`: the query mix's relative lane weights, at least one above zero.
+fn parse_lane_weights(s: &str) -> Result<weft_bench::LaneWeights, String> {
+	let parts: Vec<u32> = s.split(',').map(|w| w.trim().parse::<u32>()).collect::<Result<_, _>>().map_err(|e| format!("--query-mix-weights: {e}"))?;
+	match parts[..] {
+		[ingest, point_lookup, range_scan] if ingest + point_lookup + range_scan > 0 => Ok(weft_bench::LaneWeights { ingest, point_lookup, range_scan }),
+		_ => Err("--query-mix-weights takes INGEST,POINT,RANGE weights, not all zero (e.g. 60,20,20)".to_string()),
+	}
+}
+
 fn parse_positive(flag: &str, s: &str) -> Result<usize, String> {
 	s.parse::<usize>().ok().filter(|&n| n > 0).ok_or_else(|| format!("invalid {flag} `{s}` (expected a positive integer)"))
 }
@@ -1865,6 +2003,19 @@ INGEST OPTIONS (with --ingest):
         --compressed-query-rows <N>
                              Rows the compressed-query store holds, the corpus laid end
                              to end (k/M/B suffixes) [default: the corpus once]
+        --query-mix <OPS>
+                             Seeded query mix instead: seal the corpus, then run OPS
+                             operations whose lanes (ingest a batch, look up a point,
+                             scan a range) are drawn from --seed as the soak harness
+                             draws them; every read is checked exactly. One result per
+                             lane, in one report
+        --query-mix-rows <N>
+                             Rows the store starts with (k/M/B suffixes)
+                             [default: the corpus once]
+        --query-mix-range <ROWS>
+                             Rows per range scan [default: 1440, one day of minutes]
+        --query-mix-weights <INGEST,POINT,RANGE>
+                             Relative lane weights [default: 60,20,20, the soak mix]
         --analytics-pipeline <ROWS>
                              Analytics pipeline instead: per rep, a fresh legacy database
                              under WEFT_DATA_DIR (required) captures the corpus' first
@@ -1950,6 +2101,15 @@ COMBINE:
         --out FILE.json      Where the combined report goes (required)
         --no-manifest        Skip the provenance check and the manifest (development runs)
 
+SWEEP:
+    weft-bench sweep KNOB=v1,v2,... [--out-dir=DIR] -- <RUN ARGS>...
+        Run the benchmark once per value of KNOB, a run flag (--ingest-batch, --ingest-online,
+        --points, --sp-series, ...) or `threads` (the worker pool, RAYON_NUM_THREADS). Each
+        value's report and manifest go in DIR/<knob>=<value>; DIR/sweep.json and sweep.md lay
+        every result out as a curve and name its knee, the first value past which a step gains
+        less than 10% throughput. Exits non-zero if a run or a gate failed.
+        --out-dir=DIR        Where the runs and the summary go [default: reports/sweep]
+
 COMPARE:
     weft-bench compare <BASELINE.json> <CANDIDATE.json>
         Decide whether the candidate run is materially slower than the baseline. Workloads pair
@@ -2008,6 +2168,16 @@ mod tests {
 	}
 
 	#[test]
+	fn query_mix_takes_ops_rows_range_and_weights_and_stands_alone() {
+		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--query-mix", "500", "--query-mix-rows", "1M", "--query-mix-range", "60", "--query-mix-weights", "0,1,3"]);
+		assert_eq!((cli.query_mix, cli.query_mix_rows, cli.query_mix_range), (500, Some(1_000_000), 60));
+		assert_eq!(cli.query_mix_weights, weft_bench::LaneWeights { ingest: 0, point_lookup: 1, range_scan: 3 });
+		for bad in [&["--ingest", "--query-mix-weights", "0,0,0"][..], &["--ingest", "--query-mix-weights", "1,2"][..], &["--ingest", "--query-mix-rows", "1M"][..], &["--query-mix", "5"][..], &["--ingest", "--query-mix", "5", "--compressed-query", "2"][..]] {
+			assert!(run_cli(bad).is_err(), "{bad:?}");
+		}
+	}
+
+	#[test]
 	fn compressed_query_takes_queries_and_rows_and_stands_alone() {
 		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--compressed-query", "200", "--compressed-query-rows", "100M"]);
 		assert_eq!((cli.compressed_query, cli.compressed_query_rows), (200, Some(100_000_000)));
@@ -2039,6 +2209,7 @@ mod tests {
 			Command::Verify { .. } => panic!("expected a run, got verify"),
 			Command::Compare { .. } => panic!("expected a run, got compare"),
 			Command::Combine { .. } => panic!("expected a run, got combine"),
+			Command::Sweep { .. } => panic!("expected a run, got sweep"),
 		}
 	}
 
@@ -2081,6 +2252,14 @@ mod tests {
 		}
 		assert!(run_cli(&["combine", "--out", "all.json", "r1.json"]).unwrap_err().starts_with("combine needs at least two runs"));
 		assert_eq!(run_cli(&["combine", "r1.json", "r2.json"]).unwrap_err(), "combine needs --out <FILE.json>");
+		match run_cli(&["sweep", "--ingest-batch=1024,65536", "--out-dir=sw", "--", "--ingest", "--uci", "u.txt"]).expect("sweep parses") {
+			Command::Sweep { knob, values, out_dir, args } => assert_eq!((knob.as_str(), values, out_dir, args), ("--ingest-batch", vec!["1024".to_string(), "65536".to_string()], PathBuf::from("sw"), vec!["--ingest".to_string(), "--uci".to_string(), "u.txt".to_string()])),
+			_ => panic!("not a sweep"),
+		}
+		assert!(matches!(run_cli(&["sweep", "threads=1,2", "--", "--synthetic"]), Ok(Command::Sweep { .. })));
+		for bad in [&["sweep", "--", "--synthetic"][..], &["sweep", "--ingest-batch=1k,64k", "--", "--ingest", "--ingest-batch", "8"][..], &["sweep", "--reps=0,3", "--", "--synthetic"][..], &["sweep", "--points=1,2", "--", "--synthetic", "--out-dir", "x"][..], &["sweep", "--ingest-batch=1k,64k", "--", "verify", "m.json"][..]] {
+			assert!(run_cli(bad).is_err(), "{bad:?}");
+		}
 		assert_eq!(run_cli(&["verify", "a.json", "b.json"]).unwrap_err(), "unexpected argument `b.json`; `verify` takes one manifest path");
 		assert_eq!(run_cli(&["verify", "a.json", "--reps", "3"]).unwrap_err(), "unknown flag `--reps` for `verify`");
 	}
