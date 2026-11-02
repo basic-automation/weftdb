@@ -4634,7 +4634,7 @@ dependencies = [
 
 [[package]]
 name = "weft-arrow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -4647,7 +4647,7 @@ dependencies = [
 
 [[package]]
 name = "weft-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "weft-line-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -4684,7 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "weft-orchestration"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -4707,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "weft-physical-type"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bigdecimal",
  "serde",
@@ -4715,7 +4715,7 @@ dependencies = [
 
 [[package]]
 name = "weft-reduce"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -4726,7 +4726,7 @@ dependencies = [
 
 [[package]]
 name = "weft-xbench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4755,7 +4755,7 @@ dependencies = [
 
 [[package]]
 name = "weftdb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",

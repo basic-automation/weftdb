@@ -38,10 +38,9 @@ only the control plane, not the segment frames.
 - **Crash consistency is not finished.** Seals are write-once and durable, startup recovery
   quarantines damaged frames, ingest is idempotent, and a crash-matrix CI job kills the
   process mid-write. Power-loss durability is so far tested only with the power-cut
-  simulator: the privileged power-loss validation on real hardware has not been run. Several
-  slices remain open, among them the rollup fold (S11), partial sidecar v4 (S15) and
-  seal-backed legacy aspects (S19, S20), so a legacy (rows-mode) database keeps some of its
-  crash windows.
+  simulator: the privileged power-loss validation on real hardware has not been run. Seal-backed
+  legacy aspects still feed a per-timestamp queue rather than a change log (S20), and the
+  relaxed-durability mode (S17) is not built.
 - **Upgrading a store from v0.1.0 is one-way** (see the warning above), and **v0.1.0 clients
   that send reduction tokens in another case break**: `?agg=Min` is now a `400` (see Changed).
 - **The analytics pipeline can miss a long gap's far side** (#506). `analyze_range` works in
