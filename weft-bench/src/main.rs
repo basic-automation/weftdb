@@ -33,7 +33,7 @@ use std::{
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_compressed_query, run_ingest_growth, run_ingest_on, run_ingest_online, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressedQueryParams, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, OnlineParams, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
+	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_analytics_pipeline, run_compressed_query, run_ingest_growth, run_ingest_on, run_ingest_online, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, AnalyticsParams, CalibrationStatus, CompressedQueryParams, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, OnlineParams, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
 };
 
 /// Program name used in usage / error output.
@@ -423,6 +423,18 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		.map_err(|e| anyhow::anyhow!("compressed-query run failed: {e}"))?;
 		return Ok(code);
 	}
+	if let Some(rows) = cli.analytics_rows {
+		let rows = usize::try_from(rows)?.min(corpus.values.len());
+		let params = AnalyticsParams { rows, tail_rows: cli.analytics_tail.map_or(rows / 10, |t| usize::try_from(t).unwrap_or(usize::MAX)), batch_size: cli.analytics_batch, reps: cli.reps };
+		let result = run_analytics_pipeline(&profile, &corpus.timestamps, &corpus.values, corpus.missingness_fraction(), generation_ns, params).await.map_err(|e| anyhow::anyhow!("analytics pipeline run failed: {e}"))?;
+		if let Some(a) = &result.analytics {
+			let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
+			println!("analytics: {} rows ({} held back for the incremental run), batch {}, {} reps", a.rows, a.tail_rows, a.batch_size, result.reps);
+			println!("stages   : capture {:.1} ms  prepare {:.1} ms  patterns {:.1} ms  events {:.1} ms  correlate {:.1} ms  signals {:.1} ms  incremental {:.1} ms", ms(a.capture_ns), ms(a.prepare_ns), ms(a.patterns_ns), ms(a.events_ns), ms(a.correlate_ns), ms(a.signals_ns), ms(a.incremental_ns));
+			println!("outputs  : {} patterns, {} signals; peaks {}/{} valleys {}/{} (found/expected)", a.patterns, a.signals, a.peaks_found, a.peaks_expected, a.valleys_found, a.valleys_expected);
+		}
+		return finish(cli, &BenchReport::with_results(RunMetadata::capture(Utc::now().to_rfc3339()), vec![result]));
+	}
 	let result = run_ingest_on(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, cli.reps).await.map_err(|e| anyhow::anyhow!("ingest benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
@@ -801,6 +813,12 @@ struct Cli {
 	compressed_query: usize,
 	/// Ingest mode: rows the compressed-query store holds (`--compressed-query-rows`); `None` for the corpus once.
 	compressed_query_rows: Option<u64>,
+	/// Ingest mode: corpus rows an analytics-pipeline run ends with (`--analytics-pipeline`); `None` for none.
+	analytics_rows: Option<u64>,
+	/// Ingest mode: rows the analytics run holds back for its incremental run (`--analytics-tail`); `None` for a tenth.
+	analytics_tail: Option<u64>,
+	/// Ingest mode: the analytics pipeline's batch size (`--analytics-batch`).
+	analytics_batch: usize,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -978,6 +996,7 @@ impl Cli {
 		let mut ingest_growth: Vec<u64> = Vec::new();
 		let (mut ingest_online, mut ingest_online_rows, mut ingest_online_window): (usize, Option<u64>, usize) = (0, None, 1_440);
 		let (mut compressed_query, mut compressed_query_rows): (usize, Option<u64>) = (0, None);
+		let (mut analytics_rows, mut analytics_tail, mut analytics_batch): (Option<u64>, Option<u64>, usize) = (None, None, 1_440);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
@@ -1046,6 +1065,9 @@ impl Cli {
 				"--ingest-online" => ingest_online = parse_positive(&key, &take_value(&key)?)?,
 				"--ingest-online-rows" => ingest_online_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--ingest-online-rows needs one row count of at least 2 (e.g. 100M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--ingest-online-rows takes one row count".to_string()) })?),
 				"--ingest-online-window" => ingest_online_window = parse_positive(&key, &take_value(&key)?)?,
+				"--analytics-pipeline" => analytics_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--analytics-pipeline needs one row count of at least 2 (e.g. 100k)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--analytics-pipeline takes one row count".to_string()) })?),
+				"--analytics-tail" => analytics_tail = Some(take_value(&key)?.parse::<u64>().map_err(|_| "--analytics-tail needs a row count".to_string())?),
+				"--analytics-batch" => analytics_batch = parse_positive(&key, &take_value(&key)?)?,
 				"--compressed-query" => compressed_query = parse_positive(&key, &take_value(&key)?)?,
 				"--compressed-query-rows" => compressed_query_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--compressed-query-rows needs one row count of at least 2 (e.g. 100M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--compressed-query-rows takes one row count".to_string()) })?),
 				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
@@ -1128,11 +1150,20 @@ impl Cli {
 		if compressed_query_rows.is_some() && compressed_query == 0 {
 			return Err("`--compressed-query-rows` needs `--compressed-query <QUERIES>`".to_string());
 		}
+		if (analytics_rows.is_some() || analytics_tail.is_some()) && mode != InputMode::Ingest {
+			return Err("`--analytics-pipeline` needs `--ingest`".to_string());
+		}
+		if analytics_tail.is_some() && analytics_rows.is_none() {
+			return Err("`--analytics-tail` needs `--analytics-pipeline <ROWS>`".to_string());
+		}
+		if analytics_rows.is_some() && (compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty()) {
+			return Err("`--analytics-pipeline` is a run of its own".to_string());
+		}
 		if compressed_query > 0 && (ingest_online > 0 || !ingest_growth.is_empty()) {
 			return Err("`--compressed-query` is a run of its own, apart from `--ingest-online` and `--ingest-growth`".to_string());
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1751,6 +1782,17 @@ INGEST OPTIONS (with --ingest):
         --compressed-query-rows <N>
                              Rows the compressed-query store holds, the corpus laid end
                              to end (k/M/B suffixes) [default: the corpus once]
+        --analytics-pipeline <ROWS>
+                             Analytics pipeline instead: per rep, a fresh legacy database
+                             under WEFT_DATA_DIR (required) captures the corpus' first
+                             ROWS minus the tail, runs weft-orchestration's Pipeline
+                             stage by stage, captures the tail and runs it again; the
+                             peak and valley detectors must match a reference from the
+                             raw rows. Latency is the first run (--reps fresh databases)
+        --analytics-tail <ROWS>
+                             Rows held back for the incremental run [default: a tenth]
+        --analytics-batch <N>
+                             The pipeline's batch size, in minutes [default: 1440]
 
 GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
         --gm-rounds <N>      Rounds; each calls every size once       [default: 20]
@@ -1855,6 +1897,19 @@ mod tests {
 			assert!(run_cli(&args).is_err(), "{bad:?}");
 		}
 		assert!(run_cli(&["--gap-fill", "--ingest-online", "2"]).unwrap_err().contains("needs `--ingest`"));
+	}
+
+	#[test]
+	fn analytics_pipeline_takes_rows_a_tail_and_a_batch_and_stands_alone() {
+		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--analytics-pipeline", "100k", "--analytics-tail", "500", "--analytics-batch", "60"]);
+		assert_eq!((cli.analytics_rows, cli.analytics_tail, cli.analytics_batch), (Some(100_000), Some(500), 60));
+		let plain = expect_run(&["--ingest", "--uci", "u.txt"]);
+		assert_eq!((plain.analytics_rows, plain.analytics_tail, plain.analytics_batch), (None, None, 1_440));
+		for bad in [&["--analytics-tail", "5"][..], &["--analytics-pipeline", "1k", "--analytics-batch", "0"][..], &["--analytics-pipeline", "1k", "--compressed-query", "2"][..], &["--analytics-pipeline", "1k", "--ingest-online", "2"][..]] {
+			let args: Vec<&str> = ["--ingest", "--uci", "u.txt"].into_iter().chain(bad.iter().copied()).collect();
+			assert!(run_cli(&args).is_err(), "{bad:?}");
+		}
+		assert!(run_cli(&["--gap-fill", "--analytics-pipeline", "1k"]).unwrap_err().contains("needs `--ingest`"));
 	}
 
 	#[test]

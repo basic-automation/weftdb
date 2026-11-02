@@ -433,8 +433,12 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// Target ~50,000 output points per chunk for responsive streaming
 		let chunk_size = 50_000i64;
 		let chunk_count = ((expected_points + chunk_size - 1) / chunk_size).max(1);
-		let chunk_duration_ns = total_ns / chunk_count;
-		let chunk_duration = chrono::Duration::nanoseconds(chunk_duration_ns);
+		// Each chunk spans a whole number of steps. The interpolation grid is anchored at the
+		// chunk's start, so a chunk that ended between two steps started the next chunk's grid
+		// off the range's: past the first chunk every point was resampled between the steps it
+		// should have landed on, and an extreme sitting on a step was never output.
+		let steps_per_chunk = ((expected_points - 1 + chunk_count - 1) / chunk_count).max(1);
+		let chunk_duration = chrono::Duration::nanoseconds(step_ns.saturating_mul(steps_per_chunk));
 
 		tracing::info!(expected_points = expected_points, chunk_count = chunk_count, chunk_duration_ms = chunk_duration.num_milliseconds(), "[analyze_range] Chunked streaming setup");
 
@@ -545,6 +549,21 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 					Err(e) => Some((Err(e.into()), (chunk_end, None, true))),
 				}
 			}
+		});
+
+		// The grid is inclusive at both ends, so a chunk's last point is the next chunk's first.
+		// Emitting it twice made a value on a chunk boundary its own neighbour, which no strict
+		// extreme survives.
+		let mut last_emitted = None;
+		let stream = stream.filter(move |item| {
+			let keep = match item {
+				Ok(point) => last_emitted.is_none_or(|last| point.timestamp > last),
+				Err(_) => true,
+			};
+			if let (true, Ok(point)) = (keep, item) {
+				last_emitted = Some(point.timestamp);
+			}
+			futures::future::ready(keep)
 		});
 
 		Ok(Box::pin(stream))

@@ -46,6 +46,26 @@ only the control plane, not the segment frames.
   index write before it commits), where the planner had walked every segment of the aspect; and
   its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
   Write transactions still see `Busy` at once, as their retry protocol requires.
+- **Analytics pipeline** (#145): `weft-bench --ingest --analytics-pipeline ROWS` captures the
+  first rows of the UCI corpus into a legacy minute-resolution aspect and times the orchestration
+  pipeline stage by stage (prepare, patterns, events, correlate, signals), then an incremental
+  `run()` after a held-back tail (`--analytics-tail`, `--analytics-batch`), gated on the peak and
+  valley detectors finding exactly the extremes the raw rows hold. Report schema v27 adds
+  `analytics`.
+- **`analyze_range` stays on its step grid past 50,000 points**: it cut a long range into chunks
+  that were not a whole number of steps, so every chunk after the first was resampled between the
+  steps it should have landed on (20 s off the minute at 100k UCI rows), and the peak detector
+  reported a peak 400 s from the real one. Chunks now span whole steps, and the point two chunks
+  share is returned once.
+- **Opening a legacy `Database` no longer walks `/proc`**: its cache sized itself with
+  `sysinfo::System::new_all()`, which reads every process and thread on the machine; it now reads
+  memory only. On a busy machine that was most of each `Database::existing`, which
+  `analyze_range` calls per chunk — event detection on 3k rows went from 0.9 s to 21 ms.
+- **weft-bench records the revision it was built from**: its build script reran only when
+  `build.rs` or `Cargo.lock` changed, so a binary built after a commit named the parent commit
+  and called its tree modified, and an edit to another crate could leave a modified build
+  marked clean. It now also watches git's `HEAD`, index and branch ref and every workspace
+  member's sources.
 - **Compressed query** (#145): `weft-bench --ingest --compressed-query QUERIES` times
   `downsample_range` inside the store against decoding the window and reducing it, per window size
   from an hour to a year, gated on the two answers being equal. Report schema v26 adds

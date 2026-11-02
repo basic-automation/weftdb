@@ -76,7 +76,10 @@ fn git_facts(dir: &str) -> Option<(String, &'static str)> {
 
 /// True when the tree carries a change that could have reached the compiled program.
 fn working_tree_is_modified(dir: &str) -> bool {
-	let Ok(output) = Command::new("git").arg("-C").arg(dir).args(["status", "--porcelain"]).output() else {
+	// `GIT_OPTIONAL_LOCKS=0` keeps `git status` from rewriting the index to refresh its stat
+	// cache: the index is watched below, and a write from here would rerun this script on the
+	// next build for nothing.
+	let Ok(output) = Command::new("git").arg("-C").arg(dir).env("GIT_OPTIONAL_LOCKS", "0").args(["status", "--porcelain"]).output() else {
 		// Unreadable status is treated as modified: the safe answer to "do you know exactly what
 		// produced this number" is no.
 		return true;
@@ -91,10 +94,44 @@ fn working_tree_is_modified(dir: &str) -> bool {
 	})
 }
 
+/// The files whose change can make the recorded revision or modified flag stale.
+///
+/// Watching only `Cargo.lock` left both stale: a commit made after the last build reran
+/// nothing, so a binary built from the committed tree still named the parent commit and called
+/// itself modified, and an edit to another crate's source rebuilt the binary without rerunning
+/// this script, so a modified build could call itself clean. Watched here: git's `HEAD`, its
+/// index and the branch `HEAD` names (a commit, checkout or staging), and every workspace
+/// member's sources and manifest (an edit not yet staged). The paths come from git itself, so
+/// a linked worktree, whose `.git` is a file, watches its own `HEAD` and index.
+fn watched_paths(manifest_dir: &str) -> Vec<String> {
+	let git = |args: &[&str]| Command::new("git").arg("-C").arg(manifest_dir).args(args).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty());
+	let mut paths = Vec::new();
+	let mut git_files = vec!["HEAD".to_string(), "index".to_string()];
+	git_files.extend(git(&["symbolic-ref", "-q", "HEAD"]));
+	for file in git_files {
+		paths.extend(git(&["rev-parse", "--path-format=absolute", "--git-path", &file]));
+	}
+	let workspace = std::path::Path::new(manifest_dir).join("..");
+	let manifest = std::fs::read_to_string(workspace.join("Cargo.toml")).unwrap_or_default();
+	let members = manifest.split_once("members = [").map_or("", |(_, rest)| rest.split_once(']').map_or("", |(list, _)| list));
+	for member in members.split(',').map(|m| m.trim().trim_matches('"')).filter(|m| !m.is_empty()) {
+		for part in ["src", "Cargo.toml"] {
+			paths.push(workspace.join(member).join(part).display().to_string());
+		}
+	}
+	// Cargo treats a watched path that does not exist as always changed, which would rebuild
+	// this crate on every build.
+	paths.retain(|path| std::path::Path::new(path).exists());
+	paths
+}
+
 fn main() {
 	println!("cargo:rerun-if-changed=build.rs");
 	println!("cargo:rerun-if-changed=../Cargo.lock");
 	let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+	for path in watched_paths(&manifest_dir) {
+		println!("cargo:rerun-if-changed={path}");
+	}
 	for (key, value) in rustc_facts() {
 		println!("cargo:rustc-env={key}={value}");
 	}

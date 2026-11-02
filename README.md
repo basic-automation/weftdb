@@ -1608,6 +1608,26 @@ What it does today:
   reads** and query p50 2.9 → 0.16 ms; at 64k batches and 100M rows idle p50 is 2.9 → 0.38 ms
   (one reader) and 5.1 → 0.52 ms (eight); a compressed query of an hour at 9,769 segments is
   8.4 → 0.13 ms, and the in-store reduction now wins from a week (1.8×) to a year (3.0–3.4×).
+- **Analytics pipeline** (`--ingest --analytics-pipeline ROWS`, #145) — captures the corpus'
+  first rows into a legacy minute-resolution aspect (`WEFT_DATA_DIR` must point at scratch
+  space), holds back a tail (`--analytics-tail`, default a tenth), and times the orchestration
+  pipeline's first run stage by stage — prepare (`--analytics-batch` rows per batch), patterns,
+  events, correlate, signals — then the incremental `run()` after the tail lands. The gate: the
+  peak and valley detectors must report exactly the global extremes the raw rows hold, in every
+  rep (schema v27 `analytics`). On UCI at 60-row batches (2026-11-02, all exact):
+
+  | rows (reps) | prepare | patterns | events | correlate | signals | incremental | signals out |
+  |---:|---:|---:|---:|---:|---:|---:|---:|
+  | 10k (3) | 82 s | 9.1 s | 0.12 s | 0.56 s | 1.4 s | 30 s | 9,549 |
+  | 30k (3) | 394 s | 58 s | 0.38 s | 2.2 s | 4.3 s | 149 s | 119,055 |
+  | 100k (1) | 1,290 s | 518 s | 6.5 s | 8.7 s | 16 s | 225 s | 226,506 |
+
+  Preparation dominates and grows faster than the rows (×4.8 for ×3, then ×3.3 for ×3.3), and
+  pattern extraction faster still (×6.4, then ×8.9). The pattern and signal counts move a little
+  between runs (6–8 patterns at 30k); the extremes the gate checks do not. Building it found two
+  engine faults, both fixed: opening a legacy `Database` read every process in `/proc` (event
+  detection on 3k rows 0.9 s → 21 ms), and past 50,000 points `analyze_range` resampled off its
+  step grid, which at 100k rows moved the detected peak 400 s.
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a

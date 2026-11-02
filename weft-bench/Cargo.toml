@@ -26,6 +26,10 @@ weft-line-protocol = { workspace = true }
 # The ingest workload (EVI-6) drives the store itself, not bare segment bytes:
 # SegmentStore::open/declare/seal_declared/read_time_range.
 weftdb = { workspace = true }
+# The analytics-pipeline workload (#145) runs weft-orchestration's `Pipeline` over a legacy
+# `Database`, each rep in a fresh one named by a v4 uuid.
+weft-orchestration = { workspace = true }
+uuid = { workspace = true }
 rayon = { workspace = true }
 # `experimental-codecs`: the advisory f64 (Gorilla/Chimp/Chimp128) and FIRE estimates the
 # StorageEstimate reports. Enabled here only, so no published crate turns them on.
