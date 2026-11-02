@@ -25,16 +25,18 @@ mod exact;
 pub mod fill;
 mod scaled;
 pub mod sketch;
+pub mod width;
 
 use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-pub use fill::{fill, Fill, FillError};
+pub use fill::{fill, fill_width, Fill, FillError};
 pub use scaled::{reduce_partial_scaled, reduce_scaled};
 use serde::{Deserialize, Serialize};
 pub use sketch::{decimal_to_f64, DdSketch, SketchError};
 use splimes::{Point, Resolution};
+pub use width::BucketWidth;
 
 /// A per-bucket reduction over the values that fell in the bucket.
 ///
@@ -408,8 +410,8 @@ impl BucketAcc {
 	}
 
 	/// Materialize the requested reductions and the grid-aligned bucket start.
-	fn finish(self, resolution: Resolution, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
-		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
+	fn finish(self, width: BucketWidth, base: i64, aggregations: &[Aggregation]) -> Result<Bucket, ReduceError> {
+		let timestamp = width.start(base).ok_or(ReduceError::BucketStartOverflow)?;
 		// Percentiles read borrowed values, built once, lazily, only if one is requested. One
 		// percentile selects in linear time; several sort the borrowed values once instead.
 		let percentiles = aggregations.iter().filter(|a| a.percentile_rank().is_some()).count();
@@ -439,7 +441,7 @@ impl BucketAcc {
 					Aggregation::Twa => time_weighted_average(&self.samples, TwaMethod::Locf, None),
 					Aggregation::TwaLinear => time_weighted_average(&self.samples, TwaMethod::Linear, None),
 					// The grid end of *this* bucket: the start of the next one.
-					Aggregation::TwaBucketEnd => bucket_start(resolution, base.wrapping_add(1)).and_then(|end| time_weighted_average(&self.samples, TwaMethod::Locf, Some(end))),
+					Aggregation::TwaBucketEnd => width.start(base.wrapping_add(1)).and_then(|end| time_weighted_average(&self.samples, TwaMethod::Locf, Some(end))),
 					Aggregation::P50 | Aggregation::P90 | Aggregation::P95 | Aggregation::P99 => unreachable!("handled by percentile_rank above"),
 					Aggregation::SketchP50 | Aggregation::SketchP90 | Aggregation::SketchP95 | Aggregation::SketchP99 => unreachable!("handled by sketch_quantile above"),
 				}
@@ -573,6 +575,17 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 	reduce_partial(points, resolution, start, end, aggregations)?.finish(resolution, aggregations)
 }
 
+/// [`reduce`] into buckets of a [`BucketWidth`] (`5s`, `15m`): the reduction at the width's
+/// unit, each run of [`count`](BucketWidth::count) unit buckets merged into one
+/// ([`PartialReduction::coarsen`]). A width of one step is [`reduce`] at its unit.
+///
+/// # Errors
+///
+/// As [`reduce`].
+pub fn reduce_width(points: &[Point], width: BucketWidth, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
+	reduce_partial(points, width.unit(), start, end, aggregations)?.coarsen(width.count())?.finish_width(width, aggregations)
+}
+
 /// The in-progress state of a reduction over **part** of a series.
 ///
 /// A chunk, a segment, one shard of a parallel scan — [`merge`](PartialReduction::merge)
@@ -647,13 +660,48 @@ impl PartialReduction {
 	/// [`ReduceError::BucketStartOverflow`] if a bucket's grid start scales past the
 	/// representable time range.
 	pub fn finish(self, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
+		self.finish_width(BucketWidth::from(resolution), aggregations)
+	}
+
+	/// [`finish`](Self::finish) a partial that was [`coarsen`](Self::coarsen)ed to `width`:
+	/// each bucket starts at its index times `width`, and `twa_bucket_end` ends at the next.
+	///
+	/// # Errors
+	///
+	/// As [`finish`](Self::finish).
+	pub fn finish_width(self, width: BucketWidth, aggregations: &[Aggregation]) -> Result<Vec<Bucket>, ReduceError> {
 		let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
 		// A loop rather than a `Result` collect, which cannot size the output from its input.
 		let mut out = Vec::with_capacity(self.buckets.len());
 		for (base, acc) in self.buckets {
-			out.push(acc.finish(resolution, base, aggregations)?);
+			out.push(acc.finish(width, base, aggregations)?);
 		}
 		Ok(out)
+	}
+
+	/// Merge every run of `count` buckets of this partial's grid into one, for a
+	/// [`BucketWidth`] of `count` of its steps: bucket `i` becomes bucket `i ÷ count` (floored),
+	/// which starts at `i ÷ count · count` steps, so the wider grid stays epoch-aligned. Exact
+	/// for every reduction, since it is [`merge`](Self::merge) applied to neighbours.
+	///
+	/// # Errors
+	///
+	/// [`ReduceError::SketchValue`] if two merged buckets' sketches are incompatible
+	/// (unreachable for partials built at one [`SKETCH_ALPHA`]).
+	pub fn coarsen(self, count: u32) -> Result<Self, ReduceError> {
+		if count <= 1 {
+			return Ok(self);
+		}
+		let mut out: BTreeMap<i64, BucketAcc> = BTreeMap::new();
+		for (base, acc) in self.buckets {
+			match out.entry(base.div_euclid(i64::from(count))) {
+				std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().merge(acc)?,
+				std::collections::btree_map::Entry::Vacant(e) => {
+					e.insert(acc);
+				}
+			}
+		}
+		Ok(Self { buckets: out })
 	}
 
 	/// Re-key this partial from the `from` resolution it was built at to a **coarser**
@@ -825,6 +873,44 @@ mod tests {
 	use chrono::TimeZone;
 
 	use super::*;
+
+	#[test]
+	fn a_width_is_its_unit_reduction_merged_and_is_exact_for_every_reduction() {
+		// One sample a second for 20 s; 5 s buckets.
+		let points: Vec<Point> = (0..20).map(|s| pt(s, &format!("{}", (s * 7) % 11))).collect();
+		let width = BucketWidth::new(Resolution::Seconds, 5).expect("width");
+		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::Twa, Aggregation::TwaBucketEnd, Aggregation::SketchP50];
+		let wide = reduce_width(&points, width, None, None, &aggs).expect("reduces");
+		assert_eq!(wide.len(), 4);
+		for (i, bucket) in wide.iter().enumerate() {
+			// The same bucket reduced on its own, from exactly its five samples.
+			let own = reduce(&points[i * 5..i * 5 + 5], Resolution::Minutes, None, None, &aggs).expect("reduces");
+			assert_eq!(bucket.count, 5);
+			assert_eq!(bucket.timestamp, DateTime::from_timestamp(i64::try_from(i * 5).expect("small"), 0).expect("instant"));
+			for agg in aggs.iter().filter(|a| **a != Aggregation::TwaBucketEnd) {
+				assert_eq!(bucket.values.get(agg.as_str()), own[0].values.get(agg.as_str()), "{agg:?} in bucket {i}");
+			}
+		}
+		// The bucket end is the width's, not the unit's: the last sample (at 4 s) carries 1 s of 5.
+		assert!(wide[0].values.contains_key("twa_bucket_end"));
+		assert_eq!(reduce_width(&points, BucketWidth::from(Resolution::Seconds), None, None, &aggs).expect("reduces"), reduce(&points, Resolution::Seconds, None, None, &aggs).expect("reduces"), "a one-step width is its resolution");
+	}
+
+	#[test]
+	fn a_filled_width_marks_its_synthesized_buckets() {
+		let points = [pt(0, "0"), pt(2_700, "30")];
+		let width = BucketWidth::new(Resolution::Minutes, 15).expect("width");
+		let buckets = reduce_width(&points, width, None, None, &[Aggregation::Avg]).expect("reduces");
+		let filled = fill_width(&buckets, width, None, None, &Fill::Linear, 10).expect("fills");
+		assert_eq!(filled.iter().map(|b| (b.timestamp.timestamp(), b.count)).collect::<Vec<_>>(), [(0, 1), (900, 0), (1_800, 0), (2_700, 1)]);
+		assert_eq!(filled[1].values.get("avg"), Some(&BigDecimal::from(10)));
+		// A spline fill keeps its unit-grid points at bucket starts only.
+		let knots = [pt(0, "0"), pt(2_700, "9"), pt(4_500, "25"), pt(6_300, "49")];
+		let buckets = reduce_width(&knots, width, None, None, &[Aggregation::Avg]).expect("reduces");
+		let spline = fill_width(&buckets, width, None, None, &Fill::Spline(splimes::Spline::Quadratic), 10).expect("fills");
+		assert_eq!(spline.iter().map(|b| b.timestamp.timestamp()).collect::<Vec<_>>(), (0..8).map(|i| i * 900).collect::<Vec<_>>());
+		assert!(spline.iter().all(|b| b.values.contains_key("avg")), "every inner bucket gets a value: {spline:?}");
+	}
 
 	fn pt(secs: i64, value: &str) -> Point {
 		Point { timestamp: Utc.timestamp_opt(secs, 0).single().expect("valid instant"), value: BigDecimal::from_str(value).expect("valid decimal") }

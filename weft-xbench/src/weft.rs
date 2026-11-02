@@ -24,11 +24,23 @@ pub trait Arm {
 		true
 	}
 
+	/// Whether the arm's load is a result of its own. An arm that loads exactly as another arm of
+	/// the same engine does (the native and client-side arms load as the portable one) reports
+	/// `false` instead of a duplicate figure.
+	fn reports_load(&self) -> bool {
+		true
+	}
+
 	/// Whether the arm has a downsample of its own. An arm that would run the same reduction as
 	/// another arm over the same store reports `false` instead of a duplicate figure.
 	fn downsamples(&self) -> bool {
 		true
 	}
+
+	/// Release whatever an earlier [`load`](Arm::load) stored: drop its database, table or store.
+	/// The runner calls it before starting each load's clock, so a load's time is the load alone
+	/// and not also the teardown of the last one (`IoTDB`'s `DROP DATABASE` takes a second).
+	fn unload(&mut self);
 
 	/// Load `ds` into fresh storage, replacing whatever an earlier call loaded. This is the
 	/// timed load phase.
@@ -37,6 +49,15 @@ pub trait Arm {
 	///
 	/// If the engine refuses the data.
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()>;
+
+	/// Reconnect to what [`load`](Arm::load) stored after the engine restarted, and wait until it
+	/// answers; an in-process arm closes its files and opens them again. Called before a
+	/// post-restart rep, outside the clock (#146).
+	///
+	/// # Errors
+	///
+	/// If the engine does not come back, or nothing is loaded.
+	async fn reopen(&mut self) -> anyhow::Result<()>;
 
 	/// Bytes the loaded data occupies on disk, read after [`load`](Arm::load); `None` for an arm
 	/// with no storage.
@@ -69,11 +90,18 @@ pub struct WeftMemory;
 impl Arm for WeftMemory {
 	fn info(&self) -> ArmInfo {
 		let report = WeftAdapter::new().adapter_info();
-		ArmInfo { arm: "weftdb-memory".into(), engine: report.engine, value_type: "BigDecimal".into(), method: format!("{}; downsample via weft_reduce::reduce", report.method) }
+		ArmInfo { arm: "weftdb-memory".into(), engine: report.engine, value_type: "BigDecimal".into(), method: format!("{}; downsample via weft_reduce::reduce", report.method), class: Some(crate::ArmClass::Native), own_answer: None }
 	}
 
 	fn loads(&self) -> bool {
 		false
+	}
+
+	fn unload(&mut self) {}
+
+	/// Nothing is stored, so nothing reopens.
+	fn reopen(&mut self) -> impl Future<Output = anyhow::Result<()>> {
+		std::future::ready(Ok(()))
 	}
 
 	/// Nothing to load: the points go to splimes on every call.
@@ -107,9 +135,11 @@ const ASPECT: &str = "xbench";
 /// Counter distinguishing store directories.
 static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
 
-/// A loaded store and the directory it lives in, removed on drop (the store first).
+/// A loaded store and the directory it lives in, removed on drop.
 struct Stored {
-	store: SegmentStore,
+	/// `None` only between closing the store and opening it again in [`Arm::reopen`]: a root
+	/// opens once per process, so the old handle must go first.
+	store: Option<SegmentStore>,
 	dir: PathBuf,
 	first: i64,
 	last: i64,
@@ -196,6 +226,10 @@ async fn seal(dir: &Path, physical_type: PhysicalType, timestamps: &[i64], value
 }
 
 impl Stored {
+	fn store(&self) -> anyhow::Result<&SegmentStore> {
+		self.store.as_ref().ok_or_else(|| anyhow::anyhow!("{}: the store did not reopen", self.dir.display()))
+	}
+
 	/// The read window's bounds and a margin that takes in every stored row.
 	fn window(&self, ds: &Dataset) -> anyhow::Result<(i64, i64, i64)> {
 		let (lo, hi) = (nanos(ds.start)?, nanos(ds.end)?);
@@ -206,13 +240,13 @@ impl Stored {
 		let (lo, hi, margin) = self.window(ds)?;
 		let interpolator = Interpolator::new(Spline::Linear, ds.resolution);
 		Ok(match out {
-			ValueOut::Decimal => Output::Decimal(self.store.interpolate_range(ASPECT, lo, hi, margin, interpolator).await?.into_points()),
-			ValueOut::F64 => Output::Float(self.store.interpolate_range_f64(ASPECT, lo, hi, margin, interpolator).await?.into_parts().1),
+			ValueOut::Decimal => Output::Decimal(self.store()?.interpolate_range(ASPECT, lo, hi, margin, interpolator).await?.into_points()),
+			ValueOut::F64 => Output::Float(self.store()?.interpolate_range_f64(ASPECT, lo, hi, margin, interpolator).await?.into_parts().1),
 		})
 	}
 
 	async fn downsample(&self, ds: &Dataset) -> anyhow::Result<Vec<BucketRow>> {
-		BucketRow::from_weft(&self.store.downsample_range(ASPECT, self.first, self.last, ds.bucket, &DOWNSAMPLE_AGGREGATIONS).await?)
+		BucketRow::from_weft(&self.store()?.downsample_range(ASPECT, self.first, self.last, ds.bucket, &DOWNSAMPLE_AGGREGATIONS).await?)
 	}
 }
 
@@ -223,11 +257,23 @@ impl Arm for WeftStore {
 			ValueOut::F64 => ("f64", "interpolate_range_f64"),
 		};
 		let layout = if self.batch_rows == usize::MAX { "one segment per load".to_string() } else { format!("{}-row segments", self.batch_rows) };
-		ArmInfo { arm: self.name.into(), engine: "weftdb SegmentStore + splimes".into(), value_type: value_type.into(), method: format!("interpolation-on-read via SegmentStore::{call} (Backend::Auto), downsample via SegmentStore::downsample_range; {layout}") }
+		ArmInfo { arm: self.name.into(), engine: "weftdb SegmentStore + splimes".into(), value_type: value_type.into(), method: format!("interpolation-on-read via SegmentStore::{call} (Backend::Auto), downsample via SegmentStore::downsample_range; {layout}"), class: Some(crate::ArmClass::Native), own_answer: None }
 	}
 
 	fn downsamples(&self) -> bool {
 		self.downsamples
+	}
+
+	fn unload(&mut self) {
+		self.stored = None;
+	}
+
+	async fn reopen(&mut self) -> anyhow::Result<()> {
+		let name = self.name;
+		let stored = self.stored.as_mut().ok_or_else(|| anyhow::anyhow!("{name}: nothing loaded"))?;
+		stored.store = None;
+		stored.store = Some(SegmentStore::open(&stored.dir).await?);
+		Ok(())
 	}
 
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
@@ -240,7 +286,7 @@ impl Arm for WeftStore {
 		let dir = std::env::temp_dir().join(format!("weft-xbench-{}-{}-{}", self.name, std::process::id(), NEXT_STORE.fetch_add(1, Ordering::Relaxed)));
 		std::fs::create_dir_all(&dir)?;
 		let (first, last) = (timestamps[0], timestamps[timestamps.len() - 1]);
-		self.stored = Some(Stored { store: seal(&dir, physical_type, &timestamps, &values, self.batch_rows).await?, dir, first, last });
+		self.stored = Some(Stored { store: Some(seal(&dir, physical_type, &timestamps, &values, self.batch_rows).await?), dir, first, last });
 		Ok(())
 	}
 

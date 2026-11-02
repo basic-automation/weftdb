@@ -346,6 +346,35 @@ pub enum Problem {
 	SourceUnrecorded,
 	/// The binary was compiled from a modified tree.
 	DirtySource,
+	/// A short result rests on fewer timed samples than the fair protocol asks for.
+	FewSamples {
+		/// The result's profile and adapter.
+		result: String,
+		/// Samples behind its latency.
+		samples: usize,
+	},
+}
+
+/// The fewest timed samples a short result may rest on (fair protocol, roadmap 1.1).
+pub const MIN_REFERENCE_SAMPLES: usize = 10;
+
+/// A result whose median sample is shorter than this is a short test, held to
+/// [`MIN_REFERENCE_SAMPLES`].
+///
+/// A longer one — a pipeline run of half an hour — is not: ten of them
+/// would be most of a day, and the protocol asks for ten reps of *short* tests.
+pub const SHORT_TEST_NS: u64 = 60_000_000_000;
+
+/// The results of `report` too short and too thinly sampled to support a claim, as
+/// [`Problem::FewSamples`].
+fn thin_results(report: &BenchReport) -> Vec<Problem> {
+	report.results
+		.iter()
+		.filter_map(|result| {
+			let samples = if result.samples_ns.is_empty() { result.latency.count } else { result.samples_ns.len() };
+			(result.latency.p50_ns < SHORT_TEST_NS && samples < MIN_REFERENCE_SAMPLES).then(|| Problem::FewSamples { result: format!("{} / {}", result.profile, result.adapter), samples })
+		})
+		.collect()
 }
 
 impl fmt::Display for Problem {
@@ -359,6 +388,7 @@ impl fmt::Display for Problem {
 			Self::DuplicateMeasure(name) => write!(f, "measure `{name}` appears more than once"),
 			Self::SourceUnrecorded => f.write_str("the measured binary records no source revision"),
 			Self::DirtySource => f.write_str("the measured binary was compiled from a modified working tree"),
+			Self::FewSamples { result, samples } => write!(f, "{result} rests on {samples} timed sample(s); a short test needs at least {MIN_REFERENCE_SAMPLES}"),
 		}
 	}
 }
@@ -379,7 +409,7 @@ impl Problem {
 	/// than costing the run.
 	#[must_use]
 	pub const fn is_defect(&self) -> bool {
-		!matches!(self, Self::SourceUnrecorded | Self::DirtySource)
+		!matches!(self, Self::SourceUnrecorded | Self::DirtySource | Self::FewSamples { .. })
 	}
 }
 
@@ -529,12 +559,14 @@ impl RunManifest {
 			match std::fs::read(&path) {
 				Ok(bytes) => {
 					let actual = hex_digest(&bytes);
-					if actual != self.sources.report_sha256 {
+					if actual == self.sources.report_sha256 {
+						match serde_json::from_slice::<BenchReport>(&bytes) {
+							Err(error) => problems.push(Problem::ReportMismatch(format!("{} is not a readable report: {error}", path.display()))),
+							Ok(_) if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != self.sources.report_bytes => problems.push(Problem::ReportMismatch(format!("{} is {} bytes, the manifest recorded {}", path.display(), bytes.len(), self.sources.report_bytes))),
+							Ok(report) => problems.extend(thin_results(&report)),
+						}
+					} else {
 						problems.push(Problem::ChecksumMismatch { path: path.display().to_string(), expected: self.sources.report_sha256.clone(), actual });
-					} else if let Err(error) = serde_json::from_slice::<BenchReport>(&bytes) {
-						problems.push(Problem::ReportMismatch(format!("{} is not a readable report: {error}", path.display())));
-					} else if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != self.sources.report_bytes {
-						problems.push(Problem::ReportMismatch(format!("{} is {} bytes, the manifest recorded {}", path.display(), bytes.len(), self.sources.report_bytes)));
 					}
 				}
 				Err(error) => problems.push(Problem::SourceUnreadable { path: path.display().to_string(), reason: error.to_string() }),
@@ -712,13 +744,25 @@ mod tests {
 	/// A result with the shape a real interpolation run produces: latency, storage, and an
 	/// accuracy block (which only a synthetic profile carries).
 	fn sample_result(adapter: &str, publishable: bool) -> BenchResult {
-		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: 1000, values_finite: publishable }, accuracy: Some(crate::accuracy::AccuracyMetrics { count: 1000, rmse: 0.5, mae: 0.4, max_abs_error: 1.5, bias: 0.0 }), storage: Some(sample_storage()), cold_warm: None, gpu_pool: None, adapter_info: None }
+		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: 1000, values_finite: publishable, result_sha256: None }, accuracy: Some(crate::accuracy::AccuracyMetrics { count: 1000, rmse: 0.5, mae: 0.4, max_abs_error: 1.5, bias: 0.0 }), storage: Some(sample_storage()), cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: Vec::new(), between_run: None }
 	}
 
 	/// A storage estimate shaped like a real f64 compression result: the value column realized
 	/// 6.5 bytes/point, timestamps 1.2, total 7.7.
 	fn sample_storage() -> StorageEstimate {
 		StorageEstimate { physical_type: "f64".to_string(), value_count: 1000, estimated_value_bytes: 6500, realized_value_bytes: 6500, value_codec: "blocked".to_string(), bytes_per_point: 6.5, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "ns".to_string(), timestamp_encoding: "blocked".to_string(), timestamp_bytes: 1200, timestamp_bytes_per_point: 1.2, total_bytes_per_point: 7.7, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: None, advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }
+	}
+
+	#[test]
+	fn a_short_result_needs_ten_samples_and_a_long_one_does_not() {
+		let with = |samples: Vec<u64>| BenchResult { latency: LatencyStats::from_samples(&samples), reps: samples.len(), samples_ns: samples, ..sample_result("weftdb", true) };
+		let report = |results| BenchReport::with_results(sample_report().metadata, results);
+		let thin = thin_results(&report(vec![with(vec![100; 9]), with(vec![100; 10]), with(vec![SHORT_TEST_NS; 1])]));
+		assert_eq!(thin, vec![Problem::FewSamples { result: "interpolation-heavy-irregular / weftdb".to_string(), samples: 9 }], "nine short samples are too few; ten, or one sample a minute long, are not");
+		assert!(!thin[0].is_defect(), "too few samples is reported at the gate, not refused at capture");
+		// An artifact from before samples were kept is judged on its latency count.
+		let older = BenchResult { samples_ns: Vec::new(), ..with(vec![100; 3]) };
+		assert_eq!(thin_results(&report(vec![older])).len(), 1);
 	}
 
 	fn sample_report() -> BenchReport {

@@ -799,3 +799,36 @@ async fn test_list_dictionaries_lists_the_aspects_dictionaries() {
 
 	common::remove_database(&db_name);
 }
+
+/// A range long enough to be split into chunks stays on its step grid, without the point two
+/// chunks share appearing twice. 120,001 minutes is three chunks that do not divide it evenly:
+/// the second chunk used to start 20 s off the minute, so every point after it was resampled
+/// between minutes and the spike at minute 70,001 never came out at its own value.
+#[tokio::test]
+async fn a_chunked_range_keeps_to_its_step_grid() {
+	let db_name = format!("test_chunk_grid_{}", Uuid::new_v4());
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("grid").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "value", &Resolution::Minutes, None).await.expect("Failed to track aspect").id();
+	let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+	let (minutes, spike) = (120_001_i64, 70_001_i64);
+	let measurements: Vec<_> = (0..=minutes).map(|m| InputMeasurement::new(start + chrono::Duration::minutes(m), BigDecimal::from(if m == spike { 100 } else { 0 }))).collect();
+	for chunk in measurements.chunks(10_000) {
+		db.capture_measurement_chunk(&aspect, DatasetId::new(), chunk).await.expect("Failed to capture");
+	}
+
+	let end = start + chrono::Duration::minutes(minutes);
+	let mut stream = db.analyze_range(&aspect, start, end, Resolution::Minutes, Spline::Linear).await.expect("Failed to analyze range");
+	let mut points = Vec::new();
+	while let Some(point) = stream.next().await {
+		points.push(point.expect("a point"));
+	}
+
+	let off_grid: Vec<_> = points.iter().enumerate().filter(|(i, p)| p.timestamp != start + chrono::Duration::minutes(i64::try_from(*i).unwrap())).map(|(_, p)| p.timestamp).take(3).collect();
+	assert!(off_grid.is_empty(), "every point is the next minute, but these are not: {off_grid:?}");
+	assert_eq!(points.len(), usize::try_from(minutes + 1).unwrap());
+	let peak = points.iter().max_by(|a, b| a.value.cmp(&b.value)).expect("points");
+	assert_eq!((peak.timestamp, peak.value.clone()), (start + chrono::Duration::minutes(spike), BigDecimal::from(100)));
+
+	common::remove_database(&db_name);
+}

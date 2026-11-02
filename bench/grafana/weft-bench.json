@@ -1,0 +1,72 @@
+{
+  "title": "weft-bench",
+  "uid": "weft-bench",
+  "description": "weft-bench results from the Prometheus text a run writes with --prom (or weft-bench export --format prom), collected by a node-exporter textfile collector or a Pushgateway. Every panel shows only results that passed their gate; the gate panel shows the rest.",
+  "tags": ["weftdb", "benchmark"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-30d", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "datasource", "type": "datasource", "query": "prometheus", "label": "Prometheus" },
+      { "name": "workload", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(weft_bench_reps, workload)", "multi": true, "includeAll": true, "current": { "text": "All", "value": "$__all" } },
+      { "name": "profile", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(weft_bench_reps{workload=~\"$workload\"}, profile)", "multi": true, "includeAll": true, "current": { "text": "All", "value": "$__all" } }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Results failing their gate",
+      "description": "A result whose correctness gate failed is not publishable; its timing is not shown in the other panels.",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "refId": "A", "expr": "count(weft_bench_publishable{workload=~\"$workload\",profile=~\"$profile\"} == 0) or vector(0)" } ],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Failing results",
+      "gridPos": { "x": 6, "y": 0, "w": 18, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "refId": "A", "expr": "weft_bench_publishable{workload=~\"$workload\",profile=~\"$profile\"} == 0", "format": "table", "instant": true } ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "p50 latency (publishable results)",
+      "gridPos": { "x": 0, "y": 5, "w": 12, "h": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "refId": "A", "expr": "weft_bench_latency_seconds{quantile=\"0.5\",workload=~\"$workload\",profile=~\"$profile\"} and on(profile, workload, adapter) (weft_bench_publishable == 1)", "legendFormat": "{{profile}} · {{adapter}}" } ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "p99 latency (publishable results)",
+      "gridPos": { "x": 12, "y": 5, "w": 12, "h": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "refId": "A", "expr": "weft_bench_latency_seconds{quantile=\"0.99\",workload=~\"$workload\",profile=~\"$profile\"} and on(profile, workload, adapter) (weft_bench_publishable == 1)", "legendFormat": "{{profile}} · {{adapter}}" } ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Throughput (publishable results)",
+      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "refId": "A", "expr": "weft_bench_throughput_per_second{workload=~\"$workload\",profile=~\"$profile\"} and on(profile, workload, adapter) (weft_bench_publishable == 1)", "legendFormat": "{{profile}} · {{adapter}}" } ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Runs",
+      "gridPos": { "x": 12, "y": 14, "w": 12, "h": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "refId": "A", "expr": "weft_bench_run_info", "format": "table", "instant": true } ]
+    }
+  ]
+}

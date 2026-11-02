@@ -17,6 +17,10 @@
 //! the knot instants, then their values by equality join); the first and last segments stand in past the data. Downsampling
 //! is the native `date_bin`.
 //!
+//! The native fill is timed too, as `influxdb3-native` (fair-protocol class A, #148):
+//! `date_bin_gapfill` at the grid's step with `interpolate(avg(v))`, labelled with the answer it
+//! computes; `influxdb3-client` fetches the knots and interpolates them in this client (class C).
+//!
 //! A series and a timestamp are `InfluxDB`'s key, so a second write at the same instant replaces the
 //! first. For interpolation that is splimes' rule (the last value wins); for downsampling it means a
 //! duplicated instant counts once where `weft_reduce` counts every row. The benchmark's datasets have
@@ -30,7 +34,7 @@ use arrow::array::{Array, Float64Array, Int64Array};
 use bigdecimal::ToPrimitive;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::{weft::Arm, ArmInfo, BucketRow, Dataset, Output};
+use crate::{client_linear, place, weft::Arm, ArmClass, ArmInfo, BucketRow, Dataset, Output};
 
 /// Counter distinguishing databases of arms alive at once.
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +76,18 @@ s AS (SELECT n.t,
 SELECT CASE WHEN b_t = a_t OR t = a_t THEN a_v ELSE a_v + (b_v - a_v) * (CAST(t - a_t AS DOUBLE) / CAST(b_t - a_t AS DOUBLE)) END v
 FROM s ORDER BY t
 ";
+
+/// The native fill (class A), with `{start}`, `{end}` and `{step}` in epoch nanoseconds: bucket
+/// averages at the grid's step, the line between filled buckets across empty ones.
+const NATIVE_SQL: &str = "
+SELECT CAST(g AS BIGINT) b, v FROM (
+	SELECT date_bin_gapfill(INTERVAL '{step} nanoseconds', time, TIMESTAMP '1970-01-01T00:00:00Z') g, interpolate(avg(v)) v
+	FROM knots WHERE time >= to_timestamp_nanos({start}) AND time <= to_timestamp_nanos({end}) GROUP BY g
+) ORDER BY b
+";
+
+/// The raw knots a client fetches (class C), in instant order.
+const FETCH_SQL: &str = "SELECT CAST(time AS BIGINT) b, v FROM knots ORDER BY time";
 
 /// Count, min, max and avg per epoch-aligned bucket of `{width}` nanoseconds.
 const DOWNSAMPLE_SQL: &str = "SELECT CAST(date_bin(INTERVAL '{width} nanoseconds', time, TIMESTAMP '1970-01-01T00:00:00Z') AS BIGINT) b, CAST(count(*) AS BIGINT) n, min(v) mn, max(v) mx, avg(v) av FROM knots GROUP BY b ORDER BY b";
@@ -151,13 +167,14 @@ impl Drop for Db {
 
 /// `InfluxDB` 3 Core with the knots stored as a `float` field.
 pub struct Influx {
+	class: ArmClass,
 	server: Server,
 	db: Option<Db>,
 }
 
 impl std::fmt::Debug for Influx {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("Influx").field("server", &self.server).field("loaded", &self.db.is_some()).finish()
+		f.debug_struct("Influx").field("server", &self.server).field("class", &self.class).field("loaded", &self.db.is_some()).finish()
 	}
 }
 
@@ -165,7 +182,19 @@ impl Influx {
 	/// `influxdb3-double`.
 	#[must_use]
 	pub const fn double(server: Server) -> Self {
-		Self { server, db: None }
+		Self { class: ArmClass::PortableSql, server, db: None }
+	}
+
+	/// `influxdb3-native`: `date_bin_gapfill` with `interpolate`.
+	#[must_use]
+	pub const fn native(server: Server) -> Self {
+		Self { class: ArmClass::Native, server, db: None }
+	}
+
+	/// `influxdb3-client`: the knots fetched and interpolated in this client.
+	#[must_use]
+	pub const fn client(server: Server) -> Self {
+		Self { class: ArmClass::ClientSide, server, db: None }
 	}
 
 	/// Run `f` with the loaded database on tokio's blocking pool, as the `DuckDB` arms do, so the
@@ -213,6 +242,15 @@ fn parse_grid(parquet: bytes::Bytes) -> anyhow::Result<Vec<f64>> {
 	Ok(out)
 }
 
+fn parse_pairs(parquet: bytes::Bytes) -> anyhow::Result<Vec<(i64, f64)>> {
+	let mut out = Vec::new();
+	for batch in batches(parquet)? {
+		let (b, v) = (column::<Int64Array>(&batch, "b")?, column::<Float64Array>(&batch, "v")?);
+		out.extend((0..b.len()).map(|i| (b.value(i), if v.is_null(i) { f64::NAN } else { v.value(i) })));
+	}
+	Ok(out)
+}
+
 fn parse_buckets(parquet: bytes::Bytes) -> anyhow::Result<Vec<BucketRow>> {
 	let mut out = Vec::new();
 	for batch in batches(parquet)? {
@@ -255,7 +293,37 @@ fn load_db(server: Server, name: String, body: &str) -> anyhow::Result<Db> {
 impl Arm for Influx {
 	fn info(&self) -> ArmInfo {
 		let version = self.server.version().unwrap_or_else(|_| "unknown".into());
-		ArmInfo { arm: "influxdb3-double".into(), engine: format!("influxdb3 {version}"), value_type: "float field".into(), method: "linear interpolation in SQL: generate_series() grid merged with the knots, running max/min of the knot instants joined back to their values, first/last segment extended; downsample via date_bin; line-protocol writes of at most 8 MiB sent concurrently, each answered once the WAL file is persisted (no_sync=false); SQL over HTTP read as Parquet, on loopback".into() }
+		let storage = "line-protocol writes of at most 8 MiB sent concurrently, each answered once the WAL file is persisted (no_sync=false); SQL over HTTP read as Parquet, on loopback";
+		let (engine, value_type) = (format!("influxdb3 {version}"), "float field".to_string());
+		match self.class {
+			ArmClass::PortableSql => ArmInfo { arm: "influxdb3-double".into(), engine, value_type, method: format!("linear interpolation in SQL: generate_series() grid merged with the knots, running max/min of the knot instants joined back to their values, first/last segment extended; downsample via date_bin; {storage}"), class: Some(self.class), own_answer: None },
+			ArmClass::Native => ArmInfo { arm: "influxdb3-native".into(), engine, value_type, method: format!("native fill: date_bin_gapfill(step) with interpolate(avg(v)); {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones; nothing before the first knot's bucket or after the last's".into()) },
+			ArmClass::ClientSide => ArmInfo { arm: "influxdb3-client".into(), engine, value_type, method: format!("client-side: every knot fetched in instant order as Parquet, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None },
+		}
+	}
+
+	fn reports_load(&self) -> bool {
+		self.class == ArmClass::PortableSql
+	}
+
+	fn downsamples(&self) -> bool {
+		self.class == ArmClass::PortableSql
+	}
+
+	fn unload(&mut self) {
+		self.db = None;
+	}
+
+	/// A fresh agent, since the old one pools connections the restart closed, once the server
+	/// answers.
+	async fn reopen(&mut self) -> anyhow::Result<()> {
+		let db = self.db.as_mut().ok_or_else(|| anyhow::anyhow!("influxdb3: nothing loaded"))?;
+		let server = Server::new(&self.server.url);
+		let probe = server.clone();
+		crate::await_ready("influxdb3", move || probe.version()).await?;
+		db.server = server.clone();
+		self.server = server;
+		Ok(())
 	}
 
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
@@ -279,6 +347,19 @@ impl Arm for Influx {
 		let start = ds.start.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid start out of range"))?;
 		let end = ds.end.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid end out of range"))?;
 		let step = ds.resolution.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("grid step out of range"))?;
+		let n = ds.grid_len();
+		match self.class {
+			ArmClass::Native => {
+				let sql = NATIVE_SQL.replace("{start}", &start.to_string()).replace("{end}", &end.to_string()).replace("{step}", &step.to_string());
+				let rows = self.on_db(move |server, db| parse_pairs(server.query(db, &sql)?)).await?;
+				return Ok(Output::Float(place(&rows, start, step, n)));
+			}
+			ArmClass::ClientSide => {
+				let (t, v): (Vec<i64>, Vec<f64>) = self.on_db(move |server, db| parse_pairs(server.query(db, FETCH_SQL)?)).await?.into_iter().unzip();
+				return Ok(Output::Float(client_linear(&t, &v, start, step, n)));
+			}
+			ArmClass::PortableSql => {}
+		}
 		let sql = INTERPOLATE_SQL.replace("{start}", &start.to_string()).replace("{end}", &end.to_string()).replace("{step}", &step.to_string());
 		Ok(Output::Float(self.on_db(move |server, db| parse_grid(server.query(db, &sql)?)).await?))
 	}

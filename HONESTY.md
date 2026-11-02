@@ -57,8 +57,9 @@ WeftDB's core advantage does not apply, and a conventional TSDB is the simpler c
 
 **You expect splines to beat straight lines on market data.** On real BTC/USD closes, a cubic gap
 fill had MAE $55.34 against linear's $49.27 (hourly buckets), and $8.37 against $6.79 at
-one-minute buckets, at about 14% more time. Prices move close to a random walk. The spline wins
-only on smooth signals (README, *Where it doesn't pay off*).
+one-minute buckets, at about 14% more time. Prices move close to a random walk. On real smooth
+signals (NOAA buoy temperature and pressure) the spline wins only on short outages: with outages
+averaging a day, linear is more accurate on 8 of 9 series (README, *Where it doesn't pay off*).
 
 **You expect a GPU to make every query faster.** Reconstructing about 1M points from 100k stored
 knots took 14.1–16.3 ms on CPU threads (rayon) and 17.0–29.8 ms on an RTX 4070 Ti SUPER
@@ -86,9 +87,10 @@ correctness gate before its timing counts.
 - `weft-bench` measures WeftDB's own paths against portable in-process baselines: linear and
   forward-fill reimplementations. It covers interpolation, ingest, point and range reads,
   compression, downsampling, gap fill and block-sparse scans.
-- `weft-xbench` measures WeftDB against another engine (DuckDB today) on load and linear
-  interpolation. It is a separate workspace, because DuckDB builds from C++, with a lockfile
-  seeded from the workspace's and checked for drift in CI.
+- `weft-xbench` measures WeftDB against other engines (DuckDB, ClickHouse, TimescaleDB, QuestDB,
+  InfluxDB 3 and IoTDB) on load, linear interpolation and downsampling. It is a separate
+  workspace, because DuckDB builds from C++, with a lockfile seeded from the workspace's and
+  checked for drift in CI.
 
 **Correctness before speed.** A run's latency is publishable only if its correctness gate
 passes. Each workload defines its gate: the output grid has the expected size and every value is
@@ -123,7 +125,10 @@ never dropped.
   on 53 of 144 rows. The verdicts held better: 79 of 90 were the same in both runs, none flipped
   between win and loss, and every one that changed had a margin of 1.4× or less
   ([`bench/reports/evi-15/`](bench/reports/evi-15/README.md)). Read a margin under about 1.5× from a
-  single run as unsettled.
+  single run as unsettled. Both harnesses now keep every rep's raw sample and pool separate runs
+  (`weft-bench combine`, `weft-xbench combine`) with intervals drawn runs-first; a pooled
+  cross-engine report calls a win or a loss only where every run's median falls the same way, and
+  a report of one run says so.
 
 **Fair comparison.**
 
@@ -141,11 +146,31 @@ never dropped.
 - kdb+, AVEVA PI, and the enterprise editions of QuestDB and InfluxDB 3 are excluded on licence
   grounds (`WILLINGNESS-TO-PAY.md`, *Benchmark-publication policy*).
 
+**Three interpolation classes.** Each engine is asked for the grid three ways where it can be
+(roadmap 1.2): its native fill (class A), the linear reconstruction in its own SQL (class B), and
+every knot fetched into the Rust client and interpolated there (class C). B and C answer
+WeftDB's question and are timed against it. Most native fills answer a different one (bucket
+averages, and ClickHouse's `INTERPOLATE` carries the last value forward), so they are reported with
+how far their answer lies from the line and the truth, never raced against it.
+
+**Anti-Goodhart rules** (roadmap 1.3), each with what enforces it:
+
+| Rule | Enforced by |
+|---|---|
+| Publish negative results and workloads WeftDB loses | The cross-engine honesty section lists every loss it finds; *When WeftDB is not the right tool* above quotes them; *Kept negative results* below |
+| Methodology before numbers | This page; a report without a manifest that `weft-bench verify` accepts backs no claim |
+| No hard-coded shortcuts | `scripts/bench/check-separation.py`, in CI: no engine crate depends on `weft-bench`/`weft-xbench` or reads a `BENCH` environment variable |
+| Benchmark code separate from engine code | The same check; the harnesses are their own crates, `weft-xbench` its own workspace |
+| Run customer-supplied workloads | Every workload that reads a corpus takes a path (`--input` line protocol, `--uci`, `--comp-csv`, `--ds-csv`, `--gf-csv`, `--rf-csv`, `--pl-csv`, `weft-xbench --tsbs`), and `weft-bench sweep` runs any of them over a knob |
+| Correctness validation gates every number | `is_publishable` (correctness, finite values, the storage error bound); each run's answer digest; `weft-xbench`'s per-arm gate; the failure tests' exact read-back |
+
 **What is not yet measured.** The first cross-engine report (EVI-15) covers DuckDB `DOUBLE` and
 `DECIMAL` on load, storage bytes, linear interpolation and bucketed downsampling, over MCAR, block
 missingness and the UCI corpus at three scales. It ran on the project's reference SSD, not on priced
-cloud hardware, so it has no cost-per-query figure. Other engines, spline methods, concurrency and
-many-series workloads are not compared. Its wins hold only at `tiny` and `small` scale.
+cloud hardware, so it has no cost-per-query figure. Its wins hold only at `tiny` and `small` scale.
+The harness has since grown the other five engines, the three interpolation classes, cold and
+post-restart reads and the TSBS data; no report covering them has been published yet. Spline
+methods, concurrency and many-series workloads are not compared across engines.
 
 **Kept negative results.** The bit-sliced value codec, the GPU on stored interpolation, splines on
 prices, and the approximate percentile were all measured slower or no better than the obvious
@@ -175,9 +200,10 @@ block missingness (contiguous outages) are separate datasets. A method that does
 gaps can fail across an outage.
 
 **Real held-out values.** `weft-bench --gap-fill --gf-csv` cuts outages out of a real series and
-scores each fill against the real values it removed. This is where the spline-versus-linear result
-on prices came from. A real smooth-signal corpus is the open item before WeftDB makes any "spline
-is more accurate" claim on real data. The candidates, all openly licensed, are listed in
+scores each fill against the real values it removed. This is where the spline-versus-linear results
+came from: on prices linear wins; on NOAA NDBC buoy temperature and pressure (#144) cubic wins on
+outages averaging two hours and linear wins on outages averaging a day. WeftDB may claim the
+first only together with the second. Other candidate corpora, all openly licensed, are listed in
 `DESIGN-PARTNERS.md`.
 
 **Point provenance.** Every reconstructed point is marked raw, interpolated or extrapolated, so an

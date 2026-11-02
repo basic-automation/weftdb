@@ -203,12 +203,12 @@ pub fn run_gpu_memory(profile: &GpuMemoryProfile) -> anyhow::Result<BenchResult>
 	let stable = peak_later <= peak_first && peak_first.max(peak_later) <= max_pool_bytes;
 	let summary = GpuPoolSummary { max_pool_bytes, rounds: p.rounds, calls: samples_ns.len(), created: after.created - before.created, created_after_first_round: created_after_first, reused: after.reused - before.reused, evicted: after.evicted - before.evicted, peak_idle_bytes_first_round: peak_first, peak_idle_bytes_later: peak_later, final_idle_bytes: after.idle_bytes, stable };
 
-	let correctness = CorrectnessReport { output_count_ok: complete && stable, expected_output_points: p.sizes.iter().sum::<usize>() * p.rounds, actual_output_points: output_points, values_finite: finite };
+	let correctness = CorrectnessReport { output_count_ok: complete && stable, expected_output_points: p.sizes.iter().sum::<usize>() * p.rounds, actual_output_points: output_points, values_finite: finite, result_sha256: None };
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: p.seed ^ 0x06B0_C0DE_u64, ..BootstrapConfig::default() }));
 	#[allow(clippy::cast_precision_loss)]
 	let throughput_points_per_sec = if measured_ns > 0 { output_points as f64 / (measured_ns as f64 / 1e9) } else { 0.0 };
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GPU_MEMORY.to_string(), reps: p.rounds, dataset: DatasetMeta { input_points: inputs.iter().map(|(_, (t, _))| t.len()).sum(), output_points, irregular: true, missingness_fraction: 0.0, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: Some(summary), adapter_info: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GPU_MEMORY.to_string(), reps: p.rounds, dataset: DatasetMeta { input_points: inputs.iter().map(|(_, (t, _))| t.len()).sum(), output_points, irregular: true, missingness_fraction: 0.0, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: Some(summary), adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
 }
 
 #[cfg(test)]

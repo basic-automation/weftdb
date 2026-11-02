@@ -85,10 +85,18 @@ use crate::{
 /// artifacts, not for writing new ones.
 /// (v23 on this report line is independent of the manifest line's v23 in
 /// [`crate::manifest::MANIFEST_SCHEMA_VERSION`]: EVI-3's 23 landed on the manifest
-/// line, so 23 is the report line's next free number.)
-/// All optional fields are
+/// line, so 23 is the report line's next free number.) v24 added `growth`, what the store held
+/// at one checkpoint of an `ingest_growth` curve ([`crate::ingest::GrowthPoint`]). v25 added
+/// `online`, the ingest and idle-query baselines of an `ingest_online` run
+/// ([`crate::ingest::OnlinePoint`]). v26 added `compressed_query`, one window size of a
+/// `compressed_query` run ([`crate::compressed_query::CompressedQueryPoint`]). v27 added
+/// `analytics`, an `analytics_pipeline` run's stages ([`crate::analytics::AnalyticsPoint`]). v28
+/// added `samples_ns`, the raw samples behind every latency summary, and
+/// `correctness.result_sha256`, a digest of the output, and `between_run`, the spread of the
+/// separate runs `weft-bench combine` pooled. All
+/// optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 28;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -128,6 +136,91 @@ pub struct CorrectnessReport {
 	pub actual_output_points: usize,
 	/// True when every produced value is a finite, well-formed number.
 	pub values_finite: bool,
+	/// SHA-256 of the result's canonical output (schema v28), as [`ResultDigest`] writes it.
+	/// Two runs, two builds or two machines that report the same digest produced the same
+	/// answer, row for row; the counts above can agree while the values differ. A workload
+	/// that times many reads hashes what it checked: the windows it verified, every query's
+	/// buckets. `None` where the output has no fixed order (the online workload's concurrent
+	/// readers), where none is kept (the GPU pool's), and in older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub result_sha256: Option<String>,
+}
+
+/// How the runs pooled into one combined result differed.
+///
+/// Within one run every sample shares the machine's state, so the run's own spread says
+/// little about where another run would land; these are the per-run figures that do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BetweenRun {
+	/// Separate runs pooled.
+	pub runs: usize,
+	/// Each run's p50, in run order.
+	pub run_p50_ns: Vec<u64>,
+	/// Each run's mean, in run order.
+	pub run_mean_ns: Vec<u64>,
+	/// The slowest run's p50 over the fastest's, less one: `0.12` is a 12% spread.
+	pub p50_spread: f64,
+	/// True when every run reported the same `result_sha256`. A run that answered
+	/// differently fails the combined result's correctness.
+	pub digests_agree: bool,
+}
+
+/// SHA-256 over a result's output, one `key,value` line per row in output order.
+///
+/// Keys and values are written with `Display`, so the caller picks the canonical form: a
+/// `BigDecimal` is normalized first (`1.50` and `1.5` are the same answer), an `f64` prints
+/// its shortest round-tripping form, and a timestamp is an integer in a stated unit.
+#[derive(Debug, Clone, Default)]
+pub struct ResultDigest(sha2::Sha256);
+
+impl ResultDigest {
+	/// Add one row.
+	pub fn row(&mut self, key: impl std::fmt::Display, value: impl std::fmt::Display) {
+		use sha2::Digest as _;
+		self.0.update(format!("{key},{value}\n").as_bytes());
+	}
+
+	/// The digest of `rows`, in order.
+	#[must_use]
+	pub fn of<K: std::fmt::Display, V: std::fmt::Display>(rows: impl IntoIterator<Item = (K, V)>) -> String {
+		let mut digest = Self::default();
+		for (key, value) in rows {
+			digest.row(key, value);
+		}
+		digest.finish()
+	}
+
+	/// The lowercase hex digest.
+	#[must_use]
+	pub fn finish(self) -> String {
+		use std::fmt::Write as _;
+
+		use sha2::Digest as _;
+		self.0.finalize().iter().fold(String::with_capacity(64), |mut hex, byte| {
+			let _ = write!(hex, "{byte:02x}");
+			hex
+		})
+	}
+}
+
+/// A stored value as a digest writes it: normalized, or `null`.
+pub(crate) fn nullable_text(value: Option<&BigDecimal>) -> String {
+	value.map_or_else(|| "null".to_string(), |v| v.normalized().to_string())
+}
+
+/// The digest of a decoded column: one row per timestamp.
+pub(crate) fn column_digest(timestamps: &[i64], values: &[Option<BigDecimal>]) -> String {
+	ResultDigest::of(timestamps.iter().zip(values).map(|(t, v)| (t, nullable_text(v.as_ref()))))
+}
+
+/// A reduced bucket as a digest row: its start, then its count and each reduction by name.
+pub(crate) fn bucket_row(bucket: &weft_reduce::Bucket) -> (String, String) {
+	(bucket.timestamp.to_rfc3339(), std::iter::once(bucket.count.to_string()).chain(bucket.values.iter().map(|(name, v)| format!("{name}={}", v.normalized()))).collect::<Vec<_>>().join(";"))
+}
+
+/// The digest of reduced buckets, one row per bucket.
+pub(crate) fn bucket_digest<'a>(buckets: impl IntoIterator<Item = &'a weft_reduce::Bucket>) -> String {
+	ResultDigest::of(buckets.into_iter().map(bucket_row))
 }
 
 impl CorrectnessReport {
@@ -463,6 +556,32 @@ pub struct BenchResult {
 	/// storage paths and name the system in `adapter` instead.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub adapter_info: Option<crate::adapter::AdapterInfo>,
+	/// What the store held at this checkpoint of an `ingest_growth` curve (schema v24); `None`
+	/// for every other workload and for older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub growth: Option<crate::ingest::GrowthPoint>,
+	/// The baselines of an `ingest_online` run (schema v25): ingest alone, queries alone, and
+	/// what the concurrent queries saw; `None` for every other workload and for older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub online: Option<crate::ingest::OnlinePoint>,
+	/// One window size of a `compressed_query` run (schema v26): the in-store reduction against
+	/// decoding the window first; `None` for every other workload and for older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub compressed_query: Option<crate::compressed_query::CompressedQueryPoint>,
+	/// An `analytics_pipeline` run's stage timings and outputs (schema v27); `None` for every
+	/// other workload and for older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub analytics: Option<crate::analytics::AnalyticsPoint>,
+	/// Every timed sample behind [`Self::latency`], in nanoseconds and in the order taken
+	/// (schema v28): a rep's time, or a batch's or a query's for the workloads that time those.
+	/// The summary and its intervals are recomputable from these, and runs can be pooled
+	/// or compared sample by sample. Empty for older artifacts.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub samples_ns: Vec<u64>,
+	/// How the separate runs a combined result pools differed (`weft-bench combine`, schema
+	/// v28); `None` for a single run.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub between_run: Option<BetweenRun>,
 }
 
 /// The first timed repetition apart from the remaining ones.
@@ -501,11 +620,27 @@ impl ColdWarm {
 }
 
 impl BenchResult {
-	/// True when this result is fit to publish: correctness passed and at least
-	/// one rep was timed.
+	/// True when this result is fit to publish: correctness passed, at least one rep was
+	/// timed, and any storage estimate stayed within the error it was selected against.
 	#[must_use]
-	pub const fn is_publishable(&self) -> bool {
-		self.correctness.passed() && self.reps > 0
+	pub fn is_publishable(&self) -> bool {
+		self.correctness.passed() && self.reps > 0 && self.storage.as_ref().is_none_or(StorageEstimate::within_tolerance)
+	}
+}
+
+impl StorageEstimate {
+	/// True when the recorded worst error is within the recorded tolerance.
+	///
+	/// The encoding advisor only picks an encoding within tolerance, so this holds by
+	/// construction; checking it is what lets a bytes-per-point figure that came with an
+	/// error be quoted. A field that does not parse as a decimal fails it: an error bound
+	/// nobody can read bounds nothing.
+	#[must_use]
+	pub fn within_tolerance(&self) -> bool {
+		match (self.max_abs_error.parse::<BigDecimal>(), self.tolerance.parse::<BigDecimal>()) {
+			(Ok(error), Ok(tolerance)) => error <= tolerance,
+			_ => false,
+		}
 	}
 }
 
@@ -513,9 +648,56 @@ impl BenchResult {
 mod tests {
 	use super::*;
 
+	#[test]
+	fn a_storage_error_beyond_its_tolerance_is_not_publishable() {
+		let mut result = sample_result();
+		assert!(result.is_publishable());
+		let storage = result.storage.as_mut().expect("the sample has a storage estimate");
+		(storage.max_abs_error, storage.tolerance) = ("0.004".to_string(), "0.005".to_string());
+		assert!(result.is_publishable(), "within its tolerance");
+		result.storage.as_mut().expect("storage").max_abs_error = "0.006".to_string();
+		assert!(!result.is_publishable(), "beyond its tolerance");
+		result.storage.as_mut().expect("storage").max_abs_error = "lots".to_string();
+		assert!(!result.is_publishable(), "an unreadable bound");
+	}
+
+	#[test]
+	fn a_digest_is_of_the_answer_not_its_spelling() {
+		let d = |s: &str| s.parse::<BigDecimal>().expect("decimal");
+		let column = |values: &[&str]| column_digest(&[1, 2, 3], &values.iter().map(|v| (*v != "-").then(|| d(v))).collect::<Vec<_>>());
+		assert_eq!(column(&["1.50", "2", "-"]), column(&["1.5", "2.000", "-"]), "trailing zeros are not a different answer");
+		assert_ne!(column(&["1.5", "2", "-"]), column(&["1.5", "2", "0"]), "a null is not a zero");
+		assert_ne!(column(&["1.5", "2", "-"]), column(&["1.5", "2.0001", "-"]));
+		assert_eq!(ResultDigest::of(std::iter::empty::<(u8, u8)>()), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "nothing hashes as the empty string");
+		assert_eq!(ResultDigest::of([(1, "a")]).len(), 64);
+	}
+
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }), cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None, adapter_info: None }
+		BenchResult {
+			schema_version: SCHEMA_VERSION,
+			profile: "interpolation-heavy-irregular".to_string(),
+			adapter: "weftdb".to_string(),
+			workload: "upsample_interpolate".to_string(),
+			reps: 3,
+			dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) },
+			latency: LatencyStats::from_samples(&samples),
+			latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())),
+			throughput_points_per_sec: 5_000_000.0,
+			timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 },
+			correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true, result_sha256: None },
+			accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }),
+			storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }),
+			cold_warm: ColdWarm::from_samples(&samples),
+			gpu_pool: None,
+			adapter_info: None,
+			growth: None,
+			online: None,
+			compressed_query: None,
+			analytics: None,
+			samples_ns: samples.to_vec(),
+			between_run: None,
+		}
 	}
 
 	#[test]

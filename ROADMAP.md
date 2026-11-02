@@ -17,21 +17,38 @@ The performance thesis and the first benchmark-claim list are written, and the d
 
 `weft-bench` exists as a first-class workspace member with a CLI runner, a first workload profile, a WeftDB adapter over the vendor-neutral `SystemAdapter` trait, and portable baselines to compare against. Results are scored against analytic ground truth (RMSE, MAE, max error, bias) over selectable synthetic shapes, with latency statistics and a harness-level timing breakdown, and reported as JSON, self-contained HTML and Parquet. Each run records its hardware, disk and GPU/driver versions, and each result carries a storage estimate.
 
-The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill now runs on a real corpus. That run produced a negative result worth keeping: a spline fill does not beat linear on real prices. The compression workload's slow first repetition was explained as first-touch memory rather than lazy initialisation. External-engine adapters, fair-protocol depth and the remaining workloads are still open below.
+The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill now runs on a real corpus. That run produced a negative result worth keeping: a spline fill does not beat linear on real prices. On real buoy temperature and pressure it wins only across short outages (#144). The compression workload's slow first repetition was explained as first-touch memory rather than lazy initialisation. Since 2026-11-02 every Phase 1 line is in place: six external engines, the fair protocol (raw samples, digests, pooled runs, sweeps, a seeded query mix, post-compaction reads, failure tests), the three interpolation classes, report surfaces for dashboards, and anti-Goodhart checks in CI (DECISIONS 2026-11-02).
 
-- [ ] External-engine adapters
-- [ ] Full TSBS-compatible comparison harness (ILP parser shipped; harness pending)
+- [x] **DONE (2026-11-02) — External-engine adapters** (#140): `weft-xbench` measures DuckDB, ClickHouse, TimescaleDB, QuestDB, InfluxDB 3 and IoTDB, each in up to three interpolation classes; VictoriaMetrics is not built (the plan conditions it on monitoring) and kdb+ is excluded by its licence
+- [x] **DONE (2026-10-31) — TSBS-compatible comparison harness, on TSBS's data** (`weft-xbench --tsbs FILE`, #141): the `cpu-only` generator's output runs through every engine arm's load, interpolation and downsample phases, gated against the reference. TSBS's own query suite groups many series by tag, so it waits for tagged ingest and belongs to **TAG-12**.
 - [x] **DONE (2026-10-09) — `gap_fill` workload** (`--gap-fill`)
-  - [ ] **NEXT — `?fill=` on the downsample endpoints** (`POST /api/v1/downsample`, `GET …/storage/{aspect}/downsample` and their columnar siblings), with a …
-  - [ ] **NEXT — arbitrary bucket widths** (`5s`, `15m`)
-  - [ ] **NEXT — a real smooth-signal corpus for the spline-fill claim.**
-- [ ] Remaining workloads
+  - [x] **DONE (2026-11-02) — `?fill=` on the downsample endpoints** (#142): body `fill` on `POST /api/v1/downsample`, `?fill=` on its ILP sibling and the stored-range endpoint, every output format; synthesized buckets carry `count == 0`, missing values are JSON-absent / CSV-empty / Arrow-null, grids past 10M buckets are a `400`
+  - [x] **DONE (2026-11-02) — arbitrary bucket widths** (`5s`, `15m`, #143): `weft_reduce::BucketWidth`, the unit's partials merged by `PartialReduction::coarsen` (exact for every reduction), `SegmentStore::downsample_range_width`; the endpoints take `width` / `?resolution=15m`. Additive, so no API freeze decision was needed (DECISIONS 2026-11-02)
+  - [x] **DONE (2026-11-01) — a real smooth-signal corpus for the spline-fill claim** (#144): NOAA NDBC buoy temperature and pressure (`scripts/bench/ndbc_to_csv.py`); cubic beats linear on 7 of 9 series at a two-hour mean outage and loses on 8 of 9 at a day
+- [x] Remaining workloads
+  - [x] **DONE (2026-11-01) — bulk-ingest growth curves** (`weft-bench --ingest --ingest-growth 1M,10M,100M,1B`, #145): 64k-row batches hold 3.9M → 3.2M rows/s to 1B; 1,024-row batches fall 141k → 107k rows/s by 100M as segments pile up
+  - [x] **DONE (2026-11-01) — online ingest + query** (`weft-bench --ingest --ingest-online READERS`, #145): at 64k-row batches 100M rows ingest at 6.4M → 5.6M rows/s with 1 → 8 readers, every query exact; found reads costing ~1.8 µs per stored segment and, at 1,024-row batches, most concurrent reads refused with `database is locked`
+  - [x] **DONE (2026-11-01) — compressed query** (`weft-bench --ingest --compressed-query QUERIES`, #145): in-store downsample is 2.2–2.9× faster than decode-then-reduce for a year window and equal below a day, where the per-segment prune cost sets the floor; every answer exact
+  - [x] **DONE (2026-11-02) — analytics pipeline** (`weft-bench --ingest --analytics-pipeline ROWS`, #145): on UCI at 60-row batches every stage is timed and the detectors find exactly the raw extremes at 10k, 30k and 100k rows; preparation dominates and grows faster than the rows (82 s → 394 s → 1,290 s). Found `analyze_range` resampling off its step grid past 50k points, fixed
+    - [ ] **NEXT — preparation cost** (#505): a first run over 100k rows takes ~30 minutes, most of it `prepare_data`; profile it before the pipeline sees a larger corpus
+    - [ ] **NEXT — a chunk reads only one step past its edges** (#506), so a gap longer than a chunk (~35 days at minutes) interpolates without its far bracket
 - [x] **DONE (2026-10-09) — first-rep/warm separation** (`BenchResult.cold_warm`, schema v21, every workload; console + Parquet)
-  - [ ] **NEXT — OS-cold and post-restart runs:**
-- [ ] Fair-protocol depth (Phase 1.1)
-- [ ] Fair interpolation comparisons (Phase 1.2)
-- [ ] Report surfaces beyond JSON/HTML/Parquet
-- [ ] Anti-Goodhart (Phase 1.3)
+  - [x] **DONE (2026-10-31) — OS-cold and post-restart runs** (`weft-xbench --cold-hook CMD --cold-reps N`, #146): each read phase also runs with the page cache dropped and after an engine restart, every rep gated; schema v4 `warmth`
+- [x] **DONE (2026-11-02) — Fair-protocol depth (Phase 1.1)** (#147)
+  - [x] **DONE (2026-11-02) — raw samples, ≥10 samples per short test, stddev intervals** (#147): every result of both harnesses keeps `samples_ns`; `weft-bench verify` flags a short result under 10 samples; `weft-xbench` defaults to 10 reps
+  - [x] **DONE (2026-11-02) — result hashes** (#147): `correctness.result_sha256` over each workload's canonical output; the storage error bound gates publishing
+    - [x] **DONE (2026-11-02) — the same digest in `weft-xbench`** (`answer_sha256`, report v6): per arm, values to twelve significant digits, so separate runs of one arm can be shown to agree; arms are still compared with each other by the max-diff gate
+  - [x] **DONE (2026-11-02) — several runs per report** (`weft-bench combine`, #147): pooled samples, intervals drawn runs-first, `between_run` per result; two runs of one build 41.9% apart no longer read as a regression (DECISIONS 2026-10-29, EVI-15)
+    - [x] **DONE (2026-11-02) — the same in `weft-xbench`** (`weft-xbench combine`): run-first intervals, and a rendered win or loss only where every run's median agrees; a one-run report is flagged as one
+  - [x] **DONE (2026-11-02) — saturation sweeps and a seeded query mix** (`weft-bench sweep KNOB=v1,… -- ARGS`, `--query-mix OPS`): any run flag or the worker pool swept into curves with their knees (2M-row UCI ingest: 109k → 4.57M rows/s from 1k- to 256k-row batches, no knee yet); the soak lanes replayed against one store from a published seed, every read exact
+  - [x] **DONE (2026-11-02) — a run manifest for `weft-xbench`**: input file and binary SHA-256, and with `--container` each engine container's image digest, command and environment (secrets redacted)
+  - [x] **DONE (2026-11-02) — post-compaction reads** (`--compressed-query-compact ROWS`): the store's own squash (`squash_aspect_to_target_rows`), then the same seeded windows, gated on identical answers
+  - [x] **DONE (2026-11-02) — failure tests** (`weft-bench --failure kill-ingest|kill-compaction|corrupt-segment`): a child process killed with SIGKILL mid-ingest or mid-compaction, or a flipped byte in a closed segment; the reopened store must hold every acknowledged row exactly and quarantine, never serve, a damaged segment (open-time recovery caught all 143 byte flips of a probe frame). Network retry is SOA-8's failure deck (#502); the CI crash matrix stays D-S21/SOA-9's
+    - [ ] **NEXT — compaction cost** (#507): squashing 10M rows from 9,769 to 153 segments took 694 s, and small windows read ~36× slower after it (whole 65k-row segments decoded); the year window held
+- [x] **DONE (2026-11-02) — Fair interpolation comparisons (Phase 1.2)** (#148): every `weft-xbench` engine answers in three classes where it can — its native fill (A: TimescaleDB, QuestDB, InfluxDB 3, IoTDB, ClickHouse), portable SQL (B) and client-side (C, all six) — with native fills that compute another answer gated on shape and reported against the line, never raced; each ASOF strategy run and published (#393). A `tiny` run passed every arm on all five servers
+  - [ ] **NEXT — the pooled cross-engine evidence run** (#508): two full runs (`small,medium`, UCI, TSBS) combined with `weft-xbench combine`; the 2026-11-02 attempt stopped when ClickHouse ran out of memory beside an 82 GB local model server, so it waits for a quiet host. No cross-engine figure from the three classes is a published claim until then
+- [x] **DONE (2026-11-02) — Report surfaces beyond JSON/HTML/Parquet** (#149): Markdown, CSV and Prometheus text (`--markdown-report`, `--csv-report`, `--prom`, `weft-bench export`), and a Grafana dashboard over the Prometheus text (`bench/grafana/`)
+- [x] **DONE (2026-11-02) — Anti-Goodhart (Phase 1.3)** (#150): `scripts/bench/check-separation.py` in CI (no engine crate depends on or detects a benchmark crate); HONESTY.md maps every rule to what enforces it
 
 ### Phase 2 — Benchmark-grade server/API · *Very high*
 
@@ -301,8 +318,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-13** DuckDB adapter I
   - [x] **EVI-15R** Report renderer with honesty-section generation
   - [x] **EVI-16** Honesty pages I
-  - [ ] **SOA-7** Window digests and the oracle self-test
-  - [ ] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
+  - [x] **SOA-7** Window digests and the oracle self-test
+  - [x] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
 - [ ] **W6 · Durability CI, store split, scheduler**
   - [ ] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
   - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
@@ -329,7 +346,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **ROB-7** Ingest decode bounds
   - [ ] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
   - [ ] **ROB-23r** Probe-only admin listener
-  - [ ] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
+  - [x] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
   - [ ] **ROB-5** Legacy queue-consumer panics
   - [ ] **SEC-13** Security acceptance
   - [x] **PAC-9** Docker image and container smoke test (with a mounted keys file)
@@ -476,7 +493,7 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 
   - [ ] **NEXT — the sidecar build.**
   - [ ] *(original item)* **a `ScaledI64`-native reduction fast path in `weft-reduce`:**
-- [ ] **External-engine adapter fairness — three concrete rules from the 2026 landscape.**
+- [x] **DONE (2026-11-02) — External-engine adapter fairness — three concrete rules from the 2026 landscape** (#393): (a) QuestDB over QWP both ways; (b) each ASOF strategy run and published (`clickhouse-double-merge`, `questdb-double-linear`); (c) a precedent, no work
 - [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
 - [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters WeftDB, by a lot (measured 2026-07-23).**
   - [ ] Audit the other `weft-bench` workloads' generators for the same class of flattery (the shape

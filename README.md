@@ -394,8 +394,9 @@ Three more results from 2026-10-09 where the obvious answer was wrong:
   of their time building a decimal per point
   ([`weftdb/benches/interpolate_range.rs`](weftdb/benches/interpolate_range.rs)).
 - **A spline gap fill is less accurate than a straight line on prices.** On real BTC closes a
-  cubic fill's MAE is $55.34 against linear's $49.27 (hourly buckets); the spline wins only on a
-  smooth signal (`weft-bench --gap-fill --gf-fill cubic`, see [Benchmarking](#benchmarking)).
+  cubic fill's MAE is $55.34 against linear's $49.27 (hourly buckets). On real buoy temperature
+  and pressure the spline wins on short outages (~2 h) and loses on day-long ones, with up to 1.9×
+  linear's RMSE (`weft-bench --gap-fill --gf-fill cubic`, see [Benchmarking](#benchmarking)).
 - **The approximate percentile is not faster than the exact one.** `sketch_p99` once measured
   ~2.6× faster than exact `p99`, but only on the old generator's ~50-digit values; on real-shaped
   decimals the two run level (see [Compute endpoints](#compute-endpoints)).
@@ -465,7 +466,7 @@ CSV, Arrow IPC, or Parquet**:
 |----------|---------|
 | `POST /api/v1/interpolate` | Reconstruct an irregular series onto a regular grid (`spline` = `linear` \| `quadratic` \| `cubic` \| polynomial; `resolution` = `nanoseconds`..`years`). Every output point carries a `kind` — `raw` / `interpolated` / `extrapolated`. A grid of more than 10,000,000 points (`MAX_INTERPOLATE_OUTPUT_POINTS`, or `WEFT_MAX_INTERPOLATE_POINTS`) is refused with `400` before anything is computed; split larger ranges across requests. The response's `spline` is the method that ran: with fewer distinct timestamps than the requested method needs (cubic 4, quadratic 3, polynomial degree + 1) it is the simpler method splimes stepped down to. |
 | `POST /api/v1/interpolate/point` | Evaluate the reconstructed signal at a single instant, labelled raw/interpolated/extrapolated. |
-| `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets — `min`/`max`/`avg`/`sum`/`first`/`last`, nearest-rank percentiles `p50`/`p90`/`p95`/`p99`, the three **time-weighted averages** (`twa`, LOCF dwell-weighting, for change-only sensors; `twa_linear`, trapezoidal `Σ½(vᵢ+vᵢ₊₁)Δtᵢ/ΣΔtᵢ`, for irregularly-sampled continuous signals; `twa_bucket_end`, LOCF that additionally carries the bucket's last sample to its grid end — `twa` gives that sample no weight, so a sensor reporting `0` then `100` a minute into an hour bucket reads `twa`=0 but `twa_bucket_end`=98.33), and the **approximate `sketch_p50`/`p90`/`p95`/`p99`** (see below); all reductions computed in `BigDecimal` by the shared [`weft-reduce`](weft-reduce) crate. Aliases: `median`→`p50`, `time_weighted_avg`/`twa_locf`→`twa`, `time_weighted_avg_linear`→`twa_linear`, `twa_locf_end`→`twa_bucket_end`, `sketch_median`→`sketch_p50`. Only non-empty buckets are emitted. The JSON body's `aggregations` reads the same spellings through the same parser as `?agg=`, exact-case: every name is lowercase, as in a response, so a name in the response can be sent back unchanged. `Min` or `MEDIAN` is a `400` that names the token. The bare lowercase names (`twalinear`, `sketchp99`) are still accepted. |
+| `POST /api/v1/downsample` | Reduce samples into epoch-grid-aligned buckets — `min`/`max`/`avg`/`sum`/`first`/`last`, nearest-rank percentiles `p50`/`p90`/`p95`/`p99`, the three **time-weighted averages** (`twa`, LOCF dwell-weighting, for change-only sensors; `twa_linear`, trapezoidal `Σ½(vᵢ+vᵢ₊₁)Δtᵢ/ΣΔtᵢ`, for irregularly-sampled continuous signals; `twa_bucket_end`, LOCF that additionally carries the bucket's last sample to its grid end — `twa` gives that sample no weight, so a sensor reporting `0` then `100` a minute into an hour bucket reads `twa`=0 but `twa_bucket_end`=98.33), and the **approximate `sketch_p50`/`p90`/`p95`/`p99`** (see below); all reductions computed in `BigDecimal` by the shared [`weft-reduce`](weft-reduce) crate. Aliases: `median`→`p50`, `time_weighted_avg`/`twa_locf`→`twa`, `time_weighted_avg_linear`→`twa_linear`, `twa_locf_end`→`twa_bucket_end`, `sketch_median`→`sketch_p50`. Only non-empty buckets are emitted, unless the body names a **`fill`** (`null`, `prev`/`locf`, `linear`, `quadratic`, `cubic`, or a constant): then every grid step between the bounds is emitted, a synthesized one with `count: 0` (so it is never passed off as measured), a reduction its method leaves without a value missing from the JSON, an empty CSV cell and an Arrow/Parquet null, and a grid of more than 10M buckets refused with `400`. A **`width`** (`5s`, `15m`, `6h`) buckets by a whole number of steps instead of `resolution`'s one, epoch-aligned, every reduction exact (the unit's buckets merged); `resolution` then reports it (`"5 seconds"`). The ILP sibling takes both as `?fill=` and `?resolution=15m`. The JSON body's `aggregations` reads the same spellings through the same parser as `?agg=`, exact-case: every name is lowercase, as in a response, so a name in the response can be sent back unchanged. `Min` or `MEDIAN` is a `400` that names the token. The bare lowercase names (`twalinear`, `sketchp99`) are still accepted. |
 | `POST /api/v1/{interpolate,downsample}/ilp` | The same, fed an ILP `text/plain` body (the TSBS/InfluxDB/QuestDB wire format); `field`, `precision` (`ns`/`us`/`ms`/`s`), and the compute knobs are query parameters. `interpolation=` is accepted as an alias for `spline=` (the canonical `spline` wins if both are given). |
 | `POST /api/v1/{interpolate,downsample}/{csv,arrow,parquet}` and `…/ilp/{csv,arrow,parquet}` | The same computations with CSV (`text/csv`), Arrow IPC stream, or Parquet output — so a harness feeding line protocol pulls results in any of the four formats. |
 
@@ -593,7 +594,7 @@ under the declared encoding/tolerance is rejected `400`.
 | `GET /api/v1/storage/{aspect}/points` · `…/value-points` | Lossless JSON reads with declarative pagination — `offset`/`limit` (+ `take` and 1-based `page` aliases), with `total`/`count`/`offset` in the body. For stable forward iteration the body also carries an opaque **`next_cursor`** while rows remain; a client re-issues with `?cursor=<token>` (supersedes `offset`/`page`; malformed → `400`) until it is absent. |
 | `GET /api/v1/storage/{aspect}/at?t=` | **Single-instant point lookup**: the present value at exactly `t` (lossless decimal text) or a `found:false` miss. An **order-signal-driven read planner** resolves each candidate segment with its persisted `time_sorted` flag — binary search on a sorted segment, linear scan only on an out-of-order one — after pruning the index to the files spanning `t`. |
 | `GET /api/v1/storage/{aspect}/at-multi?t=,,` | **Batch point lookup**: a comma-separated list of instants resolved in one pass (`points:[{timestamp,value,found}]` in query order). The index is pruned once by the batch's whole span and each segment's timestamp column decoded once for the whole batch, so `N` instants sharing a segment cost one decode, not `N`. |
-| `GET`·`POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=` | **Stored-range downsample** — the same reduction set as `POST /api/v1/downsample` (above), but over the aspect's **persisted segments** instead of a request-supplied series, so a client aggregates a large stored range without fetching it. **Bounded memory**: the index is pruned by time and each surviving segment folds into its own mergeable partial reduction, merged once — only one segment's rows are ever resident, so a range far larger than RAM reduces, and with a `sketch_p*` the per-bucket state is bounded too. Omitted bounds span all stored history. `…/downsample.csv` · `…/downsample.arrow` · `…/downsample.parquet` serve the identical reduction in the compute endpoints' columnar formats. Traced as a `downsample.range` stage span. The pruned segments are reduced **concurrently**: measured **4.69× faster** than the sequential fold (16 segments over 200k rows, 39.88 ms → 8.50 ms; `sketch_p99` 49.49 ms → 9.42 ms, **5.25×**) — see [`weftdb/benches/downsample_range.rs`](weftdb/benches/downsample_range.rs). A single pruned segment takes an inline fast path (concurrency there costs more than it buys). **Materialized partials (opt-in):** with `WEFT_SEGMENT_PARTIAL_BASE` set, each segment carries a `.weftpart` partial-reduction sidecar written at seal (a sealed segment is immutable, so its partial never goes stale), and a downsample of the bounded reductions (`min`/`max`/`avg`/`sum`/`first`/`last` + `sketch_p*`) **merges the stored partials instead of decoding the value column** — measured **3.2× faster** (16 segments / 200k rows, 8.39 ms → 2.60 ms, non-overlapping CIs) and re-keyed to any coarser nesting resolution (minutes→hours→days) with no decode. **Rollup tiers (opt-in):** `WEFT_SEGMENT_PARTIAL_TIERS` materializes coarser tiers beside the base (e.g. `hours,days`), each re-keyed from the tier below, so a coarse query folds the coarsest matching tier instead of the whole fine base — the in-storage analogue of TimescaleDB's hierarchical continuous aggregates. Measured **~1.16×** on a DAY query over a MINUTES base (16 segments / 200k rows, 7.30 ms → 6.30 ms, non-overlapping CIs). The win **grows with the base-bucket count per segment**, and that scaling is now measured rather than asserted: holding rows and segments fixed while widening the sample stride (so only the base buckets per segment change) gives **1.15× at ~208 base buckets → 1.27× at ~3125 → 1.38× at ~12500** (`bench_tiered_span`). Honest read: the win is real and climbs, but a ~60× increase in base buckets buys only 1.15×→1.38×, so the elided re-key is not the dominant cost and the tiers' extra `.weftpart` bytes should be weighed against it — see [`weftdb/benches/downsample_range.rs`](weftdb/benches/downsample_range.rs). A reconcile/split/squash regenerates the sidecar (tiers and all) so the acceleration survives a rewrite. |
+| `GET`·`POST /api/v1/storage/{aspect}/downsample?start=&end=&resolution=&agg=` | **Stored-range downsample** — the same reduction set as `POST /api/v1/downsample` (above), but over the aspect's **persisted segments** instead of a request-supplied series, so a client aggregates a large stored range without fetching it. **Bounded memory**: the index is pruned by time and each surviving segment folds into its own mergeable partial reduction, merged once — only one segment's rows are ever resident, so a range far larger than RAM reduces, and with a `sketch_p*` the per-bucket state is bounded too. Omitted bounds span all stored history. `?fill=` and a width as `?resolution=` (`15m`) work as on the compute endpoint; a fill's grid runs between the given bounds, or the stored data's first and last buckets without them. `…/downsample.csv` · `…/downsample.arrow` · `…/downsample.parquet` serve the identical reduction in the compute endpoints' columnar formats. Traced as a `downsample.range` stage span. The pruned segments are reduced **concurrently**: measured **4.69× faster** than the sequential fold (16 segments over 200k rows, 39.88 ms → 8.50 ms; `sketch_p99` 49.49 ms → 9.42 ms, **5.25×**) — see [`weftdb/benches/downsample_range.rs`](weftdb/benches/downsample_range.rs). A single pruned segment takes an inline fast path (concurrency there costs more than it buys). **Materialized partials (opt-in):** with `WEFT_SEGMENT_PARTIAL_BASE` set, each segment carries a `.weftpart` partial-reduction sidecar written at seal (a sealed segment is immutable, so its partial never goes stale), and a downsample of the bounded reductions (`min`/`max`/`avg`/`sum`/`first`/`last` + `sketch_p*`) **merges the stored partials instead of decoding the value column** — measured **3.2× faster** (16 segments / 200k rows, 8.39 ms → 2.60 ms, non-overlapping CIs) and re-keyed to any coarser nesting resolution (minutes→hours→days) with no decode. **Rollup tiers (opt-in):** `WEFT_SEGMENT_PARTIAL_TIERS` materializes coarser tiers beside the base (e.g. `hours,days`), each re-keyed from the tier below, so a coarse query folds the coarsest matching tier instead of the whole fine base — the in-storage analogue of TimescaleDB's hierarchical continuous aggregates. Measured **~1.16×** on a DAY query over a MINUTES base (16 segments / 200k rows, 7.30 ms → 6.30 ms, non-overlapping CIs). The win **grows with the base-bucket count per segment**, and that scaling is now measured rather than asserted: holding rows and segments fixed while widening the sample stride (so only the base buckets per segment change) gives **1.15× at ~208 base buckets → 1.27× at ~3125 → 1.38× at ~12500** (`bench_tiered_span`). Honest read: the win is real and climbs, but a ~60× increase in base buckets buys only 1.15×→1.38×, so the elided re-key is not the dominant cost and the tiers' extra `.weftpart` bytes should be weighed against it — see [`weftdb/benches/downsample_range.rs`](weftdb/benches/downsample_range.rs). A reconcile/split/squash regenerates the sidecar (tiers and all) so the acceleration survives a rewrite. |
 | `POST /api/v1/storage/{aspect}/reconcile` | **Reconciliation pass** (`mode` in the response). Default (intra-segment): rewrite every out-of-order segment of the aspect into a time-sorted one in place. `?threshold=N` gates it on `unsorted_segments >= N` (QuestDB-style split-count trigger). `?hot_cold=true` reconciles cold segments but defers the hot tail until the backlog reaches the threshold. `?overlaps=true` instead runs the **cross-segment overlap merge** (newer-wins) — `reconciled` is then the number of segments merged away, and `?split_min_bytes=N` makes that merge **split-not-rewrite** (carve off a dominant cold prefix instead of rewriting the whole component). Returns `triggered`/`reconciled`/`cold_reconciled`/`hot_reconciled` and the post-pass `unsorted_segments` + `overlapping_segments`. Maintenance operations on one aspect take turns: while another one holds the aspect (a daemon pass, another request), the request waits up to 30 s, then answers **`409 Conflict`** without touching the aspect; retry. |
 | `POST /api/v1/storage/{aspect}/squash` | **Squash** the aspect's segments into one (newer-wins), bounding split-path fragmentation. `?max_segments=N` gates it (squash only when the count exceeds `N`). Returns `triggered`/`removed`/`segment_count`. Waits for a busy aspect and answers `409` as `reconcile` does. |
 | `POST /api/v1/storage/{aspect}/compact?target_rows=N` | **Size-targeted compaction** — coalesce the aspect's segments toward ~`N` rows per segment (leaving already-large segments untouched), holding fragmentation near the read-optimal size rather than folding to one (which `squash` does). Motivated by the `downsample_range` knee (one giant segment reads slower than several mid-sized ones). `target_rows` is required (absent → `400`). Returns `removed`/`segment_count`. The manual counterpart of the `WEFT_COMPACT_TARGET_ROWS` daemon pass. Waits for a busy aspect and answers `409` as `reconcile` does. |
@@ -702,6 +703,26 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   the root first. Restoring beside the
   original `segments/` frames reconstitutes a working store: the round-trip test
   reopens the restored root and reads its measurements back.
+- **Restore on the command line.** `weft-server restore <BACKUP> --into <NEW_ROOT>`
+  is the offline half of the same route, for the case a running server cannot serve you:
+  the store is gone, or you want the restored tree in hand before anything reads it. It
+  reads the backup's `MANIFEST.json` and picks the leg — a whole-store backup (a
+  `segments/` directory of frames beside the four databases, under a whole-store manifest)
+  restores through `weftdb::restore_store`, a control-plane backup through
+  `restore_control_plane` — so the one command covers both kinds, and it
+  refuses a destination that exists rather than overwriting a live root. Pass `--adopt`
+  and it opens the new root once, which is what acts on the restore-intent marker a
+  whole-store restore publishes: the frames are adopted now, in the foreground, instead of
+  at whatever open first serves them. `--database` and `--subject` name the scope that
+  open uses and go with `--adopt`; without it the command opens nothing, so the adoption
+  waits for the first open, which is also fine — it is idempotent. It prints the per-file
+  table, rows and bytes it verified, the store UUID the whole-store backup carried, and
+  what the adoption pass found; `--json` is the same document for a script. A refusal is
+  an exit code, not a stack trace: `78` for the command line itself (no destination, an
+  existing one, a scope flag with nothing to open), `65` for a directory that is not a
+  backup this build can verify — empty, a staging name that never finished, a pre-manifest
+  backup with nothing to check checksums against, or a manifest naming a store format this
+  build cannot read.
 - **Drills on a live server.** `POST /api/v1/storage/restore/drill?label=` rehearses
   a restore of the named backup into a throwaway directory, verifies it, reports
   `restorable`, and cleans up — non-destructive by construction, so the question
@@ -1608,7 +1629,7 @@ What it does today:
   random walk, linear is more accurate — hourly MAE $49.27 linear vs $55.34 cubic vs $61.32
   quadratic, and at one-minute buckets (187,421 filled minutes, outages averaging three) $6.79
   vs $8.37 — while the spline costs ~14% more time (64.8 vs 56.7 ms hourly; 10 reps,
-  2026-10-09, load average ~6). Reach for the spline on smooth physical signals, not on prices.
+  2026-10-09, load average ~6). On real smooth physical signals the answer depends on the outage. NOAA NDBC buoys 41008, 44013 and 46042, 2022–2024, give nine 10-minute series (water temperature, air temperature, pressure; 72k–154k readings each). Each was cut to hourly buckets with 20% lost to outages, under five outage placements per outage length (540 runs, all PASS). With outages averaging **2 hours**, cubic has lower RMSE than linear on 7 of 9 series, most on pressure (0.78–0.84× linear's RMSE, all five placements). At **6 hours** it is lower on 4 of 9. At **24 hours** linear is lower on 8 of 9, and cubic's RMSE is up to 1.9× linear's, most likely because a spline through a day-long hole overshoots the daily cycle. The spline costs ~15% more time (median p50 23.5 vs 20.4 ms). Reach for the spline on smooth physical signals with short gaps, not on prices or long outages (`scripts/bench/ndbc_to_csv.py` builds the corpus; `weft-bench --gap-fill --gf-csv <corpus> --gf-bucket h --gf-outage-len 2 --gf-fill cubic`).
   WeftDB's grid has only unit widths, so Q5's literal 5-second buckets cannot be expressed yet.
 - **Sparse block scans** (`--sparse`) — the input a presence bitmap is supposed to pay for. A
   seeded grid of `--sp-series` series × `--sp-blocks` blocks of `--sp-rows` rows (default 16 ×
@@ -1625,6 +1646,75 @@ What it does today:
   `--gap-fill`, `--downsample`), filling only the knobs left at their default, and writes the
   preset into the profile name so a 32-series grid is never compared against a 64-series one as
   though they were one run.
+- **Ingest and its growth curve** (`--ingest --uci FILE`) — seals one UCI household-power
+  column into a fresh `SegmentStore` in `--ingest-batch` rows (default 1,024) and gates on an
+  exact read-back of every row. `--ingest-growth 1M,10M,100M,1B` grows one store through those
+  checkpoints instead (#145), laying the real corpus end to end in time rather than generating
+  values (the generated ingest corpus flatters WeftDB; see ROADMAP, *Benchmark hygiene*). Each
+  stage reports its seal throughput, per-batch p50/p99 and the segments and bytes the store then
+  holds (schema v24 `growth`), and is gated on the store's row count, time span and segment
+  order plus an exact read-back of the first and last 65,536 rows; each checkpoint is written as
+  its own report and manifest as soon as it passes. Measured 2026-11-01 (`Global_active_power`,
+  2,049,280 rows per copy): with **65,536-row batches** ingest holds **3.9M rows/s** to 10M,
+  3.8M at 100M and **3.2M at 1B** (15,616 segments), batch p99 18 → 27 ms, 1.34 B/pt throughout;
+  with the default **1,024-row batches** it falls from 141k rows/s at 1M to 107k at 100M (97,693
+  segments), batch p99 8.9 → 17.0 ms, 1.41 B/pt. Small batches cost more as segments pile up:
+  a stopped 1B attempt at 1,024 rows was down to about 40k rows/s near 400k segments (counted
+  from the store's files, not a gated result). Batch your writes, or compact.
+- **Online ingest + query** (`--ingest --ingest-online READERS`, #145) — seals the corpus (laid
+  end to end to `--ingest-online-rows`) once with nothing else running, then again while
+  READERS tasks query it without pause: half the queries end at the newest sealed row, half
+  start anywhere in what is sealed, each `--ingest-online-window` rows (default 1,440, a day of
+  minutes) and each compared exactly with the corpus. The same queries then rerun on the
+  finished store. A read the store refuses is counted and fails the gate (schema v25 `online`).
+  Measured 2026-11-01 over 100M rows in **65,536-row batches**: ingest holds 6.4M rows/s with
+  one reader and drops to 6.1M with four and 5.6M with eight; query p50 is 1.0–1.8 ms during
+  the ingest and **2.9–5.1 ms on the finished store**, every query exact. That the finished
+  store is the slower one is a finding: a 1,440-row read costs about **1.8 µs per segment the
+  store holds** (p50 0.53 ms at 157 segments, 1.43 ms at 781, 2.89 ms at 1,562), because the
+  time prune walks the index from the oldest segment. At **1,024-row batches** (10M rows) reads
+  during the ingest are **refused with `database is locked`**: one reader was refused 4,567 times
+  while 2,848 reads were answered, four readers 16,452 times against 10,314 (a refused read
+  returns at once and is asked again, so these count attempts, not a share of reads); the
+  segment index's connections set no busy timeout. Both are engine fixes, tracked
+  apart from the bench. (This workload runs on a multi-threaded runtime of its own, so its
+  ingest rates are not comparable with the growth curve's single-threaded ones.)
+- **Compressed query** (`--ingest --compressed-query QUERIES`, #145) — seals the corpus once,
+  then per window size (1h, 1d, 1w, 30d, 1y of minutes) runs seeded windows two ways: reduced
+  inside the store (`downsample_range`: min, max, avg, sum, first, last per hour) and decoded
+  first (`read_time_range`, then the same reduction). The two answers must be equal and account
+  for every row, or the size fails its gate; one report per size (schema v26). On UCI
+  (2026-11-01, 200 queries per size, all exact) the in-store path wins only once a window spans
+  many rows: at 64k-row batches and 100M rows (1,561 segments, 1.34 B/pt) it is 2.5× faster for
+  a year (12.7 vs 31.9 ms p50) and 1.3× for 30 days, but even for an hour (60 rows) both take
+  ~2.9 ms — the per-segment prune cost above, not the decode, sets the floor (0.59 ms at 156
+  segments, 8.4 ms at 9,769 from 1,024-row batches).
+- **Both read findings above are fixed** (#145 engine slice): the time prune now seeks the time
+  index between `start − widest span` and `end` instead of walking every segment, and reads wait
+  out a lock instead of failing. Rerun on UCI: the 1,024-batch online runs pass with **0 refused
+  reads** and query p50 2.9 → 0.16 ms; at 64k batches and 100M rows idle p50 is 2.9 → 0.38 ms
+  (one reader) and 5.1 → 0.52 ms (eight); a compressed query of an hour at 9,769 segments is
+  8.4 → 0.13 ms, and the in-store reduction now wins from a week (1.8×) to a year (3.0–3.4×).
+- **Analytics pipeline** (`--ingest --analytics-pipeline ROWS`, #145) — captures the corpus'
+  first rows into a legacy minute-resolution aspect (`WEFT_DATA_DIR` must point at scratch
+  space), holds back a tail (`--analytics-tail`, default a tenth), and times the orchestration
+  pipeline's first run stage by stage — prepare (`--analytics-batch` rows per batch), patterns,
+  events, correlate, signals — then the incremental `run()` after the tail lands. The gate: the
+  peak and valley detectors must report exactly the global extremes the raw rows hold, in every
+  rep (schema v27 `analytics`). On UCI at 60-row batches (2026-11-02, all exact):
+
+  | rows (reps) | prepare | patterns | events | correlate | signals | incremental | signals out |
+  |---:|---:|---:|---:|---:|---:|---:|---:|
+  | 10k (3) | 82 s | 9.1 s | 0.12 s | 0.56 s | 1.4 s | 30 s | 9,549 |
+  | 30k (3) | 394 s | 58 s | 0.38 s | 2.2 s | 4.3 s | 149 s | 119,055 |
+  | 100k (1) | 1,290 s | 518 s | 6.5 s | 8.7 s | 16 s | 225 s | 226,506 |
+
+  Preparation dominates and grows faster than the rows (×4.8 for ×3, then ×3.3 for ×3.3), and
+  pattern extraction faster still (×6.4, then ×8.9). The pattern and signal counts move a little
+  between runs (6–8 patterns at 30k); the extremes the gate checks do not. Building it found two
+  engine faults, both fixed: opening a legacy `Database` read every process in `/proc` (event
+  detection on 3k rows 0.9 s → 21 ms), and past 50,000 points `analyze_range` resampled off its
+  step grid, which at 100k rows moved the detected peak 400 s.
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
@@ -1636,8 +1726,77 @@ What it does today:
   `sawtooth` the portable linear baseline out-accuracies the cubic, which
   overshoots sharp discontinuities.
 - **Fair-protocol statistics** — p50/p95/p99 + min/max/mean/stddev with
-  **seeded bootstrap confidence intervals**, and an end-to-end timing breakdown
-  proving the latency distribution times only the adapter call, never setup.
+  **seeded bootstrap confidence intervals** (mean, stddev, p50, p95, p99; the maximum has none,
+  since a resample's maximum can only fall), and an end-to-end timing breakdown
+  proving the latency distribution times only the adapter call, never setup. Every result keeps
+  its **raw samples** (`samples_ns`, schema v28; `weft-xbench` reports v5 do the same), so the
+  summary can be recomputed and runs pooled. `weft-bench verify` refuses a short test — p50 under
+  a minute — resting on fewer than **10 timed samples** (`--accept-advisories` lets it through,
+  as it does a dirty tree); `weft-xbench` now defaults to `--reps 10`.
+- **Result digests** — every result carries `correctness.result_sha256`, a SHA-256 over its
+  canonical output (one `key,value` row per output row, decimals normalized), so two runs, two
+  builds or two adapters can be shown to give the *same* answer, not just the same count: the
+  in-memory and store-backed interpolation adapters hash identically. Read-heavy workloads hash
+  what they checked (the verified windows, every query's buckets); the online workload's
+  concurrent reads and the GPU pool's discarded outputs carry none. A storage estimate whose
+  recorded error exceeds the tolerance it was selected against is no longer publishable.
+- **Several runs per report** (`weft-bench combine --out FILE <RUN.json>...`) — a run's own
+  intervals bound where *that run's* median sits, not where the next one's will. Three
+  `--synthetic --reps 20` runs of one build on one machine (2026-11-02) had p50s of 11.2, 7.9 and
+  8.8 ms, and `compare` called run 1 against run 2 a **+41.9% regression with separated
+  intervals**. `combine` pools the runs' raw samples and redraws each interval runs-first (a
+  two-level bootstrap), so the spread between runs is inside it (here 7.9–11.2 ms), and records
+  each run's p50 and the spread (`between_run`). Two combined reports of the same build then
+  compared clean. A run whose result digest differs fails the combined result; every run's
+  manifest must verify and name the combining binary's clean revision, and the combined report
+  gets its own manifest.
+- **Saturation sweeps** (`weft-bench sweep KNOB=v1,v2,… [--out-dir=DIR] -- RUN ARGS`) — one
+  setting says how fast a run was there, not where it stops getting faster. The sweep runs the
+  benchmark once per value of any run flag (`--ingest-batch`, `--ingest-online`, `--points`,
+  `--sp-series`, …) or of the worker pool (`threads`, via `RAYON_NUM_THREADS`), each value's
+  report and manifest in `DIR/<knob>=<value>`, and lays every result out as a curve in
+  `sweep.json` and `sweep.md`, naming its knee: the first value past which a step buys under 10%
+  more throughput. On UCI (2026-11-02), 2M-row ingest went 109k → 493k → 1.56M → 3.19M → 4.57M
+  rows/s from 1,024- to 262,144-row batches: no knee in range.
+- **Seeded query mix** (`--ingest --query-mix OPS`) — the soak harness's lane model replayed
+  against one store: each operation ingests a batch, looks up a point or scans a range, its lane
+  drawn from the seed and its index (`--query-mix-weights INGEST,POINT,RANGE`, 60,20,20 by
+  default), so a published seed regenerates the exact sequence. Reads are checked exactly against
+  the corpus and each lane is a report of its own, digest included.
+- **Post-compaction reads** (`--compressed-query-compact ROWS`) — after the compressed-query
+  windows, the store is compacted to ROWS-row segments and the same windows asked again as
+  `-compacted` results, each gated on answering exactly as before. On 10M UCI rows sealed in
+  1,024-row batches (2026-11-02) the squash to 65,536-row segments took **694 s** (9,769 → 153
+  segments, 1.414 → 1.341 B/pt), every window answered identically, and **small windows got
+  slower**: an hour's in-store p50 went 0.16 → 5.75 ms and a day's 0.24 → 5.39 ms, because each
+  read now decodes a whole 65k-row segment. The year window held (30.1 → 29.5 ms).
+- **Failure tests** (`--ingest --failure kill-ingest|kill-compaction|corrupt-segment|all`) — a
+  benchmark of a healthy store says nothing about the one a crash leaves. A child process (this
+  binary) seals the corpus, or compacts a store of it, and is killed with `SIGKILL` at a seeded
+  point; or one seeded byte of a closed store's segment is flipped. The reopened store must hold
+  every acknowledged row exactly, at most the batch in flight beyond them, and set a damaged
+  segment aside rather than serve it: open-time recovery quarantined the frame for every one of
+  143 byte positions flipped in a probe. Each test is one report; its latency is the reopen time.
+- **More report surfaces** (`--markdown-report`, `--csv-report`, `--prom`, or
+  `weft-bench export REPORT.json --format md|csv|prom`) — the same results as a Markdown table, CSV
+  and Prometheus text, every row with its gate. `bench/grafana/weft-bench.json` is a dashboard over
+  the Prometheus text, which hides no failing gate behind a fast number.
+- **Three interpolation classes** (`weft-xbench`, report v7) — each engine is asked for the grid
+  three ways where it can be: its native fill (class A), the linear reconstruction in its SQL
+  (class B) and every knot fetched into the Rust client and interpolated there (class C). Most
+  native fills answer a different question — TimescaleDB, QuestDB, InfluxDB 3 and IoTDB average the
+  knots per bucket and draw lines between the averages without extrapolating, and ClickHouse's
+  `INTERPOLATE` carries the last value forward — so class A is gated on the grid's shape and
+  reported with its unfilled instants, its distance from the line and its RMSE, not raced. B and C
+  are timed against WeftDB, each class with its own verdict. Where an engine picks among join
+  strategies, each is run and published (`clickhouse-double-merge`, `questdb-double-linear`).
+- **Cross-engine runs, pooled and pinned** (`weft-xbench`, report v6) — each gate carries an
+  `answer_sha256` of its arm's answer, so separate runs of one arm can be shown to agree;
+  `weft-xbench combine RUN.json… --out DIR` pools runs as `weft-bench combine` does, and the
+  rendered report calls a win or a loss only where the pooled intervals separate *and* every
+  run's median falls the same way. A report of a single run says so. The run manifest records the
+  input files' and binary's SHA-256 and, with `--container ENGINE=NAME`, each engine container's
+  image digest, command line and environment, with secret-looking variables redacted.
 - **Storage estimate** — each result carries a `StorageEstimate` (recommended
   encoding + value/timestamp/total **bytes/point**) computed by
   `weft-physical-type` over the actual columns. It also surfaces **advisory

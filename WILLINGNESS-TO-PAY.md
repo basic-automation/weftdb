@@ -26,9 +26,10 @@ Hypotheses may only lean on what WeftDB has shown, or on what a test would show.
 
 - **A spline fill does not beat linear on real prices.** Real BTC closes, hourly buckets: cubic MAE
   $55.34 against linear $49.27; minute buckets $8.37 against $6.79, at ~14% more time. The spline
-  wins only on a generated smooth signal (RMSE 0.115 against linear's 0.865). No hypothesis for
-  price data assumes better fill accuracy, and no hypothesis anywhere assumes spline accuracy on
-  real data until a real smooth-signal corpus has been run (open ROADMAP item).
+  wins on a generated smooth signal (RMSE 0.115 against linear's 0.865) and, on real buoy
+  temperature and pressure, only across short outages: 7 of 9 series at a two-hour mean outage,
+  1 of 9 at a day (#144). No hypothesis for price data assumes better fill accuracy, and no
+  hypothesis assumes spline accuracy across long outages.
 - **The GPU is not the fastest path for stored-data interpolation.** ~1M reconstructed points took
   14.1–16.3 ms on rayon and 17.0–29.8 ms on the GPU. No hypothesis sells GPU speed.
 - **Exact decimals are roughly at parity with the competition, not ahead.** Hourly `avg` over 1M

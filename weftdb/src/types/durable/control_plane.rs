@@ -58,10 +58,18 @@ const MVCC: &str = "mvcc";
 /// What `PRAGMA synchronous` reports for FULL (`turso_core` `SyncMode::Full`).
 const SYNCHRONOUS_FULL: i64 = 2;
 
+/// How long a [reader](connect_reader) waits out another connection's lock before it
+/// fails busy: the ten minutes each store's open already asks for.
+pub const READ_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Open a connection to the control-plane database `db` the way every control-plane
 /// connection must be opened: on Apple targets with `PRAGMA fullfsync=ON`, so its
 /// COMMITs reach the platter (see the module documentation). Elsewhere it is
 /// `db.connect()`.
+///
+/// It sets no busy timeout: a write transaction must see a `Busy` at once, because its
+/// own retry decides whether running again is safe and whether a busy COMMIT left the
+/// store ambiguous ([`IndexTxn`](crate::types::index_txn::IndexTxn)).
 ///
 /// # Errors
 ///
@@ -76,6 +84,20 @@ pub async fn connect(db: &turso::Database) -> turso::Result<turso::Connection> {
 		let mut rows = conn.query("PRAGMA fullfsync=ON", ()).await?;
 		while rows.next().await?.is_some() {}
 	}
+	Ok(conn)
+}
+
+/// [`connect`] for a connection that only reads: it waits up to [`READ_BUSY_TIMEOUT`]
+/// on a lock instead of failing at once. The busy timeout belongs to the connection,
+/// and the stores open a fresh one per call, so without it a read that met a seal's
+/// commit or a checkpoint failed with `database is locked`, however short the wait.
+///
+/// # Errors
+///
+/// As [`connect`], or setting the busy timeout.
+pub async fn connect_reader(db: &turso::Database) -> turso::Result<turso::Connection> {
+	let conn = connect(db).await?;
+	conn.busy_timeout(READ_BUSY_TIMEOUT)?;
 	Ok(conn)
 }
 
@@ -367,6 +389,9 @@ mod tests {
 		let db = turso::Builder::new_local(":memory:").build().await.unwrap();
 		let conn = connect(&db).await.unwrap();
 		assert_eq!(pragma(&conn, "SELECT 41 + 1").await.unwrap(), Value::Integer(42));
+		assert_eq!(pragma(&conn, "PRAGMA busy_timeout").await.unwrap(), Value::Integer(0), "a writer sees Busy at once");
+		let reader = connect_reader(&db).await.unwrap();
+		assert_eq!(pragma(&reader, "PRAGMA busy_timeout").await.unwrap(), Value::Integer(i64::try_from(READ_BUSY_TIMEOUT.as_millis()).unwrap()));
 		#[cfg(target_vendor = "apple")]
 		assert_eq!(pragma(&conn, "PRAGMA fullfsync").await.unwrap(), Value::Integer(1));
 	}

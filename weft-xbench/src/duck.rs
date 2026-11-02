@@ -11,6 +11,9 @@
 //! In the `DECIMAL` arm the knots are stored exactly, and `min` and `max` stay exact. The
 //! interpolation line is computed in `DOUBLE`, because `DuckDB`'s `DECIMAL × DOUBLE` is `DOUBLE`.
 //! `avg` is whatever `DuckDB` returns for a `DECIMAL` average. Both are read back as `DOUBLE`.
+//!
+//! With no native interpolation, `DuckDB` has no class A arm (fair protocol 1.2, #148);
+//! `duckdb-client` fetches the `DOUBLE` knots into this Rust client and interpolates there (class C).
 
 use std::{
 	path::PathBuf, sync::atomic::{AtomicU64, Ordering}
@@ -19,7 +22,7 @@ use std::{
 use bigdecimal::{BigDecimal, ToPrimitive};
 use duckdb::{params, types::Value, Connection};
 
-use crate::{weft::Arm, ArmInfo, BucketRow, Dataset, Output};
+use crate::{client_linear, weft::Arm, ArmClass, ArmInfo, BucketRow, Dataset, Output};
 
 /// Counter distinguishing database files of arms alive at once.
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -100,12 +103,13 @@ pub enum DuckValue {
 /// `DuckDB` with the knots stored as [`DuckValue`].
 pub struct Duck {
 	value: DuckValue,
+	class: ArmClass,
 	db: Option<Db>,
 }
 
 impl std::fmt::Debug for Duck {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("Duck").field("value", &self.value).field("loaded", &self.db.is_some()).finish()
+		f.debug_struct("Duck").field("value", &self.value).field("class", &self.class).field("loaded", &self.db.is_some()).finish()
 	}
 }
 
@@ -113,13 +117,19 @@ impl Duck {
 	/// `duckdb-double`.
 	#[must_use]
 	pub const fn double() -> Self {
-		Self { value: DuckValue::Double, db: None }
+		Self { value: DuckValue::Double, class: ArmClass::PortableSql, db: None }
+	}
+
+	/// `duckdb-client`: the `DOUBLE` knots fetched and interpolated in this client.
+	#[must_use]
+	pub const fn client() -> Self {
+		Self { value: DuckValue::Double, class: ArmClass::ClientSide, db: None }
 	}
 
 	/// `duckdb-decimal`.
 	#[must_use]
 	pub const fn decimal() -> Self {
-		Self { value: DuckValue::Decimal, db: None }
+		Self { value: DuckValue::Decimal, class: ArmClass::PortableSql, db: None }
 	}
 }
 
@@ -171,6 +181,15 @@ fn query_grid(conn: &Connection, start: i64, end: i64, step: i64) -> anyhow::Res
 	Ok(values)
 }
 
+/// The raw knots a client fetches (class C), in instant order, the last of an instant last.
+const FETCH_SQL: &str = "SELECT t, v::DOUBLE FROM knots ORDER BY t, seq";
+
+fn fetch_knots(conn: &Connection) -> anyhow::Result<(Vec<i64>, Vec<f64>)> {
+	let mut stmt = conn.prepare_cached(FETCH_SQL)?;
+	let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
+	Ok(rows.collect::<Result<Vec<_>, _>>()?.into_iter().unzip())
+}
+
 fn query_buckets(conn: &Connection, width: i64) -> anyhow::Result<Vec<BucketRow>> {
 	let mut stmt = conn.prepare_cached(DOWNSAMPLE_SQL)?;
 	let rows = stmt.query_map(params![width, width], |row| Ok(BucketRow { start_ns: row.get(0)?, count: row.get::<_, i64>(1)?.unsigned_abs(), min: row.get(2)?, max: row.get(3)?, avg: row.get(4)? }))?;
@@ -199,7 +218,35 @@ impl Arm for Duck {
 			DuckValue::Double => ("duckdb-double", "DOUBLE", ""),
 			DuckValue::Decimal => ("duckdb-decimal", "DECIMAL(18, s)", "; stored exactly, the interpolation line computed in DOUBLE (DECIMAL × DOUBLE is DOUBLE)"),
 		};
-		ArmInfo { arm: arm.into(), engine: format!("duckdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: range() grid, two ASOF JOINs, first/last segment extended; downsample via GROUP BY on the epoch bucket; on-disk database{note}") }
+		if self.class == ArmClass::ClientSide {
+			return ArmInfo { arm: "duckdb-client".into(), engine: format!("duckdb {version}"), value_type: value_type.into(), method: "client-side: every knot fetched in instant order, the line computed in this Rust client in f64, first/last segment extended; on-disk database".into(), class: Some(self.class), own_answer: None };
+		}
+		ArmInfo { arm: arm.into(), engine: format!("duckdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: range() grid, two ASOF JOINs, first/last segment extended; downsample via GROUP BY on the epoch bucket; on-disk database{note}"), class: Some(self.class), own_answer: None }
+	}
+
+	fn reports_load(&self) -> bool {
+		self.class == ArmClass::PortableSql
+	}
+
+	fn downsamples(&self) -> bool {
+		self.class == ArmClass::PortableSql
+	}
+
+	fn unload(&mut self) {
+		self.db = None;
+	}
+
+	async fn reopen(&mut self) -> anyhow::Result<()> {
+		let mut db = self.db.take().ok_or_else(|| anyhow::anyhow!("duckdb: nothing loaded"))?;
+		let db = tokio::task::spawn_blocking(move || -> anyhow::Result<Db> {
+			// Close the file's connection before opening it again: one database instance per file.
+			drop(std::mem::replace(&mut db.conn, Connection::open_in_memory()?));
+			db.conn = Connection::open(&db.path)?;
+			Ok(db)
+		})
+		.await??;
+		self.db = Some(db);
+		Ok(())
 	}
 
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
@@ -229,6 +276,11 @@ impl Arm for Duck {
 		let start = ds.start.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid start out of range"))?;
 		let end = ds.end.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid end out of range"))?;
 		let step = ds.resolution.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("grid step out of range"))?;
+		if self.class == ArmClass::ClientSide {
+			let n = ds.grid_len();
+			let (t, v) = self.on_db(fetch_knots).await?;
+			return Ok(Output::Float(client_linear(&t, &v, start, step, n)));
+		}
 		Ok(Output::Float(self.on_db(move |conn| query_grid(conn, start, end, step)).await?))
 	}
 

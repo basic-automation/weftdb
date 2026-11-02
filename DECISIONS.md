@@ -4,6 +4,230 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-02 — SOA-8: the failure deck is a validated card deck, recovery is exact, and the maintenance driver is a pure state machine (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W5) lists SOA-8 by name only — "Failure deck,
+phases, recovery windows, SIGTERM verdict and the maintenance driver" — and
+neither the plan nor the queue fixes the deck's contents, the phase set, what
+a recovery window measures, what the SIGTERM verdict judges, or what the
+maintenance driver drives. What the sources do fix: SOA-1's harness doc says
+SOA-8's phases are a finer breakdown *within* `Running` and do not replace
+the lifecycle state; the queue's acceptance fixes three outcomes — a failure
+deck with phases and recovery windows exists, a SIGTERM verdict is produced,
+and a maintenance driver drives the deck; the server's own code fixes the
+failures and maintenance that exist (SEC-4/D-S14's graceful drain with the
+`WEFT_SHUTDOWN_GRACE_SECS` grace and exit 0, a signal before serving exits 0
+per plan C9, `/ready`'s `previous_clean_shutdown`, the store's maintenance
+locks and busy/skipped sweeps, and ROB-3's daemons resuming reconcile,
+squash and backup); SIGKILL is SOA-9's `crash_kill9` (W6); and SOA's standing
+rules govern the shape (exact judgement, no invented tolerance or threshold;
+a field added to `SoakRun` bumps `SOAK_SCHEMA_VERSION` on SOA's own line;
+records carry no free text).
+
+**Chosen (grounded as above, under the owner's best-guess authorization of
+2026-10-26; if merge review disagrees, this decision is revisited there):**
+
+1. **New pure module `weft-bench/src/soak_failure.rs`; no live server.**
+   Like the oracle core (SOA-6), the deck, driver and verdict perform no
+   signal, read or maintenance themselves: the caller applies what the
+   driver's `DeckAction` names and supplies what it observed. The same
+   deck and observations replay identically in tests.
+2. **The deck is validated on construction.** Card ids are slugs (never
+   free text, so no record needs redaction), ids are unique, every
+   recovery window is non-empty, cards are in injection order, and a
+   SIGTERM card is at most one and last (it ends the server). Kinds are
+   `MaintenanceContention`, `ServerRestart` and `Sigterm` — the failures
+   the shipped server has. `FailureDeck::standard()` deals contention,
+   restart, SIGTERM, each recovering under a different sweep.
+3. **Phases are per-card and strictly ordered:**
+   `Baseline → Injection → Recovery → Verification → Complete`, entered
+   through the driver, which refuses gated transitions (recovery must be
+   observed and the card's maintenance run before verification; the
+   SIGTERM verdict must be judged before the SIGTERM card completes).
+   Phase records are recorded on the run record in order; the harness
+   refuses out-of-order, interleaved or tick-regressing phases.
+4. **Recovery windows are tick ranges judged exactly.** A card's window
+   is `inject_tick..inject_tick + recovery_ticks` — the deck author's
+   schedule, not a threshold this slice invents. Recovery observed
+   inside the window recovered; at/after its end, or never, it did not.
+   A card that calls for maintenance counts as recovered only when that
+   maintenance ran during recovery: the driver runs the card's
+   `MaintenanceKind` (reconcile/squash/backup/none) in the recovery
+   phase, because a recovery in which the daemons never resumed is not
+   the recovery a deployment performs.
+5. **The SIGTERM verdict is the exact conjunction** of its observation:
+   signal sent, exit code 0, drained within the grace the *caller*
+   configured (the serve path's grace is an input, never a constant
+   here), and the reopened store reporting a clean previous shutdown.
+   Any missing observation fails — no vacuous pass.
+6. **Records on the run record; soak schema v4.** `SoakRun` gains
+   `phases` and `recoveries` (`#[serde(default)]`, skipped when empty)
+   and `sigterm` (`#[serde(default)]`, skipped when absent), recorded
+   set-once/in-order through the harness while `Running`;
+   `SOAK_SCHEMA_VERSION` 3 → 4 on SOA's own line. v1–v3 artifacts still
+   deserialize.
+
+**Rejected:** a SIGKILL card (SOA-9 owns it, W6); recovery judged by a
+rate or a deadline this slice picks (the window is the deck's, the
+judgement exact); a driver that signals or restarts a real server (no
+slice names a process client, and a pure driver is replayable); phases
+as new `SoakState` variants (SOA-1 fixed them as a breakdown within
+`Running`); and free-text card names or failure descriptions (slugs
+keep every record redaction-free, as SOA-6/SOA-7's records are).
+
+## 2026-11-02 — SOA-7: window digests hash the oracle's own encoding, and the self-test judges the judge (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W5) lists SOA-7 by name only — "Window digests
+and the oracle self-test" — and neither the plan nor the queue fixes the digest
+algorithm, what a window is, where digests live, or what the self-test runs
+against. What the sources do fix: SOA-6's DECISIONS entry scopes this slice
+explicitly ("Out of scope … window digests and the oracle self-test (SOA-7)",
+"digests after the core they digest"); the oracle core's doc calls itself "the
+pure core SOA-7's self-test exercises"; the queue's acceptance fixes two
+outcomes — window digests exist in the soak harness, and the oracle self-test
+runs against SOA-6's oracle core; and SOA-6's own rules govern the shape (exact
+comparison, no invented tolerance or threshold; a field added to `SoakRun`
+bumps `SOAK_SCHEMA_VERSION` on SOA's own line; verdicts and records carry no
+free text, so no new redaction path).
+
+**Chosen (grounded in SOA-6's core and rules, under the owner's best-guess
+authorization of 2026-10-26; if merge review disagrees, this decision is
+revisited there):**
+
+1. **A window is a contiguous tick range; its digest is SHA-256 over a
+   canonical point encoding.** New module `weft-bench/src/soak_digest.rs`.
+   Each point is hashed as one line — tick, series, row, timestamp, and the
+   value's format-exact wire form (`GridValue::encode_field`, SOA-4) — so the
+   digest is over exactly what the workload wrote and the oracle compares.
+   SHA-256 and lowercase hex match the manifest's existing digest form
+   (the run manifest already carries `report_sha256`). The first line
+   hashed is a domain separator naming the algorithm
+   (`weftdb-soak-window-digest/1`): an encoding change is a new algorithm,
+   never a silent change to what an old digest means.
+2. **Two computations, one comparison.** `expected_window_digest` regenerates
+   a window from the model alone (also exposed as
+   `SoakOracle::window_digest`); `observed_window_digest` hashes a read-back
+   in the oracle's own input shape (`&[(u64, Vec<ObservedPoint>)]`).
+   The observed side is canonicalized (tick, series, row, timestamp, encoded
+   value) before hashing, so read-back order is irrelevant; duplicates are
+   hashed as many times as they occur, so a duplicated seal changes the
+   digest — the same failure the oracle classifies as `Duplicate`.
+   `WindowDigest::matches` requires the same range, point count, and hash.
+3. **Digests localize; the oracle still judges.** A matching window states
+   exactly what the oracle's per-cell judgement states for those ticks, at
+   hash-comparison cost; a differing window is re-judged tick by tick with
+   SOA-6's core to classify the damage. No tolerance, rate, or threshold is
+   introduced — equality is the only comparison, per SOA-2/SOA-3/SOA-6's
+   refusal to invent pass/fail numbers.
+4. **Digests are recorded on the run record, in window order, and the soak
+   schema takes v3.** `SoakRun.windows: Vec<WindowDigest>`
+   (`#[serde(default)]`, skipped when empty, so v1/v2 artifacts still
+   deserialize) is appended by `SoakHarness::record_window_digest`, only
+   while `Running`, and a window that overlaps or precedes the last recorded
+   one is refused — a window recorded twice would double-count its evidence.
+   Adding the field bumps `SOAK_SCHEMA_VERSION` 2 → 3 per SOA-1's bump rule,
+   on SOA's own line (§3). A digest carries no free text, so
+   `SoakRun::redacted_json` emits it unchanged.
+5. **The self-test is a pure associated function on the core it tests.**
+   `SoakOracle::self_test()` builds its own small deterministic model (never
+   the caller's — a misconfigured run cannot make it vacuous) and runs nine
+   checks whose correct outcomes are known by construction: a faithful
+   read-back passes exactly; each classified corruption (missing, wrong
+   value, wrong timestamp, unexpected, out-of-grid, duplicate) is caught as
+   exactly that kind, once; and the window digests agree with a faithful
+   read-back and disagree after a dropped point. The report
+   (`OracleSelfTestReport`) is `passed()` only when every check passed and
+   at least one ran (the SOA-12 skipped-check rule). It performs no read and
+   touches no server: a driver runs it before a soak, a publisher before
+   trusting a recorded verdict. Check names are fixed constants of the
+   self-test, so the report needs no redaction.
+
+**Rejected:** a verdict field per window on the run record (the verdict is
+the oracle's, recorded once by SOA-6; windows are evidence, not verdicts);
+a non-cryptographic hash (the digest is published evidence — a collision
+must not be able to hide corruption, and sha2 is already a weft-bench
+dependency); hashing the serialized JSON of points (the wire encoding is
+the format-exact form SOA-4 already pins, and JSON field order would make
+the digest depend on serde rather than on the workload); and a self-test
+that runs against a live server or the caller's run model (no slice names
+a read client, and a self-test that inherits the run's configuration can
+pass vacuously against the wrong expectations).
+## 2026-11-02 — Gap fill and bucket widths on the downsample endpoints (#142, #143) (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** #142 names `?fill=` on endpoints of which the compute ones take a JSON body, not a
+query string, and #143 says "freeze-track API decision first", because splimes' `Resolution` is
+one step of a unit and every reducing surface is keyed by it. Chosen:
+
+1. **The compute endpoint's `fill` is a body field**, like every other knob there; the ILP and
+   stored-range endpoints take `?fill=`. The vocabulary is `weft_reduce::Fill::from_token`'s.
+2. **The fill grid is bounded by the interpolation endpoint's output cap** (10M), since a filled
+   grid is an output grid of the same kind; past it the request is a `400` that says why.
+3. **A width is additive, not a new `Resolution`.** `BucketWidth` is a unit and a count;
+   reducing at a width is reducing at the unit and merging each run of `count` partial buckets
+   (`PartialReduction::coarsen`), exact because merging is. No existing signature changed: the
+   `Resolution` APIs delegate to the width ones with a count of one, so a freeze decision about
+   replacing `Resolution` is not needed and stays open. `.weftpart` sidecars still serve the
+   unit, and the width coarsens what they return, so `grids_nest` is untouched.
+4. **The JSON body names a width in a new `width` field** (overriding `resolution`), since its
+   `resolution` is a typed enum; the query endpoints accept a width as their `resolution` token.
+   A response's `resolution` is `"15 minutes"` for a width and unchanged for a unit.
+
+## 2026-11-02 — What closes Phase 1's open bench lines (#140, #147, #148, #149, #150, #393) (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the five Phase 1 trackers are one-line issues, and the plan text behind them was
+dropped from `ROADMAP.md` in 1228723 (recovered from 1228723^). Several of its phrases name work
+another track owns, or describe the engine as it was in July. The owner asked for all of Phase 1
+(2026-11-02, "Complete all of phase 1"). What each line was taken to mean, and where it stops:
+
+1. **Failure tests (1.1) are the bench's, the crash matrix is not.** `weft-bench --failure` kills a
+   child process (this binary) with `SIGKILL` while it seals batches (restart during ingest) or
+   compacts (crash during compaction), and flips a byte of a closed store's segment (partial or
+   corrupt segment), then gates the reopened store on exact read-back. That is the plan's 1.1 list
+   less one item. D-S21's crash-matrix CI and SOA-9's `crash_kill9` soak stay W6's: this is a
+   bench workload, not a CI matrix or a durability claim. **Network retry** is SOA-8's failure
+   deck, claimed by the other loop's open PR (#502), and is left to it.
+2. **Post-compaction reads measure the compaction the engine has.** §7.5 (query-consistent,
+   cancellable compaction) is still open, but `SegmentStore::squash_aspect_to_target_rows` exists
+   and is what `POST …/compact` runs, so `--compressed-query-compact` measures reads after it. On
+   10M UCI rows it took 694 s to go from 9,769 to 153 segments, answered every window identically,
+   and made small windows ~36× slower (1h p50 0.16 → 5.75 ms) while the year window held
+   (30.1 → 29.5 ms): the read decodes whole 65k-row segments. Recorded as a result, not acted on.
+3. **A native fill that answers another question is gated on shape, not values (1.2).** The plan
+   asks for class A "where possible". Four engines' native fills (TimescaleDB, QuestDB, InfluxDB 3,
+   IoTDB) average the knots per grid bucket and draw lines between the averages, without
+   extrapolating; ClickHouse's `INTERPOLATE` carries the last value forward and puts the column's
+   default (`0`) before the first knot. Holding them to WeftDB's line would fail them for not being
+   WeftDB; racing them against it would compare different answers. So their gate is the grid's
+   shape (`Correctness::check_shape`), and the report shows their unfilled instants, distance from
+   the line and RMSE against the truth, never a win or a loss. DuckDB has no native interpolation,
+   so no class A arm. Class C fetches every knot into the client and runs an `f64` line with the
+   SQL arms' arithmetic (no fused multiply-add), gated like class B.
+4. **#393's rules.** (a) The QuestDB arms already speak QWP both ways and say so; WeftDB's own
+   Arrow egress is Phase 2's (Flight), not a bench change. (b) Each ASOF strategy is run and
+   published: ClickHouse `hash` (default) and `full_sorting_merge`; QuestDB's optimizer default
+   (`AsOf Join Fast` in `EXPLAIN`) and the `asof_linear` hint (`AsOf Join`). The memoized and
+   dense strategies need a symbol key this keyless join does not have; `EXPLAIN` showed every
+   other hint name leaving the plan unchanged. (c) is a precedent, not work.
+5. **"Each engine's live settings" are the container's.** The run manifest records each engine
+   container's image digest, command line and environment via `--container ENGINE=NAME`, with
+   variables whose names look secret redacted. That is where the reference host's settings live
+   (QuestDB and IoTDB take them from the environment, InfluxDB 3 and TimescaleDB from the
+   command). Querying each engine's own settings table is five dialects for the same facts and was
+   not done.
+6. **Report surfaces (#149) are Markdown, CSV and Prometheus text, plus a Grafana dashboard.**
+   The plan's `reports/` list was JSON, Parquet, HTML and Grafana; the dashboard needs a metrics
+   source, which the Prometheus text is (textfile collector or Pushgateway).
+7. **Anti-Goodhart (#150) is enforced where it can be checked.** `scripts/bench/check-separation.py`
+   (in CI) fails on an engine crate depending on a benchmark crate or reading a `BENCH` variable.
+   A rule flagging any string that names the harness was tried and dropped: weft-server's settings
+   registry documents the bench's test-only variables without reading them. The other rules
+   (publish losses, methodology first, customer workloads, correctness gates) already had a
+   mechanism; HONESTY.md now maps each rule to it.
+8. **External-engine adapters (#140) are `weft-xbench`'s six.** The plan's minimum set (ClickHouse,
+   InfluxDB 3, QuestDB, TimescaleDB, DuckDB) and IoTDB are measured. VictoriaMetrics was "if
+   monitoring matters", and WeftDB does not target monitoring, so it is not built; kdb+ stays out
+   on licence grounds.
+
 ## 2026-11-01 — FRE-7b: immutable declarations, scale rules and schema read-back — the shapes the plan left open (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan names the slice (§6 W5), fixes that widening goes through
@@ -87,7 +311,6 @@ matrix is the gate's rule, widened in place); refusing proxied requests under
 `WEFT_AUTH=disabled` too (decision 7 assigns that deployment a gateway, whose requests are
 proxied by construction); and treating `X-Real-IP` as a proxy header (it is set by one
 proxy family for its own use and is not part of the de-facto forwarded set).
-
 ## 2026-11-01 — ROB-10 "Admission I": per-class budgets the gate enforces (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan names ROB-10 only as "Admission I" (§6 W5) and absorbs its parts
@@ -256,6 +479,150 @@ sources do not pin, chosen here:
 `weftdb/tests/golden/`; the v3 pair stays committed as negative fixtures the v4 reader must
 refuse.
 
+## 2026-10-31 — What "OS-cold and post-restart runs" measure, and how (#146)
+
+**Ambiguous:** the roadmap line is a heading with nothing under it. `weft-bench` already splits the
+first timed rep from the rest (`cold_warm`, schema v21), but that first rep is cold only to the
+process: the OS page cache still holds what the load just wrote. Nothing said which benchmark the
+cold runs belong to, what "restart" means for an engine that runs in the harness's process, or how
+to drop the page cache without the harness running as root.
+
+**Chosen:**
+
+- **In `weft-xbench`, beside the warm reps**, because the claim a cold read supports is a
+  comparison: WeftDB's first read after a restart against the other engines' first read after
+  theirs. `--cold-hook CMD` adds two more conditions per read phase, `--cold-reps` (3) reps each:
+  - `os-cold`: the hook drops the page cache before each rep; the engine keeps running with its
+    own caches (buffer pools, mark caches, decoded segments) intact.
+  - `restarted`: the hook restarts the engine, the arm reconnects and waits for an answer, and then
+    the page cache drops, so not even the reconnection's reads stay cached.
+  Every cold rep is gated against the reference like a warm one: a restart that loses data fails
+  the gate instead of timing an empty answer. Verdicts compare like with like (a cold WeftDB read
+  against the fastest cold read of another engine).
+- **The hook is outside the binary** (`sh -c 'HOOK "$@"' sh ACTION ENGINE`), so the harness needs
+  no root and no docker. `scripts/xbench/cold-hook.sh` is the reference host's: `docker restart`
+  of the engine's container, and `echo 3 > /proc/sys/vm/drop_caches` from a throwaway privileged
+  container, the route approved for this host (no sudo password is typed).
+- **In-process engines reopen rather than restart.** WeftDB's stored arms drop their
+  `SegmentStore` and open the directory again (a root opens once per process, so the old handle
+  goes first); DuckDB closes its connection and opens the file again. The harness's own memory
+  (allocator, loaded code) stays warm; the report says so.
+- **Reconnection is outside the clock**, except TimescaleDB's re-prepare of its two statements,
+  which belong to the old connection: a reconnected client's first query pays it too.
+- Load reps stay warm only: a load writes fresh files, so the page cache holds nothing of them
+  before it starts.
+
+**Rejected:**
+
+- Rebooting the host between reps: the most honest cold, but the harness cannot survive it and it
+  would turn a run into days.
+- `posix_fadvise(DONTNEED)` on the stores' files instead of dropping the whole cache: it reaches
+  only the files the harness can name, not a server container's data directory.
+- Running the harness as root to write `drop_caches` itself: every engine's files would then be
+  root's, and nothing else in the harness needs it.
+- Cold reps in `weft-bench`'s single-engine workloads: without another engine beside them they show
+  WeftDB's own cold cost, which `cold_warm` already approximates; the cross-engine run is where a
+  cold-read claim is made.
+
+## 2026-10-31 — What "TSBS-compatible comparison harness" means before tagged ingest (#141)
+
+**Ambiguous:** the roadmap's Phase 1 line names a "full TSBS-compatible comparison harness" and
+nothing more. TSBS's benchmark is its generator, its per-database loaders and its query suite;
+every `devops`/`iot` query (`cpu-max-all`, `high-cpu`, `groupby-orderby-limit`, `lastpoint`, …)
+groups many hosts' series by tag, and WeftDB stores one untagged series per aspect until TAG-11.
+TAG-12 already lists "TSBS benchmarks" after it.
+
+**Chosen (the owner's call, 2026-10-31):** TSBS's *data* through this benchmark's own phases now,
+TSBS's query suite with TAG-12.
+
+- `weft-xbench --tsbs FILE` reads `tsbs_generate_data --use-case=cpu-only --format=influx` output
+  with the workspace's ILP parser and keeps one host's field, `host_0`'s `usage_user` (the field
+  TSBS's own CPU queries lead with). A second tag set for the host, readings that do not strictly
+  increase, or a line that does not parse are refused, not skipped.
+- **Sized by span, not rows.** `tsbs-<scale>` is the readings within `scale.point_count()` seconds
+  of the first, reconstructed per second: the synthetic datasets' grids (3,601, 86,401 and
+  604,801 instants) from a knot every ten seconds, so nine in ten instants are interpolated. Taking
+  `point_count()` readings instead would have made the medium grid six million instants.
+- **The reference data** is generated by TSBS at commit `8323e59` with `--seed=123 --scale=10
+  --log-interval=10s` over 2016-01-01T00:00:00Z to 2016-01-08T00:00:10Z (the end is exclusive;
+  `00:00:01` stopped at 23:59:50 and left the medium grid's last ten seconds extrapolated). The
+  report's reproduction section carries the commands.
+- The report names TSBS's query suite under "Not tested" in every run, and the `tsbs` limitation
+  says what the series is and that only the reference gate applies (no ground truth).
+
+**Rejected:**
+
+- TSBS's queries over one series each: a `groupby` over one host measures nothing TSBS measures.
+- A WeftDB TSBS loader and query generator in Go now: nothing to load tagged series into until
+  TAG-11, and TAG-12 owns it.
+- Every host as its own dataset: ten times the run for ten draws of one random walk.
+- The nightly smoke does not run `tsbs`: it would need a Go toolchain and TSBS's module graph in
+  CI for data the unit tests already cover in shape.
+
+## 2026-10-31 — Load timing excludes the previous load's teardown
+
+**Ambiguous:** `weft-xbench` times each load rep from the start of `Arm::load`, and every arm's
+`load` began by dropping what the previous rep stored (`self.db = None` / `self.stored = None`),
+whose `Drop` removes the server-side database or the store directory. Whether that teardown
+belongs to a load's time was never decided; it was simply inside the clock.
+
+**Chosen:** it does not. `Arm` has a required `unload`, which releases the previous load, and
+the runner calls it before starting each load's clock; a test with a 200 ms teardown pins it.
+Found when IoTDB's loads measured about 1.2 s on every dataset, tiny ones included, against
+0.2 s for the same load on a fresh server: its `DROP DATABASE` answers in 1.0 s. InfluxDB 3's
+1 s loads are its own (its write waits for the WAL flush; a drop takes under 1 ms), so #471's
+figures stand.
+
+**Consequence:** every load row measured before this, in the committed EVI-15 report and in the
+ClickHouse, TimescaleDB and QuestDB runs, includes the previous rep's teardown in reps 2 to 5,
+so in its median. Interpolation and downsample rows are unaffected. The EVI-15 report keeps its
+numbers with a note in its README; the combined cross-engine rerun supersedes them.
+
+**Rejected:** dropping at the end of each rep instead: the last load's data must stay loaded for
+the interpolation and downsample phases that follow it.
+
+## 2026-10-31 — External engines V: how the Apache IoTDB arm is measured
+
+**Ambiguous:** IoTDB 2.0 has two data models (tree and table), native clients over Thrift only,
+no decimal type, no series generator, millisecond timestamps and an asynchronous WAL by default,
+and a key of device plus instant that replaces duplicate writes. Which model, protocol, settings
+and arms the benchmark uses were not settled.
+
+**Chosen:**
+
+- **One arm, `iotdb-double`**, in `weft-xbench/src/iotdb.rs`, run only with `--iotdb URL`, against
+  IoTDB 2.0.11 standalone. No decimal arm: the engine has no decimal type.
+- **The table model over its REST API** (`/rest/table/v1`, JSON, Basic auth as `root`). The table
+  model is IoTDB 2.0's SQL surface, with window functions and `ASOF JOIN`; the tree model's
+  path-based queries have no joins. Thrift has no Rust client, so the REST service is the protocol
+  available; the report names the JSON encoding as a cost the binary paths of the other servers do
+  not carry.
+- **Server settings:** `timestamp_precision=ns` (fixed at first start; the datasets are
+  nanosecond), `wal_mode=SYNC` so a write answers once its WAL entry is on disk, as the other
+  durable arms do (IoTDB's default `ASYNC` would not), and `rest_query_default_row_size_limit`
+  raised above the largest grid. Set by environment on the reference host and in the nightly smoke.
+- **Writes:** `insertTablet` requests of 100,000 rows sent in time order, one table
+  `knots (v DOUBLE FIELD)` with no tags, so one device. Not concurrently: IoTDB keeps rows that
+  arrive behind ones already written in separate unsequence files that every query merges.
+- **Interpolation:** `lead` pairs each knot with the next into segments; `date_bin_gapfill` with
+  the grid's start as origin emits the grid (there is no `generate_series` and no `VALUES`); a native
+  `ASOF LEFT JOIN` finds each instant's segment, the first and last segments standing in past the
+  data. `date_bin_gapfill` left out the bucket at the grid's end when no knot fell in it, under
+  `<= end` and `< end + step` alike, and emitted one past it under `<= end + step`; the grid is
+  filled over the span widened by a step each way and cut back, which the `mcar-small` gate caught.
+  **Downsample:** native `date_bin`, epoch-aligned.
+- **Bytes on disk:** a `FLUSH` once the timed loads are done, then the table's TsFile bytes from
+  `information_schema.table_disk_usage`.
+- `WEFT_XBENCH_IOTDB` is registered in the Test tier.
+
+**Rejected:**
+
+- The tree model with `FILL(LINEAR)`: it fills `NULL`s between bucket aggregates of a `GROUP BY`
+  time window, not at instants between jittered knots.
+- Writing the grid into a second table to join against: a write the other engines do not make,
+  inside the timed query.
+- Concurrent writes, as the InfluxDB arm sends: out-of-order arrival lands in unsequence files.
+
 ## 2026-10-30 — External engines IV: how the InfluxDB 3 Core arm is measured
 
 **Ambiguous:** InfluxDB 3 Core has no decimal type, no `ASOF JOIN` in its SQL engine (DataFusion),
@@ -293,8 +660,9 @@ storage, were not settled.
   1m, 5m or 10m; compaction is an Enterprise feature), so the four-year UCI series becomes about
   200,000 files. 5,000 still failed on the third run. The cap is a documented server setting;
   raising it, and saying so in the report, keeps InfluxDB on the UCI rows instead of dropping it
-  from them. The cost shows in the numbers: a medium UCI interpolation took 295 s on the trial run
-  against about 5 s for the same-size synthetic series spanning days.
+  from them. The cost shows in the numbers: on run 5 a medium UCI interpolation took 15.5 s against
+  0.3 s for the same-size synthetic series spanning a week. (The 295 s first measured for it was
+  mostly the `CROSS JOIN` defect recorded above.)
 - **Telemetry upload off** on the reference host and in the nightly smoke, which configures
   `influxdb3 serve` by environment because a service container takes no command.
   `WEFT_XBENCH_INFLUXDB3` is registered in the Test tier.
@@ -2800,6 +3168,82 @@ the silent substitution is gone. The claim adjudication behind taking this
 slice (the peer's `compute/fre-5-*` branches treated as stale squash
 leftovers) is recorded on board issue #125 and in the loop's queue notes.
 
+## 2026-11-02 — PAC-13 offline restore CLI: the shapes the plan left open — FOR MERGE REVIEW
+
+The plan gives PAC-13 one line ("Offline restore CLI over D-S16
+(`weft-server restore`)", W7) and the C-7 table the exit statuses, so
+every shape below is a judgement call this loop made. D-S16 landed the
+library half on 2026-10-30 (`restore_store`, the whole-store manifest,
+the restore-intent marker), which is the whole reason this slice is
+startable now.
+
+1. **Why this slice leads W7, with W6 items still open.** W7's other
+   code items want W6 remainders — ROB-13 wants the bounded-read work,
+   ROB-16 wants the GPU provenance lane, SOA-11 and EVI-19's RPO/RTO
+   want SOA-10's checks and EVI-25's measurements — while PAC-13's only
+   prerequisite is D-S16. PAC-9 (image) and PAC-11 (systemd unit) are
+   listed ahead of it on the packaging lane but are siblings, not
+   dependencies: the CLI ships inside whatever artifact packs it, so
+   neither blocks the binary. Chose the unblocked one and left the W6
+   remainder for the other lane rather than serialising behind it.
+2. **The exit statuses are the ones the server already returns.** The
+   command reuses `settings::CONFIG_EXIT_CODE` (78) and
+   `settings::STORE_EXIT_CODE` (65) rather than minting restore-specific
+   codes: a supervisor that already understands "78 = fix the command
+   line or the destination, 65 = the store/backup needs a human" needs no
+   new rule, and PAC-7's operator CLI folds this command into its table
+   without changing a number. The 78/65 split is by *which side of the
+   terminal* is wrong, not by severity.
+3. **The command exits the process itself.** Handing a `Refused` back to
+   `main` would flatten every status to 1 through the runtime, so
+   `restore::run` prints the reason to stderr and calls
+   `std::process::exit` with the code — the same shape
+   `store_open::spawn_exit_on_poison` uses for 77, in the same crate, for
+   the same reason. The library API stays `Result`-shaped
+   (`Refused: Display + std::error::Error`) so a caller that wants its own
+   exit policy can keep it; only the binary's path exits.
+4. **There is no `--force`.** The destination must not exist, so the one
+   thing this command cannot do is remove a live store. That is deliberate:
+   the library already refuses to overwrite a control plane, and a restore
+   that replaces a running root is a deployment decision (move the old root
+   aside by hand, then restore) rather than a flag on the command that is
+   also the last-resort recovery tool. The refusal is 78 and writes
+   nothing, so a mistyped `--into` cannot damage anything.
+5. **`--adopt` runs the adoption the marker defers, in the foreground.** A
+   whole-store restore publishes `RESTORE_INTENT`, and the frames it
+   carried are adopted into the index at whatever open first reads the
+   root. Waiting for that is correct but invisible at 3 a.m., so `--adopt`
+   opens the restored root once and reports adopted / held / quarantined /
+   suspect counts and the scope it opened. `--database`/`--subject` name
+   that open and are *refused* without `--adopt` rather than quietly
+   ignored — a scope flag that changes nothing is worse than an error.
+   Adoption is idempotent, so omitting `--adopt` is safe and the CLI says
+   so in its output.
+6. **One command, both backup kinds, chosen from the manifest.** The
+   alternative was two subcommands. The backup already declares its kind
+   (`weftdb-whole-store-backup/1` versus the control-plane manifest), and
+   an operator at 3 a.m. does not know which kind they have, so the
+   command reads `MANIFEST.json` and takes `restore_store` or
+   `restore_control_plane` accordingly, printing which leg it took. A
+   pre-manifest backup — the v0.1.0-era shape, four database files with no
+   manifest and therefore no checksums to verify against — is refused at
+   65 rather than copied on trust: a restore that cannot verify is exactly
+   what D-S16 exists to prevent. A manifest naming a store format this
+   build cannot honour (a newer WeftDB's write floor) is the same code.
+7. **Hand-rolled parsing, no new dependency.** `main.rs`'s subcommand
+   dispatch and `import-rows-mode`'s `--flag <value>` parsing are the
+   precedent; adding `clap` for one more command would buy little and
+   change how every other subcommand parses. `--help`/`-h` anywhere in the
+   command line prints the module's own `USAGE` text (a bare `restore` word is
+   treated as that question, not as an error), and an unknown option is a 78 that
+   points at `--help`.
+
+**Not in this slice:** PAC-7's operator CLI (it will absorb this command's
+table), any HTTP route that restores over a live control plane (still a
+deployment decision; the drill remains the only live-server restore), the
+image and unit files (PAC-9, PAC-11), and any change to
+`weftdb::restore_store` semantics — this is a binary over the library, and
+`Cargo.lock` is untouched.
 ## 2026-11-02 — PAC-9 container image: the shapes the plan left open — FOR MERGE REVIEW
 
 The plan gives PAC-9 one line ("Docker image and container smoke test (with a

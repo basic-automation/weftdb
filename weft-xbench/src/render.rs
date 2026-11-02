@@ -14,23 +14,29 @@ use std::fmt::Write as _;
 
 use weft_bench::stats::ConfidenceInterval;
 
-use crate::{ArmResult, DatasetKind, Phase, XbenchReport};
+use crate::{ArmClass, ArmResult, DatasetKind, Phase, Warmth, XbenchReport};
 
-/// Datasets the first report's scope (decision 18) asks for.
-const EXPECTED_KINDS: [DatasetKind; 3] = [DatasetKind::Mcar, DatasetKind::Block, DatasetKind::Uci];
+/// Datasets the first report's scope (decision 18) asks for, and TSBS's (#141).
+const EXPECTED_KINDS: [DatasetKind; 4] = [DatasetKind::Mcar, DatasetKind::Block, DatasetKind::Uci, DatasetKind::Tsbs];
 /// How many scales decision 18 asks for.
 const EXPECTED_SCALES: usize = 3;
 /// Arms decision 18 asks for: WeftDB stored, in-memory and `f64`; `DuckDB` `DOUBLE` and `DECIMAL`;
 /// and, from the second external engine on, `ClickHouse` `Float64` and `Decimal64` and
 /// `TimescaleDB` `double precision` and `numeric`; `QuestDB` `DOUBLE` and `DECIMAL`; `InfluxDB` 3's
-/// `float` field (it has no decimal type).
-const EXPECTED_ARMS: [&str; 13] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "clickhouse-double", "clickhouse-decimal", "timescaledb-double", "timescaledb-numeric", "questdb-double", "questdb-decimal", "influxdb3-double"];
+/// `float` field and `IoTDB`'s `DOUBLE` field (neither has a decimal type).
+///
+/// From #148 (fair protocol 1.2), each engine also has a client-side arm (class C), and each with a
+/// native fill a native arm (class A); `DuckDB` has none.
+///
+/// And, for #393's rule that an engine's own `ASOF JOIN` strategies are each run and published,
+/// `clickhouse-double-merge` and `questdb-double-linear`.
+const EXPECTED_ARMS: [&str; 27] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "duckdb-client", "clickhouse-double", "clickhouse-decimal", "clickhouse-double-merge", "clickhouse-native", "clickhouse-client", "timescaledb-double", "timescaledb-numeric", "timescaledb-native", "timescaledb-client", "questdb-double", "questdb-decimal", "questdb-double-linear", "questdb-native", "questdb-client", "influxdb3-double", "influxdb3-native", "influxdb3-client", "iotdb-double", "iotdb-native", "iotdb-client"];
 /// Below this many reps the bootstrap intervals are too coarse to separate much.
 const FEW_REPS: usize = 10;
 
 /// Workloads and engines outside this benchmark, listed in every report so a reader does not take
 /// silence for coverage.
-const NOT_IN_SCOPE: [&str; 6] = ["Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB, QuestDB and InfluxDB 3 has a spline, so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "IoTDB: no adapter yet. Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
+const NOT_IN_SCOPE: [&str; 7] = ["TSBS's query suite (`cpu-max-all`, `high-cpu`, `groupby-orderby-limit`, `lastpoint` and the rest): those queries group many hosts' series by tag, which WeftDB stores only once tagged ingest lands (TAG-11); the `tsbs` datasets run TSBS's data through this benchmark's own phases, one host at a time.", "Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB, QuestDB, InfluxDB 3 and IoTDB has a built-in spline in the SQL these arms use (IoTDB's optional UDF library has one for its tree model, not loaded here), so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
 
 /// How one WeftDB arm compares with the fastest other engine on one dataset and phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +49,7 @@ pub enum Outcome {
 	Noise,
 }
 
-/// One WeftDB arm against the fastest passing non-WeftDB arm.
+/// One WeftDB arm against the fastest passing non-WeftDB arm of one class.
 #[derive(Debug, Clone)]
 pub struct Verdict<'a> {
 	/// The WeftDB result.
@@ -75,6 +81,11 @@ fn is_weft(r: &ArmResult) -> bool {
 	r.arm.arm.starts_with("weftdb")
 }
 
+/// The arm's class; a pre-v7 result, which recorded none, ran the portable SQL.
+fn class_of(r: &ArmResult) -> ArmClass {
+	r.arm.class.unwrap_or_else(|| if is_weft(r) { ArmClass::Native } else { ArmClass::PortableSql })
+}
+
 fn passed(r: &ArmResult) -> bool {
 	r.correctness.as_ref().is_none_or(|c| c.passed)
 }
@@ -91,15 +102,41 @@ pub const fn compare(weft: &ConfidenceInterval, other: &ConfidenceInterval) -> O
 	}
 }
 
-/// Every passing WeftDB result against the fastest passing other-engine result on the same dataset
-/// and phase. Datasets and phases with no other engine produce no verdict.
+/// Whether every pooled run's median falls the way `outcome` says. A result from one run has
+/// nothing to disagree with.
+fn runs_agree(weft: &ArmResult, other: &ArmResult, outcome: Outcome) -> bool {
+	let (Some(w), Some(o)) = (&weft.between_run, &other.between_run) else { return true };
+	let (w_min, w_max) = (w.run_p50_ns.iter().min(), w.run_p50_ns.iter().max());
+	let (o_min, o_max) = (o.run_p50_ns.iter().min(), o.run_p50_ns.iter().max());
+	match outcome {
+		Outcome::Win => w_max < o_min,
+		Outcome::Loss => o_max < w_min,
+		Outcome::Noise => true,
+	}
+}
+
+/// Every passing WeftDB result against the fastest passing other-engine result of each class.
+///
+/// Only the classes that answer the same question count (portable SQL, client-side); a native
+/// fill that computes another answer is reported beside the reconstruction, never raced against it.
+///
+/// The other result shares the dataset, the phase and the warmth, so a cold WeftDB read is held
+/// against cold reads only. Datasets and phases with no other engine produce no verdict. In a
+/// combined report a win or a loss also needs every run's median to fall the same way; one that
+/// does not is noise.
 #[must_use]
 pub fn verdicts(report: &XbenchReport) -> Vec<Verdict<'_>> {
 	let mut out = Vec::new();
 	for weft in report.results.iter().filter(|r| is_weft(r) && passed(r)) {
-		let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.dataset == weft.dataset && r.phase == weft.phase).min_by_key(|r| r.latency_ci.p50.point_ns);
-		if let Some(other) = other {
-			out.push(Verdict { weft, other, outcome: compare(&weft.latency_ci.p50, &other.latency_ci.p50) });
+		for class in [ArmClass::PortableSql, ArmClass::ClientSide] {
+			let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.arm.own_answer.is_none() && class_of(r) == class && r.dataset == weft.dataset && r.phase == weft.phase && r.warmth == weft.warmth).min_by_key(|r| r.latency_ci.p50.point_ns);
+			if let Some(other) = other {
+				let outcome = match compare(&weft.latency_ci.p50, &other.latency_ci.p50) {
+					decided if !runs_agree(weft, other, decided) => Outcome::Noise,
+					outcome => outcome,
+				};
+				out.push(Verdict { weft, other, outcome });
+			}
 		}
 	}
 	out
@@ -134,6 +171,14 @@ const fn phase(p: Phase) -> &'static str {
 	}
 }
 
+/// The phase, with its warmth when it is not warm (`interpolate (os-cold)`).
+fn phase_of(r: &ArmResult) -> String {
+	match r.warmth {
+		Warmth::Warm => phase(r.phase).into(),
+		w => format!("{} ({})", phase(r.phase), w.as_str()),
+	}
+}
+
 /// Bytes per stored point, for a load result that recorded its size.
 fn bytes_per_point(r: &ArmResult) -> String {
 	match r.storage_bytes {
@@ -149,7 +194,7 @@ fn verdict_line(v: &Verdict<'_>) -> String {
 		Outcome::Loss => format!("{} {:.1}× faster", v.other.arm.arm, v.ratio()),
 		Outcome::Noise => "intervals overlap".to_string(),
 	};
-	format!("`{}` {}: `{}` p50 {} ms vs `{}` {} ms ({tail}).", v.weft.dataset, phase(v.weft.phase), v.weft.arm.arm, ms(v.weft.latency_ci.p50.point_ns), v.other.arm.arm, ms(v.other.latency_ci.p50.point_ns))
+	format!("`{}` {} vs {}: `{}` p50 {} ms vs `{}` {} ms ({tail}).", v.weft.dataset, phase_of(v.weft), class_of(v.other).label(), v.weft.arm.arm, ms(v.weft.latency_ci.p50.point_ns), v.other.arm.arm, ms(v.other.latency_ci.p50.point_ns))
 }
 
 /// The report as blocks: header, results, honesty section.
@@ -165,22 +210,50 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	}
 
 	b.push(Block::Heading(2, "Results".into()));
-	b.push(Block::Para("Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets. B/pt is the store's size on disk after a load, divided by the points loaded (whole files: indexes and headers included).".into()));
+	b.push(Block::Para("Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets. B/pt is the store's size on disk after a load, divided by the points loaded (whole files: indexes and headers included). A phase marked `os-cold` ran each rep after the OS page cache was dropped, and one marked `restarted` after the engine restarted as well; unmarked phases are warm, back-to-back reps.".into()));
 	let rows = report
 		.results
 		.iter()
 		.map(|r| {
-			let gate = r.correctness.as_ref().map_or_else(|| "—".into(), |c| if c.passed { "PASS".into() } else { format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference) });
+			let gate = r.correctness.as_ref().map_or_else(
+				|| "—".into(),
+				|c| match (c.passed, r.arm.own_answer.is_some()) {
+					(true, true) => "own answer".into(),
+					(true, false) => "PASS".into(),
+					(false, _) => format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference),
+				},
+			);
 			let rmse = r.accuracy.as_ref().map_or_else(|| "—".into(), |a| format!("{:.4}", a.rmse));
-			vec![r.dataset.clone(), phase(r.phase).into(), r.arm.arm.clone(), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse, bytes_per_point(r)]
+			vec![r.dataset.clone(), phase_of(r), r.arm.arm.clone(), r.arm.class.map_or_else(|| "—".into(), |c| c.label().to_string()), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse, bytes_per_point(r)]
 		})
 		.collect();
-	b.push(Block::Table(["dataset", "phase", "arm", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE", "B/pt"].map(String::from).to_vec(), rows));
+	b.push(Block::Table(["dataset", "phase", "arm", "class", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE", "B/pt"].map(String::from).to_vec(), rows));
+
+	b.push(Block::Heading(2, "Interpolation classes".into()));
+	b.push(Block::Para("Each engine is asked for the grid three ways where it can be (fair protocol 1.2): **A · native**, the engine's own interpolation or fill; **B · portable SQL**, the linear reconstruction written in its SQL; **C · client-side**, every knot fetched into this Rust client and interpolated there, end to end. B and C answer the question WeftDB answers, so they are gated against its grid and timed against it. A native fill that computes something else is gated only on the grid's shape, and is shown below with how far its answer lies from the reconstruction instead of being raced against it. DuckDB has no native interpolation, so it has no class A arm.".into()));
+	let own: Vec<&ArmResult> = report.results.iter().filter(|r| r.arm.own_answer.is_some() && r.phase == Phase::Interpolate).collect();
+	if own.is_empty() {
+		b.push(Block::Para("No native fill ran in this run.".into()));
+	} else {
+		let rows = own
+			.iter()
+			.map(|r| {
+				let c = r.correctness.as_ref();
+				vec![r.dataset.clone(), phase_of(r), r.arm.arm.clone(), ci(&r.latency_ci.p50), c.map_or_else(|| "—".into(), |c| c.unfilled_points.to_string()), c.map_or_else(|| "—".into(), |c| format!("{:.3e}", c.max_abs_diff_vs_reference)), r.accuracy.as_ref().map_or_else(|| "—".into(), |a| format!("{:.4}", a.rmse))]
+			})
+			.collect();
+		b.push(Block::Table(["dataset", "phase", "native fill", "p50 [CI]", "unfilled instants", "max diff from the line", "RMSE vs truth"].map(String::from).to_vec(), rows));
+		let mut seen = std::collections::BTreeMap::new();
+		for r in &own {
+			seen.entry(r.arm.arm.clone()).or_insert_with(|| r.arm.own_answer.clone().unwrap_or_default());
+		}
+		b.push(Block::List(seen.into_iter().map(|(arm, answer)| format!("`{arm}` computes {answer}.")).collect()));
+	}
 
 	b.push(Block::Heading(2, "Honesty".into()));
 	b.push(Block::Para("Generated from the results above. A WeftDB arm wins or loses only when its p50 interval does not overlap the fastest other engine's; overlapping intervals are within noise.".into()));
 
-	let failures: Vec<String> = report.results.iter().filter(|r| !passed(r)).map(|r| format!("`{}` {} `{}` disagrees with the in-memory reference: {:?}.", r.dataset, phase(r.phase), r.arm.arm, r.correctness)).collect();
+	let failures: Vec<String> = report.results.iter().filter(|r| !passed(r)).map(|r| format!("`{}` {} `{}` disagrees with the in-memory reference: {:?}.", r.dataset, phase_of(r), r.arm.arm, r.correctness)).collect();
 	if !failures.is_empty() {
 		b.push(Block::Heading(3, "Correctness failures".into()));
 		b.push(Block::List(failures));
@@ -202,7 +275,15 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	for kind in EXPECTED_KINDS {
 		let scales: std::collections::BTreeSet<&str> = report.results.iter().filter(|r| r.kind == kind).map(|r| r.scale.as_str()).collect();
 		if scales.is_empty() {
-			missing.push(format!("The `{}` datasets did not run{}.", kind.as_str(), if kind == DatasetKind::Uci { " (pass `--uci FILE`)" } else { "" }));
+			missing.push(format!(
+				"The `{}` datasets did not run{}.",
+				kind.as_str(),
+				match kind {
+					DatasetKind::Uci => " (pass `--uci FILE`)",
+					DatasetKind::Tsbs => " (pass `--tsbs FILE`)",
+					DatasetKind::Mcar | DatasetKind::Block => "",
+				}
+			));
 		} else if scales.len() < EXPECTED_SCALES {
 			missing.push(format!("`{}` ran at {} of {EXPECTED_SCALES} scales ({}).", kind.as_str(), scales.len(), scales.into_iter().collect::<Vec<_>>().join(", ")));
 		}
@@ -219,11 +300,16 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 					" (pass `--questdb ADDR`)"
 				} else if arm.starts_with("influxdb3") {
 					" (pass `--influxdb3 URL`)"
+				} else if arm.starts_with("iotdb") {
+					" (pass `--iotdb URL`)"
 				} else {
 					""
 				}
 			));
 		}
+	}
+	if !report.results.iter().any(|r| r.warmth != Warmth::Warm) {
+		missing.push("OS-cold and post-restart reads: every rep in this run was warm (pass `--cold-hook` for cold ones).".into());
 	}
 	missing.extend(NOT_IN_SCOPE.iter().map(|s| (*s).to_string()));
 	b.push(Block::List(missing));
@@ -259,12 +345,30 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		limits.push("InfluxDB 3 has no decimal type, so it has one arm, `influxdb3-double`, and no exact-decimal comparison. Its SQL engine (DataFusion) has no `ASOF JOIN` and `date_bin_gapfill`'s `interpolate()` fills between bucket aggregates, so the arm merges the grid with the knots and finds each grid row's neighbouring knots with running `max`/`min` windows over the knot instants, gated like every arm.".into());
 		limits.push("InfluxDB 3's write answers once the WAL file holding the rows is persisted (`no_sync=false`, its default), and the server flushes its WAL every second (`--wal-flush-interval`, default `1s`), so a load takes about a second however small it is; a load is sent as concurrent writes of at most 8 MiB, under the server's 10 MiB request cap, so they share the WAL flush. A series and an instant are its key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none). Its bytes on disk are not reported: the rows sit in the WAL until the server snapshots them to Parquet on its own schedule. InfluxDB 3 Core refuses a query that would read more than 432 Parquet files, and it writes a file per ten minutes of data time with no compaction, so the four-year UCI series is about 200,000 files once snapshotted; the reference server raises that cap with `--query-file-limit 300000`, and the UCI interpolation times show the cost of reading that many files.".into());
 	}
+	let iotdb = report.results.iter().any(|r| r.arm.arm.starts_with("iotdb"));
+	if iotdb {
+		limits.push("IoTDB has no decimal type, so it has one arm, `iotdb-double`, and no exact-decimal comparison. Its SQL has no series generator, so the grid comes from `date_bin_gapfill` over the grid's span; segments are paired by `lead` and found by a native `ASOF LEFT JOIN`. A device and an instant are IoTDB's key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none).".into());
+		limits.push("IoTDB is reached through its table-model REST API, which answers in JSON; its own clients speak Thrift, which has no Rust client, so its reads carry a text encoding the binary paths of the other servers do not. Writes are `insertTablet` requests of 100,000 rows in time order, each answered once its WAL entry is synced (`wal_mode=SYNC`, which the reference server sets; IoTDB's default is `ASYNC`). Its bytes on disk are the table's TsFiles after a `FLUSH` issued once the timed loads are done.".into());
+	}
+	if report.results.iter().any(|r| r.kind == DatasetKind::Tsbs) {
+		limits.push("The `tsbs` datasets are one host's (`host_0`) `usage_user` from TSBS's `cpu-only` generator: an integer random walk read every ten seconds with no gaps, over the synthetic datasets' span, reconstructed per second. So each grid instant falls between knots ten seconds apart, and nine in ten instants are interpolated; there is no ground truth, so only the reference gate applies.".into());
+	}
+	if report.results.iter().any(|r| r.warmth != Warmth::Warm) {
+		let hook = report.cold_hook.as_deref().unwrap_or("not recorded");
+		limits.push(format!("Cold reps (`{hook}`): before each `os-cold` rep the hook drops the OS page cache and the engine keeps running, its own caches intact; before each `restarted` rep a server engine's container restarts, the harness reconnects and waits for it to answer, and the page cache drops after that, so the reconnection's reads are not cached either. The in-process engines (WeftDB's stored arms and DuckDB) cannot restart apart from the harness: they close their files and open them again, so the process's own memory (allocator, loaded code) stays warm. The reconnection is outside the clock; TimescaleDB's prepared statements belong to the old connection, so its first rep after a restart prepares them again, inside the clock."));
+	}
 	b.push(Block::List(limits));
 
 	b.push(Block::Heading(3, "Configuration caveats".into()));
 	let mut caveats = vec![format!("Hardware: {} ({} physical / {} logical cores, {} GiB memory). The working directory was on a {} {} disk at {}.", m.cpu_model.as_deref().unwrap_or("CPU not reported"), m.cpu_cores_physical.map_or_else(|| "?".into(), |c| c.to_string()), m.cpu_cores_logical.map_or_else(|| "?".into(), |c| c.to_string()), m.total_memory_bytes.map_or_else(|| "?".into(), |b| format!("{:.0}", ns(b) / f64::from(1u32 << 30))), m.work_disk_kind.as_deref().unwrap_or("unknown"), m.work_disk_file_system.as_deref().unwrap_or("unknown file system"), m.work_disk_mount_point.as_deref().unwrap_or("an unreported mount point"),)];
+	if report.source_commit.as_deref().is_some_and(|c| c.ends_with("+dirty")) {
+		caveats.push("**The binary was built from a checkout with uncommitted changes** (`+dirty` on the source commit), so that commit alone does not reproduce it.".into());
+	}
 	if let Some(scratch) = &report.scratch_dir {
 		caveats.push(format!("The in-process engines wrote their stores to `{scratch}` (`TMPDIR`), which may be a different disk from the working directory."));
+	}
+	if iotdb {
+		caveats.push("The IoTDB server stored its data in its own data directory, which this report cannot see; check the reproduction notes for where it was mounted.".into());
 	}
 	if influx {
 		caveats.push("The InfluxDB 3 server stored its data in its own object-store directory, which this report cannot see; check the reproduction notes for where it was mounted.".into());
@@ -283,6 +387,16 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		None => caveats.push("The report does not record whether the binary was an optimised build (a v1 report).".into()),
 		Some(true) => {}
 	}
+	if report.combined_from.is_empty() {
+		caveats.push("**One run.** Two runs of this benchmark on one host once disagreed on 53 of 144 rows (EVI-15); a verdict from one run can be the run, not the engine. Pool several with `weft-xbench combine` before publishing.".into());
+	} else {
+		let spread = report.results.iter().filter_map(|r| r.between_run.as_ref()).map(|b| b.p50_spread).fold(0.0, f64::max);
+		caveats.push(format!("Pooled from {} separate runs; every interval is drawn runs-first and a win or loss needs every run's median to agree. The widest p50 spread between runs was {:.1}%.", report.combined_from.len(), spread * 100.0));
+		let disagreeing: Vec<String> = report.results.iter().filter(|r| r.between_run.as_ref().is_some_and(|b| !b.digests_agree)).map(|r| format!("{} / {}", r.dataset, r.arm.arm)).collect();
+		if !disagreeing.is_empty() {
+			caveats.push(format!("**Runs answered differently** for {}, which fails those gates.", disagreeing.join(", ")));
+		}
+	}
 	let min_reps = report.results.iter().map(|r| r.reps).min().unwrap_or(0);
 	if min_reps < FEW_REPS {
 		caveats.push(format!("Some results have only {min_reps} reps, so their intervals are wide and fewer comparisons can separate from noise."));
@@ -291,7 +405,16 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 
 	b.push(Block::Heading(3, "Reproduction".into()));
 	let invocation = if report.invocation.is_empty() { "weft-xbench".to_string() } else { report.invocation.join(" ") };
-	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), "For the QuestDB arms: `docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v <disk under test>/questdb:/var/lib/questdb questdb/questdb:<version above>`, then `--questdb 127.0.0.1:9000`.".into(), "For the InfluxDB 3 arm: `docker run -d -p 127.0.0.1:8181:8181 -v <disk under test>/influxdb3:/var/lib/influxdb3 influxdb:<version above> influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000`, then `--influxdb3 http://127.0.0.1:8181`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
+	let mut manifest: Vec<String> = report.inputs.iter().chain(&report.combined_from).map(|f| format!("{} `{}`: {} bytes, sha256 `{}`.", f.role, f.path, f.bytes, f.sha256)).collect();
+	if let Some(sha) = &report.binary_sha256 {
+		manifest.push(format!("Binary sha256 `{sha}`."));
+	}
+	manifest.extend(report.containers.iter().map(|c| format!("{} container `{}`: image `{}` (`{}`), command `{}`, environment `{}`.", c.engine, c.name, c.image, c.image_id, c.command.join(" "), c.env.join(" "))));
+	if !manifest.is_empty() {
+		b.push(Block::Heading(3, "Run manifest".into()));
+		b.push(Block::List(manifest));
+	}
+	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), "For the QuestDB arms: `docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v <disk under test>/questdb:/var/lib/questdb questdb/questdb:<version above>`, then `--questdb 127.0.0.1:9000`.".into(), "For the InfluxDB 3 arm: `docker run -d -p 127.0.0.1:8181:8181 -v <disk under test>/influxdb3:/var/lib/influxdb3 influxdb:<version above> influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000`, then `--influxdb3 http://127.0.0.1:8181`.".into(), "For the IoTDB arm: `docker run -d -p 127.0.0.1:18080:18080 -e enable_rest_service=true -e timestamp_precision=ns -e wal_mode=SYNC -e rest_query_default_row_size_limit=10000000 -v <disk under test>/iotdb:/iotdb/data apache/iotdb:<version above>-standalone` (the precision must be set before the first start), then `--iotdb http://127.0.0.1:18080`.".into(), "For the `tsbs` datasets: build TSBS's generator at the pinned commit, `GOBIN=<dir> go install github.com/timescale/tsbs/cmd/tsbs_generate_data@8323e59c74027b108f4ad5ec5d3e498b0101a02e`, write a week of `cpu-only` data, `tsbs_generate_data --use-case=cpu-only --seed=123 --scale=10 --log-interval=10s --timestamp-start=2016-01-01T00:00:00Z --timestamp-end=2016-01-08T00:00:10Z --format=influx > cpu-only.lp`, then `--tsbs cpu-only.lp`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
 	b
 }
 
@@ -403,12 +526,12 @@ mod tests {
 
 	fn result(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
 		let (latency, latency_ci) = latency(samples, 1);
-		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed });
-		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None }
+		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed, unfilled_points: 0, answer_sha256: None });
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec(), between_run: None }
 	}
 
 	fn report(results: Vec<ArmResult>) -> XbenchReport {
-		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-10-29T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: Some("abc123".into()), invocation: vec!["weft-xbench".into(), "--scales".into(), "tiny".into()], scratch_dir: Some("/mnt/weftbench/tmp".into()), optimized: Some(true), results }
+		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-10-29T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: Some("abc123".into()), invocation: vec!["weft-xbench".into(), "--scales".into(), "tiny".into()], scratch_dir: Some("/mnt/weftbench/tmp".into()), optimized: Some(true), cold_hook: None, results, inputs: Vec::new(), binary_sha256: None, containers: Vec::new(), combined_from: Vec::new() }
 	}
 
 	const FAST: [u64; 12] = [100, 101, 99, 100, 102, 98, 100, 101, 99, 100, 100, 101];
@@ -419,6 +542,43 @@ mod tests {
 		let r = report(vec![result("a", "weftdb-memory", Phase::Interpolate, &FAST, true), result("a", "duckdb-double", Phase::Interpolate, &SLOW, true), result("b", "weftdb-memory", Phase::Interpolate, &SLOW, true), result("b", "duckdb-double", Phase::Interpolate, &FAST, true), result("c", "weftdb-memory", Phase::Interpolate, &FAST, true), result("c", "duckdb-double", Phase::Interpolate, &FAST, true)]);
 		let outcomes: Vec<(String, Outcome)> = verdicts(&r).iter().map(|v| (v.weft.dataset.clone(), v.outcome)).collect();
 		assert_eq!(outcomes, vec![("a".into(), Outcome::Win), ("b".into(), Outcome::Loss), ("c".into(), Outcome::Noise)]);
+	}
+
+	#[test]
+	fn each_class_gets_its_own_verdict_and_a_native_fill_is_not_raced() {
+		let classed = |arm: &str, class: ArmClass, samples: &[u64]| {
+			let mut r = result("a", arm, Phase::Interpolate, samples, true);
+			r.arm.class = Some(class);
+			r
+		};
+		let mut native = classed("timescaledb-native", ArmClass::Native, &FAST);
+		native.arm.own_answer = Some("bucket averages".into());
+		if let Some(c) = native.correctness.as_mut() {
+			c.unfilled_points = 4;
+		}
+		let r = report(vec![classed("weftdb-memory", ArmClass::Native, &FAST), classed("duckdb-double", ArmClass::PortableSql, &SLOW), classed("duckdb-client", ArmClass::ClientSide, &FAST), native]);
+		let v = verdicts(&r);
+		assert_eq!(v.iter().map(|v| (v.other.arm.arm.as_str(), v.outcome)).collect::<Vec<_>>(), [("duckdb-double", Outcome::Win), ("duckdb-client", Outcome::Noise)], "the faster native fill answers another question and is not a rival");
+		let text = to_markdown(&blocks(&r));
+		assert!(text.contains("`timescaledb-native` computes bucket averages.") && text.contains("own answer"), "{text}");
+		assert!(text.contains("vs C · client-side"), "{text}");
+	}
+
+	#[test]
+	fn a_pooled_verdict_needs_every_run_to_agree() {
+		use weft_bench::schema::BetweenRun;
+		let between = |p50s: &[u64]| Some(BetweenRun { runs: p50s.len(), run_p50_ns: p50s.to_vec(), run_mean_ns: p50s.to_vec(), p50_spread: 0.0, digests_agree: true });
+		let pooled = |arm: &str, samples: &[u64], p50s: &[u64]| ArmResult { between_run: between(p50s), ..result("a", arm, Phase::Interpolate, samples, true) };
+		let r = report(vec![pooled("weftdb-memory", &FAST, &[100, 100]), pooled("duckdb-double", &SLOW, &[500, 500])]);
+		assert_eq!(verdicts(&r)[0].outcome, Outcome::Win);
+		// The pooled intervals separate, but one run had the other engine ahead.
+		let mut r = report(vec![pooled("weftdb-memory", &FAST, &[100, 600]), pooled("duckdb-double", &SLOW, &[500, 500])]);
+		assert_eq!(verdicts(&r)[0].outcome, Outcome::Noise);
+		r.combined_from = vec![crate::InputFile { role: "run".into(), path: "run1/xbench.json".into(), bytes: 1, sha256: "ab".into() }; 2];
+		let text = to_markdown(&blocks(&r));
+		assert!(!text.contains("**One run.**"), "a combined report is not one run");
+		let single = to_markdown(&blocks(&report(vec![])));
+		assert!(single.contains("**One run.**"), "{single}");
 	}
 
 	#[test]
@@ -479,6 +639,52 @@ mod tests {
 		for needle in ["InfluxDB 3 has no decimal type", "`no_sync=false`", "The InfluxDB 3 server stored its data"] {
 			assert!(with.contains(needle), "missing {needle:?} in\n{with}");
 		}
+	}
+
+	#[test]
+	fn iotdb_is_named_as_missing_or_carries_its_caveats() {
+		let without = to_markdown(&blocks(&report(vec![])));
+		assert!(without.contains("The `iotdb-double` arm is not in this run (pass `--iotdb URL`)"), "{without}");
+		let with = to_markdown(&blocks(&report(vec![result("a", "iotdb-double", Phase::Interpolate, &FAST, true)])));
+		for needle in ["IoTDB has no decimal type", "`wal_mode=SYNC`", "The IoTDB server stored its data"] {
+			assert!(with.contains(needle), "missing {needle:?} in\n{with}");
+		}
+	}
+
+	#[test]
+	fn tsbs_is_named_as_missing_or_carries_its_shape() {
+		let without = to_markdown(&blocks(&report(vec![])));
+		for needle in ["The `tsbs` datasets did not run (pass `--tsbs FILE`)", "TSBS's query suite", "tsbs_generate_data@8323e59"] {
+			assert!(without.contains(needle), "missing {needle:?} in\n{without}");
+		}
+		assert!(!without.contains("one host's (`host_0`)"), "no TSBS limitation without a TSBS dataset");
+		let mut tsbs = result("tsbs-tiny", "weftdb-memory", Phase::Interpolate, &FAST, true);
+		tsbs.kind = DatasetKind::Tsbs;
+		let with = to_markdown(&blocks(&report(vec![tsbs])));
+		assert!(with.contains("one host's (`host_0`) `usage_user`"), "{with}");
+		assert!(!with.contains("The `tsbs` datasets did not run"), "{with}");
+	}
+
+	#[test]
+	fn cold_reps_are_compared_only_with_cold_reps_and_explained() {
+		let warm = to_markdown(&blocks(&report(vec![result("a", "weftdb-stored", Phase::Interpolate, &FAST, true)])));
+		assert!(warm.contains("every rep in this run was warm"), "{warm}");
+		let cold = |arm: &str, samples: &[u64]| ArmResult { warmth: Warmth::Restarted, ..result("a", arm, Phase::Interpolate, samples, true) };
+		let mut r = report(vec![result("a", "weftdb-stored", Phase::Interpolate, &SLOW, true), result("a", "duckdb-double", Phase::Interpolate, &FAST, true), cold("weftdb-stored", &FAST), cold("duckdb-double", &SLOW)]);
+		r.cold_hook = Some("scripts/xbench/cold-hook.sh".into());
+		let v = verdicts(&r);
+		assert_eq!(v.iter().map(|v| (v.weft.warmth, v.other.warmth, v.outcome)).collect::<Vec<_>>(), [(Warmth::Warm, Warmth::Warm, Outcome::Loss), (Warmth::Restarted, Warmth::Restarted, Outcome::Win)]);
+		let md = to_markdown(&blocks(&r));
+		assert!(md.contains("interpolate (restarted)") && md.contains("`scripts/xbench/cold-hook.sh`"), "{md}");
+		assert!(!md.contains("every rep in this run was warm"));
+	}
+
+	#[test]
+	fn a_dirty_checkout_is_flagged() {
+		let mut r = report(vec![]);
+		assert!(!to_markdown(&blocks(&r)).contains("uncommitted changes"));
+		r.source_commit = Some("abc123+dirty".into());
+		assert!(to_markdown(&blocks(&r)).contains("uncommitted changes"));
 	}
 
 	#[test]

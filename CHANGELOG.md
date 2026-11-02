@@ -18,6 +18,25 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **`weft-server restore` puts a backup back from the command line** (1.0 plan PAC-13).
+  A backup whose restore needs a `main.rs` is no use at 3 a.m., and the server deliberately
+  offers no route that touches a live root: `POST /api/v1/storage/restore/drill` rehearses
+  into a throwaway directory and stops there. The command reads the backup's `MANIFEST.json`
+  and takes the matching leg — `weftdb::restore_store` for a whole-store backup (frames and
+  control plane, D-S16), `restore_control_plane` for a control-plane backup — into a
+  `--into` root that must not exist yet, so it cannot overwrite a live store. `--adopt`
+  opens the restored root once, which is what acts on the restore-intent marker a
+  whole-store restore publishes: the frames are adopted into the index in the foreground
+  instead of at whatever open first serves them, and `--database`/`--subject` name that
+  open's scope (refused without `--adopt`, since nothing else reads them). It prints the
+  per-file verify table, rows and bytes, the store UUID the backup carried and what
+  adoption did, or the same document as `--json`. A refusal is a status, not a trace:
+  `78` when the command line or the destination is wrong and nothing was written,
+  `65` when the backup needs the operator — not a backup, a staging name that never
+  finished, a backup changed after it was taken, a manifest this release does not know, a
+  frame that does not verify, or a store whose write floor this build cannot honour. Both
+  codes are the ones the server's startup already returns, so a supervisor reads one
+  vocabulary.
 - **A container image that is proven, not merely built** (1.0 plan PAC-9):
   `packaging/docker/Dockerfile` builds `weft-server` in the same `manylinux_2_28` baseline the
   release binaries use — so the image carries the release's glibc 2.28 floor, read back out of the
@@ -56,6 +75,140 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
+- **Range reads no longer slow down as segments pile up, and no longer fail during a seal**:
+  the segment index's time prune names its time index and seeks `min_ts` between
+  `start − widest span` and `end` (the widest span per aspect is loaded once and widened by every
+  index write before it commits), where the planner had walked every segment of the aspect; and
+  its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
+  Write transactions still see `Busy` at once, as their retry protocol requires.
+- **Gap fill on the downsample endpoints** (#142): `POST /api/v1/downsample` (body `fill`), its
+  ILP sibling and `GET`/`POST /api/v1/storage/{aspect}/downsample` (`?fill=`), in every output
+  format, take `null`, `prev`, `linear`, `quadratic`, `cubic` or a constant. Every grid step
+  between the bounds is emitted, a synthesized bucket with `count == 0`, a value the method
+  leaves out as a missing JSON key, an empty CSV cell or an Arrow/Parquet null; a grid over 10M
+  buckets is a `400`. `weft-arrow` gains `reduction_table_with_gaps_to_*`, whose nullable
+  columns leave a dense table's schema unchanged.
+- **Arbitrary bucket widths** (#143): `weft_reduce::BucketWidth` (`5s`, `15m`, `6h`, `15 minutes`),
+  `reduce_width`, `fill_width`, `PartialReduction::coarsen`/`finish_width` and
+  `SegmentStore::downsample_range_width` reduce by a whole number of resolution steps,
+  epoch-aligned and exact for every reduction (the unit's partials merged). The downsample
+  endpoints take a width as the body's `width` or as `?resolution=15m`. TSM-Bench Q5's literal
+  `SAMPLE BY 5s` now has a spelling. Additive: every `Resolution` API keeps its meaning.
+- **Three interpolation classes in `weft-xbench`** (#148, report v7): beside each engine's portable
+  SQL reconstruction (class B), its native fill where it has one (class A: TimescaleDB
+  `time_bucket_gapfill` + `interpolate`, QuestDB `SAMPLE BY … FILL(LINEAR)`, InfluxDB 3
+  `date_bin_gapfill` + `interpolate`, IoTDB `FILL METHOD LINEAR`, ClickHouse `WITH FILL …
+  INTERPOLATE`) and the knots fetched into the client and interpolated there (class C, DuckDB
+  included). A native fill computing another answer is gated on the grid's shape and reported with
+  its unfilled instants, distance from the line and RMSE, never raced; verdicts are drawn per class.
+  The report's command line no longer carries a connection string's password.
+- **Each ASOF strategy, run and published** (#393): `clickhouse-double-merge`
+  (`join_algorithm = 'full_sorting_merge'`) and `questdb-double-linear` (the `asof_linear` hint)
+  beside the defaults; at `tiny` scale QuestDB's hint beat its optimizer's choice.
+- **Failure tests** (#147): `weft-bench --ingest --failure kill-ingest|kill-compaction|corrupt-segment|all`
+  kills a child process with `SIGKILL` mid-ingest or mid-compaction, or flips a byte of a closed
+  segment, and gates the reopened store on exact read-back of every acknowledged row and on a
+  damaged segment being quarantined rather than served.
+- **Report surfaces** (#149): `weft-bench export REPORT.json --format md|csv|prom` and the run flags
+  `--markdown-report`, `--csv-report`, `--prom`; a Grafana dashboard over the Prometheus text in
+  `bench/grafana/`.
+- **Bench/engine separation check** (#150): `scripts/bench/check-separation.py`, run in CI, fails
+  when an engine crate depends on `weft-bench`/`weft-xbench` or reads a `BENCH` variable.
+- **`weft-bench sweep`** (#147): `weft-bench sweep KNOB=v1,v2,… -- RUN ARGS` runs a benchmark
+  once per value of any run flag, or of the worker pool (`threads`), each into its own directory
+  with its own report and manifest, and writes `sweep.json` and `sweep.md`: every result as a
+  curve over the knob, with its knee (the first value past which a step gains under 10%
+  throughput). On UCI, 2M-row ingest climbs from 109k rows/s at 1,024-row batches to 4.57M at
+  262,144 with no knee yet.
+- **Seeded query mix** (#147): `weft-bench --ingest --query-mix OPS` replays the soak harness's
+  lane model against one store, each operation's lane (ingest a batch, look up a point, scan a
+  range) drawn from `--seed` and the operation's index, with `--query-mix-weights` (60,20,20 by
+  default), `--query-mix-rows` and `--query-mix-range`. Every read is checked exactly; one report
+  per lane, each with a digest of its answers. 3,000 operations over 10M UCI rows passed.
+- **Post-compaction reads** (#147): `--compressed-query-compact ROWS` compacts the
+  compressed-query store to ROWS-row segments after the measured windows and asks the same seeded
+  windows again, as `-compacted` results that must answer digest for digest as before. On 10M UCI
+  rows the squash took 694 s (9,769 → 153 segments); every window answered identically, small
+  windows read ~36× slower afterwards, and the year window held.
+- **`weft-xbench` answer digests, `combine` and run manifest** (#147, report v6): each gate
+  carries `answer_sha256` (values to twelve significant digits, so a parallel sum's last bit does
+  not count); `weft-xbench combine RUN.json… --out DIR` pools runs with run-first intervals, and
+  the renderer calls a win or loss only where every run's median agrees, flagging a report of one
+  run as such; the report records its input files' and binary's SHA-256 and, with
+  `--container ENGINE=NAME`, each engine container's image digest, command and environment
+  (secret-looking variables redacted).
+- **`weft-bench combine`** (#147): pools separate runs of one benchmark into one report, with
+  intervals from a two-level bootstrap (runs, then samples) so they include the spread between
+  runs, and `between_run` per result. Two runs of one build were 41.9% apart at p50, which
+  `compare` had called a regression; combined reports of that build compare clean.
+- **Result digests** (#147): every `weft-bench` result's correctness carries `result_sha256`,
+  a SHA-256 of its canonical output (decimals normalized, so `1.50` and `1.5` agree), and a
+  storage estimate whose error exceeds its tolerance makes the result unpublishable.
+- **Fair protocol, raw samples and sample counts** (#147): every `weft-bench` result keeps the
+  timed samples behind its latency (`samples_ns`, report schema v28), and so does every
+  `weft-xbench` result (report v5). `weft-bench verify` now flags a short result (p50 under a
+  minute) resting on fewer than 10 samples, an advisory like a dirty tree. The bootstrap gains a
+  stddev interval, read off the resamples already drawn, so the existing intervals are unchanged.
+  `weft-xbench --reps` defaults to 10 (was 5).
+- **Analytics pipeline** (#145): `weft-bench --ingest --analytics-pipeline ROWS` captures the
+  first rows of the UCI corpus into a legacy minute-resolution aspect and times the orchestration
+  pipeline stage by stage (prepare, patterns, events, correlate, signals), then an incremental
+  `run()` after a held-back tail (`--analytics-tail`, `--analytics-batch`), gated on the peak and
+  valley detectors finding exactly the extremes the raw rows hold. Report schema v27 adds
+  `analytics`.
+- **`analyze_range` stays on its step grid past 50,000 points**: it cut a long range into chunks
+  that were not a whole number of steps, so every chunk after the first was resampled between the
+  steps it should have landed on (20 s off the minute at 100k UCI rows), and the peak detector
+  reported a peak 400 s from the real one. Chunks now span whole steps, and the point two chunks
+  share is returned once.
+- **Opening a legacy `Database` no longer walks `/proc`**: its cache sized itself with
+  `sysinfo::System::new_all()`, which reads every process and thread on the machine; it now reads
+  memory only. On a busy machine that was most of each `Database::existing`, which
+  `analyze_range` calls per chunk — event detection on 3k rows went from 0.9 s to 21 ms.
+- **weft-bench records the revision it was built from**: its build script reran only when
+  `build.rs` or `Cargo.lock` changed, so a binary built after a commit named the parent commit
+  and called its tree modified, and an edit to another crate could leave a modified build
+  marked clean. It now also watches git's `HEAD`, index and branch ref and every workspace
+  member's sources.
+- **Compressed query** (#145): `weft-bench --ingest --compressed-query QUERIES` times
+  `downsample_range` inside the store against decoding the window and reducing it, per window size
+  from an hour to a year, gated on the two answers being equal. Report schema v26 adds
+  `compressed_query`.
+- **Online ingest + query** (#145): `weft-bench --ingest --ingest-online READERS` queries a
+  store while it is being sealed, compares every query exactly with the corpus, and reruns the
+  queries on the finished store as a baseline (report schema v25 `online`). It found that a
+  range read's cost grows with the segments the store holds, and that at small batches most
+  concurrent reads are refused with `database is locked`.
+- **Ingest growth curves** (#145): `weft-bench --ingest --ingest-growth 1M,10M,100M,1B` grows
+  one store through those checkpoints over the real UCI corpus laid end to end, reporting each
+  stage's seal throughput, per-batch latency, segments and bytes (report schema v24 `growth`),
+  each checkpoint gated and written as its own report as soon as it passes.
+- **A real smooth-signal corpus for the spline-fill claim** (#144): `scripts/bench/ndbc_to_csv.py`
+  turns NOAA NDBC buoy history into a `weft-bench --gf-csv` corpus. On nine buoy temperature and
+  pressure series a cubic fill beats linear across short outages and loses across day-long ones;
+  README, HONESTY.md and WILLINGNESS-TO-PAY.md now say so.
+- **OS-cold and post-restart reps in the cross-engine benchmark** (#146): `weft-xbench
+  --cold-hook CMD [--cold-reps N]` times each read phase again after the OS page cache is dropped
+  (`os-cold`) and after the engine restarts as well (`restarted`), gated like the warm reps and
+  compared only with each other. `scripts/xbench/cold-hook.sh` restarts the reference host's
+  engine containers and drops the page cache from a privileged container. The report (schema v4)
+  records each result's `warmth` and the hook.
+- **Cross-engine reports flag a dirty build**: `weft-xbench` records its source commit as
+  `<sha>+dirty` when the checkout has changes, and the report says that commit alone does not
+  reproduce the binary.
+- **TSBS data in the cross-engine benchmark** (#141): `weft-xbench --tsbs FILE` reads a
+  `tsbs_generate_data --use-case=cpu-only --format=influx` file, keeps `host_0`'s `usage_user`,
+  and adds `tsbs-tiny`, `tsbs-small` and `tsbs-medium` datasets: knots every ten seconds over the
+  synthetic datasets' span, reconstructed per second by every arm and gated against the reference.
+  TSBS's tag-grouped query suite is not run; it needs tagged ingest (TAG-12).
+- **Cross-engine load timing no longer includes the previous load's teardown**: `weft-xbench`
+  now releases each rep's database or store before starting the next load's clock. Load rows
+  measured before this (the EVI-15 report among them) counted the drop of the previous rep.
+- **Apache IoTDB in the cross-engine benchmark** (#413): `weft-xbench --iotdb URL` adds an
+  `iotdb-double` arm over IoTDB's table-model REST API (`insertTablet` in time order answered once
+  the WAL entry is synced, `lead` segments joined to a `date_bin_gapfill` grid by native `ASOF LEFT
+  JOIN`, `date_bin` downsample), gated like every arm; IoTDB has no decimal type, so there is no
+  exact-decimal arm. The nightly smoke starts a pinned server.
 - **InfluxDB 3 Core in the cross-engine benchmark** (#413): `weft-xbench --influxdb3 URL` adds an
   `influxdb3-double` arm (line-protocol load answered once the WAL is persisted, SQL read back as
   Parquet, window-function interpolation, `date_bin` downsample), gated like every arm; InfluxDB 3

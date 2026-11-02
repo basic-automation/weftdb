@@ -31,6 +31,16 @@ TMPDIR=/path/on/disk/under/test target/release/weft-xbench --scales tiny,small,m
 
 The synthetic datasets are regenerated from the seed in the report.
 
+## Known defect in the load rows
+
+Every load rep after the first in this report also timed the teardown of the rep before it:
+dropping the previous WeftDB store removed its directory, and the previous `DuckDB` file was
+deleted, inside the load's clock. Found on 2026-10-31 while adding the IoTDB arm, whose
+`DROP DATABASE` takes a second; the runner now releases the previous load before starting the
+clock (DECISIONS.md, "Load timing excludes the previous load's teardown"). The interpolation and
+downsample rows are unaffected. The load rows here are left as published; the combined
+cross-engine rerun supersedes them.
+
 ## The discarded first run
 
 A first run with 3 load reps ([`discarded-run-1.json`](discarded-run-1.json)) also passed every

@@ -66,6 +66,11 @@ pub mod reconcile_daemon;
 /// carry a credential (a URL's userinfo above all) are only ever printed
 /// redacted (see [`redact`]).
 pub mod redact;
+/// PAC-13's operator command: `weft-server restore`, which puts a backup back on disk as a
+/// store root while nothing serves it. A library module for the same reason as
+/// [`import_rows_mode`]: its parsing, its report and the exit code it refuses with are
+/// testable.
+pub mod restore;
 pub mod routes;
 pub mod serve;
 pub mod settings;
