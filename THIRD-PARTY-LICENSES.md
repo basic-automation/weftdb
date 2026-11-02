@@ -899,25 +899,25 @@ Apache License 2.0
 --------------------------------------------------------------------------------
 
 Used by:
-  * weft-arrow 0.1.0
+  * weft-arrow 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-arrow-store 0.1.0
+  * weft-arrow-store 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-bench 0.1.0
+  * weft-bench 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-line-protocol 0.1.0
+  * weft-line-protocol 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-orchestration 0.1.0
+  * weft-orchestration 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-physical-type 0.1.0
+  * weft-physical-type 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-reduce 0.1.0
+  * weft-reduce 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-server 0.1.0
+  * weft-server 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-tui 0.1.0
+  * weft-tui 0.2.0
     https://github.com/basic-automation/weftdb
-  * weftdb 0.1.0
+  * weftdb 0.2.0
     https://github.com/basic-automation/weftdb
   * arrow-array 60.0.0
     https://github.com/apache/arrow-rs
