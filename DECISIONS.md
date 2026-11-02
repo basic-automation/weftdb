@@ -4,6 +4,77 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-02 — SOA-8: the failure deck is a validated card deck, recovery is exact, and the maintenance driver is a pure state machine (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W5) lists SOA-8 by name only — "Failure deck,
+phases, recovery windows, SIGTERM verdict and the maintenance driver" — and
+neither the plan nor the queue fixes the deck's contents, the phase set, what
+a recovery window measures, what the SIGTERM verdict judges, or what the
+maintenance driver drives. What the sources do fix: SOA-1's harness doc says
+SOA-8's phases are a finer breakdown *within* `Running` and do not replace
+the lifecycle state; the queue's acceptance fixes three outcomes — a failure
+deck with phases and recovery windows exists, a SIGTERM verdict is produced,
+and a maintenance driver drives the deck; the server's own code fixes the
+failures and maintenance that exist (SEC-4/D-S14's graceful drain with the
+`WEFT_SHUTDOWN_GRACE_SECS` grace and exit 0, a signal before serving exits 0
+per plan C9, `/ready`'s `previous_clean_shutdown`, the store's maintenance
+locks and busy/skipped sweeps, and ROB-3's daemons resuming reconcile,
+squash and backup); SIGKILL is SOA-9's `crash_kill9` (W6); and SOA's standing
+rules govern the shape (exact judgement, no invented tolerance or threshold;
+a field added to `SoakRun` bumps `SOAK_SCHEMA_VERSION` on SOA's own line;
+records carry no free text).
+
+**Chosen (grounded as above, under the owner's best-guess authorization of
+2026-10-26; if merge review disagrees, this decision is revisited there):**
+
+1. **New pure module `weft-bench/src/soak_failure.rs`; no live server.**
+   Like the oracle core (SOA-6), the deck, driver and verdict perform no
+   signal, read or maintenance themselves: the caller applies what the
+   driver's `DeckAction` names and supplies what it observed. The same
+   deck and observations replay identically in tests.
+2. **The deck is validated on construction.** Card ids are slugs (never
+   free text, so no record needs redaction), ids are unique, every
+   recovery window is non-empty, cards are in injection order, and a
+   SIGTERM card is at most one and last (it ends the server). Kinds are
+   `MaintenanceContention`, `ServerRestart` and `Sigterm` — the failures
+   the shipped server has. `FailureDeck::standard()` deals contention,
+   restart, SIGTERM, each recovering under a different sweep.
+3. **Phases are per-card and strictly ordered:**
+   `Baseline → Injection → Recovery → Verification → Complete`, entered
+   through the driver, which refuses gated transitions (recovery must be
+   observed and the card's maintenance run before verification; the
+   SIGTERM verdict must be judged before the SIGTERM card completes).
+   Phase records are recorded on the run record in order; the harness
+   refuses out-of-order, interleaved or tick-regressing phases.
+4. **Recovery windows are tick ranges judged exactly.** A card's window
+   is `inject_tick..inject_tick + recovery_ticks` — the deck author's
+   schedule, not a threshold this slice invents. Recovery observed
+   inside the window recovered; at/after its end, or never, it did not.
+   A card that calls for maintenance counts as recovered only when that
+   maintenance ran during recovery: the driver runs the card's
+   `MaintenanceKind` (reconcile/squash/backup/none) in the recovery
+   phase, because a recovery in which the daemons never resumed is not
+   the recovery a deployment performs.
+5. **The SIGTERM verdict is the exact conjunction** of its observation:
+   signal sent, exit code 0, drained within the grace the *caller*
+   configured (the serve path's grace is an input, never a constant
+   here), and the reopened store reporting a clean previous shutdown.
+   Any missing observation fails — no vacuous pass.
+6. **Records on the run record; soak schema v4.** `SoakRun` gains
+   `phases` and `recoveries` (`#[serde(default)]`, skipped when empty)
+   and `sigterm` (`#[serde(default)]`, skipped when absent), recorded
+   set-once/in-order through the harness while `Running`;
+   `SOAK_SCHEMA_VERSION` 3 → 4 on SOA's own line. v1–v3 artifacts still
+   deserialize.
+
+**Rejected:** a SIGKILL card (SOA-9 owns it, W6); recovery judged by a
+rate or a deadline this slice picks (the window is the deck's, the
+judgement exact); a driver that signals or restarts a real server (no
+slice names a process client, and a pure driver is replayable); phases
+as new `SoakState` variants (SOA-1 fixed them as a breakdown within
+`Running`); and free-text card names or failure descriptions (slugs
+keep every record redaction-free, as SOA-6/SOA-7's records are).
+
 ## 2026-11-02 — SOA-7: window digests hash the oracle's own encoding, and the self-test judges the judge (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6, W5) lists SOA-7 by name only — "Window digests
