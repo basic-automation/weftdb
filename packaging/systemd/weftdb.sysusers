@@ -1,0 +1,39 @@
+# /usr/lib/sysusers.d/weftdb.conf — the account and group a host install of WeftDB runs as.
+#
+# Part of PAC-11 (1.0 plan): the systemd unit, the user and the env file. Installed by
+# `scripts/packaging/install-host.sh` next to the unit; `systemd-sysusers` is the command that
+# reads it, and it is idempotent — running it twice, or on a machine where the operator already
+# made the account by hand, changes nothing and says nothing.
+#
+# Why a sysusers.d file instead of `useradd` in the installer. Three reasons, and the third is
+# the one that matters.
+#
+#   1. It is declarative: the account exists because a file says it should, not because a script
+#      ran once, so an image build, a reinstalls after a package update, and a machine rebuilt
+#      from a backup all agree about what the account is.
+#   2. It is uid-stable across distros: `-` asks systemd to pick. Hard-coding a uid would collide
+#      with something on somebody's machine, and a service whose uid changed between two boots
+#      owns a data directory it can no longer open.
+#   3. `systemd-sysusers` runs at package-install time *and* on every boot from
+#      `systemd-sysusers.service`. A `useradd` line in a shell script runs at one of those two,
+#      and the second time the machine disagrees with the account.
+#
+# The account is a service account in the sense that matters: no password, no login shell, and a
+# primary group with no members other than the account itself. `nologin` rather than `false`
+# because `systemd-sysusers` warns over `nologin` on machines whose `passwd` database is not local
+# (LDAP, `systemd-homed`) and warns over nothing else; `nologin` refuses the login exactly as
+# `false` does and leaves the account's shell in `/etc/shells`-independent shape.
+#
+# # 2. The lines
+#
+# Fields are `type name id geco home shell`. `u` is a user (and creates the group of the same
+# name, and the same gid, if neither exists). The only valid types are `u`, `g`, `m`, `r`, `~`
+# and `!` — a line of any other type is skipped with an error on stderr, which is why the
+# directories this file used to create are in `weftdb.tmpfiles` instead.
+#
+# The home is `/var/lib/weftdb` because that is what the unit declares with
+# `StateDirectory=weftdb`; `weftdb.tmpfiles` and `StateDirectory=` are what create it, with the
+# mode and owner the unit needs. `ProtectSystem=strict` in the unit means that directory is the
+# only place outside `/usr` and `/etc` the process can write to at all.
+
+u weftdb - "WeftDB time-series store" /var/lib/weftdb /usr/bin/nologin
