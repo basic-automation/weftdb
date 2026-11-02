@@ -807,6 +807,9 @@ async fn test_list_dictionaries_lists_the_aspects_dictionaries() {
 #[tokio::test]
 async fn a_chunked_range_keeps_to_its_step_grid() {
 	let db_name = format!("test_chunk_grid_{}", Uuid::new_v4());
+	// As every test here does first: it also points this binary at its own data dir, without
+	// which a runner with no `~/.weftdb/data` cannot create the database.
+	common::remove_database(&db_name);
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("grid").await.expect("Failed to add subject");
 	let aspect = db.track_aspect(&subject.id(), "value", &Resolution::Minutes, None).await.expect("Failed to track aspect").id();
