@@ -18,6 +18,13 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **Admission I** (robustness track ROB-10): the route registry's gate now enforces every
+  route's `admission_class`, not only the ingest byte budget D-S14 charged. Probes are never
+  shed; query-class requests (reads and stateless compute) are capped in flight by the new
+  `WEFT_QUERY_MAX_INFLIGHT` setting (default 128) and shed with `503 overloaded` beyond it;
+  write-class requests — declarations included — are charged byte-weighted against
+  `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
+  are admitted one at a time, a second refused `409 busy` while one runs.
 - **A real smooth-signal corpus for the spline-fill claim** (#144): `scripts/bench/ndbc_to_csv.py`
   turns NOAA NDBC buoy history into a `weft-bench --gf-csv` corpus. On nine buoy temperature and
   pressure series a cubic fill beats linear across short outages and loses across day-long ones;
