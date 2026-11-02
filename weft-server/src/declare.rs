@@ -18,24 +18,42 @@ use crate::{
 	error::{self, ApiError, StrictJson}, state::AppState, storage::AspectInfo
 };
 
+/// The scale rules (FRE-7b): a `scale` belongs to the fixed-point encodings
+/// alone. Naming one for another encoding is refused rather than silently
+/// dropped, so a declaration never reads back differently from what the
+/// caller asked for.
+///
+/// # Errors
+///
+/// Returns a human-readable message when a `scale` was supplied for an
+/// encoding that carries none.
+fn reject_scale(token: &str, scale: Option<u8>) -> Result<(), String> {
+	match scale {
+		Some(_) => Err(format!("`scale` applies only to `scaled_i64` and `scaled_i128`, not to {token:?}")),
+		None => Ok(()),
+	}
+}
+
 /// Parse a [`PhysicalType`] from its stable wire token (the inverse of
 /// [`PhysicalType::name`]) plus an optional `scale`.
 ///
 /// The fixed-point encodings (`scaled_i64`, `scaled_i128`) require a `scale` (the
-/// number of fractional decimal digits the mantissa carries); the others ignore it.
+/// number of fractional decimal digits the mantissa carries); the others take
+/// none — a `scale` named for them is refused (the scale rules, FRE-7b).
 ///
 /// # Errors
 ///
-/// Returns a human-readable message when the token is unknown, or when a
-/// scale-bearing encoding was named without a `scale`.
+/// Returns a human-readable message when the token is unknown, when a
+/// scale-bearing encoding was named without a `scale`, or when a `scale` was
+/// named for an encoding that carries none.
 fn parse_physical_type(token: &str, scale: Option<u8>) -> Result<PhysicalType, String> {
 	match token {
-		"f64" => Ok(PhysicalType::F64),
-		"f32" => Ok(PhysicalType::F32),
+		"f64" => reject_scale(token, scale).map(|()| PhysicalType::F64),
+		"f32" => reject_scale(token, scale).map(|()| PhysicalType::F32),
 		"scaled_i64" => scale.map(|scale| PhysicalType::ScaledI64 { scale }).ok_or_else(|| "`scaled_i64` requires a `scale` (fractional decimal digits)".to_string()),
 		"scaled_i128" => scale.map(|scale| PhysicalType::ScaledI128 { scale }).ok_or_else(|| "`scaled_i128` requires a `scale` (fractional decimal digits)".to_string()),
-		"decimal128" => Ok(PhysicalType::Decimal128),
-		"bigdecimal_text" => Ok(PhysicalType::BigDecimalText),
+		"decimal128" => reject_scale(token, scale).map(|()| PhysicalType::Decimal128),
+		"bigdecimal_text" => reject_scale(token, scale).map(|()| PhysicalType::BigDecimalText),
 		other => Err(format!("unknown physical_type {other:?} (expected one of f64, f32, scaled_i64, scaled_i128, decimal128, bigdecimal_text)")),
 	}
 }
@@ -59,12 +77,14 @@ fn parse_time_unit(token: &str) -> Result<TimeUnit, String> {
 /// Request body for `POST /api/v1/storage/aspects` — declare an aspect's schema.
 ///
 /// The `physical_type`/`timestamp_unit` tokens mirror the read surface
-/// ([`AspectInfo`]); `scale` is required only for the fixed-point encodings, and
-/// `value_tolerance` defaults to `"0"` (exact) when omitted.
+/// ([`AspectInfo`]); `scale` is required for the fixed-point encodings and
+/// refused for every other encoding, and `value_tolerance` defaults to `"0"`
+/// (exact) when omitted. A declaration is immutable once made (FRE-7b): see
+/// [`declare_aspect`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeclareAspectRequest {
 	/// The aspect name to declare (unique within the store's `(database, subject)`
-	/// scope; a re-declaration overwrites). It also names the aspect's files on disk, so
+	/// scope). It also names the aspect's files on disk, so
 	/// it must pass [`weftdb::aspect_name::validate`]: at most 160 bytes, no `/`, `\`,
 	/// control characters, leading `.`, trailing `.` or space, not a Windows device name
 	/// such as `CON` or `nul:x`, and, on Windows, none of `<>:"|?*`.
@@ -103,8 +123,13 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 /// Handle `POST /api/v1/storage/aspects`: declare an aspect's schema (physical
 /// encoding + value tolerance + timestamp unit) in the configured store.
 ///
-/// Returns `201 Created` with the stored schema. A re-declaration of the same
-/// aspect overwrites and still returns `201`.
+/// Returns `201 Created` with the schema read back from the store — the
+/// declaration as held, not an echo of the request (FRE-7b schema read-back).
+/// Declarations are immutable once made: re-declaring the identical schema is
+/// a no-op that still returns `201`, and the one change accepted is a
+/// widening of the value encoding to `bigdecimal_text` (tolerance and
+/// timestamp unit unchanged), whose response is the widened schema. Any other
+/// re-declaration is a `409 schema_conflict` and changes nothing.
 ///
 /// # Errors
 ///
@@ -113,7 +138,10 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 /// server will create — it either breaks a rule every aspect name must keep (it would move a
 /// path, or Windows could not open it) or one that only a new name can keep (an ASCII capital,
 /// which could take another aspect's file name) — [`ApiError::bad_request`] when a physical type,
-/// time unit or tolerance does not parse, and a `500` on a control-plane write failure.
+/// time unit, scale or tolerance does not parse or breaks the scale rules,
+/// [`Code::SchemaConflict`](crate::error::Code::SchemaConflict) when the aspect is already
+/// declared under a schema this one does not equal or widen, and a `500` on a
+/// control-plane write failure.
 pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): StrictJson<DeclareAspectRequest>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
@@ -130,12 +158,17 @@ pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): 
 	weftdb::aspect_name::validate_new(&request.name).map_err(|err| error::aspect_name_refusal(&err))?;
 	let schema = schema_from_request(&request)?;
 	let result = store.declare(&request.name, &schema).await;
-	drop(store);
 	// A refusal the store raises itself is classified the way a read's is — it rejects the same
-	// unsafe names, and a root this binary will not open is `503 incompatible_store`. A write
-	// that failed for a reason the table has no name for stays a `500` with the cause logged.
+	// unsafe names, an immutable-declaration refusal is `409 schema_conflict`, and a root this
+	// binary will not open is `503 incompatible_store`. A write that failed for a reason the
+	// table has no name for stays a `500` with the cause logged.
 	result.map_err(|err| error::classify_typed(&err).unwrap_or_else(|| ApiError::internal(&err)))?;
-	let aspect = AspectInfo { name: request.name, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() };
+	// Read the declaration back: the response is the schema the store holds
+	// (FRE-7b), which for a widening re-declaration is the widened schema.
+	let stored = store.schema_for(&request.name).await;
+	drop(store);
+	let stored = stored.map_err(|err| ApiError::internal(&err))?.ok_or_else(|| ApiError::internal("the declared aspect has no schema on read-back"))?;
+	let aspect = AspectInfo::declared(request.name, &stored);
 	Ok((StatusCode::CREATED, Json(DeclareAspectResponse { aspect })).into_response())
 }
 
@@ -194,6 +227,69 @@ mod tests {
 		assert_eq!(status, StatusCode::CREATED, "body: {body}");
 		assert_eq!(body["aspect"]["physical_type"], "scaled_i64");
 		assert_eq!(body["aspect"]["timestamp_unit"], "millis");
+		// FRE-7b schema read-back: the declared scale comes back with the schema,
+		// in the declare response and on the schema endpoint alike.
+		assert_eq!(body["aspect"]["scale"], 2);
+
+		let router = router_with_empty_store(&dir).await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/temp/schema").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let read_back: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(read_back["aspect"]["physical_type"], "scaled_i64");
+		assert_eq!(read_back["aspect"]["scale"], 2);
+		assert_eq!(read_back["aspect"]["timestamp_unit"], "millis");
+	}
+
+	/// FRE-7b scale rules: a `scale` named for an encoding that carries none is
+	/// refused, not silently dropped.
+	#[tokio::test]
+	async fn declare_scale_for_an_unscaled_encoding_is_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_empty_store(&dir).await;
+		let body = serde_json::json!({ "name": "temp", "physical_type": "f64", "scale": 2, "timestamp_unit": "millis" });
+		let (status, body) = post_json(router, "/api/v1/storage/aspects", &body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("`scale` applies only to"), "body: {body}");
+	}
+
+	/// FRE-7b: a declaration is immutable once made. The identical declaration
+	/// again is a no-op `201`; a widening to `bigdecimal_text` is accepted and
+	/// reads back widened; anything else is a `409 schema_conflict` and the
+	/// declared schema stands.
+	#[tokio::test]
+	async fn redeclare_is_immutable_except_for_widening() {
+		async fn declare(dir: &TempDir, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+			let router = router_with_empty_store(dir).await;
+			post_json(router, "/api/v1/storage/aspects", &body).await
+		}
+		let dir = TempDir::new().unwrap();
+		let body = serde_json::json!({ "name": "price", "physical_type": "decimal128", "timestamp_unit": "millis" });
+		let (status, _) = declare(&dir, body.clone()).await;
+		assert_eq!(status, StatusCode::CREATED);
+		let (status, _) = declare(&dir, body).await;
+		assert_eq!(status, StatusCode::CREATED, "the identical declaration again is a no-op");
+
+		let changed = serde_json::json!({ "name": "price", "physical_type": "f64", "timestamp_unit": "millis" });
+		let (status, body) = declare(&dir, changed).await;
+		assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+		assert_eq!(body["code"], "schema_conflict", "body: {body}");
+
+		let changed_unit = serde_json::json!({ "name": "price", "physical_type": "decimal128", "timestamp_unit": "seconds" });
+		let (status, body) = declare(&dir, changed_unit).await;
+		assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+		assert_eq!(body["code"], "schema_conflict", "body: {body}");
+
+		let widened = serde_json::json!({ "name": "price", "physical_type": "bigdecimal_text", "timestamp_unit": "millis" });
+		let (status, body) = declare(&dir, widened).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["aspect"]["physical_type"], "bigdecimal_text", "the response is the widened schema read back: {body}");
+
+		// And the narrowing back is refused: the widened declaration stands.
+		let narrowed = serde_json::json!({ "name": "price", "physical_type": "decimal128", "timestamp_unit": "millis" });
+		let (status, body) = declare(&dir, narrowed).await;
+		assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+		assert_eq!(body["code"], "schema_conflict", "body: {body}");
 	}
 
 	#[tokio::test]

@@ -18,24 +18,32 @@
 //! encrypted. With neither named, the listener is plaintext and the gate
 //! below decides whether that may start.
 //!
-//! ## The plaintext gate (plan §4 C8, decision 7)
+//! ## The exposure matrix (plan §4 C8, decision 7; completed by SEC-8)
 //!
-//! Plaintext on a **non-loopback** bind is an exposure, so it needs an
-//! explicit opt-in, exactly one of:
+//! A **non-loopback** bind is an exposure, so it needs authentication or
+//! an explicit statement that a gateway owns it — whatever the transport:
 //!
 //! - a mounted keys file ([`KEYS_FILE_ENV`] names it and the file is
-//!   there — SEC-6 defines its format and reads it; this slice only
-//!   establishes that the deployment mounted one) **plus**
-//!   [`ALLOW_PLAINTEXT_ENV`] acknowledging the traffic is unencrypted; or
-//! - [`AUTH_ENV`]`=disabled`, the explicit statement that authentication
-//!   is off because a gateway in front of the server owns it.
+//!   there — SEC-6 defines its format and reads it; this gate establishes
+//!   that the deployment mounted one) authenticates the bind. Over
+//!   plaintext it additionally needs [`ALLOW_PLAINTEXT_ENV`]
+//!   acknowledging the traffic is unencrypted; over TLS the keys alone
+//!   suffice.
+//! - [`AUTH_ENV`]`=disabled` is the explicit statement that
+//!   authentication is off because a gateway in front of the server owns
+//!   it, and it carries any non-loopback bind, plaintext or TLS.
+//! - Non-loopback with **no keys and no `disabled`** refuses to start —
+//!   TLS included: encryption without authentication still exposes every
+//!   route to anyone who can reach the port (decision 7: "Non-loopback
+//!   with no keys: refuse to start").
 //!
-//! Loopback binds are ungated: decision 7's protected mode serves loopback
-//! with the Host/Origin guard and no keys. TLS binds are ungated: the
-//! traffic is encrypted whatever the authentication story is. The full
-//! exposure matrix (proxied-request refusal, the metrics scope, the
-//! loopback guard's interplay with auth) is SEC-8's; this gate is only
-//! the C8 refusal SEC-5's acceptance names.
+//! Loopback binds are ungated at startup: decision 7's protected mode
+//! serves loopback with the Host/Origin guard and no keys, and the
+//! auth-off guard refuses proxied requests there instead (see
+//! [`crate::auth`]). The packaging track's `WEFT_ALLOW_INSECURE_BIND`
+//! never existed as a reader and is not registered: SEC-8 drops it for
+//! `WEFT_AUTH=disabled`, and strict configuration (PAC-5b) refuses the
+//! name as unknown if an operator sets it.
 
 use std::{
 	fs, net::SocketAddr, path::{Path, PathBuf}, sync::Arc
@@ -213,29 +221,30 @@ impl PlaintextGate {
 
 	/// Decide whether a listener on `bind` may serve, given the TLS
 	/// configuration startup resolved (`Some` = TLS). See the module docs
-	/// for the rule; the error *is* the operator-facing refusal, naming
+	/// for the matrix; the error *is* the operator-facing refusal, naming
 	/// every way to satisfy the gate.
 	///
 	/// # Errors
 	///
-	/// Plaintext on a non-loopback bind with no opt-in in force.
+	/// A non-loopback bind with no keys file mounted and authentication
+	/// not explicitly disabled, or a plaintext non-loopback bind whose
+	/// mounted keys lack the plaintext opt-in.
 	pub fn check(&self, bind: SocketAddr, tls: Option<&TlsConfig>) -> Result<(), String> {
-		if tls.is_some() || bind.ip().to_canonical().is_loopback() {
+		if bind.ip().to_canonical().is_loopback() || self.auth_disabled {
 			return Ok(());
 		}
-		if self.auth_disabled {
+		if !self.keys_file_mounted() {
+			let keys = match &self.keys_file {
+				Some(path) => format!("{KEYS_FILE_ENV}={} does not name a mounted file", path.display()),
+				None => format!("no keys file is mounted ({KEYS_FILE_ENV} is unset)"),
+			};
+			let transport = if tls.is_some() { "with TLS but no authentication" } else { "plaintext" };
+			return Err(format!("refusing to serve {transport} on the non-loopback address {bind}: {keys}. A non-loopback bind requires authentication: mount a keys file ({KEYS_FILE_ENV}; `weft-server keygen` mints one), or set {AUTH_ENV}=disabled when a gateway in front of this server owns authentication (plan C8, decision 7)"));
+		}
+		if tls.is_some() || self.allow_plaintext {
 			return Ok(());
 		}
-		if self.allow_plaintext && self.keys_file_mounted() {
-			return Ok(());
-		}
-		let keys = match &self.keys_file {
-			Some(path) if self.allow_plaintext => format!("{KEYS_FILE_ENV}={} does not name a mounted file", path.display()),
-			Some(path) => format!("{KEYS_FILE_ENV}={} is mounted but {ALLOW_PLAINTEXT_ENV} is not set", path.display()),
-			None if self.allow_plaintext => format!("{ALLOW_PLAINTEXT_ENV} is set but no keys file is mounted ({KEYS_FILE_ENV} is unset)"),
-			None => format!("no keys file is mounted ({KEYS_FILE_ENV} is unset) and {ALLOW_PLAINTEXT_ENV} is not set"),
-		};
-		Err(format!("refusing to serve plaintext on the non-loopback address {bind}: {keys}. Serve TLS instead ({TLS_CERT_FILE_ENV} + {TLS_KEY_FILE_ENV}), or set {AUTH_ENV}=disabled when a gateway in front of this server owns authentication (plan C8)"))
+		Err(format!("refusing to serve plaintext on the non-loopback address {bind}: {KEYS_FILE_ENV} is mounted but {ALLOW_PLAINTEXT_ENV} is not set. Serve TLS instead ({TLS_CERT_FILE_ENV} + {TLS_KEY_FILE_ENV}), set {ALLOW_PLAINTEXT_ENV}=1 to acknowledge unencrypted traffic, or set {AUTH_ENV}=disabled when a gateway in front of this server owns authentication (plan C8)"))
 	}
 }
 
@@ -267,13 +276,26 @@ mod tests {
 	}
 
 	#[test]
-	fn tls_on_a_non_loopback_bind_needs_no_opt_in() {
+	fn tls_on_a_non_loopback_bind_still_needs_keys_or_a_gateway() {
 		// A configuration from generated material, so the check runs
 		// against a real TlsConfig rather than a token stand-in.
 		let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("generate");
 		let tls = TlsConfig::from_pem(certified.cert.pem().as_bytes(), certified.signing_key.serialize_pem().as_bytes()).expect("config");
+		// SEC-8's matrix: encryption is not authentication — a non-loopback
+		// TLS bind with no keys and no gateway statement is refused
+		// (decision 7), where SEC-5's plaintext-only gate let it start.
 		let gate = PlaintextGate::default();
-		assert!(gate.check(bind(IpAddr::V4(NON_LOOPBACK)), Some(&tls)).is_ok());
+		let err = gate.check(bind(IpAddr::V4(NON_LOOPBACK)), Some(&tls)).expect_err("refused");
+		assert!(err.contains("no keys file is mounted"), "{err}");
+		// Mounted keys carry a TLS bind with no further opt-in.
+		let dir = tempfile::tempdir().expect("tempdir");
+		let keys = dir.path().join("keys.json");
+		fs::write(&keys, b"{}").expect("write keys file");
+		let keyed = PlaintextGate { keys_file: Some(keys), ..PlaintextGate::default() };
+		assert!(keyed.check(bind(IpAddr::V4(NON_LOOPBACK)), Some(&tls)).is_ok());
+		// And the gateway statement carries it too.
+		let gateway = PlaintextGate { auth_disabled: true, ..PlaintextGate::default() };
+		assert!(gateway.check(bind(IpAddr::V4(NON_LOOPBACK)), Some(&tls)).is_ok());
 	}
 
 	#[test]
