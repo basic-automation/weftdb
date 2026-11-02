@@ -34,14 +34,15 @@
 //!   record only, so a soak-record change never renumbers bench artifacts and
 //!   vice versa. SOA-2 adds no field to [`SoakRun`] or [`SoakConfig`], so
 //!   the version stays at v1 until SOA-6 records the oracle verdict on the
-//!   run record and takes v2.
+//!   run record and takes v2; SOA-7 then records window digests
+//!   ([`crate::soak_digest`]) on the record and takes v3.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	redaction, report::{DiskInfo, RunMetadata}, soak_oracle::OracleVerdict
+	redaction, report::{DiskInfo, RunMetadata}, soak_digest::WindowDigest, soak_oracle::OracleVerdict
 };
 
 /// Version of the soak run record. Bump on any breaking field change to
@@ -52,7 +53,8 @@ use crate::{
 /// preflight and redacted output beside the record, not fields on it, so v1
 /// stands. v2 (SOA-6) adds the optional oracle verdict field on [`SoakRun`]
 /// — a field on the record, so the version moves, on this line only.
-pub const SOAK_SCHEMA_VERSION: u32 = 2;
+/// v3 (SOA-7) adds the window digest list on [`SoakRun`], the same way.
+pub const SOAK_SCHEMA_VERSION: u32 = 3;
 
 /// Configuration for one soak run.
 ///
@@ -139,6 +141,14 @@ pub struct SoakRun {
 	/// judged, which must never read as a passed verdict.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub oracle: Option<OracleVerdict>,
+	/// The window digests recorded against this run (SOA-7), in window
+	/// order: the expected digests a driver computed from the workload
+	/// model as each window closed, through
+	/// [`SoakHarness::record_window_digest`]. Empty until the first
+	/// window is recorded — and forever for a run nobody digested, which
+	/// must never read as windows that matched.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub windows: Vec<WindowDigest>,
 }
 
 impl SoakRun {
@@ -303,7 +313,7 @@ impl SoakHarness {
 	/// [`RunMetadata::capture`]), not a second probe.
 	#[must_use]
 	pub const fn new(config: SoakConfig, metadata: RunMetadata) -> Self {
-		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None } }
+		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new() } }
 	}
 
 	/// Current lifecycle state.
@@ -406,6 +416,30 @@ impl SoakHarness {
 		Ok(())
 	}
 
+	/// Record one window digest against this run (SOA-7): the expected
+	/// digest of a window that just closed, kept in the run record so a
+	/// published run carries the per-window evidence its verdict was
+	/// reached over.
+	///
+	/// Recorded only while `Running`, and only in window order: a new
+	/// window must start at or after the end of the last recorded one.
+	/// Overlapping or out-of-order windows are refused rather than
+	/// appended — a digest recorded twice for the same ticks would
+	/// double-count its evidence, and a run's windows are its timeline.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when the
+	/// window overlaps or precedes the last recorded window.
+	pub fn record_window_digest(&mut self, digest: WindowDigest) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak window digests can only be recorded while Running, not {:?}", self.run.state);
+		if let Some(last) = self.run.windows.last() {
+			anyhow::ensure!(digest.start_tick >= last.end_tick(), "soak window digest at tick {} overlaps or precedes the recorded window ending at tick {}", digest.start_tick, last.end_tick());
+		}
+		self.run.windows.push(digest);
+		Ok(())
+	}
+
 	/// Move a `Running` harness to `Finished`.
 	///
 	/// # Errors
@@ -493,7 +527,7 @@ mod tests {
 		harness.start().expect("start");
 		let record = harness.run_record();
 		assert_eq!(record.soak_schema_version, SOAK_SCHEMA_VERSION);
-		assert_eq!(record.soak_schema_version, 2, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, independent of the bench schema");
+		assert_eq!(record.soak_schema_version, 3, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, independent of the bench schema");
 		// Reuse, not redefinition: the record's metadata is EVI-3's capture,
 		// with the same crate version / OS / arch / timestamp it was built from.
 		assert!(!record.metadata.weft_bench_version.is_empty(), "metadata must carry the bench crate version");
@@ -589,6 +623,41 @@ mod tests {
 		let report = harness.preflight(Path::new("weftdb-soa-2-relative-store")).expect("preflight report");
 		assert!(report.device.is_none(), "a relative path matches no mount, so no device resolves");
 		assert!(report.failed_checks().contains(&"device_resolved"), "the failing gate must be device_resolved: {:?}", report.checks);
+	}
+
+	#[test]
+	fn window_digests_are_recorded_in_window_order_while_running() {
+		use crate::{soak_digest::expected_window_digest, soak_workload::WorkloadModel};
+
+		let model = WorkloadModel::from_config(&config());
+		let digest = |start: u64| expected_window_digest(&model, start, 4);
+		let mut harness = SoakHarness::new(config(), metadata());
+		assert!(harness.record_window_digest(digest(0)).is_err(), "a digest cannot be recorded before the run starts");
+		harness.start().expect("start from Created");
+		harness.record_window_digest(digest(0)).expect("first window while Running");
+		harness.record_window_digest(digest(4)).expect("the next window starts where the last ended");
+		assert!(harness.record_window_digest(digest(4)).is_err(), "the same window twice would double-count its evidence");
+		assert!(harness.record_window_digest(digest(2)).is_err(), "an overlapping window must be refused");
+		harness.record_window_digest(digest(12)).expect("a gap between windows is allowed: undigested ticks are simply absent");
+		assert_eq!(harness.run_record().windows.len(), 3);
+		harness.finish().expect("finish from Running");
+		assert!(harness.record_window_digest(digest(16)).is_err(), "no digests after the run ends");
+		assert_eq!(harness.run_record().windows.len(), 3, "the recorded digests survive the finish transition");
+
+		let json = harness.run_record().redacted_json().expect("redacted run JSON");
+		assert!(json.contains("\"windows\""), "the recorded digests are in the run's output artifact: {json}");
+		let back: SoakRun = serde_json::from_str(&json).expect("run artifact deserializes");
+		assert_eq!(back.windows, harness.run_record().windows);
+	}
+
+	#[test]
+	fn a_v2_run_artifact_without_windows_still_deserializes() {
+		let harness = SoakHarness::new(config(), metadata());
+		let mut value = serde_json::to_value(harness.run_record()).expect("serialize run");
+		value.as_object_mut().expect("run is an object").remove("windows");
+		value["soak_schema_version"] = serde_json::json!(2);
+		let back: SoakRun = serde_json::from_value(value).expect("v2 artifact deserializes");
+		assert!(back.windows.is_empty(), "a v2 artifact carries no window digests");
 	}
 
 	#[test]

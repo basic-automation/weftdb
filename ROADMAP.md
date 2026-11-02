@@ -301,7 +301,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-13** DuckDB adapter I
   - [x] **EVI-15R** Report renderer with honesty-section generation
   - [x] **EVI-16** Honesty pages I
-  - [ ] **SOA-7** Window digests and the oracle self-test
+  - [x] **SOA-7** Window digests and the oracle self-test
   - [ ] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
 - [ ] **W6 · Durability CI, store split, scheduler**
   - [ ] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
