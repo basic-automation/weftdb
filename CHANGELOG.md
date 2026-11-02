@@ -40,6 +40,12 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
+- **Range reads no longer slow down as segments pile up, and no longer fail during a seal**:
+  the segment index's time prune names its time index and seeks `min_ts` between
+  `start − widest span` and `end` (the widest span per aspect is loaded once and widened by every
+  index write before it commits), where the planner had walked every segment of the aspect; and
+  its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
+  Write transactions still see `Busy` at once, as their retry protocol requires.
 - **Compressed query** (#145): `weft-bench --ingest --compressed-query QUERIES` times
   `downsample_range` inside the store against decoding the window and reducing it, per window size
   from an hour to a year, gated on the two answers being equal. Report schema v26 adds

@@ -1602,6 +1602,12 @@ What it does today:
   a year (12.7 vs 31.9 ms p50) and 1.3× for 30 days, but even for an hour (60 rows) both take
   ~2.9 ms — the per-segment prune cost above, not the decode, sets the floor (0.59 ms at 156
   segments, 8.4 ms at 9,769 from 1,024-row batches).
+- **Both read findings above are fixed** (#145 engine slice): the time prune now seeks the time
+  index between `start − widest span` and `end` instead of walking every segment, and reads wait
+  out a lock instead of failing. Rerun on UCI: the 1,024-batch online runs pass with **0 refused
+  reads** and query p50 2.9 → 0.16 ms; at 64k batches and 100M rows idle p50 is 2.9 → 0.38 ms
+  (one reader) and 5.1 → 0.52 ms (eight); a compressed query of an hour at 9,769 segments is
+  8.4 → 0.13 ms, and the in-store reduction now wins from a week (1.8×) to a year (3.0–3.4×).
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a

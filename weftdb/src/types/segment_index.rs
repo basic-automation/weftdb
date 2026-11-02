@@ -31,7 +31,7 @@
 //! rewritten: a legacy row reads back as generation 0, series 0, with the other three
 //! unset. `store_meta` holds the transactional copy of the store's marker.
 
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 use anyhow::{bail, Context, Result};
 use bigdecimal::BigDecimal;
@@ -40,7 +40,7 @@ use weft_physical_type::{SegmentDescriptor, SegmentIndex};
 
 use crate::{
 	types::{
-		durable::control_plane::connect, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied}, metadata::AspectMetadata, migrations, reaper::{JournalEntry, JournalState}
+		durable::control_plane::{connect, connect_reader}, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied}, metadata::AspectMetadata, migrations, reaper::{JournalEntry, JournalState}
 	}, StoreError, SUPPORTED_LAYOUT
 };
 
@@ -57,6 +57,64 @@ const SELECT_COLUMNS: &str = "id, path, format_version, physical_type, time_unit
 /// [`prune_by_time`](SegmentIndexStore::prune_by_time).
 pub struct SegmentIndexStore {
 	db: turso::Database,
+	spans: SpanBounds,
+}
+
+/// The time index a prune names (`INDEXED BY`): left to itself, the planner walks the
+/// `(aspect, id)` key through every segment of the aspect instead.
+const TIME_INDEX: &str = "idx_segment_index_time";
+
+/// The widest time span (`max_ts - min_ts`) of any segment recorded under each aspect, so
+/// that a prune can bound `min_ts` from below as well as above and seek only the segments
+/// near its window, not every segment that starts before the window ends.
+///
+/// An aspect's bound is loaded from the index the first time a prune needs it, and every
+/// transaction that writes a row through [`SegmentIndexStore::apply`] widens it before it
+/// commits, so a committed row's span is always within the bound. Nothing narrows it: a
+/// deleted wide segment leaves the bound wider than needed, which only costs a longer
+/// seek. It holds because this handle is the only writer: Turso locks the database file
+/// exclusively, and the store root's `LOCK` keeps a second process out.
+#[derive(Debug, Default)]
+struct SpanBounds(std::sync::Mutex<HashMap<String, SpanBound>>);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SpanBound {
+	/// Whether the index's own widest span has been folded in.
+	loaded: bool,
+	widest: i64,
+}
+
+impl SpanBounds {
+	fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, SpanBound>> {
+		self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	/// Widen `aspect`'s bound to `span`.
+	fn widen(&self, aspect: &str, span: i64) {
+		self.lock().entry(aspect.to_string()).or_default().widen(span);
+	}
+
+	/// `aspect`'s bound, if the index's own has been folded in.
+	fn get(&self, aspect: &str) -> Option<i64> {
+		self.lock().get(aspect).filter(|bound| bound.loaded).map(|bound| bound.widest)
+	}
+
+	/// Fold the index's widest span into `aspect`'s bound and return the bound.
+	fn load(&self, aspect: &str, indexed: i64) -> i64 {
+		self.lock().entry(aspect.to_string()).or_default().load(indexed)
+	}
+}
+
+impl SpanBound {
+	fn widen(&mut self, span: i64) {
+		self.widest = self.widest.max(span);
+	}
+
+	fn load(&mut self, indexed: i64) -> i64 {
+		self.widen(indexed);
+		self.loaded = true;
+		self.widest
+	}
 }
 
 impl SegmentIndexStore {
@@ -104,7 +162,7 @@ impl SegmentIndexStore {
 	async fn open_with(builder: Builder, path: &str) -> Result<Self> {
 		let db = builder.build().await?;
 		Self::configure(&db, path).await?;
-		Ok(Self { db })
+		Ok(Self { db, spans: SpanBounds::default() })
 	}
 
 	/// Snapshot this `segment_index.db` to `dest` (a fresh file) via Turso's
@@ -192,6 +250,7 @@ impl SegmentIndexStore {
 	/// The transaction's [`IndexTxnError`], whose kind says whether it may have
 	/// committed anyway.
 	pub(crate) async fn apply(&self, txn: &IndexTxn) -> std::result::Result<TxnApplied, IndexTxnError> {
+		self.widen_spans(txn);
 		txn.run(&self.db).await
 	}
 
@@ -202,7 +261,62 @@ impl SegmentIndexStore {
 	///
 	/// As [`apply`](Self::apply).
 	pub(crate) async fn apply_while(&self, txn: &IndexTxn, may_retry: impl Fn() -> bool) -> std::result::Result<TxnApplied, IndexTxnError> {
+		self.widen_spans(txn);
 		txn.run_while(&self.db, may_retry).await
+	}
+
+	/// Widen the prune's span bounds to every row `txn` writes, before it can commit: a
+	/// prune that sees the row then also sees a bound that reaches it.
+	fn widen_spans(&self, txn: &IndexTxn) {
+		for (aspect, span) in txn.row_spans() {
+			self.spans.widen(aspect, span);
+		}
+	}
+
+	/// The widest span recorded under `aspect`, loading it from the index on first use.
+	async fn span_bound(&self, conn: &turso::Connection, aspect: &str) -> Result<i64> {
+		if let Some(widest) = self.spans.get(aspect) {
+			return Ok(widest);
+		}
+		let mut rows = conn.query("SELECT MAX(max_ts - min_ts) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		let indexed = match rows.next().await?.map(|row| row.get_value(0)).transpose()? {
+			Some(Value::Integer(widest)) => widest,
+			_ => 0,
+		};
+		Ok(self.spans.load(aspect, indexed))
+	}
+
+	/// The rows of `aspect` whose span overlaps `[start, end]` and that pass `filter` (an
+	/// extra `AND` clause), in `id` order.
+	///
+	/// The query seeks the time index between `start - widest span` and `end`, so its cost
+	/// follows the segments near the window rather than every segment before it. A row
+	/// committed while it ran may have widened the bound after it was read: the query is
+	/// then run again with the wider bound, so it never misses a row it saw. A store
+	/// without the time index (it was always best effort) prunes by a scan instead.
+	async fn prune_rows(&self, aspect: &str, start: i64, end: i64, filter: &str) -> Result<Vec<IndexRow>> {
+		let conn = connect_reader(&self.db).await?;
+		let mut widest = self.span_bound(&conn, aspect).await?;
+		loop {
+			let floor = start.saturating_sub(widest);
+			// A NULL-spanned (empty) segment can never overlap, and the inequalities reject it.
+			let sql = |indexed: &str| format!("SELECT {SELECT_COLUMNS}
+				FROM segment_index {indexed}
+				WHERE aspect = ? AND min_ts IS NOT NULL AND max_ts IS NOT NULL AND ? <= min_ts AND min_ts <= ? AND ? <= max_ts {filter}
+				ORDER BY id");
+			let params = || turso::params![aspect.to_string(), floor, end, start];
+			let rows = match conn.query(sql(&format!("INDEXED BY {TIME_INDEX}")), params()).await {
+				Ok(rows) => rows,
+				Err(e) if e.to_string().contains("no such index") => conn.query(sql(""), params()).await?,
+				Err(e) => return Err(e.into()),
+			};
+			let rows = Self::collect(rows).await?;
+			let now = self.span_bound(&conn, aspect).await?;
+			if now == widest {
+				return Ok(rows);
+			}
+			widest = now;
+		}
 	}
 
 	/// The database behind this index: what the migration registry runs against, and what
@@ -254,18 +368,7 @@ impl SegmentIndexStore {
 
 	/// [`prune_by_time`](Self::prune_by_time), returning whole [`IndexRow`]s.
 	pub(crate) async fn prune_rows_by_time(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<IndexRow>> {
-		let conn = connect(&self.db).await?;
-		// A NULL-spanned (empty) segment can never overlap, and the inequalities reject it.
-		let rows = conn
-			.query(
-				format!("SELECT {SELECT_COLUMNS}
-					FROM segment_index
-					WHERE aspect = ? AND min_ts IS NOT NULL AND max_ts IS NOT NULL AND min_ts <= ? AND ? <= max_ts
-					ORDER BY id"),
-				turso::params![aspect.to_string(), end, start],
-			)
-			.await?;
-		Self::collect(rows).await
+		self.prune_rows(aspect, start, end, "").await
 	}
 
 	/// [`prune_by_time`](Self::prune_by_time) for a query that needs **present values**:
@@ -297,20 +400,9 @@ impl SegmentIndexStore {
 	/// [`IndexRow`]s — the form a reader that must bind a sidecar to its frame's CRC
 	/// (D-S15) prunes by.
 	pub(crate) async fn prune_present_rows(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<IndexRow>> {
-		let conn = connect(&self.db).await?;
 		// The NULL-spanned (empty) row is rejected twice over: the inequalities already
 		// reject it, and a zero-row row is not "all null" — it is nothing to skip.
-		let rows = conn
-			.query(
-				format!("SELECT {SELECT_COLUMNS}
-					FROM segment_index
-					WHERE aspect = ? AND min_ts IS NOT NULL AND max_ts IS NOT NULL AND min_ts <= ? AND ? <= max_ts
-						AND row_count > 0 AND null_count < row_count
-					ORDER BY id"),
-				turso::params![aspect.to_string(), end, start],
-			)
-			.await?;
-		Ok(Self::collect(rows).await?)
+		self.prune_rows(aspect, start, end, "AND row_count > 0 AND null_count < row_count").await
 	}
 
 	/// Every descriptor recorded under `aspect`, in seal (`id`) order.
@@ -327,7 +419,7 @@ impl SegmentIndexStore {
 
 	/// [`all`](Self::all), returning whole [`IndexRow`]s.
 	pub(crate) async fn rows(&self, aspect: &str) -> Result<Vec<IndexRow>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		let rows = conn.query(format!("SELECT {SELECT_COLUMNS} FROM segment_index WHERE aspect = ? ORDER BY id"), turso::params![aspect.to_string()]).await?;
 		Self::collect(rows).await
 	}
@@ -357,7 +449,7 @@ impl SegmentIndexStore {
 	///
 	/// Propagates any libSQL read failure, or a value bound that cannot be decoded.
 	pub(crate) async fn rollup(&self, aspect: &str) -> Result<Option<AspectMetadata>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		if !migrations::table_exists(&conn, "aspect_metadata").await? {
 			return Ok(None);
 		}
@@ -381,7 +473,7 @@ impl SegmentIndexStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub(crate) async fn rollup_aspects(&self) -> Result<Vec<String>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		if !migrations::table_exists(&conn, "aspect_metadata").await? {
 			return Ok(Vec::new());
 		}
@@ -427,7 +519,7 @@ impl SegmentIndexStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn list_aspects(&self) -> Result<Vec<String>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT DISTINCT aspect FROM segment_index ORDER BY aspect", turso::params![]).await?;
 		let mut out = Vec::new();
 		while let Some(row) = rows.next().await? {
@@ -444,7 +536,7 @@ impl SegmentIndexStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn count(&self, aspect: &str) -> Result<usize> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT COUNT(*) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("COUNT returned no row"))?;
 		let n = *row.get_value(0)?.as_integer().unwrap_or(&0);
@@ -470,7 +562,7 @@ impl SegmentIndexStore {
 
 	/// The largest segment `id` indexed under `aspect`, if it has any.
 	async fn max_id(&self, aspect: &str) -> Result<Option<u64>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT MAX(id) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("MAX returned no row"))?;
 		// MAX over no rows is SQL NULL.
@@ -487,7 +579,7 @@ impl SegmentIndexStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub(crate) async fn allocator_seed(&self, aspect: &str) -> Result<AllocatorSeed> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT next_id, next_gen, epoch FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
 		let persisted = match rows.next().await? {
 			Some(row) => {
@@ -514,7 +606,7 @@ impl SegmentIndexStore {
 	/// Propagates any libSQL read failure, or a row whose state is neither `'pending'` nor
 	/// `'retired'`.
 	pub(crate) async fn journal(&self, aspect: Option<&str>) -> Result<Vec<JournalEntry>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		let mut rows = match aspect {
 			Some(aspect) => conn.query("SELECT name, aspect, state, retire_epoch FROM frame_journal WHERE aspect = ? ORDER BY name", turso::params![aspect.to_string()]).await?,
 			None => conn.query("SELECT name, aspect, state, retire_epoch FROM frame_journal ORDER BY name", ()).await?,
@@ -593,7 +685,7 @@ impl SegmentIndexStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub(crate) async fn meta(&self, key: &str) -> Result<Option<String>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		if !migrations::table_exists(&conn, "store_meta").await? {
 			return Ok(None);
 		}
@@ -609,7 +701,7 @@ impl SegmentIndexStore {
 	///
 	/// Propagates any libSQL read failure, or a row this build cannot decode.
 	pub(crate) async fn quarantine(&self, aspect: Option<&str>) -> Result<Vec<crate::types::quarantine::QuarantineRecord>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		if !migrations::table_exists(&conn, "segment_quarantine").await? {
 			return Ok(Vec::new());
 		}
@@ -638,7 +730,7 @@ impl SegmentIndexStore {
 	/// Propagates any libSQL read failure, or a row this build cannot
 	/// decode.
 	pub(crate) async fn ledger_entry(&self, aspect: &str, key: &str) -> Result<Option<crate::types::ingest::LedgerEntry>> {
-		let conn = connect(&self.db).await?;
+		let conn = connect_reader(&self.db).await?;
 		if !migrations::table_exists(&conn, "ingest_ledger").await? {
 			return Ok(None);
 		}
@@ -818,6 +910,75 @@ mod tests {
 		assert_eq!(count_after, 1, "the re-seal did not add a second row");
 		assert!(!deleted_missing, "deleting an absent id affects no rows");
 		assert!(deleted_hit);
+	}
+
+	/// A sealed two-row segment over exactly `[lo, hi]`.
+	fn spanning(lo: i64, hi: i64) -> (Segment, u64) {
+		let seg = Segment::build(&[lo, hi], &[bd("1"), bd("2")], TimeUnit::Seconds, &bd("0")).expect("builds");
+		let len = seg.write_to().len() as u64;
+		(seg, len)
+	}
+
+	/// The span bound is loaded once and then widened by every write: a segment far
+	/// wider than any before it, sealed after a prune loaded the bound, is still found by
+	/// a window that only its far end reaches.
+	#[tokio::test]
+	async fn a_prune_finds_a_wide_segment_sealed_after_its_bound_was_loaded() {
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		for i in 0..10_u64 {
+			let (seg, len) = sealed(i64::try_from(i).expect("small") * 100);
+			store.insert("aspect", &SegmentDescriptor::of_segment(i, format!("s{i}.weftseg"), len, &seg)).await.expect("inserts");
+		}
+		let before = store.prune_by_time("aspect", 2_000, 2_010).await.expect("prunes");
+		let (seg, len) = spanning(0, 5_000);
+		store.insert("aspect", &SegmentDescriptor::of_segment(99, "wide.weftseg", len, &seg)).await.expect("inserts the wide segment");
+		let far = store.prune_by_time("aspect", 4_990, 5_000).await.expect("prunes");
+		let near = store.prune_by_time("aspect", 120, 150).await.expect("prunes");
+		drop(store);
+		let ids = |ds: &[SegmentDescriptor]| ds.iter().map(|d| d.id).collect::<Vec<_>>();
+		assert!(before.is_empty());
+		assert_eq!(ids(&far), vec![99]);
+		assert_eq!(ids(&near), vec![1, 99]);
+	}
+
+	/// The bounded, index-forced prune answers exactly what a filter over every row does,
+	/// for overlapping segments of mixed widths and windows anywhere, through both prunes.
+	#[tokio::test]
+	async fn a_prune_matches_a_filter_over_every_row() {
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let mut state = 0x9e37_79b9_u64;
+		let mut next = |modulo: u64| {
+			state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+			i64::try_from((state >> 33) % modulo).expect("small")
+		};
+		for id in 0..300_u64 {
+			let lo = next(100_000);
+			let (seg, len) = spanning(lo, lo + next(if id % 50 == 0 { 20_000 } else { 500 }) + 1);
+			store.insert("aspect", &SegmentDescriptor::of_segment(id, format!("s{id}.weftseg"), len, &seg)).await.expect("inserts");
+		}
+		let every = store.all("aspect").await.expect("reads");
+		for _ in 0..200 {
+			let start = next(110_000) - 5_000;
+			let end = start + next(3_000);
+			let ids = |ds: Vec<SegmentDescriptor>| ds.into_iter().map(|d| d.id).collect::<Vec<_>>();
+			let expected: Vec<u64> = every.iter().filter(|d| d.min_ts.is_some_and(|lo| lo <= end) && d.max_ts.is_some_and(|hi| start <= hi)).map(|d| d.id).collect();
+			assert_eq!(ids(store.prune_by_time("aspect", start, end).await.expect("prunes")), expected, "[{start}, {end}]");
+			assert_eq!(ids(store.prune_present_descriptors("aspect", start, end).await.expect("prunes")), expected, "[{start}, {end}] present");
+		}
+	}
+
+	/// The time index was always best effort: a store without it prunes by a scan.
+	#[tokio::test]
+	async fn a_prune_without_the_time_index_still_answers() {
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		for (i, base) in [0_i64, 100, 200].into_iter().enumerate() {
+			let (seg, len) = sealed(base);
+			store.insert("aspect", &SegmentDescriptor::of_segment(i as u64, format!("s{i}.weftseg"), len, &seg)).await.expect("inserts");
+		}
+		store.db.connect().expect("connects").execute("DROP INDEX idx_segment_index_time", ()).await.expect("drops the time index");
+		let straddle = store.prune_by_time("aspect", 50, 150).await.expect("prunes by a scan");
+		drop(store);
+		assert_eq!(straddle.iter().map(|d| d.id).collect::<Vec<_>>(), vec![0, 1]);
 	}
 
 	#[tokio::test]
