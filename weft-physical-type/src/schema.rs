@@ -139,6 +139,20 @@ pub fn widen_value_encoding(current: PhysicalType, values: &[BigDecimal]) -> Phy
 	current
 }
 
+/// Whether changing a declaration's value encoding from `from` to `to` is a
+/// **widening** — the one change an immutable declaration permits (FRE-7b).
+///
+/// [`widen_value_encoding`] produces exactly two outcomes for a batch: the
+/// current encoding, or [`PhysicalType::BigDecimalText`]. So at declaration
+/// level (no batch in hand) a change widens exactly when it moves to
+/// `BigDecimalText` from something narrower. Every other change of encoding —
+/// a narrowing, a sideways move between fixed-point scales or float widths —
+/// is not a widening and a declaration refuses it.
+#[must_use]
+pub fn is_value_widening(from: PhysicalType, to: PhysicalType) -> bool {
+	from != to && matches!(to, PhysicalType::BigDecimalText)
+}
+
 impl AspectSchema {
 	/// Declare an aspect's storage: the physical value encoding, the per-value error
 	/// bound it must honour, and the timestamp resolution.
@@ -708,6 +722,20 @@ mod tests {
 		assert_eq!(widen_value_encoding(PhysicalType::Decimal128, &lossy), PhysicalType::BigDecimalText, "a lossy value widens to the lossless text encoding");
 		assert_eq!(widen_value_encoding(PhysicalType::BigDecimalText, &lossy), PhysicalType::BigDecimalText, "text never narrows");
 		assert_eq!(widen_value_encoding(PhysicalType::Decimal128, &[]), PhysicalType::Decimal128, "an empty batch widens nothing");
+	}
+
+	#[test]
+	fn is_value_widening_matches_widen_value_encodings_outcomes() {
+		// The only move widen_value_encoding can produce is to the text encoding.
+		assert!(is_value_widening(PhysicalType::Decimal128, PhysicalType::BigDecimalText));
+		assert!(is_value_widening(PhysicalType::ScaledI64 { scale: 2 }, PhysicalType::BigDecimalText));
+		assert!(is_value_widening(PhysicalType::F64, PhysicalType::BigDecimalText));
+		// Identity is not a change, and no other move widens.
+		assert!(!is_value_widening(PhysicalType::BigDecimalText, PhysicalType::BigDecimalText));
+		assert!(!is_value_widening(PhysicalType::BigDecimalText, PhysicalType::Decimal128), "text never narrows");
+		assert!(!is_value_widening(PhysicalType::F32, PhysicalType::F64), "a float-width move is not the widening widen_value_encoding performs");
+		assert!(!is_value_widening(PhysicalType::ScaledI64 { scale: 2 }, PhysicalType::ScaledI64 { scale: 4 }), "a scale change is not a widening");
+		assert!(!is_value_widening(PhysicalType::ScaledI64 { scale: 2 }, PhysicalType::ScaledI128 { scale: 2 }), "a mantissa-width move is not the widening widen_value_encoding performs");
 	}
 
 	#[test]

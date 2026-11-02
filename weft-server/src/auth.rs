@@ -50,18 +50,43 @@
 //!   mode without mounting the file is a startup error.
 //! - unset — authentication on when a keys file is mounted, off when none
 //!   is. A server with no keys file behaves exactly as it did before this
-//!   slice (the loopback guard is its protection); the full exposure
-//!   matrix that refuses some of those binds is SEC-8's.
+//!   slice (the loopback guard is its protection); the exposure matrix
+//!   that refuses keyless non-loopback binds at startup is SEC-8's
+//!   ([`crate::tls`]).
+//!
+//! ## The auth-off guard (SEC-8, decision 7)
+//!
+//! Decision 7's loopback mode is "auth off, with a Host/Origin guard and
+//! proxied requests refused". The Host/Origin half is [`crate::host_guard`];
+//! the proxied half is here: while authentication is off *implicitly*
+//! (no keys file mounted, [`AuthConfig::Off`]), a request carrying a
+//! proxy's `Forwarded` or `X-Forwarded-*` header is refused
+//! `403 proxied_request_requires_auth` — the §4 code X-ERR reserved,
+//! produced here for the first time. A forwarded header means the caller
+//! the server sees is not the caller that sent the request, so the
+//! loopback assumption the mode rests on no longer holds. Explicit
+//! [`AuthConfig::Disabled`] is the gateway deployment, where proxied
+//! requests are the point, and is not refused; with keys mounted, the
+//! key check is the guard and proxied requests authenticate as usual.
+//!
+//! `/metrics` needs the `metrics` scope when auth is on (decision 17):
+//! that is the registry's own scope for the route (SEC-3), enforced by
+//! the same check below — a reader's key gets `403` on `/metrics`, an
+//! admin's serves. When auth is off, `/metrics` is as open as every
+//! other route, which is exactly what "when auth is on" scopes.
 //!
 //! ## What a request must carry
 //!
 //! `Authorization: Bearer <key>` — the only place a credential may travel.
 //! A credential in the query string is refused `400 credentials_in_query`
 //! (the code has been in the §4 table since X-ERR; this slice is its first
-//! producer), because query strings land in logs and proxies. The check
-//! runs as a layer in [`crate::app_with_state`], after the registry's
-//! fail-closed gate has matched the route, and it decides from the same
-//! [`RouteTable`] the gate sealed:
+//! producer), because query strings land in logs and proxies. The refusal
+//! applies in every authentication mode — keys mounted, off, or explicitly
+//! disabled (SEC-10): the leak it prevents does not depend on whether the
+//! server would have accepted the key. The check runs as a layer in
+//! [`crate::app_with_state`], after the registry's fail-closed gate has
+//! matched the route, and it decides from the same [`RouteTable`] the
+//! gate sealed:
 //!
 //! - no `Authorization` header — the caller is the anonymous principal
 //!   (SEC-3's [`Role::Anonymous`], probes only). A route asking for the
@@ -130,9 +155,9 @@ const KEYS_FILE_VERSION: u32 = 1;
 /// with `WWW-Authenticate`).
 const WWW_AUTHENTICATE_VALUE: &str = "Bearer realm=\"weftdb\"";
 
-/// Query parameter names that are credentials, refused when auth is on:
-/// a key belongs in the `Authorization` header, not in a string that
-/// proxies and access logs record.
+/// Query parameter names that are credentials, refused in every auth
+/// mode (SEC-10): a key belongs in the `Authorization` header, not in a
+/// string that proxies and access logs record.
 const CREDENTIAL_QUERY_PARAMS: &[&str] = &["api_key", "apikey", "access_token", "auth_token"];
 
 /// Who a request authenticated as: the key's id and the role the keys
@@ -371,11 +396,18 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// once at startup ([`from_env`](Self::from_env)).
 #[derive(Debug, Clone, Default)]
 pub enum AuthConfig {
-	/// Authentication off: no keys file mounted, or
-	/// `WEFT_AUTH=disabled` explicitly. Every request is the anonymous
-	/// principal, exactly as before SEC-6.
+	/// Authentication off implicitly: no keys file mounted and no mode
+	/// named. Every request is the anonymous principal, exactly as
+	/// before SEC-6 — except a proxied one, which the auth-off guard
+	/// refuses (SEC-8; see the module docs).
 	#[default]
 	Off,
+	/// Authentication explicitly disabled (`WEFT_AUTH=disabled`): the
+	/// gateway deployment of decision 7, where a proxy in front of the
+	/// server owns authentication, so proxied requests are expected and
+	/// served. Distinct from [`Off`](Self::Off) since SEC-8: the two
+	/// offs differ in exactly the proxied-request rule.
+	Disabled,
 	/// Authentication on: every non-probe route needs a key from this
 	/// store whose role holds the route's scope.
 	Keys(Arc<KeyStore>),
@@ -387,6 +419,19 @@ impl AuthConfig {
 	#[must_use]
 	pub const fn off() -> Self {
 		Self::Off
+	}
+
+	/// Authentication explicitly disabled (the gateway deployment).
+	#[must_use]
+	pub const fn disabled() -> Self {
+		Self::Disabled
+	}
+
+	/// Whether authentication was explicitly disabled, as opposed to
+	/// off because no keys file is mounted.
+	#[must_use]
+	pub const fn is_disabled(&self) -> bool {
+		matches!(self, Self::Disabled)
 	}
 
 	/// Authentication on, enforcing `store`.
@@ -405,7 +450,7 @@ impl AuthConfig {
 	#[must_use]
 	pub fn key_store(&self) -> Option<&KeyStore> {
 		match self {
-			Self::Off => None,
+			Self::Off | Self::Disabled => None,
 			Self::Keys(store) => Some(store),
 		}
 	}
@@ -422,7 +467,7 @@ impl AuthConfig {
 	pub fn from_env_values(auth_mode: Option<&str>, keys_file: Option<&str>) -> Result<Self, String> {
 		let mode = auth_mode.map(str::trim).filter(|value| !value.is_empty());
 		if mode.is_some_and(|value| value.eq_ignore_ascii_case(AUTH_DISABLED)) {
-			return Ok(Self::Off);
+			return Ok(Self::Disabled);
 		}
 		if let Some(value) = mode {
 			if !value.eq_ignore_ascii_case(AUTH_KEYS_MODE) {
@@ -514,18 +559,45 @@ fn unauthenticated(message: String) -> Response {
 	response
 }
 
+/// The headers a proxy adds on behalf of its own caller: the presence
+/// of any one means the request reached the server through a proxy
+/// (`Forwarded` is RFC 7239; the `X-Forwarded-*` family is the de-facto
+/// set every common proxy sends). Their *values* are never read — a
+/// deployment that trusts a proxy's word for the client address is the
+/// gateway deployment, not this guard's.
+const PROXY_HEADERS: &[&str] = &["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"];
+
+/// Whether the request carries a proxy's header (see [`PROXY_HEADERS`]).
+fn request_is_proxied(headers: &axum::http::HeaderMap) -> bool {
+	PROXY_HEADERS.iter().any(|name| headers.contains_key(*name))
+}
+
 /// axum middleware: enforce the keys file against the sealed registry,
 /// as described in the module docs. Installed by
 /// [`crate::app_with_state`] from the state's [`AuthConfig`]; with
-/// authentication off it is a pass-through, so a keyless server serves
-/// exactly the router it served before SEC-6.
+/// authentication explicitly disabled it is a pass-through, and with
+/// authentication off implicitly it is a pass-through except for the
+/// auth-off guard's proxied-request refusal (SEC-8). The one refusal no
+/// mode passes through is a credential in the query string, which is
+/// refused before any of the mode branches run (SEC-10).
 pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::body::Body>, next: Next) -> Response {
-	let Some(store) = state.auth().key_store() else {
-		return next.run(request).await;
-	};
+	// The credentials-in-query refusal runs first, in every authentication
+	// mode (SEC-10): the harm it prevents — the credential landing in a
+	// proxy's or server's log — does not depend on whether this server
+	// would have accepted the key, and with authentication off or disabled
+	// nothing else in this layer looks at the request at all.
 	if query_carries_a_credential(request.uri().query()) {
 		return ApiError::new(Code::CredentialsInQuery, "credentials belong in the `Authorization: Bearer <key>` header, not in the query string, where they are recorded by proxies and logs").into_response();
 	}
+	let Some(store) = state.auth().key_store() else {
+		if state.auth().is_disabled() {
+			return next.run(request).await;
+		}
+		if request_is_proxied(request.headers()) {
+			return ApiError::new(Code::ProxiedRequestRequiresAuth, "this request arrived through a proxy (it carries a Forwarded or X-Forwarded-* header) and authentication is off: a proxied request requires authentication — mount a keys file (WEFT_KEYS_FILE), or set WEFT_AUTH=disabled when a gateway in front of this server owns authentication").into_response();
+		}
+		return next.run(request).await;
+	};
 	let Some(matched) = request.extensions().get::<MatchedPath>().map(|matched| matched.as_str().to_string()) else {
 		// No route matched: the registry's fallback refuses it, and a
 		// 404's shape does not depend on who asked.
@@ -628,8 +700,13 @@ mod tests {
 	fn the_modes_follow_the_module_docs() {
 		// Unset with no keys file: off, as before SEC-6.
 		assert!(!AuthConfig::from_env_values(None, None).expect("off").is_enabled());
-		// `disabled` wins, even over a mounted file.
-		assert!(!AuthConfig::from_env_values(Some(" Disabled "), None).expect("off").is_enabled());
+		// `disabled` wins, even over a mounted file — and is its own
+		// variant since SEC-8, because the gateway deployment's proxied
+		// requests are served where implicit-off's are refused.
+		let disabled = AuthConfig::from_env_values(Some(" Disabled "), None).expect("disabled");
+		assert!(!disabled.is_enabled());
+		assert!(disabled.is_disabled());
+		assert!(!AuthConfig::from_env_values(None, None).expect("off").is_disabled());
 		// `keys` without a file is a startup error, not silent off.
 		let err = AuthConfig::from_env_values(Some("keys"), None).expect_err("refused");
 		assert!(err.contains(KEYS_FILE_ENV), "{err}");
@@ -718,6 +795,23 @@ mod tests {
 		assert_eq!(status, StatusCode::OK);
 	}
 
+	/// SEC-10: the refusal does not depend on the auth mode. With auth
+	/// off or explicitly disabled there is no key check to hide behind,
+	/// and the credential would otherwise sail through into whatever
+	/// logs the request — so those modes refuse it too.
+	#[tokio::test]
+	async fn credentials_in_the_query_string_are_refused_in_every_auth_mode() {
+		for router in [crate::app_with_state(AppState::new()), crate::app_with_state(AppState::new().with_auth(AuthConfig::disabled()))] {
+			let (status, _, body) = send(router, "GET", "/health?access_token=hunter2", None).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST);
+			assert_eq!(body["code"], "credentials_in_query");
+		}
+		// A query string without a credential parameter is untouched by
+		// the refusal in the same modes.
+		let (status, _, _) = send(crate::app_with_state(AppState::new()), "GET", "/health?verbose=1", None).await;
+		assert_eq!(status, StatusCode::OK);
+	}
+
 	/// A credential in the query string is refused even with a valid
 	/// key in the header: the refusal is about where it travelled.
 	#[tokio::test]
@@ -749,6 +843,60 @@ mod tests {
 	async fn auth_off_serves_as_before() {
 		let open = crate::app_with_state(AppState::new());
 		let (status, _, _) = send(open, "GET", "/metrics", None).await;
+		assert_eq!(status, StatusCode::OK);
+	}
+
+	/// SEC-8's auth-off guard (decision 7): with authentication off
+	/// implicitly, a proxied request is refused on every route, probes
+	/// and metrics included — the loopback assumption it rests on is
+	/// gone once a proxy is in the path.
+	#[tokio::test]
+	async fn a_proxied_request_requires_auth_when_auth_is_off() {
+		async fn send_proxied(router: axum::Router, uri: &str, header_name: &str, authorization: Option<String>) -> (StatusCode, serde_json::Value) {
+			let mut builder = Request::builder().method("GET").uri(uri).header(header_name, "203.0.113.9");
+			if let Some(value) = authorization {
+				builder = builder.header(header::AUTHORIZATION, value);
+			}
+			let response = router.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+			let status = response.status();
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			(status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+		}
+		for header_name in PROXY_HEADERS {
+			for uri in ["/health", "/metrics", "/api/v1/storage/stats"] {
+				let (status, body) = send_proxied(crate::app_with_state(AppState::new()), uri, header_name, None).await;
+				assert_eq!(status, StatusCode::FORBIDDEN, "{header_name} on {uri}: {body}");
+				assert_eq!(body["code"], "proxied_request_requires_auth", "{header_name} on {uri}: {body}");
+			}
+		}
+		// The gateway deployment (explicitly disabled) expects proxied
+		// requests and serves them.
+		let gateway = crate::app_with_state(AppState::new().with_auth(AuthConfig::disabled()));
+		let (status, _) = send_proxied(gateway, "/metrics", "x-forwarded-for", None).await;
+		assert_eq!(status, StatusCode::OK);
+		// With keys mounted the key check is the guard: a proxied request
+		// with an admin key serves, and one with no key is the ordinary
+		// 401, not the proxied refusal.
+		let (status, _) = send_proxied(router(), "/metrics", "x-forwarded-for", Some(bearer(ADMIN_TOKEN))).await;
+		assert_eq!(status, StatusCode::OK);
+		let (status, body) = send_proxied(router(), "/metrics", "forwarded", None).await;
+		assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+		assert_eq!(body["code"], "unauthenticated");
+		assert!(request_is_proxied(&axum::http::HeaderMap::from_iter([(axum::http::HeaderName::from_static("x-forwarded-host"), HeaderValue::from_static("example.com"))])));
+		assert!(!request_is_proxied(&axum::http::HeaderMap::new()));
+	}
+
+	/// Decision 17's metrics rule, stated as its own test (SEC-8): when
+	/// auth is on, `/metrics` needs the metrics scope — anonymous is a
+	/// 401 and a key without the scope a 403; when auth is off it serves.
+	#[tokio::test]
+	async fn metrics_needs_the_metrics_scope_when_auth_is_on() {
+		let (status, _, body) = send(router(), "GET", "/metrics", None).await;
+		assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+		let (status, _, body) = send(router(), "GET", "/metrics", Some(&bearer(READER_TOKEN))).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+		assert_eq!(body["code"], "forbidden");
+		let (status, _, _) = send(router(), "GET", "/metrics", Some(&bearer(ADMIN_TOKEN))).await;
 		assert_eq!(status, StatusCode::OK);
 	}
 }
