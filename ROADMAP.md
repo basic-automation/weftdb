@@ -154,16 +154,16 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
 - [ ] **7.1 Online ingest**
 - [ ] **7.2 WAL & crash consistency.**
   - [x] **S10** Write-once durable seal with id assigned at commit *(~8 h; after S9)*
-  - [ ] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
+  - [x] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
   - [x] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
   - [x] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
   - [x] **S14** HTTP ingest wiring
-  - [ ] **S15** Partial sidecar v4
+  - [x] **S15** Partial sidecar v4
   - [x] **S16** Whole-store backup with hard-linked frames
   - [ ] **S17** Relaxed durability mode with synced_epoch watermark (optional for 1.0) *(~6 h; after S12)*
-  - [ ] **S19** Seal-backed legacy aspects
+  - [x] **S19** Seal-backed legacy aspects
   - [ ] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*
-  - [ ] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
+  - [x] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
 - [ ] **7.3 Corruption detection**
   - [ ] Restoring *into a chosen new root* over HTTP
   - [ ] Whole-store backup manifest (fold the `.weftseg` frames in beside the control plane)
@@ -255,7 +255,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 
   On the release and identity side, the release pipeline (PAC-1a) and the canonical `TagSet`, `SeriesKey` and `SeriesSelector` types with their frozen caps (TAG-1) are in, and GitHub private vulnerability reporting is turned on (owner step).
 
-- [ ] **W1 · Baseline release, server split, goldens**
+- [x] **W1 · Baseline release, server split, goldens**
   - [x] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
   - [x] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
   - [x] **TAG-3** Open `ValueKind` in weftdb, provenance scope
@@ -267,7 +267,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] `weft-bench --sparse`: a seeded (series × block) grid of nullable cells, the block-aligned mean scan over it, and the observed missingness recorded in the report beside the grid that produced it
   - [x] `--scale tiny|small|medium|large` for the sized workloads (`--sparse`, `--gap-fill`, `--downsample`), filling only the size knobs left at their default, and naming the preset in the profile so two grid sizes never compare as one run
   - [x] **SOA-1** Soak harness skeleton
-- [ ] **W2 · Error contract, frame format, portable builds**
+- [x] **W2 · Error contract, frame format, portable builds**
   - [x] Legacy lane
     - [x] **FRE-14c** operator route: `weft-server import-rows-mode` reads one 0.1.x subject into a Storage v2 store, prints what stays behind and why, and records the run so a second read refuses
     - [x] **FRE-14c** streaming rows-mode read: a whole aspect must not have to fit in memory
@@ -283,8 +283,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-2** Soak preflight, device resolution, run metadata and secret redaction
   - [x] **SOA-3** Open-loop scheduler, HDR interval logs, harness self-monitoring and null server
   - [x] **SOA-4** Deterministic workload model, lanes, format-exact value grids and body encoders
-- [ ] **W3 · Gate, serve path, input domain**
-  - [ ] Store lane
+- [x] **W3 · Gate, serve path, input domain**
+  - [x] Store lane
   - [x] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)
   - [x] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions
   - [x] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
@@ -293,8 +293,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-8B** Benchmark adapter v2 II
   - [x] **SOA-5** Soak ingest client
   - [x] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
-- [ ] **W4 · Auth, config, ILP fix**
-  - [ ] Store lane
+- [x] **W4 · Auth, config, ILP fix**
+  - [x] Store lane
   - [x] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
   - [x] **SEC-5** TLS listener (rustls with ring) on the shared serve path
   - [x] **SEC-6** API keys, Bearer authentication, keys file and keygen
@@ -304,11 +304,11 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] L-FMT: **ROB-8** Frame decode hardening
   - [x] **EVI-11** Stored WeftDB benchmark adapter
   - [x] **SOA-6** Soak oracle core
-- [ ] **W5 · Ingest wiring, whole-store backup, legacy seal**
-  - [ ] Store lane
+- [x] **W5 · Ingest wiring, whole-store backup, legacy seal**
+  - [x] Store lane
   - [x] → **D-S15** Partial sidecar v4
   - [x] → **D-S19** Seal-backed legacy aspects
-  - [ ] L-INGEST
+  - [x] L-INGEST
   - [x] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
   - [x] **ROB-10** Admission I
   - [x] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth
@@ -323,7 +323,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 - [ ] **W6 · Durability CI, store split, scheduler**
   - [x] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
   - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
-  - [ ] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
+  - [x] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
   - [ ] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
   - [ ] **FRE-6b** Strict request parsing and caller updates
   - [ ] **SEC-7** Key reload
