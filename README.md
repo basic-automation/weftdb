@@ -1653,6 +1653,16 @@ What it does today:
   what they checked (the verified windows, every query's buckets); the online workload's
   concurrent reads and the GPU pool's discarded outputs carry none. A storage estimate whose
   recorded error exceeds the tolerance it was selected against is no longer publishable.
+- **Several runs per report** (`weft-bench combine --out FILE <RUN.json>...`) — a run's own
+  intervals bound where *that run's* median sits, not where the next one's will. Three
+  `--synthetic --reps 20` runs of one build on one machine (2026-11-02) had p50s of 11.2, 7.9 and
+  8.8 ms, and `compare` called run 1 against run 2 a **+41.9% regression with separated
+  intervals**. `combine` pools the runs' raw samples and redraws each interval runs-first (a
+  two-level bootstrap), so the spread between runs is inside it (here 7.9–11.2 ms), and records
+  each run's p50 and the spread (`between_run`). Two combined reports of the same build then
+  compared clean. A run whose result digest differs fails the combined result; every run's
+  manifest must verify and name the combining binary's clean revision, and the combined report
+  gets its own manifest.
 - **Storage estimate** — each result carries a `StorageEstimate` (recommended
   encoding + value/timestamp/total **bytes/point**) computed by
   `weft-physical-type` over the actual columns. It also surfaces **advisory

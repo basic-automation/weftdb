@@ -31,6 +31,10 @@ only the control plane, not the segment frames.
   index write before it commits), where the planner had walked every segment of the aspect; and
   its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
   Write transactions still see `Busy` at once, as their retry protocol requires.
+- **`weft-bench combine`** (#147): pools separate runs of one benchmark into one report, with
+  intervals from a two-level bootstrap (runs, then samples) so they include the spread between
+  runs, and `between_run` per result. Two runs of one build were 41.9% apart at p50, which
+  `compare` had called a regression; combined reports of that build compare clean.
 - **Result digests** (#147): every `weft-bench` result's correctness carries `result_sha256`,
   a SHA-256 of its canonical output (decimals normalized, so `1.50` and `1.5` agree), and a
   storage estimate whose error exceeds its tolerance makes the result unpublishable.
