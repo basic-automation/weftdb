@@ -838,7 +838,8 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Refere
 	let mut results = Vec::with_capacity(3 * warmths.len());
 
 	let mut load_samples = Vec::with_capacity(load_reps);
-	for _ in 0..if arm.loads() { load_reps } else { 1 } {
+	// An arm whose load is another arm's figure loads once: it only needs the data there.
+	for _ in 0..if arm.loads() && arm.reports_load() { load_reps } else { 1 } {
 		// Outside the clock: the previous rep's teardown is not part of this load.
 		arm.unload();
 		let t0 = Instant::now();
