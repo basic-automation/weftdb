@@ -295,7 +295,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
   - [x] **ROB-10** Admission I
   - [x] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth
-  - [ ] → **SEC-10** Exposure and secrets hygiene
+  - [x] → **SEC-10** Exposure and secrets hygiene
   - [ ] **FRE-5** Compute vocabulary, exact-case tokens and no silent narrowing
   - [ ] **FRE-7b** Immutable declarations, scale rules and schema read-back
   - [x] **EVI-13** DuckDB adapter I

@@ -80,10 +80,13 @@
 //! `Authorization: Bearer <key>` — the only place a credential may travel.
 //! A credential in the query string is refused `400 credentials_in_query`
 //! (the code has been in the §4 table since X-ERR; this slice is its first
-//! producer), because query strings land in logs and proxies. The check
-//! runs as a layer in [`crate::app_with_state`], after the registry's
-//! fail-closed gate has matched the route, and it decides from the same
-//! [`RouteTable`] the gate sealed:
+//! producer), because query strings land in logs and proxies. The refusal
+//! applies in every authentication mode — keys mounted, off, or explicitly
+//! disabled (SEC-10): the leak it prevents does not depend on whether the
+//! server would have accepted the key. The check runs as a layer in
+//! [`crate::app_with_state`], after the registry's fail-closed gate has
+//! matched the route, and it decides from the same [`RouteTable`] the
+//! gate sealed:
 //!
 //! - no `Authorization` header — the caller is the anonymous principal
 //!   (SEC-3's [`Role::Anonymous`], probes only). A route asking for the
@@ -152,9 +155,9 @@ const KEYS_FILE_VERSION: u32 = 1;
 /// with `WWW-Authenticate`).
 const WWW_AUTHENTICATE_VALUE: &str = "Bearer realm=\"weftdb\"";
 
-/// Query parameter names that are credentials, refused when auth is on:
-/// a key belongs in the `Authorization` header, not in a string that
-/// proxies and access logs record.
+/// Query parameter names that are credentials, refused in every auth
+/// mode (SEC-10): a key belongs in the `Authorization` header, not in a
+/// string that proxies and access logs record.
 const CREDENTIAL_QUERY_PARAMS: &[&str] = &["api_key", "apikey", "access_token", "auth_token"];
 
 /// Who a request authenticated as: the key's id and the role the keys
@@ -574,8 +577,18 @@ fn request_is_proxied(headers: &axum::http::HeaderMap) -> bool {
 /// [`crate::app_with_state`] from the state's [`AuthConfig`]; with
 /// authentication explicitly disabled it is a pass-through, and with
 /// authentication off implicitly it is a pass-through except for the
-/// auth-off guard's proxied-request refusal (SEC-8).
+/// auth-off guard's proxied-request refusal (SEC-8). The one refusal no
+/// mode passes through is a credential in the query string, which is
+/// refused before any of the mode branches run (SEC-10).
 pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::body::Body>, next: Next) -> Response {
+	// The credentials-in-query refusal runs first, in every authentication
+	// mode (SEC-10): the harm it prevents — the credential landing in a
+	// proxy's or server's log — does not depend on whether this server
+	// would have accepted the key, and with authentication off or disabled
+	// nothing else in this layer looks at the request at all.
+	if query_carries_a_credential(request.uri().query()) {
+		return ApiError::new(Code::CredentialsInQuery, "credentials belong in the `Authorization: Bearer <key>` header, not in the query string, where they are recorded by proxies and logs").into_response();
+	}
 	let Some(store) = state.auth().key_store() else {
 		if state.auth().is_disabled() {
 			return next.run(request).await;
@@ -585,9 +598,6 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 		}
 		return next.run(request).await;
 	};
-	if query_carries_a_credential(request.uri().query()) {
-		return ApiError::new(Code::CredentialsInQuery, "credentials belong in the `Authorization: Bearer <key>` header, not in the query string, where they are recorded by proxies and logs").into_response();
-	}
 	let Some(matched) = request.extensions().get::<MatchedPath>().map(|matched| matched.as_str().to_string()) else {
 		// No route matched: the registry's fallback refuses it, and a
 		// 404's shape does not depend on who asked.
@@ -782,6 +792,23 @@ mod tests {
 		assert_eq!(send_ingest(router(), "/api/v1/storage/temperature/points", WRITER_TOKEN).await, StatusCode::SERVICE_UNAVAILABLE);
 		// Admin reaches metrics.
 		let (status, _, _) = send(router(), "GET", "/metrics", Some(&bearer(ADMIN_TOKEN))).await;
+		assert_eq!(status, StatusCode::OK);
+	}
+
+	/// SEC-10: the refusal does not depend on the auth mode. With auth
+	/// off or explicitly disabled there is no key check to hide behind,
+	/// and the credential would otherwise sail through into whatever
+	/// logs the request — so those modes refuse it too.
+	#[tokio::test]
+	async fn credentials_in_the_query_string_are_refused_in_every_auth_mode() {
+		for router in [crate::app_with_state(AppState::new()), crate::app_with_state(AppState::new().with_auth(AuthConfig::disabled()))] {
+			let (status, _, body) = send(router, "GET", "/health?access_token=hunter2", None).await;
+			assert_eq!(status, StatusCode::BAD_REQUEST);
+			assert_eq!(body["code"], "credentials_in_query");
+		}
+		// A query string without a credential parameter is untouched by
+		// the refusal in the same modes.
+		let (status, _, _) = send(crate::app_with_state(AppState::new()), "GET", "/health?verbose=1", None).await;
 		assert_eq!(status, StatusCode::OK);
 	}
 
