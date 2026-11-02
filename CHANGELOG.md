@@ -44,11 +44,23 @@ only the control plane, not the segment frames.
   crash windows.
 - **Upgrading a store from v0.1.0 is one-way** (see the warning above), and **v0.1.0 clients
   that send reduction tokens in another case break**: `?agg=Min` is now a `400` (see Changed).
+- **The analytics pipeline can miss a long gap's far side** (#506). `analyze_range` works in
+  chunks of 50,000 points and reads only one step past each chunk's edges, so a gap longer than a
+  chunk (about 35 days at minute resolution) is interpolated without the knot that closes it.
+- **The cross-engine figures are one host's.** `bench/reports/phase1-pooled/` pools two runs on
+  the project machine, warm reps only, at `small` and `medium` scale; its README says which
+  verdicts hold in both runs. Treat a margin under about 1.5× as unsettled.
 - **The macOS and Windows binaries are not signed.** Gatekeeper and SmartScreen warn
   before running them.
 
 ### Added
 
+- **The pooled cross-engine report** (#508), in `bench/reports/phase1-pooled/`: two full
+  `weft-xbench` runs at `small` and `medium` scale against DuckDB, ClickHouse, TimescaleDB,
+  QuestDB, InfluxDB 3 Core and IoTDB, pooled with `combine`. 319 of 320 gates pass, and 105 of
+  112 verdicts hold in both runs: WeftDB wins 17, all against portable SQL, and loses 85,
+  including every load and every comparison with client-side interpolation. The folder's
+  README says which verdicts hold and why the one failing gate (TimescaleDB's) is left failing.
 - **TLS on the server's listener** (security track SEC-5, #468): `WEFT_TLS_CERT_FILE` and
   `WEFT_TLS_KEY_FILE` (a PEM chain and key, read once at startup) put a rustls handshake
   (ALPN `http/1.1`) in front of every connection on the shared serve
