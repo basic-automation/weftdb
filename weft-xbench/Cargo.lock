@@ -502,6 +502,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1890,6 +1891,9 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "rayon",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -4660,8 +4664,10 @@ dependencies = [
  "splimes",
  "sysinfo",
  "tokio",
+ "uuid",
  "weft-arrow",
  "weft-line-protocol",
+ "weft-orchestration",
  "weft-physical-type",
  "weft-reduce",
  "weftdb",
@@ -4674,6 +4680,29 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "splimes",
+]
+
+[[package]]
+name = "weft-orchestration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bigdecimal",
+ "chrono",
+ "futures",
+ "indexmap",
+ "num_cpus",
+ "rand 0.10.3",
+ "rayon",
+ "serde",
+ "serde_json",
+ "splimes",
+ "sysinfo",
+ "tokio",
+ "tracing",
+ "uuid",
+ "weftdb",
+ "wide",
 ]
 
 [[package]]
@@ -4712,6 +4741,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "splimes",
  "tokio",
  "tokio-postgres",

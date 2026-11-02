@@ -480,10 +480,13 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 }
 
 /// Run the crash matrix (D-S21, SOA-9 `crash_kill9`): every failure test at
-/// every matrix seed, one report holding every cell. The report's verdict is
-/// the matrix's verdict — `finish` returns a non-zero exit when any cell's
-/// gate failed — so a scripted caller gates on the exit code, and the
-/// per-cell lines below are the matrix itself, not a summary of it.
+/// every matrix seed, one report per cell, its profile naming the failure and
+/// the seed. One report each, as `--failure` and the query mix write, because
+/// a run manifest grades one result: several results in one report repeat
+/// every measure name, and the manifest refuses that. The exit is the matrix's
+/// verdict — non-zero when any cell's gate failed — so a scripted caller gates
+/// on the exit code, and the per-cell lines below are the matrix itself, not a
+/// summary of it.
 async fn run_crash_matrix(cli: &Cli, profile: &IngestProfile, corpus: &weft_bench::UciCorpus) -> anyhow::Result<ExitCode> {
 	let uci = cli.uci.clone().ok_or_else(|| anyhow::anyhow!("--crash-matrix needs --uci"))?;
 	let params = weft_bench::failure::FailureParams { uci, column: cli.uci_column.clone(), corpus_rows: cli.ingest_rows, rows: cli.failure_rows, reps: cli.failure_reps, compact_to: cli.failure_compact_to, kill_within: std::time::Duration::from_millis(cli.failure_kill_within_ms), seed: cli.seed, exe: std::env::current_exe()? };
@@ -494,8 +497,15 @@ async fn run_crash_matrix(cli: &Cli, profile: &IngestProfile, corpus: &weft_benc
 	for cell in &cells {
 		println!("crash-matrix {:<16} seed {}: {} reps  reopen p50 {:>9.3} ms max {:>9.3} ms  {}", cell.failure.as_str(), cell.seed, cell.result.reps, ms(cell.result.latency.p50_ns), ms(cell.result.latency.max_ns), if cell.passed() { "PASS" } else { "FAIL" });
 	}
-	let results: Vec<BenchResult> = cells.into_iter().map(|cell| cell.result).collect();
-	finish(cli, &BenchReport::with_results(metadata, results))
+	let mut code = ExitCode::SUCCESS;
+	for cell in cells {
+		let mut result = cell.result;
+		result.profile = format!("{}-seed{}", result.profile, cell.seed);
+		if finish(cli, &BenchReport::with_results(metadata.clone(), vec![result]))? != ExitCode::SUCCESS {
+			code = ExitCode::FAILURE;
+		}
+	}
+	Ok(code)
 }
 
 /// Persist a completed report (JSON, and optionally HTML) and print the summary,
