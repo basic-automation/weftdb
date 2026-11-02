@@ -1,3 +1,9 @@
+# yamllint disable rule:line-length
+# This file is written at the width the repository aims at, which is wider than yamllint's
+# 80-column default: `.yamllint` records that width (100) and why the rule is a warning, and
+# 101 lines here were over 80 before any YAML width rule existed. New lines still wrap; the
+# rule is off for this file so that a lint run reports findings about our YAML rather than
+# findings about its history.
 name: CI
 
 on:
@@ -352,11 +358,15 @@ jobs:
       # bundle generator: none of them has any other gate on it, and all three run at
       # release time against a real tag rather than a mocked one. The bench artifact
       # pipeline script (EVI-4) joins them: it runs in CI jobs, so a quoting slip
-      # in it is a red check here rather than a silently empty artifact.
+      # in it is a red check here rather than a silently empty artifact. The
+      # packaging scripts (PAC-9) join them for the same reason: the image build
+      # and its smoke test run in their own workflow, which only the path filter
+      # can reach, so this is the gate that sees them on every pull request.
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck scripts/release/*.sh scripts/compat/*.sh scripts/licenses/*.sh scripts/bench/*.sh
+          shellcheck scripts/release/*.sh scripts/compat/*.sh \
+            scripts/licenses/*.sh scripts/bench/*.sh scripts/packaging/*.sh
       - name: verify.sh tests
         run: scripts/release/test-verify.sh
       - name: stage.sh tests

@@ -1,0 +1,39 @@
+# yamllint configuration for this repository.
+#
+# Nothing in CI runs yamllint (no job, no step) — this file exists so that editor
+# integrations and linting agents apply the width and rule set this repository actually
+# uses instead of yamllint's 80-column default, which no workflow file has ever satisfied:
+# `.github/workflows/ci.yml` alone has 101 lines over 80 on `main`.
+#
+# The width is 100 because that is the width the repository aims at — rustfmt's
+# `max_width` default, which is what the Rust sources and the shell scripts wrap their
+# comments at. Five workflow files exceed it today (`.github/workflows/ci.yml` and
+# `release.yml` at 139, `xbench-smoke.yml` at 125, `publish.yml` at 123,
+# `contribution-terms.yml` at 271), all of them long `run:` arguments and long prose
+# comments rather than anything a reader cannot follow, so the rule is a warning: worth
+# looking at in a new line, not worth a red check on lines that predate this file.
+#
+# Nothing here enforces YAML width. If a maintainer wants that, the job is one CI step and
+# a decision about those five files, and this rule becomes `level: error`.
+extends: default
+
+rules:
+  line-length:
+    max: 100
+    level: warning
+
+  # GitHub Actions uses the `on:` key and bare `on:` triggers; yamllint's truthy rule wants
+  # `true`/`false` and flags `on`, `yes`, `no` as values. Every workflow in the tree starts
+  # with `on:`, so the rule is a mismatch with the file format, not a finding about our YAML.
+  truthy:
+    allowed-values: ["true", "false", "on"]
+    check-keys: false
+
+  # Workflow files conventionally start with `name:`; yamllint's default wants an explicit
+  # `---` document start, which no file here has and adding it to would be pure churn.
+  document-start: disable
+
+  # Our workflow comments are prose at the same indentation as the key they describe, which
+  # `comments-indentation` flags as "comment not indented like content". The prose is clearer
+  # flush with the key it explains.
+  comments-indentation: disable
