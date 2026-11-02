@@ -4,6 +4,84 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-02 — SOA-7: window digests hash the oracle's own encoding, and the self-test judges the judge (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W5) lists SOA-7 by name only — "Window digests
+and the oracle self-test" — and neither the plan nor the queue fixes the digest
+algorithm, what a window is, where digests live, or what the self-test runs
+against. What the sources do fix: SOA-6's DECISIONS entry scopes this slice
+explicitly ("Out of scope … window digests and the oracle self-test (SOA-7)",
+"digests after the core they digest"); the oracle core's doc calls itself "the
+pure core SOA-7's self-test exercises"; the queue's acceptance fixes two
+outcomes — window digests exist in the soak harness, and the oracle self-test
+runs against SOA-6's oracle core; and SOA-6's own rules govern the shape (exact
+comparison, no invented tolerance or threshold; a field added to `SoakRun`
+bumps `SOAK_SCHEMA_VERSION` on SOA's own line; verdicts and records carry no
+free text, so no new redaction path).
+
+**Chosen (grounded in SOA-6's core and rules, under the owner's best-guess
+authorization of 2026-10-26; if merge review disagrees, this decision is
+revisited there):**
+
+1. **A window is a contiguous tick range; its digest is SHA-256 over a
+   canonical point encoding.** New module `weft-bench/src/soak_digest.rs`.
+   Each point is hashed as one line — tick, series, row, timestamp, and the
+   value's format-exact wire form (`GridValue::encode_field`, SOA-4) — so the
+   digest is over exactly what the workload wrote and the oracle compares.
+   SHA-256 and lowercase hex match the manifest's existing digest form
+   (the run manifest already carries `report_sha256`). The first line
+   hashed is a domain separator naming the algorithm
+   (`weftdb-soak-window-digest/1`): an encoding change is a new algorithm,
+   never a silent change to what an old digest means.
+2. **Two computations, one comparison.** `expected_window_digest` regenerates
+   a window from the model alone (also exposed as
+   `SoakOracle::window_digest`); `observed_window_digest` hashes a read-back
+   in the oracle's own input shape (`&[(u64, Vec<ObservedPoint>)]`).
+   The observed side is canonicalized (tick, series, row, timestamp, encoded
+   value) before hashing, so read-back order is irrelevant; duplicates are
+   hashed as many times as they occur, so a duplicated seal changes the
+   digest — the same failure the oracle classifies as `Duplicate`.
+   `WindowDigest::matches` requires the same range, point count, and hash.
+3. **Digests localize; the oracle still judges.** A matching window states
+   exactly what the oracle's per-cell judgement states for those ticks, at
+   hash-comparison cost; a differing window is re-judged tick by tick with
+   SOA-6's core to classify the damage. No tolerance, rate, or threshold is
+   introduced — equality is the only comparison, per SOA-2/SOA-3/SOA-6's
+   refusal to invent pass/fail numbers.
+4. **Digests are recorded on the run record, in window order, and the soak
+   schema takes v3.** `SoakRun.windows: Vec<WindowDigest>`
+   (`#[serde(default)]`, skipped when empty, so v1/v2 artifacts still
+   deserialize) is appended by `SoakHarness::record_window_digest`, only
+   while `Running`, and a window that overlaps or precedes the last recorded
+   one is refused — a window recorded twice would double-count its evidence.
+   Adding the field bumps `SOAK_SCHEMA_VERSION` 2 → 3 per SOA-1's bump rule,
+   on SOA's own line (§3). A digest carries no free text, so
+   `SoakRun::redacted_json` emits it unchanged.
+5. **The self-test is a pure associated function on the core it tests.**
+   `SoakOracle::self_test()` builds its own small deterministic model (never
+   the caller's — a misconfigured run cannot make it vacuous) and runs nine
+   checks whose correct outcomes are known by construction: a faithful
+   read-back passes exactly; each classified corruption (missing, wrong
+   value, wrong timestamp, unexpected, out-of-grid, duplicate) is caught as
+   exactly that kind, once; and the window digests agree with a faithful
+   read-back and disagree after a dropped point. The report
+   (`OracleSelfTestReport`) is `passed()` only when every check passed and
+   at least one ran (the SOA-12 skipped-check rule). It performs no read and
+   touches no server: a driver runs it before a soak, a publisher before
+   trusting a recorded verdict. Check names are fixed constants of the
+   self-test, so the report needs no redaction.
+
+**Rejected:** a verdict field per window on the run record (the verdict is
+the oracle's, recorded once by SOA-6; windows are evidence, not verdicts);
+a non-cryptographic hash (the digest is published evidence — a collision
+must not be able to hide corruption, and sha2 is already a weft-bench
+dependency); hashing the serialized JSON of points (the wire encoding is
+the format-exact form SOA-4 already pins, and JSON field order would make
+the digest depend on serde rather than on the workload); and a self-test
+that runs against a live server or the caller's run model (no slice names
+a read client, and a self-test that inherits the run's configuration can
+pass vacuously against the wrong expectations).
+
 ## 2026-11-01 — FRE-7b: immutable declarations, scale rules and schema read-back — the shapes the plan left open (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan names the slice (§6 W5), fixes that widening goes through
