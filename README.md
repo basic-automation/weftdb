@@ -1663,6 +1663,29 @@ What it does today:
   compared clean. A run whose result digest differs fails the combined result; every run's
   manifest must verify and name the combining binary's clean revision, and the combined report
   gets its own manifest.
+- **Saturation sweeps** (`weft-bench sweep KNOB=v1,v2,… [--out-dir=DIR] -- RUN ARGS`) — one
+  setting says how fast a run was there, not where it stops getting faster. The sweep runs the
+  benchmark once per value of any run flag (`--ingest-batch`, `--ingest-online`, `--points`,
+  `--sp-series`, …) or of the worker pool (`threads`, via `RAYON_NUM_THREADS`), each value's
+  report and manifest in `DIR/<knob>=<value>`, and lays every result out as a curve in
+  `sweep.json` and `sweep.md`, naming its knee: the first value past which a step buys under 10%
+  more throughput. On UCI (2026-11-02), 2M-row ingest went 109k → 493k → 1.56M → 3.19M → 4.57M
+  rows/s from 1,024- to 262,144-row batches: no knee in range.
+- **Seeded query mix** (`--ingest --query-mix OPS`) — the soak harness's lane model replayed
+  against one store: each operation ingests a batch, looks up a point or scans a range, its lane
+  drawn from the seed and its index (`--query-mix-weights INGEST,POINT,RANGE`, 60,20,20 by
+  default), so a published seed regenerates the exact sequence. Reads are checked exactly against
+  the corpus and each lane is a report of its own, digest included.
+- **Post-compaction reads** (`--compressed-query-compact ROWS`) — after the compressed-query
+  windows, the store is compacted to ROWS-row segments and the same windows asked again as
+  `-compacted` results, each gated on answering exactly as before.
+- **Cross-engine runs, pooled and pinned** (`weft-xbench`, report v6) — each gate carries an
+  `answer_sha256` of its arm's answer, so separate runs of one arm can be shown to agree;
+  `weft-xbench combine RUN.json… --out DIR` pools runs as `weft-bench combine` does, and the
+  rendered report calls a win or a loss only where the pooled intervals separate *and* every
+  run's median falls the same way. A report of a single run says so. The run manifest records the
+  input files' and binary's SHA-256 and, with `--container ENGINE=NAME`, each engine container's
+  image digest, command line and environment, with secret-looking variables redacted.
 - **Storage estimate** — each result carries a `StorageEstimate` (recommended
   encoding + value/timestamp/total **bytes/point**) computed by
   `weft-physical-type` over the actual columns. It also surfaces **advisory

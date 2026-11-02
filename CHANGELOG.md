@@ -31,6 +31,27 @@ only the control plane, not the segment frames.
   index write before it commits), where the planner had walked every segment of the aspect; and
   its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
   Write transactions still see `Busy` at once, as their retry protocol requires.
+- **`weft-bench sweep`** (#147): `weft-bench sweep KNOB=v1,v2,… -- RUN ARGS` runs a benchmark
+  once per value of any run flag, or of the worker pool (`threads`), each into its own directory
+  with its own report and manifest, and writes `sweep.json` and `sweep.md`: every result as a
+  curve over the knob, with its knee (the first value past which a step gains under 10%
+  throughput). On UCI, 2M-row ingest climbs from 109k rows/s at 1,024-row batches to 4.57M at
+  262,144 with no knee yet.
+- **Seeded query mix** (#147): `weft-bench --ingest --query-mix OPS` replays the soak harness's
+  lane model against one store, each operation's lane (ingest a batch, look up a point, scan a
+  range) drawn from `--seed` and the operation's index, with `--query-mix-weights` (60,20,20 by
+  default), `--query-mix-rows` and `--query-mix-range`. Every read is checked exactly; one report
+  per lane, each with a digest of its answers. 3,000 operations over 10M UCI rows passed.
+- **Post-compaction reads** (#147): `--compressed-query-compact ROWS` compacts the
+  compressed-query store to ROWS-row segments after the measured windows and asks the same seeded
+  windows again, as `-compacted` results that must answer digest for digest as before.
+- **`weft-xbench` answer digests, `combine` and run manifest** (#147, report v6): each gate
+  carries `answer_sha256` (values to twelve significant digits, so a parallel sum's last bit does
+  not count); `weft-xbench combine RUN.json… --out DIR` pools runs with run-first intervals, and
+  the renderer calls a win or loss only where every run's median agrees, flagging a report of one
+  run as such; the report records its input files' and binary's SHA-256 and, with
+  `--container ENGINE=NAME`, each engine container's image digest, command and environment
+  (secret-looking variables redacted).
 - **`weft-bench combine`** (#147): pools separate runs of one benchmark into one report, with
   intervals from a two-level bootstrap (runs, then samples) so they include the spread between
   runs, and `between_run` per result. Two runs of one build were 41.9% apart at p50, which

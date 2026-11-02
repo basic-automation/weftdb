@@ -37,12 +37,13 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
 - [ ] Fair-protocol depth (Phase 1.1)
   - [x] **DONE (2026-11-02) — raw samples, ≥10 samples per short test, stddev intervals** (#147): every result of both harnesses keeps `samples_ns`; `weft-bench verify` flags a short result under 10 samples; `weft-xbench` defaults to 10 reps
   - [x] **DONE (2026-11-02) — result hashes** (#147): `correctness.result_sha256` over each workload's canonical output; the storage error bound gates publishing
-    - [ ] **NEXT — the same digest in `weft-xbench`**, per engine, where an engine's answer is exact (load and downsample); interpolation agrees only within tolerance, so it keeps the max-diff gate
+    - [x] **DONE (2026-11-02) — the same digest in `weft-xbench`** (`answer_sha256`, report v6): per arm, values to twelve significant digits, so separate runs of one arm can be shown to agree; arms are still compared with each other by the max-diff gate
   - [x] **DONE (2026-11-02) — several runs per report** (`weft-bench combine`, #147): pooled samples, intervals drawn runs-first, `between_run` per result; two runs of one build 41.9% apart no longer read as a regression (DECISIONS 2026-10-29, EVI-15)
-    - [ ] **NEXT — the same in `weft-xbench`**, whose EVI-15 rows are where the spread was found, and a renderer verdict only where every run agrees
-  - [ ] **NEXT — saturation sweeps** (`--sweep KNOB=v1,v2,…` over batch size, readers, series, parallelism) and a seeded query mix from the soak lanes
-  - [ ] **NEXT — a run manifest for `weft-xbench`**, with image digests, input file hashes and each engine's live settings
-  - [ ] Post-compaction reads wait on engine compaction (§7.5); restart-during-ingest and crash-during-compaction tests wait on the crash matrix (SOA-9, D-S21)
+    - [x] **DONE (2026-11-02) — the same in `weft-xbench`** (`weft-xbench combine`): run-first intervals, and a rendered win or loss only where every run's median agrees; a one-run report is flagged as one
+  - [x] **DONE (2026-11-02) — saturation sweeps and a seeded query mix** (`weft-bench sweep KNOB=v1,… -- ARGS`, `--query-mix OPS`): any run flag or the worker pool swept into curves with their knees (2M-row UCI ingest: 109k → 4.57M rows/s from 1k- to 256k-row batches, no knee yet); the soak lanes replayed against one store from a published seed, every read exact
+  - [x] **DONE (2026-11-02) — a run manifest for `weft-xbench`**: input file and binary SHA-256, and with `--container` each engine container's image digest, command and environment (secrets redacted)
+  - [x] **DONE (2026-11-02) — post-compaction reads** (`--compressed-query-compact ROWS`): the store's own squash (`squash_aspect_to_target_rows`), then the same seeded windows, gated on identical answers
+  - [ ] Restart-during-ingest and crash-during-compaction tests wait on the crash matrix (SOA-9, D-S21); network retry is the soak client's (SOA-6)
 - [ ] Fair interpolation comparisons (Phase 1.2)
 - [ ] Report surfaces beyond JSON/HTML/Parquet
 - [ ] Anti-Goodhart (Phase 1.3)
