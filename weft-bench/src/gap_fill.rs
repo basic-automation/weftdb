@@ -291,7 +291,7 @@ pub fn run_gap_fill_on(profile: &GapFillProfile, corpus: &GapFillCorpus, generat
 	let filled_match = filled.iter().map(|b| b.timestamp).eq(expected_filled.iter().copied());
 	let counted: usize = grid.iter().map(|b| b.count).sum();
 	let values_finite = grid.iter().flat_map(|b| b.values.values()).all(|v| v.to_f64().is_some_and(f64::is_finite));
-	let correctness = CorrectnessReport { output_count_ok: dense && filled_match && counted == corpus.points.len(), expected_output_points: expected_filled.len(), actual_output_points: filled.len(), values_finite };
+	let correctness = CorrectnessReport { output_count_ok: dense && filled_match && counted == corpus.points.len(), expected_output_points: expected_filled.len(), actual_output_points: filled.len(), values_finite, result_sha256: Some(crate::schema::bucket_digest(&grid)) };
 
 	// Accuracy: each filled outage bucket's value against the truth under it.
 	let key = p.aggregation.as_str();
@@ -311,7 +311,7 @@ pub fn run_gap_fill_on(profile: &GapFillProfile, corpus: &GapFillCorpus, generat
 	#[allow(clippy::cast_precision_loss)]
 	let missingness_fraction = 1.0 - corpus.points.len() as f64 / corpus.generated as f64;
 	let irregular = corpus.points.windows(3).any(|w| w[2].timestamp - w[1].timestamp != w[1].timestamp - w[0].timestamp);
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GAP_FILL.to_string(), reps, dataset: DatasetMeta { input_points: corpus.points.len(), output_points: grid.len(), irregular, missingness_fraction, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GAP_FILL.to_string(), reps, dataset: DatasetMeta { input_points: corpus.points.len(), output_points: grid.len(), irregular, missingness_fraction, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
 }
 
 #[cfg(test)]

@@ -226,7 +226,7 @@ pub fn run_sparse(profile: &SparseProfile, reps: usize) -> anyhow::Result<BenchR
 	// Correctness: one aggregate per populated cell, in the order the generator recorded, each
 	// equal to the mean the generator computed, and every value finite.
 	let aggregates_match = scanned.len() == table.expected.len() && scanned.iter().zip(table.expected.iter()).all(|(got, want)| (got - want).abs() <= 1e-9);
-	let correctness = CorrectnessReport { output_count_ok: aggregates_match, expected_output_points: table.expected.len(), actual_output_points: scanned.len(), values_finite: scanned.iter().all(|value| value.is_finite()) };
+	let correctness = CorrectnessReport { output_count_ok: aggregates_match, expected_output_points: table.expected.len(), actual_output_points: scanned.len(), values_finite: scanned.iter().all(|value| value.is_finite()), result_sha256: Some(crate::schema::ResultDigest::of(scanned.iter().enumerate())) };
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.params.seed ^ 0x50A8_C1EC_7B10, ..BootstrapConfig::default() }));
@@ -235,7 +235,7 @@ pub fn run_sparse(profile: &SparseProfile, reps: usize) -> anyhow::Result<BenchR
 	#[allow(clippy::cast_precision_loss)]
 	let missingness_fraction = if table.capacity > 0 { 1.0 - table.populated as f64 / table.capacity as f64 } else { 0.0 };
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_SPARSE.to_string(), reps, dataset: DatasetMeta { input_points: table.populated, output_points: scanned.len(), irregular: false, missingness_fraction, seed: profile.params.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_SPARSE.to_string(), reps, dataset: DatasetMeta { input_points: table.populated, output_points: scanned.len(), irregular: false, missingness_fraction, seed: profile.params.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
 }
 
 /// The nanoseconds elapsed since `since`, saturating at `u64::MAX`.

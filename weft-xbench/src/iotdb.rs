@@ -31,7 +31,7 @@ use std::{
 
 use bigdecimal::ToPrimitive;
 
-use crate::{weft::Arm, ArmInfo, BucketRow, Dataset, Output};
+use crate::{client_linear, place, weft::Arm, ArmClass, ArmInfo, BucketRow, Dataset, Output};
 
 /// Counter distinguishing databases of arms alive at once.
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +63,14 @@ SELECT CASE
 END v
 FROM j CROSS JOIN f ORDER BY gt
 ";
+
+/// The native fill (class A), with `{start}`, `{end}` and `{step}` in epoch nanoseconds: bucket
+/// averages at the grid's step over the grid, empty buckets filled by `FILL METHOD LINEAR`.
+/// `LINEAR` fill needs its time column as a `TIMESTAMP`, so the bucket is cast to `INT64` outside.
+const NATIVE_SQL: &str = "SELECT CAST(g AS INT64) b, v FROM (SELECT date_bin_gapfill({step}ns, time, {start}) g, avg(v) v FROM knots WHERE time >= {start} AND time <= {end} GROUP BY 1 FILL METHOD LINEAR) ORDER BY b";
+
+/// The raw knots a client fetches (class C), in instant order.
+const FETCH_SQL: &str = "SELECT CAST(time AS INT64) t, v FROM knots ORDER BY time";
 
 /// Count, min, max and avg per epoch-aligned bucket of `{width}` nanoseconds.
 const DOWNSAMPLE_SQL: &str = "SELECT CAST(date_bin({width}ns, time) AS INT64) b, count(*) n, min(v) mn, max(v) mx, avg(v) av FROM knots GROUP BY 1 ORDER BY 1";
@@ -151,13 +159,14 @@ impl Drop for Db {
 
 /// Apache `IoTDB` with the knots stored as a `DOUBLE` field.
 pub struct IoTdb {
+	class: ArmClass,
 	server: Server,
 	db: Option<Db>,
 }
 
 impl std::fmt::Debug for IoTdb {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("IoTdb").field("server", &self.server).field("loaded", &self.db.is_some()).finish()
+		f.debug_struct("IoTdb").field("server", &self.server).field("class", &self.class).field("loaded", &self.db.is_some()).finish()
 	}
 }
 
@@ -165,7 +174,19 @@ impl IoTdb {
 	/// `iotdb-double`.
 	#[must_use]
 	pub const fn double(server: Server) -> Self {
-		Self { server, db: None }
+		Self { class: ArmClass::PortableSql, server, db: None }
+	}
+
+	/// `iotdb-native`: `date_bin_gapfill` with `FILL METHOD LINEAR`.
+	#[must_use]
+	pub const fn native(server: Server) -> Self {
+		Self { class: ArmClass::Native, server, db: None }
+	}
+
+	/// `iotdb-client`: the knots fetched and interpolated in this client.
+	#[must_use]
+	pub const fn client(server: Server) -> Self {
+		Self { class: ArmClass::ClientSide, server, db: None }
 	}
 
 	/// Run `f` with the loaded database on tokio's blocking pool, as the `DuckDB` arms do, so the
@@ -210,7 +231,21 @@ fn i64_cell(cell: Option<&serde_json::Value>) -> anyhow::Result<i64> {
 impl Arm for IoTdb {
 	fn info(&self) -> ArmInfo {
 		let version = self.server.version().unwrap_or_else(|_| "unknown".into());
-		ArmInfo { arm: "iotdb-double".into(), engine: format!("iotdb {version}"), value_type: "DOUBLE field".into(), method: format!("linear interpolation in SQL: lead() into segments, date_bin_gapfill() grid, ASOF LEFT JOIN from the grid, first/last segment extended; downsample via date_bin; table model, one device; insertTablet of {ROWS_PER_INSERT} rows in time order, answered once the WAL entry is synced (wal_mode=SYNC); table REST API (JSON) on loopback") }
+		let storage = format!("table model, one device; insertTablet of {ROWS_PER_INSERT} rows in time order, answered once the WAL entry is synced (wal_mode=SYNC); table REST API (JSON) on loopback");
+		let (engine, value_type) = (format!("iotdb {version}"), "DOUBLE field".to_string());
+		match self.class {
+			ArmClass::PortableSql => ArmInfo { arm: "iotdb-double".into(), engine, value_type, method: format!("linear interpolation in SQL: lead() into segments, date_bin_gapfill() grid, ASOF LEFT JOIN from the grid, first/last segment extended; downsample via date_bin; {storage}"), class: Some(self.class), own_answer: None },
+			ArmClass::Native => ArmInfo { arm: "iotdb-native".into(), engine, value_type, method: format!("native fill: date_bin_gapfill(step) over avg(v), FILL METHOD LINEAR; {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones; nothing before the first knot's bucket or after the last's".into()) },
+			ArmClass::ClientSide => ArmInfo { arm: "iotdb-client".into(), engine, value_type, method: format!("client-side: every knot fetched in instant order as JSON, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None },
+		}
+	}
+
+	fn reports_load(&self) -> bool {
+		self.class == ArmClass::PortableSql
+	}
+
+	fn downsamples(&self) -> bool {
+		self.class == ArmClass::PortableSql
 	}
 
 	fn unload(&mut self) {
@@ -255,6 +290,19 @@ impl Arm for IoTdb {
 		let step = ds.resolution.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("grid step out of range"))?;
 		let sql = INTERPOLATE_SQL.replace("{start}", &start.to_string()).replace("{end}", &end.to_string()).replace("{step}", &step.to_string()).replace("{lo}", &(start - step).to_string()).replace("{hi}", &(end + step).to_string());
 		let rows = ds.grid_len();
+		match self.class {
+			ArmClass::Native => {
+				let sql = NATIVE_SQL.replace("{start}", &start.to_string()).replace("{end}", &end.to_string()).replace("{step}", &step.to_string());
+				let pairs = self.on_db(move |server, db| server.query(db, &sql, rows)?.iter().map(|r| Ok((i64_cell(r.get(0))?, f64_cell(r.get(1))?))).collect::<anyhow::Result<Vec<_>>>()).await?;
+				return Ok(Output::Float(place(&pairs, start, step, rows)));
+			}
+			ArmClass::ClientSide => {
+				let knots = ds.points.len();
+				let (t, v): (Vec<i64>, Vec<f64>) = self.on_db(move |server, db| server.query(db, FETCH_SQL, knots)?.iter().map(|r| Ok((i64_cell(r.get(0))?, f64_cell(r.get(1))?))).collect::<anyhow::Result<Vec<_>>>()).await?.into_iter().unzip();
+				return Ok(Output::Float(client_linear(&t, &v, start, step, rows)));
+			}
+			ArmClass::PortableSql => {}
+		}
 		Ok(Output::Float(self.on_db(move |server, db| server.query(db, &sql, rows)?.iter().map(|r| f64_cell(r.get(0))).collect()).await?))
 	}
 

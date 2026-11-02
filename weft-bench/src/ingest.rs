@@ -157,7 +157,7 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 
 	let (read_ts, read_values) = &last_read;
 	let round_trips_exactly = read_ts == timestamps && read_values.iter().map(Option::as_ref).eq(values.iter().map(Some));
-	let correctness = CorrectnessReport { output_count_ok: round_trips_exactly, expected_output_points: timestamps.len(), actual_output_points: read_ts.len(), values_finite: read_values.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite)) };
+	let correctness = CorrectnessReport { output_count_ok: round_trips_exactly, expected_output_points: timestamps.len(), actual_output_points: read_ts.len(), values_finite: read_values.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite)), result_sha256: Some(crate::schema::column_digest(read_ts, read_values)) };
 
 	let storage = Some(StorageEstimate::from_columns(values, timestamps, TimeUnit::Seconds, &BigDecimal::from(0)));
 	let latency = LatencyStats::from_samples(&samples_ns);
@@ -170,7 +170,7 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
 }
 
 /// What the store held at one checkpoint of an ingest growth curve (schema v24).
@@ -212,7 +212,7 @@ impl Tiled<'_> {
 	}
 
 	/// Rows `start..end`, which must lie within one copy.
-	fn window(&self, start: u64, end: u64) -> anyhow::Result<(Vec<i64>, &[BigDecimal])> {
+	pub(crate) fn window(&self, start: u64, end: u64) -> anyhow::Result<(Vec<i64>, &[BigDecimal])> {
 		let n = self.timestamps.len() as u64;
 		let at = usize::try_from(start % n)?;
 		let len = usize::try_from(end - start)?;
@@ -283,10 +283,14 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 		let mut rows_verified = 0;
 		let mut exact = true;
 		let mut finite = true;
+		let mut digest = crate::schema::ResultDigest::default();
 		let window = (GROWTH_VERIFY_ROWS as u64).min(checkpoint);
 		for (from, to) in [(0, window), (checkpoint - window, checkpoint)] {
 			// The window at the end may cross a copy boundary: compare it one copy at a time.
 			let (read_ts, read_values) = store.read_time_range(&profile.aspect, tiled.timestamp(from)?, tiled.timestamp(to - 1)?).await.map_err(|e| anyhow::anyhow!("cannot read back aspect {}: {e:#}", profile.aspect))?;
+			for (t, v) in read_ts.iter().zip(&read_values) {
+				digest.row(t, crate::schema::nullable_text(v.as_ref()));
+			}
 			let mut expected_ts = Vec::new();
 			let mut expected_values: Vec<&BigDecimal> = Vec::new();
 			let mut at = from;
@@ -306,28 +310,9 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 		let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
 		let throughput_points_per_sec = if measured_ns > 0 { rows_stage as f64 / (measured_ns as f64 / 1e9) } else { 0.0 };
 		let growth = GrowthPoint { rows_total: checkpoint, rows_stage, corpus_copies: checkpoint as f64 / n as f64, segments: stats.segment_count, segment_bytes: stats.total_bytes, bytes_per_point: stats.bytes_per_point, rows_verified, verify_read_ns };
-		let correctness = CorrectnessReport { output_count_ok: accounted && exact, expected_output_points: usize::try_from(checkpoint)?, actual_output_points: usize::try_from(stats.total_rows)?, values_finite: finite };
+		let correctness = CorrectnessReport { output_count_ok: accounted && exact, expected_output_points: usize::try_from(checkpoint)?, actual_output_points: usize::try_from(stats.total_rows)?, values_finite: finite, result_sha256: Some(digest.finish()) };
 		let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(stage_start) };
-		on_checkpoint(BenchResult {
-			schema_version: SCHEMA_VERSION,
-			profile: format!("{}-{}", profile.name, count_label(checkpoint)),
-			adapter: "weftdb".to_string(),
-			workload: WORKLOAD_INGEST_GROWTH.to_string(),
-			reps: samples_ns.len(),
-			dataset: DatasetMeta { input_points: usize::try_from(checkpoint)?, output_points: usize::try_from(stats.total_rows)?, irregular, missingness_fraction, seed: 0, signal_shape: None },
-			latency: LatencyStats::from_samples(&samples_ns),
-			latency_ci: None,
-			throughput_points_per_sec,
-			timing,
-			correctness,
-			accuracy: None,
-			storage: None,
-			cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns),
-			gpu_pool: None,
-			adapter_info: None,
-			growth: Some(growth),
-			online: None, compressed_query: None, analytics: None,
-		})?;
+		on_checkpoint(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, count_label(checkpoint)), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST_GROWTH.to_string(), reps: samples_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(checkpoint)?, output_points: usize::try_from(stats.total_rows)?, irregular, missingness_fraction, seed: 0, signal_shape: None }, latency: LatencyStats::from_samples(&samples_ns), latency_ci: None, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: Some(growth), online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })?;
 	}
 	drop(store);
 	Ok(())
@@ -443,13 +428,12 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 	// The phases run on a runtime of their own, on a thread of their own: a runtime cannot be
 	// entered from inside the caller's.
 	let (alone_ns, online_ns, online, idle, stats) = std::thread::scope(|scope| {
-		scope
-			.spawn(|| {
-				let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(params.readers + 1).enable_all().build()?;
-				runtime.block_on(online_phases(&profile, corpus, period, value_scale, params))
-			})
-			.join()
-			.map_err(|_| anyhow::anyhow!("the online ingest thread panicked"))?
+		scope.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(params.readers + 1).enable_all().build()?;
+			runtime.block_on(online_phases(&profile, corpus, period, value_scale, params))
+		})
+		.join()
+		.map_err(|_| anyhow::anyhow!("the online ingest thread panicked"))?
 	})?;
 
 	let rows = params.rows;
@@ -458,42 +442,10 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 	let accounted = stats.0 == rows && stats.1;
 	let mismatched_queries = online.mismatched_queries + idle.mismatched_queries;
 	let failed_queries = online.failed_queries + idle.failed_queries;
-	let point = OnlinePoint {
-		readers: params.readers,
-		window_rows: params.window_rows,
-		rows,
-		ingest_alone_rows_per_sec: throughput(alone_ns),
-		tail_queries: online.tail_queries,
-		idle_queries: idle.samples_ns.len(),
-		idle_p50_ns: idle_latency.p50_ns,
-		idle_p99_ns: idle_latency.p99_ns,
-		rows_verified: online.rows_verified + idle.rows_verified,
-		mismatched_queries,
-		failed_queries,
-		first_error: online.first_error.or(idle.first_error),
-	};
-	let correctness = CorrectnessReport { output_count_ok: accounted && mismatched_queries == 0 && failed_queries == 0, expected_output_points: usize::try_from(point.rows_verified)?, actual_output_points: usize::try_from(online.rows_read + idle.rows_read)?, values_finite: online.finite && idle.finite };
+	let point = OnlinePoint { readers: params.readers, window_rows: params.window_rows, rows, ingest_alone_rows_per_sec: throughput(alone_ns), tail_queries: online.tail_queries, idle_queries: idle.samples_ns.len(), idle_p50_ns: idle_latency.p50_ns, idle_p99_ns: idle_latency.p99_ns, rows_verified: online.rows_verified + idle.rows_verified, mismatched_queries, failed_queries, first_error: online.first_error.or(idle.first_error) };
+	let correctness = CorrectnessReport { output_count_ok: accounted && mismatched_queries == 0 && failed_queries == 0, expected_output_points: usize::try_from(point.rows_verified)?, actual_output_points: usize::try_from(online.rows_read + idle.rows_read)?, values_finite: online.finite && idle.finite, result_sha256: None };
 	let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns: online_ns, end_to_end_ns: span_ns(run_start).saturating_add(generation_ns) };
-	Ok(BenchResult {
-		schema_version: SCHEMA_VERSION,
-		profile: profile.name,
-		adapter: "weftdb".to_string(),
-		workload: WORKLOAD_INGEST_ONLINE.to_string(),
-		reps: online.samples_ns.len(),
-		dataset: DatasetMeta { input_points: usize::try_from(rows)?, output_points: usize::try_from(stats.0)?, irregular, missingness_fraction, seed: params.seed, signal_shape: None },
-		latency: LatencyStats::from_samples(&online.samples_ns),
-		latency_ci: None,
-		throughput_points_per_sec: throughput(online_ns),
-		timing,
-		correctness,
-		accuracy: None,
-		storage: None,
-		cold_warm: crate::schema::ColdWarm::from_samples(&online.samples_ns),
-		gpu_pool: None,
-		adapter_info: None,
-		growth: None,
-		online: Some(point), compressed_query: None, analytics: None,
-	})
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name, adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST_ONLINE.to_string(), reps: online.samples_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(rows)?, output_points: usize::try_from(stats.0)?, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, latency: LatencyStats::from_samples(&online.samples_ns), latency_ci: None, throughput_points_per_sec: throughput(online_ns), timing, correctness, accuracy: None, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&online.samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: Some(point), compressed_query: None, analytics: None, samples_ns: online.samples_ns.clone(), between_run: None })
 }
 
 /// A fresh store with the aspect declared, in a directory removed when the guard drops.

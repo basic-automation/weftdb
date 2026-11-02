@@ -252,7 +252,7 @@ pub fn run_compression_on(run: &CorpusRun<'_>, timestamps: &[i64], values: &[Big
 	let (dec_ts, dec_vals) = &last_decoded;
 	let round_trips = dec_ts.as_slice() == timestamps && dec_vals == &expected_values;
 	let values_finite = dec_vals.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite));
-	let correctness = CorrectnessReport { output_count_ok: dec_ts.len() == timestamps.len() && round_trips, expected_output_points: timestamps.len(), actual_output_points: dec_ts.len(), values_finite };
+	let correctness = CorrectnessReport { output_count_ok: dec_ts.len() == timestamps.len() && round_trips, expected_output_points: timestamps.len(), actual_output_points: dec_ts.len(), values_finite, result_sha256: Some(crate::schema::column_digest(dec_ts, dec_vals)) };
 
 	let storage = Some(StorageEstimate::from_columns(values, timestamps, run.unit, &BigDecimal::from(0)));
 
@@ -270,7 +270,7 @@ pub fn run_compression_on(run: &CorpusRun<'_>, timestamps: &[i64], values: &[Big
 	};
 	let irregular = timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]);
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: run.name.to_string(), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSION.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: dec_ts.len(), irregular, missingness_fraction: 0.0, seed: run.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: run.name.to_string(), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSION.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: dec_ts.len(), irregular, missingness_fraction: 0.0, seed: run.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
 }
 
 /// Load a real `(timestamp, value)` corpus from a CSV file for [`run_compression_on`].

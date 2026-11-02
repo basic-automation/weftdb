@@ -14,7 +14,14 @@
 //! Each window size (an hour, a day, a week, 30 days and a year of minute rows) is one result.
 //! Every query picks a seeded random window, runs both paths (alternating which goes first, so
 //! neither always meets a cache the other warmed), and is gated on the two answers being
-//! identical bucket for bucket. The aggregations are the streaming ones (min, max, avg, sum,
+//! identical bucket for bucket.
+//!
+//! With [`CompressedQueryParams::compact_to`] the run then compacts the store
+//! ([`SegmentStore::squash_aspect_to_target_rows`]) and asks the same seeded windows again, as
+//! `…-compacted` results: the post-compaction reads of the fair protocol (1.1). A compacted
+//! window must also answer exactly as it did before the compaction, digest for digest.
+//!
+//! The aggregations are the streaming ones (min, max, avg, sum,
 //! first, last) at hourly buckets: an exact percentile needs every row of a bucket, so it has no
 //! compressed shortcut to measure.
 
@@ -50,6 +57,8 @@ pub struct CompressedQueryParams {
 	pub queries: usize,
 	/// Seed for the query windows.
 	pub seed: u64,
+	/// Compact the store to segments of this many rows, then ask the same windows again.
+	pub compact_to: Option<u64>,
 }
 
 /// The decode-then-reduce baseline and the store's footprint for one window size (schema v26).
@@ -109,13 +118,48 @@ pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], v
 	let stats = store.aspect_stats(&profile.aspect).await.map_err(|e| anyhow::anyhow!("cannot read the stats of aspect {}: {e:#}", profile.aspect))?;
 	anyhow::ensure!(stats.total_rows == params.rows, "the store holds {} rows after sealing {}", stats.total_rows, params.rows);
 
+	let before = windows_pass(&Pass { store: &store, profile, tiled: &tiled, params, stats: &stats, irregular, missingness_fraction, generation_ns, suffix: "", before: None }, &mut on_window).await?;
+	if let Some(target) = params.compact_to {
+		let t0 = Instant::now();
+		store.squash_aspect_to_target_rows(&profile.aspect, usize::try_from(target)?).await.map_err(|e| anyhow::anyhow!("cannot compact aspect {}: {e:#}", profile.aspect))?;
+		let compact_ns = span_ns(t0);
+		let stats_after = store.aspect_stats(&profile.aspect).await.map_err(|e| anyhow::anyhow!("cannot read the stats of aspect {}: {e:#}", profile.aspect))?;
+		anyhow::ensure!(stats_after.total_rows == params.rows, "the store holds {} rows after compacting {}", stats_after.total_rows, params.rows);
+		eprintln!("compacted {} -> {} segments in {:.3} s", stats.segment_count, stats_after.segment_count, std::time::Duration::from_nanos(compact_ns).as_secs_f64());
+		windows_pass(&Pass { store: &store, profile, tiled: &tiled, params, stats: &stats_after, irregular, missingness_fraction, generation_ns, suffix: "-compacted", before: Some(&before) }, &mut on_window).await?;
+	}
+	Ok(())
+}
+
+/// One pass of every window size over the store as it stands.
+struct Pass<'a> {
+	store: &'a weftdb::SegmentStore,
+	profile: &'a IngestProfile,
+	tiled: &'a Tiled<'a>,
+	params: CompressedQueryParams,
+	stats: &'a weftdb::AspectStorageStats,
+	irregular: bool,
+	missingness_fraction: f64,
+	generation_ns: u64,
+	/// Appended to each result's profile (`-compacted`).
+	suffix: &'a str,
+	/// The digests an earlier pass returned, which this one must reproduce.
+	before: Option<&'a [String]>,
+}
+
+/// Run every window size once; returns each size's answer digest, in order.
+#[allow(clippy::cast_precision_loss)]
+async fn windows_pass(pass: &Pass<'_>, on_window: &mut impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<Vec<String>> {
+	let Pass { store, profile, tiled, params, stats, irregular, missingness_fraction, generation_ns, suffix, before } = *pass;
 	let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
+	let mut digests = Vec::with_capacity(COMPRESSED_QUERY_WINDOWS.len());
 	for (label, nominal) in COMPRESSED_QUERY_WINDOWS {
 		let window_rows = nominal.min(params.rows);
 		let window_start = Instant::now();
 		let (mut in_store_ns, mut decode_ns) = (Vec::with_capacity(params.queries), Vec::with_capacity(params.queries));
 		let (mut rows_scanned, mut in_store_buckets, mut decode_buckets) = (0_u64, 0_usize, 0_usize);
 		let mut identical = true;
+		let mut digest = crate::schema::ResultDigest::default();
 		for query in 0..params.queries {
 			let from = rng.random_range(0..=params.rows - window_rows);
 			let (start, end) = (tiled.timestamp(from)?, tiled.timestamp(from + window_rows - 1)?);
@@ -137,58 +181,30 @@ pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], v
 				}
 			}
 			let (in_store, decoded) = (in_store.unwrap_or_default(), decoded.unwrap_or_default());
+			for (start, row) in in_store.iter().map(crate::schema::bucket_row) {
+				digest.row(start, row);
+			}
 			identical &= in_store == decoded && in_store.iter().map(|b| b.count as u64).sum::<u64>() == window_rows;
 			in_store_buckets += in_store.len();
 			decode_buckets += decoded.len();
 		}
 
+		let digest = digest.finish();
+		// After a compaction a window must answer exactly as it did before.
+		identical &= before.is_none_or(|b| b.get(digests.len()) == Some(&digest));
+		digests.push(digest.clone());
 		let latency = LatencyStats::from_samples(&in_store_ns);
 		let decode = LatencyStats::from_samples(&decode_ns);
 		let measured_ns = in_store_ns.iter().copied().fold(0_u64, u64::saturating_add);
-		let point = CompressedQueryPoint {
-			window: label.to_string(),
-			window_rows,
-			rows_scanned,
-			buckets: in_store_buckets,
-			decode_p50_ns: decode.p50_ns,
-			decode_p99_ns: decode.p99_ns,
-			decode_mean_ns: decode.mean_ns,
-			speedup_p50: if latency.p50_ns > 0 { decode.p50_ns as f64 / latency.p50_ns as f64 } else { 0.0 },
-			segments: stats.segment_count,
-			bytes_per_point: stats.bytes_per_point,
-		};
-		on_window(BenchResult {
-			schema_version: SCHEMA_VERSION,
-			profile: format!("{}-{label}", profile.name),
-			adapter: "weftdb".to_string(),
-			workload: WORKLOAD_COMPRESSED_QUERY.to_string(),
-			reps: in_store_ns.len(),
-			dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: in_store_buckets, irregular, missingness_fraction, seed: params.seed, signal_shape: None },
-			throughput_points_per_sec: if measured_ns > 0 { rows_scanned as f64 / (measured_ns as f64 / 1e9) } else { 0.0 },
-			cold_warm: crate::schema::ColdWarm::from_samples(&in_store_ns),
-			latency,
-			latency_ci: None,
-			timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) },
-			correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true },
-			accuracy: None,
-			storage: None,
-			gpu_pool: None,
-			adapter_info: None,
-			growth: None,
-			online: None,
-			compressed_query: Some(point), analytics: None,
-		})?;
+		let point = CompressedQueryPoint { window: label.to_string(), window_rows, rows_scanned, buckets: in_store_buckets, decode_p50_ns: decode.p50_ns, decode_p99_ns: decode.p99_ns, decode_mean_ns: decode.mean_ns, speedup_p50: if latency.p50_ns > 0 { decode.p50_ns as f64 / latency.p50_ns as f64 } else { 0.0 }, segments: stats.segment_count, bytes_per_point: stats.bytes_per_point };
+		on_window(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{label}{suffix}", profile.name), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSED_QUERY.to_string(), reps: in_store_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: in_store_buckets, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, throughput_points_per_sec: if measured_ns > 0 { rows_scanned as f64 / (measured_ns as f64 / 1e9) } else { 0.0 }, cold_warm: crate::schema::ColdWarm::from_samples(&in_store_ns), latency, latency_ci: None, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) }, correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true, result_sha256: Some(digest) }, accuracy: None, storage: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: Some(point), analytics: None, samples_ns: in_store_ns.clone(), between_run: None })?;
 	}
-	Ok(())
+	Ok(digests)
 }
 
 /// The rows a range read returned, as the points a client would reduce (absent values skipped).
 fn points(timestamps: &[i64], values: Vec<Option<BigDecimal>>) -> anyhow::Result<Vec<Point>> {
-	timestamps
-		.iter()
-		.zip(values)
-		.filter_map(|(&t, v)| v.map(|v| DateTime::<Utc>::from_timestamp(t, 0).map(|at| Point::new(at, v)).ok_or_else(|| anyhow::anyhow!("epoch {t} is outside the representable instant range"))))
-		.collect()
+	timestamps.iter().zip(values).filter_map(|(&t, v)| v.map(|v| DateTime::<Utc>::from_timestamp(t, 0).map(|at| Point::new(at, v)).ok_or_else(|| anyhow::anyhow!("epoch {t} is outside the representable instant range")))).collect()
 }
 
 #[cfg(test)]
@@ -209,7 +225,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("cq", "global_active_power", 7);
 		let mut results = Vec::new();
-		run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, CompressedQueryParams { rows: 200, queries: 5, seed: 3 }, |r| {
+		run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, CompressedQueryParams { rows: 200, queries: 5, seed: 3, compact_to: None }, |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -228,10 +244,32 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn after_compaction_the_same_windows_answer_the_same_from_fewer_segments() {
+		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
+		let profile = IngestProfile::new("cq", "global_active_power", 7);
+		let mut results = Vec::new();
+		run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, CompressedQueryParams { rows: 200, queries: 4, seed: 9, compact_to: Some(100) }, |r| {
+			results.push(r);
+			Ok(())
+		})
+		.await
+		.expect("runs");
+		assert_eq!(results.len(), 10);
+		let (before, after) = results.split_at(5);
+		for (b, a) in before.iter().zip(after) {
+			assert_eq!(a.profile, format!("{}-compacted", b.profile));
+			assert!(a.correctness.passed(), "{}: {:?}", a.profile, a.correctness);
+			assert_eq!(a.correctness.result_sha256, b.correctness.result_sha256, "compaction must not change an answer");
+			let segments = |r: &BenchResult| r.compressed_query.as_ref().expect("point").segments;
+			assert!(segments(a) < segments(b), "{} -> {}", segments(b), segments(a));
+		}
+	}
+
+	#[tokio::test]
 	async fn compressed_query_refuses_empty_knobs() {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("cq", "global_active_power", 2);
-		for params in [CompressedQueryParams { rows: 8, queries: 0, seed: 0 }, CompressedQueryParams { rows: 1, queries: 1, seed: 0 }] {
+		for params in [CompressedQueryParams { rows: 8, queries: 0, seed: 0, compact_to: None }, CompressedQueryParams { rows: 1, queries: 1, seed: 0, compact_to: None }] {
 			assert!(run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, params, |_| Ok(())).await.is_err(), "{params:?}");
 		}
 	}

@@ -1639,8 +1639,77 @@ What it does today:
   `sawtooth` the portable linear baseline out-accuracies the cubic, which
   overshoots sharp discontinuities.
 - **Fair-protocol statistics** — p50/p95/p99 + min/max/mean/stddev with
-  **seeded bootstrap confidence intervals**, and an end-to-end timing breakdown
-  proving the latency distribution times only the adapter call, never setup.
+  **seeded bootstrap confidence intervals** (mean, stddev, p50, p95, p99; the maximum has none,
+  since a resample's maximum can only fall), and an end-to-end timing breakdown
+  proving the latency distribution times only the adapter call, never setup. Every result keeps
+  its **raw samples** (`samples_ns`, schema v28; `weft-xbench` reports v5 do the same), so the
+  summary can be recomputed and runs pooled. `weft-bench verify` refuses a short test — p50 under
+  a minute — resting on fewer than **10 timed samples** (`--accept-advisories` lets it through,
+  as it does a dirty tree); `weft-xbench` now defaults to `--reps 10`.
+- **Result digests** — every result carries `correctness.result_sha256`, a SHA-256 over its
+  canonical output (one `key,value` row per output row, decimals normalized), so two runs, two
+  builds or two adapters can be shown to give the *same* answer, not just the same count: the
+  in-memory and store-backed interpolation adapters hash identically. Read-heavy workloads hash
+  what they checked (the verified windows, every query's buckets); the online workload's
+  concurrent reads and the GPU pool's discarded outputs carry none. A storage estimate whose
+  recorded error exceeds the tolerance it was selected against is no longer publishable.
+- **Several runs per report** (`weft-bench combine --out FILE <RUN.json>...`) — a run's own
+  intervals bound where *that run's* median sits, not where the next one's will. Three
+  `--synthetic --reps 20` runs of one build on one machine (2026-11-02) had p50s of 11.2, 7.9 and
+  8.8 ms, and `compare` called run 1 against run 2 a **+41.9% regression with separated
+  intervals**. `combine` pools the runs' raw samples and redraws each interval runs-first (a
+  two-level bootstrap), so the spread between runs is inside it (here 7.9–11.2 ms), and records
+  each run's p50 and the spread (`between_run`). Two combined reports of the same build then
+  compared clean. A run whose result digest differs fails the combined result; every run's
+  manifest must verify and name the combining binary's clean revision, and the combined report
+  gets its own manifest.
+- **Saturation sweeps** (`weft-bench sweep KNOB=v1,v2,… [--out-dir=DIR] -- RUN ARGS`) — one
+  setting says how fast a run was there, not where it stops getting faster. The sweep runs the
+  benchmark once per value of any run flag (`--ingest-batch`, `--ingest-online`, `--points`,
+  `--sp-series`, …) or of the worker pool (`threads`, via `RAYON_NUM_THREADS`), each value's
+  report and manifest in `DIR/<knob>=<value>`, and lays every result out as a curve in
+  `sweep.json` and `sweep.md`, naming its knee: the first value past which a step buys under 10%
+  more throughput. On UCI (2026-11-02), 2M-row ingest went 109k → 493k → 1.56M → 3.19M → 4.57M
+  rows/s from 1,024- to 262,144-row batches: no knee in range.
+- **Seeded query mix** (`--ingest --query-mix OPS`) — the soak harness's lane model replayed
+  against one store: each operation ingests a batch, looks up a point or scans a range, its lane
+  drawn from the seed and its index (`--query-mix-weights INGEST,POINT,RANGE`, 60,20,20 by
+  default), so a published seed regenerates the exact sequence. Reads are checked exactly against
+  the corpus and each lane is a report of its own, digest included.
+- **Post-compaction reads** (`--compressed-query-compact ROWS`) — after the compressed-query
+  windows, the store is compacted to ROWS-row segments and the same windows asked again as
+  `-compacted` results, each gated on answering exactly as before. On 10M UCI rows sealed in
+  1,024-row batches (2026-11-02) the squash to 65,536-row segments took **694 s** (9,769 → 153
+  segments, 1.414 → 1.341 B/pt), every window answered identically, and **small windows got
+  slower**: an hour's in-store p50 went 0.16 → 5.75 ms and a day's 0.24 → 5.39 ms, because each
+  read now decodes a whole 65k-row segment. The year window held (30.1 → 29.5 ms).
+- **Failure tests** (`--ingest --failure kill-ingest|kill-compaction|corrupt-segment|all`) — a
+  benchmark of a healthy store says nothing about the one a crash leaves. A child process (this
+  binary) seals the corpus, or compacts a store of it, and is killed with `SIGKILL` at a seeded
+  point; or one seeded byte of a closed store's segment is flipped. The reopened store must hold
+  every acknowledged row exactly, at most the batch in flight beyond them, and set a damaged
+  segment aside rather than serve it: open-time recovery quarantined the frame for every one of
+  143 byte positions flipped in a probe. Each test is one report; its latency is the reopen time.
+- **More report surfaces** (`--markdown-report`, `--csv-report`, `--prom`, or
+  `weft-bench export REPORT.json --format md|csv|prom`) — the same results as a Markdown table, CSV
+  and Prometheus text, every row with its gate. `bench/grafana/weft-bench.json` is a dashboard over
+  the Prometheus text, which hides no failing gate behind a fast number.
+- **Three interpolation classes** (`weft-xbench`, report v7) — each engine is asked for the grid
+  three ways where it can be: its native fill (class A), the linear reconstruction in its SQL
+  (class B) and every knot fetched into the Rust client and interpolated there (class C). Most
+  native fills answer a different question — TimescaleDB, QuestDB, InfluxDB 3 and IoTDB average the
+  knots per bucket and draw lines between the averages without extrapolating, and ClickHouse's
+  `INTERPOLATE` carries the last value forward — so class A is gated on the grid's shape and
+  reported with its unfilled instants, its distance from the line and its RMSE, not raced. B and C
+  are timed against WeftDB, each class with its own verdict. Where an engine picks among join
+  strategies, each is run and published (`clickhouse-double-merge`, `questdb-double-linear`).
+- **Cross-engine runs, pooled and pinned** (`weft-xbench`, report v6) — each gate carries an
+  `answer_sha256` of its arm's answer, so separate runs of one arm can be shown to agree;
+  `weft-xbench combine RUN.json… --out DIR` pools runs as `weft-bench combine` does, and the
+  rendered report calls a win or a loss only where the pooled intervals separate *and* every
+  run's median falls the same way. A report of a single run says so. The run manifest records the
+  input files' and binary's SHA-256 and, with `--container ENGINE=NAME`, each engine container's
+  image digest, command line and environment, with secret-looking variables redacted.
 - **Storage estimate** — each result carries a `StorageEstimate` (recommended
   encoding + value/timestamp/total **bytes/point**) computed by
   `weft-physical-type` over the actual columns. It also surfaces **advisory

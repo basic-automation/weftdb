@@ -300,10 +300,12 @@ impl SegmentIndexStore {
 		loop {
 			let floor = start.saturating_sub(widest);
 			// A NULL-spanned (empty) segment can never overlap, and the inequalities reject it.
-			let sql = |indexed: &str| format!("SELECT {SELECT_COLUMNS}
+			let sql = |indexed: &str| {
+				format!("SELECT {SELECT_COLUMNS}
 				FROM segment_index {indexed}
 				WHERE aspect = ? AND min_ts IS NOT NULL AND max_ts IS NOT NULL AND ? <= min_ts AND min_ts <= ? AND ? <= max_ts {filter}
-				ORDER BY id");
+				ORDER BY id")
+			};
 			let params = || turso::params![aspect.to_string(), floor, end, start];
 			let rows = match conn.query(sql(&format!("INDEXED BY {TIME_INDEX}")), params()).await {
 				Ok(rows) => rows,

@@ -20,10 +20,10 @@ use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::Spline;
+use weft_orchestration::Pipeline;
 use weftdb::{
 	database::traits::{AspectStructure, Inputs}, Database, DatabaseStructure, DatasetId, DictionaryConstraints, InputMeasurement, Resolution, Steps, Variability, VariablilityType
 };
-use weft_orchestration::Pipeline;
 
 use crate::{
 	ingest::{span_ns, IngestProfile}, schema::{BenchResult, CorrectnessReport, DatasetMeta, TimingBreakdown, SCHEMA_VERSION}, stats::LatencyStats
@@ -147,51 +147,13 @@ pub async fn run_analytics_pipeline(profile: &IngestProfile, timestamps: &[i64],
 	};
 	let last = reps.last().ok_or_else(|| anyhow::anyhow!("no rep ran"))?;
 	let exact = reps.iter().all(|r| r.peaks == expected_peaks && r.valleys == expected_valleys);
-	let point = AnalyticsPoint {
-		rows: params.rows,
-		tail_rows: params.tail_rows,
-		batch_size: params.batch_size,
-		capture_ns: median(&|r| r.capture_ns),
-		prepare_ns: median(&|r| r.stages[0]),
-		patterns_ns: median(&|r| r.stages[1]),
-		events_ns: median(&|r| r.stages[2]),
-		correlate_ns: median(&|r| r.stages[3]),
-		signals_ns: median(&|r| r.stages[4]),
-		incremental_ns: median(&|r| r.incremental_ns),
-		patterns: last.patterns,
-		signals: last.signals,
-		peaks_expected: expected_peaks.len(),
-		peaks_found: last.peaks.len(),
-		valleys_expected: expected_valleys.len(),
-		valleys_found: last.valleys.len(),
-	};
+	let point = AnalyticsPoint { rows: params.rows, tail_rows: params.tail_rows, batch_size: params.batch_size, capture_ns: median(&|r| r.capture_ns), prepare_ns: median(&|r| r.stages[0]), patterns_ns: median(&|r| r.stages[1]), events_ns: median(&|r| r.stages[2]), correlate_ns: median(&|r| r.stages[3]), signals_ns: median(&|r| r.stages[4]), incremental_ns: median(&|r| r.incremental_ns), patterns: last.patterns, signals: last.signals, peaks_expected: expected_peaks.len(), peaks_found: last.peaks.len(), valleys_expected: expected_valleys.len(), valleys_found: last.valleys.len() };
 	let first_runs: Vec<u64> = reps.iter().map(|r| r.stages.iter().sum()).collect();
 	let first_rows = params.rows - params.tail_rows;
 	let p50_s = std::time::Duration::from_nanos(median(&|r| r.stages.iter().sum())).as_secs_f64();
 	#[allow(clippy::cast_precision_loss, reason = "a row count far below 2^52")]
 	let throughput = if p50_s > 0.0 { first_rows as f64 / p50_s } else { 0.0 };
-	Ok(BenchResult {
-		schema_version: SCHEMA_VERSION,
-		profile: profile.name.clone(),
-		adapter: "weftdb".into(),
-		workload: WORKLOAD_ANALYTICS_PIPELINE.into(),
-		dataset: DatasetMeta { input_points: params.rows, output_points: point.peaks_found + point.valleys_found, irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None },
-		reps: params.reps,
-		latency: LatencyStats::from_samples(&first_runs),
-		latency_ci: None,
-		cold_warm: None,
-		throughput_points_per_sec: throughput,
-		timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) },
-		correctness: CorrectnessReport { output_count_ok: exact, expected_output_points: point.peaks_expected + point.valleys_expected, actual_output_points: point.peaks_found + point.valleys_found, values_finite: true },
-		accuracy: None,
-		storage: None,
-		gpu_pool: None,
-		adapter_info: None,
-		growth: None,
-		online: None,
-		compressed_query: None,
-		analytics: Some(point),
-	})
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".into(), workload: WORKLOAD_ANALYTICS_PIPELINE.into(), dataset: DatasetMeta { input_points: params.rows, output_points: point.peaks_found + point.valleys_found, irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, reps: params.reps, latency: LatencyStats::from_samples(&first_runs), latency_ci: None, cold_warm: None, throughput_points_per_sec: throughput, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) }, correctness: CorrectnessReport { output_count_ok: exact, expected_output_points: point.peaks_expected + point.valleys_expected, actual_output_points: point.peaks_found + point.valleys_found, values_finite: true, result_sha256: Some(crate::schema::ResultDigest::of(last.peaks.iter().map(|t| (t, "peak")).chain(last.valleys.iter().map(|t| (t, "valley"))))) }, accuracy: None, storage: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: Some(point), samples_ns: first_runs, between_run: None })
 }
 
 /// One rep in a fresh database `name`: capture, first run stage by stage, tail capture,
@@ -208,14 +170,7 @@ async fn run_rep(name: &str, measurements: &[InputMeasurement], params: Analytic
 	progress("capture", capture_ns);
 
 	let constraints = DictionaryConstraints::new(Some(Steps::new(10, Spline::Linear)), Some(vec![VariablilityType::MaximumStatic(Variability::new(BigDecimal::from_f64(0.1).ok_or_else(|| anyhow::anyhow!("0.1 is not a decimal"))?))]));
-	let mut pipeline = Pipeline::builder(database.clone(), aspect_id)
-		.spline_method(Spline::Linear)
-		.batch_size(params.batch_size)
-		.add_dictionary("bench", "the analytics workload's dictionary", constraints)
-		.with_peak_detector(PEAKS)
-		.with_valley_detector(VALLEYS)
-		.build()
-		.await?;
+	let mut pipeline = Pipeline::builder(database.clone(), aspect_id).spline_method(Spline::Linear).batch_size(params.batch_size).add_dictionary("bench", "the analytics workload's dictionary", constraints).with_peak_detector(PEAKS).with_valley_detector(VALLEYS).build().await?;
 	let mut stages = [0_u64; 5];
 	let started = Instant::now();
 	pipeline.prepare_data().await?;

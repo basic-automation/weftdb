@@ -28,6 +28,17 @@
 //! server's 60 s query timeout on the smallest dataset. Duplicate instants keep their last value
 //! (`last(v)` per instant), as splimes does. Downsampling is the native `SAMPLE BY … ALIGN TO
 //! CALENDAR` in nanoseconds, which is epoch-aligned like `weft_reduce`'s buckets.
+//!
+//! `QuestDB` picks an `ASOF JOIN` strategy itself and takes hints to override it (#393 rule b).
+//! On this keyless join `EXPLAIN` shows the default as `AsOf Join Fast` (a binary search), and the
+//! one hint that changes the plan is `asof_linear` (`AsOf Join`, a linear scan); the memoized and
+//! dense strategies need a symbol key. `questdb-double-linear` runs the reconstruction under that
+//! hint, so both strategies are published and the verdict takes the faster.
+//!
+//! `QuestDB`'s native fill is timed too, as `questdb-native` (fair-protocol class A, #148):
+//! `SAMPLE BY` the grid's step over the grid with `FILL(LINEAR)`, which interpolates between bucket
+//! averages, labelled with the answer it computes. `questdb-client` fetches the knots over QWP and
+//! interpolates them in this client (class C).
 
 use std::{
 	sync::atomic::{AtomicU64, Ordering}, time::{Duration, Instant}
@@ -38,7 +49,7 @@ use questdb::{
 	egress::{column::ColumnView, reader::Reader}, ingress::{AckLevel, DecimalView, Sender, TimestampNanos}
 };
 
-use crate::{weft::Arm, ArmInfo, BucketRow, Dataset, Output};
+use crate::{client_linear, place, weft::Arm, ArmClass, ArmInfo, BucketRow, Dataset, Output};
 
 /// Counter distinguishing tables of arms alive at once.
 static NEXT_TABLE: AtomicU64 = AtomicU64::new(0);
@@ -58,7 +69,7 @@ s AS (SELECT b.t st, b.t::long sl, b.v sv, a.t::long el, a.v ev FROM k a LT JOIN
 seg AS ((SELECT * FROM s WHERE sl IS NOT NULL ORDER BY st) TIMESTAMP(st)),
 f AS (SELECT sl fs, sv fsv, el fe, ev fev FROM seg LIMIT 1),
 g AS ((SELECT ({start} + (x - 1) * {step})::timestamp_ns gt FROM long_sequence({n})) TIMESTAMP(gt)),
-j AS (SELECT g.gt::long gl, seg.sl, seg.sv, seg.el, seg.ev FROM g ASOF JOIN seg)
+j AS (SELECT {hint} g.gt::long gl, seg.sl, seg.sv, seg.el, seg.ev FROM g ASOF JOIN seg)
 SELECT CASE
 	WHEN sl IS NULL THEN fsv + (fev - fsv) * ((gl - fs)::double / (fe - fs)::double)
 	ELSE sv + (ev - sv) * ((gl - sl)::double / (el - sl)::double)
@@ -71,6 +82,26 @@ FROM j CROSS JOIN f ORDER BY gl
 /// a decimal rounded to the column's `s` places (2.804 for 2.80357… at `s = 3`), which no `f64`
 /// reference matches. `min` and `max` stay exact.
 const DOWNSAMPLE_SQL: &str = "SELECT t::long b, count() n, min(v)::double, max(v)::double, avg(v::double) FROM {table} SAMPLE BY {width} ALIGN TO CALENDAR";
+
+/// The native fill (class A), with `{table}`, `{interval}` (the grid step), `{from}`, `{end}` and
+/// `{to}` (the grid's first instant, last instant and one step past it, as timestamps).
+const NATIVE_SQL: &str = "SELECT t::long b, avg(v) v FROM {table} WHERE t >= '{from}' AND t <= '{end}' SAMPLE BY {interval} FROM '{from}' TO '{to}' FILL(LINEAR)";
+
+/// The raw knots a client fetches (class C), in instant order, the last of an instant last.
+const FETCH_SQL: &str = "SELECT t::long t, v::double v FROM {table} ORDER BY t, seq";
+
+/// `(LONG, DOUBLE)` rows, a null `DOUBLE` as `NaN`.
+fn pairs(reader: &mut Reader, sql: &str) -> anyhow::Result<Vec<(i64, f64)>> {
+	let mut cursor = reader.execute(sql)?;
+	let mut out = Vec::new();
+	while let Some(view) = cursor.next_batch()? {
+		let (Ok(ColumnView::Long(t)), Ok(ColumnView::Double(v))) = (view.column(0), view.column(1)) else {
+			anyhow::bail!("questdb: expected (LONG, DOUBLE) columns");
+		};
+		out.extend((0..t.len()).map(|i| (t.value(i), if v.is_null(i) { f64::NAN } else { v.value(i) })));
+	}
+	Ok(out)
+}
 
 /// `width_ns` as a `SAMPLE BY` interval in the largest unit that divides it exactly: `QuestDB`
 /// refuses a nanosecond count as large as a minute's.
@@ -161,13 +192,16 @@ impl Drop for Db {
 /// `QuestDB` with the knots stored as [`QdbValue`].
 pub struct QuestDb {
 	value: QdbValue,
+	class: ArmClass,
+	/// Force the linear `ASOF JOIN` strategy with the `asof_linear` hint (`questdb-double-linear`).
+	linear_asof: bool,
 	server: Server,
 	db: Option<Db>,
 }
 
 impl std::fmt::Debug for QuestDb {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("QuestDb").field("value", &self.value).field("server", &self.server).field("loaded", &self.db.is_some()).finish()
+		f.debug_struct("QuestDb").field("value", &self.value).field("server", &self.server).field("class", &self.class).field("linear_asof", &self.linear_asof).field("loaded", &self.db.is_some()).finish()
 	}
 }
 
@@ -175,13 +209,31 @@ impl QuestDb {
 	/// `questdb-double`.
 	#[must_use]
 	pub const fn double(server: Server) -> Self {
-		Self { value: QdbValue::Double, server, db: None }
+		Self { value: QdbValue::Double, class: ArmClass::PortableSql, linear_asof: false, server, db: None }
+	}
+
+	/// `questdb-double-linear`: `questdb-double` with the `ASOF JOIN` forced linear by hint.
+	#[must_use]
+	pub const fn double_linear(server: Server) -> Self {
+		Self { value: QdbValue::Double, class: ArmClass::PortableSql, linear_asof: true, server, db: None }
+	}
+
+	/// `questdb-native`: the `DOUBLE` table through `SAMPLE BY … FILL(LINEAR)`.
+	#[must_use]
+	pub const fn native(server: Server) -> Self {
+		Self { value: QdbValue::Double, class: ArmClass::Native, linear_asof: false, server, db: None }
+	}
+
+	/// `questdb-client`: the `DOUBLE` knots fetched over QWP and interpolated in this client.
+	#[must_use]
+	pub const fn client(server: Server) -> Self {
+		Self { value: QdbValue::Double, class: ArmClass::ClientSide, linear_asof: false, server, db: None }
 	}
 
 	/// `questdb-decimal`.
 	#[must_use]
 	pub const fn decimal(server: Server) -> Self {
-		Self { value: QdbValue::Decimal, server, db: None }
+		Self { value: QdbValue::Decimal, class: ArmClass::PortableSql, linear_asof: false, server, db: None }
 	}
 
 	/// Run `f` with the loaded table on tokio's blocking pool (the client is synchronous), as the
@@ -299,7 +351,24 @@ impl Arm for QuestDb {
 			QdbValue::Double => ("questdb-double", "DOUBLE", ""),
 			QdbValue::Decimal => ("questdb-decimal", "DECIMAL(18, s)", "; stored exactly, the interpolation line computed in DOUBLE"),
 		};
-		ArmInfo { arm: arm.into(), engine: format!("questdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: long_sequence() grid, native LT JOIN into segments, then ASOF JOIN from the grid, first/last segment extended; downsample via SAMPLE BY … ALIGN TO CALENDAR; WAL table partitioned by year, load acknowledged over QWP and timed until applied; QWP both ways over loopback WebSocket{note}") }
+		let storage = "WAL table partitioned by year, load acknowledged over QWP and timed until applied; QWP both ways over loopback WebSocket";
+		let engine = format!("questdb {version}");
+		match self.class {
+			ArmClass::PortableSql => {
+				let (arm, strategy) = if self.linear_asof { ("questdb-double-linear", "ASOF JOIN forced linear by the asof_linear hint (EXPLAIN: AsOf Join)") } else { (arm, "ASOF JOIN strategy left to the optimizer (EXPLAIN: AsOf Join Fast)") };
+				ArmInfo { arm: arm.into(), engine, value_type: value_type.into(), method: format!("linear interpolation in SQL: long_sequence() grid, native LT JOIN into segments, then ASOF JOIN from the grid, first/last segment extended; {strategy}; downsample via SAMPLE BY … ALIGN TO CALENDAR; {storage}{note}"), class: Some(self.class), own_answer: None }
+			}
+			ArmClass::Native => ArmInfo { arm: "questdb-native".into(), engine, value_type: value_type.into(), method: format!("native fill: SAMPLE BY the grid step FROM … TO … FILL(LINEAR) over avg(v); {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones".into()) },
+			ArmClass::ClientSide => ArmInfo { arm: "questdb-client".into(), engine, value_type: value_type.into(), method: format!("client-side: every knot fetched in instant order over QWP, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None },
+		}
+	}
+
+	fn reports_load(&self) -> bool {
+		self.class == ArmClass::PortableSql && !self.linear_asof
+	}
+
+	fn downsamples(&self) -> bool {
+		self.class == ArmClass::PortableSql && !self.linear_asof
 	}
 
 	fn unload(&mut self) {
@@ -349,7 +418,22 @@ impl Arm for QuestDb {
 		let end = ds.end.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid end out of range"))?;
 		let step = ds.resolution.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("grid step out of range"))?;
 		let n = (end - start) / step + 1;
-		Ok(Output::Float(self.on_db(move |db| doubles(&mut db.reader, &INTERPOLATE_SQL.replace("{table}", &db.table).replace("{start}", &start.to_string()).replace("{step}", &step.to_string()).replace("{n}", &n.to_string()))).await?))
+		let grid_len = ds.grid_len();
+		match self.class {
+			ArmClass::Native => {
+				let iso = |ns: i64| chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+				let sql = NATIVE_SQL.replace("{interval}", &sample_interval(step)).replace("{from}", &iso(start)).replace("{end}", &iso(end)).replace("{to}", &iso(end + step));
+				let rows = self.on_db(move |db| pairs(&mut db.reader, &sql.replace("{table}", &db.table))).await?;
+				return Ok(Output::Float(place(&rows, start, step, grid_len)));
+			}
+			ArmClass::ClientSide => {
+				let (t, v): (Vec<i64>, Vec<f64>) = self.on_db(move |db| pairs(&mut db.reader, &FETCH_SQL.replace("{table}", &db.table))).await?.into_iter().unzip();
+				return Ok(Output::Float(client_linear(&t, &v, start, step, grid_len)));
+			}
+			ArmClass::PortableSql => {}
+		}
+		let hint = if self.linear_asof { "/*+ asof_linear(g seg) */" } else { "" };
+		Ok(Output::Float(self.on_db(move |db| doubles(&mut db.reader, &INTERPOLATE_SQL.replace("{hint}", hint).replace("{table}", &db.table).replace("{start}", &start.to_string()).replace("{step}", &step.to_string()).replace("{n}", &n.to_string()))).await?))
 	}
 
 	async fn downsample(&mut self, ds: &Dataset, _knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {

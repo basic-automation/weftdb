@@ -61,28 +61,13 @@ impl LatencyStats {
 		#[allow(clippy::cast_possible_truncation)]
 		let mean_ns = (sum / count as u128) as u64;
 
-		// Population variance computed in f64 to avoid overflow; rounded to ns.
-		// The integer→f64 casts are intentional for statistical aggregation and
-		// lose at most sub-nanosecond significance at realistic sample counts.
-		#[allow(clippy::cast_precision_loss)]
-		let mean_f = sum as f64 / count as f64;
-		#[allow(clippy::cast_precision_loss)]
-		let variance = sorted
-			.iter()
-			.map(|&v| {
-				let d = v as f64 - mean_f;
-				d * d
-			})
-			.sum::<f64>()
-			/ count as f64;
-		#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-		let stddev_ns = variance.sqrt().round() as u64;
+		let stddev_ns = population_stddev(&sorted, sum);
 
 		Self { count, min_ns, max_ns, mean_ns, stddev_ns, p50_ns: percentile(&sorted, 0.50), p95_ns: percentile(&sorted, 0.95), p99_ns: percentile(&sorted, 0.99) }
 	}
 
-	/// Compute seeded bootstrap confidence intervals for the mean and the p50,
-	/// p95 and p99 latency percentiles.
+	/// Compute seeded bootstrap confidence intervals for the mean, the standard
+	/// deviation and the p50, p95 and p99 latency percentiles.
 	///
 	/// The sample is resampled with replacement `config.resamples` times; each
 	/// statistic is recomputed on every resample and the interval is the
@@ -99,7 +84,7 @@ impl LatencyStats {
 		let confidence = config.confidence.clamp(0.0, 1.0);
 		if samples.is_empty() || config.resamples == 0 {
 			let zero = ConfidenceInterval { point_ns: 0, lower_ns: 0, upper_ns: 0 };
-			return LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: zero.clone(), p50: zero.clone(), p95: zero.clone(), p99: zero };
+			return LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: zero.clone(), stddev: Some(zero.clone()), p50: zero.clone(), p95: zero.clone(), p99: zero };
 		}
 
 		let mut original = samples.to_vec();
@@ -108,6 +93,7 @@ impl LatencyStats {
 
 		// Bootstrap distributions, one per reported statistic.
 		let mut mean_dist: Vec<u64> = Vec::with_capacity(config.resamples);
+		let mut stddev_dist: Vec<u64> = Vec::with_capacity(config.resamples);
 		let mut p50_dist: Vec<u64> = Vec::with_capacity(config.resamples);
 		let mut p95_dist: Vec<u64> = Vec::with_capacity(config.resamples);
 		let mut p99_dist: Vec<u64> = Vec::with_capacity(config.resamples);
@@ -124,6 +110,7 @@ impl LatencyStats {
 			resample.sort_unstable();
 			#[allow(clippy::cast_possible_truncation)]
 			mean_dist.push((sum / n as u128) as u64);
+			stddev_dist.push(population_stddev(&resample, sum));
 			p50_dist.push(percentile(&resample, 0.50));
 			p95_dist.push(percentile(&resample, 0.95));
 			p99_dist.push(percentile(&resample, 0.99));
@@ -133,7 +120,56 @@ impl LatencyStats {
 		#[allow(clippy::cast_possible_truncation)]
 		let mean_point = (sum / n as u128) as u64;
 
-		LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: interval_from(&mut mean_dist, mean_point, confidence), p50: interval_from(&mut p50_dist, percentile(&original, 0.50), confidence), p95: interval_from(&mut p95_dist, percentile(&original, 0.95), confidence), p99: interval_from(&mut p99_dist, percentile(&original, 0.99), confidence) }
+		LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: interval_from(&mut mean_dist, mean_point, confidence), stddev: Some(interval_from(&mut stddev_dist, population_stddev(&original, sum), confidence)), p50: interval_from(&mut p50_dist, percentile(&original, 0.50), confidence), p95: interval_from(&mut p95_dist, percentile(&original, 0.95), confidence), p99: interval_from(&mut p99_dist, percentile(&original, 0.99), confidence) }
+	}
+}
+
+impl LatencyStats {
+	/// Seeded two-level bootstrap intervals over samples taken in separate runs.
+	///
+	/// Each resample draws as many runs as there are, with replacement, then as many samples
+	/// from each drawn run as it holds, again with replacement, and recomputes every statistic
+	/// on the result. Resampling only samples, as [`Self::bootstrap_cis`] does, treats every
+	/// sample as independent and so reports the spread *within* a run; samples from one run
+	/// share its machine state, and runs on the same host differ by more than that — two runs
+	/// of the first cross-engine report had disjoint p50 intervals on 53 of 144 rows. Drawing
+	/// the runs first puts that spread into the interval. The points are the pooled sample's.
+	///
+	/// With one run this is [`Self::bootstrap_cis`]'s question asked of a single cluster, and
+	/// empty runs are skipped.
+	#[must_use]
+	pub fn clustered_bootstrap_cis(runs: &[Vec<u64>], config: &BootstrapConfig) -> LatencyCis {
+		let runs: Vec<&Vec<u64>> = runs.iter().filter(|run| !run.is_empty()).collect();
+		let mut pooled: Vec<u64> = runs.iter().flat_map(|run| run.iter().copied()).collect();
+		let confidence = config.confidence.clamp(0.0, 1.0);
+		if pooled.is_empty() || config.resamples == 0 {
+			return Self::bootstrap_cis(&[], config);
+		}
+		pooled.sort_unstable();
+		let (mut mean_dist, mut stddev_dist, mut p50_dist, mut p95_dist, mut p99_dist) = (Vec::with_capacity(config.resamples), Vec::with_capacity(config.resamples), Vec::with_capacity(config.resamples), Vec::with_capacity(config.resamples), Vec::with_capacity(config.resamples));
+		let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
+		let mut resample = Vec::with_capacity(pooled.len());
+		for _ in 0..config.resamples {
+			resample.clear();
+			for _ in 0..runs.len() {
+				let run = runs[rng.random_range(0..runs.len())];
+				for _ in 0..run.len() {
+					resample.push(run[rng.random_range(0..run.len())]);
+				}
+			}
+			resample.sort_unstable();
+			let sum: u128 = resample.iter().map(|&v| u128::from(v)).sum();
+			#[allow(clippy::cast_possible_truncation)]
+			mean_dist.push((sum / resample.len() as u128) as u64);
+			stddev_dist.push(population_stddev(&resample, sum));
+			p50_dist.push(percentile(&resample, 0.50));
+			p95_dist.push(percentile(&resample, 0.95));
+			p99_dist.push(percentile(&resample, 0.99));
+		}
+		let sum: u128 = pooled.iter().map(|&v| u128::from(v)).sum();
+		#[allow(clippy::cast_possible_truncation)]
+		let mean_point = (sum / pooled.len() as u128) as u64;
+		LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: interval_from(&mut mean_dist, mean_point, confidence), stddev: Some(interval_from(&mut stddev_dist, population_stddev(&pooled, sum), confidence)), p50: interval_from(&mut p50_dist, percentile(&pooled, 0.50), confidence), p95: interval_from(&mut p95_dist, percentile(&pooled, 0.95), confidence), p99: interval_from(&mut p99_dist, percentile(&pooled, 0.99), confidence) }
 	}
 }
 
@@ -181,12 +217,41 @@ pub struct LatencyCis {
 	pub seed: u64,
 	/// Interval for the mean latency.
 	pub mean: ConfidenceInterval,
+	/// Interval for the standard deviation (`None` in artifacts written before it was added).
+	/// The maximum has none: every resample's maximum is at most the sample's, so a bootstrap
+	/// interval for it would only ever reach down, and say nothing about the tail it hides.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stddev: Option<ConfidenceInterval>,
 	/// Interval for the p50 latency.
 	pub p50: ConfidenceInterval,
 	/// Interval for the p95 latency.
 	pub p95: ConfidenceInterval,
 	/// Interval for the p99 latency.
 	pub p99: ConfidenceInterval,
+}
+
+/// The population standard deviation of `samples`, whose sum is `sum`, rounded to ns.
+///
+/// Computed in f64 to avoid overflow; the integer→f64 casts lose at most sub-nanosecond
+/// significance at realistic sample counts.
+fn population_stddev(samples: &[u64], sum: u128) -> u64 {
+	if samples.is_empty() {
+		return 0;
+	}
+	#[allow(clippy::cast_precision_loss)]
+	let mean = sum as f64 / samples.len() as f64;
+	#[allow(clippy::cast_precision_loss)]
+	let variance = samples
+		.iter()
+		.map(|&v| {
+			let d = v as f64 - mean;
+			d * d
+		})
+		.sum::<f64>()
+		/ samples.len() as f64;
+	#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+	let stddev = variance.sqrt().round() as u64;
+	stddev
 }
 
 /// Read a percentile-method confidence interval off a bootstrap distribution.
@@ -303,6 +368,40 @@ mod tests {
 		// Config is echoed back for reproducibility.
 		assert_eq!(cis.resamples, 1000);
 		assert!((cis.confidence - 0.95).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn the_stddev_interval_brackets_the_summary_and_leaves_the_others_unchanged() {
+		let samples: Vec<u64> = (1..=200).map(|i| i * i).collect();
+		let cis = LatencyStats::bootstrap_cis(&samples, &BootstrapConfig::default());
+		let stddev = cis.stddev.clone().expect("a stddev interval");
+		assert_eq!(stddev.point_ns, LatencyStats::from_samples(&samples).stddev_ns);
+		assert!(stddev.lower_ns < stddev.point_ns && stddev.point_ns < stddev.upper_ns, "{stddev:?}");
+		// The stddev is read off the resamples the other statistics already drew, so adding it
+		// moved none of their intervals: an artifact recomputed from its samples still agrees.
+		let without = LatencyCis { stddev: None, ..cis };
+		let json = serde_json::to_string(&without).expect("serializes");
+		assert!(!json.contains("stddev"), "an absent interval is omitted: {json}");
+		assert_eq!(serde_json::from_str::<LatencyCis>(&json).expect("an artifact without it parses"), without);
+	}
+
+	#[test]
+	fn drawing_runs_first_widens_the_interval_to_the_spread_between_them() {
+		// Three runs, each tight around its own level: the within-run bootstrap of the pooled
+		// sample is narrow, but which level a fourth run lands on is not known to that precision.
+		let runs: Vec<Vec<u64>> = [1_000, 1_100, 1_250].iter().map(|&level| (0..50).map(|i| level + i % 5).collect()).collect();
+		let pooled: Vec<u64> = runs.concat();
+		let config = BootstrapConfig::default();
+		let flat = LatencyStats::bootstrap_cis(&pooled, &config);
+		let clustered = LatencyStats::clustered_bootstrap_cis(&runs, &config);
+		let width = |ci: &ConfidenceInterval| ci.upper_ns - ci.lower_ns;
+		assert!(width(&clustered.mean) > 5 * width(&flat.mean), "flat {:?}, clustered {:?}", flat.mean, clustered.mean);
+		assert_eq!(clustered.p50.point_ns, LatencyStats::from_samples(&pooled).p50_ns, "the points are the pooled sample's");
+		assert_eq!(clustered, LatencyStats::clustered_bootstrap_cis(&runs, &config), "seeded");
+		// One run is the ordinary bootstrap's question; no runs is the empty answer.
+		let one = LatencyStats::clustered_bootstrap_cis(&runs[..1], &config);
+		assert!(width(&one.mean) <= width(&clustered.mean));
+		assert_eq!(LatencyStats::clustered_bootstrap_cis(&[], &config), LatencyStats::bootstrap_cis(&[], &config));
 	}
 
 	#[test]

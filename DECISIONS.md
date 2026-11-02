@@ -153,6 +153,62 @@ that runs against a live server or the caller's run model (no slice names
 a read client, and a self-test that inherits the run's configuration can
 pass vacuously against the wrong expectations).
 
+## 2026-11-02 — What closes Phase 1's open bench lines (#140, #147, #148, #149, #150, #393) (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the five Phase 1 trackers are one-line issues, and the plan text behind them was
+dropped from `ROADMAP.md` in 1228723 (recovered from 1228723^). Several of its phrases name work
+another track owns, or describe the engine as it was in July. The owner asked for all of Phase 1
+(2026-11-02, "Complete all of phase 1"). What each line was taken to mean, and where it stops:
+
+1. **Failure tests (1.1) are the bench's, the crash matrix is not.** `weft-bench --failure` kills a
+   child process (this binary) with `SIGKILL` while it seals batches (restart during ingest) or
+   compacts (crash during compaction), and flips a byte of a closed store's segment (partial or
+   corrupt segment), then gates the reopened store on exact read-back. That is the plan's 1.1 list
+   less one item. D-S21's crash-matrix CI and SOA-9's `crash_kill9` soak stay W6's: this is a
+   bench workload, not a CI matrix or a durability claim. **Network retry** is SOA-8's failure
+   deck, claimed by the other loop's open PR (#502), and is left to it.
+2. **Post-compaction reads measure the compaction the engine has.** §7.5 (query-consistent,
+   cancellable compaction) is still open, but `SegmentStore::squash_aspect_to_target_rows` exists
+   and is what `POST …/compact` runs, so `--compressed-query-compact` measures reads after it. On
+   10M UCI rows it took 694 s to go from 9,769 to 153 segments, answered every window identically,
+   and made small windows ~36× slower (1h p50 0.16 → 5.75 ms) while the year window held
+   (30.1 → 29.5 ms): the read decodes whole 65k-row segments. Recorded as a result, not acted on.
+3. **A native fill that answers another question is gated on shape, not values (1.2).** The plan
+   asks for class A "where possible". Four engines' native fills (TimescaleDB, QuestDB, InfluxDB 3,
+   IoTDB) average the knots per grid bucket and draw lines between the averages, without
+   extrapolating; ClickHouse's `INTERPOLATE` carries the last value forward and puts the column's
+   default (`0`) before the first knot. Holding them to WeftDB's line would fail them for not being
+   WeftDB; racing them against it would compare different answers. So their gate is the grid's
+   shape (`Correctness::check_shape`), and the report shows their unfilled instants, distance from
+   the line and RMSE against the truth, never a win or a loss. DuckDB has no native interpolation,
+   so no class A arm. Class C fetches every knot into the client and runs an `f64` line with the
+   SQL arms' arithmetic (no fused multiply-add), gated like class B.
+4. **#393's rules.** (a) The QuestDB arms already speak QWP both ways and say so; WeftDB's own
+   Arrow egress is Phase 2's (Flight), not a bench change. (b) Each ASOF strategy is run and
+   published: ClickHouse `hash` (default) and `full_sorting_merge`; QuestDB's optimizer default
+   (`AsOf Join Fast` in `EXPLAIN`) and the `asof_linear` hint (`AsOf Join`). The memoized and
+   dense strategies need a symbol key this keyless join does not have; `EXPLAIN` showed every
+   other hint name leaving the plan unchanged. (c) is a precedent, not work.
+5. **"Each engine's live settings" are the container's.** The run manifest records each engine
+   container's image digest, command line and environment via `--container ENGINE=NAME`, with
+   variables whose names look secret redacted. That is where the reference host's settings live
+   (QuestDB and IoTDB take them from the environment, InfluxDB 3 and TimescaleDB from the
+   command). Querying each engine's own settings table is five dialects for the same facts and was
+   not done.
+6. **Report surfaces (#149) are Markdown, CSV and Prometheus text, plus a Grafana dashboard.**
+   The plan's `reports/` list was JSON, Parquet, HTML and Grafana; the dashboard needs a metrics
+   source, which the Prometheus text is (textfile collector or Pushgateway).
+7. **Anti-Goodhart (#150) is enforced where it can be checked.** `scripts/bench/check-separation.py`
+   (in CI) fails on an engine crate depending on a benchmark crate or reading a `BENCH` variable.
+   A rule flagging any string that names the harness was tried and dropped: weft-server's settings
+   registry documents the bench's test-only variables without reading them. The other rules
+   (publish losses, methodology first, customer workloads, correctness gates) already had a
+   mechanism; HONESTY.md now maps each rule to it.
+8. **External-engine adapters (#140) are `weft-xbench`'s six.** The plan's minimum set (ClickHouse,
+   InfluxDB 3, QuestDB, TimescaleDB, DuckDB) and IoTDB are measured. VictoriaMetrics was "if
+   monitoring matters", and WeftDB does not target monitoring, so it is not built; kdb+ stays out
+   on licence grounds.
+
 ## 2026-11-01 — FRE-7b: immutable declarations, scale rules and schema read-back — the shapes the plan left open (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan names the slice (§6 W5), fixes that widening goes through
@@ -236,7 +292,6 @@ matrix is the gate's rule, widened in place); refusing proxied requests under
 `WEFT_AUTH=disabled` too (decision 7 assigns that deployment a gateway, whose requests are
 proxied by construction); and treating `X-Real-IP` as a proxy header (it is set by one
 proxy family for its own use and is not part of the de-facto forwarded set).
-
 ## 2026-11-01 — ROB-10 "Admission I": per-class budgets the gate enforces (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan names ROB-10 only as "Admission I" (§6 W5) and absorbs its parts
