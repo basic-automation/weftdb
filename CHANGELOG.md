@@ -40,6 +40,12 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
+- **OS-cold and post-restart reps in the cross-engine benchmark** (#146): `weft-xbench
+  --cold-hook CMD [--cold-reps N]` times each read phase again after the OS page cache is dropped
+  (`os-cold`) and after the engine restarts as well (`restarted`), gated like the warm reps and
+  compared only with each other. `scripts/xbench/cold-hook.sh` restarts the reference host's
+  engine containers and drops the page cache from a privileged container. The report (schema v4)
+  records each result's `warmth` and the hook.
 - **Cross-engine reports flag a dirty build**: `weft-xbench` records its source commit as
   `<sha>+dirty` when the checkout has changes, and the report says that commit alone does not
   reproduce the binary.

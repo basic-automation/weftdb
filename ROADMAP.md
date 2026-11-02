@@ -27,7 +27,7 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
   - [ ] **NEXT — a real smooth-signal corpus for the spline-fill claim.**
 - [ ] Remaining workloads
 - [x] **DONE (2026-10-09) — first-rep/warm separation** (`BenchResult.cold_warm`, schema v21, every workload; console + Parquet)
-  - [ ] **NEXT — OS-cold and post-restart runs:**
+  - [x] **DONE (2026-10-31) — OS-cold and post-restart runs** (`weft-xbench --cold-hook CMD --cold-reps N`, #146): each read phase also runs with the page cache dropped and after an engine restart, every rep gated; schema v4 `warmth`
 - [ ] Fair-protocol depth (Phase 1.1)
 - [ ] Fair interpolation comparisons (Phase 1.2)
 - [ ] Report surfaces beyond JSON/HTML/Parquet

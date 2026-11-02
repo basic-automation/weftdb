@@ -183,6 +183,30 @@ impl Arm for Timescale {
 		self.db = None;
 	}
 
+	/// A new connection, once the server accepts one, with the schema on its path; the statements
+	/// were the old connection's, so the first rep after a restart prepares them again, as a
+	/// reconnected client's first query does.
+	async fn reopen(&mut self) -> anyhow::Result<()> {
+		let db = self.loaded()?;
+		let deadline = std::time::Instant::now() + crate::RESTART_TIMEOUT;
+		let client = loop {
+			match connect(&db.url).await {
+				Ok(client) => match client.batch_execute(&format!("SET search_path = {}, public", db.schema)).await {
+					Ok(()) => break client,
+					Err(e) if std::time::Instant::now() >= deadline => return Err(anyhow::Error::from(e).context("timescaledb did not answer after a restart")),
+					Err(_) => {}
+				},
+				Err(e) if std::time::Instant::now() >= deadline => return Err(e.context("timescaledb did not answer after a restart")),
+				Err(_) => {}
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+		};
+		db.client = client;
+		db.interpolate = None;
+		db.downsample = None;
+		Ok(())
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;

@@ -3,7 +3,8 @@
 //! ```text
 //! TMPDIR=/mnt/weftbench weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N]
 //!                                   [--seed N] [--uci FILE] [--tsbs FILE] [--clickhouse URL] [--timescale URL]
-//!                                   [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--out DIR]
+//!                                   [--questdb ADDR] [--influxdb3 URL] [--iotdb URL]
+//!                                   [--cold-hook CMD [--cold-reps N]] [--out DIR]
 //! ```
 //!
 //! Without `--uci` the UCI datasets are skipped and the report says which datasets ran, and without
@@ -14,6 +15,10 @@
 //! `QuestDB` arms are, and without `--influxdb3` (an `InfluxDB` 3 HTTP endpoint) the `InfluxDB` 3
 //! arm is, and without `--iotdb` (an Apache `IoTDB` REST service) the `IoTDB` arm is. The process exits 1 when any result fails its correctness gate, after writing the report.
 //!
+//! `--cold-hook CMD` adds OS-cold and post-restart reps (#146), `--cold-reps` of each (3 by
+//! default) per phase, beside the warm ones; see [`weft_xbench::Cold`] for what the hook is asked
+//! to do, and `scripts/xbench/cold-hook.sh` for the reference host's.
+//!
 //! `weft-xbench render REPORT.json [--out DIR]` writes `report.md` and `report.html` from a
 //! report, with the generated honesty section (EVI-15R).
 
@@ -22,9 +27,9 @@
 use std::path::PathBuf;
 
 use weft_bench::{load_uci_corpus, scale::ScalePreset, RunMetadata, DEFAULT_UCI_COLUMN};
-use weft_xbench::{clickhouse, render, run, tsbs, Dataset, DatasetKind, Servers, XbenchReport, DEFAULT_SEED};
+use weft_xbench::{clickhouse, render, run, tsbs, Cold, Dataset, DatasetKind, Protocol, Servers, XbenchReport, DEFAULT_SEED};
 
-const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--tsbs FILE] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--out DIR]";
+const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--tsbs FILE] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--cold-hook CMD [--cold-reps N]] [--out DIR]";
 
 struct Cli {
 	scales: Vec<ScalePreset>,
@@ -38,11 +43,13 @@ struct Cli {
 	questdb: Option<String>,
 	influxdb3: Option<String>,
 	iotdb: Option<String>,
+	cold_hook: Option<String>,
+	cold_reps: usize,
 	out: PathBuf,
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, tsbs: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, out: PathBuf::from("reports/xbench") };
+	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 5, load_reps: 3, seed: DEFAULT_SEED, uci: None, tsbs: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, cold_hook: None, cold_reps: 3, out: PathBuf::from("reports/xbench") };
 	let mut args = args;
 	while let Some(flag) = args.next() {
 		let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
@@ -58,13 +65,15 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 			"--questdb" => cli.questdb = Some(value()?),
 			"--influxdb3" => cli.influxdb3 = Some(value()?),
 			"--iotdb" => cli.iotdb = Some(value()?),
+			"--cold-hook" => cli.cold_hook = Some(value()?),
+			"--cold-reps" => cli.cold_reps = value()?.parse().map_err(|e| format!("--cold-reps: {e}"))?,
 			"--out" => cli.out = PathBuf::from(value()?),
 			"-h" | "--help" => return Err(USAGE.to_string()),
 			other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
 		}
 	}
-	if cli.reps == 0 || cli.load_reps == 0 {
-		return Err("--reps and --load-reps must be > 0".into());
+	if cli.reps == 0 || cli.load_reps == 0 || cli.cold_reps == 0 {
+		return Err("--reps, --load-reps and --cold-reps must be > 0".into());
 	}
 	Ok(cli)
 }
@@ -149,7 +158,12 @@ async fn main() -> anyhow::Result<()> {
 	if let Some(server) = &servers.iotdb {
 		eprintln!("weft-xbench: iotdb {}", server.version()?);
 	}
-	let report = run(&datasets, &servers, cli.load_reps, cli.reps, cli.seed, metadata, source_commit(), invocation).await?;
+	let cold = cli.cold_hook.clone().map(|hook| Cold { hook, reps: cli.cold_reps });
+	if let Some(cold) = &cold {
+		eprintln!("weft-xbench: {} OS-cold and {} post-restart reps per phase, via {}", cold.reps, cold.reps, cold.hook);
+	}
+	let protocol = Protocol { load_reps: cli.load_reps, reps: cli.reps, seed: cli.seed, cold };
+	let report = run(&datasets, &servers, &protocol, metadata, source_commit(), invocation).await?;
 
 	std::fs::create_dir_all(&cli.out)?;
 	let path = cli.out.join("xbench.json");
@@ -158,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
 		let gate = r.correctness.as_ref().map_or(String::new(), |c| format!("  {}", if c.passed { "PASS" } else { "FAIL" }));
 		#[allow(clippy::cast_precision_loss)]
 		let p50_ms = r.latency.p50_ns as f64 / 1e6;
-		println!("{:<14} {:<18} {:<11} p50 {:>10.3} ms{gate}", r.dataset, r.arm.arm, format!("{:?}", r.phase).to_lowercase(), p50_ms);
+		println!("{:<14} {:<18} {:<11} {:<9} p50 {:>10.3} ms{gate}", r.dataset, r.arm.arm, format!("{:?}", r.phase).to_lowercase(), r.warmth.as_str(), p50_ms);
 	}
 	let blocks = render::blocks(&report);
 	std::fs::write(cli.out.join("report.md"), render::to_markdown(&blocks))?;
@@ -195,5 +209,8 @@ mod tests {
 		assert!(cli(&["--scales", "huge"]).is_err());
 		assert!(cli(&["--reps", "0"]).is_err());
 		assert!(cli(&["--bogus"]).is_err());
+		let c = cli(&["--cold-hook", "scripts/xbench/cold-hook.sh", "--cold-reps", "2"]).expect("parses");
+		assert_eq!((c.cold_hook.as_deref(), c.cold_reps), (Some("scripts/xbench/cold-hook.sh"), 2));
+		assert!(cli(&["--cold-reps", "0"]).is_err());
 	}
 }

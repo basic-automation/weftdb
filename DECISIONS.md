@@ -405,6 +405,51 @@ sources do not pin, chosen here:
 `weftdb/tests/golden/`; the v3 pair stays committed as negative fixtures the v4 reader must
 refuse.
 
+## 2026-10-31 — What "OS-cold and post-restart runs" measure, and how (#146)
+
+**Ambiguous:** the roadmap line is a heading with nothing under it. `weft-bench` already splits the
+first timed rep from the rest (`cold_warm`, schema v21), but that first rep is cold only to the
+process: the OS page cache still holds what the load just wrote. Nothing said which benchmark the
+cold runs belong to, what "restart" means for an engine that runs in the harness's process, or how
+to drop the page cache without the harness running as root.
+
+**Chosen:**
+
+- **In `weft-xbench`, beside the warm reps**, because the claim a cold read supports is a
+  comparison: WeftDB's first read after a restart against the other engines' first read after
+  theirs. `--cold-hook CMD` adds two more conditions per read phase, `--cold-reps` (3) reps each:
+  - `os-cold`: the hook drops the page cache before each rep; the engine keeps running with its
+    own caches (buffer pools, mark caches, decoded segments) intact.
+  - `restarted`: the hook restarts the engine, the arm reconnects and waits for an answer, and then
+    the page cache drops, so not even the reconnection's reads stay cached.
+  Every cold rep is gated against the reference like a warm one: a restart that loses data fails
+  the gate instead of timing an empty answer. Verdicts compare like with like (a cold WeftDB read
+  against the fastest cold read of another engine).
+- **The hook is outside the binary** (`sh -c 'HOOK "$@"' sh ACTION ENGINE`), so the harness needs
+  no root and no docker. `scripts/xbench/cold-hook.sh` is the reference host's: `docker restart`
+  of the engine's container, and `echo 3 > /proc/sys/vm/drop_caches` from a throwaway privileged
+  container, the route approved for this host (no sudo password is typed).
+- **In-process engines reopen rather than restart.** WeftDB's stored arms drop their
+  `SegmentStore` and open the directory again (a root opens once per process, so the old handle
+  goes first); DuckDB closes its connection and opens the file again. The harness's own memory
+  (allocator, loaded code) stays warm; the report says so.
+- **Reconnection is outside the clock**, except TimescaleDB's re-prepare of its two statements,
+  which belong to the old connection: a reconnected client's first query pays it too.
+- Load reps stay warm only: a load writes fresh files, so the page cache holds nothing of them
+  before it starts.
+
+**Rejected:**
+
+- Rebooting the host between reps: the most honest cold, but the harness cannot survive it and it
+  would turn a run into days.
+- `posix_fadvise(DONTNEED)` on the stores' files instead of dropping the whole cache: it reaches
+  only the files the harness can name, not a server container's data directory.
+- Running the harness as root to write `drop_caches` itself: every engine's files would then be
+  root's, and nothing else in the harness needs it.
+- Cold reps in `weft-bench`'s single-engine workloads: without another engine beside them they show
+  WeftDB's own cold cost, which `cold_warm` already approximates; the cross-engine run is where a
+  cold-read claim is made.
+
 ## 2026-10-31 — What "TSBS-compatible comparison harness" means before tagged ingest (#141)
 
 **Ambiguous:** the roadmap's Phase 1 line names a "full TSBS-compatible comparison harness" and

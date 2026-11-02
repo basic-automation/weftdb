@@ -306,6 +306,22 @@ impl Arm for QuestDb {
 		self.db = None;
 	}
 
+	/// A fresh agent and QWP reader, since the restart closed the old ones, once the server
+	/// answers.
+	async fn reopen(&mut self) -> anyhow::Result<()> {
+		let db = self.db.as_mut().ok_or_else(|| anyhow::anyhow!("questdb: nothing loaded"))?;
+		let server = Server::new(&self.server.addr);
+		let probe = server.clone();
+		db.reader = crate::await_ready("questdb", move || {
+			probe.version()?;
+			Ok(Reader::from_conf(probe.conf())?)
+		})
+		.await?;
+		db.server = server.clone();
+		self.server = server;
+		Ok(())
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;
