@@ -40,6 +40,10 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
+- **Ingest growth curves** (#145): `weft-bench --ingest --ingest-growth 1M,10M,100M,1B` grows
+  one store through those checkpoints over the real UCI corpus laid end to end, reporting each
+  stage's seal throughput, per-batch latency, segments and bytes (report schema v24 `growth`),
+  each checkpoint gated and written as its own report as soon as it passes.
 - **A real smooth-signal corpus for the spline-fill claim** (#144): `scripts/bench/ndbc_to_csv.py`
   turns NOAA NDBC buoy history into a `weft-bench --gf-csv` corpus. On nine buoy temperature and
   pressure series a cubic fill beats linear across short outages and loses across day-long ones;

@@ -33,7 +33,7 @@ use std::{
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_ingest_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
+	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_ingest_growth, run_ingest_on, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, LookupMode, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
 };
 
 /// Program name used in usage / error output.
@@ -372,6 +372,25 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let aspect = cli.uci_column.to_ascii_lowercase();
 	let profile_name = cli.name.clone().unwrap_or_else(|| format!("ingest-{}", aspect));
 	let profile = IngestProfile::new(profile_name, aspect, cli.ingest_batch);
+	if !cli.ingest_growth.is_empty() {
+		// One report per checkpoint, written as the stage ends, as every other workload writes one
+		// result per file: `compare` matches runs by profile name, a manifest grades one result's
+		// measures, and a curve stopped short keeps the stages it finished.
+		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+		let mut code = ExitCode::SUCCESS;
+		run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, &cli.ingest_growth, |result| {
+			if let Some(g) = &result.growth {
+				println!("growth   : {:>14} rows  {:>12.0} rows/s  batch p50 {:>9.3} ms p99 {:>9.3} ms  {:>8} segments  {:.3} B/pt  {}", g.rows_total, result.throughput_points_per_sec, std::time::Duration::from_nanos(result.latency.p50_ns).as_secs_f64() * 1e3, std::time::Duration::from_nanos(result.latency.p99_ns).as_secs_f64() * 1e3, g.segments, g.bytes_per_point, if result.correctness.passed() { "PASS" } else { "FAIL" });
+			}
+			if finish(cli, &BenchReport::with_results(metadata.clone(), vec![result]))? != ExitCode::SUCCESS {
+				code = ExitCode::FAILURE;
+			}
+			Ok(())
+		})
+		.await
+		.map_err(|e| anyhow::anyhow!("ingest growth run failed: {e}"))?;
+		return Ok(code);
+	}
 	let result = run_ingest_on(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, cli.reps).await.map_err(|e| anyhow::anyhow!("ingest benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
@@ -738,6 +757,8 @@ struct Cli {
 	ingest_rows: usize,
 	/// Ingest mode: rows sealed per batch (`--ingest-batch`).
 	ingest_batch: usize,
+	/// Ingest mode: the growth curve's checkpoints (`--ingest-growth`); empty for a plain ingest.
+	ingest_growth: Vec<u64>,
 	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
 	/// timestamps instead of a constant-stride regular corpus.
 	irregular: bool,
@@ -912,6 +933,7 @@ impl Cli {
 		// The workload-mode flags; exactly one may be set (`select_workload_mode`).
 		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode, mut gpu_memory_mode, mut ingest_mode) = (false, false, false, false, false, false, false, false);
 		let (mut uci, mut uci_column, mut ingest_rows, mut ingest_batch): (Option<PathBuf>, String, usize, usize) = (None, DEFAULT_UCI_COLUMN.to_string(), usize::MAX, DEFAULT_INGEST_BATCH_ROWS);
+		let mut ingest_growth: Vec<u64> = Vec::new();
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
@@ -976,6 +998,7 @@ impl Cli {
 				"--uci-column" => uci_column = take_value(&key)?,
 				"--ingest-rows" => ingest_rows = parse_points_count(&take_value(&key)?)?,
 				"--ingest-batch" => ingest_batch = parse_points_count(&take_value(&key)?)?.max(1),
+				"--ingest-growth" => ingest_growth = parse_growth_checkpoints(&take_value(&key)?)?,
 				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
 				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
 				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
@@ -1038,8 +1061,11 @@ impl Cli {
 		if mode == InputMode::Ingest && uci.is_none() {
 			return Err("`--ingest` requires `--uci <household_power_consumption.txt>`".to_string());
 		}
+		if !ingest_growth.is_empty() && mode != InputMode::Ingest {
+			return Err("`--ingest-growth` needs `--ingest`".to_string());
+		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1277,6 +1303,28 @@ fn parse_points_count(s: &str) -> Result<usize, String> {
 		return Err("--points must be >= 2".to_string());
 	}
 	Ok(n)
+}
+
+/// Parse `--ingest-growth`'s checkpoints: comma-separated row counts, each optionally suffixed
+/// `k`, `M` or `B`, at least 2 and strictly rising.
+fn parse_growth_checkpoints(s: &str) -> Result<Vec<u64>, String> {
+	let checkpoints = s
+		.split(',')
+		.map(|item| {
+			let item = item.trim();
+			let (digits, scale) = match item.char_indices().last() {
+				Some((at, 'k' | 'K')) => (&item[..at], 1_000),
+				Some((at, 'M')) => (&item[..at], 1_000_000),
+				Some((at, 'B')) => (&item[..at], 1_000_000_000),
+				_ => (item, 1),
+			};
+			digits.parse::<u64>().ok().and_then(|n| n.checked_mul(scale)).ok_or_else(|| format!("invalid --ingest-growth checkpoint `{item}` (expected e.g. 1M,10M,100M,1B)"))
+		})
+		.collect::<Result<Vec<u64>, String>>()?;
+	if checkpoints[0] < 2 || checkpoints.windows(2).any(|w| w[0] >= w[1]) {
+		return Err("--ingest-growth checkpoints must be at least 2 and strictly rising".to_string());
+	}
+	Ok(checkpoints)
 }
 
 /// Parse the point-lookup query-batch size, requiring at least one instant.
@@ -1600,6 +1648,13 @@ INGEST OPTIONS (with --ingest):
         --ingest-batch <N>   Rows sealed per batch into the SegmentStore [default: 1024]
                              (each rep ingests into a fresh store; only the seals are
                              timed; correctness is an exact read-back of every row)
+        --ingest-growth <LIST>
+                             Growth curve instead: one store ingests the corpus, laid end
+                             to end, up to each checkpoint in turn (e.g. 1M,10M,100M,1B;
+                             k/M/B suffixes), one result per stage with its per-batch
+                             seal latency; gated on the store's row count, time span and
+                             segment order and an exact read-back of both ends (--reps
+                             does not apply)
 
 GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
         --gm-rounds <N>      Rounds; each calls every size once       [default: 20]
@@ -1691,6 +1746,18 @@ mod tests {
 
 	fn run_cli(args: &[&str]) -> Result<Command, String> {
 		Cli::from_args(args.iter().map(ToString::to_string))
+	}
+
+	#[test]
+	fn ingest_growth_takes_rising_checkpoints_with_suffixes_and_needs_ingest() {
+		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--ingest-growth", "1M,10M,100M,1B"]);
+		assert_eq!(cli.ingest_growth, [1_000_000, 10_000_000, 100_000_000, 1_000_000_000]);
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--ingest-growth", "5k, 20000"]).ingest_growth, [5_000, 20_000]);
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt"]).ingest_growth, Vec::<u64>::new());
+		for bad in ["10M,1M", "1M,1M", "1", "x", "1M,", "99999999999B"] {
+			assert!(run_cli(&["--ingest", "--uci", "u.txt", "--ingest-growth", bad]).is_err(), "{bad}");
+		}
+		assert!(run_cli(&["--gap-fill", "--ingest-growth", "1M"]).unwrap_err().contains("needs `--ingest`"));
 	}
 
 	fn expect_run(args: &[&str]) -> Cli {

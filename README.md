@@ -1559,6 +1559,21 @@ What it does today:
   `--gap-fill`, `--downsample`), filling only the knobs left at their default, and writes the
   preset into the profile name so a 32-series grid is never compared against a 64-series one as
   though they were one run.
+- **Ingest and its growth curve** (`--ingest --uci FILE`) — seals one UCI household-power
+  column into a fresh `SegmentStore` in `--ingest-batch` rows (default 1,024) and gates on an
+  exact read-back of every row. `--ingest-growth 1M,10M,100M,1B` grows one store through those
+  checkpoints instead (#145), laying the real corpus end to end in time rather than generating
+  values (the generated ingest corpus flatters WeftDB; see ROADMAP, *Benchmark hygiene*). Each
+  stage reports its seal throughput, per-batch p50/p99 and the segments and bytes the store then
+  holds (schema v24 `growth`), and is gated on the store's row count, time span and segment
+  order plus an exact read-back of the first and last 65,536 rows; each checkpoint is written as
+  its own report and manifest as soon as it passes. Measured 2026-11-01 (`Global_active_power`,
+  2,049,280 rows per copy): with **65,536-row batches** ingest holds **3.9M rows/s** to 10M,
+  3.8M at 100M and **3.2M at 1B** (15,616 segments), batch p99 18 → 27 ms, 1.34 B/pt throughout;
+  with the default **1,024-row batches** it falls from 141k rows/s at 1M to 107k at 100M (97,693
+  segments), batch p99 8.9 → 17.0 ms, 1.41 B/pt. Small batches cost more as segments pile up:
+  a stopped 1B attempt at 1,024 rows was down to about 40k rows/s near 400k segments (counted
+  from the store's files, not a gated result). Batch your writes, or compact.
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
