@@ -60,7 +60,8 @@ jobs:
       - name: Run the crash matrix
         shell: bash
         run: |
-          export RUSTUP_TOOLCHAIN="$(tr -d '[:space:]' < .github/release-toolchain)"
+          RUSTUP_TOOLCHAIN="$(tr -d '[:space:]' < .github/release-toolchain)"
+          export RUSTUP_TOOLCHAIN
           bash scripts/crash-matrix.sh --stage bench-stage
       # EVI-4 artifact pipeline: staged flat by the script, uploaded even
       # when the matrix failed, because a red matrix's report is the
