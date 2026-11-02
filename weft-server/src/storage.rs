@@ -905,12 +905,17 @@ pub struct StorageDownsampleParams {
 	/// Defaults to the whole stored history when omitted.
 	#[serde(default)]
 	pub end: Option<i64>,
-	/// Resolution token (`seconds`..`years`); defaults to minutes.
+	/// Resolution token (`seconds`..`years`) or bucket width (`5s`, `15m`); defaults to minutes.
 	#[serde(default)]
 	pub resolution: Option<String>,
 	/// Comma-separated reductions (e.g. `min,max,sketch_p99`); defaults to `min,max,avg`.
 	#[serde(default)]
 	pub agg: Option<String>,
+	/// Gap fill method (`null`, `prev`, `linear`, `quadratic`, `cubic` or a constant): every
+	/// grid step between the bounds is emitted, the empty ones with `count == 0`. Without
+	/// bounds the grid runs from the first stored bucket to the last.
+	#[serde(default)]
+	pub fill: Option<String>,
 }
 
 /// Reduce an aspect's **stored** segments over `[start, end]` into grid-aligned
@@ -927,10 +932,11 @@ pub struct StorageDownsampleParams {
 async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams) -> Result<crate::downsample::DownsampleResponse, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
-	let resolution = crate::interpolate::parse_resolution_token(params.resolution.as_deref())?;
+	let width = crate::downsample::parse_width_token(params.resolution.as_deref())?;
 	let aggregations = crate::downsample::parse_aggregations(params.agg.as_deref())?;
+	let method = crate::downsample::parse_fill(params.fill.as_deref())?;
 	// An undeclared aspect is a 404 before any read work, matching the sibling reads.
-	require_schema(&store, aspect).await?;
+	let schema = require_schema(&store, aspect).await?;
 	// An omitted bound means "all of stored history" — the index prune is inclusive,
 	// so the saturating bounds simply select every segment.
 	let start = params.start.unwrap_or(i64::MIN);
@@ -939,11 +945,17 @@ async fn storage_downsample_inner(state: AppState, aspect: &str, params: &Storag
 		return Err(ApiError::bad_request(format!("`end` ({end}) must not be before `start` ({start})")));
 	}
 
-	let span = tracing::info_span!("downsample.range", %aspect, start, end, resolution = ?resolution, buckets = tracing::field::Empty);
-	let result = store.downsample_range(aspect, start, end, resolution, &aggregations).instrument(span.clone()).await;
+	let span = tracing::info_span!("downsample.range", %aspect, start, end, resolution = %width, buckets = tracing::field::Empty);
+	let result = store.downsample_range_width(aspect, start, end, width, &aggregations).instrument(span.clone()).await;
 	drop(store);
-	let buckets = result.map_err(|err| error::classify_read(&err))?;
-	let response = crate::downsample::buckets_to_response(buckets, resolution, &aggregations)?;
+	let mut buckets = result.map_err(|err| error::classify_read(&err))?;
+	if let Some(method) = &method {
+		// The fill bounds are the window's, as instants; an omitted bound is the stored data's.
+		let instant = |epoch: Option<i64>| epoch.map(|e| schema.timestamp_unit.to_nanos(e).map(chrono::DateTime::from_timestamp_nanos).ok_or_else(|| ApiError::new(error::Code::ValueNotRepresentable, format!("the bound {e} cannot be placed in time at the aspect's timestamp unit")))).transpose();
+		buckets = crate::downsample::apply_fill(&buckets, width, instant(params.start)?, instant(params.end)?, method)?;
+	}
+	let mut response = crate::downsample::buckets_to_response(buckets, width, &aggregations)?;
+	response.fill = method.is_some().then(|| params.fill.as_deref().unwrap_or_default().trim().to_string());
 	span.record("buckets", response.buckets);
 	Ok(response)
 }
@@ -1689,6 +1701,33 @@ mod tests {
 		assert_eq!(series[1]["aggregations"]["sum"], 36.0);
 		assert_eq!(series[2]["aggregations"]["max"], 23.0);
 		assert_eq!(series[2]["aggregations"]["sum"], 66.0);
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_fills_the_window_and_marks_what_it_made() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		// Minutes 0–2 are stored; a window to minute 4 (in the aspect's seconds) adds two.
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/load/downsample?start=0&end=299&resolution=minutes&agg=max&fill=prev").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!((body["buckets"].as_u64(), body["fill"].as_str()), (Some(5), Some("prev")));
+		let series = body["series"].as_array().unwrap();
+		assert_eq!(series.iter().map(|b| b["count"].as_u64().unwrap()).collect::<Vec<_>>(), [3, 3, 3, 0, 0]);
+		assert_eq!(series[4]["aggregations"]["max"], 23.0, "carried forward from minute 2");
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?resolution=minutes&agg=max&fill=linear").await;
+		assert_eq!((status, body["buckets"].as_u64()), (StatusCode::OK, Some(3)), "without bounds the grid is the stored data's: {body}");
+	}
+
+	#[tokio::test]
+	async fn stored_downsample_takes_a_width_and_merges_across_segments() {
+		let (_dir, router) = router_with_three_segment_load().await;
+		// Minutes 0 and 1 are two segments and one 2-minute bucket; minute 2 starts the next.
+		let (status, body) = get_json(router, "/api/v1/storage/load/downsample?resolution=2m&agg=min,max,sum").await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["resolution"], "2 minutes");
+		let series = body["series"].as_array().unwrap();
+		assert_eq!(series.iter().map(|b| b["count"].as_u64().unwrap()).collect::<Vec<_>>(), [6, 3]);
+		assert_eq!((series[0]["aggregations"]["min"].as_f64(), series[0]["aggregations"]["max"].as_f64(), series[0]["aggregations"]["sum"].as_f64()), (Some(1.0), Some(13.0), Some(42.0)));
+		assert_eq!(series[1]["timestamp"], "1970-01-01T00:02:00Z");
 	}
 
 	#[tokio::test]

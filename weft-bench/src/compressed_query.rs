@@ -1,14 +1,14 @@
-//! Compressed-query workload over [`SegmentStore`] (#145).
+//! Compressed-query workload over [`SegmentStore`](weftdb::SegmentStore) (#145).
 //!
 //! The question is what answering an aggregate straight from the compressed segments buys over
 //! the way a client without that path answers it: read the raw rows out, then reduce them. Both
 //! run against one store holding the real UCI corpus (laid end to end to `--cq-rows`, as the
 //! growth curve lays it), sealed in `--ingest-batch` rows:
 //!
-//! - **in-store** — [`SegmentStore::downsample_range`], which prunes the index by time and folds
+//! - **in-store** — [`SegmentStore::downsample_range`](weftdb::SegmentStore::downsample_range), which prunes the index by time and folds
 //!   each surviving segment into a mergeable partial (on the integer path for a scaled column),
 //!   never materializing the range;
-//! - **decode then reduce** — [`SegmentStore::read_time_range`] for the same window, then
+//! - **decode then reduce** — [`SegmentStore::read_time_range`](weftdb::SegmentStore::read_time_range) for the same window, then
 //!   [`weft_reduce::reduce`] over the rows it returned, as a client holding the rows would.
 //!
 //! Each window size (an hour, a day, a week, 30 days and a year of minute rows) is one result.
@@ -17,7 +17,7 @@
 //! identical bucket for bucket.
 //!
 //! With [`CompressedQueryParams::compact_to`] the run then compacts the store
-//! ([`SegmentStore::squash_aspect_to_target_rows`]) and asks the same seeded windows again, as
+//! ([`SegmentStore::squash_aspect_to_target_rows`](weftdb::SegmentStore::squash_aspect_to_target_rows)) and asks the same seeded windows again, as
 //! `…-compacted` results: the post-compaction reads of the fair protocol (1.1). A compacted
 //! window must also answer exactly as it did before the compaction, digest for digest.
 //!

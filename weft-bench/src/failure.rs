@@ -11,7 +11,7 @@
 //!   beyond them, each exactly; then the ingest resumes from what the store holds and must finish
 //!   whole.
 //! - **`kill-compaction`** — the harness seals the corpus in small batches, and the child compacts
-//!   the store ([`SegmentStore::squash_aspect_to_target_rows`]) and is killed a seeded number of
+//!   the store ([`SegmentStore::squash_aspect_to_target_rows`](weftdb::SegmentStore::squash_aspect_to_target_rows)) and is killed a seeded number of
 //!   milliseconds in. The reopened store must hold every row exactly, whatever share of the
 //!   compaction committed; then the compaction reruns and the rows must still read back exactly.
 //! - **`corrupt-segment`** — no process dies: the harness seals the corpus, closes the store, flips

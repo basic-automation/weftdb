@@ -46,6 +46,19 @@ only the control plane, not the segment frames.
   index write before it commits), where the planner had walked every segment of the aspect; and
   its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
   Write transactions still see `Busy` at once, as their retry protocol requires.
+- **Gap fill on the downsample endpoints** (#142): `POST /api/v1/downsample` (body `fill`), its
+  ILP sibling and `GET`/`POST /api/v1/storage/{aspect}/downsample` (`?fill=`), in every output
+  format, take `null`, `prev`, `linear`, `quadratic`, `cubic` or a constant. Every grid step
+  between the bounds is emitted, a synthesized bucket with `count == 0`, a value the method
+  leaves out as a missing JSON key, an empty CSV cell or an Arrow/Parquet null; a grid over 10M
+  buckets is a `400`. `weft-arrow` gains `reduction_table_with_gaps_to_*`, whose nullable
+  columns leave a dense table's schema unchanged.
+- **Arbitrary bucket widths** (#143): `weft_reduce::BucketWidth` (`5s`, `15m`, `6h`, `15 minutes`),
+  `reduce_width`, `fill_width`, `PartialReduction::coarsen`/`finish_width` and
+  `SegmentStore::downsample_range_width` reduce by a whole number of resolution steps,
+  epoch-aligned and exact for every reduction (the unit's partials merged). The downsample
+  endpoints take a width as the body's `width` or as `?resolution=15m`. TSM-Bench Q5's literal
+  `SAMPLE BY 5s` now has a spelling. Additive: every `Resolution` API keeps its meaning.
 - **Three interpolation classes in `weft-xbench`** (#148, report v7): beside each engine's portable
   SQL reconstruction (class B), its native fill where it has one (class A: TimescaleDB
   `time_bucket_gapfill` + `interpolate`, QuestDB `SAMPLE BY … FILL(LINEAR)`, InfluxDB 3

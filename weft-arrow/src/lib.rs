@@ -882,6 +882,20 @@ pub fn reconstructed_series_from_record_batch(batch: &RecordBatch) -> Result<Rec
 /// together — and [`ConvertError::Batch`] if Arrow refuses the batch. Before
 /// ROB-4 these checks were assertions.
 pub fn reduction_table_to_record_batch(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> Result<RecordBatch, ConvertError> {
+	let columns: Vec<Vec<Option<f64>>> = agg_columns.iter().map(|c| c.iter().copied().map(Some).collect()).collect();
+	reduction_table_with_gaps_to_record_batch(unit, timestamps, counts, agg_names, &columns)
+}
+
+/// [`reduction_table_to_record_batch`] for a table whose reductions may be missing in some
+/// buckets: a gap-filled downsample (`?fill=null`, or a linear fill past the last measured
+/// bucket) emits buckets without a value. A reduction column holding a `None` is a nullable
+/// `Float64` with a null there; a column with none stays non-null, so a dense table's schema
+/// is unchanged.
+///
+/// # Errors
+///
+/// As [`reduction_table_to_record_batch`].
+pub fn reduction_table_with_gaps_to_record_batch(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<Option<f64>>]) -> Result<RecordBatch, ConvertError> {
 	check_len(REDUCTION_COUNT_COLUMN, timestamps.len(), counts.len())?;
 	check_len(VALUE_COLUMN, agg_names.len(), agg_columns.len())?;
 
@@ -889,8 +903,8 @@ pub fn reduction_table_to_record_batch(unit: TimeUnit, timestamps: &[i64], count
 	let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(timestamps.iter().copied())), Arc::new(Int64Array::from_iter_values(counts.iter().copied()))];
 	for (name, column) in agg_names.iter().zip(agg_columns) {
 		check_len(VALUE_COLUMN, timestamps.len(), column.len())?;
-		fields.push(Field::new(*name, DataType::Float64, false));
-		arrays.push(Arc::new(Float64Array::from_iter_values(column.iter().copied())));
+		fields.push(Field::new(*name, DataType::Float64, column.iter().any(Option::is_none)));
+		arrays.push(Arc::new(Float64Array::from_iter(column.iter().copied())));
 	}
 
 	let mut metadata = HashMap::new();
@@ -927,6 +941,26 @@ pub fn reduction_table_to_ipc_bytes(unit: TimeUnit, timestamps: &[i64], counts: 
 /// Propagates any [`ConvertError`] from [`write_parquet`].
 pub fn reduction_table_to_parquet_bytes(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<f64>]) -> Result<Vec<u8>, ConvertError> {
 	write_parquet(&[reduction_table_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)?])
+}
+
+/// [`reduction_table_to_ipc_bytes`] for a table with missing reductions
+/// ([`reduction_table_with_gaps_to_record_batch`]).
+///
+/// # Errors
+///
+/// As [`reduction_table_to_ipc_bytes`].
+pub fn reduction_table_with_gaps_to_ipc_bytes(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<Option<f64>>]) -> Result<Vec<u8>, ConvertError> {
+	write_ipc_stream(&[reduction_table_with_gaps_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)?])
+}
+
+/// [`reduction_table_to_parquet_bytes`] for a table with missing reductions
+/// ([`reduction_table_with_gaps_to_record_batch`]).
+///
+/// # Errors
+///
+/// As [`reduction_table_to_parquet_bytes`].
+pub fn reduction_table_with_gaps_to_parquet_bytes(unit: TimeUnit, timestamps: &[i64], counts: &[i64], agg_names: &[&str], agg_columns: &[Vec<Option<f64>>]) -> Result<Vec<u8>, ConvertError> {
+	write_parquet(&[reduction_table_with_gaps_to_record_batch(unit, timestamps, counts, agg_names, agg_columns)?])
 }
 
 /// Read a reduction-table batch (as built by [`reduction_table_to_record_batch`])
@@ -1580,6 +1614,18 @@ mod tests {
 		assert_eq!(ts, timestamps.to_vec());
 		assert_eq!(cs, counts.to_vec());
 		assert_eq!(aggs, vec![("avg".to_string(), vec![5.0, 7.5])]);
+	}
+
+	#[test]
+	fn a_reduction_with_gaps_is_a_nullable_column_and_a_dense_one_is_not() {
+		let batch = reduction_table_with_gaps_to_record_batch(TimeUnit::Seconds, &[0, 60, 120], &[2, 0, 1], &["min", "max"], &[vec![Some(1.0), None, Some(3.0)], vec![Some(2.0), Some(2.5), Some(4.0)]]).expect("builds the batch");
+		let schema = batch.schema();
+		assert!(schema.field_with_name("min").expect("min").is_nullable());
+		assert!(!schema.field_with_name("max").expect("max").is_nullable(), "a column with every value keeps the dense schema");
+		let min = batch.column_by_name("min").and_then(|c| c.as_any().downcast_ref::<Float64Array>()).expect("f64");
+		assert!(min.is_null(1) && min.value(2) == 3.0);
+		assert!(!reduction_table_with_gaps_to_ipc_bytes(TimeUnit::Seconds, &[0], &[0], &["min"], &[vec![None]]).expect("writes ipc").is_empty());
+		assert!(!reduction_table_with_gaps_to_parquet_bytes(TimeUnit::Seconds, &[0], &[0], &["min"], &[vec![None]]).expect("writes parquet").is_empty());
 	}
 
 	#[test]

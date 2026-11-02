@@ -15,8 +15,27 @@
 //! Buckets are aligned to the epoch grid for the chosen resolution (the
 //! [`weft_reduce::bucket_index`] every reducing surface uses), so a bucket's start
 //! is reproducible from the resolution alone — independent of where the series
-//! happens to begin. Only buckets that actually contain samples are emitted;
-//! gap-filling is the interpolation endpoint's job, not this one's.
+//! happens to begin. By default only buckets that actually contain samples are
+//! emitted.
+//!
+//! ## Gap filling (`fill`)
+//!
+//! With `fill` (a body field here, `?fill=` on the ILP and stored-range endpoints)
+//! every grid step between the bounds is emitted, the empty ones synthesized by
+//! [`weft_reduce::fill()`]: `null`, `prev` (or `previous`, `locf`), `linear`,
+//! `quadratic`, `cubic`, or a constant. A synthesized bucket has `count == 0` in
+//! every output format, so it is never passed off as measured, and a reduction the
+//! method leaves without a value (`null`, or a line past the last measured bucket)
+//! is missing from the JSON map, an empty CSV cell and an Arrow/Parquet null. The
+//! grid is bounded by [`MAX_FILL_BUCKETS`]; a longer one is refused with `400`.
+//!
+//! ## Bucket widths (`width`, `?resolution=15m`)
+//!
+//! A bucket may be a whole number of resolution steps — `5s`, `15m`, `6h` — as a `width`
+//! body field (which overrides `resolution`) or as the `resolution` token of the ILP and
+//! stored-range endpoints. Buckets stay epoch-aligned (a 15-minute bucket starts on the
+//! quarter hour), and every reduction is exact: the series is reduced by the unit and each
+//! run of unit buckets merged ([`weft_reduce::reduce_width`]).
 //!
 //! ## Numeric boundary (deliberate, documented)
 //!
@@ -37,11 +56,11 @@ use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution};
-use weft_reduce::reduce;
 // The reduction core is the vendor-neutral `weft-reduce` crate — shared with the
 // `weft-bench` downsample workload so both drive one implementation. `Aggregation` is
 // re-exported so the server's public API surface (see `lib.rs`) is unchanged.
 pub use weft_reduce::Aggregation;
+use weft_reduce::{reduce_width, BucketWidth, Fill};
 
 use crate::{
 	error::{self, ApiError, Code, StrictJson, StrictQuery}, interpolate::{InputPoint, ResolutionSpec}, metrics::SharedMetrics
@@ -65,6 +84,57 @@ pub struct DownsampleRequest {
 	pub end: Option<DateTime<Utc>>,
 	/// Input samples (must be non-empty).
 	pub points: Vec<InputPoint>,
+	/// A bucket width that is a whole number of steps (`5s`, `15m`, `6h`); overrides
+	/// `resolution` when given.
+	#[serde(default)]
+	pub width: Option<String>,
+	/// Gap fill: emit every grid step between the bounds, the empty ones synthesized by
+	/// this method (`null`, `prev`, `linear`, `quadratic`, `cubic` or a constant); omitted,
+	/// only non-empty buckets are emitted.
+	#[serde(default)]
+	pub fill: Option<String>,
+}
+
+/// The most buckets a gap fill may emit: the interpolation endpoint's default output
+/// cap, since a filled grid is an output grid of the same kind.
+pub const MAX_FILL_BUCKETS: usize = crate::interpolate::MAX_INTERPOLATE_OUTPUT_POINTS;
+
+/// Parse a bucket-width token: a resolution name (`minutes`, the default), or a count and a
+/// unit (`5s`, `15m`, `15 minutes`).
+///
+/// # Errors
+///
+/// `bad_request` for a token that is neither.
+pub(crate) fn parse_width_token(token: Option<&str>) -> Result<BucketWidth, ApiError> {
+	match crate::interpolate::parse_resolution_token(token) {
+		Ok(resolution) => Ok(BucketWidth::from(resolution)),
+		Err(err) => token.and_then(BucketWidth::parse).ok_or(err),
+	}
+}
+
+/// Parse a `fill` token; `None` or empty is no fill.
+///
+/// # Errors
+///
+/// `bad_request` for a token that names no method and is not a number.
+pub(crate) fn parse_fill(token: Option<&str>) -> Result<Option<Fill>, ApiError> {
+	let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else { return Ok(None) };
+	Fill::from_token(token).map(Some).ok_or_else(|| ApiError::bad_request(format!("unknown fill `{token}`: one of null, prev, linear, quadratic, cubic, or a number")))
+}
+
+/// Gap-fill `buckets` over `[start, end]` (a missing bound is the first or last bucket's).
+///
+/// # Errors
+///
+/// `bad_request` when the grid would exceed [`MAX_FILL_BUCKETS`] or a spline fill fails,
+/// and `value_not_representable` when a bound has no bucket at the resolution.
+pub(crate) fn apply_fill(buckets: &[weft_reduce::Bucket], width: BucketWidth, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, method: &Fill) -> Result<Vec<weft_reduce::Bucket>, ApiError> {
+	weft_reduce::fill_width(buckets, width, start, end, method, MAX_FILL_BUCKETS).map_err(|err| match err {
+		weft_reduce::FillError::TooManyBuckets { grid, max } => ApiError::bad_request(format!("a fill over this window would emit {grid} buckets, more than the {max} allowed; narrow the window or coarsen the resolution")),
+		weft_reduce::FillError::TimestampRange | weft_reduce::FillError::BucketStartOverflow => ApiError::new(error::Code::ValueNotRepresentable, "a bound of the fill window cannot be placed in a bucket at the resolution you asked for"),
+		weft_reduce::FillError::Spline(reason) => ApiError::bad_request(format!("the spline fill failed: {reason}")),
+		other => ApiError::internal(other.to_string()),
+	})
 }
 
 /// One emitted bucket in the response.
@@ -81,16 +151,21 @@ pub struct DownsampleBucket {
 /// Response body for `POST /api/v1/downsample`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DownsampleResponse {
-	/// Bucket resolution actually used.
+	/// Bucket width actually used: a resolution name (`minutes`), or a count and one
+	/// (`15 minutes`).
 	pub resolution: String,
 	/// Reductions reported, in request order.
 	pub aggregations: Vec<String>,
 	/// Number of input samples accepted (within the range).
 	pub input_points: usize,
-	/// Number of non-empty buckets produced.
+	/// Number of buckets in `series` (non-empty ones, plus the synthesized ones under `fill`).
 	pub buckets: usize,
-	/// The reduced series, one entry per non-empty bucket, ascending by time.
+	/// The reduced series, ascending by time: one entry per non-empty bucket, and under
+	/// `fill` one per grid step, a synthesized one with `count == 0`.
 	pub series: Vec<DownsampleBucket>,
+	/// The fill method, when the request named one.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub fill: Option<String>,
 }
 
 /// Handle `POST /api/v1/downsample`: reduce a series into grid-aligned buckets.
@@ -122,12 +197,16 @@ const DEFAULT_AGGREGATIONS: [Aggregation; 3] = Aggregation::DEFAULT;
 /// The JSON path: validate, lift to `BigDecimal` points, derive the window, then
 /// delegate to [`run_downsample`]. Synchronous — no engine call is needed.
 fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleResponse>, ApiError> {
-	let DownsampleRequest { resolution, aggregations, start, end, points: input } = request;
+	let DownsampleRequest { resolution, aggregations, start, end, points: input, width, fill } = request;
+	let method = parse_fill(fill.as_deref())?;
+	let width = match width.as_deref() {
+		Some(token) => BucketWidth::parse(token).ok_or_else(|| ApiError::bad_request(format!("unknown bucket width `{token}`: a count and a unit, such as 5s or 15m")))?,
+		None => BucketWidth::from(Resolution::from(resolution)),
+	};
 	if input.is_empty() {
 		return Err(ApiError::bad_request("`points` must not be empty".to_string()));
 	}
 
-	let resolution: Resolution = resolution.into();
 	let aggregations = if aggregations.is_empty() { DEFAULT_AGGREGATIONS.to_vec() } else { aggregations };
 
 	// `downsample.parse` child span (roadmap Phase 3): the f64 → `BigDecimal` value lift
@@ -145,7 +224,7 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 	let start = start.unwrap_or_else(|| points.first().map_or_else(Utc::now, |p| p.timestamp));
 	let end = end.unwrap_or_else(|| points.last().map_or_else(Utc::now, |p| p.timestamp));
 
-	run_downsample(&points, start, end, resolution, &aggregations)
+	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, fill.as_deref().unwrap_or_default())))
 }
 
 /// Run the bucketed reduction over a prepared point set and shape the response.
@@ -161,14 +240,18 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 /// point count and resolution at entry and the in-window point count and produced
 /// bucket count on completion, so a `RUST_LOG`-enabled run sees the reduction pass's
 /// fan-in and fan-out.
-#[tracing::instrument(name = "downsample.reduce", skip_all, fields(candidate_points = points.len(), resolution = ?resolution, input_points = tracing::field::Empty, buckets = tracing::field::Empty))]
-fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Json<DownsampleResponse>, ApiError> {
+#[tracing::instrument(name = "downsample.reduce", skip_all, fields(candidate_points = points.len(), resolution = %width, input_points = tracing::field::Empty, buckets = tracing::field::Empty))]
+fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, width: BucketWidth, aggregations: &[Aggregation], fill: Option<(&Fill, &str)>) -> Result<Json<DownsampleResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`".to_string()));
 	}
 
-	let buckets = reduce(points, resolution, Some(start), Some(end), aggregations).map_err(|err| error::from_reduce_error(&err))?;
-	let response = buckets_to_response(buckets, resolution, aggregations)?;
+	let mut buckets = reduce_width(points, width, Some(start), Some(end), aggregations).map_err(|err| error::from_reduce_error(&err))?;
+	if let Some((method, _)) = fill {
+		buckets = apply_fill(&buckets, width, Some(start), Some(end), method)?;
+	}
+	let mut response = buckets_to_response(buckets, width, aggregations)?;
+	response.fill = fill.map(|(_, token)| token.trim().to_string());
 
 	let span = tracing::Span::current();
 	span.record("input_points", response.input_points);
@@ -201,7 +284,7 @@ pub(crate) fn wire_value(value: &BigDecimal, what: &str) -> Result<f64, ApiError
 /// endpoint (which reduces persisted segments via
 /// [`weftdb::SegmentStore::downsample_range`]), so both envelopes are identical
 /// by construction and cannot drift.
-pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, resolution: Resolution, aggregations: &[Aggregation]) -> Result<DownsampleResponse, ApiError> {
+pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, width: BucketWidth, aggregations: &[Aggregation]) -> Result<DownsampleResponse, ApiError> {
 	// Every in-window point lands in exactly one bucket, so the bucket counts sum to
 	// the in-window point total the response reports.
 	let input_points: usize = buckets.iter().map(|b| b.count).sum();
@@ -214,7 +297,7 @@ pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, resolution:
 		}
 		series.push(DownsampleBucket { timestamp: b.timestamp, count: b.count, aggregations: values });
 	}
-	Ok(DownsampleResponse { resolution: resolution.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series })
+	Ok(DownsampleResponse { resolution: width.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series, fill: None })
 }
 
 /// Render a [`DownsampleResponse`] as a `timestamp,count,<agg>…` CSV document.
@@ -223,10 +306,10 @@ pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, resolution:
 /// output surface beside the interpolate and storage range exports. The columns
 /// are `timestamp` (RFC 3339, grid-aligned bucket start), `count`, then one
 /// column per requested reduction **in request order**; each value is the same
-/// wire `f64` the JSON body carries. Only non-empty buckets are emitted (matching
-/// the JSON), and an emitted bucket always carries every requested reduction, so
-/// no value cell is ever blank. None of the columns can contain a comma, so no
-/// field escaping is required.
+/// wire `f64` the JSON body carries. The rows are the JSON's buckets: a measured
+/// bucket carries every requested reduction, and under `fill` a synthesized bucket
+/// (`count` 0) may leave a cell blank where its method gives no value. None of the
+/// columns can contain a comma, so no field escaping is required.
 pub(crate) fn downsample_response_to_csv(response: &DownsampleResponse) -> Response {
 	use std::fmt::Write as _;
 	let mut out = String::from("timestamp,count");
@@ -262,15 +345,16 @@ const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 ///
 /// Kept private and primitive-typed so no `arrow-*` type appears in this module's
 /// signatures — all Arrow knowledge stays inside `weft-arrow`.
-fn response_columns(response: &DownsampleResponse) -> (Vec<i64>, Vec<i64>, Vec<Vec<f64>>) {
+fn response_columns(response: &DownsampleResponse) -> (Vec<i64>, Vec<i64>, Vec<Vec<Option<f64>>>) {
 	let mut timestamps = Vec::with_capacity(response.series.len());
 	let mut counts = Vec::with_capacity(response.series.len());
 	for bucket in &response.series {
 		timestamps.push(bucket.timestamp.timestamp_nanos_opt().unwrap_or_default());
 		counts.push(i64::try_from(bucket.count).unwrap_or(i64::MAX));
 	}
-	// Every emitted bucket carries every requested reduction, so each column is dense.
-	let agg_columns: Vec<Vec<f64>> = response.aggregations.iter().map(|name| response.series.iter().map(|bucket| bucket.aggregations.get(name).copied().unwrap_or_default()).collect()).collect();
+	// A measured bucket carries every requested reduction; a filled one may lack some, which
+	// becomes a null (a column with none stays non-null, the dense schema).
+	let agg_columns: Vec<Vec<Option<f64>>> = response.aggregations.iter().map(|name| response.series.iter().map(|bucket| bucket.aggregations.get(name).copied()).collect()).collect();
 	(timestamps, counts, agg_columns)
 }
 
@@ -287,7 +371,7 @@ fn response_columns(response: &DownsampleResponse) -> (Vec<i64>, Vec<i64>, Vec<V
 pub(crate) fn downsample_response_to_arrow(response: &DownsampleResponse) -> Result<Response, ApiError> {
 	let (timestamps, counts, agg_columns) = response_columns(response);
 	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
-	let bytes = weft_arrow::reduction_table_to_ipc_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::internal(err.to_string()))?;
+	let bytes = weft_arrow::reduction_table_with_gaps_to_ipc_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::internal(err.to_string()))?;
 	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
 }
 
@@ -301,7 +385,7 @@ pub(crate) fn downsample_response_to_arrow(response: &DownsampleResponse) -> Res
 pub(crate) fn downsample_response_to_parquet(response: &DownsampleResponse) -> Result<Response, ApiError> {
 	let (timestamps, counts, agg_columns) = response_columns(response);
 	let names: Vec<&str> = response.aggregations.iter().map(String::as_str).collect();
-	let bytes = weft_arrow::reduction_table_to_parquet_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::internal(err.to_string()))?;
+	let bytes = weft_arrow::reduction_table_with_gaps_to_parquet_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &counts, &names, &agg_columns).map_err(|err| ApiError::internal(err.to_string()))?;
 	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
 }
 
@@ -385,12 +469,15 @@ pub struct DownsampleIlpParams {
 	/// Timestamp precision token (`ns`/`us`/`ms`/`s`); defaults to nanoseconds.
 	#[serde(default)]
 	pub precision: Option<String>,
-	/// Resolution token (`seconds`..`years`); defaults to minutes.
+	/// Resolution token (`seconds`..`years`) or bucket width (`5s`, `15m`); defaults to minutes.
 	#[serde(default)]
 	pub resolution: Option<String>,
 	/// Comma-separated reductions (e.g. `min,max,avg`); defaults to `min,max,avg`.
 	#[serde(default)]
 	pub agg: Option<String>,
+	/// Gap fill method (`null`, `prev`, `linear`, `quadratic`, `cubic` or a constant).
+	#[serde(default)]
+	pub fill: Option<String>,
 }
 
 /// Downsample an `InfluxDB` Line Protocol payload into grid-aligned buckets.
@@ -482,8 +569,9 @@ pub async fn downsample_ilp_parquet(State(metrics): State<SharedMetrics>, Strict
 
 fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json<DownsampleResponse>, ApiError> {
 	let precision = crate::interpolate::parse_precision_token(params.precision.as_deref())?;
-	let resolution = crate::interpolate::parse_resolution_token(params.resolution.as_deref())?;
+	let width = parse_width_token(params.resolution.as_deref())?;
 	let aggregations = parse_aggregations(params.agg.as_deref())?;
+	let method = parse_fill(params.fill.as_deref())?;
 
 	// `parse_points` returns points sorted ascending by timestamp.
 	let points = weft_line_protocol::parse_points(body, &params.field, precision).map_err(|err| crate::error::from_line_protocol_error(&err))?;
@@ -493,7 +581,7 @@ fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json
 	let start = points.first().map_or_else(Utc::now, |p| p.timestamp);
 	let end = points.last().map_or_else(Utc::now, |p| p.timestamp);
 
-	run_downsample(&points, start, end, resolution, &aggregations)
+	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, params.fill.as_deref().unwrap_or_default())))
 }
 
 /// Parse a comma-separated aggregation list (default `[min, max, avg]`).
@@ -806,6 +894,95 @@ mod tests {
 		// Minute-1 bucket: count 2, min 30, max 50, avg 40.
 		assert_eq!(lines[2], "1970-01-01T00:01:00+00:00,2,30,50,40");
 		assert_eq!(lines.len(), 3);
+	}
+
+	/// Minute 0 holds 0 and 10, minute 3 holds 30: two empty minutes between.
+	fn gapped_body(fill: &str) -> serde_json::Value {
+		serde_json::json!({
+			"resolution": "minutes",
+			"aggregations": ["min", "max"],
+			"fill": fill,
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(30), "value": 10.0 },
+				{ "timestamp": ts(180), "value": 30.0 },
+			],
+		})
+	}
+
+	#[tokio::test]
+	async fn a_linear_fill_emits_every_minute_and_marks_the_synthesized_ones() {
+		let (status, body) = post_json("/api/v1/downsample", gapped_body("linear")).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!((body["buckets"].as_u64(), body["fill"].as_str(), body["input_points"].as_u64()), (Some(4), Some("linear"), Some(3)));
+		let series = body["series"].as_array().unwrap();
+		assert_eq!(series.iter().map(|b| b["count"].as_u64().unwrap()).collect::<Vec<_>>(), [2, 0, 0, 1], "a synthesized bucket has count 0");
+		assert_eq!(series[1]["aggregations"]["min"], 10.0, "min 0 → 30 over three steps");
+		assert_eq!(series[2]["aggregations"]["max"], 23.333_333_333_333_332);
+		let (status, plain) = post_json("/api/v1/downsample", gapped_body("")).await;
+		assert_eq!((status, plain["buckets"].as_u64(), plain.get("fill")), (StatusCode::OK, Some(2), None), "an empty fill is no fill");
+	}
+
+	#[tokio::test]
+	async fn a_null_fill_leaves_the_cells_empty_in_every_format() {
+		let (status, body) = post_json("/api/v1/downsample", gapped_body("null")).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert!(body["series"][1]["aggregations"].as_object().unwrap().is_empty());
+		let (_, _, text) = post_json_for_text("/api/v1/downsample/csv", gapped_body("null")).await;
+		assert_eq!(text.lines().nth(2), Some("1970-01-01T00:01:00+00:00,0,,"));
+		let (status, _, bytes) = post_json_for_bytes("/api/v1/downsample/parquet", gapped_body("null")).await;
+		assert_eq!(status, StatusCode::OK);
+		let batch = &weft_arrow::read_parquet(&bytes).expect("valid parquet")[0];
+		assert_eq!(batch.column_by_name("min").map(|c| c.null_count()), Some(2));
+		let (status, _, bytes) = post_json_for_bytes("/api/v1/downsample/arrow", gapped_body("prev")).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(weft_arrow::read_ipc_stream(&bytes).expect("valid arrow")[0].column_by_name("min").map(|c| c.null_count()), Some(0), "a carried-forward fill has every value");
+	}
+
+	#[tokio::test]
+	async fn a_fill_is_bounded_and_its_name_checked() {
+		let (status, body) = post_json("/api/v1/downsample", gapped_body("sideways")).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		let mut wide = gapped_body("null");
+		wide["resolution"] = "nanoseconds".into();
+		wide["end"] = ts(86_400).into();
+		let (status, body) = post_json("/api/v1/downsample", wide).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body.to_string().contains("more than the"), "{body}");
+	}
+
+	#[tokio::test]
+	async fn a_bucket_width_is_a_whole_number_of_steps_and_epoch_aligned() {
+		let body = serde_json::json!({
+			"width": "5s",
+			"aggregations": ["min", "max"],
+			"points": (0..12).map(|s| serde_json::json!({ "timestamp": ts(s), "value": s as f64 })).collect::<Vec<_>>(),
+		});
+		let (status, body) = post_json("/api/v1/downsample", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {body}");
+		assert_eq!(body["resolution"], "5 seconds");
+		let series = body["series"].as_array().unwrap();
+		assert_eq!(series.iter().map(|b| (b["timestamp"].as_str().unwrap().to_string(), b["count"].as_u64().unwrap(), b["aggregations"]["max"].as_f64().unwrap())).collect::<Vec<_>>(), [("1970-01-01T00:00:00Z".to_string(), 5, 4.0), ("1970-01-01T00:00:05Z".to_string(), 5, 9.0), ("1970-01-01T00:00:10Z".to_string(), 2, 11.0)]);
+		let mut bad = gapped_body("");
+		bad["width"] = "5 parsecs".into();
+		assert_eq!(post_json("/api/v1/downsample", bad).await.0, StatusCode::BAD_REQUEST);
+	}
+
+	#[tokio::test]
+	async fn the_ilp_endpoint_takes_a_width_as_its_resolution() {
+		let response = app().oneshot(Request::builder().method("POST").uri("/api/v1/downsample/ilp?field=v&precision=s&resolution=15m&agg=max&fill=null").body(Body::from("m v=1 60\nm v=4 1000\nm v=9 2800\n")).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(body["resolution"], "15 minutes");
+		assert_eq!(body["series"].as_array().map(|s| s.iter().map(|b| b["count"].as_u64().unwrap()).collect::<Vec<_>>()), Some(vec![1, 1, 0, 1]), "{body}");
+	}
+
+	#[tokio::test]
+	async fn the_ilp_endpoint_takes_fill_as_a_query_parameter() {
+		let response = app().oneshot(Request::builder().method("POST").uri("/api/v1/downsample/ilp?field=v&precision=s&resolution=minutes&agg=min&fill=prev").body(Body::from("m v=1 0\nm v=4 180\n")).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(body["series"].as_array().map(|s| s.iter().map(|b| b["aggregations"]["min"].as_f64().unwrap()).collect::<Vec<_>>()), Some(vec![1.0, 1.0, 1.0, 4.0]));
 	}
 
 	#[tokio::test]

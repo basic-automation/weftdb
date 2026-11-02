@@ -35,7 +35,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, PointKind, Resolution, Spline};
 
-use crate::{bucket_index, bucket_start, Bucket};
+use crate::{Bucket, BucketWidth};
 
 /// How [`fill`] synthesizes the values of a bucket that held no samples.
 #[derive(Debug, Clone, PartialEq)]
@@ -117,7 +117,18 @@ pub enum FillError {
 /// [`FillError::TimestampRange`] / [`FillError::BucketStartOverflow`] if a bound or step is
 /// outside the representable range at `resolution`.
 pub fn fill(buckets: &[Bucket], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, method: &Fill, max_buckets: usize) -> Result<Vec<Bucket>, FillError> {
-	let index = |t: &DateTime<Utc>| bucket_index(resolution, t).map_err(|_| FillError::TimestampRange);
+	fill_width(buckets, BucketWidth::from(resolution), start, end, method, max_buckets)
+}
+
+/// [`fill`] on the grid of a [`BucketWidth`] (`5s`, `15m`), for buckets from
+/// [`reduce_width`](crate::reduce_width): one bucket per width, epoch-aligned. A spline fill
+/// interpolates on the width's unit grid and keeps the points at bucket starts.
+///
+/// # Errors
+///
+/// As [`fill`].
+pub fn fill_width(buckets: &[Bucket], width: BucketWidth, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, method: &Fill, max_buckets: usize) -> Result<Vec<Bucket>, FillError> {
+	let index = |t: &DateTime<Utc>| width.index(t).map_err(|_| FillError::TimestampRange);
 	let steps = buckets.iter().map(|b| index(&b.timestamp)).collect::<Result<Vec<i64>, _>>()?;
 	if steps.windows(2).any(|w| w[0] >= w[1]) {
 		return Err(FillError::Unordered);
@@ -150,7 +161,7 @@ pub fn fill(buckets: &[Bucket], resolution: Resolution, start: Option<DateTime<U
 		latest.extend(bucket.values.iter().map(|(k, v)| (k, (s, v))));
 	}
 	let splined = match method {
-		Fill::Spline(spline) => spline_values(buckets, resolution, first, last, *spline)?,
+		Fill::Spline(spline) => spline_values(buckets, width, first, last, *spline)?,
 		_ => BTreeMap::new(),
 	};
 	let mut out = Vec::with_capacity(usize::try_from(grid).unwrap_or(0));
@@ -161,7 +172,7 @@ pub fn fill(buckets: &[Bucket], resolution: Resolution, start: Option<DateTime<U
 			next += 1;
 			continue;
 		}
-		let timestamp = bucket_start(resolution, step).ok_or(FillError::BucketStartOverflow)?;
+		let timestamp = width.start(step).ok_or(FillError::BucketStartOverflow)?;
 		let values = match method {
 			Fill::Null => BTreeMap::new(),
 			Fill::Value(constant) => keys.iter().map(|&k| (k.clone(), constant.clone())).collect(),
@@ -193,19 +204,20 @@ fn linear_values(latest: &BTreeMap<&String, (i64, &BigDecimal)>, later: &[Bucket
 
 /// For each reduction the buckets carry, its spline interpolation at every grid step of
 /// `first..=last` that lies strictly inside that reduction's buckets and is not one of
-/// them, keyed by step. splimes' grid at `resolution` anchored at bucket `first`'s start
-/// is exactly the bucket grid (both step by `Resolution::step_nanos`), so grid point `k`
-/// is step `first + k`.
-fn spline_values(buckets: &[Bucket], resolution: Resolution, first: i64, last: i64, spline: Spline) -> Result<BTreeMap<String, BTreeMap<i64, BigDecimal>>, FillError> {
-	let (start, end) = (bucket_start(resolution, first).ok_or(FillError::BucketStartOverflow)?, bucket_start(resolution, last).ok_or(FillError::BucketStartOverflow)?);
+/// them, keyed by step. splimes' grid at the width's unit anchored at bucket `first`'s
+/// start puts bucket starts every [`count`](BucketWidth::count) points, so grid point `k`
+/// is step `first + k / count` when `count` divides `k`.
+fn spline_values(buckets: &[Bucket], width: BucketWidth, first: i64, last: i64, spline: Spline) -> Result<BTreeMap<String, BTreeMap<i64, BigDecimal>>, FillError> {
+	let (start, end) = (width.start(first).ok_or(FillError::BucketStartOverflow)?, width.start(last).ok_or(FillError::BucketStartOverflow)?);
+	let per = usize::try_from(width.count()).unwrap_or(usize::MAX);
 	let mut keys: Vec<&String> = buckets.iter().flat_map(|b| b.values.keys()).collect();
 	keys.sort_unstable();
 	keys.dedup();
 	let mut out = BTreeMap::new();
 	for key in keys {
 		let knots: Vec<Point> = buckets.iter().filter_map(|b| b.values.get(key).map(|v| Point::new(b.timestamp, v.clone()))).collect();
-		let series = splimes::interpolate(&knots, start, end, resolution, spline).map_err(|e| FillError::Spline(e.to_string()))?;
-		let by_step: BTreeMap<i64, BigDecimal> = series.kinds().iter().zip(series.values()).zip(first..=last).filter(|((kind, _), _)| **kind == PointKind::Interpolated).map(|((_, value), step)| (step, value.clone())).collect();
+		let series = splimes::interpolate(&knots, start, end, width.unit(), spline).map_err(|e| FillError::Spline(e.to_string()))?;
+		let by_step: BTreeMap<i64, BigDecimal> = series.kinds().iter().zip(series.values()).step_by(per).zip(first..=last).filter(|((kind, _), _)| **kind == PointKind::Interpolated).map(|((_, value), step)| (step, value.clone())).collect();
 		out.insert(key.clone(), by_step);
 	}
 	Ok(out)
