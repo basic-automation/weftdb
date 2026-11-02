@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: python3 tools/check_claims.py --registry bench/claims.json --readme README.md
+      - run: python3 tools/check_claims.py --registry bench/claims.json --readme docs/reference.md --root .
       # The artifact-reference checks in check_claims.py are part of the gate, so
       # their tests run here too (EVI-4).
       - run: python3 -m unittest discover -s tools -p 'test_*.py' -v

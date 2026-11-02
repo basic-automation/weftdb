@@ -179,10 +179,11 @@ InfluxDB 3 and IoTDB on the same data, the same machine and a correctness check 
 answer. The latest pooled run is in
 [`bench/reports/phase1-pooled/`](bench/reports/phase1-pooled/README.md). In short:
 
-- **WeftDB wins at interpolating inside the database:** 1.1× to 8.2× faster than the same
-  reconstruction written in SQL, at both scales measured.
-- **It loses on bulk loading** (ClickHouse is several times faster) **and to fetching the raw
-  points and interpolating in a fast client.** The report lists every loss.
+- **WeftDB wins at interpolating inside the database:** it beats the same reconstruction
+  written in SQL on all four datasets at the smaller scale, and on two of the four at the
+  larger one.
+- **It loses on bulk loading, and to fetching the raw points and interpolating in a fast
+  client.** The report gives every figure, win and loss, with how far each one holds.
 
 Run it yourself with `weft-xbench`; see [Benchmarking](docs/reference.md#benchmarking).
 

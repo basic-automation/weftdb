@@ -123,3 +123,40 @@ class ArtifactCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RootTests(unittest.TestCase):
+    """A document below the repository root: `--root` resolves sources and workflows, the
+    document's directory resolves its own links."""
+
+    def run_lint(self, link, with_root=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "benches").mkdir()
+            (root / "benches" / "b.rs").write_text("", encoding="utf-8")
+            (root / "docs").mkdir()
+            doc = root / "docs" / "reference.md"
+            doc.write_text(f"<!-- claim:test-1 -->\n\nThe run took **42 ms** ([bench]({link})).\n", encoding="utf-8")
+            reg = registry(artifact=None)
+            reg["claims"][0]["source"] = "benches/b.rs"
+            reg_path = root / "claims.json"
+            reg_path.write_text(json.dumps(reg), encoding="utf-8")
+            args = [sys.executable, str(LINT), "--registry", str(reg_path), "--readme", str(doc)]
+            if with_root:
+                args += ["--root", str(root)]
+            proc = subprocess.run(args, capture_output=True, text=True, check=False)
+            return proc.returncode, proc.stdout
+
+    def test_root_resolves_sources_and_links_resolve_beside_the_document(self):
+        code, out = self.run_lint("../benches/b.rs")
+        self.assertEqual(code, 0, out)
+
+    def test_without_root_a_repo_relative_source_is_missing(self):
+        code, out = self.run_lint("../benches/b.rs", with_root=False)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("source path 'benches/b.rs' does not exist", out)
+
+    def test_a_link_is_not_resolved_against_the_root(self):
+        code, out = self.run_lint("benches/b.rs")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("links to 'benches/b.rs'", out)
