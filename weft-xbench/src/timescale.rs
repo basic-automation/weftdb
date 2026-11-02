@@ -179,6 +179,10 @@ impl Arm for Timescale {
 		ArmInfo { arm: arm.into(), engine: format!("timescaledb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: generate_series() grid, two index-backed LATERAL LIMIT 1 lookups, first/last segment extended; downsample via time_bucket; hypertable on t (one chunk per load, row store), one text COPY committed with synchronous_commit on; server over loopback via tokio-postgres{note}") }
 	}
 
+	fn unload(&mut self) {
+		self.db = None;
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;

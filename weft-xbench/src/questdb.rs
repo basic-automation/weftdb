@@ -302,6 +302,10 @@ impl Arm for QuestDb {
 		ArmInfo { arm: arm.into(), engine: format!("questdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: long_sequence() grid, native LT JOIN into segments, then ASOF JOIN from the grid, first/last segment extended; downsample via SAMPLE BY … ALIGN TO CALENDAR; WAL table partitioned by year, load acknowledged over QWP and timed until applied; QWP both ways over loopback WebSocket{note}") }
 	}
 
+	fn unload(&mut self) {
+		self.db = None;
+	}
+
 	async fn load(&mut self, ds: &Dataset) -> anyhow::Result<()> {
 		self.db = None;
 		let timestamps = ds.points.iter().map(|p| p.timestamp.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("instant {} is outside the nanosecond range", p.timestamp))).collect::<anyhow::Result<Vec<i64>>>()?;

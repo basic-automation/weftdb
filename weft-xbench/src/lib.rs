@@ -27,6 +27,7 @@
 pub mod clickhouse;
 pub mod duck;
 pub mod influxdb3;
+pub mod iotdb;
 pub mod questdb;
 pub mod render;
 pub mod timescale;
@@ -446,6 +447,8 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Refere
 
 	let mut load_samples = Vec::with_capacity(load_reps);
 	for _ in 0..if arm.loads() { load_reps } else { 1 } {
+		// Outside the clock: the previous rep's teardown is not part of this load.
+		arm.unload();
 		let t0 = Instant::now();
 		arm.load(ds).await?;
 		load_samples.push(span_ns(t0));
@@ -517,6 +520,8 @@ pub struct Servers {
 	pub questdb: Option<questdb::Server>,
 	/// An `InfluxDB` 3 HTTP endpoint (`--influxdb3 URL`).
 	pub influxdb3: Option<influxdb3::Server>,
+	/// An Apache `IoTDB` REST service (`--iotdb URL`).
+	pub iotdb: Option<iotdb::Server>,
 }
 
 /// Run every arm over every dataset.
@@ -549,6 +554,9 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps
 		if let Some(server) = &servers.influxdb3 {
 			results.extend(measure(&mut influxdb3::Influx::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
 		}
+		if let Some(server) = &servers.iotdb {
+			results.extend(measure(&mut iotdb::IoTdb::double(server.clone()), ds, &reference, load_reps, reps, seed).await?);
+		}
 	}
 	let mut engines = vec![EngineVersion { engine: "weftdb".into(), version: metadata.weft_bench_version.clone() }, EngineVersion { engine: "duckdb".into(), version: duck::duckdb_version()? }];
 	if let Some(server) = &servers.clickhouse {
@@ -562,6 +570,9 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, load_reps: usize, reps
 	}
 	if let Some(server) = &servers.influxdb3 {
 		engines.push(EngineVersion { engine: "influxdb3".into(), version: server.version()? });
+	}
+	if let Some(server) = &servers.iotdb {
+		engines.push(EngineVersion { engine: "iotdb".into(), version: server.version()? });
 	}
 	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), results })
 }
@@ -692,6 +703,63 @@ mod tests {
 		let buckets = arm.downsample(&plain, plain.points.clone()).await.expect("downsamples");
 		assert!(Correctness::check_buckets(&buckets, &reference.buckets).passed, "got {buckets:?}\nwant {:?}", reference.buckets);
 		assert!(arm.storage_bytes().is_none(), "the WAL's bytes are not reported as storage");
+	}
+
+	/// The `IoTDB` arm against a live server, when `WEFT_XBENCH_IOTDB` names its REST service
+	/// (`http://127.0.0.1:18080`); without it this passes. A device and an instant are `IoTDB`'s key,
+	/// so the duplicate instant is checked for interpolation (the last value wins, as in splimes) and
+	/// the buckets on the dataset without it, where every row counts once anyway.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn iotdb_matches_the_reference_on_edges_and_duplicates_when_a_server_is_given() {
+		let Ok(url) = std::env::var("WEFT_XBENCH_IOTDB") else { return };
+		let mut arm = iotdb::IoTdb::double(iotdb::Server::new(&url));
+		let plain = edge_dataset();
+		let mut dup = edge_dataset();
+		dup.points.insert(3, Point::new(ts(14), "9".parse().expect("decimal")));
+		let reference = reference(&dup).await.expect("reference");
+		let values = values_of(&mut arm, &dup).await;
+		let gate = Correctness::check(&values, &reference.grid, dup.grid_len());
+		assert!(gate.passed, "{gate:?}\n got {values:?}\nwant {:?}", reference.grid);
+		let reference = reference_of(&plain).await;
+		arm.load(&plain).await.expect("loads");
+		let buckets = arm.downsample(&plain, plain.points.clone()).await.expect("downsamples");
+		assert!(Correctness::check_buckets(&buckets, &reference.buckets).passed, "got {buckets:?}\nwant {:?}", reference.buckets);
+		assert!(arm.storage_bytes().is_some_and(|b| b > 0), "the flushed TsFiles are reported as storage");
+	}
+
+	/// An arm whose teardown is slow and whose load is instant: the in-memory reference with a
+	/// load phase, so its answers pass the gates.
+	struct SlowTeardown;
+
+	impl Arm for SlowTeardown {
+		fn info(&self) -> ArmInfo {
+			ArmInfo { arm: "slow-teardown".into(), ..weft::WeftMemory.info() }
+		}
+
+		fn unload(&mut self) {
+			std::thread::sleep(std::time::Duration::from_millis(200));
+		}
+
+		async fn load(&mut self, _ds: &Dataset) -> anyhow::Result<()> {
+			Ok(())
+		}
+
+		async fn interpolate(&mut self, ds: &Dataset, knots: Vec<splimes::Point>) -> anyhow::Result<Output> {
+			weft::WeftMemory.interpolate(ds, knots).await
+		}
+
+		async fn downsample(&mut self, ds: &Dataset, knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {
+			weft::WeftMemory.downsample(ds, knots).await
+		}
+	}
+
+	#[tokio::test]
+	async fn a_load_is_timed_without_the_previous_loads_teardown() {
+		let ds = edge_dataset();
+		let reference = reference_of(&ds).await;
+		let results = measure(&mut SlowTeardown, &ds, &reference, 3, 1, DEFAULT_SEED).await.expect("measures");
+		let load = results.iter().find(|r| r.phase == Phase::Load).expect("a load row");
+		assert!(load.latency.max_ns < 100_000_000, "a 200 ms teardown leaked into the load clock: {:?}", load.latency);
 	}
 
 	async fn reference_of(ds: &Dataset) -> Reference {
