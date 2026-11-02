@@ -11,8 +11,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 ## [0.2.0] - 2026-11-02
 
 The second pre-beta release, cut where roadmap Phase 1 (the benchmark suite) closes. Like
-v0.1.0 it ships as pre-built binaries on the GitHub release only; the library crates are not
-on crates.io (build them from the `v0.2.0` tag). WeftDB is still pre-beta: the 1.0 beta bar
+v0.1.0 it ships pre-built binaries on the GitHub release, and it is the first release whose
+seven library crates are published on crates.io (`weftdb`, `weft-orchestration`,
+`weft-physical-type`, `weft-reduce`, `weft-line-protocol`, `weft-arrow`, `weft-arrow-store`).
+WeftDB is still pre-beta: the 1.0 beta bar
 (roadmap Phase 7 and W10–W12) is not met, and this release makes no claim that it is.
 
 ⚠️ **Upgrading a segment store from v0.1.0 is one-way.** The first open by this
