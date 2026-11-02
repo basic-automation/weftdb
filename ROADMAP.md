@@ -37,7 +37,7 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
 - [ ] Fair-protocol depth (Phase 1.1)
   - [x] **DONE (2026-11-02) — raw samples, ≥10 samples per short test, stddev intervals** (#147): every result of both harnesses keeps `samples_ns`; `weft-bench verify` flags a short result under 10 samples; `weft-xbench` defaults to 10 reps
   - [ ] **NEXT — result hashes**: a `result_sha256` over each workload's canonical output, so runs and engines can be shown to agree exactly, and the storage error bound gated
-  - [ ] **NEXT — several runs per report** (`--runs N`): between-run spread per result, a verdict only where every run agrees (DECISIONS 2026-10-30: within-run intervals understated it on 53 of 144 rows)
+  - [ ] **NEXT — several runs per report** (`--runs N`): between-run spread per result, a verdict only where every run agrees (DECISIONS 2026-10-29, EVI-15: within-run intervals understated it, with 53 of 144 rows disjoint across two runs)
   - [ ] **NEXT — saturation sweeps** (`--sweep KNOB=v1,v2,…` over batch size, readers, series, parallelism) and a seeded query mix from the soak lanes
   - [ ] **NEXT — a run manifest for `weft-xbench`**, with image digests, input file hashes and each engine's live settings
   - [ ] Post-compaction reads wait on engine compaction (§7.5); restart-during-ingest and crash-during-compaction tests wait on the crash matrix (SOA-9, D-S21)
