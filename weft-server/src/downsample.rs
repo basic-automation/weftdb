@@ -22,7 +22,7 @@
 //!
 //! With `fill` (a body field here, `?fill=` on the ILP and stored-range endpoints)
 //! every grid step between the bounds is emitted, the empty ones synthesized by
-//! [`weft_reduce::fill`]: `null`, `prev` (or `previous`, `locf`), `linear`,
+//! [`weft_reduce::fill()`]: `null`, `prev` (or `previous`, `locf`), `linear`,
 //! `quadratic`, `cubic`, or a constant. A synthesized bucket has `count == 0` in
 //! every output format, so it is never passed off as measured, and a reduction the
 //! method leaves without a value (`null`, or a line past the last measured bucket)

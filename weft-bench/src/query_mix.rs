@@ -1,4 +1,4 @@
-//! Seeded query mix over [`SegmentStore`] (fair protocol 1.1, #147).
+//! Seeded query mix over [`SegmentStore`](weftdb::SegmentStore) (fair protocol 1.1, #147).
 //!
 //! Every other store workload times one kind of operation at a time. A real store sees writes and
 //! reads interleaved, and an engine tuned for one can lose on the mix. This workload replays the
