@@ -69,6 +69,8 @@ pub mod baseline_adapter;
 pub mod combine;
 pub mod compare;
 pub mod compressed_query;
+pub mod export;
+pub mod failure;
 pub mod query_mix;
 pub mod sweep;
 pub mod compression;

@@ -40,6 +40,18 @@ use weft_bench::{
 const PROG: &str = "weft-bench";
 
 fn main() -> ExitCode {
+	let args: Vec<String> = std::env::args().skip(1).collect();
+	if args.first().map(String::as_str) == Some(weft_bench::failure::CHILD_COMMAND) {
+		// A failure test's child: it does its work until the harness kills it.
+		let outcome = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(anyhow::Error::from).and_then(|rt| rt.block_on(weft_bench::failure::child(&args[1..])));
+		return match outcome {
+			Ok(()) => ExitCode::SUCCESS,
+			Err(e) => {
+				eprintln!("{PROG} {}: {e:#}", weft_bench::failure::CHILD_COMMAND);
+				ExitCode::FAILURE
+			}
+		};
+	}
 	let command = match Cli::from_args(std::env::args().skip(1)) {
 		Ok(c) => c,
 		Err(e) => {
@@ -58,6 +70,7 @@ fn main() -> ExitCode {
 		Command::Verify { manifest, accept_advisories } => return verify_manifest(&manifest, accept_advisories),
 		Command::Combine { runs, out, no_manifest } => return combine_runs(&runs, &out, no_manifest),
 		Command::Sweep { knob, values, out_dir, args } => return sweep_runs(&knob, &values, &out_dir, &args),
+		Command::Export { report, format, out } => return export_report(&report, format, out.as_deref()),
 		Command::Compare { baseline, candidate, threshold_pct, ignore_provenance, strict, json, markdown } => return compare_runs(&baseline, &candidate, threshold_pct, ignore_provenance, strict, json.as_deref(), markdown.as_deref()),
 	};
 
@@ -425,6 +438,9 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		.map_err(|e| anyhow::anyhow!("compressed-query run failed: {e}"))?;
 		return Ok(code);
 	}
+	if !cli.failure.is_empty() {
+		return run_failures(cli, &profile, &corpus).await;
+	}
 	if cli.query_mix > 0 {
 		let params = weft_bench::QueryMixParams { rows: cli.query_mix_rows.unwrap_or(corpus.values.len() as u64), ops: cli.query_mix, range_rows: cli.query_mix_range, weights: cli.query_mix_weights, seed: cli.seed };
 		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
@@ -464,6 +480,23 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// returning the process exit code. Shared by every workload path so a write
 /// failure always surfaces as a non-zero exit and the summary/artifact layout is
 /// identical regardless of workload.
+/// `--failure`: each failure test in turn, one report each (#147).
+async fn run_failures(cli: &Cli, profile: &IngestProfile, corpus: &weft_bench::UciCorpus) -> anyhow::Result<ExitCode> {
+	let uci = cli.uci.clone().ok_or_else(|| anyhow::anyhow!("--failure needs --uci"))?;
+	let params = weft_bench::failure::FailureParams { uci, column: cli.uci_column.clone(), corpus_rows: cli.ingest_rows, rows: cli.failure_rows, reps: cli.failure_reps, compact_to: cli.failure_compact_to, kill_within: std::time::Duration::from_millis(cli.failure_kill_within_ms), seed: cli.seed, exe: std::env::current_exe()? };
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let mut code = ExitCode::SUCCESS;
+	for &failure in &cli.failure {
+		let result = weft_bench::failure::run_failure(failure, profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, &params).await.map_err(|e| anyhow::anyhow!("failure test {} failed to run: {e:#}", failure.as_str()))?;
+		let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
+		println!("failure {:<16}: {} reps  reopen p50 {:>9.3} ms max {:>9.3} ms  {}", failure.as_str(), result.reps, ms(result.latency.p50_ns), ms(result.latency.max_ns), if result.correctness.passed() { "PASS" } else { "FAIL" });
+		if finish(cli, &BenchReport::with_results(metadata.clone(), vec![result]))? != ExitCode::SUCCESS {
+			code = ExitCode::FAILURE;
+		}
+	}
+	Ok(code)
+}
+
 fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 	// The artifact name tags every adapter in the report (e.g. `weftdb+baseline-linear`)
 	// so a comparison and a solo run never collide on disk.
@@ -493,6 +526,14 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 		None
 	};
 
+	// And any other surfaces (same stem, `.md`, `.csv`, `.prom`).
+	let mut export_paths = Vec::new();
+	for &format in &cli.exports {
+		let path = out_path.with_extension(format.extension());
+		std::fs::write(&path, weft_bench::export::render(report, format)).map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+		export_paths.push(path);
+	}
+
 	// The manifest is written last so it can hash the report as it now sits on disk, and refused
 	// rather than saved if it does not verify against what was just written.
 	let manifest_path = if cli.manifest {
@@ -511,6 +552,9 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 	}
 	if let Some(path) = &html_path {
 		println!("  html report  : {}", path.display());
+	}
+	for path in &export_paths {
+		println!("  also written : {}", path.display());
 	}
 	if let Some(path) = &parquet_path {
 		println!("  parquet table: {}", path.display());
@@ -568,6 +612,26 @@ fn sweep_runs(knob: &str, values: &[String], out_dir: &Path, args: &[String]) ->
 		eprintln!("{PROG}: sweep failed: {e:#}");
 		ExitCode::FAILURE
 	})
+}
+
+/// Render the report at `path` as `format`, to `out` or standard output.
+fn export_report(path: &Path, format: weft_bench::export::Format, out: Option<&Path>) -> ExitCode {
+	let result = (|| -> anyhow::Result<()> {
+		let report: BenchReport = serde_json::from_slice(&std::fs::read(path)?).map_err(|e| anyhow::anyhow!("{} is not a weft-bench report: {e}", path.display()))?;
+		let text = weft_bench::export::render(&report, format);
+		match out {
+			Some(out) => std::fs::write(out, text)?,
+			None => print!("{text}"),
+		}
+		Ok(())
+	})();
+	result.map_or_else(
+		|e| {
+			eprintln!("{PROG}: export failed: {e:#}");
+			ExitCode::FAILURE
+		},
+		|()| ExitCode::SUCCESS,
+	)
 }
 
 fn manifest_path_for(report_path: &Path) -> PathBuf {
@@ -928,6 +992,16 @@ struct Cli {
 	/// Ingest mode: compact the compressed-query store to segments of this many rows and ask again
 	/// (`--compressed-query-compact`); `None` for no compaction.
 	compressed_query_compact: Option<u64>,
+	/// Ingest mode: the failure tests to run (`--failure NAME|all`); empty for none.
+	failure: Vec<weft_bench::failure::Failure>,
+	/// Ingest mode: rows each failure rep's store is fed (`--failure-rows`).
+	failure_rows: u64,
+	/// Ingest mode: failures injected per test (`--failure-reps`).
+	failure_reps: usize,
+	/// Ingest mode: rows a failure test's compaction coalesces toward (`--failure-compact-to`).
+	failure_compact_to: u64,
+	/// Ingest mode: upper bound of the seeded delay before a compaction is killed (`--failure-kill-within-ms`).
+	failure_kill_within_ms: u64,
 	/// Ingest mode: operations in a seeded query mix (`--query-mix`); 0 for none.
 	query_mix: usize,
 	/// Ingest mode: rows the query-mix store starts with (`--query-mix-rows`); `None` for the corpus once.
@@ -999,6 +1073,8 @@ struct Cli {
 	html: bool,
 	/// Also write the flat Parquet results table beside the JSON artifact.
 	parquet: bool,
+	/// Also write these surfaces beside the JSON artifact (`--markdown-report`, `--csv-report`, `--prom`).
+	exports: Vec<weft_bench::export::Format>,
 	/// Calibrate the interpolation backends before an interpolation run, as
 	/// `weft-server` does at startup (`--no-gpu-calibrate` turns it off).
 	gpu_calibrate: bool,
@@ -1064,6 +1140,15 @@ enum Command {
 		/// claim.
 		no_manifest: bool,
 	},
+	/// Render a stored report as Markdown, CSV or Prometheus text.
+	Export {
+		/// The report.
+		report: PathBuf,
+		/// The surface.
+		format: weft_bench::export::Format,
+		/// Where it goes; standard output when `None`.
+		out: Option<PathBuf>,
+	},
 	/// Run one benchmark once per value of a knob and lay the results out as curves.
 	Sweep {
 		/// The flag (or `threads`) varied.
@@ -1124,6 +1209,15 @@ impl Cli {
 			tokens.next();
 			return parse_combine_args(tokens);
 		}
+		if tokens.peek().is_some_and(|token| token == "export") {
+			tokens.next();
+			let args: Vec<String> = tokens.collect();
+			return match &args[..] {
+				[report, flag, format] if flag == "--format" => Ok(Command::Export { report: PathBuf::from(report), format: weft_bench::export::Format::parse(format).ok_or_else(|| format!("export --format {format:?}: one of md, csv, prom"))?, out: None }),
+				[report, flag, format, out_flag, out] if flag == "--format" && out_flag == "--out" => Ok(Command::Export { report: PathBuf::from(report), format: weft_bench::export::Format::parse(format).ok_or_else(|| format!("export --format {format:?}: one of md, csv, prom"))?, out: Some(PathBuf::from(out)) }),
+				_ => Err("usage: weft-bench export REPORT.json --format md|csv|prom [--out FILE]".to_string()),
+			};
+		}
 		if tokens.peek().is_some_and(|token| token == "sweep") {
 			tokens.next();
 			return parse_sweep_args(tokens);
@@ -1148,6 +1242,7 @@ impl Cli {
 		let mut ingest_growth: Vec<u64> = Vec::new();
 		let (mut ingest_online, mut ingest_online_rows, mut ingest_online_window): (usize, Option<u64>, usize) = (0, None, 1_440);
 		let (mut compressed_query, mut compressed_query_rows, mut compressed_query_compact): (usize, Option<u64>, Option<u64>) = (0, None, None);
+		let (mut failure, mut failure_rows, mut failure_reps, mut failure_compact_to, mut failure_kill_within_ms): (Vec<weft_bench::failure::Failure>, u64, usize, u64, u64) = (Vec::new(), 1_000_000, 5, 65_536, 2_000);
 		let (mut query_mix, mut query_mix_rows, mut query_mix_range, mut query_mix_weights): (usize, Option<u64>, u64, weft_bench::LaneWeights) = (0, None, 1_440, weft_bench::LaneWeights::default());
 		let (mut analytics_rows, mut analytics_tail, mut analytics_batch): (Option<u64>, Option<u64>, usize) = (None, None, 1_440);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
@@ -1169,6 +1264,7 @@ impl Cli {
 		let mut compare = false;
 		let mut stored = false;
 		let (mut html, mut parquet, mut ds_scaled) = (false, false, false);
+		let mut exports = Vec::new();
 		let mut gpu_calibrate = true;
 		let (mut manifest, mut claim, mut labels): (bool, Option<String>, Vec<(String, String)>) = (true, None, Vec::new());
 		let (mut sparse_mode, mut sparse) = (false, SparseParams::default());
@@ -1223,6 +1319,14 @@ impl Cli {
 				"--analytics-batch" => analytics_batch = parse_positive(&key, &take_value(&key)?)?,
 				"--compressed-query" => compressed_query = parse_positive(&key, &take_value(&key)?)?,
 				"--compressed-query-compact" => compressed_query_compact = Some(parse_positive(&key, &take_value(&key)?)? as u64),
+				"--failure" => {
+					let name = take_value(&key)?;
+					failure = if name == "all" { weft_bench::failure::Failure::ALL.to_vec() } else { vec![weft_bench::failure::Failure::parse(&name).ok_or_else(|| format!("--failure: {name:?} is not kill-ingest, kill-compaction, corrupt-segment or all"))?] };
+				}
+				"--failure-rows" => failure_rows = parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--failure-rows needs one row count of at least 2 (e.g. 1M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--failure-rows takes one row count".to_string()) })?,
+				"--failure-reps" => failure_reps = parse_positive(&key, &take_value(&key)?)?,
+				"--failure-compact-to" => failure_compact_to = parse_positive(&key, &take_value(&key)?)? as u64,
+				"--failure-kill-within-ms" => failure_kill_within_ms = parse_positive(&key, &take_value(&key)?)? as u64,
 				"--query-mix" => query_mix = parse_positive(&key, &take_value(&key)?)?,
 				"--query-mix-rows" => query_mix_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--query-mix-rows needs one row count of at least 2 (e.g. 10M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--query-mix-rows takes one row count".to_string()) })?),
 				"--query-mix-range" => query_mix_range = parse_positive(&key, &take_value(&key)?)? as u64,
@@ -1261,6 +1365,9 @@ impl Cli {
 				"-c" | "--compare" => compare = true,
 				"--stored" => stored = true,
 				"--html" => html = true,
+				"--markdown-report" => exports.push(weft_bench::export::Format::Markdown),
+				"--csv-report" => exports.push(weft_bench::export::Format::Csv),
+				"--prom" => exports.push(weft_bench::export::Format::Prometheus),
 				"--parquet" => parquet = true,
 				"--ds-scaled" => ds_scaled = true,
 				"--no-gpu-calibrate" => gpu_calibrate = false,
@@ -1320,6 +1427,9 @@ impl Cli {
 		if analytics_rows.is_some() && (compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty()) {
 			return Err("`--analytics-pipeline` is a run of its own".to_string());
 		}
+		if !failure.is_empty() && (mode != InputMode::Ingest || query_mix > 0 || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some()) {
+			return Err("`--failure` needs `--ingest` and is a run of its own".to_string());
+		}
 		if query_mix_rows.is_some() && query_mix == 0 {
 			return Err("`--query-mix-rows` needs `--query-mix <OPS>`".to_string());
 		}
@@ -1330,7 +1440,7 @@ impl Cli {
 			return Err("`--compressed-query` is a run of its own, apart from `--ingest-online` and `--ingest-growth`".to_string());
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, failure, failure_rows, failure_reps, failure_compact_to, failure_kill_within_ms, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, exports, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -2018,6 +2128,19 @@ INGEST OPTIONS (with --ingest):
                              Then compact the store to segments of ROWS rows and ask
                              the same windows again, as `-compacted` results that must
                              answer exactly as before (post-compaction reads)
+        --failure <kill-ingest|kill-compaction|corrupt-segment|all>
+                             Failure tests instead: a child process (this binary) seals
+                             the corpus, or compacts a store of it, and is SIGKILLed at
+                             a seeded point; or one seeded byte of a closed store's
+                             segment is flipped. The reopened store must hold every
+                             acknowledged row exactly and never serve a wrong value.
+                             One report per test; latency is the reopen time
+        --failure-rows <N>   Rows each rep's store is fed [default: 1M]
+        --failure-reps <N>   Failures per test [default: 5]
+        --failure-compact-to <ROWS>
+                             Segment rows the killed compaction aims at [default: 65536]
+        --failure-kill-within-ms <MS>
+                             The compaction is killed a seeded 0..MS ms in [default: 2000]
         --query-mix <OPS>
                              Seeded query mix instead: seal the corpus, then run OPS
                              operations whose lanes (ingest a batch, look up a point,
@@ -2077,6 +2200,11 @@ OPTIONS:
                              rep interpolates on read from it
         --html               Also write a human-readable HTML report alongside
                              the JSON artifact
+        --markdown-report    Also write the results as a Markdown table (.md)
+        --csv-report         Also write the results as CSV (.csv)
+        --prom               Also write the results as Prometheus text (.prom), for a
+                             node-exporter textfile collector or a Pushgateway and the
+                             Grafana dashboard in bench/grafana/
         --parquet            Also write the results as a flat Parquet table (one
                              row per result) beside the JSON, for DuckDB/Polars/
                              Grafana queries across many runs
@@ -2115,6 +2243,11 @@ COMBINE:
         report gets a manifest of its own. Exits non-zero unless the combined report is publishable.
         --out FILE.json      Where the combined report goes (required)
         --no-manifest        Skip the provenance check and the manifest (development runs)
+
+EXPORT:
+    weft-bench export <REPORT.json> --format md|csv|prom [--out FILE]
+        Render a stored report (a combined one included) as a Markdown table, CSV, or Prometheus
+        text exposition, to FILE or standard output. Every row carries its gate.
 
 SWEEP:
     weft-bench sweep KNOB=v1,v2,... [--out-dir=DIR] -- <RUN ARGS>...
@@ -2183,6 +2316,16 @@ mod tests {
 	}
 
 	#[test]
+	fn failure_takes_a_test_or_all_and_stands_alone() {
+		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--failure", "all", "--failure-rows", "2M", "--failure-reps", "3"]);
+		assert_eq!((cli.failure.len(), cli.failure_rows, cli.failure_reps), (3, 2_000_000, 3));
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-ingest"]).failure, [weft_bench::failure::Failure::KillIngest]);
+		for bad in [&["--ingest", "--uci", "u.txt", "--failure", "power-loss"][..], &["--failure", "kill-ingest"][..], &["--ingest", "--uci", "u.txt", "--failure", "all", "--query-mix", "3"][..]] {
+			assert!(run_cli(bad).is_err(), "{bad:?}");
+		}
+	}
+
+	#[test]
 	fn query_mix_takes_ops_rows_range_and_weights_and_stands_alone() {
 		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--query-mix", "500", "--query-mix-rows", "1M", "--query-mix-range", "60", "--query-mix-weights", "0,1,3"]);
 		assert_eq!((cli.query_mix, cli.query_mix_rows, cli.query_mix_range), (500, Some(1_000_000), 60));
@@ -2227,6 +2370,7 @@ mod tests {
 			Command::Compare { .. } => panic!("expected a run, got compare"),
 			Command::Combine { .. } => panic!("expected a run, got combine"),
 			Command::Sweep { .. } => panic!("expected a run, got sweep"),
+			Command::Export { .. } => panic!("expected a run, got export"),
 		}
 	}
 
@@ -2268,6 +2412,10 @@ mod tests {
 			_ => panic!("not a combine"),
 		}
 		assert!(run_cli(&["combine", "--out", "all.json", "r1.json"]).unwrap_err().starts_with("combine needs at least two runs"));
+		assert!(matches!(run_cli(&["export", "r.json", "--format", "prom"]), Ok(Command::Export { format: weft_bench::export::Format::Prometheus, out: None, .. })));
+		assert!(matches!(run_cli(&["export", "r.json", "--format", "csv", "--out", "r.csv"]), Ok(Command::Export { out: Some(_), .. })));
+		assert!(run_cli(&["export", "r.json", "--format", "xml"]).is_err());
+		assert_eq!(expect_run(&["-s", "--prom", "--csv-report"]).exports, [weft_bench::export::Format::Prometheus, weft_bench::export::Format::Csv]);
 		assert_eq!(run_cli(&["combine", "r1.json", "r2.json"]).unwrap_err(), "combine needs --out <FILE.json>");
 		match run_cli(&["sweep", "--ingest-batch=1024,65536", "--out-dir=sw", "--", "--ingest", "--uci", "u.txt"]).expect("sweep parses") {
 			Command::Sweep { knob, values, out_dir, args } => assert_eq!((knob.as_str(), values, out_dir, args), ("--ingest-batch", vec!["1024".to_string(), "65536".to_string()], PathBuf::from("sw"), vec!["--ingest".to_string(), "--uci".to_string(), "u.txt".to_string()])),

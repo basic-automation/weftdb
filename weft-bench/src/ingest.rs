@@ -212,7 +212,7 @@ impl Tiled<'_> {
 	}
 
 	/// Rows `start..end`, which must lie within one copy.
-	fn window(&self, start: u64, end: u64) -> anyhow::Result<(Vec<i64>, &[BigDecimal])> {
+	pub(crate) fn window(&self, start: u64, end: u64) -> anyhow::Result<(Vec<i64>, &[BigDecimal])> {
 		let n = self.timestamps.len() as u64;
 		let at = usize::try_from(start % n)?;
 		let len = usize::try_from(end - start)?;
