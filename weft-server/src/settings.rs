@@ -120,6 +120,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_MAX_INGEST_BYTES", tier: Tier::Tuning, summary: "The one body cap for the four ingest routes (plan C11, D-S14): a body over it is refused `413 payload_too_large` with the limit. No other route takes this cap.", accepts: "a positive whole number of bytes", default: "256 MiB (`DEFAULT_MAX_INGEST_BYTES` in ingest.rs)", read_by: "weft-server/ingest.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_MAX_INTERPOLATE_POINTS", tier: Tier::Tuning, summary: "The cap on how many output points one `/api/v1/interpolate*` request may produce.", accepts: "a positive whole number of points", default: "10,000,000 (`MAX_INTERPOLATE_OUTPUT_POINTS`); anything else stops the server from starting", read_by: "weft-server/interpolate.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_ON_AMBIGUOUS_COMMIT", tier: Tier::Stable, summary: "What the server does once its store is write-poisoned by an ambiguous COMMIT: keep serving, or exit and let a supervisor restart into the recovery that settles the commit.", accepts: "`poison` (or unset) keeps serving; `exit` exits with status 70", default: "serve; an unknown value stops the server from starting (PAC-5b strict configuration)", read_by: "weft-server/store_open.rs (the name itself is `weftdb::AMBIGUOUS_COMMIT_ENV`)" },
+	VarSpec { name: "WEFT_QUERY_MAX_INFLIGHT", tier: Tier::Tuning, summary: "The query admission class's in-flight cap (ROB-10, Admission I): at most this many read and stateless-compute requests run at once through the registry's gate, and one beyond the cap is refused `503 overloaded` with `Retry-After` instead of queueing behind them. Probes are never shed, writes are charged against `WEFT_INGEST_MAX_INFLIGHT_BYTES`, and maintenance is admitted one at a time.", accepts: "a positive whole number of requests", default: "128 (`DEFAULT_QUERY_MAX_INFLIGHT` in admission.rs); anything else stops the server from starting", read_by: "weft-server/admission.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_RECONCILE_HOT_COLD", tier: Tier::Tuning, summary: "Reconcile sweep mode: sweep every aspect's cold segments each tick and defer only the hot tail, instead of the all-or-nothing threshold sweep.", accepts: "`1`/`true`/`yes`/`on` (case-insensitive)", default: "unset or falsey: threshold sweep", read_by: "weft-server/startup/daemons.rs" },
 	VarSpec { name: "WEFT_RECONCILE_INTERVAL_SECS", tier: Tier::Tuning, summary: "How often the reconcile daemon sweeps for out-of-order segments — and, with the other `WEFT_RECONCILE_*` settings, for overlaps, squash and compaction.", accepts: "a whole number of seconds; `0` disables the daemon", default: "unset or `0`: no reconcile daemon; a non-numeric value stops the server from starting", read_by: "weft-server/startup/daemons.rs" },
 	VarSpec { name: "WEFT_RECONCILE_MAX_SPLITS", tier: Tier::Tuning, summary: "Adds a squash pass to the reconcile daemon: any aspect holding more than this many segments is folded into one, bounding split-path fragmentation.", accepts: "a positive whole number of segments", default: "unset: no squash pass", read_by: "weft-server/startup/daemons.rs" },
@@ -284,7 +285,7 @@ pub const ROOT_LOCKED_EXIT_CODE: i32 = 75;
 const NON_NEGATIVE_INTS: &[&str] = &["WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_RECONCILE_THRESHOLD", "WEFT_RECONCILE_SPLIT_MIN_BYTES", "WEFT_SEGMENT_CHECKPOINT_STRIDE"];
 
 /// Variables whose registry `accepts` shape is a positive whole number.
-const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_INGEST_MAX_INFLIGHT_BYTES", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INGEST_BYTES", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_SHUTDOWN_GRACE_SECS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
+const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_INGEST_MAX_INFLIGHT_BYTES", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INGEST_BYTES", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_QUERY_MAX_INFLIGHT", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_SHUTDOWN_GRACE_SECS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
 
 /// One line per *value* the operator should hear about, in the order the environment
 /// lists them: a registered numeric variable holding a value outside the shape its
@@ -461,7 +462,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 73, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 74, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
