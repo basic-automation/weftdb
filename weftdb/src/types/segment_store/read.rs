@@ -270,7 +270,8 @@ impl SegmentStore {
 	/// `null_count < row_count` — so a segment whose indexed stats say every row is null
 	/// is dropped before its file is ever opened; inside a surviving frame the same test
 	/// on the persisted segment and per-page stats skips the pages a point lookup cannot answer
-	/// ([`read_paged_segment_point`](weft_physical_type::weftseg::read_paged_segment_point)).
+	/// (the paged form under [`read_frame_point`](weft_physical_type::read_frame_point), which
+	/// every store read site reaches through `frame_read` — TAG-4).
 	/// Neither changes the answer: a null row is not a value.
 	///
 	/// # Errors
@@ -302,8 +303,7 @@ impl SegmentStore {
 	/// The batch analogue of [`read_point`](SegmentStore::read_point): the index is pruned
 	/// **once** by the batch's whole `[min(ts), max(ts)]` span, and each surviving segment is
 	/// opened **once** and its timestamp column decoded **once** for the whole batch (via the
-	/// streaming [`read_segment_points`](weft_physical_type::weftseg::read_segment_points) /
-	/// [`read_paged_segment_points`](weft_physical_type::weftseg::read_paged_segment_points)), so
+	/// frame reader's streaming [`read_frame_points`](weft_physical_type::read_frame_points)), so
 	/// looking up `N` instants that share segments pays one file read + one timestamp decode per
 	/// segment rather than `N`. As with `read_point`, candidates are merged in seal-id order so
 	/// the most recently sealed present value wins per instant (last-writer-wins). An empty `ts`

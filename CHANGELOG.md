@@ -37,6 +37,21 @@ only the control plane, not the segment frames.
   frame that does not verify, or a store whose write floor this build cannot honour. Both
   codes are the ones the server's startup already returns, so a supervisor reads one
   vocabulary.
+- **Every `weftdb` read site is on the frame-reader API** (1.0 plan TAG-4).
+  X-FRAME had already routed `SegmentStore`'s production decode sites through
+  `weftdb::types::frame_read` (the `read_frame*` readers, with the typed
+  `FrameFaultError` under the historical operator sentence); the crate's
+  remaining direct uses of the legacy layout-specific readers were in its own
+  tests, one of them still choosing a reader from the index row's
+  `format_version` copy. Those sites now read through `frame_read` too, so no
+  code in the `weftdb` crate names a legacy reader, and two store-level tests
+  pin the contract at the public API: a v7-envelope-wrapped frame reads
+  through `read_time_range`/`read_point`, and a frame written by a newer
+  build fails a store read with a downcastable
+  `FrameFaultError { Undecodable { newer_format: true } }` rather than a
+  sentence a caller would have to parse. No behaviour changes for any frame
+  this build could already read; `weft-bench`'s harnesses still measure the
+  legacy readers by name, as their reports say they do.
 - **A container image that is proven, not merely built** (1.0 plan PAC-9):
   `packaging/docker/Dockerfile` builds `weft-server` in the same `manylinux_2_28` baseline the
   release binaries use — so the image carries the release's glibc 2.28 floor, read back out of the
