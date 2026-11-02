@@ -4,6 +4,42 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — FRE-7b: immutable declarations, scale rules and schema read-back — the shapes the plan left open (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan names the slice (§6 W5), fixes that widening goes through
+FRE-7b's `widen_value_encoding` (§5 D-S19/D-S20 — the helper itself landed inside D-S19,
+which recorded that this slice's other parts were not built there), lists re-declare
+overwrite among the live defects (§1), and reserves `409 schema_conflict` in the §4 code
+table. It does not pin the exact re-declaration semantics, the scale rules' shape, or the
+read-back's fields. Chosen here under the owner's best-guess authorization (2026-10-26),
+recorded for merge review and reversible there:
+
+1. **Immutability with exactly one exception.** `AspectCatalog::declare` decides inside
+   its transaction: no declaration → insert; the identical schema → no-op (the call
+   stays idempotent, which rows-mode import and the legacy seal adapter rely on); a
+   value-encoding widening with tolerance and timestamp unit unchanged → update of the
+   encoding alone; anything else → the new typed `StoreError::DeclarationConflict`,
+   nothing written. The widening predicate is `weft_physical_type::is_value_widening`:
+   a change widens exactly when it moves to `BigDecimalText`, because that is the only
+   move `widen_value_encoding` can produce (its other outcome is the current encoding).
+   `ScaledI64 → ScaledI128` and `F32 → F64` are therefore refused as sideways moves,
+   not widenings — no caller performs them, and D-S19's `ensure_declared` (the one
+   widening caller) only ever widens to text. The HTTP surface maps the typed error
+   through the existing `classify_typed` to the §4 table's `409 schema_conflict`.
+2. **Scale rules at the declare surface.** A fixed-point encoding named without a
+   `scale` stays a `400` (pre-existing); a `scale` named for an encoding that carries
+   none (`f64`, `f32`, `decimal128`, `bigdecimal_text`) is now also a `400` instead of
+   being silently dropped — a declaration must read back as it was asked for.
+3. **Read-back returns the whole declared schema.** `AspectInfo` gains `scale`
+   (omitted when the encoding carries none), built by one constructor
+   (`AspectInfo::declared`) from the stored schema at all three sites: the aspects
+   list, `GET …/{aspect}/schema`, and the declare response — which is now the schema
+   read back from the store after the write, not an echo of the request, so a widening
+   re-declaration answers with the widened schema. `PhysicalType::scale()` is the new
+   accessor beside `name()`. Accepted declares keep returning `201`, including the
+   identical re-declaration and the widening one: the status contract pre-dates this
+   slice and nothing in the plan asks to split it.
+
 ## 2026-11-01 — SEC-8: the exposure matrix's exact cells, the proxied-header set, and how startup order is enforced (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the plan fixes SEC-8's four parts — startup ordering through the `startup.rs`

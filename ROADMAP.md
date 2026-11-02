@@ -297,7 +297,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth
   - [x] → **SEC-10** Exposure and secrets hygiene
   - [ ] **FRE-5** Compute vocabulary, exact-case tokens and no silent narrowing
-  - [ ] **FRE-7b** Immutable declarations, scale rules and schema read-back
+  - [x] **FRE-7b** Immutable declarations, scale rules and schema read-back
   - [x] **EVI-13** DuckDB adapter I
   - [x] **EVI-15R** Report renderer with honesty-section generation
   - [x] **EVI-16** Honesty pages I
