@@ -4717,6 +4717,7 @@ dependencies = [
  "tokio-postgres",
  "ureq",
  "weft-bench",
+ "weft-line-protocol",
  "weft-physical-type",
  "weft-reduce",
  "weftdb",

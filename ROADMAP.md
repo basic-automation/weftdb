@@ -20,7 +20,7 @@ The performance thesis and the first benchmark-claim list are written, and the d
 The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill now runs on a real corpus. That run produced a negative result worth keeping: a spline fill does not beat linear on real prices. The compression workload's slow first repetition was explained as first-touch memory rather than lazy initialisation. External-engine adapters, fair-protocol depth and the remaining workloads are still open below.
 
 - [ ] External-engine adapters
-- [ ] Full TSBS-compatible comparison harness (ILP parser shipped; harness pending)
+- [x] **DONE (2026-10-31) — TSBS-compatible comparison harness, on TSBS's data** (`weft-xbench --tsbs FILE`, #141): the `cpu-only` generator's output runs through every engine arm's load, interpolation and downsample phases, gated against the reference. TSBS's own query suite groups many series by tag, so it waits for tagged ingest and belongs to **TAG-12**.
 - [x] **DONE (2026-10-09) — `gap_fill` workload** (`--gap-fill`)
   - [ ] **NEXT — `?fill=` on the downsample endpoints** (`POST /api/v1/downsample`, `GET …/storage/{aspect}/downsample` and their columnar siblings), with a …
   - [ ] **NEXT — arbitrary bucket widths** (`5s`, `15m`)

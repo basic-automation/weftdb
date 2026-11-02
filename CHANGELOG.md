@@ -40,6 +40,14 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
+- **Cross-engine reports flag a dirty build**: `weft-xbench` records its source commit as
+  `<sha>+dirty` when the checkout has changes, and the report says that commit alone does not
+  reproduce the binary.
+- **TSBS data in the cross-engine benchmark** (#141): `weft-xbench --tsbs FILE` reads a
+  `tsbs_generate_data --use-case=cpu-only --format=influx` file, keeps `host_0`'s `usage_user`,
+  and adds `tsbs-tiny`, `tsbs-small` and `tsbs-medium` datasets: knots every ten seconds over the
+  synthetic datasets' span, reconstructed per second by every arm and gated against the reference.
+  TSBS's tag-grouped query suite is not run; it needs tagged ingest (TAG-12).
 - **Cross-engine load timing no longer includes the previous load's teardown**: `weft-xbench`
   now releases each rep's database or store before starting the next load's clock. Load rows
   measured before this (the EVI-15 report among them) counted the drop of the previous rep.

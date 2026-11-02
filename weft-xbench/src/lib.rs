@@ -31,6 +31,7 @@ pub mod iotdb;
 pub mod questdb;
 pub mod render;
 pub mod timescale;
+pub mod tsbs;
 pub mod weft;
 
 use std::time::Instant;
@@ -77,6 +78,9 @@ pub enum DatasetKind {
 	Block,
 	/// The UCI household-power corpus: real data, its own gaps, no ground truth.
 	Uci,
+	/// One host's field from TSBS's `cpu-only` generator: a gap-free random walk every ten
+	/// seconds, no ground truth.
+	Tsbs,
 }
 
 /// One benchmark input: the knots every arm loads and the grid every arm fills.
@@ -150,12 +154,13 @@ impl Dataset {
 	///
 	/// # Errors
 	///
-	/// If `kind` is [`DatasetKind::Uci`] (use [`Dataset::uci`]) or the truth cannot be computed.
+	/// If `kind` is [`DatasetKind::Uci`] or [`DatasetKind::Tsbs`] (use [`Dataset::uci`] or
+	/// [`Dataset::tsbs`]) or the truth cannot be computed.
 	pub fn synthetic(kind: DatasetKind, scale: ScalePreset, seed: u64) -> anyhow::Result<Self> {
 		let missingness = match kind {
 			DatasetKind::Mcar => MISSINGNESS,
 			DatasetKind::Block => 0.0,
-			DatasetKind::Uci => anyhow::bail!("a UCI dataset is loaded with Dataset::uci"),
+			DatasetKind::Uci | DatasetKind::Tsbs => anyhow::bail!("a {} dataset is loaded from its file", kind.as_str()),
 		};
 		let params = SyntheticParams { seed, input_points: scale.point_count(), missingness_fraction: missingness, signal_shape: SignalShape::MultiSine, spline: Spline::Linear, resolution: Resolution::Seconds, value_decimals: Some(SYNTHETIC_DECIMALS), ..SyntheticParams::default() };
 		let name = format!("{}-{}", kind.as_str(), scale.as_str());
@@ -187,6 +192,21 @@ impl Dataset {
 		let (start, end) = (points[0].timestamp, points[rows - 1].timestamp);
 		Ok(Self { name: format!("uci-{}", scale.as_str()), kind: DatasetKind::Uci, scale, points, start, end, resolution: Resolution::Minutes, truth: None, missingness_fraction: corpus.missingness_fraction(), bucket: Resolution::Hours })
 	}
+
+	/// A TSBS series over the synthetic datasets' span, `scale.point_count()` seconds from its
+	/// first reading, reconstructed per second: the same grid as the synthetic datasets, from a
+	/// knot every TSBS `--log-interval` instead of every second.
+	///
+	/// # Errors
+	///
+	/// If fewer than two readings fall in the span.
+	pub fn tsbs(series: &tsbs::TsbsSeries, scale: ScalePreset) -> anyhow::Result<Self> {
+		let start = series.points.first().ok_or_else(|| anyhow::anyhow!("the TSBS series is empty"))?.timestamp;
+		let span = chrono::Duration::seconds(i64::try_from(scale.point_count())?);
+		let points: Vec<Point> = series.points.iter().take_while(|p| p.timestamp - start <= span).cloned().collect();
+		anyhow::ensure!(points.len() >= 2, "{} readings of {} fall in the {} span; at least two are needed", points.len(), series.host, scale.as_str());
+		Ok(Self { name: format!("tsbs-{}", scale.as_str()), kind: DatasetKind::Tsbs, scale, start, end: start + span, points, resolution: Resolution::Seconds, truth: None, missingness_fraction: 0.0, bucket: Resolution::Minutes })
+	}
 }
 
 impl DatasetKind {
@@ -197,6 +217,7 @@ impl DatasetKind {
 			Self::Mcar => "mcar",
 			Self::Block => "block",
 			Self::Uci => "uci",
+			Self::Tsbs => "tsbs",
 		}
 	}
 }
@@ -809,5 +830,22 @@ mod tests {
 		assert!(report.all_correct(), "{:#?}", report.results.iter().filter_map(|r| r.correctness.as_ref()).collect::<Vec<_>>());
 		assert!(report.results.iter().filter(|r| r.phase == Phase::Interpolate).all(|r| r.accuracy.is_some()));
 		assert!(report.engines.iter().any(|e| e.engine == "duckdb" && !e.version.is_empty()));
+	}
+
+	#[test]
+	fn a_tsbs_dataset_is_the_synthetic_grid_over_ten_second_knots() {
+		use std::fmt::Write as _;
+		let mut lp = String::new();
+		for i in 0..800_i64 {
+			for host in ["host_0", "host_1"] {
+				writeln!(lp, "cpu,hostname={host},region=eu-central-1 usage_user={}i,usage_system=1i {}", 50 + i % 7, 1_451_606_400_000_000_000 + i * 10_000_000_000).expect("writes");
+			}
+		}
+		let series = tsbs::load_from_reader(lp.as_bytes(), tsbs::DEFAULT_HOST, tsbs::DEFAULT_FIELD, 7_200).expect("reads");
+		assert_eq!((series.points.len(), series.hosts), (721, 2));
+		let ds = Dataset::tsbs(&series, ScalePreset::Tiny).expect("builds");
+		assert_eq!((ds.name.as_str(), ds.kind, ds.points.len(), ds.grid_len()), ("tsbs-tiny", DatasetKind::Tsbs, 361, 3_601));
+		assert_eq!(ds.points.last().expect("knots").timestamp, ds.end, "the last knot closes the grid");
+		assert!(Dataset::synthetic(DatasetKind::Tsbs, ScalePreset::Tiny, DEFAULT_SEED).is_err());
 	}
 }
