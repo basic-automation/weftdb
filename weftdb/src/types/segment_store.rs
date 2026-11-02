@@ -3740,6 +3740,30 @@ impl SegmentStore {
 	/// stored epoch falls outside the representable instant range, or if the reduction
 	/// fails.
 	pub async fn downsample_range(&self, aspect: &str, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		let partial = self.downsample_partial(aspect, start, end, resolution, aggregations).await?;
+		partial.map_or_else(|| Ok(Vec::new()), |p| p.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")))
+	}
+
+	/// [`downsample_range`](Self::downsample_range) into buckets of a
+	/// [`BucketWidth`](weft_reduce::BucketWidth) (`5s`, `15m`): the same cross-segment fold at
+	/// the width's unit, each run of `count` unit buckets merged into one before finishing.
+	/// Exact for every reduction, as merging is; a stored sidecar partial serves the unit as
+	/// it serves [`downsample_range`](Self::downsample_range).
+	///
+	/// # Errors
+	///
+	/// As [`downsample_range`](Self::downsample_range).
+	pub async fn downsample_range_width(&self, aspect: &str, start: i64, end: i64, width: weft_reduce::BucketWidth, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		let partial = self.downsample_partial(aspect, start, end, width.unit(), aggregations).await?;
+		let Some(partial) = partial else { return Ok(Vec::new()) };
+		partial.coarsen(width.count()).and_then(|p| p.finish_width(width, aggregations)).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"))
+	}
+
+	/// The merged [`PartialReduction`] of `aspect`'s `[start, end]` rows at `resolution`, or
+	/// `None` when no row falls there: the fold behind
+	/// [`downsample_range`](Self::downsample_range) and
+	/// [`downsample_range_width`](Self::downsample_range_width).
+	async fn downsample_partial(&self, aspect: &str, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		let schema = self.require_schema(aspect).await?;
@@ -3776,13 +3800,12 @@ impl SegmentStore {
 			if sidecar_eligible && window_covers_segment(descriptor, start, end) {
 				if let Some(sidecar) = self.load_partial_sidecar(aspect, descriptor, frame_crc).await? {
 					if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
-						return partial.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"));
+						return Ok(Some(partial));
 					}
 				}
 			}
 			let bytes = self.read_frame(descriptor).await?;
-			let partial = segment_partial(descriptor, &bytes, start, end, schema.timestamp_unit, resolution, aggregations)?;
-			return partial.map_or_else(|| Ok(Vec::new()), |p| p.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")));
+			return segment_partial(descriptor, &bytes, start, end, schema.timestamp_unit, resolution, aggregations);
 		}
 
 		// Each pruned segment folds into its own `PartialReduction` **concurrently**: the
@@ -3820,7 +3843,7 @@ impl SegmentStore {
 				None => merged = Some(partial),
 			}
 		}
-		merged.map_or_else(|| Ok(Vec::new()), |m| m.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")))
+		Ok(merged)
 	}
 
 	/// **Point lookup** (roadmap Phase 4.6 read-planner): the present value of
