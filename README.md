@@ -1777,6 +1777,7 @@ What it does today:
   every acknowledged row exactly, at most the batch in flight beyond them, and set a damaged
   segment aside rather than serve it: open-time recovery quarantined the frame for every one of
   143 byte positions flipped in a probe. Each test is one report; its latency is the reopen time.
+- **Crash matrix** (`--ingest --crash-matrix`, `scripts/crash-matrix.sh`, `.github/workflows/crash-matrix.yml`) — the subprocess SIGKILL soak as one judged matrix (D-S21, SOA-9 `crash_kill9`): every failure test at every matrix seed (3 seeds by default, `--crash-matrix-seeds`), one report holding every cell, and the run fails if any cell fails. The script adds the fault-injection crash matrix (`weftdb`'s swap-point matrix, the orchestration legacy-queue crash test, the server's poisoned-ready test) and stages the report through EVI-4's artifact pipeline as the `bench-report` artifact. The matrix claims process-crash durability only: a kill soak cannot see a missing fsync, so the privileged power-loss validation stays an owner task.
 - **More report surfaces** (`--markdown-report`, `--csv-report`, `--prom`, or
   `weft-bench export REPORT.json --format md|csv|prom`) — the same results as a Markdown table, CSV
   and Prometheus text, every row with its gate. `bench/grafana/weft-bench.json` is a dashboard over
