@@ -3339,3 +3339,23 @@ enforces the width — and reflowing a file that a dozen open pull requests touc
 conflicts against every one of them to buy a style change nobody asked for. A tree-wide YAML
 reflow, or a `.yamllint` that records the width the repo actually uses, is a fine commit; it
 is not fine inside a packaging slice.
+## 2026-11-02 — D-S21 crash matrix shape (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Context:** the 1.0 plan names the crash matrix (D-S21, with SOA-9's
+`crash_kill9`) as CI durability evidence but does not fix its exact shape, and
+decision 20 leaves the privileged power-loss run owner-gated (issue #281).
+
+**Chosen:** one judged matrix in `weft-bench` — every failure test
+(kill-ingest, kill-compaction, corrupt-segment) at every matrix seed (3 by
+default, `--crash-matrix-seeds`), one report holding every cell, the run
+failing if any cell fails. `scripts/crash-matrix.sh` adds the fault-injection
+matrix (the same three suites ci.yml's crash job runs) and stages the report
+through EVI-4's artifact pipeline as the `bench-report` artifact;
+`.github/workflows/crash-matrix.yml` runs it in CI.
+
+**Explicit non-claim:** the matrix proves process-crash durability only. A
+kill soak cannot see a missing fsync, so the privileged power-loss validation
+(dm-log-writes / QEMU hard reset) remains the owner task (issue #281) and the
+§9 durability tick waits for it. No nightly compare gate: a cell either holds
+or it does not; the first successful workflow run is the hand-compared
+baseline.

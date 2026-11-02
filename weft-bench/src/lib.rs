@@ -82,6 +82,7 @@ pub mod combine;
 pub mod compare;
 pub mod compressed_query;
 pub mod compression;
+pub mod crash_matrix;
 pub mod downsample;
 pub mod engine;
 pub mod export;

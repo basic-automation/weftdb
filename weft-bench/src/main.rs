@@ -438,6 +438,9 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		.map_err(|e| anyhow::anyhow!("compressed-query run failed: {e}"))?;
 		return Ok(code);
 	}
+	if cli.crash_matrix {
+		return run_crash_matrix(cli, &profile, &corpus).await;
+	}
 	if !cli.failure.is_empty() {
 		return run_failures(cli, &profile, &corpus).await;
 	}
@@ -474,6 +477,25 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
+}
+
+/// Run the crash matrix (D-S21, SOA-9 `crash_kill9`): every failure test at
+/// every matrix seed, one report holding every cell. The report's verdict is
+/// the matrix's verdict — `finish` returns a non-zero exit when any cell's
+/// gate failed — so a scripted caller gates on the exit code, and the
+/// per-cell lines below are the matrix itself, not a summary of it.
+async fn run_crash_matrix(cli: &Cli, profile: &IngestProfile, corpus: &weft_bench::UciCorpus) -> anyhow::Result<ExitCode> {
+	let uci = cli.uci.clone().ok_or_else(|| anyhow::anyhow!("--crash-matrix needs --uci"))?;
+	let params = weft_bench::failure::FailureParams { uci, column: cli.uci_column.clone(), corpus_rows: cli.ingest_rows, rows: cli.failure_rows, reps: cli.failure_reps, compact_to: cli.failure_compact_to, kill_within: std::time::Duration::from_millis(cli.failure_kill_within_ms), seed: cli.seed, exe: std::env::current_exe()? };
+	let seeds: Vec<u64> = (0..cli.crash_matrix_seeds as u64).map(|offset| cli.seed.wrapping_add(offset)).collect();
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let cells = weft_bench::crash_matrix::run_matrix(profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, &params, &seeds).await.map_err(|e| anyhow::anyhow!("crash matrix failed to run: {e:#}"))?;
+	let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
+	for cell in &cells {
+		println!("crash-matrix {:<16} seed {}: {} reps  reopen p50 {:>9.3} ms max {:>9.3} ms  {}", cell.failure.as_str(), cell.seed, cell.result.reps, ms(cell.result.latency.p50_ns), ms(cell.result.latency.max_ns), if cell.passed() { "PASS" } else { "FAIL" });
+	}
+	let results: Vec<BenchResult> = cells.into_iter().map(|cell| cell.result).collect();
+	finish(cli, &BenchReport::with_results(metadata, results))
 }
 
 /// Persist a completed report (JSON, and optionally HTML) and print the summary,
@@ -1002,6 +1024,10 @@ struct Cli {
 	failure_compact_to: u64,
 	/// Ingest mode: upper bound of the seeded delay before a compaction is killed (`--failure-kill-within-ms`).
 	failure_kill_within_ms: u64,
+	/// Ingest mode: run the crash matrix (D-S21/SOA-9) instead of one failure test (`--crash-matrix`).
+	crash_matrix: bool,
+	/// Ingest mode: seeds the crash matrix runs, derived from `--seed` (`--crash-matrix-seeds`).
+	crash_matrix_seeds: usize,
 	/// Ingest mode: operations in a seeded query mix (`--query-mix`); 0 for none.
 	query_mix: usize,
 	/// Ingest mode: rows the query-mix store starts with (`--query-mix-rows`); `None` for the corpus once.
@@ -1243,6 +1269,7 @@ impl Cli {
 		let (mut ingest_online, mut ingest_online_rows, mut ingest_online_window): (usize, Option<u64>, usize) = (0, None, 1_440);
 		let (mut compressed_query, mut compressed_query_rows, mut compressed_query_compact): (usize, Option<u64>, Option<u64>) = (0, None, None);
 		let (mut failure, mut failure_rows, mut failure_reps, mut failure_compact_to, mut failure_kill_within_ms): (Vec<weft_bench::failure::Failure>, u64, usize, u64, u64) = (Vec::new(), 1_000_000, 5, 65_536, 2_000);
+		let (mut crash_matrix, mut crash_matrix_seeds): (bool, usize) = (false, 3);
 		let (mut query_mix, mut query_mix_rows, mut query_mix_range, mut query_mix_weights): (usize, Option<u64>, u64, weft_bench::LaneWeights) = (0, None, 1_440, weft_bench::LaneWeights::default());
 		let (mut analytics_rows, mut analytics_tail, mut analytics_batch): (Option<u64>, Option<u64>, usize) = (None, None, 1_440);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
@@ -1327,6 +1354,8 @@ impl Cli {
 				"--failure-reps" => failure_reps = parse_positive(&key, &take_value(&key)?)?,
 				"--failure-compact-to" => failure_compact_to = parse_positive(&key, &take_value(&key)?)? as u64,
 				"--failure-kill-within-ms" => failure_kill_within_ms = parse_positive(&key, &take_value(&key)?)? as u64,
+				"--crash-matrix" => crash_matrix = true,
+				"--crash-matrix-seeds" => crash_matrix_seeds = parse_positive(&key, &take_value(&key)?)?,
 				"--query-mix" => query_mix = parse_positive(&key, &take_value(&key)?)?,
 				"--query-mix-rows" => query_mix_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--query-mix-rows needs one row count of at least 2 (e.g. 10M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--query-mix-rows takes one row count".to_string()) })?),
 				"--query-mix-range" => query_mix_range = parse_positive(&key, &take_value(&key)?)? as u64,
@@ -1430,6 +1459,14 @@ impl Cli {
 		if !failure.is_empty() && (mode != InputMode::Ingest || query_mix > 0 || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some()) {
 			return Err("`--failure` needs `--ingest` and is a run of its own".to_string());
 		}
+		if crash_matrix {
+			if !failure.is_empty() {
+				return Err("`--crash-matrix` runs every failure test; do not combine it with `--failure`".to_string());
+			}
+			if mode != InputMode::Ingest || query_mix > 0 || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some() {
+				return Err("`--crash-matrix` needs `--ingest` and is a run of its own".to_string());
+			}
+		}
 		if query_mix_rows.is_some() && query_mix == 0 {
 			return Err("`--query-mix-rows` needs `--query-mix <OPS>`".to_string());
 		}
@@ -1440,7 +1477,7 @@ impl Cli {
 			return Err("`--compressed-query` is a run of its own, apart from `--ingest-online` and `--ingest-growth`".to_string());
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, failure, failure_rows, failure_reps, failure_compact_to, failure_kill_within_ms, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, exports, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, failure, failure_rows, failure_reps, failure_compact_to, failure_kill_within_ms, crash_matrix, crash_matrix_seeds, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, exports, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -2141,6 +2178,11 @@ INGEST OPTIONS (with --ingest):
                              Segment rows the killed compaction aims at [default: 65536]
         --failure-kill-within-ms <MS>
                              The compaction is killed a seeded 0..MS ms in [default: 2000]
+        --crash-matrix       Crash matrix instead (D-S21, SOA-9 crash_kill9): every
+                             failure test at every matrix seed, one report holding
+                             every cell; the run fails if any cell fails
+        --crash-matrix-seeds <N>
+                             Seeds per failure, derived from --seed [default: 3]
         --query-mix <OPS>
                              Seeded query mix instead: seal the corpus, then run OPS
                              operations whose lanes (ingest a batch, look up a point,
@@ -2321,6 +2363,16 @@ mod tests {
 		assert_eq!((cli.failure.len(), cli.failure_rows, cli.failure_reps), (3, 2_000_000, 3));
 		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-ingest"]).failure, [weft_bench::failure::Failure::KillIngest]);
 		for bad in [&["--ingest", "--uci", "u.txt", "--failure", "power-loss"][..], &["--failure", "kill-ingest"][..], &["--ingest", "--uci", "u.txt", "--failure", "all", "--query-mix", "3"][..]] {
+			assert!(run_cli(bad).is_err(), "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn crash_matrix_stands_alone_and_takes_a_seed_count() {
+		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--crash-matrix", "--crash-matrix-seeds", "5"]);
+		assert_eq!((cli.crash_matrix, cli.crash_matrix_seeds), (true, 5));
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--crash-matrix"]).crash_matrix_seeds, 3);
+		for bad in [&["--ingest", "--uci", "u.txt", "--crash-matrix", "--failure", "all"][..], &["--crash-matrix"][..], &["--ingest", "--uci", "u.txt", "--crash-matrix", "--query-mix", "3"][..]] {
 			assert!(run_cli(bad).is_err(), "{bad:?}");
 		}
 	}

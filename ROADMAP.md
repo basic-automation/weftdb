@@ -321,7 +321,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-7** Window digests and the oracle self-test
   - [x] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
 - [ ] **W6 · Durability CI, store split, scheduler**
-  - [ ] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
+  - [x] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
   - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
   - [ ] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
   - [ ] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
