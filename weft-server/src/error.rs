@@ -685,6 +685,7 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 	if let Some(e) = err.downcast_ref::<weftdb::StoreError>() {
 		return Some(match e {
 			weftdb::StoreError::UnknownAspect { .. } => ApiError::aspect_not_found(e.to_string()),
+			weftdb::StoreError::DeclarationConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IdempotencyConflict { .. } => ApiError::new(Code::IdempotencyConflict, e.to_string()),
 			weftdb::StoreError::GroupsUnsupported { .. } => ApiError::new(Code::TagsUnsupported, e.to_string()),
 			weftdb::StoreError::IngestValueOutOfRange { digits, .. } => decimal_out_of_range_refusal(*digits),
