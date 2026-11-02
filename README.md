@@ -1678,7 +1678,31 @@ What it does today:
   the corpus and each lane is a report of its own, digest included.
 - **Post-compaction reads** (`--compressed-query-compact ROWS`) — after the compressed-query
   windows, the store is compacted to ROWS-row segments and the same windows asked again as
-  `-compacted` results, each gated on answering exactly as before.
+  `-compacted` results, each gated on answering exactly as before. On 10M UCI rows sealed in
+  1,024-row batches (2026-11-02) the squash to 65,536-row segments took **694 s** (9,769 → 153
+  segments, 1.414 → 1.341 B/pt), every window answered identically, and **small windows got
+  slower**: an hour's in-store p50 went 0.16 → 5.75 ms and a day's 0.24 → 5.39 ms, because each
+  read now decodes a whole 65k-row segment. The year window held (30.1 → 29.5 ms).
+- **Failure tests** (`--ingest --failure kill-ingest|kill-compaction|corrupt-segment|all`) — a
+  benchmark of a healthy store says nothing about the one a crash leaves. A child process (this
+  binary) seals the corpus, or compacts a store of it, and is killed with `SIGKILL` at a seeded
+  point; or one seeded byte of a closed store's segment is flipped. The reopened store must hold
+  every acknowledged row exactly, at most the batch in flight beyond them, and set a damaged
+  segment aside rather than serve it: open-time recovery quarantined the frame for every one of
+  143 byte positions flipped in a probe. Each test is one report; its latency is the reopen time.
+- **More report surfaces** (`--markdown-report`, `--csv-report`, `--prom`, or
+  `weft-bench export REPORT.json --format md|csv|prom`) — the same results as a Markdown table, CSV
+  and Prometheus text, every row with its gate. `bench/grafana/weft-bench.json` is a dashboard over
+  the Prometheus text, which hides no failing gate behind a fast number.
+- **Three interpolation classes** (`weft-xbench`, report v7) — each engine is asked for the grid
+  three ways where it can be: its native fill (class A), the linear reconstruction in its SQL
+  (class B) and every knot fetched into the Rust client and interpolated there (class C). Most
+  native fills answer a different question — TimescaleDB, QuestDB, InfluxDB 3 and IoTDB average the
+  knots per bucket and draw lines between the averages without extrapolating, and ClickHouse's
+  `INTERPOLATE` carries the last value forward — so class A is gated on the grid's shape and
+  reported with its unfilled instants, its distance from the line and its RMSE, not raced. B and C
+  are timed against WeftDB, each class with its own verdict. Where an engine picks among join
+  strategies, each is run and published (`clickhouse-double-merge`, `questdb-double-linear`).
 - **Cross-engine runs, pooled and pinned** (`weft-xbench`, report v6) — each gate carries an
   `answer_sha256` of its arm's answer, so separate runs of one arm can be shown to agree;
   `weft-xbench combine RUN.json… --out DIR` pools runs as `weft-bench combine` does, and the

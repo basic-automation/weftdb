@@ -31,6 +31,26 @@ only the control plane, not the segment frames.
   index write before it commits), where the planner had walked every segment of the aspect; and
   its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
   Write transactions still see `Busy` at once, as their retry protocol requires.
+- **Three interpolation classes in `weft-xbench`** (#148, report v7): beside each engine's portable
+  SQL reconstruction (class B), its native fill where it has one (class A: TimescaleDB
+  `time_bucket_gapfill` + `interpolate`, QuestDB `SAMPLE BY … FILL(LINEAR)`, InfluxDB 3
+  `date_bin_gapfill` + `interpolate`, IoTDB `FILL METHOD LINEAR`, ClickHouse `WITH FILL …
+  INTERPOLATE`) and the knots fetched into the client and interpolated there (class C, DuckDB
+  included). A native fill computing another answer is gated on the grid's shape and reported with
+  its unfilled instants, distance from the line and RMSE, never raced; verdicts are drawn per class.
+  The report's command line no longer carries a connection string's password.
+- **Each ASOF strategy, run and published** (#393): `clickhouse-double-merge`
+  (`join_algorithm = 'full_sorting_merge'`) and `questdb-double-linear` (the `asof_linear` hint)
+  beside the defaults; at `tiny` scale QuestDB's hint beat its optimizer's choice.
+- **Failure tests** (#147): `weft-bench --ingest --failure kill-ingest|kill-compaction|corrupt-segment|all`
+  kills a child process with `SIGKILL` mid-ingest or mid-compaction, or flips a byte of a closed
+  segment, and gates the reopened store on exact read-back of every acknowledged row and on a
+  damaged segment being quarantined rather than served.
+- **Report surfaces** (#149): `weft-bench export REPORT.json --format md|csv|prom` and the run flags
+  `--markdown-report`, `--csv-report`, `--prom`; a Grafana dashboard over the Prometheus text in
+  `bench/grafana/`.
+- **Bench/engine separation check** (#150): `scripts/bench/check-separation.py`, run in CI, fails
+  when an engine crate depends on `weft-bench`/`weft-xbench` or reads a `BENCH` variable.
 - **`weft-bench sweep`** (#147): `weft-bench sweep KNOB=v1,v2,… -- RUN ARGS` runs a benchmark
   once per value of any run flag, or of the worker pool (`threads`), each into its own directory
   with its own report and manifest, and writes `sweep.json` and `sweep.md`: every result as a
@@ -44,7 +64,9 @@ only the control plane, not the segment frames.
   per lane, each with a digest of its answers. 3,000 operations over 10M UCI rows passed.
 - **Post-compaction reads** (#147): `--compressed-query-compact ROWS` compacts the
   compressed-query store to ROWS-row segments after the measured windows and asks the same seeded
-  windows again, as `-compacted` results that must answer digest for digest as before.
+  windows again, as `-compacted` results that must answer digest for digest as before. On 10M UCI
+  rows the squash took 694 s (9,769 → 153 segments); every window answered identically, small
+  windows read ~36× slower afterwards, and the year window held.
 - **`weft-xbench` answer digests, `combine` and run manifest** (#147, report v6): each gate
   carries `answer_sha256` (values to twelve significant digits, so a parallel sum's last bit does
   not count); `weft-xbench combine RUN.json… --out DIR` pools runs with run-first intervals, and
