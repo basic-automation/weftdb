@@ -4,6 +4,26 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-02 — Gap fill and bucket widths on the downsample endpoints (#142, #143) (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** #142 names `?fill=` on endpoints of which the compute ones take a JSON body, not a
+query string, and #143 says "freeze-track API decision first", because splimes' `Resolution` is
+one step of a unit and every reducing surface is keyed by it. Chosen:
+
+1. **The compute endpoint's `fill` is a body field**, like every other knob there; the ILP and
+   stored-range endpoints take `?fill=`. The vocabulary is `weft_reduce::Fill::from_token`'s.
+2. **The fill grid is bounded by the interpolation endpoint's output cap** (10M), since a filled
+   grid is an output grid of the same kind; past it the request is a `400` that says why.
+3. **A width is additive, not a new `Resolution`.** `BucketWidth` is a unit and a count;
+   reducing at a width is reducing at the unit and merging each run of `count` partial buckets
+   (`PartialReduction::coarsen`), exact because merging is. No existing signature changed: the
+   `Resolution` APIs delegate to the width ones with a count of one, so a freeze decision about
+   replacing `Resolution` is not needed and stays open. `.weftpart` sidecars still serve the
+   unit, and the width coarsens what they return, so `grids_nest` is untouched.
+4. **The JSON body names a width in a new `width` field** (overriding `resolution`), since its
+   `resolution` is a typed enum; the query endpoints accept a width as their `resolution` token.
+   A response's `resolution` is `"15 minutes"` for a width and unchanged for a unit.
+
 ## 2026-11-02 — What closes Phase 1's open bench lines (#140, #147, #148, #149, #150, #393) (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the five Phase 1 trackers are one-line issues, and the plan text behind them was
