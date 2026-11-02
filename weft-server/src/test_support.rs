@@ -118,7 +118,7 @@ pub(crate) async fn post_parquet(router: axum::Router, uri: &str, body: Vec<u8>)
 pub(crate) fn price_parquet_body(timestamps: &[i64], values: &[Option<BigDecimal>]) -> Vec<u8> {
 	use weft_arrow::{columns_to_record_batch_typed, write_parquet};
 
-	let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, timestamps, values);
+	let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, timestamps, values).expect("builds the batch");
 
 	write_parquet(std::slice::from_ref(&batch)).expect("writes parquet")
 }
