@@ -62,6 +62,10 @@ pub mod metrics;
 pub mod panic_catch;
 pub mod panic_hook;
 pub mod reconcile_daemon;
+/// SEC-10's secret hygiene for the server's own output: values that can
+/// carry a credential (a URL's userinfo above all) are only ever printed
+/// redacted (see [`redact`]).
+pub mod redact;
 pub mod routes;
 pub mod serve;
 pub mod settings;

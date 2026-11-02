@@ -634,11 +634,26 @@ pub struct AspectInfo {
 	pub name: String,
 	/// The declared physical encoding token (e.g. `"f64"`, `"scaled_i64"`).
 	pub physical_type: &'static str,
+	/// The declared fractional-decimal-digit scale, present only for the
+	/// fixed-point encodings (`scaled_i64`, `scaled_i128`) — the read-back of
+	/// a declaration carries the scale it was declared with (FRE-7b), so a
+	/// client can reconstruct the declared schema from this shape alone.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub scale: Option<u8>,
 	/// The declared per-value error tolerance (decimal text — `"0"` for an exact
 	/// encoding).
 	pub value_tolerance: String,
 	/// The declared timestamp unit token (e.g. `"seconds"`, `"millis"`).
 	pub timestamp_unit: &'static str,
+}
+
+impl AspectInfo {
+	/// The read-back DTO for one aspect's declared schema: every field the
+	/// declaration fixed, scale included (FRE-7b schema read-back).
+	#[must_use]
+	pub fn declared(name: String, schema: &weft_physical_type::AspectSchema) -> Self {
+		Self { name, physical_type: schema.value.name(), scale: schema.value.scale(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() }
+	}
 }
 
 /// Response body for `GET /api/v1/storage/aspects`.
@@ -772,7 +787,7 @@ async fn collect_aspects(store: &weftdb::SegmentStore) -> anyhow::Result<Vec<Asp
 	let mut aspects = Vec::with_capacity(names.len());
 	for name in names {
 		if let Some(schema) = store.schema_for(&name).await? {
-			aspects.push(AspectInfo { name, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() });
+			aspects.push(AspectInfo::declared(name, &schema));
 		}
 	}
 	Ok(aspects)
@@ -820,7 +835,7 @@ pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): 
 	let Some(schema) = schema else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let aspect = AspectInfo { name: aspect, physical_type: schema.value.name(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() };
+	let aspect = AspectInfo::declared(aspect, &schema);
 	Ok(Json(AspectSchemaResponse { aspect }))
 }
 
@@ -928,7 +943,7 @@ async fn storage_downsample_inner(state: AppState, aspect: &str, params: &Storag
 	let result = store.downsample_range(aspect, start, end, resolution, &aggregations).instrument(span.clone()).await;
 	drop(store);
 	let buckets = result.map_err(|err| error::classify_read(&err))?;
-	let response = crate::downsample::buckets_to_response(buckets, resolution, &aggregations);
+	let response = crate::downsample::buckets_to_response(buckets, resolution, &aggregations)?;
 	span.record("buckets", response.buckets);
 	Ok(response)
 }
