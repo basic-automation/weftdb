@@ -103,6 +103,16 @@ fn source_commit() -> Option<String> {
 	})
 }
 
+/// `arg` with the password of a `scheme://user:password@host` URL replaced; anything else unchanged.
+fn redact_password(arg: &str) -> String {
+	let Some((scheme, rest)) = arg.split_once("://") else { return arg.to_string() };
+	let Some((userinfo, host)) = rest.split_once('@') else { return arg.to_string() };
+	match userinfo.split_once(':') {
+		Some((user, _)) => format!("{scheme}://{user}:<redacted>@{host}"),
+		None => arg.to_string(),
+	}
+}
+
 /// `combine RUN.json RUN.json... --out DIR`: pool the runs, write the combined report and render it.
 fn combine_command(args: &[String]) -> anyhow::Result<()> {
 	let mut paths = Vec::new();
@@ -165,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
 		Some("combine") => return combine_command(&args[1..]),
 		_ => {}
 	}
-	let invocation: Vec<String> = std::iter::once("weft-xbench".to_string()).chain(args.iter().cloned()).collect();
+	// The report prints its command line for reproduction; a connection string's password stays out.
+	let invocation: Vec<String> = std::iter::once("weft-xbench".to_string()).chain(args.iter().map(|a| redact_password(a))).collect();
 	let cli = match parse(args.into_iter()) {
 		Ok(cli) => cli,
 		Err(message) => {
@@ -256,6 +267,14 @@ mod tests {
 
 	fn cli(args: &[&str]) -> Result<Cli, String> {
 		parse(args.iter().map(|s| (*s).to_string()))
+	}
+
+	#[test]
+	fn a_connection_string_password_is_kept_out_of_the_invocation() {
+		assert_eq!(redact_password("postgresql://postgres:s3cret@127.0.0.1:5432/xbench"), "postgresql://postgres:<redacted>@127.0.0.1:5432/xbench");
+		for plain in ["http://127.0.0.1:8123", "127.0.0.1:9000", "--timescale", "postgresql://postgres@host/db"] {
+			assert_eq!(redact_password(plain), plain);
+		}
 	}
 
 	#[test]

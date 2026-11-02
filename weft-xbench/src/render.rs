@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 use weft_bench::stats::ConfidenceInterval;
 
-use crate::{ArmResult, DatasetKind, Phase, Warmth, XbenchReport};
+use crate::{ArmClass, ArmResult, DatasetKind, Phase, Warmth, XbenchReport};
 
 /// Datasets the first report's scope (decision 18) asks for, and TSBS's (#141).
 const EXPECTED_KINDS: [DatasetKind; 4] = [DatasetKind::Mcar, DatasetKind::Block, DatasetKind::Uci, DatasetKind::Tsbs];
@@ -24,7 +24,10 @@ const EXPECTED_SCALES: usize = 3;
 /// and, from the second external engine on, `ClickHouse` `Float64` and `Decimal64` and
 /// `TimescaleDB` `double precision` and `numeric`; `QuestDB` `DOUBLE` and `DECIMAL`; `InfluxDB` 3's
 /// `float` field and `IoTDB`'s `DOUBLE` field (neither has a decimal type).
-const EXPECTED_ARMS: [&str; 14] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "clickhouse-double", "clickhouse-decimal", "timescaledb-double", "timescaledb-numeric", "questdb-double", "questdb-decimal", "influxdb3-double", "iotdb-double"];
+///
+/// From #148 (fair protocol 1.2), each engine also has a client-side arm (class C), and each with a
+/// native fill a native arm (class A); `DuckDB` has none.
+const EXPECTED_ARMS: [&str; 25] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "duckdb-client", "clickhouse-double", "clickhouse-decimal", "clickhouse-native", "clickhouse-client", "timescaledb-double", "timescaledb-numeric", "timescaledb-native", "timescaledb-client", "questdb-double", "questdb-decimal", "questdb-native", "questdb-client", "influxdb3-double", "influxdb3-native", "influxdb3-client", "iotdb-double", "iotdb-native", "iotdb-client"];
 /// Below this many reps the bootstrap intervals are too coarse to separate much.
 const FEW_REPS: usize = 10;
 
@@ -43,7 +46,7 @@ pub enum Outcome {
 	Noise,
 }
 
-/// One WeftDB arm against the fastest passing non-WeftDB arm.
+/// One WeftDB arm against the fastest passing non-WeftDB arm of one class.
 #[derive(Debug, Clone)]
 pub struct Verdict<'a> {
 	/// The WeftDB result.
@@ -75,6 +78,11 @@ fn is_weft(r: &ArmResult) -> bool {
 	r.arm.arm.starts_with("weftdb")
 }
 
+/// The arm's class; a pre-v7 result, which recorded none, ran the portable SQL.
+fn class_of(r: &ArmResult) -> ArmClass {
+	r.arm.class.unwrap_or_else(|| if is_weft(r) { ArmClass::Native } else { ArmClass::PortableSql })
+}
+
 fn passed(r: &ArmResult) -> bool {
 	r.correctness.as_ref().is_none_or(|c| c.passed)
 }
@@ -104,7 +112,10 @@ fn runs_agree(weft: &ArmResult, other: &ArmResult, outcome: Outcome) -> bool {
 	}
 }
 
-/// Every passing WeftDB result against the fastest passing other-engine result.
+/// Every passing WeftDB result against the fastest passing other-engine result of each class.
+///
+/// Only the classes that answer the same question count (portable SQL, client-side); a native
+/// fill that computes another answer is reported beside the reconstruction, never raced against it.
 ///
 /// The other result shares the dataset, the phase and the warmth, so a cold WeftDB read is held
 /// against cold reads only. Datasets and phases with no other engine produce no verdict. In a
@@ -114,13 +125,15 @@ fn runs_agree(weft: &ArmResult, other: &ArmResult, outcome: Outcome) -> bool {
 pub fn verdicts(report: &XbenchReport) -> Vec<Verdict<'_>> {
 	let mut out = Vec::new();
 	for weft in report.results.iter().filter(|r| is_weft(r) && passed(r)) {
-		let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.dataset == weft.dataset && r.phase == weft.phase && r.warmth == weft.warmth).min_by_key(|r| r.latency_ci.p50.point_ns);
+		for class in [ArmClass::PortableSql, ArmClass::ClientSide] {
+		let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.arm.own_answer.is_none() && class_of(r) == class && r.dataset == weft.dataset && r.phase == weft.phase && r.warmth == weft.warmth).min_by_key(|r| r.latency_ci.p50.point_ns);
 		if let Some(other) = other {
 			let outcome = match compare(&weft.latency_ci.p50, &other.latency_ci.p50) {
 				decided if !runs_agree(weft, other, decided) => Outcome::Noise,
 				outcome => outcome,
 			};
 			out.push(Verdict { weft, other, outcome });
+		}
 		}
 	}
 	out
@@ -178,7 +191,7 @@ fn verdict_line(v: &Verdict<'_>) -> String {
 		Outcome::Loss => format!("{} {:.1}× faster", v.other.arm.arm, v.ratio()),
 		Outcome::Noise => "intervals overlap".to_string(),
 	};
-	format!("`{}` {}: `{}` p50 {} ms vs `{}` {} ms ({tail}).", v.weft.dataset, phase_of(v.weft), v.weft.arm.arm, ms(v.weft.latency_ci.p50.point_ns), v.other.arm.arm, ms(v.other.latency_ci.p50.point_ns))
+	format!("`{}` {} vs {}: `{}` p50 {} ms vs `{}` {} ms ({tail}).", v.weft.dataset, phase_of(v.weft), class_of(v.other).label(), v.weft.arm.arm, ms(v.weft.latency_ci.p50.point_ns), v.other.arm.arm, ms(v.other.latency_ci.p50.point_ns))
 }
 
 /// The report as blocks: header, results, honesty section.
@@ -199,12 +212,37 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		.results
 		.iter()
 		.map(|r| {
-			let gate = r.correctness.as_ref().map_or_else(|| "—".into(), |c| if c.passed { "PASS".into() } else { format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference) });
+			let gate = r.correctness.as_ref().map_or_else(|| "—".into(), |c| match (c.passed, r.arm.own_answer.is_some()) {
+				(true, true) => "own answer".into(),
+				(true, false) => "PASS".into(),
+				(false, _) => format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference),
+			});
 			let rmse = r.accuracy.as_ref().map_or_else(|| "—".into(), |a| format!("{:.4}", a.rmse));
-			vec![r.dataset.clone(), phase_of(r), r.arm.arm.clone(), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse, bytes_per_point(r)]
+			vec![r.dataset.clone(), phase_of(r), r.arm.arm.clone(), r.arm.class.map_or_else(|| "—".into(), |c| c.label().to_string()), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse, bytes_per_point(r)]
 		})
 		.collect();
-	b.push(Block::Table(["dataset", "phase", "arm", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE", "B/pt"].map(String::from).to_vec(), rows));
+	b.push(Block::Table(["dataset", "phase", "arm", "class", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE", "B/pt"].map(String::from).to_vec(), rows));
+
+	b.push(Block::Heading(2, "Interpolation classes".into()));
+	b.push(Block::Para("Each engine is asked for the grid three ways where it can be (fair protocol 1.2): **A · native**, the engine's own interpolation or fill; **B · portable SQL**, the linear reconstruction written in its SQL; **C · client-side**, every knot fetched into this Rust client and interpolated there, end to end. B and C answer the question WeftDB answers, so they are gated against its grid and timed against it. A native fill that computes something else is gated only on the grid's shape, and is shown below with how far its answer lies from the reconstruction instead of being raced against it. DuckDB has no native interpolation, so it has no class A arm.".into()));
+	let own: Vec<&ArmResult> = report.results.iter().filter(|r| r.arm.own_answer.is_some() && r.phase == Phase::Interpolate).collect();
+	if own.is_empty() {
+		b.push(Block::Para("No native fill ran in this run.".into()));
+	} else {
+		let rows = own
+			.iter()
+			.map(|r| {
+				let c = r.correctness.as_ref();
+				vec![r.dataset.clone(), phase_of(r), r.arm.arm.clone(), ci(&r.latency_ci.p50), c.map_or_else(|| "—".into(), |c| c.unfilled_points.to_string()), c.map_or_else(|| "—".into(), |c| format!("{:.3e}", c.max_abs_diff_vs_reference)), r.accuracy.as_ref().map_or_else(|| "—".into(), |a| format!("{:.4}", a.rmse))]
+			})
+			.collect();
+		b.push(Block::Table(["dataset", "phase", "native fill", "p50 [CI]", "unfilled instants", "max diff from the line", "RMSE vs truth"].map(String::from).to_vec(), rows));
+		let mut seen = std::collections::BTreeMap::new();
+		for r in &own {
+			seen.entry(r.arm.arm.clone()).or_insert_with(|| r.arm.own_answer.clone().unwrap_or_default());
+		}
+		b.push(Block::List(seen.into_iter().map(|(arm, answer)| format!("`{arm}` computes {answer}.")).collect()));
+	}
 
 	b.push(Block::Heading(2, "Honesty".into()));
 	b.push(Block::Para("Generated from the results above. A WeftDB arm wins or loses only when its p50 interval does not overlap the fastest other engine's; overlapping intervals are within noise.".into()));
@@ -482,8 +520,8 @@ mod tests {
 
 	fn result(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
 		let (latency, latency_ci) = latency(samples, 1);
-		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed, answer_sha256: None });
-		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec(), between_run: None }
+		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed, unfilled_points: 0, answer_sha256: None });
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec(), between_run: None }
 	}
 
 	fn report(results: Vec<ArmResult>) -> XbenchReport {
@@ -498,6 +536,26 @@ mod tests {
 		let r = report(vec![result("a", "weftdb-memory", Phase::Interpolate, &FAST, true), result("a", "duckdb-double", Phase::Interpolate, &SLOW, true), result("b", "weftdb-memory", Phase::Interpolate, &SLOW, true), result("b", "duckdb-double", Phase::Interpolate, &FAST, true), result("c", "weftdb-memory", Phase::Interpolate, &FAST, true), result("c", "duckdb-double", Phase::Interpolate, &FAST, true)]);
 		let outcomes: Vec<(String, Outcome)> = verdicts(&r).iter().map(|v| (v.weft.dataset.clone(), v.outcome)).collect();
 		assert_eq!(outcomes, vec![("a".into(), Outcome::Win), ("b".into(), Outcome::Loss), ("c".into(), Outcome::Noise)]);
+	}
+
+	#[test]
+	fn each_class_gets_its_own_verdict_and_a_native_fill_is_not_raced() {
+		let classed = |arm: &str, class: ArmClass, samples: &[u64]| {
+			let mut r = result("a", arm, Phase::Interpolate, samples, true);
+			r.arm.class = Some(class);
+			r
+		};
+		let mut native = classed("timescaledb-native", ArmClass::Native, &FAST);
+		native.arm.own_answer = Some("bucket averages".into());
+		if let Some(c) = native.correctness.as_mut() {
+			c.unfilled_points = 4;
+		}
+		let r = report(vec![classed("weftdb-memory", ArmClass::Native, &FAST), classed("duckdb-double", ArmClass::PortableSql, &SLOW), classed("duckdb-client", ArmClass::ClientSide, &FAST), native]);
+		let v = verdicts(&r);
+		assert_eq!(v.iter().map(|v| (v.other.arm.arm.as_str(), v.outcome)).collect::<Vec<_>>(), [("duckdb-double", Outcome::Win), ("duckdb-client", Outcome::Noise)], "the faster native fill answers another question and is not a rival");
+		let text = to_markdown(&blocks(&r));
+		assert!(text.contains("`timescaledb-native` computes bucket averages.") && text.contains("own answer"), "{text}");
+		assert!(text.contains("vs C · client-side"), "{text}");
 	}
 
 	#[test]

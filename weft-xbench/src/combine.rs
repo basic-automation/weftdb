@@ -118,8 +118,8 @@ mod tests {
 	fn result(level: u64, digest: &str) -> ArmResult {
 		let samples: Vec<u64> = (0..12).map(|i| level + i % 4).collect();
 		let (latency, latency_ci) = latency(&samples, 7);
-		let correctness = Some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: 0.0, tolerance: 1e-9, passed: true, answer_sha256: Some(digest.into()) });
-		ArmResult { dataset: "mcar-tiny".into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: "duckdb-double".into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase: Phase::Interpolate, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples, between_run: None }
+		let correctness = Some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: 0.0, tolerance: 1e-9, passed: true, unfilled_points: 0, answer_sha256: Some(digest.into()) });
+		ArmResult { dataset: "mcar-tiny".into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: "duckdb-double".into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None }, phase: Phase::Interpolate, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples, between_run: None }
 	}
 
 	fn run(level: u64, digest: &str) -> XbenchReport {

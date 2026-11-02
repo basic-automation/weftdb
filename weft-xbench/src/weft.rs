@@ -24,6 +24,13 @@ pub trait Arm {
 		true
 	}
 
+	/// Whether the arm's load is a result of its own. An arm that loads exactly as another arm of
+	/// the same engine does (the native and client-side arms load as the portable one) reports
+	/// `false` instead of a duplicate figure.
+	fn reports_load(&self) -> bool {
+		true
+	}
+
 	/// Whether the arm has a downsample of its own. An arm that would run the same reduction as
 	/// another arm over the same store reports `false` instead of a duplicate figure.
 	fn downsamples(&self) -> bool {
@@ -83,7 +90,7 @@ pub struct WeftMemory;
 impl Arm for WeftMemory {
 	fn info(&self) -> ArmInfo {
 		let report = WeftAdapter::new().adapter_info();
-		ArmInfo { arm: "weftdb-memory".into(), engine: report.engine, value_type: "BigDecimal".into(), method: format!("{}; downsample via weft_reduce::reduce", report.method) }
+		ArmInfo { arm: "weftdb-memory".into(), engine: report.engine, value_type: "BigDecimal".into(), method: format!("{}; downsample via weft_reduce::reduce", report.method), class: Some(crate::ArmClass::Native), own_answer: None }
 	}
 
 	fn loads(&self) -> bool {
@@ -250,7 +257,7 @@ impl Arm for WeftStore {
 			ValueOut::F64 => ("f64", "interpolate_range_f64"),
 		};
 		let layout = if self.batch_rows == usize::MAX { "one segment per load".to_string() } else { format!("{}-row segments", self.batch_rows) };
-		ArmInfo { arm: self.name.into(), engine: "weftdb SegmentStore + splimes".into(), value_type: value_type.into(), method: format!("interpolation-on-read via SegmentStore::{call} (Backend::Auto), downsample via SegmentStore::downsample_range; {layout}") }
+		ArmInfo { arm: self.name.into(), engine: "weftdb SegmentStore + splimes".into(), value_type: value_type.into(), method: format!("interpolation-on-read via SegmentStore::{call} (Backend::Auto), downsample via SegmentStore::downsample_range; {layout}"), class: Some(crate::ArmClass::Native), own_answer: None }
 	}
 
 	fn downsamples(&self) -> bool {

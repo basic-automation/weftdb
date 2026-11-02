@@ -22,6 +22,11 @@
 //! the knot at or after it, both answered from the hypertable's index on `t`. Duplicate instants keep
 //! their last value (highest `seq`), as splimes does. Downsampling uses the native `time_bucket`.
 //!
+//! The native fill is timed too, as `timescaledb-native` (fair-protocol class A, #148): the
+//! `double precision` table, `time_bucket_gapfill` at the grid's step with `interpolate(avg(v))`,
+//! labelled with the answer it computes, and `timescaledb-client` fetches the knots and
+//! interpolates them in this client (class C).
+//!
 //! In the `numeric` arm the knots are stored exactly and `min` and `max` stay exact; the line and
 //! `avg` are read back as `double precision`. The hypertable is left in the row store: the
 //! columnstore (compression) is a separate configuration, not this arm's.
@@ -32,7 +37,7 @@ use bigdecimal::ToPrimitive;
 use futures_util::SinkExt;
 use tokio_postgres::{Client, NoTls, Statement};
 
-use crate::{weft::Arm, ArmInfo, BucketRow, Dataset, Output};
+use crate::{client_linear, place, weft::Arm, ArmClass, ArmInfo, BucketRow, Dataset, Output};
 
 /// Counter distinguishing schemas of arms alive at once.
 static NEXT_SCHEMA: AtomicU64 = AtomicU64::new(0);
@@ -68,6 +73,17 @@ const DOWNSAMPLE_SQL: &str = "
 SELECT time_bucket($1::bigint, t) AS b, count(*)::bigint, min(v)::float8, max(v)::float8, avg(v)::float8
 FROM knots GROUP BY b ORDER BY b
 ";
+
+/// The native fill (class A): bucket averages at the grid's step, the empty buckets between two
+/// filled ones on the line between their averages. Parameters: grid start, last grid instant and
+/// step, in epoch nanoseconds.
+const NATIVE_SQL: &str = "
+SELECT time_bucket_gapfill($3::bigint, t, $1::bigint, $2::bigint + $3::bigint) AS b, interpolate(avg(v)) AS v
+FROM knots WHERE t >= $1::bigint AND t < $2::bigint + $3::bigint GROUP BY b ORDER BY b
+";
+
+/// The raw knots a client fetches (class C), in instant order, the last of an instant last.
+const FETCH_SQL: &str = "SELECT t, v::float8 FROM knots ORDER BY t, seq";
 
 /// The column type the knots are stored as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +126,7 @@ impl Drop for Db {
 /// `TimescaleDB` with the knots stored as [`TsValue`].
 pub struct Timescale {
 	value: TsValue,
+	class: ArmClass,
 	url: String,
 	db: Option<Db>,
 }
@@ -143,13 +160,25 @@ impl Timescale {
 	/// `timescaledb-double`.
 	#[must_use]
 	pub fn double(url: &str) -> Self {
-		Self { value: TsValue::Double, url: url.to_string(), db: None }
+		Self { value: TsValue::Double, class: ArmClass::PortableSql, url: url.to_string(), db: None }
+	}
+
+	/// `timescaledb-native`: the `double precision` table through `time_bucket_gapfill`.
+	#[must_use]
+	pub fn native(url: &str) -> Self {
+		Self { class: ArmClass::Native, ..Self::double(url) }
+	}
+
+	/// `timescaledb-client`: the `double precision` knots fetched and interpolated in this client.
+	#[must_use]
+	pub fn client(url: &str) -> Self {
+		Self { class: ArmClass::ClientSide, ..Self::double(url) }
 	}
 
 	/// `timescaledb-numeric`.
 	#[must_use]
 	pub fn numeric(url: &str) -> Self {
-		Self { value: TsValue::Numeric, url: url.to_string(), db: None }
+		Self { value: TsValue::Numeric, class: ArmClass::PortableSql, url: url.to_string(), db: None }
 	}
 
 	fn loaded(&mut self) -> anyhow::Result<&mut Db> {
@@ -176,7 +205,21 @@ impl Arm for Timescale {
 			TsValue::Double => ("timescaledb-double", "double precision", ""),
 			TsValue::Numeric => ("timescaledb-numeric", "numeric", "; stored exactly, the interpolation line computed in double precision"),
 		};
-		ArmInfo { arm: arm.into(), engine: format!("timescaledb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: generate_series() grid, two index-backed LATERAL LIMIT 1 lookups, first/last segment extended; downsample via time_bucket; hypertable on t (one chunk per load, row store), one text COPY committed with synchronous_commit on; server over loopback via tokio-postgres{note}") }
+		let storage = "hypertable on t (one chunk per load, row store), one text COPY committed with synchronous_commit on; server over loopback via tokio-postgres";
+		let engine = format!("timescaledb {version}");
+		match self.class {
+			ArmClass::PortableSql => ArmInfo { arm: arm.into(), engine, value_type: value_type.into(), method: format!("linear interpolation in SQL: generate_series() grid, two index-backed LATERAL LIMIT 1 lookups, first/last segment extended; downsample via time_bucket; {storage}{note}"), class: Some(self.class), own_answer: None },
+			ArmClass::Native => ArmInfo { arm: "timescaledb-native".into(), engine, value_type: value_type.into(), method: format!("native fill: time_bucket_gapfill(step) with interpolate(avg(v)); {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones; nothing before the first knot's bucket or after the last's".into()) },
+			ArmClass::ClientSide => ArmInfo { arm: "timescaledb-client".into(), engine, value_type: value_type.into(), method: format!("client-side: every knot fetched in instant order ({FETCH_SQL}), the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None },
+		}
+	}
+
+	fn reports_load(&self) -> bool {
+		self.class == ArmClass::PortableSql
+	}
+
+	fn downsamples(&self) -> bool {
+		self.class == ArmClass::PortableSql
 	}
 
 	fn unload(&mut self) {
@@ -252,7 +295,21 @@ impl Arm for Timescale {
 		let start = ds.start.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid start out of range"))?;
 		let end = ds.end.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid end out of range"))?;
 		let step = ds.resolution.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("grid step out of range"))?;
+		let class = self.class;
 		let db = self.loaded()?;
+		match class {
+			ArmClass::PortableSql => {}
+			ArmClass::Native => {
+				let rows = db.client.query(NATIVE_SQL, &[&start, &end, &step]).await?;
+				let rows: Vec<(i64, f64)> = rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, Option<f64>>(1).unwrap_or(f64::NAN))).collect();
+				return Ok(Output::Float(place(&rows, start, step, ds.grid_len())));
+			}
+			ArmClass::ClientSide => {
+				let rows = db.client.query(FETCH_SQL, &[]).await?;
+				let (t, v): (Vec<i64>, Vec<f64>) = rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, f64>(1))).unzip();
+				return Ok(Output::Float(client_linear(&t, &v, start, step, ds.grid_len())));
+			}
+		}
 		let statement = if let Some(statement) = &db.interpolate {
 			statement.clone()
 		} else {
