@@ -25,6 +25,7 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 pub mod clickhouse;
+pub mod combine;
 pub mod duck;
 pub mod influxdb3;
 pub mod iotdb;
@@ -43,7 +44,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
 use weft_bench::{
-	accuracy::{synthetic_ground_truth, AccuracyMetrics}, report::RunMetadata, scale::ScalePreset, stats::{BootstrapConfig, LatencyCis, LatencyStats}, uci::UciCorpus, InterpolationProfile, SignalShape, SyntheticParams
+	accuracy::{synthetic_ground_truth, AccuracyMetrics}, report::RunMetadata, schema::{BetweenRun, ResultDigest}, scale::ScalePreset, stats::{BootstrapConfig, LatencyCis, LatencyStats}, uci::UciCorpus, InterpolationProfile, SignalShape, SyntheticParams
 };
 
 /// Version of the report this crate writes. Separate from `weft-bench`'s schema: the shapes differ.
@@ -58,7 +59,11 @@ use weft_bench::{
 /// `cold_hook`; a v3 report deserializes with every result warm.
 ///
 /// v5 (#147) keeps each result's raw `samples_ns`; an older report deserializes with none.
-pub const XBENCH_SCHEMA_VERSION: u32 = 5;
+///
+/// v6 (#147) adds each gate's `answer_sha256`, a combined report's `between_run` and
+/// `combined_from`, and the run manifest: the `inputs` files' hashes, the `binary_sha256` and the
+/// engine `containers`.
+pub const XBENCH_SCHEMA_VERSION: u32 = 6;
 
 /// The reductions the downsample phase computes per bucket.
 pub const DOWNSAMPLE_AGGREGATIONS: [weft_reduce::Aggregation; 3] = [weft_reduce::Aggregation::Min, weft_reduce::Aggregation::Max, weft_reduce::Aggregation::Avg];
@@ -336,6 +341,9 @@ pub struct ArmResult {
 	/// empty in older reports.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub samples_ns: Vec<u64>,
+	/// How the runs a combined report pooled differed (`weft-xbench combine`, v6); `None` for one run.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub between_run: Option<BetweenRun>,
 }
 
 /// What was warm when a result's reps ran.
@@ -430,6 +438,28 @@ pub struct Correctness {
 	pub tolerance: f64,
 	/// Grid size matches, values are finite and within tolerance.
 	pub passed: bool,
+	/// SHA-256 of this arm's answer ([`grid_digest`], [`bucket_digest`]), so separate runs of one arm
+	/// can be shown to answer alike (v6). Engines differ in the last bits of a float, so arms are
+	/// compared with each other by [`Self::max_abs_diff_vs_reference`], not by this.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub answer_sha256: Option<String>,
+}
+
+/// Significant digits an answer's digest keeps of each float: a run that differs past them (a
+/// parallel sum's rounding order) still answers alike, one that differs within them does not.
+const DIGEST_DIGITS: usize = 12;
+
+/// SHA-256 of an interpolated grid, each value to [`DIGEST_DIGITS`] significant digits.
+#[must_use]
+pub fn grid_digest(values: &[f64]) -> String {
+	ResultDigest::of(values.iter().enumerate().map(|(i, v)| (i, format!("{v:.*e}", DIGEST_DIGITS - 1))))
+}
+
+/// SHA-256 of downsample buckets: start, count, min and max exactly, the mean to
+/// [`DIGEST_DIGITS`] significant digits.
+#[must_use]
+pub fn bucket_digest(rows: &[BucketRow]) -> String {
+	ResultDigest::of(rows.iter().map(|r| (r.start_ns, format!("{} {:e} {:e} {:.*e}", r.count, r.min, r.max, DIGEST_DIGITS - 1, r.avg))))
 }
 
 /// Relative tolerance against the reference.
@@ -446,6 +476,7 @@ impl Correctness {
 		let same_shape = rows.len() == reference.len() && rows.iter().zip(reference).all(|(a, b)| a.start_ns == b.start_ns && a.count == b.count);
 		let flat = |rs: &[BucketRow]| rs.iter().flat_map(|r| [r.min, r.max, r.avg]).collect::<Vec<f64>>();
 		let mut gate = Self::check(&flat(rows), &flat(reference), reference.len() * 3);
+		gate.answer_sha256 = Some(bucket_digest(rows));
 		gate.expected_points = reference.len();
 		gate.actual_points = rows.len();
 		if !same_shape {
@@ -463,7 +494,7 @@ impl Correctness {
 		let magnitude = reference.iter().map(|v| v.abs()).fold(1.0, f64::max);
 		let tolerance = RELATIVE_TOLERANCE * magnitude;
 		let passed = values.len() == expected && values_finite && max_abs_diff_vs_reference <= tolerance;
-		Self { expected_points: expected, actual_points: values.len(), values_finite, max_abs_diff_vs_reference, tolerance, passed }
+		Self { expected_points: expected, actual_points: values.len(), values_finite, max_abs_diff_vs_reference, tolerance, passed, answer_sha256: Some(grid_digest(values)) }
 	}
 }
 
@@ -503,6 +534,108 @@ pub struct XbenchReport {
 	pub cold_hook: Option<String>,
 	/// Every arm × dataset × phase × warmth.
 	pub results: Vec<ArmResult>,
+	/// The input files the datasets were read from (`--uci`, `--tsbs`), with their hashes (v6).
+	#[serde(default)]
+	pub inputs: Vec<InputFile>,
+	/// SHA-256 of the binary that ran (v6).
+	#[serde(default)]
+	pub binary_sha256: Option<String>,
+	/// The engine servers' containers as `docker inspect` described them (`--container`, v6).
+	#[serde(default)]
+	pub containers: Vec<Container>,
+	/// For a combined report, each pooled run's report file and its SHA-256 (v6); empty for one run.
+	#[serde(default)]
+	pub combined_from: Vec<InputFile>,
+}
+
+/// A file the run read, as the run found it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputFile {
+	/// What the file was (`uci`, `tsbs`, `run`).
+	pub role: String,
+	/// The path given.
+	pub path: String,
+	/// Its size.
+	pub bytes: u64,
+	/// Its SHA-256.
+	pub sha256: String,
+}
+
+impl InputFile {
+	/// Hash the file at `path`.
+	///
+	/// # Errors
+	///
+	/// If the file cannot be read.
+	pub fn hash(role: &str, path: &std::path::Path) -> anyhow::Result<Self> {
+		use sha2::Digest as _;
+		let mut file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+		let mut hasher = sha2::Sha256::new();
+		let bytes = std::io::copy(&mut file, &mut hasher)?;
+		Ok(Self { role: role.to_string(), path: path.display().to_string(), bytes, sha256: hex(&hasher.finalize()) })
+	}
+}
+
+fn hex(bytes: &[u8]) -> String {
+	use std::fmt::Write as _;
+	bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+		let _ = write!(s, "{b:02x}");
+		s
+	})
+}
+
+/// An engine server's container: the image it ran and how it was started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Container {
+	/// The engine (`clickhouse`, `timescaledb`, …).
+	pub engine: String,
+	/// The container's name.
+	pub name: String,
+	/// The image reference it was started from.
+	pub image: String,
+	/// The image's content digest (`sha256:…`), which pins it where a tag does not.
+	pub image_id: String,
+	/// Entrypoint and command, which carry the engine's command-line settings.
+	pub command: Vec<String>,
+	/// Environment, which carries the settings some images read (`IoTDB`, `QuestDB`); a variable
+	/// whose name suggests a secret is kept with its value replaced.
+	pub env: Vec<String>,
+}
+
+/// Names of environment variables whose values a report must not carry.
+const SECRET_NAMES: [&str; 5] = ["PASS", "SECRET", "TOKEN", "KEY", "CREDENTIAL"];
+
+impl Container {
+	/// Describe the container `name` of `engine` from `docker inspect`.
+	///
+	/// # Errors
+	///
+	/// If `docker inspect` fails or prints something else than one container.
+	pub fn inspect(engine: &str, name: &str) -> anyhow::Result<Self> {
+		let out = std::process::Command::new("docker").args(["inspect", "--type", "container", name]).output()?;
+		anyhow::ensure!(out.status.success(), "docker inspect {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
+		Self::from_inspect(engine, name, &serde_json::from_slice(&out.stdout)?)
+	}
+
+	/// Describe a container from `docker inspect`'s JSON.
+	///
+	/// # Errors
+	///
+	/// If the JSON is not one container's description.
+	pub fn from_inspect(engine: &str, name: &str, json: &serde_json::Value) -> anyhow::Result<Self> {
+		let c = json.as_array().and_then(|a| a.first()).ok_or_else(|| anyhow::anyhow!("docker inspect {name}: no container"))?;
+		let strings = |v: &serde_json::Value| v.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+		let config = &c["Config"];
+		let command = [strings(&config["Entrypoint"]), strings(&config["Cmd"])].concat();
+		let env = strings(&config["Env"])
+			.into_iter()
+			.map(|kv| match kv.split_once('=') {
+				Some((k, _)) if SECRET_NAMES.iter().any(|s| k.to_ascii_uppercase().contains(s)) => format!("{k}=<redacted>"),
+				_ => kv,
+			})
+			.collect();
+		Ok(Self { engine: engine.to_string(), name: name.to_string(), image: config["Image"].as_str().unwrap_or_default().to_string(), image_id: c["Image"].as_str().unwrap_or_default().to_string(), command, env })
+	}
 }
 
 impl XbenchReport {
@@ -581,7 +714,7 @@ pub async fn measure<A: weft::Arm>(arm: &mut A, ds: &Dataset, reference: &Refere
 	let info = arm.info();
 	let row = |phase, warmth, output_points, reps, samples: &[u64], correctness, accuracy, storage_bytes| {
 		let (latency, latency_ci) = latency(samples, seed);
-		ArmResult { dataset: ds.name.clone(), kind: ds.kind, scale: ds.scale.as_str().to_string(), input_points: ds.points.len(), output_points, missingness_fraction: ds.missingness_fraction, arm: info.clone(), phase, reps, latency, latency_ci, correctness, accuracy, storage_bytes, warmth, samples_ns: samples.to_vec() }
+		ArmResult { dataset: ds.name.clone(), kind: ds.kind, scale: ds.scale.as_str().to_string(), input_points: ds.points.len(), output_points, missingness_fraction: ds.missingness_fraction, arm: info.clone(), phase, reps, latency, latency_ci, correctness, accuracy, storage_bytes, warmth, samples_ns: samples.to_vec(), between_run: None }
 	};
 	// An arm with nothing loaded keeps nothing to go cold.
 	let warmths: &[Warmth] = match cold {
@@ -740,7 +873,7 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, protocol: &Protocol, m
 	if let Some(server) = &servers.iotdb {
 		engines.push(EngineVersion { engine: "iotdb".into(), version: server.version()? });
 	}
-	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed: protocol.seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), cold_hook: protocol.cold.as_ref().map(|c| c.hook.clone()), results })
+	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed: protocol.seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), cold_hook: protocol.cold.as_ref().map(|c| c.hook.clone()), results, inputs: Vec::new(), binary_sha256: None, containers: Vec::new(), combined_from: Vec::new() })
 }
 
 #[cfg(test)]
@@ -750,6 +883,28 @@ mod tests {
 
 	use super::*;
 	use crate::weft::Arm;
+
+	#[test]
+	fn a_container_is_described_with_its_secrets_redacted() {
+		let json = serde_json::json!([{ "Image": "sha256:abc", "Config": { "Image": "timescale/timescaledb:2.17.2-pg16", "Entrypoint": ["docker-entrypoint.sh"], "Cmd": ["postgres", "-c", "timescaledb.telemetry_level=off"], "Env": ["POSTGRES_PASSWORD=hunter2", "POSTGRES_DB=xbench", "API_TOKEN=t"] } }]);
+		let c = Container::from_inspect("timescaledb", "xbench-ts", &json).expect("describes");
+		assert_eq!((c.image.as_str(), c.image_id.as_str()), ("timescale/timescaledb:2.17.2-pg16", "sha256:abc"));
+		assert_eq!(c.command, ["docker-entrypoint.sh", "postgres", "-c", "timescaledb.telemetry_level=off"]);
+		assert_eq!(c.env, ["POSTGRES_PASSWORD=<redacted>", "POSTGRES_DB=xbench", "API_TOKEN=<redacted>"]);
+		assert!(Container::from_inspect("x", "y", &serde_json::json!([])).is_err());
+	}
+
+	#[test]
+	fn digests_hold_an_answer_not_its_last_bits() {
+		let a = grid_digest(&[1.0, 2.5, 3.25]);
+		assert_eq!(a, grid_digest(&[1.0, 2.5, 3.25 + 1e-15]), "below twelve digits is rounding");
+		assert_ne!(a, grid_digest(&[1.0, 2.5, 3.2501]));
+		let row = |avg: f64| BucketRow { start_ns: 0, count: 3, min: 1.0, max: 2.0, avg };
+		assert_eq!(bucket_digest(&[row(1.5)]), bucket_digest(&[row(1.5 + 1e-15)]));
+		assert_ne!(bucket_digest(&[row(1.5)]), bucket_digest(&[BucketRow { count: 4, ..row(1.5) }]));
+		let gate = Correctness::check(&[1.0, 2.0], &[1.0, 2.0], 2);
+		assert_eq!(gate.answer_sha256.as_deref(), Some(grid_digest(&[1.0, 2.0]).as_str()));
+	}
 
 	fn ts(secs: i64) -> DateTime<Utc> {
 		Utc.timestamp_opt(secs, 0).single().expect("valid instant")

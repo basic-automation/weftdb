@@ -91,17 +91,36 @@ pub const fn compare(weft: &ConfidenceInterval, other: &ConfidenceInterval) -> O
 	}
 }
 
+/// Whether every pooled run's median falls the way `outcome` says. A result from one run has
+/// nothing to disagree with.
+fn runs_agree(weft: &ArmResult, other: &ArmResult, outcome: Outcome) -> bool {
+	let (Some(w), Some(o)) = (&weft.between_run, &other.between_run) else { return true };
+	let (w_min, w_max) = (w.run_p50_ns.iter().min(), w.run_p50_ns.iter().max());
+	let (o_min, o_max) = (o.run_p50_ns.iter().min(), o.run_p50_ns.iter().max());
+	match outcome {
+		Outcome::Win => w_max < o_min,
+		Outcome::Loss => o_max < w_min,
+		Outcome::Noise => true,
+	}
+}
+
 /// Every passing WeftDB result against the fastest passing other-engine result.
 ///
 /// The other result shares the dataset, the phase and the warmth, so a cold WeftDB read is held
-/// against cold reads only. Datasets and phases with no other engine produce no verdict.
+/// against cold reads only. Datasets and phases with no other engine produce no verdict. In a
+/// combined report a win or a loss also needs every run's median to fall the same way; one that
+/// does not is noise.
 #[must_use]
 pub fn verdicts(report: &XbenchReport) -> Vec<Verdict<'_>> {
 	let mut out = Vec::new();
 	for weft in report.results.iter().filter(|r| is_weft(r) && passed(r)) {
 		let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.dataset == weft.dataset && r.phase == weft.phase && r.warmth == weft.warmth).min_by_key(|r| r.latency_ci.p50.point_ns);
 		if let Some(other) = other {
-			out.push(Verdict { weft, other, outcome: compare(&weft.latency_ci.p50, &other.latency_ci.p50) });
+			let outcome = match compare(&weft.latency_ci.p50, &other.latency_ci.p50) {
+				decided if !runs_agree(weft, other, decided) => Outcome::Noise,
+				outcome => outcome,
+			};
+			out.push(Verdict { weft, other, outcome });
 		}
 	}
 	out
@@ -324,6 +343,16 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		None => caveats.push("The report does not record whether the binary was an optimised build (a v1 report).".into()),
 		Some(true) => {}
 	}
+	if report.combined_from.is_empty() {
+		caveats.push("**One run.** Two runs of this benchmark on one host once disagreed on 53 of 144 rows (EVI-15); a verdict from one run can be the run, not the engine. Pool several with `weft-xbench combine` before publishing.".into());
+	} else {
+		let spread = report.results.iter().filter_map(|r| r.between_run.as_ref()).map(|b| b.p50_spread).fold(0.0, f64::max);
+		caveats.push(format!("Pooled from {} separate runs; every interval is drawn runs-first and a win or loss needs every run's median to agree. The widest p50 spread between runs was {:.1}%.", report.combined_from.len(), spread * 100.0));
+		let disagreeing: Vec<String> = report.results.iter().filter(|r| r.between_run.as_ref().is_some_and(|b| !b.digests_agree)).map(|r| format!("{} / {}", r.dataset, r.arm.arm)).collect();
+		if !disagreeing.is_empty() {
+			caveats.push(format!("**Runs answered differently** for {}, which fails those gates.", disagreeing.join(", ")));
+		}
+	}
 	let min_reps = report.results.iter().map(|r| r.reps).min().unwrap_or(0);
 	if min_reps < FEW_REPS {
 		caveats.push(format!("Some results have only {min_reps} reps, so their intervals are wide and fewer comparisons can separate from noise."));
@@ -332,6 +361,15 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 
 	b.push(Block::Heading(3, "Reproduction".into()));
 	let invocation = if report.invocation.is_empty() { "weft-xbench".to_string() } else { report.invocation.join(" ") };
+	let mut manifest: Vec<String> = report.inputs.iter().chain(&report.combined_from).map(|f| format!("{} `{}`: {} bytes, sha256 `{}`.", f.role, f.path, f.bytes, f.sha256)).collect();
+	if let Some(sha) = &report.binary_sha256 {
+		manifest.push(format!("Binary sha256 `{sha}`."));
+	}
+	manifest.extend(report.containers.iter().map(|c| format!("{} container `{}`: image `{}` (`{}`), command `{}`, environment `{}`.", c.engine, c.name, c.image, c.image_id, c.command.join(" "), c.env.join(" "))));
+	if !manifest.is_empty() {
+		b.push(Block::Heading(3, "Run manifest".into()));
+		b.push(Block::List(manifest));
+	}
 	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), "For the QuestDB arms: `docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v <disk under test>/questdb:/var/lib/questdb questdb/questdb:<version above>`, then `--questdb 127.0.0.1:9000`.".into(), "For the InfluxDB 3 arm: `docker run -d -p 127.0.0.1:8181:8181 -v <disk under test>/influxdb3:/var/lib/influxdb3 influxdb:<version above> influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000`, then `--influxdb3 http://127.0.0.1:8181`.".into(), "For the IoTDB arm: `docker run -d -p 127.0.0.1:18080:18080 -e enable_rest_service=true -e timestamp_precision=ns -e wal_mode=SYNC -e rest_query_default_row_size_limit=10000000 -v <disk under test>/iotdb:/iotdb/data apache/iotdb:<version above>-standalone` (the precision must be set before the first start), then `--iotdb http://127.0.0.1:18080`.".into(), "For the `tsbs` datasets: build TSBS's generator at the pinned commit, `GOBIN=<dir> go install github.com/timescale/tsbs/cmd/tsbs_generate_data@8323e59c74027b108f4ad5ec5d3e498b0101a02e`, write a week of `cpu-only` data, `tsbs_generate_data --use-case=cpu-only --seed=123 --scale=10 --log-interval=10s --timestamp-start=2016-01-01T00:00:00Z --timestamp-end=2016-01-08T00:00:10Z --format=influx > cpu-only.lp`, then `--tsbs cpu-only.lp`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
 	b
 }
@@ -444,12 +482,12 @@ mod tests {
 
 	fn result(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
 		let (latency, latency_ci) = latency(samples, 1);
-		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed });
-		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec() }
+		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed, answer_sha256: None });
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into() }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec(), between_run: None }
 	}
 
 	fn report(results: Vec<ArmResult>) -> XbenchReport {
-		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-10-29T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: Some("abc123".into()), invocation: vec!["weft-xbench".into(), "--scales".into(), "tiny".into()], scratch_dir: Some("/mnt/weftbench/tmp".into()), optimized: Some(true), cold_hook: None, results }
+		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-10-29T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: Some("abc123".into()), invocation: vec!["weft-xbench".into(), "--scales".into(), "tiny".into()], scratch_dir: Some("/mnt/weftbench/tmp".into()), optimized: Some(true), cold_hook: None, results, inputs: Vec::new(), binary_sha256: None, containers: Vec::new(), combined_from: Vec::new() }
 	}
 
 	const FAST: [u64; 12] = [100, 101, 99, 100, 102, 98, 100, 101, 99, 100, 100, 101];
@@ -460,6 +498,23 @@ mod tests {
 		let r = report(vec![result("a", "weftdb-memory", Phase::Interpolate, &FAST, true), result("a", "duckdb-double", Phase::Interpolate, &SLOW, true), result("b", "weftdb-memory", Phase::Interpolate, &SLOW, true), result("b", "duckdb-double", Phase::Interpolate, &FAST, true), result("c", "weftdb-memory", Phase::Interpolate, &FAST, true), result("c", "duckdb-double", Phase::Interpolate, &FAST, true)]);
 		let outcomes: Vec<(String, Outcome)> = verdicts(&r).iter().map(|v| (v.weft.dataset.clone(), v.outcome)).collect();
 		assert_eq!(outcomes, vec![("a".into(), Outcome::Win), ("b".into(), Outcome::Loss), ("c".into(), Outcome::Noise)]);
+	}
+
+	#[test]
+	fn a_pooled_verdict_needs_every_run_to_agree() {
+		use weft_bench::schema::BetweenRun;
+		let between = |p50s: &[u64]| Some(BetweenRun { runs: p50s.len(), run_p50_ns: p50s.to_vec(), run_mean_ns: p50s.to_vec(), p50_spread: 0.0, digests_agree: true });
+		let pooled = |arm: &str, samples: &[u64], p50s: &[u64]| ArmResult { between_run: between(p50s), ..result("a", arm, Phase::Interpolate, samples, true) };
+		let r = report(vec![pooled("weftdb-memory", &FAST, &[100, 100]), pooled("duckdb-double", &SLOW, &[500, 500])]);
+		assert_eq!(verdicts(&r)[0].outcome, Outcome::Win);
+		// The pooled intervals separate, but one run had the other engine ahead.
+		let mut r = report(vec![pooled("weftdb-memory", &FAST, &[100, 600]), pooled("duckdb-double", &SLOW, &[500, 500])]);
+		assert_eq!(verdicts(&r)[0].outcome, Outcome::Noise);
+		r.combined_from = vec![crate::InputFile { role: "run".into(), path: "run1/xbench.json".into(), bytes: 1, sha256: "ab".into() }; 2];
+		let text = to_markdown(&blocks(&r));
+		assert!(!text.contains("**One run.**"), "a combined report is not one run");
+		let single = to_markdown(&blocks(&report(vec![])));
+		assert!(single.contains("**One run.**"), "{single}");
 	}
 
 	#[test]
