@@ -1,3 +1,9 @@
+# yamllint disable rule:line-length
+# This file is written at the width the repository aims at, which is wider than yamllint's
+# 80-column default: `.yamllint` records that width (100) and why the rule is a warning, and
+# 101 lines here were over 80 before any YAML width rule existed. New lines still wrap; the
+# rule is off for this file so that a lint run reports findings about our YAML rather than
+# findings about its history.
 name: CI
 
 on:
