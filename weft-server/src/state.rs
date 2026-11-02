@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{auth::AuthConfig, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics};
+use crate::{admission::AdmissionConfig, auth::AuthConfig, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -64,6 +64,9 @@ pub struct AppState {
 	/// in-flight byte budget the registry builds the ingest routes and
 	/// their gate admission from.
 	ingest: IngestConfig,
+	/// Admission I's limits (ROB-10): the query class's in-flight cap
+	/// the registry builds its gate admission from.
+	admission: AdmissionConfig,
 }
 
 impl AppState {
@@ -79,7 +82,7 @@ impl AppState {
 	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -155,6 +158,20 @@ impl AppState {
 	#[must_use]
 	pub const fn ingest_config(&self) -> IngestConfig {
 		self.ingest
+	}
+
+	/// Set Admission I's limits (ROB-10); the binary passes the
+	/// [`AdmissionConfig`] it resolved from `WEFT_QUERY_MAX_INFLIGHT`.
+	#[must_use]
+	pub const fn with_admission_config(mut self, config: AdmissionConfig) -> Self {
+		self.admission = config;
+		self
+	}
+
+	/// Admission I's limits the router is built with.
+	#[must_use]
+	pub const fn admission_config(&self) -> AdmissionConfig {
+		self.admission
 	}
 }
 
