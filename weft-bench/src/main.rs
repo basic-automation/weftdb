@@ -427,16 +427,20 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.query_mix > 0 {
 		let params = weft_bench::QueryMixParams { rows: cli.query_mix_rows.unwrap_or(corpus.values.len() as u64), ops: cli.query_mix, range_rows: cli.query_mix_range, weights: cli.query_mix_weights, seed: cli.seed };
-		let mut results = Vec::new();
+		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+		let mut code = ExitCode::SUCCESS;
 		weft_bench::run_query_mix(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, params, |result| {
 			let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
 			println!("mix {:<24}: {:>8} ops  {:>12} rows  p50 {:>9.3} ms p99 {:>9.3} ms  {}", result.profile, result.reps, result.dataset.output_points, ms(result.latency.p50_ns), ms(result.latency.p99_ns), if result.correctness.passed() { "PASS" } else { "FAIL" });
-			results.push(result);
+			// One report per lane, as the compressed-query run writes one per window size.
+			if finish(cli, &BenchReport::with_results(metadata.clone(), vec![result]))? != ExitCode::SUCCESS {
+				code = ExitCode::FAILURE;
+			}
 			Ok(())
 		})
 		.await
 		.map_err(|e| anyhow::anyhow!("query-mix run failed: {e}"))?;
-		return finish(cli, &BenchReport::with_results(RunMetadata::capture(Utc::now().to_rfc3339()), results));
+		return Ok(code);
 	}
 	if let Some(rows) = cli.analytics_rows {
 		let rows = usize::try_from(rows)?.min(corpus.values.len());
@@ -2007,8 +2011,8 @@ INGEST OPTIONS (with --ingest):
                              Seeded query mix instead: seal the corpus, then run OPS
                              operations whose lanes (ingest a batch, look up a point,
                              scan a range) are drawn from --seed as the soak harness
-                             draws them; every read is checked exactly. One result per
-                             lane, in one report
+                             draws them; every read is checked exactly. One report
+                             per lane
         --query-mix-rows <N>
                              Rows the store starts with (k/M/B suffixes)
                              [default: the corpus once]
