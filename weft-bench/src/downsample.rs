@@ -286,7 +286,7 @@ pub fn run_downsample_on(profile: &DownsampleProfile, points: &[Point], generati
 	let total_count: usize = last_buckets.iter().map(|b| b.count).sum();
 	let ordered = last_buckets.windows(2).all(|w| w[0].timestamp < w[1].timestamp);
 	let values_finite = last_buckets.iter().flat_map(|b| b.values.values()).all(|v| v.to_f64().is_some_and(f64::is_finite));
-	let correctness = CorrectnessReport { output_count_ok: total_count == points.len() && ordered && !last_buckets.is_empty() && same_as_reduce, expected_output_points: points.len(), actual_output_points: total_count, values_finite };
+	let correctness = CorrectnessReport { output_count_ok: total_count == points.len() && ordered && !last_buckets.is_empty() && same_as_reduce, expected_output_points: points.len(), actual_output_points: total_count, values_finite, result_sha256: Some(crate::schema::bucket_digest(&last_buckets)) };
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));

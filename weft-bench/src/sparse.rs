@@ -226,7 +226,7 @@ pub fn run_sparse(profile: &SparseProfile, reps: usize) -> anyhow::Result<BenchR
 	// Correctness: one aggregate per populated cell, in the order the generator recorded, each
 	// equal to the mean the generator computed, and every value finite.
 	let aggregates_match = scanned.len() == table.expected.len() && scanned.iter().zip(table.expected.iter()).all(|(got, want)| (got - want).abs() <= 1e-9);
-	let correctness = CorrectnessReport { output_count_ok: aggregates_match, expected_output_points: table.expected.len(), actual_output_points: scanned.len(), values_finite: scanned.iter().all(|value| value.is_finite()) };
+	let correctness = CorrectnessReport { output_count_ok: aggregates_match, expected_output_points: table.expected.len(), actual_output_points: scanned.len(), values_finite: scanned.iter().all(|value| value.is_finite()), result_sha256: Some(crate::schema::ResultDigest::of(scanned.iter().enumerate())) };
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.params.seed ^ 0x50A8_C1EC_7B10, ..BootstrapConfig::default() }));

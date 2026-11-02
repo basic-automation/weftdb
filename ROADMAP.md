@@ -36,7 +36,8 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
   - [x] **DONE (2026-10-31) — OS-cold and post-restart runs** (`weft-xbench --cold-hook CMD --cold-reps N`, #146): each read phase also runs with the page cache dropped and after an engine restart, every rep gated; schema v4 `warmth`
 - [ ] Fair-protocol depth (Phase 1.1)
   - [x] **DONE (2026-11-02) — raw samples, ≥10 samples per short test, stddev intervals** (#147): every result of both harnesses keeps `samples_ns`; `weft-bench verify` flags a short result under 10 samples; `weft-xbench` defaults to 10 reps
-  - [ ] **NEXT — result hashes**: a `result_sha256` over each workload's canonical output, so runs and engines can be shown to agree exactly, and the storage error bound gated
+  - [x] **DONE (2026-11-02) — result hashes** (#147): `correctness.result_sha256` over each workload's canonical output; the storage error bound gates publishing
+    - [ ] **NEXT — the same digest in `weft-xbench`**, per engine, where an engine's answer is exact (load and downsample); interpolation agrees only within tolerance, so it keeps the max-diff gate
   - [ ] **NEXT — several runs per report** (`--runs N`): between-run spread per result, a verdict only where every run agrees (DECISIONS 2026-10-29, EVI-15: within-run intervals understated it, with 53 of 144 rows disjoint across two runs)
   - [ ] **NEXT — saturation sweeps** (`--sweep KNOB=v1,v2,…` over batch size, readers, series, parallelism) and a seeded query mix from the soak lanes
   - [ ] **NEXT — a run manifest for `weft-xbench`**, with image digests, input file hashes and each engine's live settings

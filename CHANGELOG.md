@@ -31,6 +31,9 @@ only the control plane, not the segment frames.
   index write before it commits), where the planner had walked every segment of the aspect; and
   its read connections wait up to ten minutes on a lock instead of failing `database is locked`.
   Write transactions still see `Busy` at once, as their retry protocol requires.
+- **Result digests** (#147): every `weft-bench` result's correctness carries `result_sha256`,
+  a SHA-256 of its canonical output (decimals normalized, so `1.50` and `1.5` agree), and a
+  storage estimate whose error exceeds its tolerance makes the result unpublishable.
 - **Fair protocol, raw samples and sample counts** (#147): every `weft-bench` result keeps the
   timed samples behind its latency (`samples_ns`, report schema v28), and so does every
   `weft-xbench` result (report v5). `weft-bench verify` now flags a short result (p50 under a

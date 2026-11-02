@@ -342,7 +342,7 @@ pub fn run_point_lookup_on(profile: &PointLookupProfile, timestamps: &[i64], val
 	let streaming_matches_truth = last_output == expected;
 	let resolved_count = last_output.len();
 	let values_finite = last_output.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite));
-	let correctness = CorrectnessReport { output_count_ok: resolved_count == queries.len() && streaming_matches_truth, expected_output_points: queries.len(), actual_output_points: resolved_count, values_finite };
+	let correctness = CorrectnessReport { output_count_ok: resolved_count == queries.len() && streaming_matches_truth, expected_output_points: queries.len(), actual_output_points: resolved_count, values_finite, result_sha256: Some(crate::schema::ResultDigest::of(last_output.iter().enumerate().map(|(i, v)| (i, crate::schema::nullable_text(v.as_ref()))))) };
 
 	// North-star storage term for the *stored* corpus (value + timestamp columns),
 	// the same figure a sealed segment reports — the bytes/point the point-lookup

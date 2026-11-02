@@ -291,7 +291,7 @@ pub fn run_gap_fill_on(profile: &GapFillProfile, corpus: &GapFillCorpus, generat
 	let filled_match = filled.iter().map(|b| b.timestamp).eq(expected_filled.iter().copied());
 	let counted: usize = grid.iter().map(|b| b.count).sum();
 	let values_finite = grid.iter().flat_map(|b| b.values.values()).all(|v| v.to_f64().is_some_and(f64::is_finite));
-	let correctness = CorrectnessReport { output_count_ok: dense && filled_match && counted == corpus.points.len(), expected_output_points: expected_filled.len(), actual_output_points: filled.len(), values_finite };
+	let correctness = CorrectnessReport { output_count_ok: dense && filled_match && counted == corpus.points.len(), expected_output_points: expected_filled.len(), actual_output_points: filled.len(), values_finite, result_sha256: Some(crate::schema::bucket_digest(&grid)) };
 
 	// Accuracy: each filled outage bucket's value against the truth under it.
 	let key = p.aggregation.as_str();

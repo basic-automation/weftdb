@@ -252,7 +252,7 @@ pub fn run_compression_on(run: &CorpusRun<'_>, timestamps: &[i64], values: &[Big
 	let (dec_ts, dec_vals) = &last_decoded;
 	let round_trips = dec_ts.as_slice() == timestamps && dec_vals == &expected_values;
 	let values_finite = dec_vals.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite));
-	let correctness = CorrectnessReport { output_count_ok: dec_ts.len() == timestamps.len() && round_trips, expected_output_points: timestamps.len(), actual_output_points: dec_ts.len(), values_finite };
+	let correctness = CorrectnessReport { output_count_ok: dec_ts.len() == timestamps.len() && round_trips, expected_output_points: timestamps.len(), actual_output_points: dec_ts.len(), values_finite, result_sha256: Some(crate::schema::column_digest(dec_ts, dec_vals)) };
 
 	let storage = Some(StorageEstimate::from_columns(values, timestamps, run.unit, &BigDecimal::from(0)));
 

@@ -157,7 +157,7 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 
 	let (read_ts, read_values) = &last_read;
 	let round_trips_exactly = read_ts == timestamps && read_values.iter().map(Option::as_ref).eq(values.iter().map(Some));
-	let correctness = CorrectnessReport { output_count_ok: round_trips_exactly, expected_output_points: timestamps.len(), actual_output_points: read_ts.len(), values_finite: read_values.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite)) };
+	let correctness = CorrectnessReport { output_count_ok: round_trips_exactly, expected_output_points: timestamps.len(), actual_output_points: read_ts.len(), values_finite: read_values.iter().flatten().all(|v| v.to_f64().is_some_and(f64::is_finite)), result_sha256: Some(crate::schema::column_digest(read_ts, read_values)) };
 
 	let storage = Some(StorageEstimate::from_columns(values, timestamps, TimeUnit::Seconds, &BigDecimal::from(0)));
 	let latency = LatencyStats::from_samples(&samples_ns);
@@ -283,10 +283,14 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 		let mut rows_verified = 0;
 		let mut exact = true;
 		let mut finite = true;
+		let mut digest = crate::schema::ResultDigest::default();
 		let window = (GROWTH_VERIFY_ROWS as u64).min(checkpoint);
 		for (from, to) in [(0, window), (checkpoint - window, checkpoint)] {
 			// The window at the end may cross a copy boundary: compare it one copy at a time.
 			let (read_ts, read_values) = store.read_time_range(&profile.aspect, tiled.timestamp(from)?, tiled.timestamp(to - 1)?).await.map_err(|e| anyhow::anyhow!("cannot read back aspect {}: {e:#}", profile.aspect))?;
+			for (t, v) in read_ts.iter().zip(&read_values) {
+				digest.row(t, crate::schema::nullable_text(v.as_ref()));
+			}
 			let mut expected_ts = Vec::new();
 			let mut expected_values: Vec<&BigDecimal> = Vec::new();
 			let mut at = from;
@@ -306,7 +310,7 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 		let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
 		let throughput_points_per_sec = if measured_ns > 0 { rows_stage as f64 / (measured_ns as f64 / 1e9) } else { 0.0 };
 		let growth = GrowthPoint { rows_total: checkpoint, rows_stage, corpus_copies: checkpoint as f64 / n as f64, segments: stats.segment_count, segment_bytes: stats.total_bytes, bytes_per_point: stats.bytes_per_point, rows_verified, verify_read_ns };
-		let correctness = CorrectnessReport { output_count_ok: accounted && exact, expected_output_points: usize::try_from(checkpoint)?, actual_output_points: usize::try_from(stats.total_rows)?, values_finite: finite };
+		let correctness = CorrectnessReport { output_count_ok: accounted && exact, expected_output_points: usize::try_from(checkpoint)?, actual_output_points: usize::try_from(stats.total_rows)?, values_finite: finite, result_sha256: Some(digest.finish()) };
 		let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(stage_start) };
 		on_checkpoint(BenchResult {
 			schema_version: SCHEMA_VERSION,
@@ -473,7 +477,7 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 		failed_queries,
 		first_error: online.first_error.or(idle.first_error),
 	};
-	let correctness = CorrectnessReport { output_count_ok: accounted && mismatched_queries == 0 && failed_queries == 0, expected_output_points: usize::try_from(point.rows_verified)?, actual_output_points: usize::try_from(online.rows_read + idle.rows_read)?, values_finite: online.finite && idle.finite };
+	let correctness = CorrectnessReport { output_count_ok: accounted && mismatched_queries == 0 && failed_queries == 0, expected_output_points: usize::try_from(point.rows_verified)?, actual_output_points: usize::try_from(online.rows_read + idle.rows_read)?, values_finite: online.finite && idle.finite, result_sha256: None };
 	let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns: online_ns, end_to_end_ns: span_ns(run_start).saturating_add(generation_ns) };
 	Ok(BenchResult {
 		schema_version: SCHEMA_VERSION,

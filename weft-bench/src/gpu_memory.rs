@@ -203,7 +203,7 @@ pub fn run_gpu_memory(profile: &GpuMemoryProfile) -> anyhow::Result<BenchResult>
 	let stable = peak_later <= peak_first && peak_first.max(peak_later) <= max_pool_bytes;
 	let summary = GpuPoolSummary { max_pool_bytes, rounds: p.rounds, calls: samples_ns.len(), created: after.created - before.created, created_after_first_round: created_after_first, reused: after.reused - before.reused, evicted: after.evicted - before.evicted, peak_idle_bytes_first_round: peak_first, peak_idle_bytes_later: peak_later, final_idle_bytes: after.idle_bytes, stable };
 
-	let correctness = CorrectnessReport { output_count_ok: complete && stable, expected_output_points: p.sizes.iter().sum::<usize>() * p.rounds, actual_output_points: output_points, values_finite: finite };
+	let correctness = CorrectnessReport { output_count_ok: complete && stable, expected_output_points: p.sizes.iter().sum::<usize>() * p.rounds, actual_output_points: output_points, values_finite: finite, result_sha256: None };
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: p.seed ^ 0x06B0_C0DE_u64, ..BootstrapConfig::default() }));
 	#[allow(clippy::cast_precision_loss)]

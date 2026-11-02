@@ -1646,6 +1646,13 @@ What it does today:
   summary can be recomputed and runs pooled. `weft-bench verify` refuses a short test — p50 under
   a minute — resting on fewer than **10 timed samples** (`--accept-advisories` lets it through,
   as it does a dirty tree); `weft-xbench` now defaults to `--reps 10`.
+- **Result digests** — every result carries `correctness.result_sha256`, a SHA-256 over its
+  canonical output (one `key,value` row per output row, decimals normalized), so two runs, two
+  builds or two adapters can be shown to give the *same* answer, not just the same count: the
+  in-memory and store-backed interpolation adapters hash identically. Read-heavy workloads hash
+  what they checked (the verified windows, every query's buckets); the online workload's
+  concurrent reads and the GPU pool's discarded outputs carry none. A storage estimate whose
+  recorded error exceeds the tolerance it was selected against is no longer publishable.
 - **Storage estimate** — each result carries a `StorageEstimate` (recommended
   encoding + value/timestamp/total **bytes/point**) computed by
   `weft-physical-type` over the actual columns. It also surfaces **advisory

@@ -116,6 +116,7 @@ pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], v
 		let (mut in_store_ns, mut decode_ns) = (Vec::with_capacity(params.queries), Vec::with_capacity(params.queries));
 		let (mut rows_scanned, mut in_store_buckets, mut decode_buckets) = (0_u64, 0_usize, 0_usize);
 		let mut identical = true;
+		let mut digest = crate::schema::ResultDigest::default();
 		for query in 0..params.queries {
 			let from = rng.random_range(0..=params.rows - window_rows);
 			let (start, end) = (tiled.timestamp(from)?, tiled.timestamp(from + window_rows - 1)?);
@@ -137,6 +138,9 @@ pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], v
 				}
 			}
 			let (in_store, decoded) = (in_store.unwrap_or_default(), decoded.unwrap_or_default());
+			for (start, row) in in_store.iter().map(crate::schema::bucket_row) {
+				digest.row(start, row);
+			}
 			identical &= in_store == decoded && in_store.iter().map(|b| b.count as u64).sum::<u64>() == window_rows;
 			in_store_buckets += in_store.len();
 			decode_buckets += decoded.len();
@@ -169,7 +173,7 @@ pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], v
 			latency,
 			latency_ci: None,
 			timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) },
-			correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true },
+			correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true, result_sha256: Some(digest.finish()) },
 			accuracy: None,
 			storage: None,
 			gpu_pool: None,
