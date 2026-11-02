@@ -28,7 +28,7 @@ use std::num::NonZeroUsize;
 use axum::{
 	extract::State, http::header, response::{IntoResponse, Response}, Json
 };
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 /// Provenance of a reconstructed value: `raw` (the grid point coincides with an input
@@ -41,7 +41,7 @@ use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 
 use crate::{
-	error::{ApiError, Code, StrictJson, StrictQuery}, metrics::SharedMetrics
+	downsample::wire_value, error::{ApiError, Code, StrictJson, StrictQuery}, metrics::SharedMetrics
 };
 
 /// One input sample on the wire.
@@ -58,7 +58,8 @@ pub struct InputPoint {
 pub struct OutputPoint {
 	/// Output-grid timestamp.
 	pub timestamp: DateTime<Utc>,
-	/// Interpolated value (narrowed from the engine's `BigDecimal`).
+	/// Interpolated value (narrowed from the engine's `BigDecimal`; a value with
+	/// no finite `f64` representation fails the request — no silent narrowing).
 	pub value: f64,
 	/// Provenance of this value: `raw` (the grid point coincides with an input
 	/// observation), `interpolated` (within the observed span), or `extrapolated`
@@ -357,7 +358,7 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
 	// conversion of every output grid point, with its provenance — the result-shaping
 	// stage timed apart from the kernel.
-	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| OutputPoint { timestamp, value: value.to_f64().unwrap_or_default(), kind }).collect());
+	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| wire_value(value, &format!("the interpolated value at {timestamp}")).map(|wire| OutputPoint { timestamp, value: wire, kind })).collect::<Result<Vec<OutputPoint>, ApiError>>())?;
 
 	// The method splimes ran, which is simpler than the requested one when there were
 	// too few distinct input timestamps for it.
@@ -528,7 +529,8 @@ pub struct PointResponse {
 	pub instant: DateTime<Utc>,
 	/// Number of input samples accepted.
 	pub input_points: usize,
-	/// The reconstructed value at the instant (narrowed from `BigDecimal`).
+	/// The reconstructed value at the instant (narrowed from `BigDecimal`; a value
+	/// with no finite `f64` representation fails the request).
 	pub value: f64,
 	/// Whether the value is raw (coincides with an input), interpolated
 	/// (in-range), or extrapolated (out-of-range).
@@ -575,7 +577,7 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
 	// The method splimes ran, which may be simpler than the requested one.
-	Ok(Json(PointResponse { spline: output.spline().to_string(), instant, input_points: input.len(), value: value.to_f64().unwrap_or_default(), kind }))
+	Ok(Json(PointResponse { spline: output.spline().to_string(), instant, input_points: input.len(), value: wire_value(value, &format!("the interpolated value at {instant}"))?, kind }))
 }
 
 /// Query parameters for the ILP interpolation endpoint.
@@ -1430,5 +1432,26 @@ mod tests {
 	async fn interpolate_ilp_arrow_rejects_too_few_points() {
 		let (status, _content_type, _bytes) = post_text_for_bytes("/api/v1/interpolate/ilp/arrow?field=load&precision=s", "cpu load=1 1000000000\n").await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
+	}
+
+	#[tokio::test]
+	async fn extrapolated_value_beyond_f64_range_is_refused_not_zeroed() {
+		// A linear series rising 0 -> 1e307 in one minute, extrapolated twenty
+		// minutes past its span, reaches ~2e308: a finite BigDecimal with no
+		// finite f64 form. FRE-5 (no silent narrowing): the endpoint refuses
+		// with not_finite instead of returning a substitute 0.0.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "minutes",
+			"start": ts(0),
+			"end": ts(1200),
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 1e307 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/interpolate", body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert_eq!(body["code"], "not_finite", "body: {body}");
 	}
 }

@@ -7,7 +7,12 @@
 //! replaying its predecessors. SOA-5's ingest client put that traffic on
 //! the wire and deliberately stopped there — it owns no reads, because a
 //! read result is only meaningful once something can judge it. This module
-//! is that judge: the oracle core.
+//! is that judge: the oracle core. SOA-7 (W5) builds on this core: the
+//! window digests in [`crate::soak_digest`] hash the same expected and
+//! observed points this module compares, and the oracle self-test
+//! ([`SoakOracle::self_test`]) exercises this core against known-good
+//! and known-corrupt read-backs so a broken judge is caught before a
+//! run trusts its verdict.
 //!
 //! **What the oracle judges.** The caller supplies what a read-back
 //! observed — one [`ObservedPoint`] per point it found, each naming its
@@ -17,7 +22,8 @@
 //! (which endpoint, which client) is the caller's business, the same way
 //! SOA-5's client is one filler of SOA-3's server seam; the derived-read
 //! checks built on read endpoints are SOA-10's, and window digests are
-//! SOA-7's. The core here is the comparison and the verdict, nothing else.
+//! SOA-7's ([`crate::soak_digest`]). The core here is the comparison and
+//! the verdict, nothing else.
 //!
 //! **Exact comparison, no invented tolerance.** Grids are format-exact by
 //! construction (SOA-4): a cell's value is derived deterministically and
@@ -238,6 +244,59 @@ impl OracleVerdict {
 	}
 }
 
+/// One check in the oracle self-test (SOA-7): a fixed name from the
+/// closed set [`SoakOracle::self_test`] runs, and whether the core
+/// produced the judgement the check's construction requires. The names
+/// are constants of the self-test, never free text from a caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfTestCheck {
+	/// Stable name of the check (e.g. `missing_point_is_caught`).
+	pub name: String,
+	/// Whether the core judged this check's read-back correctly.
+	pub passed: bool,
+}
+
+/// The oracle self-test's report (SOA-7): every check it ran and
+/// whether each passed. Produced by [`SoakOracle::self_test`]; carries
+/// no free text beyond the checks' fixed names, so it needs no
+/// redaction pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OracleSelfTestReport {
+	/// The checks, in the order the self-test runs them.
+	pub checks: Vec<SelfTestCheck>,
+}
+
+impl OracleSelfTestReport {
+	/// Whether every check passed — and at least one ran. A report with
+	/// no checks is not a passed self-test (the SOA-12 skipped-check
+	/// rule, as with the oracle's own vacuous pass).
+	#[must_use]
+	pub fn passed(&self) -> bool {
+		!self.checks.is_empty() && self.checks.iter().all(|check| check.passed)
+	}
+
+	/// How many checks the self-test ran.
+	#[must_use]
+	pub fn checks_run(&self) -> usize {
+		self.checks.len()
+	}
+
+	/// Names of the checks that failed, in run order.
+	#[must_use]
+	pub fn failed_checks(&self) -> Vec<&str> {
+		self.checks.iter().filter(|check| !check.passed).map(|check| check.name.as_str()).collect()
+	}
+
+	/// Serialize this report as a pretty JSON artifact.
+	///
+	/// # Errors
+	///
+	/// Returns an error when serialization fails.
+	pub fn to_json(&self) -> anyhow::Result<String> {
+		Ok(serde_json::to_string_pretty(self)?)
+	}
+}
+
 /// The soak oracle: the workload model a run's traffic derived from, and
 /// the comparisons against it.
 ///
@@ -301,6 +360,107 @@ impl SoakOracle {
 			self.judge_tick_into(*tick, observed, &mut verdict);
 		}
 		verdict
+	}
+
+	/// The expected window digest of ticks
+	/// `start_tick..start_tick + tick_count` (SOA-7): the hash form of
+	/// this oracle's expectations for the window, from the model alone.
+	/// Compared against
+	/// [`observed_window_digest`](crate::soak_digest::observed_window_digest)
+	/// of a read-back via [`WindowDigest::matches`](crate::soak_digest::WindowDigest::matches);
+	/// a window whose digests differ is re-judged tick by tick with
+	/// [`Self::judge_tick`] to classify what changed.
+	#[must_use]
+	pub fn window_digest(&self, start_tick: u64, tick_count: u64) -> crate::soak_digest::WindowDigest {
+		crate::soak_digest::expected_window_digest(&self.model, start_tick, tick_count)
+	}
+
+	/// The oracle self-test (SOA-7): exercise this core against
+	/// read-backs whose correct judgements are known by construction,
+	/// and report whether the core produced them.
+	///
+	/// A soak verdict is evidence only if the judge works. The self-test
+	/// builds its own small deterministic model — it does not use this
+	/// oracle's model, so a misconfigured run cannot make it vacuous —
+	/// and checks: a faithful read-back passes exactly; each corruption
+	/// class the core classifies (missing, wrong value, wrong timestamp,
+	/// unexpected, out-of-grid, duplicate) is caught as exactly that
+	/// kind; and SOA-7's window digests agree with a faithful read-back
+	/// and disagree after a dropped point. It performs no read and
+	/// touches no server, so a driver can run it before a soak starts
+	/// and a publisher can run it before trusting a recorded verdict.
+	/// Pure and deterministic: the same core gives the same report on
+	/// any machine.
+	#[must_use]
+	pub fn self_test() -> OracleSelfTestReport {
+		use crate::soak_workload::{LaneWeights, WorkloadParams};
+
+		let model = WorkloadModel::new(7, WorkloadParams::new(3, 4, 50, LaneWeights { ingest: 1, point_lookup: 0, range_scan: 0 })).expect("self-test model params are valid");
+		let oracle = Self::new(model.clone());
+		let faithful_tick = |tick: u64| -> Vec<ObservedPoint> {
+			let step = model.step(tick);
+			let mut points = Vec::new();
+			for series in 0..step.grid.series {
+				for row in 0..step.grid.rows {
+					if let Some(value) = step.grid.cell(series, row) {
+						points.push(ObservedPoint { series, row, timestamp_ns: model.timestamp_ns(tick, row), value: value.clone() });
+					}
+				}
+			}
+			points
+		};
+		// A tick with at least one present and one absent cell, so every
+		// corruption has somewhere to land.
+		let mixed_tick = (0..64)
+			.find(|&tick| {
+				let step = model.step(tick);
+				step.grid.present_count() > 0 && step.grid.present_count() < step.grid.series * step.grid.rows
+			})
+			.expect("a 50% grid has a mixed tick within 64 ticks");
+		let absent_cell = {
+			let step = model.step(mixed_tick);
+			(0..step.grid.series).find_map(|series| (0..step.grid.rows).find(|&row| step.grid.cell(series, row).is_none()).map(|row| (series, row))).expect("the mixed tick has an absent cell")
+		};
+		let single_kind = |verdict: &OracleVerdict, kind: MismatchKind| verdict.mismatch_count == 1 && verdict.count_kind(kind) == 1;
+
+		let mut checks: Vec<SelfTestCheck> = Vec::new();
+		let mut check = |name: &str, passed: bool| checks.push(SelfTestCheck { name: name.to_string(), passed });
+
+		let faithful: Vec<(u64, Vec<ObservedPoint>)> = (0..8).map(|tick| (tick, faithful_tick(tick))).collect();
+		let verdict = oracle.judge_run(&faithful);
+		check("faithful_read_back_passes", verdict.passed() && verdict.ticks_judged == 8 && verdict.points_observed > 0);
+
+		let mut dropped = faithful_tick(mixed_tick);
+		dropped.remove(0);
+		check("missing_point_is_caught", single_kind(&oracle.judge_tick(mixed_tick, &dropped), MismatchKind::Missing));
+
+		let mut wrong_value = faithful_tick(mixed_tick);
+		wrong_value[0].value = GridValue::Text("self-test tamper".to_string());
+		check("wrong_value_is_caught", single_kind(&oracle.judge_tick(mixed_tick, &wrong_value), MismatchKind::WrongValue));
+
+		let mut wrong_timestamp = faithful_tick(mixed_tick);
+		wrong_timestamp[0].timestamp_ns += 1;
+		check("wrong_timestamp_is_caught", single_kind(&oracle.judge_tick(mixed_tick, &wrong_timestamp), MismatchKind::WrongTimestamp));
+
+		let mut unexpected = faithful_tick(mixed_tick);
+		unexpected.push(ObservedPoint { series: absent_cell.0, row: absent_cell.1, timestamp_ns: model.timestamp_ns(mixed_tick, absent_cell.1), value: GridValue::Float(0.0) });
+		check("unexpected_point_is_caught", single_kind(&oracle.judge_tick(mixed_tick, &unexpected), MismatchKind::Unexpected));
+
+		let mut out_of_grid = faithful_tick(mixed_tick);
+		out_of_grid.push(ObservedPoint { series: 99, row: 0, timestamp_ns: model.timestamp_ns(mixed_tick, 0), value: GridValue::Float(1.0) });
+		check("out_of_grid_point_is_caught", single_kind(&oracle.judge_tick(mixed_tick, &out_of_grid), MismatchKind::Unexpected));
+
+		let mut duplicated = faithful_tick(mixed_tick);
+		duplicated.push(duplicated[0].clone());
+		check("duplicate_point_is_caught", single_kind(&oracle.judge_tick(mixed_tick, &duplicated), MismatchKind::Duplicate));
+
+		let window: Vec<(u64, Vec<ObservedPoint>)> = (0..4).map(|tick| (tick, faithful_tick(tick))).collect();
+		check("window_digest_agrees_with_a_faithful_read_back", oracle.window_digest(0, 4).matches(&crate::soak_digest::observed_window_digest(0, 4, &window)));
+		let mut short_window = window.clone();
+		short_window[0].1.remove(0);
+		check("window_digest_detects_a_dropped_point", !oracle.window_digest(0, 4).matches(&crate::soak_digest::observed_window_digest(0, 4, &short_window)));
+
+		OracleSelfTestReport { checks }
 	}
 
 	/// Judge one tick into an accumulating verdict.
@@ -586,6 +746,35 @@ mod tests {
 		assert!(json.contains("\"oracle\""), "the recorded verdict is in the run's output artifact: {json}");
 		let back: crate::soak::SoakRun = serde_json::from_str(&json).expect("run artifact deserializes");
 		assert_eq!(back.oracle, harness.run_record().oracle);
+	}
+
+	#[test]
+	fn the_oracle_self_test_passes_against_this_core() {
+		let report = SoakOracle::self_test();
+		assert!(report.passed(), "the self-test must pass against the core it ships with; failures: {:?}", report.failed_checks());
+		assert_eq!(report.checks_run(), 9, "nine checks: one faithful pass, six corruption classes, two window digests");
+		assert!(report.failed_checks().is_empty());
+	}
+
+	#[test]
+	fn the_self_test_is_deterministic_and_round_trips() {
+		let first = SoakOracle::self_test();
+		assert_eq!(first, SoakOracle::self_test(), "the self-test is a pure function of the core");
+		let json = first.to_json().expect("serialize self-test report");
+		let back: OracleSelfTestReport = serde_json::from_str(&json).expect("deserialize self-test report");
+		assert_eq!(first, back);
+		let empty = OracleSelfTestReport::default();
+		assert!(!empty.passed(), "a report that ran no checks is not a passed self-test");
+	}
+
+	#[test]
+	fn the_oracle_window_digest_matches_the_digest_module() {
+		let model = model();
+		let oracle = SoakOracle::new(model.clone());
+		let ticks: Vec<(u64, Vec<ObservedPoint>)> = (0..4).map(|tick| (tick, faithful(&model, tick))).collect();
+		let expected = oracle.window_digest(0, 4);
+		assert!(expected.matches(&crate::soak_digest::observed_window_digest(0, 4, &ticks)), "the oracle's expected digest agrees with a faithful read-back's");
+		assert_eq!(expected, crate::soak_digest::expected_window_digest(&model, 0, 4), "the oracle's digest is the module's expected digest of its model");
 	}
 
 	#[test]
