@@ -377,6 +377,15 @@ impl IndexTxn {
 		Self { ops, points: TxnPoints::NONE }
 	}
 
+	/// The time span (`max_ts - min_ts`) of every segment row the transaction writes,
+	/// with its aspect: what the prune's span bound must cover before it commits.
+	pub(crate) fn row_spans(&self) -> impl Iterator<Item = (&str, i64)> {
+		self.ops.iter().filter_map(|op| match op {
+			IndexOp::InsertNew { aspect, row } | IndexOp::Upsert { aspect, row } | IndexOp::ReplaceExpected { aspect, row, .. } => Some((aspect.as_str(), row.desc.max_ts?.saturating_sub(row.desc.min_ts?))),
+			_ => None,
+		})
+	}
+
 	/// The same transaction, hitting `points`.
 	#[must_use]
 	pub const fn with_points(mut self, points: TxnPoints) -> Self {
