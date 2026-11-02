@@ -2799,3 +2799,99 @@ deliberate; the precision-preserving representation is Phase 4 work). Only
 the silent substitution is gone. The claim adjudication behind taking this
 slice (the peer's `compute/fre-5-*` branches treated as stale squash
 leftovers) is recorded on board issue #125 and in the loop's queue notes.
+
+## 2026-11-02 — PAC-9 container image: the shapes the plan left open — FOR MERGE REVIEW
+
+The plan gives PAC-9 one line ("Docker image and container smoke test (with a
+mounted keys file)", W7) and no image, no base, no user, no registry. Each
+choice below is recorded because a later reader cannot recover it from the
+Dockerfile alone.
+
+**Publishes nothing.** PAC-9 builds and proves an image; PAC-10 is the item that
+says "Publish the multi-arch image (only after API auth)", and line 354 reserves
+the ghcr.io package make-public for the owner. So the workflow builds the image,
+runs the smoke test against it, and pushes nothing. The alternative — pushing
+`ghcr.io/basic-automation/weftdb:latest` from CI now — would publish an image
+ahead of the item that decided to publish it, under a name whose visibility is
+an owner action. Cost: README cannot offer a `docker pull`, and says so.
+
+**Builder is the release's manylinux_2_28 baseline, not `rust:`.** The image
+then carries the same glibc floor as the release binaries (PAC-2's 2.28), which
+`scripts/check-glibc.sh` re-reads out of the binary inside the finished image. A
+`rust:1-slim` build would produce a binary needing Debian's glibc and put a
+different promise behind the same name. The image tag and digest are copied from
+the x86_64 leg of `release.yml`, and the same `.github/release-toolchain`, the
+same `--profile dist` and the same `--locked` lockfile are used.
+
+**Runtime installs no packages at all.** An earlier draft `apt-get install`ed
+`curl` and `ca-certificates` for the health check and for operators. Cut: the
+probe runs on bash's `/dev/tcp`, so the image ships no HTTP client, no
+package-manager state, and depends on no mirror at build time. The published
+cost is an operator inside a container who has to install what they need — which
+is the correct posture for an image whose only job is to serve.
+
+**The probe asks `/ready`, not `/health`.** `/health` says the process is up,
+which a store that failed to open also satisfies briefly; `/ready` says the
+store opened and requests are being answered, which is what should gate traffic,
+and it is `Scope::Probe` so it answers with no key (SEC-6) and is never shed by
+admission (ROB-10).
+
+**Known gap: the probe cannot speak TLS.** With `WEFT_TLS_CERT_FILE` and
+`WEFT_TLS_KEY_FILE` set the listener serves TLS only, so such a container reads
+unhealthy while serving correctly. Fixing it in the image means a TLS-capable
+client, which is the package class this slice just removed. The right fix is a
+readiness check that needs no network at all — a `weft-server` subcommand that
+opens the same state in-process — which is new CLI surface and a separate slice.
+Filed as a follow-up against #305; documented in the health-check header, the
+Dockerfile's `HEALTHCHECK` comment, and the README's container section, with the
+`--no-healthcheck` / Compose `healthcheck: {disable: true}` workaround, because
+a silent restart loop at 3 a.m. is worse than an honest limitation.
+
+**Binds `0.0.0.0:8080`, so an unconfigured container refuses to start.**
+Loopback inside a container is unreachable through a published port, and plan
+C8/SEC-8 requires authentication on a non-loopback bind. The out-of-the-box
+experience is therefore exit `78` with a message, not an open server: the smoke
+test asserts both that a keys-less `0.0.0.0` bind refuses and that a
+`WEFT_KEYS_FILE` pointing at an unmounted file refuses. A gateway deployment
+opts into `WEFT_AUTH=disabled` itself; the image never defaults to it.
+
+**uid and gid 10001**, above the range Debian's `useradd` hands out, so a bind
+mount the container writes cannot collide with a host user's files the way uid
+1000 does. The smoke test deliberately declares and ingests as this uid — file
+ownership, locking and fsync on a mount the image did not create are the
+container-specific part of the write path, and a root-only test path would prove
+nothing about a non-root image.
+
+**A separate `container.yml` with a path filter, not a job of `ci.yml`.**
+This is the only gate that pays for a full workspace release build inside a
+container. `paths:` cannot be scoped per job within one workflow. Push and
+nightly triggers cover what a path filter cannot see — a base-image digest that
+stops resolving, a toolchain component that vanishes from the baseline. To keep
+the scripts gated on *every* pull request, `scripts/packaging/*.sh` joined
+`ci.yml`'s shellcheck step; hadolint runs in the container workflow itself.
+
+**Excluded from this slice:** the registry and multi-arch image (PAC-10), the
+Helm chart, a Compose example, a `docker-compose`-managed keys workflow,
+podman-specific code (the scripts take `--docker COMMAND` instead of assuming),
+and any change to `weft-server`'s startup, routes or settings registry — the
+image only sets names that `weft-server/src/settings.rs` already registers,
+because PAC-5b's strict configuration would stop the container on an invented
+one.
+
+## 2026-11-02 — Needs human: an 80-column YAML rule and `ci.yml`'s pre-existing width
+
+**Ambiguous:** the packaging slice added a `shellcheck` glob and a four-line comment to
+`.github/workflows/ci.yml`, and the workspace's YAML lint reports 100 `line-length`
+violations (max 80) in that file. Whether the repo wants an 80-column workflow style is a
+maintainer policy call, not a packaging one.
+
+**Chosen:** the slice's own added lines were wrapped to fit 80 columns, and the file's
+pre-existing lines were left alone. **Why:** 101 of the file's 390 lines already exceed 80
+on `main`, including the lines the report names first (`main` L5/L6/L7 are 87/87/85; the two
+flagged as new, L373 and L382, are byte-identical to `main` L369/L378 and merely shifted by
+the comment added here), no CI job lints YAML — `.github/workflows/*.yml` contains no
+`yamllint` step and there is no `.yamllint` in the tree, so nothing in the merge contract
+enforces the width — and reflowing a file that a dozen open pull requests touch would create
+conflicts against every one of them to buy a style change nobody asked for. A tree-wide YAML
+reflow, or a `.yamllint` that records the width the repo actually uses, is a fine commit; it
+is not fine inside a packaging slice.

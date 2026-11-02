@@ -224,7 +224,8 @@ release upgrades one way.
 | **Security — TLS, auth, RBAC, audit logs** | **Not started** |
 | Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0, on GitHub |
 | Library crates on crates.io | Not published yet |
-| Packaging — Docker, Helm | Not started |
+| Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
+| Packaging — Helm | Not started |
 | Client SDKs (Python, TypeScript) | Not started |
 | Per-measurement tags | Not started |
 
@@ -838,6 +839,72 @@ written with that variable set, as builds from before v0.1.0 did whenever it was
 |---------|----------|--------|
 | `bitsliced-codec` | `weft-physical-type`, forwarded by `weftdb` and `weft-server` | Compiles in the opt-in bit-sliced value codec, so `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` takes effect. Without it, a segment written with the codec fails to read with an error naming the feature. |
 | `experimental-codecs` | `weft-physical-type` (enabled by `weft-bench`) | Advisory codecs never written to disk: Gorilla-XOR, Chimp, Chimp128 and Elf for `f64`, and the Sprintz FIRE timestamp forecaster. Benchmark what-ifs only. |
+
+### Running in a container
+
+The server image is built by `packaging/docker/Dockerfile`, and there is one wrapper for it:
+
+```bash
+scripts/packaging/build-image.sh --smoke   # build the image, then run the smoke test on it
+```
+
+It tags the result `weftdb:git-<12 hex of HEAD>` — `weftdb:dirty-<12 hex>` from a dirty tree — so
+a container built from uncommitted sources cannot be mistaken for one built from a commit.
+Nothing is published to a registry yet: what CI produces (`.github/workflows/container.yml`) is a
+built and smoke-tested image, not an image you can pull.
+
+The image is a server, not a shell. It compiles in the same `manylinux_2_28` baseline as the
+release binaries, so the container inherits the release's glibc 2.28 floor, and it runs on
+`debian:12-slim` with nothing installed at build time — no HTTP client, no package-manager state.
+The licences the release archives carry are in `/usr/share/doc/weftdb`. The process runs as uid
+10001, `/var/lib/weftdb` is its volume, `8080/tcp` is its port, and its health check asks `/ready`
+from inside the container.
+
+To start it you need a keys file, because the image binds `0.0.0.0:8080` and a non-loopback bind
+with no keys is refused at startup (see [SEC-8's exposure
+matrix](#configuration)): a container that exits at once with status `78` is telling you that.
+
+```bash
+mkdir -p weft-keys weft-data && sudo chown -R 10001:10001 weft-keys weft-data
+docker run --rm -v "$PWD/weft-keys:/keys" weftdb:git-abcdef123456 \
+    keygen --id grafana --role reader --keys-file /keys/api-keys.json   # prints the key once
+docker run -d --name weftdb \
+    --publish 127.0.0.1:8080:8080 \
+    --volume "$PWD/weft-data:/var/lib/weftdb" \
+    --volume "$PWD/weft-keys:/run/weftdb:ro" \
+    --env WEFT_KEYS_FILE=/run/weftdb/api-keys.json \
+    weftdb:git-abcdef123456
+```
+
+`WEFT_KEYS_FILE` names a JSON keys file that the server reads once at startup, so a new key means
+restarting the container until key reload (SEC-7) lands. The store root defaults to
+`/var/lib/weftdb/store` and the scheduled backups to `/var/lib/weftdb/backups`, both inside the
+volume. Every other setting is an environment variable from the table above, and the registry is
+strict: a name it does not recognise stops the container at startup (`78`) instead of ignoring it,
+and a store it cannot open exits `65`. Both are the statuses the binary returns outside a
+container too, so a supervisor reads one vocabulary.
+
+Three things to know before this fronts a workload:
+
+- **The published port is your firewall.** The server binds `0.0.0.0` inside its own network
+  namespace, which is what makes it reachable at all; `--publish 127.0.0.1:8080:8080` keeps it off
+  your LAN. A bare `--publish 8080:8080` puts an authenticated but plaintext server on every
+  interface of the host.
+- **A bind mount must already be writable by uid 10001.** A named volume inherits the image's
+  directory ownership; a bind mount inherits yours, and the store's first act is to probe the root
+  for write access.
+- **The health check cannot speak TLS.** With `WEFT_TLS_CERT_FILE` and `WEFT_TLS_KEY_FILE` set the
+  listener serves TLS only, and the built-in probe speaks plain HTTP, so such a container reads
+  unhealthy while serving perfectly. Disable it (`--no-healthcheck`, or Compose
+  `healthcheck: {disable: true}`) and gate traffic on your own probe; the follow-up that fixes this
+  properly is recorded against PAC-9.
+
+`scripts/packaging/smoke-container.sh <IMAGE>` is what CI runs, and it is runnable by hand: it
+mints keys inside the image, checks that a keys-less non-loopback bind refuses to start, waits for
+the container to become healthy, walks the exposure matrix through the published port
+(anonymous probes, `401` without a key, `403` with the wrong role, `2xx` with the right one),
+declares and ingests a measurement into the volume as uid 10001, restarts the container and reads
+the same row back, and re-checks the glibc floor out of the finished image.
 
 ---
 

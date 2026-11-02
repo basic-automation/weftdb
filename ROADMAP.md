@@ -332,7 +332,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
   - [ ] **ROB-5** Legacy queue-consumer panics
   - [ ] **SEC-13** Security acceptance
-  - [ ] **PAC-9** Docker image and container smoke test (with a mounted keys file)
+  - [x] **PAC-9** Docker image and container smoke test (with a mounted keys file)
   - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
   - [x] **EVI-15** First cross-engine report
   - [x] Write or approve the cross-engine report narrative *(owner)*

@@ -18,6 +18,22 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **A container image that is proven, not merely built** (1.0 plan PAC-9):
+  `packaging/docker/Dockerfile` builds `weft-server` in the same `manylinux_2_28` baseline the
+  release binaries use — so the image carries the release's glibc 2.28 floor, read back out of the
+  finished image with `scripts/check-glibc.sh` — and runs it on `debian:12-slim` as uid 10001,
+  with `/var/lib/weftdb` a volume, `8080/tcp` exposed, the licence set in `/usr/share/doc/weftdb`,
+  and no package installed at build time. `scripts/packaging/build-image.sh` builds it, stamped
+  with OCI source labels; `scripts/packaging/smoke-container.sh` is what makes the slice more than
+  a Dockerfile: it mints keys inside the image with `keygen`, shows that a keys-less `0.0.0.0` bind
+  refuses to start, waits on the image's own `HEALTHCHECK` (a bash `/dev/tcp` probe of `/ready`, so
+  the image needs no HTTP client), walks the exposure matrix through a loopback-published port,
+  declares and ingests a measurement into a named volume as uid 10001, then restarts the container
+  and reads the same row back out. `.github/workflows/container.yml` runs the pair on image
+  changes, on every push to `main`, and nightly; the scripts themselves are shellchecked by CI on
+  every pull request. Nothing is pushed to a registry: the artifact is the proof, and publishing is
+  a separate decision. One limitation is documented where it will be read — the health check
+  speaks plain HTTP, so a container configured with `WEFT_TLS_CERT_FILE` reads unhealthy.
 - **No silent narrowing in compute responses** (FRE-5): the downsample and interpolate
   endpoints converted each computed `BigDecimal` to the wire `f64` with a silent `0.0`
   fallback, so a result outside the `f64` range (for example a `sum` of two `1e308`

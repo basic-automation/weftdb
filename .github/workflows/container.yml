@@ -1,0 +1,88 @@
+name: Container
+
+# The image PAC-9 ships is only as good as the last run that proved it serves.
+# This is that run: build the image, then drive it the way an operator does —
+# mounted keys file, named volume, published loopback port, no privileges — and
+# check what comes back.
+#
+# It is a separate workflow rather than a job of CI because it is the only gate
+# that pays for a full release build of the workspace inside a container, and it
+# should be skipped by the pull requests that cannot have changed the image.
+# `paths:` cannot be scoped per job inside one workflow, so the filter lives
+# here at the trigger. CI lints these scripts and the Dockerfile on every pull
+# request; this workflow runs the artifact.
+#
+# The push and schedule triggers exist because a path filter cannot see an
+# upstream change: a base-image digest bump is in the Dockerfile and so is
+# caught by the filter, but a manylinux mirror going away, or a toolchain
+# component disappearing from the build baseline, is only visible to a run that
+# builds anyway. Nightly is that run.
+
+on:
+  pull_request:
+    paths:
+      - packaging/**
+      - scripts/packaging/**
+      - .dockerignore
+      - weft-server/**
+      - Cargo.lock
+      - Cargo.toml
+      - .github/release-toolchain
+      - .github/workflows/container.yml
+  push:
+    branches: [main]
+  schedule:
+    # 09:00 UTC, two hours after the nightly CI suite so the two do not compete
+    # for the same runners.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The tag this workflow builds and then smoke-tests. Nothing publishes it:
+  # PAC-9's artifact is a proven image, not a registry entry, and publishing is
+  # a separate decision (DECISIONS.md, 2026-11-02).
+  WEFT_IMAGE_TAG: weftdb:ci
+
+jobs:
+  image:
+    name: build image and smoke test it
+    runs-on: ubuntu-latest
+    # A cold build compiles the whole workspace in the manylinux baseline with
+    # no cache; a warm one is a few minutes. The ceiling is generous because the
+    # smoke test also starts containers and waits on their health checks.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Dockerfile is a build script with an audience, so it is linted like
+      # one. The image is pinned by tag the way the other container tooling
+      # here is pinned.
+      - name: hadolint the Dockerfile
+        uses: docker://hadolint/hadolint:v2.12.0-debian
+
+      - name: build the image
+        run: scripts/packaging/build-image.sh --tag "$WEFT_IMAGE_TAG"
+
+      # The slice's real deliverable: not a Dockerfile that builds, but evidence
+      # that the image serves, authenticates, keeps data on a volume, and still
+      # honours the glibc floor.
+      - name: smoke test the image
+        run: |
+          scripts/packaging/smoke-container.sh \
+            --image "$WEFT_IMAGE_TAG" --verbose
+
+      # The runner keeps BuildKit's cache between runs on the same branch, so a
+      # push to main does not rebuild the dependency tree from nothing. Losing
+      # it costs minutes, not correctness: nothing depends on the cache warm.
+      - name: container disk usage
+        if: always()
+        run: docker system df

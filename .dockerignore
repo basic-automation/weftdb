@@ -1,0 +1,35 @@
+# Build context filters for the WeftDB container image (1.0 plan PAC-9).
+#
+# The image is built by scripts/packaging/build-image.sh with the repository root as its
+# context, and packaging/docker/Dockerfile copies the tree into a builder stage. What is
+# excluded here is what must not reach a compiler that is producing a published artifact.
+#
+# Everything a cargo build of `-p weft-server` needs is IN: Cargo.toml, Cargo.lock,
+# rust-toolchain-free metadata, .github/release-toolchain, every crate's sources, and
+# patches/branches (the workspace patches that crate — leaving it out does not skip the
+# dependency, it fails the build with a path that does not exist).
+
+# Build output. A host `target/` is the single biggest thing that could be sent, and it would be
+# a foreign tree of objects: the container's own build writes its target to a cache mount.
+target/
+**/target/
+
+# Version-control and agent/scratch state: not inputs, and large.
+.git/
+.gitignore
+.pi/
+*.trc
+
+# Local analysis scratch (RESEARCH.md, MIGRATION.md and friends are written there by convention
+# and are untracked).
+out/
+
+# Editor and OS droppings.
+.DS_Store
+*.swp
+
+# Bench and corpus output that a test may have left beside the sources.
+**/*.f32
+**/*.arrow
+**/*.parquet
+database/
