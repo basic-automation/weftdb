@@ -68,7 +68,7 @@ static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A temporary directory removed on drop, so a failed rep never leaves a store
 /// behind. Declared before the store so it drops after the store does.
-struct TempStoreDir(std::path::PathBuf);
+pub(crate) struct TempStoreDir(std::path::PathBuf);
 
 impl Drop for TempStoreDir {
 	fn drop(&mut self) {
@@ -170,7 +170,7 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None })
 }
 
 /// What the store held at one checkpoint of an ingest growth curve (schema v24).
@@ -197,14 +197,14 @@ pub struct GrowthPoint {
 /// The `index`th row of `copies` of a corpus laid end to end: copy `k` is the corpus shifted
 /// by `k` periods, where a period is the corpus span plus its first stride, so the copies
 /// neither overlap nor touch.
-struct Tiled<'a> {
-	timestamps: &'a [i64],
-	values: &'a [BigDecimal],
-	period: i64,
+pub(crate) struct Tiled<'a> {
+	pub(crate) timestamps: &'a [i64],
+	pub(crate) values: &'a [BigDecimal],
+	pub(crate) period: i64,
 }
 
 impl Tiled<'_> {
-	fn timestamp(&self, index: u64) -> anyhow::Result<i64> {
+	pub(crate) fn timestamp(&self, index: u64) -> anyhow::Result<i64> {
 		let n = self.timestamps.len() as u64;
 		let copy = i64::try_from(index / n)?;
 		let shift = copy.checked_mul(self.period).ok_or_else(|| anyhow::anyhow!("copy {copy} of the corpus overflows the timestamp range"))?;
@@ -326,7 +326,7 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 			gpu_pool: None,
 			adapter_info: None,
 			growth: Some(growth),
-			online: None,
+			online: None, compressed_query: None,
 		})?;
 	}
 	drop(store);
@@ -492,12 +492,12 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 		gpu_pool: None,
 		adapter_info: None,
 		growth: None,
-		online: Some(point),
+		online: Some(point), compressed_query: None,
 	})
 }
 
 /// A fresh store with the aspect declared, in a directory removed when the guard drops.
-async fn fresh_store(label: &str, aspect: &str, value_scale: u8) -> anyhow::Result<(SegmentStore, TempStoreDir)> {
+pub(crate) async fn fresh_store(label: &str, aspect: &str, value_scale: u8) -> anyhow::Result<(SegmentStore, TempStoreDir)> {
 	let root = std::env::temp_dir().join(format!("weft-bench-{label}-{}-{}", std::process::id(), NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed)));
 	std::fs::create_dir_all(&root).map_err(|e| anyhow::anyhow!("cannot create ingest store dir {}: {e}", root.display()))?;
 	let guard = TempStoreDir(root.clone());
@@ -509,7 +509,7 @@ async fn fresh_store(label: &str, aspect: &str, value_scale: u8) -> anyhow::Resu
 
 /// Seal rows `0..rows` of the tiled corpus, publishing each batch's end to `sealed` once its
 /// seal has returned; returns the summed seal time.
-async fn seal_tiled(store: &SegmentStore, aspect: &str, tiled: &Tiled<'_>, rows: u64, batch: u64, sealed: &AtomicU64) -> anyhow::Result<u64> {
+pub(crate) async fn seal_tiled(store: &SegmentStore, aspect: &str, tiled: &Tiled<'_>, rows: u64, batch: u64, sealed: &AtomicU64) -> anyhow::Result<u64> {
 	let n = tiled.timestamps.len() as u64;
 	let mut at = 0;
 	let mut seal_ns = 0_u64;
@@ -673,7 +673,7 @@ pub fn count_label(n: u64) -> String {
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
 #[allow(clippy::cast_possible_truncation)]
-fn span_ns(since: Instant) -> u64 {
+pub(crate) fn span_ns(since: Instant) -> u64 {
 	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
