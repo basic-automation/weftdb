@@ -368,8 +368,7 @@ pub const SHORT_TEST_NS: u64 = 60_000_000_000;
 /// The results of `report` too short and too thinly sampled to support a claim, as
 /// [`Problem::FewSamples`].
 fn thin_results(report: &BenchReport) -> Vec<Problem> {
-	report
-		.results
+	report.results
 		.iter()
 		.filter_map(|result| {
 			let samples = if result.samples_ns.is_empty() { result.latency.count } else { result.samples_ns.len() };

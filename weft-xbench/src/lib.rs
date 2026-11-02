@@ -49,7 +49,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution, Spline};
 use weft_bench::{
-	accuracy::{synthetic_ground_truth, AccuracyMetrics}, report::RunMetadata, schema::{BetweenRun, ResultDigest}, scale::ScalePreset, stats::{BootstrapConfig, LatencyCis, LatencyStats}, uci::UciCorpus, InterpolationProfile, SignalShape, SyntheticParams
+	accuracy::{synthetic_ground_truth, AccuracyMetrics}, report::RunMetadata, scale::ScalePreset, schema::{BetweenRun, ResultDigest}, stats::{BootstrapConfig, LatencyCis, LatencyStats}, uci::UciCorpus, InterpolationProfile, SignalShape, SyntheticParams
 };
 
 /// Version of the report this crate writes. Separate from `weft-bench`'s schema: the shapes differ.

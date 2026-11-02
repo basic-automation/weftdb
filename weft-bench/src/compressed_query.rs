@@ -196,52 +196,15 @@ async fn windows_pass(pass: &Pass<'_>, on_window: &mut impl FnMut(BenchResult) -
 		let latency = LatencyStats::from_samples(&in_store_ns);
 		let decode = LatencyStats::from_samples(&decode_ns);
 		let measured_ns = in_store_ns.iter().copied().fold(0_u64, u64::saturating_add);
-		let point = CompressedQueryPoint {
-			window: label.to_string(),
-			window_rows,
-			rows_scanned,
-			buckets: in_store_buckets,
-			decode_p50_ns: decode.p50_ns,
-			decode_p99_ns: decode.p99_ns,
-			decode_mean_ns: decode.mean_ns,
-			speedup_p50: if latency.p50_ns > 0 { decode.p50_ns as f64 / latency.p50_ns as f64 } else { 0.0 },
-			segments: stats.segment_count,
-			bytes_per_point: stats.bytes_per_point,
-		};
-		on_window(BenchResult {
-			schema_version: SCHEMA_VERSION,
-			profile: format!("{}-{label}{suffix}", profile.name),
-			adapter: "weftdb".to_string(),
-			workload: WORKLOAD_COMPRESSED_QUERY.to_string(),
-			reps: in_store_ns.len(),
-			dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: in_store_buckets, irregular, missingness_fraction, seed: params.seed, signal_shape: None },
-			throughput_points_per_sec: if measured_ns > 0 { rows_scanned as f64 / (measured_ns as f64 / 1e9) } else { 0.0 },
-			cold_warm: crate::schema::ColdWarm::from_samples(&in_store_ns),
-			latency,
-			latency_ci: None,
-			timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) },
-			correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true, result_sha256: Some(digest) },
-			accuracy: None,
-			storage: None,
-			gpu_pool: None,
-			adapter_info: None,
-			growth: None,
-			online: None,
-			compressed_query: Some(point), analytics: None,
-			samples_ns: in_store_ns.clone(),
-			between_run: None,
-		})?;
+		let point = CompressedQueryPoint { window: label.to_string(), window_rows, rows_scanned, buckets: in_store_buckets, decode_p50_ns: decode.p50_ns, decode_p99_ns: decode.p99_ns, decode_mean_ns: decode.mean_ns, speedup_p50: if latency.p50_ns > 0 { decode.p50_ns as f64 / latency.p50_ns as f64 } else { 0.0 }, segments: stats.segment_count, bytes_per_point: stats.bytes_per_point };
+		on_window(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{label}{suffix}", profile.name), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSED_QUERY.to_string(), reps: in_store_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: in_store_buckets, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, throughput_points_per_sec: if measured_ns > 0 { rows_scanned as f64 / (measured_ns as f64 / 1e9) } else { 0.0 }, cold_warm: crate::schema::ColdWarm::from_samples(&in_store_ns), latency, latency_ci: None, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) }, correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true, result_sha256: Some(digest) }, accuracy: None, storage: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: Some(point), analytics: None, samples_ns: in_store_ns.clone(), between_run: None })?;
 	}
 	Ok(digests)
 }
 
 /// The rows a range read returned, as the points a client would reduce (absent values skipped).
 fn points(timestamps: &[i64], values: Vec<Option<BigDecimal>>) -> anyhow::Result<Vec<Point>> {
-	timestamps
-		.iter()
-		.zip(values)
-		.filter_map(|(&t, v)| v.map(|v| DateTime::<Utc>::from_timestamp(t, 0).map(|at| Point::new(at, v)).ok_or_else(|| anyhow::anyhow!("epoch {t} is outside the representable instant range"))))
-		.collect()
+	timestamps.iter().zip(values).filter_map(|(&t, v)| v.map(|v| DateTime::<Utc>::from_timestamp(t, 0).map(|at| Point::new(at, v)).ok_or_else(|| anyhow::anyhow!("epoch {t} is outside the representable instant range")))).collect()
 }
 
 #[cfg(test)]

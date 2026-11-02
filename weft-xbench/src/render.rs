@@ -129,14 +129,14 @@ pub fn verdicts(report: &XbenchReport) -> Vec<Verdict<'_>> {
 	let mut out = Vec::new();
 	for weft in report.results.iter().filter(|r| is_weft(r) && passed(r)) {
 		for class in [ArmClass::PortableSql, ArmClass::ClientSide] {
-		let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.arm.own_answer.is_none() && class_of(r) == class && r.dataset == weft.dataset && r.phase == weft.phase && r.warmth == weft.warmth).min_by_key(|r| r.latency_ci.p50.point_ns);
-		if let Some(other) = other {
-			let outcome = match compare(&weft.latency_ci.p50, &other.latency_ci.p50) {
-				decided if !runs_agree(weft, other, decided) => Outcome::Noise,
-				outcome => outcome,
-			};
-			out.push(Verdict { weft, other, outcome });
-		}
+			let other = report.results.iter().filter(|r| !is_weft(r) && passed(r) && r.arm.own_answer.is_none() && class_of(r) == class && r.dataset == weft.dataset && r.phase == weft.phase && r.warmth == weft.warmth).min_by_key(|r| r.latency_ci.p50.point_ns);
+			if let Some(other) = other {
+				let outcome = match compare(&weft.latency_ci.p50, &other.latency_ci.p50) {
+					decided if !runs_agree(weft, other, decided) => Outcome::Noise,
+					outcome => outcome,
+				};
+				out.push(Verdict { weft, other, outcome });
+			}
 		}
 	}
 	out
@@ -215,11 +215,14 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		.results
 		.iter()
 		.map(|r| {
-			let gate = r.correctness.as_ref().map_or_else(|| "—".into(), |c| match (c.passed, r.arm.own_answer.is_some()) {
-				(true, true) => "own answer".into(),
-				(true, false) => "PASS".into(),
-				(false, _) => format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference),
-			});
+			let gate = r.correctness.as_ref().map_or_else(
+				|| "—".into(),
+				|c| match (c.passed, r.arm.own_answer.is_some()) {
+					(true, true) => "own answer".into(),
+					(true, false) => "PASS".into(),
+					(false, _) => format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference),
+				},
+			);
 			let rmse = r.accuracy.as_ref().map_or_else(|| "—".into(), |a| format!("{:.4}", a.rmse));
 			vec![r.dataset.clone(), phase_of(r), r.arm.arm.clone(), r.arm.class.map_or_else(|| "—".into(), |c| c.label().to_string()), r.input_points.to_string(), ci(&r.latency_ci.p50), ms(r.latency.p95_ns), r.reps.to_string(), gate, rmse, bytes_per_point(r)]
 		})
