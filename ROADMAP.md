@@ -103,7 +103,7 @@ Interpolation and extrapolation run on the GPU, supported by a size-tiered LRU b
 - [ ] 5.7 Multi-GPU *(deferred until single-GPU wins are proven)*
 - [ ] Memory-mapped GPU I/O *(only after transfer bottlenecks are measured)*
 - [ ] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
-  - [x] **FOUND (2026-10-11, runtime) — `POST /api/v1/downsample` rejected the documented multi-word tokens. Closed 2026-10-28 (FRE-5, the spelling half):** the JSON body reads `Aggregation::from_token`, so `twa_linear`, `sketch_p99` and the aliases parse as they do in a query string, and the bare lowercase names still parse. Tokens are exact-case as of 2026-10-29 (FRE-5's first clause, which breaks v0.1.0's case folding; see the CHANGELOG): `Min` and `MEDIAN` are a `400`. The rest of FRE-5, "no silent narrowing", stays open.
+  - [x] **FOUND (2026-10-11, runtime) — `POST /api/v1/downsample` rejected the documented multi-word tokens. Closed 2026-10-28 (FRE-5, the spelling half):** the JSON body reads `Aggregation::from_token`, so `twa_linear`, `sketch_p99` and the aliases parse as they do in a query string, and the bare lowercase names still parse. Tokens are exact-case as of 2026-10-29 (FRE-5's first clause, which breaks v0.1.0's case folding; see the CHANGELOG): `Min` and `MEDIAN` are a `400`. The rest of FRE-5, "no silent narrowing", closed 2026-11-01 (FRE-5): a computed value with no finite `f64` representation now fails the compute request with `not_finite` instead of returning a substitute `0.0`.
   - [ ] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138` …
   - [ ] **NEXT — the compute endpoints pay the same tax:**
   - [x] **Reconcile with EVI-10A** (2026-10-19: the API now has an input cap, `interpolate_range::MAX_KNOTS`, a `pub` const the review may keep, turn into an option or drop)
@@ -310,15 +310,15 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] L-INGEST
   - [x] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
   - [x] **ROB-10** Admission I
-  - [ ] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth
-  - [ ] → **SEC-10** Exposure and secrets hygiene
-  - [ ] **FRE-5** Compute vocabulary, exact-case tokens and no silent narrowing
-  - [ ] **FRE-7b** Immutable declarations, scale rules and schema read-back
+  - [x] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth
+  - [x] → **SEC-10** Exposure and secrets hygiene
+  - [x] **FRE-5** Compute vocabulary, exact-case tokens and no silent narrowing
+  - [x] **FRE-7b** Immutable declarations, scale rules and schema read-back
   - [x] **EVI-13** DuckDB adapter I
   - [x] **EVI-15R** Report renderer with honesty-section generation
   - [x] **EVI-16** Honesty pages I
-  - [ ] **SOA-7** Window digests and the oracle self-test
-  - [ ] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
+  - [x] **SOA-7** Window digests and the oracle self-test
+  - [x] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
 - [ ] **W6 · Durability CI, store split, scheduler**
   - [ ] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
   - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*

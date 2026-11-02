@@ -83,11 +83,11 @@ pub(crate) fn admission_config() -> anyhow::Result<AdmissionConfig> {
 }
 
 /// Resolve the listener's transport for `addr` (SEC-5): TLS when a
-/// certificate and key are configured, plaintext otherwise — and, for
-/// plaintext, run the C8 gate ([`PlaintextGate::check`]) against the
-/// address about to be bound, so a refused exposure stops startup before
-/// anything is served. Logs which transport is in force and, for a
-/// plaintext opt-in, which opt-in carried it.
+/// certificate and key are configured, plaintext otherwise — and run
+/// the exposure matrix ([`PlaintextGate::check`], C8 as completed by
+/// SEC-8) against the address about to be bound, so a refused exposure
+/// stops startup before anything is served. Logs which transport is in
+/// force and, for a plaintext opt-in, which opt-in carried it.
 ///
 /// # Errors
 ///
@@ -123,8 +123,8 @@ pub(crate) fn auth() -> anyhow::Result<AuthConfig> {
 			let from = store.path().map_or_else(|| KEYS_FILE_ENV.to_string(), |path| format!("{}={}", KEYS_FILE_ENV, path.display()));
 			println!("auth: Bearer API keys from {from} ({} key(s)); each key's role in the file grants its scopes on every route (SEC-6)", store.len());
 		}
-		AuthConfig::Off if weft_server::tls::auth_disabled_from_env(std::env::var(AUTH_ENV).ok().as_deref()) => println!("auth: explicitly disabled ({AUTH_ENV}=disabled); a gateway in front of this server owns authentication"),
-		AuthConfig::Off => println!("auth: off (no keys file mounted; set {KEYS_FILE_ENV} to a keys file, or {AUTH_ENV}={AUTH_KEYS_MODE} to require one)"),
+		AuthConfig::Disabled => println!("auth: explicitly disabled ({AUTH_ENV}=disabled); a gateway in front of this server owns authentication, and proxied requests are served"),
+		AuthConfig::Off => println!("auth: off (no keys file mounted; set {KEYS_FILE_ENV} to a keys file, or {AUTH_ENV}={AUTH_KEYS_MODE} to require one); proxied requests are refused while auth is off (SEC-8)"),
 	}
 	Ok(auth)
 }

@@ -7,7 +7,10 @@
 //! plaintext to the same port does not, and a peer that connects and says
 //! nothing is cut by the same keep-alive deadline as a plaintext peer.
 //! The startup tests run the binary itself: 0.0.0.0 with no opt-in exits
-//! with the refusal; each opt-in starts serving.
+//! with the refusal; each opt-in starts serving. SEC-8 extends the
+//! startup half to the full exposure matrix: a 0.0.0.0 TLS bind with no
+//! keys file exits too, and the same bind with a mounted keys file
+//! starts.
 
 use std::{
 	io::Read as _, num::NonZeroUsize, process::{Command, Stdio}, sync::Arc, time::Duration
@@ -209,7 +212,10 @@ fn a_mounted_keys_file_with_the_plaintext_opt_in_starts() {
 }
 
 #[test]
-fn a_tls_bind_starts_without_any_plaintext_opt_in() {
+fn a_tls_bind_without_keys_is_refused_on_a_non_loopback_address() {
+	// SEC-8's exposure matrix: encryption is not authentication, so a
+	// non-loopback TLS bind with no keys file and no `WEFT_AUTH=disabled`
+	// refuses to start (decision 7) — SEC-5's plaintext-only gate let it.
 	let scratch = tempfile::tempdir().expect("scratch dir");
 	let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("generate");
 	let cert = scratch.path().join("cert.pem");
@@ -218,6 +224,25 @@ fn a_tls_bind_starts_without_any_plaintext_opt_in() {
 	std::fs::write(&key, certified.signing_key.serialize_pem()).expect("write key");
 	let cert = cert.to_str().expect("utf8 path").to_string();
 	let key = key.to_str().expect("utf8 path").to_string();
-	let (exited, output) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_TLS_CERT_FILE", &cert), ("WEFT_TLS_KEY_FILE", &key)], Duration::from_secs(5));
-	assert!(!exited, "a TLS bind starts and keeps serving; it exited:\n{output}");
+	let (exited, output) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_TLS_CERT_FILE", &cert), ("WEFT_TLS_KEY_FILE", &key)], Duration::from_secs(30));
+	assert!(exited, "the server must refuse and exit, not serve");
+	assert!(output.contains("no keys file is mounted"), "the refusal says why:\n{output}");
+}
+
+#[test]
+fn a_tls_bind_with_a_mounted_keys_file_starts() {
+	let scratch = tempfile::tempdir().expect("scratch dir");
+	let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("generate");
+	let cert = scratch.path().join("cert.pem");
+	let key = scratch.path().join("key.pem");
+	std::fs::write(&cert, certified.cert.pem()).expect("write cert");
+	std::fs::write(&key, certified.signing_key.serialize_pem()).expect("write key");
+	let cert = cert.to_str().expect("utf8 path").to_string();
+	let key = key.to_str().expect("utf8 path").to_string();
+	let keys = scratch.path().join("keys.json");
+	let document = format!("{{\"version\": 1, \"keys\": [{{\"id\": \"operator\", \"role\": \"admin\", \"key_hash\": \"{}\"}}]}}", weft_server::auth::format_key_hash("weft_keys_file_fixture_key"));
+	std::fs::write(&keys, document).expect("write the keys file");
+	let keys = keys.to_str().expect("utf8 path").to_string();
+	let (exited, output) = run_binary(&[("WEFT_SERVER_ADDR", "0.0.0.0:0"), ("WEFT_TLS_CERT_FILE", &cert), ("WEFT_TLS_KEY_FILE", &key), ("WEFT_KEYS_FILE", &keys)], Duration::from_secs(5));
+	assert!(!exited, "a TLS bind with mounted keys starts and keeps serving; it exited:\n{output}");
 }

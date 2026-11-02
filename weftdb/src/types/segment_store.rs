@@ -3085,7 +3085,12 @@ impl SegmentStore {
 
 	/// Declare `aspect`'s [`AspectSchema`] in this store's catalog, so later
 	/// [`seal_declared`](SegmentStore::seal_declared) calls need not be handed the
-	/// schema. Idempotent on the aspect (a re-declaration overwrites).
+	/// schema. Declarations are immutable once made (FRE-7b): re-declaring the
+	/// identical schema is a no-op, and the one change accepted is a widening
+	/// of the value encoding through
+	/// [`widen_value_encoding`](weft_physical_type::widen_value_encoding) (to
+	/// `BigDecimalText`, tolerance and timestamp unit unchanged) — see
+	/// [`AspectCatalog::declare`].
 	///
 	/// The name also names the aspect's segment files, so it must pass
 	/// [`aspect_name::validate`] (no path separators, no leading `.`, no control
@@ -3094,7 +3099,9 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// An [`InvalidAspectName`](crate::InvalidAspectName) when `aspect` is not a valid
-	/// name; otherwise propagates any libSQL write failure.
+	/// name; a [`StoreError::DeclarationConflict`] when the aspect is already
+	/// declared under a schema this one does not equal or widen; otherwise
+	/// propagates any libSQL write failure.
 	pub async fn declare(&self, aspect: &str, schema: &AspectSchema) -> Result<()> {
 		aspect_name::validate(aspect)?;
 		self.writable()?;
