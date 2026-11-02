@@ -28,7 +28,8 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
 - [ ] Remaining workloads
   - [x] **DONE (2026-11-01) — bulk-ingest growth curves** (`weft-bench --ingest --ingest-growth 1M,10M,100M,1B`, #145): 64k-row batches hold 3.9M → 3.2M rows/s to 1B; 1,024-row batches fall 141k → 107k rows/s by 100M as segments pile up
   - [x] **DONE (2026-11-01) — online ingest + query** (`weft-bench --ingest --ingest-online READERS`, #145): at 64k-row batches 100M rows ingest at 6.4M → 5.6M rows/s with 1 → 8 readers, every query exact; found reads costing ~1.8 µs per stored segment and, at 1,024-row batches, most concurrent reads refused with `database is locked`
-  - [ ] **NEXT — compressed query, analytics pipeline**
+  - [x] **DONE (2026-11-01) — compressed query** (`weft-bench --ingest --compressed-query QUERIES`, #145): in-store downsample is 2.2–2.9× faster than decode-then-reduce for a year window and equal below a day, where the per-segment prune cost sets the floor; every answer exact
+  - [ ] **NEXT — analytics pipeline**
 - [x] **DONE (2026-10-09) — first-rep/warm separation** (`BenchResult.cold_warm`, schema v21, every workload; console + Parquet)
   - [x] **DONE (2026-10-31) — OS-cold and post-restart runs** (`weft-xbench --cold-hook CMD --cold-reps N`, #146): each read phase also runs with the page cache dropped and after an engine restart, every rep gated; schema v4 `warmth`
 - [ ] Fair-protocol depth (Phase 1.1)

@@ -25,6 +25,10 @@ only the control plane, not the segment frames.
   write-class requests — declarations included — are charged byte-weighted against
   `WEFT_INGEST_MAX_INFLIGHT_BYTES`; and maintenance-class requests (maintenance and backup)
   are admitted one at a time, a second refused `409 busy` while one runs.
+- **Compressed query** (#145): `weft-bench --ingest --compressed-query QUERIES` times
+  `downsample_range` inside the store against decoding the window and reducing it, per window size
+  from an hour to a year, gated on the two answers being equal. Report schema v26 adds
+  `compressed_query`.
 - **Online ingest + query** (#145): `weft-bench --ingest --ingest-online READERS` queries a
   store while it is being sealed, compares every query exactly with the corpus, and reruns the
   queries on the finished store as a baseline (report schema v25 `online`). It found that a

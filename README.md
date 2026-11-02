@@ -1592,6 +1592,16 @@ What it does today:
   segment index's connections set no busy timeout. Both are engine fixes, tracked
   apart from the bench. (This workload runs on a multi-threaded runtime of its own, so its
   ingest rates are not comparable with the growth curve's single-threaded ones.)
+- **Compressed query** (`--ingest --compressed-query QUERIES`, #145) — seals the corpus once,
+  then per window size (1h, 1d, 1w, 30d, 1y of minutes) runs seeded windows two ways: reduced
+  inside the store (`downsample_range`: min, max, avg, sum, first, last per hour) and decoded
+  first (`read_time_range`, then the same reduction). The two answers must be equal and account
+  for every row, or the size fails its gate; one report per size (schema v26). On UCI
+  (2026-11-01, 200 queries per size, all exact) the in-store path wins only once a window spans
+  many rows: at 64k-row batches and 100M rows (1,561 segments, 1.34 B/pt) it is 2.5× faster for
+  a year (12.7 vs 31.9 ms p50) and 1.3× for 30 days, but even for an hour (60 rows) both take
+  ~2.9 ms — the per-segment prune cost above, not the decode, sets the floor (0.59 ms at 156
+  segments, 8.4 ms at 9,769 from 1,024-row batches).
 - **Vendor-neutral adapters** — every system is driven through the
   `SystemAdapter` trait: the WeftDB reference adapter (splimes' `Interpolator` on `Backend::Auto`),
   a precision-aware **portable linear baseline** (fair-protocol class C), and a
