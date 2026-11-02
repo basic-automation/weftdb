@@ -92,7 +92,8 @@ use crate::{
 /// `compressed_query` run ([`crate::compressed_query::CompressedQueryPoint`]). v27 added
 /// `analytics`, an `analytics_pipeline` run's stages ([`crate::analytics::AnalyticsPoint`]). v28
 /// added `samples_ns`, the raw samples behind every latency summary, and
-/// `correctness.result_sha256`, a digest of the output. All
+/// `correctness.result_sha256`, a digest of the output, and `between_run`, the spread of the
+/// separate runs `weft-bench combine` pooled. All
 /// optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
 pub const SCHEMA_VERSION: u32 = 28;
@@ -143,6 +144,25 @@ pub struct CorrectnessReport {
 	/// readers), where none is kept (the GPU pool's), and in older artifacts.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub result_sha256: Option<String>,
+}
+
+/// How the runs pooled into one combined result differed.
+///
+/// Within one run every sample shares the machine's state, so the run's own spread says
+/// little about where another run would land; these are the per-run figures that do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BetweenRun {
+	/// Separate runs pooled.
+	pub runs: usize,
+	/// Each run's p50, in run order.
+	pub run_p50_ns: Vec<u64>,
+	/// Each run's mean, in run order.
+	pub run_mean_ns: Vec<u64>,
+	/// The slowest run's p50 over the fastest's, less one: `0.12` is a 12% spread.
+	pub p50_spread: f64,
+	/// True when every run reported the same `result_sha256`. A run that answered
+	/// differently fails the combined result's correctness.
+	pub digests_agree: bool,
 }
 
 /// SHA-256 over a result's output, one `key,value` line per row in output order.
@@ -557,6 +577,10 @@ pub struct BenchResult {
 	/// or compared sample by sample. Empty for older artifacts.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub samples_ns: Vec<u64>,
+	/// How the separate runs a combined result pools differed (`weft-bench combine`, schema
+	/// v28); `None` for a single run.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub between_run: Option<BetweenRun>,
 }
 
 /// The first timed repetition apart from the remaining ones.
@@ -649,7 +673,7 @@ mod tests {
 
 	fn sample_result() -> BenchResult {
 		let samples = [100, 200, 300];
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true, result_sha256: None }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }), cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples.to_vec() }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: "weftdb".to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: Some(SignalShape::MultiSine) }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &crate::stats::BootstrapConfig::default())), throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1000, actual_output_points: 1000, values_finite: true, result_sha256: None }, accuracy: Some(AccuracyMetrics { count: 1000, rmse: 1.5, mae: 1.1, max_abs_error: 4.2, bias: -0.3 }), storage: Some(StorageEstimate { physical_type: "scaled_i64".to_string(), value_count: 200, estimated_value_bytes: 1600, realized_value_bytes: 420, value_codec: "varint".to_string(), bytes_per_point: 2.1, is_exact: true, lossy_count: 0, max_abs_error: "0".to_string(), tolerance: "0".to_string(), timestamp_unit: "micros".to_string(), timestamp_encoding: "delta_of_delta".to_string(), timestamp_bytes: 208, timestamp_bytes_per_point: 1.04, total_bytes_per_point: 3.14, advisory_best_f64_bytes: None, advisory_best_f64_codec: None, advisory_fire_timestamp_bytes: Some(180), advisory_delta_cascade_value_bytes: None, advisory_dfor_value_bytes: None, advisory_common_multiple_timestamp_bytes: None, advisory_delta_for_timestamp_bytes: None }), cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples.to_vec(), between_run: None }
 	}
 
 	#[test]

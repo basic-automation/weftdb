@@ -170,7 +170,7 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone() })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
 }
 
 /// What the store held at one checkpoint of an ingest growth curve (schema v24).
@@ -332,6 +332,7 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 			growth: Some(growth),
 			online: None, compressed_query: None, analytics: None,
 			samples_ns: samples_ns.clone(),
+			between_run: None,
 		})?;
 	}
 	drop(store);
@@ -499,6 +500,7 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 		growth: None,
 		online: Some(point), compressed_query: None, analytics: None,
 		samples_ns: online.samples_ns.clone(),
+		between_run: None,
 	})
 }
 

@@ -56,6 +56,7 @@ fn main() -> ExitCode {
 		}
 		Command::Run(cli) => *cli,
 		Command::Verify { manifest, accept_advisories } => return verify_manifest(&manifest, accept_advisories),
+		Command::Combine { runs, out, no_manifest } => return combine_runs(&runs, &out, no_manifest),
 		Command::Compare { baseline, candidate, threshold_pct, ignore_provenance, strict, json, markdown } => return compare_runs(&baseline, &candidate, threshold_pct, ignore_provenance, strict, json.as_deref(), markdown.as_deref()),
 	};
 
@@ -511,6 +512,54 @@ fn manifest_path_for(report_path: &Path) -> PathBuf {
 	report_path.with_file_name(format!("{stem}.manifest.json"))
 }
 
+/// `weft-bench combine`: pool separate runs into one report, then manifest it.
+///
+/// Unless `no_manifest`, every run must have a manifest beside it that verifies apart from
+/// advisories, and all of them must name this binary's own clean source revision: the combined
+/// manifest is captured by this binary, so it may only vouch for runs this build produced.
+fn combine_runs(runs: &[PathBuf], out: &Path, no_manifest: bool) -> ExitCode {
+	let result = (|| -> anyhow::Result<ExitCode> {
+		if !no_manifest {
+			let build = weft_bench::manifest::BuildFacts::capture();
+			let this = build.git_sha().filter(|_| build.git_dirty() == Some(false)).ok_or_else(|| anyhow::anyhow!("this binary records no clean source revision, so it cannot vouch for the runs (pass --no-manifest for runs that back no claim)"))?;
+			for run in runs {
+				let path = manifest_path_for(run);
+				let manifest = RunManifest::read(&path).map_err(|e| anyhow::anyhow!("run {} has no readable manifest at {}: {e}", run.display(), path.display()))?;
+				let verdict = manifest.verify(&path);
+				if let Some(defect) = verdict.defects().first() {
+					anyhow::bail!("the manifest of run {} does not verify: {defect}", run.display());
+				}
+				anyhow::ensure!(manifest.sources.git_sha.as_deref() == Some(this) && manifest.sources.git_dirty == Some(false), "run {} was built from {}{}, this binary from {this}: rerun it with this build", run.display(), manifest.sources.git_sha.as_deref().unwrap_or("an unrecorded revision"), if manifest.sources.git_dirty == Some(false) { "" } else { " (modified)" });
+			}
+		}
+		let combined = weft_bench::combine::combine(&weft_bench::combine::read_reports(runs)?)?;
+		combined.write_json(out).map_err(|e| anyhow::anyhow!("cannot write the combined report to {}: {e}", out.display()))?;
+		let manifest_path = if no_manifest {
+			None
+		} else {
+			let path = manifest_path_for(out);
+			let command_line: Vec<String> = std::env::args().collect();
+			let manifest = RunManifest::capture(&combined, out, &command_line, &[], None).map_err(|e| anyhow::anyhow!("cannot capture a manifest for {}: {e}", out.display()))?;
+			manifest.write_to(&path).map_err(|e| anyhow::anyhow!("cannot write the combined manifest to {}: {e}", path.display()))?;
+			Some(path)
+		};
+		print_summary(&combined, out);
+		for result in &combined.results {
+			if let Some(between) = &result.between_run {
+				println!("  {} / {}: {} runs, p50 {} ms, spread {:.1}%{}", result.profile, result.adapter, between.runs, between.run_p50_ns.iter().map(|ns| format!("{:.3}", ms(*ns))).collect::<Vec<_>>().join(" / "), between.p50_spread * 100.0, if between.digests_agree { "" } else { ", ANSWERS DIFFER" });
+			}
+		}
+		if let Some(path) = manifest_path {
+			println!("  run manifest : {}", path.display());
+		}
+		Ok(if combined.is_publishable() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+	})();
+	result.unwrap_or_else(|error| {
+		eprintln!("{PROG}: {error:#}");
+		ExitCode::FAILURE
+	})
+}
+
 /// `weft-bench verify`: re-check a manifest against the report it points at.
 ///
 /// Exits non-zero when the manifest does not verify, and prints every problem rather than the
@@ -931,6 +980,16 @@ enum Command {
 		/// (no recorded revision, a modified tree) rather than about the record itself.
 		accept_advisories: bool,
 	},
+	/// Pool separate runs of one benchmark into one report.
+	Combine {
+		/// The runs' reports, in run order.
+		runs: Vec<PathBuf>,
+		/// Where the combined report goes; its manifest goes beside it.
+		out: PathBuf,
+		/// Skip the provenance check and the combined manifest, for runs that will never back a
+		/// claim.
+		no_manifest: bool,
+	},
 	/// Decide whether one saved run is slower than another.
 	Compare {
 		/// The stored report the candidate is measured against.
@@ -975,6 +1034,10 @@ impl Cli {
 		if tokens.peek().is_some_and(|token| token == "compare") {
 			tokens.next();
 			return parse_compare_args(tokens);
+		}
+		if tokens.peek().is_some_and(|token| token == "combine") {
+			tokens.next();
+			return parse_combine_args(tokens);
 		}
 		let args = tokens;
 
@@ -1165,6 +1228,25 @@ impl Cli {
 
 		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, gpu_calibrate, manifest, claim, labels })))
 	}
+}
+
+/// Parse the arguments of `weft-bench combine --out <FILE.json> [--no-manifest] <RUN.json>...`.
+fn parse_combine_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+	let mut args = args.into_iter();
+	let (mut runs, mut out, mut no_manifest) = (Vec::new(), None, false);
+	while let Some(token) = args.next() {
+		match token.as_str() {
+			"--out" => out = Some(PathBuf::from(args.next().ok_or("--out needs a path")?)),
+			"--no-manifest" => no_manifest = true,
+			"-h" | "--help" => return Ok(Command::Help),
+			other if other.starts_with('-') => return Err(format!("unknown flag `{other}` for `combine`")),
+			other => runs.push(PathBuf::from(other)),
+		}
+	}
+	if runs.len() < 2 {
+		return Err("combine needs at least two runs: weft-bench combine --out <FILE.json> <RUN.json> <RUN.json>...".to_string());
+	}
+	Ok(Command::Combine { runs, out: out.ok_or("combine needs --out <FILE.json>")?, no_manifest })
 }
 
 /// Parse the arguments of `weft-bench verify <MANIFEST> [--accept-advisories]`.
@@ -1622,6 +1704,7 @@ USAGE:
     weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
     weft-bench --ingest --uci <FILE.txt> [INGEST OPTIONS]
     weft-bench verify <RUN.manifest.json> [--accept-advisories]
+    weft-bench combine --out <FILE.json> [--no-manifest] <RUN.json> <RUN.json>...
     weft-bench compare <BASELINE.json> <CANDIDATE.json> [COMPARE OPTIONS]
 
 INPUT MODE (choose one):
@@ -1855,6 +1938,18 @@ VERIFY:
         as not verified: those two are about the tree rather than the record, so --accept-advisories
         tolerates them (useful for a development run that will never back a claim).
 
+COMBINE:
+    weft-bench combine --out <FILE.json> <RUN.json> <RUN.json>...
+        Pool separate runs of one benchmark (the same results over the same datasets on the same
+        machine, each written by schema v28 or later) into one report. Each result keeps every
+        run's raw samples, and its intervals are drawn runs-first, so they include the spread
+        between runs that one run's own intervals cannot see; `between_run` records each run's
+        p50 and the spread. A run that answered differently (result_sha256) fails correctness.
+        Every run's manifest must verify and name this binary's clean revision, and the combined
+        report gets a manifest of its own. Exits non-zero unless the combined report is publishable.
+        --out FILE.json      Where the combined report goes (required)
+        --no-manifest        Skip the provenance check and the manifest (development runs)
+
 COMPARE:
     weft-bench compare <BASELINE.json> <CANDIDATE.json>
         Decide whether the candidate run is materially slower than the baseline. Workloads pair
@@ -1943,6 +2038,7 @@ mod tests {
 			Command::Help => panic!("expected a run, got help"),
 			Command::Verify { .. } => panic!("expected a run, got verify"),
 			Command::Compare { .. } => panic!("expected a run, got compare"),
+			Command::Combine { .. } => panic!("expected a run, got combine"),
 		}
 	}
 
@@ -1979,6 +2075,12 @@ mod tests {
 			other => panic!("expected verify, got {other:?}"),
 		}
 		assert_eq!(run_cli(&["verify"]).unwrap_err(), "verify needs a manifest path: weft-bench verify <MANIFEST>");
+		match run_cli(&["combine", "--out", "all.json", "r1.json", "r2.json", "--no-manifest"]).expect("combine parses") {
+			Command::Combine { runs, out, no_manifest } => assert_eq!((runs, out, no_manifest), (vec![PathBuf::from("r1.json"), PathBuf::from("r2.json")], PathBuf::from("all.json"), true)),
+			_ => panic!("not a combine"),
+		}
+		assert!(run_cli(&["combine", "--out", "all.json", "r1.json"]).unwrap_err().starts_with("combine needs at least two runs"));
+		assert_eq!(run_cli(&["combine", "r1.json", "r2.json"]).unwrap_err(), "combine needs --out <FILE.json>");
 		assert_eq!(run_cli(&["verify", "a.json", "b.json"]).unwrap_err(), "unexpected argument `b.json`; `verify` takes one manifest path");
 		assert_eq!(run_cli(&["verify", "a.json", "--reps", "3"]).unwrap_err(), "unknown flag `--reps` for `verify`");
 	}

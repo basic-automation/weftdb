@@ -192,6 +192,7 @@ pub async fn run_analytics_pipeline(profile: &IngestProfile, timestamps: &[i64],
 		compressed_query: None,
 		analytics: Some(point),
 		samples_ns: first_runs,
+		between_run: None,
 	})
 }
 
