@@ -24,7 +24,9 @@
 //! averages do not accumulate float drift on the hot path; only the final wire
 //! value is narrowed to JSON `f64`, mirroring the interpolation endpoint's
 //! documented transport boundary (Phase 4 physical encodings replace this with a
-//! precision-preserving representation).
+//! precision-preserving representation). The narrowing is never silent: a
+//! computed value with no finite `f64` representation fails the request with a
+//! `not_finite` error rather than returning a substitute such as `0.0` (FRE-5).
 
 use std::collections::BTreeMap;
 
@@ -42,7 +44,7 @@ use weft_reduce::reduce;
 pub use weft_reduce::Aggregation;
 
 use crate::{
-	error::{self, ApiError, StrictJson, StrictQuery}, interpolate::{InputPoint, ResolutionSpec}, metrics::SharedMetrics
+	error::{self, ApiError, Code, StrictJson, StrictQuery}, interpolate::{InputPoint, ResolutionSpec}, metrics::SharedMetrics
 };
 
 /// Request body for `POST /api/v1/downsample`.
@@ -166,7 +168,7 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 	}
 
 	let buckets = reduce(points, resolution, Some(start), Some(end), aggregations).map_err(|err| error::from_reduce_error(&err))?;
-	let response = buckets_to_response(buckets, resolution, aggregations);
+	let response = buckets_to_response(buckets, resolution, aggregations)?;
 
 	let span = tracing::Span::current();
 	span.record("input_points", response.input_points);
@@ -174,21 +176,45 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, re
 	Ok(Json(response))
 }
 
+/// Convert a computed [`BigDecimal`] to the wire `f64`, refusing a value that
+/// has no finite `f64` representation.
+///
+/// The compute endpoints' documented transport boundary narrows the final
+/// value to `f64`; a value outside the `f64` range used to fall back to `0.0`,
+/// a plausible-looking answer the caller never asked for. FRE-5's
+/// no-silent-narrowing clause makes that a typed `not_finite` refusal instead,
+/// matching the taxonomy's treatment of produced non-finite values elsewhere
+/// (see [`error::from_reduce_error`]). In-range values convert exactly as
+/// before; the boundary itself is unchanged.
+pub(crate) fn wire_value(value: &BigDecimal, what: &str) -> Result<f64, ApiError> {
+	value.to_f64().filter(|v| v.is_finite()).ok_or_else(|| ApiError::new(Code::NotFinite, format!("{what} has no finite f64 representation; refusing to return a silently narrowed substitute")))
+}
+
 /// Shape a reduced bucket set into the wire [`DownsampleResponse`].
 ///
 /// The single place a `weft-reduce` [`Bucket`](weft_reduce::Bucket) becomes an API
 /// response: it narrows each `BigDecimal` reduction to the documented wire `f64`
-/// at the API boundary and derives the reported counts. Shared by the compute
+/// at the API boundary and derives the reported counts. A reduction with no
+/// finite `f64` representation fails the whole response via [`wire_value`]
+/// rather than shipping a substitute value. Shared by the compute
 /// endpoints (which reduce a request-supplied series) and the stored-range
 /// endpoint (which reduces persisted segments via
 /// [`weftdb::SegmentStore::downsample_range`]), so both envelopes are identical
 /// by construction and cannot drift.
-pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, resolution: Resolution, aggregations: &[Aggregation]) -> DownsampleResponse {
+pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, resolution: Resolution, aggregations: &[Aggregation]) -> Result<DownsampleResponse, ApiError> {
 	// Every in-window point lands in exactly one bucket, so the bucket counts sum to
 	// the in-window point total the response reports.
 	let input_points: usize = buckets.iter().map(|b| b.count).sum();
-	let series: Vec<DownsampleBucket> = buckets.into_iter().map(|b| DownsampleBucket { timestamp: b.timestamp, count: b.count, aggregations: b.values.into_iter().map(|(name, value)| (name, value.to_f64().unwrap_or_default())).collect() }).collect();
-	DownsampleResponse { resolution: resolution.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series }
+	let mut series: Vec<DownsampleBucket> = Vec::with_capacity(buckets.len());
+	for b in buckets {
+		let mut values: BTreeMap<String, f64> = BTreeMap::new();
+		for (name, value) in b.values {
+			let wire = wire_value(&value, &format!("the `{name}` reduction for the bucket at {}", b.timestamp))?;
+			values.insert(name, wire);
+		}
+		series.push(DownsampleBucket { timestamp: b.timestamp, count: b.count, aggregations: values });
+	}
+	Ok(DownsampleResponse { resolution: resolution.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series })
 }
 
 /// Render a [`DownsampleResponse`] as a `timestamp,count,<agg>…` CSV document.
@@ -896,5 +922,34 @@ mod tests {
 	async fn downsample_ilp_arrow_rejects_missing_field() {
 		let (status, _content_type, _bytes) = post_text_for_bytes("/api/v1/downsample/ilp/arrow?field=temp&precision=s", ILP_BUCKETS).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST);
+	}
+
+	#[test]
+	fn wire_value_refuses_values_outside_f64() {
+		// 1e308 * 1e10 = 1e318: a finite BigDecimal with no finite f64 form.
+		let huge = BigDecimal::from_f64(1e308).unwrap() * BigDecimal::from_f64(1e10).unwrap();
+		let err = wire_value(&huge, "the test value").unwrap_err();
+		assert_eq!(err.code(), Code::NotFinite);
+		// In-range values convert exactly as before.
+		assert_eq!(wire_value(&BigDecimal::from_f64(1.5).unwrap(), "the test value").unwrap(), 1.5);
+		assert_eq!(wire_value(&BigDecimal::from_f64(-1e308).unwrap(), "the test value").unwrap(), -1e308);
+	}
+
+	#[tokio::test]
+	async fn sum_beyond_f64_range_is_refused_not_zeroed() {
+		// Two 1e308 samples in one bucket: the BigDecimal sum (2e308) has no
+		// finite f64 representation. FRE-5 (no silent narrowing): the endpoint
+		// refuses with not_finite instead of returning a substitute 0.0.
+		let body = serde_json::json!({
+			"resolution": "minutes",
+			"aggregations": ["sum"],
+			"points": [
+				{ "timestamp": ts(0), "value": 1e308 },
+				{ "timestamp": ts(20), "value": 1e308 },
+			],
+		});
+		let (status, body) = post_json("/api/v1/downsample", body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert_eq!(body["code"], "not_finite", "body: {body}");
 	}
 }
