@@ -4,7 +4,7 @@ use std::{
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use sysinfo::System;
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::RwLock;
 use turso::Connection as TursoConnection;
 
@@ -278,8 +278,10 @@ pub struct DatabaseCache {
 impl DatabaseCache {
 	#[must_use]
 	pub fn new() -> Self {
-		let mut sys = System::new_all();
-		sys.refresh_memory();
+		// Memory only: `System::new_all` also walks every process and thread in `/proc`,
+		// and a database is opened once per `analyze_range` chunk, so that walk ran for
+		// every chunk an analytics pipeline read (#145).
+		let sys = System::new_with_specifics(RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()));
 		let available_bytes = sys.available_memory();
 		let available_gb = available_bytes / (1024 * 1024 * 1024);
 		let available_gb = available_gb.max(1) as usize;
