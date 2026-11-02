@@ -645,7 +645,9 @@ async fn online_phases(profile: &IngestProfile, corpus: Arc<(Vec<i64>, Vec<BigDe
 	for handle in readers {
 		tallies.push(handle.await.map_err(|e| anyhow::anyhow!("an online reader failed: {e}"))??);
 	}
-	let idle_handles: Vec<_> = tallies.iter().enumerate().map(|(i, t)| tokio::spawn(reader(Arc::clone(&shared), i, Some((t.samples_ns.len() + t.failed_queries).max(64))))).collect();
+	// A refused read returns at once, so a reader the store keeps refusing asks again and again; sizing the idle
+	// rerun from the answered queries keeps it comparable, where counting the refusals made it run for hours.
+	let idle_handles: Vec<_> = tallies.iter().enumerate().map(|(i, t)| tokio::spawn(reader(Arc::clone(&shared), i, Some(t.samples_ns.len().max(64))))).collect();
 	let online = merge(tallies);
 	let mut idle = Vec::with_capacity(idle_handles.len());
 	for handle in idle_handles {
