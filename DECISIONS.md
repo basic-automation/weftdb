@@ -4,6 +4,54 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-01 — SEC-8: the exposure matrix's exact cells, the proxied-header set, and how startup order is enforced (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the plan fixes SEC-8's four parts — startup ordering through the `startup.rs`
+phase list (§2 L-MAIN, §6 W5), the exposure matrix (decision 7, absorbing PAC-5b's bind guard
+per §3, with C8 naming the Docker shape), the auth-off guard, and metrics auth (decision 17:
+"`/metrics` needs the metrics scope when auth is on") — and SEC-5/SEC-6 each recorded the
+remainder as this slice's. The points the sources do not pin, chosen here under the owner's
+best-guess authorization (2026-10-26), recorded for merge review and reversible there:
+
+1. **The matrix refuses keyless non-loopback binds over TLS too.** SEC-5's gate refused only
+   *plaintext* non-loopback binds and let TLS through ungated; decision 7 says "Non-loopback
+   with no keys: refuse to start" with no transport exception, and encryption without
+   authentication still exposes every route. So `PlaintextGate::check` (kept name, widened
+   rule) now reads: loopback → serve; `WEFT_AUTH=disabled` → serve; no mounted keys file →
+   refuse (exit 78, via startup's config-error path); keys + TLS → serve; keys + plaintext →
+   serve only with `WEFT_ALLOW_PLAINTEXT=1`. SEC-5's integration test that started a keyless
+   non-loopback TLS bind is inverted to a refusal, with a keys-mounted twin that starts.
+2. **`WEFT_ALLOW_INSECURE_BIND` is dropped by never existing.** No code ever read it; SEC-8
+   makes the drop explicit rather than implementing a reader: the name is not in the VarSpec
+   registry, so PAC-5b strict configuration refuses it as an unknown `WEFT_` name (a settings
+   test pins that), and `WEFT_AUTH=disabled` is the only spelling of the opt-out.
+3. **Proxied = `Forwarded` or any `X-Forwarded-*` of the common set** (`for`, `host`,
+   `proto`), presence only, values never read. While auth is off *implicitly* such a request
+   is refused `403 proxied_request_requires_auth` (the §4 code X-ERR reserved; this slice is
+   its first producer) on every route, probes included: a proxy in the path voids the
+   loopback assumption decision 7's keyless mode rests on. That required telling the two
+   offs apart, so `AuthConfig` gains a `Disabled` variant (SEC-6 had folded both into `Off`
+   and startup re-read the env var to log the difference; it now matches the variant). The
+   gateway deployment's proxied requests are served; with keys mounted, the key check is
+   the guard and proxied requests authenticate normally.
+4. **Metrics auth needed no new mechanism — so this slice verifies and pins it instead.**
+   `/metrics` already carries the registry's `metrics` scope (SEC-3) and SEC-6's gate
+   enforces scopes; SEC-8 adds the decision-17 test stated as such (anonymous 401, reader
+   403, admin 200; auth off serves), rather than bolting a second check onto the route.
+5. **Startup order is enforced by a source-pinning test.** `startup::PHASES` names the seven
+   phases (`strict-config`, `hooks`, `signals`, `config`, `state`, `daemons`, `serve`); a
+   test in `startup/mod.rs` reads the file's own source after `run`'s signature and asserts
+   each phase's entry-point call appears in that order. Reordering a phase now fails CI
+   unless `PHASES` and the module docs move with it. (The probe-only admin listener of
+   ROB-23r, which §3 says also goes through this matrix, is W7 work and does not exist yet;
+   when it lands it binds through the same gate.)
+
+**Rejected:** a separate `exposure.rs` module duplicating the gate SEC-5 already owned (the
+matrix is the gate's rule, widened in place); refusing proxied requests under
+`WEFT_AUTH=disabled` too (decision 7 assigns that deployment a gateway, whose requests are
+proxied by construction); and treating `X-Real-IP` as a proxy header (it is set by one
+proxy family for its own use and is not part of the de-facto forwarded set).
+
 ## 2026-11-01 — ROB-10 "Admission I": per-class budgets the gate enforces (FLAGGED FOR MERGE REVIEW)
 
 **Grounded:** the 1.0 plan names ROB-10 only as "Admission I" (§6 W5) and absorbs its parts
