@@ -956,6 +956,7 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, protocol: &Protocol, m
 		if let Some(server) = &servers.clickhouse {
 			results.extend(measure(&mut clickhouse::ClickHouse::double(server.clone()), ds, &reference, protocol).await?);
 			results.extend(measure(&mut clickhouse::ClickHouse::decimal(server.clone()), ds, &reference, protocol).await?);
+			results.extend(measure(&mut clickhouse::ClickHouse::double_merge(server.clone()), ds, &reference, protocol).await?);
 			results.extend(measure(&mut clickhouse::ClickHouse::native(server.clone()), ds, &reference, protocol).await?);
 			results.extend(measure(&mut clickhouse::ClickHouse::client(server.clone()), ds, &reference, protocol).await?);
 		}
@@ -968,6 +969,7 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, protocol: &Protocol, m
 		if let Some(server) = &servers.questdb {
 			results.extend(measure(&mut questdb::QuestDb::double(server.clone()), ds, &reference, protocol).await?);
 			results.extend(measure(&mut questdb::QuestDb::decimal(server.clone()), ds, &reference, protocol).await?);
+			results.extend(measure(&mut questdb::QuestDb::double_linear(server.clone()), ds, &reference, protocol).await?);
 			results.extend(measure(&mut questdb::QuestDb::native(server.clone()), ds, &reference, protocol).await?);
 			results.extend(measure(&mut questdb::QuestDb::client(server.clone()), ds, &reference, protocol).await?);
 		}

@@ -27,7 +27,10 @@ const EXPECTED_SCALES: usize = 3;
 ///
 /// From #148 (fair protocol 1.2), each engine also has a client-side arm (class C), and each with a
 /// native fill a native arm (class A); `DuckDB` has none.
-const EXPECTED_ARMS: [&str; 25] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "duckdb-client", "clickhouse-double", "clickhouse-decimal", "clickhouse-native", "clickhouse-client", "timescaledb-double", "timescaledb-numeric", "timescaledb-native", "timescaledb-client", "questdb-double", "questdb-decimal", "questdb-native", "questdb-client", "influxdb3-double", "influxdb3-native", "influxdb3-client", "iotdb-double", "iotdb-native", "iotdb-client"];
+///
+/// And, for #393's rule that an engine's own `ASOF JOIN` strategies are each run and published,
+/// `clickhouse-double-merge` and `questdb-double-linear`.
+const EXPECTED_ARMS: [&str; 27] = ["weftdb-memory", "weftdb-stored", "weftdb-stored-f64", "weftdb-stored-bulk", "duckdb-double", "duckdb-decimal", "duckdb-client", "clickhouse-double", "clickhouse-decimal", "clickhouse-double-merge", "clickhouse-native", "clickhouse-client", "timescaledb-double", "timescaledb-numeric", "timescaledb-native", "timescaledb-client", "questdb-double", "questdb-decimal", "questdb-double-linear", "questdb-native", "questdb-client", "influxdb3-double", "influxdb3-native", "influxdb3-client", "iotdb-double", "iotdb-native", "iotdb-client"];
 /// Below this many reps the bootstrap intervals are too coarse to separate much.
 const FEW_REPS: usize = 10;
 

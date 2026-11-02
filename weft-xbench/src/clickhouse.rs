@@ -15,6 +15,11 @@
 //! data. `ClickHouse`'s `ASOF JOIN` needs an equality condition beside the inequality, so both sides
 //! carry a constant key. Downsampling is a `GROUP BY` on the epoch-aligned bucket.
 //!
+//! `ClickHouse` answers an `ASOF JOIN` with a hash join by default or a full sorting merge on request
+//! (#393 rule b); `clickhouse-double-merge` runs the reconstruction with
+//! `join_algorithm = 'full_sorting_merge'` beside the default's `hash`, so both are published and
+//! the verdict takes the faster.
+//!
 //! That native fill is still timed, as `clickhouse-native` (fair-protocol class A, #148): bucket
 //! averages at the grid's step, `WITH FILL` over the grid and `INTERPOLATE (v)`, which carries the
 //! previous bucket's value forward (and fills the instants before the first knot with `0`, the
@@ -63,7 +68,7 @@ seg AS (SELECT lo.t AS t,
 	FROM lo JOIN hi ON lo.t = hi.t CROSS JOIN ends)
 SELECT assumeNotNull(if(b_t = a_t, a_v, a_v + (b_v - a_v) * (toFloat64(t - a_t) / toFloat64(b_t - a_t)))) AS v
 FROM seg ORDER BY t
-SETTINGS join_use_nulls = 1
+SETTINGS join_use_nulls = 1, join_algorithm = '{join}'
 FORMAT RowBinary
 ";
 
@@ -171,13 +176,16 @@ impl Drop for Db {
 pub struct ClickHouse {
 	value: ChValue,
 	class: ArmClass,
+	/// The `join_algorithm` the reconstruction's `ASOF JOIN`s run with (`hash`, the default, or
+	/// `full_sorting_merge` for `clickhouse-double-merge`).
+	join: &'static str,
 	server: Server,
 	db: Option<Db>,
 }
 
 impl std::fmt::Debug for ClickHouse {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("ClickHouse").field("value", &self.value).field("server", &self.server).field("class", &self.class).field("loaded", &self.db.is_some()).finish()
+		f.debug_struct("ClickHouse").field("value", &self.value).field("server", &self.server).field("class", &self.class).field("join", &self.join).field("loaded", &self.db.is_some()).finish()
 	}
 }
 
@@ -185,25 +193,31 @@ impl ClickHouse {
 	/// `clickhouse-double`.
 	#[must_use]
 	pub const fn double(server: Server) -> Self {
-		Self { value: ChValue::Double, class: ArmClass::PortableSql, server, db: None }
+		Self { value: ChValue::Double, class: ArmClass::PortableSql, join: "hash", server, db: None }
+	}
+
+	/// `clickhouse-double-merge`: `clickhouse-double` with the `ASOF JOIN`s as full sorting merges.
+	#[must_use]
+	pub const fn double_merge(server: Server) -> Self {
+		Self { value: ChValue::Double, class: ArmClass::PortableSql, join: "full_sorting_merge", server, db: None }
 	}
 
 	/// `clickhouse-native`: the `Float64` table through `WITH FILL … INTERPOLATE`.
 	#[must_use]
 	pub const fn native(server: Server) -> Self {
-		Self { value: ChValue::Double, class: ArmClass::Native, server, db: None }
+		Self { value: ChValue::Double, class: ArmClass::Native, join: "hash", server, db: None }
 	}
 
 	/// `clickhouse-client`: the `Float64` knots fetched and interpolated in this client.
 	#[must_use]
 	pub const fn client(server: Server) -> Self {
-		Self { value: ChValue::Double, class: ArmClass::ClientSide, server, db: None }
+		Self { value: ChValue::Double, class: ArmClass::ClientSide, join: "hash", server, db: None }
 	}
 
 	/// `clickhouse-decimal`.
 	#[must_use]
 	pub const fn decimal(server: Server) -> Self {
-		Self { value: ChValue::Decimal, class: ArmClass::PortableSql, server, db: None }
+		Self { value: ChValue::Decimal, class: ArmClass::PortableSql, join: "hash", server, db: None }
 	}
 
 	/// Run `f` with the loaded database on tokio's blocking pool, as the `DuckDB` arms do, so the
@@ -286,18 +300,21 @@ impl Arm for ClickHouse {
 		let storage = "MergeTree ORDER BY t, one fsync'd INSERT; server over loopback HTTP, RowBinary both ways";
 		let engine = format!("clickhouse {version}");
 		match self.class {
-			ArmClass::PortableSql => ArmInfo { arm: arm.into(), engine, value_type: value_type.into(), method: format!("linear interpolation in SQL: numbers() grid, two ASOF LEFT JOINs, first/last segment extended; downsample via GROUP BY on the epoch bucket; {storage}{note}"), class: Some(self.class), own_answer: None },
+			ArmClass::PortableSql => {
+				let arm = if self.join == "hash" { arm } else { "clickhouse-double-merge" };
+				ArmInfo { arm: arm.into(), engine, value_type: value_type.into(), method: format!("linear interpolation in SQL: numbers() grid, two ASOF LEFT JOINs (join_algorithm = '{}'), first/last segment extended; downsample via GROUP BY on the epoch bucket; {storage}{note}", self.join), class: Some(self.class), own_answer: None }
+			}
 			ArmClass::Native => ArmInfo { arm: "clickhouse-native".into(), engine, value_type: value_type.into(), method: format!("native fill: GROUP BY the grid-step bucket, ORDER BY … WITH FILL over the grid, INTERPOLATE (v); {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, carried forward unchanged across empty buckets (last observation carried forward, not a line), and 0 (the column's default) before the first knot".into()) },
 			ArmClass::ClientSide => ArmInfo { arm: "clickhouse-client".into(), engine, value_type: value_type.into(), method: format!("client-side: every knot fetched in instant order, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None },
 		}
 	}
 
 	fn reports_load(&self) -> bool {
-		self.class == ArmClass::PortableSql
+		self.class == ArmClass::PortableSql && self.join == "hash"
 	}
 
 	fn downsamples(&self) -> bool {
-		self.class == ArmClass::PortableSql
+		self.class == ArmClass::PortableSql && self.join == "hash"
 	}
 
 	fn unload(&mut self) {
@@ -357,7 +374,8 @@ impl Arm for ClickHouse {
 			}
 			ArmClass::PortableSql => {}
 		}
-		let bytes = self.on_db(move |server, db| server.query(&INTERPOLATE_SQL.replace("{db}", db), &[("start", start.to_string()), ("end", end.to_string()), ("step", step.to_string())], &[])).await?;
+		let join = self.join;
+		let bytes = self.on_db(move |server, db| server.query(&INTERPOLATE_SQL.replace("{db}", db).replace("{join}", join), &[("start", start.to_string()), ("end", end.to_string()), ("step", step.to_string())], &[])).await?;
 		Ok(Output::Float(parse_grid(&bytes)?))
 	}
 
