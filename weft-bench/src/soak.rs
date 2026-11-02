@@ -35,14 +35,16 @@
 //!   vice versa. SOA-2 adds no field to [`SoakRun`] or [`SoakConfig`], so
 //!   the version stays at v1 until SOA-6 records the oracle verdict on the
 //!   run record and takes v2; SOA-7 then records window digests
-//!   ([`crate::soak_digest`]) on the record and takes v3.
+//!   ([`crate::soak_digest`]) on the record and takes v3; SOA-8 records
+//!   the failure deck's phases, recovery windows and SIGTERM verdict
+//!   ([`crate::soak_failure`]) on the record and takes v4.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	redaction, report::{DiskInfo, RunMetadata}, soak_digest::WindowDigest, soak_oracle::OracleVerdict
+	redaction, report::{DiskInfo, RunMetadata}, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict
 };
 
 /// Version of the soak run record. Bump on any breaking field change to
@@ -54,7 +56,9 @@ use crate::{
 /// stands. v2 (SOA-6) adds the optional oracle verdict field on [`SoakRun`]
 /// — a field on the record, so the version moves, on this line only.
 /// v3 (SOA-7) adds the window digest list on [`SoakRun`], the same way.
-pub const SOAK_SCHEMA_VERSION: u32 = 3;
+/// v4 (SOA-8) adds the failure deck's phase log, recovery records and
+/// SIGTERM verdict on [`SoakRun`], the same way.
+pub const SOAK_SCHEMA_VERSION: u32 = 4;
 
 /// Configuration for one soak run.
 ///
@@ -149,6 +153,25 @@ pub struct SoakRun {
 	/// must never read as windows that matched.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub windows: Vec<WindowDigest>,
+	/// The failure deck's phase log for this run (SOA-8), in the order
+	/// phases were entered: one card's five phases, then the next
+	/// card's, recorded through [`SoakHarness::record_phase`]. Empty
+	/// until the first phase is recorded — and forever for a run no
+	/// deck drove, which must never read as a deck that ran.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub phases: Vec<PhaseRecord>,
+	/// The failure deck's recovery records for this run (SOA-8), in
+	/// card order, recorded through [`SoakHarness::record_recovery`].
+	/// Empty until the first card completes.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub recoveries: Vec<RecoveryRecord>,
+	/// The SIGTERM verdict on this run's server (SOA-8), recorded
+	/// through [`SoakHarness::record_sigterm_verdict`] once the deck's
+	/// SIGTERM card has been judged. `None` until then — and forever
+	/// for a run with no SIGTERM card, which must never read as a
+	/// graceful shutdown.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sigterm: Option<SigtermVerdict>,
 }
 
 impl SoakRun {
@@ -313,7 +336,7 @@ impl SoakHarness {
 	/// [`RunMetadata::capture`]), not a second probe.
 	#[must_use]
 	pub const fn new(config: SoakConfig, metadata: RunMetadata) -> Self {
-		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new() } }
+		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None } }
 	}
 
 	/// Current lifecycle state.
@@ -440,6 +463,75 @@ impl SoakHarness {
 		Ok(())
 	}
 
+	/// Record one failure-deck phase against this run (SOA-8): a line
+	/// of the deck's phase log, kept in the run record so a published
+	/// run carries the timeline its failures moved through.
+	///
+	/// Recorded only while `Running`, and only in phase order: the
+	/// first record is a card's `Baseline`; each next record is the
+	/// same card's next phase, or — after a card's `Complete` — a new
+	/// card's `Baseline`, at a tick no earlier than the last record's.
+	/// Out-of-order phases are refused rather than appended: a phase
+	/// log that can be written in any order is not a timeline.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when the
+	/// phase does not follow the last recorded one.
+	pub fn record_phase(&mut self, record: PhaseRecord) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak phases can only be recorded while Running, not {:?}", self.run.state);
+		if let Some(last) = self.run.phases.last() {
+			anyhow::ensure!(record.at_tick >= last.at_tick, "soak phase at tick {} precedes the recorded phase at tick {}", record.at_tick, last.at_tick);
+			if last.phase == SoakPhase::Complete {
+				anyhow::ensure!(record.phase == SoakPhase::Baseline && record.card != last.card, "after card '{}' completes, the next phase must be a new card's Baseline", last.card);
+			} else {
+				anyhow::ensure!(record.card == last.card && Some(record.phase) == last.phase.next(), "phase {:?} for card '{}' does not follow {:?} for card '{}'", record.phase, record.card, last.phase, last.card);
+			}
+		} else {
+			anyhow::ensure!(record.phase == SoakPhase::Baseline, "the first recorded phase must be a card's Baseline, not {:?}", record.phase);
+		}
+		self.run.phases.push(record);
+		Ok(())
+	}
+
+	/// Record one failure card's recovery against this run (SOA-8):
+	/// its window, when recovery was observed, and whether it landed
+	/// inside the window, kept in the run record beside the phase log.
+	///
+	/// Recorded only while `Running`, at most once per card — a
+	/// second record for the same card is refused rather than
+	/// overwriting the first, as with the oracle verdict.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when a
+	/// recovery for the same card has already been recorded.
+	pub fn record_recovery(&mut self, record: RecoveryRecord) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak recoveries can only be recorded while Running, not {:?}", self.run.state);
+		anyhow::ensure!(self.run.recoveries.iter().all(|existing| existing.card != record.card), "a recovery for card '{}' has already been recorded for this run", record.card);
+		self.run.recoveries.push(record);
+		Ok(())
+	}
+
+	/// Record the SIGTERM verdict on this run (SOA-8): the judgement
+	/// of the server's graceful shutdown, kept in the run record so a
+	/// published run carries the verdict with it.
+	///
+	/// Recorded exactly once, while `Running`, as with the oracle
+	/// verdict: a verdict that can be quietly replaced is not
+	/// evidence.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when a
+	/// verdict has already been recorded.
+	pub fn record_sigterm_verdict(&mut self, verdict: SigtermVerdict) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak SIGTERM verdict can only be recorded while Running, not {:?}", self.run.state);
+		anyhow::ensure!(self.run.sigterm.is_none(), "soak SIGTERM verdict has already been recorded for this run");
+		self.run.sigterm = Some(verdict);
+		Ok(())
+	}
+
 	/// Move a `Running` harness to `Finished`.
 	///
 	/// # Errors
@@ -527,7 +619,7 @@ mod tests {
 		harness.start().expect("start");
 		let record = harness.run_record();
 		assert_eq!(record.soak_schema_version, SOAK_SCHEMA_VERSION);
-		assert_eq!(record.soak_schema_version, 3, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, independent of the bench schema");
+		assert_eq!(record.soak_schema_version, 4, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, independent of the bench schema");
 		// Reuse, not redefinition: the record's metadata is EVI-3's capture,
 		// with the same crate version / OS / arch / timestamp it was built from.
 		assert!(!record.metadata.weft_bench_version.is_empty(), "metadata must carry the bench crate version");
@@ -673,6 +765,77 @@ mod tests {
 		let back: SoakRun = serde_json::from_str(&json).expect("redacted output must still deserialize");
 		assert_eq!(back.config.label, harness.run_record().redacted_label(), "the deserialized label must be the redacted one");
 		assert_eq!(back.soak_schema_version, SOAK_SCHEMA_VERSION, "redacted output keeps the soak version");
+	}
+
+	#[test]
+	fn failure_deck_records_are_recorded_in_order_while_running() {
+		use crate::soak_failure::{FailureDeck, MaintenanceDriver, MaintenanceKind, PhaseRecord, SigtermObservation};
+
+		let mut driver = MaintenanceDriver::new(FailureDeck::standard());
+		let mut harness = SoakHarness::new(config(), metadata());
+		assert!(harness.record_phase(PhaseRecord { card: "maintenance-contention".to_string(), phase: SoakPhase::Baseline, at_tick: 0 }).is_err(), "no phases before the run starts");
+		harness.start().expect("start from Created");
+		// Drive the whole standard deck, feeding every record the driver
+		// produces into the harness as it is produced.
+		while !driver.is_complete() {
+			let card = driver.current_card().expect("card").clone();
+			driver.advance(card.inject_tick).expect("baseline");
+			driver.advance(card.inject_tick).expect("injection");
+			if card.maintenance != MaintenanceKind::None {
+				driver.run_maintenance().expect("maintenance during recovery");
+			}
+			driver.observe_recovery(Some(card.inject_tick + 1)).expect("observe recovery");
+			driver.advance(card.inject_tick + 1).expect("recovery");
+			if card.kind == crate::soak_failure::FailureKind::Sigterm {
+				let verdict = driver.observe_sigterm(SigtermObservation { signal_tick: Some(card.inject_tick), exit_code: Some(0), drained_within_grace: true, previous_clean_shutdown: Some(true) }).expect("judge SIGTERM");
+				harness.record_sigterm_verdict(verdict).expect("record SIGTERM verdict while Running");
+				assert!(harness.record_sigterm_verdict(verdict).is_err(), "a second SIGTERM verdict must not overwrite the first");
+			}
+			driver.advance(card.inject_tick + 1).expect("verification");
+		}
+		for record in driver.phases() {
+			harness.record_phase(record.clone()).expect("phases record in order");
+		}
+		for record in driver.recoveries() {
+			harness.record_recovery(record.clone()).expect("recoveries record in card order");
+		}
+		assert_eq!(harness.run_record().phases.len(), 15, "three cards, five phases each");
+		assert_eq!(harness.run_record().recoveries.len(), 3);
+		assert!(harness.run_record().recoveries.iter().all(RecoveryRecord::recovered), "every card recovered inside its window with its maintenance run");
+		assert!(harness.run_record().sigterm.expect("SIGTERM verdict recorded").passed());
+		harness.finish().expect("finish from Running");
+		let json = harness.run_record().redacted_json().expect("redacted run JSON");
+		assert!(json.contains("\"phases\"") && json.contains("\"recoveries\"") && json.contains("\"sigterm\""), "the failure-deck records are in the run's output artifact: {json}");
+		let back: SoakRun = serde_json::from_str(&json).expect("run artifact deserializes");
+		assert_eq!(back.phases, harness.run_record().phases);
+		assert_eq!(back.sigterm, harness.run_record().sigterm);
+	}
+
+	#[test]
+	fn phase_records_refuse_out_of_order_phases() {
+		use crate::soak_failure::PhaseRecord;
+
+		let record = |card: &str, phase: SoakPhase, at_tick: u64| PhaseRecord { card: card.to_string(), phase, at_tick };
+		let mut harness = SoakHarness::new(config(), metadata());
+		harness.start().expect("start");
+		assert!(harness.record_phase(record("a", SoakPhase::Recovery, 0)).is_err(), "the first phase must be a Baseline");
+		harness.record_phase(record("a", SoakPhase::Baseline, 0)).expect("baseline");
+		assert!(harness.record_phase(record("a", SoakPhase::Recovery, 1)).is_err(), "phases cannot be skipped");
+		assert!(harness.record_phase(record("b", SoakPhase::Injection, 1)).is_err(), "cards cannot interleave");
+		harness.record_phase(record("a", SoakPhase::Injection, 1)).expect("injection");
+	}
+
+	#[test]
+	fn a_v3_run_artifact_without_failure_fields_still_deserializes() {
+		let harness = SoakHarness::new(config(), metadata());
+		let mut value = serde_json::to_value(harness.run_record()).expect("serialize run");
+		let object = value.as_object_mut().expect("run is an object");
+		object.remove("phases");
+		object.remove("recoveries");
+		object.remove("sigterm");
+		value["soak_schema_version"] = serde_json::json!(3);
+		let back: SoakRun = serde_json::from_value(value).expect("v3 artifact deserializes");
+		assert!(back.phases.is_empty() && back.recoveries.is_empty() && back.sigterm.is_none(), "a v3 artifact carries no failure-deck records");
 	}
 
 	#[test]
