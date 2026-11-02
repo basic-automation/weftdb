@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use weft_server::{
-	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, IngestConfig, InterpolateConfig, ServeLimits, TlsConfig, AUTH_KEYS_MODE, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
+	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ServeLimits, TlsConfig, AUTH_KEYS_MODE, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, QUERY_MAX_INFLIGHT_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
 };
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
@@ -63,6 +63,22 @@ pub(crate) fn serve_limits() -> anyhow::Result<ServeLimits> {
 pub(crate) fn ingest_config() -> anyhow::Result<IngestConfig> {
 	let config = IngestConfig::from_env().map_err(anyhow::Error::msg)?;
 	println!("ingest limits: body cap {} bytes (set {MAX_INGEST_BYTES_ENV} to change), in-flight budget {} bytes (set {INGEST_MAX_INFLIGHT_BYTES_ENV})", config.max_body_bytes(), config.max_inflight_bytes());
+	Ok(config)
+}
+
+/// Read Admission I's limits ([`AdmissionConfig`], ROB-10) from the
+/// environment, once, and log the cap in force: the query class's
+/// in-flight cap the registry's gate enforces. (The write class's
+/// budget is the ingest wiring's, above; probes are never shed and
+/// maintenance is exclusive, so neither takes a setting.)
+///
+/// # Errors
+///
+/// A value that is not a positive integer (a malformed operator config
+/// should fail loudly at start rather than silently default).
+pub(crate) fn admission_config() -> anyhow::Result<AdmissionConfig> {
+	let config = AdmissionConfig::from_env().map_err(anyhow::Error::msg)?;
+	println!("admission limits: at most {} query-class requests in flight (set {QUERY_MAX_INFLIGHT_ENV} to change); probes are never shed, maintenance is admitted one at a time", config.max_query_inflight());
 	Ok(config)
 }
 

@@ -72,7 +72,7 @@ use weftdb::SegmentStore;
 pub async fn read_time_range_to_record_batch(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<RecordBatch> {
 	let unit = aspect_time_unit(store, aspect).await?;
 	let (timestamps, values) = store.read_time_range(aspect, start, end).await?;
-	Ok(weft_arrow::columns_to_record_batch(unit, &timestamps, &values))
+	Ok(weft_arrow::columns_to_record_batch(unit, &timestamps, &values)?)
 }
 
 /// Read the rows of `aspect` in the inclusive `[start, end]` window and return them
@@ -97,7 +97,7 @@ pub async fn read_time_range_to_record_batch(store: &SegmentStore, aspect: &str,
 pub async fn read_time_range_to_record_batch_typed(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<RecordBatch> {
 	let schema = aspect_schema(store, aspect).await?;
 	let (timestamps, values) = store.read_time_range(aspect, start, end).await?;
-	Ok(weft_arrow::columns_to_record_batch_typed(schema.timestamp_unit, schema.value, &timestamps, &values))
+	Ok(weft_arrow::columns_to_record_batch_typed(schema.timestamp_unit, schema.value, &timestamps, &values)?)
 }
 
 /// Read the present rows of `aspect` whose **value** falls in the inclusive
@@ -121,7 +121,7 @@ pub async fn read_value_range_to_record_batch(store: &SegmentStore, aspect: &str
 	// read_value_range returns only present values; lift them into the nullable
 	// shape columns_to_record_batch expects.
 	let values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
-	Ok(weft_arrow::columns_to_record_batch(unit, &timestamps, &values))
+	Ok(weft_arrow::columns_to_record_batch(unit, &timestamps, &values)?)
 }
 
 /// Read the `[start, end]` window of `aspect` and return it as **Arrow IPC stream
@@ -495,7 +495,7 @@ mod tests {
 		// Build a Parquet file the way an external producer would, then ingest it.
 		let timestamps = vec![100_i64, 110, 120];
 		let values = vec![Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))];
-		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values);
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values).expect("builds the batch");
 		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
 
 		let descriptor = ingest_parquet_into_aspect(&store, "price", &bytes, None, false).await.expect("ingests");
@@ -517,7 +517,7 @@ mod tests {
 		// A Parquet batch whose timestamps step backwards at row 1 (90 < 100).
 		let timestamps = vec![100_i64, 90, 120];
 		let values = vec![Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))];
-		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values);
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values).expect("builds the batch");
 		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
 
 		// require_sorted rejects it before any seal, naming the offending row...
@@ -535,7 +535,7 @@ mod tests {
 		use weft_arrow::{columns_to_record_batch, write_parquet};
 
 		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
-		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1_i64], &[Some(bd("1"))]);
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1_i64], &[Some(bd("1"))]).expect("builds the batch");
 		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
 		let err = ingest_parquet_into_aspect(&store, "never_declared", &bytes, None, false).await.expect_err("must error");
 		assert!(err.to_string().contains("no declared schema"), "got: {err}");
