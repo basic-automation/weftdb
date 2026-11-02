@@ -329,7 +329,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **ROB-7** Ingest decode bounds
   - [ ] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
   - [ ] **ROB-23r** Probe-only admin listener
-  - [ ] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
+  - [x] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
   - [ ] **ROB-5** Legacy queue-consumer panics
   - [ ] **SEC-13** Security acceptance
   - [ ] **PAC-9** Docker image and container smoke test (with a mounted keys file)

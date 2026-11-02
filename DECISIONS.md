@@ -2799,3 +2799,80 @@ deliberate; the precision-preserving representation is Phase 4 work). Only
 the silent substitution is gone. The claim adjudication behind taking this
 slice (the peer's `compute/fre-5-*` branches treated as stale squash
 leftovers) is recorded on board issue #125 and in the loop's queue notes.
+
+## 2026-11-02 — PAC-13 offline restore CLI: the shapes the plan left open — FOR MERGE REVIEW
+
+The plan gives PAC-13 one line ("Offline restore CLI over D-S16
+(`weft-server restore`)", W7) and the C-7 table the exit statuses, so
+every shape below is a judgement call this loop made. D-S16 landed the
+library half on 2026-10-30 (`restore_store`, the whole-store manifest,
+the restore-intent marker), which is the whole reason this slice is
+startable now.
+
+1. **Why this slice leads W7, with W6 items still open.** W7's other
+   code items want W6 remainders — ROB-13 wants the bounded-read work,
+   ROB-16 wants the GPU provenance lane, SOA-11 and EVI-19's RPO/RTO
+   want SOA-10's checks and EVI-25's measurements — while PAC-13's only
+   prerequisite is D-S16. PAC-9 (image) and PAC-11 (systemd unit) are
+   listed ahead of it on the packaging lane but are siblings, not
+   dependencies: the CLI ships inside whatever artifact packs it, so
+   neither blocks the binary. Chose the unblocked one and left the W6
+   remainder for the other lane rather than serialising behind it.
+2. **The exit statuses are the ones the server already returns.** The
+   command reuses `settings::CONFIG_EXIT_CODE` (78) and
+   `settings::STORE_EXIT_CODE` (65) rather than minting restore-specific
+   codes: a supervisor that already understands "78 = fix the command
+   line or the destination, 65 = the store/backup needs a human" needs no
+   new rule, and PAC-7's operator CLI folds this command into its table
+   without changing a number. The 78/65 split is by *which side of the
+   terminal* is wrong, not by severity.
+3. **The command exits the process itself.** Handing a `Refused` back to
+   `main` would flatten every status to 1 through the runtime, so
+   `restore::run` prints the reason to stderr and calls
+   `std::process::exit` with the code — the same shape
+   `store_open::spawn_exit_on_poison` uses for 77, in the same crate, for
+   the same reason. The library API stays `Result`-shaped
+   (`Refused: Display + std::error::Error`) so a caller that wants its own
+   exit policy can keep it; only the binary's path exits.
+4. **There is no `--force`.** The destination must not exist, so the one
+   thing this command cannot do is remove a live store. That is deliberate:
+   the library already refuses to overwrite a control plane, and a restore
+   that replaces a running root is a deployment decision (move the old root
+   aside by hand, then restore) rather than a flag on the command that is
+   also the last-resort recovery tool. The refusal is 78 and writes
+   nothing, so a mistyped `--into` cannot damage anything.
+5. **`--adopt` runs the adoption the marker defers, in the foreground.** A
+   whole-store restore publishes `RESTORE_INTENT`, and the frames it
+   carried are adopted into the index at whatever open first reads the
+   root. Waiting for that is correct but invisible at 3 a.m., so `--adopt`
+   opens the restored root once and reports adopted / held / quarantined /
+   suspect counts and the scope it opened. `--database`/`--subject` name
+   that open and are *refused* without `--adopt` rather than quietly
+   ignored — a scope flag that changes nothing is worse than an error.
+   Adoption is idempotent, so omitting `--adopt` is safe and the CLI says
+   so in its output.
+6. **One command, both backup kinds, chosen from the manifest.** The
+   alternative was two subcommands. The backup already declares its kind
+   (`weftdb-whole-store-backup/1` versus the control-plane manifest), and
+   an operator at 3 a.m. does not know which kind they have, so the
+   command reads `MANIFEST.json` and takes `restore_store` or
+   `restore_control_plane` accordingly, printing which leg it took. A
+   pre-manifest backup — the v0.1.0-era shape, four database files with no
+   manifest and therefore no checksums to verify against — is refused at
+   65 rather than copied on trust: a restore that cannot verify is exactly
+   what D-S16 exists to prevent. A manifest naming a store format this
+   build cannot honour (a newer WeftDB's write floor) is the same code.
+7. **Hand-rolled parsing, no new dependency.** `main.rs`'s subcommand
+   dispatch and `import-rows-mode`'s `--flag <value>` parsing are the
+   precedent; adding `clap` for one more command would buy little and
+   change how every other subcommand parses. `--help`/`-h` anywhere in the
+   command line prints the module's own `USAGE` text (a bare `restore` word is
+   treated as that question, not as an error), and an unknown option is a 78 that
+   points at `--help`.
+
+**Not in this slice:** PAC-7's operator CLI (it will absorb this command's
+table), any HTTP route that restores over a live control plane (still a
+deployment decision; the drill remains the only live-server restore), the
+image and unit files (PAC-9, PAC-11), and any change to
+`weftdb::restore_store` semantics — this is a binary over the library, and
+`Cargo.lock` is untouched.

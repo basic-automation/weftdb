@@ -18,6 +18,25 @@ version has opened a store, do not run v0.1.0 on it again. Before upgrading, sto
 `weft-server` and copy the whole store directory; `POST /api/v1/storage/backup` copies
 only the control plane, not the segment frames.
 
+- **`weft-server restore` puts a backup back from the command line** (1.0 plan PAC-13).
+  A backup whose restore needs a `main.rs` is no use at 3 a.m., and the server deliberately
+  offers no route that touches a live root: `POST /api/v1/storage/restore/drill` rehearses
+  into a throwaway directory and stops there. The command reads the backup's `MANIFEST.json`
+  and takes the matching leg — `weftdb::restore_store` for a whole-store backup (frames and
+  control plane, D-S16), `restore_control_plane` for a control-plane backup — into a
+  `--into` root that must not exist yet, so it cannot overwrite a live store. `--adopt`
+  opens the restored root once, which is what acts on the restore-intent marker a
+  whole-store restore publishes: the frames are adopted into the index in the foreground
+  instead of at whatever open first serves them, and `--database`/`--subject` name that
+  open's scope (refused without `--adopt`, since nothing else reads them). It prints the
+  per-file verify table, rows and bytes, the store UUID the backup carried and what
+  adoption did, or the same document as `--json`. A refusal is a status, not a trace:
+  `78` when the command line or the destination is wrong and nothing was written,
+  `65` when the backup needs the operator — not a backup, a staging name that never
+  finished, a backup changed after it was taken, a manifest this release does not know, a
+  frame that does not verify, or a store whose write floor this build cannot honour. Both
+  codes are the ones the server's startup already returns, so a supervisor reads one
+  vocabulary.
 - **No silent narrowing in compute responses** (FRE-5): the downsample and interpolate
   endpoints converted each computed `BigDecimal` to the wire `f64` with a silent `0.0`
   fallback, so a result outside the `f64` range (for example a `sum` of two `1e308`

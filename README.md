@@ -701,6 +701,26 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   the root first. Restoring beside the
   original `segments/` frames reconstitutes a working store: the round-trip test
   reopens the restored root and reads its measurements back.
+- **Restore on the command line.** `weft-server restore <BACKUP> --into <NEW_ROOT>`
+  is the offline half of the same route, for the case a running server cannot serve you:
+  the store is gone, or you want the restored tree in hand before anything reads it. It
+  reads the backup's `MANIFEST.json` and picks the leg — a whole-store backup (a
+  `segments/` directory of frames beside the four databases, under a whole-store manifest)
+  restores through `weftdb::restore_store`, a control-plane backup through
+  `restore_control_plane` — so the one command covers both kinds, and it
+  refuses a destination that exists rather than overwriting a live root. Pass `--adopt`
+  and it opens the new root once, which is what acts on the restore-intent marker a
+  whole-store restore publishes: the frames are adopted now, in the foreground, instead of
+  at whatever open first serves them. `--database` and `--subject` name the scope that
+  open uses and go with `--adopt`; without it the command opens nothing, so the adoption
+  waits for the first open, which is also fine — it is idempotent. It prints the per-file
+  table, rows and bytes it verified, the store UUID the whole-store backup carried, and
+  what the adoption pass found; `--json` is the same document for a script. A refusal is
+  an exit code, not a stack trace: `78` for the command line itself (no destination, an
+  existing one, a scope flag with nothing to open), `65` for a directory that is not a
+  backup this build can verify — empty, a staging name that never finished, a pre-manifest
+  backup with nothing to check checksums against, or a manifest naming a store format this
+  build cannot read.
 - **Drills on a live server.** `POST /api/v1/storage/restore/drill?label=` rehearses
   a restore of the named backup into a throwaway directory, verifies it, reports
   `restorable`, and cleans up — non-destructive by construction, so the question
