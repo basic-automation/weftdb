@@ -152,6 +152,7 @@ use axum::{
 	extract::{MatchedPath, State}, http::{header, HeaderValue, Request}, middleware::Next, response::{IntoResponse, Response}
 };
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -703,6 +704,31 @@ fn request_is_proxied(headers: &axum::http::HeaderMap) -> bool {
 /// auth-off guard's proxied-request refusal (SEC-8). The one refusal no
 /// mode passes through is a credential in the query string, which is
 /// refused before any of the mode branches run (SEC-10).
+/// Record an authentication refusal in the audit log as a `weft_audit`
+/// event (SEC-9, decision 8: "auth denials … emit weft_audit events").
+/// The event names the refusal's code, the route and the principal when
+/// one authenticated — never the presented credential, which is not
+/// recorded anywhere. A denial is not an audited *operation* (nothing
+/// was attempted against the store), so it is an event, not an attempt
+/// record; and the denial itself is the safe answer, so a failed event
+/// write is logged by [`AuditLog::emit_event`](crate::audit::AuditLog::emit_event)
+/// and the refusal stands.
+fn emit_auth_denial(state: &AppState, request: &Request<axum::body::Body>, code: Code, operation: Option<&str>, principal: Option<&Principal>) {
+	if let Some(log) = state.audit_log() {
+		log.emit_event(
+			"auth_denied",
+			json!({
+				"code": code.as_str(),
+				"method": request.method().as_str(),
+				"path": request.uri().path(),
+				"operation": operation,
+				"principal": principal.map(|principal| principal.id.clone()),
+				"role": principal.map(|principal| principal.role.as_str()),
+			}),
+		);
+	}
+}
+
 pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::body::Body>, next: Next) -> Response {
 	// The credentials-in-query refusal runs first, in every authentication
 	// mode (SEC-10): the harm it prevents — the credential landing in a
@@ -710,6 +736,7 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 	// would have accepted the key, and with authentication off or disabled
 	// nothing else in this layer looks at the request at all.
 	if query_carries_a_credential(request.uri().query()) {
+		emit_auth_denial(&state, &request, Code::CredentialsInQuery, None, None);
 		return ApiError::new(Code::CredentialsInQuery, "credentials belong in the `Authorization: Bearer <key>` header, not in the query string, where they are recorded by proxies and logs").into_response();
 	}
 	let Some(store) = state.auth().key_store() else {
@@ -717,6 +744,7 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 			return next.run(request).await;
 		}
 		if request_is_proxied(request.headers()) {
+			emit_auth_denial(&state, &request, Code::ProxiedRequestRequiresAuth, None, None);
 			return ApiError::new(Code::ProxiedRequestRequiresAuth, "this request arrived through a proxy (it carries a Forwarded or X-Forwarded-* header) and authentication is off: a proxied request requires authentication — mount a keys file (WEFT_KEYS_FILE), or set WEFT_AUTH=disabled when a gateway in front of this server owns authentication").into_response();
 		}
 		return next.run(request).await;
@@ -732,15 +760,23 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 		return next.run(request).await;
 	};
 	let scope = entry.spec.scope;
+	let operation = entry.spec.operation_id;
 	match presented(request.headers(), &store) {
 		Presented::Absent if scope == Scope::Probe => next.run(request).await,
-		Presented::Absent => unauthenticated(format!("this route needs the `{}` scope, and the request carries no key: send `Authorization: Bearer <key>` with a key whose role grants it", scope.as_str())),
-		Presented::Refused => unauthenticated("the request's credentials are not a key this server holds: send `Authorization: Bearer <key>` with the key exactly as `weft-server keygen` printed it".to_string()),
+		Presented::Absent => {
+			emit_auth_denial(&state, &request, Code::Unauthenticated, Some(operation), None);
+			unauthenticated(format!("this route needs the `{}` scope, and the request carries no key: send `Authorization: Bearer <key>` with a key whose role grants it", scope.as_str()))
+		}
+		Presented::Refused => {
+			emit_auth_denial(&state, &request, Code::Unauthenticated, Some(operation), None);
+			unauthenticated("the request's credentials are not a key this server holds: send `Authorization: Bearer <key>` with the key exactly as `weft-server keygen` printed it".to_string())
+		}
 		Presented::Principal(principal) => {
 			if principal.role.allows(scope) {
 				request.extensions_mut().insert(principal);
 				next.run(request).await
 			} else {
+				emit_auth_denial(&state, &request, Code::Forbidden, Some(operation), Some(&principal));
 				ApiError::new(Code::Forbidden, format!("key `{}` holds the {} role, which does not grant the `{}` scope this route needs", principal.id, principal.role.as_str(), scope.as_str())).into_response()
 			}
 		}

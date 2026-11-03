@@ -44,7 +44,10 @@ use std::{
 	future::Future, sync::{Arc, Mutex}, time::Duration
 };
 
+use serde_json::json;
 use tokio::{sync::watch, task::JoinHandle};
+
+use crate::audit::AuditLog;
 
 /// How long supervision waits before restarting a panicked daemon: long
 /// enough that a daemon panicking in a tight loop cannot spin the CPU,
@@ -93,6 +96,11 @@ struct Entry {
 pub struct Daemons {
 	entries: Arc<Mutex<Vec<Entry>>>,
 	shutdown_tx: watch::Sender<bool>,
+	/// The audit log daemon panics are reported into as `weft_audit`
+	/// events (SEC-9, decision 8: "daemons emit weft_audit events"),
+	/// when the binary attached one. Absent in the registry's own
+	/// tests, where panics are reported on stderr alone, as before.
+	audit: Arc<Mutex<Option<Arc<AuditLog>>>>,
 }
 
 impl Default for Daemons {
@@ -106,7 +114,22 @@ impl Daemons {
 	#[must_use]
 	pub fn new() -> Self {
 		let (shutdown_tx, _) = watch::channel(false);
-		Self { entries: Arc::new(Mutex::new(Vec::new())), shutdown_tx }
+		Self { entries: Arc::new(Mutex::new(Vec::new())), shutdown_tx, audit: Arc::new(Mutex::new(None)) }
+	}
+
+	/// Attach the audit log daemon supervision reports into (SEC-9);
+	/// the binary passes the log it opened at startup. Builder-shaped
+	/// because the registry is created before the log's consumers are.
+	#[must_use]
+	pub fn with_audit_log(self, audit: Option<Arc<AuditLog>>) -> Self {
+		*self.audit.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = audit;
+		self
+	}
+
+	/// The audit log attached by [`with_audit_log`](Self::with_audit_log),
+	/// if any.
+	fn audit_log(&self) -> Option<Arc<AuditLog>> {
+		self.audit.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 	}
 
 	/// A receiver on the registry's shared shutdown watch (plan §5, D-S14):
@@ -183,6 +206,7 @@ impl Daemons {
 			entries.len() - 1
 		};
 		let entries = Arc::clone(&self.entries);
+		let audit = self.audit_log();
 		let mut shutdown_rx = self.shutdown_tx.subscribe();
 		tokio::spawn(async move {
 			loop {
@@ -212,7 +236,15 @@ impl Daemons {
 					}
 					Err(err) if err.is_panic() && restart_on_panic && !*shutdown_rx.borrow() => {
 						let restarts = bump_restarts(&entries, index);
-						eprintln!("daemon {name}: panicked ({}); supervision restarts it (restart {restarts})", weftdb::exec::panic_message(&*err.into_panic()));
+						let message = weftdb::exec::panic_message(&*err.into_panic());
+						eprintln!("daemon {name}: panicked ({message}); supervision restarts it (restart {restarts})");
+						// SEC-9: a daemon panic is a `weft_audit` event in
+						// the fsynced trail as well as a stderr line, so
+						// the on-box forensics decision 8 wants include
+						// the maintenance behaviour that went missing.
+						if let Some(audit) = &audit {
+							audit.emit_event("daemon_panic", json!({"daemon": name, "panic": message, "restarted": true, "restarts": restarts}));
+						}
 						// The restart delay is itself shutdown-aware: a
 						// shutdown during the wait is a stop, not a restart.
 						if tokio::time::timeout(RESTART_DELAY, shutdown_rx.changed()).await.is_ok() {
@@ -222,7 +254,11 @@ impl Daemons {
 					}
 					Err(err) => {
 						if err.is_panic() {
-							eprintln!("daemon {name}: panicked ({}); it is not restarted", weftdb::exec::panic_message(&*err.into_panic()));
+							let message = weftdb::exec::panic_message(&*err.into_panic());
+							eprintln!("daemon {name}: panicked ({message}); it is not restarted");
+							if let Some(audit) = &audit {
+								audit.emit_event("daemon_panic", json!({"daemon": name, "panic": message, "restarted": false}));
+							}
 						}
 						set_state(&entries, index, DaemonState::Stopped);
 						break;

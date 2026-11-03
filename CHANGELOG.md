@@ -8,6 +8,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
+  (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
+  gets an attempt record before it runs and an outcome record after, and the operation is
+  refused `503 audit_unavailable` when either record cannot be written (fail-closed).
+  Committed ingests, authentication denials and daemon panics land in the same file as
+  `weft_audit` events. `WEFT_AUDIT_FILE` names the file; unset, it lives at
+  `<store root>/audit.jsonl` (or `./weft-audit.jsonl` with no store configured), and a
+  server that cannot open it refuses to start.
+
 ## [0.2.1] - 2026-11-02
 
 The binaries for the v0.2.0 release. Tagging v0.2.0 built macOS and Windows, but both Linux
