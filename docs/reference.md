@@ -100,7 +100,7 @@ before you run it.
 
 ```bash
 WEFT_SEGMENT_STORE_ROOT=./store cargo run --release -p weft-server
-# weft-server v0.2.0 listening on http://127.0.0.1:8080
+# weft-server v0.2.1 listening on http://127.0.0.1:8080
 ```
 
 `WEFT_SEGMENT_STORE_ROOT` is what enables the persistent `/storage` endpoints;
@@ -213,9 +213,9 @@ version, with the measured losses, how every benchmark figure is produced and ch
 benchmarks are real and reproducible — but it has not been hardened for production
 deployment.
 
-**v0.2.0 is the latest pre-beta release**: pre-built binaries on the
-[GitHub release](https://github.com/basic-automation/weftdb/releases/tag/v0.2.0), and no
-crates on crates.io. It closes roadmap Phase 1, the benchmark suite. Its
+**v0.2.1 is the latest pre-beta release**: pre-built binaries on the
+[GitHub release](https://github.com/basic-automation/weftdb/releases/tag/v0.2.1), and the
+seven library crates on crates.io at 0.2.0. It closes roadmap Phase 1, the benchmark suite. Its
 [known limitations](https://github.com/basic-automation/weftdb/blob/v0.2.0/CHANGELOG.md#known-limitations)
 include a security layer that is new and not yet reviewed, unfinished crash consistency, and a one-way store
 upgrade from v0.1.0. [v0.1.0](https://github.com/basic-automation/weftdb/releases/tag/v0.1.0)
@@ -228,7 +228,7 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 | Observability — Prometheus metrics, OpenTelemetry traces | Working |
 | Crash consistency — power-loss durability, crash-safe maintenance | In progress ([design](https://basicautomation.io/projects/weftdb/docs/crash-consistency)) |
 | Security — TLS, API-key auth with roles, audit logs | TLS and API keys working; key reload and audit logs not started; not yet reviewed |
-| Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0 and v0.2.0, on GitHub |
+| Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0 and v0.2.1, on GitHub |
 | Library crates on crates.io | Not published yet |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
 | Packaging — Helm | Not started |

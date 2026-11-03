@@ -903,7 +903,7 @@ Used by:
     https://github.com/basic-automation/weftdb
   * weft-arrow-store 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-bench 0.2.0
+  * weft-bench 0.2.1
     https://github.com/basic-automation/weftdb
   * weft-line-protocol 0.2.0
     https://github.com/basic-automation/weftdb
@@ -913,9 +913,9 @@ Used by:
     https://github.com/basic-automation/weftdb
   * weft-reduce 0.2.0
     https://github.com/basic-automation/weftdb
-  * weft-server 0.2.0
+  * weft-server 0.2.1
     https://github.com/basic-automation/weftdb
-  * weft-tui 0.2.0
+  * weft-tui 0.2.1
     https://github.com/basic-automation/weftdb
   * weftdb 0.2.0
     https://github.com/basic-automation/weftdb
