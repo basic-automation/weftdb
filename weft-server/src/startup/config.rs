@@ -107,10 +107,11 @@ pub(crate) fn transport(addr: SocketAddr) -> anyhow::Result<Option<TlsConfig>> {
 }
 
 /// Resolve the Bearer authentication in force (SEC-6, [`AuthConfig`]):
-/// the keys file `WEFT_KEYS_FILE` names is loaded once, here, so a
+/// the keys file `WEFT_KEYS_FILE` names is loaded here, so a
 /// malformed keys file stops startup before anything is served — a
 /// server that cannot load its keys must not come up unauthenticated
-/// by accident. Logs which mode is in force.
+/// by accident. Later edits reload on SIGHUP (SEC-7; the watcher is
+/// registered in the daemons phase). Logs which mode is in force.
 ///
 /// # Errors
 ///
@@ -121,7 +122,7 @@ pub(crate) fn auth() -> anyhow::Result<AuthConfig> {
 	match &auth {
 		AuthConfig::Keys(store) => {
 			let from = store.path().map_or_else(|| KEYS_FILE_ENV.to_string(), |path| format!("{}={}", KEYS_FILE_ENV, path.display()));
-			println!("auth: Bearer API keys from {from} ({} key(s)); each key's role in the file grants its scopes on every route (SEC-6)", store.len());
+			println!("auth: Bearer API keys from {from} ({} key(s)); each key's role in the file grants its scopes on every route (SEC-6); SIGHUP reloads the file without a restart (SEC-7)", store.len());
 		}
 		AuthConfig::Disabled => println!("auth: explicitly disabled ({AUTH_ENV}=disabled); a gateway in front of this server owns authentication, and proxied requests are served"),
 		AuthConfig::Off => println!("auth: off (no keys file mounted; set {KEYS_FILE_ENV} to a keys file, or {AUTH_ENV}={AUTH_KEYS_MODE} to require one); proxied requests are refused while auth is off (SEC-8)"),

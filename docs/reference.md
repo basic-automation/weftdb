@@ -955,8 +955,10 @@ docker run -d --name weftdb \
     weftdb:git-abcdef123456
 ```
 
-`WEFT_KEYS_FILE` names a JSON keys file that the server reads once at startup, so a new key means
-restarting the container until key reload (SEC-7) lands. The store root defaults to
+`WEFT_KEYS_FILE` names a JSON keys file that the server reads at startup and reloads whenever it
+is sent `SIGHUP` (SEC-7; `docker kill --signal=HUP weftdb` for the container above), so a new,
+removed or re-roled key takes effect without restarting; a malformed edit is refused and the
+keys in force stay. The store root defaults to
 `/var/lib/weftdb/store` and the scheduled backups to `/var/lib/weftdb/backups`, both inside the
 volume. Every other setting is an environment variable from the table above, and the registry is
 strict: a name it does not recognise stops the container at startup (`78`) instead of ignoring it,

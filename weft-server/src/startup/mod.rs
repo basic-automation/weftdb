@@ -212,6 +212,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
 	daemons::spawn_reconcile_if_configured(&state, &daemons)?;
 	daemons::spawn_backup_if_configured(&state, &daemons)?;
+	// SEC-7: the key-reload watcher, so a SIGHUP after a keys-file edit
+	// reloads the keys in force instead of needing a restart.
+	daemons::spawn_key_reload_if_configured(&state, &daemons);
 
 	let listener = serve::bind(addr, tls.is_some()).await?;
 	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
