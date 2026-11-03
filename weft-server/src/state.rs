@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{admission::AdmissionConfig, auth::AuthConfig, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics};
+use crate::{admission::AdmissionConfig, audit::AuditLog, auth::AuthConfig, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -67,6 +67,11 @@ pub struct AppState {
 	/// Admission I's limits (ROB-10): the query class's in-flight cap
 	/// the registry builds its gate admission from.
 	admission: AdmissionConfig,
+	/// The fsynced audit log (SEC-9), present when the binary opened
+	/// one at startup — which it always does. Absent in the stateless
+	/// test states, where audited routes pass through unrecorded,
+	/// exactly as they pass unauthenticated with no keys configured.
+	audit: Option<Arc<AuditLog>>,
 }
 
 impl AppState {
@@ -82,7 +87,7 @@ impl AppState {
 	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT, audit: None }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -172,6 +177,21 @@ impl AppState {
 	#[must_use]
 	pub const fn admission_config(&self) -> AdmissionConfig {
 		self.admission
+	}
+
+	/// Attach the fsynced audit log (SEC-9); the binary passes the
+	/// [`AuditLog`] it opened at startup.
+	#[must_use]
+	pub fn with_audit_log(mut self, audit: Arc<AuditLog>) -> Self {
+		self.audit = Some(audit);
+		self
+	}
+
+	/// The fsynced audit log the router records into, when one is
+	/// attached.
+	#[must_use]
+	pub const fn audit_log(&self) -> Option<&Arc<AuditLog>> {
+		self.audit.as_ref()
 	}
 }
 

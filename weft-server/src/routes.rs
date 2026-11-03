@@ -187,9 +187,10 @@ impl Role {
 }
 
 /// Whether a route's calls are written to the audit log (SEC-9's fsynced
-/// JSONL file), and how. The registry records the requirement; SEC-9 owns
-/// the writer, and a route whose spec says [`Audit::AttemptOutcome`] will
-/// fail closed on `audit_unavailable` once that writer exists.
+/// JSONL file), and how. The registry records the requirement; SEC-9's
+/// writer ([`crate::audit`]) owns the file, and a route whose spec says
+/// [`Audit::AttemptOutcome`] fails closed on `audit_unavailable` when
+/// its attempt or outcome record cannot be written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Audit {
 	/// No audit record: probes, reads and stateless compute.

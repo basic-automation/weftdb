@@ -41,8 +41,8 @@
 //! process exits 0. While serving, a signal stops the accept loop; live
 //! connections then drain for up to [`SHUTDOWN_DRAIN`] (the 5 s of C9's
 //! drain order) before the remainder are aborted. The later drain steps —
-//! SEC-9's task tracker and D-S14's `store.shutdown()` — belong to their
-//! own slices and slot in after `run` returns.
+//! SEC-9's audit task tracker and D-S14's `store.shutdown()` — slot in
+//! after `run` returns, in startup's shutdown sequence.
 
 use std::{
 	future::Future, io, num::NonZeroUsize, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration
