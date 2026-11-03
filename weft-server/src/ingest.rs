@@ -151,6 +151,7 @@ impl Default for IngestConfig {
 /// declared [`TimeUnit`]) and its value as lossless decimal text, or `null` for an
 /// absent/null row.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestPoint {
 	/// Row timestamp (epoch integer in the aspect's declared unit).
 	pub timestamp: i64,
@@ -166,6 +167,7 @@ pub struct IngestPoint {
 /// partitioned into pages of that height for intra-segment page skipping);
 /// otherwise it seals into a single-block segment.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestRequest {
 	/// The points to seal, in caller order (the seal records whether they are
 	/// time-sorted).
@@ -452,6 +454,7 @@ async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate:
 
 /// Query parameters for the CSV ingest endpoint: an optional page height.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CsvIngestParams {
 	/// Optional page height — seal a paged segment of this many rows per page.
 	#[serde(default)]
@@ -571,6 +574,7 @@ async fn ingest_csv_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::me
 /// Query parameters for the ILP ingest endpoint: which field to seal, the wire
 /// timestamp precision, and an optional page height.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IlpIngestParams {
 	/// The line-protocol field key whose numeric values are sealed (one aspect ==
 	/// one field).
@@ -708,6 +712,7 @@ async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::me
 
 /// Query parameters for the Parquet ingest endpoint: an optional page height.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParquetIngestParams {
 	/// Optional page height — seal a paged segment of this many rows per page.
 	#[serde(default)]
