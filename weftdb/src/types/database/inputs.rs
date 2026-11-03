@@ -34,6 +34,12 @@ const QUEUE_WRITE_ATTEMPTS: u32 = 10;
 /// one per this many entries (a run used to dequeue in a single commit).
 const DEQUEUE_CHUNK: usize = 5_000;
 
+/// The most batches one transaction of `batch_insert_unprocessed_batches` queues. Each
+/// transaction is a synced commit, so this sets that call's commit count (it used to be one
+/// per batch), while keeping a transaction short enough that a consumer moving batches to
+/// the processed table waits for one chunk, not the whole insert.
+const QUEUE_BATCH_CHUNK: usize = 500;
+
 /// The environment variable that sets, in whole seconds, how long the processed batches DB
 /// remembers a batch pattern extraction consumed (its `extracted_batches` row), and so
 /// how long the queue's duplicate check recognises that batch (crash-consistency design,
@@ -737,15 +743,20 @@ impl Inputs for Database {
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let processed = self.get_processed_batches_db(aspect_id).await?.connect()?;
 
-		for (i, b) in batches.into_iter().enumerate() {
-			if !self.queue_batch_unless_known(aspect_id, &b, &db, &db_path, &processed).await? {
-				skipped += 1;
-			}
-			tx_ids.push(TxId::new());
+		// One transaction per chunk, not per batch (#505): a commit cost ~11 ms, so 7.5k
+		// windows spent ~85 s committing. Each batch is still checked as
+		// `queue_batch_unless_known` checks one, queued first and inside the transaction
+		// (which also sees the chunk's own earlier inserts), then processed, then extracted.
+		let mut done = 0usize;
+		for chunk in batches.chunks(QUEUE_BATCH_CHUNK) {
+			skipped += chunk.len() - self.queue_batches_unless_known(aspect_id, chunk, &db, &db_path, &processed).await?;
+			tx_ids.extend(chunk.iter().map(|_| TxId::new()));
 
 			// Report progress intermittently
-			if (i + 1) % report_interval == 0 || i + 1 == total {
-				tracing::debug!("Inserted unprocessed batches: {}/{}", i + 1, total);
+			let before = done;
+			done += chunk.len();
+			if before / report_interval != done / report_interval || done == total {
+				tracing::debug!("Inserted unprocessed batches: {done}/{total}");
 			}
 		}
 		if skipped > 0 {
@@ -2043,6 +2054,38 @@ impl Database {
 		self.insert_unprocessed_batch_row(&conn, aspect_id, batch, measurements_json, batch_hash).await?;
 		Self::commit_concurrent(&conn).await?;
 		Ok(true)
+	}
+
+	/// [`queue_batch_unless_known`](Self::queue_batch_unless_known) for every batch of
+	/// `batches` in one transaction, returning how many were inserted. Each batch is checked
+	/// in the same order, its queued check inside the transaction, so a repeat within
+	/// `batches` finds the first one queued.
+	async fn queue_batches_unless_known(&self, aspect_id: &AspectId, batches: &[Batch], db: &turso::Database, db_path: &str, processed: &turso::Connection) -> Result<usize> {
+		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
+		let mut inserted = 0usize;
+		for batch in batches {
+			let queued = async {
+				let (measurements_json, batch_hash) = Self::batch_identity(batch)?;
+				let known = if Self::batch_hash_stored(conn.as_ref(), aspect_id, &batch_hash).await? { Some("queued") } else { Self::processed_or_extracted(processed, aspect_id, &batch_hash).await? };
+				if let Some(state) = known {
+					tracing::debug!("Batch {} for aspect {aspect_id} is already {state} (hash {batch_hash}); not queuing it again", batch.id());
+					return Ok(false);
+				}
+				self.insert_unprocessed_batch_row(&conn, aspect_id, batch, measurements_json, batch_hash).await?;
+				Ok::<bool, anyhow::Error>(true)
+			}
+			.await;
+			match queued {
+				Ok(true) => inserted += 1,
+				Ok(false) => {}
+				Err(e) => {
+					let _ = Self::rollback_concurrent(&conn).await;
+					return Err(e);
+				}
+			}
+		}
+		Self::commit_concurrent(&conn).await?;
+		Ok(inserted)
 	}
 
 	/// Queue `timestamps` again once their rows are committed (crash-consistency design,

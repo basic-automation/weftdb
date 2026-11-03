@@ -111,7 +111,8 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 		return Ok(());
 	}
 
-	info!(affected_window_count = affected_windows.len(), "Creating batches for affected windows");
+	let affected_window_count = affected_windows.len();
+	info!(affected_window_count, "Creating batches for affected windows");
 
 	// The latest stored measurement, read after the entries (see the docs above): a window
 	// that ends after it is skipped without interpolating it.
@@ -122,55 +123,70 @@ pub async fn build_incremental_unprocessed_queue(database: &Database, aspect: &A
 
 	let database_info = database.get_database_info().await.map_err(|_| anyhow::anyhow!("Database info not available"))?;
 
-	let mut batches_created = 0;
-	let mut windows_past_the_data = 0usize;
+	// It cannot reach `batch_size` points yet; its entries stay queued.
+	let mut windows: Vec<BatchWindow> = affected_windows.into_iter().filter(|window| window.end <= latest_measurement).collect();
+	let windows_past_the_data = affected_window_count - windows.len();
+	windows.sort_by_key(|window| window.start);
+
+	// Interpolate each run of overlapping windows once and cut its windows out of the result
+	// (#505). One `analyze_range` and one insert per window cost ~25 ms and ~13 ms apiece, so
+	// a first run over 10k rows spent ~300 s here on ~7.5k windows of 60 points each. A run
+	// starts a window's length early, so a window at its head is interpolated from knots on
+	// both sides, as the full rebuild's one pass over the whole range interpolates it, and not
+	// extrapolated from the knots inside the window alone.
+	let mut built: Vec<(BatchWindow, Batch)> = Vec::new();
+	let mut run_start = 0;
+	while run_start < windows.len() {
+		let mut run_end = run_start;
+		let mut reach = windows[run_start].end;
+		while run_end + 1 < windows.len() && windows[run_end + 1].start <= reach {
+			run_end += 1;
+			reach = reach.max(windows[run_end].end);
+		}
+		let run = &windows[run_start..=run_end];
+		let lead = (run[0].end - run[0].start).max(resolution.step());
+		let from = run[0].start.checked_sub_signed(lead).map_or(earliest_measurement, |t| t.max(earliest_measurement));
+
+		let mut point_stream = Outputs::analyze_range(database, aspect, from, reach, *resolution, *method).await?;
+		let mut points = Vec::new();
+		while let Some(result) = point_stream.next().await {
+			points.push(result?);
+		}
+
+		for window in run {
+			let first = points.partition_point(|p| p.timestamp < window.start);
+			let window_points: Vec<_> = points[first..].iter().take_while(|p| p.timestamp <= window.end).collect();
+			if window_points.len() < batch_size {
+				debug!(
+					window_start = %window.start,
+					window_end = %window.end,
+					points = window_points.len(),
+					required = batch_size,
+					"Insufficient points for batch, skipping window"
+				);
+				continue;
+			}
+			// Take exactly batch_size points
+			let measurements: Vec<BatchedMeasurement> = window_points[..batch_size].iter().map(|p| BatchedMeasurement::new((*p).clone())).collect();
+			built.push((window.clone(), Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone())));
+		}
+		run_start = run_end + 1;
+	}
+
 	// Which of the entries read above a stored batch covers.
 	let mut covered = vec![false; unbatched.len()];
-
-	// For each affected window, create a batch
-	for window in affected_windows {
-		// It cannot reach `batch_size` points yet; its entries stay queued.
-		if window.end > latest_measurement {
-			windows_past_the_data += 1;
-			continue;
-		}
-
-		// Fetch points within this window
-		let mut point_stream = Outputs::analyze_range(database, aspect, window.start, window.end, *resolution, *method).await?;
-
-		let mut window_points = Vec::new();
-		while let Some(result) = point_stream.next().await {
-			let point = result?;
-			window_points.push(point);
-		}
-
-		// Only create a batch if we have enough points
-		if window_points.len() >= batch_size {
-			// Take exactly batch_size points
-			let batch_points = &window_points[0..batch_size];
-			let measurements: Vec<BatchedMeasurement> = batch_points.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-
-			let batch = Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone());
-
-			// Skipped (still `Ok`) when the batch is already queued, processed or extracted.
-			database.insert_unprocessed_batch(aspect, &batch).await?;
-			batches_created += 1;
-
-			// Track which entries from unbatched queue are now covered by this batch
-			for (entry, covered) in unbatched.iter().zip(covered.iter_mut()) {
-				if window.contains(entry.data_timestamp) {
-					*covered = true;
-				}
+	for (window, _) in &built {
+		for (entry, covered) in unbatched.iter().zip(covered.iter_mut()) {
+			if window.contains(entry.data_timestamp) {
+				*covered = true;
 			}
-		} else {
-			debug!(
-				window_start = %window.start,
-				window_end = %window.end,
-				points = window_points.len(),
-				required = batch_size,
-				"Insufficient points for batch, skipping window"
-			);
 		}
+	}
+	let batches_created = built.len();
+	// One insert for every batch, committed a chunk at a time; each is skipped (still `Ok`)
+	// when it is already queued, processed or extracted.
+	if !built.is_empty() {
+		database.batch_insert_unprocessed_batches(aspect, built.into_iter().map(|(_, batch)| batch).collect()).await?;
 	}
 
 	// The batches are committed and their timestamps are still queued. A crash here makes
