@@ -653,8 +653,12 @@ out-of-order reconciliation passes (manual, store-wide, and the background daemo
 threshold-held calls excluded) plus `_failed_passes_total`, the per-aspect passes a
 store-wide sweep (daemon tick or `POST /api/v1/storage/reconcile`) skipped after an
 error (the daemon also logs one `WARN` line per failed aspect), `weft_backup_*`
-counters (`_snapshots_total` / `_bytes_written_total`) over the online control-plane
-backups, and latency histograms over the compute and seal paths.
+counters (`_snapshots_total` / `_bytes_written_total` / `_failures_total`) over the
+online control-plane
+backups, plus the `_last_success_seconds` gauge (unix seconds of the most recent
+verified snapshot, `0` when none has been recorded yet — the daemon seeds it from
+the newest snapshot on disk at start, so a restart does not read as "no backup
+ever"), and latency histograms over the compute and seal paths.
 `GET /debug/profile/current` serves the same timing data as a live p50/p95/p99
 snapshot.
 
@@ -702,9 +706,13 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   Turso's `VACUUM INTO` fsyncs the destination and runs a TRUNCATE checkpoint
   before returning. On this project's btrfs volume (load average ~12) the
   background daemon's ticks landed 3.0–4.5 s apart at a 2 s configured interval. <!-- claim:backup-daemon-ticks -->
-  A tick fires late only when the one before it outlasts the interval (tokio's
-  default `Burst` catch-up), so each snapshot and its prune took that long, and
-  they ran back to back. **Set `WEFT_BACKUP_INTERVAL_SECS` from what your storage
+  That spacing was measured before EVI-18, under tokio's default `Burst`
+  catch-up: a tick fired late only when the one before it outlasted the interval,
+  so each snapshot and its prune took that long, and they ran back to back. Since
+  EVI-18 the daemon's ticking is catch-up-free (`MissedTickBehavior::Skip`): a
+  snapshot that outlasts the interval delays the next tick to the following period
+  boundary instead of running snapshots back to back to catch up, so the daemon
+  takes at most one snapshot per interval however far behind it fell. **Set `WEFT_BACKUP_INTERVAL_SECS` from what your storage
   can sustain, not from how much data you have**; point `WEFT_BENCH_BACKUP_DIR`
   at your own volume to measure it.
 - **Unattended backups with retention.** Set `WEFT_BACKUP_INTERVAL_SECS` to run a
