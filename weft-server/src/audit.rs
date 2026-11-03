@@ -16,7 +16,7 @@
 //! [`Audit`] requirement per route, and every mutating route — ingest,
 //! declare, maintenance, backup — registered
 //! [`Audit::AttemptOutcome`]. This module's middleware
-//! ([`audit_route`]) reads that same registry table (never a second copy)
+//! ([`audit_route`](crate::audit::audit_route)) reads that same registry table (never a second copy)
 //! and, for an audited route:
 //!
 //! 1. writes the **attempt** record and fsyncs it *before* the handler
@@ -29,7 +29,7 @@
 //!    names the boundary: an audited route catches
 //!    `JoinError::is_panic` *inside its own task*, rather than leaving
 //!    the panic to ROB-3's catch layer, so the outcome record can say
-//!    `panic` — see [`audit_route`]);
+//!    `panic` — see [`audit_route`](crate::audit::audit_route));
 //! 3. writes the **outcome** record — status, result, duration — and
 //!    fsyncs it. If *that* write fails the trail is broken from here on,
 //!    so the answer is again `503 audit_unavailable`: the operation may
@@ -91,7 +91,7 @@
 //! [`AUDIT_FILE_ENV`] (`WEFT_AUDIT_FILE`) names it directly. Unset, it
 //! lives beside the data it audits: `<store root>/audit.jsonl` when a
 //! segment store is configured, else `./weft-audit.jsonl`. See
-//! [`resolve_path`]. The binary opens it at startup and refuses to start
+//! [`resolve_path`](crate::audit::resolve_path). The binary opens it at startup and refuses to start
 //! when it cannot — a server that cannot audit must not come up
 //! unaudited by accident (the keys file's rule, SEC-6, applied here).
 //! A router state with no audit log attached ([`AppState::new`]'s
@@ -103,7 +103,7 @@
 //!
 //! The drain order is serve → **SEC-9 TaskTracker** →
 //! `store.shutdown()` → runtime `shutdown_timeout(5 s)`. The tracker is
-//! [`AuditLog::spawn`]'s: [`audit_route`] runs every audited handler
+//! [`AuditLog::spawn`]'s: [`audit_route`](crate::audit::audit_route) runs every audited handler
 //! through it, and [`AuditLog::close_and_drain`] — called by startup
 //! after serving ends and the daemons stop, before the store's shutdown
 //! — closes it to new work and waits for what is in flight, so no
@@ -352,7 +352,7 @@ impl AuditLog {
 	///
 	/// # Errors
 	///
-	/// Whatever [`append`](Self::append) reports: the caller
+	/// Whatever `append` reports: the caller
 	/// ([`audit_route`]) turns it into `503 audit_unavailable` and does
 	/// not run the operation — fail-closed.
 	pub fn attempt(&self, operation: &str, method: &str, path: &str, principal: Option<&Principal>) -> Result<u64, String> {
@@ -378,7 +378,7 @@ impl AuditLog {
 	///
 	/// # Errors
 	///
-	/// Whatever [`append`](Self::append) reports.
+	/// Whatever `append` reports.
 	pub fn outcome(&self, audit_id: u64, operation: &str, status: StatusCode, result: &str, duration: Duration) -> Result<(), String> {
 		let mut record = json!({
 			"v": RECORD_VERSION,
@@ -401,7 +401,7 @@ impl AuditLog {
 	///
 	/// # Errors
 	///
-	/// Whatever [`append`](Self::append) reports. Callers that cannot
+	/// Whatever `append` reports. Callers that cannot
 	/// act on a failure use [`emit_event`](Self::emit_event) instead.
 	pub fn event(&self, event: &str, detail: Value) -> Result<(), String> {
 		let mut record = json!({
@@ -626,9 +626,17 @@ mod tests {
 		if std::env::var_os(CHILD_ENV).is_some() {
 			// The child: refuse the SIGXFSZ the rlimit would kill us
 			// with, cap file sizes at zero, and watch the writes fail.
+			// Only the soft limit is capped (the hard limit stays, so
+			// the cap can be restored): the harness writes this test's
+			// own result line to stdout when the test returns, and a
+			// cap still in force then — whenever stdout is a file
+			// rather than a pipe — would eat that write and turn a
+			// passing child into an unexplained exit 101.
+			let mut saved = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 			unsafe {
 				libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-				let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+				assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut saved), 0, "the rlimit is read");
+				let limit = libc::rlimit { rlim_cur: 0, rlim_max: saved.rlim_max };
 				assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0, "the rlimit is set");
 			}
 			let dir = tempfile::tempdir().expect("tempdir");
@@ -637,6 +645,9 @@ mod tests {
 			assert!(first.contains("could not be written"), "{first}");
 			let second = log.event("ingest", json!({})).expect_err("the failure is latched");
 			assert_eq!(first, second, "a poisoned log reports the one latched failure");
+			unsafe {
+				assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &saved), 0, "the rlimit is restored");
+			}
 			return;
 		}
 		let exe = std::env::current_exe().expect("the test binary's path");
