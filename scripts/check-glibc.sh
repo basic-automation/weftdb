@@ -61,8 +61,11 @@ fi
 # grep the token out of whatever surrounds it rather than anchoring a field to it. An earlier
 # version of this function matched `^GLIBC_` on a whole field, matched nothing, and reported every
 # binary on the machine as needing no glibc at all: a check that cannot fail is worse than none.
+#
+# No match is an answer, not an error: under `set -e -o pipefail` a bare grep that finds nothing
+# killed the whole script inside the caller's command substitution, before it could say why.
 highest_glibc_in_dump() {
-	grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1
+	{ grep -o 'GLIBC_[0-9][0-9.]*' || true; } | sed 's/^GLIBC_//' | sort -uV | tail -n 1
 }
 
 # True when the binary will be served by glibc at run time, so a dump naming no GLIBC_* symbol
@@ -156,15 +159,17 @@ scan_archive() {
 
 # The failure path is the whole value of this script, so prove it works before trusting a pass: a
 # real glibc binary must yield a version, and a non-ELF file must be rejected. `--self-test` runs
-# both against the runner's own /bin/true, so CI checks the checker. Usage:
+# both against the bash interpreting this script, so CI checks the checker. Not /bin/true: in the
+# manylinux_2_28 release image that is a 51-byte shell script, which has no symbols to read. Usage:
 #   scripts/check-glibc.sh --self-test
 if [[ $self_test -eq 1 ]]; then
 	probe="$(mktemp)"
 	printf '#!/bin/sh\nexit 0\n' >"$probe"
 	status=0
-	highest="$(dump_dynamic_symbols /bin/true | highest_glibc_in_dump)"
+	elf="$(readlink -f "$BASH")"
+	highest="$(dump_dynamic_symbols "$elf" | highest_glibc_in_dump)"
 	if [[ -z "$highest" ]]; then
-		printf '%s: FAIL self-test — read no glibc version out of /bin/true\n' "$prog" >&2
+		printf '%s: FAIL self-test — read no glibc version out of %s\n' "$prog" "$elf" >&2
 		status=1
 	fi
 	if check_one "$probe" >/dev/null 2>&1; then
@@ -173,7 +178,7 @@ if [[ $self_test -eq 1 ]]; then
 	fi
 	rm -f -- "$probe"
 	if [[ $status -eq 0 ]]; then
-		printf '%s: OK — self-test read glibc %s from /bin/true and rejected a non-ELF file\n' "$prog" "$highest"
+		printf '%s: OK — self-test read glibc %s from %s and rejected a non-ELF file\n' "$prog" "$highest" "$elf"
 		exit 0
 	fi
 	exit 1
