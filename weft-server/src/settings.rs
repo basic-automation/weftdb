@@ -282,6 +282,19 @@ pub const STORE_EXIT_CODE: i32 = 65;
 /// The exit status (plan C7) for a store root already locked by another process.
 pub const ROOT_LOCKED_EXIT_CODE: i32 = 75;
 
+/// The `EX_USAGE` exit status (plan C7): the command line itself is wrong —
+/// an unknown command, an unknown option, or a missing value — so nothing
+/// was attempted. The operator CLI ([`crate::cli`]) owns this class: a
+/// subcommand's own parse errors exit with it, and so does a first word
+/// that names no command at all.
+pub const USAGE_EXIT_CODE: i32 = 2;
+
+/// The exit status (plan C7) for an unexpected error: the failure no other
+/// row of the table names. It is what the runtime's own error report (the
+/// `fn main() -> anyhow::Result<()>` return) exits with, so a caller only
+/// sees it when no phase classified the failure first.
+pub const UNEXPECTED_EXIT_CODE: i32 = 1;
+
 /// Variables whose registry `accepts` shape is a non-negative whole number. A value
 /// outside that shape was, before PAC-5b, refused by some readers and silently
 /// defaulted by others; strict validation refuses it wherever it appears.

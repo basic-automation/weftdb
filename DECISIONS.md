@@ -3497,3 +3497,71 @@ X-ERR's reserved `503 audit_unavailable`. The points the sources do not pin, cho
    supervision emits `daemon_panic` (with `restarted` and the restart count) beside its
    stderr line. The backup/reconcile ticks themselves keep reporting through their own
    logs — their *failures to stay alive* are what the trail records.
+## 2026-11-02 — PAC-7: the operator CLI's shape and the usage class (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan gives PAC-7 one line ("Operator CLI, exit-code contract and
+store identity at startup", W6) plus the C7 table (§4) and the L-MAIN lane note
+("PAC-7 then ROB-11: CLI then runtime builder", §2). No source enumerates the CLI's
+commands, says which existing behaviours count as already-landed parts of it, or
+reconciles C7's "2 = Usage" row with PAC-13's later, deliberate choice that
+`restore`'s command-line refusals exit 78.
+
+**Chosen (best guess, grounded in the code on main, flagged for merge review):**
+
+- **The CLI is a dispatch, not a rewrite.** The three operator commands already
+  exist as library modules with their own parsers, help text and tests
+  (`keygen`, `restore`, `import-rows-mode`). PAC-7 adds one module,
+  `weft_server::cli`, whose `parse` reads the first word into a `Command`
+  (serve by default, `help`/`--help`, `--version`, or a subcommand carrying
+  the exact argument shape that subcommand's parser already expects —
+  restore's parser takes the words after `restore`; the other two take the
+  subcommand word too, as before). `main.rs` becomes a pure dispatch over
+  it, which is the L-MAIN shape ROB-11's runtime builder then builds on.
+  A first word naming no command is refused by `cli::parse` itself rather
+  than falling through to `import-rows-mode`'s parser as it did before.
+- **Usage is exit 2, and only usage.** C7's row 2 had no owner before this
+  slice: every subcommand parse error returned `anyhow::Result` and the
+  runtime flattened it to 1, the row C7 reserves for an unexpected error.
+  Now the CLI's own refusals exit 2 from `main`, and `keygen` /
+  `import-rows-mode` exit 2 inside their `run` on a parse failure (the
+  `restore::run` precedent of exiting inside the library, where the codes
+  are defined). Their operational failures still return errors (exit 1),
+  and the classified startup refusals keep their codes (78 config, 65
+  store, 75 locked, 70 poison). `settings` gains the two C7 constants that
+  had no home: `USAGE_EXIT_CODE` (2) and `UNEXPECTED_EXIT_CODE` (1).
+- **`restore` keeps 78 for its command line — deliberately not renumbered.**
+  PAC-13's entry records the split it chose (78 = fix the command line or
+  the destination, 65 = the backup needs a human) and says PAC-7 "folds
+  this command into its table without changing a number". Folding it in
+  therefore means the CLI's help prints the exception next to the table,
+  not that restore's refusals move to 2. A supervisor that learned
+  restore's numbers keeps them.
+- **The table is code, and the help prints it.** `cli::EXIT_CODES` holds
+  the C7 rows; a unit test pins its codes to `[0, 1, 2, 65, 70, 75, 78]`
+  and the constants the phases exit with, and `weft-server --help` prints
+  the same table, so the contract an operator reads cannot drift from the
+  statuses the process exits with.
+- **Store identity at startup is one formatted line.** The state phase
+  already printed the UUID and layout; PAC-7 moves the formatting into
+  `store_open::store_identity_line` and completes the identity: root,
+  `store_uuid`, the `(database, subject)` scope the store was opened
+  under (from its `STORE_FORMAT`), layout, whether the previous shutdown
+  was clean, and what the open did (created / opened / migrated /
+  report-only is still the following line, as before). The scope half is
+  the new information: one root can hold several scopes, and "which store
+  came up" is not answered by a UUID alone. `/ready` is unchanged — it
+  already carries the same UUID (D-S12), so log and probe can be checked
+  against each other.
+
+**Rejected:** renumbering `restore`'s usage refusals to 2 for uniformity
+(breaks PAC-13's recorded promise to supervisors for no functional gain);
+absorbing the subcommand parsers into `cli.rs` (their parsers, help text
+and tests are theirs; a dispatch that rewrote them would be churn on three
+landed slices in the L-MAIN lane PAC-7 shares with ROB-11); and a `clap`
+dependency for the top level (the hand-rolled precedent PAC-13 recorded
+still holds — one match is not a framework).
+
+**Not in this slice:** ROB-11's runtime builder (next on L-MAIN, and the
+reason the dispatch stays a thin match), any change to what the subcommands
+do once parsed, and any new command — `PAC-9`'s follow-up (a readiness
+subcommand that needs no network) is a separate slice, not this one.
