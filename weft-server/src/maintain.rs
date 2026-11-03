@@ -231,6 +231,13 @@ pub struct ReconcileStoreResponse {
 	/// failed aspect is counted in `aspects_scanned` only. Failing to list the aspects at
 	/// all is still a `500`.
 	pub failed: Vec<SweepFailure>,
+	/// The aspects the sweep did not attempt because their per-aspect maintenance
+	/// circuit breaker is tripped (ROB-19, [`weftdb::MaintenanceBreaker`]): each has
+	/// failed enough consecutive sweep passes that sweeps leave it alone until its
+	/// cooldown passes. A tripped aspect counts in `aspects_scanned` only; the
+	/// per-aspect endpoints are never gated, so an operator can still reconcile it
+	/// directly. Empty when no breaker is tripped.
+	pub tripped: Vec<String>,
 }
 
 /// Handle `POST /api/v1/storage/reconcile`: sweep **every** declared aspect,
@@ -286,7 +293,7 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 	let threshold = threshold.unwrap_or(1).max(1);
 	// Wait out a daemon pass (or another request) on an aspect rather than skip it.
 	let wait = MaintenanceWait::Wait(store.maintenance_wait());
-	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed, busy) = if overlaps {
+	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed, busy, tripped) = if overlaps {
 		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
 		// default 50 MiB floor (every aspect's small components full-rewrite).
 		let sweep = match split_min_bytes {
@@ -296,19 +303,19 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 		}
-		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy)
+		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
 	} else if hot_cold {
 		let sweep = store.reconcile_all_hot_cold(threshold, wait).await.map_err(|err| ApiError::internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 		}
-		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed), sweep.busy)
+		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
 	} else {
 		let sweep = store.reconcile_all_over_threshold(threshold, wait).await.map_err(|err| ApiError::internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 		}
-		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy)
+		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
 	};
 	if !failed.is_empty() {
 		metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
@@ -318,7 +325,7 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 	}
 	let unsorted_segments = store.store_stats().await.map_err(|err| ApiError::internal(err.to_string()))?.unsorted_segments;
 	let overlapping_segments = store.store_overlapping_segments().await.map_err(|err| ApiError::internal(err.to_string()))?;
-	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments, failed })).into_response())
+	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments, failed, tripped })).into_response())
 }
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/squash`.
@@ -671,6 +678,46 @@ mod tests {
 			let reached = if uri.contains("overlaps") { s6.overlapping_segments == 0 } else { s6.unsorted_segments == 0 };
 			assert!(reached, "{uri}: the last aspect in name order is still reached: {s6:?}");
 		}
+	}
+
+	/// ROB-19: once an aspect's maintenance circuit breaker has tripped, the
+	/// store-wide sweep response lists it in `tripped` and records no new
+	/// failure for it, while the healthy aspects are still swept.
+	#[tokio::test]
+	async fn reconcile_store_endpoint_lists_a_tripped_aspect() {
+		let dir = TempDir::new().unwrap();
+		let sc = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		let v = |s: &str| -> bigdecimal::BigDecimal { s.parse().unwrap() };
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens").with_maintenance_breaker(weftdb::MaintenanceBreaker { failure_threshold: 1, cooldown: std::time::Duration::from_secs(60) }));
+		store.declare("bad", &sc).await.expect("declares bad");
+		store.declare("good", &sc).await.expect("declares good");
+		let first = store.seal("bad", &sc, &[100_i64, 130, 110], &[v("1"), v("3"), v("2")]).await.expect("seal bad");
+		store.seal("good", &sc, &[100_i64, 130, 110], &[v("1"), v("3"), v("2")]).await.expect("seal good");
+		let file = std::fs::OpenOptions::new().write(true).open(&first.path).expect("opens frame");
+		let len = file.metadata().expect("stats frame").len();
+		file.set_len(len / 2).expect("truncates frame");
+		drop(file);
+
+		// First sweep: the damaged aspect fails (and trips its breaker); the
+		// healthy one reconciles. Nothing is tripped yet.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(json["failed"].as_array().map(Vec::len), Some(1), "the damaged aspect fails: {json}");
+		assert_eq!(json["tripped"], serde_json::json!([]), "nothing tripped on the first sweep: {json}");
+
+		// Second sweep: the tripped aspect is listed in `tripped` and no new
+		// failure is recorded for it.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["tripped"], serde_json::json!(["bad"]), "the tripped aspect is listed: {json}");
+		assert_eq!(json["failed"], serde_json::json!([]), "a tripped aspect records no new failure: {json}");
 	}
 
 	#[tokio::test]
