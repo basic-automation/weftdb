@@ -46,7 +46,7 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
   - [x] **DONE (2026-11-02) — failure tests** (`weft-bench --failure kill-ingest|kill-compaction|corrupt-segment`): a child process killed with SIGKILL mid-ingest or mid-compaction, or a flipped byte in a closed segment; the reopened store must hold every acknowledged row exactly and quarantine, never serve, a damaged segment (open-time recovery caught all 143 byte flips of a probe frame). Network retry is SOA-8's failure deck (#502); the CI crash matrix stays D-S21/SOA-9's
     - [ ] **NEXT — compaction cost** (#507): squashing 10M rows from 9,769 to 153 segments took 694 s, and small windows read ~36× slower after it (whole 65k-row segments decoded); the year window held
 - [x] **DONE (2026-11-02) — Fair interpolation comparisons (Phase 1.2)** (#148): every `weft-xbench` engine answers in three classes where it can — its native fill (A: TimescaleDB, QuestDB, InfluxDB 3, IoTDB, ClickHouse), portable SQL (B) and client-side (C, all six) — with native fills that compute another answer gated on shape and reported against the line, never raced; each ASOF strategy run and published (#393). A `tiny` run passed every arm on all five servers
-  - [x] **DONE (2026-11-02) — the pooled cross-engine evidence run** (#508): two full runs (`small,medium`, UCI, TSBS, all five servers) pooled with `weft-xbench combine`, in `bench/reports/phase1-pooled/`. 319 of 320 gates pass; the one failure is TimescaleDB's `double` downsample, whose answer differs between runs in the last bits, so `combine` refuses to pool it. 105 of 112 verdicts hold in both runs, and none flips between a win and a loss: 17 wins, all against portable SQL (five at `medium`, TSBS and UCI interpolation), 85 losses (every load, the stored downsample, and every comparison with client-side interpolation) and 3 within noise
+  - [ ] **NEXT — the pooled cross-engine evidence run** (#508): two full runs (`small,medium`, UCI, TSBS) combined with `weft-xbench combine`; the 2026-11-02 attempt stopped when ClickHouse ran out of memory beside an 82 GB local model server, so it waits for a quiet host. No cross-engine figure from the three classes is a published claim until then
 - [x] **DONE (2026-11-02) — Report surfaces beyond JSON/HTML/Parquet** (#149): Markdown, CSV and Prometheus text (`--markdown-report`, `--csv-report`, `--prom`, `weft-bench export`), and a Grafana dashboard over the Prometheus text (`bench/grafana/`)
 - [x] **DONE (2026-11-02) — Anti-Goodhart (Phase 1.3)** (#150): `scripts/bench/check-separation.py` in CI (no engine crate depends on or detects a benchmark crate); HONESTY.md maps every rule to what enforces it
 
@@ -326,7 +326,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
   - [ ] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
   - [ ] **FRE-6b** Strict request parsing and caller updates
-  - [ ] **SEC-7** Key reload
+  - [x] **SEC-7** Key reload
   - [ ] **SEC-9** Audit
   - [ ] **SEC-11** Aspect-name traversal HTTP regression tests
   - [ ] **PAC-7** Operator CLI, exit-code contract and store identity at startup
