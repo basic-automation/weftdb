@@ -429,6 +429,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// Calculate overlap needed for interpolation method (its degree)
 		let overlap_points = method.degree();
 		let overlap_duration = step_duration * i32::try_from(overlap_points).unwrap_or(3);
+		// The knots a chunk needs past each edge, however far away they are (#506).
+		let bracket_knots = overlap_points.max(1);
 
 		// Target ~50,000 output points per chunk for responsive streaming
 		let chunk_size = 50_000i64;
@@ -490,6 +492,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				};
 
 				let measurements = match db.fetch_measurements_for_chunk(&aspect_id, fetch_start, fetch_end).await {
+					Ok(m) => m,
+					Err(e) => return Some((Err(e), (chunk_end, None, true))),
+				};
+				let measurements = match Self::widen_to_brackets(&db, &aspect_id, measurements, (current_chunk_start, chunk_end), (fetch_start, fetch_end), (range_start, end_time), bracket_knots, chunk_dur).await {
 					Ok(m) => m,
 					Err(e) => return Some((Err(e), (chunk_end, None, true))),
 				};
@@ -1448,6 +1454,51 @@ impl Database {
 
 /// Helper methods for streaming operations that don't require &self
 impl Database {
+	/// Extends one `analyze_range` chunk's measurements until `knots` lie past each edge of the
+	/// chunk, or the requested range runs out (#506).
+	///
+	/// The chunk fetch reaches only `degree` steps past the chunk, which is enough on a series
+	/// sampled every step. Across a gap longer than that it is not: a chunk inside the gap read
+	/// nothing and came out as one `0`, and a chunk at its edge was interpolated without the knot
+	/// that closes it. So each side is probed outward through the same chunk fetch, doubling the
+	/// window from one chunk's span, until the knots are found or the range's own bound is
+	/// reached. The bound is kept because `analyze_range` does not extrapolate past the requested
+	/// range. On dense data the first fetch already holds the knots and nothing more is read.
+	async fn widen_to_brackets(db: &Self, aspect_id: &AspectId, mut measurements: Vec<Measurement>, (chunk_start, chunk_end): (DateTime<Utc>, DateTime<Utc>), (fetch_start, fetch_end): (DateTime<Utc>, DateTime<Utc>), (range_start, range_end): (DateTime<Utc>, DateTime<Utc>), knots: usize, span: chrono::Duration) -> Result<Vec<Measurement>> {
+		let span = span.max(chrono::Duration::milliseconds(1));
+
+		let mut after = measurements.iter().filter(|m| m.timestamp() > chunk_end).count();
+		let (mut low, mut width) = (fetch_end, span);
+		while after < knots && low < range_end {
+			let high = low.checked_add_signed(width).map_or(range_end, |h| h.min(range_end));
+			// The fetch is inclusive at both ends, and `low` was the previous window's `high`.
+			let more: Vec<Measurement> = <Self as crate::types::database::traits::outputs::Outputs>::fetch_measurements_for_chunk(db, aspect_id, low, high).await?.into_iter().filter(|m| m.timestamp() > low).collect();
+			after += more.len();
+			measurements.extend(more);
+			low = high;
+			width = width + width;
+		}
+
+		let mut before = measurements.iter().filter(|m| m.timestamp() < chunk_start).count();
+		let (mut high, mut width) = (fetch_start, span);
+		let mut earlier: Vec<Measurement> = Vec::new();
+		while before < knots && high > range_start {
+			let low = high.checked_sub_signed(width).map_or(range_start, |l| l.max(range_start));
+			let mut more: Vec<Measurement> = <Self as crate::types::database::traits::outputs::Outputs>::fetch_measurements_for_chunk(db, aspect_id, low, high).await?.into_iter().filter(|m| m.timestamp() < high).collect();
+			before += more.len();
+			// Each window is older than everything gathered so far.
+			more.append(&mut earlier);
+			earlier = more;
+			high = low;
+			width = width + width;
+		}
+		if !earlier.is_empty() {
+			earlier.append(&mut measurements);
+			measurements = earlier;
+		}
+		Ok(measurements)
+	}
+
 	/// Fetch a correlation by ID without requiring &self (for use in streaming closures)
 	async fn fetch_correlation_by_id(db: &turso::Database, db_path: &str, cache: &std::sync::Arc<tokio::sync::Mutex<cache::DatabaseCache>>, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<Correlation> {
 		// Check cache first

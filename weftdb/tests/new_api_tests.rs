@@ -835,3 +835,44 @@ async fn a_chunked_range_keeps_to_its_step_grid() {
 
 	common::remove_database(&db_name);
 }
+
+/// A gap longer than a chunk is interpolated between the knots on either side of it (#506).
+/// Each chunk read only `degree` steps past its edges, so a chunk inside the gap found no
+/// measurement and came out as one `0` at its start, and the chunks at the gap's edges ran
+/// without the knot that closes it. The series is `value = minute`, so a straight line across
+/// the gap must give every minute its own index back.
+#[tokio::test]
+async fn a_gap_longer_than_a_chunk_keeps_both_brackets() {
+	let db_name = format!("test_chunk_gap_{}", Uuid::new_v4());
+	common::remove_database(&db_name);
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("gap").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "value", &Resolution::Minutes, None).await.expect("Failed to track aspect").id();
+	let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+	// 149,990 minutes without a sample: three of the range's four 50,000-step chunks hold none.
+	let minutes: Vec<i64> = (0..=10).chain(150_000..=150_010).collect();
+	let measurements: Vec<_> = minutes.iter().map(|&m| InputMeasurement::new(start + chrono::Duration::minutes(m), BigDecimal::from(m))).collect();
+	db.capture_measurement_chunk(&aspect, DatasetId::new(), &measurements).await.expect("Failed to capture");
+
+	let last = 150_010_i64;
+	let mut stream = db.analyze_range(&aspect, start, start + chrono::Duration::minutes(last), Resolution::Minutes, Spline::Linear).await.expect("Failed to analyze range");
+	let mut points = Vec::new();
+	while let Some(point) = stream.next().await {
+		points.push(point.expect("a point"));
+	}
+
+	assert_eq!(points.len(), usize::try_from(last + 1).unwrap(), "one point per minute of the range");
+	let wrong: Vec<_> = points
+		.iter()
+		.enumerate()
+		.filter(|(i, p)| {
+			let minute = i64::try_from(*i).unwrap();
+			p.timestamp != start + chrono::Duration::minutes(minute) || (bigdecimal::ToPrimitive::to_f64(&p.value).unwrap() - minute as f64).abs() > 1e-6
+		})
+		.map(|(_, p)| (p.timestamp, p.value.to_string()))
+		.take(3)
+		.collect();
+	assert!(wrong.is_empty(), "every minute lies on the line across the gap, but these do not: {wrong:?}");
+
+	common::remove_database(&db_name);
+}
