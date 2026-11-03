@@ -68,6 +68,7 @@ use crate::{
 
 /// Request body for `POST /api/v1/downsample`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DownsampleRequest {
 	/// Bucket width (default minutes), aligned to the epoch grid.
 	#[serde(default)]
@@ -463,6 +464,7 @@ pub async fn downsample_csv(State(metrics): State<SharedMetrics>, StrictJson(req
 
 /// Query parameters for the ILP downsample endpoint.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DownsampleIlpParams {
 	/// Numeric field to project each line-protocol record onto (required).
 	pub field: String,

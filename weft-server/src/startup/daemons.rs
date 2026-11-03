@@ -1,5 +1,6 @@
 //! Startup phase 4 — the background tasks the operator asked for: the reconcile
-//! daemon, the backup daemon, and the one-shot GPU calibration.
+//! daemon, the backup daemon, the key-reload watcher (SEC-7), and the one-shot
+//! GPU calibration.
 //!
 //! None of them is required for the server to serve. Since ROB-3 they are
 //! not spawned detached with their handles dropped: each is registered in
@@ -17,7 +18,7 @@
 use std::{sync::Arc, time::Duration};
 
 use weft_server::{
-	gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, Daemons, ReconcileDaemonConfig
+	gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, spawn_backup_daemon, spawn_key_reload_watcher, spawn_reconcile_daemon, AppState, BackupDaemonConfig, Daemons, ReconcileDaemonConfig
 };
 
 /// Await one spawned daemon task, re-raising its panic in the calling
@@ -191,6 +192,32 @@ pub(crate) fn spawn_backup_if_configured(state: &AppState, daemons: &Daemons) ->
 	let keep_note = keep.map_or_else(|| " (retaining every snapshot)".to_string(), |n| format!(" (retaining the newest {n} generated snapshot(s))"));
 	println!("backup daemon: enabled (every {interval_secs}s into {}{keep_note})", base.display());
 	Ok(())
+}
+
+/// Register the key-reload watcher (SEC-7) when authentication is on:
+/// it waits for `SIGHUP` and reloads the keys file in force, so an
+/// operator who edits the file — adds a key, removes one, changes a
+/// role — applies the edit with `kill -HUP` instead of a restart. A
+/// malformed edit is refused by the reload itself and the keys in
+/// force stay; the watcher logs either outcome. Registered in the
+/// Daemons registry (ROB-3) like the other background tasks:
+/// supervised, and stopped by the registry's shutdown watch.
+///
+/// A no-op when authentication is off or explicitly disabled: there is
+/// no keys file to reload.
+pub(crate) fn spawn_key_reload_if_configured(state: &AppState, daemons: &Daemons) {
+	if !state.auth().is_enabled() {
+		return;
+	}
+	// Owned, so the registry's factory can hold it for the process
+	// lifetime; every clone enforces (and reloads) the same shared
+	// store the router's state carries.
+	let auth = state.auth().clone();
+	drop(daemons.spawn("key-reload", move || {
+		let handle = spawn_key_reload_watcher(auth.clone());
+		await_supervised(handle)
+	}));
+	println!("key reload: enabled (SIGHUP reloads the keys file in force; a malformed edit is refused and the keys in force stay)");
 }
 
 /// Start the GPU calibration ([`gpu::calibrate`]) in the background on tokio's blocking

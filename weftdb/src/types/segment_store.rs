@@ -2346,10 +2346,11 @@ mod tests {
 		assert_eq!(on_disk.len() as u64, descriptor.byte_len);
 		assert_eq!(descriptor.row_count, 5);
 		assert_eq!(count, 1);
-		// The file round-trips back to the original data.
-		let (rt, rv) = Segment::read_from(&on_disk).expect("decodes").decode();
+		// The file round-trips back to the original data, through the
+		// frame-reader API the store's read sites use (TAG-4).
+		let (rt, rv) = frame_read::read_full(&descriptor.path, &on_disk).expect("decodes").decode_nullable();
 		assert_eq!(rt, ts);
-		assert_eq!(rv, vs);
+		assert_eq!(rv, vs.into_iter().map(Some).collect::<Vec<_>>());
 	}
 
 	/// D-S13: the same batch twice commits once. The first ingest returns
@@ -3307,6 +3308,51 @@ mod tests {
 		assert_eq!(ts, vec![30, 40, 100, 110]);
 	}
 
+	/// TAG-4: a frame wrapped in the v7 envelope — a framing no legacy
+	/// layout-specific reader understands — still reads through the store's
+	/// public read sites, because they go through the frame-reader API and
+	/// let the frame's own header choose the reader.
+	#[tokio::test]
+	async fn an_envelope_wrapped_frame_reads_through_the_store() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let descriptor = store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("seals");
+		// Rewrite the sealed frame in place, wrapped verbatim in an envelope.
+		let plain = tokio::fs::read(&descriptor.path).await.expect("reads the frame");
+		let wrapped = weft_physical_type::wrap_frame_envelope(&plain, &[]).expect("wraps");
+		tokio::fs::write(&descriptor.path, &wrapped).await.expect("rewrites the frame");
+		let (ts, vs) = store.read_time_range("a", 0, 100).await.expect("the enveloped frame reads");
+		let hit = store.read_point("a", 10).await.expect("the enveloped frame answers a point read");
+		drop(store);
+		assert_eq!(ts, vec![0, 10, 20]);
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2")), Some(bd("3"))]);
+		assert_eq!(hit, Some(bd("2")));
+	}
+
+	/// TAG-4: a frame written by a newer build fails a store read with a
+	/// **typed** error — the `FrameFaultError` under the context classifies
+	/// it `Undecodable { newer_format: true }`, so a caller acts on the
+	/// class (C5) rather than parsing the sentence.
+	#[tokio::test]
+	async fn a_newer_format_frame_fails_a_store_read_with_a_typed_error() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let descriptor = store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("seals");
+		// Restamp the frame's own version field past this build's registry
+		// and re-stamp its trailer, so the reader reaches the version check.
+		let mut bytes = tokio::fs::read(&descriptor.path).await.expect("reads the frame");
+		let bumped = weft_physical_type::FRAME_VERSION_MAX_KNOWN + 1;
+		bytes[7..9].copy_from_slice(&bumped.to_le_bytes());
+		let body = bytes.len() - 4;
+		let checksum = weft_physical_type::crc32(&bytes[..body]);
+		bytes[body..].copy_from_slice(&checksum.to_le_bytes());
+		tokio::fs::write(&descriptor.path, &bytes).await.expect("rewrites the frame");
+		let error = store.read_time_range("a", 0, 100).await.expect_err("a newer frame does not decode");
+		drop(store);
+		let fault = error.downcast_ref::<crate::FrameFaultError>().expect("the fault class travels under the context");
+		assert!(matches!(fault.fault(), weft_physical_type::FrameFault::Undecodable { newer_format: true }), "a newer frame is not a corrupt file: {fault:?}");
+	}
+
 	#[tokio::test]
 	async fn read_value_range_prunes_by_value_span() {
 		let dir = TempDir::new().expect("tempdir");
@@ -3555,8 +3601,10 @@ mod tests {
 		assert_eq!(rvs, vs);
 		assert_eq!(null_hit, None, "the null at 30 stays null (present-bit cleared)");
 		assert_eq!(suffix_hit, Some(bd("4")));
-		assert!(PagedSegment::read_from(&prefix_bytes).is_ok(), "prefix keeps the paged frame");
-		assert!(PagedSegment::read_from(&suffix_bytes).is_ok(), "suffix keeps the paged frame");
+		// Both halves still decode as paged frames through the frame reader
+		// (TAG-4): a paged frame is the one that reports a page height.
+		assert_eq!(frame_read::read_full("prefix", &prefix_bytes).expect("prefix decodes").rows_per_page(), Some(3), "prefix keeps the paged frame");
+		assert_eq!(frame_read::read_full("suffix", &suffix_bytes).expect("suffix decodes").rows_per_page(), Some(3), "suffix keeps the paged frame");
 	}
 
 	#[tokio::test]
@@ -5273,8 +5321,10 @@ mod tests {
 			assert!(descriptors.len() > 1, "the fixture must span several segments");
 			for descriptor in &descriptors {
 				let bytes = store.read_frame(descriptor).await.expect("reads the frame");
-				let decoded = if descriptor.format_version == PAGED_SEGMENT_FORMAT_VERSION { weft_physical_type::weftseg::read_paged_segment_range_physical(&bytes, i64::MIN, i64::MAX) } else { weft_physical_type::weftseg::read_segment_range_physical(&bytes, i64::MIN, i64::MAX) };
-				let (ts, vs) = decoded.expect("decodes");
+				// TAG-4: the frame is read through the frame-reader API, which
+				// chooses its reader from the frame's own header — never from
+				// the index row's `format_version` copy.
+				let (ts, vs) = frame_read::read_range_physical(descriptor.path.as_str(), &bytes, i64::MIN, i64::MAX).expect("decodes");
 				let (nanos, mantissas, scale) = scaled_rows(&ts, &vs, i64::MIN, i64::MAX, TimeUnit::Millis).expect("a ScaledI64 frame is admitted to the integer path");
 				assert_eq!(scale, 4, "the declared scale reaches the reducer");
 				assert!(weft_reduce::reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Minutes, None, None, aggs).expect("reduces").is_some(), "every requested reduction is integer-native");

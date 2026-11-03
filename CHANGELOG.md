@@ -8,6 +8,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
+  (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
+  gets an attempt record before it runs and an outcome record after, and the operation is
+  refused `503 audit_unavailable` when either record cannot be written (fail-closed).
+  Committed ingests, authentication denials and daemon panics land in the same file as
+  `weft_audit` events. `WEFT_AUDIT_FILE` names the file; unset, it lives at
+  `<store root>/audit.jsonl` (or `./weft-audit.jsonl` with no store configured), and a
+  server that cannot open it refuses to start.
+
 ### Fixed
 
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
@@ -127,6 +138,21 @@ only the control plane, not the segment frames.
   frame that does not verify, or a store whose write floor this build cannot honour. Both
   codes are the ones the server's startup already returns, so a supervisor reads one
   vocabulary.
+- **Every `weftdb` read site is on the frame-reader API** (1.0 plan TAG-4).
+  X-FRAME had already routed `SegmentStore`'s production decode sites through
+  `weftdb::types::frame_read` (the `read_frame*` readers, with the typed
+  `FrameFaultError` under the historical operator sentence); the crate's
+  remaining direct uses of the legacy layout-specific readers were in its own
+  tests, one of them still choosing a reader from the index row's
+  `format_version` copy. Those sites now read through `frame_read` too, so no
+  code in the `weftdb` crate names a legacy reader, and two store-level tests
+  pin the contract at the public API: a v7-envelope-wrapped frame reads
+  through `read_time_range`/`read_point`, and a frame written by a newer
+  build fails a store read with a downcastable
+  `FrameFaultError { Undecodable { newer_format: true } }` rather than a
+  sentence a caller would have to parse. No behaviour changes for any frame
+  this build could already read; `weft-bench`'s harnesses still measure the
+  legacy readers by name, as their reports say they do.
 - **A container image that is proven, not merely built** (1.0 plan PAC-9):
   `packaging/docker/Dockerfile` builds `weft-server` in the same `manylinux_2_28` baseline the
   release binaries use — so the image carries the release's glibc 2.28 floor, read back out of the
@@ -143,6 +169,15 @@ only the control plane, not the segment frames.
   every pull request. Nothing is pushed to a registry: the artifact is the proof, and publishing is
   a separate decision. One limitation is documented where it will be read — the health check
   speaks plain HTTP, so a container configured with `WEFT_TLS_CERT_FILE` reads unhealthy.
+- **Strict request parsing** (FRE-6b): every request type the server extracts — JSON
+  bodies and query parameters alike, on the ingest, compute, storage-read, maintenance
+  and backup surfaces — now refuses a field or parameter it does not have, instead of
+  silently ignoring it the way serde does by default. A caller with a typo
+  (`require_sorte` on an ingest, `limti` on a read) previously got a successful answer
+  to a different request than the one it meant to send; it now gets a `400` naming the
+  unknown field, in the §4 envelope (`invalid_json` for a body, `bad_request` for a
+  query). No in-repo caller sent an unknown field, so none needed updating; the whole
+  workspace test suite is the evidence.
 - **Startup ordering, exposure matrix, auth-off guard, metrics auth** (security track SEC-8):
   the startup phase list is now named (`startup::PHASES`) and pinned by a test against the
   binary's actual call order. The exposure matrix (plan C8, decision 7) is complete: a

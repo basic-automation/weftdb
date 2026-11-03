@@ -28,8 +28,9 @@ WeftDB is pre-beta. `weft-server` can serve TLS (`WEFT_TLS_CERT_FILE`,
 `WEFT_TLS_KEY_FILE`) and authenticate API keys with roles (`WEFT_KEYS_FILE`, minted by
 `weft-server keygen`), and a non-loopback bind refuses to start without a keys file unless
 `WEFT_AUTH=disabled` says a gateway in front does the authenticating. What it does not have
-yet: key reload without a restart, audit logging, and the security review the roadmap
-requires before 1.0. Reports against TLS or authentication are in scope; the missing pieces
+yet: the security review the roadmap requires before 1.0. (Key reload without a restart
+and the fsynced audit log have landed since: `WEFT_AUDIT_FILE`, default
+`<store root>/audit.jsonl`.) Reports against TLS or authentication are in scope; the missing pieces
 above are known gaps tracked on the roadmap.
 
 Bound to a loopback address (the default), `weft-server` only answers requests

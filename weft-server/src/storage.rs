@@ -60,6 +60,7 @@ const CSV_CONTENT_TYPE: &str = "text/csv; charset=utf-8";
 /// aspect's declared `TimeUnit`** (the store keeps timestamps as integers; the
 /// unit travels in the response schema metadata).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeRangeParams {
 	/// Inclusive window start (epoch integer in the aspect's declared unit).
 	pub start: i64,
@@ -71,6 +72,7 @@ pub struct TimeRangeParams {
 /// each parsed losslessly as a `BigDecimal` (WeftDB's logical numeric type — no
 /// float round-trip on the wire).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValueRangeParams {
 	/// Inclusive lower value bound (decimal text).
 	pub lo: String,
@@ -291,6 +293,7 @@ pub struct StoredPoint {
 /// supersedes any explicit `offset`; a `page` without a page size falls back to
 /// page 1 (offset 0).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PointsRangeParams {
 	/// Inclusive window start (epoch integer in the aspect's declared unit).
 	pub start: i64,
@@ -447,6 +450,7 @@ fn next_cursor(start: usize, count: usize, total: usize) -> Option<String> {
 /// band (as decimal text) plus the same declarative B-rest pagination as the time
 /// read.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValuePointsParams {
 	/// Inclusive lower value bound (decimal text).
 	pub lo: String,
@@ -512,6 +516,7 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 /// Query parameters for the single-instant point lookup: the instant `t` to read
 /// (an epoch integer in the aspect's declared `TimeUnit`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PointParams {
 	/// The instant to look up (epoch integer in the aspect's declared unit).
 	pub t: i64,
@@ -569,6 +574,7 @@ pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<Str
 
 /// Query parameters for the batch point lookup: a comma-separated list of instants.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MultiPointParams {
 	/// Comma-separated epoch integers in the aspect's declared unit (e.g. `1000,2000,3000`).
 	pub t: String,
@@ -896,6 +902,7 @@ pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreSt
 /// resolution and aggregation list use the same tokens the compute downsample
 /// endpoint accepts.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageDownsampleParams {
 	/// Inclusive window start (epoch integer in the aspect's declared unit).
 	/// Defaults to the whole stored history when omitted.

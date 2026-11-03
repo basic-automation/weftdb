@@ -208,10 +208,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// ROB-3: the Daemons registry owns every background task this process
 	// runs — supervised, and stopped on its shared shutdown watch (the
 	// watch D-S14's amendment shares with this registry) once serving ends.
-	let daemons = weft_server::Daemons::new();
+	let daemons = weft_server::Daemons::new().with_audit_log(state.audit_log().cloned());
 
 	daemons::spawn_reconcile_if_configured(&state, &daemons)?;
 	daemons::spawn_backup_if_configured(&state, &daemons)?;
+	// SEC-7: the key-reload watcher, so a SIGHUP after a keys-file edit
+	// reloads the keys in force instead of needing a restart.
+	daemons::spawn_key_reload_if_configured(&state, &daemons);
 
 	let listener = serve::bind(addr, tls.is_some()).await?;
 	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
@@ -223,6 +226,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// Serving is over: raise the registry's shutdown watch so no daemon
 	// outlives the server it maintains, and none restarts from here.
 	daemons.shutdown();
+	// C9's drain order: serve → SEC-9 TaskTracker → store.shutdown().
+	// The audit tracker drains next, so an audited handler still in
+	// flight when serving ended writes its outcome record before the
+	// store closes under it.
+	if let Some(log) = state.audit_log() {
+		log.close_and_drain().await;
+	}
 	// Serving stopped cleanly (including a signal before serving, which exits 0
 	// without accepting a connection): shut the store down — the closing
 	// reaper pass, then the clean-shutdown commit (D-S14's

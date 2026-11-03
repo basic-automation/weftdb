@@ -21,6 +21,7 @@ use crate::{
 
 /// Query parameters for `POST /api/v1/storage/restore/drill`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreDrillParams {
 	/// The backup subdirectory to rehearse restoring, under the same backup root the
 	/// snapshot endpoint writes to, in the same label grammar
@@ -135,6 +136,7 @@ async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path:
 
 /// Query parameters for `POST /api/v1/storage/backup`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupParams {
 	/// A subdirectory name for this snapshot under the backup root, in the grammar
 	/// `[A-Za-z0-9][A-Za-z0-9._-]{0,99}` and not ending with `.`, so an API caller can never

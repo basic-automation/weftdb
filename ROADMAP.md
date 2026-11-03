@@ -324,10 +324,12 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
   - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
   - [x] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
-  - [ ] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
-  - [ ] **FRE-6b** Strict request parsing and caller updates
-  - [ ] **SEC-7** Key reload
-  - [ ] **SEC-9** Audit
+  - [x] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
+  - [x] **FRE-6b** Strict request parsing and caller updates
+  - [x] **SEC-7** Key reload
+
+  - [x] **SEC-9** Audit
+
   - [ ] **SEC-11** Aspect-name traversal HTTP regression tests
   - [ ] **PAC-7** Operator CLI, exit-code contract and store identity at startup
   - [ ] → **ROB-11** Admission II

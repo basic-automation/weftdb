@@ -3359,3 +3359,141 @@ kill soak cannot see a missing fsync, so the privileged power-loss validation
 §9 durability tick waits for it. No nightly compare gate: a cell either holds
 or it does not; the first successful workflow run is the hand-compared
 baseline.
+
+## 2026-11-02 — TAG-4 scope: the weftdb crate's read sites, audited (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Context:** the 1.0 plan (§6 W6, "X-SPLIT-STORE → TAG-4") and ROADMAP line
+307 name the slice in one line — "weftdb read sites on the frame-reader API
+with typed errors" — without itemizing the sites. X-FRAME (W2) had already
+built `weftdb::types::frame_read` and routed `SegmentStore`'s production
+decode sites through it, which left the slice's remaining scope ambiguous.
+
+**Audit (on main c766830, post X-SPLIT-STORE):** every frame decode in the
+`weftdb` crate was inventoried. Production sites — `read_time_range`,
+`read_point(s)`, `read_value_range`/`decode_all`, `downsample_partial`'s
+`segment_partial`, maintenance's `read_bound_frame`/`merge_members`, and
+fsck/adoption's `read_full` calls — already decode through `frame_read`
+(`read_frame*` underneath, errors carrying the typed `FrameFaultError`).
+The remaining direct legacy-reader uses in the crate were three test read
+sites in `segment_store.rs`: the scaled-downsample helper dispatched on the
+index row's `format_version` to `read_segment_range_physical` /
+`read_paged_segment_range_physical` — the exact routing TAG-4 removes — and
+two format checks used `Segment::read_from` / `PagedSegment::read_from`.
+
+**Chosen:** TAG-4 completes the migration inside the `weftdb` crate. Those
+three sites now read through `frame_read` (the paged-format check asserts
+the frame reader's `rows_per_page()` instead of a layout-specific reader),
+the `read.rs` doc references name the frame-reader entry points, and two
+store-level tests pin the acceptance at the public API: an envelope-wrapped
+(v7) frame reads through `read_time_range`/`read_point`, and a
+newer-format frame fails a store read with a downcastable
+`FrameFaultError { Undecodable { newer_format: true } }`. After this slice,
+no code in `weftdb/src` names a legacy layout-specific reader.
+
+**Explicitly out of scope, deliberately left as they are:** `weft-bench`'s
+harnesses (`compression`, `point_lookup`, `range_fetch`) call the legacy
+readers *by name* — they measure those readers, and their reports and the
+README claims name them, so rerouting them through `read_frame*` would
+falsify the measurements. `backup.rs`'s restore verification uses
+`describe_frame`, a header/describability check (D-S16's A3), not a decode
+read site. `quarantine.rs`'s classifier already takes the typed
+`WeftSegError` source under `FrameFaultError`; frame error classes *in
+recovery* are TAG-9 (W8), not this slice.
+## 2026-11-02 — FRE-6b "strict request parsing": the shape of the refusal — FLAGGED FOR MERGE REVIEW
+
+**Grounded:** FRE-6b's title names no mechanism. The plan assigns the slice to two
+lanes (L-INGEST and L-COMPUTE, §2), lists it among the §9 contract slices required
+for the semver promise, and its sibling half FRE-6a landed as the X-ERR error
+envelope: `StrictJson`/`StrictQuery` already refuse a body or query the server
+cannot *read*. What they still accepted was a request it could read but that named
+something the endpoint does not have — every request type deserialized with serde's
+default leniency, so an unknown JSON field or query parameter was silently ignored
+and the caller got a successful answer to a different request than the one it sent
+(the request-side twin of the silent narrowing FRE-5 removed from responses). The
+codebase already holds the strict shape for a file it parses: SEC-6's keys file
+refuses unknown fields (`auth.rs`, `#[serde(deny_unknown_fields)]`, with the
+rationale spelled out there — a typo'd field silently ignored mints a key with
+defaults the operator never chose).
+
+**Chosen:** `#[serde(deny_unknown_fields)]` on every request type `weft-server`
+extracts — 26 types across `backup_routes`, `declare`, `downsample`, `ingest`,
+`interpolate` (including the `SplineSpec` enum, so the `polynomial` variant's
+fields are strict too), `maintain` and `storage` — covering JSON bodies and query
+parameters, top-level and nested. The refusal is the extractor's existing one, no
+new vocabulary: `400 invalid_json` for a body, `400 bad_request` for a query, each
+naming the unknown field. `weft-server/tests/strict_parsing.rs` pins it twice:
+over HTTP on representative routes from each surface, and per type, enumerating
+every request type so a future endpoint cannot reintroduce a lenient one without
+extending the list.
+
+**Callers:** the slice's "caller updates" half came out empty on evidence, not by
+omission — no in-repo caller (weft-server's own suites, weft-bench's soak client,
+the packaging/compat scripts) sends a field or parameter any endpoint does not
+have; the full workspace bar passing unchanged is the check. The one deliberate
+compatibility note: the B-rest aliases (`take`/`page`, `interpolation=`) are real
+fields of their types, so alias-speaking clients are unaffected; only names no
+endpoint has ever had are refused.
+## 2026-11-02 — SEC-7: key reload mechanism (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan (§6 W6) and the ROADMAP name SEC-7 "Key reload" with the
+acceptance "API keys can be reloaded without a restart", and SEC-6's entry reserved
+the slice, but neither names the trigger, nor what a bad edit does.
+
+**Chosen:** the store in force is a swappable snapshot (`auth::SharedKeyStore`
+wrapping SEC-6's `KeyStore`); a reload re-reads and re-validates the whole keys
+file and swaps it in only when the new file parses clean — a malformed edit is
+refused and the keys in force stay, which is SEC-6's "never a partially enforced
+table" carried into the edit path. The running server's trigger is `SIGHUP`,
+handled by a watcher registered in the Daemons registry whenever authentication
+is on, logging each outcome; the library also exposes `AuthConfig::reload_keys`
+for embedders. **Why:** SIGHUP is the conventional Unix reload signal and needs
+no new route, scope or setting — PAC-5b's strict configuration refuses invented
+`WEFT_*` names, and a reload route would be API surface the plan never named —
+while polling the file's mtime would silently pick up half-written edits, where
+a signal is the operator saying the edit is finished. §10's deferral stands:
+this is the API-key file only, not SEC-12's certificate hot reload.
+## 2026-11-02 — SEC-9: the audit log's shape where decision 8 does not pin it (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** plan §11 decision 8 (fsynced append-only JSONL, an attempt and an outcome
+record per admin or mutating operation, fail-closed; ingest, auth denials and daemons emit
+`weft_audit` events), C9 (shutdown drain: serve → SEC-9 TaskTracker → `store.shutdown()`),
+C12 (audited routes catch `JoinError::is_panic` inside their own task), SEC-3's frozen
+`RouteSpec.audit` table (every mutating route already carries `Audit::AttemptOutcome`), and
+X-ERR's reserved `503 audit_unavailable`. The points the sources do not pin, chosen here:
+
+1. **One middleware, the registry's own table.** `audit::audit_route` sits inside the auth
+   layer and outside the gate, looks the matched route up in the sealed registry, and
+   audits exactly the routes whose spec says `AttemptOutcome`. Reads/probes/compute
+   (`Audit::None`) are never recorded. Because auth runs first, a denial is an *event*,
+   never an attempt, and an attempt names the authenticated principal (key id + role —
+   never the key).
+2. **Fail-closed means both records.** A failed attempt write means the handler never
+   runs (`503 audit_unavailable`). A failed *outcome* write also answers
+   `503 audit_unavailable`: the operation may have completed, but the envelope claims
+   nothing either way, and the latched failure refuses every later audited operation
+   until restart. Events (committed ingest, auth denial, daemon panic) are best-effort
+   at the emit site — none of them can be un-happened — but a failed event write still
+   poisons the log, so the next audited operation refuses.
+3. **Record shape.** `{"v":1,"seq","ts_ms","kind":attempt|outcome|event,...}`; an
+   attempt's id is its own `seq`, named back by the outcome's `audit_id`. Wall-clock
+   `ts_ms`, because a trail is correlated against other systems' clocks. Reopening a
+   file continues its sequence by counting lines; a final line without a terminator is
+   a torn record and refuses the open (it was never fsynced, so it was never reported
+   recorded — the operator truncates it).
+4. **The file's place.** `WEFT_AUDIT_FILE` names it; else `<store root>/audit.jsonl`;
+   else `./weft-audit.jsonl`. The binary opens it in the state phase — after the store
+   root's filesystem check, since its default home is inside that root — and refuses
+   to start (exit 78) when it cannot (the keys file's rule). A router state with no log attached —
+   the stateless test states — passes audited routes through, as a keyless state passes
+   requests unauthenticated; the binary always attaches one.
+5. **C12's task boundary is the audit layer's spawn.** Audited handlers run in a task
+   drawn from the log's tracker; a panic returns as a `JoinError` the layer records
+   (`result:"panic"`) and maps the way ROB-3's catch layer would have (ingest by
+   D-S14's pre-commit arm, since no phase is readable at this boundary; everything else
+   `500 internal`, redacted). ROB-3's layer remains the catch for non-audited routes,
+   and ROB-2's abort still fires during the unwind, before any catch. `close_and_drain`
+   is startup's C9 step between `daemons.shutdown()` and `store.shutdown()`.
+6. **Daemon events come from the registry.** `Daemons` gains an optional audit handle;
+   supervision emits `daemon_panic` (with `restarted` and the restart count) beside its
+   stderr line. The backup/reconcile ticks themselves keep reporting through their own
+   logs — their *failures to stay alive* are what the trail records.
