@@ -19,6 +19,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `<store root>/audit.jsonl` (or `./weft-audit.jsonl` with no store configured), and a
   server that cannot open it refuses to start.
 
+### Changed
+
+- A maintenance merge (squash, squash to a target size, overlap reconcile) writes its output
+  as a paged frame of 4,096-row pages once it holds more than one page, instead of one
+  single-block frame. A small window after a squash skips the pages it does not touch rather
+  than decoding the segment's value column from its start: on 10M UCI rows squashed to
+  65,536-row segments an hour reads in 0.25 ms (0.18 ms before the squash, 0.50 ms with
+  single-block output) and the year window in 11.3 ms (13.8 ms before). The squashed store is
+  1.357 B/pt rather than 1.341, still below the 1.414 of the 1,024-row seals it replaced.
+
+
 ### Fixed
 
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
