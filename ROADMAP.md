@@ -327,7 +327,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
   - [ ] **FRE-6b** Strict request parsing and caller updates
   - [ ] **SEC-7** Key reload
-  - [ ] **SEC-9** Audit
+  - [x] **SEC-9** Audit
   - [ ] **SEC-11** Aspect-name traversal HTTP regression tests
   - [ ] **PAC-7** Operator CLI, exit-code contract and store identity at startup
   - [ ] → **ROB-11** Admission II

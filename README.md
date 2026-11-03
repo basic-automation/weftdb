@@ -163,7 +163,7 @@ The [HTTP API reference](docs/reference.md#http-api) lists every endpoint.
 **Not a good fit, today:**
 
 - **production systems that need a hardened, reviewed database.** WeftDB is pre-beta. It has
-  TLS and API keys with roles, but no audit log and no security review yet;
+  TLS and API keys with roles and a fsynced audit log, but no security review yet;
 - **generic analytics over wide tables:** use ClickHouse or DuckDB;
 - **regular, gap-free data:** if you never need values between samples, a conventional
   time-series database is simpler;
@@ -195,7 +195,7 @@ Run it yourself with `weft-xbench`; see [Benchmarking](docs/reference.md#benchma
 | | |
 |---|---|
 | Interpolation, gap fill, downsampling, HTTP API, Arrow/Parquet | Working, tested, benchmarked |
-| Security: TLS, API keys and roles | Working; no audit log or security review yet |
+| Security: TLS, API keys and roles | Working, with a fsynced audit log; no security review yet |
 | Crash safety | Durable writes and crash recovery; power-loss testing on real hardware still to do |
 | Backup and restore | Working, including `weft-server restore` |
 | Binaries, crates, container image | Binaries and crates released; container image built but not published |

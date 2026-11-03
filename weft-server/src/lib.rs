@@ -35,6 +35,9 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 pub mod admission;
+/// SEC-9's fsynced audit log: attempt/outcome records for audited
+/// routes, fail-closed, plus the `weft_audit` events (see [`audit`]).
+pub mod audit;
 pub mod auth;
 pub mod backup_daemon;
 pub mod backup_routes;
@@ -85,6 +88,7 @@ pub mod tls;
 pub mod trace;
 
 pub use admission::{Admission, AdmissionConfig, DEFAULT_QUERY_MAX_INFLIGHT, QUERY_MAX_INFLIGHT_ENV};
+pub use audit::{AuditLog, AUDIT_FILE_ENV, AUDIT_FILE_NAME};
 pub use auth::{AuthConfig, GeneratedKey, KeyStore, Principal, AUTH_KEYS_MODE, TOKEN_PREFIX};
 use axum::{middleware, Router};
 pub use backup_daemon::{backup_tick, list_generated_backups, prune_generated_backups, spawn_backup_daemon, BackupDaemonConfig};
@@ -225,6 +229,13 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// inserts, and a refused request never reaches a handler. With no keys
 /// configured in the state it is a pass-through.
 ///
+/// The audit layer ([`audit::audit_route`], SEC-9) sits inside the auth
+/// layer and outside the gate: a request auth refuses is an audit *event*,
+/// never an attempt, and a request the audit layer cannot record an
+/// attempt for never reaches its handler (fail-closed,
+/// `503 audit_unavailable`). With no audit log in the state it is a
+/// pass-through; the binary always attaches one.
+///
 /// The panic-catch layer ([`panic_catch::catch_panic`], ROB-3) sits inside
 /// the trace layer (so a caught panic's envelope still gets its
 /// `request_id`) and outside every other layer: it is the one layer that
@@ -233,7 +244,7 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// panic inside a control-plane write never reaches it: ROB-2's hook
 /// aborts during the unwind first.
 pub fn app_with_state(state: AppState) -> Router {
-	routes::build_registry_with_limits(state.ingest_config(), state.admission_config()).router().layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
+	routes::build_registry_with_limits(state.ingest_config(), state.admission_config()).router().layer(middleware::from_fn_with_state(state.clone(), audit::audit_route)).layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
 }
 
 /// Mark stored-data reads incomplete when the store holds suspect segments

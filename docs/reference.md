@@ -190,7 +190,8 @@ version, with the measured losses, how every benchmark figure is produced and ch
 
 - **You need a mature, hardened production database.** WeftDB's security layer is new and
   has not been reviewed: it serves TLS and enforces API keys with six fixed roles, but keys are
-  read once at startup (adding or revoking one means a restart), there is no audit log, and a
+  reloaded on SIGHUP without a restart, an fsynced audit log records every admin and mutating
+  operation (fail-closed), and a
   loopback bind with no keys file — the default — is unauthenticated. See
   [`SECURITY.md`](../SECURITY.md).
 - **Generic OLAP over wide tables.** WeftDB is not competing with ClickHouse or
@@ -227,7 +228,7 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 | Backup & restore (control plane) | Working, with verification and a rehearsal drill |
 | Observability — Prometheus metrics, OpenTelemetry traces | Working |
 | Crash consistency — power-loss durability, crash-safe maintenance | In progress ([design](https://basicautomation.io/projects/weftdb/docs/crash-consistency)) |
-| Security — TLS, API-key auth with roles, audit logs | TLS and API keys working; key reload and audit logs not started; not yet reviewed |
+| Security — TLS, API-key auth with roles, audit logs | Working, including SIGHUP key reload and the fsynced fail-closed audit log; not yet reviewed |
 | Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0 and v0.2.0, on GitHub |
 | Library crates on crates.io | Not published yet |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
@@ -467,8 +468,12 @@ are `401` (no key, or an unknown one), `403` (role too low) and `400 credentials
 key in the URL). `WEFT_AUTH=keys` requires the file, `WEFT_AUTH=disabled` turns auth off
 explicitly, and unset means on exactly when a keys file is mounted. While auth is off
 implicitly, a request carrying `Forwarded`/`X-Forwarded-*` is refused
-`403 proxied_request_requires_auth`. Keys are read once at startup; key reload and audit logs
-have not landed.
+`403 proxied_request_requires_auth`. Keys reload on SIGHUP without a restart. Every admin
+or mutating operation is recorded in the fsynced append-only audit log — an attempt record
+before it runs and an outcome record after, failing closed with `503 audit_unavailable`
+when the log cannot be written — and committed ingests, auth denials and daemon panics land
+there as `weft_audit` events. `WEFT_AUDIT_FILE` names the file; unset, it is
+`<store root>/audit.jsonl`, or `./weft-audit.jsonl` with no store configured.
 
 Set `WEFT_TLS_CERT_FILE` and `WEFT_TLS_KEY_FILE` (a PEM chain and key) to serve TLS
 (HTTP/1.1). Naming only one is a startup error. TLS is not authentication: a non-loopback bind

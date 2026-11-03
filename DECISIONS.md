@@ -3359,3 +3359,49 @@ kill soak cannot see a missing fsync, so the privileged power-loss validation
 §9 durability tick waits for it. No nightly compare gate: a cell either holds
 or it does not; the first successful workflow run is the hand-compared
 baseline.
+
+## 2026-11-02 — SEC-9: the audit log's shape where decision 8 does not pin it (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** plan §11 decision 8 (fsynced append-only JSONL, an attempt and an outcome
+record per admin or mutating operation, fail-closed; ingest, auth denials and daemons emit
+`weft_audit` events), C9 (shutdown drain: serve → SEC-9 TaskTracker → `store.shutdown()`),
+C12 (audited routes catch `JoinError::is_panic` inside their own task), SEC-3's frozen
+`RouteSpec.audit` table (every mutating route already carries `Audit::AttemptOutcome`), and
+X-ERR's reserved `503 audit_unavailable`. The points the sources do not pin, chosen here:
+
+1. **One middleware, the registry's own table.** `audit::audit_route` sits inside the auth
+   layer and outside the gate, looks the matched route up in the sealed registry, and
+   audits exactly the routes whose spec says `AttemptOutcome`. Reads/probes/compute
+   (`Audit::None`) are never recorded. Because auth runs first, a denial is an *event*,
+   never an attempt, and an attempt names the authenticated principal (key id + role —
+   never the key).
+2. **Fail-closed means both records.** A failed attempt write means the handler never
+   runs (`503 audit_unavailable`). A failed *outcome* write also answers
+   `503 audit_unavailable`: the operation may have completed, but the envelope claims
+   nothing either way, and the latched failure refuses every later audited operation
+   until restart. Events (committed ingest, auth denial, daemon panic) are best-effort
+   at the emit site — none of them can be un-happened — but a failed event write still
+   poisons the log, so the next audited operation refuses.
+3. **Record shape.** `{"v":1,"seq","ts_ms","kind":attempt|outcome|event,...}`; an
+   attempt's id is its own `seq`, named back by the outcome's `audit_id`. Wall-clock
+   `ts_ms`, because a trail is correlated against other systems' clocks. Reopening a
+   file continues its sequence by counting lines; a final line without a terminator is
+   a torn record and refuses the open (it was never fsynced, so it was never reported
+   recorded — the operator truncates it).
+4. **The file's place.** `WEFT_AUDIT_FILE` names it; else `<store root>/audit.jsonl`;
+   else `./weft-audit.jsonl`. The binary opens it in the state phase — after the store
+   root's filesystem check, since its default home is inside that root — and refuses
+   to start (exit 78) when it cannot (the keys file's rule). A router state with no log attached —
+   the stateless test states — passes audited routes through, as a keyless state passes
+   requests unauthenticated; the binary always attaches one.
+5. **C12's task boundary is the audit layer's spawn.** Audited handlers run in a task
+   drawn from the log's tracker; a panic returns as a `JoinError` the layer records
+   (`result:"panic"`) and maps the way ROB-3's catch layer would have (ingest by
+   D-S14's pre-commit arm, since no phase is readable at this boundary; everything else
+   `500 internal`, redacted). ROB-3's layer remains the catch for non-audited routes,
+   and ROB-2's abort still fires during the unwind, before any catch. `close_and_drain`
+   is startup's C9 step between `daemons.shutdown()` and `store.shutdown()`.
+6. **Daemon events come from the registry.** `Daemons` gains an optional audit handle;
+   supervision emits `daemon_panic` (with `restarted` and the restart count) beside its
+   stderr line. The backup/reconcile ticks themselves keep reporting through their own
+   logs — their *failures to stay alive* are what the trail records.

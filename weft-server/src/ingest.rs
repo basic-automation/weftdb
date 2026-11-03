@@ -299,11 +299,27 @@ fn ephemeral_key() -> String {
 /// Emit the `weft_audit` ingest event for a batch that just committed
 /// (plan §5, D-S14: the event is emitted *after* COMMIT — a replay,
 /// which commits nothing, emits none, and neither does a refusal).
-/// SEC-9's fsynced audit file consumes this target when it lands; until
-/// then the event rides the normal tracing pipeline under its own
-/// target, so a subscriber can route it apart from the request log.
-fn emit_ingest_audit(aspect: &str, format: &str, keyed: bool, receipt: &weftdb::IngestReceipt) {
+/// The event rides the tracing pipeline under its own target, and —
+/// since SEC-9 — it is also written into the fsynced audit file when
+/// one is attached, with the same fields. The commit has already
+/// landed when this runs, so a failed file write is logged, not
+/// propagated (the audit log is poisoned by it, and the next audited
+/// operation refuses fail-closed).
+fn emit_ingest_audit(audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, format: &str, keyed: bool, receipt: &weftdb::IngestReceipt) {
 	tracing::info!(target: "weft_audit", event = "ingest", aspect, format, keyed, rows = receipt.row_count, segments = receipt.segment_ids.len(), commit_epoch = receipt.commit_epoch, "ingest committed");
+	if let Some(audit) = audit {
+		audit.emit_event(
+			"ingest",
+			serde_json::json!({
+				"aspect": aspect,
+				"format": format,
+				"keyed": keyed,
+				"rows": receipt.row_count,
+				"segments": receipt.segment_ids.len(),
+				"commit_epoch": receipt.commit_epoch,
+			}),
+		);
+	}
 }
 
 /// Commit one parsed batch through the store's ingest entry point, in a
@@ -317,7 +333,7 @@ fn emit_ingest_audit(aspect: &str, format: &str, keyed: bool, receipt: &weftdb::
 /// (plan D21, the ROB-3 table); a panic that still escapes as a
 /// `JoinError` is mapped the same way, with no phase to key on (the
 /// pre-commit arm: nothing the task could have committed is claimed).
-async fn commit_ingest(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, format: &'static str, keyed: bool, batch: weftdb::IngestBatch, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<Response, ApiError> {
+async fn commit_ingest(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, format: &'static str, keyed: bool, batch: weftdb::IngestBatch, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<Response, ApiError> {
 	// An undeclared aspect is a clean 404 (its encoding is unknown),
 	// answered here as the handlers always answered it — the store's
 	// entry point would also refuse, but only after its name check,
@@ -348,7 +364,7 @@ async fn commit_ingest(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metri
 		}
 	};
 	if !receipt.duplicate {
-		emit_ingest_audit(aspect, format, keyed, &receipt);
+		emit_ingest_audit(audit, aspect, format, keyed, &receipt);
 		metrics.record_ingest_seal(u64::try_from(receipt.row_count).unwrap_or(u64::MAX));
 		if receipt.segment_ids.len() > 1 {
 			metrics.record_ingest_extra_segments(u64::try_from(receipt.segment_ids.len() - 1).unwrap_or(u64::MAX));
@@ -401,11 +417,14 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 		metrics.record_ingest_error();
 		ApiError::unconfigured()
 	})?;
+	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
+	// file as well as the tracing pipeline (see `emit_ingest_audit`).
+	let audit = state.audit_log().cloned();
 	drop(state);
 	// Time the commit path (not the store-unconfigured fast-fail above): this is the
 	// ingest side of the north-star "predictable p95/p99 under ingest + query".
 	let start = std::time::Instant::now();
-	let result = ingest_points_inner(&store, &metrics, &aspect, &headers, request).await;
+	let result = ingest_points_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, request).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -416,7 +435,7 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 
 /// The body of [`ingest_points`], split out so the handler can record an error
 /// metric for any failure path uniformly.
-async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, headers: &HeaderMap, request: IngestRequest) -> Result<Response, ApiError> {
+async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, request: IngestRequest) -> Result<Response, ApiError> {
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("no points to ingest (`points` is empty)".to_string()));
 	}
@@ -447,7 +466,7 @@ async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate:
 	// `.weftseg` write + control-plane index update — the write stage timed apart from
 	// value parsing.
 	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(request.rows_per_page);
-	commit_ingest(store, metrics, aspect, "json", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "json")).await
+	commit_ingest(store, metrics, audit, aspect, "json", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "json")).await
 }
 
 /// Query parameters for the CSV ingest endpoint: an optional page height.
@@ -542,9 +561,12 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 		metrics.record_ingest_error();
 		ApiError::unconfigured()
 	})?;
+	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
+	// file as well as the tracing pipeline (see `emit_ingest_audit`).
+	let audit = state.audit_log().cloned();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_csv_inner(&store, &metrics, &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_csv_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -557,7 +579,7 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 /// any failure path uniformly. Shares the commit path and
 /// `error::classify_ingest` with the JSON ingest path, so a CSV-committed batch
 /// is byte-identical to a JSON-committed one.
-async fn ingest_csv_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
+async fn ingest_csv_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
 	// `(timestamp, value)` columns, timed apart from the commit.
@@ -565,7 +587,7 @@ async fn ingest_csv_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::me
 	enforce_order_if_required(require_sorted, &timestamps)?;
 	let point_count = timestamps.len();
 	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page);
-	commit_ingest(store, metrics, aspect, "csv", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await
+	commit_ingest(store, metrics, audit, aspect, "csv", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await
 }
 
 /// Query parameters for the ILP ingest endpoint: which field to seal, the wire
@@ -651,9 +673,12 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 		metrics.record_ingest_error();
 		ApiError::unconfigured()
 	})?;
+	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
+	// file as well as the tracing pipeline (see `emit_ingest_audit`).
+	let audit = state.audit_log().cloned();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_ilp_inner(&store, &metrics, &aspect, &headers, &params, &body).await;
+	let result = ingest_ilp_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, &params, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -664,7 +689,7 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 
 /// The body of [`ingest_ilp`], split out so the handler records an error metric for
 /// any failure path uniformly.
-async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, headers: &HeaderMap, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
+async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(ApiError::bad_request)?;
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
@@ -703,7 +728,7 @@ async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::me
 	// text widened to the nullable shape the one entry point takes.
 	let nullable_values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
 	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), nullable_values.clone()).with_rows_per_page(params.rows_per_page);
-	commit_ingest(store, metrics, aspect, "ilp", keyed, batch, &timestamps, &nullable_values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "ilp")).await
+	commit_ingest(store, metrics, audit, aspect, "ilp", keyed, batch, &timestamps, &nullable_values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "ilp")).await
 }
 
 /// Query parameters for the Parquet ingest endpoint: an optional page height.
@@ -741,9 +766,12 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 		metrics.record_ingest_error();
 		ApiError::unconfigured()
 	})?;
+	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
+	// file as well as the tracing pipeline (see `emit_ingest_audit`).
+	let audit = state.audit_log().cloned();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_parquet_inner(&store, &metrics, &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_parquet_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -754,7 +782,7 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 
 /// The body of [`ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
+async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
 	if body.is_empty() {
 		return Err(ApiError::bad_request("empty Parquet body".to_string()));
 	}
@@ -769,7 +797,7 @@ async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate
 	let commit = async {
 		let (timestamps, values) = weft_arrow_store::decode_parquet_columns(body, require_sorted).map_err(|err| error::classify_ingest(&err))?;
 		let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page);
-		commit_ingest(store, metrics, aspect, "parquet", keyed, batch, &timestamps, &values).await
+		commit_ingest(store, metrics, audit, aspect, "parquet", keyed, batch, &timestamps, &values).await
 	};
 	commit.instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await
 }
