@@ -33,6 +33,7 @@ fn maintenance_error(err: &anyhow::Error) -> ApiError {
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/reconcile`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconcileParams {
 	/// Optional order-health trigger threshold (roadmap Phase 4.6). When present,
 	/// the pass runs **only** if the aspect's `unsorted_segments` backlog is at or
@@ -323,6 +324,7 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/squash`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SquashParams {
 	/// Optional segment-count cap (roadmap Phase 4.6): squash **only** when the aspect
 	/// has more than this many segments — the `QuestDB`-`max.splits`-style trigger that
@@ -386,6 +388,7 @@ pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<Str
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/compact`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactParams {
 	/// The target segment size in **rows** (required). The aspect's segments are
 	/// coalesced toward ~this many rows per segment, leaving already-large segments
@@ -442,6 +445,7 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 /// Query parameters for `GET /api/v1/storage/quarantine`: restrict the listing to
 /// one aspect when present, list every aspect when absent.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineParams {
 	/// The aspect to list, when present.
 	pub aspect: Option<String>,

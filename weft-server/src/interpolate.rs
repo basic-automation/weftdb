@@ -46,6 +46,7 @@ use crate::{
 
 /// One input sample on the wire.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InputPoint {
 	/// Sample timestamp (RFC 3339).
 	pub timestamp: DateTime<Utc>,
@@ -138,6 +139,7 @@ impl Default for InterpolateConfig {
 /// `"cubic"`; `polynomial` carries its parameters).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[serde(deny_unknown_fields)]
 pub enum SplineSpec {
 	/// Piecewise-linear.
 	Linear,
@@ -215,6 +217,7 @@ impl From<ResolutionSpec> for Resolution {
 
 /// Request body for `POST /api/v1/interpolate`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InterpolateRequest {
 	/// Spline method (default cubic).
 	#[serde(default)]
@@ -509,6 +512,7 @@ pub async fn interpolate_csv(State(metrics): State<SharedMetrics>, State(config)
 
 /// Request body for `POST /api/v1/interpolate/point`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PointRequest {
 	/// Spline method (default cubic).
 	#[serde(default)]
@@ -582,6 +586,7 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 
 /// Query parameters for the ILP interpolation endpoint.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IlpParams {
 	/// Numeric field to project each line-protocol record onto (required).
 	pub field: String,

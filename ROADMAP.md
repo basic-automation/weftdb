@@ -325,7 +325,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
   - [x] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
   - [x] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
-  - [ ] **FRE-6b** Strict request parsing and caller updates
+  - [x] **FRE-6b** Strict request parsing and caller updates
   - [ ] **SEC-7** Key reload
   - [ ] **SEC-9** Audit
   - [ ] **SEC-11** Aspect-name traversal HTTP regression tests

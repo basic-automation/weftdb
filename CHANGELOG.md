@@ -142,6 +142,15 @@ only the control plane, not the segment frames.
   every pull request. Nothing is pushed to a registry: the artifact is the proof, and publishing is
   a separate decision. One limitation is documented where it will be read — the health check
   speaks plain HTTP, so a container configured with `WEFT_TLS_CERT_FILE` reads unhealthy.
+- **Strict request parsing** (FRE-6b): every request type the server extracts — JSON
+  bodies and query parameters alike, on the ingest, compute, storage-read, maintenance
+  and backup surfaces — now refuses a field or parameter it does not have, instead of
+  silently ignoring it the way serde does by default. A caller with a typo
+  (`require_sorte` on an ingest, `limti` on a read) previously got a successful answer
+  to a different request than the one it meant to send; it now gets a `400` naming the
+  unknown field, in the §4 envelope (`invalid_json` for a body, `bad_request` for a
+  query). No in-repo caller sent an unknown field, so none needed updating; the whole
+  workspace test suite is the evidence.
 - **Startup ordering, exposure matrix, auth-off guard, metrics auth** (security track SEC-8):
   the startup phase list is now named (`startup::PHASES`) and pinned by a test against the
   binary's actual call order. The exposure matrix (plan C8, decision 7) is complete: a
