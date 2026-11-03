@@ -8,6 +8,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-02
+
+The binaries for the v0.2.0 release. Tagging v0.2.0 built macOS and Windows, but both Linux
+builds stopped at the release's glibc-floor check, so v0.2.0 has no GitHub release. This
+release is the same code with that check fixed. Only the three binaries (`weft-server`,
+`weft-tui`, `weft-bench`) move to 0.2.1. The seven library crates stay at 0.2.0, already on
+crates.io, unchanged. Everything in the [0.2.0](#020---2026-11-02) section below, including
+its known limitations and the one-way upgrade from v0.1.0, applies to this release.
+
+### Fixed
+
+- The release's glibc-floor self-test read its probe symbols from `/bin/true`, which in the
+  `manylinux_2_28` build image is a shell script. It also died without a message when it
+  found no symbols, because a failed `grep` under `set -euo pipefail` ended the script.
+  The self-test now reads the `bash` binary running it, and finding no symbols reaches the
+  script's own error message (#522).
+
 ## [0.2.0] - 2026-11-02
 
 The second pre-beta release, cut where roadmap Phase 1 (the benchmark suite) closes. Like
@@ -2005,6 +2022,7 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/basic-automation/weftdb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/basic-automation/weftdb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/basic-automation/weftdb/releases/tag/v0.1.0

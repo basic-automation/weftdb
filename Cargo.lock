@@ -5306,7 +5306,7 @@ dependencies = [
 
 [[package]]
 name = "weft-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5397,7 +5397,7 @@ dependencies = [
 
 [[package]]
 name = "weft-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5434,7 +5434,7 @@ dependencies = [
 
 [[package]]
 name = "weft-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bigdecimal",
