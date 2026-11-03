@@ -85,7 +85,7 @@ pub mod tls;
 pub mod trace;
 
 pub use admission::{Admission, AdmissionConfig, DEFAULT_QUERY_MAX_INFLIGHT, QUERY_MAX_INFLIGHT_ENV};
-pub use auth::{AuthConfig, GeneratedKey, KeyStore, Principal, AUTH_KEYS_MODE, TOKEN_PREFIX};
+pub use auth::{spawn_key_reload_watcher, AuthConfig, GeneratedKey, KeyStore, Principal, SharedKeyStore, AUTH_KEYS_MODE, TOKEN_PREFIX};
 use axum::{middleware, Router};
 pub use backup_daemon::{backup_tick, list_generated_backups, prune_generated_backups, spawn_backup_daemon, BackupDaemonConfig};
 pub use daemons::{DaemonSnapshot, DaemonState, Daemons, RESTART_DELAY};

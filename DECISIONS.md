@@ -3433,3 +3433,22 @@ have; the full workspace bar passing unchanged is the check. The one deliberate
 compatibility note: the B-rest aliases (`take`/`page`, `interpolation=`) are real
 fields of their types, so alias-speaking clients are unaffected; only names no
 endpoint has ever had are refused.
+## 2026-11-02 — SEC-7: key reload mechanism (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan (§6 W6) and the ROADMAP name SEC-7 "Key reload" with the
+acceptance "API keys can be reloaded without a restart", and SEC-6's entry reserved
+the slice, but neither names the trigger, nor what a bad edit does.
+
+**Chosen:** the store in force is a swappable snapshot (`auth::SharedKeyStore`
+wrapping SEC-6's `KeyStore`); a reload re-reads and re-validates the whole keys
+file and swaps it in only when the new file parses clean — a malformed edit is
+refused and the keys in force stay, which is SEC-6's "never a partially enforced
+table" carried into the edit path. The running server's trigger is `SIGHUP`,
+handled by a watcher registered in the Daemons registry whenever authentication
+is on, logging each outcome; the library also exposes `AuthConfig::reload_keys`
+for embedders. **Why:** SIGHUP is the conventional Unix reload signal and needs
+no new route, scope or setting — PAC-5b's strict configuration refuses invented
+`WEFT_*` names, and a reload route would be API surface the plan never named —
+while polling the file's mtime would silently pick up half-written edits, where
+a signal is the operator saying the edit is finished. §10's deferral stands:
+this is the API-key file only, not SEC-12's certificate hot reload.
