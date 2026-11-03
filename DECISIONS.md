@@ -3359,3 +3359,43 @@ kill soak cannot see a missing fsync, so the privileged power-loss validation
 §9 durability tick waits for it. No nightly compare gate: a cell either holds
 or it does not; the first successful workflow run is the hand-compared
 baseline.
+
+## 2026-11-02 — TAG-4 scope: the weftdb crate's read sites, audited (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Context:** the 1.0 plan (§6 W6, "X-SPLIT-STORE → TAG-4") and ROADMAP line
+307 name the slice in one line — "weftdb read sites on the frame-reader API
+with typed errors" — without itemizing the sites. X-FRAME (W2) had already
+built `weftdb::types::frame_read` and routed `SegmentStore`'s production
+decode sites through it, which left the slice's remaining scope ambiguous.
+
+**Audit (on main c766830, post X-SPLIT-STORE):** every frame decode in the
+`weftdb` crate was inventoried. Production sites — `read_time_range`,
+`read_point(s)`, `read_value_range`/`decode_all`, `downsample_partial`'s
+`segment_partial`, maintenance's `read_bound_frame`/`merge_members`, and
+fsck/adoption's `read_full` calls — already decode through `frame_read`
+(`read_frame*` underneath, errors carrying the typed `FrameFaultError`).
+The remaining direct legacy-reader uses in the crate were three test read
+sites in `segment_store.rs`: the scaled-downsample helper dispatched on the
+index row's `format_version` to `read_segment_range_physical` /
+`read_paged_segment_range_physical` — the exact routing TAG-4 removes — and
+two format checks used `Segment::read_from` / `PagedSegment::read_from`.
+
+**Chosen:** TAG-4 completes the migration inside the `weftdb` crate. Those
+three sites now read through `frame_read` (the paged-format check asserts
+the frame reader's `rows_per_page()` instead of a layout-specific reader),
+the `read.rs` doc references name the frame-reader entry points, and two
+store-level tests pin the acceptance at the public API: an envelope-wrapped
+(v7) frame reads through `read_time_range`/`read_point`, and a
+newer-format frame fails a store read with a downcastable
+`FrameFaultError { Undecodable { newer_format: true } }`. After this slice,
+no code in `weftdb/src` names a legacy layout-specific reader.
+
+**Explicitly out of scope, deliberately left as they are:** `weft-bench`'s
+harnesses (`compression`, `point_lookup`, `range_fetch`) call the legacy
+readers *by name* — they measure those readers, and their reports and the
+README claims name them, so rerouting them through `read_frame*` would
+falsify the measurements. `backup.rs`'s restore verification uses
+`describe_frame`, a header/describability check (D-S16's A3), not a decode
+read site. `quarantine.rs`'s classifier already takes the typed
+`WeftSegError` source under `FrameFaultError`; frame error classes *in
+recovery* are TAG-9 (W8), not this slice.
