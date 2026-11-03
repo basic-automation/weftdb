@@ -33,10 +33,11 @@ pub(crate) async fn build() -> anyhow::Result<AppState> {
 				std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
 			}
 			let store = Arc::new(store_open::open_from_env(&root).await?);
-			let report = store.open_report();
-			let how = if report.created_new { "created".to_string() } else { report.migrated_from.map_or_else(|| "opened".to_string(), |layout| format!("migrated from layout {layout}")) };
-			println!("segment store: {how} at {root} (storage endpoints live; store {}, layout {})", store.store_uuid(), store.store_format().layout_version);
-			if report.recovery_report_only {
+			// PAC-7: the store's identity is reported at startup — root,
+			// store_uuid, scope, layout and the previous shutdown's
+			// cleanliness, in the one line `store_open` formats.
+			println!("{}", store_open::store_identity_line(&store));
+			if store.open_report().recovery_report_only {
 				println!("segment store: its layout is newer than this build's; it opened without migrating");
 			}
 			Ok(AppState::new().with_store(store))

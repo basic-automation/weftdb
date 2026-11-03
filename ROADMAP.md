@@ -329,7 +329,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **SEC-7** Key reload
   - [ ] **SEC-9** Audit
   - [ ] **SEC-11** Aspect-name traversal HTTP regression tests
-  - [ ] **PAC-7** Operator CLI, exit-code contract and store identity at startup
+  - [x] **PAC-7** Operator CLI, exit-code contract and store identity at startup
   - [ ] → **ROB-11** Admission II
   - [ ] **ROB-19** Maintenance scheduler, compaction on by default, per-aspect circuit breaker
   - [ ] **SOA-10** Derived-read checks

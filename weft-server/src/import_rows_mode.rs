@@ -207,11 +207,24 @@ pub async fn import(request: &Request) -> anyhow::Result<ImportRecord> {
 
 /// The command's whole job: parse, import, report.
 ///
+/// # Process exit
+///
+/// A parse failure is a usage error (plan C7): it prints the reason and
+/// exits the process with [`crate::settings::USAGE_EXIT_CODE`] (2) here,
+/// rather than returning an error the runtime would flatten to 1, the
+/// status C7 reserves for an unexpected error (PAC-7).
+///
 /// # Errors
 ///
-/// Any parse or [`import`] failure, which the caller prints and exits non-zero on.
+/// Any [`import`] failure, which the caller prints and exits non-zero on.
 pub async fn run<I: IntoIterator<Item = String>>(arguments: I) -> anyhow::Result<()> {
-	let invocation = parse(arguments).map_err(anyhow::Error::msg)?;
+	let invocation = match parse(arguments) {
+		Ok(invocation) => invocation,
+		Err(error) => {
+			eprintln!("weft-server import-rows-mode: {error}");
+			std::process::exit(crate::settings::USAGE_EXIT_CODE);
+		}
+	};
 	match invocation {
 		Invocation::Serve => Ok(()),
 		Invocation::Help => {

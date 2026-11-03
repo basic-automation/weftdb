@@ -251,6 +251,28 @@ pub async fn open_scoped_with_env_options(root: impl AsRef<Path>, database: &str
 	Ok(store)
 }
 
+/// The store identity line startup prints once the store is open (PAC-7):
+/// one line naming the store the process is actually serving — its root,
+/// its `store_uuid`, the `(database, subject)` scope it was opened under,
+/// its layout as opened, whether the previous shutdown was clean, and
+/// what this open did (created the store, opened it, migrated it, or
+/// opened a newer layout report-only).
+///
+/// Identity is reported here, in one formatter every open path can share,
+/// because a supervisor's first question after a restart — *which store
+/// came up?* — is answered from the startup log or not at all: `/ready`
+/// carries the same UUID, so the two can be checked against each other,
+/// and the scope names the namespace the process sees, which two roots
+/// (or one root under two scopes) otherwise make ambiguous.
+#[must_use]
+pub fn store_identity_line(store: &SegmentStore) -> String {
+	let report = store.open_report();
+	let format = store.store_format();
+	let how = if report.created_new { "created".to_string() } else { report.migrated_from.map_or_else(|| "opened".to_string(), |layout| format!("migrated from layout {layout}")) };
+	let clean = if store.previous_clean_shutdown() { "previous shutdown clean" } else { "previous shutdown not clean" };
+	format!("segment store: {how} at {} (store {}, scope {}/{}, layout {}, {clean}; storage endpoints live)", store.root().display(), store.store_uuid(), format.scope.database, format.scope.subject, format.layout_version)
+}
+
 /// Exit the process with [`AMBIGUOUS_COMMIT_EXIT_CODE`] as soon as `store` is
 /// write-poisoned, by its own ambiguous COMMIT or by the process-wide poison, saying why:
 /// what `WEFT_ON_AMBIGUOUS_COMMIT=exit` asks for.
@@ -345,6 +367,27 @@ mod tests {
 		assert!(matches!(check_store_root(&file), Err(StoreRootProblem::NotDirectory(_))), "a file cannot hold a store");
 		let under_file = file.join("store");
 		assert!(check_store_root(&under_file).is_err(), "nor can a root be created under a file");
+	}
+
+	#[tokio::test]
+	async fn the_identity_line_names_the_store_that_opened() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("opens a store");
+		let line = store_identity_line(&store);
+		assert!(line.contains(&root.display().to_string()), "the root: {line}");
+		assert!(line.contains(store.store_uuid()), "the store_uuid: {line}");
+		assert!(line.contains("scope default/default"), "the scope it opened under: {line}");
+		assert!(line.contains("created"), "a fresh store says it was created: {line}");
+		assert!(line.contains("previous shutdown not clean"), "a fresh store was never shut down cleanly: {line}");
+		let uuid = store.store_uuid().to_string();
+		store.shutdown().await.expect("shuts down cleanly");
+		drop(store);
+		let reopened = SegmentStore::open(&root).await.expect("reopens");
+		let line = store_identity_line(&reopened);
+		assert!(line.contains(&uuid), "the identity survives the reopen: {line}");
+		assert!(line.contains("opened") && line.contains("previous shutdown clean"), "a reopened store says so: {line}");
+		drop(reopened);
 	}
 
 	#[test]

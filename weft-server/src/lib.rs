@@ -38,6 +38,10 @@ pub mod admission;
 pub mod auth;
 pub mod backup_daemon;
 pub mod backup_routes;
+/// PAC-7's operator CLI: the one dispatch over the binary's commands and
+/// the plan C7 exit-code table the process's statuses are read against
+/// (see [`cli`]).
+pub mod cli;
 /// ROB-3's Daemons registry: supervised background tasks and the shared
 /// shutdown watch (see [`daemons`]).
 pub mod daemons;
