@@ -157,6 +157,10 @@ pub struct RestoredFile {
 /// What the optional first open (`--adopt`) did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Adoption {
+	/// Wall-clock milliseconds the adoption open and clean shutdown took
+	/// (EVI-25: the recovery half of the RTO inputs — the first open of a
+	/// restored root is where frame adoption and quarantine happen).
+	pub duration_ms: u64,
 	/// The scope the restored root was opened as.
 	pub database: String,
 	/// The scope subject it was opened as.
@@ -198,6 +202,10 @@ pub struct Report {
 	pub rows: i64,
 	/// The bytes those files hold.
 	pub bytes: u64,
+	/// Wall-clock milliseconds the restore itself took — the copy and its
+	/// verification, before any adoption (EVI-25: the restore half of the
+	/// RTO inputs, with `adoption.duration_ms` for the recovery half).
+	pub duration_ms: u64,
 	/// The per-file verification, in [`weftdb::CONTROL_PLANE_FILES`] order.
 	pub files: Vec<RestoredFile>,
 	/// Set when `--adopt` ran; `None` means adoption waits for the first open.
@@ -260,9 +268,10 @@ fn emit(report: &Report, json: bool) {
 		println!("  {:<18} {:>4} table(s) {:>12} row(s) {:>12} bytes", file.name, file.tables, file.rows, file.bytes);
 	}
 	println!("  {} frame(s) verified, {} row(s) and {} bytes of control plane", report.frames, report.rows, report.bytes);
+	println!("  restore took {} ms", report.duration_ms);
 	match &report.adoption {
-		Some(adoption) if adoption.restore_mode => println!("  adopted {} frame(s) into the index ({} held for series keys), {} quarantined, {} suspect, opened as {}/{}", adoption.adopted, adoption.held, adoption.quarantined, adoption.suspected, adoption.database, adoption.subject),
-		Some(adoption) => println!("  opened as {}/{}: nothing to adopt (a control-plane restore carries no frames)", adoption.database, adoption.subject),
+		Some(adoption) if adoption.restore_mode => println!("  adopted {} frame(s) into the index ({} held for series keys), {} quarantined, {} suspect, opened as {}/{} in {} ms", adoption.adopted, adoption.held, adoption.quarantined, adoption.suspected, adoption.database, adoption.subject, adoption.duration_ms),
+		Some(adoption) => println!("  opened as {}/{} in {} ms: nothing to adopt (a control-plane restore carries no frames)", adoption.database, adoption.subject, adoption.duration_ms),
 		None => println!("  adoption runs at the first open of the restored root; add --adopt to run it now"),
 	}
 	println!("serve it with WEFT_SEGMENT_STORE_ROOT={} weft-server", report.root.display());
@@ -350,6 +359,9 @@ pub async fn execute(request: &Request) -> Result<Report, Refused> {
 		return Err(no_manifest(&request.backup).await);
 	};
 	let whole = manifest.is_whole_store();
+	// EVI-25: time the restore itself; adoption is timed separately below,
+	// so the two RTO components stay distinguishable.
+	let started = std::time::Instant::now();
 	let (root, files, frames, intent) = if whole {
 		let restored = restore_store(&request.backup, &request.into).await.map_err(|error| backup_refused(restore_failed(&error, &request.into)))?;
 		let intent = restored.intent.clone();
@@ -361,7 +373,8 @@ pub async fn execute(request: &Request) -> Result<Report, Refused> {
 	let files: Vec<RestoredFile> = files.iter().map(RestoredFile::from_report).collect();
 	let rows = files.iter().map(|file| file.rows).sum();
 	let bytes = files.iter().map(|file| file.bytes).sum();
-	let mut report = Report { mode: if whole { "whole-store" } else { "control-plane" }, backup: request.backup.clone(), root, intent, frames, rows, bytes, files, adoption: None };
+	let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+	let mut report = Report { mode: if whole { "whole-store" } else { "control-plane" }, backup: request.backup.clone(), root, intent, frames, rows, bytes, duration_ms, files, adoption: None };
 	if request.adopt {
 		let (database, subject) = match (request.database.clone(), request.subject.clone()) {
 			(Some(database), Some(subject)) => (database, subject),
@@ -400,9 +413,13 @@ fn restore_failed(error: &anyhow::Error, into: &Path) -> String {
 /// required step.
 async fn adopt(root: &Path, database: &str, subject: &str, whole: bool) -> Result<Adoption, Refused> {
 	let restore_mode = whole && read_intent(root).await;
+	// EVI-25: the adoption open is the recovery cost — timed separately
+	// from the restore above, including the clean shutdown that releases the
+	// root lock before the report prints.
+	let started = std::time::Instant::now();
 	let store = crate::store_open::open_scoped_with_env_options(root, database, subject).await.map_err(|error| backup_refused(format!("the restore published {root} but opening it failed: {error:#}\n  the destination is intact; the next open retries adoption, which is idempotent", root = root.display())))?;
 	let recovery = store.recovery_report();
-	let adoption = Adoption { database: database.to_string(), subject: subject.to_string(), restore_mode, adopted: recovery.adopted, held: recovery.held, quarantined: recovery.quarantined, suspected: recovery.suspected, orphans: recovery.orphans, incompatible_store: recovery.incompatible_store };
+	let adoption = Adoption { duration_ms: 0, database: database.to_string(), subject: subject.to_string(), restore_mode, adopted: recovery.adopted, held: recovery.held, quarantined: recovery.quarantined, suspected: recovery.suspected, orphans: recovery.orphans, incompatible_store: recovery.incompatible_store };
 	let shutdown = store.shutdown().await;
 	// The store is closed and its root lock released before this command reports, so a
 	// `restore --into` of a second root in the same process cannot meet a live lock.
@@ -410,6 +427,8 @@ async fn adopt(root: &Path, database: &str, subject: &str, whole: bool) -> Resul
 	if let Err(error) = shutdown {
 		return Err(backup_refused(format!("the restored root {root} opened and adopted, but its clean shutdown failed: {error:#}\n  the store is usable; open it again (the server) and shut it down cleanly to clear the flag", root = root.display())));
 	}
+	let mut adoption = adoption;
+	adoption.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 	Ok(adoption)
 }
 
@@ -537,9 +556,9 @@ mod tests {
 
 	#[test]
 	fn the_json_report_carries_the_commands_own_key_names() {
-		let report = Report { mode: "control-plane", backup: PathBuf::from("/backups/nightly"), root: PathBuf::from("/srv/weft"), intent: None, frames: 0, rows: 7, bytes: 4096, files: vec![RestoredFile { name: "catalog.db".into(), tables: 2, rows: 7, bytes: 4096 }], adoption: None };
+		let report = Report { mode: "control-plane", backup: PathBuf::from("/backups/nightly"), root: PathBuf::from("/srv/weft"), intent: None, frames: 0, rows: 7, bytes: 4096, duration_ms: 0, files: vec![RestoredFile { name: "catalog.db".into(), tables: 2, rows: 7, bytes: 4096 }], adoption: None };
 		let value = serde_json::to_value(&report).expect("a report serializes");
-		for key in ["mode", "backup", "root", "frames", "rows", "bytes", "files"] {
+		for key in ["mode", "backup", "root", "frames", "rows", "bytes", "duration_ms", "files"] {
 			assert!(value.get(key).is_some(), "the JSON document lost {key}: {value}");
 		}
 		assert!(value.get("intent").is_none(), "a control-plane report says nothing about an intent it never published");

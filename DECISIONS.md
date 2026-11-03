@@ -3359,3 +3359,34 @@ kill soak cannot see a missing fsync, so the privileged power-loss validation
 §9 durability tick waits for it. No nightly compare gate: a cell either holds
 or it does not; the first successful workflow run is the hand-compared
 baseline.
+
+## 2026-11-03 — EVI-25 RTO inputs shape (FLAGGED FOR MERGE REVIEW)
+
+**Context:** the 1.0 plan §6 lists EVI-25 in W6 and the ROADMAP line says only
+"Backup, restore and recovery costs measured (RTO inputs and backup duration
+recorded)"; neither fixes which quantities count as RTO inputs. EVI-19 (W7)
+documents RPO/RTO from these inputs, so this slice must record them, not
+document the RTO itself.
+
+**Chosen:** the RTO inputs are four recorded durations plus the sizes already
+reported: (1) backup duration — every completed, verified control-plane
+snapshot observes into the `weft_backup_duration_seconds` histogram (manual
+endpoint and daemon tick alike) and the manual response carries its own
+`duration_ms`; (2) restore duration — the drill response and the offline
+`weft-server restore` report both carry `duration_ms` for the copy plus
+verification; (3) recovery duration — the restore report's
+`adoption.duration_ms` times the `--adopt` open (frame adoption, quarantine,
+clean shutdown) separately from the restore, so the two RTO components stay
+distinguishable; a restore without `--adopt` reports no adoption duration,
+because the recovery has not run yet. (4) The existing rows/bytes/frames let
+a reader normalize a duration by what was moved. Deliberately not changed:
+no restore semantics, no new bench (the existing `backup_cost` bench already
+times the backup tick; this slice records production durations, which a bench
+cannot), and no RPO/RTO document — that is EVI-19.
+
+**Batch-merge note:** this slice deliberately does not touch
+`Metrics::record_backup`, `BackupMetrics` or `Metrics::snapshot`, so it
+applies cleanly over EVI-18's health-metrics branch (which owns those). The
+one shared assertion to union at batch merge is the Prometheus `# TYPE`
+count in `metrics.rs`: EVI-18's gauge and this slice's histogram take it
+from 18 to 20.

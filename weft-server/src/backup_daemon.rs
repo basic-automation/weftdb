@@ -308,10 +308,15 @@ pub async fn backup_tick(store: &SegmentStore, metrics: &SharedMetrics, base: &P
 	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
 	let dest = fresh_dir(base, millis);
 	let span = tracing::info_span!("backup.tick", dir = %dest.display(), verify = "snapshot", rows = tracing::field::Empty, bytes = tracing::field::Empty);
+	// EVI-25: the tick's wall-clock duration is an RTO input, so it is
+	// observed into the backup histogram alongside the byte count — a failed
+	// tick never reaches here, so no failure duration is recorded.
+	let started = std::time::Instant::now();
 	let backup = store.backup_control_plane_with_verify(&dest, VerifyMode::SnapshotOnly).instrument(span.clone()).await?;
 	span.record("rows", backup.total_rows());
 	span.record("bytes", backup.total_bytes());
 	metrics.record_backup(backup.total_bytes());
+	metrics.observe_backup_duration(started.elapsed());
 	Ok(backup)
 }
 
@@ -421,6 +426,7 @@ mod tests {
 		assert!(backup.total_rows() > 0, "the declared aspect + sealed segment are in the control plane");
 		assert_eq!(snap.backup.snapshots, 1, "the daemon tick records the same counter as the endpoint");
 		assert_eq!(snap.backup.bytes_written, backup.total_bytes());
+		assert!(metrics.render_prometheus().contains("weft_backup_duration_seconds_count 1"), "EVI-25: the tick observes its duration into the backup histogram");
 	}
 
 	#[tokio::test]

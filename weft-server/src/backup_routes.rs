@@ -42,6 +42,10 @@ pub struct RestoreDrillResponse {
 	pub total_rows: i64,
 	/// Total on-disk size of the restored files in bytes.
 	pub total_bytes: u64,
+	/// Wall-clock milliseconds the rehearsal restore itself took (EVI-25: the
+	/// restore half of the RTO inputs). Cleanup of the rehearsal copy is
+	/// excluded — it is not part of getting a store back.
+	pub duration_ms: u64,
 	/// Always `true` when the call returns `200`: the backup restored and every restored
 	/// database opened and scanned. A failure is reported as a non-`200` instead.
 	pub restorable: bool,
@@ -117,7 +121,10 @@ async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path:
 		}
 		Err(err) => return Err(ApiError::internal(format!("restore drill for `{label}` could not create its rehearsal directory {}: {err}", target.display()))),
 	}
+	// EVI-25: time the restore itself, not the cleanup that follows it.
+	let started = std::time::Instant::now();
 	let outcome = weftdb::restore_control_plane_with(fs, backup_dir, target).await;
+	let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 	// The drill's answer stands whether or not its copy can be removed, but a copy left
 	// behind is disk an operator is paying for: say so instead of dropping the error.
 	let cleanup_error = fs.remove_dir_all(target).await.err().map(|err| format!("could not remove the rehearsal copy {}: {err}", target.display()));
@@ -130,7 +137,7 @@ async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path:
 	})?;
 
 	let databases = report.restored.iter().map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes }).collect();
-	Ok(RestoreDrillResponse { label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), restorable: true, cleanup_error })
+	Ok(RestoreDrillResponse { label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), duration_ms, restorable: true, cleanup_error })
 }
 
 /// Query parameters for `POST /api/v1/storage/backup`.
@@ -184,6 +191,10 @@ pub struct BackupResponse {
 	/// `total_rows` proves: equality with the live source, or the copy's own readable
 	/// contents.
 	pub verify: &'static str,
+	/// Wall-clock milliseconds the snapshot and its verification took (EVI-25:
+	/// the backup-duration RTO input, per backup, alongside the
+	/// `weft_backup_duration_seconds` histogram the daemon tick feeds).
+	pub duration_ms: u64,
 }
 
 /// Parse the `?verify=` selector into a [`VerifyMode`].
@@ -296,11 +307,16 @@ pub async fn backup_store(State(state): State<AppState>, StrictQuery(params): St
 	if dest.exists() {
 		return Err(ApiError::already_exists(format!("backup target already exists: {} (choose a fresh label)", dest.display())));
 	}
+	// EVI-25: time the snapshot and its verification, the same duration the
+	// daemon tick observes into the backup histogram.
+	let started = std::time::Instant::now();
 	let backup = store.backup_control_plane_with_verify(&dest, mode).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 	drop(store);
 	metrics.record_backup(backup.total_bytes());
+	metrics.observe_backup_duration(started.elapsed());
 	let databases = [("segment_index.db", &backup.segment_index), ("metadata.db", &backup.metadata), ("aspect_catalog.db", &backup.aspect_catalog), ("catalog.db", &backup.registry)].into_iter().map(|(name, report)| BackupDbReport { name: name.to_string(), tables: report.tables, rows: report.rows, bytes: report.bytes }).collect();
-	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows(), total_bytes: backup.total_bytes(), verify: verify_token(mode) };
+	let response = BackupResponse { dir: backup.dir.display().to_string(), databases, total_rows: backup.total_rows(), total_bytes: backup.total_bytes(), verify: verify_token(mode), duration_ms };
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
 
@@ -378,6 +394,7 @@ mod tests {
 		assert_eq!(json["databases"].as_array().unwrap().len(), 4, "four control-plane DBs snapshotted");
 		assert!(json["total_rows"].as_i64().unwrap() >= 2, "at least the seal's index + rollup rows");
 		assert!(json["total_bytes"].as_u64().unwrap() > 0, "the snapshot files have a non-zero footprint");
+		assert!(json["duration_ms"].is_u64(), "EVI-25: the backup response records its own duration; body: {json}");
 		assert!(json["databases"][0]["bytes"].as_u64().unwrap() > 0, "each snapshot file reports its size");
 		let backup_dir = dir.path().join("backups").join("nightly");
 		for name in ["segment_index.db", "metadata.db", "aspect_catalog.db", "catalog.db"] {
@@ -398,6 +415,7 @@ mod tests {
 		let mbytes = axum::body::to_bytes(metrics.into_body(), usize::MAX).await.unwrap();
 		let mtext = String::from_utf8(mbytes.to_vec()).unwrap();
 		assert!(mtext.contains("weft_backup_snapshots_total 1"), "one snapshot recorded; got:\n{mtext}");
+		assert!(mtext.contains("weft_backup_duration_seconds_count 1"), "EVI-25: the endpoint snapshot observes its duration; got:\n{mtext}");
 		assert!(mtext.contains("weft_backup_bytes_written_total"), "bytes-written counter present");
 		assert_eq!(json["verify"], "source", "the default verification is the quiescent source cross-check");
 
@@ -431,6 +449,7 @@ mod tests {
 		assert_eq!(djson["cleanup_error"], serde_json::Value::Null, "the rehearsal copy was removed");
 		assert_eq!(djson["databases"].as_array().unwrap().len(), 4, "all four control-plane DBs came back");
 		assert!(djson["total_rows"].as_i64().unwrap() >= 2, "rows read back out of the restored copies");
+		assert!(djson["duration_ms"].is_u64(), "EVI-25: the drill records its restore duration; body: {djson}");
 		// The rehearsal left nothing behind, and the live store is untouched.
 		let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("backups")).unwrap().filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(".restore-drill-")).collect();
 		assert!(leftovers.is_empty(), "the drill cleaned up its rehearsal dir; found {leftovers:?}");
