@@ -3359,3 +3359,43 @@ kill soak cannot see a missing fsync, so the privileged power-loss validation
 §9 durability tick waits for it. No nightly compare gate: a cell either holds
 or it does not; the first successful workflow run is the hand-compared
 baseline.
+
+## 2026-11-03 — SOA-14 adjudicated: its named elements landed under other slices; the residue is the /ready identity pin (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan lists SOA-14 by name only (§6, W6: "Server hooks"), and
+the queue's acceptance — "Server hooks exist for the soak harness (startup
+phases hooks.rs, plan §2 L-MAIN)" — names no deliverable that a diff could
+obviously carry. An implementing agent returned blocked asking whether the
+slice was already satisfied, and if not, whether "build info" requires fields
+beyond the version string and whether "shutdown state" requires a live
+shutting-down flag on `/ready`. Traced element by element, every concrete
+thing the sources name for SOA-14 has already landed:
+
+- **`hooks.rs` exists** as the §2 L-MAIN startup phase module
+  (`weft-server/src/startup/hooks.rs`, phase 1: tracing subscriber, OTLP
+  exporter, panic hook), landed with the startup split the lane describes.
+- **The OTLP userinfo redaction is SEC-10's**, by the plan's own §3 table
+  ("SOA-14's OTLP userinfo redaction" is SEC-10's row), and it landed in
+  SEC-10 (W5); `hooks.rs` routes every endpoint it prints through it.
+- **The `/ready` content is D-S12's**, by the same table: "/ready returns 503
+  when not ready, carries counts only, and carries `store_uuid`, durability
+  class, `previous_clean_shutdown` and build info (SOA-14/C-5)" — landed in
+  D-S12 (W4), attribution tag and all.
+
+**Decided:** (1) "Build info" is the build version the response already
+carries (`weft_server::VERSION`, doc-commented as surfaced in probe responses
+so a deployed instance is identifiable from a plain `curl`). No source —
+plan, DECISIONS, or code — specifies a git SHA, build profile, or any further
+field, and inventing a build-stamping pipeline for an unnamed field is scope
+the spec rule forbids. (2) No source requires a live shutting-down flag on
+`/ready`; the shutdown-related field the sources name is
+`previous_clean_shutdown`, and it is carried. (3) The one residue that is
+real: the C-5 identity fields had **no test pinning them** — the existing
+`/ready` tests pin the counts, the poison report and the 503, so a refactor
+could drop or miswire `store_uuid`, `durability_class`,
+`previous_clean_shutdown`, or `version` unnoticed, while the soak harness
+(SOA-10's checks read server state against a model) is the consumer that
+needs the contract held. SOA-14 therefore lands as that pin:
+`weft-server/tests/ready_identity.rs` asserts the fields against the served
+store's own reported values (never restated constants), with and without a
+store configured. No behaviour changes.

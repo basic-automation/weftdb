@@ -333,7 +333,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] → **ROB-11** Admission II
   - [ ] **ROB-19** Maintenance scheduler, compaction on by default, per-aspect circuit breaker
   - [ ] **SOA-10** Derived-read checks
-  - [ ] **SOA-14** Server hooks
+  - [x] **SOA-14** Server hooks
   - [x] **EVI-14** DuckDB adapter II
   - [ ] **EVI-18** Backup health metrics and catch-up-free ticking
   - [ ] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
