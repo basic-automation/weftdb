@@ -93,7 +93,7 @@ use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, write_new_durable, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
+		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
@@ -927,7 +927,7 @@ impl PreparedPlan {
 
 	/// Step M5's ops for this plan, committing in aspect epoch `epoch` (design section 5.3):
 	/// `ReplaceExpected` on the member whose id each output takes (against the version M1
-	/// read) or `InsertNew` under a fresh id, `DeleteExpected` on the members left over,
+	/// read) or `InsertNew` under a fresh id, one `DeleteEveryExpected` for the members left over,
 	/// `JournalRetire` for every member's frame, and `ClearJournal` for every output's
 	/// pending row.
 	fn ops(&self, aspect: &str, epoch: u64, created_ms: i64, ops: &mut Vec<IndexOp>) {
@@ -938,8 +938,9 @@ impl PreparedPlan {
 				None => ops.push(IndexOp::InsertNew { aspect: aspect.to_string(), row }),
 			}
 		}
-		for member in self.members.iter().skip(self.outputs.len()) {
-			ops.push(IndexOp::DeleteExpected { aspect: aspect.to_string(), expected: member.version() });
+		let deleted: Vec<RowVersion> = self.members.iter().skip(self.outputs.len()).map(IndexRow::version).collect();
+		if !deleted.is_empty() {
+			ops.push(IndexOp::DeleteEveryExpected { aspect: aspect.to_string(), expected: deleted });
 		}
 		for name in &self.retired {
 			ops.push(IndexOp::JournalRetire { aspect: aspect.to_string(), name: name.clone(), retire_epoch: epoch, created_ms });

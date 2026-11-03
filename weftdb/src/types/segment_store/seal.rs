@@ -148,6 +148,11 @@ impl SegmentStore {
 				IndexOp::DeleteExpected { expected, .. } => {
 					by_id.remove(&expected.id);
 				}
+				IndexOp::DeleteEveryExpected { expected, .. } => {
+					for version in expected {
+						by_id.remove(&version.id);
+					}
+				}
 				IndexOp::Delete { id, .. } => {
 					by_id.remove(id);
 				}

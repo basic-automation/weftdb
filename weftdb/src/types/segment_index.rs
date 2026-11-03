@@ -353,6 +353,25 @@ impl SegmentIndexStore {
 		Ok(changed > 0)
 	}
 
+	/// Checkpoint the index with TRUNCATE, writing what the MVCC log holds into the database
+	/// file. A maintenance pass that deletes thousands of rows calls this after (#507):
+	/// until a checkpoint, Turso keeps every version those deletes left, and every later
+	/// read and keyed write of the index walked them — after a 10M-row squash an hour's
+	/// read cost 2.2 ms rather than 0.54 ms, and only a reopen brought it back.
+	///
+	/// A writer that begins meanwhile meets `Busy` and retries ([`IndexTxn`]); a reader
+	/// waits on its busy timeout.
+	///
+	/// # Errors
+	///
+	/// Connecting, or the checkpoint itself.
+	pub(crate) async fn checkpoint(&self) -> Result<()> {
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await.context("PRAGMA wal_checkpoint(TRUNCATE) on segment_index.db")?;
+		while rows.next().await?.is_some() {}
+		Ok(())
+	}
+
 	/// **Data skipping at the control plane** (roadmap Phase 4.4): the descriptors
 	/// for `aspect` whose segments may hold a row in the inclusive time range
 	/// `[start, end]` — the ones a query must open. The pruning runs as a SQL

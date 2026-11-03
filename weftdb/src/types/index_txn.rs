@@ -21,8 +21,9 @@
 //!   below.
 //! - **Conflict**: a precondition failed. [`IndexOp::ReplaceExpected`] and
 //!   [`IndexOp::DeleteExpected`] must each change exactly the one row whose
-//!   `(aspect, id, gen, frame_crc)` the caller read, and [`IndexOp::InsertNew`] must not
-//!   find its key taken. Another writer got there first; nothing was written.
+//!   `(aspect, id, gen, frame_crc)` the caller read ([`IndexOp::DeleteEveryExpected`]
+//!   each of its rows), and [`IndexOp::InsertNew`] must not find its key taken. Another
+//!   writer got there first; nothing was written.
 //! - **Definite**: any other error before COMMIT. Nothing was written.
 //! - **Ambiguous**: COMMIT itself returned an error. Turso fsyncs the MVCC log inside
 //!   COMMIT and returns a sync error with `?`, so the transaction may be durable even
@@ -41,7 +42,8 @@
 //! **Which conflicts are retried.** A retry re-runs every op on a snapshot that now holds
 //! the commit of the writer that won the conflict, so it is only safe for an op that
 //! re-checks, on that snapshot, what its caller decided from: [`IndexOp::InsertNew`],
-//! [`IndexOp::ReplaceExpected`] and [`IndexOp::DeleteExpected`] are guarded, and a race
+//! [`IndexOp::ReplaceExpected`], [`IndexOp::DeleteExpected`] and
+//! [`IndexOp::DeleteEveryExpected`] are guarded, and a race
 //! they lost turns into a [`TxnErrorKind::Conflict`] on the retry. [`IndexOp::SeqBump`]
 //! only ever raises the allocator row, so running it again over another writer's raise
 //! keeps the larger value; [`IndexOp::RaiseFloor`] only ever raises the floors, and
@@ -56,7 +58,7 @@
 //! (`InsertNew` and `SeqBump`, since S7, plus the rollup fold, since S11) get the retries, and so do the write-once swaps
 //! of every maintenance operation (reconcile and split since S8, the overlap merge,
 //! squash and compaction since S9), whose ops are all guarded: `ReplaceExpected`,
-//! `DeleteExpected`, `InsertNew`, the journal ops and `SeqBump`.
+//! `DeleteEveryExpected`, `InsertNew`, the journal ops and `SeqBump`.
 //!
 //! **The write scope** (robustness track ROB-2). Every transaction runs inside
 //! [`control_plane_write`](crate::exec::control_plane_write), so the process's panic hook
@@ -143,6 +145,12 @@ pub enum IndexOp {
 	ReplaceExpected { aspect: String, expected: RowVersion, row: IndexRow },
 	/// Delete the row matching `expected`. Exactly one row must match.
 	DeleteExpected { aspect: String, expected: RowVersion },
+	/// Delete the row matching each of `expected`, which name distinct ids: as many
+	/// [`DeleteExpected`](Self::DeleteExpected)s, each row exactly at its version, but in
+	/// a statement per [`DELETE_CHUNK`] rows rather than one per row (#507). Under Turso's
+	/// MVCC each keyed delete cost milliseconds, growing with the versions earlier swaps
+	/// left behind, so a squash of 10M rows spent ~350 s deleting its members one at a time.
+	DeleteEveryExpected { aspect: String, expected: Vec<RowVersion> },
 	/// Insert `row`, replacing any row with its `(aspect, id)` (`INSERT OR REPLACE`): the
 	/// legacy [`SegmentIndexStore::insert`](crate::SegmentIndexStore::insert). No path of
 	/// the store writes it any more: seals insert with [`InsertNew`](Self::InsertNew) (S7)
@@ -233,7 +241,7 @@ impl IndexOp {
 			// writer of that aspect's rollup row can commit between attempts: a retry
 			// re-runs the same fold over the same index state. An `IndexTxn` run
 			// without that lock must not rely on it.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::JournalHeld { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } => true,
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::DeleteEveryExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::JournalHeld { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } => true,
 			// `QuarantineInsert` replaces a record of the same key and
 			// `QuarantineDelete` deletes one if it exists, so neither re-checks
 			// what its caller decided from, like `Upsert` and `Delete`.
@@ -508,6 +516,26 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 			let changed = conn.execute(sql, version_values(aspect, *expected)).await.map_err(|e| statement_error(&format!("deleting {aspect:?} segment {}", expected.id), &e))?;
 			expect_one(changed, "delete", aspect, *expected)
 		}
+		IndexOp::DeleteEveryExpected { aspect, expected } => {
+			let mut changed = 0;
+			for chunk in expected.chunks(DELETE_CHUNK) {
+				let versions = vec!["(id = ? AND gen = ? AND frame_crc IS ?)"; chunk.len()].join(" OR ");
+				let sql = format!("DELETE FROM segment_index WHERE aspect = ? AND ({versions})");
+				let mut params = vec![Value::Text(aspect.clone())];
+				for version in chunk {
+					params.extend(version_values(aspect, *version).into_iter().skip(1));
+				}
+				let deleted = conn.execute(sql, params).await.map_err(|e| statement_error(&format!("deleting {} {aspect:?} segments", chunk.len()), &e))?;
+				// The ids are distinct, so the count falls short exactly when some row is not
+				// at the version its caller read.
+				if deleted != chunk.len() as u64 {
+					let ids = chunk.iter().map(|version| version.id.to_string()).collect::<Vec<_>>().join(", ");
+					return Err((TxnErrorKind::Conflict, format!("delete expected the {} {aspect:?} rows with ids {ids} at the versions read, and matched {deleted}", chunk.len())));
+				}
+				changed += deleted;
+			}
+			Ok(changed)
+		}
 		IndexOp::Delete { aspect, id } => conn.execute("DELETE FROM segment_index WHERE aspect = ? AND id = ?", vec![Value::Text(aspect.clone()), integer(*id)]).await.map_err(|e| statement_error(&format!("deleting {aspect:?} segment {id}"), &e)),
 		IndexOp::SeqBump { aspect, next_id, next_gen, epoch } => {
 			// A new row's `next_gen` is at least 1: generation 0 names the legacy
@@ -564,6 +592,11 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 		}
 	}
 }
+
+/// The rows one statement of [`IndexOp::DeleteEveryExpected`] deletes: a squash group's
+/// members in one (64 for 65,536-row segments over 1,024-row seals), while the
+/// `OR` chain stays inside Turso's expression depth of 100, which refuses 256 terms.
+const DELETE_CHUNK: usize = 64;
 
 /// A precondition holds when the guarded statement changed exactly one row.
 fn expect_one(changed: u64, what: &str, aspect: &str, expected: RowVersion) -> Result<u64, (TxnErrorKind, String)> {
@@ -1064,6 +1097,35 @@ mod tests {
 		drop(index);
 		assert_eq!(applied.changes, vec![1, 1, 1]);
 		assert_eq!(rows, vec![a, row(2, 2, None)]);
+	}
+
+	/// A delete of many rows at once is guarded as its rows one at a time would be: one row
+	/// that is not at the version read, or not there, fails it `Conflict` and leaves every
+	/// row, in any chunk; at their versions, it deletes them all, past a chunk's worth too.
+	#[tokio::test]
+	async fn a_delete_of_many_rows_is_every_row_or_none() {
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let rows: Vec<IndexRow> = (0..DELETE_CHUNK as u64 + 10).map(|id| row(id, 1, (id % 2 == 0).then(|| u32::try_from(id).expect("small id")))).collect();
+		index.apply(&IndexTxn::new(rows.iter().cloned().map(insert).collect())).await.expect("commits the rows");
+		let every = |versions: Vec<RowVersion>| IndexOp::DeleteEveryExpected { aspect: ASPECT.to_string(), expected: versions };
+		let versions: Vec<RowVersion> = rows.iter().map(IndexRow::version).collect();
+		let with = |at: usize, version: RowVersion| {
+			let mut versions = versions.clone();
+			versions[at] = version;
+			versions
+		};
+		let stale = [("a generation that changed", with(3, RowVersion { gen: 2, ..versions[3] })), ("a CRC where the row has none", with(1, RowVersion { frame_crc: Some(0), ..versions[1] })), ("no CRC where the row has one", with(DELETE_CHUNK + 2, RowVersion { frame_crc: None, ..versions[DELETE_CHUNK + 2] })), ("a row that does not exist", with(DELETE_CHUNK + 5, row(9_999, 1, None).version()))];
+		for (what, expected) in stale {
+			let err = index.apply(&IndexTxn::new(vec![every(expected)])).await.expect_err(what);
+			assert_eq!((err.kind, err.op), (TxnErrorKind::Conflict, Some(0)), "{what}: {err}");
+			assert_eq!(rows_of(&index, ASPECT).await, rows, "{what}: every row is still there");
+		}
+		let applied = index.apply(&IndexTxn::new(vec![every(versions)])).await.expect("commits");
+		let left = rows_of(&index, ASPECT).await;
+		drop(index);
+		assert_eq!(applied.changes, vec![rows.len() as u64]);
+		assert!(left.is_empty(), "every row is deleted: {left:?}");
+		assert!(every(Vec::new()).is_guarded(), "its rows are checked, so a retry is safe");
 	}
 
 	/// Set only in the child process [`run_txn_child`] starts: the index database to open.

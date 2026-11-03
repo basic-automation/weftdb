@@ -19,6 +19,22 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `<store root>/audit.jsonl` (or `./weft-audit.jsonl` with no store configured), and a
   server that cannot open it refuses to start.
 
+### Fixed
+
+- Squashing an aspect deleted its merged segments' index rows one statement at a time, and
+  under Turso's MVCC each delete cost milliseconds and grew with the swaps before it. One
+  guarded statement now deletes a group's rows: squashing 10M UCI rows from 9,769 to 153
+  segments takes 31–43 s, not 361 s (694 s was measured on a loaded machine). The index is
+  checkpointed after a squash, so later reads no longer walk the deleted rows' versions: an
+  hour's read after it costs 0.49 ms, not 2.2 ms (0.22 ms before the squash in that run; what
+  remains is decoding into a 65k-row segment) (#507).
+- The analytics pipeline's first run interpolates each run of overlapping batch windows once
+  and queues the batches 500 to a transaction, instead of one interpolation and one commit
+  per window: preparing 10k UCI rows takes 204 s, not ~420 s (#505).
+- `analyze_range` read only one step past each 50,000-point chunk, so a gap longer than a
+  chunk was interpolated without its far bracket and came out as a single `0`. A chunk now
+  widens its read until it holds the knots on both sides (#506).
+
 ## [0.2.1] - 2026-11-02
 
 The binaries for the v0.2.0 release. Tagging v0.2.0 built macOS and Windows, but both Linux
