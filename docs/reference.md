@@ -1828,10 +1828,15 @@ What it does today:
 - **Post-compaction reads** (`--compressed-query-compact ROWS`) — after the compressed-query
   windows, the store is compacted to ROWS-row segments and the same windows asked again as
   `-compacted` results, each gated on answering exactly as before. On 10M UCI rows sealed in
-  1,024-row batches (2026-11-02) the squash to 65,536-row segments took **694 s** (9,769 → 153
-  segments, 1.414 → 1.341 B/pt), every window answered identically, and **small windows got
-  slower**: an hour's in-store p50 went 0.16 → 5.75 ms and a day's 0.24 → 5.39 ms, because each
-  read now decodes a whole 65k-row segment. The year window held (30.1 → 29.5 ms).
+  1,024-row batches the squash to 65,536-row segments (9,769 → 153 segments, 1.414 → 1.341
+  B/pt) took **694 s** on 2026-11-02 under load and 361 s on a quiet machine, nearly all of it
+  one keyed `segment_index` delete per merged segment under Turso's MVCC. Since #507 a group's
+  rows go in one guarded delete and the squash takes **31–43 s** (2026-11-03, three runs).
+  Every window answers identically. Small windows still read slower after it, but less: the
+  index is now checkpointed after a squash, without which every later read walked the deleted
+  rows' versions (an hour's p50 2.2 ms). With it an hour went 0.22 → 0.49 ms and a day
+  0.30 → 0.61 ms in the same run; what remains is decoding into a 65k-row segment. The year
+  window held (22.9 → 17.8 ms).
 - **Failure tests** (`--ingest --failure kill-ingest|kill-compaction|corrupt-segment|all`) — a
   benchmark of a healthy store says nothing about the one a crash leaves. A child process (this
   binary) seals the corpus, or compacts a store of it, and is killed with `SIGKILL` at a seeded

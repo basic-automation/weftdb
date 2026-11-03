@@ -1281,6 +1281,13 @@ impl SegmentStore {
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}
+		// The swaps deleted `removed` index rows; drop the versions they left (see
+		// `SegmentIndexStore::checkpoint`). The squash is done either way.
+		if removed > 0 {
+			if let Err(e) = self.index.checkpoint().await {
+				tracing::warn!(aspect, removed, error = %e, "could not checkpoint the segment index after a squash; reads walk the deleted rows' versions until Turso's own checkpoint");
+			}
+		}
 		Ok(removed)
 	}
 
