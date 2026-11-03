@@ -8,6 +8,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- `weft-server` builds its tokio runtime explicitly (ROB-11, Admission II's runtime-builder
+  side): workers are named `weft-worker`, the new `WEFT_WORKER_THREADS` setting sizes the
+  pool (unset keeps one worker per available core), and the runtime is shut down with plan
+  C9's `shutdown_timeout` of 5 seconds after serving, the task drain and the store's
+  shutdown, instead of the implicit `#[tokio::main]` runtime whose drop waits indefinitely
+  for blocking work. Admission I's per-class gate budgets and refusals are unchanged.
+
 ## [0.2.1] - 2026-11-02
 
 The binaries for the v0.2.0 release. Tagging v0.2.0 built macOS and Windows, but both Linux

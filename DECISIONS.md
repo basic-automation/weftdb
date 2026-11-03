@@ -3359,3 +3359,63 @@ kill soak cannot see a missing fsync, so the privileged power-loss validation
 §9 durability tick waits for it. No nightly compare gate: a cell either holds
 or it does not; the first successful workflow run is the hand-compared
 baseline.
+
+## 2026-11-02 — ROB-11 "Admission II": the runtime-builder side (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan names ROB-11 only as "Admission II" (§6 W6) and
+places it on the L-MAIN lane as the wave's second main.rs edit — "PAC-7 →
+ROB-11 (W6, CLI then runtime builder)" (§2). ROB-10's entry records the
+split from the other side: Admission I is the registry gate's per-class
+budgets, and "Admission II (ROB-11, W6) is not pre-empted. It arrives with
+PAC-7's runtime builder (§2 L-MAIN) and owns later refinement". The queue
+acceptance repeats the shape: "Admission II lands on the runtime-builder
+side (after PAC-7's CLI side)". Plan C9 fixes one concrete runtime
+behaviour: the drain order ends "serve → SEC-9 TaskTracker →
+`store.shutdown()` → runtime `shutdown_timeout(5 s)`" — and the first
+three steps already land inside startup, while the runtime itself was
+still `#[tokio::main]`'s implicit one, whose shutdown has no such bound.
+The points the sources do not pin, chosen here under the owner's
+best-guess authorization (2026-10-26), recorded for merge review and
+reversible there:
+
+1. **The runtime is built explicitly, in a library module.** A new
+   `weft_server::runtime` holds `RuntimeConfig`, `build_runtime` and
+   `run` (build → `block_on` → `shutdown_timeout`); `main` reads the
+   config, calls `runtime::run(config, dispatch())`, and the dispatch
+   body is byte-for-byte the command dispatch `#[tokio::main]` used to
+   run. The builder is multi-thread with every driver enabled — the
+   attribute's own flavour — so no behaviour changes beyond what this
+   entry names. Workers are named `weft-worker`.
+2. **One new knob: `WEFT_WORKER_THREADS` (Tuning, unset = the runtime's
+   machine-sized default).** It joins the VarSpec registry (74 → 75
+   entries) and the strict-config positive-integer list. Sizing the
+   pool beside Admission I's caps is the runtime side of admission:
+   the gate decides how much work of each class may run at once, and
+   this decides the capacity those permits spend. No default number is
+   invented — unset keeps tokio's one-worker-per-core, exactly the
+   pre-slice behaviour.
+3. **`shutdown_timeout` is C9's 5 s, not a knob.**
+   `RUNTIME_SHUTDOWN_TIMEOUT` is a constant in `runtime.rs`, applied
+   after `block_on` returns — i.e. after serve, the daemons' drain and
+   `store.shutdown()` inside startup have all finished, which is the
+   order C9 names. The serve path's own connection grace stays
+   `WEFT_SHUTDOWN_GRACE_SECS`; the two 5 s numbers are different steps
+   of the same drain, not one setting read twice.
+4. **A malformed `WEFT_WORKER_THREADS` exits 78 from `main`.** The
+   runtime must exist before startup's strict-configuration phase can
+   run, so that phase cannot be the first to refuse this one value;
+   `main` refuses it itself with the C7 configuration status and the
+   registry's own wording. Every other variable is still refused by
+   the strict phase first, as before.
+
+**Rejected:** admission policy changes on the gate side (queueing shed
+queries, priorities, per-route overrides) — ROB-10's entry lists those
+as not-Admission-I, but no source assigns them to ROB-11 either, and
+the acceptance names the runtime-builder side, not the gate; a
+`WEFT_RUNTIME_SHUTDOWN_SECS` knob (C9 fixes the number, and a second
+shutdown knob beside `WEFT_SHUTDOWN_GRACE_SECS` invites confusing the
+two steps); and building this slice on PAC-7's unmerged branch — the
+PR is based on main like every W6 slice, so at the batch merge PAC-7's
+CLI dispatch and this runtime builder combine in `main.rs` (the
+dispatch body becomes the future `runtime::run` drives), which is the
+L-MAIN order the plan lists.
