@@ -846,8 +846,8 @@ impl SegmentStore {
 	/// reconciliation/upsert behaviour. Rows at a timestamp carried by only one member
 	/// — including that member's own internal duplicates — are preserved.
 	///
-	/// Each overlap component is either fully rewritten into one segment (paged once it
-	/// holds more than a page, see [`MERGE_ROWS_PER_PAGE`], whatever kind its members
+	/// Each overlap component is either fully rewritten into one segment (paged once it holds
+	/// more than 4,096 rows, whatever kind its members
 	/// were) or, when a large **cold prefix**
 	/// dominates, **split** (per [`SplitPolicy`]) into an untouched-going-forward prefix
 	/// segment plus a merged hot-suffix segment — see
@@ -1072,7 +1072,7 @@ impl SegmentStore {
 	/// the QuestDB-style bound on that fragmentation: it folds **every** segment of
 	/// `aspect` — in ascending seal id, [`merge_newer_wins`] so any residual shared
 	/// timestamp still resolves last-writer-wins — into a single time-sorted segment
-	/// (paged past [`MERGE_ROWS_PER_PAGE`] rows) under the lowest id, deleting the rest. After it, the aspect is one segment
+	/// (paged past 4,096 rows) under the lowest id, deleting the rest. After it, the aspect is one segment
 	/// with no cross-segment overlap. The natural trigger is a segment count past a
 	/// threshold (see [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds));
 	/// squashing trades the split path's low write amplification for a low segment count,
