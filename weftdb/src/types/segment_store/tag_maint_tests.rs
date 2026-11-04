@@ -4,7 +4,7 @@
 //! `had_overlap`) count per series, and the overlap statistics sum per-series indexes. An
 //! untagged aspect is a single series, so it plans exactly as before (the existing
 //! maintenance, crash-matrix and compat tests are the proof). Tagged batches seal through the
-//! crate-private `ingest_inner(.., TagPolicy::Allow)`; the library gate opens in TAG-8.
+//! public `ingest`, whose library gate opened in TAG-8.
 
 use std::{collections::BTreeMap, path::Path, str::FromStr};
 
@@ -12,7 +12,7 @@ use bigdecimal::BigDecimal;
 use tempfile::TempDir;
 use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType, SplitPolicy};
 
-use super::{merge_rows_per_page, IndexRow, MaintenanceWait, SegmentStore, SwapPlan, TagPolicy};
+use super::{merge_rows_per_page, IndexRow, MaintenanceWait, SegmentStore, SwapPlan};
 use crate::{IngestBatch, TagSet};
 
 fn bd(s: &str) -> BigDecimal {
@@ -47,7 +47,7 @@ async fn seal(store: &SegmentStore, aspect: &str, groups: &TagSet, timestamps: &
 	let key = format!("{aspect}-{}", KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 	let values = timestamps.iter().map(|t| BigDecimal::from(*t)).collect();
 	let batch = IngestBatch::dense(key, timestamps.to_vec(), values).with_groups(groups.clone());
-	let receipt = store.ingest_inner(aspect, &batch, TagPolicy::Allow).await.expect("ingests");
+	let receipt = store.ingest(aspect, &batch).await.expect("ingests");
 	assert_eq!(receipt.segment_ids.len(), 1, "one segment per seal");
 	receipt.segment_ids[0]
 }

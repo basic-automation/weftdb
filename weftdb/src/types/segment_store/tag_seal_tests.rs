@@ -1,8 +1,7 @@
 //! TAG-7, the seal lane of tagged series: a tagged batch seals frames in a v7 envelope that
 //! carries its series key (critical `EXT_SERIES_KEY`, tags D3), and rows under the series id the
-//! commit resolves (or registers) in the aspect's catalog. An untagged batch is unchanged, and
-//! the public `ingest` still refuses groups (the library gate opens in TAG-8): these tests seal
-//! tagged batches through the crate-private `ingest_inner(.., TagPolicy::Allow)`.
+//! commit resolves (or registers) in the aspect's catalog. An untagged batch is unchanged. The
+//! library gate opened in TAG-8, so these tests seal tagged batches through the public `ingest`.
 
 use std::{path::Path, str::FromStr};
 
@@ -10,7 +9,7 @@ use bigdecimal::BigDecimal;
 use tempfile::TempDir;
 use weft_physical_type::{crc32, describe_frame, timestamp::TimeUnit, AspectSchema, FrameExtension, PhysicalType, EXT_SERIES_KEY, FRAME_ENVELOPE, FRAME_PAGED, FRAME_SINGLE_BLOCK, PAGED_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION};
 
-use super::{series_envelope_overhead, tag_frame, IndexRow, SegmentStore, SegmentStoreOptions, TagPolicy};
+use super::{series_envelope_overhead, tag_frame, IndexRow, SegmentStore, SegmentStoreOptions};
 use crate::{IngestBatch, SeriesId, SeriesKey, StoreError, TagSet};
 
 fn bd(s: &str) -> BigDecimal {
@@ -44,7 +43,7 @@ async fn store_at(root: &Path, options: SegmentStoreOptions) -> SegmentStore {
 
 /// Ingest `batch` with the tags gate open.
 async fn ingest_tagged(store: &SegmentStore, batch: &IngestBatch) -> anyhow::Result<crate::IngestReceipt> {
-	store.ingest_inner(ASPECT, batch, TagPolicy::Allow).await
+	store.ingest(ASPECT, batch).await
 }
 
 /// The rows of [`ASPECT`], ascending by id.
@@ -122,7 +121,8 @@ async fn tagged_ingest_writes_a_critical_series_key_envelope() {
 		let payload = SeriesKey::from_canonical(&info.extensions[0].payload).expect("the payload is canonical");
 		assert_eq!(&payload, groups.series_key(), "the frame records the key, never the id");
 	}
-	let (ts, vs) = store.read_time_range(ASPECT, 0, 50).await.expect("the enveloped frames read");
+	let (ts, vs) = store.read_time_range_of(ASPECT, SeriesId(1), 0, 50).await.expect("the enveloped frames read");
+	assert_eq!(store.read_time_range(ASPECT, 0, 50).await.expect("reads series 0"), (vec![], vec![]), "series 0 holds none of them (TAG-8)");
 	assert_eq!(ts, vec![0, 10, 20, 30, 40, 50]);
 	assert_eq!(vs, ["1", "2", "3", "4", "5", "6"].iter().map(|v| Some(bd(v))).collect::<Vec<_>>());
 	assert_eq!(store.index.series_key_of(ASPECT, SeriesId(1)).await.expect("reads").as_ref(), Some(groups.series_key()), "the frame key equals the catalog key for the row's id");
@@ -219,7 +219,7 @@ async fn series_limit_refuses_the_next_new_key_and_keeps_existing_ones_writable(
 	assert_eq!(store.index.series_of(ASPECT).await.expect("reads").len(), 2);
 	// The commit's own check refuses too, for a new key that got past the early one.
 	let mut ops = Vec::new();
-	let err = store.resolve_series(ASPECT, &tags("c"), &mut ops).await.expect_err("the commit-time check");
+	let err = store.commit_series_id(ASPECT, &tags("c"), &mut ops).await.expect_err("the commit-time check");
 	assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::SeriesLimit { limit: 2, .. })), "{err:#}");
 	assert!(ops.is_empty(), "nothing to register");
 }
@@ -273,7 +273,7 @@ async fn a_tagged_compaction_output_keeps_its_series_key() {
 	let split = rows(&store).await;
 	assert_eq!(split.iter().map(|row| row.desc.id).collect::<Vec<_>>(), vec![id, fresh]);
 	split.iter().for_each(check);
-	let (ts, vs) = store.read_time_range(ASPECT, i64::MIN, i64::MAX).await.expect("reads");
+	let (ts, vs) = store.read_time_range_of(ASPECT, SeriesId(split[0].series_id), i64::MIN, i64::MAX).await.expect("reads");
 	assert_eq!(ts, vec![0, 10, 20, 30, 40]);
 	assert_eq!(vs, ["1", "20", "3", "4", "5"].iter().map(|v| Some(bd(v))).collect::<Vec<_>>(), "the newer value wins at 10");
 }

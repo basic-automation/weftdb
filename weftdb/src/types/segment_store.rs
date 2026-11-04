@@ -822,23 +822,6 @@ impl IngestSegment {
 	}
 }
 
-/// Whether an ingest refuses a non-empty `groups` (the public gate) or seals it as a
-/// tagged series (TAG-7).
-///
-/// [`SegmentStore::ingest`] always passes [`Refuse`](Self::Refuse): the library gate
-/// stays shut until TAG-8, when maintenance and reads are series-correct too (tags D5).
-/// Until then only the crate's own tests seal tagged batches, through
-/// `ingest_inner(.., TagPolicy::Allow)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TagPolicy {
-	/// A non-empty `groups` is [`GroupsUnsupported`](crate::StoreError::GroupsUnsupported).
-	Refuse,
-	/// A non-empty `groups` seals into its series: frames in a series-key envelope, rows
-	/// under the id the catalog holds for the key (registered at commit when new).
-	#[cfg_attr(not(test), expect(dead_code, reason = "the library gate opens in TAG-8; until then only the tests seal tagged batches"))]
-	Allow,
-}
-
 /// The most bytes a series-key envelope ([`tag_frame`]) adds to a frame carrying `key`:
 /// the envelope's 16 bytes (a 12-byte header and a 4-byte CRC trailer) plus one
 /// extension entry, charged as the envelope writer sizes it (6 bytes of id, flag and
@@ -2983,9 +2966,10 @@ mod tests {
 		let err = store.seal_declared("undeclared", &[0], &[bd("1")]).await.expect_err("seal_declared shares require_schema");
 		assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::UnknownAspect { .. })), "{err:#}");
 		store.declare("price", &schema()).await.expect("declares");
-		let grouped = batch.clone().with_groups(crate::TagSet::from_pairs([("host", "a")]).expect("valid tags"));
-		let err = store.ingest("price", &grouped).await.expect_err("non-empty groups before the gate flips");
-		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::GroupsUnsupported { aspect: "price".to_string() }), "{err:#}");
+		// TAG-8: the library gate is open, but a reserved `__` key is still refused.
+		let reserved = batch.clone().with_groups(crate::TagSet::from(crate::SeriesKey::from_canonical(b"__dim\x1fs").expect("a stored reserved key")));
+		let err = store.ingest("price", &reserved).await.expect_err("a reserved tag key");
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::ReservedTagKey { aspect: "price".to_string(), key: "__dim".to_string() }), "{err:#}");
 		let err = store.ingest("price", &IngestBatch::dense("k", vec![], vec![])).await.expect_err("an empty batch");
 		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::EmptyIngestBatch { aspect: "price".to_string() }), "{err:#}");
 		let err = store.ingest("price", &IngestBatch::new("k", vec![0, 10], vec![Some(bd("1"))])).await.expect_err("mismatched columns");
@@ -3272,11 +3256,13 @@ mod tests {
 		assert_eq!(report.adopted, 2, "both orphans are adopted: {report:?}");
 		assert_eq!(report.held, 0, "a tagged orphan of a declared aspect is not held: {report:?}");
 		let (times, _) = reopened.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
-		// Reads are aspect-wide until series-scoped reads land (TAG-8), so the
-		// tagged frame's rows are served too: they are no longer invisible.
-		assert_eq!(times, vec![0, 10, 20, 30, 40, 50, 60], "both adopted frames' rows are readable");
+		// Reads target one series (TAG-8): series 0 serves the plain frame's rows, and
+		// the tagged frame's rows are read from the series its key names.
+		assert_eq!(times, vec![0, 10, 20, 30, 40], "the plain adopted frame's rows are series 0's");
 		let key = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
 		let id = reopened.index().series_id_for("price", &key).await.expect("catalog").expect("the key is registered");
+		let (times, _) = reopened.read_time_range_of("price", id, i64::MIN, i64::MAX).await.expect("reads");
+		assert_eq!(times, vec![50, 60], "the tagged adopted frame's rows are readable in their series");
 		assert_ne!(id, crate::SeriesId::UNTAGGED);
 		let rows = reopened.index().rows("price").await.expect("rows");
 		let tagged: Vec<_> = rows.iter().filter(|row| row.desc.path.ends_with("price-8.weftseg")).collect();
@@ -8297,3 +8283,7 @@ mod tag_seal_tests;
 /// TAG-6: every maintenance pass plans within one series.
 #[cfg(test)]
 mod tag_maint_tests;
+
+/// TAG-8: every store read targets one series; selectors resolve to one.
+#[cfg(test)]
+mod tag_read_tests;

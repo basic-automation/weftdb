@@ -77,8 +77,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   writes themselves stay refused at both gates until TAG-8 (library) and TAG-11 (HTTP), so
   nothing reaches the cap yet.
 
+- **Series-scoped reads and tagged library ingest (TAG-8).** `SegmentStore::ingest` now
+  accepts a non-empty `IngestBatch::groups` and seals it as its own tag series; a group key
+  with the reserved `__` prefix is refused with the typed `StoreError::ReservedTagKey`
+  (`400 invalid_tag`). Each store read has an `_of` form that takes a `SeriesId`
+  (`read_time_range_of`, `downsample_range_of`, `downsample_range_width_of`, `read_point_of`,
+  `read_points_of`, `read_value_range_of`, `interpolate_range_of`, `interpolate_range_f64_of`,
+  and the `weft-arrow-store` exports), and `SegmentStore::resolve_series` turns a
+  `SeriesSelector` into the one series it names, or refuses with the typed
+  `StoreError::AmbiguousSeries` (`400 ambiguous_series`) when it matches several. HTTP
+  ingest still refuses tags until TAG-11.
+
 ### Changed
 
+- **Reads without a series mean the untagged series (TAG-8).** The existing read methods
+  answer series 0 only. A store with no tagged writes answers exactly as before; on an aspect
+  holding tagged series, they no longer return the tagged rows (use the `_of` reads).
+  `StoreError::GroupsUnsupported` is no longer produced and is kept as a reserved variant.
 - **Maintenance plans within one series (TAG-6).** Overlap reconciles, squashes, size-targeted
   compaction and the hot/cold reconcile never fold two tag series together; the squash cap,
   the fragmentation gate and `AspectStorageStats::overlapping_segments` (and
