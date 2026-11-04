@@ -484,7 +484,10 @@ still needs keys.
 Requests are admitted by class. Probes are never shed. Reads and compute are capped at
 `WEFT_QUERY_MAX_INFLIGHT` (beyond it, `503 overloaded` with `Retry-After`). Writes are charged
 by body size against `WEFT_INGEST_MAX_INFLIGHT_BYTES`. Maintenance and backup run one at a
-time (`409 busy`).
+time (`409 busy`). The budgets are spent by the process runtime, which the binary builds
+explicitly: `WEFT_WORKER_THREADS` sizes its worker pool (unset: one worker per available
+core), and the runtime is shut down with a 5-second `shutdown_timeout` once serving, the
+task drain and the store's shutdown have finished.
 
 ### Service endpoints
 
@@ -864,6 +867,7 @@ WeftDB is configured primarily through environment variables:
 | `WEFT_AUTH` | `weft-server` | `keys` requires the keys file; `disabled` turns auth off explicitly (a gateway in front authenticates). | on exactly when a keys file is mounted |
 | `WEFT_ALLOW_PLAINTEXT` | `weft-server` | Allows a non-loopback plaintext bind, with keys. | unset (refused) |
 | `WEFT_QUERY_MAX_INFLIGHT` | `weft-server` | Concurrent read and compute requests; past it, `503 overloaded`. | 128 |
+| `WEFT_WORKER_THREADS` | `weft-server` | Worker threads in the process runtime the admitted requests run on. | unset (one per available core) |
 | `WEFT_INGEST_MAX_INFLIGHT_BYTES` | `weft-server` | Byte budget across in-flight writes. | 256 MiB |
 | `WEFT_MAX_INGEST_BYTES` | `weft-server` | Per-request ingest body cap (`413`). | 256 MiB |
 | `WEFT_MAX_CONNECTIONS` | `weft-server` | Connection cap. | half of `RLIMIT_NOFILE`, clamped to 16..65,536 |
