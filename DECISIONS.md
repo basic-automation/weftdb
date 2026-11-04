@@ -4228,3 +4228,57 @@ of #310 is not done here.
 **Rejected:** carrying the source aspect's `series_id` on an aspect move (E19); treating a
 non-critical `SERIES_KEY` as malformed (writers always mark it critical, and the key is
 still well-defined); a separate `released` counter (released held rows count as `adopted`).
+
+## 2026-11-04 — TAG-8: every store read targets one series, selectors resolve once, the library gate opens and refuses reserved keys (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Issue #442; design PR 4 without X-READ, with critique D15–D17.
+
+1. **Reads target exactly one series (tags D4).** `SegmentStore` gains `read_time_range_of`,
+   `downsample_range_of`, `downsample_range_width_of`, `read_point_of`, `read_points_of`,
+   `read_value_range_of`, `interpolate_range_of` and `interpolate_range_f64_of` (critique D16
+   adds the two interpolations), each taking a `SeriesId`. The existing methods delegate with
+   `SeriesId::UNTAGGED`, so an untagged caller of a tagged aspect sees series 0 only, and an
+   untagged-only store answers byte-for-byte as before (every pre-existing read test passes
+   unchanged). An id the aspect never registered reads empty rather than erroring.
+2. **Series-scoped prune is crate-private (critique D15).** `prune_rows` takes an
+   `Option<SeriesId>` bound as a parameter (`AND series_id = ?`, never formatted into the SQL)
+   and keeps `INDEXED BY idx_segment_index_time`; the composite index stays PHASE4-TAGPRUNE's.
+   New crate-private `prune_series_rows_by_time`, `prune_series_present_rows`, `series_rows`
+   and `load_series_index` carry it. The public `prune_by_time`, `all` and `load_index` stay
+   aspect-wide (weft-server calls `store.index().all(aspect)`), and so do the maintenance and
+   recovery callers. `prune_present_descriptors`/`prune_present_rows` (aspect-wide) are now
+   called only by their own tests and carry a `cfg_attr(not(test), expect(dead_code))`.
+3. **`read_value_range_of` builds its resident `SegmentIndex` from the series' rows only.**
+4. **`resolve_series(aspect, &SeriesSelector) -> Result<Option<SeriesId>>`.** `untagged()`
+   short-circuits to series 0 without touching the catalog (compared by value, so `all()`,
+   which also has no matchers, does not short-circuit). Otherwise each catalog series whose
+   `TagSet` the selector matches is a candidate, and series 0 is one only when the selector
+   matches the empty set **and** series 0 holds rows (one `EXISTS` query). None → `Ok(None)`;
+   two or more → the new typed `StoreError::AmbiguousSeries { aspect, matched }`.
+   **Deviation (naming):** TAG-7's crate-private seal helper was also called `resolve_series`;
+   it is renamed `commit_series_id` so the public name is the spec's.
+5. **Library gate opens; reserved keys refused (D5, critique D17).** `TagPolicy` and
+   `ingest_inner` are removed: `SegmentStore::ingest` seals a non-empty `groups` as its series.
+   A `groups` key starting with `__` (only a `TagSet` converted from a stored `SeriesKey` can
+   carry one, and `groups` is a public field) is refused before anything is written with the
+   new typed `StoreError::ReservedTagKey { aspect, key }`. `GroupsUnsupported` stays as a
+   documented, no-longer-produced variant of the `#[non_exhaustive]` enum.
+6. **HTTP mapping.** `classify_typed` maps `AmbiguousSeries` → `400 ambiguous_series`
+   (`SeriesLimit` → `400 series_limit` was already mapped by TAG-7) and `ReservedTagKey` →
+   `400 invalid_tag`. All three codes already existed; the error-code count stays 43. There is
+   no HTTP producer of the new variants yet (the HTTP gate opens in TAG-11).
+7. **weft-arrow-store** gains an `_of` wrapper for each of its seven store-read exports; the
+   plain ones delegate with `SeriesId::UNTAGGED`.
+8. **Tests changed, and why.** Three TAG-7/TAG-9 tests read tagged rows through the
+   aspect-wide `read_time_range`; they now read them with `read_time_range_of`, and the
+   restore test (TAG-9's deviation 8) now asserts the split it could not before: series 0
+   reads the plain frame's rows only, the tagged series reads its own.
+
+**Not done here:** X-READ (newer-wins per series, C16) stays a separate PR 4b; multi-series
+fan-out is TAG-13. ROADMAP.md is unchanged: issue #442 says the slice has no ROADMAP line.
+
+**Rejected:** read methods that take a selector directly (they would repeat the ambiguity
+check on every call, and a cursor wants a stable id); `all()` as the meaning of the old
+methods (it would break pinned untagged reads on tagged stores); reusing `GroupsUnsupported`
+or `TagError` for reserved keys (the first now means "gate shut", the second carries no
+aspect).

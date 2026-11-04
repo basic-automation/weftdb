@@ -7,10 +7,9 @@
 //!
 //! - [`IngestBatch`]: an idempotency `key`, a `groups` tag set, and the
 //!   `(timestamp, value)` rows (nullable, like the quality-column seal).
-//!   Before the tags gate flips, `groups` accepts only the empty
-//!   [`TagSet`] — series 0 — exactly as the plan's D-S13 amendment and C1/A4
-//!   prescribe; a non-empty set is refused with the typed
-//!   [`StoreError::GroupsUnsupported`](crate::StoreError).
+//!   An empty `groups` is series 0; a non-empty set seals as its own series
+//!   (the library gate opened in TAG-8), and a reserved `__` key is refused
+//!   with the typed [`StoreError::ReservedTagKey`](crate::StoreError).
 //! - The **fingerprint**: a deterministic 64-bit hash over the batch's rows,
 //!   each present value hashed as its **bounded plain form** (ROB-6's one
 //!   decimal domain: the form every sink writes, at most
@@ -100,9 +99,10 @@ pub struct IngestBatch {
 	/// the caller's, from whatever namespace its own retries use (the HTTP
 	/// layer's `Idempotency-Key` header lands on this field in D-S14).
 	pub key: String,
-	/// The batch's tag groups (plan §4 C1, shape A4). Before the tags gate
-	/// flips only the empty set is accepted — series 0 — and a non-empty set
-	/// is refused with [`GroupsUnsupported`](StoreError::GroupsUnsupported).
+	/// The batch's tag groups (plan §4 C1, shape A4): the empty set is series
+	/// 0, and a non-empty set names the series the batch seals into (TAG-8).
+	/// A key with the reserved `__` prefix is refused with
+	/// [`ReservedTagKey`](StoreError::ReservedTagKey).
 	pub groups: TagSet,
 	/// The page height the batch's segments seal with, when the caller asked
 	/// for paged frames (crash-consistency §8: the HTTP layer's
