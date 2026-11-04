@@ -77,7 +77,7 @@ pub struct RestoreDrillResponse {
 /// backup will not restore or verify — which is a failed drill, and the answer the
 /// caller asked for.
 pub async fn restore_drill(State(state): State<AppState>, StrictQuery(params): StrictQuery<RestoreDrillParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	if !valid_backup_label(&params.label) {
 		return Err(invalid_backup_label(&params.label));
@@ -265,7 +265,7 @@ fn valid_backup_label(label: &str) -> bool {
 /// [`ApiError::already_exists`] when the target dir already exists, and
 /// [`ApiError::internal`] on a backup/verify failure.
 pub async fn backup_store(State(state): State<AppState>, StrictQuery(params): StrictQuery<BackupParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
 	let mode = match params.verify.as_deref() {

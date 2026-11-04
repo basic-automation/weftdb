@@ -223,7 +223,9 @@ pub struct ReconcileMetrics {
 }
 
 /// Counters for the online control-plane backup (`POST …/storage/backup`, roadmap
-/// Phase 7.4). An operator needs to see how many snapshots ran and the total bytes
+/// Phase 7.4).
+///
+/// An operator needs to see how many snapshots ran and the total bytes
 /// written to reason about backup cadence and storage growth — and, since EVI-18,
 /// whether the scheduled daemon is healthy: how many of its ticks failed, and when
 /// the last verified snapshot landed (`last_success_unix_secs`, 0 when none has

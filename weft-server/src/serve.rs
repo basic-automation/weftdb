@@ -109,7 +109,9 @@ pub const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 /// (registered by C-2, given to this drain by D-S14, plan C9): how long
 /// the serve side waits for live connections to finish after the
 /// shutdown future resolves, before startup proceeds to the next drain
-/// step. Positive whole number; default [`SHUTDOWN_DRAIN`].
+/// step.
+///
+/// Positive whole number; default [`SHUTDOWN_DRAIN`].
 pub const SHUTDOWN_GRACE_SECS_ENV: &str = "WEFT_SHUTDOWN_GRACE_SECS";
 
 /// The pre-auth listener limits [`run`] enforces, read once at startup.

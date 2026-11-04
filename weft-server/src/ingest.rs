@@ -46,7 +46,9 @@ use crate::{
 
 /// Environment variable naming the one body cap for the ingest routes
 /// (plan C11, crash-consistency §8): a positive whole number of bytes,
-/// read once at startup. Every other route keeps its own limits — this
+/// read once at startup.
+///
+/// Every other route keeps its own limits — this
 /// cap applies to the four ingest routes only, as a
 /// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) the registry
 /// installs at registration.
@@ -54,7 +56,9 @@ pub const MAX_INGEST_BYTES_ENV: &str = "WEFT_MAX_INGEST_BYTES";
 
 /// Environment variable naming the ingest routes' in-flight byte budget
 /// (crash-consistency §8): the byte-weighted admission the registry's
-/// gate enforces inside itself (plan C10). A request whose body would
+/// gate enforces inside itself (plan C10).
+///
+/// A request whose body would
 /// push the in-flight total past the budget is refused
 /// `503 overloaded` with `Retry-After`, instead of queueing without
 /// bound behind the ingests already running.

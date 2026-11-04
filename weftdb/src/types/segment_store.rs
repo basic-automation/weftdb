@@ -2402,9 +2402,7 @@ impl StoreStorageStats {
 		if self.total_rows == 0 {
 			return 0.0;
 		}
-		#[allow(clippy::cast_precision_loss)]
 		let n = self.total_rows as f64;
-		#[allow(clippy::cast_precision_loss)]
 		let total = self.total_bytes as f64;
 		total / n
 	}
@@ -5094,7 +5092,6 @@ mod tests {
 		assert_eq!(stats.time_range, Some((0, 140)));
 		// Both seals were in order, so the aspect is fully sorted.
 		assert_eq!(stats.unsorted_segments, 0);
-		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = expected_bytes as f64 / 10.0;
 		assert!((stats.bytes_per_point - expected_bpp).abs() < f64::EPSILON);
 		// Empty aspect.
@@ -5182,7 +5179,6 @@ mod tests {
 		assert_eq!(stats.total_bytes, temp.total_bytes + humidity.total_bytes);
 		// The time span is the union across aspects.
 		assert_eq!(stats.time_range, Some((0, 120)));
-		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = stats.total_bytes as f64 / 5.0;
 		assert!((stats.bytes_per_point() - expected_bpp).abs() < f64::EPSILON);
 		// Both aspects sealed in order, so the store-wide order-health count is clean,

@@ -1,4 +1,6 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::io;
 

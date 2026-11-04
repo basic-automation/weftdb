@@ -289,13 +289,17 @@ pub const ROOT_LOCKED_EXIT_CODE: i32 = 75;
 
 /// The `EX_USAGE` exit status (plan C7): the command line itself is wrong —
 /// an unknown command, an unknown option, or a missing value — so nothing
-/// was attempted. The operator CLI ([`crate::cli`]) owns this class: a
+/// was attempted.
+///
+/// The operator CLI ([`crate::cli`]) owns this class: a
 /// subcommand's own parse errors exit with it, and so does a first word
 /// that names no command at all.
 pub const USAGE_EXIT_CODE: i32 = 2;
 
 /// The exit status (plan C7) for an unexpected error: the failure no other
-/// row of the table names. It is what the runtime's own error report (the
+/// row of the table names.
+///
+/// It is what the runtime's own error report (the
 /// `fn main() -> anyhow::Result<()>` return) exits with, so a caller only
 /// sees it when no phase classified the failure first.
 pub const UNEXPECTED_EXIT_CODE: i32 = 1;
@@ -311,7 +315,9 @@ const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BAT
 /// One line per *value* the operator should hear about, in the order the environment
 /// lists them: a registered numeric variable holding a value outside the shape its
 /// registry entry accepts, or the one closed enum whose reader used to warn and keep
-/// serving (`WEFT_ON_AMBIGUOUS_COMMIT`: `poison` or `exit`). Variables whose readers
+/// serving (`WEFT_ON_AMBIGUOUS_COMMIT`: `poison` or `exit`).
+///
+/// Variables whose readers
 /// define open shapes (paths, endpoints, truthy flags where anything else is simply
 /// "off") are not judged here — their own startup phase refuses what it cannot use.
 #[must_use]
@@ -347,7 +353,9 @@ pub fn value_errors_for(entries: impl IntoIterator<Item = (String, String)>) -> 
 /// Every reason strict server configuration (PAC-5b) refuses this environment: the
 /// name problems [`warnings_for`] reports (an unknown `WEFT_` name, a `Test`-tier
 /// channel set on a real server) plus the value problems [`value_errors_for`]
-/// reports. An empty result is a configuration the server will start with; anything
+/// reports.
+///
+/// An empty result is a configuration the server will start with; anything
 /// else is refused before any phase reads a setting, with exit [`CONFIG_EXIT_CODE`].
 #[must_use]
 pub fn strict_errors_for(entries: Vec<(String, String)>) -> Vec<String> {

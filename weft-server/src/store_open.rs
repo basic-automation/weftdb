@@ -79,7 +79,9 @@ pub const DATABASE_ENV: &str = "WEFT_STORE_DATABASE";
 pub const SUBJECT_ENV: &str = "WEFT_STORE_SUBJECT";
 
 /// The scope `weftdb::SegmentStore::open` uses, and the scope a server runs under when
-/// neither [`DATABASE_ENV`] nor [`SUBJECT_ENV`] is set. Spelled out here rather than
+/// neither [`DATABASE_ENV`] nor [`SUBJECT_ENV`] is set.
+///
+/// Spelled out here rather than
 /// imported because `weftdb` keeps its copy private, and a server that drifted from it
 /// would silently open a different store than `cargo run -p weftdb` does.
 pub const DEFAULT_SCOPE_DATABASE: &str = "default";
@@ -122,7 +124,9 @@ pub fn store_root_from_env() -> anyhow::Result<std::path::PathBuf> {
 
 /// Why the store filesystem check (PAC-5b) refuses a root before the store is
 /// opened: the root is not a usable directory on a filesystem this build can be
-/// durable on. Every variant is a filesystem refusal in plan C7's terms, so the
+/// durable on.
+///
+/// Every variant is a filesystem refusal in plan C7's terms, so the
 /// server exits it with [`crate::settings::CONFIG_EXIT_CODE`] (78).
 #[derive(Debug)]
 pub enum StoreRootProblem {
@@ -154,7 +158,9 @@ impl std::error::Error for StoreRootProblem {
 /// The store filesystem check (PAC-5b): refuse `root` before the store opens when
 /// the filesystem cannot hold a store — the root exists as a file, cannot be
 /// created or listed, is not writable, or (on Unix) its directory entry cannot be
-/// synced, which is the durability every store write assumes. A missing root is
+/// synced, which is the durability every store write assumes.
+///
+/// A missing root is
 /// created, as the open itself would create it, and then probed. The probe file
 /// is removed before this returns, success or failure.
 ///
@@ -203,7 +209,9 @@ fn sync_directory(_dir: &Path) -> std::io::Result<()> {
 /// The exit status (plan C7) a store-open failure maps to, when it maps to one:
 /// [`crate::settings::ROOT_LOCKED_EXIT_CODE`] (75) for a root another process
 /// holds, [`crate::settings::STORE_EXIT_CODE`] (65) for a [`weftdb::StoreError`]
-/// — the store needs operator action. Anything else keeps the caller's default.
+/// — the store needs operator action.
+///
+/// Anything else keeps the caller's default.
 #[must_use]
 pub fn exit_code_for_store_error(error: &anyhow::Error) -> Option<i32> {
 	if error.downcast_ref::<weftdb::StoreLocked>().is_some() {

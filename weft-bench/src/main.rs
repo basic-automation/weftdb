@@ -24,7 +24,9 @@
 //! here as a pure, unit-tested function rather than pulling a new dependency into
 //! the workspace.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{
 	path::{Path, PathBuf}, process::ExitCode

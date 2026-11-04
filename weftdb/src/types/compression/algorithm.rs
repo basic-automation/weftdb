@@ -89,7 +89,6 @@ pub async fn simplify_with_aggressiveness(measurements: &[Measurement], aggressi
 ///
 /// Returns a resolution that's between original (at aggressiveness=0)
 /// and base (at aggressiveness=1).
-#[allow(clippy::cast_possible_truncation)]
 fn interpolate_resolution(original: Resolution, base: Resolution, aggressiveness: f64) -> Resolution {
 	let original_rank = resolution_rank(original);
 	let base_rank = resolution_rank(base);

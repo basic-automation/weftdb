@@ -1,8 +1,6 @@
 //! Shared pieces the write-path endpoint tests are built from: a router over a
 //! temporary store, and the request helpers those tests post through it.
 
-#![allow(clippy::missing_panics_doc)]
-
 use std::{str::FromStr, sync::Arc};
 
 use axum::{

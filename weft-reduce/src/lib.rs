@@ -18,8 +18,9 @@
 //! `Resolution`, `bigdecimal`, `chrono`): it is a leaf crate every reducing surface
 //! can depend on without pulling in an HTTP stack or a storage backend.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::module_name_repetitions)]
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 mod exact;
 pub mod fill;
@@ -575,8 +576,9 @@ pub fn reduce(points: &[Point], resolution: Resolution, start: Option<DateTime<U
 	reduce_partial(points, resolution, start, end, aggregations)?.finish(resolution, aggregations)
 }
 
-/// [`reduce`] into buckets of a [`BucketWidth`] (`5s`, `15m`): the reduction at the width's
-/// unit, each run of [`count`](BucketWidth::count) unit buckets merged into one
+/// [`reduce`] into buckets of a [`BucketWidth`] (`5s`, `15m`).
+///
+/// The reduction at the width's unit, each run of [`count`](BucketWidth::count) unit buckets merged into one
 /// ([`PartialReduction::coarsen`]). A width of one step is [`reduce`] at its unit.
 ///
 /// # Errors
@@ -950,7 +952,7 @@ mod tests {
 		// its next request must get the same reductions back.
 		let every = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd, Aggregation::SketchP50, Aggregation::SketchP90, Aggregation::SketchP95, Aggregation::SketchP99];
 		for agg in every {
-			assert_eq!(read_json_token(agg.as_str()).expect(agg.as_str()), agg);
+			assert_eq!(read_json_token(agg.as_str()).unwrap_or_else(|_| panic!("{}", agg.as_str())), agg);
 		}
 	}
 

@@ -1,5 +1,5 @@
 // Increase recursion limit for complex async type checking
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 //! # Dataset Management - Time-Series Pattern Recognition and Signal Generation
 //!
@@ -420,8 +420,8 @@
 //! }
 //! ```
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception, clippy::cast_precision_loss)]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{collections::HashMap, sync::LazyLock};
 

@@ -110,9 +110,7 @@ impl AspectMetadata {
 		if self.total_rows == 0 {
 			return 0.0;
 		}
-		#[allow(clippy::cast_precision_loss)]
 		let n = self.total_rows as f64;
-		#[allow(clippy::cast_precision_loss)]
 		let total = self.total_bytes as f64;
 		total / n
 	}

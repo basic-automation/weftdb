@@ -72,9 +72,8 @@ impl Verdict<'_> {
 	}
 }
 
-#[allow(clippy::cast_precision_loss)]
-const fn ns(v: u64) -> f64 {
-	v as f64
+fn ns(v: u64) -> f64 {
+	crate::as_f64(v)
 }
 
 fn is_weft(r: &ArmResult) -> bool {
@@ -182,8 +181,7 @@ fn phase_of(r: &ArmResult) -> String {
 /// Bytes per stored point, for a load result that recorded its size.
 fn bytes_per_point(r: &ArmResult) -> String {
 	match r.storage_bytes {
-		#[allow(clippy::cast_precision_loss)]
-		Some(bytes) if r.input_points > 0 => format!("{:.2}", bytes as f64 / r.input_points as f64),
+		Some(bytes) if r.input_points > 0 => format!("{:.2}", crate::as_f64(bytes) / crate::as_f64(r.input_points)),
 		_ => "—".into(),
 	}
 }
@@ -197,18 +195,23 @@ fn verdict_line(v: &Verdict<'_>) -> String {
 	format!("`{}` {} vs {}: `{}` p50 {} ms vs `{}` {} ms ({tail}).", v.weft.dataset, phase_of(v.weft), class_of(v.other).label(), v.weft.arm.arm, ms(v.weft.latency_ci.p50.point_ns), v.other.arm.arm, ms(v.other.latency_ci.p50.point_ns))
 }
 
-/// The report as blocks: header, results, honesty section.
-#[must_use]
-#[allow(clippy::too_many_lines)]
-pub fn blocks(report: &XbenchReport) -> Vec<Block> {
+/// Whether any result ran on an arm whose name starts with `prefix`.
+fn ran(report: &XbenchReport, prefix: &str) -> bool {
+	report.results.iter().any(|r| r.arm.arm.starts_with(prefix))
+}
+
+/// The report's title, provenance line and gate warning.
+fn header_section(report: &XbenchReport, b: &mut Vec<Block>) {
 	let m = &report.metadata;
-	let mut b = vec![Block::Heading(1, "WeftDB cross-engine benchmark".into())];
 	let engines = report.engines.iter().map(|e| format!("{} {}", e.engine, e.version)).collect::<Vec<_>>().join(", ");
 	b.push(Block::Para(format!("Generated {} on {} ({} {}). Engines: {engines}. Source commit: {}. Seed: {}.", m.generated_at, m.cpu_model.as_deref().unwrap_or("an unreported CPU"), m.os, m.arch, report.source_commit.as_deref().unwrap_or("not recorded"), report.seed)));
 	if !report.all_correct() {
 		b.push(Block::Para("**At least one result failed its correctness gate. Its timing is not a valid comparison; see the failures below.**".into()));
 	}
+}
 
+/// The results table.
+fn results_section(report: &XbenchReport, b: &mut Vec<Block>) {
 	b.push(Block::Heading(2, "Results".into()));
 	b.push(Block::Para("Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets. B/pt is the store's size on disk after a load, divided by the points loaded (whole files: indexes and headers included). A phase marked `os-cold` ran each rep after the OS page cache was dropped, and one marked `restarted` after the engine restarted as well; unmarked phases are warm, back-to-back reps.".into()));
 	let rows = report
@@ -228,7 +231,10 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		})
 		.collect();
 	b.push(Block::Table(["dataset", "phase", "arm", "class", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE", "B/pt"].map(String::from).to_vec(), rows));
+}
 
+/// The interpolation classes and the native fills.
+fn classes_section(report: &XbenchReport, b: &mut Vec<Block>) {
 	b.push(Block::Heading(2, "Interpolation classes".into()));
 	b.push(Block::Para("Each engine is asked for the grid three ways where it can be (fair protocol 1.2): **A · native**, the engine's own interpolation or fill; **B · portable SQL**, the linear reconstruction written in its SQL; **C · client-side**, every knot fetched into this Rust client and interpolated there, end to end. B and C answer the question WeftDB answers, so they are gated against its grid and timed against it. A native fill that computes something else is gated only on the grid's shape, and is shown below with how far its answer lies from the reconstruction instead of being raced against it. DuckDB has no native interpolation, so it has no class A arm.".into()));
 	let own: Vec<&ArmResult> = report.results.iter().filter(|r| r.arm.own_answer.is_some() && r.phase == Phase::Interpolate).collect();
@@ -249,7 +255,10 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		}
 		b.push(Block::List(seen.into_iter().map(|(arm, answer)| format!("`{arm}` computes {answer}.")).collect()));
 	}
+}
 
+/// The generated honesty section: correctness failures and the verdicts.
+fn honesty_section(report: &XbenchReport, b: &mut Vec<Block>) {
 	b.push(Block::Heading(2, "Honesty".into()));
 	b.push(Block::Para("Generated from the results above. A WeftDB arm wins or loses only when its p50 interval does not overlap the fastest other engine's; overlapping intervals are within noise.".into()));
 
@@ -269,7 +278,10 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 			b.push(Block::List(lines));
 		}
 	}
+}
 
+/// What this run did not test.
+fn not_tested_section(report: &XbenchReport, b: &mut Vec<Block>) {
 	b.push(Block::Heading(3, "Not tested".into()));
 	let mut missing = Vec::new();
 	for kind in EXPECTED_KINDS {
@@ -313,8 +325,12 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	}
 	missing.extend(NOT_IN_SCOPE.iter().map(|s| (*s).to_string()));
 	b.push(Block::List(missing));
+}
 
+/// The known limitations that apply to this run.
+fn limitations_section(report: &XbenchReport, b: &mut Vec<Block>) {
 	b.push(Block::Heading(3, "Known limitations".into()));
+	let (clickhouse, timescale, questdb, influx, iotdb) = (ran(report, "clickhouse"), ran(report, "timescaledb"), ran(report, "questdb"), ran(report, "influxdb3"), ran(report, "iotdb"));
 	let mut limits = vec!["DuckDB has no interpolation function. Its arm is hand-written SQL (two `ASOF JOIN`s and the first/last segment extended), which is what a DuckDB user would write, and it is gated against WeftDB's grid.".to_string(), "WeftDB has no last-observation-carried-forward fill on stored data in 1.0, so no LOCF comparison is made.".to_string(), "Every dataset is a single series; the grid is fixed per dataset, so input size grows with scale while output size does not.".to_string()];
 	if report.results.iter().any(|r| r.phase == Phase::Load && is_weft(r)) && report.results.iter().any(|r| r.phase == Phase::Load && !is_weft(r)) {
 		limits.push(if report.results.iter().any(|r| r.arm.arm == "weftdb-stored-bulk") { "Load layouts differ by arm: `weftdb-stored` and `weftdb-stored-f64` seal 1,024-row durable segments (the layout the stored read path is measured on), `weftdb-stored-bulk` seals one segment per load, and DuckDB does one bulk append and one CHECKPOINT. `weftdb-stored-bulk` is the like-for-like load comparison.".into() } else { "Load is not like-for-like: WeftDB seals 1,024-row durable segments (the layout its read path is measured on), DuckDB does one bulk append and one CHECKPOINT.".into() });
@@ -322,7 +338,6 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	if report.results.iter().any(|r| r.arm.arm == "duckdb-decimal") {
 		limits.push("`duckdb-decimal` stores the knots exactly as `DECIMAL(18, s)`, but its interpolation line is computed in `DOUBLE` (DuckDB's `DECIMAL × DOUBLE` is `DOUBLE`), as is WeftDB's (splimes computes in `f64`). Neither engine interpolates in exact decimal arithmetic.".into());
 	}
-	let clickhouse = report.results.iter().any(|r| r.arm.arm.starts_with("clickhouse"));
 	if clickhouse {
 		limits.push("ClickHouse's own gap filling (`WITH FILL … INTERPOLATE`) carries the previous row's expression forward rather than drawing a line between neighbours, so its arm runs the same hand-written `ASOF JOIN` SQL as DuckDB's, gated the same way.".into());
 		limits.push("ClickHouse is a server; the other engines run in-process. Its timings include a loopback HTTP round trip and `RowBinary` encoding both ways, which is what a ClickHouse client pays, and its load is one `INSERT` into a `MergeTree` part with `fsync_after_insert` on.".into());
@@ -330,22 +345,18 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	if report.results.iter().any(|r| r.arm.arm == "clickhouse-decimal") {
 		limits.push("`clickhouse-decimal` stores the knots exactly as `Decimal64(s)`; its interpolation line is computed in `Float64`, since ClickHouse refuses `Decimal × Float64` without a cast.".into());
 	}
-	let timescale = report.results.iter().any(|r| r.arm.arm.starts_with("timescaledb"));
 	if timescale {
 		limits.push("TimescaleDB's `time_bucket_gapfill` with `interpolate()` draws its line between bucket aggregates at bucket boundaries, not between the knots, and does not extend past the data, so on jittered knots it computes a different answer. Its arm is the SQL a PostgreSQL user writes without `ASOF JOIN`: two index-backed `LATERAL … LIMIT 1` lookups per grid instant, gated like every arm.".into());
 		limits.push("TimescaleDB is a PostgreSQL server; its timings include the loopback wire protocol, and its load is one text `COPY` committed with `synchronous_commit` on, into a hypertable whose one chunk spans the dataset. The hypertable stays in the row store: TimescaleDB's columnstore (compression) is not enabled, so its bytes on disk are uncompressed.".into());
 	}
-	let questdb = report.results.iter().any(|r| r.arm.arm.starts_with("questdb"));
 	if questdb {
 		limits.push("QuestDB's `SAMPLE BY … FILL(LINEAR)` fills between bucket aggregates, not between the knots, so its arm builds segments with the native `LT JOIN` and finds each grid instant's segment with an `ASOF JOIN`, gated like every arm.".into());
 		limits.push("Open-source QuestDB acknowledges that a write was received, not that it is durable (a durable acknowledgement needs Enterprise). Its load is timed from the first QWP frame until the WAL is applied and the rows are visible, and the engine line records the server's `cairo.commit.mode`; under `sync` each commit is synced to disk. In `questdb-decimal` the bucket mean is `avg(v::double)`: QuestDB's own `avg` of a `DECIMAL` column rounds the mean to the column's scale. Its bytes on disk are `table_partitions()`'s, which include the space QuestDB reserves ahead in the active partition, so small tables report far more than they hold.".into());
 	}
-	let influx = report.results.iter().any(|r| r.arm.arm.starts_with("influxdb3"));
 	if influx {
 		limits.push("InfluxDB 3 has no decimal type, so it has one arm, `influxdb3-double`, and no exact-decimal comparison. Its SQL engine (DataFusion) has no `ASOF JOIN` and `date_bin_gapfill`'s `interpolate()` fills between bucket aggregates, so the arm merges the grid with the knots and finds each grid row's neighbouring knots with running `max`/`min` windows over the knot instants, gated like every arm.".into());
 		limits.push("InfluxDB 3's write answers once the WAL file holding the rows is persisted (`no_sync=false`, its default), and the server flushes its WAL every second (`--wal-flush-interval`, default `1s`), so a load takes about a second however small it is; a load is sent as concurrent writes of at most 8 MiB, under the server's 10 MiB request cap, so they share the WAL flush. A series and an instant are its key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none). Its bytes on disk are not reported: the rows sit in the WAL until the server snapshots them to Parquet on its own schedule. InfluxDB 3 Core refuses a query that would read more than 432 Parquet files, and it writes a file per ten minutes of data time with no compaction, so the four-year UCI series is about 200,000 files once snapshotted; the reference server raises that cap with `--query-file-limit 300000`, and the UCI interpolation times show the cost of reading that many files.".into());
 	}
-	let iotdb = report.results.iter().any(|r| r.arm.arm.starts_with("iotdb"));
 	if iotdb {
 		limits.push("IoTDB has no decimal type, so it has one arm, `iotdb-double`, and no exact-decimal comparison. Its SQL has no series generator, so the grid comes from `date_bin_gapfill` over the grid's span; segments are paired by `lead` and found by a native `ASOF LEFT JOIN`. A device and an instant are IoTDB's key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none).".into());
 		limits.push("IoTDB is reached through its table-model REST API, which answers in JSON; its own clients speak Thrift, which has no Rust client, so its reads carry a text encoding the binary paths of the other servers do not. Writes are `insertTablet` requests of 100,000 rows in time order, each answered once its WAL entry is synced (`wal_mode=SYNC`, which the reference server sets; IoTDB's default is `ASYNC`). Its bytes on disk are the table's TsFiles after a `FLUSH` issued once the timed loads are done.".into());
@@ -358,7 +369,12 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		limits.push(format!("Cold reps (`{hook}`): before each `os-cold` rep the hook drops the OS page cache and the engine keeps running, its own caches intact; before each `restarted` rep a server engine's container restarts, the harness reconnects and waits for it to answer, and the page cache drops after that, so the reconnection's reads are not cached either. The in-process engines (WeftDB's stored arms and DuckDB) cannot restart apart from the harness: they close their files and open them again, so the process's own memory (allocator, loaded code) stays warm. The reconnection is outside the clock; TimescaleDB's prepared statements belong to the old connection, so its first rep after a restart prepares them again, inside the clock."));
 	}
 	b.push(Block::List(limits));
+}
 
+/// The configuration caveats that apply to this run.
+fn caveats_section(report: &XbenchReport, b: &mut Vec<Block>) {
+	let m = &report.metadata;
+	let (clickhouse, timescale, questdb, influx, iotdb) = (ran(report, "clickhouse"), ran(report, "timescaledb"), ran(report, "questdb"), ran(report, "influxdb3"), ran(report, "iotdb"));
 	b.push(Block::Heading(3, "Configuration caveats".into()));
 	let mut caveats = vec![format!("Hardware: {} ({} physical / {} logical cores, {} GiB memory). The working directory was on a {} {} disk at {}.", m.cpu_model.as_deref().unwrap_or("CPU not reported"), m.cpu_cores_physical.map_or_else(|| "?".into(), |c| c.to_string()), m.cpu_cores_logical.map_or_else(|| "?".into(), |c| c.to_string()), m.total_memory_bytes.map_or_else(|| "?".into(), |b| format!("{:.0}", ns(b) / f64::from(1u32 << 30))), m.work_disk_kind.as_deref().unwrap_or("unknown"), m.work_disk_file_system.as_deref().unwrap_or("unknown file system"), m.work_disk_mount_point.as_deref().unwrap_or("an unreported mount point"),)];
 	if report.source_commit.as_deref().is_some_and(|c| c.ends_with("+dirty")) {
@@ -402,7 +418,10 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		caveats.push(format!("Some results have only {min_reps} reps, so their intervals are wide and fewer comparisons can separate from noise."));
 	}
 	b.push(Block::List(caveats));
+}
 
+/// How to reproduce the run.
+fn reproduction_section(report: &XbenchReport, b: &mut Vec<Block>) {
 	b.push(Block::Heading(3, "Reproduction".into()));
 	let invocation = if report.invocation.is_empty() { "weft-xbench".to_string() } else { report.invocation.join(" ") };
 	let mut manifest: Vec<String> = report.inputs.iter().chain(&report.combined_from).map(|f| format!("{} `{}`: {} bytes, sha256 `{}`.", f.role, f.path, f.bytes, f.sha256)).collect();
@@ -415,6 +434,20 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 		b.push(Block::List(manifest));
 	}
 	b.push(Block::List(vec![format!("Check out commit `{}`.", report.source_commit.as_deref().unwrap_or("(not recorded)")), "Build: `cargo build --release --manifest-path weft-xbench/Cargo.toml` (DuckDB compiles from C++; put `CARGO_TARGET_DIR` on a fast local disk).".into(), format!("Run: `TMPDIR=<scratch on the disk under test> {invocation}`."), "For the ClickHouse arms, a server on the same disk: `docker run -d -p 127.0.0.1:8123:8123 -v <disk under test>/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:<version above>`, then `--clickhouse http://127.0.0.1:8123`.".into(), "For the TimescaleDB arms, likewise: `docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=<password> -e POSTGRES_DB=xbench -v <disk under test>/timescale:/var/lib/postgresql/data timescale/timescaledb:<version above> postgres -c timescaledb.telemetry_level=off`, then `--timescale postgresql://postgres:<password>@127.0.0.1:5432/xbench`.".into(), "For the QuestDB arms: `docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v <disk under test>/questdb:/var/lib/questdb questdb/questdb:<version above>`, then `--questdb 127.0.0.1:9000`.".into(), "For the InfluxDB 3 arm: `docker run -d -p 127.0.0.1:8181:8181 -v <disk under test>/influxdb3:/var/lib/influxdb3 influxdb:<version above> influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000`, then `--influxdb3 http://127.0.0.1:8181`.".into(), "For the IoTDB arm: `docker run -d -p 127.0.0.1:18080:18080 -e enable_rest_service=true -e timestamp_precision=ns -e wal_mode=SYNC -e rest_query_default_row_size_limit=10000000 -v <disk under test>/iotdb:/iotdb/data apache/iotdb:<version above>-standalone` (the precision must be set before the first start), then `--iotdb http://127.0.0.1:18080`.".into(), "For the `tsbs` datasets: build TSBS's generator at the pinned commit, `GOBIN=<dir> go install github.com/timescale/tsbs/cmd/tsbs_generate_data@8323e59c74027b108f4ad5ec5d3e498b0101a02e`, write a week of `cpu-only` data, `tsbs_generate_data --use-case=cpu-only --seed=123 --scale=10 --log-interval=10s --timestamp-start=2016-01-01T00:00:00Z --timestamp-end=2016-01-08T00:00:10Z --format=influx > cpu-only.lp`, then `--tsbs cpu-only.lp`.".into(), format!("Render: `weft-xbench render <xbench.json> --out <dir>`. The synthetic datasets are regenerated from seed {}.", report.seed)]));
+}
+
+/// The report as blocks: header, results, honesty section.
+#[must_use]
+pub fn blocks(report: &XbenchReport) -> Vec<Block> {
+	let mut b = vec![Block::Heading(1, "WeftDB cross-engine benchmark".into())];
+	header_section(report, &mut b);
+	results_section(report, &mut b);
+	classes_section(report, &mut b);
+	honesty_section(report, &mut b);
+	not_tested_section(report, &mut b);
+	limitations_section(report, &mut b);
+	caveats_section(report, &mut b);
+	reproduction_section(report, &mut b);
 	b
 }
 

@@ -165,7 +165,9 @@ use crate::{
 pub const AUTH_KEYS_MODE: &str = "keys";
 
 /// The prefix every key [`generate_api_key`] mints carries, so a key is
-/// recognisable in a log line or a password manager as a WeftDB key. The
+/// recognisable in a log line or a password manager as a WeftDB key.
+///
+/// The
 /// prefix is part of the hashed text: a key authenticates exactly as
 /// printed, prefix included.
 pub const TOKEN_PREFIX: &str = "weft_";
@@ -185,7 +187,9 @@ const WWW_AUTHENTICATE_VALUE: &str = "Bearer realm=\"weftdb\"";
 const CREDENTIAL_QUERY_PARAMS: &[&str] = &["api_key", "apikey", "access_token", "auth_token"];
 
 /// Who a request authenticated as: the key's id and the role the keys
-/// file grants it. Inserted into the request's extensions by
+/// file grants it.
+///
+/// Inserted into the request's extensions by
 /// [`enforce`] once a key checks out, for the layers that follow
 /// (SEC-9's audit). Ids and roles are not secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +210,9 @@ struct KeyEntry {
 }
 
 /// The loaded keys file: the principals this server accepts, and where
-/// they came from. One immutable snapshot of the file; the store in
+/// they came from.
+///
+/// One immutable snapshot of the file; the store in
 /// force is a [`SharedKeyStore`] holding the current snapshot, which a
 /// reload (SEC-7) replaces whole.
 #[derive(Debug, Clone)]
@@ -336,7 +342,9 @@ impl KeyStore {
 /// The keys file in force (SEC-7): the current [`KeyStore`] snapshot
 /// behind a lock, so [`reload`](Self::reload) can swap it while the
 /// server runs and every request authenticates against the snapshot
-/// its moment sees. Cheap to clone — the lock is `Arc`-backed, like
+/// its moment sees.
+///
+/// Cheap to clone — the lock is `Arc`-backed, like
 /// the [`AuthConfig`] that carries it.
 #[derive(Debug, Clone)]
 pub struct SharedKeyStore {
@@ -787,7 +795,9 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 /// `SIGHUP` and, on each one, reloads the keys file `auth` enforces
 /// and logs the outcome — the new key count on success, or the refusal
 /// and its reason (in which case the keys in force stay; see
-/// [`SharedKeyStore::reload`]). The startup sequence registers it with
+/// [`SharedKeyStore::reload`]).
+///
+/// The startup sequence registers it with
 /// the Daemons registry when authentication is on; the registry's
 /// factory may call this again after a panic, and re-registering the
 /// signal stream is all a restart does.

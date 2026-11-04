@@ -144,7 +144,7 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 /// declared under a schema this one does not equal or widen, and a `500` on a
 /// control-plane write failure.
 pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): StrictJson<DeclareAspectRequest>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	// The name becomes part of every frame's file name: refuse one that could leave the
 	// store's `segments/` directory before anything is written. This has its own code in the §4

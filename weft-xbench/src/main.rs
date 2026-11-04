@@ -30,7 +30,9 @@
 //! `weft-xbench render REPORT.json [--out DIR]` writes `report.md` and `report.html` from a
 //! report, with the generated honesty section (EVI-15R).
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::path::PathBuf;
 
@@ -134,8 +136,7 @@ fn combine_command(args: &[String]) -> anyhow::Result<()> {
 	for r in &report.results {
 		if let Some(b) = &r.between_run {
 			let gate = r.correctness.as_ref().map_or(String::new(), |c| format!("  {}", if c.passed { "PASS" } else { "FAIL" }));
-			#[allow(clippy::cast_precision_loss)]
-			let (lo, hi) = (r.latency_ci.p50.lower_ns as f64 / 1e6, r.latency_ci.p50.upper_ns as f64 / 1e6);
+			let (lo, hi) = (weft_xbench::as_f64(r.latency_ci.p50.lower_ns) / 1e6, weft_xbench::as_f64(r.latency_ci.p50.upper_ns) / 1e6);
 			println!("{:<14} {:<18} {:<11} {:<9} p50 [{lo:>9.3}, {hi:>9.3}] ms  spread {:>5.1}%{}{gate}", r.dataset, r.arm.arm, format!("{:?}", r.phase).to_lowercase(), r.warmth.as_str(), b.p50_spread * 100.0, if b.digests_agree { "" } else { "  ANSWERS DIFFER" });
 		}
 	}
@@ -246,8 +247,7 @@ async fn main() -> anyhow::Result<()> {
 	std::fs::write(&path, serde_json::to_vec_pretty(&report)?)?;
 	for r in &report.results {
 		let gate = r.correctness.as_ref().map_or(String::new(), |c| format!("  {}", if c.passed { "PASS" } else { "FAIL" }));
-		#[allow(clippy::cast_precision_loss)]
-		let p50_ms = r.latency.p50_ns as f64 / 1e6;
+		let p50_ms = weft_xbench::as_f64(r.latency.p50_ns) / 1e6;
 		println!("{:<14} {:<18} {:<11} {:<9} p50 {:>10.3} ms{gate}", r.dataset, r.arm.arm, format!("{:?}", r.phase).to_lowercase(), r.warmth.as_str(), p50_ms);
 	}
 	let blocks = render::blocks(&report);

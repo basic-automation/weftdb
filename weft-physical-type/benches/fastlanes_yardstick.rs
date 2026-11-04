@@ -17,31 +17,33 @@
 //!
 //! Corpora: zig-zag widths 3, 10 and 20 bits, so the sweep shows how each decoder's cost
 //! scales with width.
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fastlanes::BitPacking;
-use weft_physical_type::timestamp::{transpose_bitpack_decode, transpose_bitpack_encode, TRANSPOSE_TILE};
+use weft_physical_type::{
+	cast, timestamp::{transpose_bitpack_decode, transpose_bitpack_encode, TRANSPOSE_TILE}
+};
 
 const N: usize = 1 << 20;
 
 const fn zigzag(v: i64) -> u64 {
-	#[allow(clippy::cast_sign_loss)] // the bit pattern is exactly the zig-zag mapping.
-	let z = ((v << 1) ^ (v >> 63)) as u64;
-	z
+	((v << 1) ^ (v >> 63)).cast_unsigned()
 }
 
-#[allow(clippy::cast_possible_wrap)] // `z >> 1` fits `i64`; the XOR restores the sign.
 const fn unzigzag(z: u64) -> i64 {
-	((z >> 1) as i64) ^ -((z & 1) as i64)
+	(z >> 1).cast_signed() ^ -((z & 1).cast_signed())
 }
 
 /// A deterministic corpus whose zig-zag codes need exactly `width` bits (values in
 /// `[-2^(width-1), 2^(width-1))`, with the extremes present in every tile).
 fn corpus(width: u32) -> Vec<i64> {
 	let half = 1_i64 << (width - 1);
-	(0..N as i64).map(|i| if i % 1024 == 0 { -half } else { (i.wrapping_mul(2_654_435_761) % half).abs() * if i % 2 == 0 { 1 } else { -1 } }).collect()
+	(0..cast::usize_to_i64(N)).map(|i| if i % 1024 == 0 { -half } else { (i.wrapping_mul(2_654_435_761) % half).abs() * if i % 2 == 0 { 1 } else { -1 } }).collect()
 }
 
 /// Pack with `fastlanes` at a fixed `width`: one `1024 * width / 64`-word block per tile.

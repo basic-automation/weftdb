@@ -113,7 +113,6 @@ pub struct Aspect {
 
 #[async_trait::async_trait]
 impl AspectStructure for Aspect {
-	#[allow(clippy::too_many_lines)]
 	#[instrument(skip(metadata_conn), fields(aspect_name = %name, subject_id = %subject_id))]
 	async fn new(id: Option<AspectId>, name: &str, subject_id: &SubjectId, resolution: &Resolution, metadata_conn: &Connection) -> Result<Self> {
 		let id = id.unwrap_or_default();

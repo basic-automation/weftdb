@@ -31,6 +31,9 @@
 //! none of them. Built without extra target features, so every arm, `pco` included, runs the
 //! same portable code (pco's docs note BMI/AVX2 speed up its decode, so its times here are a
 //! floor, not its best).
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{
 	hint::black_box, io::{BufRead, BufReader}, str::FromStr
@@ -40,7 +43,7 @@ use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fastlanes::BitPacking;
 use weft_physical_type::{
-	column::recommend_encoding, floatcodec::{chimp128_f64_decode, chimp128_f64_encode, chimp_f64_decode, chimp_f64_encode, elf_f64_decode, elf_f64_encode, xor_f64_decode, xor_f64_encode}, timestamp::{blocked_bitpack_decode, blocked_bitpack_encode, dfor_bitpack_decode, dfor_bitpack_encode, for_bitpack_decode, for_bitpack_encode, BLOCKED_BITPACK_BLOCK}, PhysicalType
+	cast, column::recommend_encoding, floatcodec::{chimp128_f64_decode, chimp128_f64_encode, chimp_f64_decode, chimp_f64_encode, elf_f64_decode, elf_f64_encode, xor_f64_decode, xor_f64_encode}, timestamp::{blocked_bitpack_decode, blocked_bitpack_encode, dfor_bitpack_decode, dfor_bitpack_encode, for_bitpack_decode, for_bitpack_encode, BLOCKED_BITPACK_BLOCK}, PhysicalType
 };
 
 const N: usize = 1 << 20;
@@ -164,7 +167,7 @@ fn sensor_2dp() -> Corpus {
 }
 
 fn real_doubles() -> Corpus {
-	let floats = noise(N, 0xd1b5_4a32_d192_ed03).enumerate().map(|(i, r)| (i as f64 * 1e-3).sin() * 1_000.0 + (r >> 11) as f64 / (1_u64 << 53) as f64).collect();
+	let floats = noise(N, 0xd1b5_4a32_d192_ed03).enumerate().map(|(i, r)| (cast::usize_to_f64(i) * 1e-3).sin().mul_add(1_000.0, cast::u64_to_f64(r >> 11) / cast::u64_to_f64(1_u64 << 53))).collect();
 	from_floats("real_doubles", floats)
 }
 
@@ -182,7 +185,7 @@ fn weft_dfor(corpus: &Corpus) -> Option<(Vec<u8>, u8)> {
 
 fn weft_dfor_decode(bytes: &[u8], scale: u8) -> Vec<f64> {
 	let divisor = 10_f64.powi(i32::from(scale));
-	dfor_bitpack_decode(bytes, BLOCKED_BITPACK_BLOCK, N).iter().map(|&m| m as f64 / divisor).collect()
+	dfor_bitpack_decode(bytes, BLOCKED_BITPACK_BLOCK, N).iter().map(|&m| cast::i64_to_f64(m) / divisor).collect()
 }
 
 fn pco_f64(values: &[f64]) -> Vec<u8> {
@@ -204,7 +207,7 @@ fn pco_scaled(corpus: &Corpus) -> Option<(Vec<u8>, u8)> {
 
 fn pco_scaled_decode(bytes: &[u8], scale: u8) -> Vec<f64> {
 	let divisor = 10_f64.powi(i32::from(scale));
-	pco::standalone::simple_decompress::<i64>(bytes).expect("pco decompresses").iter().map(|&m| m as f64 / divisor).collect()
+	pco::standalone::simple_decompress::<i64>(bytes).expect("pco decompresses").iter().map(|&m| cast::i64_to_f64(m) / divisor).collect()
 }
 
 /// The realized exact path for a corpus: the codec the default selector picks, and a decoder
@@ -233,11 +236,11 @@ fn weft_scaled(corpus: &Corpus) -> Option<(&'static str, Vec<u8>, u8)> {
 fn weft_scaled_decode(codec: &str, bytes: &[u8], scale: u8) -> Vec<f64> {
 	let mantissas = if codec == "scaled_for" { for_bitpack_decode(bytes, BLOCKED_BITPACK_BLOCK, N) } else { blocked_bitpack_decode(bytes, BLOCKED_BITPACK_BLOCK, N) };
 	let divisor = 10_f64.powi(i32::from(scale));
-	mantissas.iter().map(|&m| m as f64 / divisor).collect()
+	mantissas.iter().map(|&m| cast::i64_to_f64(m) / divisor).collect()
 }
 
 fn bits_per_value(bytes: usize) -> f64 {
-	bytes as f64 * 8.0 / N as f64
+	cast::usize_to_f64(bytes) * 8.0 / cast::usize_to_f64(N)
 }
 
 fn bench_alp(c: &mut Criterion) {
@@ -276,7 +279,7 @@ fn bench_alp(c: &mut Criterion) {
 		}
 
 		eprintln!("== {} ({N} values) — bits/value", corpus.name);
-		eprintln!("  alp (FOR + fastlanes pack) {:>7.3}   exceptions {exceptions} ({:.3}%)", bits_per_value(alp_bytes(&alp)), exceptions as f64 * 100.0 / N as f64);
+		eprintln!("  alp (FOR + fastlanes pack) {:>7.3}   exceptions {exceptions} ({:.3}%)", bits_per_value(alp_bytes(&alp)), cast::usize_to_f64(exceptions) * 100.0 / cast::usize_to_f64(N));
 		eprintln!("  alp_rd (sized only)        {:>7.3}", bits_per_value(alp_rd_bytes(values)));
 		eprintln!("  gorilla                    {:>7.3}", bits_per_value(gorilla.len()));
 		eprintln!("  chimp                      {:>7.3}", bits_per_value(chimp.len()));

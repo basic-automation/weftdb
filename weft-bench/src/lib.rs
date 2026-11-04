@@ -75,8 +75,9 @@
 //! `DuckDB`), additional workloads, dataset corpora, and report runners land in
 //! subsequent increments per the roadmap.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::module_name_repetitions)]
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 pub mod accuracy;
 pub mod adapter;

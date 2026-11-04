@@ -187,7 +187,9 @@ impl Role {
 }
 
 /// Whether a route's calls are written to the audit log (SEC-9's fsynced
-/// JSONL file), and how. The registry records the requirement; SEC-9's
+/// JSONL file), and how.
+///
+/// The registry records the requirement; SEC-9's
 /// writer ([`crate::audit`]) owns the file, and a route whose spec says
 /// [`Audit::AttemptOutcome`] fails closed on `audit_unavailable` when
 /// its attempt or outcome record cannot be written.
@@ -213,7 +215,9 @@ impl Audit {
 }
 
 /// How a route competes for admission when the server is loaded — ROB-10's
-/// per-route classes, folded into this registry by §3. Admission lives
+/// per-route classes, folded into this registry by §3.
+///
+/// Admission lives
 /// *inside* the gate (C10): D-S14 charged the write class's byte budget
 /// there, and ROB-10 (Admission I) generalised the gate to consult this
 /// class for every route — see [`crate::admission`].
@@ -354,7 +358,9 @@ pub struct RouteEntry {
 	pub spec: RouteSpec,
 }
 
-/// The sealed registry's read side: the tables every consumer shares. Built
+/// The sealed registry's read side: the tables every consumer shares.
+///
+/// Built
 /// once by [`Routes::seal`]; there is no way to add to it afterwards, which
 /// is what "sealed" means here — the router and the tables cannot drift
 /// because both are this one value.
@@ -505,7 +511,9 @@ fn method_key(method: &Method) -> &'static str {
 	}
 }
 
-/// The registry under construction. Routes enter only through
+/// The registry under construction.
+///
+/// Routes enter only through
 /// [`Routes::route`], called by the per-area registration functions;
 /// [`Routes::seal`] freezes the result into a [`SealedRoutes`], after
 /// which registration is impossible (the builder is consumed).
@@ -616,7 +624,9 @@ struct GateState {
 }
 
 /// The whole surface's registry, assembled from the per-area registration
-/// functions, with the default ingest limits (D-S14). This is the
+/// functions, with the default ingest limits (D-S14).
+///
+/// This is the
 /// registry the table tests read; the served router comes from
 /// [`build_registry_with_ingest_config`] via [`crate::app_with_state`].
 #[must_use]
@@ -627,7 +637,9 @@ pub fn build_registry() -> SealedRoutes {
 /// The whole surface's registry, with the ingest wiring's limits
 /// (D-S14): the body cap rides on the ingest routes themselves, and the
 /// in-flight byte budget becomes the write class's admission the gate
-/// enforces. Admission I's own limits (ROB-10) take their defaults.
+/// enforces.
+///
+/// Admission I's own limits (ROB-10) take their defaults.
 #[must_use]
 pub fn build_registry_with_ingest_config(config: IngestConfig) -> SealedRoutes {
 	build_registry_with_limits(config, AdmissionConfig::DEFAULT)

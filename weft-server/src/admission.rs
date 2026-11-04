@@ -64,7 +64,9 @@ pub const DEFAULT_QUERY_MAX_INFLIGHT: usize = 128;
 
 /// Admission I's limits (ROB-10), read once at startup and carried on
 /// the router state, so the registry the binary serves and a test's
-/// registry can carry different caps. The write class's byte budget
+/// registry can carry different caps.
+///
+/// The write class's byte budget
 /// is not here: it is D-S14's [`IngestConfig`](crate::ingest::IngestConfig),
 /// and the two configs travel side by side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +129,9 @@ impl Default for AdmissionConfig {
 }
 
 /// The serve path's admission state (ROB-10): one budget per
-/// [`AdmissionClass`](crate::routes::AdmissionClass) that sheds. The
+/// [`AdmissionClass`](crate::routes::AdmissionClass) that sheds.
+///
+/// The
 /// registry's gate holds one of these and charges each matched request
 /// against its class's budget before the handler runs; the permit is
 /// held by the gate's future across the handler call and released

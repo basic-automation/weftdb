@@ -24,6 +24,10 @@
 //! classified falls out of this function's `anyhow::Result` return as
 //! the runtime's 1, the unexpected error.
 
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
+
 mod startup;
 
 // The process allocator is this binary's choice, not a side effect of what a library it links

@@ -12,20 +12,23 @@
 //! block packs to a handful of bits over a per-block reference). The value block therefore
 //! uses [`VAL_CODEC_FOR`], so the streaming read takes the block-skip fast path; the assertion
 //! below makes a codec regression loud. The timestamps are sorted, so the lookup binary-searches.
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
 use weft_physical_type::{
-	timestamp::TimeUnit, weftseg::{read_paged_segment_point, read_segment, read_segment_point, read_segment_points, read_segment_range}, PagedSegment, Segment
+	cast, timestamp::TimeUnit, weftseg::{read_paged_segment_point, read_segment, read_segment_point, read_segment_points, read_segment_range}, PagedSegment, Segment
 };
 
 /// The FOR-packing corpus values: a high base (`10000000`) with a tiny 2-decimal wobble
 /// (`.00`..`.96`) that f64 cannot represent exactly, so `recommend_encoding` selects `ScaledI64`
 /// and the clustered mantissas pick `VAL_CODEC_FOR` (the block-skip fast path).
 fn corpus(n: usize) -> (Vec<i64>, Vec<BigDecimal>) {
-	let timestamps: Vec<i64> = (0..n as i64).map(|i| 1_000 + i * 10).collect();
+	let timestamps: Vec<i64> = (0..cast::usize_to_i64(n)).map(|i| 1_000 + i * 10).collect();
 	let values: Vec<BigDecimal> = (0..n).map(|i| format!("10000000.{:02}", i % 97).parse().expect("literal parses")).collect();
 	(timestamps, values)
 }
@@ -49,7 +52,7 @@ fn bench_point_read(c: &mut Criterion) {
 	let bytes = segment.write_to();
 
 	// A mid-segment timestamp (present) — a representative interior point lookup.
-	let t = 1_000 + (n as i64 / 2) * 10;
+	let t = 1_000 + (cast::usize_to_i64(n) / 2) * 10;
 
 	// Correctness guard: the two paths must agree before we time them.
 	let streaming = read_segment_point(&bytes, t).expect("reads");
@@ -75,7 +78,7 @@ fn bench_paged_point_read(c: &mut Criterion) {
 	let bytes = segment.write_to();
 
 	// A mid-segment timestamp (present) — lands in an interior page.
-	let t = 1_000 + (n as i64 / 2) * 10;
+	let t = 1_000 + (cast::usize_to_i64(n) / 2) * 10;
 
 	// Correctness guard: the streaming paged read must equal the full paged decode + value_at.
 	let streaming = read_paged_segment_point(&bytes, t).expect("reads");
@@ -99,7 +102,7 @@ fn bench_batch_point_read(c: &mut Criterion) {
 	let bytes = segment.write_to();
 
 	// 64 instants spread across the segment — all present grid points.
-	let instants: Vec<i64> = (0..64).map(|k| 1_000 + (k * (n as i64 / 64)) * 10).collect();
+	let instants: Vec<i64> = (0..64).map(|k| 1_000 + (k * (cast::usize_to_i64(n) / 64)) * 10).collect();
 
 	// Correctness guard: the batch equals the per-instant reads.
 	let batch = read_segment_points(&bytes, &instants).expect("reads");
@@ -116,8 +119,8 @@ fn bench_batch_point_read(c: &mut Criterion) {
 			for &t in &instants {
 				out.push(read_segment_point(black_box(&bytes), black_box(t)).expect("reads"));
 			}
-			black_box(out)
-		})
+			black_box(out);
+		});
 	});
 	// One batch read: the timestamp column is decoded once for all 64 instants.
 	group.bench_function("one_batch_read", |b| b.iter(|| black_box(read_segment_points(black_box(&bytes), black_box(&instants)).expect("reads"))));
@@ -145,7 +148,7 @@ fn bench_regular_vs_irregular(c: &mut Criterion) {
 	let irregular_bytes = irregular.write_to();
 
 	// Look up the mid instant of each (both present, both interior).
-	let t_regular = 1_000 + (n as i64 / 2) * 10;
+	let t_regular = 1_000 + (cast::usize_to_i64(n) / 2) * 10;
 	let t_irregular = ts[n / 2];
 	assert!(read_segment_point(&regular_bytes, t_regular).expect("reads").is_some());
 	assert!(read_segment_point(&irregular_bytes, t_irregular).expect("reads").is_some());
@@ -164,14 +167,14 @@ fn bench_range_read(c: &mut Criterion) {
 	let bytes = segment.write_to();
 
 	// A selective 100-row window in the middle of a 100k-row segment.
-	let start = 1_000 + (n as i64 / 2) * 10;
+	let start = 1_000 + (cast::usize_to_i64(n) / 2) * 10;
 	let end = start + 99 * 10;
 
 	// Correctness guard: the windowed read equals the full decode + filter.
 	let (wt, wv) = read_segment_range(&bytes, start, end).expect("reads");
 	let (ft, fv) = read_segment(&bytes).expect("reads").decode_nullable();
 	let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = ft.into_iter().zip(fv).filter(|(t, _)| start <= *t && *t <= end).unzip();
-	assert_eq!((wt.clone(), wv.clone()), expected, "windowed range read must equal the full decode + filter");
+	assert_eq!((wt.clone(), wv), expected, "windowed range read must equal the full decode + filter");
 	assert_eq!(wt.len(), 100, "the window must be 100 rows");
 
 	let mut group = c.benchmark_group("range_read_100k_window100");
@@ -180,8 +183,8 @@ fn bench_range_read(c: &mut Criterion) {
 		b.iter(|| {
 			let (t, v) = read_segment(black_box(&bytes)).expect("reads").decode_nullable();
 			let out: (Vec<i64>, Vec<Option<BigDecimal>>) = t.into_iter().zip(v).filter(|(t, _)| start <= *t && *t <= end).unzip();
-			black_box(out)
-		})
+			black_box(out);
+		});
 	});
 	// Windowed read — closed-form row window, unpacks only the ~100 values inside it.
 	group.bench_function("windowed_read", |b| b.iter(|| black_box(read_segment_range(black_box(&bytes), black_box(start), black_box(end)).expect("reads"))));

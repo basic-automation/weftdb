@@ -47,7 +47,6 @@ async fn sealed_store(dir: &TempDir) -> SegmentStore {
 		for i in 0..per_segment {
 			let n = seg * per_segment + i;
 			ts.push(n * STRIDE_SECS + i64::try_from(next() % 7).unwrap_or(0) - 3);
-			#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 			let cents = ((20.0_f64.mul_add((n as f64 / 360.0).sin(), 50.0) + (next() % 200) as f64 / 100.0) * 100.0).round() as i64;
 			vs.push(BigDecimal::new(cents.into(), 2));
 		}

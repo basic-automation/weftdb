@@ -400,7 +400,6 @@ impl SimFs {
 	/// `InvalidInput` if `dest` is inside the root, `AlreadyExists` if it holds
 	/// anything, or any error reading the root or writing the image.
 	// The model lock is held throughout so the image is one instant's state.
-	#[allow(clippy::significant_drop_tightening)]
 	pub fn power_cut(&self, seed: u64, dest: &Path) -> io::Result<()> {
 		let model = self.lock();
 		if dest.starts_with(&self.root) {
@@ -646,7 +645,6 @@ impl SimFs {
 // and the directory never disagree about the order those happened in.
 // `create_new_write` lets go after the create: its fault points may pause, and the
 // content writes that follow have no order to keep.
-#[allow(clippy::significant_drop_tightening)]
 #[async_trait]
 impl StoreFs for SimFs {
 	async fn create_new_write(&self, path: &Path, bytes: Vec<u8>, policy: SyncPolicy, points: WritePoints) -> io::Result<()> {

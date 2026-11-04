@@ -47,7 +47,9 @@ use std::{future::Future, time::Duration};
 
 /// Environment variable naming the runtime's worker-thread count
 /// (ROB-11): a positive whole number of threads, read once by `main`
-/// before the runtime is built. Registered in the VarSpec registry
+/// before the runtime is built.
+///
+/// Registered in the VarSpec registry
 /// ([`crate::settings`]).
 pub const WORKER_THREADS_ENV: &str = "WEFT_WORKER_THREADS";
 

@@ -625,7 +625,6 @@ async fn survey(subject: &str, name: &str, database: &Path) -> Result<LegacyAspe
 	let conn = open(database, "series").await?;
 	let columns = columns_of(&conn, database).await?;
 	pick_value_column(database, &columns)?;
-	#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 	let total = u64::try_from(scalar(&conn, database, "SELECT count(*) FROM measurements").await?).unwrap_or(u64::MAX);
 	let mut rows = conn.query("SELECT min(timestamp), max(timestamp) FROM measurements", ()).await.with_context(|| format!("asking {} for the span of its series", database.display()))?;
 	let row = rows.next().await?.with_context(|| format!("{} answers the span query with no row", database.display()))?;
@@ -639,7 +638,6 @@ async fn survey(subject: &str, name: &str, database: &Path) -> Result<LegacyAspe
 		Value::Null => None,
 		other => return Err(anyhow::Error::new(RowsModeError::RowShape { path: database.to_path_buf(), rowid: 0, detail: format!("`max(timestamp)` is {other:?}, and 0.1.x wrote `timestamp INTEGER NOT NULL`") })),
 	};
-	#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 	let distinct = u64::try_from(scalar(&conn, database, "SELECT count(DISTINCT timestamp) FROM measurements").await?).unwrap_or(0);
 	Ok(LegacyAspect { subject: subject.to_string(), name: name.to_string(), database: database.to_path_buf(), rows: total, first_timestamp: first, last_timestamp: last, duplicate_timestamps: total.saturating_sub(distinct) })
 }
@@ -1193,7 +1191,6 @@ mod tests {
 	/// time, the span its catalog recorded, and its compression config. The subject
 	/// row must already be there ([`write_catalog_subject`]). A test that wants an
 	/// aspect with no catalog row simply does not call this for it.
-	#[allow(clippy::too_many_arguments)]
 	async fn write_catalog_aspect(root: &Path, subject: &str, aspect: &str, resolution: &str, created_at: i64, earliest: &str, latest: &str, compression_config: Option<&str>) {
 		let path = root.join("metadata.db");
 		let db = Builder::new_local(&path.to_string_lossy()).build().await.expect("a local database of the 0.1.x shape");

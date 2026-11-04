@@ -31,8 +31,9 @@
 
 // Proving the axum handler bounds for the full router exceeds the default limit of 128;
 // rustc warns that overflowing it will become a hard error.
-#![recursion_limit = "256"]
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 pub mod admission;
 /// SEC-9's fsynced audit log: attempt/outcome records for audited

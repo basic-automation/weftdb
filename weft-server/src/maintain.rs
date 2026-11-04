@@ -122,7 +122,7 @@ pub struct ReconcileResponse {
 /// [`ApiError::busy`] when another maintenance operation held the aspect for the
 /// whole wait, and [`ApiError::internal`] on a read/seal/control-plane failure.
 pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ReconcileParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
 	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
@@ -280,7 +280,7 @@ pub struct ReconcileStoreResponse {
 /// the whole wait, and [`ApiError::internal`] when the aspect list or the post-sweep
 /// store stats cannot be read.
 pub async fn reconcile_store(State(state): State<AppState>, StrictQuery(params): StrictQuery<ReconcileParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
 	let result = reconcile_store_inner(&store, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
@@ -378,7 +378,7 @@ pub struct SquashResponse {
 /// [`ApiError::busy`] when another maintenance operation held the aspect for the
 /// whole wait, and [`ApiError::internal`] on a read/seal/control-plane failure.
 pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<SquashParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	// Undeclared aspect → 404 (mirrors the reconcile/read surfaces).
 	if store.schema_for(&aspect).await.map_err(|err| error::classify_read(&err))?.is_none() {
@@ -436,7 +436,7 @@ pub struct CompactResponse {
 /// [`ApiError::busy`] when another maintenance operation held the aspect for the
 /// whole wait, and [`ApiError::internal`] on a read/seal/control-plane failure.
 pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<CompactParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let target_rows = params.target_rows.ok_or_else(|| ApiError::bad_request("compact requires a target_rows query parameter".to_string()))?;
 	// Undeclared aspect → 404 (mirrors the reconcile/squash surfaces).
@@ -460,10 +460,12 @@ pub struct QuarantineParams {
 
 /// Handle `POST /api/v1/storage/fsck`: run the recovery pass now, with repair
 /// (never report-only: an operator asking for fsck is asking for the repair),
-/// and answer with its counts. The same pass runs at startup, where a
+/// and answer with its counts.
+///
+/// The same pass runs at startup, where a
 /// newer-layout store gets the report-only form instead.
 pub async fn fsck_store(State(state): State<AppState>) -> Result<Json<weftdb::RecoveryReport>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let report = store.fsck(false).await.map_err(|err| maintenance_error(&err))?;
 	drop(store);
@@ -471,11 +473,13 @@ pub async fn fsck_store(State(state): State<AppState>) -> Result<Json<weftdb::Re
 }
 
 /// Handle `GET /api/v1/storage/quarantine`: list the quarantine records, of one
-/// aspect for `?aspect=` or of every aspect without it. Records, not segment
+/// aspect for `?aspect=` or of every aspect without it.
+///
+/// Records, not segment
 /// contents: the listing names what recovery removed and why, and the file
 /// under `segments/quarantine/` is what an operator inspects.
 pub async fn quarantine_list(State(state): State<AppState>, StrictQuery(params): StrictQuery<QuarantineParams>) -> Result<Json<Vec<weftdb::QuarantineRecord>>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let records = store.quarantine_list(params.aspect.as_deref()).await.map_err(|err| maintenance_error(&err))?;
 	drop(store);
@@ -483,11 +487,13 @@ pub async fn quarantine_list(State(state): State<AppState>, StrictQuery(params):
 }
 
 /// Handle `POST /api/v1/storage/quarantine/{aspect}/{id}/{gen}/release`: put one
-/// quarantined segment back into reads, exactly as quarantine recorded it. A
+/// quarantined segment back into reads, exactly as quarantine recorded it.
+///
+/// A
 /// record that does not exist is a 404, following the backup routes' precedent
 /// for a missing named resource.
 pub async fn quarantine_release(State(state): State<AppState>, Path((aspect, id, gen)): Path<(String, u64, u64)>) -> Result<Json<weftdb::QuarantineRecord>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let record = store.quarantine_release(&aspect, id, gen).await.map_err(|err| if err.to_string().starts_with("no quarantine record") { ApiError::aspect_not_found(err.to_string()) } else { maintenance_error(&err) })?;
 	drop(store);
@@ -495,10 +501,12 @@ pub async fn quarantine_release(State(state): State<AppState>, Path((aspect, id,
 }
 
 /// Handle `POST /api/v1/storage/quarantine/{aspect}/{id}/{gen}/purge`: delete one
-/// quarantine record and unlink its file, of either class. The operator's
+/// quarantine record and unlink its file, of either class.
+///
+/// The operator's
 /// explicit purge is the only purge a suspect record ever gets.
 pub async fn quarantine_purge(State(state): State<AppState>, Path((aspect, id, gen)): Path<(String, u64, u64)>) -> Result<Json<weftdb::QuarantineRecord>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let record = store.quarantine_purge(&aspect, id, gen).await.map_err(|err| if err.to_string().starts_with("no quarantine record") { ApiError::aspect_not_found(err.to_string()) } else { maintenance_error(&err) })?;
 	drop(store);
@@ -517,7 +525,7 @@ pub struct PurgeExpiredResponse {
 /// Handle `POST /api/v1/storage/quarantine/purge-expired`: purge every corrupt
 /// quarantine record whose TTL has passed, and report how many went.
 pub async fn purge_expired_quarantine(State(state): State<AppState>) -> Result<Json<PurgeExpiredResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let purged = store.purge_expired_quarantine().await.map_err(|err| maintenance_error(&err))?;
 	drop(store);

@@ -70,7 +70,6 @@ pub struct CompressionRequirement {
 /// # Returns
 /// `CompressionRequirement` with calculated values
 #[must_use]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn calculate_required_compression(current_size: u64, target_size: u64, measurement_count: usize) -> CompressionRequirement {
 	if current_size <= target_size {
 		return CompressionRequirement { needs_compression: false, target_measurement_count: measurement_count, required_reduction_ratio: 0.0, suggested_aggressiveness: 0.0 };
@@ -103,7 +102,6 @@ pub fn calculate_required_compression(current_size: u64, target_size: u64, measu
 /// # Returns
 /// Estimated size in bytes after compression
 #[must_use]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn estimate_compressed_size(original_count: usize, aggressiveness: f64) -> u64 {
 	// Very rough estimate: aggressiveness maps roughly to reduction ratio
 	// aggressiveness 0 = 0% reduction, aggressiveness 1 = ~95% reduction

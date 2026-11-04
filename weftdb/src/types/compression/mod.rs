@@ -203,7 +203,6 @@ pub struct CompressionResult {
 impl CompressionResult {
 	/// Create a new compression result.
 	#[must_use]
-	#[allow(clippy::cast_precision_loss)]
 	pub fn new(original_count: usize, compressed_count: usize, start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
 		let compression_ratio = if original_count > 0 { 1.0 - (compressed_count as f64 / original_count as f64) } else { 0.0 };
 		Self { original_count, compressed_count, compression_ratio, time_range_start: start, time_range_end: end }
@@ -234,7 +233,6 @@ impl CompressionSummary {
 
 	/// Get the overall compression ratio.
 	#[must_use]
-	#[allow(clippy::cast_precision_loss)]
 	pub fn overall_compression_ratio(&self) -> f64 {
 		if self.total_original_count > 0 {
 			1.0 - (self.total_compressed_count as f64 / self.total_original_count as f64)
@@ -256,7 +254,6 @@ impl CompressionSummary {
 /// # Returns
 /// Aggressiveness value from 0.0 (no compression) to 0.95 (max compression)
 #[must_use]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 pub fn calculate_tier_aggressiveness(data_age: chrono::Duration, pure_duration: chrono::Duration, tier_duration: chrono::Duration, max_tiers: u32, scaling: &AggressivenessScaling) -> f64 {
 	// If within pure duration, no compression
 	if data_age <= pure_duration {

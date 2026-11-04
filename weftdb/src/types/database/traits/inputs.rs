@@ -8,7 +8,6 @@ use crate::{cache::Connection, AspectId, Batch, BatchId, Correlation, Correlatio
 ///
 /// Add a Subject for observation -> track various aspects of the subject
 #[async_trait::async_trait]
-#[allow(clippy::too_many_arguments)]
 pub trait Inputs {
 	//
 	// Unbatched Measurements Queue

@@ -135,7 +135,9 @@ fn entry_json(request: &Request, key_hash: &str) -> Value {
 }
 
 /// Append `entry` to the keys file at `path`, creating the document
-/// when the file does not exist yet. An existing file must parse as a
+/// when the file does not exist yet.
+///
+/// An existing file must parse as a
 /// keys file and must not already hold the entry's id or hash —
 /// redefining a principal by appending is exactly what the loader
 /// refuses, so the tool refuses it first, with the same message.

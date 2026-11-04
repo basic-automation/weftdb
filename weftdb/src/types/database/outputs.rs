@@ -30,7 +30,6 @@ type CorrelationRowData = (CorrelationID, DictionaryId, SubjectId, AspectId, Pat
 const MAX_PAGES_FOR_POINT_ANALYSIS: usize = 10;
 
 // Avoid triggering pedantic 'too_many_lines' on this large impl
-#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl crate::types::database::traits::outputs::Outputs for Database {
 	//
@@ -1642,7 +1641,6 @@ impl Database {
 	/// Helper function to parse a batch row from the database with aspect context
 	///
 	/// Expected columns: `id(0)`, `aspect_id(1)`, `database_id(2)`, `size(3)`, `resolution(4)`, `measurements(5)`, `batch_hash(6)`
-	#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 	fn parse_batch_row_helper(row: &turso::Row, db_name: &str, db_path: &str) -> Result<Batch> {
 		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Batch ID is not text".to_string()))?.clone();
 		let batch_id = BatchId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for batch ID: {e}")))?);

@@ -90,7 +90,9 @@ struct Entry {
 
 /// The Daemons registry: spawn background work through it, read it back
 /// with [`snapshot`](Self::snapshot), stop everything with
-/// [`shutdown`](Self::shutdown). Cloneable — every clone is the same
+/// [`shutdown`](Self::shutdown).
+///
+/// Cloneable — every clone is the same
 /// registry, which is what lets startup phases register into one.
 #[derive(Debug, Clone)]
 pub struct Daemons {

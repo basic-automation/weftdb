@@ -440,7 +440,6 @@ mod active {
 	/// The faults a `WEFT_FAULT` value arms. Unset arms nothing. A value that is not
 	/// UTF-8, or does not parse, panics instead of being ignored.
 	// The escaped (Debug) form shows exactly which bytes are not UTF-8.
-	#[allow(clippy::unnecessary_debug_formatting)]
 	pub(super) fn faults_from_var(value: Option<OsString>) -> HashMap<FaultPoint, FaultAction> {
 		let Some(value) = value else { return HashMap::new() };
 		let spec = value.into_string().unwrap_or_else(|raw| panic!("{FAULT_ENV}={raw:?} is not valid UTF-8"));

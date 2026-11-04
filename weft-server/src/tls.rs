@@ -63,7 +63,9 @@ pub const TLS_CERT_FILE_ENV: &str = "WEFT_TLS_CERT_FILE";
 /// [`TLS_CERT_FILE_ENV`]: set together with it, read once at startup.
 pub const TLS_KEY_FILE_ENV: &str = "WEFT_TLS_KEY_FILE";
 
-/// Environment variable naming the API keys file. SEC-6 defines its format
+/// Environment variable naming the API keys file.
+///
+/// SEC-6 defines its format
 /// and enforces the keys; SEC-5's gate reads its *presence*: a mounted
 /// keys file is one half of the plaintext opt-in on a non-loopback bind
 /// (C8), because it is what the Docker image mounts.
@@ -71,11 +73,15 @@ pub const KEYS_FILE_ENV: &str = "WEFT_KEYS_FILE";
 
 /// Environment variable that explicitly opts in to unencrypted traffic:
 /// with a mounted keys file it lets a non-loopback bind serve plaintext
-/// (C8). `1`/`true`/`yes`/`on` opts in; unset, `0` or anything else does
+/// (C8).
+///
+/// `1`/`true`/`yes`/`on` opts in; unset, `0` or anything else does
 /// not.
 pub const ALLOW_PLAINTEXT_ENV: &str = "WEFT_ALLOW_PLAINTEXT";
 
-/// Environment variable carrying the authentication mode. The only value
+/// Environment variable carrying the authentication mode.
+///
+/// The only value
 /// this slice reads is [`AUTH_DISABLED`]: authentication explicitly off,
 /// which on a non-loopback bind is the gateway deployment's plaintext
 /// opt-in (C8, decision 7). SEC-6 owns the modes that turn auth on.
