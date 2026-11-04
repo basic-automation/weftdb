@@ -154,6 +154,21 @@ pub async fn read_value_range_to_record_batch_of(store: &SegmentStore, aspect: &
 	Ok(weft_arrow::columns_to_record_batch(unit, &timestamps, &values)?)
 }
 
+/// [`read_value_range_to_record_batch`] with the value column in the aspect's declared
+/// Arrow type, as [`read_time_range_to_record_batch_typed`] answers a window — so a
+/// value-band read and a time-window read of one aspect share one schema (the Flight
+/// listener advertises that schema before it reads any rows).
+///
+/// # Errors
+///
+/// As [`read_value_range_to_record_batch`].
+pub async fn read_value_range_to_record_batch_typed(store: &SegmentStore, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<RecordBatch> {
+	let schema = aspect_schema(store, aspect).await?;
+	let (timestamps, values) = store.read_value_range(aspect, lo, hi).await?;
+	let values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
+	Ok(weft_arrow::columns_to_record_batch_typed(schema.timestamp_unit, schema.value, &timestamps, &values)?)
+}
+
 /// Read the `[start, end]` window of `aspect` and return it as **Arrow IPC stream
 /// bytes**.
 ///

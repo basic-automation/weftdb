@@ -443,7 +443,9 @@ fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, t
 /// past the one just served (`start + count < total`), `None` at the end of the
 /// window (so a client stops when `next_cursor` is absent).
 fn next_cursor(start: usize, count: usize, total: usize) -> Option<String> {
-	(start + count < total).then(|| encode_cursor(start + count))
+	// An empty page (`limit=0`) is a count probe, not a step: a cursor that pointed back at
+	// `start` would hand a cursor-following client the same empty page forever.
+	(count > 0 && start + count < total).then(|| encode_cursor(start + count))
 }
 
 /// Query parameters for the JSON value-range read: the inclusive `[lo, hi]` value
@@ -936,7 +938,7 @@ pub struct StorageDownsampleParams {
 ///
 /// Traced as `downsample.range` so a `RUST_LOG`/OTLP run attributes the stored
 /// reduction apart from the compute endpoints' `downsample.reduce`.
-async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams) -> Result<crate::downsample::DownsampleResponse, ApiError> {
+pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams) -> Result<crate::downsample::DownsampleResponse, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
 	let width = crate::downsample::parse_width_token(params.resolution.as_deref())?;

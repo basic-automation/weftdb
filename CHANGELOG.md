@@ -10,6 +10,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **R client** (`clients/r`, package `weftdb`): stored windows, value bands and server-side
+  downsamples as Arrow tables, exact JSON rows paged by cursor, interpolation, and ingest of a
+  data frame or Arrow table as one Parquet batch with `Idempotency-Key`. Refusals are
+  conditions of class `weft_<code>` carrying `status`, `details` and `request_id`.
+- **Grafana JSON-datasource routes** (experimental, `read` scope): `GET /api/v1/grafana`,
+  `POST /api/v1/grafana/metrics` and `POST /api/v1/grafana/query` answer the community
+  `simpod-json-datasource` plugin, so a dashboard charts stored aspects with each panel's
+  buckets (its interval, capped at its `maxDataPoints`) reduced by the stored downsample.
+  `packaging/grafana/weftdb-datasource.yaml` provisions it.
+- **Arrow Flight listener** (experimental, read-only). With `WEFT_FLIGHT_ADDR` set to a
+  loopback address, `weft-server` serves Arrow Flight over gRPC beside the HTTP listener:
+  `DoGet` streams a stored time window or value band (a JSON ticket) as the same typed record
+  batch the Arrow range routes encode, and `GetFlightInfo`, `GetSchema` and `ListFlights`
+  describe the declared aspects. Keys and the `read` scope apply as on HTTP, denials are
+  audited, a query gate sized by `WEFT_QUERY_MAX_INFLIGHT` sheds load as `UNAVAILABLE`, and a
+  refusal carries its envelope code in `x-weft-error-code`. Writes, Flight SQL and a
+  non-loopback (plaintext) bind are refused.
 - **Rust SDK** (`weft-client`). An async client for every route of the HTTP API, on
   `reqwest`: compute, catalog, the four ingest formats with `Idempotency-Key`, stored reads
   with cursor-following `Stream`s, maintenance, backup and the bench runs. Stored values are
@@ -125,6 +142,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- An Arrow or Parquet ingest whose `timestamp` column held a null stored that row at the epoch
+  (`values()` ignores the validity bitmap); it is now refused `400`, naming the column.
+- A stored read with `limit=0` answered a `next_cursor` pointing at the same offset, so a
+  client following cursors fetched the same empty page forever; an empty page now carries no
+  cursor.
+- Parquet ingest (`POST /api/v1/storage/{aspect}/parquet`) refused a Snappy-compressed file
+  with `400 … Disabled feature at compile time: snap`. Snappy is the default codec of R's
+  arrow, pyarrow, pandas and Spark; the workspace's `parquet` now builds with it.
 - **Restore no longer strands tagged frames (part of TAG-9, #310).** A restore-mode open
   adopts an orphan frame that carries a series key into the series the key names,
   registering the key in the aspect's catalog in the same transaction, instead of journaling

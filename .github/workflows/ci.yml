@@ -199,6 +199,11 @@ jobs:
         env:
           # Absolute: cargo runs an integration test from its package directory.
           WEFT_SERVER_BIN: ${{ github.workspace }}/target/debug/weft-server
+      # The R client's offline checks and its contract against the same server, in a pinned
+      # rocker/r-ver container (scripts/clients/test-r.sh), so the runner needs no R.
+      - name: R client (clients/r)
+        if: runner.os == 'Linux'
+        run: scripts/clients/test-r.sh target/debug/weft-server
       # Tests create their legacy databases in a temporary data dir (weftdb/tests/common,
       # weft-orchestration's test_support, db_tests' own temp dirs), never in the default
       # ~/.weftdb/data. A fresh runner has no ~/.weftdb, so one here was written by a test.
@@ -383,7 +388,7 @@ jobs:
         run: |
           shellcheck --version
           shellcheck scripts/release/*.sh scripts/compat/*.sh \
-            scripts/licenses/*.sh scripts/bench/*.sh scripts/packaging/*.sh
+            scripts/licenses/*.sh scripts/bench/*.sh scripts/packaging/*.sh scripts/clients/*.sh
       - name: verify.sh tests
         run: scripts/release/test-verify.sh
       - name: stage.sh tests

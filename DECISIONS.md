@@ -4,6 +4,46 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-04 — Phase 2 integrations: what was built, and the two items left with a reason (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** Phase 2's two remaining roadmap lines chain six items with arrows —
+"Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)" and
+"Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows" — and name none
+of their shapes. The owner asked for Phases 2 and 3 to be completed, best judgement, one CI run
+at the end.
+
+**Chosen:**
+
+- **Arrow Flight, read-only, opt-in, loopback only** (`WEFT_FLIGHT_ADDR`, experimental). Flight
+  is gRPC over HTTP/2 and the serve path is HTTP/1.1 (SEC-4), so it is a second listener, not a
+  route. It binds loopback only because it is plaintext: SEC-5's plaintext gate refuses a
+  non-loopback plaintext bind for the HTTP listener, and a Flight call carries the same bearer
+  key. Reads only, because writes carry idempotency keys, the ingest byte budget and audit
+  records on the HTTP path, and a second write path would have to re-earn all three. Tickets
+  are JSON naming the same two reads the HTTP Arrow routes serve. Auth, the `read` scope,
+  `auth_denied` audit events and a query gate sized like the HTTP one carry over.
+- **Grafana through the community JSON datasource**, not a native plugin. A native datasource
+  is a separately built, signed TypeScript-and-Go project; `simpod-json-datasource` is
+  installable today and speaks three calls, which three experimental `read`-scope routes
+  answer with the stored downsample, so the reduction runs in the store.
+- **R/Arrow as an R package** (`clients/r`) over the HTTP Arrow and Parquet routes, with
+  Flight described for long windows rather than wrapped (R's `flight_connect` goes through
+  `pyarrow` via `reticulate`).
+- **Parquet ingest reads Snappy.** Found by the R contract test: the workspace built `parquet`
+  without its `snap` feature, so a file from R's arrow, pyarrow, pandas or Spark (all Snappy by
+  default) was refused `400`. `snap` is pure Rust (BSD-3-Clause).
+
+**Left, with the reason:**
+
+- **Prometheus remote write/read** — the line is conditional ("if monitoring"), and the
+  condition is not met by the data model: a remote-write series is a metric name plus a label
+  set, and WeftDB has no per-measurement tags yet (backlog **B-tags**, absent). Mapping each
+  label set to an aspect name would mint unbounded aspects from label cardinality, which is
+  the failure B-tags exists to design out. It follows B-tags.
+- **Flight SQL** — Flight SQL is SQL statements carried over Flight; with no SQL engine there
+  is nothing to answer them. It follows the SQL surface (DataFusion), which the roadmap marks
+  "later".
+
 ## 2026-11-03 — SOA-10: derived-read checks judge the stored downsample's buckets against the model, exactly (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6, W6) lists SOA-10 by name only — "Derived-read

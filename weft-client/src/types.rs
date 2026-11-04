@@ -39,9 +39,18 @@ impl StoredValue for BigDecimal {
 	}
 }
 
+/// The widest exponent a decimal string may carry. Plain notation spells every digit an
+/// exponent implies, so `1e999999999` would be a gigabyte of zeros; no value the server can
+/// store needs more than a few dozen digits either side of the point.
+const MAX_EXPONENT: i64 = 4_096;
+
 impl StoredValue for str {
 	fn to_decimal_text(&self) -> Result<Option<String>> {
 		let parsed = BigDecimal::from_str(self.trim()).map_err(|_| Error::invalid(format!("{self:?} is not a decimal")))?;
+		let (_, scale) = parsed.as_bigint_and_exponent();
+		if scale.unsigned_abs() > MAX_EXPONENT.unsigned_abs() {
+			return Err(Error::invalid(format!("{self:?} spans more than {MAX_EXPONENT} decimal places; no stored type holds it")));
+		}
 		Ok(Some(parsed.to_plain_string()))
 	}
 }
@@ -194,7 +203,8 @@ impl Format {
 pub struct Interpolate {
 	/// The reconstruction.
 	pub spline: Spline,
-	/// The grid step: `seconds`, `minutes`, `hours`, `days`, or a width such as `"250ms"`.
+	/// The grid step, a resolution name: `milliseconds`, `seconds`, `minutes`, `hours`, `days`, …
+	/// (the JSON endpoint takes names, not widths such as `"250ms"`).
 	pub resolution: String,
 	/// The grid's first instant (default: the first point's).
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -207,7 +217,7 @@ pub struct Interpolate {
 }
 
 impl Interpolate {
-	/// A request over `points` with the server's defaults (cubic, one-second grid).
+	/// A request over `points`: cubic, on a one-second grid.
 	pub fn new(points: impl IntoIterator<Item = impl Into<ComputePoint>>) -> Self {
 		Self { spline: Spline::Cubic, resolution: "seconds".into(), start: None, end: None, points: points.into_iter().map(Into::into).collect() }
 	}
@@ -304,7 +314,8 @@ pub(crate) struct InterpolatePointBody<'a> {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct Downsample {
-	/// The bucket width: `seconds`, `minutes`, `hours`, `days`, or a width such as `"15m"`.
+	/// The bucket resolution, a name: `seconds`, `minutes`, `hours`, `days`, … (a count such
+	/// as `"15m"` goes in [`width`](Self::width)).
 	pub resolution: String,
 	/// The reductions per bucket: `avg`, `min`, `max`, `sum`, `count`, `first`, `last`, ….
 	pub aggregations: Vec<String>,
@@ -334,6 +345,13 @@ impl Downsample {
 	#[must_use]
 	pub fn resolution(mut self, resolution: impl Into<String>) -> Self {
 		self.resolution = resolution.into();
+		self
+	}
+
+	/// Buckets `width` wide, e.g. `"15m"` or `"250ms"` (overrides the resolution).
+	#[must_use]
+	pub fn width(mut self, width: impl Into<String>) -> Self {
+		self.width = Some(width.into());
 		self
 	}
 
@@ -388,7 +406,8 @@ pub struct IlpOptions {
 	pub precision: Option<String>,
 	/// The reconstruction (interpolate only).
 	pub spline: Option<Spline>,
-	/// The grid step or bucket width.
+	/// Interpolation: the grid step, a resolution name (`seconds`, …). Downsample: the bucket
+	/// width, a name or a count such as `"15m"`.
 	pub resolution: Option<String>,
 	/// The reductions (downsample only).
 	pub aggregations: Vec<String>,
@@ -745,6 +764,8 @@ mod tests {
 		assert_eq!(None::<i64>.to_decimal_text().unwrap(), None);
 		assert_eq!(Some("3").to_decimal_text().unwrap(), Some("3".into()));
 		assert_eq!(BigDecimal::from_str("1e-3").unwrap().to_decimal_text().unwrap(), Some("0.001".into()), "plain notation, which every parser on the server takes");
+		assert_eq!("1e999999999".to_decimal_text().unwrap_err().kind(), crate::ErrorKind::InvalidInput, "refused before it is spelled out");
+		assert_eq!("1e-5000".to_decimal_text().unwrap_err().kind(), crate::ErrorKind::InvalidInput);
 		let refused = "1.2.3".to_decimal_text().unwrap_err();
 		assert_eq!(refused.kind(), crate::ErrorKind::InvalidInput);
 	}
