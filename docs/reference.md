@@ -233,7 +233,7 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 | Library crates on crates.io | Not published yet |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
 | Packaging — Helm | Not started |
-| Client SDKs (Python, TypeScript) | Not started |
+| Client SDKs | Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
 | Per-measurement tags | Not started |
 
 The full work queue lives in [`ROADMAP.md`](../ROADMAP.md). It is the single source of
@@ -286,6 +286,9 @@ truth for status and priorities, and it records negative results alongside wins.
   directly in Arrow-native tooling.
 - **Prometheus `/metrics`** with latency histograms, plus a live p50/p95/p99 profile
   endpoint and **OpenTelemetry** trace export.
+- **Python client** ([`clients/python`](../clients/python)) — every HTTP route from Python,
+  lossless `Decimal` values on the storage paths, and Arrow/Parquet answers as `pyarrow`
+  tables.
 - **Rust libraries** — use the engine, the storage layer or the reductions directly,
   without the server.
 - **Terminal UI** for importing CSV, browsing and plotting aspects, and running
@@ -497,6 +500,8 @@ task drain and the store's shutdown have finished.
 | `GET /ready` | Readiness, including the segment-store dependency check. With a store, `poisoned` / `restart_required` report that a segment-index COMMIT failed in a way that may still have committed, so the store refuses writes until the server restarts (reads keep working, and `ready` stays `true`); `poison_reason` says which transaction and error. |
 | `GET /metrics` | Prometheus text exposition — request/error/output counters, ingest counters (`weft_ingest_*`), and **latency histograms** for the compute and storage-ingest paths. |
 | `GET /debug/profile/current` | Live p50/p95/p99 latency snapshot per instrumented path. |
+| `GET /bench/runs` | *Experimental.* The benchmark runs under `WEFT_BENCH_RUNS_DIR`, newest first: run id, path, `schema_version`, `generated_at`, `claim`. `metrics` scope. |
+| `GET /bench/runs/{id}` | *Experimental.* One run's EVI-3 manifest, byte for byte; the id is the manifest's SHA-256 (64 lower-case hex), so the response is immutable and carries it as its `ETag`. `404 run_not_found` when no manifest hashes to it. `metrics` scope. |
 
 ### Compute endpoints
 
@@ -858,6 +863,7 @@ recovery-point and recovery-time objectives these settings produce, see
 | `WEFT_BACKUP_DIR` | `weft-server` | Directory each control-plane backup is written under — shared by the manual `POST …/storage/backup` endpoint and the background backup daemon, so hand-taken and automatic snapshots live together. | `<store_root>/backups` |
 | `WEFT_BACKUP_INTERVAL_SECS` | `weft-server` | Background control-plane backup daemon interval in seconds; `0`/unset disables it. Each tick writes a verified snapshot into a fresh `backup-<unix_millis>` directory, using the concurrent-write-safe `snapshot` verification (it backs up a live store). Needs a segment store configured. | unset (disabled) |
 | `WEFT_BACKUP_KEEP` | `weft-server` | How many **daemon-generated** snapshots to retain; after each successful backup the oldest `backup-<digits>` directories beyond this many are removed. Only daemon-generated names are ever counted or pruned — a snapshot taken through `POST …/storage/backup` (a `?label=` one, or an unlabelled `manual-<unix_millis>` one) is never a candidate — and a generated-looking directory stamped more than 24 h past the clock or past its own modification time is ignored (not counted, not removed, logged as a warning; remove it by hand). | unset (retain everything) |
+| `WEFT_BENCH_RUNS_DIR` | `weft-server` | *Experimental.* Directory of `weft-bench` run manifests (`*.manifest.json`, searched four levels deep, symlinks not followed). `GET /bench/runs` lists them and `GET /bench/runs/{id}` serves one byte for byte, where the id is the SHA-256 of the manifest file (`weft-bench` prints it as `run id`). Both routes need the `metrics` scope. | unset (both routes answer `503 unconfigured`) |
 | `BTC_TEST_MAX_ROWS` / `BTC_TEST_FULL` | `weftdb` (tests) | Row cap for the bounded, hermetic default run of `test_create_btc_1min_database` (into a temp data dir), or `BTC_TEST_FULL=1` for the historical whole-corpus load into the shared data dir. | `5000` / unset |
 | `WEFT_SEGMENT_CHECKPOINT_STRIDE` | `weft-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |
 | `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` | `weft-server` | Row floor below which a segment is never checkpointed (a small column decodes trivially, so an index would be pure cost). | `8192` |

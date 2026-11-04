@@ -713,6 +713,19 @@ fn push_result_measures(result: &BenchResult, measures: &mut Vec<Measure>) {
 	measures.push(Measure { name: "correctness.passed".to_string(), adapter: adapter.to_string(), value: if result.correctness.passed() { 1.0 } else { 0.0 }, unit: "flag".to_string(), better: Better::Pass, headline: false });
 }
 
+/// The run id of the manifest file at `path`: the SHA-256 of its exact bytes, lower-case hex.
+///
+/// This is the id `weft-server`'s `GET /bench/runs/{id}` serves the manifest under. It is
+/// content-addressed rather than assigned, so the manifest needs no field for it, the same file
+/// has the same id everywhere, and an edited manifest is a different run.
+///
+/// # Errors
+///
+/// The file cannot be read.
+pub fn run_id(path: &Path) -> std::io::Result<String> {
+	Ok(hex_digest(&std::fs::read(path)?))
+}
+
 /// Lower-case hex SHA-256 of `bytes`.
 fn hex_digest(bytes: &[u8]) -> String {
 	let mut hasher = Sha256::new();

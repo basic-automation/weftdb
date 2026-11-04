@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use weft_server::{audit, store_open, AppState, AuditLog, AUDIT_FILE_ENV};
+use weft_server::{audit, store_open, AppState, AuditLog, BenchRuns, AUDIT_FILE_ENV, BENCH_RUNS_DIR_ENV};
 
 /// Environment variable naming the segment-store root directory (optional).
 pub(crate) const STORE_ROOT_ENV: &str = "WEFT_SEGMENT_STORE_ROOT";
@@ -52,7 +52,14 @@ pub(crate) async fn build() -> anyhow::Result<AppState> {
 			(AppState::new(), None)
 		}
 	};
-	Ok(state.with_audit_log(open_audit_log(store_root.as_deref())))
+	let state = state.with_audit_log(open_audit_log(store_root.as_deref()));
+	Ok(match std::env::var(BENCH_RUNS_DIR_ENV) {
+		Ok(dir) => {
+			println!("bench runs: serving the run manifests under {dir} on /bench/runs (metrics scope)");
+			state.with_bench_runs(BenchRuns::new(dir))
+		}
+		Err(_) => state,
+	})
 }
 
 /// Open the fsynced audit log (SEC-9, [`AuditLog`]): the path

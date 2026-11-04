@@ -107,7 +107,11 @@ async fn every_refusal_carries_exactly_the_envelope_keys() {
 		let (_status, headers, body) = refuse(router_for(code), refusal.request).await;
 		let object = body.as_object().unwrap_or_else(|| panic!("{code}: envelope object, got {body}"));
 		let keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
-		assert_eq!(keys, BTreeSet::from(["error", "code", "request_id"]), "{code}: envelope keys, and none of them null: {body}");
+		// `unconfigured` carries `details`: its 5xx sentence is shared by every subsystem
+		// a route can need (the segment store, the bench-run directory), so which one is
+		// missing, and the variable that enables it, can only travel there.
+		let expected = if code == "unconfigured" { BTreeSet::from(["error", "code", "details", "request_id"]) } else { BTreeSet::from(["error", "code", "request_id"]) };
+		assert_eq!(keys, expected, "{code}: envelope keys, and none of them null: {body}");
 		assert_eq!(headers["content-type"], "application/json", "{code}: a refusal is JSON: {body}");
 	}
 }
@@ -141,11 +145,13 @@ async fn a_generated_request_id_reaches_the_body_too() {
 #[tokio::test]
 async fn a_server_side_refusal_says_the_fixed_sentence() {
 	// `unconfigured` is a 5xx, and a 5xx body says what the server could not do rather than
-	// what went wrong inside it. Here the two are the same sentence by design: there is no
-	// detail to hide, and the operator reading the body still learns the cause.
+	// what went wrong inside it. The sentence is the code's, shared by every subsystem, so
+	// which one is missing — and the variable that enables it — rides in `details`.
 	let refusal = refusals().into_iter().find(|refusal| refusal.code == "unconfigured").expect("the unconfigured read");
 	let (_status, _headers, body) = refuse(router_for("unconfigured"), refusal.request).await;
-	assert_eq!(body["error"], "no segment store is configured on this server", "{body}");
+	assert_eq!(body["error"], "a subsystem this route needs is not configured on this server", "{body}");
+	assert_eq!(body["details"]["subsystem"], "segment_store", "{body}");
+	assert_eq!(body["details"]["enabled_by"], "WEFT_SEGMENT_STORE_ROOT", "{body}");
 }
 
 #[tokio::test]
