@@ -77,8 +77,8 @@
 
 use std::{
 	collections::{HashMap, HashSet}, ffi::OsStr, future::Future, path::{Component, Path, PathBuf}, sync::{
-		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Arc, OnceLock, PoisonError, RwLock
-	}, time::Duration
+		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Arc, Mutex, OnceLock, PoisonError, RwLock
+	}, time::{Duration, Instant}
 };
 
 use anyhow::{bail, Context, Result};
@@ -389,21 +389,27 @@ pub struct SegmentStoreOptions {
 	pub partials: PartialSidecarPolicy,
 	/// Whether new seals write the bit-sliced value codec.
 	pub transposed: TransposedPolicy,
+	/// The per-aspect circuit breaker store-wide maintenance sweeps run under
+	/// (ROB-19). Unlike the seal policies above this one is **on** by default
+	/// ([`MaintenanceBreaker::default`]): decision 17's scheduler is on by
+	/// default, and the breaker is part of it.
+	pub breaker: MaintenanceBreaker,
 }
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default() }
 	}
 }
 
 impl SegmentStoreOptions {
 	/// The options the environment describes: [`CheckpointPolicy::from_env`],
-	/// [`PartialSidecarPolicy::from_env`] and [`TransposedPolicy::from_env`], each as
-	/// lenient as it documents. Explicit: nothing in the library calls it.
+	/// [`PartialSidecarPolicy::from_env`], [`TransposedPolicy::from_env`] and
+	/// [`MaintenanceBreaker::from_env`], each as lenient as it documents.
+	/// Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env() }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env() }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -424,6 +430,13 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_transposed(mut self, policy: TransposedPolicy) -> Self {
 		self.transposed = policy;
+		self
+	}
+
+	/// These options with `breaker` for the maintenance circuit breaker.
+	#[must_use]
+	pub const fn with_breaker(mut self, breaker: MaintenanceBreaker) -> Self {
+		self.breaker = breaker;
 		self
 	}
 }
@@ -546,6 +559,74 @@ impl MaintenanceWait {
 			Self::Wait(wait) => Some(tokio::time::Instant::now() + wait),
 		}
 	}
+}
+
+/// Consecutive failed store-wide sweep passes on one aspect after which that
+/// aspect's maintenance circuit breaker trips (ROB-19).
+pub const DEFAULT_MAINTENANCE_BREAKER_FAILURES: u32 = 3;
+
+/// How long a tripped maintenance circuit breaker leaves its aspect alone before
+/// a store-wide sweep may try it once more (ROB-19).
+pub const DEFAULT_MAINTENANCE_BREAKER_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// The per-aspect **circuit breaker** for store-wide maintenance sweeps (ROB-19,
+/// release plan decision 17's maintenance scheduler).
+///
+/// A sweep already isolates a failing aspect — it records the failure and
+/// maintains the rest — but without a breaker it retries that aspect on *every*
+/// sweep: a permanently damaged frame is re-read and re-failed on every daemon
+/// tick forever, paying the decode cost and a failure log line each time. The
+/// breaker counts an aspect's **consecutive** failed sweep passes; at
+/// [`failure_threshold`](Self::failure_threshold) the breaker **trips** and
+/// sweeps skip the aspect (listing it in the sweep's `tripped` field) until
+/// [`cooldown`](Self::cooldown) has passed. The first sweep after the cooldown
+/// is a half-open trial: a pass that succeeds (or finds nothing to do) closes
+/// the breaker and clears the count; a pass that fails trips it again for a
+/// fresh cooldown. Any successful pass resets the consecutive count, so an
+/// aspect that fails only intermittently never trips. A busy aspect is neither
+/// a failure nor a success — another operation is maintaining it, so its count
+/// is left alone. Per-aspect entry points (the operator's `reconcile`,
+/// `squash`, `compact` endpoints) are never gated: the breaker governs only the
+/// store-wide sweeps the scheduler runs, and an operator can always work on a
+/// tripped aspect directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceBreaker {
+	/// Consecutive failed sweep passes that trip the breaker; `0` disables the
+	/// breaker (sweeps attempt every aspect on every pass, as before ROB-19).
+	pub failure_threshold: u32,
+	/// How long a tripped breaker skips its aspect before allowing one trial pass.
+	pub cooldown: Duration,
+}
+
+impl Default for MaintenanceBreaker {
+	fn default() -> Self {
+		Self { failure_threshold: DEFAULT_MAINTENANCE_BREAKER_FAILURES, cooldown: DEFAULT_MAINTENANCE_BREAKER_COOLDOWN }
+	}
+}
+
+impl MaintenanceBreaker {
+	/// The breaker the environment describes: `WEFT_MAINTENANCE_BREAKER_FAILURES`
+	/// (absent or unparseable → [`DEFAULT_MAINTENANCE_BREAKER_FAILURES`]; `0`
+	/// disables the breaker) and `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (absent
+	/// or unparseable → [`DEFAULT_MAINTENANCE_BREAKER_COOLDOWN`]). Lenient, like
+	/// the other policies: nothing in the library calls it — `weft-server` does,
+	/// through [`SegmentStoreOptions::from_env`].
+	#[must_use]
+	pub fn from_env() -> Self {
+		let failure_threshold = std::env::var("WEFT_MAINTENANCE_BREAKER_FAILURES").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(DEFAULT_MAINTENANCE_BREAKER_FAILURES);
+		let cooldown = std::env::var("WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, Duration::from_secs);
+		Self { failure_threshold, cooldown }
+	}
+}
+
+/// One aspect's circuit-breaker state, held in the store's breaker map.
+#[derive(Debug, Default)]
+struct AspectBreakerState {
+	/// Failed sweep passes since the last successful one.
+	consecutive_failures: u32,
+	/// While this instant is in the future the breaker is open and sweeps skip
+	/// the aspect; once it passes, the next sweep's pass is the half-open trial.
+	open_until: Option<Instant>,
 }
 
 /// A store's write poison: set once, by the first ambiguous COMMIT, and never cleared.
@@ -1257,6 +1338,13 @@ pub struct SegmentStore {
 	/// How long a per-aspect maintenance entry point waits for an aspect another
 	/// maintenance operation holds.
 	maintenance_wait: Duration,
+	/// The per-aspect circuit breaker store-wide maintenance sweeps run under
+	/// (ROB-19): its policy, from the open options.
+	maintenance_breaker: MaintenanceBreaker,
+	/// Each aspect's circuit-breaker state (consecutive sweep failures and, once
+	/// tripped, when the cooldown ends), guarded by a plain mutex: it is only
+	/// ever held for a map touch, never across an await.
+	breaker_state: Mutex<HashMap<String, AspectBreakerState>>,
 	/// Segment-index transaction attempts that lost an MVCC conflict; see
 	/// [`index_conflicts`](SegmentStore::index_conflicts).
 	index_conflicts: AtomicU64,
@@ -2072,6 +2160,11 @@ pub struct ReconcileSweep {
 	/// [`MaintenanceWait`]), in visit order. Empty when it took every aspect. A busy
 	/// aspect counts only toward `aspects_scanned`; a later sweep maintains it.
 	pub busy: Vec<String>,
+	/// Aspects the sweep did not attempt because their maintenance circuit breaker
+	/// is tripped (see [`MaintenanceBreaker`]), in visit order. A tripped aspect
+	/// counts only toward `aspects_scanned`; a sweep after the breaker's cooldown
+	/// retries it once.
+	pub tripped: Vec<String>,
 }
 
 /// The cold-vs-hot split of a hot/cold reconcile pass over one aspect, returned by
@@ -2122,6 +2215,11 @@ pub struct HotColdSweep {
 	/// [`MaintenanceWait`]), in visit order. Empty when it took every aspect. A busy
 	/// aspect counts only toward `aspects_scanned`; a later sweep maintains it.
 	pub busy: Vec<String>,
+	/// Aspects the sweep did not attempt because their maintenance circuit breaker
+	/// is tripped (see [`MaintenanceBreaker`]), in visit order. A tripped aspect
+	/// counts only toward `aspects_scanned`; a sweep after the breaker's cooldown
+	/// retries it once.
+	pub tripped: Vec<String>,
 }
 
 impl HotColdSweep {
@@ -2158,6 +2256,11 @@ pub struct OverlapSweep {
 	/// [`MaintenanceWait`]), in visit order. Empty when it took every aspect. A busy
 	/// aspect counts only toward `aspects_scanned`; a later sweep maintains it.
 	pub busy: Vec<String>,
+	/// Aspects the sweep did not attempt because their maintenance circuit breaker
+	/// is tripped (see [`MaintenanceBreaker`]), in visit order. A tripped aspect
+	/// counts only toward `aspects_scanned`; a sweep after the breaker's cooldown
+	/// retries it once.
+	pub tripped: Vec<String>,
 }
 
 /// The outcome of a store-wide squash sweep, returned by
@@ -2187,6 +2290,11 @@ pub struct SquashSweep {
 	/// [`MaintenanceWait`]), in visit order. Empty when it took every aspect. A busy
 	/// aspect counts only toward `aspects_scanned`; a later sweep maintains it.
 	pub busy: Vec<String>,
+	/// Aspects the sweep did not attempt because their maintenance circuit breaker
+	/// is tripped (see [`MaintenanceBreaker`]), in visit order. A tripped aspect
+	/// counts only toward `aspects_scanned`; a sweep after the breaker's cooldown
+	/// retries it once.
+	pub tripped: Vec<String>,
 }
 
 /// Await one database's snapshot into a backup's build directory, fsync the copy through
@@ -4417,6 +4525,100 @@ mod tests {
 		assert_eq!(sweep.segments_removed, 5);
 		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
 		assert_eq!(missed, Vec::<&str>::new(), "healthy aspects left uncompacted");
+	}
+
+	/// ROB-19: the per-aspect circuit breaker trips an aspect whose sweep passes
+	/// keep failing, and later sweeps skip it — listing it in `tripped`, recording
+	/// no new failure — while every other aspect is maintained as usual. The
+	/// per-aspect entry point is never gated: an operator can still attempt the
+	/// tripped aspect directly.
+	#[tokio::test]
+	async fn maintenance_breaker_trips_a_failing_aspect_and_sweeps_the_rest() {
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let store = store.with_maintenance_breaker(MaintenanceBreaker { failure_threshold: 2, cooldown: Duration::from_secs(60) });
+
+		// First sweep: the bad aspect fails (one consecutive failure), the five
+		// healthy aspects reconcile. Below the threshold of 2, nothing trips.
+		let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps");
+		assert_eq!(sweep.aspects_reconciled, 5, "every healthy aspect is reconciled");
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert!(sweep.tripped.is_empty(), "nothing has tripped yet: {:?}", sweep.tripped);
+		assert!(!store.breaker_tripped(SWEEP_BAD), "one failure is below the threshold");
+
+		// Second sweep: the bad aspect fails again and trips. The healthy aspects
+		// have nothing left to reconcile, which still counts as success.
+		let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps");
+		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert!(store.breaker_tripped(SWEEP_BAD), "the second consecutive failure trips the breaker");
+
+		// Third sweep: the tripped aspect is not attempted at all — no failure is
+		// recorded for it, it is listed in `tripped`, and the sweep is clean.
+		let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps");
+		drop(store);
+		assert_eq!(sweep.aspects_scanned, 6);
+		assert!(sweep.failed.is_empty(), "a tripped aspect records no new failure: {:?}", sweep.failed);
+		assert_eq!(sweep.tripped, vec![SWEEP_BAD.to_string()], "the tripped aspect is named");
+
+		// The breaker gates only the store-wide sweeps: the per-aspect entry point
+		// still attempts the aspect (and still meets the truncated frame).
+		let dir = TempDir::new().expect("tempdir");
+		let (store, _bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let store = store.with_maintenance_breaker(MaintenanceBreaker { failure_threshold: 1, cooldown: Duration::from_secs(60) });
+		let _ = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps");
+		assert!(store.breaker_tripped(SWEEP_BAD));
+		let direct = store.reconcile_aspect(SWEEP_BAD).await;
+		drop(store);
+		assert!(direct.is_err(), "the per-aspect pass is attempted, not gated: {direct:?}");
+	}
+
+	/// ROB-19: once a tripped breaker's cooldown passes, the next sweep retries
+	/// the aspect once (the half-open trial); a trial that succeeds closes the
+	/// breaker and the aspect is maintained again.
+	#[tokio::test]
+	async fn maintenance_breaker_half_open_trial_closes_on_success() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens").with_maintenance_breaker(MaintenanceBreaker { failure_threshold: 1, cooldown: Duration::from_millis(50) });
+		store.declare("a", &schema()).await.expect("declares");
+		// One out-of-order segment; keep its frame's bytes so the damage can be undone.
+		let first = store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.expect("seals");
+		let original = std::fs::read(&first.path).expect("reads frame");
+		let file = std::fs::OpenOptions::new().write(true).open(&first.path).expect("opens frame");
+		file.set_len(original.len() as u64 / 2).expect("truncates frame");
+		drop(file);
+
+		// The failing pass trips the breaker at a threshold of one failure.
+		let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps");
+		assert_eq!(sweep.failed.len(), 1, "the damaged aspect fails");
+		assert!(store.breaker_tripped("a"), "one failure trips a threshold-1 breaker");
+
+		// Repair the frame and let the cooldown pass: the trial pass reconciles
+		// the aspect and closes the breaker.
+		std::fs::write(&first.path, &original).expect("restores frame");
+		tokio::time::sleep(Duration::from_millis(60)).await;
+		let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps");
+		let stats = store.aspect_stats("a").await.expect("stats");
+		drop(store);
+		assert!(sweep.failed.is_empty(), "the trial pass succeeds: {:?}", sweep.failed);
+		assert!(sweep.tripped.is_empty(), "the cooldown passed, so the aspect was tried");
+		assert_eq!(sweep.aspects_reconciled, 1, "the trial pass reconciles the aspect");
+		assert_eq!(stats.unsorted_segments, 0, "the aspect is maintained again");
+	}
+
+	/// ROB-19: a failure threshold of 0 disables the breaker — a failing aspect
+	/// is attempted (and fails) on every sweep, as before the breaker existed.
+	#[tokio::test]
+	async fn maintenance_breaker_disabled_never_trips() {
+		let dir = TempDir::new().expect("tempdir");
+		let (store, bad_frame) = sweep_isolation_fixture(dir.path()).await;
+		let store = store.with_maintenance_breaker(MaintenanceBreaker { failure_threshold: 0, cooldown: Duration::from_secs(60) });
+		for _ in 0..3 {
+			let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps");
+			assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+			assert!(sweep.tripped.is_empty(), "a disabled breaker trips nothing");
+			assert!(!store.breaker_tripped(SWEEP_BAD));
+		}
+		drop(store);
 	}
 
 	#[tokio::test]

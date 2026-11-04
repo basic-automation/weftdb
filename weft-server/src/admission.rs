@@ -35,8 +35,14 @@
 //! `WEFT_INGEST_MAX_INFLIGHT_BYTES`, and the query cap is
 //! `WEFT_QUERY_MAX_INFLIGHT`. Maintenance exclusivity is the class's
 //! definition, not a knob, so it takes no variable. Admission II
-//! (ROB-11, W6) owns whatever refinement comes next (it arrives with
-//! PAC-7's runtime builder, plan §2 L-MAIN); nothing here pre-empts it.
+//! (ROB-11, W6) is the other side of this module, not a refinement of
+//! it: the gate's budgets are spent by the process runtime, so ROB-11
+//! lands on the runtime-builder side (plan §2 L-MAIN, after PAC-7's
+//! CLI side) — the binary builds its runtime explicitly in
+//! [`crate::runtime`], sizes its worker pool with
+//! `WEFT_WORKER_THREADS` beside the caps above, and shuts the runtime
+//! down with plan C9's `shutdown_timeout(5 s)`. The gate's classes,
+//! budgets and refusals are unchanged by it.
 
 use std::sync::Arc;
 

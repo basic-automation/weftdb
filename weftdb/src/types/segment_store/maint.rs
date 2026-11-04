@@ -28,6 +28,48 @@ impl SegmentStore {
 		}
 	}
 
+	/// Whether a store-wide sweep may attempt `aspect` under its maintenance
+	/// circuit breaker (ROB-19, [`MaintenanceBreaker`]): `false` only while the
+	/// breaker is tripped and its cooldown is still running. A breaker whose
+	/// cooldown has passed permits the attempt — that pass is the half-open
+	/// trial whose outcome [`breaker_record`](Self::breaker_record) settles.
+	fn breaker_permits(&self, aspect: &str) -> bool {
+		if self.maintenance_breaker.failure_threshold == 0 {
+			return true;
+		}
+		let state = self.breaker_state.lock().unwrap_or_else(PoisonError::into_inner);
+		state.get(aspect).and_then(|aspect_state| aspect_state.open_until).is_none_or(|until| until <= Instant::now())
+	}
+
+	/// Record the outcome of one store-wide sweep pass on `aspect` in its
+	/// circuit breaker (ROB-19). A success clears the aspect's state outright
+	/// (the breaker closes, the consecutive count resets). A failure extends
+	/// the count and, once it reaches the policy's threshold, trips the
+	/// breaker for a fresh cooldown — logged once, at the trip, so a failing
+	/// aspect announces its quarantine instead of failing silently forever.
+	/// A failure on a half-open trial re-trips at once: the count is already
+	/// at the threshold, so the increment keeps it there. Never called for a
+	/// busy aspect: contention is not a failure.
+	fn breaker_record(&self, aspect: &str, failed: bool) {
+		if self.maintenance_breaker.failure_threshold == 0 {
+			return;
+		}
+		let mut state = self.breaker_state.lock().unwrap_or_else(PoisonError::into_inner);
+		if !failed {
+			state.remove(aspect);
+			return;
+		}
+		let aspect_state = state.entry(aspect.to_string()).or_default();
+		aspect_state.consecutive_failures = aspect_state.consecutive_failures.saturating_add(1);
+		if aspect_state.consecutive_failures >= self.maintenance_breaker.failure_threshold {
+			let was_open = aspect_state.open_until.is_some_and(|until| until > Instant::now());
+			aspect_state.open_until = Some(Instant::now() + self.maintenance_breaker.cooldown);
+			if !was_open {
+				tracing::warn!(aspect, failures = aspect_state.consecutive_failures, cooldown = ?self.maintenance_breaker.cooldown, "maintenance circuit breaker tripped: store-wide sweeps skip this aspect until the cooldown passes; per-aspect maintenance is unaffected");
+			}
+		}
+	}
+
 	/// Take `aspect`'s maintenance lock for a store-wide sweep: at once or not at all with
 	/// no `deadline` ([`MaintenanceWait::Skip`]), else waiting until `deadline`.
 	pub(crate) async fn sweep_maintain(&self, aspect: &str, deadline: Option<tokio::time::Instant>) -> Option<MaintGuard> {
@@ -699,17 +741,25 @@ impl SegmentStore {
 		let deadline = wait.deadline();
 		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
 		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
 			};
 			match self.reconcile_aspect_if_unsorted_exceeds_held(&held, threshold).await {
 				Ok(Some(reconciled)) => {
+					self.breaker_record(aspect, false);
 					sweep.aspects_reconciled += 1;
 					sweep.segments_reconciled += reconciled;
 				}
-				Ok(None) => {}
-				Err(err) => sweep.failed.push((aspect.clone(), err)),
+				Ok(None) => self.breaker_record(aspect, false),
+				Err(err) => {
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
 			}
 		}
 		Ok(sweep)
@@ -806,18 +856,26 @@ impl SegmentStore {
 		let deadline = wait.deadline();
 		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
 		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
 			};
 			match self.reconcile_aspect_hot_cold_held(&held, threshold).await {
 				Ok(outcome) if outcome.total() > 0 => {
+					self.breaker_record(aspect, false);
 					sweep.aspects_reconciled += 1;
 					sweep.cold_reconciled += outcome.cold_reconciled;
 					sweep.hot_reconciled += outcome.hot_reconciled;
 				}
-				Ok(_) => {}
-				Err(err) => sweep.failed.push((aspect.clone(), err)),
+				Ok(_) => self.breaker_record(aspect, false),
+				Err(err) => {
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
 			}
 		}
 		Ok(sweep)
@@ -996,17 +1054,25 @@ impl SegmentStore {
 		let deadline = wait.deadline();
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
 			};
 			match self.reconcile_overlaps_held(&held, SplitPolicy::questdb_default()).await {
 				Ok(removed) if removed > 0 => {
+					self.breaker_record(aspect, false);
 					sweep.aspects_reconciled += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok(_) => {}
-				Err(err) => sweep.failed.push((aspect.clone(), err)),
+				Ok(_) => self.breaker_record(aspect, false),
+				Err(err) => {
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
 			}
 		}
 		Ok(sweep)
@@ -1042,6 +1108,10 @@ impl SegmentStore {
 		let deadline = wait.deadline();
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
@@ -1053,11 +1123,15 @@ impl SegmentStore {
 			};
 			match pass.await {
 				Ok((true, removed)) => {
+					self.breaker_record(aspect, false);
 					sweep.aspects_reconciled += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok((false, _)) => {}
-				Err(err) => sweep.failed.push((aspect.clone(), err)),
+				Ok((false, _)) => self.breaker_record(aspect, false),
+				Err(err) => {
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
 			}
 		}
 		Ok(sweep)
@@ -1185,17 +1259,25 @@ impl SegmentStore {
 		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
 			};
 			match self.squash_aspect_if_exceeds_held(&held, max_segments).await {
 				Ok(Some(removed)) => {
+					self.breaker_record(aspect, false);
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok(None) => {}
-				Err(err) => sweep.failed.push((aspect.clone(), err)),
+				Ok(None) => self.breaker_record(aspect, false),
+				Err(err) => {
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
 			}
 		}
 		Ok(sweep)
@@ -1321,17 +1403,25 @@ impl SegmentStore {
 		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
 			};
 			match self.squash_aspect_to_target_rows_held(&held, target_rows).await {
 				Ok(removed) if removed > 0 => {
+					self.breaker_record(aspect, false);
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok(_) => {}
-				Err(err) => sweep.failed.push((aspect.clone(), err)),
+				Ok(_) => self.breaker_record(aspect, false),
+				Err(err) => {
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
 			}
 		}
 		Ok(sweep)
@@ -1404,17 +1494,25 @@ impl SegmentStore {
 		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
 			};
 			match self.squash_aspect_to_target_rows_if_fragmented_held(&held, target_rows).await {
 				Ok(Some(removed)) if removed > 0 => {
+					self.breaker_record(aspect, false);
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok(_) => {}
-				Err(err) => sweep.failed.push((aspect.clone(), err)),
+				Ok(_) => self.breaker_record(aspect, false),
+				Err(err) => {
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
 			}
 		}
 		Ok(sweep)

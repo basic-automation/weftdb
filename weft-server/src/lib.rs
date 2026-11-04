@@ -41,6 +41,10 @@ pub mod audit;
 pub mod auth;
 pub mod backup_daemon;
 pub mod backup_routes;
+/// PAC-7's operator CLI: the one dispatch over the binary's commands and
+/// the plan C7 exit-code table the process's statuses are read against
+/// (see [`cli`]).
+pub mod cli;
 /// ROB-3's Daemons registry: supervised background tasks and the shared
 /// shutdown watch (see [`daemons`]).
 pub mod daemons;
@@ -75,6 +79,9 @@ pub mod redact;
 /// testable.
 pub mod restore;
 pub mod routes;
+/// ROB-11's runtime builder: the explicit tokio runtime the binary
+/// runs on (see [`runtime`]).
+pub mod runtime;
 pub mod serve;
 pub mod settings;
 pub mod state;
@@ -100,6 +107,7 @@ pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpola
 pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyHistogram, LatencyHistogramSnapshot, LatencyProfile, Metrics, MetricsSnapshot, ProfileReport, SharedMetrics};
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
 pub use routes::{build_registry_with_ingest_config, build_registry_with_limits, AdmissionClass, Audit, ClassEntry, IngestAdmission, PolicyEntry, Role, RouteEntry, RouteSpec, RouteTable, Routes, Scope, SealedRoutes};
+pub use runtime::{RuntimeConfig, RUNTIME_SHUTDOWN_TIMEOUT, WORKER_THREADS_ENV};
 use serde::Serialize;
 pub use serve::{ServeLimits, ShutdownSignals, HEADER_READ_TIMEOUT_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV};
 pub use state::AppState;

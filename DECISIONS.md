@@ -3497,3 +3497,172 @@ X-ERR's reserved `503 audit_unavailable`. The points the sources do not pin, cho
    supervision emits `daemon_panic` (with `restarted` and the restart count) beside its
    stderr line. The backup/reconcile ticks themselves keep reporting through their own
    logs — their *failures to stay alive* are what the trail records.
+## 2026-11-02 — PAC-7: the operator CLI's shape and the usage class (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan gives PAC-7 one line ("Operator CLI, exit-code contract and
+store identity at startup", W6) plus the C7 table (§4) and the L-MAIN lane note
+("PAC-7 then ROB-11: CLI then runtime builder", §2). No source enumerates the CLI's
+commands, says which existing behaviours count as already-landed parts of it, or
+reconciles C7's "2 = Usage" row with PAC-13's later, deliberate choice that
+`restore`'s command-line refusals exit 78.
+
+**Chosen (best guess, grounded in the code on main, flagged for merge review):**
+
+- **The CLI is a dispatch, not a rewrite.** The three operator commands already
+  exist as library modules with their own parsers, help text and tests
+  (`keygen`, `restore`, `import-rows-mode`). PAC-7 adds one module,
+  `weft_server::cli`, whose `parse` reads the first word into a `Command`
+  (serve by default, `help`/`--help`, `--version`, or a subcommand carrying
+  the exact argument shape that subcommand's parser already expects —
+  restore's parser takes the words after `restore`; the other two take the
+  subcommand word too, as before). `main.rs` becomes a pure dispatch over
+  it, which is the L-MAIN shape ROB-11's runtime builder then builds on.
+  A first word naming no command is refused by `cli::parse` itself rather
+  than falling through to `import-rows-mode`'s parser as it did before.
+- **Usage is exit 2, and only usage.** C7's row 2 had no owner before this
+  slice: every subcommand parse error returned `anyhow::Result` and the
+  runtime flattened it to 1, the row C7 reserves for an unexpected error.
+  Now the CLI's own refusals exit 2 from `main`, and `keygen` /
+  `import-rows-mode` exit 2 inside their `run` on a parse failure (the
+  `restore::run` precedent of exiting inside the library, where the codes
+  are defined). Their operational failures still return errors (exit 1),
+  and the classified startup refusals keep their codes (78 config, 65
+  store, 75 locked, 70 poison). `settings` gains the two C7 constants that
+  had no home: `USAGE_EXIT_CODE` (2) and `UNEXPECTED_EXIT_CODE` (1).
+- **`restore` keeps 78 for its command line — deliberately not renumbered.**
+  PAC-13's entry records the split it chose (78 = fix the command line or
+  the destination, 65 = the backup needs a human) and says PAC-7 "folds
+  this command into its table without changing a number". Folding it in
+  therefore means the CLI's help prints the exception next to the table,
+  not that restore's refusals move to 2. A supervisor that learned
+  restore's numbers keeps them.
+- **The table is code, and the help prints it.** `cli::EXIT_CODES` holds
+  the C7 rows; a unit test pins its codes to `[0, 1, 2, 65, 70, 75, 78]`
+  and the constants the phases exit with, and `weft-server --help` prints
+  the same table, so the contract an operator reads cannot drift from the
+  statuses the process exits with.
+- **Store identity at startup is one formatted line.** The state phase
+  already printed the UUID and layout; PAC-7 moves the formatting into
+  `store_open::store_identity_line` and completes the identity: root,
+  `store_uuid`, the `(database, subject)` scope the store was opened
+  under (from its `STORE_FORMAT`), layout, whether the previous shutdown
+  was clean, and what the open did (created / opened / migrated /
+  report-only is still the following line, as before). The scope half is
+  the new information: one root can hold several scopes, and "which store
+  came up" is not answered by a UUID alone. `/ready` is unchanged — it
+  already carries the same UUID (D-S12), so log and probe can be checked
+  against each other.
+
+**Rejected:** renumbering `restore`'s usage refusals to 2 for uniformity
+(breaks PAC-13's recorded promise to supervisors for no functional gain);
+absorbing the subcommand parsers into `cli.rs` (their parsers, help text
+and tests are theirs; a dispatch that rewrote them would be churn on three
+landed slices in the L-MAIN lane PAC-7 shares with ROB-11); and a `clap`
+dependency for the top level (the hand-rolled precedent PAC-13 recorded
+still holds — one match is not a framework).
+
+**Not in this slice:** ROB-11's runtime builder (next on L-MAIN, and the
+reason the dispatch stays a thin match), any change to what the subcommands
+do once parsed, and any new command — `PAC-9`'s follow-up (a readiness
+subcommand that needs no network) is a separate slice, not this one.
+## 2026-11-02 — ROB-11 "Admission II": the runtime-builder side (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan names ROB-11 only as "Admission II" (§6 W6) and
+places it on the L-MAIN lane as the wave's second main.rs edit — "PAC-7 →
+ROB-11 (W6, CLI then runtime builder)" (§2). ROB-10's entry records the
+split from the other side: Admission I is the registry gate's per-class
+budgets, and "Admission II (ROB-11, W6) is not pre-empted. It arrives with
+PAC-7's runtime builder (§2 L-MAIN) and owns later refinement". The queue
+acceptance repeats the shape: "Admission II lands on the runtime-builder
+side (after PAC-7's CLI side)". Plan C9 fixes one concrete runtime
+behaviour: the drain order ends "serve → SEC-9 TaskTracker →
+`store.shutdown()` → runtime `shutdown_timeout(5 s)`" — and the first
+three steps already land inside startup, while the runtime itself was
+still `#[tokio::main]`'s implicit one, whose shutdown has no such bound.
+The points the sources do not pin, chosen here under the owner's
+best-guess authorization (2026-10-26), recorded for merge review and
+reversible there:
+
+1. **The runtime is built explicitly, in a library module.** A new
+   `weft_server::runtime` holds `RuntimeConfig`, `build_runtime` and
+   `run` (build → `block_on` → `shutdown_timeout`); `main` reads the
+   config, calls `runtime::run(config, dispatch())`, and the dispatch
+   body is byte-for-byte the command dispatch `#[tokio::main]` used to
+   run. The builder is multi-thread with every driver enabled — the
+   attribute's own flavour — so no behaviour changes beyond what this
+   entry names. Workers are named `weft-worker`.
+2. **One new knob: `WEFT_WORKER_THREADS` (Tuning, unset = the runtime's
+   machine-sized default).** It joins the VarSpec registry (74 → 75
+   entries) and the strict-config positive-integer list. Sizing the
+   pool beside Admission I's caps is the runtime side of admission:
+   the gate decides how much work of each class may run at once, and
+   this decides the capacity those permits spend. No default number is
+   invented — unset keeps tokio's one-worker-per-core, exactly the
+   pre-slice behaviour.
+3. **`shutdown_timeout` is C9's 5 s, not a knob.**
+   `RUNTIME_SHUTDOWN_TIMEOUT` is a constant in `runtime.rs`, applied
+   after `block_on` returns — i.e. after serve, the daemons' drain and
+   `store.shutdown()` inside startup have all finished, which is the
+   order C9 names. The serve path's own connection grace stays
+   `WEFT_SHUTDOWN_GRACE_SECS`; the two 5 s numbers are different steps
+   of the same drain, not one setting read twice.
+4. **A malformed `WEFT_WORKER_THREADS` exits 78 from `main`.** The
+   runtime must exist before startup's strict-configuration phase can
+   run, so that phase cannot be the first to refuse this one value;
+   `main` refuses it itself with the C7 configuration status and the
+   registry's own wording. Every other variable is still refused by
+   the strict phase first, as before.
+
+**Rejected:** admission policy changes on the gate side (queueing shed
+queries, priorities, per-route overrides) — ROB-10's entry lists those
+as not-Admission-I, but no source assigns them to ROB-11 either, and
+the acceptance names the runtime-builder side, not the gate; a
+`WEFT_RUNTIME_SHUTDOWN_SECS` knob (C9 fixes the number, and a second
+shutdown knob beside `WEFT_SHUTDOWN_GRACE_SECS` invites confusing the
+two steps); and building this slice on PAC-7's unmerged branch — the
+PR is based on main like every W6 slice, so at the batch merge PAC-7's
+CLI dispatch and this runtime builder combine in `main.rs` (the
+dispatch body becomes the future `runtime::run` drives), which is the
+L-MAIN order the plan lists.
+## 2026-11-02 — ROB-19 maintenance scheduler shapes (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Context:** decision 17 adopts the maintenance/compaction daemon "on by
+default once D-S9 lands" (D-S9 has landed) and the ROADMAP names ROB-19
+"Maintenance scheduler, compaction on by default, per-aspect circuit
+breaker", but neither fixes the default interval, the default compaction
+target, or the breaker's shape (threshold, cooldown, scope).
+
+**Chosen:**
+
+1. **On by default, `0` opts out.** An unset `WEFT_RECONCILE_INTERVAL_SECS`
+   now resolves to 60 s (`DEFAULT_MAINTENANCE_INTERVAL_SECS`); the existing
+   `0` spelling still disables the scheduler. All other daemon settings keep
+   their meanings.
+2. **Compaction on by default at 65,536 rows.** An unset
+   `WEFT_COMPACT_TARGET_ROWS` now resolves to `DEFAULT_COMPACT_TARGET_ROWS`
+   (65,536). The daemon's compaction sweep is fragmentation-gated, so a
+   converged aspect costs one O(1) rollup read per tick and is never
+   rewritten; 65,536 sits between the 8,192-row checkpoint floor and the
+   ~200k-row single segment the `downsample_range` knee measured slowly.
+3. **Breaker in the store's sweeps, not the daemon.** The per-aspect circuit
+   breaker (`weftdb::MaintenanceBreaker`) lives in `SegmentStore`, consulted
+   by every store-wide sweep (reconcile, hot/cold, overlaps, squash,
+   compaction): it counts an aspect's *consecutive* failed sweep passes,
+   trips at 3 (`WEFT_MAINTENANCE_BREAKER_FAILURES`; `0` disables), and sweeps
+   then skip the aspect — listed in the sweep's new `tripped` field and in
+   `POST /api/v1/storage/reconcile` responses — for a 300 s cooldown
+   (`WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`). The first pass after the
+   cooldown is a half-open trial: success closes the breaker and clears the
+   count, failure re-trips for a fresh cooldown. Any successful pass resets
+   the count; a busy aspect records neither. Putting the state in the store
+   means the HTTP store-wide sweep and the daemon share one breaker, exactly
+   as they already share the sweeps. Per-aspect entry points are never
+   gated, so an operator can always work on a tripped aspect directly.
+   Breaker state is in-memory only (a restart starts every aspect closed —
+   the first ticks re-trip a still-damaged aspect within the threshold).
+
+**Alternatives considered:** a daemon-side breaker filtering per-aspect
+calls (duplicates the sweeps' iteration and leaves the HTTP sweep
+unprotected); breaker metrics counters (deferred — ROB-21 adds
+cancellation/metrics on this scheduler, and the trip is already logged once
+at `WARN` by the store plus per-tick `DEBUG`/span fields in the daemon).

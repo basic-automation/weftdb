@@ -1,10 +1,28 @@
 //! `weft-server` binary entry point: the process runtime and one call into
-//! [`startup`].
+//! the operator CLI ([`weft_server::cli`], PAC-7).
 //!
-//! Every startup phase lives in [`startup`], in the order it runs, so this file
-//! carries no behaviour of its own — the router under test is exactly the router
-//! served, and a later wave can change one startup phase without touching this
-//! file.
+//! The CLI parses the command line into a command before anything runs —
+//! serve by default, or one of the operator subcommands — so this file
+//! carries no behaviour of its own beyond the dispatch: the router under
+//! test is exactly the router served, and a later wave can change one
+//! startup phase or one subcommand without touching this file.
+//!
+//! The runtime is built explicitly (ROB-11, [`weft_server::runtime`]):
+//! `main` reads its shape, builds it with tokio's runtime builder, runs
+//! the dispatch on it, and shuts it down with plan C9's
+//! `shutdown_timeout(5 s)` — the last step of the drain order, after
+//! serving, the task drain and the store's shutdown have all finished
+//! inside [`startup`].
+//!
+//! Every startup phase lives in [`startup`], in the order it runs.
+//!
+//! Exit statuses are plan C7's table ([`weft_server::cli::EXIT_CODES`]):
+//! a usage error the CLI or a subcommand's parser finds exits 2 here
+//! (or inside the command, for the ones that exit themselves), a
+//! configuration refusal exits 78, a store that needs operator action
+//! 65, a locked root 75, a poison exit 70 — and anything no phase
+//! classified falls out of this function's `anyhow::Result` return as
+//! the runtime's 1, the unexpected error.
 
 mod startup;
 
@@ -16,20 +34,37 @@ mod startup;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-	// A word on the command line is a command, and there are exactly three besides serving: a
-	// misspelled `import-rows-mode` must not quietly come up as a server instead of
-	// migrating the tree the operator was pointing at, `keygen` must not either, and above
-	// all a misspelled `restore` must not stand up a live server on the machine that was
-	// meant to be putting a store back. Any other word goes to `import_rows_mode`, which
-	// refuses it rather than serving.
-	let mut args = std::env::args();
-	args.next();
-	match args.next().as_deref() {
-		None => startup::run().await,
-		Some(weft_server::keygen::SUBCOMMAND) => weft_server::keygen::run(std::env::args().skip(1)),
-		Some(weft_server::restore::SUBCOMMAND) => weft_server::restore::run(std::env::args().skip(1)).await,
-		Some(_command) => weft_server::import_rows_mode::run(std::env::args().skip(1)).await,
+fn main() -> anyhow::Result<()> {
+	// The runtime's shape is read before anything async can run — the
+	// runtime must exist before even the strict-configuration phase
+	// inside `startup` can execute — so a malformed `WEFT_WORKER_THREADS`
+	// is refused here, with the plan C7 status for invalid configuration
+	// (78) that the strict phase would have used for the same value.
+	let config = weft_server::RuntimeConfig::from_env().unwrap_or_else(|error| {
+		eprintln!("weft-server: invalid configuration: {error}");
+		std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
+	});
+	weft_server::runtime::run(config, dispatch())?
+}
+
+async fn dispatch() -> anyhow::Result<()> {
+	let argv: Vec<String> = std::env::args().skip(1).collect();
+	match weft_server::cli::parse(&argv) {
+		Ok(weft_server::cli::Command::Serve) => startup::run().await,
+		Ok(weft_server::cli::Command::Help) => {
+			println!("{}", weft_server::cli::USAGE);
+			Ok(())
+		}
+		Ok(weft_server::cli::Command::Version) => {
+			println!("{} {}", weft_server::SERVICE, weft_server::VERSION);
+			Ok(())
+		}
+		Ok(weft_server::cli::Command::Keygen(arguments)) => weft_server::keygen::run(arguments),
+		Ok(weft_server::cli::Command::Restore(arguments)) => weft_server::restore::run(arguments.into_iter()).await,
+		Ok(weft_server::cli::Command::ImportRowsMode(arguments)) => weft_server::import_rows_mode::run(arguments).await,
+		Err(error) => {
+			eprintln!("weft-server: {error}");
+			std::process::exit(weft_server::settings::USAGE_EXIT_CODE);
+		}
 	}
 }

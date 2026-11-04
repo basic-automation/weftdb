@@ -28,7 +28,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   65,536-row segments an hour reads in 0.25 ms (0.18 ms before the squash, 0.50 ms with
   single-block output) and the year window in 11.3 ms (13.8 ms before). The squashed store is
   1.357 B/pt rather than 1.341, still below the 1.414 of the 1,024-row seals it replaced.
-
+- `weft-server` builds its tokio runtime explicitly (ROB-11, Admission II's runtime-builder
+  side): workers are named `weft-worker`, the new `WEFT_WORKER_THREADS` setting sizes the
+  pool (unset keeps one worker per available core), and the runtime is shut down with plan
+  C9's `shutdown_timeout` of 5 seconds after serving, the task drain and the store's
+  shutdown, instead of the implicit `#[tokio::main]` runtime whose drop waits indefinitely
+  for blocking work. Admission I's per-class gate budgets and refusals are unchanged.
 
 ### Fixed
 
