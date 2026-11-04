@@ -829,7 +829,9 @@ fixture, committed read-only.
 
 ## Configuration
 
-WeftDB is configured primarily through environment variables:
+WeftDB is configured primarily through environment variables; for the
+recovery-point and recovery-time objectives these settings produce, see
+[RPO/RTO](RPO-RTO.md).
 
 | Variable | Used by | Purpose | Default |
 |----------|---------|---------|---------|

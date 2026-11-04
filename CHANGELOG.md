@@ -10,6 +10,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **RPO/RTO (EVI-19).** New [`docs/RPO-RTO.md`](docs/RPO-RTO.md) pins the
+  recovery-point and recovery-time objectives against the snapshot cadence: the
+  corrected formula `RPO = max(I, d_max) + d_max`, the backup settings that set
+  `I`, and the restore paths that set RTO — with every figure measured, derived
+  or labelled unmeasured.
+
 - **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
   (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
   gets an attempt record before it runs and an outcome record after, and the operation is
