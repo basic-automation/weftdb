@@ -253,7 +253,7 @@ impl SegmentStore {
 		// The previous process's clean-shutdown flag, as this open finds it, before
 		// this open resets it: a later crash must not inherit a clean verdict.
 		let previous_clean_shutdown = index.meta("clean_shutdown").await.with_context(|| format!("{}: reading the previous clean-shutdown flag", names[0]))?.as_deref() == Some("1");
-		let store = Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, recovery: RwLock::new(RecoveryReport::default()), suspect_present: AtomicBool::new(false), previous_clean_shutdown, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), frame_gens: tokio::sync::OnceCell::new(), reaper, maintenance_wait: DEFAULT_MAINTENANCE_WAIT, index_conflicts: AtomicU64::new(0), _root_lock: root_lock };
+		let store = Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, recovery: RwLock::new(RecoveryReport::default()), suspect_present: AtomicBool::new(false), previous_clean_shutdown, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), frame_gens: tokio::sync::OnceCell::new(), reaper, maintenance_wait: DEFAULT_MAINTENANCE_WAIT, maintenance_breaker: options.breaker, breaker_state: Mutex::new(HashMap::new()), index_conflicts: AtomicU64::new(0), _root_lock: root_lock };
 		// 12. The frame journal's replay (R6), before anything is served: unless recovery
 		// must only report what it finds, a newer WeftDB's store.
 		// 13. Backfill the rollup rows the journal replay did not write: a pre-S11
@@ -420,6 +420,37 @@ impl SegmentStore {
 	pub const fn with_maintenance_wait(mut self, wait: Duration) -> Self {
 		self.maintenance_wait = wait;
 		self
+	}
+
+	/// The per-aspect circuit breaker this store's store-wide maintenance sweeps
+	/// run under (ROB-19): from the open options
+	/// ([`SegmentStoreOptions::breaker`], [`MaintenanceBreaker::default`] unless
+	/// changed), or [`with_maintenance_breaker`](Self::with_maintenance_breaker).
+	#[must_use]
+	pub const fn maintenance_breaker(&self) -> MaintenanceBreaker {
+		self.maintenance_breaker
+	}
+
+	/// Override the maintenance circuit breaker policy; see
+	/// [`maintenance_breaker`](Self::maintenance_breaker). A
+	/// `failure_threshold` of 0 disables the breaker. Breaker state accumulated
+	/// under the old policy is kept: counts and cooldowns already in force stand.
+	#[must_use]
+	pub const fn with_maintenance_breaker(mut self, breaker: MaintenanceBreaker) -> Self {
+		self.maintenance_breaker = breaker;
+		self
+	}
+
+	/// Whether `aspect`'s maintenance circuit breaker is currently tripped: a
+	/// store-wide sweep would skip it until the cooldown ends. Always `false`
+	/// when the breaker is disabled or the aspect has never failed a sweep pass.
+	#[must_use]
+	pub fn breaker_tripped(&self, aspect: &str) -> bool {
+		if self.maintenance_breaker.failure_threshold == 0 {
+			return false;
+		}
+		let state = self.breaker_state.lock().unwrap_or_else(PoisonError::into_inner);
+		state.get(aspect).and_then(|aspect_state| aspect_state.open_until).is_some_and(|until| until > Instant::now())
 	}
 
 	/// The open's replay of the frame journal (design section 6, R6, in its minimal S8

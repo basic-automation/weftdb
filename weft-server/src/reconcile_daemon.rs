@@ -22,6 +22,16 @@
 //! kind, the aspect and the full error chain) and counts it in
 //! `weft_reconcile_failed_passes_total`; the healthy aspects are maintained as usual.
 //!
+//! **Per-aspect circuit breaker (ROB-19).** This daemon is the maintenance
+//! scheduler of release plan decision 17 — on by default, compaction included
+//! (see `startup::daemons`). Its sweeps run under the store's per-aspect
+//! circuit breaker ([`MaintenanceBreaker`](weftdb::MaintenanceBreaker)): an
+//! aspect whose passes keep failing is tripped after a few consecutive
+//! failures and later ticks skip it (the tick span's `tripped` field, one
+//! `DEBUG` line each) until its cooldown passes, instead of re-reading and
+//! re-failing its damaged frames on every tick forever. The rest of the store
+//! is maintained as usual, and a successful trial pass closes the breaker.
+//!
 //! **Busy aspects (crash-consistency S7).** Maintenance operations on one aspect take
 //! turns under the aspect's maintenance lock. The daemon never waits for it: every sweep
 //! runs with [`MaintenanceWait::Skip`], so an aspect an operator's request (or a long
@@ -68,6 +78,22 @@ fn report_sweep_failures(span: &tracing::Span, metrics: &SharedMetrics, kind: &'
 		}
 	});
 	metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
+}
+
+/// Record the aspects a sweep did not attempt because their per-aspect
+/// maintenance circuit breaker is tripped (ROB-19): the tick span's `tripped`
+/// field, and one `DEBUG` line each. A tripped aspect is not a new failure —
+/// the breaker tripping was already logged once, by the store, when it
+/// tripped — so it is neither recounted nor re-logged at `WARN` here; the
+/// sweep simply leaves it alone until its cooldown passes, and maintains
+/// every other aspect as usual.
+fn report_tripped_aspects(span: &tracing::Span, kind: &'static str, tripped: &[String]) {
+	span.record("tripped", tripped.len());
+	span.in_scope(|| {
+		for aspect in tripped {
+			tracing::debug!(sweep = kind, aspect = %aspect, "reconcile daemon: aspect's maintenance circuit breaker is tripped; skipped this tick");
+		}
+	});
 }
 
 /// Record the aspects a sweep skipped because another maintenance operation held them:
@@ -144,7 +170,7 @@ pub struct ReconcileDaemonConfig {
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_over_threshold`](weftdb::SegmentStore::reconcile_all_over_threshold).
 pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<ReconcileSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty);
 	let sweep = store.reconcile_all_over_threshold(threshold, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_reconciled);
@@ -153,6 +179,7 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 	}
 	report_sweep_failures(&span, metrics, "threshold", &sweep.failed);
 	report_busy_aspects(&span, "threshold", &sweep.busy);
+	report_tripped_aspects(&span, "threshold", &sweep.tripped);
 	Ok(sweep)
 }
 
@@ -173,7 +200,7 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold).
 pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<HotColdSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty);
 	let sweep = store.reconcile_all_hot_cold(threshold, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_reconciled());
@@ -182,6 +209,7 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 	}
 	report_sweep_failures(&span, metrics, "hot_cold", &sweep.failed);
 	report_busy_aspects(&span, "hot_cold", &sweep.busy);
+	report_tripped_aspects(&span, "hot_cold", &sweep.tripped);
 	Ok(sweep)
 }
 
@@ -200,7 +228,7 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps).
 pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics) -> anyhow::Result<OverlapSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty);
 	let sweep = store.reconcile_all_overlaps(MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_removed);
@@ -209,6 +237,7 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 	}
 	report_sweep_failures(&span, metrics, "overlaps", &sweep.failed);
 	report_busy_aspects(&span, "overlaps", &sweep.busy);
+	report_tripped_aspects(&span, "overlaps", &sweep.tripped);
 	Ok(sweep)
 }
 
@@ -227,7 +256,7 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_overlaps_with_policy`](weftdb::SegmentStore::reconcile_all_overlaps_with_policy).
 pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty);
 	let sweep = store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min_split_bytes), MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
 	span.record("segments", sweep.segments_removed);
@@ -236,6 +265,7 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 	}
 	report_sweep_failures(&span, metrics, "overlaps_split", &sweep.failed);
 	report_busy_aspects(&span, "overlaps_split", &sweep.busy);
+	report_tripped_aspects(&span, "overlaps_split", &sweep.tripped);
 	Ok(sweep)
 }
 
@@ -256,7 +286,7 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::squash_all_over_threshold`](weftdb::SegmentStore::squash_all_over_threshold).
 pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, max_segments: usize) -> anyhow::Result<SquashSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty);
 	let sweep = store.squash_all_over_threshold(max_segments, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_squashed);
 	span.record("segments", sweep.segments_removed);
@@ -265,6 +295,7 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 	}
 	report_sweep_failures(&span, metrics, "squash", &sweep.failed);
 	report_busy_aspects(&span, "squash", &sweep.busy);
+	report_tripped_aspects(&span, "squash", &sweep.tripped);
 	Ok(sweep)
 }
 
@@ -286,7 +317,7 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](weftdb::SegmentStore::squash_all_to_target_rows_if_fragmented).
 pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetrics, target_rows: usize) -> anyhow::Result<SquashSweep> {
-	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty);
+	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty);
 	// The gated sweep: a converged aspect costs one O(1) rollup read per tick, not a full
 	// segment-index scan, so the 1s daemon does not churn the control plane on a tidy store.
 	let sweep = store.squash_all_to_target_rows_if_fragmented(target_rows, MaintenanceWait::Skip).instrument(span.clone()).await?;
@@ -297,6 +328,7 @@ pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetric
 	}
 	report_sweep_failures(&span, metrics, "compact", &sweep.failed);
 	report_busy_aspects(&span, "compact", &sweep.busy);
+	report_tripped_aspects(&span, "compact", &sweep.tripped);
 	Ok(sweep)
 }
 
@@ -386,7 +418,7 @@ mod tests {
 	use bigdecimal::BigDecimal;
 	use tempfile::TempDir;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use weftdb::SegmentStore;
+	use weftdb::{MaintenanceBreaker, SegmentStore};
 
 	use super::*;
 	use crate::metrics::Metrics;
@@ -653,6 +685,32 @@ mod tests {
 		assert_eq!(s6_unsorted, 0, "the last aspect in name order is still reached");
 		assert_eq!(snap.reconcile.failed_passes, 1, "one failed aspect pass counted");
 		assert_eq!(snap.reconcile.passes, 5, "the healthy aspects still count as passes");
+	}
+
+	/// ROB-19: once an aspect's circuit breaker has tripped, a tick skips it —
+	/// listed in `tripped`, no new failed pass counted — and still maintains
+	/// the rest of the store.
+	#[tokio::test]
+	async fn tick_skips_a_tripped_aspect_without_counting_a_failure() {
+		let dir = TempDir::new().unwrap();
+		let store = sweep_isolation_fixture(dir.path()).await.with_maintenance_breaker(MaintenanceBreaker { failure_threshold: 1, cooldown: std::time::Duration::from_secs(60) });
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		// First tick: the damaged aspect fails and trips its breaker (threshold
+		// 1); the five healthy aspects reconcile.
+		let sweep = reconcile_tick(&store, &metrics, 1).await.expect("tick");
+		assert_eq!(sweep.failed.len(), 1, "the damaged aspect fails once");
+		assert_eq!(sweep.aspects_reconciled, 5, "the healthy aspects are maintained");
+		assert!(store.breaker_tripped("s2"), "the failure tripped the breaker");
+		assert_eq!(metrics.snapshot().reconcile.failed_passes, 1);
+
+		// Second tick: the tripped aspect is skipped outright — no attempt, no
+		// new failure — and the tick is otherwise clean.
+		let sweep = reconcile_tick(&store, &metrics, 1).await.expect("tick");
+		drop(store);
+		assert_eq!(sweep.tripped, vec!["s2".to_string()], "the tripped aspect is named");
+		assert!(sweep.failed.is_empty(), "a tripped aspect records no new failure");
+		assert_eq!(metrics.snapshot().reconcile.failed_passes, 1, "the failure count does not grow while tripped");
 	}
 
 	/// Crash-consistency S4: every tick kind the daemon runs isolates the bad aspect the

@@ -3624,3 +3624,45 @@ PR is based on main like every W6 slice, so at the batch merge PAC-7's
 CLI dispatch and this runtime builder combine in `main.rs` (the
 dispatch body becomes the future `runtime::run` drives), which is the
 L-MAIN order the plan lists.
+## 2026-11-02 — ROB-19 maintenance scheduler shapes (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Context:** decision 17 adopts the maintenance/compaction daemon "on by
+default once D-S9 lands" (D-S9 has landed) and the ROADMAP names ROB-19
+"Maintenance scheduler, compaction on by default, per-aspect circuit
+breaker", but neither fixes the default interval, the default compaction
+target, or the breaker's shape (threshold, cooldown, scope).
+
+**Chosen:**
+
+1. **On by default, `0` opts out.** An unset `WEFT_RECONCILE_INTERVAL_SECS`
+   now resolves to 60 s (`DEFAULT_MAINTENANCE_INTERVAL_SECS`); the existing
+   `0` spelling still disables the scheduler. All other daemon settings keep
+   their meanings.
+2. **Compaction on by default at 65,536 rows.** An unset
+   `WEFT_COMPACT_TARGET_ROWS` now resolves to `DEFAULT_COMPACT_TARGET_ROWS`
+   (65,536). The daemon's compaction sweep is fragmentation-gated, so a
+   converged aspect costs one O(1) rollup read per tick and is never
+   rewritten; 65,536 sits between the 8,192-row checkpoint floor and the
+   ~200k-row single segment the `downsample_range` knee measured slowly.
+3. **Breaker in the store's sweeps, not the daemon.** The per-aspect circuit
+   breaker (`weftdb::MaintenanceBreaker`) lives in `SegmentStore`, consulted
+   by every store-wide sweep (reconcile, hot/cold, overlaps, squash,
+   compaction): it counts an aspect's *consecutive* failed sweep passes,
+   trips at 3 (`WEFT_MAINTENANCE_BREAKER_FAILURES`; `0` disables), and sweeps
+   then skip the aspect — listed in the sweep's new `tripped` field and in
+   `POST /api/v1/storage/reconcile` responses — for a 300 s cooldown
+   (`WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`). The first pass after the
+   cooldown is a half-open trial: success closes the breaker and clears the
+   count, failure re-trips for a fresh cooldown. Any successful pass resets
+   the count; a busy aspect records neither. Putting the state in the store
+   means the HTTP store-wide sweep and the daemon share one breaker, exactly
+   as they already share the sweeps. Per-aspect entry points are never
+   gated, so an operator can always work on a tripped aspect directly.
+   Breaker state is in-memory only (a restart starts every aspect closed —
+   the first ticks re-trip a still-damaged aspect within the threshold).
+
+**Alternatives considered:** a daemon-side breaker filtering per-aspect
+calls (duplicates the sweeps' iteration and leaves the HTTP sweep
+unprotected); breaker metrics counters (deferred — ROB-21 adds
+cancellation/metrics on this scheduler, and the trip is already logged once
+at `WARN` by the store plus per-tick `DEBUG`/span fields in the daemon).
