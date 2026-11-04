@@ -131,20 +131,19 @@ fn decimal(value: f64) -> BigDecimal {
 fn walk(rng: &mut Rng, n: usize, spacing: i64, shape: &str, irregular: bool) -> Vec<Point> {
 	let mut t = epoch();
 	let mut v = 0.0_f64;
-	(0..n)
-		.map(|_| {
-			let gap = if irregular { (spacing as f64 * 2.95_f64.mul_add(rng.unit(), 0.05)) as i64 } else { spacing };
-			t += TimeDelta::nanoseconds(gap.max(1));
-			v += rng.unit() - 0.5;
-			let value = match shape {
-				"offset" => v.mul_add(1e-3, 1e9),
-				"tiny" => v * 1e-200,
-				"huge" => v * 1e200,
-				_ => v,
-			};
-			Point::new(t, decimal(value))
-		})
-		.collect()
+	(0..n).map(|_| {
+		let gap = if irregular { (spacing as f64 * 2.95_f64.mul_add(rng.unit(), 0.05)) as i64 } else { spacing };
+		t += TimeDelta::nanoseconds(gap.max(1));
+		v += rng.unit() - 0.5;
+		let value = match shape {
+			"offset" => v.mul_add(1e-3, 1e9),
+			"tiny" => v * 1e-200,
+			"huge" => v * 1e200,
+			_ => v,
+		};
+		Point::new(t, decimal(value))
+	})
+	.collect()
 }
 
 /// A series in the shape of the UCI household-power corpus' `Global_active_power` column: one
@@ -234,12 +233,11 @@ pub fn corpus(size: CorpusSize, real: Option<Vec<Point>>) -> Vec<Series> {
 	let mut t = 0.0;
 	push(
 		"burst/smooth".to_owned(),
-		(0..40)
-			.map(|i| {
-				t += if i < 32 { 3.0 } else { 0.05 };
-				Point::new(at(t), decimal((t / 10.0).sin().mul_add(10.0, t)))
-			})
-			.collect(),
+		(0..40).map(|i| {
+			t += if i < 32 { 3.0 } else { 0.05 };
+			Point::new(at(t), decimal((t / 10.0).sin().mul_add(10.0, t)))
+		})
+		.collect(),
 	);
 	let mut t = 0.0;
 	push(
@@ -547,8 +545,7 @@ pub enum Outcome {
 #[must_use]
 pub fn run_once(corpus: &[Series], fixtures: &[Fixture], target: Target, api: Api) -> Vec<Outcome> {
 	let (backend, precision) = target.backend();
-	fixtures
-		.iter()
+	fixtures.iter()
 		.map(|f| {
 			let points = &corpus[f.series].points;
 			let interpolator = Interpolator::new(f.spline, f.resolution).backend(backend).gpu_precision(precision);
@@ -684,8 +681,7 @@ pub fn score(fixtures: &[Fixture], outcomes: &[Outcome], target: Target) -> Vec<
 /// The values of a run, by fixture (`None` where the fixture returned no grid).
 #[must_use]
 pub fn values_of(outcomes: &[Outcome]) -> Vec<Option<Vec<u64>>> {
-	outcomes
-		.iter()
+	outcomes.iter()
 		.map(|o| match o {
 			Outcome::Values { bits, .. } => Some(bits.clone()),
 			_ => None,
@@ -883,20 +879,7 @@ pub fn run_environment(options: &RunOptions) -> (EnvironmentRun, Vec<Vec<Option<
 			values.push(first_values);
 		}
 	}
-	let report = EnvironmentRun {
-		schema_version: CONFORMANCE_SCHEMA_VERSION,
-		env: options.env.clone(),
-		env_vars: options.env_vars.clone(),
-		corpus_size: options.size,
-		series: corpus.iter().map(|s| s.label.clone()).collect(),
-		fixtures: fixtures.len(),
-		grid_points: fixtures.iter().map(|f| f.exact.len()).sum(),
-		corpus_hash: hash,
-		adapter,
-		gpu_error,
-		started_at,
-		targets: reports,
-	};
+	let report = EnvironmentRun { schema_version: CONFORMANCE_SCHEMA_VERSION, env: options.env.clone(), env_vars: options.env_vars.clone(), corpus_size: options.size, series: corpus.iter().map(|s| s.label.clone()).collect(), fixtures: fixtures.len(), grid_points: fixtures.iter().map(|f| f.exact.len()).sum(), corpus_hash: hash, adapter, gpu_error, started_at, targets: reports };
 	(report, values)
 }
 
@@ -995,7 +978,6 @@ pub struct Matrix {
 	/// Contract failures found (empty when the matrix passes).
 	pub failures: Vec<String>,
 }
-
 
 /// Merges environment runs (and their values) into the matrix, computing every pairwise drift
 /// and listing every contract failure: a bound exceeded, a raw point not exact, a wrong
