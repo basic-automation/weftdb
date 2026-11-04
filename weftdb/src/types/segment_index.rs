@@ -435,7 +435,12 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// As [`prune_by_time`](Self::prune_by_time).
-	#[cfg_attr(not(test), expect(dead_code, reason = "the store reads prune one series since TAG-8; the aspect-wide form is kept for its tests"))]
+	///
+	/// `#[cfg(test)]`: since TAG-8 every store read prunes one series, so only the
+	/// tests below call the aspect-wide prunes. See
+	/// [`prune_present_rows`](Self::prune_present_rows) for why that is `#[cfg(test)]`
+	/// rather than an `expect(dead_code)`.
+	#[cfg(test)]
 	pub(crate) async fn prune_present_descriptors(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<SegmentDescriptor>> {
 		Ok(self.prune_present_rows(aspect, start, end).await?.into_iter().map(|row| row.desc).collect())
 	}
@@ -443,14 +448,21 @@ impl SegmentIndexStore {
 	/// [`prune_present_descriptors`](Self::prune_present_descriptors), returning whole
 	/// [`IndexRow`]s — the form a reader that must bind a sidecar to its frame's CRC
 	/// (D-S15) prunes by.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the store reads prune one series since TAG-8; the aspect-wide form is kept for its tests"))]
+	///
+	/// `#[cfg(test)]`, not `expect(dead_code)`: an expectation on a wrapper whose sole
+	/// caller is itself dead is judged differently across rustc versions — 1.95 sees
+	/// this as live through the dead [`prune_present_descriptors`](Self::prune_present_descriptors)
+	/// and fails `unfulfilled_lint_expectations` under `-D warnings` — whereas compiling
+	/// the pair out of a non-test build is something every toolchain agrees on.
+	#[cfg(test)]
 	pub(crate) async fn prune_present_rows(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<IndexRow>> {
 		// The NULL-spanned (empty) row is rejected twice over: the inequalities already
 		// reject it, and a zero-row row is not "all null" — it is nothing to skip.
 		self.prune_rows(aspect, None, start, end, PRESENT_FILTER).await
 	}
 
-	/// [`prune_present_rows`](Self::prune_present_rows) scoped to one series (TAG-8).
+	/// The aspect-wide present prune above, scoped to one series (TAG-8). This is what
+	/// every store read uses; the aspect-wide form survives only under `#[cfg(test)]`.
 	pub(crate) async fn prune_series_present_rows(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<Vec<IndexRow>> {
 		self.prune_rows(aspect, Some(series), start, end, PRESENT_FILTER).await
 	}

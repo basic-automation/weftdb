@@ -434,7 +434,7 @@ impl SegmentStore {
 	}
 
 	/// The present-value descriptors of `series` overlapping `[start, end]`: the
-	/// series-scoped [`prune_present_descriptors`](SegmentIndexStore::prune_present_descriptors).
+	/// series-scoped form of the aspect-wide present prune (`prune_present_descriptors`, TAG-8).
 	async fn series_present_descriptors(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<Vec<SegmentDescriptor>> {
 		Ok(self.index.prune_series_present_rows(aspect, series, start, end).await?.into_iter().map(|row| row.desc).collect())
 	}
