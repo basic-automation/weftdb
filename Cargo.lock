@@ -5593,6 +5593,7 @@ dependencies = [
  "axum",
  "bigdecimal",
  "chrono",
+ "criterion",
  "hyper",
  "hyper-util",
  "libc",
