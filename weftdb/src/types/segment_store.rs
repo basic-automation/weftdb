@@ -1892,6 +1892,47 @@ impl SegmentStore {
 		Ok(())
 	}
 
+	/// What [`adopt_orphan`](Self::adopt_orphan) would do with `name`, without
+	/// committing anything: the aspect, generation, precision and decoded frame
+	/// to adopt, or the [`Adoption::Undeclared`] / [`Adoption::Skipped`]
+	/// outcome. A report-only pass counts through this, so it counts exactly
+	/// what a real pass adopts.
+	async fn plan_adoption(&self, name: &str, bytes: &[u8]) -> Result<std::result::Result<(String, u64, Option<u64>, frame_read::FullFrame), Adoption>> {
+		let (aspect, gen, prec) = match frame_name::parse(name) {
+			Some(parsed) => match parsed.aspect() {
+				Some(aspect) => (aspect, parsed.gen, Some(parsed.prec)),
+				None => return Ok(Err(Adoption::Skipped)),
+			},
+			None => match legacy_file_id(name) {
+				Some((aspect, _)) => (aspect.to_string(), 0, None),
+				None => return Ok(Err(Adoption::Skipped)),
+			},
+		};
+		if self.schema_for(&aspect).await?.is_none() {
+			return Ok(Err(Adoption::Undeclared(aspect)));
+		}
+		let frame = frame_read::read_full(name, bytes)?;
+		if frame.descriptor(0, String::new(), 0).row_count == 0 {
+			return Ok(Err(Adoption::Skipped));
+		}
+		Ok(Ok((aspect, gen, prec, frame)))
+	}
+
+	/// The outcome [`adopt_orphan`](Self::adopt_orphan) would report for
+	/// `name`, with nothing committed (a report-only pass).
+	async fn would_adopt(&self, name: &str, bytes: &[u8]) -> Result<Adoption> {
+		Ok(match self.plan_adoption(name, bytes).await? {
+			Ok((aspect, ..)) => Adoption::Adopted(aspect),
+			Err(outcome) => outcome,
+		})
+	}
+
+	/// Whether [`quarantine_orphan`](Self::quarantine_orphan) can file `name`:
+	/// its name names an aspect, write-once or legacy.
+	fn orphan_names_aspect(name: &str) -> bool {
+		frame_name::parse(name).and_then(|parsed| parsed.aspect()).is_some() || legacy_file_id(name).is_some()
+	}
+
 	/// Adopt one orphan frame (R8, TAG-9): rebuild its descriptor from the
 	/// frame itself and insert its row under the aspect's next id, raising
 	/// the allocator past it in the same transaction, under the aspect's
@@ -1911,23 +1952,10 @@ impl SegmentStore {
 	/// rows. The caller has already classified the frame through
 	/// `describe_frame` and read `series_key` from it with [`frame_series_key`].
 	async fn adopt_orphan(&self, name: &str, bytes: &[u8], series_key: Option<crate::SeriesKey>, clear_journal: bool) -> Result<Adoption> {
-		let (aspect, gen, prec) = match frame_name::parse(name) {
-			Some(parsed) => match parsed.aspect() {
-				Some(aspect) => (aspect, parsed.gen, Some(parsed.prec)),
-				None => return Ok(Adoption::Skipped),
-			},
-			None => match legacy_file_id(name) {
-				Some((aspect, _)) => (aspect.to_string(), 0, None),
-				None => return Ok(Adoption::Skipped),
-			},
+		let (aspect, gen, prec, frame) = match self.plan_adoption(name, bytes).await? {
+			Ok(plan) => plan,
+			Err(outcome) => return Ok(outcome),
 		};
-		if self.schema_for(&aspect).await?.is_none() {
-			return Ok(Adoption::Undeclared(aspect));
-		}
-		let frame = frame_read::read_full(name, bytes)?;
-		if frame.descriptor(0, String::new(), 0).row_count == 0 {
-			return Ok(Adoption::Skipped);
-		}
 		let mut commit = self.commit_lock(&aspect).await?;
 		let mut ops: Vec<IndexOp> = Vec::with_capacity(5);
 		let series_id = match &series_key {
@@ -2017,17 +2045,20 @@ impl SegmentStore {
 	///   row moving aspect has its key resolved again in the target aspect
 	///   rather than carrying a foreign id. Counted in `series_rebound`.
 	///
-	/// Then, for each aspect the index or the series catalog names, R10 seeds
-	/// `aspect_seq.next_series_id` past the largest series id any row holds or
-	/// the catalog registered, and the aspect's rollup is rebuilt when
-	/// the pass changed its rows. Orphan `.weftseg` files — no index row and no
+	/// Before any row is checked, for each aspect the index or the series
+	/// catalog names, R10 seeds `aspect_seq.next_series_id` past the largest
+	/// series id any row holds or the catalog registered, so a rebind that
+	/// registers a key never reuses an id. Each aspect's rollup is rebuilt,
+	/// after the orphan pass, when the pass changed its rows. Orphan `.weftseg` files — no index row and no
 	/// journal entry claims them — are counted; one that fails to decode is
 	/// quarantined the same way (a decodable orphan is left where it is: with
 	/// no row behind it there is no id to adopt it under outside a restore).
 	/// Held journal rows — tagged frames a restore could not bind because their
 	/// aspect was undeclared — are adopted through the same path once the
 	/// aspect is declared, the journal row cleared in the adopting
-	/// transaction (TAG-9). Finally the TTL purge runs over pre-existing corrupt
+	/// transaction (TAG-9); one whose frame no longer decodes or whose key is
+	/// malformed is quarantined with its journal row cleared, and one whose
+	/// frame is gone or holds no rows is cleared (`held_cleared`). Finally the TTL purge runs over pre-existing corrupt
 	/// records.
 	///
 	/// With `report_only` the pass counts everything it would do and changes
@@ -2077,13 +2108,25 @@ impl SegmentStore {
 		// handed out again if its allocator row is lost.
 		let mut aspects: std::collections::BTreeSet<String> = self.index.list_aspects().await?.into_iter().collect();
 		aspects.extend(self.index.series_aspects().await?);
+		// R10 runs before any row is checked: a row rebound below may register its key,
+		// and `resolve_series_key` takes the id from `next_series_id`, which must already
+		// sit past every id the catalog and the rows hold — in every aspect, since a row
+		// can move to an aspect that sorts later.
+		for aspect in &aspects {
+			let mut max_series_id = self.index.max_registered_series_id(aspect).await?;
+			for row in self.index.rows(aspect).await? {
+				max_series_id = max_series_id.max(row.series_id);
+			}
+			if !report_only {
+				self.commit_index(&IndexTxn::new(vec![IndexOp::SeedSeries { aspect: aspect.clone(), next_series_id: max_series_id.saturating_add(1).max(1) }])).await?;
+			}
+			report.seeded += 1;
+		}
 		for aspect in aspects {
 			let rows = self.index.rows(&aspect).await?;
-			let mut max_series_id = self.index.max_registered_series_id(&aspect).await?;
 			let mut aspect_changed = false;
 			for row in &rows {
 				report.checked += 1;
-				max_series_id = max_series_id.max(row.series_id);
 				let desc = &row.desc;
 				let Some(file_name) = Path::new(&desc.path).file_name().and_then(|name| name.to_str()) else {
 					report.skipped_outside_segments += 1;
@@ -2191,9 +2234,6 @@ impl SegmentStore {
 							if resolved != Some(crate::SeriesId(row.series_id)) {
 								if let Some(id) = resolved {
 									rebound.series_id = id.0;
-									if target == aspect {
-										max_series_id = max_series_id.max(id.0);
-									}
 								}
 								report.series_rebound += 1;
 								changed = true;
@@ -2242,12 +2282,6 @@ impl SegmentStore {
 					}
 				}
 			}
-			// R10: seed next_series_id past every series id the aspect's rows hold and
-			// every id its catalog registered.
-			if !report_only {
-				self.commit_index(&IndexTxn::new(vec![IndexOp::SeedSeries { aspect: aspect.clone(), next_series_id: max_series_id.saturating_add(1).max(1) }])).await?;
-			}
-			report.seeded += 1;
 			if aspect_changed {
 				changed_aspects.push(aspect);
 			}
@@ -2262,33 +2296,79 @@ impl SegmentStore {
 				continue;
 			}
 			let Ok(path) = contained_file(&segments_dir, &entry.name) else { continue };
-			let Ok(bytes) = tokio::fs::read(&path).await else { continue };
+			let clear = vec![IndexOp::ClearJournal { name: entry.name.clone() }];
+			let bytes = match tokio::fs::read(&path).await {
+				Ok(bytes) => bytes,
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+					// Nothing left to adopt: the row is cleared, not kept forever.
+					if !report_only {
+						self.commit_index(&IndexTxn::new(clear)).await?;
+					}
+					report.held_cleared += 1;
+					continue;
+				}
+				Err(error) => return Err(error).with_context(|| format!("reading held frame {}", path.display())),
+			};
+			// A held frame that no longer decodes (it decayed since it was held)
+			// is quarantined under its decode class, and its journal row cleared
+			// in the same transaction; one that decodes but whose key cannot be
+			// bound is suspect.
 			let key = match weft_physical_type::describe_frame(&bytes) {
-				Ok(info) if info.decodable() => frame_series_key(&info),
-				Ok(_) => continue,
-				Err(error) => Err(format!("describing the frame: {error:?}")),
+				Ok(info) if info.decodable() => frame_series_key(&info).map_err(|reason| (QuarantineClass::Suspect, reason)),
+				_ => Err(match frame_read::read_full(&entry.name, &bytes) {
+					Err(error) => {
+						let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
+						let class = match &source {
+							Some(source) => {
+								if is_newer_format(source) {
+									report.incompatible_store = true;
+								}
+								classify_decode_failure(&bytes, source)
+							}
+							None => QuarantineClass::Corrupt,
+						};
+						(class, format!("{error:#}"))
+					}
+					Ok(_) => (QuarantineClass::Suspect, "describing the frame: not decodable".to_string()),
+				}),
 			};
 			match key {
 				Ok(key) => {
-					if report_only {
-						if self.schema_for(&entry.aspect).await?.is_some() {
-							report.adopted += 1;
-						}
-						continue;
-					}
 					let tagged = !key.is_empty();
-					if let Adoption::Adopted(aspect) = self.adopt_orphan(&entry.name, &bytes, tagged.then_some(key), true).await? {
-						report.adopted += 1;
-						if !changed_aspects.contains(&aspect) {
-							changed_aspects.push(aspect);
+					let outcome = if report_only { self.would_adopt(&entry.name, &bytes).await? } else { self.adopt_orphan(&entry.name, &bytes, tagged.then_some(key), true).await? };
+					match outcome {
+						Adoption::Adopted(aspect) => {
+							report.adopted += 1;
+							if !report_only && !changed_aspects.contains(&aspect) {
+								changed_aspects.push(aspect);
+							}
+						}
+						// Its aspect is still undeclared: it stays held.
+						Adoption::Undeclared(_) => {}
+						// No rows, or a name that names no aspect: nothing will ever adopt it.
+						Adoption::Skipped => {
+							if !report_only {
+								self.commit_index(&IndexTxn::new(clear)).await?;
+							}
+							report.held_cleared += 1;
 						}
 					}
 				}
-				Err(reason) => {
-					if !report_only {
-						moved |= self.quarantine_orphan(&entry.name, &path, QuarantineClass::Suspect, format!("held: {reason}"), vec![IndexOp::ClearJournal { name: entry.name.clone() }]).await?;
+				Err((class, reason)) => {
+					if Self::orphan_names_aspect(&entry.name) {
+						if !report_only {
+							moved |= self.quarantine_orphan(&entry.name, &path, class, format!("held: {reason}"), clear).await?;
+						}
+						match class {
+							QuarantineClass::Corrupt => report.quarantined += 1,
+							QuarantineClass::Suspect => report.suspected += 1,
+						}
+					} else {
+						if !report_only {
+							self.commit_index(&IndexTxn::new(clear)).await?;
+						}
+						report.held_cleared += 1;
 					}
-					report.suspected += 1;
 				}
 			}
 		}
@@ -2348,8 +2428,10 @@ impl SegmentStore {
 								}
 							}
 							Err(reason) => {
-								moved |= self.quarantine_orphan(&name, &path, QuarantineClass::Suspect, format!("orphan: no index row claims this frame: {reason}"), Vec::new()).await?;
-								report.suspected += 1;
+								if Self::orphan_names_aspect(&name) {
+									moved |= self.quarantine_orphan(&name, &path, QuarantineClass::Suspect, format!("orphan: no index row claims this frame: {reason}"), Vec::new()).await?;
+									report.suspected += 1;
+								}
 							}
 						}
 						continue;
@@ -2365,7 +2447,7 @@ impl SegmentStore {
 				if newer {
 					report.incompatible_store = true;
 				}
-				if frame_name::parse(&name).and_then(|parsed| parsed.aspect()).is_none() && legacy_file_id(&name).is_none() {
+				if !Self::orphan_names_aspect(&name) {
 					continue;
 				}
 				if !report_only {
@@ -3201,6 +3283,10 @@ mod tests {
 		assert_eq!(tagged.len(), 1);
 		assert_eq!(tagged[0].series_id, id.0, "the adopted row names the key's series");
 		assert!(reopened.index().journal(None).await.expect("journal").is_empty(), "nothing is held");
+		// The rollup is rebuilt after the orphan pass, so it counts both adopted frames.
+		let metadata = reopened.aspect_metadata("price").await.expect("metadata");
+		assert_eq!(metadata.total_rows, 7, "{metadata:?}");
+		assert_eq!(metadata.time_range.map(|(_, max)| max), Some(60), "{metadata:?}");
 		drop(reopened);
 		// A second open finds the frame indexed and rebinds nothing.
 		let reopened = SegmentStore::open(&restored_root).await.expect("reopens");
@@ -3241,6 +3327,165 @@ mod tests {
 		assert_eq!(rows.len(), 1);
 		assert_eq!(rows[0].series_id, id.0);
 		drop(reopened);
+	}
+
+	/// Restore a populated store, hold a tagged `volume-1.weftseg` orphan (its
+	/// aspect undeclared at the restore), then declare `volume`. Returns the
+	/// restored root, the held frame's path and the still-open store.
+	async fn restored_with_held_frame(dir: &TempDir) -> (PathBuf, PathBuf, SegmentStore) {
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("whole");
+		store.backup_store(&backup_dir, crate::BackupMode::Linked).await.expect("whole-store backup");
+		drop(store);
+		let restored_root = dir.path().join("restored");
+		crate::restore_store(&backup_dir, &restored_root).await.expect("restores");
+		let held = restored_root.join("segments").join("volume-1.weftseg");
+		std::fs::write(&held, tagged_frame(&[50, 60], b"a\x1f1")).unwrap();
+		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		assert_eq!(reopened.recovery_report().held, 1);
+		reopened.declare("volume", &schema()).await.expect("declares");
+		(restored_root, held, reopened)
+	}
+
+	/// TAG-9: a held frame whose SERIES_KEY payload is malformed is quarantined
+	/// suspect on the next open, its journal row cleared in the same pass.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_held_frame_with_a_malformed_key_is_suspect() {
+		let dir = TempDir::new().unwrap();
+		let (root, held, store) = restored_with_held_frame(&dir).await;
+		drop(store);
+		std::fs::write(&held, tagged_frame(&[50, 60], b"volume|a=1")).unwrap();
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!((report.suspected, report.adopted, report.held_cleared), (1, 0, 0), "{report:?}");
+		assert!(store.index().journal(None).await.expect("journal").is_empty(), "the journal row is cleared");
+		assert!(root.join("segments").join("quarantine").join("volume-1.weftseg").exists(), "the frame moved to quarantine");
+		assert!(!held.exists());
+	}
+
+	/// TAG-9: a held frame that decayed (its CRC no longer verifies) is
+	/// quarantined under its decode class rather than kept held forever.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_decayed_held_frame_is_quarantined() {
+		let dir = TempDir::new().unwrap();
+		let (root, held, store) = restored_with_held_frame(&dir).await;
+		drop(store);
+		let mut bytes = std::fs::read(&held).unwrap();
+		let middle = bytes.len() / 2;
+		bytes[middle] ^= 0xff;
+		std::fs::write(&held, bytes).unwrap();
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!(report.quarantined + report.suspected, 1, "{report:?}");
+		assert_eq!(report.adopted, 0, "{report:?}");
+		assert!(store.index().journal(None).await.expect("journal").is_empty(), "the journal row is cleared");
+		assert!(!held.exists(), "the frame left segments/");
+	}
+
+	/// TAG-9: a held row whose frame is gone is cleared and counted, not kept.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_held_row_without_its_frame_is_cleared() {
+		let dir = TempDir::new().unwrap();
+		let (root, held, store) = restored_with_held_frame(&dir).await;
+		drop(store);
+		std::fs::remove_file(&held).unwrap();
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!((report.held_cleared, report.adopted), (1, 0), "{report:?}");
+		assert!(store.index().journal(None).await.expect("journal").is_empty());
+	}
+
+	/// TAG-9: a report-only pass over a held row counts the adoption it would
+	/// make and leaves the journal row, the catalog and the index untouched.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn report_only_leaves_a_held_row_alone() {
+		let dir = TempDir::new().unwrap();
+		let (_, _, store) = restored_with_held_frame(&dir).await;
+		let journal = store.index().journal(None).await.expect("journal");
+		assert_eq!(journal.len(), 1, "the row is held before the pass");
+		let report = store.fsck(true).await.expect("fsck");
+		assert_eq!((report.adopted, report.held_cleared), (1, 0), "{report:?}");
+		assert_eq!(store.index().journal(None).await.expect("journal").len(), 1, "the journal row stays");
+		assert!(store.index().rows("volume").await.expect("rows").is_empty(), "nothing is indexed");
+		assert!(store.index().series_of("volume").await.expect("catalog").is_empty(), "nothing is registered");
+	}
+
+	/// TAG-9: a restore-mode orphan whose SERIES_KEY payload is malformed is
+	/// quarantined suspect, not adopted.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_restore_orphan_with_a_malformed_key_is_suspect() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("whole");
+		store.backup_store(&backup_dir, crate::BackupMode::Linked).await.expect("whole-store backup");
+		drop(store);
+		let restored_root = dir.path().join("restored");
+		crate::restore_store(&backup_dir, &restored_root).await.expect("restores");
+		std::fs::write(restored_root.join("segments").join("price-8.weftseg"), tagged_frame(&[50, 60], b"price|a=1")).unwrap();
+		let store = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		let report = store.recovery_report();
+		assert_eq!((report.suspected, report.adopted, report.held), (1, 0, 0), "{report:?}");
+		let records = store.quarantine_list(None).await.expect("records");
+		assert_eq!(records.len(), 1);
+		assert_eq!(records[0].class, QuarantineClass::Suspect);
+	}
+
+	/// TAG-9: a SERIES_KEY extension marked non-critical is still the frame's
+	/// key: the row is rebound to it, not refused.
+	#[tokio::test]
+	async fn a_non_critical_series_key_is_accepted() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		let rows = store.index().rows("price").await.expect("rows");
+		let values: Vec<BigDecimal> = [0i64, 10, 20].iter().map(|ts| bd(&(ts / 10).to_string())).collect();
+		let segment = schema().seal(&[0, 10, 20], &values).expect("encodes");
+		let bytes = weft_physical_type::wrap_frame_envelope(&segment.write_to(), &[weft_physical_type::FrameExtension { id: weft_physical_type::EXT_SERIES_KEY, critical: false, payload: b"a\x1f1".to_vec() }]).expect("wraps");
+		std::fs::write(&rows[0].desc.path, bytes).unwrap();
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!((report.series_rebound, report.suspected, report.quarantined), (1, 0, 0), "{report:?}");
+		let key = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		assert!(store.index().series_id_for("price", &key).await.expect("catalog").is_some());
+	}
+
+	/// TAG-9: an untagged store's fsck rebinds nothing and registers nothing.
+	#[tokio::test]
+	async fn an_untagged_store_sees_no_series_work() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!((report.series_rebound, report.rebound, report.suspected, report.quarantined), (0, 0, 0, 0), "{report:?}");
+		assert!(store.index().series_of("price").await.expect("catalog").is_empty());
+		assert!(store.index().rows("price").await.expect("rows").iter().all(|row| row.series_id == 0));
+	}
+
+	/// TAG-9, R10: with the allocator row lost but the catalog intact, a row
+	/// rebound during recovery registers its key past the catalog's ids rather
+	/// than colliding with one (the seed runs before any row is checked).
+	#[tokio::test]
+	async fn a_rebind_after_a_lost_allocator_does_not_reuse_a_catalog_id() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("store");
+		let store = populated_store(&root).await;
+		let taken = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		store.commit_index(&IndexTxn::new(vec![IndexOp::RegisterSeries { aspect: "price".to_string(), series_id: crate::SeriesId(1), series_key: taken.clone() }, IndexOp::SeedSeries { aspect: "price".to_string(), next_series_id: 2 }])).await.expect("registers");
+		retag_indexed_frame(&store, b"b\x1f2").await;
+		drop(store);
+		on_raw_index(&root, &["DELETE FROM aspect_seq"]).await;
+		let store = SegmentStore::open(&root).await.expect("recovery succeeds");
+		let report = store.recovery_report();
+		assert_eq!(report.series_rebound, 1, "{report:?}");
+		let key = crate::SeriesKey::from_canonical(b"b\x1f2").unwrap();
+		let id = store.index().series_id_for("price", &key).await.expect("catalog").expect("registered");
+		assert_eq!(id, crate::SeriesId(2), "past the catalog's id 1");
+		assert_eq!(store.index().series_id_for("price", &taken).await.expect("catalog"), Some(crate::SeriesId(1)));
+		assert_eq!(store.index().rows("price").await.expect("rows")[0].series_id, 2);
 	}
 
 	/// A v7 frame of `[(ts, ts / 10)]` rows wrapped with one critical

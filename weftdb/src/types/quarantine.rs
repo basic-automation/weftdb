@@ -173,6 +173,10 @@ pub struct RecoveryReport {
 	/// from the frame's, or the row moved to another aspect and its key was
 	/// resolved again there. Each is also counted in `rebound`.
 	pub series_rebound: usize,
+	/// Held journal rows cleared without an adoption (TAG-9): the held frame
+	/// was missing, held no rows, or named no aspect, so nothing could ever
+	/// adopt it.
+	pub held_cleared: usize,
 	/// Rows whose indexed path escapes `segments/` and were left exactly where
 	/// they are: recovery never moves a file it cannot contain.
 	pub skipped_outside_segments: usize,

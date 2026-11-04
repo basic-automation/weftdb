@@ -119,7 +119,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   row whose series id names a different key is rebound to the frame's series, counted in the
   new `RecoveryReport::series_rebound` (also in the fsck response). A row moved back to the
   aspect its frame names gets its key resolved in that aspect's catalog rather than keeping
-  the other aspect's series id. Untagged stores see no change.
+  the other aspect's series id. Untagged frames and reads are unchanged; a restore's adopted
+  orphans now take ids from the commit allocator (which may skip past legacy ids) and their
+  aspect's rollup is rebuilt in the same pass.
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
   under Turso's MVCC each delete cost milliseconds and grew with the swaps before it. One
   guarded statement now deletes a group's rows: squashing 10M UCI rows from 9,769 to 153

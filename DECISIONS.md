@@ -4175,6 +4175,15 @@ of #310 is not done here.
 8. **Deviation (tests):** the inverted restore test cannot assert that untagged reads omit the
    tagged rows, because reads are still aspect-wide until series-scoped reads land (TAG-8);
    it asserts the tagged rows are readable and bound to their registered series instead.
+9. **R10 seeds before the row loop.** A rebind registers its key from `next_series_id`, so the
+   seed (max of catalog and row ids, every aspect) now commits before any row is checked; a
+   lost `aspect_seq` row can no longer make a rebind collide with a catalog id and fail open.
+10. **Held rows always settle.** A held frame that no longer decodes is quarantined under its
+   decode class, one with a malformed key is suspect (journal row cleared in the same txn);
+   a missing frame, a zero-row frame or a name with no aspect clears the row and counts in
+   the new `RecoveryReport.held_cleared`. Report-only counts held adoptions through the same
+   pure `plan_adoption` the real path uses, and `suspected` counts only orphans whose name
+   lets them be filed.
 
 **Rejected:** carrying the source aspect's `series_id` on an aspect move (E19); treating a
 non-critical `SERIES_KEY` as malformed (writers always mark it critical, and the key is
