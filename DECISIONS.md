@@ -3802,3 +3802,34 @@ reassuring. Treating `d_max` as `I` (so RPO = 2·I) — rejected as an
 oversimplification that hides the pass-duration term the formula exists to
 capture. Defining `d_max` as a setting — rejected: no such setting exists; it
 is a measured property of the storage and the control-plane size.
+## 2026-11-03 — EVI-18 backup health metrics and catch-up-free ticking (FLAGGED FOR MERGE REVIEW)
+
+**Context:** the 1.0 plan (§6 W6) and the ROADMAP line name only the outcomes —
+"backup health metrics exist" and "backup ticking is catch-up-free" — not the
+metrics or the ticking rule. The code pins both gaps down: the daemon's ticker
+is a bare `tokio::time::interval`, whose default `MissedTickBehavior::Burst`
+runs missed ticks back to back (docs/reference.md already records the symptom:
+ticks landing 3.0–4.5 s apart at a 2 s interval), and `/metrics` exposes only
+`weft_backup_snapshots_total` / `weft_backup_bytes_written_total` — no failure
+signal, no recency, so a daemon that fails every tick, or stops ticking at
+all, is invisible to a scrape.
+
+**Chosen:** two health signals, following the reconcile precedent
+(`failed_passes` is how a failing sweep stays visible). `weft_backup_failures_total`
+counts daemon ticks that failed to snapshot (the loop retries on the next tick,
+so a transient failure is invisible without it); `weft_backup_last_success_seconds`
+is a gauge of the most recent verified snapshot in unix seconds, `0` when none
+has been recorded, stamped by every successful snapshot whichever path took it
+(daemon tick or manual endpoint) and seeded at daemon start from the newest
+snapshot already on disk, so a restart does not read as "no backup ever" until
+the first tick. Ticking is `MissedTickBehavior::Skip`: a snapshot that
+outlasts the interval delays the next tick to the following period boundary,
+so the daemon takes at most one snapshot per interval however far behind it
+fell. Scope is the backup daemon only; the reconcile daemon's ticker is
+untouched (a different lane's slice).
+
+**Explicit non-claim:** backup duration is NOT part of this slice. EVI-25 (same
+wave, still pending) is the slice that records backup duration and RTO inputs;
+putting duration here would duplicate it. The 3.0–4.5 s tick-spacing figure in
+docs/reference.md is kept verbatim as a pre-EVI-18 observation under the old
+`Burst` behaviour, not re-measured under `Skip`.

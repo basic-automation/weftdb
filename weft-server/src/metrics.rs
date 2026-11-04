@@ -224,11 +224,21 @@ pub struct ReconcileMetrics {
 
 /// Counters for the online control-plane backup (`POST …/storage/backup`, roadmap
 /// Phase 7.4). An operator needs to see how many snapshots ran and the total bytes
-/// written to reason about backup cadence and storage growth.
+/// written to reason about backup cadence and storage growth — and, since EVI-18,
+/// whether the scheduled daemon is healthy: how many of its ticks failed, and when
+/// the last verified snapshot landed (`last_success_unix_secs`, 0 when none has
+/// been recorded yet, so a scrape can alert on a stale backup).
 #[derive(Debug, Default)]
 pub struct BackupMetrics {
 	snapshots: AtomicU64,
 	bytes_written: AtomicU64,
+	/// Daemon ticks that failed to snapshot (a failed tick retries on the next
+	/// tick; this counter is how a permanently failing daemon stays visible).
+	failures: AtomicU64,
+	/// Unix seconds of the most recent verified snapshot, daemon tick or manual
+	/// endpoint alike. `0` means no snapshot has been recorded by this process
+	/// (the daemon seeds it from the newest on-disk snapshot at start).
+	last_success_unix_secs: AtomicU64,
 }
 
 /// A point-in-time read of [`Metrics`], convenient for assertions and rendering.
@@ -302,6 +312,11 @@ pub struct BackupSnapshot {
 	pub snapshots: u64,
 	/// Total bytes written across all control-plane snapshots.
 	pub bytes_written: u64,
+	/// Daemon ticks that failed to snapshot.
+	pub failures: u64,
+	/// Unix seconds of the most recent verified snapshot, or 0 when none has
+	/// been recorded yet.
+	pub last_success_unix_secs: u64,
 }
 
 impl Metrics {
@@ -386,9 +401,28 @@ impl Metrics {
 
 	/// Record one completed, verified control-plane backup snapshot and the bytes it
 	/// wrote (roadmap Phase 7.4). Only a snapshot that succeeded should call this.
+	/// Also stamps the last-success time, so the health gauge tracks the newest
+	/// verified snapshot whichever path took it (daemon tick or manual endpoint).
 	pub fn record_backup(&self, bytes_written: u64) {
 		self.backup.snapshots.fetch_add(1, Ordering::Relaxed);
 		self.backup.bytes_written.fetch_add(bytes_written, Ordering::Relaxed);
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+		self.seed_backup_last_success(now);
+	}
+
+	/// Record one backup-daemon tick that failed to snapshot. The daemon retries
+	/// on the next tick, so a transient failure is invisible without this counter.
+	pub fn record_backup_failure(&self) {
+		self.backup.failures.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Move the last-success time forward to `unix_secs` when it is newer than
+	/// the recorded one (never backward: a concurrent tick must not lose to a
+	/// stale seed). The daemon calls this at start with the newest on-disk
+	/// snapshot's stamp, so the gauge survives a restart instead of reading 0
+	/// until the first tick.
+	pub fn seed_backup_last_success(&self, unix_secs: u64) {
+		self.backup.last_success_unix_secs.fetch_max(unix_secs, Ordering::Relaxed);
 	}
 
 	/// Record the end-to-end handling latency of one interpolation request
@@ -410,7 +444,7 @@ impl Metrics {
 	/// Take a consistent-enough snapshot of all counters.
 	#[must_use]
 	pub fn snapshot(&self) -> MetricsSnapshot {
-		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) }, ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) }, reconcile: ReconcileSnapshot { passes: self.reconcile.passes.load(Ordering::Relaxed), segments_reconciled: self.reconcile.segments_reconciled.load(Ordering::Relaxed), failed_passes: self.reconcile.failed_passes.load(Ordering::Relaxed) }, backup: BackupSnapshot { snapshots: self.backup.snapshots.load(Ordering::Relaxed), bytes_written: self.backup.bytes_written.load(Ordering::Relaxed) } }
+		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) }, ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) }, reconcile: ReconcileSnapshot { passes: self.reconcile.passes.load(Ordering::Relaxed), segments_reconciled: self.reconcile.segments_reconciled.load(Ordering::Relaxed), failed_passes: self.reconcile.failed_passes.load(Ordering::Relaxed) }, backup: BackupSnapshot { snapshots: self.backup.snapshots.load(Ordering::Relaxed), bytes_written: self.backup.bytes_written.load(Ordering::Relaxed), failures: self.backup.failures.load(Ordering::Relaxed), last_success_unix_secs: self.backup.last_success_unix_secs.load(Ordering::Relaxed) } }
 	}
 
 	/// Render the counters in the Prometheus text exposition format (v0.0.4).
@@ -419,13 +453,18 @@ impl Metrics {
 		use std::fmt::Write as _;
 		let snap = self.snapshot();
 		let mut out = String::with_capacity(512);
-		let counters = [("weft_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("weft_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("weft_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("weft_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("weft_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("weft_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("weft_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("weft_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("weft_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("weft_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed), ("weft_reconcile_passes_total", "Out-of-order reconciliation passes that actually ran (threshold-gated holds excluded).", snap.reconcile.passes), ("weft_reconcile_segments_reconciled_total", "Total out-of-order segments rewritten sorted across all reconciliation passes.", snap.reconcile.segments_reconciled), ("weft_reconcile_failed_passes_total", "Per-aspect passes that failed inside a store-wide maintenance sweep (the sweep skipped the aspect and continued).", snap.reconcile.failed_passes), ("weft_backup_snapshots_total", "Control-plane backup snapshots that completed and verified.", snap.backup.snapshots), ("weft_backup_bytes_written_total", "Total bytes written across all control-plane backup snapshots.", snap.backup.bytes_written)];
+		let counters = [("weft_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("weft_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("weft_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("weft_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("weft_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("weft_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("weft_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("weft_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("weft_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("weft_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed), ("weft_reconcile_passes_total", "Out-of-order reconciliation passes that actually ran (threshold-gated holds excluded).", snap.reconcile.passes), ("weft_reconcile_segments_reconciled_total", "Total out-of-order segments rewritten sorted across all reconciliation passes.", snap.reconcile.segments_reconciled), ("weft_reconcile_failed_passes_total", "Per-aspect passes that failed inside a store-wide maintenance sweep (the sweep skipped the aspect and continued).", snap.reconcile.failed_passes), ("weft_backup_snapshots_total", "Control-plane backup snapshots that completed and verified.", snap.backup.snapshots), ("weft_backup_bytes_written_total", "Total bytes written across all control-plane backup snapshots.", snap.backup.bytes_written), ("weft_backup_failures_total", "Backup-daemon ticks that failed to snapshot (a failed tick retries on the next tick).", snap.backup.failures)];
 		for (name, help, value) in counters {
 			// `writeln!` into a String is infallible.
 			let _ = writeln!(out, "# HELP {name} {help}");
 			let _ = writeln!(out, "# TYPE {name} counter");
 			let _ = writeln!(out, "{name} {value}");
 		}
+		// Health gauges: a scrape alerts on a stale backup from the last-success
+		// time, not from a counter it would have to difference itself.
+		let _ = writeln!(out, "# HELP weft_backup_last_success_seconds Unix seconds of the most recent verified control-plane backup snapshot, or 0 when none has been recorded yet.");
+		let _ = writeln!(out, "# TYPE weft_backup_last_success_seconds gauge");
+		let _ = writeln!(out, "weft_backup_last_success_seconds {}", snap.backup.last_success_unix_secs);
 		// Latency histograms — the p95/p99 surface for the north-star target.
 		self.interpolate_latency.render_prometheus(&mut out, "weft_interpolate_duration_seconds", "End-to-end handling latency for the interpolate endpoints (POST /api/v1/interpolate and /interpolate/ilp).");
 		self.downsample_latency.render_prometheus(&mut out, "weft_downsample_duration_seconds", "End-to-end handling latency for the downsample endpoints (POST /api/v1/downsample and /downsample/ilp).");
@@ -567,15 +606,16 @@ mod tests {
 		m.record_reconcile_pass(3);
 		m.record_reconcile_failures(2);
 		m.record_backup(4096);
+		m.record_backup_failure();
 		let text = m.render_prometheus();
 		// Every counter carries HELP, TYPE, and a value line.
 		assert!(text.contains("# HELP weft_interpolate_requests_total"));
 		assert!(text.contains("# TYPE weft_interpolate_requests_total counter"));
 		assert!(text.contains("weft_interpolate_requests_total 1"));
 		assert!(text.contains("weft_interpolate_output_points_total 5"));
-		// No value line is left dangling without a preceding TYPE line: 15
-		// counters + the 3 latency histograms.
-		assert_eq!(text.matches("# TYPE ").count(), 18);
+		// No value line is left dangling without a preceding TYPE line: 16
+		// counters + the backup last-success gauge + the 3 latency histograms.
+		assert_eq!(text.matches("# TYPE ").count(), 20);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE weft_downsample_requests_total counter"));
 		// And the storage-ingest counters.
@@ -591,6 +631,26 @@ mod tests {
 		assert!(text.contains("# TYPE weft_backup_snapshots_total counter"));
 		assert!(text.contains("weft_backup_snapshots_total 1"));
 		assert!(text.contains("weft_backup_bytes_written_total 4096"));
+		// And the backup health signals: one failed daemon tick, and a
+		// last-success gauge stamped by the successful snapshot (nonzero, and
+		// no later than now).
+		assert!(text.contains("# TYPE weft_backup_failures_total counter"));
+		assert!(text.contains("weft_backup_failures_total 1"));
+		assert!(text.contains("# TYPE weft_backup_last_success_seconds gauge"));
+		let gauge_line = text.lines().find(|line| line.starts_with("weft_backup_last_success_seconds ")).expect("the gauge has a value line");
+		let stamped: u64 = gauge_line.rsplit(' ').next().unwrap().parse().unwrap();
+		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+		assert!(stamped > 0 && stamped <= now, "the gauge stamps the successful snapshot: {stamped} vs now {now}");
+	}
+
+	#[test]
+	fn backup_last_success_seed_never_moves_backward() {
+		let m = Metrics::default();
+		assert_eq!(m.snapshot().backup.last_success_unix_secs, 0, "no snapshot recorded yet");
+		m.seed_backup_last_success(1_000);
+		assert_eq!(m.snapshot().backup.last_success_unix_secs, 1_000);
+		m.seed_backup_last_success(500);
+		assert_eq!(m.snapshot().backup.last_success_unix_secs, 1_000, "a stale seed must not lose to a newer tick");
 	}
 
 	#[test]
