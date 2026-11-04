@@ -191,6 +191,14 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           WEFT_SERVER_BIN: target/debug/weft-server
+      # The Rust SDK's contract tests against the same server. The workspace run above
+      # skips them (no WEFT_SERVER_BIN); `arrow` adds the columnar decode checks.
+      - name: Rust SDK contract (weft-client)
+        if: runner.os == 'Linux'
+        run: cargo test -p weft-client --features arrow --locked --test live -- --test-threads=4
+        env:
+          # Absolute: cargo runs an integration test from its package directory.
+          WEFT_SERVER_BIN: ${{ github.workspace }}/target/debug/weft-server
       # Tests create their legacy databases in a temporary data dir (weftdb/tests/common,
       # weft-orchestration's test_support, db_tests' own temp dirs), never in the default
       # ~/.weftdb/data. A fresh runner has no ~/.weftdb, so one here was written by a test.

@@ -31,7 +31,7 @@ rather than assumed.
 OVERVIEW
 --------
 
-  Apache License 2.0 — 302 crate(s)
+  Apache License 2.0 — 303 crate(s)
   MIT License — 104 crate(s)
   Unicode License v3 — 25 crate(s)
   ISC License — 19 crate(s)
@@ -904,6 +904,8 @@ Used by:
   * weft-arrow-store 0.2.0
     https://github.com/basic-automation/weftdb
   * weft-bench 0.2.1
+    https://github.com/basic-automation/weftdb
+  * weft-client 0.1.0
     https://github.com/basic-automation/weftdb
   * weft-line-protocol 0.2.0
     https://github.com/basic-automation/weftdb

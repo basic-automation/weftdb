@@ -1,0 +1,48 @@
+[package]
+name = "weft-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/weft-client"
+readme = "README.md"
+description = "Async Rust client for weft-server's HTTP API: compute, catalog, lossless ingest and stored reads, maintenance and backup."
+keywords = ["weftdb", "timeseries", "client", "database", "http"]
+categories = ["database", "api-bindings", "web-programming::http-client"]
+
+[lib]
+name = "weft_client"
+path = "src/lib.rs"
+
+[features]
+default = []
+# HTTPS, on rustls with the ring provider (the one weft-server's own listener uses) and the
+# platform's certificate verifier, or the roots a caller supplies. Off by default: the
+# server's default listener is loopback HTTP, and TLS pulls in a certificate stack.
+rustls = ["reqwest/rustls-no-provider", "dep:rustls", "dep:rustls-platform-verifier"]
+# Decode Arrow IPC and Parquet answers into `RecordBatch`es; without it they are bytes.
+arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-ipc", "dep:parquet", "dep:bytes"]
+
+[dependencies]
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+reqwest = { version = "0.13", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["time"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-ipc = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

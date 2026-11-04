@@ -13,6 +13,7 @@ members = [
 	"weft-arrow",
 	"weft-arrow-store",
 	"weft-reduce",
+	"weft-client",
 ]
 
 # Fields every workspace member inherits with `<field>.workspace = true`.
