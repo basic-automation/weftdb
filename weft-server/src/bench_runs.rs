@@ -21,8 +21,8 @@
 //! ## Where runs come from
 //!
 //! [`BENCH_RUNS_DIR_ENV`] names a directory. Every `*.manifest.json` under it
-//! (to [`MAX_DEPTH`] levels, symlinks not followed, each at most
-//! [`MAX_MANIFEST_BYTES`]) is a run. The directory is scanned per request:
+//! (to [`MAX_DEPTH`](crate::bench_runs::MAX_DEPTH) levels, symlinks not followed, each at most
+//! [`MAX_MANIFEST_BYTES`](crate::bench_runs::MAX_MANIFEST_BYTES)) is a run. The directory is scanned per request:
 //! runs arrive by `weft-bench` writing files, not through this server, and a
 //! cache would have to be told when that happens. Unset, both routes answer
 //! `503 unconfigured`.
@@ -31,11 +31,11 @@
 //!
 //! A manifest records host hardware, the toolchain and the command line —
 //! redacted at capture, but still operator information. The routes ask for
-//! [`Scope::Metrics`](crate::routes::Scope::Metrics), the operational
+//! the [metrics scope](crate::routes::Scope::Metrics), the operational
 //! telemetry scope `/metrics` and `/debug/profile/current` already use, so
 //! with auth on only a maintainer or admin key reads them, and SEC-8's
 //! exposure matrix covers them like the rest of that scope. They register at
-//! [`Tier::Experimental`](crate::settings::Tier::Experimental): the surface is
+//! the [experimental tier](crate::settings::Tier::Experimental): the surface is
 //! not part of the 1.0 freeze.
 
 use std::{
