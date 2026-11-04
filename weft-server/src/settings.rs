@@ -162,6 +162,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_TLS_KEY_FILE", tier: Tier::Stable, summary: "The PEM private key matching `WEFT_TLS_CERT_FILE` (SEC-5). Never logged, never served; read once at startup.", accepts: "a path to a PEM file holding the private key", default: "unset: no TLS — the listener is plaintext and the C8 gate applies", read_by: "weft-server/tls.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_UPDATE_GOLDENS", tier: Tier::Test, summary: "Re-record the committed byte goldens from what this build writes, instead of failing when the bytes differ. No shipped binary reads it.", accepts: "any value means rewrite the fixture file", default: "unset: a golden test compares bytes and fails on a difference", read_by: "weft-physical-type/tests/golden/harness.rs, weftdb/tests/golden_sidecar.rs" },
 	VarSpec { name: "WEFT_VERBOSE", tier: Tier::Test, summary: "Not WeftDB's own: it is `splimes`' verbose-logging switch. WeftDB's benchmarks clear it so a dependency's chatter cannot distort the timings they are measuring.", accepts: "any value turns the dependency's verbose output on", default: "unset (and deliberately removed at the top of the benchmarks that care about timings)", read_by: "weftdb/benches (cleared); read by the splimes dependency" },
+	VarSpec { name: "WEFT_WORKER_THREADS", tier: Tier::Tuning, summary: "The worker-thread count of the tokio runtime the binary builds (ROB-11, Admission II's runtime-builder side): the pool Admission I's class budgets spend, sized beside them. The runtime is shut down with plan C9's `shutdown_timeout` (5 s) whatever this is set to.", accepts: "a positive whole number of threads", default: "unset: one worker per available core (the runtime's own default)", read_by: "weft-server/runtime.rs, read in main.rs before the runtime is built" },
 	VarSpec { name: "WEFT_WRITE_STALL_TIMEOUT_SECS", tier: Tier::Tuning, summary: "How long a connection's writes may make no progress (a peer that stopped reading) before the connection is closed (SEC-4, pre-auth).", accepts: "a positive whole number of seconds", default: "10 s (`DEFAULT_WRITE_STALL_TIMEOUT` in serve.rs)", read_by: "weft-server/serve.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_XBENCH_CLICKHOUSE", tier: Tier::Test, summary: "Points the cross-engine benchmark's live ClickHouse test at a server, so the ClickHouse arms are checked against WeftDB's reference. No shipped binary reads it.", accepts: "a ClickHouse HTTP endpoint, e.g. `http://127.0.0.1:8123`", default: "unset: the live test returns without checking anything", read_by: "weft-xbench/lib.rs (test body)" },
 	VarSpec { name: "WEFT_XBENCH_INFLUXDB3", tier: Tier::Test, summary: "Points the cross-engine benchmark's live InfluxDB 3 test at a server, so the InfluxDB 3 arm is checked against WeftDB's reference. No shipped binary reads it.", accepts: "an InfluxDB 3 HTTP endpoint, e.g. `http://127.0.0.1:8181`", default: "unset: the live test returns without checking anything", read_by: "weft-xbench/lib.rs (test body)" },
@@ -301,7 +302,7 @@ pub const UNEXPECTED_EXIT_CODE: i32 = 1;
 const NON_NEGATIVE_INTS: &[&str] = &["WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_RECONCILE_THRESHOLD", "WEFT_RECONCILE_SPLIT_MIN_BYTES", "WEFT_SEGMENT_CHECKPOINT_STRIDE"];
 
 /// Variables whose registry `accepts` shape is a positive whole number.
-const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_INGEST_MAX_INFLIGHT_BYTES", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INGEST_BYTES", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_QUERY_MAX_INFLIGHT", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_SHUTDOWN_GRACE_SECS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
+const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_INGEST_MAX_INFLIGHT_BYTES", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INGEST_BYTES", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_QUERY_MAX_INFLIGHT", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_SHUTDOWN_GRACE_SECS", "WEFT_WORKER_THREADS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
 
 /// One line per *value* the operator should hear about, in the order the environment
 /// lists them: a registered numeric variable holding a value outside the shape its
@@ -478,7 +479,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 77, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 78, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
