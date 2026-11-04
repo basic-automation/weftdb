@@ -1795,8 +1795,9 @@ impl SegmentStore {
 	///   disagrees with it. An aspect re-bind moves the row to the aspect the
 	///   frame's name names. A row that already matches its frame is untouched.
 	///
-	/// Then, for each aspect, R10 seeds `aspect_seq.next_series_id` past the
-	/// largest series id any row holds, and the aspect's rollup is rebuilt when
+	/// Then, for each aspect the index or the series catalog names, R10 seeds
+	/// `aspect_seq.next_series_id` past the largest series id any row holds or
+	/// the catalog registered, and the aspect's rollup is rebuilt when
 	/// the pass changed its rows. Orphan `.weftseg` files — no index row and no
 	/// journal entry claims them — are counted; one that fails to decode is
 	/// quarantined the same way (a decodable orphan is left where it is: with
@@ -1844,9 +1845,14 @@ impl SegmentStore {
 		let mut live_names: HashSet<String> = HashSet::new();
 		let mut moved = false;
 		let mut changed_aspects: Vec<String> = Vec::new();
-		for aspect in self.index.list_aspects().await? {
+		// R10 seeds every aspect the index or the series catalog names: an aspect whose
+		// rows were all quarantined keeps its catalog rows, and their ids must not be
+		// handed out again if its allocator row is lost.
+		let mut aspects: std::collections::BTreeSet<String> = self.index.list_aspects().await?.into_iter().collect();
+		aspects.extend(self.index.series_aspects().await?);
+		for aspect in aspects {
 			let rows = self.index.rows(&aspect).await?;
-			let mut max_series_id = 0u64;
+			let mut max_series_id = self.index.max_registered_series_id(&aspect).await?;
 			let mut aspect_changed = false;
 			for row in &rows {
 				report.checked += 1;
@@ -1965,7 +1971,8 @@ impl SegmentStore {
 					}
 				}
 			}
-			// R10: seed next_series_id past every series id the aspect holds.
+			// R10: seed next_series_id past every series id the aspect's rows hold and
+			// every id its catalog registered.
 			if !report_only {
 				self.commit_index(&IndexTxn::new(vec![IndexOp::SeedSeries { aspect: aspect.clone(), next_series_id: max_series_id.saturating_add(1).max(1) }])).await?;
 			}
@@ -5977,16 +5984,16 @@ mod tests {
 		assert_eq!(schemas[1], schemas[0], "the second open changes nothing the first did not");
 		assert_eq!(schemas[2], schemas[0], "nor does the third");
 
-		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false };
+		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false };
 		let settled = OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: false };
 		assert_eq!(reports, vec![migrated, settled.clone(), settled], "the first open migrates from layout 1 through the registry, and the later ones find nothing pending");
 		let (format, uuid) = formats[0].clone();
-		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0005_d_s13".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
+		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0006_tag5_series".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
 		assert!(formats.iter().all(|seen| seen == &formats[0]), "the marker and the store's identity stay put: {formats:?}");
 		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads the marker"), Some(format));
 
 		let schema = &schemas[0];
-		for table in ["aspect_metadata", "aspect_seq", "frame_journal", "ingest_ledger", "segment_changes", "segment_index", "segment_quarantine", "store_meta", "store_migrations"] {
+		for table in ["aspect_metadata", "aspect_seq", "frame_journal", "ingest_ledger", "segment_changes", "segment_index", "segment_quarantine", "series", "store_meta", "store_migrations"] {
 			assert!(schema.contains(&format!("table {table}: ")), "{table} exists:\n{schema}");
 		}
 		assert!(schema.contains("| Text(\"gen\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0) | Text(\"prec\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"frame_crc\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"commit_epoch\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains gen (NOT NULL DEFAULT 0), prec, frame_crc, commit_epoch and series_id (NOT NULL DEFAULT 0):\n{schema}");
@@ -5997,13 +6004,13 @@ mod tests {
 			assert!(row.contains("/var/tmp/weft-pre-v2-fixture/root/segments/"), "the stored path is left as the pre-v2 build wrote it: {row}");
 			assert!(row.ends_with(" Integer(0) Null Null Null Integer(0)"), "a legacy row is generation 0 and series 0, with no prec, frame_crc or commit_epoch: {row}");
 		}
-		for (key, value) in [("applied_through", "0005_d_s13"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
+		for (key, value) in [("applied_through", "0006_tag5_series"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
 			assert!(schema.contains(&format!("meta Text(\"{key}\") Text(\"{value}\")\n")), "store_meta mirrors the marker's {key}:\n{schema}");
 		}
 		assert!(uuid::Uuid::parse_str(&uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
 		let migrations: Vec<&str> = schema.lines().filter_map(|line| line.strip_prefix("migration ")).collect();
-		assert_eq!(migrations.len(), 5, "{schema}");
-		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) "), "{migrations:?}");
+		assert_eq!(migrations.len(), 6, "{schema}");
+		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) ") && migrations[5].starts_with("Text(\"0006_tag5_series\") Integer(2) "), "{migrations:?}");
 	}
 
 	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
@@ -6077,9 +6084,9 @@ mod tests {
 		let (last, databases) = &markers[1];
 		assert_eq!(databases, &CONTROL_PLANE_FILES.to_vec(), "the final marker follows the databases");
 		assert_eq!(last, &format);
-		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0005_d_s13".into()), ..first.clone() }, "the final marker is the first, settled");
+		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0006_tag5_series".into()), ..first.clone() }, "the final marker is the first, settled");
 		assert_eq!((format.store_uuid.as_str(), &format.scope), (uuid.as_str(), &StoreScope { database: "market".into(), subject: "BTCUSD".into() }));
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false });
 		let reopened = SegmentStore::open_scoped(&root, "market", "BTCUSD").await.expect("reopens");
 		let again = (reopened.open_report().created_new, reopened.store_uuid().to_string());
 		drop(reopened);
@@ -6141,7 +6148,7 @@ mod tests {
 		let applied = store.open_report().applied.clone();
 		let reads = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
-		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13"]);
+		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
 		assert!(before.contains("store_migrations") && before.contains("0002_s6_s7"), "{before}");
 		assert_eq!(after, before, "a second run of every migration changed nothing");
 		assert!(applied.is_empty(), "nothing is pending: {applied:?}");
@@ -6320,7 +6327,7 @@ mod tests {
 				let settled = store.store_format();
 				let reads = if legacy { Some(fixture_reads(&store).await) } else { None };
 				drop(store);
-				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0005_d_s13")), "{}", image.display());
+				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0006_tag5_series")), "{}", image.display());
 				if let Some(reads) = reads {
 					assert_eq!(reads, expected_reads, "{}: the image reads what the fixture holds", image.display());
 				}
@@ -6482,12 +6489,80 @@ mod tests {
 		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
 		let schema = index_schema(&root).await;
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false });
 		assert_eq!(kept, uuid, "the S6 store_uuid is kept");
 		assert!(schema.contains("| Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains series_id (NOT NULL DEFAULT 0):\n{schema}");
 		assert!(schema.contains("| Text(\"next_series_id\") Text(\"INTEGER\") Integer(1) Text(\"1\") Integer(0)\n"), "aspect_seq gains next_series_id (NOT NULL DEFAULT 1):\n{schema}");
 		assert_eq!(sealed.expect("the store seals"), 1);
 		assert_eq!(ts, vec![0, 10, 20]);
+	}
+
+	/// TAG-5: a layout-2 store written before the series catalog (its registry through
+	/// `0005_d_s13`, no `series` table) gains the catalog at its next open with nothing
+	/// else changed: only `0006_tag5_series` applies, the layout and both floors stay 2
+	/// (so it is not reported as migrated from an older layout), the store keeps its
+	/// identity, and its rows and reads are what they were.
+	#[tokio::test]
+	async fn a_layout_2_store_gains_the_series_catalog_and_keeps_its_identity() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let (format, before) = (store.store_format(), store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads"));
+		drop(store);
+		put_marker(&root, &StoreFormat { applied_through: Some("0005_d_s13".into()), ..format.clone() });
+		on_raw_index(&root, &["DROP TABLE series", "DELETE FROM store_migrations WHERE id = '0006_tag5_series'", "UPDATE store_meta SET value = '0005_d_s13' WHERE key = 'applied_through'"]).await;
+		assert!(!index_tables(&root).await.contains(&"series".to_string()), "the pre-TAG-5 shape");
+		let rows_before: Vec<String> = index_schema(&root).await.lines().filter(|line| line.starts_with("row ")).map(str::to_string).collect();
+
+		let store = SegmentStore::open(&root).await.expect("a pre-TAG-5 layout-2 store opens");
+		let (report, settled, uuid) = (store.open_report().clone(), store.store_format(), store.store_uuid().to_string());
+		let after = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		let catalog = store.index().series_of("price").await.expect("the catalog reads");
+		drop(store);
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: vec!["0006_tag5_series".into()], recovery_report_only: false });
+		assert_eq!(settled, StoreFormat { applied_through: Some("0006_tag5_series".into()), ..format.clone() }, "layout, floors and identity unchanged");
+		assert_eq!((settled.layout_version, settled.min_read_layout, settled.min_write_layout), (2, 2, 2), "the catalog is a layout-2 migration (DECISIONS: TAG-5)");
+		assert_eq!(uuid, format.store_uuid, "the store keeps its identity");
+		assert_eq!(after, before, "reads are unchanged");
+		assert!(catalog.is_empty(), "the migration registers no series: series 0 is implicit");
+		let schema = index_schema(&root).await;
+		assert!(schema.contains("table series: Text(\"aspect\") Text(\"TEXT\") Integer(1) Null Integer(1) | Text(\"series_key\") Text(\"TEXT\") Integer(1) Null Integer(2) | Text(\"series_id\") Text(\"INTEGER\") Integer(1) Null Integer(0)\n"), "series(aspect, series_key, series_id), keyed on (aspect, series_key):\n{schema}");
+		let rows_after: Vec<String> = schema.lines().filter(|line| line.starts_with("row ")).map(str::to_string).collect();
+		assert_eq!(rows_after, rows_before, "no segment_index row is rewritten");
+		assert!(schema.contains("meta Text(\"applied_through\") Text(\"0006_tag5_series\")\n"), "{schema}");
+	}
+
+	/// TAG-5, R10: the repair pass seeds each aspect's series allocator past the ids its
+	/// catalog registered as well as the ids its rows hold, and seeds an aspect the
+	/// catalog names even when the index holds none of its rows. So an allocator row
+	/// lost after every row of a series was quarantined cannot hand that id out again.
+	#[tokio::test]
+	async fn r10_seeds_next_series_id_past_the_catalog_as_well_as_the_rows() {
+		use crate::{
+			types::index_txn::{IndexOp, IndexTxn}, SeriesId, TagSet
+		};
+
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals series 0");
+		let key = TagSet::from_pairs([("host", "a")]).expect("valid tags").series_key().clone();
+		let register = |aspect: &str, id: u64| [IndexOp::RegisterSeries { aspect: aspect.to_string(), series_id: SeriesId(id), series_key: key.clone() }, IndexOp::SeedSeries { aspect: aspect.to_string(), next_series_id: id + 1 }];
+		store.commit_index(&IndexTxn::new(register("price", 5).into_iter().chain(register("ghost", 3)).collect())).await.expect("registers");
+		drop(store);
+		// Lose every allocator row: only the rows and the catalog are left to seed from.
+		on_raw_index(&root, &["DELETE FROM aspect_seq"]).await;
+
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let report = store.fsck(false).await.expect("fsck");
+		let (price, ghost) = (store.index().next_series_id("price").await.expect("reads"), store.index().next_series_id("ghost").await.expect("reads"));
+		let ghost_rows = store.index().rows("ghost").await.expect("reads");
+		drop(store);
+		assert!(ghost_rows.is_empty(), "ghost has catalog rows only");
+		assert_eq!(report.seeded, 2, "both the indexed aspect and the catalog-only one are seeded: {report:?}");
+		assert_eq!(price, 6, "past the catalog's id 5, though every row of price is series 0");
+		assert_eq!(ghost, 4, "past the catalog's id 3, though the index holds no ghost row");
 	}
 
 	/// An open that stopped part way leaves its marker unsettled, and the next open reports
@@ -6507,7 +6582,7 @@ mod tests {
 		let store = SegmentStore::open(&root).await.expect("finishes the creation");
 		let (report, uuid) = (store.open_report().clone(), store.store_uuid().to_string());
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false });
 		assert_eq!(uuid, format.store_uuid);
 
 		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
@@ -6518,7 +6593,7 @@ mod tests {
 		let store = SegmentStore::open(&legacy).await.expect("finishes the upgrade");
 		let report = store.open_report().clone();
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false });
 	}
 
 	/// FRE-12a's `ensure_floor`: raising a floor writes the marker first, fsynced, and

@@ -29,7 +29,10 @@
 //! tables the write-once protocols commit into (`aspect_seq`, `frame_journal`,
 //! `ingest_ledger`, `segment_quarantine`, `aspect_metadata`, `segment_changes`). No row is
 //! rewritten: a legacy row reads back as generation 0, series 0, with the other three
-//! unset. `store_meta` holds the transactional copy of the store's marker.
+//! unset. `store_meta` holds the transactional copy of the store's marker. The series
+//! catalog (`series`, TAG-5) maps each aspect's registered
+//! [`SeriesKey`](crate::SeriesKey)s to their [`SeriesId`](crate::SeriesId)s; series 0 is
+//! implicit and has no row.
 
 use std::{collections::HashMap, str::FromStr};
 
@@ -619,6 +622,124 @@ impl SegmentIndexStore {
 		Ok(AllocatorSeed { next_id: persisted.map(|(next_id, _, _)| next_id), next_gen: persisted.map(|(_, next_gen, _)| next_gen), epoch: persisted.map_or(0, |(_, _, epoch)| epoch), max_id: self.max_id(aspect).await?, max_gen })
 	}
 
+	/// The id `aspect`'s catalog registered `key` under, or `None` when it has not
+	/// registered it. The empty key is series 0, [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED),
+	/// which no row names.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or a row whose id is not a series id.
+	#[cfg_attr(not(test), expect(dead_code, reason = "the tagged seal (TAG-7) and series-scoped reads (TAG-8) call it; until then only the tests do"))]
+	pub(crate) async fn series_id_for(&self, aspect: &str, key: &crate::SeriesKey) -> Result<Option<crate::SeriesId>> {
+		if key.is_empty() {
+			return Ok(Some(crate::SeriesId::UNTAGGED));
+		}
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("SELECT series_id FROM series WHERE aspect = ? AND series_key = ?", turso::params![aspect.to_string(), key.as_str().to_string()]).await?;
+		match rows.next().await? {
+			Some(row) => Ok(Some(series_id_value(row.get_value(0)?)?)),
+			None => Ok(None),
+		}
+	}
+
+	/// The key `aspect`'s catalog registered as series `id`, decoded through
+	/// [`SeriesKey::from_canonical`](crate::SeriesKey::from_canonical) (the storage path,
+	/// which accepts reserved `__` keys), or `None` for an id it has not handed out.
+	/// Series 0 is the empty key.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or a stored key that is not canonical.
+	#[cfg_attr(not(test), expect(dead_code, reason = "tagged reads (TAG-8) and recovery (TAG-9) call it; until then only the tests do"))]
+	pub(crate) async fn series_key_of(&self, aspect: &str, id: crate::SeriesId) -> Result<Option<crate::SeriesKey>> {
+		if id == crate::SeriesId::UNTAGGED {
+			return Ok(Some(crate::SeriesKey::default()));
+		}
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("SELECT series_key FROM series WHERE aspect = ? AND series_id = ?", turso::params![aspect.to_string(), integer_param(id.0)?]).await?;
+		match rows.next().await? {
+			Some(row) => Ok(Some(series_key_value(aspect, row.get_value(0)?)?)),
+			None => Ok(None),
+		}
+	}
+
+	/// Every series `aspect`'s catalog registered, in id order. Series 0 is implicit
+	/// and is not listed.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or a row this build cannot decode.
+	#[cfg_attr(not(test), expect(dead_code, reason = "selector resolution (TAG-8) calls it; until then only the tests do"))]
+	pub(crate) async fn series_of(&self, aspect: &str) -> Result<Vec<(crate::SeriesId, crate::SeriesKey)>> {
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("SELECT series_id, series_key FROM series WHERE aspect = ? ORDER BY series_id", turso::params![aspect.to_string()]).await?;
+		let mut out = Vec::new();
+		while let Some(row) = rows.next().await? {
+			out.push((series_id_value(row.get_value(0)?)?, series_key_value(aspect, row.get_value(1)?)?));
+		}
+		Ok(out)
+	}
+
+	/// The id `aspect`'s series allocator hands out next: its
+	/// `aspect_seq.next_series_id`, or 1 when the aspect has no allocator row yet
+	/// (series 0 is never allocated).
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	#[cfg_attr(not(test), expect(dead_code, reason = "the tagged seal (TAG-7) allocates from it; until then only the tests do"))]
+	pub(crate) async fn next_series_id(&self, aspect: &str) -> Result<u64> {
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("SELECT next_series_id FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		let next = match rows.next().await? {
+			Some(row) => Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok()),
+			None => None,
+		};
+		Ok(next.unwrap_or(1).max(1))
+	}
+
+	/// Every aspect with at least one row in the series catalog, in name order: the
+	/// aspects R10 must seed even when the index holds none of their rows (all of them
+	/// quarantined, say), so that a lost allocator row cannot hand out a registered id
+	/// again.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub(crate) async fn series_aspects(&self) -> Result<Vec<String>> {
+		let conn = connect_reader(&self.db).await?;
+		if !migrations::table_exists(&conn, "series").await? {
+			return Ok(Vec::new());
+		}
+		let mut rows = conn.query("SELECT DISTINCT aspect FROM series ORDER BY aspect", ()).await?;
+		let mut out = Vec::new();
+		while let Some(row) = rows.next().await? {
+			if let Value::Text(aspect) = row.get_value(0)? {
+				out.push(aspect);
+			}
+		}
+		Ok(out)
+	}
+
+	/// The largest series id `aspect`'s catalog registered, or 0 when it registered
+	/// none. Read without decoding the keys, so that R10 seeds past a catalog whose
+	/// keys this build could not read.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub(crate) async fn max_registered_series_id(&self, aspect: &str) -> Result<u64> {
+		let conn = connect_reader(&self.db).await?;
+		if !migrations::table_exists(&conn, "series").await? {
+			return Ok(0);
+		}
+		let mut rows = conn.query("SELECT MAX(series_id) FROM series WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		Ok(match rows.next().await? {
+			Some(row) => Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok()).unwrap_or(0),
+			None => 0,
+		})
+	}
+
 	/// The `frame_journal` rows (design section 5.3) of `aspect`, or of every aspect for
 	/// `None`, by name.
 	///
@@ -833,6 +954,30 @@ pub(crate) struct AllocatorSeed {
 	pub max_id: Option<u64>,
 	/// The largest generation among the aspect's `segment_index` rows, when it has any.
 	pub max_gen: Option<u64>,
+}
+
+/// A catalog `series_id` as a [`SeriesId`](crate::SeriesId).
+#[cfg_attr(not(test), expect(dead_code, reason = "the catalog readers' callers (TAG-7, TAG-8) arrive later; until then only the tests read ids"))]
+fn series_id_value(value: Value) -> Result<crate::SeriesId> {
+	match value {
+		Value::Integer(n) => Ok(crate::SeriesId(u64::try_from(n).with_context(|| format!("the series catalog holds the negative id {n}"))?)),
+		other => bail!("the series catalog holds {other:?} where it records a series id"),
+	}
+}
+
+/// A catalog `series_key` of `aspect`, decoded through the storage path.
+#[cfg_attr(not(test), expect(dead_code, reason = "the catalog readers' callers (TAG-8, TAG-9) arrive later; until then only the tests read keys"))]
+fn series_key_value(aspect: &str, value: Value) -> Result<crate::SeriesKey> {
+	match value {
+		Value::Text(text) => crate::SeriesKey::from_canonical(text.as_bytes()).with_context(|| format!("the {aspect:?} series catalog holds a key that is not canonical")),
+		other => bail!("the {aspect:?} series catalog holds {other:?} where it records a series key"),
+	}
+}
+
+/// A `u64` as an SQL integer parameter.
+#[cfg_attr(not(test), expect(dead_code, reason = "`series_key_of`'s callers (TAG-8, TAG-9) arrive later; until then only the tests bind it"))]
+fn integer_param(n: u64) -> Result<Value> {
+	Ok(Value::Integer(i64::try_from(n).with_context(|| format!("{n} is beyond an SQL integer"))?))
 }
 
 /// Refuse the database behind `conn` when its `store_meta` records a write floor newer
@@ -1305,5 +1450,40 @@ mod tests {
 		assert_eq!(second, 1);
 		assert_eq!(third, 2);
 		assert_eq!(other, 0, "a fresh aspect starts at 0");
+	}
+
+	/// TAG-5: a series registered with its allocator raise reads back through every
+	/// catalog reader: by key, by id, as the aspect's list in id order, and as the
+	/// allocator's next id. A key with a reserved `__` name (which only the storage path
+	/// accepts) round-trips through `SeriesKey::from_canonical` byte for byte. Series 0 is
+	/// the empty key and has no row; another aspect's catalog is its own.
+	#[tokio::test]
+	async fn series_round_trip_their_canonical_key() {
+		use crate::{SeriesId, SeriesKey, TagSet};
+
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let host = TagSet::from_pairs([("host", "a"), ("dc", "east")]).expect("valid tags").series_key().clone();
+		let reserved = SeriesKey::from_canonical(b"__sys\x1fx\x1ehost\x1fa").expect("the storage path accepts a reserved key");
+		assert_eq!(store.next_series_id("price").await.expect("reads"), 1, "an aspect with no allocator row hands out 1 first");
+		assert_eq!(store.series_of("price").await.expect("reads"), Vec::new());
+		let register = |series_id: u64, series_key: &SeriesKey| vec![IndexOp::RegisterSeries { aspect: "price".into(), series_id: SeriesId(series_id), series_key: series_key.clone() }, IndexOp::SeedSeries { aspect: "price".into(), next_series_id: series_id + 1 }];
+		store.apply(&IndexTxn::new(register(1, &host))).await.expect("registers host");
+		store.apply(&IndexTxn::new(register(2, &reserved))).await.expect("registers the reserved key");
+
+		assert_eq!(store.series_id_for("price", &host).await.expect("reads"), Some(SeriesId(1)));
+		assert_eq!(store.series_id_for("price", &reserved).await.expect("reads"), Some(SeriesId(2)));
+		assert_eq!(store.series_id_for("volume", &host).await.expect("reads"), None, "another aspect's catalog is its own");
+		assert_eq!(store.series_id_for("price", &SeriesKey::default()).await.expect("reads"), Some(SeriesId::UNTAGGED), "the empty key is series 0");
+		let read_back = store.series_key_of("price", SeriesId(2)).await.expect("reads").expect("registered");
+		assert_eq!(read_back, reserved);
+		assert_eq!(read_back.as_bytes(), reserved.as_bytes(), "the canonical bytes come back unchanged");
+		assert_eq!(store.series_key_of("price", SeriesId(1)).await.expect("reads"), Some(host.clone()));
+		assert_eq!(store.series_key_of("price", SeriesId(3)).await.expect("reads"), None, "an id not handed out");
+		assert_eq!(store.series_key_of("price", SeriesId::UNTAGGED).await.expect("reads"), Some(SeriesKey::default()));
+		assert_eq!(store.series_of("price").await.expect("reads"), vec![(SeriesId(1), host), (SeriesId(2), reserved)], "the catalog in id order, series 0 not listed");
+		assert_eq!(store.next_series_id("price").await.expect("reads"), 3);
+		assert_eq!(store.series_aspects().await.expect("reads"), vec!["price".to_string()]);
+		assert_eq!(store.max_registered_series_id("price").await.expect("reads"), 2);
+		assert_eq!(store.max_registered_series_id("volume").await.expect("reads"), 0);
 	}
 }

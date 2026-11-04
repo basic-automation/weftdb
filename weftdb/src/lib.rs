@@ -276,6 +276,29 @@ pub use types::*;
 // crate. `weftdb::tags` also carries the frozen caps and separators.
 pub use weft_physical_type::tags::{self, SeriesKey, SeriesSelector, TagError, TagSet};
 
+/// The id a store gave one series of an aspect: the handle its reads target and the value
+/// `segment_index.series_id` records.
+///
+/// An id means something only inside the store and aspect that handed it out, which is
+/// why a frame records its [`SeriesKey`] and never its id. Ids are allocated per aspect
+/// from 1 upwards and never reused; [`SeriesId::UNTAGGED`], series 0, is the empty tag
+/// set, which every untagged write lands in and which no catalog row names. It is a
+/// newtype rather than a bare `u64` so that a series id cannot be passed where a segment
+/// id is meant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SeriesId(pub u64);
+
+impl SeriesId {
+	/// Series 0: the empty tag set, implicit in every aspect.
+	pub const UNTAGGED: Self = Self(0);
+}
+
+impl std::fmt::Display for SeriesId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{tags, SeriesKey, SeriesSelector, TagError, TagSet};
