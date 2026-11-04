@@ -110,7 +110,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   by default and loosely with `tag_match=subset`; `tag.<key>=` requires the tag to be
   absent. No `tag.*` parameter reads the untagged series as before. No match reads empty,
   two or more matches are `400 ambiguous_series`, and a bad, repeated or reserved key or
-  more than 16 matchers is `400 invalid_tag`. The JSON read bodies gain a `tags` field.
+  more than 16 matchers is `400 invalid_tag`. The JSON read bodies gain a `tags` field; untagged `points`, `value-points`, `at`, `at-multi` and stored `downsample` responses now include `"tags":{}` too, so their bodies are not byte-identical to before (an additive field).
   `SegmentStore::series_tags` reads one series' tags.
 
 ### Changed

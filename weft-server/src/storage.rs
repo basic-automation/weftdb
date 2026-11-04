@@ -60,9 +60,14 @@ async fn resolve_target(store: &weftdb::SegmentStore, aspect: &str, selector: &w
 	let tags = match series {
 		Some(id) => {
 			let tags = store.series_tags(aspect, id).await.map_err(|err| error::classify_read(&err))?;
-			// The id came from the catalog a moment ago and ids are never reused, so a
-			// missing row means the catalog changed under the read: report no tags.
-			Some(tags.map(|tags| tags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()).unwrap_or_default())
+			// The id came from the catalog a moment ago and ids are never reused, so a missing
+			// row for a tagged id means the catalog changed under the read. Reporting `{}` would
+			// name the untagged series for rows read from another, so it is a server fault.
+			match tags {
+				Some(tags) => Some(tags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+				None if id == weftdb::SeriesId::UNTAGGED => Some(std::collections::BTreeMap::new()),
+				None => return Err(ApiError::server(error::Code::SeriesBindingMismatch, format!("series {id:?} of aspect `{aspect}` has no catalog row"))),
+			}
 		}
 		None => None,
 	};
@@ -1046,7 +1051,8 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 	};
 	drop(store);
 	let mut buckets = result.map_err(|err| error::classify_read(&err))?;
-	if let Some(method) = &method {
+	// A selector that matched no series reads empty: no fill grid is synthesised for it.
+	if let (Some(method), Some(_)) = (&method, target.series) {
 		// The fill bounds are the window's, as instants; an omitted bound is the stored data's.
 		let instant = |epoch: Option<i64>| epoch.map(|e| schema.timestamp_unit.to_nanos(e).map(chrono::DateTime::from_timestamp_nanos).ok_or_else(|| ApiError::new(error::Code::ValueNotRepresentable, format!("the bound {e} cannot be placed in time at the aspect's timestamp unit")))).transpose();
 		buckets = crate::downsample::apply_fill(&buckets, width, instant(params.start)?, instant(params.end)?, method)?;
@@ -2078,7 +2084,12 @@ mod tests {
 		assert_eq!(body["found"], false, "series 0's row is not the tagged series' row");
 		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/at-multi?t=110,200,400&tag.host=a").await;
 		assert_eq!(body["points"].as_array().unwrap().iter().map(|p| p["found"].as_bool().unwrap()).collect::<Vec<_>>(), vec![false, true, false]);
-		let (_, body) = get_json(router, "/api/v1/storage/price/downsample?resolution=seconds&agg=sum&tag.host=a").await;
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/downsample?resolution=seconds&agg=sum&tag.host=a").await;
+		assert_eq!((&body["input_points"], &body["tags"]), (&serde_json::json!(2), &serde_json::json!({ "host": "a" })), "{body}");
+		// POST takes the same selector as GET.
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/downsample?resolution=seconds&agg=sum&tag.host=a").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
 		assert_eq!((&body["input_points"], &body["tags"]), (&serde_json::json!(2), &serde_json::json!({ "host": "a" })), "{body}");
 	}
 
@@ -2145,10 +2156,25 @@ mod tests {
 		assert_eq!(body["points"].as_array().unwrap().len(), 2);
 		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/downsample?resolution=seconds&tag.host=zzz").await;
 		assert_eq!((&body["buckets"], &body["tags"]), (&serde_json::json!(0), &serde_json::Value::Null), "{body}");
-		let response = router.clone().oneshot(Request::builder().uri("/api/v1/storage/price/range?start=0&end=1000&tag.host=zzz").body(Body::empty()).unwrap()).await.unwrap();
-		assert_eq!(response.status(), StatusCode::OK);
-		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-		assert_eq!(record_batches_to_columns(&read_ipc_stream(&bytes).expect("reads stream")).expect("columns").0, Vec::<i64>::new());
+		// A fill over given bounds synthesises no grid for a selector that matched nothing.
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/downsample?resolution=seconds&fill=0&start=0&end=1000&tag.host=zzz").await;
+		assert_eq!((status, &body["buckets"], &body["tags"]), (StatusCode::OK, &serde_json::json!(0), &serde_json::Value::Null), "{body}");
+		for uri in ["/api/v1/storage/price/range?start=0&end=1000&tag.host=zzz", "/api/v1/storage/price/value-range?lo=0&hi=100&tag.host=zzz"] {
+			let response = router.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{uri}");
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			assert_eq!(record_batches_to_columns(&read_ipc_stream(&bytes).expect("reads stream")).expect("columns").0, Vec::<i64>::new(), "{uri}");
+		}
+		for uri in ["/api/v1/storage/price/range.parquet?start=0&end=1000&tag.host=zzz", "/api/v1/storage/price/value-range.parquet?lo=0&hi=100&tag.host=zzz"] {
+			let response = router.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{uri}");
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			assert_eq!(record_batches_to_columns(&weft_arrow::read_parquet(&bytes).expect("reads parquet")).expect("columns").0, Vec::<i64>::new(), "{uri}");
+		}
+		for uri in ["/api/v1/storage/price/range.csv?start=0&end=1000&tag.host=zzz", "/api/v1/storage/price/value-range.csv?lo=0&hi=100&tag.host=zzz"] {
+			let (status, _, body) = get_text(router.clone(), uri).await;
+			assert_eq!((status, body.as_str()), (StatusCode::OK, "timestamp,value\n"), "{uri}");
+		}
 		// An undeclared aspect stays a 404 whatever the selector.
 		let (status, _) = get_json(router, "/api/v1/storage/never_declared/points?start=0&end=1&tag.host=a").await;
 		assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2163,7 +2189,7 @@ mod tests {
 		}
 		let matchers: Vec<String> = (0..=weftdb::tags::MAX_TAGS).map(|n| format!("tag.k{n}=v")).collect();
 		let (status, body) = get_json(router, &format!("/api/v1/storage/price/points?start=0&end=1000&{}", matchers.join("&"))).await;
-		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag")), "{body}");
+		assert_eq!((status, &body["code"], &body["details"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag"), &serde_json::json!({ "count": weftdb::tags::MAX_TAGS + 1, "limit": weftdb::tags::MAX_TAGS })), "{body}");
 	}
 
 	#[tokio::test]
