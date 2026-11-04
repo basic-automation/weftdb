@@ -45,6 +45,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weft_audit` events. `WEFT_AUDIT_FILE` names the file; unset, it lives at
   `<store root>/audit.jsonl` (or `./weft-audit.jsonl` with no store configured), and a
   server that cannot open it refuses to start.
+- **Series catalog (TAG-5).** Migration `0006_tag5_series` adds an empty `series` table to
+  `segment_index.db`, mapping each aspect's canonical series keys to their series ids, and
+  `weftdb::SeriesId` (`SeriesId::UNTAGGED` is series 0, the empty tag set) names the id.
+  It is pure DDL at layout 2: the next open of an existing store applies it, the marker's
+  layout and floors stay 2, and no row or frame changes. Nothing registers a series yet;
+  tagged writes stay refused.
 
 ### Changed
 
