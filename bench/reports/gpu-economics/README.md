@@ -21,9 +21,11 @@ dollars per billion interpolated points on public cloud instances. The numbers c
 | Commit | ⟦MEASURE: commit⟧, release build, `--locked` |
 | Workload | cubic, one-second grid, 1 Mi output points per call from 10,000 irregular knots, `run_f64` |
 
-**Not measured: AMD, Intel and Apple GPUs.** The project has no such hardware attached
-(the workstation's Radeon iGPU is bound to `vfio-pci`, see the splimes roadmap's
-conformance-matrix item). Nothing below says anything about them, and none of the cloud GPUs
+**Not measured: AMD, Intel and Apple GPUs.** The workstation does have an AMD Radeon 610M
+iGPU (Raphael, `amdgpu` driver, RADV Vulkan ICD present on 2026-11-04), but this workload runs
+on the adapter splimes selects, which is the discrete NVIDIA card; no run targeted the iGPU,
+and a 2-CU iGPU says nothing about AMD's discrete or datacenter parts anyway. There is no Intel
+GPU and no Apple hardware. Nothing below says anything about them, and none of the cloud GPUs
 priced below were run either: their rows apply the local RTX 4070 Ti SUPER's throughput as a
 stand-in, which is only an order-of-magnitude guide (see "Caveats").
 
@@ -157,5 +159,6 @@ Verdict: ⟦MEASURE: which is cheaper per point, by how much, and at what concur
 - **On-demand, one region, compute only.** No reserved, savings-plan or spot prices, no
   storage, network or egress, and no idle time: a GPU instance billed for a server that
   interpolates a few percent of the time costs its full hourly price.
-- **Shared GPU.** The measurement host's GPU is shared with other work; the baseline
-  utilization in each report says how busy it was.
+- **Shared GPU.** The measurement host's GPU is shared with other work (on 2026-11-04, before
+  any run, `nvidia-smi` showed it at 100% utilization with 12.9 GiB in use by another
+  process); the baseline utilization in each report says how busy it was during the run.
