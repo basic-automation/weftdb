@@ -98,6 +98,9 @@ mod test_fs;
 mod test_support;
 pub mod tls;
 pub mod trace;
+/// `GET /api/v1/version`: which build this is, which store it serves, and what
+/// its exit statuses mean (FRE-12b).
+pub mod version;
 
 pub use admission::{Admission, AdmissionConfig, DEFAULT_QUERY_MAX_INFLIGHT, QUERY_MAX_INFLIGHT_ENV};
 pub use audit::{AuditLog, AUDIT_FILE_ENV, AUDIT_FILE_NAME};
@@ -119,6 +122,7 @@ pub use serve::{ServeLimits, ShutdownSignals, HEADER_READ_TIMEOUT_ENV, KEEP_ALIV
 pub use state::AppState;
 pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_downsample, storage_downsample_arrow, storage_downsample_csv, storage_downsample_parquet, storage_point, storage_points, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, MultiPointParams, PointParams, StorageDownsampleParams, StoreStatsResponse, StoredPoint, StoredPointEntry, StoredPointResponse, StoredPointsResponse, StoredRangeResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};
 pub use tls::{PlaintextGate, TlsConfig, ALLOW_PLAINTEXT_ENV, AUTH_DISABLED, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV};
+pub use version::{build_info, version, BuildInfo, ScopeInfo, ScopePinInfo, StoreIdentity, VersionResponse};
 
 pub use crate::{
 	declare::{declare_aspect, DeclareAspectRequest, DeclareAspectResponse}, ingest::{ingest_csv, ingest_ilp, ingest_parquet, ingest_points, CsvIngestParams, IlpIngestParams, IngestConfig, IngestPoint, IngestRequest, IngestResponse, ParquetIngestParams, DEFAULT_MAX_INGEST_BYTES, INGEST_MAX_INFLIGHT_BYTES_ENV, MAX_INGEST_BYTES_ENV}, maintain::{fsck_store, purge_expired_quarantine, quarantine_list, quarantine_purge, quarantine_release, reconcile_aspect, reconcile_store, PurgeExpiredResponse, QuarantineParams, ReconcileResponse, ReconcileStoreResponse, SweepFailure}

@@ -54,6 +54,24 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   corrected formula `RPO = max(I, d_max) + d_max`, the backup settings that set
   `I`, and the restore paths that set RTO — with every figure measured, derived
   or labelled unmeasured.
+
+- **The scope pin and `GET /api/v1/version` (FRE-12b).** A store root holds many `(database,
+  subject)` namespaces, so a server whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` name one
+  the root does not hold does not fail: it serves an empty namespace, which is what a lost
+  store looks like from the outside. `weft-server` now compares the scope it is configured for
+  against the scope the root's own `STORE_FORMAT` records before it opens, and refuses a
+  mismatch with exit `65` — the operator-action class, where "scope mismatch" has always sat in
+  the exit table without the server ever producing one. The message names both scopes, the
+  root, and the three ways out. `WEFT_STORE_SCOPE_PIN=off` serves the root under the configured
+  scope anyway, for a deployment that means it; a root with no marker yet has no recorded scope
+  to refuse against. The new `GET /api/v1/version` answers the same questions over HTTP — the
+  build (OS, architecture, libc, debug or release, and the target triple, compiler and commit
+  it was built from, recorded at compile time because a released box has neither to ask), the
+  store's layout numbers beside what this build can write, the scope being served against the
+  scope the store records, and the whole exit-status table — from process state alone, so it
+  answers while a store is being refused. It takes a key where keys are mounted: `/health` and
+  `/ready` stay the anonymous surface.
+
 - **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
   (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
   gets an attempt record before it runs and an outcome record after, and the operation is
@@ -62,9 +80,33 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weft_audit` events. `WEFT_AUDIT_FILE` names the file; unset, it lives at
   `<store root>/audit.jsonl` (or `./weft-audit.jsonl` with no store configured), and a
   server that cannot open it refuses to start.
+- **Series catalog (TAG-5).** Migration `0006_tag5_series` adds an empty `series` table to
+  `segment_index.db`, mapping each aspect's canonical series keys to their series ids, and
+  `weftdb::SeriesId` (`SeriesId::UNTAGGED` is series 0, the empty tag set) names the id.
+  It is pure DDL at layout 2: the next open of an existing store applies it, the marker's
+  layout and floors stay 2, and no row or frame changes. Nothing registers a series yet;
+  tagged writes stay refused.
+- **Per-aspect series cap (TAG-7).** `SegmentStoreOptions::max_series_per_aspect`
+  (`DEFAULT_MAX_SERIES_PER_ASPECT`, 100,000) bounds how many tag series one aspect may
+  register. A batch for a new series past it is refused with the typed
+  `StoreError::SeriesLimit` (`400 series_limit` over HTTP) before any frame is written;
+  series already registered stay writable, and the untagged series never counts. Tagged
+  writes themselves stay refused at both gates until TAG-8 (library) and TAG-11 (HTTP), so
+  nothing reaches the cap yet.
 
 ### Changed
 
+- **Maintenance plans within one series (TAG-6).** Overlap reconciles, squashes, size-targeted
+  compaction and the hot/cold reconcile never fold two tag series together; the squash cap,
+  the fragmentation gate and `AspectStorageStats::overlapping_segments` (and
+  `store_overlapping_segments`) count per series, and each series keeps its own hot tail.
+  An untagged aspect is one series, so its maintenance and statistics are unchanged; tagged
+  writes stay refused until TAG-8, so nothing observable changes yet.
+- **Breaking (library):** `IngestBatch::series_ids()` is removed (TAG-7). It always answered
+  `[0]`, and a tagged batch's series id is not known until its commit resolves the key in the
+  aspect's catalog; read the id from `IngestReceipt::series_ids` instead. The method shipped
+  in `weftdb` 0.2.0 on crates.io, so this is a breaking change, allowed in the next minor
+  release by the pre-1.0 policy above.
 - The `503 unconfigured` sentence no longer names the segment store, since the bench-run
   routes answer it too: it reads "a subsystem this route needs is not configured on this
   server", and `details.subsystem` / `details.enabled_by` say which one and the variable that
@@ -93,6 +135,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - Parquet ingest (`POST /api/v1/storage/{aspect}/parquet`) refused a Snappy-compressed file
   with `400 … Disabled feature at compile time: snap`. Snappy is the default codec of R's
   arrow, pyarrow, pandas and Spark; the workspace's `parquet` now builds with it.
+- **Restore no longer strands tagged frames (part of TAG-9, #310).** A restore-mode open
+  adopts an orphan frame that carries a series key into the series the key names,
+  registering the key in the aspect's catalog in the same transaction, instead of journaling
+  it `held` forever; only a tagged orphan of an undeclared aspect is still held, and a later
+  open adopts it once the aspect is declared. Recovery and `POST /api/v1/storage/fsck` also check
+  each indexed tagged frame's key: a malformed or repeated key is quarantined suspect, and a
+  row whose series id names a different key is rebound to the frame's series, counted in the
+  new `RecoveryReport::series_rebound` (also in the fsck response). A row moved back to the
+  aspect its frame names gets its key resolved in that aspect's catalog rather than keeping
+  the other aspect's series id. Untagged frames and reads are unchanged; a restore's adopted
+  orphans now take ids from the commit allocator (which may skip past legacy ids) and their
+  aspect's rollup is rebuilt in the same pass.
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
   under Turso's MVCC each delete cost milliseconds and grew with the swaps before it. One
   guarded statement now deletes a group's rows: squashing 10M UCI rows from 9,769 to 153

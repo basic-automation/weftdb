@@ -704,6 +704,7 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 			weftdb::StoreError::DeclarationConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IdempotencyConflict { .. } => ApiError::new(Code::IdempotencyConflict, e.to_string()),
 			weftdb::StoreError::GroupsUnsupported { .. } => ApiError::new(Code::TagsUnsupported, e.to_string()),
+			weftdb::StoreError::SeriesLimit { .. } => ApiError::new(Code::SeriesLimit, e.to_string()),
 			weftdb::StoreError::IngestValueOutOfRange { digits, .. } => decimal_out_of_range_refusal(*digits),
 			weftdb::StoreError::EmptyIngestBatch { .. } | weftdb::StoreError::IngestLengthMismatch { .. } => ApiError::bad_request(e.to_string()),
 			_ => ApiError::server(Code::IncompatibleStore, e.to_string()),
@@ -839,6 +840,15 @@ mod tests {
 		names.sort_unstable();
 		names.dedup();
 		assert_eq!(names.len(), TABLE.len(), "two codes share a wire name");
+	}
+
+	/// The store's series cap (TAG-7) is the plan's `400 series_limit`, read from the type,
+	/// never the sentence.
+	#[test]
+	fn the_store_series_cap_is_series_limit() {
+		let err = anyhow::Error::new(weftdb::StoreError::SeriesLimit { aspect: "price".to_string(), limit: 2 }).context("ingest of aspect \"price\" failed while committing");
+		let refusal = classify_typed(&err).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::SeriesLimit, StatusCode::BAD_REQUEST));
 	}
 
 	/// The synonyms C6 dropped stay dropped: a client that coded against the old vocabulary

@@ -23,8 +23,8 @@
 //! The compute endpoints are `f64`, as the server's are.
 //!
 //! Features: `rustls` for HTTPS (ring provider, platform or caller-supplied roots), and
-//! `arrow` to decode Arrow IPC and Parquet answers with [`decode_arrow`] and
-//! [`decode_parquet`].
+//! `arrow` to decode Arrow IPC and Parquet answers (`decode_arrow` and
+//! `decode_parquet`, both behind the `arrow` feature).
 
 #![warn(missing_docs)]
 

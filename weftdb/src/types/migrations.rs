@@ -49,6 +49,13 @@
 //! - **`0005_d_s13`** (layout 2): `ingest_ledger.series_ids` (plan §4 C1: S13
 //!   adds it beside the `groups` shape). A ledger row that predates it reads
 //!   back with no series ids, the same empty default the new column declares.
+//! - **`0006_tag5_series`** (layout 2): the per-aspect series catalog in
+//!   `segment_index.db` (TAG-5): `series(aspect, series_key, series_id)`, keyed on
+//!   `(aspect, series_key)`, so registering a taken key is a conflict. Series 0, the
+//!   empty tag set, is implicit and has no row. Pure DDL: an existing store gains an
+//!   empty table and nothing else changes, so an older layout-2 build reads it exactly
+//!   as before. It stays at layout 2 by the rule in `store_format` (every pre-1.0
+//!   migration belongs to layout 2), not at the layout 3 plan C1 names; see DECISIONS.md.
 
 use std::collections::BTreeSet;
 
@@ -121,7 +128,7 @@ pub(crate) struct Floors {
 /// Every registered migration, in id order. An id is four digits, an underscore, and a
 /// lower snake_case name: the digits are the ordinal that `pending` and `after` select on,
 /// so the numbering rule is part of the registry's contract and the test below asserts it.
-pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }, Migration { id: "0005_d_s13", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s13, rederive: None }];
+pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }, Migration { id: "0005_d_s13", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s13, rederive: None }, Migration { id: "0006_tag5_series", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: tag5_series, rederive: None }];
 
 /// The ordinal of a migration id: its leading digits (`0002_s6_s7` → 2). An id without
 /// them sorts first.
@@ -448,6 +455,30 @@ fn d_s13<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
 	})
 }
 
+/// The series catalog `0006_tag5_series` adds to `segment_index.db` (TAG-5): one row
+/// per registered series of an aspect, its canonical [`SeriesKey`](crate::SeriesKey)
+/// as text and the id the aspect's allocator (`aspect_seq.next_series_id`) handed it.
+/// The primary key is the key, not the id: a plain `INSERT` of a key already
+/// registered fails on it, which is the conflict path a primary key is proven to take
+/// under Turso's MVCC, where a secondary `UNIQUE` index is not relied on. Ids stay
+/// unique because only the allocator hands them out, under the aspect's commit lock,
+/// and never twice. Series 0 (the empty tag set) has no row.
+const SERIES_TABLE: &str = "CREATE TABLE IF NOT EXISTS series (
+	aspect TEXT NOT NULL,
+	series_key TEXT NOT NULL,
+	series_id INTEGER NOT NULL,
+	PRIMARY KEY (aspect, series_key)
+)";
+
+/// `0006_tag5_series`: the series catalog in `segment_index.db`.
+fn tag5_series<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
+	Box::pin(async move {
+		let Some(index) = cp.index else { return Ok(()) };
+		let conn = connect(index.db).await.with_context(|| format!("{}: connecting", index.name))?;
+		ddl(&conn, index.name, SERIES_TABLE).await
+	})
+}
+
 /// `0004_d_s12`: the C5 quarantine columns in `segment_index.db`.
 fn d_s12<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
 	Box::pin(async move {
@@ -586,14 +617,15 @@ mod tests {
 	#[test]
 	fn pending_and_after_select_by_applied_set_and_by_ordinal() {
 		let applied: BTreeSet<String> = ["0001_baseline".to_string()].into();
-		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13"]);
+		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
 		assert_eq!(pending(REGISTRY, &BTreeSet::new()).len(), REGISTRY.len());
 		assert_eq!(after(REGISTRY, None).len(), REGISTRY.len());
-		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13"]);
-		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13"]);
-		assert_eq!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0004_d_s12", "0005_d_s13"]);
-		assert_eq!(after(REGISTRY, Some("0004_d_s12")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0005_d_s13"]);
-		assert!(after(REGISTRY, Some("0005_d_s13")).is_empty());
+		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
+		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
+		assert_eq!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
+		assert_eq!(after(REGISTRY, Some("0004_d_s12")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0005_d_s13", "0006_tag5_series"]);
+		assert_eq!(after(REGISTRY, Some("0005_d_s13")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0006_tag5_series"]);
+		assert!(after(REGISTRY, Some("0006_tag5_series")).is_empty());
 		assert!(after(REGISTRY, Some("0009_future")).is_empty(), "a newer marker's ordinal is past everything here");
 		assert_eq!(floors(pending(REGISTRY, &applied)), Some(Floors { layout: 2, min_read: 2, min_write: 2 }));
 		assert_eq!(floors(Vec::<&Migration>::new()), None);

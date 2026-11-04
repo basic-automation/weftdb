@@ -104,6 +104,82 @@ so a tolerance would be an invented threshold); and folding the point-at or
 range raw read-backs in here (those are the oracle's raw judgements, SOA-6 —
 the derived surface is what was missing).
 
+## 2026-11-03 — FRE-12b: what the scope pin pins, where the check lives, and what `/api/v1/version` may say (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan gives FRE-12b one line — "Scope pin, `GET /api/v1/version`,
+incompatible-store mapping and exit code" (`ROADMAP.md:343`). It does not say what the pin
+pins, which lane owns the check, whether a disagreement refuses a start or only reports it,
+or what the version route must answer. The exit table (decision 4, C7) has named "scope
+mismatch" under 65 ever since PAC-7 wrote that table, and nothing on main ever produced one:
+the sentence described a class the server could not emit.
+
+**Chosen (best guess, grounded in the code on main, flagged for merge review):**
+
+- "Scope pin" pins the scope the process is configured to serve — `WEFT_STORE_DATABASE` and
+  `WEFT_STORE_SUBJECT`, each defaulting to `default` — against the scope the store root's own
+  `STORE_FORMAT` marker records. That is the only statement a store makes about itself:
+  `StoreFormat::scope` (`weftdb/src/types/store_format.rs:126`) is written by
+  `StoreFormat::new_store` at creation and carried unchanged through every later rewrite by
+  `settled_format` (`weftdb/src/store/open.rs:1813`), which spreads the marker read off disk
+  and overrides only the layout numbers — so it is the store's founding scope, not the last
+  writer's. It is also the pair `import-rows-mode` tells the operator to serve the migrated
+  root under (`weft-server/src/bin/weft-server.rs:431` prints
+  `WEFT_STORE_DATABASE=... WEFT_STORE_SUBJECT=...`), so the pin measures the thing an operator
+  is already told to set, and a wrong one is exactly the mistake that message invites.
+- The check lives in the server, not in the store. A Storage-v2 root is a container of
+  `(database, subject)` namespaces, and opening one root under two subjects is a tested store
+  feature (`weftdb/src/store/segment_store.rs:4468`); a refusal inside the open path would
+  undo designed behaviour that other code and other tests depend on. What is actually broken
+  is a *server* serving a namespace of its own store that holds nothing, which from outside
+  the process is indistinguishable from a lost database — the one failure mode an operator
+  must not have to diagnose from query results. So the pin is
+  `weft-server/src/store_open.rs::pin_store_scope`, and the store lane is untouched.
+- Refused, and refused by default, with `WEFT_STORE_SCOPE_PIN=off` as the way out. Report and
+  serve anyway leaves the operator discovering the empty namespace by querying it, which is
+  the failure this slice exists to remove; the workspace's 1.0 posture elsewhere is the same
+  refusal-first choice — strict configuration (PAC-5b) and SEC-8's non-loopback-without-keys.
+  The refusal names both scopes, the root, and the three ways out (set both variables to the
+  store's scope, point `WEFT_SEGMENT_STORE_ROOT` at the root you mean, or turn the pin off),
+  and startup exits 65 — the operator-action class, which is what `exit_code_for_store_error`
+  has always said a scope mismatch is; this slice is the first to produce one.
+- Checked *before* the open, through the public `weftdb::store_format::read_marker`
+  (`weftdb/src/types/store_format.rs:715`), so a refusal leaves the root exactly as it found
+  it, takes no root lock, and cannot be raced by whoever holds it. A root with no marker
+  records no scope and is accepted: a fresh root has nothing to disagree with.
+- One narrow edge is accepted rather than fixed, and recorded here because it is real. A root
+  whose marker was lost while `store_meta` survived has no scope on disk; the open rebuilds
+  the marker from `store_meta`, which mirrors no scope, and records the scope that open came
+  with. The first start after such a loss therefore blesses whatever scope it ran under, and
+  every pin afterwards measures against that. Refusing it would mean refusing every
+  unmatched-marker recovery, a worse trade than the typo it would catch.
+- `GET /api/v1/version` takes `Scope::Read`, not `Scope::Probe`. It names layout numbers, the
+  store UUID and the scope being served, which is more than the anonymous probe surface should
+  carry; `/health` and `/ready` stay keyless, and `/ready` keeps reporting service, version
+  and store UUID, so a monitor needs no key and an operator with one gets the rest. The route
+  table in `docs/reference.md` records the choice beside the route.
+- The answer is built from process state alone — `Store::store()` and the scope startup
+  captured — and never from a store read. The questions this route exists to answer (which
+  build, what layout, which scope, why will it not start) are exactly the ones asked while a
+  store is being refused, and a handler that read the store would fail on the very state it is
+  being asked about. `/ready` reports a poisoned store for the same reason rather than failing.
+- The served scope and the pin mode are captured once into `AppState`'s `ServingScope`, on the
+  way to the open that consumes the environment, rather than re-read from the environment per
+  request: a request must report what the process *is* serving, which is what the open did,
+  not what a shell has exported since.
+
+**Rejected:** the pin inside `weftdb`'s open path, for the tested multi-scope reason above; a
+`scopes` list added to `STORE_FORMAT` so a root could record every scope it has held, which is
+a layout-format change on a slice whose subject is reporting a format that must not move (the
+release-pin job re-hashes those fixture bytes); `Scope::Probe` on the new route, which would
+widen the anonymous surface for no operator benefit; and answering the route from a fresh
+marker read, which would make it lie, or 500, precisely when it is most needed.
+
+**Not in this slice:** any change to the `STORE_FORMAT` bytes or the migration gate (FRE-12a's);
+the CLI's `--version` output, which PAC-7 settled; an HTTP status or flag for "the pin is off"
+beyond the field the version route reports; a store-lane scope registry; and pin handling in
+`import-rows-mode`, `restore`, `verify` or `admin`, which take `--database`/`--subject` or
+their own flags and resolve no serving scope at all.
+
 ## 2026-11-02 — SOA-8: the failure deck is a validated card deck, recovery is exact, and the maintenance driver is a pure state machine (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6, W5) lists SOA-8 by name only — "Failure deck,
@@ -3873,3 +3949,282 @@ wave, still pending) is the slice that records backup duration and RTO inputs;
 putting duration here would duplicate it. The 3.0–4.5 s tick-spacing figure in
 docs/reference.md is kept verbatim as a pre-EVI-18 observation under the old
 `Burst` behaviour, not re-measured under `Skip`.
+## 2026-11-03 — EVI-25 RTO inputs shape (FLAGGED FOR MERGE REVIEW)
+
+**Context:** the 1.0 plan §6 lists EVI-25 in W6 and the ROADMAP line says only
+"Backup, restore and recovery costs measured (RTO inputs and backup duration
+recorded)"; neither fixes which quantities count as RTO inputs. EVI-19 (W7)
+documents RPO/RTO from these inputs, so this slice must record them, not
+document the RTO itself.
+
+**Chosen:** the RTO inputs are four recorded durations plus the sizes already
+reported: (1) backup duration — every completed, verified control-plane
+snapshot observes into the `weft_backup_duration_seconds` histogram (manual
+endpoint and daemon tick alike) and the manual response carries its own
+`duration_ms`; (2) restore duration — the drill response and the offline
+`weft-server restore` report both carry `duration_ms` for the copy plus
+verification; (3) recovery duration — the restore report's
+`adoption.duration_ms` times the `--adopt` open (frame adoption, quarantine,
+clean shutdown) separately from the restore, so the two RTO components stay
+distinguishable; a restore without `--adopt` reports no adoption duration,
+because the recovery has not run yet. (4) The existing rows/bytes/frames let
+a reader normalize a duration by what was moved. Deliberately not changed:
+no restore semantics, no new bench (the existing `backup_cost` bench already
+times the backup tick; this slice records production durations, which a bench
+cannot), and no RPO/RTO document — that is EVI-19.
+
+**Batch-merge note:** this slice deliberately does not touch
+`Metrics::record_backup`, `BackupMetrics` or `Metrics::snapshot`, so it
+applies cleanly over EVI-18's health-metrics branch (which owns those). The
+one shared assertion to union at batch merge is the Prometheus `# TYPE`
+count in `metrics.rs`: EVI-18's gauge and this slice's histogram take it
+from 18 to 20.
+
+## 2026-11-04 — TAG-5: the series catalog is a layout-2 migration, keyed on the series key (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Conflict:** issue #437 and plan C1 ask for "the series table, the catalog and the
+`layout_version=3` marker as a registered migration". The code and the rest of the plan say
+otherwise: `store_format.rs` states that "every migration written before 1.0 belongs to
+layout 2", the three migrations since FRE-12a (`0003_fre14_legacy_catalog`, `0004_d_s12`,
+`0005_d_s13`) all followed that rule, and ROADMAP's FRE-13 ("Layout-1 to layout-2 upgrade
+test") and FRE-18 ("layout-2 baseline fixtures") both name layout 2 as the 1.0 baseline.
+
+**Chosen — deviates from C1 and from #437's second acceptance line:**
+
+1. **Layout 2, no `SUPPORTED_LAYOUT` bump.** `0006_tag5_series` is registered at layout 2
+   with floors 2/2, `older_writers_safe: false`, no precheck, no re-derive. The marker of a
+   store that applies it keeps `layout_version` 2; only `applied_through` moves. So #437's
+   "layout_version=3 marker written by that migration" is **not** met, on purpose.
+   - Why: a layout-3 bump would raise the floors of every store, untagged ones included, and
+     so remove rollback for everyone, to protect only unreleased layout-2 development builds
+     (v0.1.0 is layout 1). It would also make FRE-13 and FRE-18 false as written.
+   - What it costs: a layout-2 build from before TAG-5 still opens and writes a store that
+     has the catalog (floors 2/2 let it). It never reads the table, and it cannot write a
+     tagged series itself (the library and HTTP gates stay shut until TAG-8 and TAG-11).
+     But once a tags-enabled build has written tagged rows, a pre-TAG-5 build that reopens
+     the store breaks series isolation: its `segment_index` reads (`rows`, `all`) select by
+     aspect with no `series_id` filter, so it returns tagged rows as untagged results, and
+     its fsck R10 seeds `next_series_id` from the rows alone, ignoring the catalog.
+   - **Accepted, not mitigated:** no released build is affected. v0.1.0 is layout 1 and
+     refuses a layout-2 store, so only unreleased development builds between FRE-12a and
+     TAG-5 could reopen a tagged store. Guarding against them needs a lazy floor raise to 3
+     on the first tagged write, but `ensure_floor` cannot raise past `SUPPORTED_LAYOUT`, and
+     that would bring back the layout-3 bump this entry rejects. If the owner wants that
+     guard, it belongs to the layout decision at rc.1 (FRE-18), not to TAG-7.
+2. **Catalog shape:** `series(aspect TEXT, series_key TEXT, series_id INTEGER,
+   PRIMARY KEY(aspect, series_key))` in `segment_index.db`, so a registration commits in the
+   same `IndexTxn` as the rows that use it. The primary key is the key, not the id: a plain
+   `INSERT` of a taken key fails on the primary key, which is the conflict path proven
+   under Turso's MVCC. No secondary `UNIQUE` index is relied on (every index in this code
+   base is best effort). Ids are unique because only the allocator
+   (`aspect_seq.next_series_id`) hands them out, under the aspect's commit lock, and
+   because the registration's `INSERT ... SELECT ... WHERE NOT EXISTS` re-checks that no
+   key of the aspect holds the id, so a retried transaction that read a stale allocator
+   fails with `Conflict` rather than giving a second key the same id. The key is
+   stored as its canonical text. Series 0 (the empty tag set) is implicit and has no row.
+   The migration is pure DDL: no backfill.
+3. **No composite `segment_index(aspect, series_id, min_ts, max_ts)` index here.** It would
+   cost every `InsertNew` and every member delete on every workload, untagged included,
+   long before anything reads by series. It is deferred to tag pruning.
+4. **`IndexOp::RegisterSeries { aspect, series_id: SeriesId, series_key: SeriesKey }`** is a
+   plain `INSERT`, classified as guarded (a retry re-checks both the key and the id and
+   fails with `Conflict` on either), and is always paired with
+   `SeedSeries { next_series_id: id + 1 }` in the same transaction. Series 0 and the empty
+   key are refused as `Definite` before any statement runs, so the empty tag set never
+   gets a second id and no key ever aliases series 0.
+5. **Readers** on `SegmentIndexStore`: `series_id_for`, `series_key_of` (decoded through
+   `SeriesKey::from_canonical`, the storage path that accepts reserved `__` keys),
+   `series_of` and `next_series_id` (default 1). They are crate-private, so the public
+   `SegmentIndexStore` methods stay aspect-wide, and they carry
+   `cfg_attr(not(test), expect(dead_code))` until TAG-7 and TAG-8 call them.
+6. **R10 covers the catalog.** fsck now walks the union of the aspects `segment_index` and
+   `series` name, and seeds `next_series_id` past both the largest `series_id` on a row
+   and the largest id the catalog registered. Without the catalog term, losing
+   `aspect_seq` after every row of a series was quarantined would hand that id out again.
+   The catalog maximum is read with `MAX(series_id)`, not by decoding keys, so the repair
+   pass still seeds past a catalog whose keys this build cannot decode.
+7. **`pub struct SeriesId(pub u64)`** in `weftdb`, with `SeriesId::UNTAGGED = SeriesId(0)`,
+   `Default` (untagged) and `Display`. It is a newtype so that a series id cannot be passed
+   where a segment id is meant. `IndexRow.series_id` stays a bare `u64` for now; moving the
+   row type over is left to the slices that read by series.
+
+**Rejected:** layout 3 with floors 3/3 (the design's B1), for the reasons in 1. Floors 2/2
+with a re-derive hook (B2): it would be the first production use of `rederive` and still
+protects only development stores. `PRIMARY KEY (aspect, series_id)` plus `UNIQUE (aspect,
+series_key)`: the unique index is the part that cannot be relied on.
+
+## 2026-11-04 — TAG-7: tagged frames are a critical series-key envelope, the id is resolved at commit, and each aspect has a series cap (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** issue #441 names the slice only ("seal-lane tags work"). The design note's PR 2
+and its critique (B7-B9) fix the shape; where they disagree the critique wins. The library gate
+stays shut (tags D5), so nothing outside the crate's tests writes a tagged batch yet.
+
+**Chosen:**
+
+1. **Frame identity (tags D3).** A tagged batch's frames are each wrapped in a v7 envelope with
+   exactly one extension, `EXT_SERIES_KEY`, `critical: true`, whose payload is the canonical
+   `SeriesKey` bytes. The frame never records the id. An untagged frame is not enveloped and is
+   byte-identical to what `ingest` sealed before this slice; a test pins its CRC to the value
+   measured on the pre-TAG-7 commit. `byte_len` and `frame_crc` are the wrapped frame's (the
+   envelope ends in its own CRC, which is what the durable write reads off the trailer), so
+   `read_bound_frame` and fsck's checks need no change. `critical: true` is kept although the
+   critique calls the rationale weak (B10): it is harmless, and a build that cannot bind the key
+   must not serve the rows as untagged.
+2. **Chunking.** A tagged batch is cut to `MAX_ENCODED_FRAME_BYTES` less the envelope's worst
+   case (16 + 6 + key bytes, at most 1,046), so the wrapped frame still fits the target. Only
+   tagged batches pay it; an untagged batch is cut exactly as before.
+3. **`format_version` (critique B7).** The descriptor, and so `IngestResponse.format_version`,
+   records the **body's** layout: 5 single-block, 6 paged, never 7. Readers already choose
+   their decoder from the frame's own header (X-FRAME), so the number is a description, and
+   the body is what a caller can compare across tagged and untagged writes. The envelope is
+   documented on `IngestResponse` and counted in `byte_len`. Pinned by
+   `tagged_ingest_writes_a_critical_series_key_envelope`.
+4. **Series resolution at commit.** `publish_ingest` resolves the key under the aspect's commit
+   lock, in the same `IndexTxn` as the rows: the catalog's id when the key is registered;
+   otherwise `aspect_seq.next_series_id`, pushed as `RegisterSeries` plus `SeedSeries`. Every
+   row's `series_id`, the receipt's and the ledger's `series_ids` carry that id. A `Conflict`
+   on the registration is an error, not retried (critique B8): only ingest registers series,
+   and only under the commit lock. A crash before the commit leaves the frame as ordinary
+   crash litter and leaks no id (`a_power_cut_between_tagged_frames_leaves_no_catalog_row_without_rows`).
+5. **Gate split.** Public `ingest` is `ingest_inner(.., TagPolicy::Refuse)` and still answers
+   `GroupsUnsupported`. `TagPolicy::Allow` is crate-private and, until TAG-8, constructed only
+   by tests. Reserved `__` keys are not refused on that path yet; that check belongs to the
+   gate flip (critique D17).
+6. **`IngestBatch::series_ids()` is removed (critique B9).** Correction to B9's premise: the
+   method did ship, in `weftdb` 0.2.0 on crates.io (v0.2.0 published the library crates). It is
+   removed anyway, because it could only ever answer `[0]` and a tagged batch's id does not
+   exist until commit; the pre-1.0 policy allows the break in the next minor release, and
+   CHANGELOG marks it as breaking. Deprecating instead would leave a method that answers wrong
+   for every tagged batch.
+7. **Series cap.** `StoreError::SeriesLimit { aspect, limit }` and
+   `SegmentStoreOptions::max_series_per_aspect` (`DEFAULT_MAX_SERIES_PER_ASPECT` = 100,000;
+   the number is a guess, as the design says). It counts the catalog's rows for the aspect
+   (series 0 never counts), is checked before any frame is written and again at commit under
+   the lock, and refuses only a new key. `weft-server` maps it to the existing `400
+   series_limit`. No operator setting is added; one Test-tier harness variable
+   (`WEFT_TEST_TAG_SEAL_CRASH_ROOT`) is, so the registry holds 84. A refusal at commit
+   (the race the pre-check cannot close) unlinks the frames that batch just wrote, so
+   recovery never journals a refused key's frames as orphans for TAG-9 to adopt.
+8. **Maintenance outputs keep their key.** `PlannedOutput` carries `Option<SeriesKey>`;
+   `swap_plans` looks up `series_key_of` once per tagged plan, and `write_output` wraps the
+   output in the same envelope. A plan whose series the catalog does not hold fails the swap.
+   This lands here, not in TAG-6, so that no commit ever puts an untagged frame under a
+   non-zero `series_id`.
+9. **No floor raise.** Following the TAG-5 entry and D1, nothing calls `ensure_floor`; the store
+   stays at layout 2.
+
+**Rejected:** writing the id into the frame (meaningless after a restore); allocating the id
+before the frame write (a catalog transaction outside the commit lock, and a crash would leak
+ids); retrying once on a registration `Conflict` (a dead path under the commit lock);
+reporting `format_version` 7 for a tagged frame (it would describe the wrapper rather than
+the data, and differ between two writes of the same rows).
+
+## 2026-11-04 — TAG-6: maintenance plans within one series; precedence, overlap stats and gates count per series; hot tail per series, aspect-wide threshold (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** issue #440 names the slice only ("maintenance lane"). The design note's PR 3 and
+its critique (C11-C14) fix the shape; where they disagree the critique wins. Tagged rows still
+come only from the crate's tests (the library gate opens in TAG-8), so nothing outside them
+reaches the per-series paths yet; an untagged aspect is one series and plans exactly as before.
+
+**Chosen:**
+
+1. **Partition first.** `overlap_components` splits an aspect's rows by `series_id` (`by_series`)
+   and sweeps each series on its own, so a component never mixes series (I12 is now guaranteed
+   upstream of `swap_plans`' bail). The M2 closure property holds per series, which is sound
+   only because a read targets one series (tags D4).
+2. **No batching across components (critique C11).** `reconcile_overlaps_held` already makes one
+   swap per component; it is unchanged. The design's batch test is dropped.
+3. **One swap per series (critique C12).** `squash_aspect` folds each series into its own output,
+   looping one series per `swap_plan` rather than putting a plan per series into one
+   transaction, so no swap nears `MAX_PLANS_PER_TXN` (32) whatever the series count, and
+   memory stays one series' merge. A failure leaves the series squashed before it squashed.
+   `squash_aspect_to_target_rows` groups consecutive ids within a series; the P1 argument is
+   restated per series (no other row *of the series* has an id between a group's members).
+4. **Gates count per series (critique C13).**
+   - `squash_aspect_if_exceeds`: the cap applies per series. The cheap aspect-wide count still
+     settles most ticks (no series holds more than the aspect); past it, only the series over
+     the cap are squashed.
+   - Fragmentation gate: after the O(1) rollup check, an aspect with registered series computes
+     `ideal = Σ max(1, ⌈rows_s / target⌉)` from its rows. That sum is never below the
+     aspect-wide ideal, so an untagged aspect (no catalog rows) still costs one rollup read.
+   - The overlap sweep's `had_overlap` is the per-series count, so a tagged aspect whose series
+     merely share a window is not reported as reconciled.
+5. **Precedence per series (critique C14, overriding the design's "leave it aspect-wide").**
+   `refuse_outranking_outputs` compares only rows of the members' series. Left aspect-wide, a
+   newer row of any other series in the window would refuse almost every `split_segment` and
+   P2 output of a tagged aspect.
+6. **Hot tail per series, aspect-wide threshold.** `reconcile_aspect_hot_cold` keeps each
+   series' highest id hot; the backlog it compares with `threshold` stays the aspect's unsorted
+   count, so a single knob stays and the untagged decision is unchanged.
+7. **Overlap stats per series, no descriptor field.** `aspect_stats().overlapping_segments`
+   and `store_overlapping_segments` sum `SegmentIndex::overlapping_count` over one index per
+   series built from the index rows. `SegmentDescriptor` gets no series field (its serde shape
+   is frozen).
+8. **Deviation: the daemon test.** The design asks for weft-server's
+   `every_tick_kind_isolates_a_truncated_frame` with a two-series aspect. weft-server cannot
+   write a tagged batch until the gate opens (only the crate-private `TagPolicy::Allow` can),
+   and a `fault-injection` hook would run only in a job that does not run the lib tests. The
+   same coverage lands in weftdb as
+   `every_sweep_kind_isolates_a_truncated_frame_beside_a_two_series_aspect`, which runs each
+   store-wide sweep the daemon's six tick kinds call; the weft-server test is unchanged and
+   gets its two-series variant when TAG-11 opens the HTTP gate.
+
+**Rejected:** batching plans across components or series into one transaction (no saving the
+swap needs, and it holds every merged series in memory at once); a series field on
+`SegmentDescriptor`; per-series metrics and sweep counters (deferred by the plan); a per-series
+backlog threshold for the hot tail (a second knob for no measured need).
+
+## 2026-11-04 — TAG-9 (part of #310): recovery binds series keys — tagged orphans adopted into their series, held rows released, indexed rows checked against their frame's key (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Minimal TAG-9 per design PR 5 with critique E19-E20. The broader C5 frame-error-class work
+of #310 is not done here.
+
+1. **`adopt_orphan` takes `Option<SeriesKey>`.** A tagged orphan resolves its key in the
+   frame's aspect — the catalog's id, or the aspect's next series id with `RegisterSeries` +
+   `SeedSeries` — in the same transaction as its `InsertNew` and allocator bump (plus
+   `ClearJournal` when it releases a held row). Adoption now runs under the aspect's commit
+   lock and takes its id from `CommitGuard::allocate`, rather than computing it from
+   `allocator_seed` beside the lock: a held row may be released by an fsck on a live store,
+   where an id handed out outside the lock would collide with the lock's cached allocator.
+   Ids may therefore start past a legacy-named file's id in `segments/`, as every seal's do.
+2. **No series cap in recovery.** The new `resolve_series_key` (shared with ingest's
+   `resolve_series`, which still checks `max_series_per_aspect` first) applies no cap: the
+   data already exists, and refusing to bind it would leave it invisible again.
+3. **Restore mode:** a decodable tagged orphan is adopted directly; `JournalHeld` only when
+   its aspect is undeclared (no catalog to bind in). Held rows are released on every later
+   pass (open or fsck) through the same `adopt_orphan` path once the aspect is declared; a
+   still-undeclared one stays held. A held or orphan frame whose key cannot be bound is
+   quarantined suspect (the held one's journal row cleared in the same transaction).
+4. **Indexed rows:** `describe_frame` beside `read_full`. A `SERIES_KEY` payload that is not
+   canonical, is empty, or appears twice, in a frame whose body decoded (so its CRC verified),
+   is **suspect** under C5. A key that differs from `series_key_of(row.series_id)` is rebound
+   with one `ReplaceExpected` (registration ops first in the same transaction) and counted in
+   the new `RecoveryReport.series_rebound` as well as `rebound`. Critique E19: a row moved to
+   the aspect its frame names gets its key resolved in the **target** aspect's catalog, never
+   the source aspect's id.
+5. **`report_only` everywhere:** it counts the suspects, series rebinds and held releases it
+   would make, and registers, rewrites, quarantines and clears nothing.
+6. **Rollup rebuild moved after the orphan pass**, so aspects that gained adopted rows get
+   their rollup rebuilt in the same pass (before, adoptions were pushed onto
+   `changed_aspects` after the rebuild loop had already run).
+7. **Fixture and wording.** `restore_mode_adopts_orphans_and_holds_series_key_frames` used a
+   non-canonical payload (`price|a=1`, critical false); it becomes
+   `restore_mode_adopts_series_key_frames_into_their_series` with `a\x1f1`, critical true,
+   expecting adopted = 2, held = 0. `restore_cli.rs:83` already asserted held = 0 (E20) and
+   is unchanged; `restore.rs` wording no longer says frames are held "until TAG-9".
+8. **Deviation (tests):** the inverted restore test cannot assert that untagged reads omit the
+   tagged rows, because reads are still aspect-wide until series-scoped reads land (TAG-8);
+   it asserts the tagged rows are readable and bound to their registered series instead.
+9. **R10 seeds before the row loop.** A rebind registers its key from `next_series_id`, so the
+   seed (max of catalog and row ids, every aspect) now commits before any row is checked; a
+   lost `aspect_seq` row can no longer make a rebind collide with a catalog id and fail open.
+10. **Held rows always settle.** A held frame that no longer decodes is quarantined under its
+   decode class, one with a malformed key is suspect (journal row cleared in the same txn);
+   a missing frame, a zero-row frame or a name with no aspect clears the row and counts in
+   the new `RecoveryReport.held_cleared`. Report-only counts held adoptions through the same
+   pure `plan_adoption` the real path uses, and `suspected` counts only orphans whose name
+   lets them be filed.
+
+**Rejected:** carrying the source aspect's `series_id` on an aspect move (E19); treating a
+non-critical `SERIES_KEY` as malformed (writers always mark it critical, and the key is
+still well-defined); a separate `released` counter (released held rows count as `adopted`).

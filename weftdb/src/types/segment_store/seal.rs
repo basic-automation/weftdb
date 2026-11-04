@@ -200,8 +200,12 @@ impl SegmentStore {
 	/// `format_version` and statistics, not those of the member whose id it takes (a paged
 	/// member merged into a single-block output; design window
 	/// merge-paged-target-format-wedge).
+	///
+	/// An output of a tagged series (`series_key` set) is wrapped in the same series-key
+	/// envelope its members were sealed in ([`tag_frame`]); its `byte_len` and CRC are the
+	/// wrapped frame's, and its `format_version` stays the body's (5 or 6).
 	pub(crate) async fn write_output(&self, aspect: &str, schema: &AspectSchema, output: PlannedOutput) -> Result<WrittenOutput> {
-		let PlannedOutput { gen, prec, timestamps, values, rows_per_page } = output;
+		let PlannedOutput { gen, prec, timestamps, values, rows_per_page, series_key } = output;
 		let name = frame_name::frame_name(aspect, gen, prec);
 		let path = self.output_path(aspect, &name)?;
 		let stored = path.to_string_lossy().into_owned();
@@ -209,12 +213,12 @@ impl SegmentStore {
 		let encode = move || -> Result<EncodedOutput> {
 			let (bytes, descriptor) = if let Some(rows_per_page) = rows_per_page {
 				let segment = schema.seal_paged_nullable(&timestamps, &values, rows_per_page).map_err(|e| anyhow::anyhow!("sealing a maintenance output failed: {e}"))?;
-				let bytes = segment.write_to();
+				let bytes = tag_frame(segment.write_to(), series_key.as_ref())?;
 				let descriptor = SegmentDescriptor::of_paged_segment(0, stored, bytes.len() as u64, &segment);
 				(bytes, descriptor)
 			} else {
 				let segment = schema.seal_nullable(&timestamps, &values).map_err(|e| anyhow::anyhow!("sealing a maintenance output failed: {e}"))?;
-				let bytes = segment.write_to();
+				let bytes = tag_frame(segment.write_to(), series_key.as_ref())?;
 				let descriptor = SegmentDescriptor::of_segment(0, stored, bytes.len() as u64, &segment);
 				(bytes, descriptor)
 			};
@@ -331,7 +335,7 @@ impl SegmentStore {
 	///   already folded into the swap's transaction at M5, S11).
 	///
 	/// Up to [`MAX_PLANS_PER_TXN`] plans, independent of each other (no member in two).
-	/// Every caller today swaps one at a time; per-series maintenance batches them.
+	/// Every caller today swaps one at a time; per-series maintenance (TAG-6) loops a series at a time.
 	///
 	/// Returns each plan's outcome, in order. A plan refused or in conflict at M5 has its
 	/// outputs discarded and fails alone.
@@ -369,15 +373,28 @@ impl SegmentStore {
 			prepared.push(PreparedPlan { members, retired, series_id, prec, fresh: Vec::new(), outputs: Vec::new() });
 			rows.push(outputs);
 		}
+		// Each tagged plan's outputs carry its series key (TAG-7), looked up once per plan:
+		// an output is written in the envelope its members were, so no commit ever puts an
+		// untagged frame under a non-zero `series_id`. Series ids are never reused, so the
+		// key a row's id names cannot change under the swap.
+		let mut keys = Vec::with_capacity(prepared.len());
+		for plan in &prepared {
+			keys.push(if plan.series_id == 0 {
+				None
+			} else {
+				let key = self.index.series_key_of(aspect, crate::SeriesId(plan.series_id)).await?;
+				Some(key.with_context(|| format!("a swap plan of aspect {aspect:?} rewrites series {}, which its catalog has not registered", plan.series_id))?)
+			});
+		}
 		fault::hit(FaultPoint::MPlanned).await?;
 		// M2: a run of fresh generations for every output, in plan and time order.
 		let counts: Vec<usize> = rows.iter().map(Vec::len).collect();
 		let count: usize = counts.iter().sum();
 		let mut gen = self.allocate_gens(aspect, u64::try_from(count).unwrap_or(u64::MAX)).await?;
 		let mut planned = Vec::with_capacity(count);
-		for (outputs, plan) in rows.into_iter().zip(&prepared) {
+		for ((outputs, plan), series_key) in rows.into_iter().zip(&prepared).zip(keys) {
 			for PlanOutput { timestamps, values, rows_per_page } in outputs {
-				planned.push(PlannedOutput { gen, prec: plan.prec, timestamps, values, rows_per_page });
+				planned.push(PlannedOutput { gen, prec: plan.prec, timestamps, values, rows_per_page, series_key: series_key.clone() });
 				gen = gen.saturating_add(1);
 			}
 		}
@@ -606,12 +623,38 @@ impl SegmentStore {
 	/// filesystem write error, or a libSQL index failure (an ambiguous
 	/// COMMIT poisons the store, as for every write).
 	pub async fn ingest(&self, aspect: &str, batch: &IngestBatch) -> Result<IngestReceipt> {
+		self.ingest_inner(aspect, batch, TagPolicy::Refuse).await
+	}
+
+	/// [`ingest`](Self::ingest), with the tags gate set by `tags` (TAG-7).
+	///
+	/// Under [`TagPolicy::Refuse`] this is exactly the public entry point. Under
+	/// [`TagPolicy::Allow`] a non-empty `batch.groups` seals as its series (tags D3):
+	///
+	/// - every frame is wrapped in a v7 envelope carrying the canonical series key as
+	///   a critical [`EXT_SERIES_KEY`](weft_physical_type::EXT_SERIES_KEY) extension
+	///   ([`tag_frame`]), and the batch is cut to [`ingest_frame_target`], the frame
+	///   target less the envelope, so the wrapped frame still fits;
+	/// - the series id is resolved at commit, under the commit lock
+	///   ([`publish_ingest`](Self::publish_ingest)): the id the catalog holds for the
+	///   key, or a new one registered in the same transaction as the rows;
+	/// - a new key past [`SegmentStoreOptions::max_series_per_aspect`] is
+	///   [`StoreError::SeriesLimit`], checked before any frame is written and again at
+	///   commit.
+	///
+	/// An empty `groups` is series 0 under either policy, and its frames are
+	/// byte-identical to the ones an ingest sealed before tags.
+	///
+	/// # Errors
+	///
+	/// As [`ingest`](Self::ingest), plus [`SeriesLimit`](StoreError::SeriesLimit).
+	pub(crate) async fn ingest_inner(&self, aspect: &str, batch: &IngestBatch, tags: TagPolicy) -> Result<IngestReceipt> {
 		self.writable()?;
 		aspect_name::validate(aspect)?;
 		let mut phase = IngestPhase::Validating;
 		crate::exec::set_ingest_phase(phase);
 		let schema = self.require_schema(aspect).await.map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
-		if !batch.groups.is_empty() {
+		if !batch.groups.is_empty() && tags == TagPolicy::Refuse {
 			return Err(StoreError::GroupsUnsupported { aspect: aspect.to_string() }.into());
 		}
 		if batch.timestamps.len() != batch.values.len() {
@@ -629,6 +672,15 @@ impl SegmentStore {
 			receipt.duplicate = true;
 			return Ok(receipt);
 		}
+		// A new series past the cap is refused before any frame is written; the commit
+		// checks again under the lock, and that check is the one that decides.
+		let series_key = (!batch.groups.is_empty()).then(|| batch.groups.series_key());
+		if let Some(key) = series_key {
+			if self.index.series_id_for(aspect, key).await?.is_none() {
+				self.check_series_room(aspect).await?;
+			}
+		}
+		let target = ingest_frame_target(&batch.groups);
 		phase = IngestPhase::Encoding;
 		crate::exec::set_ingest_phase(phase);
 		// Encode the whole batch once, then cut the encoded run at
@@ -636,18 +688,18 @@ impl SegmentStore {
 		// over rows, and each chunk re-seals from its own rows, so a chunk
 		// boundary is a segment boundary and nothing else.
 		let whole = encode_ingest_chunk(&schema, &batch.timestamps, &batch.values, batch.rows_per_page).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
-		let chunks = if whole.write_to_with(&self.frame_options(whole.row_count(), false, 0.0)).len() as u64 <= crate::MAX_ENCODED_FRAME_BYTES {
+		let chunks = if whole.write_to_with(&self.frame_options(whole.row_count(), false, 0.0)).len() as u64 <= target {
 			vec![(batch.timestamps.clone(), batch.values.clone())]
 		} else {
 			let mut chunks: Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::new();
-			for (timestamps, values) in chunk_ingest_rows(&batch.timestamps, &batch.values) {
+			for (timestamps, values) in chunk_ingest_rows(&batch.timestamps, &batch.values, target) {
 				// Prove each chunk's frame fits before any frame is
 				// written: a chunk that still exceeds the target holds a
 				// single timestamp run, the smallest cut there is.
 				let segment = encode_ingest_chunk(&schema, &timestamps, &values, batch.rows_per_page)?;
 				let bytes = segment.write_to_with(&self.frame_options(segment.row_count(), false, 0.0));
-				if bytes.len() as u64 > crate::MAX_ENCODED_FRAME_BYTES && timestamps.len() > 1 {
-					bail!("an ingest chunk of {} rows still encodes past the {}-byte frame target", timestamps.len(), crate::MAX_ENCODED_FRAME_BYTES);
+				if bytes.len() as u64 > target && timestamps.len() > 1 {
+					bail!("an ingest chunk of {} rows still encodes past the {target}-byte frame target", timestamps.len());
 				}
 				chunks.push((timestamps, values));
 			}
@@ -658,7 +710,9 @@ impl SegmentStore {
 		let mut written: Vec<(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::with_capacity(chunks.len());
 		for (timestamps, values) in &chunks {
 			let segment = encode_ingest_chunk(&schema, timestamps, values, batch.rows_per_page).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
-			let bytes = segment.write_to_with(&self.frame_options(segment.row_count(), segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
+			// A tagged frame is wrapped before it is written, so its `byte_len` and the CRC
+			// the write reads off its trailer are the envelope's (tags D3).
+			let bytes = tag_frame(segment.write_to_with(&self.frame_options(segment.row_count(), segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead())), series_key)?;
 			let byte_len = bytes.len() as u64;
 			let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await.with_context(|| format!("ingest of aspect {aspect:?} failed while {phase}"))?;
 			if written.len() + 1 < chunks.len() {
@@ -669,7 +723,22 @@ impl SegmentStore {
 		}
 		phase = IngestPhase::Committing;
 		crate::exec::set_ingest_phase(phase);
-		let receipt = self.publish_ingest(aspect, batch, fingerprint, &written).await.with_context(|| format!("ingest of aspect {aspect:?} failed while {phase}"))?;
+		let receipt = match self.publish_ingest(aspect, batch, fingerprint, &written).await {
+			Ok(receipt) => receipt,
+			Err(err) => {
+				// A series-cap refusal at commit is definite and pre-COMMIT: no index row
+				// names these frames, so unlinking them breaks no write-once rule, and it keeps
+				// recovery from journaling a refused key's frames as orphans to adopt later.
+				if matches!(err.downcast_ref::<StoreError>(), Some(StoreError::SeriesLimit { .. })) {
+					for (descriptor, ..) in &written {
+						if let Err(cleanup) = self.fs.remove_file(std::path::Path::new(&descriptor.path)).await {
+							tracing::warn!(aspect, path = %descriptor.path, error = %cleanup, "failed to unlink a frame of a refused tagged ingest");
+						}
+					}
+				}
+				return Err(err.context(format!("ingest of aspect {aspect:?} failed while {phase}")));
+			}
+		};
 		// Per-segment partial sidecars (opt-in), as in `persist`: a pure
 		// read accelerator, never failing the ingest.
 		for (descriptor, gen, crc, timestamps, values) in &written {
@@ -690,6 +759,15 @@ impl SegmentStore {
 	/// ids and the fold atomic against every other writer of the aspect.
 	/// The caller has set its phase to
 	/// [`IngestPhase::Committing`] before calling this.
+	///
+	/// A tagged batch's series is resolved here, under the same lock and in the same
+	/// transaction (TAG-7): the id the catalog holds for the batch's key, or, for a
+	/// new key, the aspect's next series id, registered with
+	/// [`RegisterSeries`](IndexOp::RegisterSeries) and
+	/// [`SeedSeries`](IndexOp::SeedSeries) beside the rows that use it, so a tagged
+	/// row never commits without its catalog row. Every row, the receipt and the ledger
+	/// record that id. Only ingest registers series, and only under the commit lock, so
+	/// a `Conflict` on the registration is not a race to retry but an error.
 	pub(crate) async fn publish_ingest(&self, aspect: &str, batch: &IngestBatch, fingerprint: i64, written: &[(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)]) -> Result<IngestReceipt> {
 		let mut commit = self.commit_lock(aspect).await?;
 		// The ledger is re-checked under the commit lock: a commit of the
@@ -706,14 +784,15 @@ impl SegmentStore {
 			return Ok(receipt);
 		}
 		let epoch = commit.state().epoch.saturating_add(1);
-		let mut ops: Vec<IndexOp> = Vec::with_capacity(written.len() + 3);
+		let mut ops: Vec<IndexOp> = Vec::with_capacity(written.len() + 5);
+		let series_id = self.resolve_series(aspect, &batch.groups, &mut ops).await?;
 		let mut descriptors: Vec<SegmentDescriptor> = Vec::with_capacity(written.len());
 		let mut max_gen = 0u64;
 		for (descriptor, gen, frame_crc, _ts, _vs) in written {
 			let id = commit.allocate()?;
 			let descriptor = SegmentDescriptor { id, ..descriptor.clone() };
 			max_gen = max_gen.max(*gen);
-			ops.push(IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow { desc: descriptor.clone(), gen: *gen, prec: Some(*gen), frame_crc: Some(*frame_crc), commit_epoch: Some(epoch), series_id: 0 } });
+			ops.push(IndexOp::InsertNew { aspect: aspect.to_string(), row: IndexRow { desc: descriptor.clone(), gen: *gen, prec: Some(*gen), frame_crc: Some(*frame_crc), commit_epoch: Some(epoch), series_id: series_id.0 } });
 			descriptors.push(descriptor);
 		}
 		let mut rollup = self.index.rollup(aspect).await?.unwrap_or_default();
@@ -721,8 +800,8 @@ impl SegmentStore {
 			rollup = rollup.folded(descriptor);
 		}
 		let (min_ts, max_ts) = span_of(&batch.timestamps).map_or((None, None), |(lo, hi)| (Some(lo), Some(hi)));
-		let receipt = IngestReceipt { aspect: aspect.to_string(), key: batch.key.clone(), fingerprint, row_count: batch.timestamps.len(), min_ts, max_ts, segment_ids: descriptors.iter().map(|d| d.id).collect(), series_ids: batch.series_ids(), commit_epoch: epoch, duplicate: false };
-		let entry = LedgerEntry { aspect: aspect.to_string(), key: batch.key.clone(), fingerprint, row_count: batch.timestamps.len(), min_ts, max_ts, id_lo: receipt.segment_ids.first().copied(), id_hi: receipt.segment_ids.last().copied(), receipt_json: receipt.to_json(), series_ids: batch.series_ids(), commit_epoch: epoch, created_ms: now_ms() };
+		let receipt = IngestReceipt { aspect: aspect.to_string(), key: batch.key.clone(), fingerprint, row_count: batch.timestamps.len(), min_ts, max_ts, segment_ids: descriptors.iter().map(|d| d.id).collect(), series_ids: vec![series_id.0], commit_epoch: epoch, duplicate: false };
+		let entry = LedgerEntry { aspect: aspect.to_string(), key: batch.key.clone(), fingerprint, row_count: batch.timestamps.len(), min_ts, max_ts, id_lo: receipt.segment_ids.first().copied(), id_hi: receipt.segment_ids.last().copied(), receipt_json: receipt.to_json(), series_ids: vec![series_id.0], commit_epoch: epoch, created_ms: now_ms() };
 		ops.push(seq_bump(aspect, &commit, max_gen.saturating_add(1), epoch));
 		ops.push(IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup });
 		ops.push(IndexOp::RecordIngest { entry });
@@ -730,6 +809,64 @@ impl SegmentStore {
 		commit.set_epoch(epoch);
 		drop(commit);
 		Ok(receipt)
+	}
+
+	/// The series id `groups` commits under in `aspect`, for
+	/// [`publish_ingest`](Self::publish_ingest), which holds the aspect's commit lock:
+	/// series 0 for the empty tag set; the catalog's id for a registered key; otherwise
+	/// the aspect's next series id, with the [`RegisterSeries`](IndexOp::RegisterSeries)
+	/// and [`SeedSeries`](IndexOp::SeedSeries) that register it pushed onto `ops`.
+	///
+	/// # Errors
+	///
+	/// [`StoreError::SeriesLimit`] for a new key when the aspect already holds
+	/// [`max_series_per_aspect`](SegmentStoreOptions::max_series_per_aspect) series, or
+	/// a catalog read failure.
+	pub(crate) async fn resolve_series(&self, aspect: &str, groups: &crate::TagSet, ops: &mut Vec<IndexOp>) -> Result<crate::SeriesId> {
+		if groups.is_empty() {
+			return Ok(crate::SeriesId::UNTAGGED);
+		}
+		let key = groups.series_key();
+		if let Some(id) = self.index.series_id_for(aspect, key).await? {
+			return Ok(id);
+		}
+		self.check_series_room(aspect).await?;
+		self.resolve_series_key(aspect, key, ops).await
+	}
+
+	/// The series id `key` has in `aspect`'s catalog, registering it as the aspect's
+	/// next series id when the catalog does not hold it yet: the
+	/// [`RegisterSeries`](IndexOp::RegisterSeries) and [`SeedSeries`](IndexOp::SeedSeries)
+	/// that register it are pushed onto `ops`, for the caller to commit in the same
+	/// transaction as the rows that use the id. The empty key is series 0 and is never
+	/// registered. No series cap is applied: [`resolve_series`](Self::resolve_series)
+	/// checks it for ingest, and recovery (TAG-9) binds data that already exists.
+	///
+	/// The caller holds `aspect`'s commit lock, the only lock under which series are
+	/// registered, so a `Conflict` on the registration is an error, not a race.
+	///
+	/// # Errors
+	///
+	/// A catalog read failure.
+	pub(crate) async fn resolve_series_key(&self, aspect: &str, key: &crate::SeriesKey, ops: &mut Vec<IndexOp>) -> Result<crate::SeriesId> {
+		if let Some(id) = self.index.series_id_for(aspect, key).await? {
+			return Ok(id);
+		}
+		let id = self.index.next_series_id(aspect).await?;
+		ops.push(IndexOp::RegisterSeries { aspect: aspect.to_string(), series_id: crate::SeriesId(id), series_key: key.clone() });
+		ops.push(IndexOp::SeedSeries { aspect: aspect.to_string(), next_series_id: id.saturating_add(1) });
+		Ok(crate::SeriesId(id))
+	}
+
+	/// Refuse with [`StoreError::SeriesLimit`] when `aspect` already holds
+	/// [`max_series_per_aspect`](SegmentStoreOptions::max_series_per_aspect) registered
+	/// series, so one more cannot be registered. Series 0 does not count.
+	pub(crate) async fn check_series_room(&self, aspect: &str) -> Result<()> {
+		let held = self.index.series_count(aspect).await?;
+		if held >= self.max_series_per_aspect {
+			return Err(StoreError::SeriesLimit { aspect: aspect.to_string(), limit: self.max_series_per_aspect }.into());
+		}
+		Ok(())
 	}
 
 	/// Seal a dense `(timestamp, value)` batch under `aspect`'s **declared** schema —

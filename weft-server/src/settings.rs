@@ -142,9 +142,10 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_SEGMENT_STORE_ROOT", tier: Tier::Stable, summary: "Opens the columnar segment store rooted at this directory, which is what makes the `/api/v1/storage/...` endpoints live at all.", accepts: "a directory path; the Storage v2 layout is created there if absent", default: "unset: no store — the stateless interpolate/downsample API only, and `503` on storage reads", read_by: "weft-server/startup/state.rs" },
 	VarSpec { name: "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD", tier: Tier::Experimental, summary: "Writes a sealed segment's value column in the bit-sliced (bit-plane-major) codec when it costs no more than this ratio over the size-selected codec. The decode-latency win that motivated it did not survive the word-wise linear unpack, and the codec sits behind the `bitsliced-codec` cargo feature, so this is the clearest candidate for removal.", accepts: "a finite number above 0 (`1.0` = only when free)", default: "unset: the ordinary size-selected codec; a build without the feature warns once and ignores it", read_by: "weftdb/types/segment_store.rs (`TransposedPolicy::from_env`)" },
 	VarSpec { name: "WEFT_SERVER_ADDR", tier: Tier::Stable, summary: "The address and port `weft-server` binds.", accepts: "a `host:port` socket address, e.g. `0.0.0.0:9000`", default: "`127.0.0.1:8080`; an unparseable value stops the server from starting", read_by: "weft-server/startup/config.rs" },
-	VarSpec { name: "WEFT_SERVER_BIN", tier: Tier::Test, summary: "The built weft-server binary the client contract tests start and drive over the wire (weft-client's tests/live.rs, and clients/python's test_live.py). No shipped binary reads it.", accepts: "a path to a weft-server executable", default: "unset: the contract tests pass without running", read_by: "weft-client/tests/live.rs" },
+	VarSpec { name: "WEFT_SERVER_BIN", tier: Tier::Test, summary: "Points the weft-client live contract tests at a server binary to run, so the client is tested against a real server instead of skipped. No shipped binary reads it.", accepts: "a path to a weft-server binary", default: "unset, or naming no file: the live contract tests pass without running", read_by: "weft-client/tests/live.rs" },
 	VarSpec { name: "WEFT_SHUTDOWN_GRACE_SECS", tier: Tier::Tuning, summary: "The shutdown grace (plan C9, wired by D-S14): how long the serve path lets live connections finish after the shutdown signal before the remainder are aborted and startup proceeds to the task drain and the store's shutdown.", accepts: "a positive whole number of seconds", default: "5 s (`SHUTDOWN_DRAIN` in serve.rs)", read_by: "weft-server/serve.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_STORE_DATABASE", tier: Tier::Tuning, summary: "Which database inside the store root the storage endpoints read and write. A Storage v2 root holds several databases, so this says whose declared aspects and rows a request sees — the container half of the store's scope.", accepts: "a database name, e.g. `default` or `v010_legacy`", default: "`default`, the database `weftdb::SegmentStore::open` uses, so a store written before this variable existed keeps opening the same way", read_by: "weft-server/store_open.rs" },
+	VarSpec { name: "WEFT_STORE_SCOPE_PIN", tier: Tier::Tuning, summary: "Whether the server refuses to serve a store root that records a different `(database, subject)` scope than the two `WEFT_STORE_*` variables name (FRE-12b). Serving a scope the store does not hold looks like an empty database and then quietly fills a phantom one, so the refusal is the default.", accepts: crate::store_open::SCOPE_PIN_VALUES, default: "on: a mismatched scope stops the server from starting with status 65 and a message naming both scopes; `off` serves the configured scope anyway, for a deployment that really does hold several scopes in one root", read_by: "weft-server/store_open.rs (`ScopePin::from_env`), read in startup/state.rs" },
 	VarSpec { name: "WEFT_STORE_SUBJECT", tier: Tier::Tuning, summary: "Which subject inside the store's database the storage endpoints read and write: the namespace the aspect catalog is keyed by, and the one `weft-server import-rows-mode` writes a migrated series into.", accepts: "a subject name", default: "`default`, the subject `weftdb::SegmentStore::open` uses", read_by: "weft-server/store_open.rs" },
 	VarSpec { name: "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process the ambiguous-COMMIT test spawns: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_AUDIT_FULL_CHILD", tier: Tier::Test, summary: "Marks the child process the audit write-failure test spawns, in which a file-size rlimit of zero makes the audit log's writes fail so its poisoned-failure latching is exercised. No shipped binary reads it.", accepts: "any value", default: "unset: the parent test spawns the child instead of running the scenario", read_by: "weft-server/audit.rs (test child)" },
@@ -162,6 +163,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_TEST_S9_SUFFIX_RACE_DIR", tier: Tier::Test, summary: "Set only in the child process racing an overlap split's suffix against a later seal: the directory it works in.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_SWAP_MATRIX", tier: Tier::Test, summary: "Names which cell of the swap/crash matrix a child process runs, so each cell arms its faults in its own process.", accepts: "a `<mode>:<op>` spec", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_SWAP_MATRIX_DIR", tier: Tier::Test, summary: "The work directory handed to the swap-matrix child named by `WEFT_TEST_SWAP_MATRIX`.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
+	VarSpec { name: "WEFT_TEST_TAG_SEAL_CRASH_ROOT", tier: Tier::Test, summary: "The store root handed to the tagged-seal crash child that `a_power_cut_between_tagged_frames_leaves_no_catalog_row_without_rows` starts.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/tag_seal_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_TXN_CHILD_INDEX", tier: Tier::Test, summary: "Set only in the child process that dies inside an `IndexTxn`: the index database it opens.", accepts: "a file path", default: "unset", read_by: "weftdb/types/index_txn.rs (test child)" },
 	VarSpec { name: "WEFT_TLS_CERT_FILE", tier: Tier::Stable, summary: "The PEM certificate chain the TLS listener presents (SEC-5). Set with `WEFT_TLS_KEY_FILE`; naming one without the other stops the server from starting.", accepts: "a path to a PEM file holding the certificate chain", default: "unset: no TLS — the listener is plaintext and the C8 gate applies", read_by: "weft-server/tls.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_TLS_KEY_FILE", tier: Tier::Stable, summary: "The PEM private key matching `WEFT_TLS_CERT_FILE` (SEC-5). Never logged, never served; read once at startup.", accepts: "a path to a PEM file holding the private key", default: "unset: no TLS — the listener is plaintext and the C8 gate applies", read_by: "weft-server/tls.rs, read in startup/config.rs" },
@@ -311,10 +313,11 @@ const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BAT
 
 /// One line per *value* the operator should hear about, in the order the environment
 /// lists them: a registered numeric variable holding a value outside the shape its
-/// registry entry accepts, or the one closed enum whose reader used to warn and keep
-/// serving (`WEFT_ON_AMBIGUOUS_COMMIT`: `poison` or `exit`). Variables whose readers
-/// define open shapes (paths, endpoints, truthy flags where anything else is simply
-/// "off") are not judged here — their own startup phase refuses what it cannot use.
+/// registry entry accepts, or a closed enum whose reader used to warn and keep serving
+/// (`WEFT_ON_AMBIGUOUS_COMMIT`: `poison` or `exit`; `WEFT_STORE_SCOPE_PIN`: on or off).
+/// Variables whose readers define open shapes (paths, endpoints, truthy flags where
+/// anything else is simply "off") are not judged here — their own startup phase refuses
+/// what it cannot use.
 #[must_use]
 pub fn value_errors_for(entries: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
 	let mut errors = Vec::new();
@@ -335,6 +338,10 @@ pub fn value_errors_for(entries: impl IntoIterator<Item = (String, String)>) -> 
 		} else if name == "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD" {
 			if trimmed.parse::<f64>().ok().filter(|n| n.is_finite() && *n > 0.0).is_none() {
 				errors.push(format!("{name}={value:?} is not a finite number above 0, which is the only shape it accepts"));
+			}
+		} else if name == "WEFT_STORE_SCOPE_PIN" {
+			if crate::store_open::ScopePin::parse_strict(trimmed).is_none() {
+				errors.push(format!("{name}={value:?} is neither on (`on`/`1`/`true`/`yes`) nor off (`off`/`0`/`false`/`no`), the only values it accepts"));
 			}
 		} else if name == "WEFT_ON_AMBIGUOUS_COMMIT" {
 			if !(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("poison") || trimmed.eq_ignore_ascii_case("exit")) {
@@ -484,7 +491,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 83, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 85, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
@@ -521,7 +528,7 @@ mod tests {
 		let experimental: Vec<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Experimental).map(|spec| spec.name).collect();
 		assert_eq!(experimental, ["WEFT_BENCH_RUNS_DIR", "WEFT_FLIGHT_ADDR", "WEFT_GPU_CALIBRATE", "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD"], "two surfaces outside the 1.0 freeze (the bench-run routes and the Flight listener), and two knobs whose value is unproven (GPU calibration's thresholds, and a codec the measurements retired)");
 		let harness: BTreeSet<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Test).map(|spec| spec.name).collect();
-		let allowlist: BTreeSet<&str> = ["SKIP_SLOW_TESTS", "TEST_DATA_DIR", "WEFT_FAULT", "WEFT_FAULT_TEST_CHILD", "WEFT_REQUIRE_GPU", "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", "WEFT_TEST_AUDIT_FULL_CHILD", "WEFT_TEST_AUDIT_REFUSAL_CHILD", "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", "WEFT_TEST_OPEN_CHILD_ROOT", "WEFT_TEST_ORPHAN_CHILD_ROOT", "WEFT_TEST_PANIC_CHILD_MODE", "WEFT_TEST_POISON_EXIT_CHILD_ROOT", "WEFT_TEST_RACE_CHILD_ROOT", "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", "WEFT_TEST_S8_SPLIT_RACE_ROOT", "WEFT_TEST_S9_DROPPED_SWAP_DIR", "WEFT_TEST_S9_SQUASH_RACE_DIR", "WEFT_TEST_S9_SUFFIX_RACE_DIR", "WEFT_TEST_SWAP_MATRIX", "WEFT_TEST_SWAP_MATRIX_DIR", "WEFT_TEST_TXN_CHILD_INDEX", "WEFT_BENCH_BACKUP_DIR", "WEFT_BTC_CSV", "WEFT_DB_NEW_CRASH_CHILD", "WEFT_LEGACY_CONSUMER_CRASH_CHILD", "WEFT_LEGACY_INGEST_CRASH_CHILD", "WEFT_SERVER_BIN", "WEFT_UPDATE_GOLDENS", "WEFT_VERBOSE", "WEFT_XBENCH_CLICKHOUSE", "WEFT_XBENCH_INFLUXDB3", "WEFT_XBENCH_IOTDB", "WEFT_XBENCH_QUESTDB", "WEFT_XBENCH_TIMESCALE"].into_iter().collect();
+		let allowlist: BTreeSet<&str> = ["SKIP_SLOW_TESTS", "TEST_DATA_DIR", "WEFT_FAULT", "WEFT_FAULT_TEST_CHILD", "WEFT_REQUIRE_GPU", "WEFT_SERVER_BIN", "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", "WEFT_TEST_AUDIT_FULL_CHILD", "WEFT_TEST_AUDIT_REFUSAL_CHILD", "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", "WEFT_TEST_OPEN_CHILD_ROOT", "WEFT_TEST_ORPHAN_CHILD_ROOT", "WEFT_TEST_PANIC_CHILD_MODE", "WEFT_TEST_POISON_EXIT_CHILD_ROOT", "WEFT_TEST_RACE_CHILD_ROOT", "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", "WEFT_TEST_S8_SPLIT_RACE_ROOT", "WEFT_TEST_S9_DROPPED_SWAP_DIR", "WEFT_TEST_S9_SQUASH_RACE_DIR", "WEFT_TEST_S9_SUFFIX_RACE_DIR", "WEFT_TEST_SWAP_MATRIX", "WEFT_TEST_SWAP_MATRIX_DIR", "WEFT_TEST_TAG_SEAL_CRASH_ROOT", "WEFT_TEST_TXN_CHILD_INDEX", "WEFT_BENCH_BACKUP_DIR", "WEFT_BTC_CSV", "WEFT_DB_NEW_CRASH_CHILD", "WEFT_LEGACY_CONSUMER_CRASH_CHILD", "WEFT_LEGACY_INGEST_CRASH_CHILD", "WEFT_UPDATE_GOLDENS", "WEFT_VERBOSE", "WEFT_XBENCH_CLICKHOUSE", "WEFT_XBENCH_INFLUXDB3", "WEFT_XBENCH_IOTDB", "WEFT_XBENCH_QUESTDB", "WEFT_XBENCH_TIMESCALE"].into_iter().collect();
 		assert_eq!(harness, allowlist, "the Test tier is the plan's allowlist: a channel a test harness sets for the child it spawns, and nothing else may sit in it");
 		assert_eq!(VARS.iter().filter(|spec| spec.tier == Tier::Tuning).count(), VARS.len() - stable.len() - experimental.len() - allowlist.len(), "every remaining name is Tuning: a knob whose value is deployment-specific and whose number is still moving");
 	}
@@ -559,8 +566,8 @@ mod tests {
 	/// and a correctly shaped value is not one.
 	#[test]
 	fn strict_errors_cover_bad_names_and_bad_values() {
-		assert!(strict_errors_for(vec![("WEFT_BACKUP_KEEP".into(), "3".into()), ("WEFT_ON_AMBIGUOUS_COMMIT".into(), " EXIT ".into()), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD".into(), "1.25".into())]).is_empty());
-		for (name, value) in [("WEFT_BACKUP_KEEP", "-1"), ("WEFT_BACKUP_KEEP", "three"), ("WEFT_MAX_INTERPOLATE_POINTS", "0"), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD", "0.5"), ("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD", "0"), ("WEFT_ON_AMBIGUOUS_COMMIT", "nonsense")] {
+		assert!(strict_errors_for(vec![("WEFT_BACKUP_KEEP".into(), "3".into()), ("WEFT_ON_AMBIGUOUS_COMMIT".into(), " EXIT ".into()), ("WEFT_STORE_SCOPE_PIN".into(), " OFF ".into()), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD".into(), "1.25".into())]).is_empty());
+		for (name, value) in [("WEFT_BACKUP_KEEP", "-1"), ("WEFT_BACKUP_KEEP", "three"), ("WEFT_MAX_INTERPOLATE_POINTS", "0"), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD", "0.5"), ("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD", "0"), ("WEFT_ON_AMBIGUOUS_COMMIT", "nonsense"), ("WEFT_STORE_SCOPE_PIN", "maybe")] {
 			let errors = strict_errors_for(vec![(name.into(), value.into())]);
 			assert_eq!(errors.len(), 1, "{name}={value}: {errors:?}");
 			assert!(errors[0].starts_with(name), "{errors:?}");

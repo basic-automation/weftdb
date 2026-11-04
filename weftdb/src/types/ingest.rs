@@ -149,15 +149,6 @@ impl IngestBatch {
 		self
 	}
 
-	/// The series ids this batch's rows belong to: the empty group is
-	/// series 0, the only series an ingest can name before the tags gate
-	/// flips. Recorded on every segment row the batch commits and in the
-	/// ledger's `series_ids` column (plan §4 C1).
-	#[must_use]
-	pub fn series_ids(&self) -> Vec<u64> {
-		vec![0]
-	}
-
 	/// This batch's fingerprint: the deterministic hash the ledger records
 	/// and compares (see the module documentation). Equal batches — same
 	/// groups, same rows in the same order, values equal in their bounded
@@ -220,8 +211,11 @@ pub struct IngestReceipt {
 	pub max_ts: Option<i64>,
 	/// The segment ids the batch's commit assigned, in time order.
 	pub segment_ids: Vec<u64>,
-	/// The series ids the batch's rows belong to (`[0]`, the empty group,
-	/// until the tags gate flips).
+	/// The series ids the batch's rows belong to: `[0]` for the empty group,
+	/// otherwise the one id the aspect's catalog holds for the batch's series
+	/// key, resolved (and, for a new key, registered) by the commit itself
+	/// (TAG-7). A batch never names its id: ids are per store and only known
+	/// at commit.
 	pub series_ids: Vec<u64>,
 	/// The aspect epoch the batch committed in.
 	pub commit_epoch: u64,
