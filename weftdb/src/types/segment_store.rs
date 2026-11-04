@@ -894,6 +894,29 @@ fn fold_newest_wins(frames: Vec<DecodedFrame>) -> (Vec<i64>, Vec<Option<BigDecim
 	merged.into_iter().unzip()
 }
 
+/// Rows per page of a maintenance merge's output once it holds more than one page.
+///
+/// A merge writes outputs far larger than the seals it folds (a squash to 65,536-row
+/// segments over 1,024-row seals), and a single-block frame decodes its value column from
+/// the start, so after a squash an hour's read decoded up to a whole segment: 0.19 →
+/// 0.50 ms on 10M UCI rows (#507). A paged frame skips the pages outside the window. At
+/// 4,096 rows an hour read 0.24 ms before the squash and 0.24 ms after, and the year window
+/// got faster (17.8 → 14.1 ms), for 1.341 → 1.357 B/pt, still below the 1.414 of the
+/// 1,024-row seals it replaced. 1,024-row pages cost 1.404 B/pt for no faster read, and
+/// 16,384-row pages left an hour 1.3× slower.
+pub(crate) const MERGE_ROWS_PER_PAGE: usize = 4_096;
+
+/// The frame kind of a maintenance merge's output of `rows` rows: paged at
+/// [`MERGE_ROWS_PER_PAGE`] once it holds more than one page, single-block below that,
+/// where there is nothing to skip.
+pub(crate) const fn merge_rows_per_page(rows: usize) -> Option<usize> {
+	if rows > MERGE_ROWS_PER_PAGE {
+		Some(MERGE_ROWS_PER_PAGE)
+	} else {
+		None
+	}
+}
+
 /// How many independent plans one swap transaction may carry: the default of
 /// `WEFT_MAINT_PLANS_PER_TXN` (tags amendment A5), which per-series compaction batches up
 /// to. Every caller today swaps one plan at a time.
@@ -4196,6 +4219,44 @@ mod tests {
 		assert_eq!(ts.len(), 12, "every row preserved");
 		assert_eq!(ts, vec![0, 10, 100, 110, 200, 210, 300, 310, 400, 410, 500, 510], "rows stay time-sorted across the compaction");
 		assert_eq!(hit, Some(bd("15")), "a point still resolves after compaction");
+	}
+
+	/// A merge that holds more than a page writes a paged frame (#507), so a small window
+	/// after it skips the pages it does not touch, and it reads the same rows as before;
+	/// one that fits in a page stays single-block.
+	#[tokio::test]
+	async fn a_merge_past_a_page_writes_a_paged_frame() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		for aspect in ["big", "small"] {
+			store.declare(aspect, &schema()).await.expect("declares");
+		}
+		let rows = 2_000_i64;
+		for seg in 0..3 {
+			let ts: Vec<i64> = (seg * rows..(seg + 1) * rows).map(|i| i * 10).collect();
+			let vs: Vec<BigDecimal> = (seg * rows..(seg + 1) * rows).map(|i| bd(&i.to_string())).collect();
+			store.seal("big", &schema(), &ts, &vs).await.expect("seals");
+		}
+		store.seal("small", &schema(), &[0_i64, 10], &[bd("0"), bd("1")]).await.expect("seals");
+		store.seal("small", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.expect("seals");
+		let window = (4_090 * 10, 4_110 * 10);
+		let before = store.read_time_range("big", window.0, window.1).await.expect("reads");
+		assert_eq!(store.squash_aspect_to_target_rows("big", 10_000).await.expect("compacts"), 2);
+		assert_eq!(store.squash_aspect_to_target_rows("small", 10).await.expect("compacts"), 1);
+		let mut kinds = Vec::new();
+		for aspect in ["big", "small"] {
+			let rows = store.index.rows(aspect).await.expect("rows");
+			assert_eq!(rows.len(), 1, "{aspect} is one segment");
+			let bytes = store.read_frame(&rows[0].desc).await.expect("reads the frame");
+			kinds.push(frame_read::read_full("merged", &bytes).expect("decodes").rows_per_page());
+		}
+		let after = store.read_time_range("big", window.0, window.1).await.expect("reads");
+		let every = store.read_time_range("big", 0, i64::MAX).await.expect("reads");
+		drop(store);
+		assert_eq!(kinds, vec![Some(MERGE_ROWS_PER_PAGE), None], "6,000 merged rows are paged, 4 are not");
+		assert_eq!(after, before, "a window across a page boundary reads the same rows");
+		assert_eq!(after.0.len(), 21);
+		assert_eq!(every.0, (0..3 * rows).map(|i| i * 10).collect::<Vec<_>>(), "every row is kept, in order");
 	}
 
 	#[tokio::test]

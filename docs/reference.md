@@ -834,7 +834,9 @@ fixture, committed read-only.
 
 ## Configuration
 
-WeftDB is configured primarily through environment variables:
+WeftDB is configured primarily through environment variables; for the
+recovery-point and recovery-time objectives these settings produce, see
+[RPO/RTO](RPO-RTO.md).
 
 | Variable | Used by | Purpose | Default |
 |----------|---------|---------|---------|
@@ -1851,11 +1853,13 @@ What it does today:
   B/pt) took **694 s** on 2026-11-02 under load and 361 s on a quiet machine, nearly all of it
   one keyed `segment_index` delete per merged segment under Turso's MVCC. Since #507 a group's
   rows go in one guarded delete and the squash takes **31–43 s** (2026-11-03, three runs).
-  Every window answers identically. Small windows still read slower after it, but less: the
-  index is now checkpointed after a squash, without which every later read walked the deleted
-  rows' versions (an hour's p50 2.2 ms). With it an hour went 0.22 → 0.49 ms and a day
-  0.30 → 0.61 ms in the same run; what remains is decoding into a 65k-row segment. The year
-  window held (22.9 → 17.8 ms).
+  Every window answers identically. The index is checkpointed after a squash, without which
+  every later read walked the deleted rows' versions (an hour's p50 2.2 ms), and a merge's
+  output is paged at 4,096 rows, so a small window skips the pages it does not touch instead
+  of decoding a 65k-row value column from its start (an hour 0.50 ms single-block). With both,
+  an hour went 0.18 → 0.25 ms, a day 0.25 → 0.30 ms and 30 days held (1.51 → 1.50 ms), while
+  the year window got faster (13.8 → 11.3 ms); the store went 1.414 → 1.357 B/pt, where
+  single-block output gave 1.341 (2026-11-03).
 - **Failure tests** (`--ingest --failure kill-ingest|kill-compaction|corrupt-segment|all`) — a
   benchmark of a healthy store says nothing about the one a crash leaves. A child process (this
   binary) seals the corpus, or compacts a store of it, and is killed with `SIGKILL` at a seeded

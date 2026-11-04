@@ -23,14 +23,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   directory and serves one byte for byte by its run id, the SHA-256 of the manifest file;
   `weft-bench` prints the id beside the manifest path. An unknown id is the new
   `404 run_not_found`.
-
-### Changed
-
-- The `503 unconfigured` sentence no longer names the segment store, since the bench-run
-  routes answer it too: it reads "a subsystem this route needs is not configured on this
-  server", and `details.subsystem` / `details.enabled_by` say which one and the variable that
-  enables it. Match on `code`, as before.
-
+- **RPO/RTO (EVI-19).** New [`docs/RPO-RTO.md`](docs/RPO-RTO.md) pins the
+  recovery-point and recovery-time objectives against the snapshot cadence: the
+  corrected formula `RPO = max(I, d_max) + d_max`, the backup settings that set
+  `I`, and the restore paths that set RTO — with every figure measured, derived
+  or labelled unmeasured.
 - **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
   (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
   gets an attempt record before it runs and an outcome record after, and the operation is
@@ -42,6 +39,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- The `503 unconfigured` sentence no longer names the segment store, since the bench-run
+  routes answer it too: it reads "a subsystem this route needs is not configured on this
+  server", and `details.subsystem` / `details.enabled_by` say which one and the variable that
+  enables it. Match on `code`, as before.
+- A maintenance merge (squash, squash to a target size, overlap reconcile) writes its output
+  as a paged frame of 4,096-row pages once it holds more than one page, instead of one
+  single-block frame. A small window after a squash skips the pages it does not touch rather
+  than decoding the segment's value column from its start: on 10M UCI rows squashed to
+  65,536-row segments an hour reads in 0.25 ms (0.18 ms before the squash, 0.50 ms with
+  single-block output) and the year window in 11.3 ms (13.8 ms before). The squashed store is
+  1.357 B/pt rather than 1.341, still below the 1.414 of the 1,024-row seals it replaced.
 - `weft-server` builds its tokio runtime explicitly (ROB-11, Admission II's runtime-builder
   side): workers are named `weft-worker`, the new `WEFT_WORKER_THREADS` setting sizes the
   pool (unset keeps one worker per available core), and the runtime is shut down with plan
