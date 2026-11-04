@@ -71,6 +71,7 @@ pub mod metrics;
 /// ROB-3's single panic-catch layer (see [`panic_catch`]).
 pub mod panic_catch;
 pub mod panic_hook;
+pub mod read_limits;
 pub mod reconcile_daemon;
 /// SEC-10's secret hygiene for the server's own output: values that can
 /// carry a credential (a URL's userinfo above all) are only ever printed
@@ -112,6 +113,7 @@ pub use error::{ApiError, Code};
 pub use host_guard::{HostGuard, ALLOW_ANY_HOST_ENV};
 pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpolate_ilp, interpolate_ilp_arrow, interpolate_ilp_csv, interpolate_ilp_parquet, interpolate_parquet, interpolate_point, InterpolateConfig, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse, MAX_INTERPOLATE_OUTPUT_POINTS, MAX_INTERPOLATE_POINTS_ENV};
 pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyHistogram, LatencyHistogramSnapshot, LatencyProfile, Metrics, MetricsSnapshot, ProfileReport, SharedMetrics};
+pub use read_limits::{grid_buckets, ReadLimits, DEFAULT_PAGE_ROWS, DEFAULT_READ_TIMEOUT, MAX_AT_MULTI_INSTANTS, MAX_AT_MULTI_INSTANTS_ENV, MAX_DOWNSAMPLE_BUCKETS, MAX_DOWNSAMPLE_BUCKETS_ENV, MAX_PAGE_ROWS, MAX_PAGE_ROWS_ENV, MAX_READ_ROWS, MAX_READ_ROWS_ENV, READ_TIMEOUT_SECS_ENV};
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
 pub use routes::{build_registry_with_ingest_config, build_registry_with_limits, AdmissionClass, Audit, ClassEntry, IngestAdmission, PolicyEntry, Role, RouteEntry, RouteSpec, RouteTable, Routes, Scope, SealedRoutes};
 pub use runtime::{RuntimeConfig, RUNTIME_SHUTDOWN_TIMEOUT, WORKER_THREADS_ENV};

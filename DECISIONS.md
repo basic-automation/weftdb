@@ -2645,7 +2645,6 @@ followed "make and merge PRs as you go" and merged #98, #100, #101, #102 and #11
 2026-10-25 entry above concludes the opposite and is marked Needs human. Both loops should end up
 behaving the same way, and which way is not for them to pick.
 
-
 ## 2026-10-27 — the 0.1.x migration route is a server subcommand, and only half of FRE-14c
 
 **Decision:** `weft-server import-rows-mode <tree> --subject <s>` reads one subject of a 0.1.x
@@ -2815,7 +2814,6 @@ the other loop's.
 (The sentence above was first written while that run was still going, which is how it came to be
 unverified at the time; the numbers are its terminal output, from the seventh run of the script,
 background task `bd2e7b318`, against commit `40e61f7`.)
-
 
 ## 2026-10-28 — extend the open pruning PR rather than open a second store-lane slice
 
@@ -4012,3 +4010,116 @@ test") and FRE-18 ("layout-2 baseline fixtures") both name layout 2 as the 1.0 b
 with a re-derive hook (B2): it would be the first production use of `rederive` and still
 protects only development stores. `PRIMARY KEY (aspect, series_id)` plus `UNIQUE (aspect,
 series_key)`: the unique index is the part that cannot be relied on.
+## 2026-11-03 — ROB-12 read limits: where each ceiling bites, and two inherited semantics (FLAGGED FOR MERGE REVIEW)
+
+**Context:** decision 12 fixes the five numbers (page 100,000 rows; read and
+export 5,000,000 rows; downsample grid 1,000,000 buckets; `at-multi` 10,000
+instants; a 30 s read wait) and the two statuses (`422 result_too_large` with the
+limit, `504 query_timeout`). It does not say where each ceiling is enforced, what
+"read rows" bounds when a read is paginated, what an operator's ceiling does to
+the default page, or what a deadline owes work already handed to a blocking
+thread. The branch also arrived with uncommitted work from an earlier session;
+two of its semantics are changed here, and both are recorded below rather than
+silently rewritten.
+
+**Chosen:**
+
+1. **The row ceiling bounds the window, not the page.**
+   `SegmentStore::read_time_range` materializes every row the window names before
+   `offset`/`limit` are applied, so checking the page would let the memory cost
+   through and refuse only the response. The JSON reads therefore check
+   `total` (the pre-pagination count the response already reports) and the
+   Arrow/Parquet/CSV exports check the batch they just built. Consequence, stated
+   in `docs/reference.md`: a window over `WEFT_MAX_READ_ROWS` is not reachable by
+   paging — the operator raises the ceiling or the client narrows the window. That
+   is decision 12's intent ("refuse rather than attempt"), not an oversight.
+2. **An export is told to narrow the window; a paged read is told to paginate.**
+   `ReadLimits::check_rows` takes `paginate_with: Option<&'static str>`: `Some("limit")`
+   for the JSON reads, `None` for the six export shapes, whose message says the
+   window has no page to shrink. The inherited version took the *environment
+   variable* name in that slot, so refusals told clients to "paginate with
+   `WEFT_MAX_READ_ROWS`".
+3. **An operator's ceiling caps the default page; it cannot raise it.**
+   `page_size(None)` returns `min(DEFAULT_PAGE_ROWS, page_max)`. The inherited
+   behaviour returned 10,000 regardless, so an operator who set
+   `WEFT_MAX_PAGE_ROWS=10` to keep responses small was still served 10,000-row
+   pages on every request that named no page size — the opposite of the setting's
+   point. The unit test that pinned the unclamped default
+   (`a_request_that_names_no_page_gets_the_contract_default`) is replaced by
+   `a_request_that_names_no_page_gets_the_contract_default_or_the_ceiling`, which
+   pins both halves: the documented default at defaults, the ceiling when lower.
+   This is a deliberate change to a test's assertion, made because the assertion
+   encoded the bug; no test was skipped or deleted.
+4. **The bucket ceiling is counted before the read when the request names its own
+   bounds, and after it when it does not.** Pre-checking a window that omits
+   `start`/`end` means treating `i64::MIN..i64::MAX` as the window, which refuses
+   every unbounded downsample — the common shape, and one the store reduces in
+   bounded memory. So `grid_buckets(start_nanos, end_nanos, width.step_nanos())`
+   gates the request only when both bounds are present, and
+   `check_downsample_buckets(response.buckets)` refuses the grid actually produced
+   either way. The row ceiling is the one that protects the box; the grid is
+   bounded state, so a post-read refusal costs a reduction, not a blowup.
+5. **The deadline bounds the wait, not the work.** `within_deadline` wraps every
+   stored read's await and answers `504 query_timeout` when it expires; a read
+   already on a blocking thread runs to completion whatever the client was told,
+   which is why each row and bucket ceiling is checked again before a body is
+   serialized. A tower `Timeout` layer was rejected: it answers without the error
+   envelope's `code`, and would bound `/health` and `/ready`, which must stay
+   answerable while reads are timing out.
+6. **A zero cap is refused at startup rather than accepted.** `parse_positive`
+   lost its zero refusal while its integer conversions were being retyped, and the
+   inherited test `a_malformed_or_zero_cap_names_the_variable_and_stops_startup`
+   caught it: `WEFT_MAX_PAGE_ROWS=0` produced a live `ReadLimits` whose every
+   request would be refused, which reads to a client as a broken server. A ceiling
+   of nothing is not a ceiling, so the parse refuses it and tells the operator to
+   leave the variable unset for the default. No test changed for this one — the
+   existing test was right and the code was wrong.
+7. **One inherited test could not pass, and a magnitude assertion would not have
+   caught the bug either.**
+   `a_decade_at_nanosecond_resolution_is_counted_without_overflowing` asserted
+   `buckets > u128::from(u64::MAX) / 2` for a one-nanosecond grid over a decade —
+   315,576,000,000,000,000 buckets against a 9.2e18 threshold, so the assertion
+   fails for the correct answer too. It is now pinned to the exact count, and a
+   second test (`the_whole_nanosecond_range_counts_to_the_i128_answer_and_not_a_
+   wrapped_one`) covers the case the first one was reaching for: the full `i64`
+   nanosecond range counts to 2^64, a number `u64` cannot hold, so a wrapped
+   computation cannot satisfy it. That is the assertion that actually pins `i128`
+   arithmetic; the old one pinned nothing in either direction.
+8. **The `504` is pinned in unit tests, not on the wire.** A read with
+   `WEFT_READ_TIMEOUT_SECS=0` answered `200` in one run and `504` in the next,
+   from the same code, on the same machine: `tokio::time::timeout` polls the
+   future before it inspects an already-elapsed clock, so a stored read whose
+   first poll is `Ready` is served and one that yields is refused. That is a
+   schedule, not a contract, and a wire assertion on it would flake in both
+   directions. `a_read_deadline_bounds_reads_and_never_the_probes` therefore
+   asserts only what is deterministic on the wire — `/health` and `/ready` answer
+   `200` under a zero read deadline — while `504 query_timeout` itself is pinned
+   by `a_read_still_waiting_when_its_deadline_passes_is_refused_with_504`, which
+   creates a genuinely waiting read (a 5 ms deadline around a 60 s sleep) instead
+   of racing one. This removes an assertion rather than weakening one: the removed
+   line would have been the only reason the suite could go red without the
+   product changing — which Windows CI confirmed the same day, when the one read
+   assertion left in that test (`a stored read is served under a zero deadline`)
+   answered `504` on `windows-latest` while `ubuntu-latest` and `macos-latest`
+   answered `200` from the same commit (run 41833456746, job 126586229944,
+   `weft-server/tests/read_limits.rs:204`). A stored read touches the filesystem,
+   so any read that yields at all is already past a deadline of zero and whether it
+   wins is a property of the machine's I/O, not of the ceiling. The reason is now in
+   the test's own doc comment.
+9. **A local toolchain note, so the next session does not re-derive it.** This
+   box's default nightly (1.100.0) cannot build the vendored `patches/branches`
+   crate (`core::intrinsics::abort_immediate` is gone; `pub extern "C" fn abort() -> !`
+   no longer type-checks), and a shared target directory reused across toolchains
+   makes `cext-sys` pass a nightly-only feature to a stable rustc. Local gates run
+   on `cargo +1.99.0` (= `+stable` = `.github/release-toolchain`); CI's nightly job
+   is `continue-on-error`, so a nightly-only breakage is not this slice's blocker.
+
+**Alternatives considered:** truncating the page at the ceiling instead of
+refusing (decision 12 says refuse, and a silently shortened export is exactly the
+silent narrowing FRE-5 exists to prevent); counting rows from the segment index
+before the read (no such count API on `SegmentStore`; adding one is a store change
+outside this slice); a `WEFT_READ_TIMEOUT_SECS`-shaped cancellation token threaded
+into the store (real cancellation, but it reaches into every read path — ROB-15's
+"one set of read limits" is where that plumbing belongs); leaving the default page
+unbounded when no page size is named (the pre-slice behaviour, and the hole this
+slice exists to close).

@@ -26,6 +26,13 @@
 //! `503 Service Unavailable`. An aspect that was never declared in the store is a
 //! `404 Not Found` (its timestamp unit / encoding is unknown, so there is nothing
 //! to read), and any other read failure is a `500`.
+//!
+//! Every read here is bounded (ROB-12, decision 12): a window wider than
+//! `WEFT_MAX_READ_ROWS` rows, a page over `WEFT_MAX_PAGE_ROWS`, a grid over
+//! `WEFT_MAX_DOWNSAMPLE_BUCKETS` or an `at-multi` batch over `WEFT_MAX_AT_MULTI_INSTANTS` is
+//! a `422 result_too_large` carrying the limit, and a read the server is still waiting on when
+//! `WEFT_READ_TIMEOUT_SECS` elapses is a `504 query_timeout`. A paginated read naming no page
+//! size gets [`read_limits::DEFAULT_PAGE_ROWS`] rows and pages with `next_cursor`.
 
 use axum::{
 	body::Body, extract::{Path, State}, http::header, response::{IntoResponse, Response}, Json
@@ -35,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 
 use crate::{
-	error::{self, ApiError, StrictQuery}, state::AppState
+	error::{self, ApiError, StrictQuery}, read_limits, state::AppState
 };
 
 /// Parse a `lo`/`hi` value-range bound into the one decimal domain (ROB-6):
@@ -148,11 +155,12 @@ async fn require_schema(store: &weftdb::SegmentStore, aspect: &str) -> Result<we
 /// [`ApiError::internal`] on a read failure.
 pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<TimeRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	require_schema(&store, &aspect).await?;
-	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "csv")).await;
+	let (timestamps, values) = read_limits::within_deadline(&limits, async { store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "csv")).await.map_err(|err| error::classify_read(&err)) }).await?;
+	limits.check_rows(timestamps.len(), "this range export", None)?;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let body = tracing::info_span!("storage.range.serialize", format = "csv").in_scope(|| render_csv(timestamps.into_iter().zip(values)));
 	Ok(csv_response(body))
 }
@@ -170,13 +178,14 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 /// bound does not parse as a decimal.
 pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
 	require_schema(&store, &aspect).await?;
-	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await;
+	let (timestamps, values) = read_limits::within_deadline(&limits, async { store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await.map_err(|err| error::classify_read(&err)) }).await?;
+	limits.check_rows(timestamps.len(), "this value-range export", None)?;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let body = tracing::info_span!("storage.value_range.serialize", format = "csv").in_scope(|| render_csv(timestamps.into_iter().zip(values.into_iter().map(Some))));
 	Ok(csv_response(body))
 }
@@ -194,10 +203,11 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 /// [`ApiError::internal`] on a read/serialization failure.
 pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<TimeRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
-	let batch = weft_arrow_store::read_time_range_to_record_batch_typed(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await;
+	let batch = read_limits::within_deadline(&limits, async { weft_arrow_store::read_time_range_to_record_batch_typed(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await.map_err(|err| error::classify_read(&err)) }).await?;
+	limits.check_rows(batch.num_rows(), "this range export", None)?;
 	drop(store);
-	let batch = batch.map_err(|err| error::classify_read(&err))?;
 	let bytes = tracing::info_span!("storage.range.serialize", format = "arrow").in_scope(|| weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(arrow_stream_response(bytes))
 }
@@ -213,12 +223,13 @@ pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Pat
 /// does not parse as a decimal.
 pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
-	let batch = weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await;
+	let batch = read_limits::within_deadline(&limits, async { weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await.map_err(|err| error::classify_read(&err)) }).await?;
+	limits.check_rows(batch.num_rows(), "this value-range export", None)?;
 	drop(store);
-	let batch = batch.map_err(|err| error::classify_read(&err))?;
 	let bytes = tracing::info_span!("storage.value_range.serialize", format = "arrow").in_scope(|| weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(arrow_stream_response(bytes))
 }
@@ -236,10 +247,11 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 /// read/serialization failure).
 pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<TimeRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
-	let batch = weft_arrow_store::read_time_range_to_record_batch_typed(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await;
+	let batch = read_limits::within_deadline(&limits, async { weft_arrow_store::read_time_range_to_record_batch_typed(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await.map_err(|err| error::classify_read(&err)) }).await?;
+	limits.check_rows(batch.num_rows(), "this range export", None)?;
 	drop(store);
-	let batch = batch.map_err(|err| error::classify_read(&err))?;
 	let bytes = tracing::info_span!("storage.range.serialize", format = "parquet").in_scope(|| weft_arrow::write_parquet(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(parquet_response(bytes))
 }
@@ -256,12 +268,13 @@ pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspe
 /// bound does not parse as a decimal.
 pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
-	let batch = weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
+	let batch = read_limits::within_deadline(&limits, async { weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await.map_err(|err| error::classify_read(&err)) }).await?;
+	limits.check_rows(batch.num_rows(), "this value-range export", None)?;
 	drop(store);
-	let batch = batch.map_err(|err| error::classify_read(&err))?;
 	let bytes = tracing::info_span!("storage.value_range.serialize", format = "parquet").in_scope(|| weft_arrow::write_parquet(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(parquet_response(bytes))
 }
@@ -290,8 +303,11 @@ pub struct StoredPoint {
 /// `take` is an alias for `limit` (the page size — `limit` wins if both are
 /// given), and `page` is a **1-based** page number that derives the offset from
 /// the page size (`offset = (page - 1) * page_size`). When `page` is present it
-/// supersedes any explicit `offset`; a `page` without a page size falls back to
-/// page 1 (offset 0).
+/// supersedes any explicit `offset`.
+///
+/// A request that names no page size gets this server's default page
+/// ([`DEFAULT_PAGE_ROWS`](read_limits::DEFAULT_PAGE_ROWS)) rather than the whole
+/// window, and follows `next_cursor` for the rest (ROB-12, decision 12).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointsRangeParams {
@@ -302,7 +318,8 @@ pub struct PointsRangeParams {
 	/// Skip this many leading rows of the window before returning (default 0).
 	#[serde(default)]
 	pub offset: Option<usize>,
-	/// Return at most this many rows (default: all remaining after `offset`).
+	/// Return at most this many rows (default: this server's page size, `MAX_PAGE_ROWS`
+	/// is the ceiling and is answered `422 result_too_large`).
 	#[serde(default)]
 	pub limit: Option<usize>,
 	/// Declarative alias for `limit` (the page size). `limit` takes precedence if
@@ -336,8 +353,8 @@ pub struct StoredRangeResponse {
 	pub count: usize,
 	/// The number of leading rows skipped (the applied `offset`, 0 if none).
 	pub offset: usize,
-	/// The effective page size applied (the resolved `limit`/`take`); absent when
-	/// the read was unbounded.
+	/// The effective page size applied (the resolved `limit`/`take`, or the server's
+	/// default page when the request named neither).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub limit: Option<usize>,
 	/// The 1-based page number served, present only for a page-based request
@@ -372,40 +389,50 @@ pub struct StoredRangeResponse {
 /// unknown), and [`ApiError::internal`] on a read failure.
 pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<PointsRangeParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	let schema = store.schema_for(&aspect).await.map_err(|err| ApiError::internal(err.to_string()))?;
 	let Some(schema) = schema else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "json")).await;
+	let (timestamps, values) = read_limits::within_deadline(&limits, async { store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "json")).await.map_err(|err| error::classify_read(&err)) }).await?;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let total = timestamps.len();
-	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
+	limits.check_rows(total, "this range read", Some("limit"))?;
+	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref(), &limits)?;
 	// Paginate + stringify under a serialize span: skip `offset` rows of the window,
 	// take at most `page_size`.
-	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| {
-		let paginated = timestamps.into_iter().zip(values).skip(offset);
-		match page_size {
-			Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
-			None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
-		}
-	});
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| timestamps.into_iter().zip(values).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect());
 	let next_cursor = next_cursor(offset, points.len(), total);
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, next_cursor, points }))
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
 }
 
 /// Resolve the declarative B-rest pagination params shared by the JSON range reads
 /// into `(offset, page_size, page_echo)`.
 ///
-/// The page size is `limit` if present else the `take` alias. `page` (1-based)
-/// derives the offset (`(page - 1) * page_size`) and supersedes an explicit
-/// `offset`; a `page` without a page size falls back to page 1 (offset 0). The
-/// returned `page_echo` is the served 1-based page (only for a page-based request).
-fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>) -> (usize, Option<usize>, Option<usize>) {
-	let page_size = limit.or(take);
-	let offset = page.map_or_else(|| offset.unwrap_or(0), |page| page_size.map_or(0, |size| page.saturating_sub(1).saturating_mul(size)));
-	(offset, page_size, page.map(|page| page.max(1)))
+/// The page size is `limit` if present else the `take` alias, and, when the request
+/// names neither, this server's default page
+/// ([`read_limits::DEFAULT_PAGE_ROWS`]) — a range read is paged whether or not the
+/// client asked for pages, so no request can ask for a whole window (ROB-12). A named
+/// page size over [`read_limits::MAX_PAGE_ROWS`] is a `422 result_too_large` naming the
+/// cap, not a silently smaller page. `page` (1-based) derives the offset
+/// (`(page - 1) * page_size`) from a page size the request **named**, and supersedes an
+/// explicit `offset`; a `page` with no page size names a page of unknown size, so it is
+/// echoed and the first page is served.
+fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, limits: &read_limits::ReadLimits) -> Result<(usize, usize, Option<usize>), ApiError> {
+	let named = limit.or(take);
+	let page_size = limits.page_size(named, "limit")?;
+	// A `page` derives its offset from the page size **the request named**. This
+	// server's default page is not something the client chose to page by, so a
+	// `page` with no page size keeps the meaning it had before ROB-12: the number
+	// is echoed back, and the first page is served. Deriving an offset from the
+	// default would move a client that asked for nothing of the kind to row
+	// `(page - 1) * 10_000` of a window it never tried to skip.
+	let offset = match (page, named) {
+		(Some(page), Some(_)) => page.saturating_sub(1).saturating_mul(page_size),
+		_ => offset.unwrap_or(0),
+	};
+	Ok((offset, page_size, page.map(|page| page.max(1))))
 }
 
 /// Encode a forward-iteration position — a row offset in the deterministic read order
@@ -428,8 +455,8 @@ fn decode_cursor(token: &str) -> Option<usize> {
 /// A present `cursor` supersedes `offset`/`page` (it *is* the resolved start position,
 /// so the `page` echo is cleared); a malformed `cursor` is a `400`. Returns the
 /// `(offset, page_size, page_echo)` triple that drives the slice.
-fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, cursor: Option<&str>) -> Result<(usize, Option<usize>, Option<usize>), ApiError> {
-	let (offset, page_size, page) = resolve_pagination(offset, limit, take, page);
+fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, cursor: Option<&str>, limits: &read_limits::ReadLimits) -> Result<(usize, usize, Option<usize>), ApiError> {
+	let (offset, page_size, page) = resolve_pagination(offset, limit, take, page, limits)?;
 	match cursor {
 		Some(token) => {
 			let cursor_offset = decode_cursor(token).ok_or_else(|| ApiError::bad_request(format!("`cursor` is not a valid token: {token:?}")))?;
@@ -459,13 +486,14 @@ pub struct ValuePointsParams {
 	/// Skip this many leading rows before returning (default 0).
 	#[serde(default)]
 	pub offset: Option<usize>,
-	/// Return at most this many rows (default: all remaining after `offset`).
+	/// Return at most this many rows (default: this server's page size,
+	/// `DEFAULT_PAGE_ROWS`; over `MAX_PAGE_ROWS` is a `422 result_too_large`).
 	#[serde(default)]
 	pub limit: Option<usize>,
 	/// Declarative alias for `limit` (the page size). `limit` wins if both are given.
 	#[serde(default)]
 	pub take: Option<usize>,
-	/// 1-based page number; with a page size it derives the offset.
+	/// 1-based page number; it derives the offset from the resolved page size.
 	#[serde(default)]
 	pub page: Option<usize>,
 	/// Opaque forward-iteration cursor (from a prior response's `next_cursor`);
@@ -490,6 +518,7 @@ pub struct ValuePointsParams {
 /// decimal, and [`ApiError::internal`] on a read failure.
 pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValuePointsParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -497,20 +526,14 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 	let Some(schema) = schema else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "json")).await;
+	let (timestamps, values) = read_limits::within_deadline(&limits, async { store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "json")).await.map_err(|err| error::classify_read(&err)) }).await?;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let total = timestamps.len();
-	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
-	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| {
-		let paginated = timestamps.into_iter().zip(values).skip(offset);
-		match page_size {
-			Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
-			None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
-		}
-	});
+	limits.check_rows(total, "this value-range read", Some("limit"))?;
+	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref(), &limits)?;
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| timestamps.into_iter().zip(values).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect());
 	let next_cursor = next_cursor(offset, points.len(), total);
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, next_cursor, points }))
+	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
 }
 
 /// Query parameters for the single-instant point lookup: the instant `t` to read
@@ -557,14 +580,15 @@ pub struct StoredPointResponse {
 ///
 /// [`ApiError::unconfigured`] when no store is attached,
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared (its timestamp unit is
-/// unknown), and [`ApiError::internal`] on a read failure.
+/// unknown), a `504 query_timeout` when the lookup outlasts `WEFT_READ_TIMEOUT_SECS`,
+/// and [`ApiError::internal`] on a read failure.
 pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<PointParams>) -> Result<Json<StoredPointResponse>, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
-	let result = store.read_point(&aspect, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t, format = "json")).await;
+	let value = read_limits::within_deadline(&limits, async { store.read_point(&aspect, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t, format = "json")).await.map_err(|err| error::classify_read(&err)) }).await?;
 	drop(store);
-	let value = result.map_err(|err| error::classify_read(&err))?;
 	let body = tracing::info_span!("storage.point.serialize", format = "json").in_scope(|| {
 		let found = value.is_some();
 		StoredPointResponse { aspect, time_unit: schema.timestamp_unit.name(), timestamp: params.t, value: value.map(|v| v.to_string()), found }
@@ -616,16 +640,20 @@ pub struct StoredPointsResponse {
 ///
 /// [`ApiError::unconfigured`] when no store is attached, [`ApiError::aspect_not_found`] when
 /// the aspect is undeclared, [`ApiError::bad_request`] when the `t` list has a non-integer
-/// entry, and [`ApiError::internal`] on a read failure.
+/// entry, a `422 result_too_large` naming the limit when the list names more instants than
+/// `WEFT_MAX_AT_MULTI_INSTANTS` (refused before a segment is opened), a `504 query_timeout`
+/// when the batch outlasts `WEFT_READ_TIMEOUT_SECS`, and [`ApiError::internal`] on a read failure.
 pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<MultiPointParams>) -> Result<Json<StoredPointsResponse>, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	// Parse the comma-separated instants; a non-integer (or otherwise malformed) entry is a 400.
 	let ts: Vec<i64> = params.t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::parse::<i64>).collect::<Result<_, _>>().map_err(|e| ApiError::bad_request(format!("invalid `t` list {:?}: {e}", params.t)))?;
-	let result = store.read_points(&aspect, &ts).instrument(tracing::info_span!("storage.points.read", %aspect, count = ts.len(), format = "json")).await;
+	// The batch is the read: over the cap it is refused before a single segment opens.
+	limits.check_at_multi_instants(ts.len())?;
+	let values = read_limits::within_deadline(&limits, async { store.read_points(&aspect, &ts).instrument(tracing::info_span!("storage.points.read", %aspect, count = ts.len(), format = "json")).await.map_err(|err| error::classify_read(&err)) }).await?;
 	drop(store);
-	let values = result.map_err(|err| error::classify_read(&err))?;
 	let body = tracing::info_span!("storage.points.serialize", count = ts.len(), format = "json").in_scope(|| {
 		let points = ts.iter().zip(values).map(|(&timestamp, v)| StoredPointEntry { timestamp, found: v.is_some(), value: v.map(|v| v.to_string()) }).collect();
 		StoredPointsResponse { aspect, time_unit: schema.timestamp_unit.name(), points }
@@ -934,16 +962,26 @@ pub struct StorageDownsampleParams {
 /// range far larger than RAM still reduces — and with a `sketch_p*` reduction the
 /// per-bucket state is bounded too. An omitted bound spans the whole stored history.
 ///
+/// The grid itself is capped (ROB-12): more than `WEFT_MAX_DOWNSAMPLE_BUCKETS` buckets is a
+/// `422 result_too_large` naming the limit — refused from the request's own bounds when it
+/// names both, and from the grid actually produced otherwise, since a window naming no bounds
+/// is as wide as the stored history. The read is also the one a `WEFT_READ_TIMEOUT_SECS` wait
+/// answers `504 query_timeout` for.
+///
 /// Traced as `downsample.range` so a `RUST_LOG`/OTLP run attributes the stored
 /// reduction apart from the compute endpoints' `downsample.reduce`.
 async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams) -> Result<crate::downsample::DownsampleResponse, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let limits = state.read_limits();
 	drop(state);
 	let width = crate::downsample::parse_width_token(params.resolution.as_deref())?;
 	let aggregations = crate::downsample::parse_aggregations(params.agg.as_deref())?;
 	let method = crate::downsample::parse_fill(params.fill.as_deref())?;
 	// An undeclared aspect is a 404 before any read work, matching the sibling reads.
 	let schema = require_schema(&store, aspect).await?;
+	// A bound that cannot be placed in time at the aspect's unit is the same `422` the
+	// fill path already returns for it.
+	let bound_nanos = |epoch: i64| schema.timestamp_unit.to_nanos(epoch).ok_or_else(|| ApiError::new(error::Code::ValueNotRepresentable, format!("the bound {epoch} cannot be placed in time at the aspect's timestamp unit")));
 	// An omitted bound means "all of stored history" — the index prune is inclusive,
 	// so the saturating bounds simply select every segment.
 	let start = params.start.unwrap_or(i64::MIN);
@@ -951,19 +989,29 @@ async fn storage_downsample_inner(state: AppState, aspect: &str, params: &Storag
 	if end < start {
 		return Err(ApiError::bad_request(format!("`end` ({end}) must not be before `start` ({start})")));
 	}
+	// A request that names both bounds states its own grid, so an impossible one is
+	// refused before any segment is opened (ROB-12). A request that names neither is
+	// not refusals on a number it never gave: its grid is checked on the count the
+	// reduction actually produces, below.
+	if let (Some(start), Some(end)) = (params.start, params.end) {
+		let grid = read_limits::grid_buckets(i128::from(bound_nanos(start)?), i128::from(bound_nanos(end)?), width.step_nanos());
+		limits.check_downsample_buckets(grid)?;
+	}
 
 	let span = tracing::info_span!("downsample.range", %aspect, start, end, resolution = %width, buckets = tracing::field::Empty);
-	let result = store.downsample_range_width(aspect, start, end, width, &aggregations).instrument(span.clone()).await;
+	let mut buckets = read_limits::within_deadline(&limits, async { store.downsample_range_width(aspect, start, end, width, &aggregations).instrument(span.clone()).await.map_err(|err| error::classify_read(&err)) }).await?;
 	drop(store);
-	let mut buckets = result.map_err(|err| error::classify_read(&err))?;
 	if let Some(method) = &method {
 		// The fill bounds are the window's, as instants; an omitted bound is the stored data's.
-		let instant = |epoch: Option<i64>| epoch.map(|e| schema.timestamp_unit.to_nanos(e).map(chrono::DateTime::from_timestamp_nanos).ok_or_else(|| ApiError::new(error::Code::ValueNotRepresentable, format!("the bound {e} cannot be placed in time at the aspect's timestamp unit")))).transpose();
+		let instant = |epoch: Option<i64>| epoch.map(|e| bound_nanos(e).map(chrono::DateTime::from_timestamp_nanos)).transpose();
 		buckets = crate::downsample::apply_fill(&buckets, width, instant(params.start)?, instant(params.end)?, method)?;
 	}
 	let mut response = crate::downsample::buckets_to_response(buckets, width, &aggregations)?;
 	response.fill = method.is_some().then(|| params.fill.as_deref().unwrap_or_default().trim().to_string());
 	span.record("buckets", response.buckets);
+	// The grid that was actually produced, which is what an unbounded window's cap has
+	// to go on — and the last chance to refuse before the buckets are serialized.
+	limits.check_downsample_buckets(u128::try_from(response.buckets).unwrap_or(u128::MAX))?;
 	Ok(response)
 }
 
@@ -1467,8 +1515,10 @@ mod tests {
 		assert_eq!(body["total"], 5);
 		assert_eq!(body["count"], 5);
 		assert_eq!(body["offset"], 0);
-		// Unbounded read omits the `limit`/`page` echoes.
-		assert!(body.get("limit").is_none());
+		// ROB-12: a read that names no page size is a paged read at the default page,
+		// so `limit` reports the page that was applied; a read that named no `page`
+		// still omits the `page` echo.
+		assert_eq!(body["limit"], 10_000, "the applied page is reported even when it was not asked for");
 		assert!(body.get("page").is_none());
 	}
 
@@ -1536,7 +1586,9 @@ mod tests {
 		assert_eq!(body["offset"], 0);
 		assert_eq!(body["count"], 5);
 		assert_eq!(body["page"], 5);
-		assert!(body.get("limit").is_none());
+		// ROB-12: `page` without a page size takes the default page, and that page is
+		// what `limit` now reports.
+		assert_eq!(body["limit"], 10_000, "a `page` with no page size still gets the default page");
 	}
 
 	#[tokio::test]
