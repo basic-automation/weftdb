@@ -37,14 +37,16 @@
 //!   run record and takes v2; SOA-7 then records window digests
 //!   ([`crate::soak_digest`]) on the record and takes v3; SOA-8 records
 //!   the failure deck's phases, recovery windows and SIGTERM verdict
-//!   ([`crate::soak_failure`]) on the record and takes v4.
+//!   ([`crate::soak_failure`]) on the record and takes v4; SOA-10 records
+//!   the derived-read verdict ([`crate::soak_read`]) on the record and
+//!   takes v5.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	redaction, report::{DiskInfo, RunMetadata}, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict
+	redaction, report::{DiskInfo, RunMetadata}, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict
 };
 
 /// Version of the soak run record. Bump on any breaking field change to
@@ -58,7 +60,9 @@ use crate::{
 /// v3 (SOA-7) adds the window digest list on [`SoakRun`], the same way.
 /// v4 (SOA-8) adds the failure deck's phase log, recovery records and
 /// SIGTERM verdict on [`SoakRun`], the same way.
-pub const SOAK_SCHEMA_VERSION: u32 = 4;
+/// v5 (SOA-10) adds the optional derived-read verdict on [`SoakRun`],
+/// the same way.
+pub const SOAK_SCHEMA_VERSION: u32 = 5;
 
 /// Configuration for one soak run.
 ///
@@ -172,6 +176,12 @@ pub struct SoakRun {
 	/// graceful shutdown.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub sigterm: Option<SigtermVerdict>,
+	/// The derived-read verdict on this run (SOA-10), recorded through
+	/// [`SoakHarness::record_derived_verdict`] once the run's derived
+	/// reads have been judged. `None` until then — and forever for a run
+	/// nobody checked, which must never read as a passed verdict.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub derived: Option<DerivedReadVerdict>,
 }
 
 impl SoakRun {
@@ -336,7 +346,7 @@ impl SoakHarness {
 	/// [`RunMetadata::capture`]), not a second probe.
 	#[must_use]
 	pub const fn new(config: SoakConfig, metadata: RunMetadata) -> Self {
-		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None } }
+		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None, derived: None } }
 	}
 
 	/// Current lifecycle state.
@@ -436,6 +446,29 @@ impl SoakHarness {
 		anyhow::ensure!(self.run.state == SoakState::Running, "soak oracle verdict can only be recorded while Running, not {:?}", self.run.state);
 		anyhow::ensure!(self.run.oracle.is_none(), "soak oracle verdict has already been recorded for this run");
 		self.run.oracle = Some(verdict);
+		Ok(())
+	}
+
+	/// Record the derived-read verdict against this run (SOA-10): the
+	/// judgement of the run's derived reads (the stored downsample's
+	/// buckets, derived by [`DerivedReadChecker`](crate::soak_read::DerivedReadChecker)
+	/// from the workload model), kept in the run record beside the
+	/// oracle verdict so a published run carries the evidence for its
+	/// derived surface as well as its raw read-back.
+	///
+	/// Recorded exactly once, while `Running` — the driver judges the
+	/// derived read, records the verdict, and then finishes the run. A
+	/// second recording is refused rather than overwriting the first: a
+	/// verdict that can be quietly replaced is not evidence.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when a
+	/// verdict has already been recorded.
+	pub fn record_derived_verdict(&mut self, verdict: DerivedReadVerdict) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak derived-read verdict can only be recorded while Running, not {:?}", self.run.state);
+		anyhow::ensure!(self.run.derived.is_none(), "soak derived-read verdict has already been recorded for this run");
+		self.run.derived = Some(verdict);
 		Ok(())
 	}
 
@@ -619,7 +652,7 @@ mod tests {
 		harness.start().expect("start");
 		let record = harness.run_record();
 		assert_eq!(record.soak_schema_version, SOAK_SCHEMA_VERSION);
-		assert_eq!(record.soak_schema_version, 4, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, independent of the bench schema");
+		assert_eq!(record.soak_schema_version, 5, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, v5 from SOA-10's derived-read field, independent of the bench schema");
 		// Reuse, not redefinition: the record's metadata is EVI-3's capture,
 		// with the same crate version / OS / arch / timestamp it was built from.
 		assert!(!record.metadata.weft_bench_version.is_empty(), "metadata must carry the bench crate version");
@@ -715,6 +748,28 @@ mod tests {
 		let report = harness.preflight(Path::new("weftdb-soa-2-relative-store")).expect("preflight report");
 		assert!(report.device.is_none(), "a relative path matches no mount, so no device resolves");
 		assert!(report.failed_checks().contains(&"device_resolved"), "the failing gate must be device_resolved: {:?}", report.checks);
+	}
+
+	#[test]
+	fn derived_verdict_is_recorded_once_while_running() {
+		use crate::soak_read::DerivedReadVerdict;
+
+		let verdict = DerivedReadVerdict { ticks_judged: 2, buckets_checked: 40, buckets_present: 32, points_counted: 96, mismatch_count: 0, mismatches: Vec::new() };
+		let mut harness = SoakHarness::new(config(), metadata());
+		assert!(harness.run_record().derived.is_none(), "no verdict before one is recorded");
+		assert!(harness.record_derived_verdict(verdict.clone()).is_err(), "a verdict cannot be recorded before the run starts");
+		harness.start().expect("start");
+		harness.record_derived_verdict(verdict.clone()).expect("record while Running");
+		assert_eq!(harness.run_record().derived.as_ref(), Some(&verdict), "the recorded verdict is on the run record");
+		assert!(harness.record_derived_verdict(verdict).is_err(), "a second verdict must not overwrite the first");
+		harness.finish().expect("finish");
+		assert!(harness.run_record().derived.is_some(), "the verdict survives the finish");
+		// The field is additive: a v4 artifact without it deserializes
+		// with no verdict.
+		let mut json = serde_json::to_value(harness.run_record().redacted_copy()).expect("record to json");
+		json.as_object_mut().expect("object").remove("derived");
+		let back: SoakRun = serde_json::from_value(json).expect("v4-shaped record deserializes");
+		assert!(back.derived.is_none(), "an absent derived field reads as no verdict, never a pass");
 	}
 
 	#[test]
