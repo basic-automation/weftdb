@@ -4,6 +4,66 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-03 — SOA-10: derived-read checks judge the stored downsample's buckets against the model, exactly (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W6) lists SOA-10 by name only — "Derived-read
+checks" — and the queue's acceptance fixes one outcome: derived-read checks run
+in the soak harness. Neither source says which derived reads, what the expected
+values derive from, or where the verdict lives. What the sources do fix:
+SOA-5's DECISIONS entry assigns reads to "the oracle and the derived-read
+checks (SOA-6, SOA-10), which are what make a read result verifiable at all";
+SOA-6's entry and module doc reserve the *endpoint-level* derived-read checks
+to SOA-10 (the oracle core judges raw read-backs the caller supplies, and
+performs no read itself); the stored downsample read
+(`GET /api/v1/storage/{aspect}/downsample`) is the server's derived read over
+stored data — its buckets are computed from the sealed segments, not stored —
+with the streaming reductions `count`/`min`/`max`/`sum`/`avg` (weft-reduce's
+`Aggregation` set); SOA-5 records that the ingest route seals only the numeric
+subset of the named field into the aspect's `f64` schema; and SOA's standing
+rules govern the shape (exact judgement, no invented tolerance or threshold; a
+field added to `SoakRun` bumps `SOAK_SCHEMA_VERSION` on SOA's own line; records
+carry no free text).
+
+**Chosen (grounded as above, under the owner's best-guess authorization of
+2026-10-26; if merge review disagrees, this decision is revisited there):**
+
+1. **Library module, no read client, no CLI flag**: `weft-bench/src/soak_read.rs`,
+   exported from the crate, on the SOA-6 precedent. The caller performs the
+   downsample read against its server and maps each returned bucket into a
+   `DerivedBucket`; the slices that own how a soak is launched are later ones.
+2. **One derived read, at one-second buckets.** Grid rows are one second apart
+   on whole seconds, so each row's bucket is its own timestamp and the expected
+   bucket aggregates, across series, the values sealed at that timestamp. The
+   expected side counts only the numeric cells (float/integer/unsigned — the
+   subset SOA-5 records the server seals); boolean and text cells never reach
+   the store and never reach an expected bucket. Sums accumulate in seal order
+   (ticks ascending, series in grid order) so exact `f64` comparison is
+   attainable, and `avg` is judged as the server's own reported value, not
+   recomputed from the observed sum, so a server that sums right but averages
+   wrong is still caught.
+3. **Pass is zero mismatches, not a threshold.** Differences are classified
+   `MissingBucket`, `UnexpectedBucket`, `DuplicateBucket`, or the first
+   differing reduction (`WrongCount`, `WrongMin`, `WrongMax`, `WrongSum`,
+   `WrongAvg`, checked in that order — one mismatch per bucket, the oracle's
+   one-per-cell rule at bucket granularity). The mismatch list is capped at
+   1024 (`MAX_REPORTED_DERIVED_MISMATCHES`); the count is not. A verdict that
+   judged nothing passes vacuously, so publishers check `ticks_judged` beside
+   it (the SOA-12 skipped-check rule).
+4. **The verdict is recorded on the run record, and the soak schema takes v5.**
+   `SoakRun.derived: Option<DerivedReadVerdict>` (`#[serde(default)]`, skipped
+   when absent, so v1–v4 artifacts still deserialize) is set exactly once by
+   `SoakHarness::record_derived_verdict`, only while `Running`, mirroring
+   `record_oracle_verdict`. The verdict carries no free text, so redacted
+   output emits it unchanged.
+
+**Rejected:** judging the stateless compute endpoints (`POST /api/v1/downsample`,
+`/api/v1/interpolate`) — those derive from a request body, not from what the
+server stored, so they verify the reducer, not the soak's server; a tolerance-
+based float comparison (the sealed values and their seal-order sums are exact,
+so a tolerance would be an invented threshold); and folding the point-at or
+range raw read-backs in here (those are the oracle's raw judgements, SOA-6 —
+the derived surface is what was missing).
+
 ## 2026-11-02 — SOA-8: the failure deck is a validated card deck, recovery is exact, and the maintenance driver is a pure state machine (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6, W5) lists SOA-8 by name only — "Failure deck,
@@ -3565,3 +3625,104 @@ still holds — one match is not a framework).
 reason the dispatch stays a thin match), any change to what the subcommands
 do once parsed, and any new command — `PAC-9`'s follow-up (a readiness
 subcommand that needs no network) is a separate slice, not this one.
+## 2026-11-02 — ROB-11 "Admission II": the runtime-builder side (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** the 1.0 plan names ROB-11 only as "Admission II" (§6 W6) and
+places it on the L-MAIN lane as the wave's second main.rs edit — "PAC-7 →
+ROB-11 (W6, CLI then runtime builder)" (§2). ROB-10's entry records the
+split from the other side: Admission I is the registry gate's per-class
+budgets, and "Admission II (ROB-11, W6) is not pre-empted. It arrives with
+PAC-7's runtime builder (§2 L-MAIN) and owns later refinement". The queue
+acceptance repeats the shape: "Admission II lands on the runtime-builder
+side (after PAC-7's CLI side)". Plan C9 fixes one concrete runtime
+behaviour: the drain order ends "serve → SEC-9 TaskTracker →
+`store.shutdown()` → runtime `shutdown_timeout(5 s)`" — and the first
+three steps already land inside startup, while the runtime itself was
+still `#[tokio::main]`'s implicit one, whose shutdown has no such bound.
+The points the sources do not pin, chosen here under the owner's
+best-guess authorization (2026-10-26), recorded for merge review and
+reversible there:
+
+1. **The runtime is built explicitly, in a library module.** A new
+   `weft_server::runtime` holds `RuntimeConfig`, `build_runtime` and
+   `run` (build → `block_on` → `shutdown_timeout`); `main` reads the
+   config, calls `runtime::run(config, dispatch())`, and the dispatch
+   body is byte-for-byte the command dispatch `#[tokio::main]` used to
+   run. The builder is multi-thread with every driver enabled — the
+   attribute's own flavour — so no behaviour changes beyond what this
+   entry names. Workers are named `weft-worker`.
+2. **One new knob: `WEFT_WORKER_THREADS` (Tuning, unset = the runtime's
+   machine-sized default).** It joins the VarSpec registry (74 → 75
+   entries) and the strict-config positive-integer list. Sizing the
+   pool beside Admission I's caps is the runtime side of admission:
+   the gate decides how much work of each class may run at once, and
+   this decides the capacity those permits spend. No default number is
+   invented — unset keeps tokio's one-worker-per-core, exactly the
+   pre-slice behaviour.
+3. **`shutdown_timeout` is C9's 5 s, not a knob.**
+   `RUNTIME_SHUTDOWN_TIMEOUT` is a constant in `runtime.rs`, applied
+   after `block_on` returns — i.e. after serve, the daemons' drain and
+   `store.shutdown()` inside startup have all finished, which is the
+   order C9 names. The serve path's own connection grace stays
+   `WEFT_SHUTDOWN_GRACE_SECS`; the two 5 s numbers are different steps
+   of the same drain, not one setting read twice.
+4. **A malformed `WEFT_WORKER_THREADS` exits 78 from `main`.** The
+   runtime must exist before startup's strict-configuration phase can
+   run, so that phase cannot be the first to refuse this one value;
+   `main` refuses it itself with the C7 configuration status and the
+   registry's own wording. Every other variable is still refused by
+   the strict phase first, as before.
+
+**Rejected:** admission policy changes on the gate side (queueing shed
+queries, priorities, per-route overrides) — ROB-10's entry lists those
+as not-Admission-I, but no source assigns them to ROB-11 either, and
+the acceptance names the runtime-builder side, not the gate; a
+`WEFT_RUNTIME_SHUTDOWN_SECS` knob (C9 fixes the number, and a second
+shutdown knob beside `WEFT_SHUTDOWN_GRACE_SECS` invites confusing the
+two steps); and building this slice on PAC-7's unmerged branch — the
+PR is based on main like every W6 slice, so at the batch merge PAC-7's
+CLI dispatch and this runtime builder combine in `main.rs` (the
+dispatch body becomes the future `runtime::run` drives), which is the
+L-MAIN order the plan lists.
+## 2026-11-02 — ROB-19 maintenance scheduler shapes (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Context:** decision 17 adopts the maintenance/compaction daemon "on by
+default once D-S9 lands" (D-S9 has landed) and the ROADMAP names ROB-19
+"Maintenance scheduler, compaction on by default, per-aspect circuit
+breaker", but neither fixes the default interval, the default compaction
+target, or the breaker's shape (threshold, cooldown, scope).
+
+**Chosen:**
+
+1. **On by default, `0` opts out.** An unset `WEFT_RECONCILE_INTERVAL_SECS`
+   now resolves to 60 s (`DEFAULT_MAINTENANCE_INTERVAL_SECS`); the existing
+   `0` spelling still disables the scheduler. All other daemon settings keep
+   their meanings.
+2. **Compaction on by default at 65,536 rows.** An unset
+   `WEFT_COMPACT_TARGET_ROWS` now resolves to `DEFAULT_COMPACT_TARGET_ROWS`
+   (65,536). The daemon's compaction sweep is fragmentation-gated, so a
+   converged aspect costs one O(1) rollup read per tick and is never
+   rewritten; 65,536 sits between the 8,192-row checkpoint floor and the
+   ~200k-row single segment the `downsample_range` knee measured slowly.
+3. **Breaker in the store's sweeps, not the daemon.** The per-aspect circuit
+   breaker (`weftdb::MaintenanceBreaker`) lives in `SegmentStore`, consulted
+   by every store-wide sweep (reconcile, hot/cold, overlaps, squash,
+   compaction): it counts an aspect's *consecutive* failed sweep passes,
+   trips at 3 (`WEFT_MAINTENANCE_BREAKER_FAILURES`; `0` disables), and sweeps
+   then skip the aspect — listed in the sweep's new `tripped` field and in
+   `POST /api/v1/storage/reconcile` responses — for a 300 s cooldown
+   (`WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`). The first pass after the
+   cooldown is a half-open trial: success closes the breaker and clears the
+   count, failure re-trips for a fresh cooldown. Any successful pass resets
+   the count; a busy aspect records neither. Putting the state in the store
+   means the HTTP store-wide sweep and the daemon share one breaker, exactly
+   as they already share the sweeps. Per-aspect entry points are never
+   gated, so an operator can always work on a tripped aspect directly.
+   Breaker state is in-memory only (a restart starts every aspect closed —
+   the first ticks re-trip a still-damaged aspect within the threshold).
+
+**Alternatives considered:** a daemon-side breaker filtering per-aspect
+calls (duplicates the sweeps' iteration and leaves the HTTP sweep
+unprotected); breaker metrics counters (deferred — ROB-21 adds
+cancellation/metrics on this scheduler, and the trip is already logged once
+at `WARN` by the store plus per-tick `DEBUG`/span fields in the daemon).

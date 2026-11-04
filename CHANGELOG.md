@@ -40,6 +40,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `<store root>/audit.jsonl` (or `./weft-audit.jsonl` with no store configured), and a
   server that cannot open it refuses to start.
 
+### Changed
+
+- `weft-server` builds its tokio runtime explicitly (ROB-11, Admission II's runtime-builder
+  side): workers are named `weft-worker`, the new `WEFT_WORKER_THREADS` setting sizes the
+  pool (unset keeps one worker per available core), and the runtime is shut down with plan
+  C9's `shutdown_timeout` of 5 seconds after serving, the task drain and the store's
+  shutdown, instead of the implicit `#[tokio::main]` runtime whose drop waits indefinitely
+  for blocking work. Admission I's per-class gate budgets and refusals are unchanged.
+
 ### Fixed
 
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
