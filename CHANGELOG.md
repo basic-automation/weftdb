@@ -122,6 +122,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   aspect's catalog; read the id from `IngestReceipt::series_ids` instead. The method shipped
   in `weftdb` 0.2.0 on crates.io, so this is a breaking change, allowed in the next minor
   release by the pre-1.0 policy above.
+- **Seal-backed legacy aspects feed a change log, not the per-timestamp queue (S20).**
+  Each seal-store commit records one `segment_changes` row (epoch, time span, row count)
+  in its own index transaction, and the batch consumer rebuilds the windows a change's
+  span touches and acknowledges the row by epoch. Seal-backed ingest no longer writes
+  `unbatched_measurements` entries; rows-mode aspects keep the queue unchanged. This
+  closes the S20 half of the 0.2.0 "crash consistency is not finished" limitation.
 - The `503 unconfigured` sentence no longer names the segment store, since the bench-run
   routes answer it too: it reads "a subsystem this route needs is not configured on this
   server", and `details.subsystem` / `details.enabled_by` say which one and the variable that

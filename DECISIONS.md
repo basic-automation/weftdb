@@ -4282,3 +4282,79 @@ check on every call, and a cursor wants a stable id); `all()` as the meaning of 
 methods (it would break pinned untagged reads on tagged stores); reusing `GroupsUnsupported`
 or `TagError` for reserved keys (the first now means "gate shut", the second carries no
 aspect).
+## 2026-11-04 — D-S20 change log replaces the per-timestamp queue for seal-backed aspects — FOR MERGE REVIEW
+
+**Ambiguous:** the 1.0 plan (§5 D-S19/D-S20 amendment, §6 W7 seal lane) and
+issue #210 name the deliverable — "change log replaces the per-timestamp
+unbatched queue for seal-backed aspects" — and D-S19's decision notes name
+the mechanism's table (`segment_changes`, created by migration `0002` with
+columns `(aspect, epoch, min_ts, max_ts, row_count)`), but no source fixes:
+which commits write a row, how a consumer acknowledges work, or how a
+span-based consumer decides coverage.
+
+**Chosen:**
+1. **One row per data commit, in the commit's own transaction.** A new
+   `IndexOp::RecordChange` rides the seal (`publish_seal`) and ingest
+   (`publish_ingest`) index transactions, keyed by the commit's aspect
+   epoch with that commit's span and row count. Because the row commits
+   with the segments, there is no write-ahead entry for a commit that
+   never landed and no landed commit without its row — the S18
+   write-ahead/requeue shape the queue needed has no counterpart.
+   Maintenance swaps write no row: they move no new data, and the
+   ingest that fed them already recorded its change (a swap row would
+   only rebuild the same windows). A replayed ingest records nothing,
+   because it commits nothing.
+2. **Legacy ingest drops the queue.** The seal-backed branches of
+   `capture_measurement` and `batch_capture_measurements` no longer
+   enqueue or requeue timestamps; `count_unbatched_measurements` for a
+   seal-backed aspect is always 0. Rows mode is untouched. The capture
+   variants D-S19 already left in rows mode (`capture_new_measurement`
+   and the chunk helpers, which the design does not name) are unchanged.
+3. **Acknowledgement is deletion by epoch.** `SegmentStore::ack_changes`
+   (`IndexOp::DeleteChanges`) deletes an aspect's rows at or below an
+   epoch, as a queue consumer dequeues what it batched. No watermark
+   table: a crash before the acknowledgement leaves the rows, the next
+   run rebuilds the same windows, and the batch dedupe skips them. A
+   commit landing after a consumer's read takes a higher epoch and is
+   never deleted by that consumer's acknowledgement.
+4. **Coverage is per change, over spans.** The orchestration consumer
+   (`build_incremental_from_change_log`, dispatched from
+   `build_incremental_unprocessed_queue` for seal-backed aspects) unions
+   each change span's windows via `calculate_affected_windows_for_range`
+   — a superset of the span's rows' windows, so a gap inside a span
+   costs extra rebuilds that dedupe skips, never a missed row — and
+   acknowledges only the longest prefix of changes whose windows were
+   all built, since acknowledgement is through an epoch. A change
+   touching a window past the stored data, or short of points, stays
+   logged for the next run, as a queued timestamp stays queued. A first
+   run (no batches yet) is the full rebuild plus acknowledgement of the
+   rows read, which also covers aspects sealed before D-S20 whose rows
+   have no change rows.
+
+5. **One seal-store open per process, shared across handles.** The
+   consumer reaches the rows through `analyze_range`, which reopens the
+   database by name for every chunk — a fresh `Database` handle whose
+   per-handle seal-store cache is empty, so its first seal read refused
+   the root as locked by the ingest handle's open (a root can be open
+   only once in a process). Seal-backed aspects could therefore never
+   be batched at all. `Database::seal_store` now shares its open
+   through a process-wide weak registry keyed by the root path
+   (`SEAL_STORES`): every handle of a database gets the one open, and
+   when the last reference drops the next open goes back to disk.
+
+**Not in this slice:** change rows for maintenance swaps (see 1), the
+rows-mode queue (unchanged, S18 semantics intact), and the plan's `:780`
+gate tick as a separate line — the current ROADMAP carries no distinct
+`:780` line; this slice ticks the Phase 7 **S20** mirror line, the same
+line the queue records for D-S20.
+
+**Salvage amendment (parent, 2026-11-04):** the verification bar caught an
+interaction the slice's own tests missed. FRE-12a's newer-layout store
+opens without running a migration and deliberately has no
+`segment_changes` table — its test drops the table and asserts it stays
+gone — so the unconditional change-log insert failed that store's seals
+outright. `RecordChange` and `DeleteChanges` now probe for the table on
+the transaction's connection and record/delete nothing when it is
+absent, the agreement the change-log reader already kept: a store with
+no change log has no consumer to notify, and this build must not create
+the table outside a migration.

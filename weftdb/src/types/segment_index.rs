@@ -967,6 +967,64 @@ impl SegmentIndexStore {
 		let series_ids = text(11)?.split(',').filter(|part| !part.is_empty()).map(str::parse::<u64>).collect::<Result<Vec<_>, _>>().with_context(|| format!("ingest_ledger records series_ids for {aspect:?} key {key:?} that do not parse"))?;
 		Ok(Some(crate::types::ingest::LedgerEntry { aspect: text(0)?, key: text(1)?, fingerprint: integer(2)?, row_count: usize::try_from(integer(3)?).unwrap_or(0), min_ts: opt_integer(4)?, max_ts: opt_integer(5)?, id_lo: opt_unsigned(6)?, id_hi: opt_unsigned(7)?, receipt_json: text(8)?, commit_epoch: u64::try_from(integer(9)?).unwrap_or(0), created_ms: integer(10)?, series_ids }))
 	}
+
+	/// Every change-log row of `aspect` at an epoch after `after_epoch`, in
+	/// epoch order (D-S20): the commits a consumer has not yet been told
+	/// about, one row per commit instead of one queue entry per timestamp.
+	/// A store whose registry has not created `segment_changes` yet (a
+	/// layout-1 read in a test) reads as no changes.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or a row this build cannot
+	/// decode.
+	pub(crate) async fn changes_after(&self, aspect: &str, after_epoch: u64) -> Result<Vec<SegmentChange>> {
+		let conn = connect_reader(&self.db).await?;
+		if !migrations::table_exists(&conn, "segment_changes").await? {
+			return Ok(Vec::new());
+		}
+		let mut rows = conn.query("SELECT epoch, min_ts, max_ts, row_count FROM segment_changes WHERE aspect = ? AND epoch > ? ORDER BY epoch ASC", turso::params![aspect.to_string(), i64::try_from(after_epoch).unwrap_or(i64::MAX)]).await?;
+		let mut changes = Vec::new();
+		while let Some(row) = rows.next().await? {
+			let integer = |idx: usize| -> Result<i64> {
+				match row.get_value(idx)? {
+					Value::Integer(n) => Ok(n),
+					other => bail!("segment_changes holds {other:?} where it records an integer"),
+				}
+			};
+			let opt_integer = |idx: usize| -> Result<Option<i64>> {
+				match row.get_value(idx)? {
+					Value::Integer(n) => Ok(Some(n)),
+					Value::Null => Ok(None),
+					other => bail!("segment_changes holds {other:?} where it records an integer or NULL"),
+				}
+			};
+			changes.push(SegmentChange { aspect: aspect.to_string(), epoch: u64::try_from(integer(0)?).unwrap_or(0), min_ts: opt_integer(1)?, max_ts: opt_integer(2)?, row_count: u64::try_from(integer(3)?).unwrap_or(0) });
+		}
+		Ok(changes)
+	}
+}
+
+/// One row of an aspect's change log, `segment_changes` (slice D-S20): a
+/// single commit's footprint — the aspect epoch it committed in, the time
+/// span its rows cover and how many rows it carried. The log replaces the
+/// per-timestamp unbatched queue for seal-backed aspects: a consumer reads
+/// these rows, rebuilds the batch windows their spans touch, and deletes
+/// the rows it has batched (`IndexOp::DeleteChanges`).
+/// A commit that never landed has no row (the row commits in the commit's
+/// own index transaction), and a landed commit always has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentChange {
+	/// The aspect the commit wrote to (the seal store's aspect key).
+	pub aspect: String,
+	/// The aspect epoch the commit committed in.
+	pub epoch: u64,
+	/// The commit's earliest timestamp, in the aspect's declared unit.
+	pub min_ts: Option<i64>,
+	/// The commit's latest timestamp.
+	pub max_ts: Option<i64>,
+	/// How many rows the commit carried.
+	pub row_count: u64,
 }
 
 /// Decode one `segment_quarantine` row in the column order [`SegmentIndexStore::quarantine`] selects.
