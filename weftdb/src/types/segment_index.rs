@@ -47,11 +47,11 @@ use crate::{
 	}, StoreError, SUPPORTED_LAYOUT
 };
 
-/// Every `segment_index` column a read decodes, in the order
-/// [`SegmentIndexStore::decode_row`] reads them.
 /// The quality term of a present-values prune: a row with at least one non-null value.
 const PRESENT_FILTER: &str = "AND row_count > 0 AND null_count < row_count";
 
+/// Every `segment_index` column a read decodes, in the order
+/// [`SegmentIndexStore::decode_row`] reads them.
 const SELECT_COLUMNS: &str = "id, path, format_version, physical_type, time_unit, row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value, byte_len, gen, prec, frame_crc, commit_epoch, series_id";
 
 /// A durable, libSQL-backed index of sealed segments, scoped by aspect.
