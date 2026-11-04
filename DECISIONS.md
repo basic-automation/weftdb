@@ -3889,10 +3889,12 @@ test") and FRE-18 ("layout-2 baseline fixtures") both name layout 2 as the 1.0 b
      the store breaks series isolation: its `segment_index` reads (`rows`, `all`) select by
      aspect with no `series_id` filter, so it returns tagged rows as untagged results, and
      its fsck R10 seeds `next_series_id` from the rows alone, ignoring the catalog.
-   - **Binding requirement on TAG-7 (not optional):** the first tagged write must call
-     `SegmentStore::ensure_floor` with a layout that pre-TAG-5 builds cannot write (3),
-     before that write commits, so only stores that actually hold a tagged series lose
-     rollback to pre-TAG-5 builds. TAG-7 is not complete without it.
+   - **Accepted, not mitigated:** no released build is affected. v0.1.0 is layout 1 and
+     refuses a layout-2 store, so only unreleased development builds between FRE-12a and
+     TAG-5 could reopen a tagged store. Guarding against them needs a lazy floor raise to 3
+     on the first tagged write, but `ensure_floor` cannot raise past `SUPPORTED_LAYOUT`, and
+     that would bring back the layout-3 bump this entry rejects. If the owner wants that
+     guard, it belongs to the layout decision at rc.1 (FRE-18), not to TAG-7.
 2. **Catalog shape:** `series(aspect TEXT, series_key TEXT, series_id INTEGER,
    PRIMARY KEY(aspect, series_key))` in `segment_index.db`, so a registration commits in the
    same `IndexTxn` as the rows that use it. The primary key is the key, not the id: a plain
