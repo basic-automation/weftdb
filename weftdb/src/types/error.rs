@@ -220,10 +220,10 @@ pub enum StoreError {
 		/// The fingerprint of the batch just offered.
 		offered_fingerprint: i64,
 	},
-	/// An ingest batch carried a non-empty `groups` tag set before the tags
-	/// gate flips (1.0 plan §5 D-S13, §4 C1/A4): until then the only group an
-	/// ingest may name is the empty [`TagSet`](crate::TagSet), series 0.
-	/// Nothing was written.
+	/// **Reserved; no longer produced.** An ingest batch carried a non-empty
+	/// `groups` tag set before the tags gate flipped (1.0 plan §5 D-S13, §4
+	/// C1/A4). The library gate opened in TAG-8: a tagged batch now seals as its
+	/// series. The variant stays so that matching code keeps compiling.
 	#[error("aspect {aspect:?}: ingest groups are not accepted yet (only the empty tag set, series 0, before the tags gate flips); nothing was written")]
 	GroupsUnsupported {
 		/// The aspect the batch was offered to.
@@ -240,6 +240,28 @@ pub enum StoreError {
 		aspect: String,
 		/// The per-aspect series cap in force.
 		limit: usize,
+	},
+	/// An ingest batch's `groups` named a tag key with the reserved `__` prefix
+	/// ([`RESERVED_TAG_KEY_PREFIX`](crate::tags::RESERVED_TAG_KEY_PREFIX)), which a
+	/// [`TagSet`](crate::TagSet) converted from a stored
+	/// [`SeriesKey`](crate::SeriesKey) may carry but an ingest may not write
+	/// (TAG-8). Nothing was written.
+	#[error("aspect {aspect:?}: the tag key {key:?} starts with `__`, which is reserved for system dimensions; nothing was written")]
+	ReservedTagKey {
+		/// The aspect the batch was offered to.
+		aspect: String,
+		/// The reserved key the batch named.
+		key: String,
+	},
+	/// A [`SeriesSelector`](crate::SeriesSelector) matched more than one series
+	/// of `aspect`, and a store read targets exactly one (TAG-8, tags D4). Narrow
+	/// the selector, or select exactly. Nothing was read.
+	#[error("aspect {aspect:?}: the series selector matched {matched} series, and a read targets exactly one; narrow the selector")]
+	AmbiguousSeries {
+		/// The aspect the selector was resolved in.
+		aspect: String,
+		/// How many series it matched (two or more).
+		matched: usize,
 	},
 	/// An ingest batch held no rows. Nothing was written, and the key is not
 	/// recorded: an empty batch has no receipt to replay.

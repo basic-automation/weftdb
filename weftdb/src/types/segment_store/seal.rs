@@ -606,12 +606,30 @@ impl SegmentStore {
 	/// [`ingest_phase_scope`](crate::exec::ingest_phase_scope) reports the
 	/// phase it reached, not just the error path's context string.
 	///
+	/// **Tags** (TAG-7; the library gate opened in TAG-8). A non-empty
+	/// `batch.groups` seals as its series (tags D3):
+	///
+	/// - every frame is wrapped in a v7 envelope carrying the canonical series key as
+	///   a critical [`EXT_SERIES_KEY`](weft_physical_type::EXT_SERIES_KEY) extension,
+	///   and the batch is cut to the frame target less the envelope, so the wrapped
+	///   frame still fits;
+	/// - the series id is resolved at commit, under the commit lock: the id the catalog holds for the
+	///   key, or a new one registered in the same transaction as the rows;
+	/// - a new key past [`SegmentStoreOptions::max_series_per_aspect`] is
+	///   [`StoreError::SeriesLimit`], checked before any frame is written and again at
+	///   commit.
+	///
+	/// An empty `groups` is series 0, and its frames are byte-identical to the ones an
+	/// ingest sealed before tags.
+	///
 	/// # Errors
 	///
 	/// Typed [`StoreError`]s, recovered with `downcast_ref::<StoreError>()`:
 	/// [`UnknownAspect`](StoreError::UnknownAspect) when `aspect` has no
-	/// declared schema; [`GroupsUnsupported`](StoreError::GroupsUnsupported)
-	/// for a non-empty `batch.groups`;
+	/// declared schema; [`ReservedTagKey`](StoreError::ReservedTagKey) when
+	/// `batch.groups` names a reserved `__` key;
+	/// [`SeriesLimit`](StoreError::SeriesLimit) for a new series past
+	/// [`SegmentStoreOptions::max_series_per_aspect`];
 	/// [`EmptyIngestBatch`](StoreError::EmptyIngestBatch) for a batch with
 	/// no rows; [`IngestLengthMismatch`](StoreError::IngestLengthMismatch)
 	/// when the timestamp and value columns differ in length;
@@ -623,39 +641,16 @@ impl SegmentStore {
 	/// filesystem write error, or a libSQL index failure (an ambiguous
 	/// COMMIT poisons the store, as for every write).
 	pub async fn ingest(&self, aspect: &str, batch: &IngestBatch) -> Result<IngestReceipt> {
-		self.ingest_inner(aspect, batch, TagPolicy::Refuse).await
-	}
-
-	/// [`ingest`](Self::ingest), with the tags gate set by `tags` (TAG-7).
-	///
-	/// Under [`TagPolicy::Refuse`] this is exactly the public entry point. Under
-	/// [`TagPolicy::Allow`] a non-empty `batch.groups` seals as its series (tags D3):
-	///
-	/// - every frame is wrapped in a v7 envelope carrying the canonical series key as
-	///   a critical [`EXT_SERIES_KEY`](weft_physical_type::EXT_SERIES_KEY) extension
-	///   ([`tag_frame`]), and the batch is cut to [`ingest_frame_target`], the frame
-	///   target less the envelope, so the wrapped frame still fits;
-	/// - the series id is resolved at commit, under the commit lock
-	///   ([`publish_ingest`](Self::publish_ingest)): the id the catalog holds for the
-	///   key, or a new one registered in the same transaction as the rows;
-	/// - a new key past [`SegmentStoreOptions::max_series_per_aspect`] is
-	///   [`StoreError::SeriesLimit`], checked before any frame is written and again at
-	///   commit.
-	///
-	/// An empty `groups` is series 0 under either policy, and its frames are
-	/// byte-identical to the ones an ingest sealed before tags.
-	///
-	/// # Errors
-	///
-	/// As [`ingest`](Self::ingest), plus [`SeriesLimit`](StoreError::SeriesLimit).
-	pub(crate) async fn ingest_inner(&self, aspect: &str, batch: &IngestBatch, tags: TagPolicy) -> Result<IngestReceipt> {
 		self.writable()?;
 		aspect_name::validate(aspect)?;
 		let mut phase = IngestPhase::Validating;
 		crate::exec::set_ingest_phase(phase);
 		let schema = self.require_schema(aspect).await.map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
-		if !batch.groups.is_empty() && tags == TagPolicy::Refuse {
-			return Err(StoreError::GroupsUnsupported { aspect: aspect.to_string() }.into());
+		// The library gate is open (TAG-8), but a `TagSet` converted from a stored
+		// `SeriesKey` may carry a reserved `__` key, and `groups` is a public field: no
+		// ingest may write one (critique D17).
+		if let Some((key, _)) = batch.groups.iter().find(|(key, _)| key.starts_with(crate::tags::RESERVED_TAG_KEY_PREFIX)) {
+			return Err(StoreError::ReservedTagKey { aspect: aspect.to_string(), key: key.to_string() }.into());
 		}
 		if batch.timestamps.len() != batch.values.len() {
 			return Err(StoreError::IngestLengthMismatch { timestamps: batch.timestamps.len(), values: batch.values.len() }.into());
@@ -785,7 +780,7 @@ impl SegmentStore {
 		}
 		let epoch = commit.state().epoch.saturating_add(1);
 		let mut ops: Vec<IndexOp> = Vec::with_capacity(written.len() + 5);
-		let series_id = self.resolve_series(aspect, &batch.groups, &mut ops).await?;
+		let series_id = self.commit_series_id(aspect, &batch.groups, &mut ops).await?;
 		let mut descriptors: Vec<SegmentDescriptor> = Vec::with_capacity(written.len());
 		let mut max_gen = 0u64;
 		for (descriptor, gen, frame_crc, _ts, _vs) in written {
@@ -822,7 +817,7 @@ impl SegmentStore {
 	/// [`StoreError::SeriesLimit`] for a new key when the aspect already holds
 	/// [`max_series_per_aspect`](SegmentStoreOptions::max_series_per_aspect) series, or
 	/// a catalog read failure.
-	pub(crate) async fn resolve_series(&self, aspect: &str, groups: &crate::TagSet, ops: &mut Vec<IndexOp>) -> Result<crate::SeriesId> {
+	pub(crate) async fn commit_series_id(&self, aspect: &str, groups: &crate::TagSet, ops: &mut Vec<IndexOp>) -> Result<crate::SeriesId> {
 		if groups.is_empty() {
 			return Ok(crate::SeriesId::UNTAGGED);
 		}
@@ -839,7 +834,7 @@ impl SegmentStore {
 	/// [`RegisterSeries`](IndexOp::RegisterSeries) and [`SeedSeries`](IndexOp::SeedSeries)
 	/// that register it are pushed onto `ops`, for the caller to commit in the same
 	/// transaction as the rows that use the id. The empty key is series 0 and is never
-	/// registered. No series cap is applied: [`resolve_series`](Self::resolve_series)
+	/// registered. No series cap is applied: [`commit_series_id`](Self::commit_series_id)
 	/// checks it for ingest, and recovery (TAG-9) binds data that already exists.
 	///
 	/// The caller holds `aspect`'s commit lock, the only lock under which series are

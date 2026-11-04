@@ -51,7 +51,7 @@ use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
 use bigdecimal::BigDecimal;
 use weft_physical_type::{first_order_violation, AspectSchema, SegmentDescriptor, TimeUnit};
-use weftdb::SegmentStore;
+use weftdb::{SegmentStore, SeriesId};
 
 /// Read the rows of `aspect` whose timestamp falls in the inclusive `[start, end]`
 /// window and return them as a single lossless Arrow [`RecordBatch`].
@@ -70,8 +70,18 @@ use weftdb::SegmentStore;
 /// timestamp unit is unknown), or if the underlying time-range read fails (libSQL
 /// prune, filesystem read, or a corrupt `.weftseg` frame).
 pub async fn read_time_range_to_record_batch(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<RecordBatch> {
+	read_time_range_to_record_batch_of(store, aspect, SeriesId::UNTAGGED, start, end).await
+}
+
+/// [`read_time_range_to_record_batch`] of one series (TAG-8): the store's series-scoped `_of` read, so only the
+/// rows of `series` are exported. [`read_time_range_to_record_batch`] is this with [`SeriesId::UNTAGGED`].
+///
+/// # Errors
+///
+/// As [`read_time_range_to_record_batch`].
+pub async fn read_time_range_to_record_batch_of(store: &SegmentStore, aspect: &str, series: SeriesId, start: i64, end: i64) -> Result<RecordBatch> {
 	let unit = aspect_time_unit(store, aspect).await?;
-	let (timestamps, values) = store.read_time_range(aspect, start, end).await?;
+	let (timestamps, values) = store.read_time_range_of(aspect, series, start, end).await?;
 	Ok(weft_arrow::columns_to_record_batch(unit, &timestamps, &values)?)
 }
 
@@ -95,8 +105,18 @@ pub async fn read_time_range_to_record_batch(store: &SegmentStore, aspect: &str,
 /// As [`read_time_range_to_record_batch`]: undeclared aspect, or an underlying
 /// time-range read failure.
 pub async fn read_time_range_to_record_batch_typed(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<RecordBatch> {
+	read_time_range_to_record_batch_typed_of(store, aspect, SeriesId::UNTAGGED, start, end).await
+}
+
+/// [`read_time_range_to_record_batch_typed`] of one series (TAG-8): the store's series-scoped `_of` read, so only the
+/// rows of `series` are exported. [`read_time_range_to_record_batch_typed`] is this with [`SeriesId::UNTAGGED`].
+///
+/// # Errors
+///
+/// As [`read_time_range_to_record_batch_typed`].
+pub async fn read_time_range_to_record_batch_typed_of(store: &SegmentStore, aspect: &str, series: SeriesId, start: i64, end: i64) -> Result<RecordBatch> {
 	let schema = aspect_schema(store, aspect).await?;
-	let (timestamps, values) = store.read_time_range(aspect, start, end).await?;
+	let (timestamps, values) = store.read_time_range_of(aspect, series, start, end).await?;
 	Ok(weft_arrow::columns_to_record_batch_typed(schema.timestamp_unit, schema.value, &timestamps, &values)?)
 }
 
@@ -116,8 +136,18 @@ pub async fn read_time_range_to_record_batch_typed(store: &SegmentStore, aspect:
 /// underlying value-range read fails (libSQL read, filesystem read, or a corrupt
 /// `.weftseg` frame).
 pub async fn read_value_range_to_record_batch(store: &SegmentStore, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<RecordBatch> {
+	read_value_range_to_record_batch_of(store, aspect, SeriesId::UNTAGGED, lo, hi).await
+}
+
+/// [`read_value_range_to_record_batch`] of one series (TAG-8): the store's series-scoped `_of` read, so only the
+/// rows of `series` are exported. [`read_value_range_to_record_batch`] is this with [`SeriesId::UNTAGGED`].
+///
+/// # Errors
+///
+/// As [`read_value_range_to_record_batch`].
+pub async fn read_value_range_to_record_batch_of(store: &SegmentStore, aspect: &str, series: SeriesId, lo: &BigDecimal, hi: &BigDecimal) -> Result<RecordBatch> {
 	let unit = aspect_time_unit(store, aspect).await?;
-	let (timestamps, values) = store.read_value_range(aspect, lo, hi).await?;
+	let (timestamps, values) = store.read_value_range_of(aspect, series, lo, hi).await?;
 	// read_value_range returns only present values; lift them into the nullable
 	// shape columns_to_record_batch expects.
 	let values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
@@ -142,7 +172,17 @@ pub async fn read_value_range_to_record_batch(store: &SegmentStore, aspect: &str
 /// As [`read_time_range_to_record_batch_typed`] (undeclared aspect, or a read
 /// failure), plus a [`weft_arrow::ConvertError`] if IPC serialization fails.
 pub async fn read_time_range_to_ipc_bytes(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<Vec<u8>> {
-	let batch = read_time_range_to_record_batch_typed(store, aspect, start, end).await?;
+	read_time_range_to_ipc_bytes_of(store, aspect, SeriesId::UNTAGGED, start, end).await
+}
+
+/// [`read_time_range_to_ipc_bytes`] of one series (TAG-8): the store's series-scoped `_of` read, so only the
+/// rows of `series` are exported. [`read_time_range_to_ipc_bytes`] is this with [`SeriesId::UNTAGGED`].
+///
+/// # Errors
+///
+/// As [`read_time_range_to_ipc_bytes`].
+pub async fn read_time_range_to_ipc_bytes_of(store: &SegmentStore, aspect: &str, series: SeriesId, start: i64, end: i64) -> Result<Vec<u8>> {
+	let batch = read_time_range_to_record_batch_typed_of(store, aspect, series, start, end).await?;
 	Ok(weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))?)
 }
 
@@ -157,7 +197,17 @@ pub async fn read_time_range_to_ipc_bytes(store: &SegmentStore, aspect: &str, st
 /// As [`read_value_range_to_record_batch`], plus a [`weft_arrow::ConvertError`] if
 /// IPC serialization fails.
 pub async fn read_value_range_to_ipc_bytes(store: &SegmentStore, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<Vec<u8>> {
-	let batch = read_value_range_to_record_batch(store, aspect, lo, hi).await?;
+	read_value_range_to_ipc_bytes_of(store, aspect, SeriesId::UNTAGGED, lo, hi).await
+}
+
+/// [`read_value_range_to_ipc_bytes`] of one series (TAG-8): the store's series-scoped `_of` read, so only the
+/// rows of `series` are exported. [`read_value_range_to_ipc_bytes`] is this with [`SeriesId::UNTAGGED`].
+///
+/// # Errors
+///
+/// As [`read_value_range_to_ipc_bytes`].
+pub async fn read_value_range_to_ipc_bytes_of(store: &SegmentStore, aspect: &str, series: SeriesId, lo: &BigDecimal, hi: &BigDecimal) -> Result<Vec<u8>> {
+	let batch = read_value_range_to_record_batch_of(store, aspect, series, lo, hi).await?;
 	Ok(weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))?)
 }
 
@@ -178,7 +228,17 @@ pub async fn read_value_range_to_ipc_bytes(store: &SegmentStore, aspect: &str, l
 /// As [`read_time_range_to_record_batch_typed`] (undeclared aspect, or a read
 /// failure), plus a [`weft_arrow::ConvertError`] if Parquet serialization fails.
 pub async fn read_time_range_to_parquet_bytes(store: &SegmentStore, aspect: &str, start: i64, end: i64) -> Result<Vec<u8>> {
-	let batch = read_time_range_to_record_batch_typed(store, aspect, start, end).await?;
+	read_time_range_to_parquet_bytes_of(store, aspect, SeriesId::UNTAGGED, start, end).await
+}
+
+/// [`read_time_range_to_parquet_bytes`] of one series (TAG-8): the store's series-scoped `_of` read, so only the
+/// rows of `series` are exported. [`read_time_range_to_parquet_bytes`] is this with [`SeriesId::UNTAGGED`].
+///
+/// # Errors
+///
+/// As [`read_time_range_to_parquet_bytes`].
+pub async fn read_time_range_to_parquet_bytes_of(store: &SegmentStore, aspect: &str, series: SeriesId, start: i64, end: i64) -> Result<Vec<u8>> {
+	let batch = read_time_range_to_record_batch_typed_of(store, aspect, series, start, end).await?;
 	Ok(weft_arrow::write_parquet(std::slice::from_ref(&batch))?)
 }
 
@@ -193,7 +253,17 @@ pub async fn read_time_range_to_parquet_bytes(store: &SegmentStore, aspect: &str
 /// As [`read_value_range_to_record_batch`], plus a [`weft_arrow::ConvertError`] if
 /// Parquet serialization fails.
 pub async fn read_value_range_to_parquet_bytes(store: &SegmentStore, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<Vec<u8>> {
-	let batch = read_value_range_to_record_batch(store, aspect, lo, hi).await?;
+	read_value_range_to_parquet_bytes_of(store, aspect, SeriesId::UNTAGGED, lo, hi).await
+}
+
+/// [`read_value_range_to_parquet_bytes`] of one series (TAG-8): the store's series-scoped `_of` read, so only the
+/// rows of `series` are exported. [`read_value_range_to_parquet_bytes`] is this with [`SeriesId::UNTAGGED`].
+///
+/// # Errors
+///
+/// As [`read_value_range_to_parquet_bytes`].
+pub async fn read_value_range_to_parquet_bytes_of(store: &SegmentStore, aspect: &str, series: SeriesId, lo: &BigDecimal, hi: &BigDecimal) -> Result<Vec<u8>> {
+	let batch = read_value_range_to_record_batch_of(store, aspect, series, lo, hi).await?;
 	Ok(weft_arrow::write_parquet(std::slice::from_ref(&batch))?)
 }
 
@@ -321,6 +391,36 @@ mod tests {
 		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
 		assert_eq!(ts, vec![110, 120, 130]);
 		assert_eq!(vs, vec![Some(bd("2.5")), Some(bd("3.5")), Some(bd("4.5"))]);
+	}
+
+	/// TAG-8: the `_of` wrappers export one series; the plain ones export series 0 only.
+	#[tokio::test]
+	async fn of_wrappers_export_one_series() {
+		use weft_arrow::{read_ipc_stream, read_parquet, record_batches_to_columns};
+		use weftdb::{IngestBatch, SeriesSelector, TagSet};
+
+		let (_dir, store) = store_with_aspect(TimeUnit::Seconds, PhysicalType::F64).await;
+		store.seal_declared("price", &[1_i64, 2, 3], &[bd("1"), bd("2"), bd("3")]).await.expect("seals series 0");
+		let host = TagSet::from_pairs([("host", "a")]).expect("valid tags");
+		store.ingest("price", &IngestBatch::dense("a", vec![1, 2, 3], vec![bd("10"), bd("20"), bd("30")]).with_groups(host)).await.expect("ingests series a");
+		let a = store.resolve_series("price", &SeriesSelector::new([("host", Some("a"))]).expect("valid selector")).await.expect("resolves").expect("one series");
+
+		let (_, vs) = record_batch_to_columns(&read_time_range_to_record_batch(&store, "price", 0, 10).await.expect("exports")).expect("reads back");
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2")), Some(bd("3"))], "the plain wrapper is series 0");
+		let (_, vs) = record_batch_to_columns(&read_time_range_to_record_batch_of(&store, "price", a, 0, 10).await.expect("exports")).expect("reads back");
+		assert_eq!(vs, vec![Some(bd("10")), Some(bd("20")), Some(bd("30"))]);
+		let (_, vs) = record_batch_to_columns(&read_time_range_to_record_batch_typed_of(&store, "price", a, 2, 3).await.expect("exports")).expect("reads back");
+		assert_eq!(vs, vec![Some(bd("20")), Some(bd("30"))]);
+		let (ts, _) = record_batch_to_columns(&read_value_range_to_record_batch_of(&store, "price", a, &bd("15"), &bd("40")).await.expect("exports")).expect("reads back");
+		assert_eq!(ts, vec![2, 3]);
+		let (ts, _) = record_batches_to_columns(&read_ipc_stream(&read_time_range_to_ipc_bytes_of(&store, "price", a, 1, 1).await.expect("serializes")).expect("reads")).expect("reads back");
+		assert_eq!(ts, vec![1]);
+		let (ts, _) = record_batches_to_columns(&read_ipc_stream(&read_value_range_to_ipc_bytes_of(&store, "price", a, &bd("0"), &bd("5")).await.expect("serializes")).expect("reads")).expect("reads back");
+		assert!(ts.is_empty(), "series a holds no value below 10");
+		let (_, vs) = record_batches_to_columns(&read_parquet(&read_time_range_to_parquet_bytes_of(&store, "price", a, 3, 3).await.expect("serializes")).expect("reads")).expect("reads back");
+		assert_eq!(vs, vec![Some(bd("30"))]);
+		let (_, vs) = record_batches_to_columns(&read_parquet(&read_value_range_to_parquet_bytes_of(&store, "price", a, &bd("20"), &bd("20")).await.expect("serializes")).expect("reads")).expect("reads back");
+		assert_eq!(vs, vec![Some(bd("20"))]);
 	}
 
 	#[tokio::test]
