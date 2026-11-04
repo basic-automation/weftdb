@@ -142,3 +142,14 @@ pub(crate) fn host_guard_for(local: SocketAddr) -> HostGuard {
 	}
 	guard
 }
+
+/// Read the Arrow Flight listener's address from `WEFT_FLIGHT_ADDR`, once: `None` leaves
+/// Flight off.
+///
+/// # Errors
+///
+/// A value that is not a socket address, or one that is not loopback (the listener is
+/// plaintext; [`weft_server::flight::flight_addr`] says why).
+pub(crate) fn flight_addr() -> anyhow::Result<Option<SocketAddr>> {
+	weft_server::flight::flight_addr(std::env::var(weft_server::flight::FLIGHT_ADDR_ENV).ok().as_deref()).map_err(anyhow::Error::msg)
+}

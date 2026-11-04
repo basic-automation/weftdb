@@ -73,7 +73,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
+	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, grafana, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
 };
 
 /// What a request to a route must hold, from the frozen table above. See the
@@ -649,6 +649,7 @@ pub fn build_registry_with_limits(config: IngestConfig, admission_config: Admiss
 	register_maintenance_routes(&mut routes);
 	register_backup_routes(&mut routes);
 	register_bench_run_routes(&mut routes);
+	register_grafana_routes(&mut routes);
 	routes.seal(Some(Arc::new(Admission::new(IngestAdmission::new(config.max_inflight_bytes()), admission_config))))
 }
 
@@ -814,6 +815,14 @@ fn register_bench_run_routes(routes: &mut Routes) {
 	routes.route(Method::GET, "/bench/runs/{id}", RouteSpec::experimental(Scope::Metrics, Audit::None, true, AdmissionClass::Query, "get_bench_run"), get(bench_runs::get_run));
 }
 
+/// Grafana's JSON-datasource protocol over the stored aspects (Phase 2, experimental):
+/// the connection test, the metric picker and the query, all reads in the `read` scope.
+fn register_grafana_routes(routes: &mut Routes) {
+	routes.route(Method::GET, "/api/v1/grafana", RouteSpec::experimental(Scope::Read, Audit::None, false, AdmissionClass::Query, "grafana_test"), get(grafana::test));
+	routes.route(Method::POST, "/api/v1/grafana/metrics", RouteSpec::experimental(Scope::Read, Audit::None, false, AdmissionClass::Query, "grafana_metrics"), post(grafana::metrics));
+	routes.route(Method::POST, "/api/v1/grafana/query", RouteSpec::experimental(Scope::Read, Audit::None, false, AdmissionClass::Query, "grafana_query"), post(grafana::query));
+}
+
 /// Stateless compute: interpolation and downsampling over what the
 /// request body carries. No store is touched, so no audit record.
 fn register_compute_routes(routes: &mut Routes) {
@@ -944,17 +953,17 @@ mod tests {
 
 	/// Every registered route is one the pre-SEC-3 router served: the
 	/// registry must not lose (or invent) a route in the move. The count
-	/// is 62 method routes over 56 path templates (55/49 before D-S12
+	/// is 65 method routes over 59 path templates (55/49 before D-S12
 	/// added the fsck and quarantine routes, 60/54 before Phase 3 added
 	/// the two bench-run routes).
 	#[test]
 	fn registry_covers_the_whole_surface() {
 		let table = build_registry().table();
-		assert_eq!(table.entries().len(), 62, "the registry must carry every route the old lib.rs chain served");
+		assert_eq!(table.entries().len(), 65, "the registry must carry every route the old lib.rs chain served");
 		let mut operations: Vec<&str> = table.entries().iter().map(|entry| entry.spec.operation_id).collect();
 		operations.sort_unstable();
 		operations.dedup();
-		assert_eq!(operations.len(), 62, "operation ids are unique");
+		assert_eq!(operations.len(), 65, "operation ids are unique");
 		// Every scope in the frozen table is used by at least one route:
 		// an unused scope in a frozen table is a scope nobody can hold.
 		for scope in Scope::ALL {
@@ -981,7 +990,7 @@ mod tests {
 		let document = table.openapi_document();
 		assert_eq!(document["openapi"], "3.1.0");
 		let paths = document["paths"].as_object().unwrap();
-		assert_eq!(paths.len(), 56, "one path item per template");
+		assert_eq!(paths.len(), 59, "one path item per template");
 		let health = &paths["/health"]["get"];
 		assert_eq!(health["operationId"], "get_health");
 		assert_eq!(health["x-weft-scope"], "probe");

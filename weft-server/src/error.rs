@@ -246,7 +246,7 @@ impl Code {
 	/// The one sentence a `5xx` client is allowed to see for this code. The real cause goes
 	/// to the log; this is what the body carries. Kept free of anything that names a path,
 	/// a subsystem version, or an internal type.
-	const fn redacted_message(self) -> &'static str {
+	pub(crate) const fn redacted_message(self) -> &'static str {
 		match self {
 			Self::Internal => "the server could not complete the request",
 			Self::CommitFailed => "the write did not commit and the store was not modified",

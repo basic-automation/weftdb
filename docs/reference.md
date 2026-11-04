@@ -233,7 +233,7 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 | Library crates on crates.io | Not published yet |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
 | Packaging — Helm | Not started |
-| Client SDKs | Rust: [`weft-client`](../weft-client) (not on crates.io yet). Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
+| Client SDKs | Rust: [`weft-client`](../weft-client) (not on crates.io yet). R: [`clients/r`](../clients/r) (not on CRAN). Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
 | Per-measurement tags | Not started |
 
 The full work queue lives in [`ROADMAP.md`](../ROADMAP.md). It is the single source of
@@ -289,6 +289,12 @@ truth for status and priorities, and it records negative results alongside wins.
 - **Python client** ([`clients/python`](../clients/python)) — every HTTP route from Python,
   lossless `Decimal` values on the storage paths, and Arrow/Parquet answers as `pyarrow`
   tables.
+- **R client** ([`clients/r`](../clients/r)) — stored windows and server-side downsamples
+  as Arrow tables in R, and data frames written as Parquet.
+- **Grafana** (experimental) — chart stored aspects through the community JSON datasource,
+  with each panel's buckets reduced in the store.
+- **Arrow Flight** (experimental, read-only) — stream a stored window or value band as
+  Arrow record batches to `pyarrow.flight` or any Flight client.
 - **Rust client** ([`weft-client`](../weft-client)) — every HTTP route from async Rust,
   lossless `BigDecimal` values on the storage paths, cursor-following streams, and
   optional Arrow `RecordBatch` decoding.
@@ -659,6 +665,61 @@ under the declared encoding/tolerance is rejected `422 value_not_representable` 
 | `POST /api/v1/storage/restore/drill?label=<backup>` | **Restore drill** (Phase 7.4) — rehearse restoring a backup *on a running server*, so an operator can answer "is my backup actually restorable?" without risking anything. Restores the named backup into a throwaway directory beside the backups, verifies every restored database at its destination (it opens, and every row of every table reads), returns per-DB `{name, tables, rows, bytes}` + `total_rows`/`total_bytes`/`restorable`, then deletes the rehearsal copy (`cleanup_error` says why, if it could not; it is `null` otherwise). **Non-destructive by construction** — it cannot touch the live store, and restoring *over* a live control plane is deliberately not offered (the library primitive refuses to clobber; pointing `WEFT_SEGMENT_STORE_ROOT` at a restored copy is a deployment decision, not an HTTP call). Unknown backup → `404`; a label outside the backup label grammar (so also traversal and the staging names `.partial-*`, `.deleting-*`, `.restore-drill-*`) → `400`, while a daemon snapshot's `backup-<digits>` is accepted, since a drill only reads it; a rehearsal directory already taken by a drill started in the same millisecond → `409` with `"code": "already_exists"` (retry; nothing was restored or removed); a backup that will not restore → `500` carrying the failure, which is a failed drill rather than a server bug. |
 | `GET /api/v1/storage/{aspect}/stats` · `…/storage/stats` | Materialized per-aspect and store-wide rollups, including the realized **bytes/point** (the north-star cost term), an `unsorted_segments` order-health count (segments that would force a linear scan on a point lookup), and an `overlapping_segments` count (time-overlapping segments — the cross-segment order-health signal, computed by an index scan). Rollup fields are served from the control plane without opening a segment. |
 
+### Grafana (experimental)
+
+`weft-server` answers Grafana's community **JSON datasource** (`simpod-json-datasource`)
+under `/api/v1/grafana`, so a dashboard charts stored aspects with the reduction computed in
+the store, not in Grafana:
+
+| Method & path | Purpose |
+|---------------|---------|
+| `GET /api/v1/grafana` | The datasource's "Save & test": `{"status": "ok"}`. |
+| `POST /api/v1/grafana/metrics` | The metric picker: one entry per declared aspect (filtered by the typed `metric` text), with the reduction offered as the `agg` payload option. |
+| `POST /api/v1/grafana/query` | One series per visible target: the aspect's stored downsample over the panel's `range`, bucketed at its `intervalMs` (widened so it never exceeds `maxDataPoints`, or 11,000), as `datapoints: [[value, epoch_ms], …]`. The target's `agg` payload picks one reduction (default `avg`; any single stored-downsample token, aliases such as `median` included, e.g. `max`, `p95`, `twa`), or `count` for the rows in each bucket. The width is sent in the coarsest unit that divides it (`10m`, not `600000ms`). Empty buckets are left out, which Grafana draws as gaps. At most 64 visible targets per query. |
+
+All three need the `read` scope. Values are the reduction's `f64`, as the JSON downsample
+route answers them; exact decimal reads stay on the storage routes. Provision the datasource
+with [`packaging/grafana/weftdb-datasource.yaml`](../packaging/grafana/weftdb-datasource.yaml)
+(base URL `http://<server>/api/v1/grafana`, a reader key as the `Authorization` header). A
+target naming no declared aspect is `404 aspect_not_found`, and Grafana shows that message on
+the panel. The dashboard over `weft-bench`'s Prometheus output is a separate thing, in
+`bench/grafana/`.
+
+### Arrow Flight (experimental)
+
+With `WEFT_FLIGHT_ADDR` set (loopback only, e.g. `127.0.0.1:8815`), `weft-server` also
+serves **Arrow Flight** over gRPC beside the HTTP listener, so an Arrow client streams a
+stored window as record batches instead of one HTTP body. It is **read-only**:
+
+| Flight call | What it does |
+|-------------|--------------|
+| `DoGet(ticket)` | The rows a ticket names, as the same typed record batch `GET …/range` and `…/value-range` encode. |
+| `GetFlightInfo(descriptor)` · `GetSchema(descriptor)` | The schema (read from an empty window, so no rows are decoded) and one endpoint whose ticket is the descriptor's read. |
+| `ListFlights` | One flight per declared aspect: descriptor path `[aspect]`, ticket for its whole time range. |
+| `DoPut` · `DoExchange` · `DoAction` · `Handshake` | `UNIMPLEMENTED`: writes go through the HTTP ingest routes. |
+
+A ticket (or a descriptor's `cmd`) is JSON: `{"aspect":"price","start":0,"end":9999}` for a
+time window, `{"aspect":"price","lo":"1.5","hi":"2"}` for a value band (decimal text). A
+descriptor `path` of one aspect name is that aspect's whole range. From Python:
+
+```python
+import json, pyarrow.flight as flight
+client = flight.connect("grpc://127.0.0.1:8815")
+ticket = flight.Ticket(json.dumps({"aspect": "price", "start": 0, "end": 9999}))
+table = client.do_get(ticket).read_all()   # with keys: flight.FlightCallOptions(headers=[(b"authorization", b"Bearer weft_…")])
+```
+
+With a keys file mounted every call needs `authorization: Bearer <key>` metadata whose role
+grants the `read` scope, and a refusal is an `auth_denied` audit event. Each call takes a
+permit from a query gate sized by `WEFT_QUERY_MAX_INFLIGHT`; a full gate is `UNAVAILABLE`.
+Refusals keep the HTTP envelope's code: the status message reads `<code>: <message>` and the
+`x-weft-error-code` metadata carries the code (`aspect_not_found` is `NOT_FOUND`, `bad_request`
+`INVALID_ARGUMENT`, `forbidden` `PERMISSION_DENIED`). The listener is plaintext, which is why
+a non-loopback address refuses the start; reach it remotely through an authenticated tunnel or
+a TLS-terminating proxy. On shutdown it stops with the server's other tasks, giving open
+streams 5 s, before the store closes. Flight SQL is not served: it needs the SQL surface
+(DataFusion), which is later on the roadmap.
+
 ### Metrics
 
 `GET /metrics` renders Prometheus text exposition (v0.0.4): shared
@@ -874,6 +935,7 @@ recovery-point and recovery-time objectives these settings produce, see
 | `WEFT_BACKUP_DIR` | `weft-server` | Directory each control-plane backup is written under — shared by the manual `POST …/storage/backup` endpoint and the background backup daemon, so hand-taken and automatic snapshots live together. | `<store_root>/backups` |
 | `WEFT_BACKUP_INTERVAL_SECS` | `weft-server` | Background control-plane backup daemon interval in seconds; `0`/unset disables it. Each tick writes a verified snapshot into a fresh `backup-<unix_millis>` directory, using the concurrent-write-safe `snapshot` verification (it backs up a live store). Needs a segment store configured. | unset (disabled) |
 | `WEFT_BACKUP_KEEP` | `weft-server` | How many **daemon-generated** snapshots to retain; after each successful backup the oldest `backup-<digits>` directories beyond this many are removed. Only daemon-generated names are ever counted or pruned — a snapshot taken through `POST …/storage/backup` (a `?label=` one, or an unlabelled `manual-<unix_millis>` one) is never a candidate — and a generated-looking directory stamped more than 24 h past the clock or past its own modification time is ignored (not counted, not removed, logged as a warning; remove it by hand). | unset (retain everything) |
+| `WEFT_FLIGHT_ADDR` | `weft-server` | *Experimental.* Turns on the read-only Arrow Flight listener (gRPC) at this address: `DoGet`, `GetFlightInfo`, `GetSchema` and `ListFlights` over the stored range and value-band reads, with the HTTP range routes' keys and `read` scope. Loopback only; a non-loopback address refuses the start (exit 78). See [Arrow Flight](#arrow-flight-experimental). | unset (no Flight listener) |
 | `WEFT_BENCH_RUNS_DIR` | `weft-server` | *Experimental.* Directory of `weft-bench` run manifests (`*.manifest.json`, searched four levels deep, symlinks not followed). `GET /bench/runs` lists them and `GET /bench/runs/{id}` serves one byte for byte, where the id is the SHA-256 of the manifest file (`weft-bench` prints it as `run id`). Both routes need the `metrics` scope. | unset (both routes answer `503 unconfigured`) |
 | `BTC_TEST_MAX_ROWS` / `BTC_TEST_FULL` | `weftdb` (tests) | Row cap for the bounded, hermetic default run of `test_create_btc_1min_database` (into a temp data dir), or `BTC_TEST_FULL=1` for the historical whole-corpus load into the shared data dir. | `5000` / unset |
 | `WEFT_SEGMENT_CHECKPOINT_STRIDE` | `weft-server` | Rows between entries of the sealed **timestamp checkpoint index** — trades a little size for much faster point lookups on **sorted, irregular** columns (~3.45× single-block; see the checkpointed-frames feature above). Applies only where it pays: sorted + irregular + at least `WEFT_SEGMENT_CHECKPOINT_MIN_ROWS` rows. ~1024 is the sweet spot (stride barely moves speed but does move size). | unset (no index; frames byte-for-byte as before) |

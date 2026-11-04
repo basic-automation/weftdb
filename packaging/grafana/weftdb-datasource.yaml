@@ -1,0 +1,15 @@
+# Grafana provisioning for WeftDB's JSON-datasource routes (docs/reference.md, "Grafana").
+# Needs the community JSON datasource plugin:
+#   grafana-cli plugins install simpod-json-datasource
+# Drop this file in /etc/grafana/provisioning/datasources/ and set WEFT_URL (and, with
+# authentication on, WEFT_READER_KEY to a key whose role grants the `read` scope).
+apiVersion: 1
+datasources:
+  - name: WeftDB
+    type: simpod-json-datasource
+    access: proxy
+    url: ${WEFT_URL}/api/v1/grafana
+    jsonData:
+      httpHeaderName1: Authorization
+    secureJsonData:
+      httpHeaderValue1: Bearer ${WEFT_READER_KEY}
