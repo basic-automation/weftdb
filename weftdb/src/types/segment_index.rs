@@ -629,7 +629,6 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure, or a row whose id is not a series id.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the tagged seal (TAG-7) and series-scoped reads (TAG-8) call it; until then only the tests do"))]
 	pub(crate) async fn series_id_for(&self, aspect: &str, key: &crate::SeriesKey) -> Result<Option<crate::SeriesId>> {
 		if key.is_empty() {
 			return Ok(Some(crate::SeriesId::UNTAGGED));
@@ -650,7 +649,6 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure, or a stored key that is not canonical.
-	#[cfg_attr(not(test), expect(dead_code, reason = "tagged reads (TAG-8) and recovery (TAG-9) call it; until then only the tests do"))]
 	pub(crate) async fn series_key_of(&self, aspect: &str, id: crate::SeriesId) -> Result<Option<crate::SeriesKey>> {
 		if id == crate::SeriesId::UNTAGGED {
 			return Ok(Some(crate::SeriesKey::default()));
@@ -687,7 +685,6 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the tagged seal (TAG-7) allocates from it; until then only the tests do"))]
 	pub(crate) async fn next_series_id(&self, aspect: &str) -> Result<u64> {
 		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT next_series_id FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
@@ -696,6 +693,22 @@ impl SegmentIndexStore {
 			None => None,
 		};
 		Ok(next.unwrap_or(1).max(1))
+	}
+
+	/// How many series `aspect`'s catalog registered: the count the per-aspect series
+	/// cap ([`SegmentStoreOptions::max_series_per_aspect`](crate::SegmentStoreOptions::max_series_per_aspect))
+	/// is checked against. Series 0 is implicit and is not counted.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub(crate) async fn series_count(&self, aspect: &str) -> Result<usize> {
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("SELECT COUNT(*) FROM series WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		Ok(match rows.next().await? {
+			Some(row) => Self::opt_integer(&row, 0).and_then(|n| usize::try_from(n).ok()).unwrap_or(0),
+			None => 0,
+		})
 	}
 
 	/// Every aspect with at least one row in the series catalog, in name order: the
@@ -957,7 +970,6 @@ pub(crate) struct AllocatorSeed {
 }
 
 /// A catalog `series_id` as a [`SeriesId`](crate::SeriesId).
-#[cfg_attr(not(test), expect(dead_code, reason = "the catalog readers' callers (TAG-7, TAG-8) arrive later; until then only the tests read ids"))]
 fn series_id_value(value: Value) -> Result<crate::SeriesId> {
 	match value {
 		Value::Integer(n) => Ok(crate::SeriesId(u64::try_from(n).with_context(|| format!("the series catalog holds the negative id {n}"))?)),
@@ -966,7 +978,6 @@ fn series_id_value(value: Value) -> Result<crate::SeriesId> {
 }
 
 /// A catalog `series_key` of `aspect`, decoded through the storage path.
-#[cfg_attr(not(test), expect(dead_code, reason = "the catalog readers' callers (TAG-8, TAG-9) arrive later; until then only the tests read keys"))]
 fn series_key_value(aspect: &str, value: Value) -> Result<crate::SeriesKey> {
 	match value {
 		Value::Text(text) => crate::SeriesKey::from_canonical(text.as_bytes()).with_context(|| format!("the {aspect:?} series catalog holds a key that is not canonical")),
@@ -975,7 +986,6 @@ fn series_key_value(aspect: &str, value: Value) -> Result<crate::SeriesKey> {
 }
 
 /// A `u64` as an SQL integer parameter.
-#[cfg_attr(not(test), expect(dead_code, reason = "`series_key_of`'s callers (TAG-8, TAG-9) arrive later; until then only the tests bind it"))]
 fn integer_param(n: u64) -> Result<Value> {
 	Ok(Value::Integer(i64::try_from(n).with_context(|| format!("{n} is beyond an SQL integer"))?))
 }

@@ -394,11 +394,21 @@ pub struct SegmentStoreOptions {
 	/// ([`MaintenanceBreaker::default`]): decision 17's scheduler is on by
 	/// default, and the breaker is part of it.
 	pub breaker: MaintenanceBreaker,
+	/// The most series one aspect may register (TAG-7):
+	/// [`DEFAULT_MAX_SERIES_PER_ASPECT`] unless changed. An ingest that would register
+	/// one more is refused with [`StoreError::SeriesLimit`](crate::StoreError::SeriesLimit);
+	/// series already registered stay writable. Series 0, the empty tag set, is implicit
+	/// and does not count.
+	pub max_series_per_aspect: usize,
 }
+
+/// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
+/// 100,000 series.
+pub const DEFAULT_MAX_SERIES_PER_ASPECT: usize = 100_000;
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default() }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT }
 	}
 }
 
@@ -409,7 +419,7 @@ impl SegmentStoreOptions {
 	/// Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env() }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -437,6 +447,14 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_breaker(mut self, breaker: MaintenanceBreaker) -> Self {
 		self.breaker = breaker;
+		self
+	}
+
+	/// These options with `limit` as the per-aspect series cap (see
+	/// [`max_series_per_aspect`](Self::max_series_per_aspect)).
+	#[must_use]
+	pub const fn with_max_series_per_aspect(mut self, limit: usize) -> Self {
+		self.max_series_per_aspect = limit;
 		self
 	}
 }
@@ -802,6 +820,69 @@ impl IngestSegment {
 	}
 }
 
+/// Whether an ingest refuses a non-empty `groups` (the public gate) or seals it as a
+/// tagged series (TAG-7).
+///
+/// [`SegmentStore::ingest`] always passes [`Refuse`](Self::Refuse): the library gate
+/// stays shut until TAG-8, when maintenance and reads are series-correct too (tags D5).
+/// Until then only the crate's own tests seal tagged batches, through
+/// `ingest_inner(.., TagPolicy::Allow)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TagPolicy {
+	/// A non-empty `groups` is [`GroupsUnsupported`](crate::StoreError::GroupsUnsupported).
+	Refuse,
+	/// A non-empty `groups` seals into its series: frames in a series-key envelope, rows
+	/// under the id the catalog holds for the key (registered at commit when new).
+	#[cfg_attr(not(test), expect(dead_code, reason = "the library gate opens in TAG-8; until then only the tests seal tagged batches"))]
+	Allow,
+}
+
+/// The most bytes a series-key envelope ([`tag_frame`]) adds to a frame carrying `key`:
+/// the envelope's 16 bytes (a 12-byte header and a 4-byte CRC trailer) plus one
+/// extension entry, charged as the envelope writer sizes it (6 bytes of id, flag and
+/// length prefix) plus the key itself. A canonical key is at most
+/// [`MAX_SERIES_KEY_BYTES`](weft_physical_type::tags::MAX_SERIES_KEY_BYTES) long, so this
+/// is at most 1,046 bytes.
+pub(crate) fn series_envelope_overhead(key: &crate::SeriesKey) -> u64 {
+	(16 + 6_u64).saturating_add(u64::try_from(key.as_bytes().len()).unwrap_or(u64::MAX))
+}
+
+/// The encoded-frame target an ingest of `groups` cuts its rows to:
+/// [`MAX_ENCODED_FRAME_BYTES`](crate::MAX_ENCODED_FRAME_BYTES) for an untagged batch,
+/// and that less [`series_envelope_overhead`] for a tagged one, so that the frame on
+/// disk, envelope included, still fits the target. Only tagged batches pay it.
+pub(crate) fn ingest_frame_target(groups: &crate::TagSet) -> u64 {
+	if groups.is_empty() {
+		crate::MAX_ENCODED_FRAME_BYTES
+	} else {
+		crate::MAX_ENCODED_FRAME_BYTES.saturating_sub(series_envelope_overhead(groups.series_key()))
+	}
+}
+
+/// Wrap the complete frame `bytes` for series `key` (tags D3): `None` (series 0, the
+/// empty tag set) returns the bytes untouched, so an untagged frame is byte-identical to
+/// one sealed before tags; `Some` wraps them in a v7 envelope with one
+/// [`EXT_SERIES_KEY`](weft_physical_type::EXT_SERIES_KEY) extension, `critical: true`,
+/// whose payload is the canonical key. The frame records the key, never the id: an id
+/// means nothing outside its store, while the key can be bound again after a restore.
+///
+/// The envelope ends in its own CRC, so the trailer the durable write reads as
+/// `frame_crc`, and the `byte_len` a row records, are the wrapped frame's.
+///
+/// # Errors
+///
+/// The envelope writer's refusal of a frame it cannot read, which a frame this build
+/// just encoded never is.
+pub(crate) fn tag_frame(bytes: Vec<u8>, key: Option<&crate::SeriesKey>) -> Result<Vec<u8>> {
+	match key {
+		Some(key) if !key.is_empty() => {
+			let extension = weft_physical_type::FrameExtension { id: weft_physical_type::EXT_SERIES_KEY, critical: true, payload: key.as_bytes().to_vec() };
+			weft_physical_type::wrap_frame_envelope(&bytes, &[extension]).map_err(|e| anyhow::anyhow!("wrapping a frame in its series-key envelope failed: {e}"))
+		}
+		_ => Ok(bytes),
+	}
+}
+
 /// Encode one ingest chunk under `schema`, in the batch's frame shape:
 /// paged when `rows_per_page` is set, single-block otherwise. The error
 /// is the shape's seal failure, worded as the direct seal paths word it.
@@ -812,9 +893,10 @@ fn encode_ingest_chunk(schema: &AspectSchema, timestamps: &[i64], values: &[Opti
 	}
 }
 
-/// Cut an ingest batch's rows into chunks of at most
-/// [`MAX_ENCODED_FRAME_BYTES`](crate::MAX_ENCODED_FRAME_BYTES) of encoded
-/// frame, by a conservative per-row estimate (D-S13): each row is charged
+/// Cut an ingest batch's rows into chunks of at most `target` bytes of encoded
+/// frame ([`ingest_frame_target`]: [`MAX_ENCODED_FRAME_BYTES`](crate::MAX_ENCODED_FRAME_BYTES),
+/// less the series-key envelope for a tagged batch), by a conservative per-row
+/// estimate (D-S13): each row is charged
 /// 24 bytes plus its value's bounded plain-form length (at most
 /// [`MAX_PLAIN_DIGITS`](weft_physical_type::MAX_PLAIN_DIGITS) digits, so
 /// the estimate can be computed arithmetically, without materialising the
@@ -822,8 +904,8 @@ fn encode_ingest_chunk(schema: &AspectSchema, timestamps: &[i64], values: &[Opti
 /// holding a run holds all of it, so a chunk may exceed the estimate —
 /// the caller proves each chunk's real frame against the target, and a
 /// single timestamp run is the smallest cut there is.
-fn chunk_ingest_rows(timestamps: &[i64], values: &[Option<BigDecimal>]) -> Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> {
-	let target = usize::try_from(crate::MAX_ENCODED_FRAME_BYTES).unwrap_or(usize::MAX);
+fn chunk_ingest_rows(timestamps: &[i64], values: &[Option<BigDecimal>], target: u64) -> Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+	let target = usize::try_from(target).unwrap_or(usize::MAX);
 	let mut chunks: Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::new();
 	let mut start = 0usize;
 	while start < timestamps.len() {
@@ -1187,6 +1269,11 @@ pub(crate) struct PlannedOutput {
 	timestamps: Vec<i64>,
 	values: Vec<Option<BigDecimal>>,
 	rows_per_page: Option<usize>,
+	/// The series key of the plan's series, when it is not series 0: the output is
+	/// written in a v7 envelope carrying it ([`tag_frame`]), exactly as the ingest that
+	/// sealed its members wrote them, so no committed row of a tagged series ever names
+	/// an untagged frame.
+	series_key: Option<crate::SeriesKey>,
 }
 
 /// A maintenance output encoded off the async workers: its frame bytes, its descriptor
@@ -1341,6 +1428,9 @@ pub struct SegmentStore {
 	/// The per-aspect circuit breaker store-wide maintenance sweeps run under
 	/// (ROB-19): its policy, from the open options.
 	maintenance_breaker: MaintenanceBreaker,
+	/// The most series one aspect may register, from the open options
+	/// ([`SegmentStoreOptions::max_series_per_aspect`]).
+	max_series_per_aspect: usize,
 	/// Each aspect's circuit-breaker state (consecutive sweep failures and, once
 	/// tripped, when the cooldown ends), guarded by a plain mutex: it is only
 	/// ever held for a map touch, never across an await.
@@ -2607,7 +2697,7 @@ mod tests {
 		let big = bd("1e200000");
 		let timestamps: Vec<i64> = (0..2_000).map(|i| i / 3).collect();
 		let values: Vec<Option<BigDecimal>> = (0..2_000).map(|_| Some(big.clone())).collect();
-		let chunks = chunk_ingest_rows(&timestamps, &values);
+		let chunks = chunk_ingest_rows(&timestamps, &values, crate::MAX_ENCODED_FRAME_BYTES);
 		assert!(chunks.len() >= 3, "a ~400 MB batch is cut: {} chunk(s)", chunks.len());
 		let mut flat_ts: Vec<i64> = Vec::new();
 		for (chunk_ts, chunk_vs) in &chunks {
@@ -7588,3 +7678,7 @@ mod swap_tests;
 /// A sidecar-served downsample keeps the column's decimal scale.
 #[cfg(test)]
 mod sidecar_scale_tests;
+
+/// TAG-7: tagged batches seal series-key envelopes under catalog-resolved series ids.
+#[cfg(test)]
+mod tag_seal_tests;

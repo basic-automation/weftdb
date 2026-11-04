@@ -108,8 +108,9 @@ pub struct IndexRow {
 	pub frame_crc: Option<u32>,
 	/// The aspect epoch the row committed in. `None` on legacy rows.
 	pub commit_epoch: Option<u64>,
-	/// The tag series the row's frame holds (tags A7): 0, the empty tag set, for every row
-	/// until tagged ingest lands.
+	/// The tag series the row's frame holds (tags A7): 0, the empty tag set, for an untagged
+	/// row; otherwise the id the aspect's series catalog holds for the series key the frame's
+	/// envelope carries (TAG-7), which the commit that inserts the row resolved.
 	pub series_id: u64,
 }
 
@@ -222,7 +223,6 @@ pub enum IndexOp {
 	/// a taken id is a `Conflict` as well. The empty key is series 0 and is never
 	/// registered: registering it, or any key as series 0, is refused as
 	/// [`TxnErrorKind::Definite`] before any statement runs.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the tagged seal (TAG-7) registers series; until then only the tests do"))]
 	RegisterSeries { aspect: String, series_id: crate::SeriesId, series_key: crate::SeriesKey },
 	/// Record an ingest batch in `ingest_ledger` (D-S13): a plain `INSERT`
 	/// on the `(aspect, key)` primary key, never `OR REPLACE` — a key already

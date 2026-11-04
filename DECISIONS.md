@@ -4012,3 +4012,69 @@ test") and FRE-18 ("layout-2 baseline fixtures") both name layout 2 as the 1.0 b
 with a re-derive hook (B2): it would be the first production use of `rederive` and still
 protects only development stores. `PRIMARY KEY (aspect, series_id)` plus `UNIQUE (aspect,
 series_key)`: the unique index is the part that cannot be relied on.
+
+## 2026-11-04 — TAG-7: tagged frames are a critical series-key envelope, the id is resolved at commit, and each aspect has a series cap (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** issue #441 names the slice only ("seal-lane tags work"). The design note's PR 2
+and its critique (B7-B9) fix the shape; where they disagree the critique wins. The library gate
+stays shut (tags D5), so nothing outside the crate's tests writes a tagged batch yet.
+
+**Chosen:**
+
+1. **Frame identity (tags D3).** A tagged batch's frames are each wrapped in a v7 envelope with
+   exactly one extension, `EXT_SERIES_KEY`, `critical: true`, whose payload is the canonical
+   `SeriesKey` bytes. The frame never records the id. An untagged frame is not enveloped and is
+   byte-identical to what `ingest` sealed before this slice; a test pins its CRC to the value
+   measured on the pre-TAG-7 commit. `byte_len` and `frame_crc` are the wrapped frame's (the
+   envelope ends in its own CRC, which is what the durable write reads off the trailer), so
+   `read_bound_frame` and fsck's checks need no change. `critical: true` is kept although the
+   critique calls the rationale weak (B10): it is harmless, and a build that cannot bind the key
+   must not serve the rows as untagged.
+2. **Chunking.** A tagged batch is cut to `MAX_ENCODED_FRAME_BYTES` less the envelope's worst
+   case (16 + 6 + key bytes, at most 1,046), so the wrapped frame still fits the target. Only
+   tagged batches pay it; an untagged batch is cut exactly as before.
+3. **`format_version` (critique B7).** The descriptor, and so `IngestResponse.format_version`,
+   records the **body's** layout: 5 single-block, 6 paged, never 7. Readers already choose
+   their decoder from the frame's own header (X-FRAME), so the number is a description, and
+   the body is what a caller can compare across tagged and untagged writes. The envelope is
+   documented on `IngestResponse` and counted in `byte_len`. Pinned by
+   `tagged_ingest_writes_a_critical_series_key_envelope`.
+4. **Series resolution at commit.** `publish_ingest` resolves the key under the aspect's commit
+   lock, in the same `IndexTxn` as the rows: the catalog's id when the key is registered;
+   otherwise `aspect_seq.next_series_id`, pushed as `RegisterSeries` plus `SeedSeries`. Every
+   row's `series_id`, the receipt's and the ledger's `series_ids` carry that id. A `Conflict`
+   on the registration is an error, not retried (critique B8): only ingest registers series,
+   and only under the commit lock. A crash before the commit leaves the frame as ordinary
+   crash litter and leaks no id (`a_power_cut_between_tagged_frames_leaves_no_catalog_row_without_rows`).
+5. **Gate split.** Public `ingest` is `ingest_inner(.., TagPolicy::Refuse)` and still answers
+   `GroupsUnsupported`. `TagPolicy::Allow` is crate-private and, until TAG-8, constructed only
+   by tests. Reserved `__` keys are not refused on that path yet; that check belongs to the
+   gate flip (critique D17).
+6. **`IngestBatch::series_ids()` is removed (critique B9).** Correction to B9's premise: the
+   method did ship, in `weftdb` 0.2.0 on crates.io (v0.2.0 published the library crates). It is
+   removed anyway, because it could only ever answer `[0]` and a tagged batch's id does not
+   exist until commit; the pre-1.0 policy allows the break in the next minor release, and
+   CHANGELOG marks it as breaking. Deprecating instead would leave a method that answers wrong
+   for every tagged batch.
+7. **Series cap.** `StoreError::SeriesLimit { aspect, limit }` and
+   `SegmentStoreOptions::max_series_per_aspect` (`DEFAULT_MAX_SERIES_PER_ASPECT` = 100,000;
+   the number is a guess, as the design says). It counts the catalog's rows for the aspect
+   (series 0 never counts), is checked before any frame is written and again at commit under
+   the lock, and refuses only a new key. `weft-server` maps it to the existing `400
+   series_limit`. No operator setting is added; one Test-tier harness variable
+   (`WEFT_TEST_TAG_SEAL_CRASH_ROOT`) is, so the registry holds 84. A refusal at commit
+   (the race the pre-check cannot close) unlinks the frames that batch just wrote, so
+   recovery never journals a refused key's frames as orphans for TAG-9 to adopt.
+8. **Maintenance outputs keep their key.** `PlannedOutput` carries `Option<SeriesKey>`;
+   `swap_plans` looks up `series_key_of` once per tagged plan, and `write_output` wraps the
+   output in the same envelope. A plan whose series the catalog does not hold fails the swap.
+   This lands here, not in TAG-6, so that no commit ever puts an untagged frame under a
+   non-zero `series_id`.
+9. **No floor raise.** Following the TAG-5 entry and D1, nothing calls `ensure_floor`; the store
+   stays at layout 2.
+
+**Rejected:** writing the id into the frame (meaningless after a restore); allocating the id
+before the frame write (a catalog transaction outside the commit lock, and a crash would leak
+ids); retrying once on a registration `Conflict` (a dead path under the commit lock);
+reporting `format_version` 7 for a tagged frame (it would describe the wrapper rather than
+the data, and differ between two writes of the same rows).
