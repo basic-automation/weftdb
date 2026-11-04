@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{admission::AdmissionConfig, audit::AuditLog, auth::AuthConfig, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics};
+use crate::{admission::AdmissionConfig, audit::AuditLog, auth::AuthConfig, bench_runs::BenchRuns, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -72,6 +72,9 @@ pub struct AppState {
 	/// test states, where audited routes pass through unrecorded,
 	/// exactly as they pass unauthenticated with no keys configured.
 	audit: Option<Arc<AuditLog>>,
+	/// The benchmark-run manifests `GET /bench/runs` serves, present when
+	/// the binary was given `WEFT_BENCH_RUNS_DIR`.
+	bench_runs: Option<Arc<BenchRuns>>,
 }
 
 impl AppState {
@@ -87,7 +90,7 @@ impl AppState {
 	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT, audit: None }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT, audit: None, bench_runs: None }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -192,6 +195,20 @@ impl AppState {
 	#[must_use]
 	pub const fn audit_log(&self) -> Option<&Arc<AuditLog>> {
 		self.audit.as_ref()
+	}
+
+	/// Serve the benchmark-run manifests under `runs` on `/bench/runs`;
+	/// the binary passes the directory `WEFT_BENCH_RUNS_DIR` names.
+	#[must_use]
+	pub fn with_bench_runs(mut self, runs: BenchRuns) -> Self {
+		self.bench_runs = Some(Arc::new(runs));
+		self
+	}
+
+	/// The benchmark-run directory, when one is configured.
+	#[must_use]
+	pub const fn bench_runs(&self) -> Option<&Arc<BenchRuns>> {
+		self.bench_runs.as_ref()
 	}
 }
 

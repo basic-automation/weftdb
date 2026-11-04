@@ -73,7 +73,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-	admission::{Admission, AdmissionConfig}, backup_routes, declare, downsample, error::{ApiError, Code}, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
+	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
 };
 
 /// What a request to a route must hold, from the frozen table above. See the
@@ -331,6 +331,13 @@ impl RouteSpec {
 	#[must_use]
 	pub const fn stable(scope: Scope, audit: Audit, operator_detail: bool, admission_class: AdmissionClass, operation_id: &'static str) -> Self {
 		Self { scope, audit, operator_detail, tier: Tier::Stable, admission_class, operation_id }
+	}
+
+	/// A spec for a route outside the 1.0 freeze ([`Tier::Experimental`]):
+	/// it may be reshaped or removed with only a CHANGELOG note.
+	#[must_use]
+	pub const fn experimental(scope: Scope, audit: Audit, operator_detail: bool, admission_class: AdmissionClass, operation_id: &'static str) -> Self {
+		Self { scope, audit, operator_detail, tier: Tier::Experimental, admission_class, operation_id }
 	}
 }
 
@@ -641,6 +648,7 @@ pub fn build_registry_with_limits(config: IngestConfig, admission_config: Admiss
 	register_declare_routes(&mut routes);
 	register_maintenance_routes(&mut routes);
 	register_backup_routes(&mut routes);
+	register_bench_run_routes(&mut routes);
 	routes.seal(Some(Arc::new(Admission::new(IngestAdmission::new(config.max_inflight_bytes()), admission_config))))
 }
 
@@ -797,6 +805,15 @@ fn register_metrics_routes(routes: &mut Routes) {
 	routes.route(Method::GET, "/debug/profile/current", RouteSpec::stable(Scope::Metrics, Audit::None, true, AdmissionClass::Query, "get_debug_profile_current"), get(metrics::profile_current));
 }
 
+/// Benchmark runs (Phase 3): the EVI-3 run manifests, addressed by content
+/// hash. Operator information (host hardware, command lines), so the metrics
+/// scope like the rest of the operator's telemetry; experimental, because the
+/// surface postdates the 1.0 freeze.
+fn register_bench_run_routes(routes: &mut Routes) {
+	routes.route(Method::GET, "/bench/runs", RouteSpec::experimental(Scope::Metrics, Audit::None, true, AdmissionClass::Query, "list_bench_runs"), get(bench_runs::list_runs));
+	routes.route(Method::GET, "/bench/runs/{id}", RouteSpec::experimental(Scope::Metrics, Audit::None, true, AdmissionClass::Query, "get_bench_run"), get(bench_runs::get_run));
+}
+
 /// Stateless compute: interpolation and downsampling over what the
 /// request body carries. No store is touched, so no audit record.
 fn register_compute_routes(routes: &mut Routes) {
@@ -927,16 +944,17 @@ mod tests {
 
 	/// Every registered route is one the pre-SEC-3 router served: the
 	/// registry must not lose (or invent) a route in the move. The count
-	/// is 60 method routes over 54 path templates (55/49 before D-S12
-	/// added the fsck and quarantine routes).
+	/// is 62 method routes over 56 path templates (55/49 before D-S12
+	/// added the fsck and quarantine routes, 60/54 before Phase 3 added
+	/// the two bench-run routes).
 	#[test]
 	fn registry_covers_the_whole_surface() {
 		let table = build_registry().table();
-		assert_eq!(table.entries().len(), 60, "the registry must carry every route the old lib.rs chain served");
+		assert_eq!(table.entries().len(), 62, "the registry must carry every route the old lib.rs chain served");
 		let mut operations: Vec<&str> = table.entries().iter().map(|entry| entry.spec.operation_id).collect();
 		operations.sort_unstable();
 		operations.dedup();
-		assert_eq!(operations.len(), 60, "operation ids are unique");
+		assert_eq!(operations.len(), 62, "operation ids are unique");
 		// Every scope in the frozen table is used by at least one route:
 		// an unused scope in a frozen table is a scope nobody can hold.
 		for scope in Scope::ALL {
@@ -963,7 +981,7 @@ mod tests {
 		let document = table.openapi_document();
 		assert_eq!(document["openapi"], "3.1.0");
 		let paths = document["paths"].as_object().unwrap();
-		assert_eq!(paths.len(), 54, "one path item per template");
+		assert_eq!(paths.len(), 56, "one path item per template");
 		let health = &paths["/health"]["get"];
 		assert_eq!(health["operationId"], "get_health");
 		assert_eq!(health["x-weft-scope"], "probe");

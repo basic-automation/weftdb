@@ -57,6 +57,7 @@ The `axum` server is in place with the flagship `POST /api/v1/interpolate` over 
 Interchange and output are covered too: Parquet and CSV in, columnar Arrow/Parquet out of the compute endpoints, and cursor paging on the stored-range reads. Observability is wired in at the API, with Prometheus latency histograms and OpenTelemetry trace export alongside `/metrics`.
 
 - [ ] Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)
+  - [x] **Python SDK** (2026-11-03): `clients/python` (package `weftdb`), standard-library only with `pyarrow` as the optional `arrow` extra. It covers every route: compute, catalog, the four ingest formats with `Idempotency-Key`, stored reads with cursor-following iterators, maintenance, backup and the bench runs. Storage values travel as `Decimal`/text and a `float` is refused at that boundary. The unit tests run against an in-process fake; `tests/test_live.py` is the contract test against a real `weft-server`, which CI runs on Linux after the build.
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
 
 ### Phase 3 — Instrument everything · *Very high*
@@ -69,8 +70,9 @@ Tracing has a `RUST_LOG`-driven foundation, a per-request root span, and per-sta
   - *Closed 2026-10-27: every stored read closes a `.serialize` span tagged with its `format` (CSV, Arrow, Parquet, JSON, point and at-multi). The Arrow and Parquet encode now runs as its own stage in the handler, so it is timed apart from the read. The point and at-multi `.read` spans carry `format` too. `every_stored_read_format_closes_its_serialize_span` in `weft-server/src/storage.rs` asserts each one. The downsample handlers' `downsample.range` span is not a `.read` span and is outside this item's list.*
 - [x] **`Statement::n_change()` accounting on the seal path's index write**
   - *Closed 2026-10-27: `publish_seal` wraps its `InsertNew` commit in a `control_plane.index.insert` span whose `rows_changed` is that op's affected-row count, taken from the `TxnApplied` the commit already returns. `weftdb/tests/seal_index_span.rs` asserts the span.*
-- [ ] `/bench/runs/:id` endpoint
-  - *Deferred 2026-10-27, not built, pending a design decision. Nothing on `main` names a run: the EVI-3 `RunManifest` keys a run on its report path, and no id is assigned. A route that serves run provenance (host hardware, paths) would also expose it before the exposure matrix and auth work (SEC-6, SEC-8) and before the public surface is frozen.*
+- [x] `/bench/runs/:id` endpoint
+  - *Deferred 2026-10-27, pending a design decision: nothing named a run, and serving provenance before SEC-6/SEC-8 would have exposed it.*
+  - *Closed 2026-11-03: a run id is the SHA-256 of the manifest file's bytes, content-addressed rather than assigned, so the manifest schema is unchanged and `weft-bench` prints the id beside the manifest path. With `WEFT_BENCH_RUNS_DIR` set, `GET /bench/runs` lists the manifests under it and `GET /bench/runs/{id}` serves one byte for byte, immutable, with the id as its `ETag`. An unknown id is `404 run_not_found`. Both routes sit in the `metrics` scope (maintainer and admin, behind SEC-8's exposure matrix) at the experimental tier, outside the 1.0 freeze. The tests in `weft-server/src/bench_runs.rs` cover the walk (depth cap, symlinks not followed), the bytes and `ETag`, 400/404/503, and the role check.*
 
 ### Phase 4 — Hot path: physical types & Storage v2 · *High*
 

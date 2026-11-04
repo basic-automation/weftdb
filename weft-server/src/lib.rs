@@ -41,6 +41,9 @@ pub mod audit;
 pub mod auth;
 pub mod backup_daemon;
 pub mod backup_routes;
+/// The Phase 3 benchmark-run routes: run manifests served by content hash
+/// (see [`bench_runs`]).
+pub mod bench_runs;
 /// PAC-7's operator CLI: the one dispatch over the binary's commands and
 /// the plan C7 exit-code table the process's statuses are read against
 /// (see [`cli`]).
@@ -96,6 +99,7 @@ pub use audit::{AuditLog, AUDIT_FILE_ENV, AUDIT_FILE_NAME};
 pub use auth::{spawn_key_reload_watcher, AuthConfig, GeneratedKey, KeyStore, Principal, SharedKeyStore, AUTH_KEYS_MODE, TOKEN_PREFIX};
 use axum::{middleware, Router};
 pub use backup_daemon::{backup_tick, list_generated_backups, prune_generated_backups, spawn_backup_daemon, BackupDaemonConfig};
+pub use bench_runs::{BenchRuns, BENCH_RUNS_DIR_ENV};
 pub use daemons::{DaemonSnapshot, DaemonState, Daemons, RESTART_DELAY};
 pub use downsample::{downsample, downsample_arrow, downsample_csv, downsample_ilp, downsample_ilp_arrow, downsample_ilp_csv, downsample_ilp_parquet, downsample_parquet, Aggregation, DownsampleRequest, DownsampleResponse};
 pub use error::{ApiError, Code};

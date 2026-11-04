@@ -102,6 +102,8 @@ pub enum Code {
 	RouteNotFound,
 	/// The addressed aspect does not exist in this store.
 	AspectNotFound,
+	/// No benchmark run manifest has the addressed run id (`GET /bench/runs/{id}`).
+	RunNotFound,
 	// ── 405 ────────────────────────────────────────────────────────────────────────
 	/// The path is a route but the method is not one it serves (`Allow` header).
 	MethodNotAllowed,
@@ -188,6 +190,7 @@ impl Code {
 			Self::ProxiedRequestRequiresAuth => "proxied_request_requires_auth",
 			Self::RouteNotFound => "route_not_found",
 			Self::AspectNotFound => "aspect_not_found",
+			Self::RunNotFound => "run_not_found",
 			Self::MethodNotAllowed => "method_not_allowed",
 			Self::BodyTimeout => "body_timeout",
 			Self::SchemaConflict => "schema_conflict",
@@ -225,7 +228,7 @@ impl Code {
 			Self::BadRequest | Self::InvalidJson | Self::InvalidAspectName | Self::DecimalOutOfRange | Self::NotFinite | Self::CredentialsInQuery | Self::InvalidTag | Self::AmbiguousSeries | Self::TagsUnsupported | Self::SeriesLimit => StatusCode::BAD_REQUEST,
 			Self::Unauthenticated => StatusCode::UNAUTHORIZED,
 			Self::Forbidden | Self::HostNotAllowed | Self::CrossOriginWrite | Self::ProxiedRequestRequiresAuth => StatusCode::FORBIDDEN,
-			Self::RouteNotFound | Self::AspectNotFound => StatusCode::NOT_FOUND,
+			Self::RouteNotFound | Self::AspectNotFound | Self::RunNotFound => StatusCode::NOT_FOUND,
 			Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
 			Self::BodyTimeout => StatusCode::REQUEST_TIMEOUT,
 			Self::SchemaConflict | Self::AlreadyExists | Self::Busy | Self::IdempotencyConflict => StatusCode::CONFLICT,
@@ -249,7 +252,7 @@ impl Code {
 			Self::CommitFailed => "the write did not commit and the store was not modified",
 			Self::FrameUndecodable => "the server could not decode data it has on disk",
 			Self::SeriesBindingMismatch => "the server found stored rows that do not match their series",
-			Self::Unconfigured => "no segment store is configured on this server",
+			Self::Unconfigured => "a subsystem this route needs is not configured on this server",
 			Self::NotReady => "the server is not ready to serve requests yet",
 			Self::IncompatibleStore => "the store on disk uses a format this server cannot open",
 			Self::AuditUnavailable => "the server could not record the request in its audit log",
@@ -357,10 +360,23 @@ impl ApiError {
 		Self::new(Code::AspectNotFound, message)
 	}
 
-	/// The route asked for something this server was started without.
+	/// The route asked for the segment store and this server was started without one.
 	#[must_use = "a refusal is returned to the caller; constructing and dropping one does nothing"]
 	pub fn unconfigured() -> Self {
-		Self::new(Code::Unconfigured, "no segment store is configured on this server")
+		Self::unconfigured_subsystem("segment_store", "WEFT_SEGMENT_STORE_ROOT")
+	}
+
+	/// The route asked for `subsystem` and this server was started without it. The
+	/// `5xx` sentence is the code's fixed one, so which subsystem, and the variable that
+	/// enables it, travel in `details`.
+	#[must_use = "a refusal is returned to the caller; constructing and dropping one does nothing"]
+	pub fn unconfigured_subsystem(subsystem: &'static str, enabled_by: &'static str) -> Self {
+		Self::new(Code::Unconfigured, format!("{subsystem} is not configured on this server; set {enabled_by} to enable it")).with_details(serde_json::json!({ "subsystem": subsystem, "enabled_by": enabled_by }))
+	}
+
+	/// No benchmark run manifest has the addressed run id.
+	pub fn run_not_found(message: impl Into<String>) -> Self {
+		Self::new(Code::RunNotFound, message)
 	}
 
 	/// The request collides with the same thing existing, under a different definition.
@@ -803,17 +819,18 @@ mod tests {
 	/// Every code in the table, with the status and the wire name the plan's §4 table gives
 	/// it. A new code is added to the plan's table and here together — that pairing is the
 	/// contract, and `the_table_is_the_plan_table` is what enforces it.
-	const TABLE: &[(Code, StatusCode, &str)] = &[(Code::BadRequest, StatusCode::BAD_REQUEST, "bad_request"), (Code::InvalidJson, StatusCode::BAD_REQUEST, "invalid_json"), (Code::InvalidAspectName, StatusCode::BAD_REQUEST, "invalid_aspect_name"), (Code::DecimalOutOfRange, StatusCode::BAD_REQUEST, "decimal_out_of_range"), (Code::NotFinite, StatusCode::BAD_REQUEST, "not_finite"), (Code::CredentialsInQuery, StatusCode::BAD_REQUEST, "credentials_in_query"), (Code::InvalidTag, StatusCode::BAD_REQUEST, "invalid_tag"), (Code::AmbiguousSeries, StatusCode::BAD_REQUEST, "ambiguous_series"), (Code::TagsUnsupported, StatusCode::BAD_REQUEST, "tags_unsupported"), (Code::SeriesLimit, StatusCode::BAD_REQUEST, "series_limit"), (Code::Unauthenticated, StatusCode::UNAUTHORIZED, "unauthenticated"), (Code::Forbidden, StatusCode::FORBIDDEN, "forbidden"), (Code::HostNotAllowed, StatusCode::FORBIDDEN, "host_not_allowed"), (Code::CrossOriginWrite, StatusCode::FORBIDDEN, "cross_origin_write"), (Code::ProxiedRequestRequiresAuth, StatusCode::FORBIDDEN, "proxied_request_requires_auth"), (Code::RouteNotFound, StatusCode::NOT_FOUND, "route_not_found"), (Code::AspectNotFound, StatusCode::NOT_FOUND, "aspect_not_found"), (Code::MethodNotAllowed, StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"), (Code::BodyTimeout, StatusCode::REQUEST_TIMEOUT, "body_timeout"), (Code::SchemaConflict, StatusCode::CONFLICT, "schema_conflict"), (Code::AlreadyExists, StatusCode::CONFLICT, "already_exists"), (Code::Busy, StatusCode::CONFLICT, "busy"), (Code::IdempotencyConflict, StatusCode::CONFLICT, "idempotency_conflict"), (Code::CursorStale, StatusCode::GONE, "cursor_stale"), (Code::PayloadTooLarge, StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"), (Code::TooManyRows, StatusCode::PAYLOAD_TOO_LARGE, "too_many_rows"), (Code::UnsupportedMediaType, StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type"), (Code::ResultTooLarge, StatusCode::UNPROCESSABLE_ENTITY, "result_too_large"), (Code::ValueNotRepresentable, StatusCode::UNPROCESSABLE_ENTITY, "value_not_representable"), (Code::Internal, StatusCode::INTERNAL_SERVER_ERROR, "internal"), (Code::CommitFailed, StatusCode::INTERNAL_SERVER_ERROR, "commit_failed"), (Code::FrameUndecodable, StatusCode::INTERNAL_SERVER_ERROR, "frame_undecodable"), (Code::SeriesBindingMismatch, StatusCode::INTERNAL_SERVER_ERROR, "series_binding_mismatch"), (Code::Unconfigured, StatusCode::SERVICE_UNAVAILABLE, "unconfigured"), (Code::NotReady, StatusCode::SERVICE_UNAVAILABLE, "not_ready"), (Code::IncompatibleStore, StatusCode::SERVICE_UNAVAILABLE, "incompatible_store"), (Code::AuditUnavailable, StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"), (Code::Overloaded, StatusCode::SERVICE_UNAVAILABLE, "overloaded"), (Code::OutcomeUnknown, StatusCode::SERVICE_UNAVAILABLE, "outcome_unknown"), (Code::Poisoned, StatusCode::SERVICE_UNAVAILABLE, "poisoned"), (Code::QueryTimeout, StatusCode::GATEWAY_TIMEOUT, "query_timeout"), (Code::InsufficientStorage, StatusCode::INSUFFICIENT_STORAGE, "insufficient_storage")];
+	const TABLE: &[(Code, StatusCode, &str)] = &[(Code::BadRequest, StatusCode::BAD_REQUEST, "bad_request"), (Code::InvalidJson, StatusCode::BAD_REQUEST, "invalid_json"), (Code::InvalidAspectName, StatusCode::BAD_REQUEST, "invalid_aspect_name"), (Code::DecimalOutOfRange, StatusCode::BAD_REQUEST, "decimal_out_of_range"), (Code::NotFinite, StatusCode::BAD_REQUEST, "not_finite"), (Code::CredentialsInQuery, StatusCode::BAD_REQUEST, "credentials_in_query"), (Code::InvalidTag, StatusCode::BAD_REQUEST, "invalid_tag"), (Code::AmbiguousSeries, StatusCode::BAD_REQUEST, "ambiguous_series"), (Code::TagsUnsupported, StatusCode::BAD_REQUEST, "tags_unsupported"), (Code::SeriesLimit, StatusCode::BAD_REQUEST, "series_limit"), (Code::Unauthenticated, StatusCode::UNAUTHORIZED, "unauthenticated"), (Code::Forbidden, StatusCode::FORBIDDEN, "forbidden"), (Code::HostNotAllowed, StatusCode::FORBIDDEN, "host_not_allowed"), (Code::CrossOriginWrite, StatusCode::FORBIDDEN, "cross_origin_write"), (Code::ProxiedRequestRequiresAuth, StatusCode::FORBIDDEN, "proxied_request_requires_auth"), (Code::RouteNotFound, StatusCode::NOT_FOUND, "route_not_found"), (Code::AspectNotFound, StatusCode::NOT_FOUND, "aspect_not_found"), (Code::RunNotFound, StatusCode::NOT_FOUND, "run_not_found"), (Code::MethodNotAllowed, StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"), (Code::BodyTimeout, StatusCode::REQUEST_TIMEOUT, "body_timeout"), (Code::SchemaConflict, StatusCode::CONFLICT, "schema_conflict"), (Code::AlreadyExists, StatusCode::CONFLICT, "already_exists"), (Code::Busy, StatusCode::CONFLICT, "busy"), (Code::IdempotencyConflict, StatusCode::CONFLICT, "idempotency_conflict"), (Code::CursorStale, StatusCode::GONE, "cursor_stale"), (Code::PayloadTooLarge, StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"), (Code::TooManyRows, StatusCode::PAYLOAD_TOO_LARGE, "too_many_rows"), (Code::UnsupportedMediaType, StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type"), (Code::ResultTooLarge, StatusCode::UNPROCESSABLE_ENTITY, "result_too_large"), (Code::ValueNotRepresentable, StatusCode::UNPROCESSABLE_ENTITY, "value_not_representable"), (Code::Internal, StatusCode::INTERNAL_SERVER_ERROR, "internal"), (Code::CommitFailed, StatusCode::INTERNAL_SERVER_ERROR, "commit_failed"), (Code::FrameUndecodable, StatusCode::INTERNAL_SERVER_ERROR, "frame_undecodable"), (Code::SeriesBindingMismatch, StatusCode::INTERNAL_SERVER_ERROR, "series_binding_mismatch"), (Code::Unconfigured, StatusCode::SERVICE_UNAVAILABLE, "unconfigured"), (Code::NotReady, StatusCode::SERVICE_UNAVAILABLE, "not_ready"), (Code::IncompatibleStore, StatusCode::SERVICE_UNAVAILABLE, "incompatible_store"), (Code::AuditUnavailable, StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"), (Code::Overloaded, StatusCode::SERVICE_UNAVAILABLE, "overloaded"), (Code::OutcomeUnknown, StatusCode::SERVICE_UNAVAILABLE, "outcome_unknown"), (Code::Poisoned, StatusCode::SERVICE_UNAVAILABLE, "poisoned"), (Code::QueryTimeout, StatusCode::GATEWAY_TIMEOUT, "query_timeout"), (Code::InsufficientStorage, StatusCode::INSUFFICIENT_STORAGE, "insufficient_storage")];
 
 	async fn json_of(response: Response) -> Value {
 		let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.expect("the envelope fits");
 		serde_json::from_slice(&bytes).expect("the envelope is JSON")
 	}
 
-	/// The table is the plan's table: 42 codes, each with §4's status and §4's spelling.
+	/// The table is the plan's table: 43 codes, each with §4's status and §4's spelling
+	/// (`run_not_found` joined the 42 with the Phase 3 bench-run routes).
 	#[test]
 	fn the_table_is_the_plan_table() {
-		assert_eq!(TABLE.len(), 42, "§4 lists 42 codes; a new code goes into the plan's table and here together");
+		assert_eq!(TABLE.len(), 43, "§4 lists 43 codes; a new code goes into the plan's table and here together");
 		for &(code, status, name) in TABLE {
 			assert_eq!(code.status(), status, "`{name}` must be sent with {status}");
 			assert_eq!(code.as_str(), name, "the wire name is the plan's spelling");

@@ -581,6 +581,9 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 	print_summary(report, &out_path);
 	if let Some(path) = &manifest_path {
 		println!("  run manifest : {}", path.display());
+		if let Ok(id) = weft_bench::manifest::run_id(path) {
+			println!("  run id       : {id}");
+		}
 	}
 	if let Some(path) = &html_path {
 		println!("  html report  : {}", path.display());
@@ -710,6 +713,9 @@ fn combine_runs(runs: &[PathBuf], out: &Path, no_manifest: bool) -> ExitCode {
 		}
 		if let Some(path) = manifest_path {
 			println!("  run manifest : {}", path.display());
+			if let Ok(id) = weft_bench::manifest::run_id(&path) {
+				println!("  run id       : {id}");
+			}
 		}
 		Ok(if combined.is_publishable() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 	})();

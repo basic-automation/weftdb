@@ -10,6 +10,27 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Python SDK** (`clients/python`, package `weftdb`). A standard-library client for every
+  route of the HTTP API: compute (`interpolate`, `downsample`, their ILP forms), catalog,
+  ingest (JSON points, ILP, CSV, Parquet or a `pyarrow.Table`, with `Idempotency-Key`),
+  stored reads with cursor-following iterators, maintenance and backup. Stored values travel
+  as `Decimal`/text and a `float` is refused at that boundary; Arrow and Parquet answers
+  decode to `pyarrow.Table` with the optional `arrow` extra. Refusals raise one exception
+  class per envelope family carrying `code`, `details` and `request_id`, and an overloaded
+  read is retried after `Retry-After`.
+- **`GET /bench/runs` and `GET /bench/runs/{id}`** (experimental, `metrics` scope). With
+  `WEFT_BENCH_RUNS_DIR` set, `weft-server` lists the weft-bench run manifests under that
+  directory and serves one byte for byte by its run id, the SHA-256 of the manifest file;
+  `weft-bench` prints the id beside the manifest path. An unknown id is the new
+  `404 run_not_found`.
+
+### Changed
+
+- The `503 unconfigured` sentence no longer names the segment store, since the bench-run
+  routes answer it too: it reads "a subsystem this route needs is not configured on this
+  server", and `details.subsystem` / `details.enabled_by` say which one and the variable that
+  enables it. Match on `code`, as before.
+
 - **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
   (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
   gets an attempt record before it runs and an outcome record after, and the operation is
