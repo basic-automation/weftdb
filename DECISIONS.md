@@ -3765,3 +3765,40 @@ needs the contract held. SOA-14 therefore lands as that pin:
 `weft-server/tests/ready_identity.rs` asserts the fields against the served
 store's own reported values (never restated constants), with and without a
 store configured. No behaviour changes.
+
+## 2026-11-03 — EVI-19 RPO/RTO: what this page may claim — FLAGGED FOR MERGE REVIEW
+
+**Context:** issue #215 asks to document RPO/RTO "against the measured snapshot
+cadence", and plan decision D-S21 corrects the durability design's RPO formula
+to `max(I, d_max) + d_max`. The page had to be written now, but the slices that
+measure recovery cost — EVI-25 (#295) and SOA-11 (#308) — are still open, so
+the honesty of the page turns on what it refuses to state.
+
+**Chosen:** (1) **`d_max` is defined from the write path, not invented.**
+An ingest is acknowledged once its index COMMIT returns
+(`weftdb/src/types/segment_store/seal.rs:729`), and off Windows the store's
+durability class is `full` (`weftdb/src/types/segment_store.rs:1572-1576`), so
+a returned COMMIT is durable. A snapshot is a `VACUUM INTO` point-in-time image
+(`weftdb/src/types/backup.rs:300`), so writes that COMMIT while a pass runs are
+absent from that snapshot: `d_max` is the pass's own duration, which the daemon
+runs between ticks — not a setting. The worked example assumes `I = 60 s` and
+takes `d_max` from the measured btrfs tick spacing already in reference.md,
+labelling `I` as assumed because the daemon is disabled by default
+(`weft-server/src/settings.rs:102`). (2) **Measured durations are deferred to
+EVI-25/SOA-11.** Neither the offline restore `Report`
+(`weft-server/src/restore.rs:184`) nor `RestoreDrillResponse`
+(`weft-server/src/backup_routes.rs:36`) nor `BackupResponse` (`:175`) carries an
+elapsed-time field — the only timestamp is the absolute `restore_started_ms`
+(`weft-server/src/restore.rs:257`), and the only metrics are byte/snapshot
+counters (`weft-server/src/metrics.rs:389`, `:422`). Quoting a duration would
+mean inventing one, so the page says RTO is `unmeasured` until those two slices
+land. (3) **Nothing is rounded into existence.** Every unmeasured figure is
+listed with the command or job that would measure it.
+
+**Alternatives considered:** stating a representative RTO (e.g. "minutes") from
+the `tmpfs` benchmark numbers — rejected, because those are a tmpfs vacuum cost,
+not a restore-time measurement, and the page's job is to be citable, not
+reassuring. Treating `d_max` as `I` (so RPO = 2·I) — rejected as an
+oversimplification that hides the pass-duration term the formula exists to
+capture. Defining `d_max` as a setting — rejected: no such setting exists; it
+is a measured property of the storage and the control-plane size.
