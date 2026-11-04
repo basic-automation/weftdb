@@ -50,7 +50,8 @@ use crate::{
 pub struct InputPoint {
 	/// Sample timestamp (RFC 3339).
 	pub timestamp: DateTime<Utc>,
-	/// Sample value. Widened to `BigDecimal` before the engine sees it.
+	/// Sample value. Widened to `BigDecimal` (the shortest decimal that round-trips to
+	/// it, `crate::downsample::widen_json_value`) before the engine sees it.
 	pub value: f64,
 }
 
@@ -321,7 +322,7 @@ async fn interpolate_inner(request: InterpolateRequest, config: InterpolateConfi
 	{
 		let _parse = tracing::info_span!("interpolate.parse", input_points).entered();
 		for sample in &request.points {
-			let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))?;
+			let value = crate::downsample::json_point_value(sample.value)?;
 			points.push(Point::new(sample.timestamp, value));
 		}
 	}
@@ -567,7 +568,7 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 
 	let mut points: Vec<Point> = Vec::with_capacity(input.len());
 	for sample in &input {
-		let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))?;
+		let value = crate::downsample::json_point_value(sample.value)?;
 		points.push(Point::new(sample.timestamp, value));
 	}
 
