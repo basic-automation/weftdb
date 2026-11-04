@@ -69,9 +69,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   It is pure DDL at layout 2: the next open of an existing store applies it, the marker's
   layout and floors stay 2, and no row or frame changes. Nothing registers a series yet;
   tagged writes stay refused.
+- **Per-aspect series cap (TAG-7).** `SegmentStoreOptions::max_series_per_aspect`
+  (`DEFAULT_MAX_SERIES_PER_ASPECT`, 100,000) bounds how many tag series one aspect may
+  register. A batch for a new series past it is refused with the typed
+  `StoreError::SeriesLimit` (`400 series_limit` over HTTP) before any frame is written;
+  series already registered stay writable, and the untagged series never counts. Tagged
+  writes themselves stay refused at both gates until TAG-8 (library) and TAG-11 (HTTP), so
+  nothing reaches the cap yet.
 
 ### Changed
 
+- **Breaking (library):** `IngestBatch::series_ids()` is removed (TAG-7). It always answered
+  `[0]`, and a tagged batch's series id is not known until its commit resolves the key in the
+  aspect's catalog; read the id from `IngestReceipt::series_ids` instead. The method shipped
+  in `weftdb` 0.2.0 on crates.io, so this is a breaking change, allowed in the next minor
+  release by the pre-1.0 policy above.
 - The `503 unconfigured` sentence no longer names the segment store, since the bench-run
   routes answer it too: it reads "a subsystem this route needs is not configured on this
   server", and `details.subsystem` / `details.enabled_by` say which one and the variable that

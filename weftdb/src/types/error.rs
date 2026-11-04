@@ -229,6 +229,18 @@ pub enum StoreError {
 		/// The aspect the batch was offered to.
 		aspect: String,
 	},
+	/// An ingest batch named a series `aspect` has not registered, and the aspect
+	/// already holds `limit` series, the most
+	/// [`SegmentStoreOptions::max_series_per_aspect`](crate::SegmentStoreOptions::max_series_per_aspect)
+	/// allows (TAG-7). Series already registered stay writable; only a new key is
+	/// refused. Nothing was committed.
+	#[error("aspect {aspect:?} already holds {limit} series, the most it may hold; a batch for a new series was refused and nothing was committed (series already registered stay writable)")]
+	SeriesLimit {
+		/// The aspect the batch was offered to.
+		aspect: String,
+		/// The per-aspect series cap in force.
+		limit: usize,
+	},
 	/// An ingest batch held no rows. Nothing was written, and the key is not
 	/// recorded: an empty batch has no receipt to replay.
 	#[error("aspect {aspect:?}: an ingest batch must hold at least one row; nothing was written")]
