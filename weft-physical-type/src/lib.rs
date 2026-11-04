@@ -366,6 +366,21 @@ impl std::error::Error for DecimalOutOfRange {}
 ///
 /// Returns [`DecimalOutOfRange`] when the value's plain form carries more
 /// than [`MAX_PLAIN_DIGITS`] digits.
+/// Whether `text` names a value that has no decimal representation at all — the text
+/// form of `NaN` or an infinity (ROB-7).
+///
+/// A decimal parse refuses these too, but for a reason that sends the caller to look
+/// at their precision ("not a decimal"), and the write paths owe them the truer word:
+/// WeftDB stores exact decimals, so there is nothing to store, and a reader that
+/// quietly turned the cell into a null would hand back fewer rows than were sent.
+/// Spelled the way `f64::from_str` spells it, lower- or upper-case, with or without a
+/// leading sign, and tolerating the surrounding whitespace a text column can carry.
+#[must_use]
+pub fn is_non_finite_decimal_text(text: &str) -> bool {
+	let word = text.trim().trim_start_matches(['+', '-']).to_ascii_lowercase();
+	word == "nan" || matches!(word.as_str(), "inf" | "infinity")
+}
+
 pub fn check_decimal_domain(value: &BigDecimal) -> Result<(), DecimalOutOfRange> {
 	let digits = plain_digit_count(value);
 	if digits > MAX_PLAIN_DIGITS {
@@ -856,5 +871,19 @@ mod tests {
 		assert_eq!(PhysicalType::ScaledI128 { scale: 3 }.name(), "scaled_i128");
 		assert_eq!(PhysicalType::Decimal128.name(), "decimal128");
 		assert_eq!(PhysicalType::BigDecimalText.name(), "bigdecimal_text");
+	}
+
+	#[test]
+	fn the_non_finite_text_predicate_covers_the_spellings_a_float_parser_accepts() {
+		// ROB-7: JSON and CSV values arrive as decimal text, and the parser a producer
+		// would reach for (`f64::from_str`) accepts all of these — so every one of them
+		// has to reach the `not_finite` refusal rather than the generic bad-request one
+		// a malformed number gets.
+		for text in ["NaN", "nan", "  NaN  ", "inf", "+inf", "-inf", "Inf", "infinity", "-INFINITY", "+infinity"] {
+			assert!(is_non_finite_decimal_text(text), "`{text}` names a value with no decimal form");
+		}
+		for text in ["1.5", "-0.0", "1e9", "", "1.5 NaN", "nan1", "12", "nanosecond"] {
+			assert!(!is_non_finite_decimal_text(text), "`{text}` is an ordinary value or an ordinary malformed one");
+		}
 	}
 }

@@ -3878,6 +3878,7 @@ reassuring. Treating `d_max` as `I` (so RPO = 2·I) — rejected as an
 oversimplification that hides the pass-duration term the formula exists to
 capture. Defining `d_max` as a setting — rejected: no such setting exists; it
 is a measured property of the storage and the control-plane size.
+ HEAD
 ## 2026-11-03 — EVI-18 backup health metrics and catch-up-free ticking (FLAGGED FOR MERGE REVIEW)
 
 **Context:** the 1.0 plan (§6 W6) and the ROADMAP line name only the outcomes —
@@ -4012,3 +4013,79 @@ test") and FRE-18 ("layout-2 baseline fixtures") both name layout 2 as the 1.0 b
 with a re-derive hook (B2): it would be the first production use of `rederive` and still
 protects only development stores. `PRIMARY KEY (aspect, series_id)` plus `UNIQUE (aspect,
 series_key)`: the unique index is the part that cannot be relied on.
+
+## 2026-11-04 — ROB-7: non-finite ingest is a refusal in every format, plus two size ceilings (#299)
+
+*Status: implemented on `w7/rob-7-ingest-limits`. Closes #299, and absorbs the
+Parquet NaN step the 1.0 plan had parked in FRE-8b — the plan's dedup map
+attaches that step to this slice ("Non-finite input returns 400 in every ingest
+format"), so leaving it for FRE-8b would have closed #299 with the hole open.*
+
+**The hole was two holes, and only one of them was in the plan.** A Parquet body
+whose `value` column is `Float64` carried `NaN` or `±Infinity` into
+`ConvertError::NonFinite`… except that it did not: the converter mapped
+`BigDecimal::from_f64(v)` and took the `None` it returns for a non-finite float
+as *a null value*, so the row sealed with no value at all. The second was not in
+the plan at all: an ILP line `temp=NaN` parsed into `FieldValue::Float(NaN)`,
+`FieldValue::as_big_decimal` returned `None`, and the projection's `else
+{ continue }` dropped the line — while the response still answered `rows: 1`, so
+the sender was told the write succeeded. `Code::NotFinite` (400 `not_finite`)
+already existed and was already what the *read* side answered
+(`downsample.rs:274`, `interpolate.rs:271`) — it was the write side that was
+lenient, twice.
+
+**A strict entry point beside the existing one, rather than a stricter existing
+one.** The conversion that swallowed the NaN lives in `weft-arrow`, whose
+contract is "arrow types stay inside weft-arrow" — so weft-server cannot see a
+non-finite float without the crate telling it. Changing `record_batch_to_columns`
+outright would have changed the legacy ingest path's semantics too, which is a
+different slice's promise to keep. So `weft-arrow` gained
+`record_batch_to_columns_strict` and `record_batches_to_columns_strict` over a
+shared private `columns_from_batch(batch, strict, row_offset)`, and
+`weft-arrow-store` gained `decode_parquet_columns_strict` beside its lenient
+twin; `ConvertError::NonFinite { column, row }` is a new variant of an already
+`#[non_exhaustive]` enum, so this is additive for every other caller. The strict
+path also refuses the *text* spellings — a `Utf8` column reading `NaN` or
+`-Infinity` is as unstorable as a float one, and before this it answered
+`bad_request` from the generic parse-failure arm.
+
+**ILP's skipped line becomes a refusal, and that is the whole point.** One could
+keep skipping and only count honestly, but the skip is itself the bug: a sender
+streaming a thousand lines wants the one bad line named, not silently absent.
+`weft-line-protocol` gained `ParseErrorKind::NonFiniteValue` and
+`FieldValue::is_non_finite_float`, and `parse_points` refuses before the
+projection can skip — naming the line. The float-only case is checked at the
+field level (`LineRecord::field_is_non_finite`) because a *tag* reading `NaN` is
+a string and means nothing special.
+
+**Numbers the plan did not give.** It says only "ROB-7 adds the row and
+decoded-byte caps". `WEFT_MAX_INGEST_ROWS` defaults to **10,000,000 rows** — the
+body cap already refuses a 256 MiB JSON body, and 10M rows is roughly a 240 MB
+seal, so the row ceiling bites where the body ceiling stands rather than
+replacing it. `WEFT_MAX_INGEST_DECODED_BYTES` defaults to **1 GiB**, four times
+the body cap: a Parquet body can legitimately expand several-fold, and a ceiling
+below that expansion would refuse bodies the sender was entitled to send.
+`check_decoded_size` counts a 16-byte slot per timestamp and per value (a `Vec<i64>`
+plus a `Vec<Option<BigDecimal>>` are exactly that) and adds only the mantissa
+bytes the non-null decimals need (`bits() / 8 + 1`), so a million tiny decimals
+and a million 38-digit ones are not charged the same. Both run **after** the
+parse and **before** the seal: there is no way to know the decoded size before
+decoding, and the point of the ceiling is the allocation the decode makes, so the
+honest statement of the bound is "what one body may become", not "what one body
+may cost to read".
+
+**Refused as themselves, not as the generic cap.** The row ceiling answers
+`413 too_many_rows` — a `Code` the crate already defined and nothing had ever
+raised — and names the row count, the limit, and the fix; the byte ceiling reuses
+`413 payload_too_large` naming both numbers and the setting. A zero for either is
+refused at startup, as the body cap's zero already was: a zero ceiling is not
+"unlimited", it is a node that refuses every write.
+
+**Alternatives considered.** Changing `record_batch_to_columns` to refuse
+everywhere — rejected: it rewrites legacy ingest semantics under a slice that
+did not ask for it. Dropping the non-finite row and reporting the true count —
+rejected: it keeps the silent data loss the slice exists to close. Counting
+decoded bytes as `rows × 24` (a fixed per-row estimate) — rejected: it is wrong
+in both directions for decimal widths, which are what actually vary. Checking the
+caps on the request body instead of the decoded columns — rejected: the body cap
+already exists, and a compressed Parquet file makes it meaningless. 31e15cf ([ROB-7] Refuse non-finite input and cap decoded ingest)

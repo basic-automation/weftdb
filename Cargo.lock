@@ -5589,6 +5589,8 @@ name = "weft-server"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
  "axum",
  "bigdecimal",

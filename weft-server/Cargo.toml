@@ -86,6 +86,8 @@ name = "poison_exit"
 required-features = ["fault-injection"]
 
 [dev-dependencies]
+arrow-array = { workspace = true }  # a RecordBatch with a raw IEEE-754 NaN, for the ingest non-finite test (production code keeps arrow types inside weft-arrow)
+arrow-schema = { workspace = true }  # the schema of that test batch
 async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
 libc = { workspace = true }  # raise(SIGTERM) for the signal-before-serving test in tests/serve_path.rs
 rcgen = "0.14"  # self-signed certificate material for the TLS tests (tls.rs unit tests, tests/tls_serve.rs)

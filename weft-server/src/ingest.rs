@@ -60,9 +60,32 @@ pub const MAX_INGEST_BYTES_ENV: &str = "WEFT_MAX_INGEST_BYTES";
 /// bound behind the ingests already running.
 pub const INGEST_MAX_INFLIGHT_BYTES_ENV: &str = "WEFT_INGEST_MAX_INFLIGHT_BYTES";
 
+/// Environment variable naming the row cap for the four ingest routes (ROB-7, plan
+/// C11's row limit): a positive whole number of rows, counted on the decoded columns
+/// — the rows the seal would write, whichever format carried them. A body over it is
+/// refused `413 too_many_rows` with the limit.
+pub const MAX_INGEST_ROWS_ENV: &str = "WEFT_MAX_INGEST_ROWS";
+
+/// Environment variable naming the decoded-byte cap for the four ingest routes
+/// (ROB-7, plan C11's decoded-byte limit): a positive whole number of bytes of
+/// *decoded* columns, not of body. `WEFT_MAX_INGEST_BYTES` bounds what arrives on the
+/// socket, which says nothing about what a compressed Parquet body expands to.
+pub const MAX_INGEST_DECODED_BYTES_ENV: &str = "WEFT_MAX_INGEST_DECODED_BYTES";
+
 /// The default body cap when `WEFT_MAX_INGEST_BYTES` is unset:
 /// 256 MiB (crash-consistency §8).
 pub const DEFAULT_MAX_INGEST_BYTES: usize = 256 * 1024 * 1024;
+
+/// The default row cap when `WEFT_MAX_INGEST_ROWS` is unset: 10 million rows. A batch
+/// that size is a ~240 MB seal — the same order as the 256 MiB body cap, so the row
+/// ceiling sits where the body ceiling already stands, and it bites on a Parquet body
+/// that the body cap lets through.
+pub const DEFAULT_MAX_INGEST_ROWS: usize = 10_000_000;
+
+/// The default decoded-byte cap when `WEFT_MAX_INGEST_DECODED_BYTES` is unset: 1 GiB,
+/// four times the default body cap, so a compressed body gets room to expand without
+/// the decode being able to grow past what a node's memory is sized for.
+pub const DEFAULT_MAX_INGEST_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The ingest wiring's two limits (D-S14), read once at startup and
 /// carried on the router state, so the registry the binary serves and a
@@ -71,26 +94,42 @@ pub const DEFAULT_MAX_INGEST_BYTES: usize = 256 * 1024 * 1024;
 pub struct IngestConfig {
 	max_body_bytes: usize,
 	max_inflight_bytes: u64,
+	max_rows: usize,
+	max_decoded_bytes: u64,
 }
 
 impl IngestConfig {
 	/// The defaults: a 256 MiB body cap, and an in-flight budget of the
 	/// same 256 MiB — one max-size body in flight by default, or any
 	/// number of smaller ones whose bodies sum under it.
-	pub const DEFAULT: Self = Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64 };
+	pub const DEFAULT: Self = Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64, max_rows: DEFAULT_MAX_INGEST_ROWS, max_decoded_bytes: DEFAULT_MAX_INGEST_DECODED_BYTES };
 
 	/// A configuration with an explicit body cap and the default
 	/// in-flight budget (tests, embedders).
 	#[must_use]
 	pub const fn with_max_body_bytes(max_body_bytes: usize) -> Self {
-		Self { max_body_bytes, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64 }
+		Self { max_body_bytes, ..Self::DEFAULT }
 	}
 
 	/// A configuration with an explicit in-flight byte budget and the
 	/// default body cap (tests, embedders).
 	#[must_use]
 	pub const fn with_max_inflight_bytes(max_inflight_bytes: u64) -> Self {
-		Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes }
+		Self { max_inflight_bytes, ..Self::DEFAULT }
+	}
+
+	/// A configuration with an explicit row cap and everything else at its
+	/// default (tests, embedders).
+	#[must_use]
+	pub const fn with_max_rows(max_rows: usize) -> Self {
+		Self { max_rows, ..Self::DEFAULT }
+	}
+
+	/// A configuration with an explicit decoded-byte cap and everything else at its
+	/// default (tests, embedders).
+	#[must_use]
+	pub const fn with_max_decoded_bytes(max_decoded_bytes: u64) -> Self {
+		Self { max_decoded_bytes, ..Self::DEFAULT }
 	}
 
 	/// The limits the two `WEFT_*` values describe (`None` for an unset
@@ -101,7 +140,7 @@ impl IngestConfig {
 	/// A message naming the variable when a value is not a positive
 	/// whole number, so a malformed setting fails startup instead of
 	/// silently falling back to a default the operator did not ask for.
-	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>) -> Result<Self, String> {
+	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>, max_rows: Option<&str>, max_decoded_bytes: Option<&str>) -> Result<Self, String> {
 		let mut config = Self::DEFAULT;
 		if let Some(raw) = max_body_bytes {
 			config.max_body_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
@@ -115,6 +154,18 @@ impl IngestConfig {
 				return Err(format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest"));
 			}
 		}
+		if let Some(raw) = max_rows {
+			config.max_rows = raw.parse().map_err(|e| format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: {e}"))?;
+			if config.max_rows == 0 {
+				return Err(format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: zero would refuse every ingest body"));
+			}
+		}
+		if let Some(raw) = max_decoded_bytes {
+			config.max_decoded_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.max_decoded_bytes == 0 {
+				return Err(format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest body"));
+			}
+		}
 		Ok(config)
 	}
 
@@ -125,7 +176,7 @@ impl IngestConfig {
 	///
 	/// A set variable whose value is not a positive whole number.
 	pub fn from_env() -> Result<Self, String> {
-		Self::from_env_values(std::env::var(MAX_INGEST_BYTES_ENV).ok().as_deref(), std::env::var(INGEST_MAX_INFLIGHT_BYTES_ENV).ok().as_deref())
+		Self::from_env_values(std::env::var(MAX_INGEST_BYTES_ENV).ok().as_deref(), std::env::var(INGEST_MAX_INFLIGHT_BYTES_ENV).ok().as_deref(), std::env::var(MAX_INGEST_ROWS_ENV).ok().as_deref(), std::env::var(MAX_INGEST_DECODED_BYTES_ENV).ok().as_deref())
 	}
 
 	/// The one body cap for the ingest routes, in bytes.
@@ -139,6 +190,49 @@ impl IngestConfig {
 	pub const fn max_inflight_bytes(self) -> u64 {
 		self.max_inflight_bytes
 	}
+
+	/// The row cap on one decoded ingest body (ROB-7).
+	#[must_use]
+	pub const fn max_rows(self) -> usize {
+		self.max_rows
+	}
+
+	/// The decoded-byte cap on one ingest body (ROB-7).
+	#[must_use]
+	pub const fn max_decoded_bytes(self) -> u64 {
+		self.max_decoded_bytes
+	}
+}
+
+/// Refuse a decoded body that is too big to seal (ROB-7, plan C11's two limits).
+///
+/// Both ceilings are measured here, on the columns the format's parser produced,
+/// rather than on the body: a body cap cannot bound what a compressed Parquet file
+/// expands to, and a row count cannot bound what those rows weigh when the decimals
+/// are wide. Every format reaches the same two numbers, so a client that sizes a
+/// batch for one format is sized for all four.
+fn check_decoded_size(timestamps: &[i64], values: &[Option<BigDecimal>], limits: IngestConfig) -> Result<(), ApiError> {
+	if timestamps.len() > limits.max_rows() {
+		return Err(error::too_many_ingest_rows(timestamps.len(), limits.max_rows()));
+	}
+	let decoded = decoded_column_bytes(timestamps, values);
+	if decoded > limits.max_decoded_bytes() {
+		return Err(error::decoded_too_large(decoded, limits.max_decoded_bytes()));
+	}
+	Ok(())
+}
+
+/// The decoded columns' byte cost (ROB-7): a slot per row in each column, plus the
+/// mantissa bytes each decimal actually carries.
+///
+/// An estimate, and deliberately generous about the fixed part: what it must not do is
+/// read the cap as satisfied because the *body* was small. The mantissa term is what
+/// makes a wide decimal cost more than a narrow one, which is the difference between
+/// this and a row count.
+fn decoded_column_bytes(timestamps: &[i64], values: &[Option<BigDecimal>]) -> u64 {
+	let slots = (timestamps.len() + values.len()) as u64;
+	let mantissas: u64 = values.iter().flatten().map(|value| value.as_bigint_and_exponent().0.bits() as u64 / 8 + 1).sum();
+	slots * 16 + mantissas
 }
 
 impl Default for IngestConfig {
@@ -422,11 +516,14 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
 	// file as well as the tracing pipeline (see `emit_ingest_audit`).
 	let audit = state.audit_log().cloned();
+	// Read the ingest ceilings before the state is dropped: the handler owns the
+	// `AppState` by value and the inner call takes the limits, not the state.
+	let limits = state.ingest_config();
 	drop(state);
 	// Time the commit path (not the store-unconfigured fast-fail above): this is the
 	// ingest side of the north-star "predictable p95/p99 under ingest + query".
 	let start = std::time::Instant::now();
-	let result = ingest_points_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, request).await;
+	let result = ingest_points_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, limits, request).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -437,7 +534,7 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 
 /// The body of [`ingest_points`], split out so the handler can record an error
 /// metric for any failure path uniformly.
-async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, request: IngestRequest) -> Result<Response, ApiError> {
+async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, limits: IngestConfig, request: IngestRequest) -> Result<Response, ApiError> {
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("no points to ingest (`points` is empty)".to_string()));
 	}
@@ -456,6 +553,12 @@ async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate:
 			match &point.value {
 				None => values.push(None),
 				Some(text) => {
+					// A `NaN` or infinity is not "not a decimal" — it is a value with no
+					// decimal form, and it gets the code the read side already uses for
+					// the same condition (ROB-7).
+					if weft_physical_type::is_non_finite_decimal_text(text) {
+						return Err(error::non_finite_value(format!("value {text:?} (at timestamp {})", point.timestamp)));
+					}
 					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
 					values.push(Some(parsed));
 				}
@@ -463,6 +566,7 @@ async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate:
 		}
 	}
 
+	check_decoded_size(&timestamps, &values, limits)?;
 	enforce_order_if_required(request.require_sorted, &timestamps)?;
 	// `storage.ingest.seal` child span (roadmap Phase 3): the typed-column encode +
 	// `.weftseg` write + control-plane index update — the write stage timed apart from
@@ -529,6 +633,9 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 		if value_text.is_empty() {
 			any_null = true;
 			values.push(None);
+		} else if weft_physical_type::is_non_finite_decimal_text(value_text) {
+			// ROB-7: a `NaN` cell is refused with the reason, not stored as a hole.
+			return Err(error::non_finite_value(format!("CSV line {}: value {value_text:?}", index + 1)));
 		} else {
 			let parsed: BigDecimal = weft_physical_type::parse_decimal(value_text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1))))?;
 			values.push(Some(parsed));
@@ -567,9 +674,12 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
 	// file as well as the tracing pipeline (see `emit_ingest_audit`).
 	let audit = state.audit_log().cloned();
+	// Read the ingest ceilings before the state is dropped: the handler owns the
+	// `AppState` by value and the inner call takes the limits, not the state.
+	let limits = state.ingest_config();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_csv_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_csv_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, limits, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -582,11 +692,12 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 /// any failure path uniformly. Shares the commit path and
 /// `error::classify_ingest` with the JSON ingest path, so a CSV-committed batch
 /// is byte-identical to a JSON-committed one.
-async fn ingest_csv_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
+async fn ingest_csv_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, limits: IngestConfig, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
 	// `(timestamp, value)` columns, timed apart from the commit.
 	let ParsedCsv { timestamps, values, any_null } = tracing::info_span!("storage.ingest.parse", format = "csv").in_scope(|| parse_csv_points(body))?;
+	check_decoded_size(&timestamps, &values, limits)?;
 	enforce_order_if_required(require_sorted, &timestamps)?;
 	let point_count = timestamps.len();
 	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page);
@@ -680,9 +791,12 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
 	// file as well as the tracing pipeline (see `emit_ingest_audit`).
 	let audit = state.audit_log().cloned();
+	// Read the ingest ceilings before the state is dropped: the handler owns the
+	// `AppState` by value and the inner call takes the limits, not the state.
+	let limits = state.ingest_config();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_ilp_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, &params, &body).await;
+	let result = ingest_ilp_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, limits, &params, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -693,7 +807,7 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 
 /// The body of [`ingest_ilp`], split out so the handler records an error metric for
 /// any failure path uniformly.
-async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
+async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, limits: IngestConfig, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(ApiError::bad_request)?;
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
@@ -731,6 +845,7 @@ async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::me
 	// ILP fields are always present, so the batch's value column is dense
 	// text widened to the nullable shape the one entry point takes.
 	let nullable_values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
+	check_decoded_size(&timestamps, &nullable_values, limits)?;
 	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), nullable_values.clone()).with_rows_per_page(params.rows_per_page);
 	commit_ingest(store, metrics, audit, aspect, "ilp", keyed, batch, &timestamps, &nullable_values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "ilp")).await
 }
@@ -774,9 +889,12 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
 	// file as well as the tracing pipeline (see `emit_ingest_audit`).
 	let audit = state.audit_log().cloned();
+	// Read the ingest ceilings before the state is dropped: the handler owns the
+	// `AppState` by value and the inner call takes the limits, not the state.
+	let limits = state.ingest_config();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_parquet_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_parquet_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, limits, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -787,7 +905,7 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 
 /// The body of [`ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
+async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, limits: IngestConfig, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
 	if body.is_empty() {
 		return Err(ApiError::bad_request("empty Parquet body".to_string()));
 	}
@@ -800,7 +918,12 @@ async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate
 	// decoded columns commit through the same entry point as the other three
 	// formats (D-S14) — the decode is the only Parquet-specific step left.
 	let commit = async {
-		let (timestamps, values) = weft_arrow_store::decode_parquet_columns(body, require_sorted).map_err(|err| error::classify_ingest(&err))?;
+		// The strict decode (ROB-7): a `NaN` or infinite value in the file is refused
+		// with its row, not mapped to a null the sender never asked for.
+		let (timestamps, values) = weft_arrow_store::decode_parquet_columns_strict(body, require_sorted).map_err(|err| error::classify_ingest(&err))?;
+		// The two ceilings (ROB-7) land here rather than on the body: a Parquet file is
+		// the one format whose body size says nothing about what it decodes to.
+		check_decoded_size(&timestamps, &values, limits)?;
 		let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page);
 		commit_ingest(store, metrics, audit, aspect, "parquet", keyed, batch, &timestamps, &values).await
 	};
@@ -1506,6 +1629,123 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn a_json_nan_value_is_refused_as_not_finite() {
+		// ROB-7: `"NaN"` parses as an `f64`, and a float with no decimal form used to
+		// reach the seal as a value the operator never sent. `not_finite` is the code the
+		// read side already uses for the same fact about a value.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let body = serde_json::json!({ "points": [ { "timestamp": 100, "value": "NaN" } ] });
+		let (status, json) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn a_csv_nan_cell_is_refused_as_not_finite() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/price/csv", "timestamp,value\n100,1.5\n110,-Infinity\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn an_ndjson_nan_cell_is_refused_as_not_finite() {
+		// Same fact through the line-oriented JSON route: `"NaN"` is valid JSON that
+		// serde turns into a float with no decimal form.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/price/ndjson", "{\"timestamp\":100,\"value\":\"1.5\"}\n{\"timestamp\":110,\"value\":\"Infinity\"}\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn a_parquet_nan_cell_is_refused_as_not_finite() {
+		// The issue's last open question: `null_count: 0` alongside a row the producer
+		// never sent. A NaN Parquet cell is refused at the route, not sealed as a null.
+		//
+		// The bytes are a real Parquet file whose value column holds a raw IEEE-754 NaN,
+		// built by `weft_arrow::write_raw_float_parquet` — the typed column builder in this
+		// crate maps a non-finite float to a null, which is exactly the lenient behaviour
+		// under test, so the file cannot be produced with it.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let body = {
+			use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
+			use arrow_schema::{DataType, Field, Schema};
+			let schema = std::sync::Arc::new(Schema::new(vec![Field::new(weft_arrow::TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(weft_arrow::VALUE_COLUMN, DataType::Float64, false)]));
+			let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(vec![100, 110])) as ArrayRef, std::sync::Arc::new(Float64Array::from(vec![1.5, f64::NAN])) as ArrayRef]).expect("builds a batch whose second value is a NaN");
+			weft_arrow::write_parquet(std::slice::from_ref(&batch)).expect("writes parquet")
+		};
+		let (status, json) = post_parquet(router, "/api/v1/storage/price/parquet", body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "a NaN Parquet cell is refused, not sealed as a null: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn an_ilp_nan_field_is_refused_as_not_finite() {
+		// The ILP hole was the quietest one: the line parsed, then dropped, so the
+		// response counted one row fewer than the sender sent and stored a gap.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", "weather temp=1 100\nweather temp=NaN 110\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn a_batch_over_the_row_cap_is_too_many_rows() {
+		// ROB-7's row ceiling: the body cap cannot express "too many rows" for a
+		// compressed Parquet body, so the decoded row count is checked before the seal.
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(super::IngestConfig::with_max_rows(2)));
+		let body = serde_json::json!({ "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 110, "value": "2.5" },
+			{ "timestamp": 120, "value": "3.5" },
+		] });
+		let (status, json) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {json}");
+		assert_eq!(json["code"], "too_many_rows", "body: {json}");
+		assert!(json["error"].as_str().unwrap().contains("WEFT_MAX_INGEST_ROWS"), "an operator ceiling names itself: {json}");
+	}
+
+	#[tokio::test]
+	async fn a_decoded_column_set_over_the_byte_cap_is_payload_too_large() {
+		// The decoded ceiling, at test scale: three seconds-resolution rows are 96 bytes
+		// of columns plus their mantissas, so a 64-byte ceiling refuses them.
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(super::IngestConfig::with_max_decoded_bytes(64)));
+		let body = serde_json::json!({ "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 110, "value": "2.5" },
+			{ "timestamp": 120, "value": "3.5" },
+		] });
+		let (status, json) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {json}");
+		assert_eq!(json["code"], "payload_too_large", "body: {json}");
+		assert!(json["error"].as_str().unwrap().contains("WEFT_MAX_INGEST_DECODED_BYTES"), "the ceiling names itself: {json}");
+	}
+
+	#[test]
+	fn the_parquet_route_decodes_under_the_ingest_rules() {
+		// The Parquet half of ROB-7 is a choice of entry point, and the only honest
+		// proof of a choice is the source: the lenient decoder must stay on the export
+		// and re-seal paths, never on the write path (weft-arrow's no-panic lint is the
+		// same shape of test, over the production half for the same reason).
+		let source = include_str!("ingest.rs");
+		let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+		assert!(production.contains("decode_parquet_columns_strict("), "the Parquet route must decode strict, or a NaN body stores a null");
+		assert!(!production.contains("decode_parquet_columns("), "the lenient decoder has no business on a write path");
+	}
+
+	#[tokio::test]
 	async fn admission_refuses_an_ingest_over_the_inflight_budget() {
 		// D-S14, inside the gate (C10): a request whose declared body
 		// alone exceeds the in-flight budget is refused 503 overloaded
@@ -1526,12 +1766,17 @@ mod tests {
 
 	#[test]
 	fn ingest_config_parses_and_refuses_zero() {
-		let config = super::IngestConfig::from_env_values(Some("1024"), Some("2048")).expect("valid");
+		let config = super::IngestConfig::from_env_values(Some("1024"), Some("2048"), Some("40"), Some("8192")).expect("valid");
 		assert_eq!(config.max_body_bytes(), 1024);
 		assert_eq!(config.max_inflight_bytes(), 2048);
-		let defaults = super::IngestConfig::from_env_values(None, None).expect("defaults");
+		let defaults = super::IngestConfig::from_env_values(None, None, None, None).expect("defaults");
 		assert_eq!(defaults.max_body_bytes(), super::DEFAULT_MAX_INGEST_BYTES);
-		assert!(super::IngestConfig::from_env_values(Some("0"), None).is_err());
-		assert!(super::IngestConfig::from_env_values(None, Some("many")).is_err());
+		assert!(super::IngestConfig::from_env_values(Some("0"), None, None, None).is_err());
+		assert!(super::IngestConfig::from_env_values(None, Some("many"), None, None).is_err());
+		// ROB-7: the two new ceilings refuse a zero the same way, because a zero row
+		// cap or decoded cap refuses every body.
+		assert!(super::IngestConfig::from_env_values(None, None, Some("0"), None).is_err());
+		assert!(super::IngestConfig::from_env_values(None, None, None, Some("0")).is_err());
+		assert_eq!(super::IngestConfig::from_env_values(None, None, Some("40"), Some("8192")).expect("valid").max_rows(), 40);
 	}
 }

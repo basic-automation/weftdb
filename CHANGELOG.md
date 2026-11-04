@@ -10,6 +10,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+ HEAD
 - **Rust SDK** (`weft-client`). An async client for every route of the HTTP API, on
   `reqwest`: compute, catalog, the four ingest formats with `Idempotency-Key`, stored reads
   with cursor-following `Stream`s, maintenance, backup and the bench runs. Stored values are
@@ -32,6 +33,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   directory and serves one byte for byte by its run id, the SHA-256 of the manifest file;
   `weft-bench` prints the id beside the manifest path. An unknown id is the new
   `404 run_not_found`.
+
+- **Ingest ceilings (ROB-7).** Two more numbers bound what one ingest body can
+  become, in all four formats: `WEFT_MAX_INGEST_ROWS` (default 10,000,000 rows,
+  refused `413 too_many_rows`) and `WEFT_MAX_INGEST_DECODED_BYTES` (default
+  1 GiB, refused `413 payload_too_large`). Both are measured on the columns the
+  format's parser produced rather than on the bytes that arrived — a body cap
+  cannot bound what a compressed Parquet file expands to, and a row count cannot
+  bound what those rows weigh once the decimals are wide. The byte ceiling counts
+  a 16-byte slot per timestamp and per value, plus the mantissa bytes the
+  non-null decimals actually need. 31e15cf ([ROB-7] Refuse non-finite input and cap decoded ingest)
 - **RPO/RTO (EVI-19).** New [`docs/RPO-RTO.md`](docs/RPO-RTO.md) pins the
   recovery-point and recovery-time objectives against the snapshot cadence: the
   corrected formula `RPO = max(I, d_max) + d_max`, the backup settings that set
@@ -91,6 +102,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   for blocking work. Admission I's per-class gate budgets and refusals are unchanged.
 
 ### Fixed
+
+- **A `NaN` or infinity in an ingest body is refused, not stored as a hole or a
+  skipped row (ROB-7).** A Parquet body's `Float64`/`Float32` column turned
+  `NaN`/`±Infinity` into nulls on the way through the Arrow converter (a decimal
+  has no representation for them, and `None` was the path of least resistance),
+  and an ILP line carrying `temp=NaN` was dropped by the projection that could
+  not convert it — while the response still answered `rows: 1`, so the sender
+  believed the line had been written. All four formats now answer `400 not_finite`
+  naming the row (and, for Parquet, the column); JSON and CSV answer it for the
+  text spellings (`NaN`, `inf`, `+Infinity`) that a float parser accepts, and an
+  empty CSV cell stays a null, which is what an absent measurement means. The
+  read side already refused the same values with this code, so it was only ever
+  the write side that was lenient.
 
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
   under Turso's MVCC each delete cost milliseconds and grew with the swaps before it. One
