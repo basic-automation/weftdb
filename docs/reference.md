@@ -233,7 +233,7 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 | Library crates on crates.io | Not published yet |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
 | Packaging — Helm | Not started |
-| Client SDKs | Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
+| Client SDKs | Rust: [`weft-client`](../weft-client) (not on crates.io yet). Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
 | Per-measurement tags | Not started |
 
 The full work queue lives in [`ROADMAP.md`](../ROADMAP.md). It is the single source of
@@ -289,6 +289,9 @@ truth for status and priorities, and it records negative results alongside wins.
 - **Python client** ([`clients/python`](../clients/python)) — every HTTP route from Python,
   lossless `Decimal` values on the storage paths, and Arrow/Parquet answers as `pyarrow`
   tables.
+- **Rust client** ([`weft-client`](../weft-client)) — every HTTP route from async Rust,
+  lossless `BigDecimal` values on the storage paths, cursor-following streams, and
+  optional Arrow `RecordBatch` decoding.
 - **Rust libraries** — use the engine, the storage layer or the reductions directly,
   without the server.
 - **Terminal UI** for importing CSV, browsing and plotting aspects, and running

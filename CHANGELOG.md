@@ -10,6 +10,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Rust SDK** (`weft-client`). An async client for every route of the HTTP API, on
+  `reqwest`: compute, catalog, the four ingest formats with `Idempotency-Key`, stored reads
+  with cursor-following `Stream`s, maintenance, backup and the bench runs. Stored values are
+  written from any `StoredValue` (decimal text, `BigDecimal`, integers) and read back as
+  `BigDecimal`; `f64` is not a `StoredValue`, so a float cannot reach the store by accident.
+  Refusals are one `Error` carrying the whole envelope (`code`, `details`, `limit`,
+  `committed`, `request_id`); an overloaded read is retried after `Retry-After`, a write
+  never is. Features: `rustls` (HTTPS on the ring provider, platform or supplied roots) and
+  `arrow` (decode Arrow IPC and Parquet answers to `RecordBatch`es).
 - **Python SDK** (`clients/python`, package `weftdb`). A standard-library client for every
   route of the HTTP API: compute (`interpolate`, `downsample`, their ILP forms), catalog,
   ingest (JSON points, ILP, CSV, Parquet or a `pyarrow.Table`, with `Idempotency-Key`),
