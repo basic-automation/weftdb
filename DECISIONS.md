@@ -3883,27 +3883,37 @@ test") and FRE-18 ("layout-2 baseline fixtures") both name layout 2 as the 1.0 b
      so remove rollback for everyone, to protect only unreleased layout-2 development builds
      (v0.1.0 is layout 1). It would also make FRE-13 and FRE-18 false as written.
    - What it costs: a layout-2 build from before TAG-5 still opens and writes a store that
-     has the catalog. It never reads the table, and it cannot write a tagged series (the
-     library and HTTP gates stay shut until TAG-8 and TAG-11), so the only harm would come
-     from a store written by a later, tags-enabled build and then reopened by a pre-TAG-5
-     dev build. If the owner wants that closed, the raise belongs on the first tagged write
-     (`SegmentStore::ensure_floor`, which exists for exactly this), not on every store.
+     has the catalog (floors 2/2 let it). It never reads the table, and it cannot write a
+     tagged series itself (the library and HTTP gates stay shut until TAG-8 and TAG-11).
+     But once a tags-enabled build has written tagged rows, a pre-TAG-5 build that reopens
+     the store breaks series isolation: its `segment_index` reads (`rows`, `all`) select by
+     aspect with no `series_id` filter, so it returns tagged rows as untagged results, and
+     its fsck R10 seeds `next_series_id` from the rows alone, ignoring the catalog.
+   - **Binding requirement on TAG-7 (not optional):** the first tagged write must call
+     `SegmentStore::ensure_floor` with a layout that pre-TAG-5 builds cannot write (3),
+     before that write commits, so only stores that actually hold a tagged series lose
+     rollback to pre-TAG-5 builds. TAG-7 is not complete without it.
 2. **Catalog shape:** `series(aspect TEXT, series_key TEXT, series_id INTEGER,
    PRIMARY KEY(aspect, series_key))` in `segment_index.db`, so a registration commits in the
    same `IndexTxn` as the rows that use it. The primary key is the key, not the id: a plain
    `INSERT` of a taken key fails on the primary key, which is the conflict path proven
    under Turso's MVCC. No secondary `UNIQUE` index is relied on (every index in this code
    base is best effort). Ids are unique because only the allocator
-   (`aspect_seq.next_series_id`) hands them out, under the aspect's commit lock. The key is
+   (`aspect_seq.next_series_id`) hands them out, under the aspect's commit lock, and
+   because the registration's `INSERT ... SELECT ... WHERE NOT EXISTS` re-checks that no
+   key of the aspect holds the id, so a retried transaction that read a stale allocator
+   fails with `Conflict` rather than giving a second key the same id. The key is
    stored as its canonical text. Series 0 (the empty tag set) is implicit and has no row.
    The migration is pure DDL: no backfill.
 3. **No composite `segment_index(aspect, series_id, min_ts, max_ts)` index here.** It would
    cost every `InsertNew` and every member delete on every workload, untagged included,
    long before anything reads by series. It is deferred to tag pruning.
 4. **`IndexOp::RegisterSeries { aspect, series_id: SeriesId, series_key: SeriesKey }`** is a
-   plain `INSERT`, classified as guarded (a retry re-checks the key and fails with
-   `Conflict`), and is always paired with `SeedSeries { next_series_id: id + 1 }` in the
-   same transaction.
+   plain `INSERT`, classified as guarded (a retry re-checks both the key and the id and
+   fails with `Conflict` on either), and is always paired with
+   `SeedSeries { next_series_id: id + 1 }` in the same transaction. Series 0 and the empty
+   key are refused as `Definite` before any statement runs, so the empty tag set never
+   gets a second id and no key ever aliases series 0.
 5. **Readers** on `SegmentIndexStore`: `series_id_for`, `series_key_of` (decoded through
    `SeriesKey::from_canonical`, the storage path that accepts reserved `__` keys),
    `series_of` and `next_series_id` (default 1). They are crate-private, so the public
