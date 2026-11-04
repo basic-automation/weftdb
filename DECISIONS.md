@@ -4078,3 +4078,58 @@ before the frame write (a catalog transaction outside the commit lock, and a cra
 ids); retrying once on a registration `Conflict` (a dead path under the commit lock);
 reporting `format_version` 7 for a tagged frame (it would describe the wrapper rather than
 the data, and differ between two writes of the same rows).
+
+## 2026-11-04 — TAG-6: maintenance plans within one series; precedence, overlap stats and gates count per series; hot tail per series, aspect-wide threshold (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** issue #440 names the slice only ("maintenance lane"). The design note's PR 3 and
+its critique (C11-C14) fix the shape; where they disagree the critique wins. Tagged rows still
+come only from the crate's tests (the library gate opens in TAG-8), so nothing outside them
+reaches the per-series paths yet; an untagged aspect is one series and plans exactly as before.
+
+**Chosen:**
+
+1. **Partition first.** `overlap_components` splits an aspect's rows by `series_id` (`by_series`)
+   and sweeps each series on its own, so a component never mixes series (I12 is now guaranteed
+   upstream of `swap_plans`' bail). The M2 closure property holds per series, which is sound
+   only because a read targets one series (tags D4).
+2. **No batching across components (critique C11).** `reconcile_overlaps_held` already makes one
+   swap per component; it is unchanged. The design's batch test is dropped.
+3. **One swap per series (critique C12).** `squash_aspect` folds each series into its own output,
+   looping one series per `swap_plan` rather than putting a plan per series into one
+   transaction, so no swap nears `MAX_PLANS_PER_TXN` (32) whatever the series count, and
+   memory stays one series' merge. A failure leaves the series squashed before it squashed.
+   `squash_aspect_to_target_rows` groups consecutive ids within a series; the P1 argument is
+   restated per series (no other row *of the series* has an id between a group's members).
+4. **Gates count per series (critique C13).**
+   - `squash_aspect_if_exceeds`: the cap applies per series. The cheap aspect-wide count still
+     settles most ticks (no series holds more than the aspect); past it, only the series over
+     the cap are squashed.
+   - Fragmentation gate: after the O(1) rollup check, an aspect with registered series computes
+     `ideal = Σ max(1, ⌈rows_s / target⌉)` from its rows. That sum is never below the
+     aspect-wide ideal, so an untagged aspect (no catalog rows) still costs one rollup read.
+   - The overlap sweep's `had_overlap` is the per-series count, so a tagged aspect whose series
+     merely share a window is not reported as reconciled.
+5. **Precedence per series (critique C14, overriding the design's "leave it aspect-wide").**
+   `refuse_outranking_outputs` compares only rows of the members' series. Left aspect-wide, a
+   newer row of any other series in the window would refuse almost every `split_segment` and
+   P2 output of a tagged aspect.
+6. **Hot tail per series, aspect-wide threshold.** `reconcile_aspect_hot_cold` keeps each
+   series' highest id hot; the backlog it compares with `threshold` stays the aspect's unsorted
+   count, so a single knob stays and the untagged decision is unchanged.
+7. **Overlap stats per series, no descriptor field.** `aspect_stats().overlapping_segments`
+   and `store_overlapping_segments` sum `SegmentIndex::overlapping_count` over one index per
+   series built from the index rows. `SegmentDescriptor` gets no series field (its serde shape
+   is frozen).
+8. **Deviation: the daemon test.** The design asks for weft-server's
+   `every_tick_kind_isolates_a_truncated_frame` with a two-series aspect. weft-server cannot
+   write a tagged batch until the gate opens (only the crate-private `TagPolicy::Allow` can),
+   and a `fault-injection` hook would run only in a job that does not run the lib tests. The
+   same coverage lands in weftdb as
+   `every_sweep_kind_isolates_a_truncated_frame_beside_a_two_series_aspect`, which runs each
+   store-wide sweep the daemon's six tick kinds call; the weft-server test is unchanged and
+   gets its two-series variant when TAG-11 opens the HTTP gate.
+
+**Rejected:** batching plans across components or series into one transaction (no saving the
+swap needs, and it holds every merged series in memory at once); a series field on
+`SegmentDescriptor`; per-series metrics and sweep counters (deferred by the plan); a per-series
+backlog threshold for the hot tail (a second knob for no measured need).

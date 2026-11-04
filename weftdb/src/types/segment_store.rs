@@ -713,15 +713,17 @@ fn resolve_frame_path(root: &Path, stored: &str) -> Result<PathBuf> {
 }
 
 /// Refuse the outputs of `members` that would take fresh ids (rule P2 of the release
-/// plan's D17), given the aspect's `rows`, when one of `rows` with an id above every
-/// member overlaps one of their spans `extra`: such an output takes an id above every row,
-/// so at the timestamps they share it would outrank that newer row (design section 5.3,
-/// M2; `split_segment`'s rule). Rows without a time range, and outputs without one,
-/// overlap nothing.
+/// plan's D17), given the aspect's `rows`, when one of `rows` of the members' series with
+/// an id above every member overlaps one of their spans `extra`: such an output takes an
+/// id above every row, so at the timestamps they share it would outrank that newer row
+/// (design section 5.3, M2; `split_segment`'s rule). Precedence only matters within a
+/// series (a read targets one series, tags D4; TAG-6), so a newer row of another series
+/// never refuses. Rows without a time range, and outputs without one, overlap nothing.
 fn refuse_outranking_outputs(aspect: &str, members: &[IndexRow], extra: impl IntoIterator<Item = Option<(i64, i64)>>, rows: &[IndexRow]) -> Result<()> {
 	let Some(newest_member) = members.iter().map(|member| member.desc.id).max() else { return Ok(()) };
+	let series_id = members.first().map_or(0, |member| member.series_id);
 	for (lo, hi) in extra.into_iter().flatten() {
-		if let Some(newer) = rows.iter().find(|row| row.desc.id > newest_member && row.desc.time_range().is_some_and(|(min, max)| min <= hi && lo <= max)) {
+		if let Some(newer) = rows.iter().find(|row| row.series_id == series_id && row.desc.id > newest_member && row.desc.time_range().is_some_and(|(min, max)| min <= hi && lo <= max)) {
 			let ids: Vec<u64> = members.iter().map(|member| member.desc.id).collect();
 			bail!("refusing to swap segment(s) {ids:?} of aspect {aspect:?}: segment {} is newer and overlaps [{lo}, {hi}], where an output under a new id would outrank it", newer.desc.id);
 		}
@@ -936,12 +938,41 @@ fn span_of(timestamps: &[i64]) -> Option<(i64, i64)> {
 	Some((*lo, *hi))
 }
 
-/// The connected components of `rows` that overlap in time, transitively: the spans are
-/// swept in `(min_ts, max_ts)` order, and a new component starts whenever a span begins
-/// after the running end of the current one. So no row outside a component overlaps its
-/// span (the closure property design section 5.3's M2 relies on). A row without a time
-/// range is in none.
+/// `rows` partitioned by series (TAG-6): one run per series id present, in ascending
+/// series order, each keeping the order `rows` had. An untagged aspect is one run.
+fn by_series(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
+	let mut series: std::collections::BTreeMap<u64, Vec<IndexRow>> = std::collections::BTreeMap::new();
+	for row in rows {
+		series.entry(row.series_id).or_default().push(row);
+	}
+	series.into_values().collect()
+}
+
+/// The aspect's [`overlapping_count`](weft_physical_type::SegmentIndex::overlapping_count)
+/// per series (TAG-6): the sum over one [`SegmentIndex`](weft_physical_type::SegmentIndex)
+/// per series of `rows`, so two series sharing a window do not count as overlap (a read
+/// targets one series, tags D4). An untagged aspect counts exactly as its whole index.
+fn series_overlapping_count(rows: &[IndexRow]) -> usize {
+	let mut series: std::collections::BTreeMap<u64, weft_physical_type::SegmentIndex> = std::collections::BTreeMap::new();
+	for row in rows {
+		series.entry(row.series_id).or_default().push(row.desc.clone());
+	}
+	series.values().map(weft_physical_type::SegmentIndex::overlapping_count).sum()
+}
+
+/// The connected components of `rows` that overlap in time, transitively, within each
+/// series (TAG-6: rows are partitioned by `series_id` first, so a component never mixes
+/// series, invariant I12): per series the spans are swept in `(min_ts, max_ts)` order,
+/// and a new component starts whenever a span begins after the running end of the
+/// current one. So no row of the series outside a component overlaps its span (the
+/// closure property design section 5.3's M2 relies on, per series: a read targets one
+/// series, tags D4). A row without a time range is in none.
 fn overlap_components(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
+	by_series(rows).into_iter().flat_map(series_overlap_components).collect()
+}
+
+/// [`overlap_components`] of the rows of one series.
+fn series_overlap_components(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
 	let mut spanned: Vec<(i64, i64, IndexRow)> = rows.into_iter().filter_map(|row| row.desc.time_range().map(|(lo, hi)| (lo, hi, row))).collect();
 	spanned.sort_by_key(|(lo, hi, _)| (*lo, *hi));
 	let mut components: Vec<Vec<IndexRow>> = Vec::new();
@@ -1000,8 +1031,8 @@ pub(crate) const fn merge_rows_per_page(rows: usize) -> Option<usize> {
 }
 
 /// How many independent plans one swap transaction may carry: the default of
-/// `WEFT_MAINT_PLANS_PER_TXN` (tags amendment A5), which per-series compaction batches up
-/// to. Every caller today swaps one plan at a time.
+/// `WEFT_MAINT_PLANS_PER_TXN` (tags amendment A5). Every caller today swaps one plan at a
+/// time, so per-series maintenance (TAG-6) loops one series at a time and never nears it.
 const MAX_PLANS_PER_TXN: usize = 32;
 
 /// The rows of one output a swap plans, in time order, and the frame kind it is written
@@ -2206,7 +2237,7 @@ impl SegmentStore {
 
 	/// **Store-wide cross-segment overlap count** (roadmap Phase 4.6): the total
 	/// number of segments across every aspect whose time window overlaps another
-	/// segment *in the same aspect* — the store-wide form of
+	/// segment *of the same series of the same aspect* (TAG-6) — the store-wide form of
 	/// [`AspectStorageStats::overlapping_segments`](AspectStorageStats::overlapping_segments).
 	///
 	/// Unlike [`store_stats`](SegmentStore::store_stats) — which reads O(1)
@@ -2225,7 +2256,7 @@ impl SegmentStore {
 		let aspects = self.index.list_aspects().await?;
 		let mut total = 0;
 		for aspect in &aspects {
-			total += self.index.load_index(aspect).await?.overlapping_count();
+			total += series_overlapping_count(&self.index.rows(aspect).await?);
 		}
 		Ok(total)
 	}
@@ -2530,7 +2561,8 @@ pub struct AspectStorageStats {
 	/// construction. See [`SegmentIndex::unsorted_count`](weft_physical_type::SegmentIndex::unsorted_count).
 	pub unsorted_segments: usize,
 	/// The number of sealed segments whose time span **overlaps at least one other
-	/// segment's** — the *cross-segment* order-health signal (roadmap Phase 4.6),
+	/// segment's** of the same series (TAG-6: each series is counted on its own, so two
+	/// series sharing a window are not overlap) — the *cross-segment* order-health signal (roadmap Phase 4.6),
 	/// distinct from [`unsorted_segments`](AspectStorageStats::unsorted_segments)
 	/// (which counts *intra*-segment disorder). A non-zero count means late data
 	/// re-entered an already-covered window, so a point lookup may have to consult
@@ -7682,3 +7714,7 @@ mod sidecar_scale_tests;
 /// TAG-7: tagged batches seal series-key envelopes under catalog-resolved series ids.
 #[cfg(test)]
 mod tag_seal_tests;
+
+/// TAG-6: every maintenance pass plans within one series.
+#[cfg(test)]
+mod tag_maint_tests;

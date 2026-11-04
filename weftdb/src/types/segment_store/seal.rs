@@ -335,7 +335,7 @@ impl SegmentStore {
 	///   already folded into the swap's transaction at M5, S11).
 	///
 	/// Up to [`MAX_PLANS_PER_TXN`] plans, independent of each other (no member in two).
-	/// Every caller today swaps one at a time; per-series maintenance batches them.
+	/// Every caller today swaps one at a time; per-series maintenance (TAG-6) loops a series at a time.
 	///
 	/// Returns each plan's outcome, in order. A plan refused or in conflict at M5 has its
 	/// outputs discarded and fails alone.
