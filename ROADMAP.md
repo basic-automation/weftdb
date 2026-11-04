@@ -340,7 +340,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 
   - [x] **EVI-14** DuckDB adapter II
   - [x] **EVI-18** Backup health metrics and catch-up-free ticking
-  - [ ] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
+  - [x] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
 - [ ] **W7 · Post-split lanes open; security and packaging close**
   - [ ] open lane
   - [ ] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code

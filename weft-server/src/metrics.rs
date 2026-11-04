@@ -52,6 +52,11 @@ pub struct Metrics {
 	/// Seal-path latency for the storage-ingest endpoints (JSON / CSV / ILP) —
 	/// the ingest side of the "predictable p95/p99 under ingest + query" claim.
 	pub ingest_latency: LatencyHistogram,
+	/// Duration of each completed, verified control-plane backup snapshot
+	/// (EVI-25): the manual endpoint and the daemon tick both observe here, so
+	/// the backup-duration half of the RTO inputs is a scrapeable histogram
+	/// rather than a log line or a one-off bench number.
+	pub backup_latency: LatencyHistogram,
 }
 
 /// A cumulative, fixed-bucket latency histogram rendered in the Prometheus
@@ -441,6 +446,14 @@ impl Metrics {
 		self.ingest_latency.observe(elapsed);
 	}
 
+	/// Record the wall-clock duration of one completed, verified control-plane
+	/// backup snapshot (EVI-25). Only a snapshot that succeeded should call
+	/// this, matching [`Metrics::record_backup`]; a failed tick is visible in
+	/// the failure counter instead, not as a duration.
+	pub fn observe_backup_duration(&self, elapsed: Duration) {
+		self.backup_latency.observe(elapsed);
+	}
+
 	/// Take a consistent-enough snapshot of all counters.
 	#[must_use]
 	pub fn snapshot(&self) -> MetricsSnapshot {
@@ -469,6 +482,7 @@ impl Metrics {
 		self.interpolate_latency.render_prometheus(&mut out, "weft_interpolate_duration_seconds", "End-to-end handling latency for the interpolate endpoints (POST /api/v1/interpolate and /interpolate/ilp).");
 		self.downsample_latency.render_prometheus(&mut out, "weft_downsample_duration_seconds", "End-to-end handling latency for the downsample endpoints (POST /api/v1/downsample and /downsample/ilp).");
 		self.ingest_latency.render_prometheus(&mut out, "weft_ingest_duration_seconds", "Seal-path latency for the storage-ingest endpoints (JSON / CSV / ILP).");
+		self.backup_latency.render_prometheus(&mut out, "weft_backup_duration_seconds", "Wall-clock duration of each completed, verified control-plane backup snapshot (manual endpoint and backup daemon alike).");
 		out
 	}
 }
@@ -614,8 +628,9 @@ mod tests {
 		assert!(text.contains("weft_interpolate_requests_total 1"));
 		assert!(text.contains("weft_interpolate_output_points_total 5"));
 		// No value line is left dangling without a preceding TYPE line: 16
-		// counters + the backup last-success gauge + the 3 latency histograms.
-		assert_eq!(text.matches("# TYPE ").count(), 20);
+		// counters + the backup last-success gauge + the 4 latency histograms
+		// (EVI-25 adds the backup one).
+		assert_eq!(text.matches("# TYPE ").count(), 21);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE weft_downsample_requests_total counter"));
 		// And the storage-ingest counters.
@@ -651,6 +666,16 @@ mod tests {
 		assert_eq!(m.snapshot().backup.last_success_unix_secs, 1_000);
 		m.seed_backup_last_success(500);
 		assert_eq!(m.snapshot().backup.last_success_unix_secs, 1_000, "a stale seed must not lose to a newer tick");
+	}
+
+	#[test]
+	fn backup_duration_histogram_is_rendered() {
+		let m = Metrics::default();
+		m.observe_backup_duration(Duration::from_millis(3));
+		let text = m.render_prometheus();
+		assert!(text.contains("# TYPE weft_backup_duration_seconds histogram"), "{text}");
+		assert!(text.contains("weft_backup_duration_seconds_bucket{le=\"0.005\"} 1"), "{text}");
+		assert!(text.contains("weft_backup_duration_seconds_count 1"), "{text}");
 	}
 
 	#[test]
