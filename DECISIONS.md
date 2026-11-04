@@ -4282,3 +4282,51 @@ check on every call, and a cursor wants a stable id); `all()` as the meaning of 
 methods (it would break pinned untagged reads on tagged stores); reusing `GroupsUnsupported`
 or `TagError` for reserved keys (the first now means "gate shut", the second carries no
 aspect).
+
+## 2026-11-04 — Decision 18 amended: the stored-interpolation HTTP route ships now (P5-http, FOR MERGE REVIEW)
+
+**Amends:** the 1.0 plan's decision 18 (`f085f84:docs/release/1.0-plan.md:540`), which shipped
+stored interpolation "as a library API (EVI-10A); the HTTP route is deferred", and the
+2026-10-29 EVI-11 entry above, which relied on that deferral. **The owner overrode the
+deferral on 2026-11-04** (the Phase 5 run: build every Phase 5 item, the gated ones included).
+The evidence scope the rest of decision 18 fixes (the first report's arms and datasets, no LOCF
+on stored data) is unchanged; `weftdb-stored` still times the library call, not this route.
+
+**Chosen:**
+
+1. **Route shape.** `GET /api/v1/storage/{aspect}/interpolate?start=&end=&resolution=&spline=&margin=`,
+   with `.csv`, `.arrow` and `.parquet` siblings, as the stored downsample spells its formats.
+   GET only: it takes no body (the stored downsample's POST exists only because the roadmap
+   named one). `start`/`end` are required, since a grid needs both ends.
+2. **Policy row.** Scope `read`, audit none, admission `query`, tier stable — the stored reads'
+   row exactly (task instruction). *For review:* registering it `experimental` instead would
+   let the margin default (point 4) change after 1.0 without a breaking note.
+3. **`f64` out.** The route runs `interpolate_range_f64`, the interpolation family's wire type,
+   and skips the per-point `BigDecimal` measured at ~80% of the library call (2026-10-09). A
+   `raw` point is the stored value rounded to the nearest `f64`, as the compute endpoints' JSON
+   already rounds it; a non-finite computed value is `400 not_finite` (FRE-5). Timestamps are
+   RFC 3339 (JSON, CSV) and nanosecond epochs (Arrow, Parquet), the compute endpoints'
+   reconstructed-series layout, because a grid finer than the aspect's unit has instants the
+   unit cannot hold.
+4. **Margin default: the window width, `end − start`.** The library takes the margin
+   explicitly and has no default. Zero would leave every window edge between samples to
+   extrapolation, which a caller who forgets the parameter gets silently (the `kind` labels it,
+   but the values are worse). The window width covers the edges whenever the window holds a
+   few samples and at most triples the rows read, which `MAX_KNOTS` still bounds. *For
+   review:* a sample-spacing-derived default needs per-segment statistics the route does not
+   have.
+5. **Bounds and error vocabulary.** The grid is capped by the compute endpoints' existing
+   `WEFT_MAX_INTERPOLATE_POINTS` and checked *before* the read (splimes sizes the grid before it
+   reads knots, so a run over no knots is a free pre-flight). The knots are capped by
+   `interpolate_range::MAX_KNOTS`, kept as the `pub` const the 2026-10-28 EVI-10A entry left.
+   Both are `422 result_too_large` with `limit`. To answer the knot cap with a code rather than
+   by matching a sentence, the library's two window refusals became a typed
+   `weftdb::interpolate_range::StoredWindowError` (`TooManyRows`, `NoSample`) inside the same
+   `anyhow` chain, with the same messages. A window with no stored sample is `400 bad_request`,
+   as an empty `points` is on the compute endpoint; splimes errors map through the compute
+   endpoints' `engine_error`; an undeclared aspect is `404 aspect_not_found` before any read.
+
+**Not done here:** the route does not record the `weft_interpolate_*` metrics (the stored
+downsample does not record `weft_downsample_*` either; mixing stored and compute latencies in
+one histogram would blur the compute p95). The ROADMAP line is ticked by the Phase 5 roll-up,
+not this PR.

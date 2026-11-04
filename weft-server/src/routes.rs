@@ -73,7 +73,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, grafana, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, version::version, HealthResponse, ReadyResponse
+	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, grafana, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, stored_interpolate, version::version, HealthResponse, ReadyResponse
 };
 
 /// What a request to a route must hold, from the frozen table above. See the
@@ -877,6 +877,10 @@ fn register_storage_read_routes(routes: &mut Routes) {
 	routes.route(Method::POST, "/api/v1/storage/{aspect}/downsample.arrow", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_downsample_arrow_post"), post(storage::storage_downsample_arrow));
 	routes.route(Method::GET, "/api/v1/storage/{aspect}/downsample.parquet", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_downsample_parquet_get"), get(storage::storage_downsample_parquet));
 	routes.route(Method::POST, "/api/v1/storage/{aspect}/downsample.parquet", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_downsample_parquet_post"), post(storage::storage_downsample_parquet));
+	routes.route(Method::GET, "/api/v1/storage/{aspect}/interpolate", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_interpolate_get"), get(stored_interpolate::storage_interpolate));
+	routes.route(Method::GET, "/api/v1/storage/{aspect}/interpolate.csv", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_interpolate_csv_get"), get(stored_interpolate::storage_interpolate_csv));
+	routes.route(Method::GET, "/api/v1/storage/{aspect}/interpolate.arrow", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_interpolate_arrow_get"), get(stored_interpolate::storage_interpolate_arrow));
+	routes.route(Method::GET, "/api/v1/storage/{aspect}/interpolate.parquet", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_interpolate_parquet_get"), get(stored_interpolate::storage_interpolate_parquet));
 	routes.route(Method::GET, "/api/v1/storage/{aspect}/at", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_point_at"), get(storage::storage_point));
 	routes.route(Method::GET, "/api/v1/storage/{aspect}/at-multi", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_points_at_multi"), get(storage::storage_points));
 	routes.route(Method::GET, "/api/v1/storage/{aspect}/value-range", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_value_range"), get(storage::storage_value_range));

@@ -91,6 +91,12 @@ required-features = ["fault-injection"]
 name = "poison_exit"
 required-features = ["fault-injection"]
 
+# End-to-end stored interpolation through the HTTP route (Phase 5), hand-rolled for p50/p95:
+# `cargo bench -p weft-server --bench stored_interpolate`.
+[[bench]]
+name = "stored_interpolate"
+harness = false
+
 [dev-dependencies]
 async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
 libc = { workspace = true }  # raise(SIGTERM) for the signal-before-serving test in tests/serve_path.rs

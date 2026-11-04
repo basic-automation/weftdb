@@ -92,6 +92,7 @@ pub mod settings;
 pub mod state;
 pub mod storage;
 pub mod store_open;
+pub mod stored_interpolate;
 #[cfg(test)]
 mod test_fs;
 #[cfg(test)]
