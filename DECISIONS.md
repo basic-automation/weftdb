@@ -4282,3 +4282,55 @@ check on every call, and a cursor wants a stable id); `all()` as the meaning of 
 methods (it would break pinned untagged reads on tagged stores); reusing `GroupsUnsupported`
 or `TagError` for reserved keys (the first now means "gate shut", the second carries no
 aspect).
+
+## 2026-11-04 — TAG-10: stored reads take `tag.<k>=v` selectors, exact by default; a JSON body reports the series' `tags` (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Issue #447; design PR 6 without 6b (the `DownsampleResponse.series → buckets` rename), with
+tags D6 and critique G.
+
+1. **Route count (critique G).** The design said 21 data-read routes; `routes.rs` registers
+   **18**: `range`/`range.parquet`/`range.csv`, `points`, `downsample{,.csv,.arrow,.parquet}`
+   over GET and POST (8), `at`, `at-multi`, `value-range`/`value-range.parquet`/
+   `value-range.csv`, `value-points`. All 18 (11 handlers) take the selector. No route,
+   operation id, error code or setting was added, so the 62/56, 43 and 81 pins are unchanged.
+2. **Spelling (tags D6).** `SelectorQuery<T>` in `error.rs` splits the raw query before
+   binding: `tag.<key>` parameters and one `tag_match` build the selector; everything else
+   binds `T` through axum's `Query` exactly as `StrictQuery` does, so `deny_unknown_fields`
+   still refuses a typo with the same message. Names and values are form-decoded
+   (`tag%2Ehost` is `tag.host`). No `tag.*` and no `tag_match` is `SeriesSelector::untagged()`
+   (series 0, no catalog read), so every untagged client reads what it read before.
+   **Exact by default**; `tag_match=subset` is `SeriesSelector::new`; `tag_match=exact` is
+   accepted explicitly; any other value, or a repeated `tag_match`, is `400 bad_request`
+   (it is not a tag, so not `invalid_tag`). `tag.<key>=` (empty value) is the absent matcher.
+   Owner call carried from the design: with loose-by-default, `{a=1}` could never be read
+   while `{a=1,b=2}` exists.
+3. **Refusals.** A repeated `tag.<key>` (including `tag.k=a&tag.k=`) is left to the selector
+   builder's `TagError::DuplicateKey` (the variant is `#[non_exhaustive]`, so the server
+   cannot construct it, and need not). More than `MAX_TAGS` (16) matchers is refused in the
+   extractor (there is no cap in `tags.rs`) as `400 invalid_tag` with
+   `details: {count, limit}`. `from_tag_error`: every input variant is `400 invalid_tag`
+   with `details: {tag: key}` where the variant has a key (`EmptyKey` reports `""`);
+   `UnsortedKeys`, `MissingSeparator`, `ValueNotUtf8` (stored bytes only) are
+   `500 series_binding_mismatch`; a future variant is treated as input. `classify_typed`
+   also downcasts `TagError` through the same mapping, so a key the catalog cannot decode
+   surfaces as the 500.
+4. **Resolution and empty matches.** Each handler checks the aspect's schema first (an
+   undeclared aspect stays `404` whatever the selector; the Arrow/Parquet handlers now call
+   `require_schema` themselves, one extra catalog read), then `resolve_series` once, then the
+   `_of` read. No match is an empty body (`200`): zero rows, `found:false` per instant, zero
+   buckets; Arrow/Parquet build an empty batch of the declared schema directly. Two or more
+   matches are `400 ambiguous_series` (TAG-8's mapping).
+5. **`tags` in JSON bodies.** `StoredRangeResponse` (`points`, `value-points`),
+   `StoredPointResponse` (`at`), `StoredPointsResponse` (`at-multi`) gain an always-present
+   `tags`: `{}` for series 0, the series' tags for a tagged one, `null` when nothing
+   matched. This is an additive field on untagged responses too (the store read itself is
+   byte-identical). `DownsampleResponse` gains an optional `tags` set only by the stored
+   downsample, so the compute endpoint's body is unchanged. The tags come from a new public
+   `SegmentStore::series_tags(aspect, SeriesId) -> Result<Option<TagSet>>`
+   (`series_key_of` is crate-private). CSV/Arrow/Parquet carry no tags.
+6. **Auth.** `tag.api_key` is not a credential parameter: `query_carries_a_credential`
+   compares whole names, so only a bare `api_key`/`apikey`/`access_token`/`auth_token` is
+   refused; pinned by `tag_api_key_is_not_a_credential_param`.
+7. **Not done here:** the cursor is not bound to the selector (ROB-15, C15); OpenAPI does
+   not describe the dynamic `tag.*` family (FRE-9a); the SDKs gain no selector arguments;
+   HTTP ingest of tags stays shut until TAG-11.

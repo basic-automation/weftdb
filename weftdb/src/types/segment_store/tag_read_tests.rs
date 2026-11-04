@@ -153,3 +153,18 @@ async fn the_library_gate_admits_tags_but_not_reserved_keys() {
 	assert_eq!(store.segment_count(ASPECT).await.expect("counts"), 1, "the refusal wrote nothing");
 	assert_eq!(store.index.series_count(ASPECT).await.expect("counts"), 1, "and registered nothing");
 }
+
+/// `series_tags` (TAG-10): series 0 is the empty set without the catalog, a registered id is
+/// its decoded key, and an id never handed out is `None`.
+#[tokio::test]
+async fn series_tags_reads_back_the_catalog_key() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+	assert_eq!(store.series_tags(ASPECT, SeriesId::UNTAGGED).await.expect("reads"), Some(TagSet::new()));
+	let groups = tags(&[("host", "a"), ("dc", "x")]);
+	ingest(&store, "a", groups.clone(), 1).await;
+	let a = id_of(&store, &groups).await;
+	assert_eq!(store.series_tags(ASPECT, a).await.expect("reads"), Some(groups));
+	assert_eq!(store.series_tags(ASPECT, SeriesId(a.0 + 1)).await.expect("reads"), None);
+	assert!(store.series_tags("../x", a).await.is_err(), "an invalid aspect name");
+}
