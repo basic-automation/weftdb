@@ -343,7 +343,12 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
 - [ ] **W7 · Post-split lanes open; security and packaging close**
   - [ ] open lane
-  - [ ] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code
+  - [x] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code
+    - The pin refuses a start whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` differ from the
+      scope the store root's own `STORE_FORMAT` records (exit 65, the class the exit table has
+      always named for a scope mismatch; `WEFT_STORE_SCOPE_PIN=off` serves the root anyway).
+      `GET /api/v1/version` answers build, layout, scope-pin and exit-code state from process
+      state alone, so it answers while a store is being refused. DECISIONS 2026-11-03
   - [ ] seal lane
   - [ ] read lane
   - [ ] → **ROB-13** Bounded stored downsample and point lookups

@@ -37,6 +37,24 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   corrected formula `RPO = max(I, d_max) + d_max`, the backup settings that set
   `I`, and the restore paths that set RTO — with every figure measured, derived
   or labelled unmeasured.
+
+- **The scope pin and `GET /api/v1/version` (FRE-12b).** A store root holds many `(database,
+  subject)` namespaces, so a server whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` name one
+  the root does not hold does not fail: it serves an empty namespace, which is what a lost
+  store looks like from the outside. `weft-server` now compares the scope it is configured for
+  against the scope the root's own `STORE_FORMAT` records before it opens, and refuses a
+  mismatch with exit `65` — the operator-action class, where "scope mismatch" has always sat in
+  the exit table without the server ever producing one. The message names both scopes, the
+  root, and the three ways out. `WEFT_STORE_SCOPE_PIN=off` serves the root under the configured
+  scope anyway, for a deployment that means it; a root with no marker yet has no recorded scope
+  to refuse against. The new `GET /api/v1/version` answers the same questions over HTTP — the
+  build (OS, architecture, libc, debug or release, and the target triple, compiler and commit
+  it was built from, recorded at compile time because a released box has neither to ask), the
+  store's layout numbers beside what this build can write, the scope being served against the
+  scope the store records, and the whole exit-status table — from process state alone, so it
+  answers while a store is being refused. It takes a key where keys are mounted: `/health` and
+  `/ready` stay the anonymous surface.
+
 - **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
   (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
   gets an attempt record before it runs and an outcome record after, and the operation is

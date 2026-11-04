@@ -37,7 +37,8 @@ pub(crate) async fn build() -> anyhow::Result<AppState> {
 				eprintln!("weft-server: {problem}");
 				std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
 			}
-			let store = Arc::new(store_open::open_from_env(&root).await?);
+			let (store, serving) = store_open::open_and_pin_from_env(&root).await?;
+			let store = Arc::new(store);
 			// PAC-7: the store's identity is reported at startup — root,
 			// store_uuid, scope, layout and the previous shutdown's
 			// cleanliness, in the one line `store_open` formats.
@@ -45,7 +46,7 @@ pub(crate) async fn build() -> anyhow::Result<AppState> {
 			if store.open_report().recovery_report_only {
 				println!("segment store: its layout is newer than this build's; it opened without migrating");
 			}
-			(AppState::new().with_store(store), Some(root))
+			(AppState::new().with_store(store).with_serving_scope(serving), Some(root))
 		}
 		Err(_) => {
 			println!("segment store: not configured (set {STORE_ROOT_ENV} to enable the /api/v1/storage endpoints)");
