@@ -4058,6 +4058,16 @@ projection can skip — naming the line. The float-only case is checked at the
 field level (`LineRecord::field_is_non_finite`) because a *tag* reading `NaN` is
 a string and means nothing special.
 
+**One test the worker wrote asserted a route that does not exist.** The first
+cut of this slice carried
+`an_ndjson_nan_cell_is_refused_as_not_finite`, which POSTed newline-delimited
+JSON to `/api/v1/storage/price/ndjson` and expected 400. The server has no
+NDJSON ingest route — the ingest formats are JSON points, ILP, CSV and Parquet —
+so the route table answered 404 and CI said so on Linux and Windows alike. The
+test was rewritten as `an_infinity_value_is_refused_as_not_finite`, which posts
+the `"Infinity"` spelling through the real JSON route: the same fact, a route
+that exists. It was not deleted and no other test was loosened.
+
 **Numbers the plan did not give.** It says only "ROB-7 adds the row and
 decoded-byte caps". `WEFT_MAX_INGEST_ROWS` defaults to **10,000,000 rows** — the
 body cap already refuses a 256 MiB JSON body, and 10M rows is roughly a 240 MB

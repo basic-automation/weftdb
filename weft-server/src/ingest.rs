@@ -1651,12 +1651,18 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn an_ndjson_nan_cell_is_refused_as_not_finite() {
-		// Same fact through the line-oriented JSON route: `"NaN"` is valid JSON that
-		// serde turns into a float with no decimal form.
+	async fn an_infinity_value_is_refused_as_not_finite() {
+		// The other spelling a float parser accepts: `"Infinity"` reaches `f64` as a
+		// positive infinity through the JSON route, and is the same fact `"NaN"` is.
+		//
+		// This covers the JSON route's second spelling rather than a fifth ingest
+		// format: the server's ingest formats are JSON points, ILP, CSV and Parquet —
+		// there is no NDJSON route to POST to, so the earlier version of this test
+		// asserted a 404.
 		let dir = TempDir::new().unwrap();
 		let router = router_with_declared_price(&dir).await;
-		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/price/ndjson", "{\"timestamp\":100,\"value\":\"1.5\"}\n{\"timestamp\":110,\"value\":\"Infinity\"}\n").await;
+		let body = serde_json::json!({ "points": [ { "timestamp": 110, "value": "Infinity" } ] });
+		let (status, json) = post_json(router, "/api/v1/storage/price/points", &body).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
 		assert_eq!(json["code"], "not_finite", "body: {json}");
 	}
