@@ -904,8 +904,9 @@ impl SegmentStore {
 	/// reconciliation/upsert behaviour. Rows at a timestamp carried by only one member
 	/// — including that member's own internal duplicates — are preserved.
 	///
-	/// Each overlap component is either fully rewritten into one single-block segment
-	/// (a paged member is compacted to single-block) or, when a large **cold prefix**
+	/// Each overlap component is either fully rewritten into one segment (paged once it holds
+	/// more than 4,096 rows, whatever kind its members
+	/// were) or, when a large **cold prefix**
 	/// dominates, **split** (per [`SplitPolicy`]) into an untouched-going-forward prefix
 	/// segment plus a merged hot-suffix segment — see
 	/// [`reconcile_overlaps_with_policy`](SegmentStore::reconcile_overlaps_with_policy).
@@ -915,8 +916,8 @@ impl SegmentStore {
 	///
 	/// **Write-once** (crash-consistency design sections 5.3 and 7; slice S9). A
 	/// component's output is a new frame under a never-used name, written and fsynced
-	/// beside its members (the output's row records the single-block frame actually
-	/// written, whatever kind its id's member was), and one `segment_index.db` transaction
+	/// beside its members (the output's row records the frame actually written, whatever
+	/// kind its id's member was), and one `segment_index.db` transaction
 	/// swaps it in: it replaces the lowest member's row and deletes the others, each only
 	/// if it is still the version read, and journals every member's frame as retired, for
 	/// the reaper to unlink once no read may still open it. No reader ever sees a member's
@@ -1016,11 +1017,12 @@ impl SegmentStore {
 			let prefix_bytes = bytes_per_row.saturating_mul(prefix_len as u64);
 			let suffix_bytes = bytes_per_row.saturating_mul((all_ts.len() - prefix_len) as u64);
 			let split = prefix_len > 0 && prefix_len < all_ts.len() && policy.decide(prefix_bytes, suffix_bytes, 0) == SplitDecision::Split;
-			// Full rewrite: one single-block output under the lowest member id. Split: the cold
+			// Full rewrite: one output under the lowest member id. Split: the cold
 			// prefix under the lowest id and the merged hot suffix under the next lowest (P1),
 			// cut at the timestamp where the suffix starts; the two are disjoint in time.
 			let cuts: &[i64] = if split { &[cold_boundary] } else { &[] };
-			let plan = SwapPlan::cut(members, all_ts, all_vs, None, cuts);
+			let rows_per_page = merge_rows_per_page(all_ts.len());
+			let plan = SwapPlan::cut(members, all_ts, all_vs, rows_per_page, cuts);
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}
@@ -1143,8 +1145,8 @@ impl SegmentStore {
 	/// fragments an aspect and multiplies the per-segment read/prune overhead. Squash is
 	/// the QuestDB-style bound on that fragmentation: it folds **every** segment of
 	/// `aspect` — in ascending seal id, [`merge_newer_wins`] so any residual shared
-	/// timestamp still resolves last-writer-wins — into a single time-sorted single-block
-	/// segment under the lowest id, deleting the rest. After it, the aspect is one segment
+	/// timestamp still resolves last-writer-wins — into a single time-sorted segment
+	/// (paged past 4,096 rows) under the lowest id, deleting the rest. After it, the aspect is one segment
 	/// with no cross-segment overlap. The natural trigger is a segment count past a
 	/// threshold (see [`squash_aspect_if_exceeds`](SegmentStore::squash_aspect_if_exceeds));
 	/// squashing trades the split path's low write amplification for a low segment count,
@@ -1187,7 +1189,8 @@ impl SegmentStore {
 		let schema = self.require_schema(aspect).await?;
 		// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
 		let (all_ts, all_vs) = self.merge_members(&members).await?;
-		let plan = SwapPlan::cut(members, all_ts, all_vs, None, &[]);
+		let rows_per_page = merge_rows_per_page(all_ts.len());
+		let plan = SwapPlan::cut(members, all_ts, all_vs, rows_per_page, &[]);
 		let removed = plan.removes();
 		self.swap_plan(held, &schema, plan).await?;
 		Ok(removed)
@@ -1359,7 +1362,8 @@ impl SegmentStore {
 			// One swap per group: its members folded oldest → newest (the most-recently-sealed
 			// value wins any residual tie) into one output under the group's lowest id.
 			let (all_ts, all_vs) = self.merge_members(&members).await?;
-			let plan = SwapPlan::cut(members, all_ts, all_vs, None, &[]);
+			let rows_per_page = merge_rows_per_page(all_ts.len());
+			let plan = SwapPlan::cut(members, all_ts, all_vs, rows_per_page, &[]);
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}
