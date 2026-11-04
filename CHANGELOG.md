@@ -110,6 +110,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **Restore no longer strands tagged frames (part of TAG-9, #310).** A restore-mode open
+  adopts an orphan frame that carries a series key into the series the key names,
+  registering the key in the aspect's catalog in the same transaction, instead of journaling
+  it `held` forever; only a tagged orphan of an undeclared aspect is still held, and a later
+  open adopts it once the aspect is declared. Recovery and `POST /api/v1/storage/fsck` also check
+  each indexed tagged frame's key: a malformed or repeated key is quarantined suspect, and a
+  row whose series id names a different key is rebound to the frame's series, counted in the
+  new `RecoveryReport::series_rebound` (also in the fsck response). A row moved back to the
+  aspect its frame names gets its key resolved in that aspect's catalog rather than keeping
+  the other aspect's series id. Untagged frames and reads are unchanged; a restore's adopted
+  orphans now take ids from the commit allocator (which may skip past legacy ids) and their
+  aspect's rollup is rebuilt in the same pass.
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
   under Turso's MVCC each delete cost milliseconds and grew with the swaps before it. One
   guarded statement now deletes a group's rows: squashing 10M UCI rows from 9,769 to 153

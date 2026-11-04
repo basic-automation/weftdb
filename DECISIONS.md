@@ -4133,3 +4133,58 @@ reaches the per-series paths yet; an untagged aspect is one series and plans exa
 swap needs, and it holds every merged series in memory at once); a series field on
 `SegmentDescriptor`; per-series metrics and sweep counters (deferred by the plan); a per-series
 backlog threshold for the hot tail (a second knob for no measured need).
+
+## 2026-11-04 — TAG-9 (part of #310): recovery binds series keys — tagged orphans adopted into their series, held rows released, indexed rows checked against their frame's key (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Minimal TAG-9 per design PR 5 with critique E19-E20. The broader C5 frame-error-class work
+of #310 is not done here.
+
+1. **`adopt_orphan` takes `Option<SeriesKey>`.** A tagged orphan resolves its key in the
+   frame's aspect — the catalog's id, or the aspect's next series id with `RegisterSeries` +
+   `SeedSeries` — in the same transaction as its `InsertNew` and allocator bump (plus
+   `ClearJournal` when it releases a held row). Adoption now runs under the aspect's commit
+   lock and takes its id from `CommitGuard::allocate`, rather than computing it from
+   `allocator_seed` beside the lock: a held row may be released by an fsck on a live store,
+   where an id handed out outside the lock would collide with the lock's cached allocator.
+   Ids may therefore start past a legacy-named file's id in `segments/`, as every seal's do.
+2. **No series cap in recovery.** The new `resolve_series_key` (shared with ingest's
+   `resolve_series`, which still checks `max_series_per_aspect` first) applies no cap: the
+   data already exists, and refusing to bind it would leave it invisible again.
+3. **Restore mode:** a decodable tagged orphan is adopted directly; `JournalHeld` only when
+   its aspect is undeclared (no catalog to bind in). Held rows are released on every later
+   pass (open or fsck) through the same `adopt_orphan` path once the aspect is declared; a
+   still-undeclared one stays held. A held or orphan frame whose key cannot be bound is
+   quarantined suspect (the held one's journal row cleared in the same transaction).
+4. **Indexed rows:** `describe_frame` beside `read_full`. A `SERIES_KEY` payload that is not
+   canonical, is empty, or appears twice, in a frame whose body decoded (so its CRC verified),
+   is **suspect** under C5. A key that differs from `series_key_of(row.series_id)` is rebound
+   with one `ReplaceExpected` (registration ops first in the same transaction) and counted in
+   the new `RecoveryReport.series_rebound` as well as `rebound`. Critique E19: a row moved to
+   the aspect its frame names gets its key resolved in the **target** aspect's catalog, never
+   the source aspect's id.
+5. **`report_only` everywhere:** it counts the suspects, series rebinds and held releases it
+   would make, and registers, rewrites, quarantines and clears nothing.
+6. **Rollup rebuild moved after the orphan pass**, so aspects that gained adopted rows get
+   their rollup rebuilt in the same pass (before, adoptions were pushed onto
+   `changed_aspects` after the rebuild loop had already run).
+7. **Fixture and wording.** `restore_mode_adopts_orphans_and_holds_series_key_frames` used a
+   non-canonical payload (`price|a=1`, critical false); it becomes
+   `restore_mode_adopts_series_key_frames_into_their_series` with `a\x1f1`, critical true,
+   expecting adopted = 2, held = 0. `restore_cli.rs:83` already asserted held = 0 (E20) and
+   is unchanged; `restore.rs` wording no longer says frames are held "until TAG-9".
+8. **Deviation (tests):** the inverted restore test cannot assert that untagged reads omit the
+   tagged rows, because reads are still aspect-wide until series-scoped reads land (TAG-8);
+   it asserts the tagged rows are readable and bound to their registered series instead.
+9. **R10 seeds before the row loop.** A rebind registers its key from `next_series_id`, so the
+   seed (max of catalog and row ids, every aspect) now commits before any row is checked; a
+   lost `aspect_seq` row can no longer make a rebind collide with a catalog id and fail open.
+10. **Held rows always settle.** A held frame that no longer decodes is quarantined under its
+   decode class, one with a malformed key is suspect (journal row cleared in the same txn);
+   a missing frame, a zero-row frame or a name with no aspect clears the row and counts in
+   the new `RecoveryReport.held_cleared`. Report-only counts held adoptions through the same
+   pure `plan_adoption` the real path uses, and `suspected` counts only orphans whose name
+   lets them be filed.
+
+**Rejected:** carrying the source aspect's `series_id` on an aspect move (E19); treating a
+non-critical `SERIES_KEY` as malformed (writers always mark it critical, and the key is
+still well-defined); a separate `released` counter (released held rows count as `adopted`).
