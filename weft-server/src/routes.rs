@@ -73,7 +73,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, HealthResponse, ReadyResponse
+	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, version::version, HealthResponse, ReadyResponse
 };
 
 /// What a request to a route must hold, from the frozen table above. See the
@@ -641,6 +641,7 @@ pub fn build_registry_with_ingest_config(config: IngestConfig) -> SealedRoutes {
 pub fn build_registry_with_limits(config: IngestConfig, admission_config: AdmissionConfig) -> SealedRoutes {
 	let mut routes = Routes::new();
 	register_probe_routes(&mut routes);
+	register_version_route(&mut routes);
 	register_metrics_routes(&mut routes);
 	register_compute_routes(&mut routes);
 	register_storage_read_routes(&mut routes);
@@ -797,6 +798,18 @@ async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> (
 	(status, axum::Json(body))
 }
 
+/// The process and store identity route (FRE-12b).
+///
+/// `/health` and `/ready` are the only routes an unauthenticated orchestrator
+/// needs, and they are deliberately kept that way: this one names layout numbers,
+/// the store's UUID and the scope it serves, so it takes the read scope and answers
+/// `401` behind auth like every other read. It sits with the probes rather than with
+/// the storage reads because it reads no stored data — the answer comes from process
+/// state, which is also why it answers while a store is being refused.
+fn register_version_route(routes: &mut Routes) {
+	routes.route(Method::GET, "/api/v1/version", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "get_version"), get(version));
+}
+
 /// Operational telemetry: the Prometheus surface and the operator's
 /// current-profile view. Decision 17: `/metrics` needs the metrics scope
 /// once auth is on.
@@ -944,17 +957,17 @@ mod tests {
 
 	/// Every registered route is one the pre-SEC-3 router served: the
 	/// registry must not lose (or invent) a route in the move. The count
-	/// is 62 method routes over 56 path templates (55/49 before D-S12
-	/// added the fsck and quarantine routes, 60/54 before Phase 3 added
-	/// the two bench-run routes).
+	/// is 63 method routes over 57 path templates (62/56 before FRE-12b added
+	/// `GET /api/v1/version`, 60/54 before Phase 3 added the two bench-run
+	/// routes, 55/49 before D-S12 added the fsck and quarantine routes).
 	#[test]
 	fn registry_covers_the_whole_surface() {
 		let table = build_registry().table();
-		assert_eq!(table.entries().len(), 62, "the registry must carry every route the old lib.rs chain served");
+		assert_eq!(table.entries().len(), 63, "the registry must carry every route the old lib.rs chain served");
 		let mut operations: Vec<&str> = table.entries().iter().map(|entry| entry.spec.operation_id).collect();
 		operations.sort_unstable();
 		operations.dedup();
-		assert_eq!(operations.len(), 62, "operation ids are unique");
+		assert_eq!(operations.len(), 63, "operation ids are unique");
 		// Every scope in the frozen table is used by at least one route:
 		// an unused scope in a frozen table is a scope nobody can hold.
 		for scope in Scope::ALL {
@@ -981,7 +994,7 @@ mod tests {
 		let document = table.openapi_document();
 		assert_eq!(document["openapi"], "3.1.0");
 		let paths = document["paths"].as_object().unwrap();
-		assert_eq!(paths.len(), 56, "one path item per template");
+		assert_eq!(paths.len(), 57, "one path item per template");
 		let health = &paths["/health"]["get"];
 		assert_eq!(health["operationId"], "get_health");
 		assert_eq!(health["x-weft-scope"], "probe");

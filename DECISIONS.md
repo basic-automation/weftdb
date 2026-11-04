@@ -64,6 +64,82 @@ so a tolerance would be an invented threshold); and folding the point-at or
 range raw read-backs in here (those are the oracle's raw judgements, SOA-6 —
 the derived surface is what was missing).
 
+## 2026-11-03 — FRE-12b: what the scope pin pins, where the check lives, and what `/api/v1/version` may say (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan gives FRE-12b one line — "Scope pin, `GET /api/v1/version`,
+incompatible-store mapping and exit code" (`ROADMAP.md:343`). It does not say what the pin
+pins, which lane owns the check, whether a disagreement refuses a start or only reports it,
+or what the version route must answer. The exit table (decision 4, C7) has named "scope
+mismatch" under 65 ever since PAC-7 wrote that table, and nothing on main ever produced one:
+the sentence described a class the server could not emit.
+
+**Chosen (best guess, grounded in the code on main, flagged for merge review):**
+
+- "Scope pin" pins the scope the process is configured to serve — `WEFT_STORE_DATABASE` and
+  `WEFT_STORE_SUBJECT`, each defaulting to `default` — against the scope the store root's own
+  `STORE_FORMAT` marker records. That is the only statement a store makes about itself:
+  `StoreFormat::scope` (`weftdb/src/types/store_format.rs:126`) is written by
+  `StoreFormat::new_store` at creation and carried unchanged through every later rewrite by
+  `settled_format` (`weftdb/src/store/open.rs:1813`), which spreads the marker read off disk
+  and overrides only the layout numbers — so it is the store's founding scope, not the last
+  writer's. It is also the pair `import-rows-mode` tells the operator to serve the migrated
+  root under (`weft-server/src/bin/weft-server.rs:431` prints
+  `WEFT_STORE_DATABASE=... WEFT_STORE_SUBJECT=...`), so the pin measures the thing an operator
+  is already told to set, and a wrong one is exactly the mistake that message invites.
+- The check lives in the server, not in the store. A Storage-v2 root is a container of
+  `(database, subject)` namespaces, and opening one root under two subjects is a tested store
+  feature (`weftdb/src/store/segment_store.rs:4468`); a refusal inside the open path would
+  undo designed behaviour that other code and other tests depend on. What is actually broken
+  is a *server* serving a namespace of its own store that holds nothing, which from outside
+  the process is indistinguishable from a lost database — the one failure mode an operator
+  must not have to diagnose from query results. So the pin is
+  `weft-server/src/store_open.rs::pin_store_scope`, and the store lane is untouched.
+- Refused, and refused by default, with `WEFT_STORE_SCOPE_PIN=off` as the way out. Report and
+  serve anyway leaves the operator discovering the empty namespace by querying it, which is
+  the failure this slice exists to remove; the workspace's 1.0 posture elsewhere is the same
+  refusal-first choice — strict configuration (PAC-5b) and SEC-8's non-loopback-without-keys.
+  The refusal names both scopes, the root, and the three ways out (set both variables to the
+  store's scope, point `WEFT_SEGMENT_STORE_ROOT` at the root you mean, or turn the pin off),
+  and startup exits 65 — the operator-action class, which is what `exit_code_for_store_error`
+  has always said a scope mismatch is; this slice is the first to produce one.
+- Checked *before* the open, through the public `weftdb::store_format::read_marker`
+  (`weftdb/src/types/store_format.rs:715`), so a refusal leaves the root exactly as it found
+  it, takes no root lock, and cannot be raced by whoever holds it. A root with no marker
+  records no scope and is accepted: a fresh root has nothing to disagree with.
+- One narrow edge is accepted rather than fixed, and recorded here because it is real. A root
+  whose marker was lost while `store_meta` survived has no scope on disk; the open rebuilds
+  the marker from `store_meta`, which mirrors no scope, and records the scope that open came
+  with. The first start after such a loss therefore blesses whatever scope it ran under, and
+  every pin afterwards measures against that. Refusing it would mean refusing every
+  unmatched-marker recovery, a worse trade than the typo it would catch.
+- `GET /api/v1/version` takes `Scope::Read`, not `Scope::Probe`. It names layout numbers, the
+  store UUID and the scope being served, which is more than the anonymous probe surface should
+  carry; `/health` and `/ready` stay keyless, and `/ready` keeps reporting service, version
+  and store UUID, so a monitor needs no key and an operator with one gets the rest. The route
+  table in `docs/reference.md` records the choice beside the route.
+- The answer is built from process state alone — `Store::store()` and the scope startup
+  captured — and never from a store read. The questions this route exists to answer (which
+  build, what layout, which scope, why will it not start) are exactly the ones asked while a
+  store is being refused, and a handler that read the store would fail on the very state it is
+  being asked about. `/ready` reports a poisoned store for the same reason rather than failing.
+- The served scope and the pin mode are captured once into `AppState`'s `ServingScope`, on the
+  way to the open that consumes the environment, rather than re-read from the environment per
+  request: a request must report what the process *is* serving, which is what the open did,
+  not what a shell has exported since.
+
+**Rejected:** the pin inside `weftdb`'s open path, for the tested multi-scope reason above; a
+`scopes` list added to `STORE_FORMAT` so a root could record every scope it has held, which is
+a layout-format change on a slice whose subject is reporting a format that must not move (the
+release-pin job re-hashes those fixture bytes); `Scope::Probe` on the new route, which would
+widen the anonymous surface for no operator benefit; and answering the route from a fresh
+marker read, which would make it lie, or 500, precisely when it is most needed.
+
+**Not in this slice:** any change to the `STORE_FORMAT` bytes or the migration gate (FRE-12a's);
+the CLI's `--version` output, which PAC-7 settled; an HTTP status or flag for "the pin is off"
+beyond the field the version route reports; a store-lane scope registry; and pin handling in
+`import-rows-mode`, `restore`, `verify` or `admin`, which take `--database`/`--subject` or
+their own flags and resolve no serving scope at all.
+
 ## 2026-11-02 — SOA-8: the failure deck is a validated card deck, recovery is exact, and the maintenance driver is a pure state machine (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6, W5) lists SOA-8 by name only — "Failure deck,
