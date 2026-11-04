@@ -831,6 +831,27 @@ impl SegmentStore {
 			return Ok(id);
 		}
 		self.check_series_room(aspect).await?;
+		self.resolve_series_key(aspect, key, ops).await
+	}
+
+	/// The series id `key` has in `aspect`'s catalog, registering it as the aspect's
+	/// next series id when the catalog does not hold it yet: the
+	/// [`RegisterSeries`](IndexOp::RegisterSeries) and [`SeedSeries`](IndexOp::SeedSeries)
+	/// that register it are pushed onto `ops`, for the caller to commit in the same
+	/// transaction as the rows that use the id. The empty key is series 0 and is never
+	/// registered. No series cap is applied: [`resolve_series`](Self::resolve_series)
+	/// checks it for ingest, and recovery (TAG-9) binds data that already exists.
+	///
+	/// The caller holds `aspect`'s commit lock, the only lock under which series are
+	/// registered, so a `Conflict` on the registration is an error, not a race.
+	///
+	/// # Errors
+	///
+	/// A catalog read failure.
+	pub(crate) async fn resolve_series_key(&self, aspect: &str, key: &crate::SeriesKey, ops: &mut Vec<IndexOp>) -> Result<crate::SeriesId> {
+		if let Some(id) = self.index.series_id_for(aspect, key).await? {
+			return Ok(id);
+		}
 		let id = self.index.next_series_id(aspect).await?;
 		ops.push(IndexOp::RegisterSeries { aspect: aspect.to_string(), series_id: crate::SeriesId(id), series_key: key.clone() });
 		ops.push(IndexOp::SeedSeries { aspect: aspect.to_string(), next_series_id: id.saturating_add(1) });

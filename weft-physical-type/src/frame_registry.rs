@@ -112,9 +112,9 @@ pub struct FrameExtensionSpec {
 /// frame's rows belong to. Since TAG-7 every frame of a tagged series is a v7
 /// envelope carrying exactly this one extension, marked critical, around an
 /// unchanged v5 or v6 body; an untagged frame has no envelope at all. A reader
-/// that does not bind series keys yet must still not adopt or reap such a frame
-/// as if it were untagged: D-S16 journals orphans carrying it `held` until TAG-9
-/// binds them.
+/// that does not bind series keys must still not adopt or reap such a frame as
+/// if it were untagged: since TAG-9 recovery binds the key to the frame's series,
+/// journaling an orphan `held` only while its aspect is undeclared.
 pub const EXT_SERIES_KEY: u32 = 1;
 
 /// The extension numbers this build implements.
