@@ -79,6 +79,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **Maintenance plans within one series (TAG-6).** Overlap reconciles, squashes, size-targeted
+  compaction and the hot/cold reconcile never fold two tag series together; the squash cap,
+  the fragmentation gate and `AspectStorageStats::overlapping_segments` (and
+  `store_overlapping_segments`) count per series, and each series keeps its own hot tail.
+  An untagged aspect is one series, so its maintenance and statistics are unchanged; tagged
+  writes stay refused until TAG-8, so nothing observable changes yet.
 - **Breaking (library):** `IngestBatch::series_ids()` is removed (TAG-7). It always answered
   `[0]`, and a tagged batch's series id is not known until its commit resolves the key in the
   aspect's catalog; read the id from `IngestReceipt::series_ids` instead. The method shipped
