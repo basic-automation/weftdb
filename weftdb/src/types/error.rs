@@ -113,7 +113,8 @@ mod tests {
 
 /// Why a [`SegmentStore`](crate::SegmentStore) refused an operation: an open it
 /// would not perform (freeze design §4.3, FRE-12a), or — since D-S13 — an ingest
-/// it would not commit. The ingest variants are the typed errors the 1.0 plan
+/// it would not commit, or — since ROB-13 — a stored read over its decision 12
+/// bound. The ingest variants are the typed errors the 1.0 plan
 /// (§3 X-ERR, §5 D-S13) assigns to this lane: they land here, in the store's one
 /// typed error, rather than in sentences a caller must re-recognise.
 ///
@@ -320,5 +321,34 @@ pub enum StoreError {
 		digits: usize,
 		/// The bound it exceeded.
 		max: usize,
+	},
+	/// A stored downsample of `aspect` produced more than `limit` buckets —
+	/// the decision 12 grid cap in force
+	/// ([`SegmentStoreOptions::max_downsample_buckets`](crate::SegmentStoreOptions::max_downsample_buckets))
+	/// — and was refused while the fold was running (ROB-13). The partial
+	/// state is dropped; nothing was written. A coarser resolution or a
+	/// narrower window fits under the cap.
+	#[error("the stored downsample of aspect {aspect:?} produced {buckets} buckets, over the limit of {limit}; narrow the window or use a coarser resolution (nothing was written)")]
+	DownsampleTooLarge {
+		/// The aspect the downsample named.
+		aspect: String,
+		/// The bucket count the fold had produced when it was refused (the
+		/// first count over the limit, not the grid's full width).
+		buckets: usize,
+		/// The cap in force.
+		limit: usize,
+	},
+	/// A batch point lookup named more instants than the decision 12 cap in
+	/// force ([`SegmentStoreOptions::max_point_batch`](crate::SegmentStoreOptions::max_point_batch))
+	/// allows (ROB-13). It was refused before the index was pruned; nothing
+	/// was read. Split the batch across lookups.
+	#[error("the point lookup of aspect {aspect:?} names {instants} instants, over the limit of {limit} per batch; split the batch (nothing was read)")]
+	PointBatchTooLarge {
+		/// The aspect the lookup named.
+		aspect: String,
+		/// How many instants the batch named.
+		instants: usize,
+		/// The cap in force.
+		limit: usize,
 	},
 }
