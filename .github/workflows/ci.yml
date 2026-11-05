@@ -384,6 +384,13 @@ jobs:
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
           args: -color
+      # A `run:` step that starts with a repository path executes that file, so the file needs
+      # the executable bit in the tree - and an editor or an agent that writes the script sets
+      # none. The R client step landed that way and made the ubuntu test job red on every open
+      # pull request with the least useful error a runner produces: `Permission denied`, exit
+      # code 126. This gate names the file and the workflow line instead.
+      - name: workflow-invoked scripts are executable
+        run: python3 scripts/contrib/check_exec_bits.py
       # The release pipeline scripts, the fixture generator X-FX added, and the license
       # bundle generator: none of them has any other gate on it, and all three run at
       # release time against a real tag rather than a mocked one. The bench artifact
