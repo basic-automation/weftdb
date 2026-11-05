@@ -476,6 +476,21 @@ impl SegmentStore {
 		}
 	}
 
+	/// The tags of one series of `aspect` (TAG-10): the empty set for
+	/// [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED), the decoded catalog key for a
+	/// registered series, and `None` for an id the catalog does not hold. A read route
+	/// reports this beside the rows of the series [`resolve_series`](Self::resolve_series)
+	/// picked.
+	///
+	/// # Errors
+	///
+	/// An invalid `aspect` name, a libSQL read failure, or a stored key that is not
+	/// canonical.
+	pub async fn series_tags(&self, aspect: &str, series: crate::SeriesId) -> Result<Option<crate::TagSet>> {
+		aspect_name::validate(aspect)?;
+		Ok(self.index.series_key_of(aspect, series).await?.map(crate::TagSet::from))
+	}
+
 	/// Read and fully decode one segment file (frame-version aware), returning all
 	/// rows aligned `(timestamps, values)` with `None` at every null row.
 	pub(crate) async fn decode_all(&self, descriptor: &SegmentDescriptor) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
