@@ -27,7 +27,9 @@
 //! every output format, so it is never passed off as measured, and a reduction the
 //! method leaves without a value (`null`, or a line past the last measured bucket)
 //! is missing from the JSON map, an empty CSV cell and an Arrow/Parquet null. The
-//! grid is bounded by [`MAX_FILL_BUCKETS`]; a longer one is refused with `400`.
+//! grid is bounded by the configured compute limit ([`InterpolateConfig`]'s
+//! output cap, [`MAX_FILL_BUCKETS`] by default); a longer one is refused with
+//! `400`. One limit governs every grid a client can size (ROB-16).
 //!
 //! ## Bucket widths (`width`, `?resolution=15m`)
 //!
@@ -63,7 +65,7 @@ pub use weft_reduce::Aggregation;
 use weft_reduce::{reduce_width, BucketWidth, Fill};
 
 use crate::{
-	error::{self, ApiError, Code, StrictJson, StrictQuery}, interpolate::{InputPoint, ResolutionSpec}, metrics::SharedMetrics
+	error::{self, ApiError, Code, StrictJson, StrictQuery}, interpolate::{InputPoint, InterpolateConfig, ResolutionSpec}, metrics::SharedMetrics
 };
 
 /// Request body for `POST /api/v1/downsample`.
@@ -96,8 +98,11 @@ pub struct DownsampleRequest {
 	pub fill: Option<String>,
 }
 
-/// The most buckets a gap fill may emit: the interpolation endpoint's default output
-/// cap, since a filled grid is an output grid of the same kind.
+/// The default for the most buckets a gap fill may emit: the interpolation
+/// endpoint's default output cap, since a filled grid is an output grid of the
+/// same kind. The handlers pass the operator's configured cap
+/// ([`InterpolateConfig::max_output_points`]) to [`apply_fill`], which is this
+/// value unless `WEFT_MAX_INTERPOLATE_POINTS` changed it (ROB-16).
 pub const MAX_FILL_BUCKETS: usize = crate::interpolate::MAX_INTERPOLATE_OUTPUT_POINTS;
 
 /// Parse a bucket-width token: a resolution name (`minutes`, the default), or a count and a
@@ -127,10 +132,11 @@ pub(crate) fn parse_fill(token: Option<&str>) -> Result<Option<Fill>, ApiError> 
 ///
 /// # Errors
 ///
-/// `bad_request` when the grid would exceed [`MAX_FILL_BUCKETS`] or a spline fill fails,
+/// `bad_request` when the grid would exceed `max_buckets` (the configured
+/// compute limit; [`MAX_FILL_BUCKETS`] by default) or a spline fill fails,
 /// and `value_not_representable` when a bound has no bucket at the resolution.
-pub(crate) fn apply_fill(buckets: &[weft_reduce::Bucket], width: BucketWidth, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, method: &Fill) -> Result<Vec<weft_reduce::Bucket>, ApiError> {
-	weft_reduce::fill_width(buckets, width, start, end, method, MAX_FILL_BUCKETS).map_err(|err| match err {
+pub(crate) fn apply_fill(buckets: &[weft_reduce::Bucket], width: BucketWidth, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, method: &Fill, max_buckets: usize) -> Result<Vec<weft_reduce::Bucket>, ApiError> {
+	weft_reduce::fill_width(buckets, width, start, end, method, max_buckets).map_err(|err| match err {
 		weft_reduce::FillError::TooManyBuckets { grid, max } => ApiError::bad_request(format!("a fill over this window would emit {grid} buckets, more than the {max} allowed; narrow the window or coarsen the resolution")),
 		weft_reduce::FillError::TimestampRange | weft_reduce::FillError::BucketStartOverflow => ApiError::new(error::Code::ValueNotRepresentable, "a bound of the fill window cannot be placed in a bucket at the resolution you asked for"),
 		weft_reduce::FillError::Spline(reason) => ApiError::bad_request(format!("the spline fill failed: {reason}")),
@@ -179,10 +185,10 @@ pub struct DownsampleResponse {
 /// Returns `bad_request` (`400`) for an empty point set, a non-finite value,
 /// or an inverted range, and `internal` (`500`) if a timestamp cannot be
 /// mapped onto the resolution grid.
-pub async fn downsample(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Json<DownsampleResponse>, ApiError> {
+pub async fn downsample(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Json<DownsampleResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_downsample_request();
-	let result = downsample_inner(request);
+	let result = downsample_inner(request, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -197,7 +203,7 @@ const DEFAULT_AGGREGATIONS: [Aggregation; 3] = Aggregation::DEFAULT;
 
 /// The JSON path: validate, lift to `BigDecimal` points, derive the window, then
 /// delegate to [`run_downsample`]. Synchronous — no engine call is needed.
-fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleResponse>, ApiError> {
+fn downsample_inner(request: DownsampleRequest, config: InterpolateConfig) -> Result<Json<DownsampleResponse>, ApiError> {
 	let DownsampleRequest { resolution, aggregations, start, end, points: input, width, fill } = request;
 	let method = parse_fill(fill.as_deref())?;
 	let width = match width.as_deref() {
@@ -225,7 +231,7 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 	let start = start.unwrap_or_else(|| points.first().map_or_else(Utc::now, |p| p.timestamp));
 	let end = end.unwrap_or_else(|| points.last().map_or_else(Utc::now, |p| p.timestamp));
 
-	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, fill.as_deref().unwrap_or_default())))
+	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, fill.as_deref().unwrap_or_default())), config.max_output_points())
 }
 
 /// Run the bucketed reduction over a prepared point set and shape the response.
@@ -242,14 +248,14 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 /// bucket count on completion, so a `RUST_LOG`-enabled run sees the reduction pass's
 /// fan-in and fan-out.
 #[tracing::instrument(name = "downsample.reduce", skip_all, fields(candidate_points = points.len(), resolution = %width, input_points = tracing::field::Empty, buckets = tracing::field::Empty))]
-fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, width: BucketWidth, aggregations: &[Aggregation], fill: Option<(&Fill, &str)>) -> Result<Json<DownsampleResponse>, ApiError> {
+fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, width: BucketWidth, aggregations: &[Aggregation], fill: Option<(&Fill, &str)>, max_fill_buckets: usize) -> Result<Json<DownsampleResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`".to_string()));
 	}
 
 	let mut buckets = reduce_width(points, width, Some(start), Some(end), aggregations).map_err(|err| error::from_reduce_error(&err))?;
 	if let Some((method, _)) = fill {
-		buckets = apply_fill(&buckets, width, Some(start), Some(end), method)?;
+		buckets = apply_fill(&buckets, width, Some(start), Some(end), method, max_fill_buckets)?;
 	}
 	let mut response = buckets_to_response(buckets, width, aggregations)?;
 	response.fill = fill.map(|(_, token)| token.trim().to_string());
@@ -406,9 +412,9 @@ pub(crate) fn downsample_response_to_parquet(response: &DownsampleResponse) -> R
 /// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
 /// value, or an inverted range, and `internal` (`500`) on a grid-mapping or
 /// Arrow-encoding failure.
-pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_inner(request);
+	let result = downsample_inner(request, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -430,9 +436,9 @@ pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, StrictJson(r
 /// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
 /// value, or an inverted range, and `internal` (`500`) on a grid-mapping or
 /// Parquet-encoding failure.
-pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_inner(request);
+	let result = downsample_inner(request, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -452,9 +458,9 @@ pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, StrictJson
 /// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
 /// value, or an inverted range, and `internal` (`500`) if a timestamp cannot be
 /// mapped onto the resolution grid.
-pub async fn downsample_csv(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_inner(request);
+	let result = downsample_inner(request, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -497,10 +503,10 @@ pub struct DownsampleIlpParams {
 /// Returns `bad_request` (`400`) for an unknown precision/resolution/aggregation
 /// token, a malformed payload, or fewer than one usable point, and
 /// `internal` (`500`) if a timestamp cannot be mapped onto the grid.
-pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Json<DownsampleResponse>, ApiError> {
+pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Json<DownsampleResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_downsample_request();
-	let result = downsample_ilp_inner(&params, &body);
+	let result = downsample_ilp_inner(&params, &body, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -530,9 +536,9 @@ fn record_downsample_outcome(metrics: &SharedMetrics, result: &Result<Json<Downs
 /// # Errors
 ///
 /// As [`downsample_ilp`].
-pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_ilp_inner(&params, &body);
+	let result = downsample_ilp_inner(&params, &body, config);
 	record_downsample_outcome(&metrics, &result);
 	Ok(downsample_response_to_csv(&result?.0))
 }
@@ -546,9 +552,9 @@ pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, StrictQuer
 /// # Errors
 ///
 /// As [`downsample_ilp`], plus `internal` (`500`) on an Arrow-encoding failure.
-pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_ilp_inner(&params, &body);
+	let result = downsample_ilp_inner(&params, &body, config);
 	record_downsample_outcome(&metrics, &result);
 	downsample_response_to_arrow(&result?.0)
 }
@@ -562,14 +568,14 @@ pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, StrictQu
 /// # Errors
 ///
 /// As [`downsample_ilp`], plus `internal` (`500`) on a Parquet-encoding failure.
-pub async fn downsample_ilp_parquet(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn downsample_ilp_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_ilp_inner(&params, &body);
+	let result = downsample_ilp_inner(&params, &body, config);
 	record_downsample_outcome(&metrics, &result);
 	downsample_response_to_parquet(&result?.0)
 }
 
-fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json<DownsampleResponse>, ApiError> {
+fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str, config: InterpolateConfig) -> Result<Json<DownsampleResponse>, ApiError> {
 	let precision = crate::interpolate::parse_precision_token(params.precision.as_deref())?;
 	let width = parse_width_token(params.resolution.as_deref())?;
 	let aggregations = parse_aggregations(params.agg.as_deref())?;
@@ -583,7 +589,7 @@ fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json
 	let start = points.first().map_or_else(Utc::now, |p| p.timestamp);
 	let end = points.last().map_or_else(Utc::now, |p| p.timestamp);
 
-	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, params.fill.as_deref().unwrap_or_default())))
+	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, params.fill.as_deref().unwrap_or_default())), config.max_output_points())
 }
 
 /// Parse a comma-separated aggregation list (default `[min, max, avg]`).
@@ -951,6 +957,20 @@ mod tests {
 		let (status, body) = post_json("/api/v1/downsample", wide).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
 		assert!(body.to_string().contains("more than the"), "{body}");
+	}
+
+	#[tokio::test]
+	async fn the_fill_grid_obeys_the_configured_compute_limit() {
+		// ROB-16: one compute limit governs every grid a client can size. The
+		// gapped body fills 4 minute buckets; a server configured with a cap of
+		// 3 (WEFT_MAX_INTERPOLATE_POINTS=3) refuses it, naming the limit, where
+		// the default server above serves it.
+		let config = InterpolateConfig::new(std::num::NonZeroUsize::new(3).unwrap());
+		let router = crate::app_with_state(crate::AppState::new().with_interpolate_config(config));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/downsample").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&gapped_body("linear")).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert!(body.to_string().contains("more than the 3 allowed"), "{body}");
 	}
 
 	#[tokio::test]

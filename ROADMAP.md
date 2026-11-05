@@ -358,7 +358,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] read lane
   - [ ] → **ROB-13** Bounded stored downsample and point lookups
   - [ ] **ROB-7** Ingest decode bounds
-  - [ ] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
+  - [x] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
   - [ ] **ROB-23r** Probe-only admin listener
   - [x] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
   - [ ] **ROB-5** Legacy queue-consumer panics

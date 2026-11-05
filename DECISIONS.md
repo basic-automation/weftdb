@@ -4282,3 +4282,69 @@ check on every call, and a cursor wants a stable id); `all()` as the meaning of 
 methods (it would break pinned untagged reads on tagged stores); reusing `GroupsUnsupported`
 or `TagError` for reserved keys (the first now means "gate shut", the second carries no
 aspect).
+
+## 2026-11-04 — ROB-16: GPU configuration, compute limits, interpolation provenance and metrics — FOR MERGE REVIEW
+
+The plan gives ROB-16 one line (W7, L-COMPUTE lane) and the queue's two
+acceptance clauses. A DECISIONS note for PAC-13 records the dependency the
+other way round: "ROB-16 wants the GPU provenance lane". Auditing the lane
+(`weft-server/src/{interpolate,downsample,gpu,metrics}.rs`) against the
+clauses found four concrete gaps; each fix below is the smallest shape that
+closes one. Flagged for merge review like the other best-guess entries.
+
+1. **GPU configuration: the backend is now a setting.** Before this slice the
+   only GPU configuration was `WEFT_GPU_CALIBRATE` (whether startup times the
+   backends); every interpolation then ran on `Backend::Auto` because nothing
+   else was reachable. `WEFT_GPU_BACKEND` (`auto`/`cpu`/`parallel`/`gpu`,
+   case-insensitive) is read once at startup into `InterpolateConfig`, an
+   unknown value fails startup naming the variable (the
+   `WEFT_MAX_INTERPOLATE_POINTS` pattern), and it is registered in the
+   settings registry at the Experimental tier — beside `WEFT_GPU_CALIBRATE`,
+   because a backend pin's value is as unproven as the calibration thresholds.
+   An explicit `gpu` surfaces GPU failures as request errors (the
+   `engine_error` table already documented that only an explicit
+   `Backend::Gpu` does); `auto` keeps splimes' silent fallback, now reported
+   (item 3).
+
+2. **Compute limits: one cap governs every fill grid.** The interpolate output
+   cap was operator-configurable, but the downsample gap fill bounded itself
+   with the *constant* `MAX_FILL_BUCKETS` (the default 10M), so
+   `WEFT_MAX_INTERPOLATE_POINTS=1000` left a downsample fill free to emit ten
+   million buckets. `apply_fill` now takes the configured
+   `InterpolateConfig::max_output_points` from every caller — the stateless
+   downsample handlers and the stored-range fill alike — and the constant
+   remains only as the default the config starts from.
+
+3. **Interpolation provenance: `ValueKind` on the wire, and the backend named.**
+   TAG-3 built `weftdb::ValueKind` for exactly this adoption (its module doc
+   and the CHANGELOG name ROB-16 as an adopter): the compute endpoints put
+   splimes' closed `PointKind` straight into responses, so a future kind
+   (`compressed`, `reconstructed` — the reserved tokens) would break every
+   client that matches on it. `OutputPoint.kind` and `PointResponse.kind` are
+   now `ValueKind`; the wire tokens are byte-identical (`raw` /
+   `interpolated` / `extrapolated`), and splimes' type stays re-exported for
+   direct engine callers. The envelope also gains the GPU half of provenance:
+   `backend` (the backend that actually ran — `cpu`, `parallel` or `gpu`,
+   never the configured `auto`) and `gpu_fallback` (whether `auto` tried the
+   GPU and fell back), both read from splimes' `Interpolation` result, which
+   the handlers previously discarded.
+
+4. **Metrics: provenance is countable.** `InterpolateMetrics` gains output
+   points by kind (`weft_interpolate_output_points_by_kind_total{kind=…}`),
+   successful requests by backend
+   (`weft_interpolate_backend_requests_total{backend=…}`) and
+   `weft_interpolate_gpu_fallbacks_total`, all rendered on `/metrics` and
+   carried in the `/debug/profile/current` profile beside the existing
+   counters. The point endpoint records its single point the same way.
+
+**Rejected:** a per-request backend field (compute configuration is an
+operator decision; letting each request pin `gpu` would let one client starve
+the pool the calibration sized); recording provenance inside
+`run_interpolation` (the handlers already own metrics accounting via
+`record_outcome` — the response carries the facts instead, so JSON, ILP and
+point requests account identically); exposing the fallback *reason* (splimes'
+error text is an engine detail; the boolean plus the server log is the
+operator surface).
+
+**Unchanged:** the calibration itself, the wire tokens, the error table, and
+the default behaviour — unset, `WEFT_GPU_BACKEND` changes nothing.

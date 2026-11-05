@@ -10,6 +10,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **GPU configuration, compute limits, interpolation provenance and metrics** (ROB-16).
+  `WEFT_GPU_BACKEND` (`auto` / `cpu` / `parallel` / `gpu`) pins the compute backend the
+  interpolation endpoints run on, beside the existing startup calibration; the configured
+  `WEFT_MAX_INTERPOLATE_POINTS` cap now also bounds the downsample gap-fill grids, which
+  previously used the 10,000,000 default constant regardless of the setting. Interpolate
+  responses carry each point's provenance in the open `ValueKind` vocabulary (the wire
+  tokens `raw` / `interpolated` / `extrapolated` are unchanged) and name the backend that
+  actually produced the values (`backend`, plus `gpu_fallback` when `auto` tried the GPU
+  and fell back); `/metrics` gains per-kind output-point counters, per-backend request
+  counters and a GPU-fallback counter, also present in `/debug/profile/current`.
+
 - **R client** (`clients/r`, package `weftdb`): stored windows, value bands and server-side
   downsamples as Arrow tables, exact JSON rows paged by cursor, interpolation, and ingest of a
   data frame or Arrow table as one Parquet batch with `Idempotency-Key`. Refusals are

@@ -14,6 +14,24 @@
 //! [`MAX_INTERPOLATE_POINTS_ENV`]. A larger grid is a `400`, refused before anything is
 //! allocated.
 //!
+//! ## GPU configuration, provenance and metrics (ROB-16)
+//!
+//! The compute backend is operator configuration, not a hardcoded default:
+//! [`GPU_BACKEND_ENV`] (`WEFT_GPU_BACKEND`) selects `auto` (the default — splimes
+//! chooses per grid size, using the thresholds the startup calibration in
+//! [`crate::gpu`] measures), `cpu`, `parallel` or `gpu` (an explicit GPU request
+//! surfaces GPU failures as errors instead of falling back). The same
+//! [`InterpolateConfig`] output cap also bounds the downsample endpoints' gap-fill
+//! grids, so one compute limit governs every grid a client can size.
+//!
+//! Every response carries its provenance: each point's `kind` is the open
+//! [`weftdb::ValueKind`] vocabulary (the wire tokens are the ones splimes'
+//! `PointKind` already sent — `raw` / `interpolated` / `extrapolated`), and the
+//! envelope names the `backend` that actually produced the values plus whether
+//! `auto` tried the GPU and fell back (`gpu_fallback`). The handlers feed the same
+//! facts to [`SharedMetrics`], which exports per-kind output-point counters and
+//! per-backend request counters on `/metrics`.
+//!
 //! ## Numeric boundary (deliberate, documented)
 //!
 //! The wire DTOs carry values as JSON `f64`. WeftDB's logical/API numeric type is
@@ -31,14 +49,17 @@ use axum::{
 use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-/// Provenance of a reconstructed value: `raw` (the grid point coincides with an input
+/// The engine's own provenance type: `raw` (the grid point coincides with an input
 /// observation), `interpolated` (strictly inside the observed span) or `extrapolated`
-/// (outside it). splimes reports it for every output point, serialised as those
-/// lowercase tokens.
+/// (outside it). Splimes reports it for every output point; the wire carries the
+/// open [`ValueKind`] vocabulary instead (identical tokens today), so a future
+/// kind cannot break a client the way a new variant of this closed enum would.
+/// Retained as a re-export for callers that drive splimes directly.
 pub use splimes::PointKind;
-use splimes::{Interpolator, Point, Resolution, Spline};
+use splimes::{Backend, Interpolator, Point, Resolution, Spline};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
+use weftdb::ValueKind;
 
 use crate::{
 	downsample::wire_value, error::{ApiError, Code, StrictJson, StrictQuery}, metrics::SharedMetrics
@@ -62,10 +83,11 @@ pub struct OutputPoint {
 	/// Interpolated value (narrowed from the engine's `BigDecimal`; a value with
 	/// no finite `f64` representation fails the request — no silent narrowing).
 	pub value: f64,
-	/// Provenance of this value: `raw` (the grid point coincides with an input
-	/// observation), `interpolated` (within the observed span), or `extrapolated`
-	/// (outside it).
-	pub kind: PointKind,
+	/// Provenance of this value, in the open [`ValueKind`] vocabulary: `raw`
+	/// (the grid point coincides with an input observation), `interpolated`
+	/// (within the observed span), or `extrapolated` (outside it). The wire
+	/// tokens are unchanged from the splimes kinds they replace.
+	pub kind: ValueKind,
 }
 
 /// The default for the most output points one interpolation request may produce
@@ -82,6 +104,10 @@ pub const MAX_INTERPOLATE_OUTPUT_POINTS: usize = 10_000_000;
 /// integer, read once at startup. Unset means [`MAX_INTERPOLATE_OUTPUT_POINTS`].
 pub const MAX_INTERPOLATE_POINTS_ENV: &str = "WEFT_MAX_INTERPOLATE_POINTS";
 
+/// Environment variable that sets the compute backend ([`InterpolateConfig::backend`]):
+/// `auto`, `cpu`, `parallel` or `gpu`, read once at startup. Unset means `auto`.
+pub const GPU_BACKEND_ENV: &str = "WEFT_GPU_BACKEND";
+
 /// The interpolation settings every `/api/v1/interpolate*` handler applies.
 ///
 /// Read once at startup ([`InterpolateConfig::from_env_value`]) and held in
@@ -90,16 +116,55 @@ pub const MAX_INTERPOLATE_POINTS_ENV: &str = "WEFT_MAX_INTERPOLATE_POINTS";
 pub struct InterpolateConfig {
 	/// The most output points one request may produce.
 	max_output_points: NonZeroUsize,
+	/// The compute backend every interpolation runs on.
+	backend: Backend,
 }
 
 impl InterpolateConfig {
-	/// The defaults: at most [`MAX_INTERPOLATE_OUTPUT_POINTS`] output points per request.
-	pub const DEFAULT: Self = Self { max_output_points: NonZeroUsize::new(MAX_INTERPOLATE_OUTPUT_POINTS).expect("the default cap is positive") };
+	/// The defaults: at most [`MAX_INTERPOLATE_OUTPUT_POINTS`] output points per
+	/// request, on [`Backend::Auto`].
+	pub const DEFAULT: Self = Self { max_output_points: NonZeroUsize::new(MAX_INTERPOLATE_OUTPUT_POINTS).expect("the default cap is positive"), backend: Backend::Auto };
 
-	/// Settings that allow at most `max_output_points` output points per request.
+	/// Settings that allow at most `max_output_points` output points per request,
+	/// on [`Backend::Auto`].
 	#[must_use]
 	pub const fn new(max_output_points: NonZeroUsize) -> Self {
-		Self { max_output_points }
+		Self { max_output_points, backend: Backend::Auto }
+	}
+
+	/// These settings with the compute backend every interpolation runs on.
+	#[must_use]
+	pub const fn with_backend(mut self, backend: Backend) -> Self {
+		self.backend = backend;
+		self
+	}
+
+	/// These settings with the backend named by a value of [`GPU_BACKEND_ENV`]
+	/// (`None` when it is unset, which keeps the current backend).
+	///
+	/// # Errors
+	///
+	/// A message naming the variable when the value is none of `auto`, `cpu`,
+	/// `parallel` or `gpu` (case and surrounding whitespace are ignored), so a
+	/// malformed setting fails startup instead of silently falling back to
+	/// `auto` — a typo that quietly moved every reconstruction off the GPU
+	/// would otherwise look exactly like a slow machine.
+	pub fn with_backend_from_env_value(self, value: Option<&str>) -> Result<Self, String> {
+		let Some(raw) = value else { return Ok(self) };
+		let backend = match raw.trim().to_ascii_lowercase().as_str() {
+			"auto" => Backend::Auto,
+			"cpu" => Backend::Cpu,
+			"parallel" => Backend::Parallel,
+			"gpu" => Backend::Gpu,
+			_ => return Err(format!("{GPU_BACKEND_ENV}={raw:?} is not a compute backend: use auto, cpu, parallel or gpu")),
+		};
+		Ok(self.with_backend(backend))
+	}
+
+	/// The compute backend every interpolation runs on.
+	#[must_use]
+	pub const fn backend(self) -> Backend {
+		self.backend
 	}
 
 	/// The settings for a value of [`MAX_INTERPOLATE_POINTS_ENV`] (`None` when it is
@@ -121,10 +186,10 @@ impl InterpolateConfig {
 	}
 
 	/// The interpolator every endpoint here runs: `spline` onto a `resolution` grid on
-	/// the default `Backend::Auto`, refusing grids above
+	/// the configured [`backend`](Self::backend), refusing grids above
 	/// [`max_output_points`](Self::max_output_points).
 	const fn interpolator(self, spline: Spline, resolution: Resolution) -> Interpolator {
-		Interpolator::new(spline, resolution).max_points(self.max_output_points())
+		Interpolator::new(spline, resolution).backend(self.backend).max_points(self.max_output_points())
 	}
 }
 
@@ -248,6 +313,15 @@ pub struct InterpolateResponse {
 	pub input_points: usize,
 	/// Number of interpolated samples produced.
 	pub output_points: usize,
+	/// The compute backend that actually produced the values: `cpu`, `parallel`
+	/// or `gpu` (never the configured `auto` — the one that ran). The GPU
+	/// provenance lane (ROB-16): a value's `kind` says how it was derived, this
+	/// says what derived it.
+	pub backend: String,
+	/// Whether the configured `auto` backend tried the GPU for this request and
+	/// fell back to the CPU pool when it failed. Always `false` on an explicit
+	/// backend: `gpu` surfaces its failures as errors instead.
+	pub gpu_fallback: bool,
 	/// The interpolated series on the output grid.
 	pub points: Vec<OutputPoint>,
 }
@@ -298,10 +372,16 @@ pub async fn interpolate(State(metrics): State<SharedMetrics>, State(config): St
 }
 
 /// Update the interpolation counters from a finished request's outcome, so both
-/// the JSON and ILP handlers account identically.
+/// the JSON and ILP handlers account identically. A success also records its
+/// provenance — the backend that ran and the per-kind output counts — so
+/// `/metrics` can answer "how much of what we served was GPU work, and how
+/// much of it was reconstructed rather than raw" (ROB-16).
 fn record_outcome(metrics: &SharedMetrics, result: &Result<Json<InterpolateResponse>, ApiError>) {
 	match result {
-		Ok(response) => metrics.add_output_points(response.0.output_points as u64),
+		Ok(response) => {
+			metrics.add_output_points(response.0.output_points as u64);
+			metrics.record_interpolate_output(&response.0.backend, response.0.gpu_fallback, response.0.points.iter().map(|point| &point.kind));
+		}
 		Err(_) => metrics.record_interpolate_error(),
 	}
 }
@@ -361,7 +441,7 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
 	// conversion of every output grid point, with its provenance — the result-shaping
 	// stage timed apart from the kernel.
-	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| wire_value(value, &format!("the interpolated value at {timestamp}")).map(|wire| OutputPoint { timestamp, value: wire, kind })).collect::<Result<Vec<OutputPoint>, ApiError>>())?;
+	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| wire_value(value, &format!("the interpolated value at {timestamp}")).map(|wire| OutputPoint { timestamp, value: wire, kind: ValueKind::from(kind) })).collect::<Result<Vec<OutputPoint>, ApiError>>())?;
 
 	// The method splimes ran, which is simpler than the requested one when there were
 	// too few distinct input timestamps for it.
@@ -369,7 +449,7 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	let span = tracing::Span::current();
 	span.record("effective_spline", effective_spline.as_str());
 	span.record("output_points", points.len());
-	Ok(Json(InterpolateResponse { spline: effective_spline, resolution: resolution_label, output_points: points.len(), input_points, points }))
+	Ok(Json(InterpolateResponse { spline: effective_spline, resolution: resolution_label, output_points: points.len(), input_points, backend: output.backend().to_string(), gpu_fallback: output.gpu_fallback().is_some(), points }))
 }
 
 /// Render an [`InterpolateResponse`] as a `timestamp,value,kind` CSV document.
@@ -403,7 +483,7 @@ const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 ///
 /// Kept private and primitive-typed so no `arrow-*` type appears in this module's
 /// signatures — all Arrow knowledge stays inside `weft-arrow`.
-fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<&'static str>) {
+fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<&str>) {
 	let mut timestamps = Vec::with_capacity(response.points.len());
 	let mut values = Vec::with_capacity(response.points.len());
 	let mut kinds = Vec::with_capacity(response.points.len());
@@ -536,9 +616,16 @@ pub struct PointResponse {
 	/// The reconstructed value at the instant (narrowed from `BigDecimal`; a value
 	/// with no finite `f64` representation fails the request).
 	pub value: f64,
-	/// Whether the value is raw (coincides with an input), interpolated
-	/// (in-range), or extrapolated (out-of-range).
-	pub kind: PointKind,
+	/// The value's provenance, in the open [`ValueKind`] vocabulary: raw
+	/// (coincides with an input), interpolated (in-range), or extrapolated
+	/// (out-of-range).
+	pub kind: ValueKind,
+	/// The compute backend that actually produced the value: `cpu`, `parallel`
+	/// or `gpu`.
+	pub backend: String,
+	/// Whether the configured `auto` backend tried the GPU for this request and
+	/// fell back to the CPU pool when it failed.
+	pub gpu_fallback: bool,
 }
 
 /// Handle `POST /api/v1/interpolate/point`: evaluate the reconstructed signal at
@@ -553,7 +640,10 @@ pub async fn interpolate_point(State(metrics): State<SharedMetrics>, State(confi
 	metrics.record_interpolate_request();
 	let result = interpolate_point_inner(request, config).await;
 	match &result {
-		Ok(_) => metrics.add_output_points(1),
+		Ok(response) => {
+			metrics.add_output_points(1);
+			metrics.record_interpolate_output(&response.0.backend, response.0.gpu_fallback, std::iter::once(&response.0.kind));
+		}
 		Err(_) => metrics.record_interpolate_error(),
 	}
 	result
@@ -581,7 +671,7 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
 	// The method splimes ran, which may be simpler than the requested one.
-	Ok(Json(PointResponse { spline: output.spline().to_string(), instant, input_points: input.len(), value: wire_value(value, &format!("the interpolated value at {instant}"))?, kind }))
+	Ok(Json(PointResponse { spline: output.spline().to_string(), instant, input_points: input.len(), value: wire_value(value, &format!("the interpolated value at {instant}"))?, kind: ValueKind::from(kind), backend: output.backend().to_string(), gpu_fallback: output.gpu_fallback().is_some() }))
 }
 
 /// Query parameters for the ILP interpolation endpoint.
@@ -881,6 +971,79 @@ mod tests {
 		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=cubic&resolution=seconds", "cpu load=0 0\ncpu load=60 60\n").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["spline"], "Linear");
+	}
+
+	#[test]
+	fn gpu_backend_env_values_parse() {
+		// Unset keeps the current backend (Auto by default); the four tokens map
+		// case-insensitively; anything else is a startup error naming the variable.
+		assert_eq!(InterpolateConfig::DEFAULT.with_backend_from_env_value(None).unwrap().backend(), Backend::Auto);
+		for (token, want) in [("auto", Backend::Auto), ("CPU", Backend::Cpu), (" parallel ", Backend::Parallel), ("gpu", Backend::Gpu)] {
+			assert_eq!(InterpolateConfig::DEFAULT.with_backend_from_env_value(Some(token)).unwrap().backend(), want, "{token:?}");
+		}
+		let err = InterpolateConfig::DEFAULT.with_backend_from_env_value(Some("tpu")).unwrap_err();
+		assert!(err.contains("WEFT_GPU_BACKEND"), "{err}");
+	}
+
+	#[tokio::test]
+	async fn responses_name_the_backend_that_ran() {
+		// ROB-16's GPU provenance lane: with the backend pinned to the CPU, the
+		// envelope says so, and no fallback is reported.
+		let config = InterpolateConfig::DEFAULT.with_backend(Backend::Cpu);
+		let router = crate::app_with_state(crate::AppState::new().with_interpolate_config(config));
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let response = router.clone().oneshot(Request::builder().method("POST").uri("/api/v1/interpolate").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(body["backend"], "cpu", "body: {body}");
+		assert_eq!(body["gpu_fallback"], false, "body: {body}");
+		// The point endpoint reports the same provenance.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"instant": ts(30),
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/interpolate/point").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(body["backend"], "cpu", "body: {body}");
+		assert_eq!(body["kind"], "interpolated", "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn provenance_reaches_the_metrics() {
+		// The same facts the response carries land in the shared metrics:
+		// per-kind output points and a per-backend request count.
+		let metrics = crate::SharedMetrics::default();
+		let router = crate::app_with_metrics(metrics.clone());
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/interpolate").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let snap = metrics.snapshot();
+		// The two grid endpoints coincide with inputs (raw); the 59 interior
+		// seconds are interpolated; nothing is extrapolated.
+		assert_eq!(snap.interpolate.output_raw_points, 2);
+		assert_eq!(snap.interpolate.output_interpolated_points, 59);
+		assert_eq!(snap.interpolate.output_extrapolated_points, 0);
+		assert_eq!(snap.interpolate.backend_cpu_requests + snap.interpolate.backend_parallel_requests + snap.interpolate.backend_gpu_requests, 1);
+		assert_eq!(snap.interpolate.gpu_fallbacks, 0);
 	}
 
 	#[tokio::test]
