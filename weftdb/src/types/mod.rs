@@ -30,7 +30,7 @@ pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState
 pub use quarantine::{QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS};
 pub use relative::Relative;
 pub use rows_mode::{discover, import_into, read_import_record, record_key, ImportRecord, ImportedAspect, LegacyAspect, LegacyCatalogAspect, LegacyTree, NotCarried, RowsModeError, DEFAULT_ROWS_PER_SEGMENT, IMPORT_RECORD_KEY, MEASUREMENTS_FILE, TIMESTAMP_COLUMN, TIMESTAMP_TIME_UNIT, TIMESTAMP_UNIT};
-pub use segment_index::SegmentIndexStore;
+pub use segment_index::{SegmentChange, SegmentIndexStore};
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;

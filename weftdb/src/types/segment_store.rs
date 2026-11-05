@@ -93,7 +93,7 @@ use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, write_new_durable, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
+		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, segment_index::SegmentChange, store_format::{self, StoreFormat, StoreScope}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
