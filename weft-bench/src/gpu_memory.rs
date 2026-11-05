@@ -18,8 +18,17 @@
 //! behaviour. It needs a hardware GPU with `f64` shaders: a CPU/software adapter is refused,
 //! as the server does not calibrate onto one either, and so is a device without `f64`
 //! support (such as the Apple Paravirtual device on a macOS CI runner).
+//!
+//! The pool counts only idle buffer sets; a leak outside it would not show there. So every
+//! call also samples `splimes::gpu_memory_report` (splimes 1.3: the device allocator's live
+//! and reserved bytes, on Vulkan and DX12), and, out of process, `nvidia-smi`'s
+//! `memory.used` every `--gm-smi-ms` as a cross-check that sees driver allocations too.
+//! `--gm-soak-secs` keeps running rounds until that long has passed, for a long soak. The
+//! report's `gpu_pool.device_memory` block holds both trends, each cut into at most
+//! [`TREND_WINDOWS`] windows (the max of each), and flags monotonic growth after the first
+//! round as a leak; a device-allocator leak fails the run.
 
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use rand::{seq::SliceRandom, RngExt, SeedableRng};
@@ -50,12 +59,17 @@ pub struct GpuMemoryParams {
 	pub knots: usize,
 	/// The pool cap to start the GPU with, in MiB; `None` keeps splimes' default.
 	pub pool_mib: Option<u64>,
+	/// Keep running rounds (at least `rounds`) until this many seconds have passed; `None`
+	/// runs exactly `rounds`.
+	pub soak_secs: Option<u64>,
+	/// `nvidia-smi` sampling interval in milliseconds; 0 turns the cross-check off.
+	pub smi_interval_ms: u64,
 }
 
 impl Default for GpuMemoryParams {
 	/// Twenty rounds of 16 Ki-, 1 Mi- and 4 Mi-point calls over 1,000 knots, default pool.
 	fn default() -> Self {
-		Self { seed: DEFAULT_GPU_MEMORY_SEED, rounds: 20, sizes: vec![16 << 10, 1 << 20, 4 << 20], knots: 1_000, pool_mib: None }
+		Self { seed: DEFAULT_GPU_MEMORY_SEED, rounds: 20, sizes: vec![16 << 10, 1 << 20, 4 << 20], knots: 1_000, pool_mib: None, soak_secs: None, smi_interval_ms: 1_000 }
 	}
 }
 
@@ -84,6 +98,87 @@ pub struct GpuPoolSummary {
 	pub final_idle_bytes: u64,
 	/// No idle-byte growth after the first round, and never over the cap.
 	pub stable: bool,
+	/// The device's own memory over the run (schema v30); `None` in older artifacts.
+	#[serde(default)]
+	pub device_memory: Option<DeviceMemorySoak>,
+}
+
+/// The most windows a trend is cut into.
+pub const TREND_WINDOWS: usize = 60;
+
+/// Device memory over a `gpu_memory` run: splimes' allocator report sampled after every
+/// call, and `nvidia-smi`'s `memory.used` sampled out of process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceMemorySoak {
+	/// The soak length asked for, in seconds (`None`: a fixed number of rounds).
+	pub soak_secs: Option<u64>,
+	/// Wall-clock seconds the rounds took.
+	pub elapsed_secs: u64,
+	/// Calls after which the allocator gave a report (0: the backend has none).
+	pub samples: usize,
+	/// The most allocated bytes after any call of the first round.
+	pub peak_allocated_bytes_first_round: u64,
+	/// The most allocated bytes after any later call.
+	pub peak_allocated_bytes_later: u64,
+	/// Allocated bytes after the last call.
+	pub final_allocated_bytes: u64,
+	/// Reserved (block) bytes after the last call.
+	pub final_reserved_bytes: u64,
+	/// Allocated bytes at the end of each round after the first, cut into at most
+	/// [`TREND_WINDOWS`] windows (each window's max).
+	pub allocated_trend_bytes: Vec<u64>,
+	/// `allocated_trend_bytes` never falls and ends higher than it starts: a leak.
+	pub allocated_growth: bool,
+	/// `nvidia-smi` `memory.used` per GPU (the whole GPU, other processes included).
+	pub smi: Vec<SmiMemoryTrend>,
+}
+
+/// One GPU's `nvidia-smi` `memory.used` over the run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmiMemoryTrend {
+	/// GPU index.
+	pub gpu_index: u32,
+	/// Samples taken.
+	pub samples: usize,
+	/// `memory.used` in MiB, cut into at most [`TREND_WINDOWS`] windows (each window's max).
+	pub memory_used_trend_mib: Vec<u64>,
+	/// The trend never falls and ends higher than it starts.
+	pub growth: bool,
+}
+
+/// Cut `series` into at most `windows` consecutive windows of near-equal length and keep each
+/// window's max.
+#[must_use]
+pub fn window_max(series: &[u64], windows: usize) -> Vec<u64> {
+	if series.is_empty() || windows == 0 {
+		return Vec::new();
+	}
+	let n = windows.min(series.len());
+	(0..n).map(|w| series[w * series.len() / n..(w + 1) * series.len() / n].iter().copied().max().unwrap_or(0)).collect()
+}
+
+/// Monotonic growth: at least three points, never falling, and ending above the start.
+#[must_use]
+pub fn monotonic_growth(trend: &[u64]) -> bool {
+	trend.len() >= 3 && trend.windows(2).all(|w| w[1] >= w[0]) && trend.last() > trend.first()
+}
+
+/// Per-GPU `memory.used` trends from `nvidia-smi` samples, in GPU order. The first window
+/// (the start-up) is left out of the growth check.
+#[must_use]
+pub fn smi_trends(samples: &[crate::gpu_economics::SmiSample]) -> Vec<SmiMemoryTrend> {
+	let mut indices: Vec<u32> = samples.iter().map(|s| s.index).collect();
+	indices.sort_unstable();
+	indices.dedup();
+	indices.into_iter()
+		.map(|gpu_index| {
+			let used: Vec<u64> = samples.iter().filter(|s| s.index == gpu_index).map(|s| s.memory_used_mib).collect();
+			let trend = window_max(&used, TREND_WINDOWS);
+			// The first window holds the start-up allocations; growth is judged after it.
+			let growth = monotonic_growth(trend.get(1..).unwrap_or_default());
+			SmiMemoryTrend { gpu_index, samples: used.len(), memory_used_trend_mib: trend, growth }
+		})
+		.collect()
 }
 
 /// A reproducible GPU memory workload profile.
@@ -103,7 +198,7 @@ impl GpuMemoryProfile {
 		if sizes.is_empty() {
 			sizes = GpuMemoryParams::default().sizes;
 		}
-		Self { name: name.into(), params: GpuMemoryParams { rounds: params.rounds.max(1), knots: params.knots.max(2), sizes, ..params } }
+		Self { name: name.into(), params: GpuMemoryParams { rounds: params.rounds.max(1), knots: params.knots.max(2), sizes, soak_secs: params.soak_secs.filter(|s| *s > 0), ..params } }
 	}
 }
 
@@ -168,11 +263,17 @@ pub fn run_gpu_memory(profile: &GpuMemoryProfile) -> anyhow::Result<BenchResult>
 
 	let stats = || splimes::gpu_pool_stats().ok_or_else(|| anyhow::anyhow!("the GPU is not started"));
 	let before = stats()?;
+	let sampler = crate::gpu_economics::SmiSampler::start(p.smi_interval_ms);
+	let soak = p.soak_secs.map(StdDuration::from_secs);
+	let rounds_start = Instant::now();
+	let (mut dev_samples, mut dev_peak_first, mut dev_peak_later, mut dev_last) = (0_usize, 0_u64, 0_u64, None::<splimes::GpuMemoryReport>);
+	let mut round_end_allocated: Vec<u64> = Vec::new();
 	let (mut samples_ns, mut complete, mut finite) = (Vec::new(), true, true);
 	let (mut peak_first, mut peak_later, mut created_after_first) = (0_u64, 0_u64, 0_u64);
 	let mut output_points = 0_usize;
 	let mut order: Vec<usize> = (0..inputs.len()).collect();
-	for round in 0..p.rounds {
+	let mut round = 0_usize;
+	while round < p.rounds || soak.is_some_and(|d| rounds_start.elapsed() < d) {
 		order.shuffle(&mut rng);
 		let created_before_round = stats()?.created;
 		for &i in &order {
@@ -185,27 +286,47 @@ pub fn run_gpu_memory(profile: &GpuMemoryProfile) -> anyhow::Result<BenchResult>
 			finite &= series.values().iter().all(|v| v.is_finite());
 			output_points += series.len();
 			let idle = stats()?.idle_bytes;
+			let device = splimes::gpu_memory_report();
 			if round == 0 {
 				peak_first = peak_first.max(idle);
 			} else {
 				peak_later = peak_later.max(idle);
 			}
+			if let Some(d) = device {
+				dev_samples += 1;
+				if round == 0 {
+					dev_peak_first = dev_peak_first.max(d.allocated_bytes);
+				} else {
+					dev_peak_later = dev_peak_later.max(d.allocated_bytes);
+				}
+				dev_last = Some(d);
+			}
 		}
 		if round > 0 {
 			created_after_first += stats()?.created - created_before_round;
+			if let Some(d) = splimes::gpu_memory_report() {
+				round_end_allocated.push(d.allocated_bytes);
+			}
 		}
+		round += 1;
 	}
+	let rounds = round;
+	let elapsed_secs = rounds_start.elapsed().as_secs();
+	let smi = sampler.map(crate::gpu_economics::SmiSampler::stop).unwrap_or_default();
+	let allocated_trend_bytes = window_max(&round_end_allocated, TREND_WINDOWS);
+	let allocated_growth = monotonic_growth(&allocated_trend_bytes);
+	let device_memory = DeviceMemorySoak { soak_secs: p.soak_secs, elapsed_secs, samples: dev_samples, peak_allocated_bytes_first_round: dev_peak_first, peak_allocated_bytes_later: dev_peak_later, final_allocated_bytes: dev_last.map_or(0, |d| d.allocated_bytes), final_reserved_bytes: dev_last.map_or(0, |d| d.reserved_bytes), allocated_trend_bytes, allocated_growth, smi: smi_trends(&smi) };
 	let after = stats()?;
 	let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
 	let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(run_start) };
 	let stable = peak_later <= peak_first && peak_first.max(peak_later) <= max_pool_bytes;
-	let summary = GpuPoolSummary { max_pool_bytes, rounds: p.rounds, calls: samples_ns.len(), created: after.created - before.created, created_after_first_round: created_after_first, reused: after.reused - before.reused, evicted: after.evicted - before.evicted, peak_idle_bytes_first_round: peak_first, peak_idle_bytes_later: peak_later, final_idle_bytes: after.idle_bytes, stable };
+	let summary = GpuPoolSummary { max_pool_bytes, rounds, calls: samples_ns.len(), created: after.created - before.created, created_after_first_round: created_after_first, reused: after.reused - before.reused, evicted: after.evicted - before.evicted, peak_idle_bytes_first_round: peak_first, peak_idle_bytes_later: peak_later, final_idle_bytes: after.idle_bytes, stable, device_memory: Some(device_memory) };
 
-	let correctness = CorrectnessReport { output_count_ok: complete && stable, expected_output_points: p.sizes.iter().sum::<usize>() * p.rounds, actual_output_points: output_points, values_finite: finite, result_sha256: None };
+	let correctness = CorrectnessReport { output_count_ok: complete && stable && !allocated_growth, expected_output_points: p.sizes.iter().sum::<usize>() * rounds, actual_output_points: output_points, values_finite: finite, result_sha256: None };
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: p.seed ^ 0x06B0_C0DE_u64, ..BootstrapConfig::default() }));
 	let throughput_points_per_sec = if measured_ns > 0 { output_points as f64 / (measured_ns as f64 / 1e9) } else { 0.0 };
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GPU_MEMORY.to_string(), reps: p.rounds, dataset: DatasetMeta { input_points: inputs.iter().map(|(_, (t, _))| t.len()).sum(), output_points, irregular: true, missingness_fraction: 0.0, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: Some(summary), adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GPU_MEMORY.to_string(), reps: rounds, dataset: DatasetMeta { input_points: inputs.iter().map(|(_, (t, _))| t.len()).sum(), output_points, irregular: true, missingness_fraction: 0.0, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: Some(summary), adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
 }
 
 #[cfg(test)]
@@ -225,6 +346,37 @@ mod tests {
 		assert_eq!(timestamps.len(), values.len());
 	}
 
+	#[test]
+	fn window_max_keeps_each_windows_max_and_growth_needs_a_rising_trend() {
+		assert_eq!(window_max(&[], 4), Vec::<u64>::new());
+		assert_eq!(window_max(&[5, 1, 2], 10), vec![5, 1, 2]);
+		assert_eq!(window_max(&[1, 9, 2, 3, 4, 8], 3), vec![9, 3, 8]);
+		assert_eq!(window_max(&(0..1_000).collect::<Vec<u64>>(), TREND_WINDOWS).len(), TREND_WINDOWS);
+		assert!(monotonic_growth(&[1, 1, 2, 3]));
+		assert!(!monotonic_growth(&[5, 5, 5, 5]), "flat is steady, not a leak");
+		assert!(!monotonic_growth(&[1, 3, 2, 4]), "a fall breaks the growth");
+		assert!(!monotonic_growth(&[1, 2]), "too few points to call");
+	}
+
+	#[test]
+	fn smi_trends_split_by_gpu_and_skip_the_first_window() {
+		use crate::gpu_economics::SmiSample;
+		let s = |index, mib| SmiSample { index, utilization_pct: 0, memory_used_mib: mib };
+		// GPU 0: a start-up jump, then flat. GPU 1: rising throughout.
+		let samples: Vec<SmiSample> = (0..10_u64).flat_map(|i| [s(0, if i == 0 { 100 } else { 900 }), s(1, 100 + i)]).collect();
+		let trends = smi_trends(&samples);
+		assert_eq!(trends.iter().map(|t| (t.gpu_index, t.samples)).collect::<Vec<_>>(), vec![(0, 10), (1, 10)]);
+		assert!(!trends[0].growth, "{:?}", trends[0]);
+		assert!(trends[1].growth, "{:?}", trends[1]);
+	}
+
+	#[test]
+	fn old_pool_summaries_still_deserialize() {
+		let old = r#"{"max_pool_bytes":1,"rounds":1,"calls":1,"created":1,"created_after_first_round":0,"reused":0,"evicted":0,"peak_idle_bytes_first_round":0,"peak_idle_bytes_later":0,"final_idle_bytes":0,"stable":true}"#;
+		let summary: GpuPoolSummary = serde_json::from_str(old).expect("v22 summary");
+		assert_eq!(summary.device_memory, None);
+	}
+
 	/// Runs on a hardware GPU only (skips otherwise, as splimes' own GPU tests do unless
 	/// `WEFT_REQUIRE_GPU` is set).
 	#[test]
@@ -240,5 +392,8 @@ mod tests {
 		let pool = result.gpu_pool.expect("summary");
 		assert_eq!(pool.calls, 6);
 		assert!(pool.stable);
+		let device = pool.device_memory.expect("device memory block");
+		assert!(!device.allocated_growth, "{device:?}");
+		assert!(device.samples == 0 || device.final_reserved_bytes >= device.final_allocated_bytes, "{device:?}");
 	}
 }

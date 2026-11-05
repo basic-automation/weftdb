@@ -400,14 +400,8 @@ impl WorkloadModel {
 					let base = signal(series, row);
 					column.push(Some(match format {
 						ValueFormat::Float => GridValue::Float(base),
-						ValueFormat::Integer =>
-						{
-							GridValue::Integer(base.trunc() as i64)
-						}
-						ValueFormat::Unsigned =>
-						{
-							GridValue::Unsigned(base.abs().trunc() as u64)
-						}
+						ValueFormat::Integer => GridValue::Integer(base.trunc() as i64),
+						ValueFormat::Unsigned => GridValue::Unsigned(base.abs().trunc() as u64),
 						ValueFormat::Boolean => GridValue::Boolean(base >= 0.0),
 						ValueFormat::Text => GridValue::Text(format!("{base:.2}")),
 					}));

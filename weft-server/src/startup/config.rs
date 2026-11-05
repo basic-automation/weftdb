@@ -150,6 +150,14 @@ pub fn host_guard_for(local: SocketAddr) -> HostGuard {
 ///
 /// A value that is not a socket address, or one that is not loopback (the listener is
 /// plaintext; [`weft_server::flight::flight_addr`] says why).
+/// Phase 5 (5.7): the GPU adapter and device mode `WEFT_GPU_ADAPTER` / `WEFT_GPU_DEVICES`
+/// ask for, or `None` when neither is set (splimes' single-device default). A malformed
+/// value refuses the start (exit 78) rather than silently running on another device.
+pub fn gpu_config() -> anyhow::Result<Option<splimes::GpuConfig>> {
+	use weft_server::gpu::{gpu_config_from_env, GPU_ADAPTER_ENV, GPU_DEVICES_ENV};
+	gpu_config_from_env(std::env::var(GPU_ADAPTER_ENV).ok().as_deref(), std::env::var(GPU_DEVICES_ENV).ok().as_deref()).map_err(anyhow::Error::msg)
+}
+
 pub fn flight_addr() -> anyhow::Result<Option<SocketAddr>> {
 	weft_server::flight::flight_addr(std::env::var(weft_server::flight::FLIGHT_ADDR_ENV).ok().as_deref()).map_err(anyhow::Error::msg)
 }

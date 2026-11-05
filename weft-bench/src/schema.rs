@@ -94,10 +94,12 @@ use crate::{
 /// added `samples_ns`, the raw samples behind every latency summary, and
 /// `correctness.result_sha256`, a digest of the output, and `between_run`, the spread of the
 /// separate runs `weft-bench combine` pooled. v29 added `gpu_economics`, one lane of a
-/// `gpu_economics` run ([`crate::gpu_economics::GpuEconomicsPoint`]). All
+/// `gpu_economics` run ([`crate::gpu_economics::GpuEconomicsPoint`]). v30 added
+/// `gpu_pool.device_memory`, the device allocator's and `nvidia-smi`'s memory over a
+/// `gpu_memory` run ([`crate::gpu_memory::DeviceMemorySoak`]). All
 /// optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 29;
+pub const SCHEMA_VERSION: u32 = 30;
 
 /// Metadata describing the dataset a result was measured against.
 ///

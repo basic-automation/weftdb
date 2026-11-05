@@ -422,7 +422,6 @@
 //! }
 //! ```
 
-
 use std::{collections::HashMap, sync::LazyLock};
 
 use anyhow::Result;
