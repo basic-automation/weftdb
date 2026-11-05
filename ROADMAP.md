@@ -361,7 +361,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
   - [ ] **ROB-23r** Probe-only admin listener
   - [x] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
-  - [ ] **ROB-5** Legacy queue-consumer panics
+  - [x] **ROB-5** Legacy queue-consumer panics
   - [ ] **SEC-13** Security acceptance
   - [x] **PAC-9** Docker image and container smoke test (with a mounted keys file)
   - [ ] **PAC-11** systemd unit, user and env files, and host-install CI

@@ -175,6 +175,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - `analyze_range` read only one step past each 50,000-point chunk, so a gap longer than a
   chunk was interpolated without its far bracket and came out as a single `0`. A chunk now
   widens its read until it holds the knots on both sides (#506).
+- **Legacy queue-consumer panics converted to errors (ROB-5, #303).**
+  `Pipeline::dictionary()` and `dictionary_mut()` return `Option` instead of panicking when
+  no dictionaries are registered, and `build_patterns_queue`'s min/max timestamp extraction
+  returns an error with the batch ID instead of `.expect()` on data invariant violations.
+  Test coverage added for each conversion.
 
 ## [0.2.1] - 2026-11-02
 
