@@ -455,7 +455,7 @@ impl Inputs for Database {
 	/// - if unable to insert measurements into database
 	///
 	/// An empty batch is a no-op: it returns an empty list of ids without touching the
-	/// database. It is not a panic, and the bounds the write needs come from [`batch_bounds`],
+	/// database. It is not a panic, and the bounds the write needs come from `batch_bounds`,
 	/// which answers a typed error for a batch with no rows instead of unwrapping an absent
 	/// minimum (ROB-5).
 	async fn batch_capture_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {

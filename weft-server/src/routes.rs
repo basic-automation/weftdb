@@ -671,7 +671,7 @@ pub fn build_registry_with_limits(config: IngestConfig, admission_config: Admiss
 /// [`RouteSpec`]s the full registry registers, and nothing else.
 ///
 /// This is not a second routing table to keep in step: it calls the same
-/// [`register_probe_routes`], so a probe that gains a route gains it on both
+/// `register_probe_routes`, so a probe that gains a route gains it on both
 /// listeners. Because the gate layer looks a request up in *this* registry's
 /// table, a data, ingest, declare or maintenance path on the admin listener has
 /// no entry and is refused by the same fallback with `route_not_found` — the

@@ -150,7 +150,7 @@ pub enum IndexOp {
 	DeleteExpected { aspect: String, expected: RowVersion },
 	/// Delete the row matching each of `expected`, which name distinct ids: as many
 	/// [`DeleteExpected`](Self::DeleteExpected)s, each row exactly at its version, but in
-	/// a statement per [`DELETE_CHUNK`] rows rather than one per row (#507). Under Turso's
+	/// a statement per `DELETE_CHUNK` rows rather than one per row (#507). Under Turso's
 	/// MVCC each keyed delete cost milliseconds, growing with the versions earlier swaps
 	/// left behind, so a squash of 10M rows spent ~350 s deleting its members one at a time.
 	DeleteEveryExpected { aspect: String, expected: Vec<RowVersion> },
@@ -245,14 +245,14 @@ pub enum IndexOp {
 	/// there is no write-ahead entry for a commit that never landed, and
 	/// no committed commit without its change row. On a store whose
 	/// registry has not created `segment_changes` the op records nothing
-	/// (see [`record_change`]): such a store has no change log to write
+	/// (see `record_change`): such a store has no change log to write
 	/// and must not gain one outside a migration.
 	RecordChange { aspect: String, epoch: u64, min_ts: Option<i64>, max_ts: Option<i64>, row_count: u64 },
 	/// Delete `aspect`'s change-log rows at or below `through_epoch`
 	/// (D-S20): the change log's dequeue, run by a consumer that has
 	/// batched the changes it read. Rows above the epoch stay, including
 	/// any a commit landed after the consumer's read. On a store without
-	/// `segment_changes` the op deletes nothing (see [`delete_changes`]).
+	/// `segment_changes` the op deletes nothing (see `delete_changes`).
 	DeleteChanges { aspect: String, through_epoch: u64 },
 }
 

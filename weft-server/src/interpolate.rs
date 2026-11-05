@@ -57,7 +57,7 @@
 //! magnitude below `2^53` (about `9.0e15`; a differential test over `1e-19..1e15` pins
 //! it): an interpolated `f64` became its shortest round-trip decimal and that decimal
 //! narrowed back to the same `f64`, a raw sample came back as the `f64` it was sent
-//! as, and a negative zero became `0` (which [`wire_f64`] keeps). Above that the old
+//! as, and a negative zero became `0` (which `wire_f64` keeps). Above that the old
 //! answer could be the artefact: once a value's shortest decimal has an integer part
 //! wider than `2^53`, `BigDecimal::to_f64` can round twice and land one ulp off the
 //! kernel's value (observed at about `2.0e19`: `...146e19` computed, `...142e19`

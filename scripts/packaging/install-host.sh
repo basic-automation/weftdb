@@ -52,7 +52,8 @@
 set -euo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly REPO_ROOT=$(cd -- "$(dirname -- "$0")/../.." && pwd)
+REPO_ROOT=$(cd -- "$(dirname -- "$0")/../.." && pwd)
+readonly REPO_ROOT
 
 PREFIX=/usr/local
 DESTDIR=

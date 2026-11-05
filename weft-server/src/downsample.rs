@@ -107,7 +107,7 @@ pub struct DownsampleRequest {
 /// same kind.
 ///
 /// The handlers pass the operator's configured cap
-/// ([`InterpolateConfig::max_output_points`]) to [`apply_fill`], which is this
+/// ([`InterpolateConfig::max_output_points`]) to `apply_fill`, which is this
 /// value unless `WEFT_MAX_INTERPOLATE_POINTS` changed it (ROB-16).
 pub const MAX_FILL_BUCKETS: usize = crate::interpolate::MAX_INTERPOLATE_OUTPUT_POINTS;
 
