@@ -576,13 +576,14 @@ impl Client {
 	}
 
 	/// `POST /api/v1/storage/{aspect}/ilp`: seal one field of a Line Protocol body
-	/// (`options.precision` is the body's timestamp precision).
+	/// (`options.precision` is the body's timestamp precision, `options.measurement` the
+	/// measurement sealed, which the server requires).
 	///
 	/// # Errors
 	///
 	/// The server's refusal, or a transport failure.
 	pub async fn write_ilp(&self, aspect: &str, field: &str, body: impl Into<Vec<u8>>, options: &WriteOptions) -> Result<WriteSummary> {
-		let call = Call::post(&["api", "v1", "storage", aspect, "ilp"]).param("field", Some(field)).param("precision", options.precision.as_ref()).write_options(options).bytes(body.into(), "text/plain");
+		let call = Call::post(&["api", "v1", "storage", aspect, "ilp"]).param("measurement", options.measurement.as_ref()).param("field", Some(field)).param("precision", options.precision.as_ref()).write_options(options).bytes(body.into(), "text/plain");
 		self.send(call).await?.json()
 	}
 

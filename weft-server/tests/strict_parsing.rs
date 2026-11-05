@@ -84,7 +84,7 @@ async fn an_unknown_query_parameter_is_refused() {
 	assert_eq!(body["code"], "bad_request");
 	assert!(body["error"].as_str().unwrap().contains("unknown field"), "{}", body["error"]);
 	// The ILP ingest takes its parameters in the query and its payload in the body.
-	let request = HttpRequest::builder().method("POST").uri("/api/v1/storage/temperature/ilp?field=v&precison=ms").header("content-type", "text/plain").body(Body::from("m v=1 1")).unwrap();
+	let request = HttpRequest::builder().method("POST").uri("/api/v1/storage/temperature/ilp?measurement=m&field=v&precison=ms").header("content-type", "text/plain").body(Body::from("m v=1 1")).unwrap();
 	let (status, body) = answer(request).await;
 	assert_eq!(status, StatusCode::BAD_REQUEST);
 	assert_eq!(body["code"], "bad_request");
