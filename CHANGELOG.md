@@ -104,6 +104,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `SeriesSelector` into the one series it names, or refuses with the typed
   `StoreError::AmbiguousSeries` (`400 ambiguous_series`) when it matches several. HTTP
   ingest still refuses tags until TAG-11.
+- **Store read bounds (ROB-13).** The stored downsample and the batch point lookup are
+  bounded in `SegmentStore` itself, at 1.0 decision 12's numbers:
+  `SegmentStoreOptions::max_downsample_buckets` (`DEFAULT_MAX_DOWNSAMPLE_BUCKETS`,
+  1,000,000) and `max_point_batch` (`DEFAULT_MAX_POINT_BATCH`, 10,000 instants). A
+  downsample whose fold reaches one bucket more is refused with the typed
+  `StoreError::DownsampleTooLarge` while it runs (for a `BucketWidth` the bound is the
+  returned, coarsened grid); a wider point batch is refused with
+  `StoreError::PointBatchTooLarge` before the index is pruned. Over HTTP both are
+  `422 result_too_large` carrying the cap. The single point lookup names one instant
+  and needs no cap. The HTTP read ceilings themselves are ROB-12's.
 
 ### Changed
 
