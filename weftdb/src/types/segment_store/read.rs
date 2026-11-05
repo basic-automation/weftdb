@@ -445,7 +445,8 @@ impl SegmentStore {
 	/// - [`SeriesSelector::untagged`](crate::SeriesSelector::untagged) is
 	///   [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED) without touching the catalog.
 	/// - Otherwise every registered series whose [`TagSet`](crate::TagSet) the selector
-	///   [matches](crate::SeriesSelector::matches) is a candidate, and series 0 is one
+	///   [matches](crate::SeriesSelector::matches_key) is a candidate, read from the
+	///   index's per-aspect catalog cache (no SQL once loaded), and series 0 is one
 	///   only when the selector matches the empty tag set **and** series 0 holds rows
 	///   (series 0 has no catalog row; without the existence test a loose selector would
 	///   always be ambiguous on a tagged aspect).
@@ -464,9 +465,9 @@ impl SegmentStore {
 		if selector.matches(&crate::TagSet::new()) && self.index.series_has_rows(aspect, crate::SeriesId::UNTAGGED).await? {
 			matched.push(crate::SeriesId::UNTAGGED);
 		}
-		for (id, key) in self.index.series_of(aspect).await? {
-			if selector.matches(&crate::TagSet::from(key)) {
-				matched.push(id);
+		for (id, key) in self.index.cached_series_of(aspect).await?.iter() {
+			if selector.matches_key(key) {
+				matched.push(*id);
 			}
 		}
 		match matched.as_slice() {
