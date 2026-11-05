@@ -4431,3 +4431,45 @@ Issue #158; design PR 8, with critique A4 (the composite index was deferred from
    `a_tagged_read_among_a_thousand_series_opens_only_its_own_frames` (1,000 series over one
    window; every other series' frame is overwritten with garbage, so opening one would fail
    the read; about 40 s locally, from 1,000 durable seals). No micro-benchmark was run.
+## 2026-11-04 — SEC-13: what the security acceptance pass pins (FOR MERGE REVIEW)
+
+**Grounded:** the plan gives SEC-13 no controls of its own — §6 W7 lists it as the
+slice that ticks ROADMAP :786/:787 (the 1.0 criteria "TLS on `weft-server`" and
+"API-key/token auth + basic RBAC + audit log"), §7 ends the security chain
+X-SPLIT-SRV → X-ERR → SEC-3 → SEC-6 → SEC-9 → SEC-13 at it, and §9 names
+SEC-3…SEC-8 as 1.0 gates because those two criteria make TLS and auth gates.
+So SEC-13 is an acceptance pass over the landed SEC-3…SEC-11 surface, not a
+ninth control: one suite, `weft-server/tests/security_acceptance.rs`, that runs
+the controls composed the way a deployment runs them, and ticks the two
+criteria plus its own W7 line.
+
+**The shape, and why:**
+
+1. **Composed, at two levels.** In-process over the real router: the full
+   role × scope matrix (six roles × the registry's eight scopes, including the
+   discriminating cells — writer refused declare, maintainer refused backup,
+   reader refused `/metrics`), credential placement (`credentials_in_query`
+   refused in all three auth modes), live key reload (added key authenticates,
+   removed key stops, malformed edit refused whole), the audit trail of a
+   mixed run, and SEC-11's traversal name meeting the gate. Against the real
+   binary: TLS + mounted keys + store + audit file, the matrix's decisive
+   cells over HTTPS, plaintext unserved on the TLS port, SIGHUP reload with no
+   restart, the auth-off loopback guards (proxied and foreign-Host refusals)
+   and the `WEFT_AUTH=disabled` gateway mode they exempt.
+2. **No re-pinning of slice internals.** Where a behaviour is a slice's own —
+   the exposure matrix's startup refusals (tls_serve.rs), the traversal
+   spellings (aspect_name_traversal.rs), the audit file's fail-closed refusal
+   (audit_log.rs), redaction's unit rules (redact.rs) — the slice's suite owns
+   it and this one checks only the composed result, so a future change breaks
+   exactly one suite per broken promise.
+3. **No key material, anywhere it should not be.** The suite asserts the
+   audit file (in-process and the binary's on-disk one) records principals
+   and denial codes but never a plaintext key or the bearer <redacted> — the
+   SEC-9/SEC-10 hygiene property, checked on the artifact an operator
+   actually keeps.
+
+**Rejected:** a shell-driven external acceptance script (the repo's
+acceptance evidence is its test suites; a script would need its own harness
+for ports, certs and readiness that the suite already has), and folding the
+remaining criteria parents (Packaging, Upgrade/rollback) into this tick —
+they are PAC slices' gates (:788, W8), not SEC-13's.
