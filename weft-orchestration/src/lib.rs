@@ -1207,7 +1207,7 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 			// Assign constant to local variable before borrowing to avoid clippy warning
 			let error_rate = HashMap::new();
 
-			let correlation = Correlation::new(None, DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), aspect.subject_id(), aspect_id, pattern.id(), event.id().clone(), error_rate, pattern.occurrences().clone(), average_distance);
+			let correlation = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), subject_id: aspect.subject_id(), aspect_id: aspect_id.clone(), pattern_id: pattern.id(), event_id: event.id().clone() }, error_rate, pattern.occurrences().clone(), average_distance);
 			database.insert_correlation(aspect_id, &correlation).await?;
 		}
 	}

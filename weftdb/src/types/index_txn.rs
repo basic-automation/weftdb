@@ -964,6 +964,8 @@ mod tests {
 			apply(&winning, &replace(base.version(), winner.clone())).await.expect("the winner takes the row first");
 			let (go, go_rx) = std::sync::mpsc::channel::<()>();
 			let (done_tx, done) = std::sync::mpsc::channel::<()>();
+			// `apply_while` wants a `Send` callback; a bare `Receiver` is not `Sync`.
+			let done = std::sync::Mutex::new(done);
 			let committer = tokio::spawn(async move {
 				tokio::task::spawn_blocking(move || go_rx.recv()).await.expect("joins").expect("told to commit");
 				winning.execute("COMMIT", ()).await.expect("the winner commits");
@@ -973,7 +975,7 @@ mod tests {
 			let commit_the_winner = || {
 				if asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
 					go.send(()).expect("starts the commit");
-					done.recv().expect("waits for it");
+					done.lock().expect("not poisoned").recv().expect("waits for it");
 				}
 				true
 			};

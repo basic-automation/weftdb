@@ -199,7 +199,7 @@ async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, as
 	drop(store);
 	let series: Interpolation<f64> = result.map_err(|err| classify(&err, config))?;
 
-	let points = tracing::info_span!(parent: &span, "interpolate.serialize", output_points = series.len()).in_scope(|| series.iter().map(|(timestamp, value, kind)| if value.is_finite() { Ok(OutputPoint { timestamp, value: *value, kind }) } else { Err(ApiError::new(Code::NotFinite, format!("the interpolated value at {timestamp} has no finite f64 representation; refusing to return a silently narrowed substitute"))) }).collect::<Result<Vec<_>, ApiError>>())?;
+	let points = tracing::info_span!(parent: &span, "interpolate.serialize", output_points = series.len()).in_scope(|| series.iter().map(|(timestamp, value, kind)| if value.is_finite() { Ok(OutputPoint { timestamp, value: *value, kind: kind.into() }) } else { Err(ApiError::new(Code::NotFinite, format!("the interpolated value at {timestamp} has no finite f64 representation; refusing to return a silently narrowed substitute"))) }).collect::<Result<Vec<_>, ApiError>>())?;
 	let backend = format!("{:?}", series.backend());
 	span.record("output_points", points.len());
 	span.record("backend", backend.as_str());
@@ -250,7 +250,7 @@ fn encode_chunk(chunk: &weftdb::interpolate_range::StoredChunk, unit: splimes::T
 				if chunk.first + i > 0 {
 					out.push(',');
 				}
-				let point = serde_json::to_string(&OutputPoint { timestamp, value, kind }).map_err(|err| ApiError::internal(format!("serialising a point: {err}")))?;
+				let point = serde_json::to_string(&OutputPoint { timestamp, value, kind: kind.into() }).map_err(|err| ApiError::internal(format!("serialising a point: {err}")))?;
 				out.push_str(&point);
 			}
 			Format::Csv => {

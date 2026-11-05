@@ -71,7 +71,7 @@ use std::num::NonZeroUsize;
 use axum::{
 	extract::State, http::header, response::{IntoResponse, Response}, Json
 };
-use bigdecimal::{BigDecimal, ToPrimitive};
+use bigdecimal::ToPrimitive;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 /// The engine's own provenance type: `raw` (the grid point coincides with an input
@@ -1722,8 +1722,8 @@ mod tests {
 		let spline: Spline = request.spline.into();
 		let resolution: Resolution = request.resolution.into();
 		let output = config.interpolator(spline, resolution).run_async(points, start, end).await.map_err(|err| engine_error(&err, config))?;
-		let points = output.iter().map(|(timestamp, value, kind)| wire_value(value, "the test value").map(|value| OutputPoint { timestamp, value, kind })).collect::<Result<Vec<_>, _>>()?;
-		Ok(InterpolateResponse { spline: output.spline().to_string(), resolution: format!("{resolution:?}"), input_points, output_points: points.len(), points })
+		let points = output.iter().map(|(timestamp, value, kind)| wire_value(value, "the test value").map(|value| OutputPoint { timestamp, value, kind: kind.into() })).collect::<Result<Vec<_>, _>>()?;
+		Ok(InterpolateResponse { spline: output.spline().to_string(), resolution: format!("{resolution:?}"), input_points, output_points: points.len(), backend: output.backend().to_string(), gpu_fallback: output.gpu_fallback().is_some(), points })
 	}
 
 	async fn body_bytes(response: Response) -> Vec<u8> {

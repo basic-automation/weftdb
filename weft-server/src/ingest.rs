@@ -645,7 +645,7 @@ async fn ingest_points_inner(target: IngestTarget<'_>, request: IngestRequest) -
 					if weft_physical_type::is_non_finite_decimal_text(text) {
 						return Err(error::non_finite_value(format!("value {text:?} (at timestamp {})", point.timestamp)));
 					}
-					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
+					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
 					values.push(Some(parsed));
 				}
 			}
@@ -724,7 +724,7 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 			// ROB-7: a `NaN` cell is refused with the reason, not stored as a hole.
 			return Err(error::non_finite_value(format!("CSV line {}: value {value_text:?}", index + 1)));
 		} else {
-			let parsed: BigDecimal = weft_physical_type::parse_decimal(value_text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1))))?;
+			let parsed: BigDecimal = weft_physical_type::parse_decimal(value_text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1))))?;
 			values.push(Some(parsed));
 		}
 		timestamps.push(timestamp);

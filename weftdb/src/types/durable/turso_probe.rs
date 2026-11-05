@@ -54,14 +54,15 @@ struct HeldSync {
 
 /// A sync held by [`ProbeIo::hold_next_sync`]. Dropping it releases the sync.
 pub struct SyncHold {
-	reached: mpsc::Receiver<()>,
+	/// Behind a mutex so a hold can be shared (`Sync`) with a retry callback.
+	reached: Mutex<mpsc::Receiver<()>>,
 	release: mpsc::Sender<()>,
 }
 
 impl SyncHold {
 	/// Wait, for at most `timeout`, until a thread is held in the sync. Whether one is.
 	pub fn reached(&self, timeout: Duration) -> bool {
-		self.reached.recv_timeout(timeout).is_ok()
+		self.reached.lock().is_ok_and(|reached| reached.recv_timeout(timeout).is_ok())
 	}
 
 	/// Let the held sync go ahead (now, or as soon as it is reached).
@@ -86,7 +87,7 @@ impl ProbeIo {
 		if let Ok(mut held) = self.held.lock() {
 			*held = Some(HeldSync { file: file.to_string(), reached: reached_tx, release: release_rx });
 		}
-		SyncHold { reached, release }
+		SyncHold { reached: Mutex::new(reached), release }
 	}
 
 	/// Every event so far, in the order Turso issued them.

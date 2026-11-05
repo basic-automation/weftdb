@@ -85,7 +85,7 @@ async fn resolve_target(store: &weftdb::SegmentStore, aspect: &str, selector: &w
 /// not-a-decimal is the caller's `400 bad_request` as before, and a decimal
 /// whose plain form is over the bound is `400 decimal_out_of_range`.
 fn parse_value_bound(name: &str, text: &str) -> Result<BigDecimal, ApiError> {
-	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
+	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
 }
 
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.

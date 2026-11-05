@@ -233,7 +233,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Result<Json<Ve
 			.iter()
 			.filter_map(|bucket| {
 				let value = match reduction {
-					Reduction::Count => Some(bucket.count as f64),
+					Reduction::Count => Some(crate::num::usize_to_f64(bucket.count)),
 					Reduction::Aggregation(_) => bucket.aggregations.get(agg).copied(),
 				};
 				value.map(|value| (value, bucket.timestamp.timestamp_millis()))

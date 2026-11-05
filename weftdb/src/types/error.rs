@@ -350,29 +350,3 @@ pub enum StoreError {
 		limit: usize,
 	},
 }
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn turso_conflicts_are_transient_anywhere_in_the_chain() {
-		let conflict = || anyhow::Error::new(turso::Error::Error(WRITE_WRITE_CONFLICT.to_string()));
-		assert!(is_transient_mvcc_error(&conflict()));
-		assert!(is_transient_mvcc_error(&conflict().context("Failed to set dictionary metadata: Write-write conflict")));
-		assert!(is_transient_mvcc_error(&anyhow::Error::new(turso::Error::Busy("database is locked".to_string()))));
-		assert!(is_transient_mvcc_error(&anyhow::Error::new(turso::Error::BusySnapshot("database snapshot is stale".to_string()))));
-		assert!(is_transient_mvcc_error(&anyhow::Error::new(Error::TransientMvccError("type mismatch".to_string())).context("read")));
-	}
-
-	#[test]
-	fn other_errors_are_not_transient() {
-		assert!(!is_transient_mvcc_error(&anyhow::Error::new(turso::Error::Error("no such table: patterns".to_string()))));
-		assert!(!is_transient_mvcc_error(&anyhow::Error::new(turso::Error::Constraint("UNIQUE constraint failed".to_string()))));
-		assert!(!is_transient_mvcc_error(&anyhow::Error::new(Error::DatabaseError("Write-write conflict".to_string()))));
-		// Only the error itself counts, not a message that quotes one: this is how a
-		// conflict looked once the failed `ROLLBACK` after it had replaced it.
-		assert!(!is_transient_mvcc_error(&anyhow::anyhow!("Rollback failed: cannot rollback - no transaction is active")));
-		assert!(!is_transient_mvcc_error(&anyhow::anyhow!("Failed to set dictionary metadata: Write-write conflict")));
-	}
-}

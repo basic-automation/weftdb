@@ -1834,7 +1834,7 @@ mod tests {
 		let batch = build_record_batch(TimeUnit::Seconds, PhysicalType::F64.name(), LOGICAL_EXPORT_VERSION, &[100, 110, 120], Arc::new(Float64Array::from(vec![Some(1.5), Some(f64::NAN), Some(f64::NEG_INFINITY)])), VALUE_ENCODING_F64).expect("builds the batch");
 		let (timestamps, values) = record_batch_to_columns(&batch).expect("the lenient reader accepts it");
 		assert_eq!(timestamps, vec![100, 110, 120]);
-		assert_eq!(values[0], Some(bd("1.5")));
+		assert_eq!(values[0], Some(bd("1.5").expect("parses")));
 		assert_eq!(values[1], None, "a NaN reads back as the hole the writer meant");
 		assert_eq!(values[2], None);
 		assert_eq!(record_batch_to_columns_strict(&batch), Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: 1 }));
