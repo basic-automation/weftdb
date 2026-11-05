@@ -443,7 +443,7 @@ impl SegmentIndexStore {
 	/// [`prune_present_descriptors`](Self::prune_present_descriptors), returning whole
 	/// [`IndexRow`]s — the form a reader that must bind a sidecar to its frame's CRC
 	/// (D-S15) prunes by.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the store reads prune one series since TAG-8; the aspect-wide form is kept for its tests"))]
+	#[cfg_attr(not(test), allow(dead_code, reason = "the store reads prune one series since TAG-8; the aspect-wide form is kept for its tests (allow, not expect: whether rustc reports a callee of a dead fn differs between 1.95 and the release toolchain)"))]
 	pub(crate) async fn prune_present_rows(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<IndexRow>> {
 		// The NULL-spanned (empty) row is rejected twice over: the inequalities already
 		// reject it, and a zero-row row is not "all null" — it is nothing to skip.

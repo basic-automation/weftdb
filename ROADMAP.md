@@ -220,7 +220,7 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 `splimes` 1.0 is released and WeftDB depends on it, and the control-plane engine decision is made.
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
-- [ ] **B-tags**
+- [x] **B-tags**
 
 ### Security & packaging *(Phase 8 minimum)*
 
@@ -393,12 +393,12 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] maint lane
   - [ ] open lane
   - [ ] L-INGEST
-  - [ ] storage read handlers lane
+  - [x] storage read handlers lane (TAG-10)
   - [ ] **FRE-10a** Contract tests
   - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [ ] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
-  - [ ] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
+  - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
   - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
   - [ ] read lane
   - [ ] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
@@ -434,7 +434,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 
 The interpolation item (B-interp, Phase 5) is done.
 
-- [ ] **B-tags** *(Phase 2/4 · absent)*
+- [x] **B-tags** *(Phase 2/4 · done: TAG-5..TAG-11)*
 - [ ] **B-conn** *(Phase 2/7 · absent)*
 - [ ] **B-ilp** *(Phase 2 · partial)*
 - [ ] **B-rest** *(Phase 2 · partial)*

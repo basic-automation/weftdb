@@ -402,6 +402,14 @@ pub struct SegmentStoreOptions {
 	pub max_series_per_aspect: usize,
 }
 
+/// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
+/// whole number, or [`DEFAULT_MAX_SERIES_PER_ASPECT`] when it is unset or anything
+/// else (the server's strict configuration check refuses a malformed value at
+/// startup, so this leniency only reaches library embedders).
+fn max_series_per_aspect_from(value: Option<&str>) -> usize {
+	value.and_then(|v| v.trim().parse::<usize>().ok()).filter(|limit| *limit > 0).unwrap_or(DEFAULT_MAX_SERIES_PER_ASPECT)
+}
+
 /// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
 /// 100,000 series.
 pub const DEFAULT_MAX_SERIES_PER_ASPECT: usize = 100_000;
@@ -414,12 +422,14 @@ impl Default for SegmentStoreOptions {
 
 impl SegmentStoreOptions {
 	/// The options the environment describes: [`CheckpointPolicy::from_env`],
-	/// [`PartialSidecarPolicy::from_env`], [`TransposedPolicy::from_env`] and
-	/// [`MaintenanceBreaker::from_env`], each as lenient as it documents.
-	/// Explicit: nothing in the library calls it.
+	/// [`PartialSidecarPolicy::from_env`], [`TransposedPolicy::from_env`],
+	/// [`MaintenanceBreaker::from_env`] and `WEFT_MAX_SERIES_PER_ASPECT`
+	/// ([`max_series_per_aspect`](Self::max_series_per_aspect); absent or not a
+	/// positive whole number → [`DEFAULT_MAX_SERIES_PER_ASPECT`]), each as lenient
+	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()) }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -2838,6 +2848,17 @@ mod tests {
 	use weft_physical_type::{timestamp::TimeUnit, PhysicalType, PAGED_SEGMENT_FORMAT_VERSION};
 
 	use super::*;
+
+	/// `WEFT_MAX_SERIES_PER_ASPECT` (TAG-11): a positive whole number sets the cap;
+	/// unset, zero, or anything else keeps the default.
+	#[test]
+	fn max_series_per_aspect_reads_a_positive_whole_number() {
+		assert_eq!(max_series_per_aspect_from(Some("7")), 7);
+		assert_eq!(max_series_per_aspect_from(Some(" 12 ")), 12);
+		for other in [None, Some(""), Some("0"), Some("-1"), Some("many")] {
+			assert_eq!(max_series_per_aspect_from(other), DEFAULT_MAX_SERIES_PER_ASPECT, "{other:?}");
+		}
+	}
 	use crate::{types::index_txn::TxnPoints, STORE_FORMAT_FILE};
 
 	fn bd(s: &str) -> BigDecimal {
