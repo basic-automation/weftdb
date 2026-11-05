@@ -1,0 +1,194 @@
+# The WeftDB server as a systemd service (1.0 plan PAC-11, issue #306).
+#
+# This is the host half of the deployment story: the container (packaging/docker/Dockerfile)
+# and this unit configure the *same* variables and read the *same* registry — a deployment
+# that moves from one to the other moves its environment file, not its configuration.
+#
+# Do not run this file directly. Install it with scripts/packaging/install-host.sh, which
+# writes it to <prefix>/lib/systemd/system/ with its ExecStart rewritten to the prefix it is
+# given and its environment file to <prefix>/etc/weftdb/weft-server.env; then
+#
+#     systemctl daemon-reload
+#     systemd-sysusers /usr/lib/sysusers.d/weftdb.conf
+#     systemd-tmpfiles --create /usr/lib/tmpfiles.d/weftdb.conf
+#     systemctl enable --now weft-server
+#
+# The three commands above are what scripts/packaging/test-host-install.sh proves on a
+# throwaway tree in CI (issue #306: "host-install CI").
+#
+# ── What this unit is responsible for ───────────────────────────────────────────────────
+# The identity, the filesystem the process may see, and the restart policy. Everything about
+# *behaviour* — bind address, store scope, authentication, TLS, grace — lives in
+# /etc/weftdb/weft-server.env, because every name there is registered with a tier, a default
+# and a reader in weft-server/src/settings.rs and the server refuses, at exit 78, a name it
+# does not know or a value outside the shape its entry accepts (PAC-5b). Editing the unit to
+# change behaviour would move configuration out of the one surface that validates it.
+
+[Unit]
+Description=WeftDB time-series server
+Documentation=https://github.com/basic-automation/weftdb/tree/main/packaging
+Documentation=https://github.com/basic-automation/weftdb#running-as-a-systemd-service
+# The server does not need the network to start — it binds whatever it is given and a failed
+# bind is its own error — but an operator who enables this unit expects it to answer on its
+# bind address the first time, so it starts after the network is actually up rather than
+# after systemd notices an interface. network-online.target is the standard way to ask.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# `exec`, not `simple`: the process that ExecStart spawns is the service, and systemd
+# considers it started once the binary has been executed. WeftDB has no readiness protocol
+# (it does not talk to systemd: no `libsystemd`, no `NotifyAccess`); readiness is the
+# `GET /ready` probe, which is what the container health check uses and what an operator or
+# a load balancer should use. `exec` also means a binary that fails to load — a missing
+# interpreter, a glibc floor the host does not meet — is a start failure, not a silent
+# success. The floor is glibc 2.28 (PAC-2/PAC-9), so an RHEL-8-era host is exactly the case this
+# catches: the dynamic loader writes its own reason to the journal, and `Type=exec` turns it into
+# `failed` instead of a green start.
+Type=exec
+
+# The identity from packaging/systemd/weftdb.sysusers. Nothing in the deployment needs more
+# than this: the data directory and the backup directory are its own, the keys file is owned
+# by it or group-readable to it, and a privileged helper would have to be written, so there
+# is no privilege to escalate into (`NoNewPrivileges` below is therefore free).
+User=weftdb
+Group=weftdb
+
+# /var/lib/weftdb, created 0750 root-owned with weftdb:weftdb able to write it, by systemd
+# itself — which is why this unit starts on a host where no one has run an install step for
+# directories. `StateDirectory=` is the reason packaging/systemd/weftdb.tmpfiles holds only
+# the runtime directory.
+StateDirectory=weftdb
+# The store root is *inside* the state directory so that one path is the whole deployment:
+# backing up or moving /var/lib/weftdb moves the store, its `<store root>/backups` directory
+# (WEFT_BACKUP_DIR's default) and the logs together. Both names are Stable-tier: they are
+# what 1.0 promises, and a deployment's environment file can override either.
+Environment=WEFT_DATA_DIR=/var/lib/weftdb
+Environment=WEFT_SEGMENT_STORE_ROOT=/var/lib/weftdb/store
+# Loopback by default. The server refuses a non-loopback plaintext bind without TLS or keys
+# (SEC-8's exposure matrix), so an operator who wants to serve a network edits the
+# environment file and takes that decision explicitly — it is not a default a package should
+# make. `EnvironmentFile=` below is loaded after these, so it overrides them.
+Environment=WEFT_SERVER_ADDR=127.0.0.1:8080
+# The operator's file: every WEFT_* the deployment needs, one per line, no `export`, no
+# shell. The leading `-` means a missing file is fine: a fresh install serves loopback with
+# no keys, which is a working development node, and the packaging ships a commented template
+# to /usr/share/doc/weftdb/ for the operator to copy into place (install-host.sh will not
+# overwrite a file it did not write, so edits survive an upgrade).
+EnvironmentFile=-/etc/weftdb/weft-server.env
+# Rewritten to the install prefix by scripts/packaging/install-host.sh.
+ExecStart=/usr/local/bin/weft-server
+WorkingDirectory=/var/lib/weftdb
+
+# ---------------------------------------------------------------------------
+# Restart and shutdown
+# ---------------------------------------------------------------------------
+# `on-failure`, not `always`: the two non-zero exits that need a human are exit codes, and a
+# service that restarts in a loop hides them in a journal the operator is not reading.
+# PAC-5b/C7's classes: 78 is a configuration refusal (a name the registry does not know, a
+# value outside its shape, an unmounted keys file), 65 is a store needing operator action (a
+# newer layout, a scope mismatch, frames without a trailer). Both are fixed by editing the
+# environment file or the store, not by restarting.
+Restart=on-failure
+RestartSec=5s
+# A cold start on a large store is open-recovery: reading frames, finding the tail. 120 s is
+# generous for a node whose segments are local; it is a start timeout, not a health timeout —
+# systemd does not poll `GET /ready` here.
+TimeoutStartSec=120
+# The stop budget has to exceed the drain the server actually performs: live connections get
+# WEFT_SHUTDOWN_GRACE_SECS (default 5 s), the remainder are aborted, then the task drain runs
+# and the store closes. SIGTERM is the graceful path (D-S14's C9 drain); SIGKILL after this
+# timeout is the ungraceful one, and it is what leaves frames without a trailer for
+# open-recovery to sort out — so the budget is deliberately wide. An operator who raises the
+# grace above ~60 s must raise this with it, and that is in the env file's comments rather
+# than here because the grace is configuration.
+TimeoutStopSec=90
+KillSignal=SIGTERM
+
+# WEFT_MAX_CONNECTIONS defaults to half the process's RLIMIT_NOFILE soft limit, clamped to
+# 16..=65,536 (1,024 when the limit cannot be read). systemd's default soft limit is 1,024,
+# which would therefore mean 512 connections at once and the rest waiting unread in the
+# listen backlog; a node serving a fleet of collectors wants the clamp's ceiling instead.
+LimitNOFILE=65536
+
+# ---------------------------------------------------------------------------
+# Filesystem and kernel isolation
+# ---------------------------------------------------------------------------
+# Everything below was chosen against what this binary does, not copied from a hardening
+# list; the two lines that are *off* are commented for the same reason the rest are on.
+NoNewPrivileges=yes
+ProtectSystem=strict
+# Read-only /usr, /etc, /boot; /var stays writable only where named. The state directory is
+# writable because `StateDirectory=` says so — the store, its backups and its write-ahead
+# frames are the only thing this process writes by design.
+ReadWritePaths=/var/lib/weftdb
+# `ProtectHome=yes` is why the unit sets WEFT_DATA_DIR explicitly: a bare `weft-server`
+# defaults its data directory to ~/.weftdb/data, and here /home is not merely read-only, it
+# is absent. A deployment that *wants* a home-directory store has to disable this line and
+# say so in the drop-in, which is the point.
+ProtectHome=yes
+# A private /tmp, and with `ProtectSystem=strict` it is more than tidiness: strict makes the
+# hierarchy read-only, and a process with no writable temporary directory cannot run its own
+# database. Measured on a rootless run of this property list, where /tmp stayed read-only: the
+# store refused to open at migration 0001_baseline with
+# `segment_index transaction failed with an error before COMMIT: BEGIN CONCURRENT: I/O error
+# (tempdir): read-only filesystem or storage medium`, and pointing `TMPDIR` at a directory inside
+# `ReadWritePaths=` was what let the same store open. So the line stays on, and an operator who
+# turns it off in a drop-in on a strict host has to give the service a temporary directory
+# another way — `Environment=TMPDIR=/var/lib/weftdb/tmp` is enough, and the store's own frames,
+# write-ahead log and backups stay in the state directory either way.
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+# The server listens on TCP and does not create sockets of any other family. If a deployment
+# adds a UNIX-socket proxy upstream that needs the *server* to speak on one, add AF_UNIX —
+# but the bind surface is WEFT_SERVER_ADDR, a socket address, so it does not.
+RestrictAddressFamilies=AF_INET AF_INET6
+# Verified against this binary rather than assumed: the block above, this line included, was
+# started around the real server with `systemd-run --user --wait` carrying the same property list
+# (copied verbatim from this unit), the unit's own `Environment=` lines giving it its bind address
+# and store. The server reached `GET /ready` with 200 and served a storage ingest. See
+# scripts/packaging/test-host-install.sh, which repeats that run against the unit file as it stands;
+# README.md, "Running as a systemd service", is the operator-facing version of the same reasoning.
+
+# W^X for the process. This one is worth the argument, because a server that loaded code at run
+# time would hang or die at start under it — and it does not: nothing in this workspace JITs,
+# embeds a wasm engine or calls `dlopen` (`rg -i 'wasmtime|cranelift|dlopen|PROT_EXEC'` over the
+# workspace is empty), and the verification run above calibrated its GPU backends with that
+# mapping class denied: the journal from that unit reads
+# `GPU ready: NVIDIA GeForce RTX 4070 Ti SUPER (vulkan, discrete), f64 supported`, which is a
+# driver compiling SPIR-V at run time while W^X was in force. A host whose GPU stack genuinely needs a mapping that is both writable and
+# executable would fail to start rather than answer wrongly, and the escape hatch is a one-line
+# drop-in next to `PrivateDevices` below.
+MemoryDenyWriteExecute=yes
+
+# ---------------------------------------------------------------------------
+# The two protections this unit deliberately does not enable
+# ---------------------------------------------------------------------------
+# `PrivateDevices=yes` would hide /dev/dri and take the GPU away. WEFT_GPU_CALIBRATE
+# (Experimental) auto-calibrates only when a real GPU is present, so with PrivateDevices the node
+# would silently lose the backends it was sized for and fall back to rayon/single-core
+# interpolation. That path is not hypothetical on this project's hardware: the verification run
+# behind the note above compiled Vulkan compute onto an NVIDIA RTX 4070 Ti SUPER from inside the
+# hardened unit, which is only possible while /dev/dri is visible. A GPU-less host may enable it;
+# a GPU node must not. The same reasoning is why nothing here touches /dev at all, and why there is
+# no `DevicePolicy=closed` line either — it would deny the very same render nodes.
+#
+# `ProtectProc=invisible` and `ProcPID=` are left off for the same class of reason: the operator
+# tools on the same host read process information to work out which node is doing what, and the
+# store's own recovery diagnostics name PIDs. Neither property changes what the server can reach
+# through its own directories, which is where the real blast radius lives.
+
+# ---------------------------------------------------------------------------
+# Operator overrides go in a drop-in, not in this file
+# ---------------------------------------------------------------------------
+#     systemctl edit weft-server
+# writes /etc/systemd/system/weft-server.service.d/override.conf. A package manager (or a
+# re-install) replaces this file; it never touches the drop-in directory.
