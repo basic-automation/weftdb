@@ -101,7 +101,7 @@ async fn test_pipeline_dictionary_mut_no_panic() -> Result<()> {
 	let (db, aspect_id) = setup_test_db(&db_name).await?;
 
 	// Create a pipeline without adding any dictionaries
-	let mut pipeline = weft_orchestration::Pipeline::builder(db, aspect_id).build().await?;
+	let pipeline = weft_orchestration::Pipeline::builder(db, aspect_id).build().await?;
 
 	// This should return None instead of panicking
 	// Spawn in a task to catch any panics as JoinError
