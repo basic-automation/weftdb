@@ -170,7 +170,8 @@ pub struct Adoption {
 	pub restore_mode: bool,
 	/// Orphan frames adopted into the index (D-S16, R8).
 	pub adopted: usize,
-	/// Orphan frames journaled `held` until TAG-9 binds series keys.
+	/// Tagged orphan frames journaled `held` because their aspect is not declared
+	/// yet: a later open adopts them once it is (TAG-9).
 	pub held: usize,
 	/// Rows quarantined by the pass.
 	pub quarantined: usize,
@@ -270,7 +271,7 @@ fn emit(report: &Report, json: bool) {
 	println!("  {} frame(s) verified, {} row(s) and {} bytes of control plane", report.frames, report.rows, report.bytes);
 	println!("  restore took {} ms", report.duration_ms);
 	match &report.adoption {
-		Some(adoption) if adoption.restore_mode => println!("  adopted {} frame(s) into the index ({} held for series keys), {} quarantined, {} suspect, opened as {}/{} in {} ms", adoption.adopted, adoption.held, adoption.quarantined, adoption.suspected, adoption.database, adoption.subject, adoption.duration_ms),
+		Some(adoption) if adoption.restore_mode => println!("  adopted {} frame(s) into the index ({} held for an undeclared aspect), {} quarantined, {} suspect, opened as {}/{} in {} ms", adoption.adopted, adoption.held, adoption.quarantined, adoption.suspected, adoption.database, adoption.subject, adoption.duration_ms),
 		Some(adoption) => println!("  opened as {}/{} in {} ms: nothing to adopt (a control-plane restore carries no frames)", adoption.database, adoption.subject, adoption.duration_ms),
 		None => println!("  adoption runs at the first open of the restored root; add --adopt to run it now"),
 	}

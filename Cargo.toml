@@ -108,7 +108,9 @@ weft-arrow-store = { path = "./weft-arrow-store", version = "0.2.0" }
 arrow-array = "60"
 arrow-schema = "60"
 arrow-ipc = "60"
-parquet = { version = "60", default-features = false, features = ["arrow"] }
+# `snap`: Snappy is the default codec of pyarrow, R's arrow, pandas and Spark, so a reader
+# without it refuses the Parquet most clients send (pure Rust, BSD-3-Clause).
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
 bytes = "1"
 csv = "1"
 indexmap = "2"

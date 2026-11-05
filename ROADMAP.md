@@ -59,7 +59,12 @@ Interchange and output are covered too: Parquet and CSV in, columnar Arrow/Parqu
 - [ ] Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)
   - [x] **Python SDK** (2026-11-03): `clients/python` (package `weftdb`), standard-library only with `pyarrow` as the optional `arrow` extra. It covers every route: compute, catalog, the four ingest formats with `Idempotency-Key`, stored reads with cursor-following iterators, maintenance, backup and the bench runs. Storage values travel as `Decimal`/text and a `float` is refused at that boundary. The unit tests run against an in-process fake; `tests/test_live.py` is the contract test against a real `weft-server`, which CI runs on Linux after the build.
   - [x] **Rust SDK** (2026-11-04): `weft-client`, async on `reqwest`, covering the same routes. Stored values are written from any `StoredValue` (decimal text, `BigDecimal`, integers) and read back as `BigDecimal`; `f64` does not implement `StoredValue`, so the float boundary is a compile error rather than a runtime refusal. Cursor-following reads are `Stream`s, refusals are one `Error` carrying the whole envelope, and an overloaded read is retried after `Retry-After`. Features: `rustls` (ring provider, platform or supplied roots) and `arrow` (Arrow IPC and Parquet to `RecordBatch`). `tests/fake.rs` pins the client's own behaviour against a fake server; `tests/live.rs` is the contract test against a real `weft-server`, which CI runs on Linux after the build.
+  - [x] **Arrow Flight** (2026-11-04): an opt-in, read-only gRPC listener (`WEFT_FLIGHT_ADDR`, experimental, loopback only since it is plaintext). `DoGet` takes a JSON ticket (`aspect` with `start`/`end`, or `lo`/`hi`) and streams the same typed record batch the Arrow range routes encode; `GetFlightInfo`, `GetSchema` and `ListFlights` describe the declared aspects. Keys and the `read` scope apply as on HTTP, denials are audited, a query gate sheds load as `UNAVAILABLE`, and refusals keep their envelope code in `x-weft-error-code`. `weft-server/tests/flight.rs` drives it with the Arrow project's `FlightClient`. Writes stay on HTTP.
+  - [ ] **Flight SQL**: waits for the SQL surface (DataFusion, later): Flight SQL is SQL statements over Flight, and there is no SQL engine to answer them yet.
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
+  - [x] **Grafana** (2026-11-04): `GET /api/v1/grafana`, `POST …/metrics` and `POST …/query` answer the community JSON datasource (`simpod-json-datasource`), experimental and in the `read` scope. A panel's targets are aspects; each is the stored downsample over the panel's range at its interval (capped at `maxDataPoints`), the reduction picked per target (`agg`, default `avg`). `packaging/grafana/weftdb-datasource.yaml` provisions it; the unit test in `weft-server/src/grafana.rs` charts a stored aspect through the router.
+  - [ ] **Prometheus remote write/read**: follows **B-tags**. A remote-write series is a metric plus a label set, and without per-measurement tags each label set would become its own aspect (DECISIONS 2026-11-04).
+  - [x] **R/Arrow workflows** (2026-11-04): `clients/r` (package `weftdb`) reads stored windows, value bands and server-side downsamples as Arrow tables, pages the exact JSON rows, and writes data frames or Arrow tables as one Parquet batch with `Idempotency-Key`. Refusals are `weft_<code>` conditions. `tests/testthat/test-live.R` is the contract against a running server. It found that Parquet ingest refused Snappy, the default codec of R's arrow, pyarrow, pandas and Spark; the workspace's `parquet` now reads it.
 
 ### Phase 3 — Instrument everything · *Very high*
 
@@ -89,7 +94,8 @@ Out-of-order data is fully handled (4.6): in-place per-segment sort, cross-segme
     - *Landed 2026-10-27 (`w2/qprune-read-path`). Three levels, each at the layer that owns the decision: `SegmentIndexStore::prune_present_descriptors` (`weftdb/src/types/segment_index.rs`) is the SQL mirror of `SegmentIndex::prune_present_by_time` (`weft-physical-type/src/catalog.rs:395`) and is what `SegmentStore::read_point`/`read_points` now prune with, so a segment indexed as all-null never has its file opened; `read_segment_point(s)`/`read_paged_segment_point(s)` (`weft-physical-type/src/weftseg.rs`) drop a fully null frame and fully null pages from the persisted stats, reached through `read_frame_point(s)`.*
     - *Deliberately not pruned: `read_time_range` returns null rows, so dropping a segment there would delete timestamps the caller asked for — a range read over a window holding a corrupt all-null frame still reports the damage, which is what pins this boundary in `point_reads_prune_an_all_null_segment_without_opening_it`. `read_segment_instant` — the last-writer-wins reader behind `Segment::query`/`query_as_of` — is not pruned either, because skipping a segment can change which segment wins. `prune_by_time` stays the ingest primitive for the same reason (`weft-reduce/src/windowed.rs:55`, `bounded.rs:57`). The page-level `prune_present_pages_by_time` (`page.rs:364`) stays a resident-index helper: the store's range reads stream values straight out of blocks, where an all-null page costs one u64 header compare and appending its nulls is cheaper than filtering them back out.*
     - *Extended 2026-10-28 (same branch): `downsample_range` now prunes with `prune_present_descriptors` too. A null row is part of a range read's answer but not of a bucket's: it enters no sum, count, min, max, first or last, and a partial holding nothing is dropped when buckets merge, so a window covered only by nulls yields no buckets rather than a run of empty ones. `an_all_null_segment_changes_no_bucket_of_a_downsample` pins that against the single-pass `reduce` over the live rows, at two resolutions and seven aggregations, including a window the null segment covers alone.*
-  - [ ] Tag pruning *(blocked on B-tags — per-measurement tags/labels don't exist yet)*
+  - [x] Tag pruning
+    - *Landed 2026-11-04 (`p4/tag-pruning`, #158). A read of one series prunes in SQL before any file opens: migration `0007_series_time_index` (layout 2, best effort) adds `idx_segment_index_series_time` on `segment_index(aspect, series_id, min_ts, max_ts)`, which `prune_rows` names for a series-bound prune and falls back from to the time index, then to a scan (`weftdb/src/types/segment_index.rs`). The seek's span bound is kept per `(aspect, series)`, so one wide series no longer widens every other's seek. `resolve_series` reads a per-aspect catalog cache that every `RegisterSeries` transaction forgets once it runs, and matches with the zero-allocation `SeriesSelector::matches_key` (`weft-physical-type/src/tags.rs`). `a_tagged_read_among_a_thousand_series_opens_only_its_own_frames` overwrites every other series' frame with garbage and still reads its own.*
 - [ ] **4.6 Correctness semantics**
   - [ ] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
 
@@ -215,7 +221,7 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 `splimes` 1.0 is released and WeftDB depends on it, and the control-plane engine decision is made.
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
-- [ ] **B-tags**
+- [x] **B-tags**
 
 ### Security & packaging *(Phase 8 minimum)*
 
@@ -388,12 +394,12 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] maint lane
   - [ ] open lane
   - [ ] L-INGEST
-  - [ ] storage read handlers lane
+  - [x] storage read handlers lane (TAG-10)
   - [ ] **FRE-10a** Contract tests
   - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [ ] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
-  - [ ] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
+  - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
   - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
   - [ ] read lane
   - [ ] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
@@ -429,7 +435,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 
 The interpolation item (B-interp, Phase 5) is done.
 
-- [ ] **B-tags** *(Phase 2/4 · absent)*
+- [x] **B-tags** *(Phase 2/4 · done: TAG-5..TAG-11)*
 - [ ] **B-conn** *(Phase 2/7 · absent)*
 - [ ] **B-ilp** *(Phase 2 · partial)*
 - [ ] **B-rest** *(Phase 2 · partial)*

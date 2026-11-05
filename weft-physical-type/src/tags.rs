@@ -603,6 +603,42 @@ impl SeriesSelector {
 		!self.exact || tags.len() == valued
 	}
 
+	/// [`matches`](Self::matches) on a canonical [`SeriesKey`], without building a
+	/// [`TagSet`] or allocating: one merge walk over the key's pairs and the matchers,
+	/// both sorted bytewise by key. What a read resolving a selector against a whole
+	/// series catalog calls once per series.
+	#[must_use]
+	pub fn matches_key(&self, key: &SeriesKey) -> bool {
+		let mut pairs = Iter { rest: key.as_str() }.peekable();
+		let mut seen = 0_usize;
+		let mut valued = 0_usize;
+		for (wanted_key, wanted) in &self.matchers {
+			let mut found = None;
+			while let Some(&(candidate, value)) = pairs.peek() {
+				match candidate.cmp(wanted_key) {
+					Ordering::Less => {
+						pairs.next();
+						seen += 1;
+					}
+					Ordering::Equal => {
+						found = Some(value);
+						pairs.next();
+						seen += 1;
+						break;
+					}
+					Ordering::Greater => break,
+				}
+			}
+			match wanted {
+				Some(value) if found != Some(&**value) => return false,
+				Some(_) => valued += 1,
+				None if found.is_some() => return false,
+				None => {}
+			}
+		}
+		!self.exact || seen + pairs.count() == valued
+	}
+
 	/// The matchers as `(key, value)` pairs, in ascending bytewise order of key; a value of
 	/// [`None`] means the tag must be absent.
 	#[must_use]
@@ -1444,6 +1480,8 @@ mod tests {
 		for (selector, expected) in &table {
 			let got: Vec<bool> = sets.iter().map(|set| selector.matches(set)).collect();
 			assert_eq!(got, expected.to_vec(), "{selector:?}");
+			let on_keys: Vec<bool> = sets.iter().map(|set| selector.matches_key(set.series_key())).collect();
+			assert_eq!(on_keys, expected.to_vec(), "matches_key: {selector:?}");
 		}
 	}
 
@@ -1466,7 +1504,21 @@ mod tests {
 			let valued: BTreeMap<&str, &str> = matchers.iter().filter_map(|(key, value)| value.map(|value| (*key, value))).collect();
 			let expected = every_matcher_holds && (!exact || model == valued);
 			assert_eq!(selector.matches(&set), expected, "{selector:?} on {set:?}");
+			assert_eq!(selector.matches_key(set.series_key()), expected, "matches_key: {selector:?} on {set:?}");
 		}
+	}
+
+	/// A stored key may carry a reserved `__` key no selector can name: a loose selector
+	/// skips it like any other unnamed tag, and an exact one never matches it.
+	#[test]
+	fn matches_key_treats_a_reserved_key_as_an_unnamed_tag() {
+		let key = SeriesKey::from_canonical(b"__shard\x1f1\x1ehost\x1fa").expect("canonical bytes");
+		let loose = SeriesSelector::new([("host", Some("a"))]).expect("valid");
+		let exact = SeriesSelector::exact([("host", Some("a"))]).expect("valid");
+		assert!(loose.matches_key(&key));
+		assert!(!exact.matches_key(&key));
+		assert_eq!(loose.matches_key(&key), loose.matches(&TagSet::from(key.clone())));
+		assert_eq!(exact.matches_key(&key), exact.matches(&TagSet::from(key)));
 	}
 
 	#[test]

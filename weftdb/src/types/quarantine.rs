@@ -160,11 +160,23 @@ pub struct RecoveryReport {
 	/// Files under `segments/` no index row or journal entry claims, counted
 	/// whether or not the pass quarantined them.
 	pub orphans: usize,
-	/// Orphan frames a restore-mode pass adopted into the index (D-S16, R8).
+	/// Orphan frames a restore-mode pass adopted into the index (D-S16, R8),
+	/// plus held frames a later pass released into it (TAG-9).
 	pub adopted: usize,
-	/// Orphan frames a restore-mode pass journaled `held` because they carry
-	/// a `SERIES_KEY` extension, until TAG-9 binds series keys (D-S16).
+	/// Orphan frames a restore-mode pass journaled `held`: they carry a
+	/// `SERIES_KEY` extension and their aspect has no declared schema, so
+	/// there is no catalog to bind the key in yet (D-S16, TAG-9). A later pass
+	/// adopts them once the aspect is declared.
 	pub held: usize,
+	/// Rows whose series id was rebound to the series their frame's
+	/// `SERIES_KEY` names (TAG-9): the catalog key under the row's id differed
+	/// from the frame's, or the row moved to another aspect and its key was
+	/// resolved again there. Each is also counted in `rebound`.
+	pub series_rebound: usize,
+	/// Held journal rows cleared without an adoption (TAG-9): the held frame
+	/// was missing, held no rows, or named no aspect, so nothing could ever
+	/// adopt it.
+	pub held_cleared: usize,
 	/// Rows whose indexed path escapes `segments/` and were left exactly where
 	/// they are: recovery never moves a file it cannot contain.
 	pub skipped_outside_segments: usize,

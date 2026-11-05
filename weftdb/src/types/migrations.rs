@@ -56,6 +56,12 @@
 //!   empty table and nothing else changes, so an older layout-2 build reads it exactly
 //!   as before. It stays at layout 2 by the rule in `store_format` (every pre-1.0
 //!   migration belongs to layout 2), not at the layout 3 plan C1 names; see DECISIONS.md.
+//! - **`0007_series_time_index`** (layout 2): `idx_segment_index_series_time` on
+//!   `segment_index(aspect, series_id, min_ts, max_ts)` (Phase 4 tag pruning), which a
+//!   prune bound to one series names. Best effort, like the time index of
+//!   `0001_baseline`: a store that cannot build it still opens, and its series prunes
+//!   fall back to the time index. An older layout-2 build never names it, so it reads
+//!   and writes the store exactly as before.
 
 use std::collections::BTreeSet;
 
@@ -128,7 +134,7 @@ pub(crate) struct Floors {
 /// Every registered migration, in id order. An id is four digits, an underscore, and a
 /// lower snake_case name: the digits are the ordinal that `pending` and `after` select on,
 /// so the numbering rule is part of the registry's contract and the test below asserts it.
-pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }, Migration { id: "0005_d_s13", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s13, rederive: None }, Migration { id: "0006_tag5_series", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: tag5_series, rederive: None }];
+pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }, Migration { id: "0005_d_s13", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s13, rederive: None }, Migration { id: "0006_tag5_series", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: tag5_series, rederive: None }, Migration { id: "0007_series_time_index", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: series_time_index, rederive: None }];
 
 /// The ordinal of a migration id: its leading digits (`0002_s6_s7` → 2). An id without
 /// them sorts first.
@@ -479,6 +485,24 @@ fn tag5_series<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
 	})
 }
 
+/// The composite index `0007_series_time_index` adds: a series-bound prune seeks
+/// `(aspect, series_id)` and then the time span, so it reads only that series' rows
+/// near its window rather than every series' rows there.
+const SEGMENT_INDEX_SERIES_TIME_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_segment_index_series_time ON segment_index(aspect, series_id, min_ts, max_ts)";
+
+/// `0007_series_time_index`: the series-time index in `segment_index.db`, best effort.
+/// A failure to build it is logged, not fatal: the prune falls back without it.
+fn series_time_index<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
+	Box::pin(async move {
+		let Some(index) = cp.index else { return Ok(()) };
+		let conn = connect(index.db).await.with_context(|| format!("{}: connecting", index.name))?;
+		if let Err(e) = conn.execute(SEGMENT_INDEX_SERIES_TIME_INDEX, ()).await {
+			tracing::warn!(database = index.name, error = %e, "could not create the segment_index series-time index; series prunes use the time index instead");
+		}
+		Ok(())
+	})
+}
+
 /// `0004_d_s12`: the C5 quarantine columns in `segment_index.db`.
 fn d_s12<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
 	Box::pin(async move {
@@ -617,15 +641,16 @@ mod tests {
 	#[test]
 	fn pending_and_after_select_by_applied_set_and_by_ordinal() {
 		let applied: BTreeSet<String> = ["0001_baseline".to_string()].into();
-		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
+		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
 		assert_eq!(pending(REGISTRY, &BTreeSet::new()).len(), REGISTRY.len());
 		assert_eq!(after(REGISTRY, None).len(), REGISTRY.len());
-		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
-		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
-		assert_eq!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
-		assert_eq!(after(REGISTRY, Some("0004_d_s12")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0005_d_s13", "0006_tag5_series"]);
-		assert_eq!(after(REGISTRY, Some("0005_d_s13")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0006_tag5_series"]);
-		assert!(after(REGISTRY, Some("0006_tag5_series")).is_empty());
+		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
+		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
+		assert_eq!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
+		assert_eq!(after(REGISTRY, Some("0004_d_s12")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
+		assert_eq!(after(REGISTRY, Some("0005_d_s13")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0006_tag5_series", "0007_series_time_index"]);
+		assert_eq!(after(REGISTRY, Some("0006_tag5_series")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0007_series_time_index"]);
+		assert!(after(REGISTRY, Some("0007_series_time_index")).is_empty());
 		assert!(after(REGISTRY, Some("0009_future")).is_empty(), "a newer marker's ordinal is past everything here");
 		assert_eq!(floors(pending(REGISTRY, &applied)), Some(Floors { layout: 2, min_read: 2, min_write: 2 }));
 		assert_eq!(floors(Vec::<&Migration>::new()), None);
