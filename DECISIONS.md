@@ -4,6 +4,46 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-04 — Phase 2 integrations: what was built, and the two items left with a reason (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** Phase 2's two remaining roadmap lines chain six items with arrows —
+"Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)" and
+"Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows" — and name none
+of their shapes. The owner asked for Phases 2 and 3 to be completed, best judgement, one CI run
+at the end.
+
+**Chosen:**
+
+- **Arrow Flight, read-only, opt-in, loopback only** (`WEFT_FLIGHT_ADDR`, experimental). Flight
+  is gRPC over HTTP/2 and the serve path is HTTP/1.1 (SEC-4), so it is a second listener, not a
+  route. It binds loopback only because it is plaintext: SEC-5's plaintext gate refuses a
+  non-loopback plaintext bind for the HTTP listener, and a Flight call carries the same bearer
+  key. Reads only, because writes carry idempotency keys, the ingest byte budget and audit
+  records on the HTTP path, and a second write path would have to re-earn all three. Tickets
+  are JSON naming the same two reads the HTTP Arrow routes serve. Auth, the `read` scope,
+  `auth_denied` audit events and a query gate sized like the HTTP one carry over.
+- **Grafana through the community JSON datasource**, not a native plugin. A native datasource
+  is a separately built, signed TypeScript-and-Go project; `simpod-json-datasource` is
+  installable today and speaks three calls, which three experimental `read`-scope routes
+  answer with the stored downsample, so the reduction runs in the store.
+- **R/Arrow as an R package** (`clients/r`) over the HTTP Arrow and Parquet routes, with
+  Flight described for long windows rather than wrapped (R's `flight_connect` goes through
+  `pyarrow` via `reticulate`).
+- **Parquet ingest reads Snappy.** Found by the R contract test: the workspace built `parquet`
+  without its `snap` feature, so a file from R's arrow, pyarrow, pandas or Spark (all Snappy by
+  default) was refused `400`. `snap` is pure Rust (BSD-3-Clause).
+
+**Left, with the reason:**
+
+- **Prometheus remote write/read** — the line is conditional ("if monitoring"), and the
+  condition is not met by the data model: a remote-write series is a metric name plus a label
+  set, and WeftDB has no per-measurement tags yet (backlog **B-tags**, absent). Mapping each
+  label set to an aspect name would mint unbounded aspects from label cardinality, which is
+  the failure B-tags exists to design out. It follows B-tags.
+- **Flight SQL** — Flight SQL is SQL statements carried over Flight; with no SQL engine there
+  is nothing to answer them. It follows the SQL surface (DataFusion), which the roadmap marks
+  "later".
+
 ## 2026-11-03 — SOA-10: derived-read checks judge the stored downsample's buckets against the model, exactly (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6, W6) lists SOA-10 by name only — "Derived-read
@@ -4012,3 +4052,233 @@ test") and FRE-18 ("layout-2 baseline fixtures") both name layout 2 as the 1.0 b
 with a re-derive hook (B2): it would be the first production use of `rederive` and still
 protects only development stores. `PRIMARY KEY (aspect, series_id)` plus `UNIQUE (aspect,
 series_key)`: the unique index is the part that cannot be relied on.
+
+## 2026-11-04 — TAG-7: tagged frames are a critical series-key envelope, the id is resolved at commit, and each aspect has a series cap (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** issue #441 names the slice only ("seal-lane tags work"). The design note's PR 2
+and its critique (B7-B9) fix the shape; where they disagree the critique wins. The library gate
+stays shut (tags D5), so nothing outside the crate's tests writes a tagged batch yet.
+
+**Chosen:**
+
+1. **Frame identity (tags D3).** A tagged batch's frames are each wrapped in a v7 envelope with
+   exactly one extension, `EXT_SERIES_KEY`, `critical: true`, whose payload is the canonical
+   `SeriesKey` bytes. The frame never records the id. An untagged frame is not enveloped and is
+   byte-identical to what `ingest` sealed before this slice; a test pins its CRC to the value
+   measured on the pre-TAG-7 commit. `byte_len` and `frame_crc` are the wrapped frame's (the
+   envelope ends in its own CRC, which is what the durable write reads off the trailer), so
+   `read_bound_frame` and fsck's checks need no change. `critical: true` is kept although the
+   critique calls the rationale weak (B10): it is harmless, and a build that cannot bind the key
+   must not serve the rows as untagged.
+2. **Chunking.** A tagged batch is cut to `MAX_ENCODED_FRAME_BYTES` less the envelope's worst
+   case (16 + 6 + key bytes, at most 1,046), so the wrapped frame still fits the target. Only
+   tagged batches pay it; an untagged batch is cut exactly as before.
+3. **`format_version` (critique B7).** The descriptor, and so `IngestResponse.format_version`,
+   records the **body's** layout: 5 single-block, 6 paged, never 7. Readers already choose
+   their decoder from the frame's own header (X-FRAME), so the number is a description, and
+   the body is what a caller can compare across tagged and untagged writes. The envelope is
+   documented on `IngestResponse` and counted in `byte_len`. Pinned by
+   `tagged_ingest_writes_a_critical_series_key_envelope`.
+4. **Series resolution at commit.** `publish_ingest` resolves the key under the aspect's commit
+   lock, in the same `IndexTxn` as the rows: the catalog's id when the key is registered;
+   otherwise `aspect_seq.next_series_id`, pushed as `RegisterSeries` plus `SeedSeries`. Every
+   row's `series_id`, the receipt's and the ledger's `series_ids` carry that id. A `Conflict`
+   on the registration is an error, not retried (critique B8): only ingest registers series,
+   and only under the commit lock. A crash before the commit leaves the frame as ordinary
+   crash litter and leaks no id (`a_power_cut_between_tagged_frames_leaves_no_catalog_row_without_rows`).
+5. **Gate split.** Public `ingest` is `ingest_inner(.., TagPolicy::Refuse)` and still answers
+   `GroupsUnsupported`. `TagPolicy::Allow` is crate-private and, until TAG-8, constructed only
+   by tests. Reserved `__` keys are not refused on that path yet; that check belongs to the
+   gate flip (critique D17).
+6. **`IngestBatch::series_ids()` is removed (critique B9).** Correction to B9's premise: the
+   method did ship, in `weftdb` 0.2.0 on crates.io (v0.2.0 published the library crates). It is
+   removed anyway, because it could only ever answer `[0]` and a tagged batch's id does not
+   exist until commit; the pre-1.0 policy allows the break in the next minor release, and
+   CHANGELOG marks it as breaking. Deprecating instead would leave a method that answers wrong
+   for every tagged batch.
+7. **Series cap.** `StoreError::SeriesLimit { aspect, limit }` and
+   `SegmentStoreOptions::max_series_per_aspect` (`DEFAULT_MAX_SERIES_PER_ASPECT` = 100,000;
+   the number is a guess, as the design says). It counts the catalog's rows for the aspect
+   (series 0 never counts), is checked before any frame is written and again at commit under
+   the lock, and refuses only a new key. `weft-server` maps it to the existing `400
+   series_limit`. No operator setting is added; one Test-tier harness variable
+   (`WEFT_TEST_TAG_SEAL_CRASH_ROOT`) is, so the registry holds 84. A refusal at commit
+   (the race the pre-check cannot close) unlinks the frames that batch just wrote, so
+   recovery never journals a refused key's frames as orphans for TAG-9 to adopt.
+8. **Maintenance outputs keep their key.** `PlannedOutput` carries `Option<SeriesKey>`;
+   `swap_plans` looks up `series_key_of` once per tagged plan, and `write_output` wraps the
+   output in the same envelope. A plan whose series the catalog does not hold fails the swap.
+   This lands here, not in TAG-6, so that no commit ever puts an untagged frame under a
+   non-zero `series_id`.
+9. **No floor raise.** Following the TAG-5 entry and D1, nothing calls `ensure_floor`; the store
+   stays at layout 2.
+
+**Rejected:** writing the id into the frame (meaningless after a restore); allocating the id
+before the frame write (a catalog transaction outside the commit lock, and a crash would leak
+ids); retrying once on a registration `Conflict` (a dead path under the commit lock);
+reporting `format_version` 7 for a tagged frame (it would describe the wrapper rather than
+the data, and differ between two writes of the same rows).
+
+## 2026-11-04 — TAG-6: maintenance plans within one series; precedence, overlap stats and gates count per series; hot tail per series, aspect-wide threshold (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** issue #440 names the slice only ("maintenance lane"). The design note's PR 3 and
+its critique (C11-C14) fix the shape; where they disagree the critique wins. Tagged rows still
+come only from the crate's tests (the library gate opens in TAG-8), so nothing outside them
+reaches the per-series paths yet; an untagged aspect is one series and plans exactly as before.
+
+**Chosen:**
+
+1. **Partition first.** `overlap_components` splits an aspect's rows by `series_id` (`by_series`)
+   and sweeps each series on its own, so a component never mixes series (I12 is now guaranteed
+   upstream of `swap_plans`' bail). The M2 closure property holds per series, which is sound
+   only because a read targets one series (tags D4).
+2. **No batching across components (critique C11).** `reconcile_overlaps_held` already makes one
+   swap per component; it is unchanged. The design's batch test is dropped.
+3. **One swap per series (critique C12).** `squash_aspect` folds each series into its own output,
+   looping one series per `swap_plan` rather than putting a plan per series into one
+   transaction, so no swap nears `MAX_PLANS_PER_TXN` (32) whatever the series count, and
+   memory stays one series' merge. A failure leaves the series squashed before it squashed.
+   `squash_aspect_to_target_rows` groups consecutive ids within a series; the P1 argument is
+   restated per series (no other row *of the series* has an id between a group's members).
+4. **Gates count per series (critique C13).**
+   - `squash_aspect_if_exceeds`: the cap applies per series. The cheap aspect-wide count still
+     settles most ticks (no series holds more than the aspect); past it, only the series over
+     the cap are squashed.
+   - Fragmentation gate: after the O(1) rollup check, an aspect with registered series computes
+     `ideal = Σ max(1, ⌈rows_s / target⌉)` from its rows. That sum is never below the
+     aspect-wide ideal, so an untagged aspect (no catalog rows) still costs one rollup read.
+   - The overlap sweep's `had_overlap` is the per-series count, so a tagged aspect whose series
+     merely share a window is not reported as reconciled.
+5. **Precedence per series (critique C14, overriding the design's "leave it aspect-wide").**
+   `refuse_outranking_outputs` compares only rows of the members' series. Left aspect-wide, a
+   newer row of any other series in the window would refuse almost every `split_segment` and
+   P2 output of a tagged aspect.
+6. **Hot tail per series, aspect-wide threshold.** `reconcile_aspect_hot_cold` keeps each
+   series' highest id hot; the backlog it compares with `threshold` stays the aspect's unsorted
+   count, so a single knob stays and the untagged decision is unchanged.
+7. **Overlap stats per series, no descriptor field.** `aspect_stats().overlapping_segments`
+   and `store_overlapping_segments` sum `SegmentIndex::overlapping_count` over one index per
+   series built from the index rows. `SegmentDescriptor` gets no series field (its serde shape
+   is frozen).
+8. **Deviation: the daemon test.** The design asks for weft-server's
+   `every_tick_kind_isolates_a_truncated_frame` with a two-series aspect. weft-server cannot
+   write a tagged batch until the gate opens (only the crate-private `TagPolicy::Allow` can),
+   and a `fault-injection` hook would run only in a job that does not run the lib tests. The
+   same coverage lands in weftdb as
+   `every_sweep_kind_isolates_a_truncated_frame_beside_a_two_series_aspect`, which runs each
+   store-wide sweep the daemon's six tick kinds call; the weft-server test is unchanged and
+   gets its two-series variant when TAG-11 opens the HTTP gate.
+
+**Rejected:** batching plans across components or series into one transaction (no saving the
+swap needs, and it holds every merged series in memory at once); a series field on
+`SegmentDescriptor`; per-series metrics and sweep counters (deferred by the plan); a per-series
+backlog threshold for the hot tail (a second knob for no measured need).
+
+## 2026-11-04 — TAG-9 (part of #310): recovery binds series keys — tagged orphans adopted into their series, held rows released, indexed rows checked against their frame's key (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Minimal TAG-9 per design PR 5 with critique E19-E20. The broader C5 frame-error-class work
+of #310 is not done here.
+
+1. **`adopt_orphan` takes `Option<SeriesKey>`.** A tagged orphan resolves its key in the
+   frame's aspect — the catalog's id, or the aspect's next series id with `RegisterSeries` +
+   `SeedSeries` — in the same transaction as its `InsertNew` and allocator bump (plus
+   `ClearJournal` when it releases a held row). Adoption now runs under the aspect's commit
+   lock and takes its id from `CommitGuard::allocate`, rather than computing it from
+   `allocator_seed` beside the lock: a held row may be released by an fsck on a live store,
+   where an id handed out outside the lock would collide with the lock's cached allocator.
+   Ids may therefore start past a legacy-named file's id in `segments/`, as every seal's do.
+2. **No series cap in recovery.** The new `resolve_series_key` (shared with ingest's
+   `resolve_series`, which still checks `max_series_per_aspect` first) applies no cap: the
+   data already exists, and refusing to bind it would leave it invisible again.
+3. **Restore mode:** a decodable tagged orphan is adopted directly; `JournalHeld` only when
+   its aspect is undeclared (no catalog to bind in). Held rows are released on every later
+   pass (open or fsck) through the same `adopt_orphan` path once the aspect is declared; a
+   still-undeclared one stays held. A held or orphan frame whose key cannot be bound is
+   quarantined suspect (the held one's journal row cleared in the same transaction).
+4. **Indexed rows:** `describe_frame` beside `read_full`. A `SERIES_KEY` payload that is not
+   canonical, is empty, or appears twice, in a frame whose body decoded (so its CRC verified),
+   is **suspect** under C5. A key that differs from `series_key_of(row.series_id)` is rebound
+   with one `ReplaceExpected` (registration ops first in the same transaction) and counted in
+   the new `RecoveryReport.series_rebound` as well as `rebound`. Critique E19: a row moved to
+   the aspect its frame names gets its key resolved in the **target** aspect's catalog, never
+   the source aspect's id.
+5. **`report_only` everywhere:** it counts the suspects, series rebinds and held releases it
+   would make, and registers, rewrites, quarantines and clears nothing.
+6. **Rollup rebuild moved after the orphan pass**, so aspects that gained adopted rows get
+   their rollup rebuilt in the same pass (before, adoptions were pushed onto
+   `changed_aspects` after the rebuild loop had already run).
+7. **Fixture and wording.** `restore_mode_adopts_orphans_and_holds_series_key_frames` used a
+   non-canonical payload (`price|a=1`, critical false); it becomes
+   `restore_mode_adopts_series_key_frames_into_their_series` with `a\x1f1`, critical true,
+   expecting adopted = 2, held = 0. `restore_cli.rs:83` already asserted held = 0 (E20) and
+   is unchanged; `restore.rs` wording no longer says frames are held "until TAG-9".
+8. **Deviation (tests):** the inverted restore test cannot assert that untagged reads omit the
+   tagged rows, because reads are still aspect-wide until series-scoped reads land (TAG-8);
+   it asserts the tagged rows are readable and bound to their registered series instead.
+9. **R10 seeds before the row loop.** A rebind registers its key from `next_series_id`, so the
+   seed (max of catalog and row ids, every aspect) now commits before any row is checked; a
+   lost `aspect_seq` row can no longer make a rebind collide with a catalog id and fail open.
+10. **Held rows always settle.** A held frame that no longer decodes is quarantined under its
+   decode class, one with a malformed key is suspect (journal row cleared in the same txn);
+   a missing frame, a zero-row frame or a name with no aspect clears the row and counts in
+   the new `RecoveryReport.held_cleared`. Report-only counts held adoptions through the same
+   pure `plan_adoption` the real path uses, and `suspected` counts only orphans whose name
+   lets them be filed.
+
+**Rejected:** carrying the source aspect's `series_id` on an aspect move (E19); treating a
+non-critical `SERIES_KEY` as malformed (writers always mark it critical, and the key is
+still well-defined); a separate `released` counter (released held rows count as `adopted`).
+
+## 2026-11-04 — TAG-8: every store read targets one series, selectors resolve once, the library gate opens and refuses reserved keys (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Issue #442; design PR 4 without X-READ, with critique D15–D17.
+
+1. **Reads target exactly one series (tags D4).** `SegmentStore` gains `read_time_range_of`,
+   `downsample_range_of`, `downsample_range_width_of`, `read_point_of`, `read_points_of`,
+   `read_value_range_of`, `interpolate_range_of` and `interpolate_range_f64_of` (critique D16
+   adds the two interpolations), each taking a `SeriesId`. The existing methods delegate with
+   `SeriesId::UNTAGGED`, so an untagged caller of a tagged aspect sees series 0 only, and an
+   untagged-only store answers byte-for-byte as before (every pre-existing read test passes
+   unchanged). An id the aspect never registered reads empty rather than erroring.
+2. **Series-scoped prune is crate-private (critique D15).** `prune_rows` takes an
+   `Option<SeriesId>` bound as a parameter (`AND series_id = ?`, never formatted into the SQL)
+   and keeps `INDEXED BY idx_segment_index_time`; the composite index stays PHASE4-TAGPRUNE's.
+   New crate-private `prune_series_rows_by_time`, `prune_series_present_rows`, `series_rows`
+   and `load_series_index` carry it. The public `prune_by_time`, `all` and `load_index` stay
+   aspect-wide (weft-server calls `store.index().all(aspect)`), and so do the maintenance and
+   recovery callers. `prune_present_descriptors`/`prune_present_rows` (aspect-wide) are now
+   called only by their own tests and carry a `cfg_attr(not(test), expect(dead_code))`.
+3. **`read_value_range_of` builds its resident `SegmentIndex` from the series' rows only.**
+4. **`resolve_series(aspect, &SeriesSelector) -> Result<Option<SeriesId>>`.** `untagged()`
+   short-circuits to series 0 without touching the catalog (compared by value, so `all()`,
+   which also has no matchers, does not short-circuit). Otherwise each catalog series whose
+   `TagSet` the selector matches is a candidate, and series 0 is one only when the selector
+   matches the empty set **and** series 0 holds rows (one `EXISTS` query). None → `Ok(None)`;
+   two or more → the new typed `StoreError::AmbiguousSeries { aspect, matched }`.
+   **Deviation (naming):** TAG-7's crate-private seal helper was also called `resolve_series`;
+   it is renamed `commit_series_id` so the public name is the spec's.
+5. **Library gate opens; reserved keys refused (D5, critique D17).** `TagPolicy` and
+   `ingest_inner` are removed: `SegmentStore::ingest` seals a non-empty `groups` as its series.
+   A `groups` key starting with `__` (only a `TagSet` converted from a stored `SeriesKey` can
+   carry one, and `groups` is a public field) is refused before anything is written with the
+   new typed `StoreError::ReservedTagKey { aspect, key }`. `GroupsUnsupported` stays as a
+   documented, no-longer-produced variant of the `#[non_exhaustive]` enum.
+6. **HTTP mapping.** `classify_typed` maps `AmbiguousSeries` → `400 ambiguous_series`
+   (`SeriesLimit` → `400 series_limit` was already mapped by TAG-7) and `ReservedTagKey` →
+   `400 invalid_tag`. All three codes already existed; the error-code count stays 43. There is
+   no HTTP producer of the new variants yet (the HTTP gate opens in TAG-11).
+7. **weft-arrow-store** gains an `_of` wrapper for each of its seven store-read exports; the
+   plain ones delegate with `SeriesId::UNTAGGED`.
+8. **Tests changed, and why.** Three TAG-7/TAG-9 tests read tagged rows through the
+   aspect-wide `read_time_range`; they now read them with `read_time_range_of`, and the
+   restore test (TAG-9's deviation 8) now asserts the split it could not before: series 0
+   reads the plain frame's rows only, the tagged series reads its own.
+
+**Not done here:** X-READ (newer-wins per series, C16) stays a separate PR 4b; multi-series
+fan-out is TAG-13. ROADMAP.md is unchanged: issue #442 says the slice has no ROADMAP line.
+
+**Rejected:** read methods that take a selector directly (they would repeat the ambiguity
+check on every call, and a cursor wants a stable id); `all()` as the meaning of the old
+methods (it would break pinned untagged reads on tagged stores); reusing `GroupsUnsupported`
+or `TagError` for reserved keys (the first now means "gate shut", the second carries no
+aspect).

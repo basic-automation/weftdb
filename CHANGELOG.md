@@ -10,6 +10,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **R client** (`clients/r`, package `weftdb`): stored windows, value bands and server-side
+  downsamples as Arrow tables, exact JSON rows paged by cursor, interpolation, and ingest of a
+  data frame or Arrow table as one Parquet batch with `Idempotency-Key`. Refusals are
+  conditions of class `weft_<code>` carrying `status`, `details` and `request_id`.
+- **Grafana JSON-datasource routes** (experimental, `read` scope): `GET /api/v1/grafana`,
+  `POST /api/v1/grafana/metrics` and `POST /api/v1/grafana/query` answer the community
+  `simpod-json-datasource` plugin, so a dashboard charts stored aspects with each panel's
+  buckets (its interval, capped at its `maxDataPoints`) reduced by the stored downsample.
+  `packaging/grafana/weftdb-datasource.yaml` provisions it.
+- **Arrow Flight listener** (experimental, read-only). With `WEFT_FLIGHT_ADDR` set to a
+  loopback address, `weft-server` serves Arrow Flight over gRPC beside the HTTP listener:
+  `DoGet` streams a stored time window or value band (a JSON ticket) as the same typed record
+  batch the Arrow range routes encode, and `GetFlightInfo`, `GetSchema` and `ListFlights`
+  describe the declared aspects. Keys and the `read` scope apply as on HTTP, denials are
+  audited, a query gate sized by `WEFT_QUERY_MAX_INFLIGHT` sheds load as `UNAVAILABLE`, and a
+  refusal carries its envelope code in `x-weft-error-code`. Writes, Flight SQL and a
+  non-loopback (plaintext) bind are refused.
 - **Rust SDK** (`weft-client`). An async client for every route of the HTTP API, on
   `reqwest`: compute, catalog, the four ingest formats with `Idempotency-Key`, stored reads
   with cursor-following `Stream`s, maintenance, backup and the bench runs. Stored values are
@@ -69,9 +86,42 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   It is pure DDL at layout 2: the next open of an existing store applies it, the marker's
   layout and floors stay 2, and no row or frame changes. Nothing registers a series yet;
   tagged writes stay refused.
+- **Per-aspect series cap (TAG-7).** `SegmentStoreOptions::max_series_per_aspect`
+  (`DEFAULT_MAX_SERIES_PER_ASPECT`, 100,000) bounds how many tag series one aspect may
+  register. A batch for a new series past it is refused with the typed
+  `StoreError::SeriesLimit` (`400 series_limit` over HTTP) before any frame is written;
+  series already registered stay writable, and the untagged series never counts. Tagged
+  writes themselves stay refused at both gates until TAG-8 (library) and TAG-11 (HTTP), so
+  nothing reaches the cap yet.
+
+- **Series-scoped reads and tagged library ingest (TAG-8).** `SegmentStore::ingest` now
+  accepts a non-empty `IngestBatch::groups` and seals it as its own tag series; a group key
+  with the reserved `__` prefix is refused with the typed `StoreError::ReservedTagKey`
+  (`400 invalid_tag`). Each store read has an `_of` form that takes a `SeriesId`
+  (`read_time_range_of`, `downsample_range_of`, `downsample_range_width_of`, `read_point_of`,
+  `read_points_of`, `read_value_range_of`, `interpolate_range_of`, `interpolate_range_f64_of`,
+  and the `weft-arrow-store` exports), and `SegmentStore::resolve_series` turns a
+  `SeriesSelector` into the one series it names, or refuses with the typed
+  `StoreError::AmbiguousSeries` (`400 ambiguous_series`) when it matches several. HTTP
+  ingest still refuses tags until TAG-11.
 
 ### Changed
 
+- **Reads without a series mean the untagged series (TAG-8).** The existing read methods
+  answer series 0 only. A store with no tagged writes answers exactly as before; on an aspect
+  holding tagged series, they no longer return the tagged rows (use the `_of` reads).
+  `StoreError::GroupsUnsupported` is no longer produced and is kept as a reserved variant.
+- **Maintenance plans within one series (TAG-6).** Overlap reconciles, squashes, size-targeted
+  compaction and the hot/cold reconcile never fold two tag series together; the squash cap,
+  the fragmentation gate and `AspectStorageStats::overlapping_segments` (and
+  `store_overlapping_segments`) count per series, and each series keeps its own hot tail.
+  An untagged aspect is one series, so its maintenance and statistics are unchanged; tagged
+  writes stay refused until TAG-8, so nothing observable changes yet.
+- **Breaking (library):** `IngestBatch::series_ids()` is removed (TAG-7). It always answered
+  `[0]`, and a tagged batch's series id is not known until its commit resolves the key in the
+  aspect's catalog; read the id from `IngestReceipt::series_ids` instead. The method shipped
+  in `weftdb` 0.2.0 on crates.io, so this is a breaking change, allowed in the next minor
+  release by the pre-1.0 policy above.
 - The `503 unconfigured` sentence no longer names the segment store, since the bench-run
   routes answer it too: it reads "a subsystem this route needs is not configured on this
   server", and `details.subsystem` / `details.enabled_by` say which one and the variable that
@@ -92,6 +142,26 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- An Arrow or Parquet ingest whose `timestamp` column held a null stored that row at the epoch
+  (`values()` ignores the validity bitmap); it is now refused `400`, naming the column.
+- A stored read with `limit=0` answered a `next_cursor` pointing at the same offset, so a
+  client following cursors fetched the same empty page forever; an empty page now carries no
+  cursor.
+- Parquet ingest (`POST /api/v1/storage/{aspect}/parquet`) refused a Snappy-compressed file
+  with `400 … Disabled feature at compile time: snap`. Snappy is the default codec of R's
+  arrow, pyarrow, pandas and Spark; the workspace's `parquet` now builds with it.
+- **Restore no longer strands tagged frames (part of TAG-9, #310).** A restore-mode open
+  adopts an orphan frame that carries a series key into the series the key names,
+  registering the key in the aspect's catalog in the same transaction, instead of journaling
+  it `held` forever; only a tagged orphan of an undeclared aspect is still held, and a later
+  open adopts it once the aspect is declared. Recovery and `POST /api/v1/storage/fsck` also check
+  each indexed tagged frame's key: a malformed or repeated key is quarantined suspect, and a
+  row whose series id names a different key is rebound to the frame's series, counted in the
+  new `RecoveryReport::series_rebound` (also in the fsck response). A row moved back to the
+  aspect its frame names gets its key resolved in that aspect's catalog rather than keeping
+  the other aspect's series id. Untagged frames and reads are unchanged; a restore's adopted
+  orphans now take ids from the commit allocator (which may skip past legacy ids) and their
+  aspect's rollup is rebuilt in the same pass.
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
   under Turso's MVCC each delete cost milliseconds and grew with the swaps before it. One
   guarded statement now deletes a group's rows: squashing 10M UCI rows from 9,769 to 153

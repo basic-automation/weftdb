@@ -192,6 +192,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// opens — a keys file that cannot be loaded stops startup, and the
 	// server never comes up unauthenticated by accident.
 	let auth = config::auth().unwrap_or_else(|error| exit_config(&error));
+	// Phase 2: the opt-in Arrow Flight listener's address, refused here (exit 78) when it
+	// is not loopback, before anything opens.
+	let flight_addr = config::flight_addr().unwrap_or_else(|error| exit_config(&error));
 	let state = match state::build().await {
 		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth).with_ingest_config(ingest).with_admission_config(admission),
 		Err(error) => match weft_server::store_open::exit_code_for_store_error(&error) {
@@ -215,6 +218,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// SEC-7: the key-reload watcher, so a SIGHUP after a keys-file edit
 	// reloads the keys in force instead of needing a restart.
 	daemons::spawn_key_reload_if_configured(&state, &daemons);
+	let flight = match flight_addr {
+		Some(addr) => Some(daemons::spawn_flight(addr, &state, &daemons).await?),
+		None => None,
+	};
 
 	let listener = serve::bind(addr, tls.is_some()).await?;
 	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
@@ -226,6 +233,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// Serving is over: raise the registry's shutdown watch so no daemon
 	// outlives the server it maintains, and none restarts from here.
 	daemons.shutdown();
+	// The Flight listener stops on that watch and gives its open streams their grace
+	// before the store below shuts down; a stream still open after it is abandoned and
+	// ends in an error rather than holding the shutdown.
+	if let Some(flight) = flight {
+		let _ = flight.await;
+	}
 	// C9's drain order: serve → SEC-9 TaskTracker → store.shutdown().
 	// The audit tracker drains next, so an audited handler still in
 	// flight when serving ended writes its outcome record before the

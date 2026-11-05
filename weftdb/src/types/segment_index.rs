@@ -47,6 +47,9 @@ use crate::{
 	}, StoreError, SUPPORTED_LAYOUT
 };
 
+/// The quality term of a present-values prune: a row with at least one non-null value.
+const PRESENT_FILTER: &str = "AND row_count > 0 AND null_count < row_count";
+
 /// Every `segment_index` column a read decodes, in the order
 /// [`SegmentIndexStore::decode_row`] reads them.
 const SELECT_COLUMNS: &str = "id, path, format_version, physical_type, time_unit, row_count, null_count, time_sorted, min_ts, max_ts, min_value, max_value, byte_len, gen, prec, frame_crc, commit_epoch, series_id";
@@ -297,19 +300,29 @@ impl SegmentIndexStore {
 	/// committed while it ran may have widened the bound after it was read: the query is
 	/// then run again with the wider bound, so it never misses a row it saw. A store
 	/// without the time index (it was always best effort) prunes by a scan instead.
-	async fn prune_rows(&self, aspect: &str, start: i64, end: i64, filter: &str) -> Result<Vec<IndexRow>> {
+	///
+	/// `series` scopes the prune to one series (TAG-8, tags D4): the id is bound as a
+	/// parameter (`AND series_id = ?`), never formatted into the SQL. [`None`] is the
+	/// aspect-wide prune the public [`prune_by_time`](Self::prune_by_time) keeps.
+	async fn prune_rows(&self, aspect: &str, series: Option<crate::SeriesId>, start: i64, end: i64, filter: &str) -> Result<Vec<IndexRow>> {
 		let conn = connect_reader(&self.db).await?;
 		let mut widest = self.span_bound(&conn, aspect).await?;
 		loop {
 			let floor = start.saturating_sub(widest);
 			// A NULL-spanned (empty) segment can never overlap, and the inequalities reject it.
+			let series_filter = if series.is_some() { "AND series_id = ?" } else { "" };
 			let sql = |indexed: &str| {
 				format!("SELECT {SELECT_COLUMNS}
 				FROM segment_index {indexed}
-				WHERE aspect = ? AND min_ts IS NOT NULL AND max_ts IS NOT NULL AND ? <= min_ts AND min_ts <= ? AND ? <= max_ts {filter}
+				WHERE aspect = ? AND min_ts IS NOT NULL AND max_ts IS NOT NULL AND ? <= min_ts AND min_ts <= ? AND ? <= max_ts {filter} {series_filter}
 				ORDER BY id")
 			};
-			let params = || turso::params![aspect.to_string(), floor, end, start];
+			let series_param = series.map(|id| integer_param(id.0)).transpose()?;
+			let params = || {
+				let mut params = vec![Value::Text(aspect.to_string()), Value::Integer(floor), Value::Integer(end), Value::Integer(start)];
+				params.extend(series_param.clone());
+				turso::params_from_iter(params)
+			};
 			let rows = match conn.query(sql(&format!("INDEXED BY {TIME_INDEX}")), params()).await {
 				Ok(rows) => rows,
 				Err(e) if e.to_string().contains("no such index") => conn.query(sql(""), params()).await?,
@@ -392,7 +405,13 @@ impl SegmentIndexStore {
 
 	/// [`prune_by_time`](Self::prune_by_time), returning whole [`IndexRow`]s.
 	pub(crate) async fn prune_rows_by_time(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<IndexRow>> {
-		self.prune_rows(aspect, start, end, "").await
+		self.prune_rows(aspect, None, start, end, "").await
+	}
+
+	/// [`prune_rows_by_time`](Self::prune_rows_by_time) scoped to one series (TAG-8): only
+	/// the rows whose `series_id` is `series`.
+	pub(crate) async fn prune_series_rows_by_time(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<Vec<IndexRow>> {
+		self.prune_rows(aspect, Some(series), start, end, "").await
 	}
 
 	/// [`prune_by_time`](Self::prune_by_time) for a query that needs **present values**:
@@ -416,6 +435,7 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// As [`prune_by_time`](Self::prune_by_time).
+	#[cfg_attr(not(test), expect(dead_code, reason = "the store reads prune one series since TAG-8; the aspect-wide form is kept for its tests"))]
 	pub(crate) async fn prune_present_descriptors(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<SegmentDescriptor>> {
 		Ok(self.prune_present_rows(aspect, start, end).await?.into_iter().map(|row| row.desc).collect())
 	}
@@ -423,10 +443,16 @@ impl SegmentIndexStore {
 	/// [`prune_present_descriptors`](Self::prune_present_descriptors), returning whole
 	/// [`IndexRow`]s — the form a reader that must bind a sidecar to its frame's CRC
 	/// (D-S15) prunes by.
+	#[cfg_attr(not(test), expect(dead_code, reason = "the store reads prune one series since TAG-8; the aspect-wide form is kept for its tests"))]
 	pub(crate) async fn prune_present_rows(&self, aspect: &str, start: i64, end: i64) -> Result<Vec<IndexRow>> {
 		// The NULL-spanned (empty) row is rejected twice over: the inequalities already
 		// reject it, and a zero-row row is not "all null" — it is nothing to skip.
-		self.prune_rows(aspect, start, end, "AND row_count > 0 AND null_count < row_count").await
+		self.prune_rows(aspect, None, start, end, PRESENT_FILTER).await
+	}
+
+	/// [`prune_present_rows`](Self::prune_present_rows) scoped to one series (TAG-8).
+	pub(crate) async fn prune_series_present_rows(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<Vec<IndexRow>> {
+		self.prune_rows(aspect, Some(series), start, end, PRESENT_FILTER).await
 	}
 
 	/// Every descriptor recorded under `aspect`, in seal (`id`) order.
@@ -446,6 +472,32 @@ impl SegmentIndexStore {
 		let conn = connect_reader(&self.db).await?;
 		let rows = conn.query(format!("SELECT {SELECT_COLUMNS} FROM segment_index WHERE aspect = ? ORDER BY id"), turso::params![aspect.to_string()]).await?;
 		Self::collect(rows).await
+	}
+
+	/// [`rows`](Self::rows) scoped to one series (TAG-8), in seal (`id`) order.
+	pub(crate) async fn series_rows(&self, aspect: &str, series: crate::SeriesId) -> Result<Vec<IndexRow>> {
+		let conn = connect_reader(&self.db).await?;
+		let rows = conn.query(format!("SELECT {SELECT_COLUMNS} FROM segment_index WHERE aspect = ? AND series_id = ? ORDER BY id"), turso::params![aspect.to_string(), integer_param(series.0)?]).await?;
+		Self::collect(rows).await
+	}
+
+	/// [`load_index`](Self::load_index) over one series' rows only (TAG-8): the resident
+	/// index [`read_value_range_of`](crate::SegmentStore::read_value_range_of) prunes by value.
+	pub(crate) async fn load_series_index(&self, aspect: &str, series: crate::SeriesId) -> Result<SegmentIndex> {
+		let mut index = SegmentIndex::new();
+		for row in self.series_rows(aspect, series).await? {
+			index.push(row.desc);
+		}
+		Ok(index)
+	}
+
+	/// Whether `aspect` holds at least one row of `series` (TAG-8): the existence test
+	/// [`resolve_series`](crate::SegmentStore::resolve_series) puts series 0 to, since series
+	/// 0 has no catalog row.
+	pub(crate) async fn series_has_rows(&self, aspect: &str, series: crate::SeriesId) -> Result<bool> {
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("SELECT EXISTS (SELECT 1 FROM segment_index WHERE aspect = ? AND series_id = ?)", turso::params![aspect.to_string(), integer_param(series.0)?]).await?;
+		Ok(matches!(rows.next().await?.map(|row| row.get_value(0)).transpose()?, Some(Value::Integer(n)) if n != 0))
 	}
 
 	/// Load every descriptor for `aspect` into a resident
@@ -629,7 +681,6 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure, or a row whose id is not a series id.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the tagged seal (TAG-7) and series-scoped reads (TAG-8) call it; until then only the tests do"))]
 	pub(crate) async fn series_id_for(&self, aspect: &str, key: &crate::SeriesKey) -> Result<Option<crate::SeriesId>> {
 		if key.is_empty() {
 			return Ok(Some(crate::SeriesId::UNTAGGED));
@@ -650,7 +701,6 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure, or a stored key that is not canonical.
-	#[cfg_attr(not(test), expect(dead_code, reason = "tagged reads (TAG-8) and recovery (TAG-9) call it; until then only the tests do"))]
 	pub(crate) async fn series_key_of(&self, aspect: &str, id: crate::SeriesId) -> Result<Option<crate::SeriesKey>> {
 		if id == crate::SeriesId::UNTAGGED {
 			return Ok(Some(crate::SeriesKey::default()));
@@ -669,7 +719,6 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure, or a row this build cannot decode.
-	#[cfg_attr(not(test), expect(dead_code, reason = "selector resolution (TAG-8) calls it; until then only the tests do"))]
 	pub(crate) async fn series_of(&self, aspect: &str) -> Result<Vec<(crate::SeriesId, crate::SeriesKey)>> {
 		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT series_id, series_key FROM series WHERE aspect = ? ORDER BY series_id", turso::params![aspect.to_string()]).await?;
@@ -687,7 +736,6 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure.
-	#[cfg_attr(not(test), expect(dead_code, reason = "the tagged seal (TAG-7) allocates from it; until then only the tests do"))]
 	pub(crate) async fn next_series_id(&self, aspect: &str) -> Result<u64> {
 		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT next_series_id FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
@@ -696,6 +744,22 @@ impl SegmentIndexStore {
 			None => None,
 		};
 		Ok(next.unwrap_or(1).max(1))
+	}
+
+	/// How many series `aspect`'s catalog registered: the count the per-aspect series
+	/// cap ([`SegmentStoreOptions::max_series_per_aspect`](crate::SegmentStoreOptions::max_series_per_aspect))
+	/// is checked against. Series 0 is implicit and is not counted.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub(crate) async fn series_count(&self, aspect: &str) -> Result<usize> {
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("SELECT COUNT(*) FROM series WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		Ok(match rows.next().await? {
+			Some(row) => Self::opt_integer(&row, 0).and_then(|n| usize::try_from(n).ok()).unwrap_or(0),
+			None => 0,
+		})
 	}
 
 	/// Every aspect with at least one row in the series catalog, in name order: the
@@ -957,7 +1021,6 @@ pub(crate) struct AllocatorSeed {
 }
 
 /// A catalog `series_id` as a [`SeriesId`](crate::SeriesId).
-#[cfg_attr(not(test), expect(dead_code, reason = "the catalog readers' callers (TAG-7, TAG-8) arrive later; until then only the tests read ids"))]
 fn series_id_value(value: Value) -> Result<crate::SeriesId> {
 	match value {
 		Value::Integer(n) => Ok(crate::SeriesId(u64::try_from(n).with_context(|| format!("the series catalog holds the negative id {n}"))?)),
@@ -966,7 +1029,6 @@ fn series_id_value(value: Value) -> Result<crate::SeriesId> {
 }
 
 /// A catalog `series_key` of `aspect`, decoded through the storage path.
-#[cfg_attr(not(test), expect(dead_code, reason = "the catalog readers' callers (TAG-8, TAG-9) arrive later; until then only the tests read keys"))]
 fn series_key_value(aspect: &str, value: Value) -> Result<crate::SeriesKey> {
 	match value {
 		Value::Text(text) => crate::SeriesKey::from_canonical(text.as_bytes()).with_context(|| format!("the {aspect:?} series catalog holds a key that is not canonical")),
@@ -975,7 +1037,6 @@ fn series_key_value(aspect: &str, value: Value) -> Result<crate::SeriesKey> {
 }
 
 /// A `u64` as an SQL integer parameter.
-#[cfg_attr(not(test), expect(dead_code, reason = "`series_key_of`'s callers (TAG-8, TAG-9) arrive later; until then only the tests bind it"))]
 fn integer_param(n: u64) -> Result<Value> {
 	Ok(Value::Integer(i64::try_from(n).with_context(|| format!("{n} is beyond an SQL integer"))?))
 }

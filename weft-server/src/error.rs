@@ -246,7 +246,7 @@ impl Code {
 	/// The one sentence a `5xx` client is allowed to see for this code. The real cause goes
 	/// to the log; this is what the body carries. Kept free of anything that names a path,
 	/// a subsystem version, or an internal type.
-	const fn redacted_message(self) -> &'static str {
+	pub(crate) const fn redacted_message(self) -> &'static str {
 		match self {
 			Self::Internal => "the server could not complete the request",
 			Self::CommitFailed => "the write did not commit and the store was not modified",
@@ -704,6 +704,9 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 			weftdb::StoreError::DeclarationConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IdempotencyConflict { .. } => ApiError::new(Code::IdempotencyConflict, e.to_string()),
 			weftdb::StoreError::GroupsUnsupported { .. } => ApiError::new(Code::TagsUnsupported, e.to_string()),
+			weftdb::StoreError::SeriesLimit { .. } => ApiError::new(Code::SeriesLimit, e.to_string()),
+			weftdb::StoreError::AmbiguousSeries { .. } => ApiError::new(Code::AmbiguousSeries, e.to_string()),
+			weftdb::StoreError::ReservedTagKey { .. } => ApiError::new(Code::InvalidTag, e.to_string()),
 			weftdb::StoreError::IngestValueOutOfRange { digits, .. } => decimal_out_of_range_refusal(*digits),
 			weftdb::StoreError::EmptyIngestBatch { .. } | weftdb::StoreError::IngestLengthMismatch { .. } => ApiError::bad_request(e.to_string()),
 			_ => ApiError::server(Code::IncompatibleStore, e.to_string()),
@@ -839,6 +842,28 @@ mod tests {
 		names.sort_unstable();
 		names.dedup();
 		assert_eq!(names.len(), TABLE.len(), "two codes share a wire name");
+	}
+
+	/// The store's series cap (TAG-7) is the plan's `400 series_limit`, read from the type,
+	/// never the sentence.
+	#[test]
+	fn the_store_series_cap_is_series_limit() {
+		let err = anyhow::Error::new(weftdb::StoreError::SeriesLimit { aspect: "price".to_string(), limit: 2 }).context("ingest of aspect \"price\" failed while committing");
+		let refusal = classify_typed(&err).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::SeriesLimit, StatusCode::BAD_REQUEST));
+	}
+
+	/// A store read whose selector matched several series (TAG-8) is the plan's
+	/// `400 ambiguous_series`, and an ingest naming a reserved `__` tag key is
+	/// `400 invalid_tag`, both read from the type.
+	#[test]
+	fn store_tag_refusals_map_to_their_codes() {
+		let ambiguous = anyhow::Error::new(weftdb::StoreError::AmbiguousSeries { aspect: "price".to_string(), matched: 2 }).context("resolving a series of \"price\"");
+		let refusal = classify_typed(&ambiguous).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::AmbiguousSeries, StatusCode::BAD_REQUEST));
+		let reserved = anyhow::Error::new(weftdb::StoreError::ReservedTagKey { aspect: "price".to_string(), key: "__dim".to_string() });
+		let refusal = classify_typed(&reserved).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::InvalidTag, StatusCode::BAD_REQUEST));
 	}
 
 	/// The synonyms C6 dropped stay dropped: a client that coded against the old vocabulary

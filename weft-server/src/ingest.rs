@@ -198,7 +198,10 @@ pub struct IngestResponse {
 	pub aspect: String,
 	/// The id assigned to the new segment (monotonic within the aspect).
 	pub segment_id: u64,
-	/// The `.weftseg` frame format version sealed (5 single-block, 6 paged).
+	/// The `.weftseg` frame format version sealed (5 single-block, 6 paged): the
+	/// body's layout. A tagged series' frame is that body inside a v7 envelope
+	/// carrying its series key (TAG-7); the envelope is not reported here, and
+	/// `byte_len` counts it.
 	pub format_version: u16,
 	/// Total rows sealed (present and null).
 	pub row_count: usize,

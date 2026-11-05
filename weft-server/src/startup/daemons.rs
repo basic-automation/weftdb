@@ -326,3 +326,24 @@ mod tests {
 		assert!(resolve_maintenance_config(env(&[(RECONCILE_THRESHOLD_ENV, "some")])).is_err());
 	}
 }
+
+/// Phase 2: bind and start the opt-in Arrow Flight listener at `addr`. It stops on the
+/// registry's shutdown watch but is not supervised by it: the supervisor aborts its task
+/// on that watch, which would cut the listener's own grace short. The caller joins the
+/// handle after serving ends and before the store shuts down, so open streams get
+/// [`weft_server::flight::FLIGHT_SHUTDOWN_GRACE`] to finish first.
+///
+/// # Errors
+///
+/// The bind's failure: an address in use stops the start rather than leaving Flight off.
+pub(crate) async fn spawn_flight(addr: std::net::SocketAddr, state: &AppState, daemons: &Daemons) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+	let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| anyhow::anyhow!("cannot bind the Flight listener on {addr}: {error}"))?;
+	println!("flight: Arrow Flight, read-only, on {} (experimental; {} turns it off)", listener.local_addr()?, weft_server::flight::FLIGHT_ADDR_ENV);
+	let state = state.clone();
+	let shutdown = daemons.shutdown_watch();
+	Ok(tokio::spawn(async move {
+		if let Err(error) = weft_server::flight::serve(listener, state, shutdown).await {
+			tracing::error!(%error, "the Flight listener stopped");
+		}
+	}))
+}
