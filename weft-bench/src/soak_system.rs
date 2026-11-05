@@ -1074,21 +1074,21 @@ impl SamplerThread {
 		let stop = Arc::new(AtomicBool::new(false));
 		let thread_stop = Arc::clone(&stop);
 		let handle = std::thread::Builder::new().name("weft-soak-sampler".to_string()).spawn(move || {
-			let mut samples = Vec::new();
+			let mut readings = Vec::new();
 			let mut failures = 0_u64;
 			while !thread_stop.load(Ordering::Relaxed) {
 				match sampler.sample() {
-					Ok(sample) => samples.push(sample),
+					Ok(sample) => readings.push(sample),
 					Err(_) => failures += 1,
 				}
 				let mut waited = Duration::ZERO;
 				while waited < every && !thread_stop.load(Ordering::Relaxed) {
-					let slice = every.checked_sub(waited).unwrap().min(Duration::from_millis(10));
+					let slice = every.saturating_sub(waited).min(Duration::from_millis(10));
 					std::thread::sleep(slice);
 					waited += slice;
 				}
 			}
-			SamplerShutdown { samples, failures }
+			SamplerShutdown { samples: readings, failures }
 		})?;
 		Ok(Self { stop, handle: Some(handle) })
 	}

@@ -1064,7 +1064,7 @@ mod tests {
 		let body = serde_json::json!({
 			"width": "5s",
 			"aggregations": ["min", "max"],
-			"points": (0..12).map(|s| serde_json::json!({ "timestamp": ts(s), "value": s as f64 })).collect::<Vec<_>>(),
+			"points": (0..12_i32).map(|s| serde_json::json!({ "timestamp": ts(i64::from(s)), "value": f64::from(s) })).collect::<Vec<_>>(),
 		});
 		let (status, body) = post_json("/api/v1/downsample", body).await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -1292,7 +1292,7 @@ mod tests {
 
 	#[test]
 	fn widening_matches_the_shortest_round_trip_text_for_every_finite_f64() {
-		let mut state = 0x5EED_F64_u64;
+		let mut state = 0x05EE_DF64_u64;
 		let mut checked = 0;
 		while checked < 200_000 {
 			// Alternate random bit patterns (every exponent, subnormals) with short decimals

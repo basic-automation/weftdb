@@ -124,6 +124,7 @@ pub async fn metrics(State(state): State<AppState>, body: Bytes) -> Result<Json<
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let names = store.list_declared_aspects().await.map_err(|error| error::classify_read(&error))?;
+	drop(store);
 	let needle = find.metric.unwrap_or_default().to_lowercase();
 	let payload = json!({"label": "Reduction", "name": "agg", "type": "select", "placeholder": DEFAULT_AGG, "options": OFFERED_AGGS.iter().map(|agg| json!({"label": agg, "value": agg})).collect::<Vec<_>>()});
 	Ok(Json(names.into_iter().filter(|name| name.to_lowercase().contains(&needle)).map(|name| MetricOption { label: name.clone(), value: name, payloads: vec![payload.clone()] }).collect()))
@@ -244,6 +245,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Result<Json<Ve
 			.collect();
 		answered.push(Series { target: aspect, ref_id: target.ref_id, datapoints });
 	}
+	drop(store);
 	Ok(Json(answered))
 }
 
@@ -313,7 +315,8 @@ mod tests {
 	async fn grafana_charts_a_stored_aspect() {
 		let dir = tempfile::tempdir().unwrap();
 		let store = Arc::new(weftdb::SegmentStore::open(dir.path()).await.unwrap());
-		let router = crate::app_with_state(AppState::new().with_store(store));
+		let router = crate::app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store)));
+		drop(store);
 		let (status, _) = call(&router, "POST", "/api/v1/storage/aspects", json!({"name": "temp", "physical_type": "f64", "timestamp_unit": "seconds"})).await;
 		assert!(status.is_success(), "{status}");
 		// Two readings a minute for ten minutes: 0, 1, 2, … at 0 s, 30 s, 60 s, ….

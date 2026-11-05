@@ -1927,16 +1927,16 @@ mod tests {
 		let subjects = db.list_subjects().await?;
 		let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
 		let aspects = db.get_subject_aspects(&subject).await?;
-		let aspect = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?;
+		let aspect_id = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?.id();
 		let resolution = Resolution::Minutes;
 		let method = Spline::Linear;
 		let batch_size = 60;
 
-		tracing::info!(aspect_id = %aspect.id(), "Aspect ID");
+		tracing::info!(aspect_id = %aspect_id, "Aspect ID");
 
-		build_unprocessed_queue(&db, &aspect.id(), &resolution, &method, batch_size).await?;
-		build_processed_batch_queue(&db, &aspect.id()).await?;
-		let processed_batches: Vec<Batch> = db.get_processed_batches(&aspect.id()).await?.try_collect().await?;
+		build_unprocessed_queue(&db, &aspect_id, &resolution, &method, batch_size).await?;
+		build_processed_batch_queue(&db, &aspect_id).await?;
+		let processed_batches: Vec<Batch> = db.get_processed_batches(&aspect_id).await?.try_collect().await?;
 		let length = processed_batches.len();
 		tracing::info!(count = length, "Processed batches count");
 		if length > 0 {
@@ -1959,7 +1959,7 @@ mod tests {
                                         VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.000_000_001).unwrap())),
                                 ]) ));
 
-		load_dictionary(&db, &aspect.id(), &mut dictionary).await?;
+		load_dictionary(&db, &aspect_id, &mut dictionary).await?;
 
 		tracing::info!(pattern_count = dictionary.len(), "Dictionary now contains patterns");
 
@@ -1971,8 +1971,8 @@ mod tests {
 			output_denk_format_pattern(first_pattern);
 		}
 
-		build_patterns_queue(&db, &aspect.id(), &mut dictionary).await?;
-		let patterns: Vec<weftdb::Pattern> = Outputs::get_dictionary_patterns(&db, &aspect.id(), "TestDictionary").await?.try_collect().await?;
+		build_patterns_queue(&db, &aspect_id, &mut dictionary).await?;
+		let patterns: Vec<weftdb::Pattern> = Outputs::get_dictionary_patterns(&db, &aspect_id, "TestDictionary").await?.try_collect().await?;
 		let length = patterns.len();
 		tracing::info!(count = length, "Patterns count");
 		if length > 0 {
@@ -1986,11 +1986,11 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		tracing::info!("Starting create_correlations_for_events...");
-		create_correlations_for_events(&db, &dictionary, &aspect.id()).await?;
+		create_correlations_for_events(&db, &dictionary, &aspect_id).await?;
 		tracing::info!(elapsed = ?timer.elapsed(), "Time taken for create_correlations_for_events");
 
 		// print the number of correlations with more than 1 occurrence (using streaming)
-		let mut correlation_stream = db.get_correlations(&aspect.id()).await?;
+		let mut correlation_stream = db.get_correlations(&aspect_id).await?;
 		let mut multi_occurrence_count = 0usize;
 		while let Some(result) = correlation_stream.next().await {
 			if let Ok(correlation) = result {
@@ -2008,7 +2008,7 @@ mod tests {
 
 		let timer = std::time::Instant::now();
 		tracing::info!("Starting create_signals...");
-		create_signals(&db, &aspect.id()).await?;
+		create_signals(&db, &aspect_id).await?;
 		tracing::info!(elapsed = ?timer.elapsed(), "Time taken for create_signals");
 
 		// print the number of signals created
@@ -2023,7 +2023,7 @@ mod tests {
 		// The last peak was at hour 61, so signals predicting peaks at hours 1, 5, 9, ..., 61 are all resolved.
 		let last_known_time = start_time + chrono::Duration::hours(64);
 		tracing::debug!(last_known_time = %last_known_time, "Filtering expired signals up to last known time");
-		filter_expired_signals(&db, &aspect.id(), Some(last_known_time)).await?;
+		filter_expired_signals(&db, &aspect_id, Some(last_known_time)).await?;
 
 		let signals_lock = SIGNALS_QUEUE.lock().await;
 		tracing::info!(count = signals_lock.len(), "Number of signals after filtering");
@@ -2034,13 +2034,13 @@ mod tests {
 		drop(signals_lock);
 
 		// Calculate and print the probability for the Signals in the queue for hours 65-70
-		let events = get_events_queue(&db, &aspect.id()).await?;
+		let events = get_events_queue(&db, &aspect_id).await?;
 		let event_id_option = events.first().map(|e| e.id().clone());
 		drop(events);
 
 		if let Some(event_id) = event_id_option {
 			// Get the first correlation to show error rate
-			let correlations: Vec<weftdb::Correlation> = db.get_correlations(&aspect.id()).await?.try_collect().await?;
+			let correlations: Vec<weftdb::Correlation> = db.get_correlations(&aspect_id).await?.try_collect().await?;
 			let signal_type = SignalType::PredictStart;
 			let error_rate = correlations.first().and_then(|c| c.error_rate().get(&signal_type).cloned()).unwrap_or_else(|| weftdb::Distance::new(BigDecimal::from(0), splimes::Resolution::Seconds));
 			drop(correlations);
@@ -2055,20 +2055,20 @@ mod tests {
 				let signals_lock = SIGNALS_QUEUE.lock().await;
 				tracing::debug!(hour = hour, count = signals_lock.len(), "Number of signals for hour");
 
-				let Some(sum_probability) = signals_lock.probability_sum(&event_id, &signal_type, query_time, &db, &aspect.id()).await? else {
+				let Some(sum_probability) = signals_lock.probability_sum(&event_id, &signal_type, query_time, &db, &aspect_id).await? else {
 					tracing::debug!(event_id = %event_id, hour = hour, "No signals found for event at hour");
 					drop(signals_lock);
 					continue;
 				};
 
-				let Some(avg_probability) = signals_lock.probability_average(&event_id, &signal_type, query_time, &db, &aspect.id()).await? else {
+				let Some(avg_probability) = signals_lock.probability_average(&event_id, &signal_type, query_time, &db, &aspect_id).await? else {
 					tracing::debug!(event_id = %event_id, hour = hour, "No signals found for event at hour");
 					drop(signals_lock);
 					continue;
 				};
 
 				// Also calculate event-based probability (time since last manifestation)
-				let event_prob = signals_lock.event_probability(&event_id, &signal_type, query_time, &db, &aspect.id()).await?;
+				let event_prob = signals_lock.event_probability(&event_id, &signal_type, query_time, &db, &aspect_id).await?;
 
 				// Format output nicely
 				let event_prob_str = event_prob.map_or_else(|| "N/A".to_string(), |p| format!("{p:.4}"));
@@ -2083,7 +2083,7 @@ mod tests {
 				drop(signals_lock);
 			}
 		}
-		drop(aspect);
+		drop(aspects);
 		drop(db);
 		discard_database("TestDB").await;
 		Ok(())
@@ -2106,9 +2106,8 @@ mod tests {
 		let subjects = db.list_subjects().await?;
 		let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
 		let aspects = db.get_subject_aspects(&subject).await?;
-		let aspect = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?;
-		let aspect_id = aspect.id();
-		drop(aspect);
+		let aspect_id = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?.id();
+		drop(aspects);
 
 		tracing::info!(aspect_id = %aspect_id, "Aspect ID");
 
@@ -2555,12 +2554,12 @@ mod tests {
 		let subjects = db.list_subjects().await?;
 		let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
 		let aspects = db.get_subject_aspects(&subject).await?;
-		let aspect = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?;
+		let aspect_id = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?.id();
 
 		tracing::info!("=== Testing Pipeline Builder ===");
 
 		// Build a pipeline using the new API
-		let mut pipeline = Pipeline::builder(db.clone(), aspect.id())
+		let mut pipeline = Pipeline::builder(db.clone(), aspect_id)
 			.spline_method(Spline::Linear)
 			.batch_size(60)
 			.add_dictionary("PipelineTestDictionary", "Pipeline test dictionary", DictionaryConstraints::new(Some(Steps::new(10, Spline::Linear)), Some(vec![VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.000_000_001).unwrap()))])))
@@ -2595,10 +2594,10 @@ mod tests {
 		tracing::info!("=== Testing Persistence ===");
 
 		// Test state persistence
-		assert!(Pipeline::exists(&db, &aspect.id()).await?);
+		assert!(Pipeline::exists(&db, &aspect_id).await?);
 
 		// Load the pipeline state
-		let mut loaded_pipeline = Pipeline::load(db.clone(), &aspect.id()).await?;
+		let mut loaded_pipeline = Pipeline::load(db.clone(), &aspect_id).await?;
 
 		// Verify loaded state matches
 		assert_eq!(loaded_pipeline.state().run_count, pipeline.state().run_count);
@@ -2631,8 +2630,8 @@ mod tests {
 		// Cleanup: delete the pipeline
 		loaded_pipeline.delete().await?;
 		drop(loaded_pipeline);
-		assert!(!Pipeline::exists(&db, &aspect.id()).await?);
-		drop(aspect);
+		assert!(!Pipeline::exists(&db, &aspect_id).await?);
+		drop(aspects);
 		drop(db);
 
 		tracing::info!("test_pipeline_api completed successfully!");

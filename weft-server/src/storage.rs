@@ -87,7 +87,7 @@ async fn resolve_target(store: &weftdb::SegmentStore, aspect: &str, selector: &w
 /// not-a-decimal is the caller's `400 bad_request` as before, and a decimal
 /// whose plain form is over the bound is `400 decimal_out_of_range`.
 fn parse_value_bound(name: &str, text: &str) -> Result<BigDecimal, ApiError> {
-	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
+	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
 }
 
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.
@@ -2155,19 +2155,24 @@ mod tests {
 
 	// ── TAG-10: `tag.<k>=v` selectors on the stored reads ─────────────────────────────
 
+	/// One series' tags and its `(timestamp, value)` rows.
+	type TaggedRows<'a> = (&'a [(&'a str, &'a str)], &'a [(i64, &'a str)]);
+
 	/// `price` with the untagged rows of [`sealed_price_store`] (100..=140) plus three
 	/// tagged series: `{host=a}` at 200 and 210, `{host=a, region=eu}` at 300, and
 	/// `{host=b}` at 400.
 	async fn router_with_tagged_price() -> (TempDir, axum::Router) {
 		let dir = TempDir::new().expect("temp dir");
 		let store = sealed_price_store(&dir).await;
-		let series: [(&[(&str, &str)], &[(i64, &str)]); 3] = [(&[("host", "a")], &[(200, "7"), (210, "8")]), (&[("host", "a"), ("region", "eu")], &[(300, "9")]), (&[("host", "b")], &[(400, "10")])];
+		let series: [TaggedRows<'_>; 3] = [(&[("host", "a")], &[(200, "7"), (210, "8")]), (&[("host", "a"), ("region", "eu")], &[(300, "9")]), (&[("host", "b")], &[(400, "10")])];
 		for (n, (tags, rows)) in series.into_iter().enumerate() {
 			let groups = weftdb::TagSet::from_pairs(tags.iter().copied()).expect("valid tags");
 			let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = rows.iter().map(|(t, v)| (*t, bd(v))).unzip();
 			store.ingest("price", &weftdb::IngestBatch::dense(format!("tagged-{n}"), ts, vs).with_groups(groups)).await.expect("ingests a tagged batch");
 		}
-		(dir, app_with_state(AppState::new().with_store(store)))
+		let result = (dir, app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store))));
+		drop(store);
+		result
 	}
 
 	/// GET `uri` and parse the body as JSON.

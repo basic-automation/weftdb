@@ -1791,20 +1791,20 @@ mod tests {
 		};
 		let splines = [serde_json::json!("linear"), serde_json::json!("quadratic"), serde_json::json!("cubic"), serde_json::json!({ "polynomial": { "degree": 3 } })];
 		for case in 0..64 {
-			let knots = 1 + (next() % 12) as i64;
+			let knots = 1 + (next() % 12).cast_signed();
 			let exponent = (next() % 35) as i32 - 19; // 1e-19 ..= 1e15
 			let mut t = 0_i64;
 			let mut points = Vec::new();
 			for _ in 0..knots {
-				t += 1 + (next() % 90) as i64;
-				let unit = crate::num::u64_to_f64((next() >> 11)) / crate::num::u64_to_f64(1_u64 << 53) * 2.0 - 1.0;
+				t += 1 + (next() % 90).cast_signed();
+				let unit = (crate::num::u64_to_f64(next() >> 11) / crate::num::u64_to_f64(1_u64 << 53)).mul_add(2.0, -1.0);
 				points.push(serde_json::json!({ "timestamp": ts(t), "value": unit * 10_f64.powi(exponent) }));
 			}
 			let body = serde_json::json!({
 				"spline": splines[case % splines.len()],
 				"resolution": "seconds",
-				"start": ts(-((next() % 60) as i64)),
-				"end": ts(t + (next() % 60) as i64),
+				"start": ts(-(next() % 60).cast_signed()),
+				"end": ts(t + (next() % 60).cast_signed()),
 				"points": points,
 			});
 			assert_paths_agree(body).await;

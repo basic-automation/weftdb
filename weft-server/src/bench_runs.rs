@@ -301,7 +301,7 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
 		std::os::unix::fs::symlink(outside.path().join("secret.manifest.json"), dir.path().join("file.manifest.json")).unwrap();
-		assert!(BenchRuns::new(dir.path()).list().unwrap().is_empty());
+		assert_eq!(BenchRuns::new(dir.path()).list().unwrap(), [] as [RunSummary; 0]);
 	}
 
 	#[test]

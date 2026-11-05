@@ -343,7 +343,6 @@ pub fn read_report(path: &Path) -> Result<BenchReport, CompareError> {
 ///
 /// Returns [`CompareError::Incomparable`] when the two runs ran on different operating systems or
 /// architectures and `ignore_provenance` is not set.
-#[must_use]
 pub fn compare_reports(baseline: &BenchReport, candidate: &BenchReport, threshold_pct: f64, ignore_provenance: bool) -> Result<Comparison, CompareError> {
 	let notes = provenance(baseline, candidate);
 	let hard: Vec<String> = notes.iter().filter(|note| note.starts_with("hard:")).map(|note| note.trim_start_matches("hard: ").to_string()).collect();
@@ -372,10 +371,7 @@ fn key_of(result: &BenchResult) -> WorkloadKey {
 }
 
 fn shape_of(dataset: &DatasetMeta) -> String {
-	let shape = match &dataset.signal_shape {
-		Some(signal) => serde_json::to_string(signal).unwrap_or_else(|_| "unknown".to_string()),
-		None => "none".to_string(),
-	};
+	let shape = dataset.signal_shape.as_ref().map_or_else(|| "none".to_string(), |signal| serde_json::to_string(signal).unwrap_or_else(|_| "unknown".to_string()));
 	format!("in={} out={} irregular={} missing={} seed={} shape={}", dataset.input_points, dataset.output_points, dataset.irregular, format_pct(dataset.missingness_fraction * 100.0), dataset.seed, shape)
 }
 
@@ -456,6 +452,79 @@ fn move_of(metric: String, before: f64, after: f64, higher_is_better: bool, nois
 		Verdict::Flat
 	};
 	MetricMove { metric, higher_is_better, baseline: before, candidate: after, change_pct, worse_by_pct: if worse { magnitude } else { 0.0 }, noise, verdict }
+}
+
+/// Differences between the two runs' environment blocks. Entries prefixed `hard:` are the ones
+/// that make a comparison meaningless rather than merely worth a caveat.
+fn provenance(baseline: &BenchReport, candidate: &BenchReport) -> Vec<String> {
+	let mut notes = Vec::new();
+	let b = &baseline.metadata;
+	let c = &candidate.metadata;
+	if b.os != c.os {
+		notes.push(format!("hard: os {} vs {}", b.os, c.os));
+	}
+	if b.arch != c.arch {
+		notes.push(format!("hard: architecture {} vs {}", b.arch, c.arch));
+	}
+	note_diff(&mut notes, "cpu", b.cpu_model.as_deref(), c.cpu_model.as_deref());
+	note_diff(&mut notes, "physical cores", b.cpu_cores_physical.map(|v| v.to_string()).as_deref(), c.cpu_cores_physical.map(|v| v.to_string()).as_deref());
+	note_diff(&mut notes, "total memory", b.total_memory_bytes.map(|v| (v / (1 << 30)).to_string()).map(|v| format!("{v} GiB")).as_deref(), c.total_memory_bytes.map(|v| format!("{} GiB", v / (1 << 30))).as_deref());
+	note_diff(&mut notes, "work disk", b.work_disk_kind.as_deref(), c.work_disk_kind.as_deref());
+	note_diff(&mut notes, "work filesystem", b.work_disk_file_system.as_deref(), c.work_disk_file_system.as_deref());
+	if b.weft_bench_version != c.weft_bench_version {
+		notes.push(format!("weft-bench {} vs {}", b.weft_bench_version, c.weft_bench_version));
+	}
+	if baseline.schema_version != candidate.schema_version {
+		// Two reports of different schema versions do not necessarily measure the same thing in the
+		// same column, so this is a refusal and not a caveat -- `--ignore-provenance` is the override.
+		notes.push(format!("hard: report schema v{} vs v{}", baseline.schema_version, candidate.schema_version));
+	}
+	// Which adapters produced the numbers is provenance too, and now that every
+	// adapter reports itself it is recorded rather than assumed. It is a caveat and
+	// never a refusal: pairing WeftDB with another engine is the point of a
+	// competitor comparison. What must not happen is a table that reads like a
+	// like-for-like race while one side ran a native engine and the other an
+	// in-process baseline, or like a machine difference that is really an
+	// interface difference.
+	let baseline_adapters = adapters_of(baseline);
+	let candidate_adapters = adapters_of(candidate);
+	if baseline_adapters != candidate_adapters {
+		notes.push(format!("adapter: {} vs {}", baseline_adapters.join(" + "), candidate_adapters.join(" + ")));
+	}
+	notes
+}
+
+/// The distinct engines behind a report's results, each spelled out with what it
+/// reported, as one sorted set so two reports compare by content. A result with
+/// no report is named as such: that shape only exists in artifacts written before
+/// the reporting interface, and in the workloads that do not drive an adapter.
+fn adapters_of(report: &BenchReport) -> Vec<String> {
+	let mut adapters: Vec<String> = report.results.iter().map(|result| result.adapter_info.as_ref().map_or_else(|| format!("{} [no adapter report]", result.adapter), |info| format!("{} [engine {}; {}; {}; {}]", result.adapter, info.engine, info.method, engine_kind(info.native_engine), spline_honour(info.honours_requested_spline)))).collect();
+	adapters.sort_unstable();
+	adapters.dedup();
+	adapters
+}
+
+const fn engine_kind(native_engine: bool) -> &'static str {
+	if native_engine {
+		"native engine"
+	} else {
+		"in-process baseline"
+	}
+}
+
+const fn spline_honour(honours_requested_spline: bool) -> &'static str {
+	if honours_requested_spline {
+		"honours the requested spline"
+	} else {
+		"ignores the requested spline"
+	}
+}
+
+fn note_diff(notes: &mut Vec<String>, label: &str, before: Option<&str>, after: Option<&str>) {
+	if before != after {
+		notes.push(format!("{label}: {} vs {}", before.unwrap_or("unrecorded"), after.unwrap_or("unrecorded")));
+	}
 }
 
 #[cfg(test)]
@@ -763,85 +832,5 @@ mod tests {
 		std::fs::write(&ok, serde_json::to_vec(&report("linux", "x86_64", vec![result("query", 1, 2, 3, 1.0, None)])).expect("serialise")).expect("write");
 		assert_eq!(read_report(&ok).expect("reads back").results.len(), 1);
 		let _ = std::fs::remove_dir_all(&dir);
-	}
-}
-
-/// Differences between the two runs' environment blocks. Entries prefixed `hard:` are the ones
-/// that make a comparison meaningless rather than merely worth a caveat.
-fn provenance(baseline: &BenchReport, candidate: &BenchReport) -> Vec<String> {
-	let mut notes = Vec::new();
-	let b = &baseline.metadata;
-	let c = &candidate.metadata;
-	if b.os != c.os {
-		notes.push(format!("hard: os {} vs {}", b.os, c.os));
-	}
-	if b.arch != c.arch {
-		notes.push(format!("hard: architecture {} vs {}", b.arch, c.arch));
-	}
-	note_diff(&mut notes, "cpu", &b.cpu_model, &c.cpu_model);
-	note_diff(&mut notes, "physical cores", &b.cpu_cores_physical.map(|v| v.to_string()), &c.cpu_cores_physical.map(|v| v.to_string()));
-	note_diff(&mut notes, "total memory", &b.total_memory_bytes.map(|v| (v / (1 << 30)).to_string()).map(|v| format!("{v} GiB")), &c.total_memory_bytes.map(|v| format!("{} GiB", v / (1 << 30))));
-	note_diff(&mut notes, "work disk", &b.work_disk_kind, &c.work_disk_kind);
-	note_diff(&mut notes, "work filesystem", &b.work_disk_file_system, &c.work_disk_file_system);
-	if b.weft_bench_version != c.weft_bench_version {
-		notes.push(format!("weft-bench {} vs {}", b.weft_bench_version, c.weft_bench_version));
-	}
-	if baseline.schema_version != candidate.schema_version {
-		// Two reports of different schema versions do not necessarily measure the same thing in the
-		// same column, so this is a refusal and not a caveat -- `--ignore-provenance` is the override.
-		notes.push(format!("hard: report schema v{} vs v{}", baseline.schema_version, candidate.schema_version));
-	}
-	// Which adapters produced the numbers is provenance too, and now that every
-	// adapter reports itself it is recorded rather than assumed. It is a caveat and
-	// never a refusal: pairing WeftDB with another engine is the point of a
-	// competitor comparison. What must not happen is a table that reads like a
-	// like-for-like race while one side ran a native engine and the other an
-	// in-process baseline, or like a machine difference that is really an
-	// interface difference.
-	let baseline_adapters = adapters_of(baseline);
-	let candidate_adapters = adapters_of(candidate);
-	if baseline_adapters != candidate_adapters {
-		notes.push(format!("adapter: {} vs {}", baseline_adapters.join(" + "), candidate_adapters.join(" + ")));
-	}
-	notes
-}
-
-/// The distinct engines behind a report's results, each spelled out with what it
-/// reported, as one sorted set so two reports compare by content. A result with
-/// no report is named as such: that shape only exists in artifacts written before
-/// the reporting interface, and in the workloads that do not drive an adapter.
-fn adapters_of(report: &BenchReport) -> Vec<String> {
-	let mut adapters: Vec<String> = report
-		.results
-		.iter()
-		.map(|result| match &result.adapter_info {
-			Some(info) => format!("{} [engine {}; {}; {}; {}]", result.adapter, info.engine, info.method, engine_kind(info.native_engine), spline_honour(info.honours_requested_spline)),
-			None => format!("{} [no adapter report]", result.adapter),
-		})
-		.collect();
-	adapters.sort_unstable();
-	adapters.dedup();
-	adapters
-}
-
-const fn engine_kind(native_engine: bool) -> &'static str {
-	if native_engine {
-		"native engine"
-	} else {
-		"in-process baseline"
-	}
-}
-
-const fn spline_honour(honours_requested_spline: bool) -> &'static str {
-	if honours_requested_spline {
-		"honours the requested spline"
-	} else {
-		"ignores the requested spline"
-	}
-}
-
-fn note_diff(notes: &mut Vec<String>, label: &str, before: &Option<String>, after: &Option<String>) {
-	if before != after {
-		notes.push(format!("{label}: {} vs {}", before.as_deref().unwrap_or("unrecorded"), after.as_deref().unwrap_or("unrecorded")));
 	}
 }

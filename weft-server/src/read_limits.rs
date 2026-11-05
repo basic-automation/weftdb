@@ -228,10 +228,7 @@ impl ReadLimits {
 	/// [`read_rows_max`](Self::read_rows_max).
 	pub fn check_rows(&self, rows: usize, subject: &str, paginate_with: Option<&'static str>) -> Result<(), ApiError> {
 		if rows > self.read_rows_max {
-			let way_out = match paginate_with {
-				Some(parameter) => format!("narrow the window or paginate with `{parameter}`"),
-				None => "narrow the window — an export of a whole window has no page to shrink".to_string(),
-			};
+			let way_out = paginate_with.map_or_else(|| "narrow the window — an export of a whole window has no page to shrink".to_string(), |parameter| format!("narrow the window or paginate with `{parameter}`"));
 			return Err(refusal(format!("{subject} returns {rows} rows, over this server's cap of {} rows per read (set {MAX_READ_ROWS_ENV} to change it; {way_out})", self.read_rows_max), self.read_rows_max));
 		}
 		Ok(())
@@ -295,6 +292,11 @@ impl ReadLimits {
 /// The read's own failure and the timeout are both `ApiError`, so the result is
 /// flattened: a caller's `?` sees one error type and the `504` cannot be mistaken
 /// for the read's own status.
+///
+/// # Errors
+///
+/// The read's own error, or the `504` of [`ReadLimits::deadline_exceeded`] when the
+/// deadline passes first.
 pub async fn within_deadline<T, F>(limits: &ReadLimits, read: F) -> Result<T, ApiError>
 where
 	F: std::future::Future<Output = Result<T, ApiError>>,
@@ -316,7 +318,7 @@ pub const fn grid_buckets(start_nanos: i128, end_nanos: i128, step_nanos: i128) 
 	if step_nanos <= 0 || end_nanos < start_nanos {
 		return 0;
 	}
-	((end_nanos - start_nanos) / step_nanos) as u128 + 1
+	((end_nanos - start_nanos) / step_nanos).unsigned_abs() + 1
 }
 
 /// The `422 result_too_large` shared by the four checks, carrying the cap in the
@@ -379,7 +381,7 @@ mod tests {
 				MAX_AT_MULTI_INSTANTS_ENV => ReadLimits::from_env_values(None, None, None, Some(raw), None),
 				_ => ReadLimits::from_env_values(None, None, None, None, Some(raw)),
 			};
-			let message = error.expect_err(&format!("{name}={raw:?} must be refused")).to_string();
+			let message = error.expect_err(&format!("{name}={raw:?} must be refused")).clone();
 			assert!(message.contains(name), "{message} must name {name}");
 		}
 	}

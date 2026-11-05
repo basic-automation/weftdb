@@ -100,7 +100,8 @@ pub struct CompressedQueryPoint {
 /// do not strictly rise, if `batch_rows` or `queries` is zero, if `params.rows < 2` or a copy
 /// would leave the timestamp range, if a store operation or a reduction fails, or if
 /// `on_window` fails. Two paths disagreeing is not an error: it fails that size's gate.
-pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: CompressedQueryParams, mut on_window: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+pub async fn run_compressed_query(profile: &IngestProfile, corpus: crate::ingest::LaneCorpus<'_>, params: CompressedQueryParams, mut on_window: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+	let crate::ingest::LaneCorpus { timestamps, values, value_scale, missingness_fraction, generation_ns } = corpus;
 	anyhow::ensure!(timestamps.len() >= 2, "a compressed-query corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "compressed-query corpus timestamps and values differ in length");
 	anyhow::ensure!(profile.batch_rows > 0, "ingest batch_rows must be > 0");
@@ -223,7 +224,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("cq", "global_active_power", 7);
 		let mut results = Vec::new();
-		run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, CompressedQueryParams { rows: 200, queries: 5, seed: 3, compact_to: None }, |r| {
+		run_compressed_query(&profile, crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, CompressedQueryParams { rows: 200, queries: 5, seed: 3, compact_to: None }, |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -246,7 +247,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("cq", "global_active_power", 7);
 		let mut results = Vec::new();
-		run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, CompressedQueryParams { rows: 200, queries: 4, seed: 9, compact_to: Some(100) }, |r| {
+		run_compressed_query(&profile, crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, CompressedQueryParams { rows: 200, queries: 4, seed: 9, compact_to: Some(100) }, |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -268,7 +269,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("cq", "global_active_power", 2);
 		for params in [CompressedQueryParams { rows: 8, queries: 0, seed: 0, compact_to: None }, CompressedQueryParams { rows: 1, queries: 1, seed: 0, compact_to: None }] {
-			assert!(run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, params, |_| Ok(())).await.is_err(), "{params:?}");
+			assert!(run_compressed_query(&profile, crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, params, |_| Ok(())).await.is_err(), "{params:?}");
 		}
 	}
 }

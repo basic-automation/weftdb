@@ -15,7 +15,6 @@
 
 use std::time::Instant;
 
-use bigdecimal::BigDecimal;
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -61,7 +60,8 @@ struct Lane {
 /// do not strictly rise, if a knob is zero or the weights sum to zero, if a copy would leave the
 /// timestamp range, if a store operation fails, or if `on_lane` fails. A read that answers wrongly
 /// is not an error: it fails that lane's gate.
-pub async fn run_query_mix(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: QueryMixParams, mut on_lane: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+pub async fn run_query_mix(profile: &IngestProfile, corpus: crate::ingest::LaneCorpus<'_>, params: QueryMixParams, mut on_lane: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+	let crate::ingest::LaneCorpus { timestamps, values, value_scale, missingness_fraction, generation_ns } = corpus;
 	anyhow::ensure!(timestamps.len() >= 2 && timestamps.len() == values.len(), "a query-mix corpus needs at least two rows and as many values as timestamps");
 	anyhow::ensure!(profile.batch_rows > 0 && params.ops > 0 && params.range_rows > 0 && params.rows > 0, "query mix needs rows, ops, range rows and a batch size above zero");
 	let stride = timestamps[1] - timestamps[0];
@@ -141,7 +141,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("mix", "global_active_power", 5);
 		let mut results = Vec::new();
-		run_query_mix(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, QueryMixParams { rows: 40, ops: 60, range_rows: 9, weights, seed }, |r| {
+		run_query_mix(&profile, crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, QueryMixParams { rows: 40, ops: 60, range_rows: 9, weights, seed }, |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -177,6 +177,6 @@ mod tests {
 
 	async fn mix_err(weights: LaneWeights) -> bool {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
-		run_query_mix(&IngestProfile::new("mix", "a", 5), &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, QueryMixParams { rows: 4, ops: 1, range_rows: 1, weights, seed: 0 }, |_| Ok(())).await.is_err()
+		run_query_mix(&IngestProfile::new("mix", "a", 5), crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, QueryMixParams { rows: 4, ops: 1, range_rows: 1, weights, seed: 0 }, |_| Ok(())).await.is_err()
 	}
 }

@@ -369,11 +369,7 @@ pub fn value_errors_for(entries: impl IntoIterator<Item = (String, String)>) -> 
 			if trimmed.parse::<f64>().ok().as_ref().is_none_or(|n| !(n.is_finite() && *n > 0.0)) {
 				errors.push(format!("{name}={value:?} is not a finite number above 0, which is the only shape it accepts"));
 			}
-		} else if name == "WEFT_SEGMENT_MMAP_READS" {
-			if crate::store_open::ScopePin::parse_strict(trimmed).is_none() {
-				errors.push(format!("{name}={value:?} is neither on (`on`/`1`/`true`/`yes`) nor off (`off`/`0`/`false`/`no`), the only values it accepts"));
-			}
-		} else if name == "WEFT_STORE_SCOPE_PIN" {
+		} else if name == "WEFT_SEGMENT_MMAP_READS" || name == "WEFT_STORE_SCOPE_PIN" {
 			if crate::store_open::ScopePin::parse_strict(trimmed).is_none() {
 				errors.push(format!("{name}={value:?} is neither on (`on`/`1`/`true`/`yes`) nor off (`off`/`0`/`false`/`no`), the only values it accepts"));
 			}

@@ -398,7 +398,7 @@ impl InterpolationProfile {
 		// Candidate count is inflated so that, after dropping `missingness`, we
 		// still land near `input_points`.
 		let keep = 1.0 - self.missingness_fraction.clamp(0.0, 0.95);
-		let candidates = crate::num::f64_to_usize(((self.input_points as f64) / keep.max(0.05)).ceil());
+		let candidates = crate::num::f64_to_usize((crate::num::usize_to_f64(self.input_points) / keep.max(0.05)).ceil());
 		let candidates = candidates.max(2);
 
 		// `candidates` is small (bounded by ~input_points); the i64 casts of the
@@ -416,7 +416,7 @@ impl InterpolationProfile {
 			let base_offset = nominal_step_ns.saturating_mul(crate::num::usize_to_i64(i));
 			// Jitter span is a small fraction of one step; precision/truncation
 			// in the f64 round-trip is intended and harmless.
-			let jitter_span = (crate::num::i64_to_f64(nominal_step_ns) * self.jitter_fraction) as i64;
+			let jitter_span = crate::num::f64_to_i64(crate::num::i64_to_f64(nominal_step_ns) * self.jitter_fraction);
 			let jitter = if jitter_span > 0 { rng.random_range(-jitter_span..=jitter_span) } else { 0 };
 			let offset_ns = (base_offset + jitter).clamp(0, span_ns);
 			let timestamp = start + Duration::nanoseconds(offset_ns);
@@ -431,7 +431,7 @@ impl InterpolationProfile {
 			// non-empty range, so guard the degenerate case explicitly.
 			let noise = if self.noise_amplitude > 0.0 { rng.random_range(-self.noise_amplitude..=self.noise_amplitude) } else { 0.0 };
 			let signal = self.signal_shape.evaluate(phase) + noise;
-			let rounded = |places: u32| BigDecimal::new(((signal * 10_f64.powi(places.cast_signed())).round() as i64).into(), i64::from(places));
+			let rounded = |places: u32| BigDecimal::new(crate::num::f64_to_i64((signal * 10_f64.powi(places.cast_signed())).round()).into(), i64::from(places));
 			let value = self.value_decimals.map_or_else(|| BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(0)), rounded);
 			points.push(Point { timestamp, value });
 		}

@@ -605,7 +605,7 @@ mod tests {
 	async fn prune_on_a_missing_base_is_a_no_op() {
 		let dir = TempDir::new().unwrap();
 		let base = dir.path().join("never-created");
-		assert!(list_generated_backups(&base).await.unwrap().is_empty());
+		assert_eq!(list_generated_backups(&base).await.unwrap(), [] as [(u128, std::path::PathBuf); 0]);
 		assert_eq!(prune_generated_backups(&base, 3).await.unwrap(), 0);
 	}
 
@@ -793,7 +793,8 @@ mod tests {
 		let now = mtime(&stale) + weftdb::STAGING_SWEEP_AGE + gap / 2;
 
 		let config = BackupDaemonConfig { interval: Duration::from_secs(3600), base: base.clone(), keep: None };
-		let daemon = spawn_backup_daemon_with_clock(store, Arc::new(Metrics::default()), config, move || now);
+		let daemon = spawn_backup_daemon_with_clock(std::sync::Arc::clone(&store), Arc::new(Metrics::default()), config, move || now);
+		drop(store);
 		wait_until_gone(&stale, "the start-up sweep removes a stale entry without waiting for a tick").await;
 		daemon.abort();
 		let _ = daemon.await;
@@ -811,7 +812,8 @@ mod tests {
 
 		// Two sweep ages ahead, every staging entry is stale.
 		let config = BackupDaemonConfig { interval: Duration::from_millis(50), base: base.clone(), keep: None };
-		let daemon = spawn_backup_daemon_with_clock(store, Arc::new(Metrics::default()), config, || SystemTime::now() + 2 * weftdb::STAGING_SWEEP_AGE);
+		let daemon = spawn_backup_daemon_with_clock(std::sync::Arc::clone(&store), Arc::new(Metrics::default()), config, || SystemTime::now() + 2 * weftdb::STAGING_SWEEP_AGE);
+		drop(store);
 		wait_until_gone(&first, "the start-up sweep runs").await;
 		// Made after the start-up sweep listed the base, so only a tick's sweep can see it.
 		let second = base.join(".restore-drill-2");
@@ -837,7 +839,7 @@ mod tests {
 		tokio::time::advance(Duration::from_millis(350)).await;
 		ticker.tick().await; // The one tick the skipped schedule still owes.
 		let waker = Waker::noop();
-		let mut cx = Context::from_waker(&waker);
+		let mut cx = Context::from_waker(waker);
 		let mut next = Box::pin(ticker.tick());
 		assert!(matches!(std::future::Future::poll(next.as_mut(), &mut cx), Poll::Pending), "a missed tick must not burst: nothing is due until the next period boundary");
 	}

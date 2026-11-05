@@ -59,6 +59,8 @@
 //! changes, the separator changes with it, and digests from the two
 //! algorithms can never compare equal by accident.
 
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -138,7 +140,7 @@ fn finish_hex(hasher: Sha256) -> String {
 	let digest = hasher.finalize();
 	let mut out = String::with_capacity(digest.len() * 2);
 	for byte in digest {
-		out.push_str(&format!("{byte:02x}"));
+		let _ = write!(out, "{byte:02x}");
 	}
 	out
 }

@@ -629,12 +629,19 @@ pub struct SelectorQuery<T>(pub T, pub weftdb::SeriesSelector);
 
 impl<T, S> FromRequestParts<S> for SelectorQuery<T>
 where
-	T: DeserializeOwned,
+	T: DeserializeOwned + Send,
 	S: Send + Sync,
 {
 	type Rejection = ApiError;
 
-	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+	fn from_request_parts(parts: &mut Parts, _state: &S) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+		std::future::ready(Self::from_parts(parts))
+	}
+}
+
+impl<T: DeserializeOwned> SelectorQuery<T> {
+	/// The extraction itself, which reads only the request's query string.
+	fn from_parts(parts: &Parts) -> Result<Self, ApiError> {
 		let (rest, selector) = split_selector(parts.uri.query().unwrap_or_default())?;
 		let uri: axum::http::Uri = format!("/?{rest}").parse().map_err(|_| ApiError::bad_request("the query string is not a valid URI query".to_string()))?;
 		let Query(params) = Query::<T>::try_from_uri(&uri).map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
@@ -715,12 +722,19 @@ pub struct TaggedQuery<T>(pub T, pub weftdb::TagSet);
 
 impl<T, S> FromRequestParts<S> for TaggedQuery<T>
 where
-	T: DeserializeOwned,
+	T: DeserializeOwned + Send,
 	S: Send + Sync,
 {
 	type Rejection = ApiError;
 
-	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+	fn from_request_parts(parts: &mut Parts, _state: &S) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+		std::future::ready(Self::from_parts(parts))
+	}
+}
+
+impl<T: DeserializeOwned> TaggedQuery<T> {
+	/// The extraction itself, which reads only the request's query string.
+	fn from_parts(parts: &Parts) -> Result<Self, ApiError> {
 		let TagParams { rest, matchers, mode } = split_tag_params(parts.uri.query().unwrap_or_default())?;
 		if mode.is_some() {
 			return Err(ApiError::bad_request(format!("`{TAG_MATCH_PARAM}` is a read option; an ingest names its series exactly with `{TAG_PARAM_PREFIX}<key>=value`")));
@@ -862,7 +876,6 @@ pub fn classify_ingest(err: &anyhow::Error) -> ApiError {
 			weft_arrow::ConvertError::WrongType { column, expected } => ApiError::bad_request(format!("column `{column}` is not the Arrow type WeftDB reads here ({expected})")),
 			weft_arrow::ConvertError::MissingMetadata(k) => ApiError::bad_request(format!("the batch schema carries no `{k}` metadata, which says how to read its timestamps")),
 			weft_arrow::ConvertError::UnknownTimeUnit(s) => ApiError::bad_request(format!("the batch schema names time unit `{s}`, which WeftDB does not use (the units are s, ms, us, ns)")),
-			weft_arrow::ConvertError::BadValue(_) | weft_arrow::ConvertError::Ipc(_) | weft_arrow::ConvertError::Parquet(_) => ApiError::bad_request(e.to_string()),
 			weft_arrow::ConvertError::DecimalOutOfRange { digits } => decimal_out_of_range_refusal(*digits),
 			// A `NaN` or infinity in a Parquet body: the strict decode (ROB-7) names
 			// the row, and the code says why the row cannot be stored at all.
@@ -896,7 +909,7 @@ pub(crate) fn decimal_out_of_range_refusal(digits: usize) -> ApiError {
 /// Map a failed [`weft_physical_type::parse_decimal`] at a parse site: the
 /// caller's own `invalid` error for text that is not a decimal at all, and
 /// the `decimal_out_of_range` refusal for a decimal outside the domain.
-pub(crate) fn decimal_error(error: weft_physical_type::ParseDecimalError, invalid: ApiError) -> ApiError {
+pub(crate) fn decimal_error(error: &weft_physical_type::ParseDecimalError, invalid: ApiError) -> ApiError {
 	match error {
 		weft_physical_type::ParseDecimalError::Invalid => invalid,
 		weft_physical_type::ParseDecimalError::OutOfRange(e) => decimal_out_of_range_refusal(e.digits),
@@ -936,7 +949,7 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 	if let Some(e) = err.downcast_ref::<weftdb::StoreError>() {
 		return Some(match e {
 			weftdb::StoreError::UnknownAspect { .. } => ApiError::aspect_not_found(e.to_string()),
-			weftdb::StoreError::DeclarationConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
+			weftdb::StoreError::DeclarationConflict { .. } | weftdb::StoreError::UpsertKeysConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IdempotencyConflict { .. } => ApiError::new(Code::IdempotencyConflict, e.to_string()),
 			weftdb::StoreError::GroupsUnsupported { .. } => ApiError::new(Code::TagsUnsupported, e.to_string()),
 			weftdb::StoreError::SeriesLimit { .. } => ApiError::new(Code::SeriesLimit, e.to_string()),
@@ -944,7 +957,6 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 			weftdb::StoreError::ReservedTagKey { .. } => ApiError::new(Code::InvalidTag, e.to_string()),
 			// A tag outside the aspect's declared upsert keys is the caller's tag to fix.
 			weftdb::StoreError::NotAnUpsertKey { key, .. } => ApiError::new(Code::InvalidTag, e.to_string()).with_details(serde_json::json!({ "tag": key, "reason": "not an upsert key" })),
-			weftdb::StoreError::UpsertKeysConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IngestValueOutOfRange { digits, .. } => decimal_out_of_range_refusal(*digits),
 			// The store's own decision 12 read bounds (ROB-13): the same
 			// `422 result_too_large` the read ceilings answer with (ROB-12),
@@ -1059,7 +1071,6 @@ pub fn from_sketch_error(e: &weft_reduce::SketchError) -> ApiError {
 		weft_reduce::SketchError::InvalidAccuracy => ApiError::bad_request("a sketch's relative accuracy must be inside (0, 1)"),
 		weft_reduce::SketchError::InvalidMaxBins => ApiError::bad_request("a sketch needs a bucket budget of at least 1"),
 		weft_reduce::SketchError::ValueRange => ApiError::new(Code::NotFinite, "a value here is not finite, or lies outside the range the sketch can cover"),
-		weft_reduce::SketchError::AccuracyMismatch => ApiError::internal(e.to_string()),
 		_ => ApiError::internal(e.to_string()),
 	}
 }
@@ -1351,7 +1362,7 @@ mod tests {
 		// well-formed and its content cannot be represented.
 		let api = classify_ingest(&sealed(weft_physical_type::SealError::ToleranceExceeded { max_abs_error: "0.5".parse().unwrap(), tolerance: "0".parse().unwrap() }));
 		assert_eq!(api.code(), Code::ValueNotRepresentable);
-		let details = api.details.clone().expect("the tolerance figures travel as details, not inside a sentence");
+		let details = api.details.expect("the tolerance figures travel as details, not inside a sentence");
 		assert_eq!(details["max_abs_error"], "0.5");
 		assert_eq!(details["tolerance"], "0");
 		// A backwards timestamp is a malformed batch: a different condition, and a different
@@ -1386,7 +1397,7 @@ mod tests {
 		let api = classify_read(&anyhow::Error::from(refused).context("could not address the aspect"));
 		assert_eq!(api.code(), Code::InvalidAspectName);
 		assert_eq!(api.code().status(), StatusCode::BAD_REQUEST);
-		let details = api.details.clone().expect("the name and its reason travel as details");
+		let details = api.details.expect("the name and its reason travel as details");
 		assert_eq!(details["aspect"], "../escape");
 		assert!(details["reason"].as_str().is_some_and(|reason| !reason.is_empty()), "the reason names the rule: {details}");
 	}

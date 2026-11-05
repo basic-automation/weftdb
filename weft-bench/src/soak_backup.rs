@@ -467,7 +467,7 @@ impl BackupLaneChecker {
 		let mut seen: BTreeMap<(usize, usize), &ObservedPoint> = BTreeMap::new();
 		for point in observed {
 			let expected_timestamp_ns = self.model.timestamp_ns(tick, point.row);
-			let in_grid = point.series < grid.series && point.row < grid.rows;
+			let in_grid = grid.contains(point.series, point.row);
 			let expected = if in_grid { grid.cell(point.series, point.row).cloned() } else { None };
 			if seen.insert((point.series, point.row), point).is_some() {
 				mismatches.push(BackupMismatch { tick, series: point.series, row: point.row, kind: BackupMismatchKind::DuplicatePoint, expected, observed: Some(point.value.clone()), expected_timestamp_ns, observed_timestamp_ns: Some(point.timestamp_ns) });

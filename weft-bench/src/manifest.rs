@@ -834,7 +834,7 @@ mod tests {
 		let manifest = RunManifest::read(&manifest_path).expect("reads");
 		assert_eq!(manifest.invocation.labels["token"], REDACTED);
 		assert_eq!(manifest.invocation.labels["note"], "nightly", "an ordinary label must survive untouched");
-		assert!(manifest.verify(&manifest_path).defects().is_empty());
+		assert_eq!(manifest.verify(&manifest_path).defects(), [] as [&Problem; 0]);
 	}
 
 	#[test]
@@ -869,7 +869,7 @@ mod tests {
 		manifest.sources.report = "reports/json/heavy__weftdb.json".to_string();
 		let manifest_path = dir.join("heavy__weftdb.manifest.json");
 		manifest.write_to(&manifest_path).expect("the sibling lookup finds the report");
-		assert!(manifest.verify(&manifest_path).defects().is_empty());
+		assert_eq!(manifest.verify(&manifest_path).defects(), [] as [&Problem; 0]);
 	}
 
 	#[test]
@@ -927,8 +927,8 @@ mod tests {
 		let manifest_path = dir.join("run.manifest.json");
 		manifest.write_to(&manifest_path).expect("the numbers are still real, so the record is still written");
 		let verdict = RunManifest::read(&manifest_path).expect("reads").verify(&manifest_path);
-		assert!(verdict.problems.iter().any(|problem| *problem == Problem::SourceUnrecorded), "{:?}", verdict.problems);
-		assert!(verdict.problems.iter().any(|problem| *problem == Problem::DirtySource), "{:?}", verdict.problems);
+		assert!(verdict.problems.contains(&Problem::SourceUnrecorded), "{:?}", verdict.problems);
+		assert!(verdict.problems.contains(&Problem::DirtySource), "{:?}", verdict.problems);
 		assert!(verdict.defects().is_empty(), "neither is a defect: {:?}", verdict.defects());
 	}
 

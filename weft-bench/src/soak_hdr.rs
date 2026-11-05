@@ -161,7 +161,7 @@ impl HdrHistogram {
 			return None;
 		}
 		let clamped = if percentile.is_nan() { 0.0 } else { percentile.clamp(0.0, 100.0) };
-		let rank = ((clamped / 100.0) * crate::num::u64_to_f64(self.total)).ceil() as u64;
+		let rank = crate::num::f64_to_u64(((clamped / 100.0) * crate::num::u64_to_f64(self.total)).ceil());
 		let rank = rank.max(1);
 		let mut cumulative: u64 = 0;
 		for (index, count) in self.counts.iter().enumerate() {

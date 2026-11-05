@@ -106,44 +106,44 @@ pub const DEFAULT_MAX_INGEST_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
 /// test's registry can carry different caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
-	max_body_bytes: usize,
-	max_inflight_bytes: u64,
-	max_rows: usize,
-	max_decoded_bytes: u64,
+	body_bytes: usize,
+	inflight_bytes: u64,
+	rows: usize,
+	decoded_bytes: u64,
 }
 
 impl IngestConfig {
 	/// The defaults: a 256 MiB body cap, and an in-flight budget of the
 	/// same 256 MiB — one max-size body in flight by default, or any
 	/// number of smaller ones whose bodies sum under it.
-	pub const DEFAULT: Self = Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64, max_rows: DEFAULT_MAX_INGEST_ROWS, max_decoded_bytes: DEFAULT_MAX_INGEST_DECODED_BYTES };
+	pub const DEFAULT: Self = Self { body_bytes: DEFAULT_MAX_INGEST_BYTES, inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64, rows: DEFAULT_MAX_INGEST_ROWS, decoded_bytes: DEFAULT_MAX_INGEST_DECODED_BYTES };
 
 	/// A configuration with an explicit body cap and the default
 	/// in-flight budget (tests, embedders).
 	#[must_use]
 	pub const fn with_max_body_bytes(max_body_bytes: usize) -> Self {
-		Self { max_body_bytes, ..Self::DEFAULT }
+		Self { body_bytes: max_body_bytes, ..Self::DEFAULT }
 	}
 
 	/// A configuration with an explicit in-flight byte budget and the
 	/// default body cap (tests, embedders).
 	#[must_use]
 	pub const fn with_max_inflight_bytes(max_inflight_bytes: u64) -> Self {
-		Self { max_inflight_bytes, ..Self::DEFAULT }
+		Self { inflight_bytes: max_inflight_bytes, ..Self::DEFAULT }
 	}
 
 	/// A configuration with an explicit row cap and everything else at its
 	/// default (tests, embedders).
 	#[must_use]
 	pub const fn with_max_rows(max_rows: usize) -> Self {
-		Self { max_rows, ..Self::DEFAULT }
+		Self { rows: max_rows, ..Self::DEFAULT }
 	}
 
 	/// A configuration with an explicit decoded-byte cap and everything else at its
 	/// default (tests, embedders).
 	#[must_use]
 	pub const fn with_max_decoded_bytes(max_decoded_bytes: u64) -> Self {
-		Self { max_decoded_bytes, ..Self::DEFAULT }
+		Self { decoded_bytes: max_decoded_bytes, ..Self::DEFAULT }
 	}
 
 	/// The limits the two `WEFT_*` values describe (`None` for an unset
@@ -157,26 +157,26 @@ impl IngestConfig {
 	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>, max_rows: Option<&str>, max_decoded_bytes: Option<&str>) -> Result<Self, String> {
 		let mut config = Self::DEFAULT;
 		if let Some(raw) = max_body_bytes {
-			config.max_body_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
-			if config.max_body_bytes == 0 {
+			config.body_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.body_bytes == 0 {
 				return Err(format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest body"));
 			}
 		}
 		if let Some(raw) = max_inflight_bytes {
-			config.max_inflight_bytes = raw.parse().map_err(|e| format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
-			if config.max_inflight_bytes == 0 {
+			config.inflight_bytes = raw.parse().map_err(|e| format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.inflight_bytes == 0 {
 				return Err(format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest"));
 			}
 		}
 		if let Some(raw) = max_rows {
-			config.max_rows = raw.parse().map_err(|e| format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: {e}"))?;
-			if config.max_rows == 0 {
+			config.rows = raw.parse().map_err(|e| format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: {e}"))?;
+			if config.rows == 0 {
 				return Err(format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: zero would refuse every ingest body"));
 			}
 		}
 		if let Some(raw) = max_decoded_bytes {
-			config.max_decoded_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
-			if config.max_decoded_bytes == 0 {
+			config.decoded_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.decoded_bytes == 0 {
 				return Err(format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest body"));
 			}
 		}
@@ -196,25 +196,25 @@ impl IngestConfig {
 	/// The one body cap for the ingest routes, in bytes.
 	#[must_use]
 	pub const fn max_body_bytes(self) -> usize {
-		self.max_body_bytes
+		self.body_bytes
 	}
 
 	/// The ingest routes' in-flight byte budget, in bytes.
 	#[must_use]
 	pub const fn max_inflight_bytes(self) -> u64 {
-		self.max_inflight_bytes
+		self.inflight_bytes
 	}
 
 	/// The row cap on one decoded ingest body (ROB-7).
 	#[must_use]
 	pub const fn max_rows(self) -> usize {
-		self.max_rows
+		self.rows
 	}
 
 	/// The decoded-byte cap on one ingest body (ROB-7).
 	#[must_use]
 	pub const fn max_decoded_bytes(self) -> u64 {
-		self.max_decoded_bytes
+		self.decoded_bytes
 	}
 }
 
@@ -655,7 +655,7 @@ async fn ingest_points_inner(target: IngestTarget<'_>, request: IngestRequest) -
 					if weft_physical_type::is_non_finite_decimal_text(text) {
 						return Err(error::non_finite_value(format!("value {text:?} (at timestamp {})", point.timestamp)));
 					}
-					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
+					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
 					values.push(Some(parsed));
 				}
 			}
@@ -734,7 +734,7 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 			// ROB-7: a `NaN` cell is refused with the reason, not stored as a hole.
 			return Err(error::non_finite_value(format!("CSV line {}: value {value_text:?}", index + 1)));
 		} else {
-			let parsed: BigDecimal = weft_physical_type::parse_decimal(value_text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1))))?;
+			let parsed: BigDecimal = weft_physical_type::parse_decimal(value_text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1))))?;
 			values.push(Some(parsed));
 		}
 		timestamps.push(timestamp);
@@ -1403,6 +1403,7 @@ mod tests {
 		let store = Arc::new(SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_max_series_per_aspect(1)).await.unwrap());
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.unwrap();
 		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
 		let point = |host: &str| serde_json::json!({ "tags": { "host": host }, "points": [{ "timestamp": 1, "value": "1" }] });
 		let (status, body) = post_json(router.clone(), "/api/v1/storage/price/points", &point("a")).await;
 		assert_eq!(status, StatusCode::CREATED, "the first series fits: {body}");
@@ -1997,7 +1998,8 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
-		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(super::IngestConfig::with_max_rows(2)));
+		let router = app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store)).with_ingest_config(super::IngestConfig::with_max_rows(2)));
+		drop(store);
 		let body = serde_json::json!({ "points": [
 			{ "timestamp": 100, "value": "1.5" },
 			{ "timestamp": 110, "value": "2.5" },
@@ -2016,7 +2018,8 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
-		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(super::IngestConfig::with_max_decoded_bytes(64)));
+		let router = app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store)).with_ingest_config(super::IngestConfig::with_max_decoded_bytes(64)));
+		drop(store);
 		let body = serde_json::json!({ "points": [
 			{ "timestamp": 100, "value": "1.5" },
 			{ "timestamp": 110, "value": "2.5" },

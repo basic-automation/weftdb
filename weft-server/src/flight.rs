@@ -131,7 +131,7 @@ impl FlightTicket {
 		match (self.start, self.end, self.lo, self.hi) {
 			(Some(start), Some(end), None, None) => Ok(Read::Time { aspect: self.aspect, start, end }),
 			(None, None, Some(lo), Some(hi)) => {
-				let bound = |name: &str, text: &str| weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))));
+				let bound = |name: &str, text: &str| weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))));
 				Ok(Read::Value { lo: bound("lo", &lo)?, hi: bound("hi", &hi)?, aspect: self.aspect })
 			}
 			_ => Err(ApiError::bad_request("a Flight ticket carries `start` and `end` (a time window) or `lo` and `hi` (a value band), and not both")),
@@ -222,6 +222,7 @@ impl WeftFlight {
 			Read::Time { aspect, start, end } => weft_arrow_store::read_time_range_to_record_batch_typed(&store, aspect, *start, *end).instrument(tracing::info_span!("flight.read", %aspect, start, end)).await,
 			Read::Value { aspect, lo, hi } => weft_arrow_store::read_value_range_to_record_batch_typed(&store, aspect, lo, hi).instrument(tracing::info_span!("flight.read", %aspect, %lo, %hi)).await,
 		};
+		drop(store);
 		batch.map_err(|error| status(&error::classify_read(&error)))
 	}
 
@@ -283,6 +284,7 @@ impl FlightService for WeftFlight {
 		let _permit = self.admit()?;
 		let store = self.store()?;
 		let names = store.list_declared_aspects().await.map_err(|error| status(&ApiError::internal(error.to_string())))?;
+		drop(store);
 		let mut infos = Vec::with_capacity(names.len());
 		for name in names {
 			let ticket = FlightTicket::whole(name.clone());
@@ -375,12 +377,10 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState, mut shutd
 		result = &mut server => return result,
 		() = signal => {}
 	}
-	if let Ok(result) = tokio::time::timeout(FLIGHT_SHUTDOWN_GRACE, server).await {
-		result
-	} else {
+	tokio::time::timeout(FLIGHT_SHUTDOWN_GRACE, server).await.unwrap_or_else(|_| {
 		tracing::warn!(grace_secs = FLIGHT_SHUTDOWN_GRACE.as_secs(), "the Flight listener's open streams outlived the shutdown grace; dropping them");
 		Ok(())
-	}
+	})
 }
 
 #[cfg(test)]

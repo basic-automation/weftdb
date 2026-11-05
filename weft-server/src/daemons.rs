@@ -320,9 +320,7 @@ mod tests {
 			let attempts = Arc::clone(&factory_attempts);
 			async move {
 				// Panic on the first two runs, then run until shutdown.
-				if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
-					panic!("tick blew up");
-				}
+				assert!(attempts.fetch_add(1, Ordering::SeqCst) >= 2, "tick blew up");
 				std::future::pending::<()>().await;
 			}
 		}));

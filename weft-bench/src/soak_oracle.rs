@@ -396,6 +396,10 @@ impl SoakOracle {
 	/// and a publisher can run it before trusting a recorded verdict.
 	/// Pure and deterministic: the same core gives the same report on
 	/// any machine.
+	///
+	/// # Panics
+	///
+	/// If the fixed self-test workload parameters are refused, which they never are.
 	#[must_use]
 	pub fn self_test() -> OracleSelfTestReport {
 		use crate::soak_workload::{LaneWeights, WorkloadParams};
@@ -483,7 +487,7 @@ impl SoakOracle {
 		let mut seen: BTreeMap<(usize, usize), &ObservedPoint> = BTreeMap::new();
 		for point in observed {
 			let expected_timestamp_ns = self.model.timestamp_ns(tick, point.row);
-			let in_grid = point.series < grid.series && point.row < grid.rows;
+			let in_grid = grid.contains(point.series, point.row);
 			let expected = if in_grid { grid.cell(point.series, point.row).cloned() } else { None };
 			if seen.insert((point.series, point.row), point).is_some() {
 				verdict.push_capped(OracleMismatch { tick, series: point.series, row: point.row, kind: MismatchKind::Duplicate, expected, observed: Some(point.value.clone()), expected_timestamp_ns, observed_timestamp_ns: Some(point.timestamp_ns) });
@@ -755,7 +759,7 @@ mod tests {
 		let report = SoakOracle::self_test();
 		assert!(report.passed(), "the self-test must pass against the core it ships with; failures: {:?}", report.failed_checks());
 		assert_eq!(report.checks_run(), 9, "nine checks: one faithful pass, six corruption classes, two window digests");
-		assert!(report.failed_checks().is_empty());
+		assert_eq!(report.failed_checks(), [] as [&str; 0]);
 	}
 
 	#[test]

@@ -511,8 +511,25 @@ fn run_child<T: for<'de> Deserialize<'de>>(exe: &Path, args: &[String], hide_dri
 // Lanes
 // ---------------------------------------------------------------------------------------------
 
+/// What one lane measured, for [`result`].
+struct LaneRun {
+	/// Per-call latencies, ns.
+	samples_ns: Vec<u64>,
+	/// The measured span the throughput is taken over, ns.
+	measured_ns: u64,
+	/// Points the lane produced.
+	output_points: usize,
+	/// Points it should have produced.
+	expected: usize,
+	/// Whether every call returned a complete series.
+	complete: bool,
+	/// Whether every value was finite.
+	finite: bool,
+}
+
 /// Assemble one lane's [`BenchResult`].
-fn result(profile: &GpuEconomicsProfile, suffix: &str, samples_ns: Vec<u64>, measured_ns: u64, output_points: usize, expected: usize, complete: bool, finite: bool, point: GpuEconomicsPoint, started: Instant) -> BenchResult {
+fn result(profile: &GpuEconomicsProfile, suffix: &str, run: LaneRun, point: GpuEconomicsPoint, started: Instant) -> BenchResult {
+	let LaneRun { samples_ns, measured_ns, output_points, expected, complete, finite } = run;
 	let p = &profile.params;
 	BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{suffix}", profile.name), adapter: "weftdb".to_string(), workload: WORKLOAD_GPU_ECONOMICS.to_string(), reps: samples_ns.len(), dataset: DatasetMeta { input_points: p.knots, output_points, irregular: true, missingness_fraction: 0.0, seed: p.seed, signal_shape: None }, latency: LatencyStats::from_samples(&samples_ns), latency_ci: None, throughput_points_per_sec: if point.lane == "cold_start" || point.lane == "no_adapter" { 0.0 } else { throughput(output_points, measured_ns) }, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns, end_to_end_ns: span_ns(started) }, correctness: CorrectnessReport { output_count_ok: complete && output_points == expected, expected_output_points: expected, actual_output_points: output_points, values_finite: finite, result_sha256: None }, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns, between_run: None, gpu_economics: Some(point) }
 }
@@ -552,7 +569,7 @@ pub fn run_child_lanes(profile: &GpuEconomicsProfile, exe: &Path, mut on_lane: i
 			let latency: Vec<u64> = samples.iter().map(|s| s.spawn_to_first_result_ns).collect();
 			let n = samples.len();
 			let measured = latency.iter().copied().fold(0_u64, u64::saturating_add);
-			on_lane(result(profile, &format!("cold-{mode}"), latency, measured, n * p.points, n * p.points, true, true, GpuEconomicsPoint { cold_starts: samples, ..point("cold_start", mode) }, started))?;
+			on_lane(result(profile, &format!("cold-{mode}"), LaneRun { samples_ns: latency, measured_ns: measured, output_points: n * p.points, expected: n * p.points, complete: true, finite: true }, GpuEconomicsPoint { cold_starts: samples, ..point("cold_start", mode) }, started))?;
 		}
 	}
 	if p.no_adapter {
@@ -566,7 +583,7 @@ pub fn run_child_lanes(profile: &GpuEconomicsProfile, exe: &Path, mut on_lane: i
 				let gate = outcome.auto_complete && (!outcome.adapter_hidden || outcome.gpu_call_error.is_some());
 				let ns = outcome.prewarm_ns;
 				let used = outcome.auto_backend.clone();
-				on_lane(result(profile, "no-adapter", vec![ns], ns, if gate { p.points } else { 0 }, p.points, gate, outcome.auto_complete, GpuEconomicsPoint { backend_used: Some(used), no_adapter: Some(outcome), ..point("no_adapter", "auto") }, started))?;
+				on_lane(result(profile, "no-adapter", LaneRun { samples_ns: vec![ns], measured_ns: ns, output_points: if gate { p.points } else { 0 }, expected: p.points, complete: gate, finite: outcome.auto_complete }, GpuEconomicsPoint { backend_used: Some(used), no_adapter: Some(outcome), ..point("no_adapter", "auto") }, started))?;
 			}
 			Err(e) => eprintln!("gpu-economics: no-adapter child failed: {e:#}"),
 		}
@@ -586,6 +603,10 @@ pub fn start_gpu() -> anyhow::Result<EngineMetadata> {
 	let gpu = format!("{} ({}, {}; f64 shaders: {})", info.name, info.api, info.device_type, if info.supports_f64 { "yes" } else { "no" });
 	Ok(EngineMetadata::new(CalibrationStatus::Disabled, Some(gpu), Some("gpu-economics workload: backends forced per lane; Auto uses the default thresholds".to_string()), splimes::auto_thresholds()).with_gpu_driver(&info.driver))
 }
+
+/// A contention caller's thread: its per-call latencies (ns), whether every call
+/// returned a complete, finite series, and how many points it produced.
+type CallerHandle = JoinHandle<anyhow::Result<(Vec<u64>, bool, usize)>>;
 
 /// The in-process lanes: fallback, then contention. GPU lanes run only when `gpu` is true
 /// (the GPU started, [`start_gpu`]); `baseline` is the idle `nvidia-smi` sample.
@@ -611,7 +632,7 @@ pub fn run_in_process_lanes(profile: &GpuEconomicsProfile, gpu: bool, baseline: 
 			continue;
 		}
 		let started = Instant::now();
-		let sampler = if lane.needs_gpu() { SmiSampler::start(p.smi_interval_ms) } else { None };
+		let smi = if lane.needs_gpu() { SmiSampler::start(p.smi_interval_ms) } else { None };
 		let interpolator = lane.interpolator();
 		let (mut samples, mut complete, mut finite, mut out_points) = (Vec::with_capacity(p.calls), true, true, 0_usize);
 		let (mut last, mut used) = (Vec::new(), String::new());
@@ -625,14 +646,14 @@ pub fn run_in_process_lanes(profile: &GpuEconomicsProfile, gpu: bool, baseline: 
 			used = series.backend().to_string();
 			last = series.values().to_vec();
 		}
-		let utilization = sampler.map(|s| summarize_utilization(&s.stop(), baseline)).unwrap_or_default();
+		let utilization = smi.map(|s| summarize_utilization(&s.stop(), baseline)).unwrap_or_default();
 		let diff = cpu_values.as_ref().filter(|c| c.len() == last.len()).map(|c| c.iter().zip(&last).map(|(a, b)| (a - b).abs()).fold(0.0_f64, f64::max));
 		if lane == Lane::Cpu {
 			cpu_values = Some(last);
 		}
 		let measured = samples.iter().copied().fold(0_u64, u64::saturating_add);
 		let pt = GpuEconomicsPoint { backend_used: Some(used), max_abs_diff_vs_cpu: diff, utilization, process_gpu_memory_mib: if lane.needs_gpu() { process_gpu_memory_mib() } else { None }, ..point("fallback", lane.as_str()) };
-		on_lane(result(profile, &format!("fallback-{}", lane.as_str()), samples, measured, out_points, p.points * p.calls, complete, finite, pt, started))?;
+		on_lane(result(profile, &format!("fallback-{}", lane.as_str()), LaneRun { samples_ns: samples, measured_ns: measured, output_points: out_points, expected: p.points * p.calls, complete, finite }, pt, started))?;
 	}
 
 	let timestamps = Arc::new(timestamps);
@@ -643,9 +664,9 @@ pub fn run_in_process_lanes(profile: &GpuEconomicsProfile, gpu: bool, baseline: 
 		}
 		for &callers in &p.concurrency {
 			let started = Instant::now();
-			let sampler = if lane.needs_gpu() { SmiSampler::start(p.smi_interval_ms) } else { None };
+			let smi = if lane.needs_gpu() { SmiSampler::start(p.smi_interval_ms) } else { None };
 			let barrier = Arc::new(Barrier::new(callers + 1));
-			let handles: Vec<JoinHandle<anyhow::Result<(Vec<u64>, bool, usize)>>> = (0..callers)
+			let handles: Vec<CallerHandle> = (0..callers)
 				.map(|_| {
 					let (timestamps, values, barrier, calls, points) = (Arc::clone(&timestamps), Arc::clone(&values), Arc::clone(&barrier), p.calls_per_caller, p.points);
 					std::thread::spawn(move || {
@@ -673,9 +694,9 @@ pub fn run_in_process_lanes(profile: &GpuEconomicsProfile, gpu: bool, baseline: 
 				out_points += n;
 			}
 			let wall_ns = span_ns(wall_start);
-			let utilization = sampler.map(|s| summarize_utilization(&s.stop(), baseline)).unwrap_or_default();
+			let utilization = smi.map(|s| summarize_utilization(&s.stop(), baseline)).unwrap_or_default();
 			let pt = GpuEconomicsPoint { concurrency: Some(callers), utilization, process_gpu_memory_mib: if lane.needs_gpu() { process_gpu_memory_mib() } else { None }, ..point("contention", lane.as_str()) };
-			on_lane(result(profile, &format!("contention-{}-c{callers}", lane.as_str()), samples, wall_ns, out_points, p.points * p.calls_per_caller * callers, ok, ok, pt, started))?;
+			on_lane(result(profile, &format!("contention-{}-c{callers}", lane.as_str()), LaneRun { samples_ns: samples, measured_ns: wall_ns, output_points: out_points, expected: p.points * p.calls_per_caller * callers, complete: ok, finite: ok }, pt, started))?;
 		}
 	}
 	Ok(())

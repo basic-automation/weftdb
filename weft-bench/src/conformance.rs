@@ -32,7 +32,7 @@
 //! [`build_matrix`].
 
 use std::{
-	collections::BTreeMap, io::{Read, Write}, time::Instant
+	collections::BTreeMap, fmt::Write as _, io::{Read, Write}, time::Instant
 };
 
 use bigdecimal::BigDecimal;
@@ -217,7 +217,7 @@ pub fn corpus(size: CorpusSize, real: Option<Vec<Point>>) -> Vec<Series> {
 	push("constant".to_owned(), (1..=20).map(|i| Point::new(t0 + TimeDelta::seconds(i * 7), decimal(42.5))).collect());
 	if size == CorpusSize::Full {
 		// Steps between three levels: overshoot is the method's, not rounding.
-		push("step".to_owned(), (1..=60).map(|i| Point::new(t0 + TimeDelta::seconds(i * 10), decimal([0.0, 5.0, -3.0][(i as usize / 20) % 3]))).collect());
+		push("step".to_owned(), (1..=60).map(|i| Point::new(t0 + TimeDelta::seconds(i * 10), decimal([0.0, 5.0, -3.0][usize::try_from(i / 20 % 3).unwrap_or_default()]))).collect());
 		// Duplicate instants, shuffled: the last of each instant wins (the input contract).
 		let mut dup = walk(&mut rng, 30, 1_000_000_000, "walk", true);
 		let copies: Vec<Point> = dup.iter().step_by(3).map(|p| Point::new(p.timestamp, &p.value + BigDecimal::from(1))).collect();
@@ -286,6 +286,10 @@ fn value_range(points: &[Point]) -> (BigDecimal, BigDecimal) {
 }
 
 /// The nearest `f64` to a decimal (its shortest round-trip text parses back exactly).
+///
+/// # Panics
+///
+/// If the decimal's text does not parse as an `f64`, which a decimal's text always does.
 #[must_use]
 pub fn to_f64(d: &BigDecimal) -> f64 {
 	d.to_string().parse().expect("a decimal parses as f64")
@@ -315,15 +319,15 @@ pub fn exact_with_lebesgue(points: &[Point], spline: Spline, t: DateTime<Utc>) -
 	if matches!(spline, Spline::Cubic) && (below || above) {
 		return (if below { knots[0].value.clone() } else { knots[n - 1].value.clone() }, 1.0);
 	}
-	let m = spline.min_points().min(n);
-	let p = x.iter().filter(|&xi| *xi <= target).count();
+	let window = spline.min_points().min(n);
+	let at_or_below = x.iter().filter(|&xi| *xi <= target).count();
 	#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-	let start = (p as isize - (m / 2) as isize).clamp(0, (n - m) as isize) as usize;
+	let start = (at_or_below as isize - (window / 2) as isize).clamp(0, (n - window) as isize) as usize;
 	let mut total = BigDecimal::from(0);
 	let mut lebesgue = BigDecimal::from(0);
-	for j in start..start + m {
+	for j in start..start + window {
 		let mut basis = BigDecimal::from(1);
-		for k in start..start + m {
+		for k in start..start + window {
 			if k != j {
 				basis = (basis * (&target - &x[k]) / (&x[j] - &x[k])).with_prec(60);
 			}
@@ -440,7 +444,10 @@ pub fn corpus_hash(corpus: &[Series], fixtures: &[Fixture]) -> String {
 			h.update(s.to_bits().to_le_bytes());
 		}
 	}
-	h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+	h.finalize().iter().fold(String::new(), |mut hex, b| {
+		let _ = write!(hex, "{b:02x}");
+		hex
+	})
 }
 
 /// Where a run executes.
@@ -633,6 +640,10 @@ pub fn contract_error(got: f64, exact: f64, scale: f64) -> f64 {
 }
 
 /// Scores one run against the exact reference, per method.
+///
+/// # Panics
+///
+/// If a fixture names a method that is not one of [`SPLINES`].
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn score(fixtures: &[Fixture], outcomes: &[Outcome], target: Target) -> Vec<MethodStats> {
@@ -859,10 +870,9 @@ pub fn run_environment(options: &RunOptions) -> (EnvironmentRun, Vec<Vec<Option<
 	for &target in &options.targets {
 		for api in Api::ALL {
 			let unavailable = match (target.is_gpu(), &adapter) {
-				(false, _) => None,
 				(true, None) => Some(format!("no GPU: {}", gpu_error.as_deref().unwrap_or("not started"))),
 				(true, Some(a)) if target == Target::GpuF64 && !a.supports_f64 => Some(format!("{} has no f64 kernel", a.name)),
-				(true, Some(_)) => None,
+				(false, _) | (true, Some(_)) => None,
 			};
 			if let Some(reason) = unavailable {
 				reports.push(TargetReport { target, api, unavailable: Some(reason), methods: Vec::new(), repeats: 0, run_to_run_identical: true, run_to_run: Drift::default(), wall_ms: 0.0 });
@@ -989,6 +999,10 @@ pub struct Matrix {
 	pub failures: Vec<String>,
 }
 
+/// One environment run's values: per fixture, per spline, the `f64` bits of each output
+/// point, or `None` where the run produced no value.
+pub type RunValues = Vec<Vec<Option<Vec<u64>>>>;
+
 /// Merges environment runs (and their values) into the matrix, computing every pairwise drift
 /// and listing every contract failure.
 ///
@@ -998,7 +1012,7 @@ pub struct Matrix {
 /// than `fixtures`.
 ///
 #[must_use]
-pub fn build_matrix(fixtures: &[Fixture], corpus_hash: &str, runs: Vec<(EnvironmentRun, Vec<Vec<Option<Vec<u64>>>>)>, skipped: Vec<(String, String)>) -> Matrix {
+pub fn build_matrix(fixtures: &[Fixture], corpus_hash: &str, runs: Vec<(EnvironmentRun, RunValues)>, skipped: Vec<(String, String)>) -> Matrix {
 	let mut failures = Vec::new();
 	let mut keyed: Vec<(String, &Vec<Option<Vec<u64>>>)> = Vec::new();
 	for (run, values) in &runs {
@@ -1056,7 +1070,6 @@ fn sci(x: f64) -> String {
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn render_markdown(matrix: &Matrix) -> String {
-	use std::fmt::Write as _;
 	let mut s = String::new();
 	let _ = writeln!(s, "# GPU conformance matrix\n");
 	let _ = writeln!(s, "Errors are `(|v − exact| − ε·|exact|)⁺ / (range · Λ(t))` against a 60-digit exact reference: the unit splimes publishes its bound in (1e-13 `f64`, 1e-5 `f32`).\n");
@@ -1195,33 +1208,33 @@ mod tests {
 
 	#[test]
 	fn the_score_catches_a_violation_and_the_matrix_reports_it() {
-		let c = corpus(CorpusSize::Smoke, None);
-		let f = fixtures(&c, CorpusSize::Smoke);
-		let mut outcomes = run_once(&c, &f, Target::Cpu, Api::F64);
+		let corp = corpus(CorpusSize::Smoke, None);
+		let fixture_set = fixtures(&corp, CorpusSize::Smoke);
+		let mut outcomes = run_once(&corp, &fixture_set, Target::Cpu, Api::F64);
 		// Nudge one interpolated value of the first fixture that has one (of a Linear grid) by
 		// a millionth of its scale.
 		let (fi, i) = outcomes
 			.iter()
 			.enumerate()
 			.find_map(|(fi, o)| match o {
-				Outcome::Values { kinds, .. } if f[fi].spline == Spline::Linear => kinds.iter().position(|k| *k == PointKind::Interpolated).map(|i| (fi, i)),
+				Outcome::Values { kinds, .. } if fixture_set[fi].spline == Spline::Linear => kinds.iter().position(|k| *k == PointKind::Interpolated).map(|i| (fi, i)),
 				_ => None,
 			})
 			.expect("a Linear grid with an interpolated point");
 		if let Outcome::Values { bits, .. } = &mut outcomes[fi] {
-			bits[i] = (f64::from_bits(bits[i]) + f[fi].scale[i] * 1e-6).to_bits();
+			bits[i] = fixture_set[fi].scale[i].mul_add(1e-6, f64::from_bits(bits[i])).to_bits();
 		}
-		let stats = score(&f, &outcomes, Target::Cpu);
+		let stats = score(&fixture_set, &outcomes, Target::Cpu);
 		assert!(!stats[0].pass && stats[0].inside_max > 1e-7, "{:?}", stats[0]);
 		assert!(stats[1..].iter().all(|m| m.pass));
 		// The same nudge is within the f32 bound.
-		assert!(score(&f, &outcomes, Target::GpuF32)[0].pass);
-		let clean = values_of(&run_once(&c, &f, Target::Cpu, Api::F64));
-		let d = drift(&f, &clean, &values_of(&outcomes));
+		assert!(score(&fixture_set, &outcomes, Target::GpuF32)[0].pass);
+		let clean = values_of(&run_once(&corp, &fixture_set, Target::Cpu, Api::F64));
+		let d = drift(&fixture_set, &clean, &values_of(&outcomes));
 		assert_eq!(d.points - d.identical, 1);
 		assert!((d.max - 1e-6).abs() < 1e-9, "{d:?}");
-		let e = drift(&f, &clean, &[vec![None], clean[1..].to_vec()].concat());
-		assert_eq!(e.points, d.points - f[0].exact.len() as u64);
+		let e = drift(&fixture_set, &clean, &[vec![None], clean[1..].to_vec()].concat());
+		assert_eq!(e.points, d.points - fixture_set[0].exact.len() as u64);
 		assert_eq!(e.outcome_mismatches, 1);
 	}
 

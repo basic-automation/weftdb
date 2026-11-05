@@ -93,6 +93,10 @@ pub fn load_uci_corpus(path: &Path, column: &str, max_rows: usize) -> anyhow::Re
 
 /// The reader half of [`load_uci_corpus`], exposed so tests can load a fixture
 /// from memory and so a caller that already holds the file need not re-open it.
+///
+/// # Errors
+///
+/// As [`load_uci_corpus`], less the failure to open the file.
 pub fn load_uci_corpus_from_reader(reader: impl BufRead, column: &str, max_rows: usize) -> anyhow::Result<UciCorpus> {
 	let mut lines = reader.lines();
 	let header = lines.next().ok_or_else(|| anyhow::anyhow!("empty file: no header row"))?.map_err(|e| anyhow::anyhow!("cannot read header row: {e}"))?;

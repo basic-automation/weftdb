@@ -65,10 +65,7 @@ pub fn redact(text: &str) -> String {
 /// right direction to fail for a string that should not have been in a manifest at all.
 #[must_use]
 pub fn redact_pem(text: &str) -> String {
-	match text.find(PEM_MARKER) {
-		Some(index) => format!("{}{REDACTED}", &text[..index]),
-		None => text.to_string(),
-	}
+	text.find(PEM_MARKER).map_or_else(|| text.to_string(), |index| format!("{}{REDACTED}", &text[..index]))
 }
 
 /// Replace the user-info of every URL with [`REDACTED`].
@@ -366,7 +363,7 @@ mod tests {
 
 	#[test]
 	fn redaction_is_idempotent() {
-		let corpus = ORDINARY.iter().map(|s| s.to_string()).chain(["https://u:p@h/db".to_string(), "token=abc".to_string(), format!("ghp_{}", "b".repeat(36)), "-----BEGIN CERTIFICATE-----abc".to_string()]);
+		let corpus = ORDINARY.iter().map(std::string::ToString::to_string).chain(["https://u:p@h/db".to_string(), "token=abc".to_string(), format!("ghp_{}", "b".repeat(36)), "-----BEGIN CERTIFICATE-----abc".to_string()]);
 		for text in corpus {
 			let once = redact(&text);
 			assert_eq!(redact(&once), once, "redaction is not idempotent for {text:?}");

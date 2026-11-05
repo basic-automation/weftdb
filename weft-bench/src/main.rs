@@ -175,13 +175,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
 	// Calibrate before anything is timed, once the input has loaded (so a bad input fails
 	// at once). Only the interpolation workloads run splimes, so only they calibrate.
-	let engine = calibrate_engine(cli.gpu_calibrate).await;
+	let engine = calibrate_engine(cli.switches.gpu_calibrate).await;
 
 	// WeftDB is always run; under `--compare` the full portable-baseline suite runs
 	// too — linear (fair-protocol class C) and forward-fill/LOCF (class B, the
 	// in-process mirror of native TSDB `FILL(previous)`) — so the report carries a
 	// real multi-system comparison rather than a lone number.
-	let mut results: Vec<BenchResult> = Vec::with_capacity(1 + usize::from(cli.stored) + if cli.compare { 2 } else { 0 });
+	let mut results: Vec<BenchResult> = Vec::with_capacity(1 + usize::from(cli.switches.stored) + if cli.switches.compare { 2 } else { 0 });
 	// Every adapter here reports itself, so each result carries the capability and
 	// provenance of the thing that produced it — including the one fact that
 	// separates WeftDB from the baselines: whether the requested spline was run.
@@ -189,11 +189,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	results.push(weft_result);
 	// `--stored`: the same profile served from a `SegmentStore` (sealed before timing), so
 	// the gap to the line above is the cost of interpolating on read from storage.
-	if cli.stored {
+	if cli.switches.stored {
 		let stored = run_profile(&StoredWeftAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("stored WeftDB benchmark run failed: {e}"))?;
 		results.push(stored);
 	}
-	if cli.compare {
+	if cli.switches.compare {
 		let linear = run_profile(&BaselineLinearAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("linear baseline run failed: {e}"))?;
 		results.push(linear);
 		let forward_fill = run_profile(&ForwardFillAdapter::new(), &profile, cli.reps).await.map_err(|e| anyhow::anyhow!("forward-fill baseline run failed: {e}"))?;
@@ -213,8 +213,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 /// analytic ground truth (a lookup returns the stored value), so the report carries
 /// no accuracy, only latency, throughput, and the north-star storage estimate.
 fn run_point_lookup_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
-	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "point-lookup-irregular".to_string() } else { "point-lookup-regular".to_string() });
-	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode, rows_per_page: cli.pl_rows_per_page };
+	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.corpus_switches.irregular { "point-lookup-irregular".to_string() } else { "point-lookup-regular".to_string() });
+	let params = PointLookupParams { seed: cli.seed, point_count: cli.pl_rows, query_count: cli.pl_queries, regular: !cli.corpus_switches.irregular, absent_fraction: cli.pl_absent, mode: cli.pl_mode, rows_per_page: cli.pl_rows_per_page };
 	let profile = PointLookupProfile::new(profile_name, params);
 	let result = if let Some(path) = &cli.csv.point_lookup {
 		// A real corpus: the same lookup engine, queries drawn from the loaded timestamps.
@@ -239,8 +239,8 @@ fn run_point_lookup_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// truth (a range read materializes stored rows), so the report carries latency,
 /// throughput, and the storage estimate but no accuracy.
 fn run_range_fetch_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
-	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.irregular { "range-fetch-irregular".to_string() } else { "range-fetch-regular".to_string() });
-	let params = RangeFetchParams { seed: cli.seed, point_count: cli.rf_rows, window_rows: cli.rf_window, window_count: cli.rf_windows, regular: !cli.irregular, rows_per_page: cli.rf_rows_per_page };
+	let profile_name = cli.name.clone().unwrap_or_else(|| if cli.corpus_switches.irregular { "range-fetch-irregular".to_string() } else { "range-fetch-regular".to_string() });
+	let params = RangeFetchParams { seed: cli.seed, point_count: cli.rf_rows, window_rows: cli.rf_window, window_count: cli.rf_windows, regular: !cli.corpus_switches.irregular, rows_per_page: cli.rf_rows_per_page };
 	let profile = RangeFetchProfile::new(profile_name, params);
 	let result = if let Some(path) = &cli.csv.range_fetch {
 		// A real corpus: the same windowed-read engine, windows drawn from the loaded timestamps.
@@ -275,7 +275,7 @@ fn run_compression_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		return finish(cli, &report);
 	}
 	let profile_name = cli.name.clone().unwrap_or_else(|| format!("compression-{}", cli.comp_shape.as_str()));
-	let params = CompressionParams { seed: cli.seed, point_count: cli.comp_rows, regular: !cli.irregular, value_shape: cli.comp_shape };
+	let params = CompressionParams { seed: cli.seed, point_count: cli.comp_rows, regular: !cli.corpus_switches.irregular, value_shape: cli.comp_shape };
 	let profile = CompressionProfile::new(profile_name, params);
 	let result = run_compression(&profile, cli.reps).map_err(|e| anyhow::anyhow!("compression benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
@@ -291,7 +291,7 @@ fn run_downsample_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let profile_name = profile_name(cli, "downsample");
 	// A preset sizes the series, but only where the caller left the knob at its default: an
 	// explicit --ds-points is a measurement choice, not an omission.
-	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel, value_decimals: cli.ds_decimals, scaled: cli.ds_scaled };
+	let params = DownsampleParams { seed: cli.seed, point_count: cli.ds_points, input_stride_secs: cli.ds_stride, bucket_resolution: cli.ds_bucket, aggregations: cli.ds_aggs.clone(), parallel_chunks: cli.ds_parallel, value_decimals: cli.ds_decimals, scaled: cli.corpus_switches.ds_scaled };
 	let profile = DownsampleProfile::new(profile_name, params);
 	let result = if let Some(path) = &cli.csv.downsample {
 		// A real series: the same reduction engine over loaded rows (epoch seconds, exact decimals).
@@ -340,13 +340,7 @@ fn run_gap_fill_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 /// and one at 486 660 would otherwise be filed as the same measurement and scored as a regression.
 /// Workloads a preset does not size carry no suffix, because there is nothing there to record.
 fn profile_name(cli: &Cli, workload: &str) -> String {
-	match &cli.name {
-		Some(name) => name.clone(),
-		None => match cli.scale {
-			Some(preset) => format!("{workload}-{}", preset.as_str()),
-			None => workload.to_string(),
-		},
-	}
+	cli.name.clone().unwrap_or_else(|| cli.scale.map_or_else(|| workload.to_string(), |preset| format!("{workload}-{}", preset.as_str())))
 }
 
 /// Run the block-missingness workload: generate the seeded (series x block) grid and time the
@@ -362,7 +356,7 @@ fn run_sparse_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 			None => grid,
 		}
 	});
-	let profile = SparseProfile::new(profile_name, SparseParams { seed: cli.seed, ..cli.sparse.clone() });
+	let profile = SparseProfile::new(profile_name, &SparseParams { seed: cli.seed, ..cli.sparse.clone() });
 	println!("grid   : {} series x {} blocks of {} rows, {}% present", profile.params.series, profile.params.blocks, profile.params.rows_per_block, profile.params.density_percent);
 	let result = run_sparse(&profile, cli.reps).map_err(|e| anyhow::anyhow!("block-missingness benchmark run failed: {e}"))?;
 	println!("holes  : {:.1}% of the grid's values absent; {} block aggregates per scan", result.dataset.missingness_fraction * 100.0, result.dataset.output_points);
@@ -448,7 +442,7 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		// measures, and a curve stopped short keeps the stages it finished.
 		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 		let mut code = ExitCode::SUCCESS;
-		run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, &cli.ingest_growth, |result| {
+		run_ingest_growth(&profile, weft_bench::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: corpus.missingness_fraction(), generation_ns }, &cli.ingest_growth, |result| {
 			if let Some(g) = &result.growth {
 				println!("growth   : {:>14} rows  {:>12.0} rows/s  batch p50 {:>9.3} ms p99 {:>9.3} ms  {:>8} segments  {:.3} B/pt  {}", g.rows_total, result.throughput_points_per_sec, std::time::Duration::from_nanos(result.latency.p50_ns).as_secs_f64() * 1e3, std::time::Duration::from_nanos(result.latency.p99_ns).as_secs_f64() * 1e3, g.segments, g.bytes_per_point, if result.correctness.passed() { "PASS" } else { "FAIL" });
 			}
@@ -480,7 +474,7 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 		let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
 		let mut code = ExitCode::SUCCESS;
-		run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, params, |result| {
+		run_compressed_query(&profile, weft_bench::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: corpus.missingness_fraction(), generation_ns }, params, |result| {
 			if let Some(q) = &result.compressed_query {
 				println!("cq {:>4}  : {:>9} rows/window  in-store p50 {:>9.3} ms p99 {:>9.3} ms  decode p50 {:>9.3} ms p99 {:>9.3} ms  {:>6.2}x  {:>7} segments  {:.3} B/pt  {}", q.window, q.window_rows, ms(result.latency.p50_ns), ms(result.latency.p99_ns), ms(q.decode_p50_ns), ms(q.decode_p99_ns), q.speedup_p50, q.segments, q.bytes_per_point, if result.correctness.passed() { "PASS" } else { "FAIL" });
 			}
@@ -493,7 +487,7 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		.map_err(|e| anyhow::anyhow!("compressed-query run failed: {e}"))?;
 		return Ok(code);
 	}
-	if cli.crash_matrix {
+	if cli.corpus_switches.crash_matrix {
 		return run_crash_matrix(cli, &profile, &corpus).await;
 	}
 	if !cli.failure.is_empty() {
@@ -503,7 +497,7 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		let params = weft_bench::QueryMixParams { rows: cli.query_mix_rows.unwrap_or(corpus.values.len() as u64), ops: cli.query_mix, range_rows: cli.query_mix_range, weights: cli.query_mix_weights, seed: cli.seed };
 		let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 		let mut code = ExitCode::SUCCESS;
-		weft_bench::run_query_mix(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, params, |result| {
+		weft_bench::run_query_mix(&profile, weft_bench::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: corpus.missingness_fraction(), generation_ns }, params, |result| {
 			let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
 			println!("mix {:<24}: {:>8} ops  {:>12} rows  p50 {:>9.3} ms p99 {:>9.3} ms  {}", result.profile, result.reps, result.dataset.output_points, ms(result.latency.p50_ns), ms(result.latency.p99_ns), if result.correctness.passed() { "PASS" } else { "FAIL" });
 			// One report per lane, as the compressed-query run writes one per window size.
@@ -596,7 +590,7 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 
 	// Optionally also emit a human-readable HTML view of the same results,
 	// co-located with the JSON artifact (same stem, `.html`).
-	let html_path = if cli.html {
+	let html_path = if cli.outputs.html {
 		let path = cli.out_dir.join(default_html_filename(&report.results[0].profile, &adapter_tag));
 		report.write_html(&path).map_err(|e| anyhow::anyhow!("cannot write HTML report to {}: {e}", path.display()))?;
 		Some(path)
@@ -605,7 +599,7 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 	};
 
 	// And optionally the flat results table (same stem, `.parquet`), one row per result.
-	let parquet_path = if cli.parquet {
+	let parquet_path = if cli.outputs.parquet {
 		let path = out_path.with_extension("parquet");
 		weft_bench::parquet_report::write_parquet(report, &path)?;
 		Some(path)
@@ -623,7 +617,7 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 
 	// The manifest is written last so it can hash the report as it now sits on disk, and refused
 	// rather than saved if it does not verify against what was just written.
-	let manifest_path = if cli.manifest {
+	let manifest_path = if cli.outputs.manifest {
 		let path = manifest_path_for(&out_path);
 		let command_line: Vec<String> = std::env::args().collect();
 		let manifest = RunManifest::capture(report, &out_path, &command_line, &cli.labels, cli.claim.as_deref()).map_err(|e| anyhow::anyhow!("cannot capture a run manifest for {}: {e}", out_path.display()))?;
@@ -942,7 +936,7 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 		// the realized value codec, the value-column compression ratio (realized /
 		// naive fixed-width), and total bytes/point. Present once the run estimates it.
 		if let Some(s) = &r.storage {
-			let ratio = if s.estimated_value_bytes > 0 { s.realized_value_bytes as f64 / s.estimated_value_bytes as f64 } else { 1.0 };
+			let ratio = if s.estimated_value_bytes > 0 { weft_bench::num::usize_to_f64(s.realized_value_bytes) / weft_bench::num::usize_to_f64(s.estimated_value_bytes) } else { 1.0 };
 			println!("    storage      : codec={}{} ratio={ratio:.3} val={:.2} total={:.2} B/pt", s.value_codec, if s.is_exact { "" } else { "*" }, s.bytes_per_point, s.total_bytes_per_point);
 		}
 	}
@@ -959,7 +953,7 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 
 /// Nanoseconds rendered as fractional milliseconds for display.
 fn ms(ns: u64) -> f64 {
-	ns as f64 / 1e6
+	weft_bench::num::u64_to_f64(ns) / 1e6
 }
 
 /// Derive a profile name from the input file stem, e.g. `cpu-usage.lp` →
@@ -1049,8 +1043,6 @@ struct Cli {
 	/// Downsample mode: decimal places of the generated values; `None` = the exact
 	/// binary expansion (`--ds-decimals full`).
 	ds_decimals: Option<u32>,
-	/// Downsample mode: time the integer-native path (`--ds-scaled`).
-	ds_scaled: bool,
 	/// Gap-fill mode: the workload knobs (the seed comes from `--seed`).
 	gap_fill: GapFillParams,
 	/// Block-missingness mode: the workload knobs (the seed comes from `--seed`).
@@ -1094,8 +1086,6 @@ struct Cli {
 	failure_compact_to: u64,
 	/// Ingest mode: upper bound of the seeded delay before a compaction is killed (`--failure-kill-within-ms`).
 	failure_kill_within_ms: u64,
-	/// Ingest mode: run the crash matrix (D-S21/SOA-9) instead of one failure test (`--crash-matrix`).
-	crash_matrix: bool,
 	/// Ingest mode: seeds the crash matrix runs, derived from `--seed` (`--crash-matrix-seeds`).
 	crash_matrix_seeds: usize,
 	/// Ingest mode: operations in a seeded query mix (`--query-mix`); 0 for none.
@@ -1112,9 +1102,6 @@ struct Cli {
 	analytics_tail: Option<u64>,
 	/// Ingest mode: the analytics pipeline's batch size (`--analytics-batch`).
 	analytics_batch: usize,
-	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
-	/// timestamps instead of a constant-stride regular corpus.
-	irregular: bool,
 	/// Point-lookup mode: rows sealed into the segment (the stored corpus size).
 	pl_rows: usize,
 	/// Point-lookup mode: instants resolved per timed rep (the query batch size).
@@ -1159,28 +1146,56 @@ struct Cli {
 	out_dir: PathBuf,
 	/// Optional explicit profile name (defaults to the input file stem).
 	name: Option<String>,
+	/// Also write these surfaces beside the JSON artifact (`--markdown-report`, `--csv-report`, `--prom`).
+	exports: Vec<weft_bench::export::Format>,
+	/// The claim id this run is evidence for, recorded in the manifest (`--claim`).
+	claim: Option<String>,
+	/// Operator labels from repeated `--label name=value`, recorded in the manifest.
+	labels: Vec<(String, String)>,
+	/// The report artifacts written beside the JSON (`--html`, `--parquet`, and the manifest `--no-manifest` turns off).
+	outputs: ReportOutputs,
+	/// How the run is performed (`--compare`, `--stored`, `--no-gpu-calibrate`).
+	switches: RunSwitches,
+	/// Corpus and run-shape switches (`--ds-scaled`, `--irregular`, `--crash-matrix`).
+	corpus_switches: CorpusSwitches,
+}
+
+/// The report artifacts written beside the JSON (`--html`, `--parquet`, and the manifest `--no-manifest` turns off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReportOutputs {
+	/// Also write a human-readable HTML report alongside the JSON artifact.
+	html: bool,
+	/// Also write the flat Parquet results table beside the JSON artifact.
+	parquet: bool,
+	/// Also write a run manifest beside the report (`--no-manifest` turns it off). The manifest is
+	/// the provenance record a published benchmark claim points at (1.0 plan EVI-3).
+	manifest: bool,
+}
+
+/// How the run is performed (`--compare`, `--stored`, `--no-gpu-calibrate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunSwitches {
 	/// Also run the portable baseline suite (linear + forward-fill) and emit a
 	/// comparison report.
 	compare: bool,
 	/// Also run the stored WeftDB adapter: the same reconstruction read back from a
 	/// `SegmentStore` the dataset is sealed into before timing.
 	stored: bool,
-	/// Also write a human-readable HTML report alongside the JSON artifact.
-	html: bool,
-	/// Also write the flat Parquet results table beside the JSON artifact.
-	parquet: bool,
-	/// Also write these surfaces beside the JSON artifact (`--markdown-report`, `--csv-report`, `--prom`).
-	exports: Vec<weft_bench::export::Format>,
 	/// Calibrate the interpolation backends before an interpolation run, as
 	/// `weft-server` does at startup (`--no-gpu-calibrate` turns it off).
 	gpu_calibrate: bool,
-	/// Also write a run manifest beside the report (`--no-manifest` turns it off). The manifest is
-	/// the provenance record a published benchmark claim points at (1.0 plan EVI-3).
-	manifest: bool,
-	/// The claim id this run is evidence for, recorded in the manifest (`--claim`).
-	claim: Option<String>,
-	/// Operator labels from repeated `--label name=value`, recorded in the manifest.
-	labels: Vec<(String, String)>,
+}
+
+/// Corpus and run-shape switches (`--ds-scaled`, `--irregular`, `--crash-matrix`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CorpusSwitches {
+	/// Downsample mode: time the integer-native path (`--ds-scaled`).
+	ds_scaled: bool,
+	/// Storage-workload knob (point-lookup / range-fetch): jittered (irregular)
+	/// timestamps instead of a constant-stride regular corpus.
+	irregular: bool,
+	/// Ingest mode: run the crash matrix (D-S21/SOA-9) instead of one failure test (`--crash-matrix`).
+	crash_matrix: bool,
 }
 
 /// Which input mode / workload a run drives. Exactly one is selected per
@@ -1320,56 +1335,98 @@ impl Cli {
 			tokens.next();
 			return parse_sweep_args(tokens);
 		}
-		let args = tokens;
+		Self::parse_run(tokens)
+	}
 
+	/// The defaults every run flag starts from, before the arguments are applied.
+	fn defaults() -> Self {
 		// Synthetic-knob defaults come from the flagship knob set so the CLI never
 		// hardcodes a second copy of those constants.
 		let defaults = SyntheticParams::default();
-
 		// Storage-workload knob defaults come from the flagship profiles so the CLI
 		// never hardcodes a second copy of those constants.
 		let pl_defaults = PointLookupParams::default();
 		let rf_defaults = RangeFetchParams::default();
 		let comp_defaults = CompressionParams::default();
 		let ds_defaults = DownsampleParams::default();
+		Self {
+			outputs: ReportOutputs { html: false, parquet: false, manifest: true },
+			switches: RunSwitches { compare: false, stored: false, gpu_calibrate: true },
+			corpus_switches: CorpusSwitches { ds_scaled: false, irregular: false, crash_matrix: false },
+			input: None,
+			field: None,
+			mode: InputMode::LineProtocol,
+			comp_rows: comp_defaults.point_count,
+			comp_shape: comp_defaults.value_shape,
+			csv: CsvKnobs::default(),
+			ds_points: ds_defaults.point_count,
+			ds_stride: ds_defaults.input_stride_secs,
+			ds_bucket: ds_defaults.bucket_resolution,
+			ds_aggs: ds_defaults.aggregations,
+			ds_parallel: ds_defaults.parallel_chunks.max(1),
+			ds_decimals: ds_defaults.value_decimals,
+			gap_fill: GapFillParams::default(),
+			sparse: SparseParams::default(),
+			scale: None,
+			gpu_memory: weft_bench::gpu_memory::GpuMemoryParams::default(),
+			gpu_economics: weft_bench::gpu_economics::GpuEconomicsParams::default(),
+			uci: None,
+			uci_column: DEFAULT_UCI_COLUMN.to_string(),
+			ingest_rows: usize::MAX,
+			ingest_batch: DEFAULT_INGEST_BATCH_ROWS,
+			ingest_growth: Vec::new(),
+			ingest_online: 0,
+			ingest_online_rows: None,
+			ingest_online_window: 1_440,
+			compressed_query: 0,
+			compressed_query_rows: None,
+			compressed_query_compact: None,
+			failure: Vec::new(),
+			failure_rows: 1_000_000,
+			failure_reps: 5,
+			failure_compact_to: 65_536,
+			failure_kill_within_ms: 2_000,
+			crash_matrix_seeds: 3,
+			query_mix: 0,
+			query_mix_rows: None,
+			query_mix_range: 1_440,
+			query_mix_weights: weft_bench::LaneWeights::default(),
+			analytics_rows: None,
+			analytics_tail: None,
+			analytics_batch: 1_440,
+			pl_rows: pl_defaults.point_count,
+			pl_queries: pl_defaults.query_count,
+			pl_absent: pl_defaults.absent_fraction,
+			pl_mode: pl_defaults.mode,
+			pl_rows_per_page: pl_defaults.rows_per_page,
+			rf_rows: rf_defaults.point_count,
+			rf_window: rf_defaults.window_rows,
+			rf_windows: rf_defaults.window_count,
+			rf_rows_per_page: rf_defaults.rows_per_page,
+			seed: defaults.seed,
+			points: defaults.input_points,
+			missingness: defaults.missingness_fraction,
+			jitter: defaults.jitter_fraction,
+			noise: defaults.noise_amplitude,
+			decimals: defaults.value_decimals,
+			shape: defaults.signal_shape,
+			precision: TimestampPrecision::Nanoseconds,
+			spline: Spline::Cubic,
+			resolution: Resolution::Seconds,
+			reps: 10,
+			out_dir: PathBuf::from("reports").join("json"),
+			name: None,
+			exports: Vec::new(),
+			claim: None,
+			labels: Vec::new(),
+		}
+	}
 
-		let (mut input, mut field): (Option<PathBuf>, Option<String>) = (None, None);
-		// The workload-mode flags; exactly one may be set (`select_workload_mode`).
-		let (mut synthetic, mut point_lookup, mut range_fetch, mut compression, mut downsample, mut gap_fill_mode, mut gpu_memory_mode, mut ingest_mode) = (false, false, false, false, false, false, false, false);
-		let (mut uci, mut uci_column, mut ingest_rows, mut ingest_batch): (Option<PathBuf>, String, usize, usize) = (None, DEFAULT_UCI_COLUMN.to_string(), usize::MAX, DEFAULT_INGEST_BATCH_ROWS);
-		let mut ingest_growth: Vec<u64> = Vec::new();
-		let (mut ingest_online, mut ingest_online_rows, mut ingest_online_window): (usize, Option<u64>, usize) = (0, None, 1_440);
-		let (mut compressed_query, mut compressed_query_rows, mut compressed_query_compact): (usize, Option<u64>, Option<u64>) = (0, None, None);
-		let (mut failure, mut failure_rows, mut failure_reps, mut failure_compact_to, mut failure_kill_within_ms): (Vec<weft_bench::failure::Failure>, u64, usize, u64, u64) = (Vec::new(), 1_000_000, 5, 65_536, 2_000);
-		let (mut crash_matrix, mut crash_matrix_seeds): (bool, usize) = (false, 3);
-		let (mut query_mix, mut query_mix_rows, mut query_mix_range, mut query_mix_weights): (usize, Option<u64>, u64, weft_bench::LaneWeights) = (0, None, 1_440, weft_bench::LaneWeights::default());
-		let (mut analytics_rows, mut analytics_tail, mut analytics_batch): (Option<u64>, Option<u64>, usize) = (None, None, 1_440);
-		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
-		let (mut gpu_economics_mode, mut gpu_economics) = (false, weft_bench::gpu_economics::GpuEconomicsParams::default());
-		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
-		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
-		let (mut ds_aggs, mut ds_parallel, mut ds_decimals) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1), ds_defaults.value_decimals);
-		let mut irregular = false;
-		let (mut pl_rows, mut pl_queries, mut pl_absent, mut pl_mode, mut pl_rows_per_page) = (pl_defaults.point_count, pl_defaults.query_count, pl_defaults.absent_fraction, pl_defaults.mode, pl_defaults.rows_per_page);
-		let (mut rf_rows, mut rf_window, mut rf_windows, mut rf_rows_per_page) = (rf_defaults.point_count, rf_defaults.window_rows, rf_defaults.window_count, rf_defaults.rows_per_page);
-		let (mut seed, mut points, mut missingness, mut jitter) = (defaults.seed, defaults.input_points, defaults.missingness_fraction, defaults.jitter_fraction);
-		let (mut noise, mut decimals) = (defaults.noise_amplitude, defaults.value_decimals);
-		let mut shape = defaults.signal_shape;
-		let mut precision = TimestampPrecision::Nanoseconds;
-		let mut spline = Spline::Cubic;
-		let mut resolution = Resolution::Seconds;
-		let mut reps: usize = 10;
-		let mut out_dir = PathBuf::from("reports").join("json");
-		let mut name: Option<String> = None;
-		let mut compare = false;
-		let mut stored = false;
-		let (mut html, mut parquet, mut ds_scaled) = (false, false, false);
-		let mut exports = Vec::new();
-		let mut gpu_calibrate = true;
-		let (mut manifest, mut claim, mut labels): (bool, Option<String>, Vec<(String, String)>) = (true, None, Vec::new());
-		let (mut sparse_mode, mut sparse) = (false, SparseParams::default());
-		let mut scale: Option<ScalePreset> = None;
-
+	/// Parse the flags of a benchmark run (no subcommand).
+	fn parse_run(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+		let mut cli = Self::defaults();
+		// The workload-mode flags given; exactly one may be (`select_workload_mode`).
+		let mut modes = Vec::new();
 		let mut iter = args.into_iter();
 		while let Some(token) = iter.next() {
 			// Split `--key=value` once; otherwise treat the next token as the value.
@@ -1387,172 +1444,197 @@ impl Cli {
 				iter.next().ok_or_else(|| format!("flag `{k}` requires a value"))
 			};
 
-			match key.as_str() {
-				"-h" | "--help" => return Ok(Command::Help),
-				"-i" | "--input" => input = Some(PathBuf::from(take_value(&key)?)),
-				"-f" | "--field" => field = Some(take_value(&key)?),
-				"-s" | "--synthetic" => synthetic = true,
-				"-p" | "--point-lookup" => point_lookup = true,
-				"-r" | "--range-fetch" => range_fetch = true,
-				"-z" | "--compression" => compression = true,
-				"--comp-rows" => comp_rows = parse_points_count(&take_value(&key)?)?,
-				"--comp-shape" => comp_shape = parse_value_shape(&take_value(&key)?)?,
-				flag if CsvKnobs::FLAGS.contains(&flag) => csv.set(flag, take_value(&key)?)?,
-				"-d" | "--downsample" => downsample = true,
-				"-g" | "--gap-fill" => gap_fill_mode = true,
-				flag if GAP_FILL_FLAGS.contains(&flag) => set_gap_fill_knob(&mut gap_fill, flag, &take_value(&key)?)?,
-				"--sparse" => sparse_mode = true,
-				flag if SPARSE_FLAGS.contains(&flag) => set_sparse_knob(&mut sparse, flag, &take_value(&key)?)?,
-				"--scale" => scale = Some(ScalePreset::parse(&take_value(&key)?).ok_or_else(|| format!("--scale must name a preset ({})", ScalePreset::names()))?),
-				"--gpu-memory" => gpu_memory_mode = true,
-				"--gpu-economics" => gpu_economics_mode = true,
-				flag if GPU_ECONOMICS_FLAGS.contains(&flag) => set_gpu_economics_knob(&mut gpu_economics, flag, &take_value(&key)?)?,
-				"--ingest" => ingest_mode = true,
-				"--uci" => uci = Some(PathBuf::from(take_value(&key)?)),
-				"--uci-column" => uci_column = take_value(&key)?,
-				"--ingest-rows" => ingest_rows = parse_points_count(&take_value(&key)?)?,
-				"--ingest-batch" => ingest_batch = parse_points_count(&take_value(&key)?)?.max(1),
-				"--ingest-growth" => ingest_growth = parse_growth_checkpoints(&take_value(&key)?)?,
-				"--ingest-online" => ingest_online = parse_positive(&key, &take_value(&key)?)?,
-				"--ingest-online-rows" => ingest_online_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--ingest-online-rows needs one row count of at least 2 (e.g. 100M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--ingest-online-rows takes one row count".to_string()) })?),
-				"--ingest-online-window" => ingest_online_window = parse_positive(&key, &take_value(&key)?)?,
-				"--analytics-pipeline" => analytics_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--analytics-pipeline needs one row count of at least 2 (e.g. 100k)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--analytics-pipeline takes one row count".to_string()) })?),
-				"--analytics-tail" => analytics_tail = Some(take_value(&key)?.parse::<u64>().map_err(|_| "--analytics-tail needs a row count".to_string())?),
-				"--analytics-batch" => analytics_batch = parse_positive(&key, &take_value(&key)?)?,
-				"--compressed-query" => compressed_query = parse_positive(&key, &take_value(&key)?)?,
-				"--compressed-query-compact" => compressed_query_compact = Some(parse_positive(&key, &take_value(&key)?)? as u64),
-				"--failure" => {
-					let name = take_value(&key)?;
-					failure = if name == "all" { weft_bench::failure::Failure::ALL.to_vec() } else { vec![weft_bench::failure::Failure::parse(&name).ok_or_else(|| format!("--failure: {name:?} is not kill-ingest, kill-compaction, corrupt-segment or all"))?] };
-				}
-				"--failure-rows" => failure_rows = parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--failure-rows needs one row count of at least 2 (e.g. 1M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--failure-rows takes one row count".to_string()) })?,
-				"--failure-reps" => failure_reps = parse_positive(&key, &take_value(&key)?)?,
-				"--failure-compact-to" => failure_compact_to = parse_positive(&key, &take_value(&key)?)? as u64,
-				"--failure-kill-within-ms" => failure_kill_within_ms = parse_positive(&key, &take_value(&key)?)? as u64,
-				"--crash-matrix" => crash_matrix = true,
-				"--crash-matrix-seeds" => crash_matrix_seeds = parse_positive(&key, &take_value(&key)?)?,
-				"--query-mix" => query_mix = parse_positive(&key, &take_value(&key)?)?,
-				"--query-mix-rows" => query_mix_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--query-mix-rows needs one row count of at least 2 (e.g. 10M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--query-mix-rows takes one row count".to_string()) })?),
-				"--query-mix-range" => query_mix_range = parse_positive(&key, &take_value(&key)?)? as u64,
-				"--query-mix-weights" => query_mix_weights = parse_lane_weights(&take_value(&key)?)?,
-				"--compressed-query-rows" => compressed_query_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--compressed-query-rows needs one row count of at least 2 (e.g. 100M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--compressed-query-rows takes one row count".to_string()) })?),
-				flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut gpu_memory, flag, &take_value(&key)?)?,
-				"--ds-points" => ds_points = parse_points_count(&take_value(&key)?)?,
-				"--ds-stride" => ds_stride = parse_stride_secs(&take_value(&key)?)?,
-				"--ds-bucket" => ds_bucket = parse_resolution(&take_value(&key)?)?,
-				"--ds-aggs" => ds_aggs = parse_aggregations(&take_value(&key)?)?,
-				"--ds-parallel" => ds_parallel = take_value(&key)?.parse::<usize>().map_err(|_| "--ds-parallel must be a positive integer".to_string())?.max(1),
-				"--ds-decimals" => ds_decimals = parse_value_decimals(&take_value(&key)?)?,
-				"--irregular" | "--pl-irregular" | "--rf-irregular" => irregular = true,
-				"--pl-rows" => pl_rows = parse_points_count(&take_value(&key)?)?,
-				"--pl-queries" => pl_queries = parse_query_count(&take_value(&key)?)?,
-				"--pl-absent" => pl_absent = parse_fraction(&take_value(&key)?, "pl-absent")?,
-				"--pl-mode" => pl_mode = parse_lookup_mode(&take_value(&key)?)?,
-				"--pl-rows-per-page" => pl_rows_per_page = parse_rows_per_page(&take_value(&key)?)?,
-				"--rf-rows" => rf_rows = parse_points_count(&take_value(&key)?)?,
-				"--rf-window" => rf_window = parse_query_count(&take_value(&key)?)?,
-				"--rf-windows" => rf_windows = parse_query_count(&take_value(&key)?)?,
-				"--rf-rows-per-page" => rf_rows_per_page = parse_rows_per_page(&take_value(&key)?)?,
-				"--seed" => seed = parse_seed(&take_value(&key)?)?,
-				"--points" => points = parse_points_count(&take_value(&key)?)?,
-				"--missingness" => missingness = parse_fraction(&take_value(&key)?, "missingness")?,
-				"--jitter" => jitter = parse_fraction(&take_value(&key)?, "jitter")?,
-				"--noise" => noise = parse_noise(&take_value(&key)?)?,
-				"--decimals" => decimals = parse_value_decimals(&take_value(&key)?)?,
-				"--shape" => shape = parse_shape(&take_value(&key)?)?,
-				"--precision" => precision = parse_precision(&take_value(&key)?)?,
-				"--spline" => spline = parse_spline(&take_value(&key)?)?,
-				"--resolution" => resolution = parse_resolution(&take_value(&key)?)?,
-				"--reps" => reps = parse_reps(&take_value(&key)?)?,
-				"--out-dir" => out_dir = PathBuf::from(take_value(&key)?),
-				"--name" => name = Some(take_value(&key)?),
-				"-c" | "--compare" => compare = true,
-				"--stored" => stored = true,
-				"--html" => html = true,
-				"--markdown-report" => exports.push(weft_bench::export::Format::Markdown),
-				"--csv-report" => exports.push(weft_bench::export::Format::Csv),
-				"--prom" => exports.push(weft_bench::export::Format::Prometheus),
-				"--parquet" => parquet = true,
-				"--ds-scaled" => ds_scaled = true,
-				"--no-gpu-calibrate" => gpu_calibrate = false,
-				"--no-manifest" => manifest = false,
-				"--claim" => claim = Some(take_value(&key)?),
-				"--label" => labels.push(parse_label(&take_value(&key)?)?),
-				other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
-				// A bare positional is taken as the input path if one is not set yet.
-				other => {
-					if input.is_some() {
-						return Err(format!("unexpected argument `{other}`"));
-					}
-					input = Some(PathBuf::from(other));
-				}
+			if let Some(command) = cli.apply_flag(&key, &mut modes, &mut take_value)? {
+				return Ok(command);
 			}
 		}
+		cli.finish(&modes)
+	}
 
-		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (sparse_mode, InputMode::Sparse), (gpu_memory_mode, InputMode::GpuMemory), (gpu_economics_mode, InputMode::GpuEconomics), (ingest_mode, InputMode::Ingest)])?;
-		if let Some(preset) = scale {
-			apply_scale_preset(preset, &mut ds_points, &mut gap_fill, &mut sparse);
+	/// Apply one flag (or the bare input path); `Some` when the flag is a command of its own.
+	fn apply_flag(&mut self, key: &str, modes: &mut Vec<InputMode>, take_value: &mut impl FnMut(&str) -> Result<String, String>) -> Result<Option<Command>, String> {
+		match key {
+			"-h" | "--help" => return Ok(Some(Command::Help)),
+			"-i" | "--input" => self.input = Some(PathBuf::from(take_value(key)?)),
+			"-f" | "--field" => self.field = Some(take_value(key)?),
+			"-s" | "--synthetic" => modes.push(InputMode::Synthetic),
+			"-p" | "--point-lookup" => modes.push(InputMode::PointLookup),
+			"-r" | "--range-fetch" => modes.push(InputMode::RangeFetch),
+			"-z" | "--compression" => modes.push(InputMode::Compression),
+			"--comp-rows" => self.comp_rows = parse_points_count(&take_value(key)?)?,
+			"--comp-shape" => self.comp_shape = parse_value_shape(&take_value(key)?)?,
+			flag if CsvKnobs::FLAGS.contains(&flag) => self.csv.set(flag, take_value(key)?)?,
+			"-d" | "--downsample" => modes.push(InputMode::Downsample),
+			"-g" | "--gap-fill" => modes.push(InputMode::GapFill),
+			flag if GAP_FILL_FLAGS.contains(&flag) => set_gap_fill_knob(&mut self.gap_fill, flag, &take_value(key)?)?,
+			"--sparse" => modes.push(InputMode::Sparse),
+			flag if SPARSE_FLAGS.contains(&flag) => set_sparse_knob(&mut self.sparse, flag, &take_value(key)?)?,
+			"--scale" => self.scale = Some(ScalePreset::parse(&take_value(key)?).ok_or_else(|| format!("--scale must name a preset ({})", ScalePreset::names()))?),
+			"--gpu-memory" => modes.push(InputMode::GpuMemory),
+			"--gpu-economics" => modes.push(InputMode::GpuEconomics),
+			flag if GPU_ECONOMICS_FLAGS.contains(&flag) => set_gpu_economics_knob(&mut self.gpu_economics, flag, &take_value(key)?)?,
+			"--ingest" => modes.push(InputMode::Ingest),
+			"--uci" => self.uci = Some(PathBuf::from(take_value(key)?)),
+			"--uci-column" => self.uci_column = take_value(key)?,
+			"--ingest-rows" => self.ingest_rows = parse_points_count(&take_value(key)?)?,
+			"--ingest-batch" => self.ingest_batch = parse_points_count(&take_value(key)?)?.max(1),
+			"--ingest-growth" => self.ingest_growth = parse_growth_checkpoints(&take_value(key)?)?,
+			"--ingest-online" => self.ingest_online = parse_positive(key, &take_value(key)?)?,
+			"--ingest-online-rows" => self.ingest_online_rows = Some(parse_growth_checkpoints(&take_value(key)?).map_err(|_| "--ingest-online-rows needs one row count of at least 2 (e.g. 100M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--ingest-online-rows takes one row count".to_string()) })?),
+			"--ingest-online-window" => self.ingest_online_window = parse_positive(key, &take_value(key)?)?,
+			"--analytics-pipeline" => self.analytics_rows = Some(parse_growth_checkpoints(&take_value(key)?).map_err(|_| "--analytics-pipeline needs one row count of at least 2 (e.g. 100k)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--analytics-pipeline takes one row count".to_string()) })?),
+			"--analytics-tail" => self.analytics_tail = Some(take_value(key)?.parse::<u64>().map_err(|_| "--analytics-tail needs a row count".to_string())?),
+			"--analytics-batch" => self.analytics_batch = parse_positive(key, &take_value(key)?)?,
+			"--compressed-query" => self.compressed_query = parse_positive(key, &take_value(key)?)?,
+			"--compressed-query-compact" => self.compressed_query_compact = Some(parse_positive(key, &take_value(key)?)? as u64),
+			"--failure" => {
+				let which = take_value(key)?;
+				self.failure = if which == "all" { weft_bench::failure::Failure::ALL.to_vec() } else { vec![weft_bench::failure::Failure::parse(&which).ok_or_else(|| format!("--failure: {which:?} is not kill-ingest, kill-compaction, corrupt-segment or all"))?] };
+			}
+			"--failure-rows" => self.failure_rows = parse_growth_checkpoints(&take_value(key)?).map_err(|_| "--failure-rows needs one row count of at least 2 (e.g. 1M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--failure-rows takes one row count".to_string()) })?,
+			"--failure-reps" => self.failure_reps = parse_positive(key, &take_value(key)?)?,
+			"--failure-compact-to" => self.failure_compact_to = parse_positive(key, &take_value(key)?)? as u64,
+			"--failure-kill-within-ms" => self.failure_kill_within_ms = parse_positive(key, &take_value(key)?)? as u64,
+			"--crash-matrix" => self.corpus_switches.crash_matrix = true,
+			"--crash-matrix-seeds" => self.crash_matrix_seeds = parse_positive(key, &take_value(key)?)?,
+			"--query-mix" => self.query_mix = parse_positive(key, &take_value(key)?)?,
+			"--query-mix-rows" => self.query_mix_rows = Some(parse_growth_checkpoints(&take_value(key)?).map_err(|_| "--query-mix-rows needs one row count of at least 2 (e.g. 10M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--query-mix-rows takes one row count".to_string()) })?),
+			"--query-mix-range" => self.query_mix_range = parse_positive(key, &take_value(key)?)? as u64,
+			"--query-mix-weights" => self.query_mix_weights = parse_lane_weights(&take_value(key)?)?,
+			"--compressed-query-rows" => self.compressed_query_rows = Some(parse_growth_checkpoints(&take_value(key)?).map_err(|_| "--compressed-query-rows needs one row count of at least 2 (e.g. 100M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--compressed-query-rows takes one row count".to_string()) })?),
+			flag if GPU_MEMORY_FLAGS.contains(&flag) => set_gpu_memory_knob(&mut self.gpu_memory, flag, &take_value(key)?)?,
+			_ => return self.apply_knob(key, take_value),
 		}
-		validate_mode(mode, input.as_ref(), field.as_deref(), compare, gpu_calibrate)?;
-		if let Some(mode_flag) = self_generating_mode_flag(mode).filter(|_| stored) {
+		Ok(None)
+	}
+
+	/// The rest of [`apply_flag`](Self::apply_flag): the knobs of the later flag groups.
+	fn apply_knob(&mut self, key: &str, take_value: &mut impl FnMut(&str) -> Result<String, String>) -> Result<Option<Command>, String> {
+		match key {
+			"--ds-points" => self.ds_points = parse_points_count(&take_value(key)?)?,
+			"--ds-stride" => self.ds_stride = parse_stride_secs(&take_value(key)?)?,
+			"--ds-bucket" => self.ds_bucket = parse_resolution(&take_value(key)?)?,
+			"--ds-aggs" => self.ds_aggs = parse_aggregations(&take_value(key)?)?,
+			"--ds-parallel" => self.ds_parallel = take_value(key)?.parse::<usize>().map_err(|_| "--ds-parallel must be a positive integer".to_string())?.max(1),
+			"--ds-decimals" => self.ds_decimals = parse_value_decimals(&take_value(key)?)?,
+			"--irregular" | "--pl-irregular" | "--rf-irregular" => self.corpus_switches.irregular = true,
+			"--pl-rows" => self.pl_rows = parse_points_count(&take_value(key)?)?,
+			"--pl-queries" => self.pl_queries = parse_query_count(&take_value(key)?)?,
+			"--pl-absent" => self.pl_absent = parse_fraction(&take_value(key)?, "pl-absent")?,
+			"--pl-mode" => self.pl_mode = parse_lookup_mode(&take_value(key)?)?,
+			"--pl-rows-per-page" => self.pl_rows_per_page = parse_rows_per_page(&take_value(key)?)?,
+			"--rf-rows" => self.rf_rows = parse_points_count(&take_value(key)?)?,
+			"--rf-window" => self.rf_window = parse_query_count(&take_value(key)?)?,
+			"--rf-windows" => self.rf_windows = parse_query_count(&take_value(key)?)?,
+			"--rf-rows-per-page" => self.rf_rows_per_page = parse_rows_per_page(&take_value(key)?)?,
+			"--seed" => self.seed = parse_seed(&take_value(key)?)?,
+			"--points" => self.points = parse_points_count(&take_value(key)?)?,
+			"--missingness" => self.missingness = parse_fraction(&take_value(key)?, "missingness")?,
+			"--jitter" => self.jitter = parse_fraction(&take_value(key)?, "jitter")?,
+			"--noise" => self.noise = parse_noise(&take_value(key)?)?,
+			"--decimals" => self.decimals = parse_value_decimals(&take_value(key)?)?,
+			"--shape" => self.shape = parse_shape(&take_value(key)?)?,
+			"--precision" => self.precision = parse_precision(&take_value(key)?)?,
+			"--spline" => self.spline = parse_spline(&take_value(key)?)?,
+			"--resolution" => self.resolution = parse_resolution(&take_value(key)?)?,
+			"--reps" => self.reps = parse_reps(&take_value(key)?)?,
+			"--out-dir" => self.out_dir = PathBuf::from(take_value(key)?),
+			"--name" => self.name = Some(take_value(key)?),
+			"-c" | "--compare" => self.switches.compare = true,
+			"--stored" => self.switches.stored = true,
+			"--html" => self.outputs.html = true,
+			"--markdown-report" => self.exports.push(weft_bench::export::Format::Markdown),
+			"--csv-report" => self.exports.push(weft_bench::export::Format::Csv),
+			"--prom" => self.exports.push(weft_bench::export::Format::Prometheus),
+			"--parquet" => self.outputs.parquet = true,
+			"--ds-scaled" => self.corpus_switches.ds_scaled = true,
+			"--no-gpu-calibrate" => self.switches.gpu_calibrate = false,
+			"--no-manifest" => self.outputs.manifest = false,
+			"--claim" => self.claim = Some(take_value(key)?),
+			"--label" => self.labels.push(parse_label(&take_value(key)?)?),
+			other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
+			// A bare positional is taken as the input path if one is not set yet.
+			other => {
+				if self.input.is_some() {
+					return Err(format!("unexpected argument `{other}`"));
+				}
+				self.input = Some(PathBuf::from(other));
+			}
+		}
+		Ok(None)
+	}
+
+	/// Settle the workload mode from the mode flags given, then check the flags against it.
+	fn finish(mut self, modes: &[InputMode]) -> Result<Command, String> {
+		// Exactly one workload mode may be selected; the rest default to line protocol.
+		self.mode = select_workload_mode(&[(modes.contains(&InputMode::Synthetic), InputMode::Synthetic), (modes.contains(&InputMode::PointLookup), InputMode::PointLookup), (modes.contains(&InputMode::RangeFetch), InputMode::RangeFetch), (modes.contains(&InputMode::Compression), InputMode::Compression), (modes.contains(&InputMode::Downsample), InputMode::Downsample), (modes.contains(&InputMode::GapFill), InputMode::GapFill), (modes.contains(&InputMode::Sparse), InputMode::Sparse), (modes.contains(&InputMode::GpuMemory), InputMode::GpuMemory), (modes.contains(&InputMode::GpuEconomics), InputMode::GpuEconomics), (modes.contains(&InputMode::Ingest), InputMode::Ingest)])?;
+		if let Some(preset) = self.scale {
+			apply_scale_preset(preset, &mut self.ds_points, &mut self.gap_fill, &mut self.sparse);
+		}
+		validate_mode(self.mode, self.input.as_ref(), self.field.as_deref(), self.switches.compare, self.switches.gpu_calibrate)?;
+		if let Some(mode_flag) = self_generating_mode_flag(self.mode).filter(|_| self.switches.stored) {
 			return Err(format!("`--stored` has no meaning in `{mode_flag}` mode"));
 		}
-		if mode == InputMode::Ingest && uci.is_none() {
+		self.check_ingest_combinations()?;
+		Ok(Command::Run(Box::new(self)))
+	}
+
+	/// Refuse the `--ingest` sub-run flags given without `--ingest`, or combined with a run they exclude.
+	fn check_ingest_combinations(&self) -> Result<(), String> {
+		if self.mode == InputMode::Ingest && self.uci.is_none() {
 			return Err("`--ingest` requires `--uci <household_power_consumption.txt>`".to_string());
 		}
-		if !ingest_growth.is_empty() && mode != InputMode::Ingest {
+		if !self.ingest_growth.is_empty() && self.mode != InputMode::Ingest {
 			return Err("`--ingest-growth` needs `--ingest`".to_string());
 		}
-		if (ingest_online > 0 || ingest_online_rows.is_some()) && mode != InputMode::Ingest {
+		if (self.ingest_online > 0 || self.ingest_online_rows.is_some()) && self.mode != InputMode::Ingest {
 			return Err("`--ingest-online` needs `--ingest`".to_string());
 		}
-		if ingest_online_rows.is_some() && ingest_online == 0 {
+		if self.ingest_online_rows.is_some() && self.ingest_online == 0 {
 			return Err("`--ingest-online-rows` needs `--ingest-online <READERS>`".to_string());
 		}
-		if ingest_online > 0 && !ingest_growth.is_empty() {
+		if self.ingest_online > 0 && !self.ingest_growth.is_empty() {
 			return Err("`--ingest-online` and `--ingest-growth` are separate runs".to_string());
 		}
-		if (compressed_query > 0 || compressed_query_rows.is_some()) && mode != InputMode::Ingest {
+		if (self.compressed_query > 0 || self.compressed_query_rows.is_some()) && self.mode != InputMode::Ingest {
 			return Err("`--compressed-query` needs `--ingest`".to_string());
 		}
-		if compressed_query_compact.is_some() && compressed_query == 0 {
+		if self.compressed_query_compact.is_some() && self.compressed_query == 0 {
 			return Err("`--compressed-query-compact` needs `--compressed-query <QUERIES>`".to_string());
 		}
-		if compressed_query_rows.is_some() && compressed_query == 0 {
+		if self.compressed_query_rows.is_some() && self.compressed_query == 0 {
 			return Err("`--compressed-query-rows` needs `--compressed-query <QUERIES>`".to_string());
 		}
-		if (analytics_rows.is_some() || analytics_tail.is_some()) && mode != InputMode::Ingest {
+		if (self.analytics_rows.is_some() || self.analytics_tail.is_some()) && self.mode != InputMode::Ingest {
 			return Err("`--analytics-pipeline` needs `--ingest`".to_string());
 		}
-		if analytics_tail.is_some() && analytics_rows.is_none() {
+		if self.analytics_tail.is_some() && self.analytics_rows.is_none() {
 			return Err("`--analytics-tail` needs `--analytics-pipeline <ROWS>`".to_string());
 		}
-		if analytics_rows.is_some() && (compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty()) {
+		if self.analytics_rows.is_some() && (self.compressed_query > 0 || self.ingest_online > 0 || !self.ingest_growth.is_empty()) {
 			return Err("`--analytics-pipeline` is a run of its own".to_string());
 		}
-		if !failure.is_empty() && (mode != InputMode::Ingest || query_mix > 0 || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some()) {
+		if !self.failure.is_empty() && (self.mode != InputMode::Ingest || self.query_mix > 0 || self.compressed_query > 0 || self.ingest_online > 0 || !self.ingest_growth.is_empty() || self.analytics_rows.is_some()) {
 			return Err("`--failure` needs `--ingest` and is a run of its own".to_string());
 		}
-		if crash_matrix {
-			if !failure.is_empty() {
+		if self.corpus_switches.crash_matrix {
+			if !self.failure.is_empty() {
 				return Err("`--crash-matrix` runs every failure test; do not combine it with `--failure`".to_string());
 			}
-			if mode != InputMode::Ingest || query_mix > 0 || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some() {
+			if self.mode != InputMode::Ingest || self.query_mix > 0 || self.compressed_query > 0 || self.ingest_online > 0 || !self.ingest_growth.is_empty() || self.analytics_rows.is_some() {
 				return Err("`--crash-matrix` needs `--ingest` and is a run of its own".to_string());
 			}
 		}
-		if query_mix_rows.is_some() && query_mix == 0 {
+		if self.query_mix_rows.is_some() && self.query_mix == 0 {
 			return Err("`--query-mix-rows` needs `--query-mix <OPS>`".to_string());
 		}
-		if query_mix > 0 && (mode != InputMode::Ingest || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some()) {
+		if self.query_mix > 0 && (self.mode != InputMode::Ingest || self.compressed_query > 0 || self.ingest_online > 0 || !self.ingest_growth.is_empty() || self.analytics_rows.is_some()) {
 			return Err("`--query-mix` needs `--ingest` and is a run of its own".to_string());
 		}
-		if compressed_query > 0 && (ingest_online > 0 || !ingest_growth.is_empty()) {
+		if self.compressed_query > 0 && (self.ingest_online > 0 || !self.ingest_growth.is_empty()) {
 			return Err("`--compressed-query` is a run of its own, apart from `--ingest-online` and `--ingest-growth`".to_string());
 		}
-
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, gpu_economics, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, failure, failure_rows, failure_reps, failure_compact_to, failure_kill_within_ms, crash_matrix, crash_matrix_seeds, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, exports, gpu_calibrate, manifest, claim, labels })))
+		Ok(())
 	}
 }
 
@@ -2501,7 +2583,7 @@ mod tests {
 	#[test]
 	fn crash_matrix_stands_alone_and_takes_a_seed_count() {
 		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--crash-matrix", "--crash-matrix-seeds", "5"]);
-		assert_eq!((cli.crash_matrix, cli.crash_matrix_seeds), (true, 5));
+		assert_eq!((cli.corpus_switches.crash_matrix, cli.crash_matrix_seeds), (true, 5));
 		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--crash-matrix"]).crash_matrix_seeds, 3);
 		for bad in [&["--ingest", "--uci", "u.txt", "--crash-matrix", "--failure", "all"][..], &["--crash-matrix"][..], &["--ingest", "--uci", "u.txt", "--crash-matrix", "--query-mix", "3"][..]] {
 			assert!(run_cli(bad).is_err(), "{bad:?}");
@@ -2560,11 +2642,11 @@ mod tests {
 	#[test]
 	fn a_run_records_a_manifest_unless_told_otherwise() {
 		let cli = expect_run(&["--synthetic"]);
-		assert!(cli.manifest, "the manifest is on by default: provenance is the default, not an extra step");
+		assert!(cli.outputs.manifest, "the manifest is on by default: provenance is the default, not an extra step");
 		assert_eq!(cli.claim, None);
 		assert_eq!(cli.labels, [] as [(std::string::String, std::string::String); 0]);
 		let cli = expect_run(&["--synthetic", "--no-manifest"]);
-		assert!(!cli.manifest);
+		assert!(!cli.outputs.manifest);
 	}
 
 	#[test]
@@ -2638,7 +2720,7 @@ mod tests {
 		assert_eq!(cli.reps, 10);
 		assert_eq!(cli.out_dir, PathBuf::from("reports").join("json"));
 		assert_eq!(cli.name, None);
-		assert!(!cli.compare, "comparison is off unless requested");
+		assert!(!cli.switches.compare, "comparison is off unless requested");
 	}
 
 	#[test]
@@ -2676,7 +2758,7 @@ mod tests {
 		let pl = PointLookupParams::default();
 		assert_eq!(cli.pl_rows, pl.point_count);
 		assert_eq!(cli.pl_queries, pl.query_count);
-		assert!(!cli.irregular, "regular (closed-form) is the default corpus");
+		assert!(!cli.corpus_switches.irregular, "regular (closed-form) is the default corpus");
 		assert!((cli.pl_absent - pl.absent_fraction).abs() < f64::EPSILON);
 		assert_eq!(cli.pl_mode, pl.mode);
 	}
@@ -2687,7 +2769,7 @@ mod tests {
 		assert_eq!(cli.mode, InputMode::PointLookup);
 		assert_eq!(cli.pl_rows, 5_000);
 		assert_eq!(cli.pl_queries, 256);
-		assert!(cli.irregular);
+		assert!(cli.corpus_switches.irregular);
 		assert!((cli.pl_absent - 0.5).abs() < 1e-12);
 		assert_eq!(cli.pl_mode, LookupMode::Single, "single mode parsed");
 	}
@@ -2702,7 +2784,7 @@ mod tests {
 		assert_eq!(cli.rf_rows, rf.point_count);
 		assert_eq!(cli.rf_window, rf.window_rows);
 		assert_eq!(cli.rf_windows, rf.window_count);
-		assert!(!cli.irregular, "regular is the default corpus");
+		assert!(!cli.corpus_switches.irregular, "regular is the default corpus");
 	}
 
 	#[test]
@@ -2712,7 +2794,7 @@ mod tests {
 		assert_eq!(cli.rf_rows, 8_000);
 		assert_eq!(cli.rf_window, 250);
 		assert_eq!(cli.rf_windows, 48);
-		assert!(cli.irregular);
+		assert!(cli.corpus_switches.irregular);
 	}
 
 	#[test]
@@ -2807,8 +2889,8 @@ mod tests {
 		assert!(run_cli(&["-d", "--ds-decimals", "13"]).unwrap_err().contains("invalid decimal places"));
 		assert_eq!(expect_run(&["-s"]).decimals, None, "synthetic samples keep their exact expansion by default");
 		assert_eq!(expect_run(&["-s", "--decimals", "2"]).decimals, Some(2));
-		assert!(!expect_run(&["-d"]).ds_scaled);
-		assert!(expect_run(&["-d", "--ds-scaled"]).ds_scaled);
+		assert!(!expect_run(&["-d"]).corpus_switches.ds_scaled);
+		assert!(expect_run(&["-d", "--ds-scaled"]).corpus_switches.ds_scaled);
 		// Aggregations parse from a comma list (including percentiles) and reject unknowns.
 		assert_eq!(cli.ds_aggs, Aggregation::ALL.to_vec(), "default is the six streaming reductions");
 		assert_eq!(expect_run(&["-d", "--ds-aggs", "min,max,p99"]).ds_aggs, vec![Aggregation::Min, Aggregation::Max, Aggregation::P99]);
@@ -2920,26 +3002,26 @@ mod tests {
 
 	#[test]
 	fn compare_flag_is_parsed_in_both_forms() {
-		assert!(expect_run(&["data.lp", "-f", "v", "--compare"]).compare);
-		assert!(expect_run(&["data.lp", "-f", "v", "-c"]).compare);
-		assert!(!expect_run(&["data.lp", "-f", "v"]).compare);
+		assert!(expect_run(&["data.lp", "-f", "v", "--compare"]).switches.compare);
+		assert!(expect_run(&["data.lp", "-f", "v", "-c"]).switches.compare);
+		assert!(!expect_run(&["data.lp", "-f", "v"]).switches.compare);
 	}
 
 	#[test]
 	fn stored_flag_is_parsed_for_interpolation_and_refused_elsewhere() {
-		assert!(expect_run(&["data.lp", "-f", "v", "--stored"]).stored);
-		assert!(expect_run(&["-s", "--stored"]).stored);
-		assert!(!expect_run(&["-s"]).stored);
+		assert!(expect_run(&["data.lp", "-f", "v", "--stored"]).switches.stored);
+		assert!(expect_run(&["-s", "--stored"]).switches.stored);
+		assert!(!expect_run(&["-s"]).switches.stored);
 		assert!(run_cli(&["--range-fetch", "--stored"]).unwrap_err().contains("`--stored` has no meaning"));
 	}
 
 	#[test]
 	fn html_flag_is_off_by_default_and_parsed_when_present() {
-		assert!(!expect_run(&["data.lp", "-f", "v"]).html, "html is off unless requested");
-		assert!(expect_run(&["data.lp", "-f", "v", "--html"]).html);
-		assert!(expect_run(&["-s", "--html"]).html);
-		assert!(!expect_run(&["-s"]).parquet, "parquet is off unless requested");
-		assert!(expect_run(&["-g", "--parquet"]).parquet);
+		assert!(!expect_run(&["data.lp", "-f", "v"]).outputs.html, "html is off unless requested");
+		assert!(expect_run(&["data.lp", "-f", "v", "--html"]).outputs.html);
+		assert!(expect_run(&["-s", "--html"]).outputs.html);
+		assert!(!expect_run(&["-s"]).outputs.parquet, "parquet is off unless requested");
+		assert!(expect_run(&["-g", "--parquet"]).outputs.parquet);
 	}
 
 	/// `--sparse` is its own workload mode, with grid knobs of its own.
@@ -3047,9 +3129,9 @@ mod tests {
 
 	#[test]
 	fn gpu_calibration_is_on_by_default_and_can_be_turned_off() {
-		assert!(expect_run(&["--synthetic"]).gpu_calibrate, "an interpolation run calibrates by default");
-		assert!(!expect_run(&["--synthetic", "--no-gpu-calibrate"]).gpu_calibrate);
-		assert!(!expect_run(&["--input", "data.lp", "--field", "usage", "--no-gpu-calibrate"]).gpu_calibrate);
+		assert!(expect_run(&["--synthetic"]).switches.gpu_calibrate, "an interpolation run calibrates by default");
+		assert!(!expect_run(&["--synthetic", "--no-gpu-calibrate"]).switches.gpu_calibrate);
+		assert!(!expect_run(&["--input", "data.lp", "--field", "usage", "--no-gpu-calibrate"]).switches.gpu_calibrate);
 		// The storage workloads never interpolate, so they never calibrate and reject the flag.
 		for mode in ["--point-lookup", "--range-fetch", "--compression", "--downsample"] {
 			let err = run_cli(&[mode, "--no-gpu-calibrate"]).unwrap_err();

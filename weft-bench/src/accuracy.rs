@@ -228,7 +228,7 @@ mod tests {
 		let truth = synthetic_ground_truth(&profile).expect("generated profile has ground truth");
 		let expected = grid_timestamps(profile.start(), profile.end(), profile.resolution).len();
 		assert_eq!(truth.len(), expected, "ground truth must cover the whole reconstruction grid");
-		assert!(!truth.is_empty());
+		assert_ne!(truth, [] as [f64; 0]);
 		for v in truth {
 			assert!(v.is_finite() && (10.0..=90.0).contains(&v), "every truth value must be finite in [10, 90], got {v}");
 		}

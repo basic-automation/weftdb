@@ -342,13 +342,13 @@ impl DerivedReadChecker {
 			};
 			let kind = if bucket.count != expected_bucket.count {
 				Some(DerivedMismatchKind::WrongCount)
-			} else if bucket.min != expected_bucket.min {
+			} else if bucket.min.partial_cmp(&expected_bucket.min) != Some(std::cmp::Ordering::Equal) {
 				Some(DerivedMismatchKind::WrongMin)
-			} else if bucket.max != expected_bucket.max {
+			} else if bucket.max.partial_cmp(&expected_bucket.max) != Some(std::cmp::Ordering::Equal) {
 				Some(DerivedMismatchKind::WrongMax)
-			} else if bucket.sum != expected_bucket.sum {
+			} else if bucket.sum.partial_cmp(&expected_bucket.sum) != Some(std::cmp::Ordering::Equal) {
 				Some(DerivedMismatchKind::WrongSum)
-			} else if bucket.avg != expected_bucket.avg {
+			} else if bucket.avg.partial_cmp(&expected_bucket.avg) != Some(std::cmp::Ordering::Equal) {
 				Some(DerivedMismatchKind::WrongAvg)
 			} else {
 				None
@@ -390,7 +390,7 @@ mod tests {
 			assert!(bucket.min <= bucket.avg && bucket.avg <= bucket.max, "reductions agree: {bucket:?}");
 			assert_eq!(bucket.avg, bucket.sum / 3.0, "avg is sum over count");
 		}
-		let model = checker.model.clone();
+		let model = checker.model;
 		assert_eq!(buckets[0].timestamp_ns, model.timestamp_ns(0, 0), "the bucket is the row's own timestamp");
 	}
 

@@ -224,6 +224,21 @@ impl Tiled<'_> {
 	}
 }
 
+/// The corpus a store-backed lane loads, with the provenance its results record.
+#[derive(Debug, Clone, Copy)]
+pub struct LaneCorpus<'a> {
+	/// Timestamps of the corpus rows, in order.
+	pub timestamps: &'a [i64],
+	/// The value of each row.
+	pub values: &'a [BigDecimal],
+	/// Decimal scale of the values, as the ingest schema declares it.
+	pub value_scale: u8,
+	/// Fraction of the corpus grid that is missing, recorded with each result.
+	pub missingness_fraction: f64,
+	/// Nanoseconds spent generating the corpus, recorded with each result.
+	pub generation_ns: u64,
+}
+
 /// Run the ingest growth curve: one store ingests the corpus, laid end to end, up to each checkpoint.
 ///
 /// Every checkpoint becomes one [`BenchResult`] (workload [`WORKLOAD_INGEST_GROWTH`]) for the
@@ -243,7 +258,8 @@ impl Tiled<'_> {
 /// `batch_rows == 0`, if `checkpoints` is empty or not strictly rising, if a copy would leave
 /// the timestamp range, if any store operation fails, or if `on_checkpoint` fails. A failed
 /// check is not an error: it fails that checkpoint's correctness gate.
-pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, checkpoints: &[u64], mut on_checkpoint: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+pub async fn run_ingest_growth(profile: &IngestProfile, corpus: LaneCorpus<'_>, checkpoints: &[u64], mut on_checkpoint: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+	let LaneCorpus { timestamps, values, value_scale, missingness_fraction, generation_ns } = corpus;
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
 	anyhow::ensure!(profile.batch_rows > 0, "ingest batch_rows must be > 0");
@@ -610,6 +626,7 @@ async fn online_phases(profile: &IngestProfile, corpus: Arc<(Vec<i64>, Vec<BigDe
 	let stats = shared.store.aspect_stats(&profile.aspect).await.map_err(|e| anyhow::anyhow!("cannot read the stats of aspect {}: {e:#}", profile.aspect))?;
 	let tiled = Tiled { timestamps: &shared.corpus.0, values: &shared.corpus.1, period };
 	let ordered = stats.time_range == Some((tiled.timestamp(0)?, tiled.timestamp(params.rows - 1)?)) && stats.unsorted_segments == 0 && stats.overlapping_segments == 0;
+	drop(shared);
 	Ok((alone_ns, online_ns, online, merge(idle), (stats.total_rows, ordered)))
 }
 
@@ -673,7 +690,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("growth", "global_active_power", 3);
 		let mut results = Vec::new();
-		run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, &[6, 10], |r| {
+		run_ingest_growth(&profile, LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, &[6, 10], |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -744,7 +761,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("growth", "global_active_power", 2);
 		for bad in [&[][..], &[8, 8][..], &[8, 4][..], &[1][..]] {
-			assert!(run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, bad, |_| Ok(())).await.is_err(), "{bad:?}");
+			assert!(run_ingest_growth(&profile, LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, bad, |_| Ok(())).await.is_err(), "{bad:?}");
 		}
 	}
 

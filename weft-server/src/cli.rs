@@ -162,7 +162,7 @@ pub fn parse(argv: &[String]) -> Result<Command, UsageError> {
 		"-V" | "--version" => Ok(Command::Version),
 		SERVE_COMMAND => {
 			if argv.len() > 1 {
-				Err(usage(format!("`serve` takes no arguments, not {:?}", argv[1])))
+				Err(usage(&format!("`serve` takes no arguments, not {:?}", argv[1])))
 			} else {
 				Ok(Command::Serve)
 			}
@@ -170,13 +170,13 @@ pub fn parse(argv: &[String]) -> Result<Command, UsageError> {
 		word if word == crate::keygen::SUBCOMMAND => Ok(Command::Keygen(with_word())),
 		word if word == crate::restore::SUBCOMMAND => Ok(Command::Restore(rest())),
 		word if word == crate::import_rows_mode::SUBCOMMAND => Ok(Command::ImportRowsMode(with_word())),
-		other if other.starts_with('-') => Err(usage(format!("`{other}` is not an option `weft-server` takes before a command"))),
-		other => Err(usage(format!("there is no `{other}` command"))),
+		other if other.starts_with('-') => Err(usage(&format!("`{other}` is not an option `weft-server` takes before a command"))),
+		other => Err(usage(&format!("there is no `{other}` command"))),
 	}
 }
 
 /// A usage refusal: the reason, then the help it points at.
-fn usage(reason: String) -> UsageError {
+fn usage(reason: &str) -> UsageError {
 	UsageError { message: format!("{reason}\n\n{USAGE}") }
 }
 

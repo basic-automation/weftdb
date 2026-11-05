@@ -110,7 +110,7 @@ impl SparseProfile {
 	/// Build a profile, clamping the knobs: at least one series, block and row, and a density
 	/// between 1% and 100% — an entirely empty table has nothing to scan.
 	#[must_use]
-	pub fn new(name: impl Into<String>, params: SparseParams) -> Self {
+	pub fn new(name: impl Into<String>, params: &SparseParams) -> Self {
 		let params = SparseParams { seed: params.seed, series: params.series.max(1), blocks: params.blocks.max(1), rows_per_block: params.rows_per_block.max(1), density_percent: params.density_percent.clamp(1, 100) };
 		Self { name: name.into(), params }
 	}
@@ -244,7 +244,7 @@ mod tests {
 	use super::*;
 
 	fn tiny(density_percent: u32) -> SparseProfile {
-		SparseProfile::new("sp-tiny", SparseParams { seed: 7, series: 3, blocks: 8, rows_per_block: 16, density_percent })
+		SparseProfile::new("sp-tiny", &SparseParams { seed: 7, series: 3, blocks: 8, rows_per_block: 16, density_percent })
 	}
 
 	#[test]
@@ -281,7 +281,7 @@ mod tests {
 	fn a_one_row_block_is_still_a_valid_grid() {
 		// The smallest block the knobs allow: a cell is a single value, so block granularity and
 		// row granularity coincide, and nothing in the scan may divide by a zero row count.
-		let profile = SparseProfile::new("sp-rows1", SparseParams { seed: 3, series: 2, blocks: 6, rows_per_block: 0, density_percent: 50 });
+		let profile = SparseProfile::new("sp-rows1", &SparseParams { seed: 3, series: 2, blocks: 6, rows_per_block: 0, density_percent: 50 });
 		assert_eq!(profile.params.rows_per_block, 1, "the row knob clamps up like the others");
 		let table = profile.generate();
 		assert_eq!(table.capacity, 12, "2 series x 6 blocks of one row");

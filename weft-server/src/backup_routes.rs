@@ -81,7 +81,7 @@ pub struct RestoreDrillResponse {
 /// backup will not restore or verify — which is a failed drill, and the answer the
 /// caller asked for.
 pub async fn restore_drill(State(state): State<AppState>, StrictQuery(params): StrictQuery<RestoreDrillParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	if !valid_backup_label(&params.label) {
 		return Err(invalid_backup_label(&params.label));
@@ -276,7 +276,7 @@ fn valid_backup_label(label: &str) -> bool {
 /// [`ApiError::already_exists`] when the target dir already exists, and
 /// [`ApiError::internal`] on a backup/verify failure.
 pub async fn backup_store(State(state): State<AppState>, StrictQuery(params): StrictQuery<BackupParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
 	let mode = match params.verify.as_deref() {
@@ -323,7 +323,6 @@ pub async fn backup_store(State(state): State<AppState>, StrictQuery(params): St
 }
 
 #[cfg(test)]
-
 mod tests {
 
 	use std::sync::Arc;
@@ -462,6 +461,7 @@ mod tests {
 		let missing = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=no-such-backup").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(missing.status(), StatusCode::NOT_FOUND, "drilling a backup that does not exist");
 		let router = app_with_state(state.clone());
+		drop(state);
 		let traversal = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/restore/drill?label=..").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(traversal.status(), StatusCode::BAD_REQUEST, "traversal label rejected on the drill too");
 		drop(store);
@@ -516,6 +516,7 @@ mod tests {
 			let response = app_with_state(state.clone()).oneshot(Request::builder().method("POST").uri(&uri).body(Body::empty()).unwrap()).await.unwrap();
 			assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}: a staging name is never a backup");
 		}
+		drop(state);
 		drop(store);
 	}
 

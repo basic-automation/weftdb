@@ -180,10 +180,7 @@ fn describe_config(config: &GpuConfig) -> String {
 		other => format!("{other:?}"),
 	};
 	let devices = match &config.devices {
-		GpuDevices::One => match &config.adapter {
-			Some(adapter) => format!("one (adapter {})", selector(adapter)),
-			None => "one".to_string(),
-		},
+		GpuDevices::One => config.adapter.as_ref().map_or_else(|| "one".to_string(), |adapter| format!("one (adapter {})", selector(adapter))),
 		GpuDevices::All => "all".to_string(),
 		GpuDevices::List(list) => format!("list [{}]", list.iter().map(selector).collect::<Vec<_>>().join(", ")),
 		other => format!("{other:?}"),

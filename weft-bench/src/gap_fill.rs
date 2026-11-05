@@ -114,7 +114,7 @@ impl GapFillProfile {
 	/// The noise-free signal at sample `i`: a one-hour-period sinusoid around 50.
 	fn clean(&self, i: usize) -> f64 {
 		use std::f64::consts::TAU;
-		let seconds = (i as f64) * (self.params.input_stride_secs as f64);
+		let seconds = crate::num::usize_to_f64(i) * crate::num::i64_to_f64(self.params.input_stride_secs);
 		20.0_f64.mul_add((seconds / 3_600.0 * TAU).sin(), 50.0)
 	}
 

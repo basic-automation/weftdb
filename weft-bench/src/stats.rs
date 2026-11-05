@@ -275,7 +275,7 @@ fn percentile(sorted: &[u64], q: f64) -> u64 {
 	if q >= 1.0 {
 		return sorted[n - 1];
 	}
-	let rank = (q * crate::num::usize_to_f64(n)).ceil() as usize;
+	let rank = crate::num::f64_to_usize((q * crate::num::usize_to_f64(n)).ceil());
 	let idx = rank.saturating_sub(1).min(n - 1);
 	sorted[idx]
 }

@@ -265,6 +265,12 @@ pub struct ValueGrid {
 }
 
 impl ValueGrid {
+	/// Whether (`series`, `row`) lies inside the grid's `series` × `rows` bounds.
+	#[must_use]
+	pub const fn contains(&self, series: usize, row: usize) -> bool {
+		series < self.series && row < self.rows
+	}
+
 	/// The cell at (`series`, `row`), or `None` when out of range or absent.
 	#[must_use]
 	pub fn cell(&self, series: usize, row: usize) -> Option<&GridValue> {

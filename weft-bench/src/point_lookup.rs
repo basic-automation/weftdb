@@ -218,7 +218,7 @@ impl PointLookupProfile {
 		assert!(timestamps.len() >= 2, "a point-lookup corpus needs at least two rows");
 		let mut rng = ChaCha8Rng::seed_from_u64(self.seed ^ 0x_C0DE_5EED_A11A_B0BA);
 		let n = timestamps.len();
-		let absent = crate::num::f64_to_usize(((self.query_count as f64) * self.absent_fraction).round());
+		let absent = crate::num::f64_to_usize((crate::num::usize_to_f64(self.query_count) * self.absent_fraction).round());
 		let present = self.query_count.saturating_sub(absent);
 
 		let mut queries: Vec<i64> = Vec::with_capacity(self.query_count);

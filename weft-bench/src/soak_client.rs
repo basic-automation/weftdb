@@ -722,7 +722,6 @@ mod tests {
 	/// lifetime: every test binds its own ephemeral port, so an idle loop costs a
 	/// parked thread and nothing else, and stopping it cleanly would need a socket
 	/// the test then has to coordinate with.
-
 	impl TestServer {
 		/// Start a server whose response for a request is `response_for(request)`.
 		fn spawn(response_for: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
@@ -882,7 +881,7 @@ mod tests {
 	#[test]
 	fn a_tick_posts_the_models_body_byte_for_byte() {
 		let server = TestServer::spawn(|_| sealed(4));
-		let model = ingest_model(20261029);
+		let model = ingest_model(20_261_029);
 		let mut client = IngestClient::new(server.target(), model.clone()).expect("an ingest-only model is accepted");
 		client.handle(3).expect("the tick posts");
 

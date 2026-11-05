@@ -163,7 +163,7 @@ struct Validated {
 
 /// Validate the request: tokens, window, margin, the aspect's schema, and the grid cap.
 async fn validate(state: AppState, config: InterpolateConfig, aspect: &str, params: &StoredInterpolateParams) -> Result<Validated, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let spline = interpolate::parse_spline_token(params.spline.as_deref())?;
 	let resolution = interpolate::parse_resolution_token(params.resolution.as_deref())?;
@@ -652,7 +652,8 @@ mod tests {
 		let store = line_store(&dir).await;
 		let expected = store.interpolate_range_f64("line", 0, 190, 0, InterpolateConfig::DEFAULT.interpolator(splimes::Spline::Cubic, splimes::Resolution::Milliseconds)).await.unwrap();
 		assert!(expected.len() > 2 * STREAM_CHUNK_POINTS, "several chunks");
-		let router = app_with_state(AppState::new().with_store(store));
+		let router = app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store)));
+		drop(store);
 		let query = "?start=0&end=190&resolution=milliseconds&spline=cubic&margin=0";
 		let (status, body) = get_json(router.clone(), &format!("/api/v1/storage/line/interpolate{query}")).await;
 		assert_eq!(status, StatusCode::OK);

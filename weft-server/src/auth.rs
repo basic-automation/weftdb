@@ -853,7 +853,7 @@ mod tests {
 	const ADMIN_TOKEN: &str = "weft_admin_token_for_tests";
 
 	fn keys_json() -> String {
-		format!("{{\n  \"version\": 1,\n  \"keys\": [\n    {{ \"id\": \"reader-1\", \"role\": \"reader\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"ingest-1\", \"role\": \"writer\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"operator\", \"role\": \"admin\", \"key_hash\": \"{}\" }}\n  ]\n}}", format_key_hash(READER_TOKEN), format_key_hash(WRITER_TOKEN), format_key_hash(ADMIN_TOKEN),)
+		format!("{{\n  \"version\": 1,\n  \"keys\": [\n    {{ \"id\": \"reader-1\", \"role\": \"reader\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"ingest-1\", \"role\": \"writer\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"operator\", \"role\": \"admin\", \"key_hash\": \"{}\" }}\n  ]\n}}", format_key_hash(READER_TOKEN), format_key_hash(WRITER_TOKEN), format_key_hash(ADMIN_TOKEN))
 	}
 
 	fn store() -> KeyStore {
