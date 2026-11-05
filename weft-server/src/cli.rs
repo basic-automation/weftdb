@@ -46,7 +46,9 @@ pub struct ExitCode {
 	pub meaning: &'static str,
 }
 
-/// The plan C7 exit-code table, in code order. This is the contract a
+/// The plan C7 exit-code table, in code order.
+///
+/// This is the contract a
 /// supervisor or a script reads the process's status against; the
 /// constants the phases exit with are these rows' codes, and a test in
 /// this module pins the two together so the table cannot drift from the

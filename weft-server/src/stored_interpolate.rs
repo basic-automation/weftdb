@@ -208,7 +208,9 @@ async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, as
 
 /// Grid points per streamed chunk on the JSON and CSV routes: small enough that one chunk's
 /// text stays a few MB, large enough that a GPU run is a handful of dispatches per million
-/// points. Not tuned by measurement (P5-5.3's measurement stage compares it).
+/// points.
+///
+/// Not tuned by measurement (P5-5.3's measurement stage compares it).
 pub const STREAM_CHUNK_POINTS: usize = 64 * 1024;
 
 /// Chunks computed ahead of the one being serialised (the channel depth of
@@ -224,7 +226,7 @@ enum Format {
 
 /// The instant of grid tick `tick` of `unit` (the stream's tick unit, which is a stored unit or
 /// nanoseconds).
-fn tick_instant(tick: i64, unit: splimes::TickUnit) -> Option<DateTime<Utc>> {
+const fn tick_instant(tick: i64, unit: splimes::TickUnit) -> Option<DateTime<Utc>> {
 	match unit.nanos_per_tick() {
 		1 => Some(DateTime::<Utc>::from_timestamp_nanos(tick)),
 		1_000 => DateTime::<Utc>::from_timestamp_micros(tick),

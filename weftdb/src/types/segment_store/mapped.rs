@@ -38,7 +38,7 @@
 use std::{ops::Deref, path::Path};
 
 /// A frame's bytes: read into the heap, or (with the `mmap-reads` feature) mapped.
-pub(crate) enum FrameBytes {
+pub enum FrameBytes {
 	/// The buffered read's bytes.
 	Owned(Vec<u8>),
 	/// A read-only mapping of the frame file.
@@ -61,7 +61,7 @@ impl Deref for FrameBytes {
 /// Whether `WEFT_SEGMENT_MMAP_READS`'s value turns mapped reads on: `1`, `true`, `on` or
 /// `yes` in any case; anything else, or unset, is off (the server's strict configuration
 /// check refuses a value that is neither on nor off; this leniency only reaches embedders).
-pub(crate) fn mmap_reads_from(value: Option<&str>) -> bool {
+pub fn mmap_reads_from(value: Option<&str>) -> bool {
 	let on = value.map(str::trim).is_some_and(|v| ["1", "true", "on", "yes"].iter().any(|word| v.eq_ignore_ascii_case(word)));
 	if on && !MMAP_COMPILED {
 		static WARNED: std::sync::Once = std::sync::Once::new();
@@ -77,7 +77,7 @@ pub(crate) fn mmap_reads_from(value: Option<&str>) -> bool {
 ///
 /// Opening, stat-ing or mapping the file fails.
 #[cfg(feature = "mmap-reads")]
-pub(crate) fn map_frame(path: &Path) -> std::io::Result<FrameBytes> {
+pub fn map_frame(path: &Path) -> std::io::Result<FrameBytes> {
 	let file = std::fs::File::open(path)?;
 	if file.metadata()?.len() == 0 {
 		return Ok(FrameBytes::Owned(Vec::new()));
@@ -98,12 +98,12 @@ pub(crate) fn map_frame(path: &Path) -> std::io::Result<FrameBytes> {
 ///
 /// Reading the file fails.
 #[cfg(not(feature = "mmap-reads"))]
-pub(crate) fn map_frame(path: &Path) -> std::io::Result<FrameBytes> {
+pub fn map_frame(path: &Path) -> std::io::Result<FrameBytes> {
 	std::fs::read(path).map(FrameBytes::Owned)
 }
 
 /// Whether this build can map frames at all (the `mmap-reads` feature).
-pub(crate) const MMAP_COMPILED: bool = cfg!(feature = "mmap-reads");
+pub const MMAP_COMPILED: bool = cfg!(feature = "mmap-reads");
 
 #[cfg(test)]
 mod tests {

@@ -465,7 +465,7 @@ impl AuditLog {
 fn route_table() -> &'static RouteTable {
 	static TABLE: OnceLock<Arc<RouteTable>> = OnceLock::new();
 	let table: &'static Arc<RouteTable> = TABLE.get_or_init(|| crate::routes::build_registry().table());
-	&**table
+	table
 }
 
 /// The `503 audit_unavailable` refusal: the envelope X-ERR's code table
@@ -476,7 +476,9 @@ fn audit_unavailable(detail: String) -> Response {
 }
 
 /// axum middleware: the audit pair around every audited route, as the
-/// module docs describe. Installed by [`crate::app_with_state`] between
+/// module docs describe.
+///
+/// Installed by [`crate::app_with_state`] between
 /// the auth layer (outside it, so a denial is an *event*, never an
 /// attempt, and the attempt can name the authenticated principal) and
 /// the registry's gate (inside it). With no audit log in the state it

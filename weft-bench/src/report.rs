@@ -342,7 +342,7 @@ const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>workload</th><th>shape</th><t
 
 /// Nanoseconds rendered as fractional milliseconds for display.
 fn ms(ns: u64) -> f64 {
-	ns as f64 / 1e6
+	crate::num::u64_to_f64(ns) / 1e6
 }
 
 /// Render the captured hardware facts as a second metadata paragraph, or an empty
@@ -360,7 +360,7 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 		(None, None) => {}
 	}
 	if let Some(bytes) = m.total_memory_bytes {
-		let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+		let gib = crate::num::u64_to_f64(bytes) / (1024.0 * 1024.0 * 1024.0);
 		parts.push(format!("{gib:.1} GiB RAM"));
 	}
 	if let Some(mount) = &m.work_disk_mount_point {

@@ -95,7 +95,9 @@ use crate::{
 };
 
 /// Cap on the mismatches a [`BackupPrefixVerdict`] or
-/// [`RestoreVerdict`] lists. The total is always counted in the
+/// [`RestoreVerdict`] lists.
+///
+/// The total is always counted in the
 /// verdict's `mismatch_count`; the cap only bounds the artifact a
 /// badly broken run produces, on the same reasoning as the oracle's
 /// [`MAX_REPORTED_MISMATCHES`](crate::soak_oracle::MAX_REPORTED_MISMATCHES).
@@ -263,7 +265,7 @@ impl BackupPrefixVerdict {
 	/// Whether the mismatch list was capped: the total in
 	/// [`Self::mismatch_count`] is larger than the list kept.
 	#[must_use]
-	pub fn truncated(&self) -> bool {
+	pub const fn truncated(&self) -> bool {
 		#[allow(clippy::cast_possible_truncation)]
 		let listed = self.mismatches.len() as u64;
 		self.mismatch_count > listed
@@ -319,7 +321,7 @@ impl RestoreVerdict {
 	/// Whether the mismatch list was capped: the total in
 	/// [`Self::mismatch_count`] is larger than the list kept.
 	#[must_use]
-	pub fn truncated(&self) -> bool {
+	pub const fn truncated(&self) -> bool {
 		#[allow(clippy::cast_possible_truncation)]
 		let listed = self.mismatches.len() as u64;
 		self.mismatch_count > listed
@@ -560,7 +562,7 @@ impl BackupLaneChecker {
 			verdict.ticks_in_backup = verdict.ticks_in_backup.saturating_add(1);
 			if !ack_set.contains(tick) {
 				verdict.points_in_backup = verdict.points_in_backup.saturating_add(points.len() as u64);
-				for point in points.iter() {
+				for point in *points {
 					verdict.push(BackupMismatch { tick: *tick, series: point.series, row: point.row, kind: BackupMismatchKind::UnacknowledgedPoint, expected: None, observed: Some(point.value.clone()), expected_timestamp_ns: self.model.timestamp_ns(*tick, point.row), observed_timestamp_ns: Some(point.timestamp_ns) });
 				}
 			}
@@ -616,7 +618,7 @@ impl BackupLaneChecker {
 				continue;
 			}
 			verdict.points_restored = verdict.points_restored.saturating_add(points.len() as u64);
-			for point in points.iter() {
+			for point in *points {
 				verdict.push(BackupMismatch { tick: *tick, series: point.series, row: point.row, kind: BackupMismatchKind::UnacknowledgedPoint, expected: None, observed: Some(point.value.clone()), expected_timestamp_ns: self.model.timestamp_ns(*tick, point.row), observed_timestamp_ns: Some(point.timestamp_ns) });
 			}
 		}

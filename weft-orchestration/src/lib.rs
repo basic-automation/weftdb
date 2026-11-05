@@ -570,7 +570,7 @@ pub async fn run_all_pipelines<S: ::std::hash::BuildHasher>(database: &Database,
 				}
 
 				// Run the pipeline
-				match pipeline.run().await {
+				let result = match pipeline.run().await {
 					Ok(()) => {
 						let signal_count = pipeline.signals().len();
 						let run_count = pipeline.state().run_count;
@@ -593,7 +593,9 @@ pub async fn run_all_pipelines<S: ::std::hash::BuildHasher>(database: &Database,
 						);
 						PipelineRunResult { aspect_id, run_count: 0, signal_count: 0, elapsed: start.elapsed(), error: Some(format!("Pipeline execution failed: {e}")) }
 					}
-				}
+				};
+				drop(pipeline);
+				result
 			}
 		})
 		.collect();
@@ -661,6 +663,34 @@ static SIGNALS_QUEUE: LazyLock<Mutex<Signals>> = LazyLock::new(|| Mutex::new(Sig
 
 type ExpiredSignal = (weftdb::CorrelationID, weftdb::ManifestationId, SignalType, chrono::DateTime<chrono::Utc>);
 
+/// Remove `signals_to_remove` from `signals` with error correction (see
+/// [`Signals::remove_with_error_correction`]), each against its own correlation.
+///
+/// Answers the correlations the removals corrected, one per correlation however many of
+/// its signals were removed, and how many signals were removed.
+fn remove_expired_signals(signals: &mut Signals, correlations: &[weftdb::Correlation], signals_to_remove: Vec<ExpiredSignal>) -> (Vec<weftdb::Correlation>, usize) {
+	// Each correlation is copied out once, on its first signal, and every later signal of it
+	// corrects the same copy, so each is updated once however many of its signals expire.
+	let mut corrected: Vec<weftdb::Correlation> = Vec::new();
+	let mut slots: std::collections::HashMap<weftdb::CorrelationID, usize> = std::collections::HashMap::new();
+	let mut removed_count = 0;
+	for (correlation_id, manifestation_id, signal_type, resolution_time) in signals_to_remove {
+		let slot = if let Some(&slot) = slots.get(&correlation_id) {
+			slot
+		} else {
+			let Some(correlation) = correlations.iter().find(|c| *c.id() == correlation_id) else { continue };
+			corrected.push(correlation.clone());
+			slots.insert(correlation_id, corrected.len() - 1);
+			corrected.len() - 1
+		};
+		// Use error correction when removing the signal
+		if let Ok(Some(_removed_signal)) = signals.remove_with_error_correction(&mut corrected[slot], &manifestation_id, &signal_type, resolution_time) {
+			removed_count += 1;
+		}
+	}
+	(corrected, removed_count)
+}
+
 fn collect_expired_signals(signals: &Signals, events: &[weftdb::Event], correlations: &[weftdb::Correlation], current_time: chrono::DateTime<chrono::Utc>) -> (Vec<ExpiredSignal>, usize, usize) {
 	let mut signals_to_remove = Vec::new();
 	let mut expired_historical = 0usize;
@@ -677,6 +707,7 @@ fn collect_expired_signals(signals: &Signals, events: &[weftdb::Event], correlat
 
 		if let Some(event_id) = signal_event_id {
 			if let Some(event) = events.iter().find(|e| *e.id() == event_id) {
+				let average_distance = correlations.iter().find(|c| c.id() == signal.correlation_id()).and_then(|c| c.average_distance().cloned());
 				if let Some((_, predicted_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
 					let prediction_point = match signal.signal_type() {
 						SignalType::PredictStart | SignalType::PredictMid => predicted_manifestation.midpoint(),
@@ -687,21 +718,19 @@ fn collect_expired_signals(signals: &Signals, events: &[weftdb::Event], correlat
 						signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), prediction_point));
 						expired_historical += 1;
 					}
-				} else if let Some(correlation) = correlations.iter().find(|c| c.id() == signal.correlation_id()) {
-					if let Some(avg_dist) = correlation.average_distance() {
-						use bigdecimal::ToPrimitive;
-						if let Some(distance_minutes) = avg_dist.value().to_i64() {
-							let duration = match avg_dist.units() {
-								Resolution::Hours => chrono::Duration::hours(distance_minutes),
-								Resolution::Days => chrono::Duration::days(distance_minutes),
-								Resolution::Seconds => chrono::Duration::seconds(distance_minutes),
-								_ => chrono::Duration::minutes(distance_minutes),
-							};
-							let predicted_time = *signal.manifestation_date() + duration;
-							if current_time >= predicted_time {
-								signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), predicted_time));
-								expired_forward += 1;
-							}
+				} else if let Some(avg_dist) = average_distance {
+					use bigdecimal::ToPrimitive;
+					if let Some(distance_minutes) = avg_dist.value().to_i64() {
+						let duration = match avg_dist.units() {
+							Resolution::Hours => chrono::Duration::hours(distance_minutes),
+							Resolution::Days => chrono::Duration::days(distance_minutes),
+							Resolution::Seconds => chrono::Duration::seconds(distance_minutes),
+							_ => chrono::Duration::minutes(distance_minutes),
+						};
+						let predicted_time = *signal.manifestation_date() + duration;
+						if current_time >= predicted_time {
+							signals_to_remove.push((signal.correlation_id().clone(), signal.manifestation_id().clone(), signal.signal_type().clone(), predicted_time));
+							expired_forward += 1;
 						}
 					}
 				}
@@ -757,6 +786,7 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &weftdb
 		total_db_time += db_elapsed;
 
 		processed_count += chunk.len();
+		drop(chunk);
 		tracing::info!(processed_count = processed_count, cpu_ms = cpu_elapsed.as_millis(), db_ms = db_elapsed.as_millis(), "Processed batches chunk");
 	}
 
@@ -993,6 +1023,7 @@ pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, 
 			// Yield to prevent blocking other tasks
 			tokio::task::yield_now().await;
 		}
+		drop(processed_patterns);
 
 		// Patterns are now stored in dictionary databases and should persist,
 		// so we don't remove them after loading into memory
@@ -1000,9 +1031,11 @@ pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, 
 		//     database.dequeue_processed_pattern(&pattern).await?;
 		// }
 	}
+	drop(patterns);
 
 	let final_elapsed = start_time.elapsed();
-	let final_rate = pattern_count as f64 / final_elapsed.as_secs_f64();
+	// A log figure: a count past u32::MAX reads as u32::MAX patterns.
+	let final_rate = f64::from(u32::try_from(pattern_count).unwrap_or(u32::MAX)) / final_elapsed.as_secs_f64();
 	tracing::info!(pattern_count = pattern_count, elapsed = ?final_elapsed, rate = final_rate, "Dictionary loading completed");
 	Ok(())
 }
@@ -1068,7 +1101,7 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 	}
 
 	// Sort points by timestamp to ensure proper chronological order
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	let mut event = Event::new(None, format!("5% Monthly Price Increase - {aspect}"), Some(format!("Detects when price increases 5% or more from start to end of month for aspect {aspect}")), None);
 	let threshold_percentage = BigDecimal::from_f64(0.05).unwrap(); // 5% threshold
@@ -1091,7 +1124,7 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 
 		// Sort points within the month by timestamp
 		let mut sorted_month_points = month_points;
-		sorted_month_points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+		sorted_month_points.sort_by_key(|a| a.timestamp);
 
 		let start_price = &sorted_month_points[0].value;
 		let end_price = &sorted_month_points[sorted_month_points.len() - 1].value;
@@ -1110,6 +1143,7 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 				sorted_month_points[0].timestamp, // Start of the month
 				end_timestamp,                    // End of the month
 			);
+			drop(database_info);
 
 			event.add_manifestation(manifestation);
 		}
@@ -1207,10 +1241,11 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 			// Assign constant to local variable before borrowing to avoid clippy warning
 			let error_rate = HashMap::new();
 
-			let correlation = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), subject_id: aspect.subject_id(), aspect_id: aspect_id.clone(), pattern_id: pattern.id(), event_id: event.id().clone() }, error_rate, pattern.occurrences().clone(), average_distance);
+			let correlation = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), subject_id: aspect.subject_id(), aspect_id: *aspect_id, pattern_id: pattern.id(), event_id: event.id().clone() }, error_rate, pattern.occurrences().clone(), average_distance);
 			database.insert_correlation(aspect_id, &correlation).await?;
 		}
 	}
+	drop(aspect);
 
 	tracing::info!("Pattern-Event correlation completed successfully");
 	Ok(())
@@ -1375,30 +1410,7 @@ pub async fn filter_expired_signals(database: &Database, aspect_id: &AspectId, c
 
 	// Remove expired signals with error correction
 	// Use a HashMap to track correlations by ID so we only update each once
-	let mut removed_count = 0;
-	let mut correlations_map: std::collections::HashMap<weftdb::CorrelationID, weftdb::Correlation> = std::collections::HashMap::new();
-
-	// Pre-populate the map with correlations that have signals to remove
-	for (correlation_id, _, _, _) in &signals_to_remove {
-		if !correlations_map.contains_key(correlation_id) {
-			if let Some(correlation) = correlations.iter().find(|c| c.id() == correlation_id) {
-				correlations_map.insert(correlation_id.clone(), correlation.clone());
-			}
-		}
-	}
-
-	for (correlation_id, manifestation_id, signal_type, resolution_time) in signals_to_remove {
-		// Get the mutable correlation from our map
-		if let Some(correlation) = correlations_map.get_mut(&correlation_id) {
-			// Use error correction when removing the signal
-			if let Ok(Some(_removed_signal)) = signals_lock.remove_with_error_correction(correlation, &manifestation_id, &signal_type, resolution_time) {
-				removed_count += 1;
-			}
-		}
-	}
-
-	// Batch update only unique modified correlations
-	let unique_correlations: Vec<_> = correlations_map.into_values().collect();
+	let (unique_correlations, removed_count) = remove_expired_signals(&mut signals_lock, &correlations, signals_to_remove);
 	tracing::debug!(unique_correlations = unique_correlations.len(), "Updating modified correlations");
 	for correlation in unique_correlations {
 		database.update_correlation(aspect_id, &correlation).await?;
@@ -1514,6 +1526,7 @@ mod tests {
 			tracing::debug!(batch = %json!(&processed_batches[random_index]), "Random processed batch");
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
+		drop(processed_batches);
 
 		#[rustfmt::skip]
 		let contraints = DictionaryConstraints::new(
@@ -1552,6 +1565,7 @@ mod tests {
 			tracing::debug!(batch = %json!(&processed_batches[random_index]), "Random processed batch");
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
+		drop(processed_batches);
 
 		build_patterns_queue(&database, &aspect_id, &mut dictionary).await?;
 		let patterns: Vec<weftdb::Pattern> = Outputs::get_dictionary_patterns(&database, &aspect.id(), "TestDictionary").await?.try_collect().await?;
@@ -1593,6 +1607,7 @@ mod tests {
 
 		// print the number of patterns with more than 1 occurrence
 		tracing::info!(count = dictionary.patterns().iter().filter(|p| p.occurrences().len() > 1).count(), "Number of patterns with more than 1 occurrence");
+		drop(patterns);
 
 		let timer = std::time::Instant::now();
 		tracing::info!("Starting create_signals...");
@@ -1653,6 +1668,7 @@ mod tests {
 		let signal_type = random_signal.signal_type().clone();
 		let random_correlation = database.get_correlation(&aspect.id(), &random_correlation_id).await?;
 		let random_correlation_error_rate = random_correlation.error_rate().clone();
+		drop(random_correlation);
 
 		// Get the error rate for the specific signal type we're using
 		let error_rate = random_correlation_error_rate.get(&signal_type).or_else(|| random_correlation_error_rate.values().next()).cloned().unwrap_or_else(|| weftdb::Distance::new(BigDecimal::from(0), splimes::Resolution::Seconds));
@@ -1666,6 +1682,7 @@ mod tests {
 		let sig_sum_probability = signals_lock.probability_sum(&random_event_id, &signal_type, sample_datetime, &database, &aspect.id()).await?.unwrap_or_else(|| BigDecimal::from(0));
 		let sig_avg_probability = signals_lock.probability_average(&random_event_id, &signal_type, sample_datetime, &database, &aspect.id()).await?.unwrap_or_else(|| BigDecimal::from(0));
 		let sig_event_probability = signals_lock.event_probability(&random_event_id, &signal_type, sample_datetime, &database, &aspect.id()).await?;
+		drop(database);
 
 		tracing::info!(elapsed = ?timer.elapsed(), "Time taken for sample signal probability calculation");
 
@@ -1785,6 +1802,7 @@ mod tests {
 			tracing::debug!(batch = %json!(&processed_batches[random_index]), "Random processed batch");
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
+		drop(processed_batches);
 
 		// Get patterns to verify pattern extraction worked
 		let patterns: Vec<weftdb::Pattern> = Outputs::get_dictionary_patterns(&database, &aspect_id, "TestDictionary").await?.try_collect().await?;
@@ -1810,6 +1828,7 @@ mod tests {
 
 		// Check patterns with multiple occurrences
 		let dict_multi_occ_count = pipeline.get_dictionary("TestDictionary").map_or(0, |d| d.patterns().iter().filter(|p| p.occurrences().len() > 1).count());
+		drop(patterns);
 		tracing::info!(count = dict_multi_occ_count, "Number of patterns with more than 1 occurrence");
 
 		// Query probability for a random signal if signals exist
@@ -1885,6 +1904,8 @@ mod tests {
 				"Pipeline loaded from saved state"
 			);
 		}
+		drop(database);
+		drop(pipeline);
 
 		tracing::info!("Pipeline API test completed successfully!");
 		Ok(())
@@ -1923,6 +1944,7 @@ mod tests {
 			tracing::debug!(batch = %json!(&processed_batches[random_index]), "Random processed batch");
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
+		drop(processed_batches);
 
 		#[rustfmt::skip]
                 let mut dictionary = Dictionary::new(
@@ -1981,6 +2003,8 @@ mod tests {
 
 		// print the number of patterns with more than 1 occurrence
 		tracing::info!(count = dictionary.patterns().iter().filter(|p| p.occurrences().len() > 1).count(), "Number of patterns with more than 1 occurrence");
+		drop(dictionary);
+		drop(patterns);
 
 		let timer = std::time::Instant::now();
 		tracing::info!("Starting create_signals...");
@@ -2019,6 +2043,7 @@ mod tests {
 			let correlations: Vec<weftdb::Correlation> = db.get_correlations(&aspect.id()).await?.try_collect().await?;
 			let signal_type = SignalType::PredictStart;
 			let error_rate = correlations.first().and_then(|c| c.error_rate().get(&signal_type).cloned()).unwrap_or_else(|| weftdb::Distance::new(BigDecimal::from(0), splimes::Resolution::Seconds));
+			drop(correlations);
 
 			for hour in 65..=70 {
 				let query_time = start_time + chrono::Duration::hours(hour);
@@ -2058,6 +2083,8 @@ mod tests {
 				drop(signals_lock);
 			}
 		}
+		drop(aspect);
+		drop(db);
 		discard_database("TestDB").await;
 		Ok(())
 	}
@@ -2081,6 +2108,7 @@ mod tests {
 		let aspects = db.get_subject_aspects(&subject).await?;
 		let aspect = aspects.iter().find(|a| a.name() == "TestAspect").ok_or_else(|| anyhow::anyhow!("Aspect 'TestAspect' not found"))?;
 		let aspect_id = aspect.id();
+		drop(aspect);
 
 		tracing::info!(aspect_id = %aspect_id, "Aspect ID");
 
@@ -2121,6 +2149,7 @@ mod tests {
 			tracing::debug!(batch = %json!(&processed_batches[random_index]), "Random processed batch");
 			output_denk_format_batch(&processed_batches[random_index]);
 		}
+		drop(processed_batches);
 
 		// Run pattern extraction
 		let timer = std::time::Instant::now();
@@ -2168,6 +2197,7 @@ mod tests {
 		}
 		tracing::info!(count = multi_occurrence_count, "Number of correlations with more than 1 occurrence");
 		let dict_multi_occ_count_2 = pipeline.get_dictionary("TestDictionary").map_or(0, |d| d.patterns().iter().filter(|p| p.occurrences().len() > 1).count());
+		drop(patterns);
 		tracing::info!(count = dict_multi_occ_count_2, "Number of patterns with more than 1 occurrence");
 
 		// Run signal generation
@@ -2200,6 +2230,7 @@ mod tests {
 			let correlations: Vec<weftdb::Correlation> = db.get_correlations(&aspect_id).await?.try_collect().await?;
 			let signal_type = SignalType::PredictStart;
 			let error_rate = correlations.first().and_then(|c| c.error_rate().get(&signal_type).cloned()).unwrap_or_else(|| weftdb::Distance::new(BigDecimal::from(0), splimes::Resolution::Seconds));
+			drop(correlations);
 
 			for hour in 65..=70 {
 				let query_time = start_time + chrono::Duration::hours(hour);
@@ -2229,6 +2260,8 @@ mod tests {
 				);
 			}
 		}
+		drop(db);
+		drop(pipeline);
 
 		tracing::info!("Pipeline API precise test completed successfully!");
 		discard_database("TestDB").await;
@@ -2297,7 +2330,7 @@ mod tests {
 
 		let db = Database::new("test_bath_processing").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds, None).await.unwrap();
+		let aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds, None).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
@@ -2321,10 +2354,9 @@ mod tests {
 		for (i, value) in points {
 			let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.capture_measurement(&test_aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
+			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 		}
 
-		let aspect = test_aspect;
 		let resolution = Resolution::Minutes;
 		let method = Spline::Linear;
 		let batch_size = 10;
@@ -2340,6 +2372,8 @@ mod tests {
 		build_processed_batch_queue(&db, &aspect.id()).await?;
 
 		let processed_batches: Vec<Batch> = db.get_processed_batches(&aspect.id()).await?.try_collect().await?;
+		drop(aspect);
+		drop(db);
 		tracing::info!(count = processed_batches.len(), "Processed batches");
 
 		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
@@ -2362,7 +2396,7 @@ mod tests {
 
 		let db = Database::new("test_specific_process_batch").await.unwrap();
 		let test_subject = db.observe_subject("TestSubject").await.unwrap();
-		let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds, None).await.unwrap();
+		let aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Seconds, None).await.unwrap();
 		let start_time = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
 		#[rustfmt::skip]
 		let points = vec![
@@ -2386,10 +2420,9 @@ mod tests {
 		for (i, value) in points {
 			let timestamp = start_time + chrono::Duration::minutes(i64::from(i));
 			let measurement = InputMeasurement::new(timestamp, value);
-			db.capture_measurement(&test_aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
+			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
 		}
 
-		let aspect = test_aspect;
 		let resolution = Resolution::Minutes;
 		let method = Spline::Linear;
 		let batch_size = 10;
@@ -2405,6 +2438,8 @@ mod tests {
 		build_processed_batch_queue(&db, &aspect.id()).await?;
 
 		let processed_batches: Vec<Batch> = db.get_processed_batches(&aspect.id()).await?.try_collect().await?;
+		drop(aspect);
+		drop(db);
 		tracing::info!(count = processed_batches.len(), "Processed batches");
 
 		// With 15 points and batch size 10, sliding window creates: 15 - 10 + 1 = 6 overlapping batches
@@ -2428,7 +2463,7 @@ mod tests {
 		}
 
 		// Sort points by timestamp to ensure proper chronological order
-		points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+		points.sort_by_key(|a| a.timestamp);
 
 		// Find the global maximum value
 		let global_max = points.iter().map(|p| &p.value).max().unwrap();
@@ -2451,6 +2486,7 @@ mod tests {
 					points[i - 1].timestamp, // Start of rise to peak
 					points[i + 1].timestamp, // Start of decline from peak
 				);
+				drop(database_info);
 
 				event.add_manifestation(manifestation);
 			}
@@ -2594,7 +2630,10 @@ mod tests {
 
 		// Cleanup: delete the pipeline
 		loaded_pipeline.delete().await?;
+		drop(loaded_pipeline);
 		assert!(!Pipeline::exists(&db, &aspect.id()).await?);
+		drop(aspect);
+		drop(db);
 
 		tracing::info!("test_pipeline_api completed successfully!");
 		discard_database("TestDB").await;
@@ -2626,12 +2665,14 @@ mod tests {
 		// Test load_or_create on a new aspect (should create default)
 		let pipeline = Pipeline::load_or_create(db.clone(), &aspect.id()).await?;
 		assert!(pipeline.is_dormant(), "New pipeline should be dormant");
+		drop(pipeline);
 		assert!(Pipeline::exists(&db, &aspect.id()).await?, "Pipeline should exist after creation");
 
 		tracing::info!("Pipeline created as dormant, testing runtime config...");
 
 		// Test applying runtime config
 		let mut pipeline = Pipeline::load_or_create(db.clone(), &aspect.id()).await?;
+		drop(aspect);
 		let config = PipelineRunConfig::new().with_peak_detector("Test Peaks").batch_size(4);
 
 		pipeline.apply_runtime_config(config).await?;
@@ -2683,6 +2724,7 @@ mod tests {
 
 		// Run all pipelines for the subject in parallel
 		let results = crate::run_subject_pipelines(&db, &subject.id(), |aspect| PipelineRunConfig::new().with_peak_detector(format!("{} Peaks", aspect.name())).batch_size(4)).await?;
+		drop(subject);
 
 		tracing::info!(result_count = results.len(), "Pipeline run completed");
 
@@ -2743,6 +2785,8 @@ mod tests {
 		assert_eq!(count, 1, "one metadata row after three loads");
 
 		let listed = db.list_dictionaries(&aspect.id()).await?;
+		drop(aspect);
+		drop(db);
 		assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["pipeline"]);
 
 		remove_database(&db_name);
@@ -2781,6 +2825,7 @@ mod tests {
 
 		load_dictionary(&db, &aspect.id(), &mut dictionary).await?;
 		assert_eq!(stored_registration(&db, &aspect.id(), "pipeline").await?, (degree_9.to_string(), 1), "the stored registration is unchanged");
+		drop(db);
 
 		remove_database(&db_name);
 		Ok(())
@@ -2798,6 +2843,8 @@ mod tests {
 		let mut dictionary = Dictionary::new("../escape".to_string(), "outside".to_string(), DictionaryConstraints::default());
 
 		let err = load_dictionary(&db, &aspect.id(), &mut dictionary).await.expect_err("an invalid name");
+		drop(aspect);
+		drop(db);
 		assert_eq!(err.downcast_ref::<weftdb::InvalidDictionaryName>().map(weftdb::InvalidDictionaryName::name), Some("../escape"));
 		assert!(!data_dir().join(&db_name).join("subject").join("aspect").join("escape.db").exists());
 

@@ -324,7 +324,7 @@ fn round2(value: f64) -> f64 {
 /// so a wrong series or row offset shows up in the values.
 fn signal(series: usize, row: usize) -> f64 {
 	use std::f64::consts::TAU;
-	let (series_f, row_f) = (series as f64, row as f64);
+	let (series_f, row_f) = (crate::num::usize_to_f64(series), crate::num::usize_to_f64(row));
 	let amplitude = 10.0_f64.mul_add((series_f * 0.7).sin(), 30.0);
 	round2(amplitude.mul_add((row_f / 512.0 * TAU).sin(), series_f))
 }
@@ -400,8 +400,8 @@ impl WorkloadModel {
 					let base = signal(series, row);
 					column.push(Some(match format {
 						ValueFormat::Float => GridValue::Float(base),
-						ValueFormat::Integer => GridValue::Integer(base.trunc() as i64),
-						ValueFormat::Unsigned => GridValue::Unsigned(base.abs().trunc() as u64),
+						ValueFormat::Integer => GridValue::Integer(crate::num::f64_to_i64(base.trunc())),
+						ValueFormat::Unsigned => GridValue::Unsigned(crate::num::f64_to_u64(base.abs().trunc())),
 						ValueFormat::Boolean => GridValue::Boolean(base >= 0.0),
 						ValueFormat::Text => GridValue::Text(format!("{base:.2}")),
 					}));

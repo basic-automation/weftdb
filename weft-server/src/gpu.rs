@@ -68,16 +68,23 @@ impl CalibrationMode {
 	}
 }
 
-/// Environment variable naming the one adapter splimes opens (5.7): a whole number is an
+/// Environment variable naming the one adapter splimes opens (5.7).
+///
+/// A whole number is an
 /// index into `splimes::gpu_adapters()`, `api:<api>` the first adapter on that graphics
 /// API, `name:<text>` (or any other text) the first adapter whose name contains it,
-/// ignoring case. Unset: splimes' own choice (`WGPU_ADAPTER_NAME`, else the
+/// ignoring case.
+///
+/// Unset: splimes' own choice (`WGPU_ADAPTER_NAME`, else the
 /// high-performance adapter).
 pub const GPU_ADAPTER_ENV: &str = "WEFT_GPU_ADAPTER";
 
-/// Environment variable choosing how many devices splimes opens (5.7): `one` (the
+/// Environment variable choosing how many devices splimes opens (5.7).
+///
+/// `one` (the
 /// default), `all` (every hardware adapter), or a comma-separated list of adapter
 /// selectors in [`GPU_ADAPTER_ENV`]'s syntax, opened in that order.
+///
 pub const GPU_DEVICES_ENV: &str = "WEFT_GPU_DEVICES";
 
 /// Parse one adapter selector ([`GPU_ADAPTER_ENV`]'s syntax).
@@ -124,7 +131,9 @@ pub fn parse_devices(raw: &str) -> Result<GpuDevices, String> {
 }
 
 /// The GPU configuration [`GPU_ADAPTER_ENV`] and [`GPU_DEVICES_ENV`] ask for (`None` for
-/// a variable that is unset or blank). `Ok(None)` when neither asks for anything, so the
+/// a variable that is unset or blank).
+///
+/// `Ok(None)` when neither asks for anything, so the
 /// server leaves splimes' default (one device, splimes' own adapter choice) untouched.
 ///
 /// # Errors
@@ -148,7 +157,9 @@ pub fn gpu_config_from_env(adapter: Option<&str>, devices: Option<&str>) -> Resu
 	Ok(Some(config.with_devices(devices)))
 }
 
-/// Install `config` with `splimes::configure_gpu`, returning the log line. Call it once at
+/// Install `config` with `splimes::configure_gpu`, returning the log line.
+///
+/// Call it once at
 /// startup, before calibration or any request starts the GPU. A refusal (the GPU already
 /// started) is reported, not fatal: interpolation still works on splimes' defaults.
 #[must_use]

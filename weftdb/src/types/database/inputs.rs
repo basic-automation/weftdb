@@ -317,7 +317,7 @@ impl Inputs for Database {
 	/// - if aspect not found
 	/// - if unable to insert measurement into database
 	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
-		legacy_metadata_write(async move {
+		Box::pin(legacy_metadata_write(async move {
 			// Seal-backed aspects (slice D-S19): a one-row ingest through the
 			// seal store, followed by the store's O(1) fragmentation gate. The
 			// per-timestamp queue is never touched (slice D-S20): the ingest
@@ -397,7 +397,7 @@ impl Inputs for Database {
 					Ok(tx_id)
 				}
 			}
-		})
+		}))
 		.await
 	}
 
@@ -459,7 +459,7 @@ impl Inputs for Database {
 	/// which answers a typed error for a batch with no rows instead of unwrapping an absent
 	/// minimum (ROB-5).
 	async fn batch_capture_measurements(&self, aspect_id: AspectId, dataset_id: DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
-		legacy_metadata_write(async move {
+		Box::pin(legacy_metadata_write(async move {
 			if input_measurements.is_empty() {
 				return Ok(Vec::new());
 			}
@@ -602,7 +602,7 @@ impl Inputs for Database {
 			}
 			tracing::info!("[batch_capture] Batch complete: {} measurements imported for aspect {}", total_measurements, aspect_id);
 			Ok(all_tx_ids)
-		})
+		}))
 		.await
 	}
 
@@ -829,7 +829,7 @@ impl Inputs for Database {
 			Self::commit_concurrent(&conn).await?;
 
 			let log = format!("Removed unprocessed batch {batch_id} for aspect {aspect_id}");
-			Ok(self.record_transaction(&log).await?)
+			self.record_transaction(&log).await
 		})
 		.await
 	}
@@ -854,7 +854,7 @@ impl Inputs for Database {
 
 			Self::commit_concurrent(&conn).await?;
 			let log = format!("Cleared all unprocessed batches for aspect {aspect_id}");
-			Ok(self.record_transaction(&log).await?)
+			self.record_transaction(&log).await
 		})
 		.await
 	}
@@ -879,7 +879,7 @@ impl Inputs for Database {
 
 			Self::commit_concurrent(&conn).await?;
 			let log = format!("Cleaned up unprocessed batches older than {older_than} for aspect {aspect_id}");
-			Ok(self.record_transaction(&log).await?)
+			self.record_transaction(&log).await
 		})
 		.await
 	}
@@ -956,7 +956,7 @@ impl Inputs for Database {
 			Self::commit_concurrent(&conn).await?;
 
 			let log = format!("Removed processed batch {batch_id} for aspect {aspect_id}");
-			Ok(self.record_transaction(&log).await?)
+			self.record_transaction(&log).await
 		})
 		.await
 	}
@@ -1056,7 +1056,7 @@ impl Inputs for Database {
 
 			Self::commit_concurrent(&conn).await?;
 			let log = format!("Cleared all processed batches for aspect {aspect_id}");
-			Ok(self.record_transaction(&log).await?)
+			self.record_transaction(&log).await
 		})
 		.await
 	}
@@ -1082,7 +1082,7 @@ impl Inputs for Database {
 
 			Self::commit_concurrent(&conn).await?;
 			let log = format!("Cleaned up processed batches older than {older_than} for aspect {aspect_id}");
-			Ok(self.record_transaction(&log).await?)
+			self.record_transaction(&log).await
 		})
 		.await
 	}
@@ -1284,7 +1284,7 @@ impl Inputs for Database {
 			}
 			Self::commit_concurrent(&conn).await?;
 			let log = format!("Removed pattern '{pattern}' for aspect {aspect_id}");
-			Ok(self.record_transaction(&log).await?)
+			self.record_transaction(&log).await
 		})
 		.await
 	}
@@ -1307,7 +1307,7 @@ impl Inputs for Database {
 			}
 			Self::commit_concurrent(&conn).await?;
 			let log = format!("Cleared all patterns for aspect {aspect_id}");
-			Ok(self.record_transaction(&log).await?)
+			self.record_transaction(&log).await
 		})
 		.await
 	}

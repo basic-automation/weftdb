@@ -140,7 +140,7 @@ impl RangeFetchProfile {
 		let values: Vec<BigDecimal> = (0..n).map(|i| format!("10000000.{:02}", i % 97).parse().expect("literal decimal parses")).collect();
 		let timestamps: Vec<i64> = if self.regular {
 			// `n` is a row count (never near `i64::MAX`), so the index cast cannot wrap.
-			(0..n as i64).map(|i| EPOCH_ANCHOR_MS + i * REGULAR_STRIDE_MS).collect()
+			(0..crate::num::usize_to_i64(n)).map(|i| EPOCH_ANCHOR_MS + i * REGULAR_STRIDE_MS).collect()
 		} else {
 			let mut rng = ChaCha8Rng::seed_from_u64(self.seed ^ 0x_1F0E_2D3C_4B5A_6978);
 			let mut cur = EPOCH_ANCHOR_MS;
@@ -278,8 +278,8 @@ pub fn run_range_fetch_on(profile: &RangeFetchProfile, timestamps: &[i64], value
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	// Throughput is rows fetched per second (a "point" here is one materialized row).
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		let secs = latency.mean_ns as f64 / 1e9;
-		let points = rows_fetched as f64;
+		let secs = crate::num::u64_to_f64(latency.mean_ns) / 1e9;
+		let points = crate::num::usize_to_f64(rows_fetched);
 		points / secs
 	} else {
 		0.0

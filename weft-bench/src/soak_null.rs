@@ -67,7 +67,7 @@ impl NullServer {
 }
 
 impl SoakServer for NullServer {
-	fn name(&self) -> &str {
+	fn name(&self) -> &'static str {
 		"null"
 	}
 

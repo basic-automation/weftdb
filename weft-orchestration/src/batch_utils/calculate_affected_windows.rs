@@ -56,7 +56,10 @@ pub fn calculate_affected_windows(unbatched_timestamps: &[DateTime<Utc>], resolu
 
 	// Window duration is (batch_size - 1) * step since we have batch_size points
 	// with step intervals between consecutive points
-	let window_duration_millis = (batch_size as i64 - 1) * step_millis;
+	let Ok(batch_len) = i64::try_from(batch_size) else {
+		return HashSet::new();
+	};
+	let window_duration_millis = (batch_len - 1) * step_millis;
 
 	// Align the earliest_measurement to the step boundary
 	let base_millis = earliest_measurement.timestamp_millis();
@@ -106,8 +109,9 @@ pub fn calculate_affected_windows(unbatched_timestamps: &[DateTime<Utc>], resolu
 }
 
 /// Calculate which batch windows are affected by every timestamp in the
-/// inclusive range `min_ts..=max_ts` (slice D-S20): the union of the
-/// windows [`calculate_affected_windows`] computes for the range's two
+/// inclusive range `min_ts..=max_ts` (slice D-S20).
+///
+/// This is the union of the windows [`calculate_affected_windows`] computes for the range's two
 /// ends, which is every window in between as well — the windows a
 /// timestamp affects form one contiguous run of indices, and the runs of
 /// two timestamps overlap or abut whenever the timestamps are within one
@@ -133,7 +137,10 @@ pub fn calculate_affected_windows_for_range(min_ts: DateTime<Utc>, max_ts: DateT
 		return HashSet::new();
 	}
 	#[allow(clippy::cast_possible_wrap)]
-	let window_duration_millis = (batch_size as i64 - 1) * step_millis;
+	let Ok(batch_len) = i64::try_from(batch_size) else {
+		return HashSet::new();
+	};
+	let window_duration_millis = (batch_len - 1) * step_millis;
 	let base_millis = earliest_measurement.timestamp_millis();
 
 	// Latest window index that starts at or before max_ts.

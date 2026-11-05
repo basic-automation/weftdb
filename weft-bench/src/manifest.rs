@@ -161,7 +161,7 @@ impl BuildFacts {
 
 	/// The revision the binary was compiled from, when the build script could read one.
 	#[must_use]
-	pub fn git_sha(&self) -> Option<&'static str> {
+	pub const fn git_sha(&self) -> Option<&'static str> {
 		option_env!("WEFTDB_BUILD_GIT_SHA")
 	}
 
@@ -177,7 +177,7 @@ impl BuildFacts {
 }
 
 /// The hardware/toolchain block.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
 	/// `weft-bench` version that wrote this manifest.
 	pub weft_bench_version: String,
@@ -226,7 +226,7 @@ pub struct Provenance {
 }
 
 /// How the run was invoked.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invocation {
 	/// The process arguments, secret-redacted and home-redacted.
 	pub command_line: Vec<String>,
@@ -239,7 +239,7 @@ pub struct Invocation {
 }
 
 /// What this manifest is about, and how to tell it has not been edited since.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sources {
 	/// The report this manifest describes, as recorded at capture time.
 	pub report: String,
@@ -291,7 +291,7 @@ pub enum ManifestError {
 	Parse {
 		/// The offending file.
 		path: PathBuf,
-		/// What serde_json said.
+		/// What `serde_json` said.
 		source: serde_json::Error,
 	},
 	/// The manifest is a schema this build cannot fully verify.
@@ -422,7 +422,7 @@ impl Verdict {
 
 	/// True when nothing was wrong.
 	#[must_use]
-	pub fn is_clean(&self) -> bool {
+	pub const fn is_clean(&self) -> bool {
 		self.problems.is_empty()
 	}
 }
@@ -444,7 +444,7 @@ impl RunManifest {
 
 		let provenance = Provenance { weft_bench_version: report.metadata.weft_bench_version.clone(), os: redaction::redact(&report.metadata.os), arch: redaction::redact(&report.metadata.arch), build: build.clone(), cpu_model: report.metadata.cpu_model.as_deref().map(redaction::redact).filter(|s| !s.is_empty()), cpu_cores_physical: report.metadata.cpu_cores_physical, cpu_cores_logical: report.metadata.cpu_cores_logical, total_memory_bytes: report.metadata.total_memory_bytes, work_disk_kind: report.metadata.work_disk_kind.clone(), work_disk_file_system: report.metadata.work_disk_file_system.clone(), work_disk_mount_point: report.metadata.work_disk_mount_point.as_deref().map(redaction::redact).filter(|s| !s.is_empty()), gpu: report.metadata.engine.as_ref().and_then(|e| e.gpu.as_deref()).map(redaction::redact).filter(|s| !s.is_empty()), gpu_driver: report.metadata.engine.as_ref().and_then(|e| e.gpu_driver.as_deref()).map(redaction::redact).filter(|s| !s.is_empty()), engine_calibration: report.metadata.engine.as_ref().map(|e| redaction::redact(&e.describe_calibration())), engine_note: report.metadata.engine.as_ref().and_then(|e| e.note.as_deref()).map(redaction::redact).filter(|s| !s.is_empty()), target_cpu: std::env::var("TARGET_CPU").ok().filter(|v| !v.trim().is_empty()).map(|v| redaction::redact(v.trim())) };
 
-		let invocation = Invocation { command_line: command_line.iter().map(|arg| redaction::redact(arg)).collect(), working_directory: std::env::current_dir().map(|dir| redaction::redact_home(&dir.to_string_lossy())).unwrap_or_else(|_| String::new()), environment: capture_environment(), labels: labels.iter().map(|(name, value)| (redaction::redact(name), redaction::redact(value))).collect() };
+		let invocation = Invocation { command_line: command_line.iter().map(|arg| redaction::redact(arg)).collect(), working_directory: std::env::current_dir().map_or_else(|_| String::new(), |dir| redaction::redact_home(&dir.to_string_lossy())), environment: capture_environment(), labels: labels.iter().map(|(name, value)| (redaction::redact(name), redaction::redact(value))).collect() };
 
 		let sources = Sources { report: redaction::redact_home(&report_path.to_string_lossy()), report_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX), report_sha256, report_schema: report.schema_version, git_sha: build.git_sha().map(str::to_string), git_dirty: build.git_dirty() };
 
@@ -694,7 +694,7 @@ fn push_result_measures(result: &BenchResult, measures: &mut Vec<Measure>) {
 	let adapter = result.adapter.as_str();
 	// Latency is a whole number of nanoseconds; f64 carries it exactly, so the cast is a
 	// representation change and not a rounding choice.
-	let as_f64 = |value: u64| value as f64;
+	let as_f64 = |value: u64| crate::num::u64_to_f64(value);
 	measures.push(Measure { name: "latency.p50_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.p50_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
 	measures.push(Measure { name: "latency.mean_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.mean_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
 	measures.push(Measure { name: "latency.p95_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.p95_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });

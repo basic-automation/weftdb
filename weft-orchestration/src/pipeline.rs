@@ -528,7 +528,8 @@ impl Pipeline {
 	/// ```
 	pub async fn load_or_create(database: Database, aspect_id: &AspectId) -> Result<Self> {
 		// Try to load existing pipeline
-		if let Some(config) = database.load_pipeline_config(aspect_id).await? {
+		let loaded = database.load_pipeline_config(aspect_id).await?;
+		if let Some(config) = loaded {
 			// Pipeline exists, load it
 			let resolution = database.get_aspect_resolution(aspect_id).await?;
 			let state = database.load_pipeline_state(aspect_id).await?.unwrap_or_default();
@@ -803,6 +804,7 @@ impl Pipeline {
 		} else {
 			tracing::debug!("No compression config set, skipping compression step");
 		}
+		drop(aspect);
 
 		// Run standard pipeline steps
 		self.prepare_data().await?;
@@ -1446,6 +1448,7 @@ async fn compress_aspect(database: &Database, aspect_id: &AspectId) -> Result<we
 
 	let mut aspect = database.get_aspect(aspect_id).await?;
 	let summary = aspect.compress(database).await?;
+	drop(aspect);
 
 	tracing::info!(
 		original = summary.total_original_count,

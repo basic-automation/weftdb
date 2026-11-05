@@ -1797,7 +1797,7 @@ mod tests {
 			let mut points = Vec::new();
 			for _ in 0..knots {
 				t += 1 + (next() % 90) as i64;
-				let unit = (next() >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0;
+				let unit = crate::num::u64_to_f64((next() >> 11)) / crate::num::u64_to_f64(1_u64 << 53) * 2.0 - 1.0;
 				points.push(serde_json::json!({ "timestamp": ts(t), "value": unit * 10_f64.powi(exponent) }));
 			}
 			let body = serde_json::json!({

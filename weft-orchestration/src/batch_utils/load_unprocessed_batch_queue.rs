@@ -228,8 +228,9 @@ async fn build_batches_for_windows(database: &Database, aspect: &AspectId, resol
 	Ok(built)
 }
 
-/// The change-log consumer for a seal-backed aspect (slice D-S20): the
-/// counterpart of [`build_incremental_unprocessed_queue`] that reads the
+/// The change-log consumer for a seal-backed aspect (slice D-S20).
+///
+/// It is the counterpart of [`build_incremental_unprocessed_queue`] that reads the
 /// seal store's `segment_changes` log instead of the per-timestamp
 /// unbatched queue.
 ///
@@ -367,35 +368,37 @@ pub async fn build_unprocessed_queue(database: &Database, aspect: &AspectId, res
 	if batch_size > 0 && all_points.len() >= batch_size {
 		let database_info = database.get_database_info().await.map_err(|_| anyhow::anyhow!("Database info not available"))?;
 
-		let total_batches = all_points.len() - batch_size + 1;
-		let report_interval = std::cmp::max(1, total_batches / 10); // Report every 10% of total batches (at least every batch)
-		info!(total_batches, "Creating sliding window batches");
-
-		// Collect all batches first, then store them in bulk for better performance
-		let mut batches = Vec::with_capacity(total_batches);
-
-		// Create overlapping sliding window batches - each batch has exactly batch_size measurements
-		for i in 0..=(all_points.len() - batch_size) {
-			let window = &all_points[i..i + batch_size];
-			assert_eq!(window.len(), batch_size, "Window should always have exactly batch_size elements");
-
-			let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
-			let batch = Batch::new(batch_size, measurements, *resolution, *aspect, database_info.clone());
-			batches.push(batch);
-
-			// Progress indicator for batch creation
-			if (i + 1) % report_interval == 0 || i + 1 == total_batches {
-				debug!(created = i + 1, total = total_batches, "Batch creation progress");
-			}
-		}
-
-		info!(batch_count = batches.len(), "Storing batches in database");
 		// Store all batches at once using bulk insert
-		database.batch_insert_unprocessed_batches(aspect, batches).await?;
+		database.batch_insert_unprocessed_batches(aspect, sliding_window_batches(&all_points, batch_size, *resolution, *aspect, &database_info)).await?;
 	}
 
 	// Note: No longer using global queue length since batches are stored in database
 	info!("Batches stored in database successfully");
 
 	Ok(())
+}
+
+/// Build the overlapping sliding-window batches over `all_points`: one batch of exactly
+/// `batch_size` measurements starting at every point that leaves a full window.
+fn sliding_window_batches(all_points: &[weftdb::Point], batch_size: usize, resolution: Resolution, aspect: AspectId, database_info: &weftdb::DatabaseInfo) -> Vec<Batch> {
+	let total_batches = all_points.len() - batch_size + 1;
+	let report_interval = std::cmp::max(1, total_batches / 10); // Report every 10% of total batches (at least every batch)
+	info!(total_batches, "Creating sliding window batches");
+
+	// Collect all batches first, then store them in bulk for better performance
+	let mut batches = Vec::with_capacity(total_batches);
+
+	// Create overlapping sliding window batches - each batch has exactly batch_size measurements
+	for (i, window) in all_points.windows(batch_size).enumerate() {
+		let measurements = window.iter().map(|p| BatchedMeasurement::new(p.clone())).collect();
+		batches.push(Batch::new(batch_size, measurements, resolution, aspect, database_info.clone()));
+
+		// Progress indicator for batch creation
+		if (i + 1) % report_interval == 0 || i + 1 == total_batches {
+			debug!(created = i + 1, total = total_batches, "Batch creation progress");
+		}
+	}
+
+	info!(batch_count = batches.len(), "Storing batches in database");
+	batches
 }

@@ -597,9 +597,12 @@ where
 /// value) matches series without tag `key`.
 pub const TAG_PARAM_PREFIX: &str = "tag.";
 
-/// The query parameter that picks the selector's matching mode: absent or `exact` matches
+/// The query parameter that picks the selector's matching mode.
+///
+/// This is absent or `exact` matches
 /// the series whose tags equal the valued `tag.*` parameters, `subset` matches every series
 /// that carries them (other tags allowed).
+///
 pub const TAG_MATCH_PARAM: &str = "tag_match";
 
 /// [`StrictQuery`] for a stored read that also takes a series selector (TAG-10).
@@ -694,8 +697,9 @@ fn split_selector(query: &str) -> Result<(String, weftdb::SeriesSelector), ApiEr
 	Ok((rest.join("&"), selector))
 }
 
-/// [`StrictQuery`] for an ingest route whose body carries no tags of its own (CSV,
-/// Parquet): the `tag.<key>=value` parameters name the one series the batch writes
+/// [`StrictQuery`] for an ingest route whose body carries no tags of its own (CSV, Parquet).
+///
+/// The `tag.<key>=value` parameters name the one series the batch writes
 /// (TAG-11), and the rest bind `T` exactly as [`StrictQuery`] binds it.
 ///
 /// - No `tag.*` parameter is the empty [`TagSet`](weftdb::TagSet): series 0, the write
@@ -801,6 +805,7 @@ pub fn from_tag_error(error: &weftdb::TagError) -> ApiError {
 /// encoder failing (ours, `500`). Everything direction-free — a name the store cannot
 /// address, a batch that will not seal, a store this binary cannot open — is decided by
 /// `classify_typed`, which both classifiers consult first.
+#[must_use]
 pub fn classify_read(err: &anyhow::Error) -> ApiError {
 	if let Some(api) = classify_typed(err) {
 		return api;
@@ -845,6 +850,7 @@ pub fn decoded_too_large(decoded: u64, limit: u64) -> ApiError {
 
 /// Map a library failure from an **ingest** route: the bytes being refused came from the
 /// caller, so a decode failure is theirs (`4xx`) rather than ours.
+#[must_use]
 pub fn classify_ingest(err: &anyhow::Error) -> ApiError {
 	if let Some(api) = classify_typed(err) {
 		return api;
@@ -975,6 +981,7 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 /// a whole is not unusable either, and C5's quarantine of the file happens in the storage layer.
 /// A frame needing a critical extension or an off-by-default codec also stays `500`: the build is
 /// behind on a feature, not on the format, and the message names what to enable.
+#[must_use]
 pub fn from_frame_fault(e: &weftdb::FrameFaultError) -> ApiError {
 	use weft_physical_type::FrameFault;
 
@@ -991,6 +998,7 @@ pub fn from_frame_fault(e: &weftdb::FrameFaultError) -> ApiError {
 /// hold — overflow, or a loss beyond the declared tolerance — is a well-formed request whose
 /// *content* cannot be represented (`422 value_not_representable`), which is the same call the
 /// interpolate route already makes for a value outside the physical type's range.
+#[must_use]
 pub fn from_seal_error(e: &weft_physical_type::SealError) -> ApiError {
 	use weft_physical_type::{ColumnEncodeError, EncodeError, SealError};
 	match e {
@@ -1011,6 +1019,7 @@ pub fn from_seal_error(e: &weft_physical_type::SealError) -> ApiError {
 /// A reduction the library could not produce, by variant (all three are a request whose
 /// window or content cannot be represented, not a server fault — which is what this route
 /// answered with before X-ERR).
+#[must_use]
 pub fn from_reduce_error(e: &weft_reduce::ReduceError) -> ApiError {
 	match e {
 		weft_reduce::ReduceError::TimestampRange => ApiError::new(Code::ValueNotRepresentable, "a timestamp in the requested window cannot be placed in a bucket at the resolution you asked for"),
@@ -1022,12 +1031,16 @@ pub fn from_reduce_error(e: &weft_reduce::ReduceError) -> ApiError {
 	}
 }
 
-/// A line-protocol payload the shared parser refused, by kind (TAG-0): a
+/// A line-protocol payload the shared parser refused, by kind (TAG-0).
+///
+/// A
 /// malformed line is the generic `400 bad_request`, and a payload whose
 /// projected field spans more than one series is the table's
 /// `400 ambiguous_series` — the ILP compute and ingest routes project a
 /// single series, so pooling the points (the pre-TAG-0 behaviour) would
 /// silently merge distinct series into one stream.
+///
+#[must_use]
 pub fn from_line_protocol_error(e: &weft_line_protocol::ParseError) -> ApiError {
 	match e.kind {
 		weft_line_protocol::ParseErrorKind::AmbiguousSeries => ApiError::new(Code::AmbiguousSeries, e.to_string()),
@@ -1040,6 +1053,7 @@ pub fn from_line_protocol_error(e: &weft_line_protocol::ParseError) -> ApiError 
 
 /// A quantile sketch that could not be built or fed. An accuracy or bucket budget came from
 /// the request; two sketches the server built disagreeing is the server's.
+#[must_use]
 pub fn from_sketch_error(e: &weft_reduce::SketchError) -> ApiError {
 	match e {
 		weft_reduce::SketchError::InvalidAccuracy => ApiError::bad_request("a sketch's relative accuracy must be inside (0, 1)"),

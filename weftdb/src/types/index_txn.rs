@@ -476,7 +476,7 @@ impl IndexTxn {
 	/// # Errors
 	///
 	/// As [`run`](Self::run).
-	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool + Send) -> Result<TxnApplied, IndexTxnError> {
+	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool + Send + Sync) -> Result<TxnApplied, IndexTxnError> {
 		crate::exec::control_plane_write(async {
 			let mut attempts = 1;
 			loop {

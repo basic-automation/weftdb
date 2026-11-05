@@ -117,7 +117,7 @@ impl AccuracyMetrics {
 			}
 		}
 
-		let n = predicted.len() as f64;
+		let n = crate::num::usize_to_f64(predicted.len());
 		Ok(Self { count: predicted.len(), rmse: (sum_sq / n).sqrt(), mae: sum_abs / n, max_abs_error: max_abs, bias: sum_signed / n })
 	}
 }

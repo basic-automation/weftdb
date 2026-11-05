@@ -83,7 +83,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::soak_workload::{GridValue, WorkloadModel};
 
-/// Cap on the mismatches a [`DerivedReadVerdict`] lists. The total is
+/// Cap on the mismatches a [`DerivedReadVerdict`] lists.
+///
+/// The total is
 /// always counted in [`DerivedReadVerdict::mismatch_count`]; the cap
 /// only bounds the artifact a badly broken run produces, on the same
 /// reasoning as the oracle's [`MAX_REPORTED_MISMATCHES`](crate::soak_oracle::MAX_REPORTED_MISMATCHES).
@@ -205,7 +207,7 @@ impl DerivedReadVerdict {
 	/// Whether the mismatch list was capped: the total in
 	/// [`Self::mismatch_count`] is larger than the list kept.
 	#[must_use]
-	pub fn truncated(&self) -> bool {
+	pub const fn truncated(&self) -> bool {
 		let kept = self.mismatches.len() as u64;
 		self.mismatch_count > kept
 	}
@@ -230,8 +232,8 @@ impl DerivedReadVerdict {
 fn sealed_value(value: &GridValue) -> Option<f64> {
 	match value {
 		GridValue::Float(value) => Some(*value),
-		GridValue::Integer(value) => Some(*value as f64),
-		GridValue::Unsigned(value) => Some(*value as f64),
+		GridValue::Integer(value) => Some(crate::num::i64_to_f64(*value)),
+		GridValue::Unsigned(value) => Some(crate::num::u64_to_f64(*value)),
 		GridValue::Boolean(_) | GridValue::Text(_) => None,
 	}
 }
@@ -254,7 +256,7 @@ impl BucketAcc {
 	}
 
 	fn finish(self, timestamp_ns: i64) -> DerivedBucket {
-		let avg = self.sum / self.count as f64;
+		let avg = self.sum / crate::num::u64_to_f64(self.count);
 		DerivedBucket { timestamp_ns, count: self.count, min: self.min, max: self.max, sum: self.sum, avg }
 	}
 }

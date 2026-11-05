@@ -45,9 +45,11 @@ use crate::{
 	error::{self, ApiError, SelectorQuery}, read_limits, state::AppState
 };
 
-/// The tags of the series a stored read served, as the JSON bodies report them (TAG-10):
+/// The tags of the series a stored read served, as the JSON bodies report them (TAG-10).
+///
 /// `{}` for the untagged series 0, `{key: value}` for a tagged one, and `null` when the
 /// selector matched no series (the body is then empty).
+///
 pub type SeriesTags = Option<std::collections::BTreeMap<String, String>>;
 
 /// The one series a stored read targets, resolved once from the request's selector.

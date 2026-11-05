@@ -205,7 +205,7 @@ impl SegmentStore {
 	pub async fn downsample_range_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
 		// At a plain resolution the finished grid is the partial's own buckets,
 		// so the decision 12 cap is the fold's cap unchanged (ROB-13).
-		let partial = self.downsample_partial(aspect, series, start, end, resolution, aggregations, self.max_downsample_buckets).await?;
+		let partial = self.downsample_partial(aspect, series, (start, end), resolution, aggregations, self.max_downsample_buckets).await?;
 		partial.map_or_else(|| Ok(Vec::new()), |p| p.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")))
 	}
 
@@ -237,7 +237,7 @@ impl SegmentStore {
 		// count; the cap itself is then enforced exactly on the coarsened
 		// grid, which is the grid the caller gets (ROB-13).
 		let unit_cap = self.max_downsample_buckets.saturating_mul(width.count() as usize);
-		let partial = self.downsample_partial(aspect, series, start, end, width.unit(), aggregations, unit_cap).await?;
+		let partial = self.downsample_partial(aspect, series, (start, end), width.unit(), aggregations, unit_cap).await?;
 		let Some(partial) = partial else { return Ok(Vec::new()) };
 		let coarsened = partial.coarsen(width.count()).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"))?;
 		if coarsened.len() > self.max_downsample_buckets {
@@ -257,7 +257,7 @@ impl SegmentStore {
 	/// [`StoreError::DownsampleTooLarge`](crate::StoreError::DownsampleTooLarge)
 	/// and the state is dropped, rather than the grid being counted for the
 	/// first time once it has been built.
-	pub(crate) async fn downsample_partial(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation], max_buckets: usize) -> Result<Option<PartialReduction>> {
+	pub(crate) async fn downsample_partial(&self, aspect: &str, series: crate::SeriesId, (start, end): (i64, i64), resolution: Resolution, aggregations: &[Aggregation], max_buckets: usize) -> Result<Option<PartialReduction>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		let schema = self.require_schema(aspect).await?;
@@ -299,10 +299,7 @@ impl SegmentStore {
 				}
 			}
 			let bytes = self.read_frame(descriptor).await?;
-			return match segment_partial(descriptor, &bytes, start, end, schema.timestamp_unit, resolution, aggregations)? {
-				Some(partial) => check_partial_len(aspect, partial, max_buckets).map(Some),
-				None => Ok(None),
-			};
+			return segment_partial(descriptor, &bytes, start, end, schema.timestamp_unit, resolution, aggregations)?.map_or(Ok(None), |partial| check_partial_len(aspect, partial, max_buckets).map(Some));
 		}
 
 		// Each pruned segment folds into its own `PartialReduction` **concurrently**: the

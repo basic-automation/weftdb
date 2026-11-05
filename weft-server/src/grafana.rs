@@ -58,22 +58,25 @@ impl Reduction {
 	}
 }
 
-/// A bucket width as a token the stored downsample reads: the coarsest unit that divides
+/// A bucket width as a token the stored downsample reads.
+///
+/// This is the coarsest unit that divides
 /// it exactly (so `600000` ms is `10m`, which keeps the reduction on its per-segment fast
 /// path), and otherwise a count small enough for the width's 32-bit count, rounded up so
 /// the panel's point budget still holds.
+///
 #[must_use]
 pub fn width_token(ms: u64) -> String {
 	const UNITS: [(u64, &str); 6] = [(604_800_000, "w"), (86_400_000, "d"), (3_600_000, "h"), (60_000, "m"), (1_000, "s"), (1, "ms")];
 	let ms = ms.max(1);
-	if let Some((per, unit)) = UNITS.iter().find(|(per, _)| ms % per == 0 && ms / per <= u64::from(u32::MAX)) {
+	if let Some((per, unit)) = UNITS.iter().find(|(per, _)| ms.is_multiple_of(*per) && u32::try_from(ms / per).is_ok()) {
 		return format!("{}{unit}", ms / per);
 	}
 	UNITS.iter()
 		.rev()
 		.find_map(|(per, unit)| {
 			let count = ms.div_ceil(*per);
-			(count <= u64::from(u32::MAX)).then(|| format!("{count}{unit}"))
+			u32::try_from(count).is_ok().then(|| format!("{count}{unit}"))
 		})
 		.unwrap_or_else(|| format!("{}w", u32::MAX))
 }

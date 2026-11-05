@@ -161,7 +161,7 @@ fn find_secret_key(lower: &str, from: usize) -> Option<(usize, usize)> {
 			if !before_ok {
 				continue;
 			}
-			let after_ok = matches!(bytes.get(index + key.len()), None | Some(b'=') | Some(b':') | Some(b' ') | Some(b'\t'));
+			let after_ok = matches!(bytes.get(index + key.len()), None | Some(b'=' | b':' | b' ' | b'\t'));
 			if !after_ok {
 				continue;
 			}
@@ -267,7 +267,7 @@ fn split_words(text: &str) -> Vec<(&str, &str)> {
 /// `/home/penelope/…` is not, and it is the commonest way a published artifact leaks who ran it.
 #[must_use]
 pub fn redact_home(text: &str) -> String {
-	let homes = ["HOME", "USERPROFILE"].iter().filter_map(|name| std::env::var_os(name)).map(|value| value.to_string_lossy().into_owned()).filter(|home| home.len() > 1);
+	let homes = ["HOME", "USERPROFILE"].iter().filter_map(std::env::var_os).map(|value| value.to_string_lossy().into_owned()).filter(|home| home.len() > 1);
 	let mut out = text.to_string();
 	for home in homes {
 		if out.contains(&home) {

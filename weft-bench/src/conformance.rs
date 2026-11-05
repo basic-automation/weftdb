@@ -162,15 +162,15 @@ fn uci_shape(rng: &mut Rng, n: usize) -> Vec<Point> {
 		if plateau == 0 {
 			// Appliances switch on for 5 to 60 minutes, otherwise the base load wanders.
 			if rng.unit() < 0.04 {
-				level = 1.0 + rng.unit() * 7.0;
+				level = rng.unit().mul_add(7.0, 1.0);
 				plateau = 5 + (rng.unit() * 55.0) as usize;
 			} else {
-				level = 0.2 + rng.unit() * 0.3;
+				level = rng.unit().mul_add(0.3, 0.2);
 			}
 		} else {
 			plateau -= 1;
 		}
-		let reading = (level + (rng.unit() - 0.5) * 0.05).max(0.076);
+		let reading = (rng.unit() - 0.5).mul_add(0.05, level).max(0.076);
 		// Three decimals, as the file stores them.
 		let thousandths = (reading * 1000.0).round() as i64;
 		out.push(Point::new(t, BigDecimal::new(thousandths.into(), 3)));
@@ -291,10 +291,13 @@ pub fn to_f64(d: &BigDecimal) -> f64 {
 	d.to_string().parse().expect("a decimal parses as f64")
 }
 
-/// The method defined on `Spline`, evaluated at `t` in exact decimal arithmetic (60
-/// significant digits per term) on the caller's own timestamps, each value first rounded to
+/// The method defined on `Spline`, evaluated at `t` in exact decimal arithmetic.
+///
+/// The arithmetic carries 60 significant digits per term, on the caller's own timestamps, each value first rounded to
 /// its nearest `f64` as splimes does; and `Λ(t)`, the window's Lebesgue function there (at
-/// least 1). A port of splimes' `tests/common::exact_with_lebesgue`, the reference its
+/// least 1).
+///
+/// A port of splimes' `tests/common::exact_with_lebesgue`, the reference its
 /// contract tests use.
 ///
 /// # Panics
@@ -360,9 +363,13 @@ pub struct Fixture {
 	pub scale: Vec<f64>,
 }
 
-/// Builds every fixture of the corpus: per series, five grids (across the first edge, the
+/// Builds every fixture of the corpus.
+///
+/// This is per series, five grids (across the first edge, the
 /// middle, the densest stretch, across the last edge, and 100 edge spacings out) for each
-/// method, as splimes' contract test lays them out. The exact reference runs on rayon.
+/// method, as splimes' contract test lays them out.
+///
+/// The exact reference runs on rayon.
 ///
 /// # Panics
 ///
@@ -515,7 +522,7 @@ impl Api {
 }
 
 /// What one fixture produced on one target.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
 	/// The grid values (`f64` bits) and their kinds.
 	Values {
@@ -622,7 +629,7 @@ pub struct MethodStats {
 /// The contract error of `got` against `exact`: `(|got − exact| − ε·|exact|)⁺ / (range · Λ)`.
 #[must_use]
 pub fn contract_error(got: f64, exact: f64, scale: f64) -> f64 {
-	((got - exact).abs() - f64::EPSILON * exact.abs()).max(0.0) / scale
+	f64::mul_add(f64::EPSILON, -exact.abs(), (got - exact).abs()).max(0.0) / scale
 }
 
 /// Scores one run against the exact reference, per method.
@@ -831,6 +838,7 @@ pub struct RunOptions {
 
 /// Runs one environment: builds the corpus and fixtures, starts the GPU if a GPU target is
 /// asked for, runs every target through both entry points `repeats` times and scores them.
+///
 /// Returns the report and each target's values (first repeat) for drift.
 #[must_use]
 pub fn run_environment(options: &RunOptions) -> (EnvironmentRun, Vec<Vec<Option<Vec<u64>>>>) {
@@ -887,7 +895,9 @@ const VALUES_MAGIC: &[u8; 8] = b"WGCVAL01";
 const NO_GRID: u32 = u32::MAX;
 
 /// Writes a run's values (one entry per target report, in order) as a little-endian binary
-/// sidecar: JSON would need serde_json's `float_roundtrip` to read every value back exactly,
+/// sidecar.
+///
+/// JSON would need `serde_json`'s `float_roundtrip` to read every value back exactly,
 /// and would be ~10× larger.
 ///
 /// # Errors
@@ -980,10 +990,13 @@ pub struct Matrix {
 }
 
 /// Merges environment runs (and their values) into the matrix, computing every pairwise drift
-/// and listing every contract failure: a bound exceeded, a raw point not exact, a wrong
+/// and listing every contract failure.
+///
+/// This is a bound exceeded, a raw point not exact, a wrong
 /// `NonFiniteResult` or another error, `Cpu` and `Parallel` not bit-identical within an
 /// environment (promised by the contract), or environments built from a different corpus
 /// than `fixtures`.
+///
 #[must_use]
 pub fn build_matrix(fixtures: &[Fixture], corpus_hash: &str, runs: Vec<(EnvironmentRun, Vec<Vec<Option<Vec<u64>>>>)>, skipped: Vec<(String, String)>) -> Matrix {
 	let mut failures = Vec::new();

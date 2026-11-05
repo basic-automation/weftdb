@@ -166,7 +166,9 @@ async fn series_tags_reads_back_the_catalog_key() {
 	let a = id_of(&store, &groups).await;
 	assert_eq!(store.series_tags(ASPECT, a).await.expect("reads"), Some(groups));
 	assert_eq!(store.series_tags(ASPECT, SeriesId(a.0 + 1)).await.expect("reads"), None);
-	assert!(store.series_tags("../x", a).await.is_err(), "an invalid aspect name");
+	let invalid = store.series_tags("../x", a).await;
+	drop(store);
+	assert!(invalid.is_err(), "an invalid aspect name");
 }
 
 /// Phase 4 tag pruning: a tagged read of an aspect with 1,000 series, every one over the

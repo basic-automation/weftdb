@@ -185,13 +185,13 @@ pub struct DeviceCounters {
 impl DeviceCounters {
 	/// Bytes written since boot, in bytes.
 	#[must_use]
-	pub fn bytes_written(&self) -> u64 {
+	pub const fn bytes_written(&self) -> u64 {
 		self.sectors_written.saturating_mul(DISKSTATS_SECTOR_BYTES)
 	}
 
 	/// Bytes read since boot, in bytes.
 	#[must_use]
-	pub fn bytes_read(&self) -> u64 {
+	pub const fn bytes_read(&self) -> u64 {
 		self.sectors_read.saturating_mul(DISKSTATS_SECTOR_BYTES)
 	}
 
@@ -205,7 +205,7 @@ impl DeviceCounters {
 			return 0.0;
 		}
 		let busy = self.millis_doing_io.saturating_sub(previous.millis_doing_io);
-		(busy as f64 / elapsed_ms as f64) * 100.0
+		(crate::num::u64_to_f64(busy) / crate::num::u64_to_f64(elapsed_ms)) * 100.0
 	}
 }
 
@@ -229,7 +229,7 @@ impl CpuJiffies {
 			return 0.0;
 		}
 		let idle = self.idle.saturating_sub(previous.idle);
-		((total - idle.min(total)) as f64 / total as f64) * 100.0
+		(crate::num::u64_to_f64(total - idle.min(total)) / crate::num::u64_to_f64(total)) * 100.0
 	}
 }
 
@@ -281,7 +281,7 @@ pub struct SystemSample {
 impl SystemSample {
 	/// Bytes of page-cache writeback still outstanding, in bytes.
 	#[must_use]
-	pub fn unwritten_bytes(&self) -> u64 {
+	pub const fn unwritten_bytes(&self) -> u64 {
 		(self.dirty_kib + self.writeback_kib).saturating_mul(1024)
 	}
 }
@@ -432,7 +432,7 @@ impl SystemSampler {
 
 	/// The procfs this sampler reads.
 	#[must_use]
-	pub fn root(&self) -> &ProcRoot {
+	pub const fn root(&self) -> &ProcRoot {
 		&self.root
 	}
 
@@ -587,7 +587,7 @@ impl ContaminationPolicy {
 	/// The publication policy: a run is clean only on a machine that was
 	/// demonstrably doing nothing else.
 	#[must_use]
-	pub fn strict() -> Self {
+	pub const fn strict() -> Self {
 		Self { max_io_psi_some_avg10: 1.0, max_cpu_psi_some_avg10: 1.0, max_memory_psi_some_avg10: 0.0, max_dirty_kib: 8_192, max_swap_out_pages_per_sec: 0.0, max_major_faults_per_sec: 1.0, max_clock_step_ms: 25, max_sample_gap_ms: 5_000, max_load_per_core: 1.5, foreign_write_tolerance_bytes: 1_048_576 }
 	}
 }
@@ -628,7 +628,7 @@ pub enum ContaminationFlag {
 impl ContaminationFlag {
 	/// The stable name used in the artifact.
 	#[must_use]
-	pub fn as_str(self) -> &'static str {
+	pub const fn as_str(self) -> &'static str {
 		match self {
 			Self::IoPressure => "io_pressure",
 			Self::CpuPressure => "cpu_pressure",
@@ -693,7 +693,7 @@ pub struct ContaminationVerdict {
 impl ContaminationVerdict {
 	/// True when nothing fired.
 	#[must_use]
-	pub fn clean(&self) -> bool {
+	pub const fn clean(&self) -> bool {
 		self.flags.is_empty()
 	}
 
@@ -735,7 +735,7 @@ fn clock_offset_ms(sample: &SystemSample) -> i64 {
 /// `u128` to `f64` for the rate math, where the magnitude matters and the last bit
 /// does not.
 fn u128_to_f64(value: u128) -> f64 {
-	value as f64
+	crate::num::u128_to_f64(value)
 }
 
 impl ContaminationLedger {
@@ -754,7 +754,7 @@ impl ContaminationLedger {
 
 	/// The bytes the run acknowledged, for the foreign-write comparison at
 	/// [`ContaminationLedger::close`].
-	pub fn set_acknowledged_bytes(&mut self, acknowledged_bytes: u64) {
+	pub const fn set_acknowledged_bytes(&mut self, acknowledged_bytes: u64) {
 		self.acknowledged_bytes = Some(acknowledged_bytes);
 	}
 
@@ -803,7 +803,7 @@ impl ContaminationLedger {
 		if sample.dirty_kib > self.policy.max_dirty_kib {
 			self.flags.insert(ContaminationFlag::DirtyBacklog);
 		}
-		let per_core = sample.load_avg[0] / sample.cpu_count.max(1) as f64;
+		let per_core = sample.load_avg[0] / crate::num::usize_to_f64(sample.cpu_count.max(1));
 		self.worst.load_per_core = self.worst.load_per_core.max(per_core);
 		if per_core > self.policy.max_load_per_core {
 			self.flags.insert(ContaminationFlag::LoadAverage);
@@ -835,11 +835,11 @@ impl ContaminationLedger {
 			self.window_ms = window_ms;
 			let seconds = u128_to_f64(u128::from(window_ms)) / 1000.0;
 			let swap_out = last.swap_out_pages.saturating_sub(first.swap_out_pages);
-			if swap_out != 0 && swap_out as f64 / seconds > self.policy.max_swap_out_pages_per_sec {
+			if swap_out != 0 && crate::num::u64_to_f64(swap_out) / seconds > self.policy.max_swap_out_pages_per_sec {
 				self.flags.insert(ContaminationFlag::SwapActivity);
 			}
 			let major = last.major_faults.saturating_sub(first.major_faults);
-			if major != 0 && major as f64 / seconds > self.policy.max_major_faults_per_sec {
+			if major != 0 && crate::num::u64_to_f64(major) / seconds > self.policy.max_major_faults_per_sec {
 				self.flags.insert(ContaminationFlag::MajorFaults);
 			}
 			if last.oom_kills > first.oom_kills {
@@ -851,7 +851,7 @@ impl ContaminationLedger {
 			// which reads as a giant foreign writer on any long-lived host.
 			let device_written = self.device.as_ref().and_then(|resolved| {
 				let at = |sample: &SystemSample| sample.device.as_ref().filter(|counters| counters.name == resolved.name).map(DeviceCounters::bytes_written);
-				Some(at(last)?.checked_sub(at(first)?)?)
+				at(last)?.checked_sub(at(first)?)
 			});
 			let foreign_write_bytes = device_written.zip(self.acknowledged_bytes).map(|(written, acked)| written.saturating_sub(acked));
 			if let Some(foreign) = foreign_write_bytes {
@@ -915,7 +915,7 @@ pub enum FlushFailureKind {
 impl FlushFailureKind {
 	/// The stable name used in the artifact.
 	#[must_use]
-	pub fn as_str(self) -> &'static str {
+	pub const fn as_str(self) -> &'static str {
 		match self {
 			Self::DeviceUnresolved => "device_unresolved",
 			Self::SamplerUnavailable => "sampler_unavailable",
@@ -927,7 +927,7 @@ impl FlushFailureKind {
 
 /// The outcome of the flush check: passed, skipped with a reason, or failed with a
 /// kind.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlushCheckResult {
 	/// Always `flush_observed`, so the result can be appended to a list of
 	/// preflight checks by name.
@@ -1083,7 +1083,7 @@ impl SamplerThread {
 				}
 				let mut waited = Duration::ZERO;
 				while waited < every && !thread_stop.load(Ordering::Relaxed) {
-					let slice = (every - waited).min(Duration::from_millis(10));
+					let slice = every.checked_sub(waited).unwrap().min(Duration::from_millis(10));
 					std::thread::sleep(slice);
 					waited += slice;
 				}
@@ -1102,7 +1102,7 @@ impl SamplerThread {
 	pub fn stop(mut self) -> anyhow::Result<SamplerShutdown> {
 		self.stop.store(true, Ordering::Relaxed);
 		let handle = self.handle.take().ok_or_else(|| anyhow::anyhow!("sampler thread already stopped"))?;
-		Ok(handle.join().map_err(|_| anyhow::anyhow!("sampler thread panicked"))?)
+		handle.join().map_err(|_| anyhow::anyhow!("sampler thread panicked"))
 	}
 }
 

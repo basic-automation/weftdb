@@ -168,7 +168,7 @@ pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, res
 	while let Some(result) = point_stream.next().await {
 		points.push(result?);
 	}
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	let mut event = Event::new(None, format!("{:.0}% Monthly Price Increase - {aspect}", threshold_percent * 100.0), Some(format!("Detects when price increases {:.0}% or more from start to end of month", threshold_percent * 100.0)), None);
 
@@ -186,7 +186,7 @@ pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, res
 			continue;
 		}
 
-		month_points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+		month_points.sort_by_key(|a| a.timestamp);
 
 		let start_price = &month_points[0].value;
 		let end_price = &month_points[month_points.len() - 1].value;
@@ -198,6 +198,7 @@ pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, res
 		if percentage_increase >= threshold {
 			let database_info = database.get_database_info().await?;
 			let manifestation = Manifestation::new(database_info.id().as_uuid(), month_points[0].timestamp, end_timestamp);
+			drop(database_info);
 			event.add_manifestation(manifestation);
 		}
 	}
@@ -245,7 +246,7 @@ pub async fn detect_peaks(database: &Database, aspect: &AspectId, resolution: &R
 	while let Some(result) = point_stream.next().await {
 		points.push(result?);
 	}
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	if points.len() < 3 {
 		return Ok(vec![]);
@@ -264,6 +265,7 @@ pub async fn detect_peaks(database: &Database, aspect: &AspectId, resolution: &R
 		if curr_value == global_max && curr_value > prev_value && curr_value > next_value {
 			let database_info = database.get_database_info().await?;
 			let manifestation = Manifestation::new(database_info.id().as_uuid(), points[i - 1].timestamp, points[i + 1].timestamp);
+			drop(database_info);
 			event.add_manifestation(manifestation);
 		}
 	}
@@ -311,7 +313,7 @@ pub async fn detect_all_peaks(database: &Database, aspect: &AspectId, resolution
 	while let Some(result) = point_stream.next().await {
 		points.push(result?);
 	}
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	if points.len() < 3 {
 		return Ok(vec![]);
@@ -328,6 +330,7 @@ pub async fn detect_all_peaks(database: &Database, aspect: &AspectId, resolution
 		if curr_value > prev_value && curr_value > next_value {
 			let database_info = database.get_database_info().await?;
 			let manifestation = Manifestation::new(database_info.id().as_uuid(), points[i - 1].timestamp, points[i + 1].timestamp);
+			drop(database_info);
 			event.add_manifestation(manifestation);
 		}
 	}
@@ -375,7 +378,7 @@ pub async fn detect_valleys(database: &Database, aspect: &AspectId, resolution: 
 	while let Some(result) = point_stream.next().await {
 		points.push(result?);
 	}
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	if points.len() < 3 {
 		return Ok(vec![]);
@@ -394,6 +397,7 @@ pub async fn detect_valleys(database: &Database, aspect: &AspectId, resolution: 
 		if curr_value == global_min && curr_value < prev_value && curr_value < next_value {
 			let database_info = database.get_database_info().await?;
 			let manifestation = Manifestation::new(database_info.id().as_uuid(), points[i - 1].timestamp, points[i + 1].timestamp);
+			drop(database_info);
 			event.add_manifestation(manifestation);
 		}
 	}
@@ -441,7 +445,7 @@ pub async fn detect_all_valleys(database: &Database, aspect: &AspectId, resoluti
 	while let Some(result) = point_stream.next().await {
 		points.push(result?);
 	}
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	if points.len() < 3 {
 		return Ok(vec![]);
@@ -458,6 +462,7 @@ pub async fn detect_all_valleys(database: &Database, aspect: &AspectId, resoluti
 		if curr_value < prev_value && curr_value < next_value {
 			let database_info = database.get_database_info().await?;
 			let manifestation = Manifestation::new(database_info.id().as_uuid(), points[i - 1].timestamp, points[i + 1].timestamp);
+			drop(database_info);
 			event.add_manifestation(manifestation);
 		}
 	}
@@ -506,7 +511,7 @@ pub async fn detect_threshold_crossing_up(database: &Database, aspect: &AspectId
 	while let Some(result) = point_stream.next().await {
 		points.push(result?);
 	}
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	if points.len() < 2 {
 		return Ok(vec![]);
@@ -522,6 +527,7 @@ pub async fn detect_threshold_crossing_up(database: &Database, aspect: &AspectId
 		if prev_value < &threshold && curr_value >= &threshold {
 			let database_info = database.get_database_info().await?;
 			let manifestation = Manifestation::new(database_info.id().as_uuid(), points[i - 1].timestamp, points[i].timestamp);
+			drop(database_info);
 			event.add_manifestation(manifestation);
 		}
 	}
@@ -571,7 +577,7 @@ pub async fn detect_threshold_crossing_down(database: &Database, aspect: &Aspect
 	while let Some(result) = point_stream.next().await {
 		points.push(result?);
 	}
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	if points.len() < 2 {
 		return Ok(vec![]);
@@ -587,6 +593,7 @@ pub async fn detect_threshold_crossing_down(database: &Database, aspect: &Aspect
 		if prev_value > &threshold && curr_value <= &threshold {
 			let database_info = database.get_database_info().await?;
 			let manifestation = Manifestation::new(database_info.id().as_uuid(), points[i - 1].timestamp, points[i].timestamp);
+			drop(database_info);
 			event.add_manifestation(manifestation);
 		}
 	}
@@ -636,7 +643,7 @@ pub async fn detect_drawdown(database: &Database, aspect: &AspectId, resolution:
 	while let Some(result) = point_stream.next().await {
 		points.push(result?);
 	}
-	points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+	points.sort_by_key(|a| a.timestamp);
 
 	if points.len() < 2 {
 		return Ok(vec![]);
@@ -656,10 +663,11 @@ pub async fn detect_drawdown(database: &Database, aspect: &AspectId, resolution:
 			high_timestamp = point.timestamp;
 		} else {
 			// Check for drawdown
-			let drop = (&running_high - &point.value) / &running_high;
-			if drop >= threshold {
+			let drawdown = (&running_high - &point.value) / &running_high;
+			if drawdown >= threshold {
 				let database_info = database.get_database_info().await?;
 				let manifestation = Manifestation::new(database_info.id().as_uuid(), high_timestamp, point.timestamp);
+				drop(database_info);
 				event.add_manifestation(manifestation);
 
 				// Reset the high to current value to detect subsequent drawdowns

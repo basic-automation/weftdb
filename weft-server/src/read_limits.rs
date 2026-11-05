@@ -267,6 +267,7 @@ impl ReadLimits {
 	///
 	/// A `5xx`, so the client gets the code's fixed sentence and this detail is
 	/// the logged cause — the operator's number, not the caller's.
+	#[must_use]
 	pub fn deadline_exceeded(&self) -> ApiError {
 		ApiError::server(Code::QueryTimeout, format!("the read did not finish within this server's {} s deadline (set {READ_TIMEOUT_SECS_ENV} to change it); a narrower window reads less", self.read_timeout.as_secs()))
 	}

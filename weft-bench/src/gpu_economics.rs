@@ -176,7 +176,7 @@ impl GpuEconomicsProfile {
 }
 
 /// One cold-start child's measurements.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColdStartSample {
 	/// `prewarm` or `lazy`.
 	pub mode: String,
@@ -286,7 +286,7 @@ fn knots(seed: u64, count: usize, points: usize) -> Knots {
 	offsets.extend([0, span]);
 	offsets.sort_unstable();
 	offsets.dedup();
-	let values = offsets.iter().map(|&o| 20.0_f64.mul_add((o as f64 / 600.0).sin(), 50.0) + rng.random_range(-1.0..=1.0)).collect();
+	let values = offsets.iter().map(|&o| 20.0_f64.mul_add((crate::num::i64_to_f64(o) / 600.0).sin(), 50.0) + rng.random_range(-1.0..=1.0)).collect();
 	(offsets.into_iter().map(|o| anchor() + Duration::seconds(o)).collect(), values)
 }
 
@@ -310,7 +310,7 @@ fn median(samples: &[u64]) -> u64 {
 /// Output points per second over `ns`.
 fn throughput(points: usize, ns: u64) -> f64 {
 	if ns > 0 {
-		points as f64 / (ns as f64 / 1e9)
+		crate::num::usize_to_f64(points) / (crate::num::u64_to_f64(ns) / 1e9)
 	} else {
 		0.0
 	}
@@ -377,7 +377,7 @@ pub fn summarize_utilization(samples: &[SmiSample], baseline: &[SmiSample]) -> V
 	let mut indices: Vec<u32> = samples.iter().map(|s| s.index).collect();
 	indices.sort_unstable();
 	indices.dedup();
-	let mean = |of: &[&SmiSample]| (!of.is_empty()).then(|| of.iter().map(|s| f64::from(s.utilization_pct)).sum::<f64>() / of.len() as f64);
+	let mean = |of: &[&SmiSample]| (!of.is_empty()).then(|| of.iter().map(|s| f64::from(s.utilization_pct)).sum::<f64>() / crate::num::usize_to_f64(of.len()));
 	indices.into_iter()
 		.map(|index| {
 			let lane: Vec<&SmiSample> = samples.iter().filter(|s| s.index == index).collect();

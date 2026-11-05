@@ -347,7 +347,9 @@ impl FlightService for WeftFlight {
 }
 
 /// Serve Flight on `listener` until `shutdown` turns `true`, then give the open streams
-/// [`FLIGHT_SHUTDOWN_GRACE`] to finish. A stream still open after that is abandoned: tonic
+/// [`FLIGHT_SHUTDOWN_GRACE`] to finish.
+///
+/// A stream still open after that is abandoned: tonic
 /// runs each connection on its own task, so it may keep reading until the store it holds
 /// is shut down under it and its read fails.
 ///
@@ -373,12 +375,11 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState, mut shutd
 		result = &mut server => return result,
 		() = signal => {}
 	}
-	match tokio::time::timeout(FLIGHT_SHUTDOWN_GRACE, server).await {
-		Ok(result) => result,
-		Err(_) => {
-			tracing::warn!(grace_secs = FLIGHT_SHUTDOWN_GRACE.as_secs(), "the Flight listener's open streams outlived the shutdown grace; dropping them");
-			Ok(())
-		}
+	if let Ok(result) = tokio::time::timeout(FLIGHT_SHUTDOWN_GRACE, server).await {
+		result
+	} else {
+		tracing::warn!(grace_secs = FLIGHT_SHUTDOWN_GRACE.as_secs(), "the Flight listener's open streams outlived the shutdown grace; dropping them");
+		Ok(())
 	}
 }
 

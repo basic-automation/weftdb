@@ -64,15 +64,20 @@ pub const MAX_INGEST_BYTES_ENV: &str = "WEFT_MAX_INGEST_BYTES";
 /// bound behind the ingests already running.
 pub const INGEST_MAX_INFLIGHT_BYTES_ENV: &str = "WEFT_INGEST_MAX_INFLIGHT_BYTES";
 
-/// Environment variable naming the row cap for the four ingest routes (ROB-7, plan
-/// C11's row limit): a positive whole number of rows, counted on the decoded columns
-/// — the rows the seal would write, whichever format carried them. A body over it is
+/// Environment variable naming the row cap for the four ingest routes (ROB-7, plan C11's row limit).
+///
+/// A positive whole number of rows, counted on the decoded columns
+/// — the rows the seal would write, whichever format carried them.
+///
+/// A body over it is
 /// refused `413 too_many_rows` with the limit.
 pub const MAX_INGEST_ROWS_ENV: &str = "WEFT_MAX_INGEST_ROWS";
 
 /// Environment variable naming the decoded-byte cap for the four ingest routes
 /// (ROB-7, plan C11's decoded-byte limit): a positive whole number of bytes of
-/// *decoded* columns, not of body. `WEFT_MAX_INGEST_BYTES` bounds what arrives on the
+/// *decoded* columns, not of body.
+///
+/// `WEFT_MAX_INGEST_BYTES` bounds what arrives on the
 /// socket, which says nothing about what a compressed Parquet body expands to.
 pub const MAX_INGEST_DECODED_BYTES_ENV: &str = "WEFT_MAX_INGEST_DECODED_BYTES";
 
@@ -80,15 +85,20 @@ pub const MAX_INGEST_DECODED_BYTES_ENV: &str = "WEFT_MAX_INGEST_DECODED_BYTES";
 /// 256 MiB (crash-consistency §8).
 pub const DEFAULT_MAX_INGEST_BYTES: usize = 256 * 1024 * 1024;
 
-/// The default row cap when `WEFT_MAX_INGEST_ROWS` is unset: 10 million rows. A batch
+/// The default row cap when `WEFT_MAX_INGEST_ROWS` is unset: 10 million rows.
+///
+/// A batch
 /// that size is a ~240 MB seal — the same order as the 256 MiB body cap, so the row
 /// ceiling sits where the body ceiling already stands, and it bites on a Parquet body
 /// that the body cap lets through.
 pub const DEFAULT_MAX_INGEST_ROWS: usize = 10_000_000;
 
-/// The default decoded-byte cap when `WEFT_MAX_INGEST_DECODED_BYTES` is unset: 1 GiB,
+/// The default decoded-byte cap when `WEFT_MAX_INGEST_DECODED_BYTES` is unset.
+///
+/// 1 GiB,
 /// four times the default body cap, so a compressed body gets room to expand without
 /// the decode being able to grow past what a node's memory is sized for.
+///
 pub const DEFAULT_MAX_INGEST_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The ingest wiring's two limits (D-S14), read once at startup and
@@ -235,7 +245,7 @@ fn check_decoded_size(timestamps: &[i64], values: &[Option<BigDecimal>], limits:
 /// this and a row count.
 fn decoded_column_bytes(timestamps: &[i64], values: &[Option<BigDecimal>]) -> u64 {
 	let slots = (timestamps.len() + values.len()) as u64;
-	let mantissas: u64 = values.iter().flatten().map(|value| value.as_bigint_and_exponent().0.bits() as u64 / 8 + 1).sum();
+	let mantissas: u64 = values.iter().flatten().map(|value| value.as_bigint_and_exponent().0.bits() / 8 + 1).sum();
 	slots * 16 + mantissas
 }
 

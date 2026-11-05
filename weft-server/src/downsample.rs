@@ -104,7 +104,9 @@ pub struct DownsampleRequest {
 
 /// The default for the most buckets a gap fill may emit: the interpolation
 /// endpoint's default output cap, since a filled grid is an output grid of the
-/// same kind. The handlers pass the operator's configured cap
+/// same kind.
+///
+/// The handlers pass the operator's configured cap
 /// ([`InterpolateConfig::max_output_points`]) to [`apply_fill`], which is this
 /// value unless `WEFT_MAX_INTERPOLATE_POINTS` changed it (ROB-16).
 pub const MAX_FILL_BUCKETS: usize = crate::interpolate::MAX_INTERPOLATE_OUTPUT_POINTS;

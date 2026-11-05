@@ -110,8 +110,9 @@ pub async fn read_time_range_to_record_batch_typed(store: &SegmentStore, aspect:
 	read_time_range_to_record_batch_typed_of(store, aspect, SeriesId::UNTAGGED, start, end).await
 }
 
-/// [`read_time_range_to_record_batch_typed`] of one series (TAG-8): the store's series-scoped `_of` read, so only the
-/// rows of `series` are exported. [`read_time_range_to_record_batch_typed`] is this with [`SeriesId::UNTAGGED`].
+/// [`read_time_range_to_record_batch_typed`] of one series (TAG-8).
+///
+/// This is the store's series-scoped `_of` read, so only the rows of `series` are exported. [`read_time_range_to_record_batch_typed`] is this with [`SeriesId::UNTAGGED`].
 ///
 /// # Errors
 ///
@@ -156,8 +157,9 @@ pub async fn read_value_range_to_record_batch_of(store: &SegmentStore, aspect: &
 	Ok(weft_arrow::columns_to_record_batch(unit, &timestamps, &values)?)
 }
 
-/// [`read_value_range_to_record_batch`] with the value column in the aspect's declared
-/// Arrow type, as [`read_time_range_to_record_batch_typed`] answers a window — so a
+/// [`read_value_range_to_record_batch`] with the value column in the aspect's declared Arrow type.
+///
+/// The column is typed as [`read_time_range_to_record_batch_typed`] answers a window — so a
 /// value-band read and a time-window read of one aspect share one schema (the Flight
 /// listener advertises that schema before it reads any rows).
 ///

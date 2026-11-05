@@ -44,12 +44,14 @@ pub use config::{data_dir, default_data_dir};
 /// between them, so a scope that covered only the connection would end in the middle of the
 /// write (ROB-5, constraint C22: "ROB-5 wraps legacy metadata writes").
 pub(crate) async fn legacy_metadata_write<F: std::future::Future>(fut: F) -> F::Output {
-	crate::types::exec::control_plane_write(async {
-		#[cfg(test)]
+	// A test records whether the write really ran inside the scope; the wrapper is
+	// polled by `control_plane_write`, so it observes from within it.
+	#[cfg(test)]
+	let fut = async {
 		crate::types::exec::observe_scope();
 		fut.await
-	})
-	.await
+	};
+	crate::types::exec::control_plane_write(fut).await
 }
 
 /// Clear all cached connections that contain the given name in their path.

@@ -428,7 +428,7 @@ fn run_gpu_economics_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 }
 
 /// Run the ingest workload: load one column of a UCI household-power file,
-/// ingest it into a fresh SegmentStore in batches, and persist the report.
+/// ingest it into a fresh `SegmentStore` in batches, and persist the report.
 /// The load time is charged to setup (never to latency); the aspect name is
 /// the column name lowercased, because the store refuses uppercase in a new
 /// aspect name, and the aspect is declared as an exact scaled-integer column
@@ -440,7 +440,7 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let generation_ns = u64::try_from(load_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
 	println!("uci      : {} rows loaded from {} (column {}, {} rows seen, {} missing, scale {})", corpus.values.len(), uci_path.display(), corpus.column, corpus.rows_seen, corpus.rows_missing, corpus.decimal_scale);
 	let aspect = cli.uci_column.to_ascii_lowercase();
-	let profile_name = cli.name.clone().unwrap_or_else(|| format!("ingest-{}", aspect));
+	let profile_name = cli.name.clone().unwrap_or_else(|| format!("ingest-{aspect}"));
 	let profile = IngestProfile::new(profile_name, aspect, cli.ingest_batch);
 	if !cli.ingest_growth.is_empty() {
 		// One report per checkpoint, written as the stage ends, as every other workload writes one
@@ -1208,7 +1208,7 @@ enum InputMode {
 	/// The GPU economics workload (cold start, CPU fallback, contention, utilization).
 	GpuEconomics,
 	/// The ingest workload (EVI-6): load a UCI household-power column and seal
-	/// it into a fresh SegmentStore in batches, gated on an exact read-back.
+	/// it into a fresh `SegmentStore` in batches, gated on an exact read-back.
 	Ingest,
 }
 
@@ -2562,7 +2562,7 @@ mod tests {
 		let cli = expect_run(&["--synthetic"]);
 		assert!(cli.manifest, "the manifest is on by default: provenance is the default, not an extra step");
 		assert_eq!(cli.claim, None);
-		assert!(cli.labels.is_empty());
+		assert_eq!(cli.labels, [] as [(std::string::String, std::string::String); 0]);
 		let cli = expect_run(&["--synthetic", "--no-manifest"]);
 		assert!(!cli.manifest);
 	}

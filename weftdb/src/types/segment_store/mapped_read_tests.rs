@@ -28,6 +28,7 @@ async fn seed(root: &Path) {
 		let vs: Vec<BigDecimal> = (part * 400..(part + 1) * 400).map(|i| bd(&format!("{}.{}", (i * i % 97) / 4, (i * i % 97) % 4 * 25))).collect();
 		store.seal_declared(ASPECT, &ts, &vs).await.expect("seals");
 	}
+	drop(store);
 }
 
 async fn open(root: &Path, mmap_reads: bool) -> SegmentStore {
@@ -52,12 +53,14 @@ async fn a_mapped_range_read_returns_the_buffered_rows() {
 		for (start, end) in windows {
 			buffered.push(store.read_time_range(ASPECT, start, end).await.expect("buffered read"));
 		}
+		drop(store);
 	}
 	let store = open(dir.path(), true).await;
 	for ((start, end), expected) in windows.into_iter().zip(&buffered) {
 		let mapped = store.read_time_range(ASPECT, start, end).await.expect("mapped read");
 		assert_eq!(&mapped, expected, "[{start}, {end}]: the mapped read returns the buffered rows");
 	}
+	drop(store);
 	assert!(!buffered[2].0.is_empty() && buffered[3].0.is_empty(), "the windows read what they were chosen to");
 }
 
@@ -70,10 +73,12 @@ async fn a_mapped_interpolation_is_the_buffered_one_bit_for_bit() {
 	let (expected, expected_kinds) = {
 		let store = open(dir.path(), false).await;
 		let series = store.interpolate_range_f64(ASPECT, 1000, 1400, 30, cubic).await.expect("buffered interpolation");
+		drop(store);
 		(bits(&series), series.kinds().to_vec())
 	};
 	let store = open(dir.path(), true).await;
 	let series = store.interpolate_range_f64(ASPECT, 1000, 1400, 30, cubic).await.expect("mapped interpolation");
+	drop(store);
 	assert_eq!(series.len(), 401, "one point per second of [1000, 1400]");
 	assert_eq!(bits(&series), expected, "same knots in, same values out");
 	assert_eq!(series.kinds(), expected_kinds.as_slice(), "and the same provenance");
@@ -90,5 +95,7 @@ async fn a_mapped_read_of_a_missing_frame_is_an_error_not_a_crash() {
 			std::fs::remove_file(&path).expect("removes the frame");
 		}
 	}
-	assert!(store.read_time_range(ASPECT, 0, 3700).await.is_err(), "an indexed frame that is gone fails the read");
+	let read = store.read_time_range(ASPECT, 0, 3700).await;
+	drop(store);
+	assert!(read.is_err(), "an indexed frame that is gone fails the read");
 }

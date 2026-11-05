@@ -42,7 +42,7 @@ enum Cli {
 	Run { common: Common, env_name: String, gpu_only: bool },
 }
 
-fn usage() -> &'static str {
+const fn usage() -> &'static str {
 	"usage:\n  weft-gpu-conformance matrix [--out DIR] [--size smoke|full] [--repeats N] [--uci FILE] [--uci-rows N] [--env NAME:VAR=VAL[,VAR=VAL...]]... [--no-lavapipe]\n  weft-gpu-conformance run --env-name NAME [--out DIR] [--size smoke|full] [--repeats N] [--uci FILE] [--uci-rows N] [--gpu-only]"
 }
 

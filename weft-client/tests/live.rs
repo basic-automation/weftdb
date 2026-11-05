@@ -22,7 +22,7 @@ const MANIFEST: &[u8] = br#"{"schema_version":23,"generated_at":"2026-11-03T00:0
 struct Server {
 	child: Child,
 	client: Client,
-	_dir: tempfile::TempDir,
+	dir: tempfile::TempDir,
 }
 
 impl Drop for Server {
@@ -47,11 +47,11 @@ async fn server() -> Option<Server> {
 	let log = std::fs::File::create(dir.path().join("server.log")).unwrap();
 	let child = Command::new(&bin).env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default()).env("HOME", dir.path()).env("WEFT_SERVER_ADDR", format!("127.0.0.1:{port}")).env("WEFT_SEGMENT_STORE_ROOT", dir.path().join("store")).env("WEFT_BENCH_RUNS_DIR", dir.path().join("runs")).env("WEFT_GPU_CALIBRATE", "0").env("RUST_LOG", "warn").stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
 	let client = Client::builder(format!("http://127.0.0.1:{port}")).timeout(Duration::from_secs(20)).build().unwrap();
-	let mut server = Server { child, client, _dir: dir };
+	let mut server = Server { child, client, dir };
 	let deadline = Instant::now() + Duration::from_secs(60);
 	while server.client.health().await.is_err() {
 		let exited = server.child.try_wait().unwrap();
-		assert!(exited.is_none() && Instant::now() < deadline, "weft-server did not come up ({exited:?}); its log:\n{}", std::fs::read_to_string(server._dir.path().join("server.log")).unwrap_or_default());
+		assert!(exited.is_none() && Instant::now() < deadline, "weft-server did not come up ({exited:?}); its log:\n{}", std::fs::read_to_string(server.dir.path().join("server.log")).unwrap_or_default());
 		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
 	Some(server)
@@ -105,7 +105,7 @@ async fn a_series_round_trips_losslessly() {
 	assert_eq!(band.iter().map(|p| p.timestamp).collect::<Vec<_>>(), [2_000, 3_000]);
 	let csv = String::from_utf8(client.range("price", 0, 9_999, Format::Csv).await.unwrap()).unwrap();
 	assert!(csv.starts_with("timestamp"), "{csv}");
-	assert!(!client.value_range("price", "0", "9", Format::Arrow).await.unwrap().is_empty());
+	assert_ne!(client.value_range("price", "0", "9", Format::Arrow).await.unwrap().len(), 0, "the value range is not empty");
 
 	let down = client.stored_downsample("price", &StoredDownsample::new(0, 9_999, "seconds", ["avg", "max"])).await.unwrap();
 	assert_eq!(down.buckets, 3);
@@ -169,15 +169,15 @@ async fn columnar_answers_decode() {
 	let points = [ComputePoint::new(at("1970-01-01T00:00:00Z"), 0.0), ComputePoint::new(at("1970-01-01T00:01:00Z"), 60.0)];
 	let request = Interpolate::new(points).spline(Spline::Linear);
 	let arrow = weft_client::decode_arrow(&server.client.interpolate_as(&request, Format::Arrow).await.unwrap()).unwrap();
-	assert_eq!(arrow.iter().map(|b| b.num_rows()).sum::<usize>(), 61);
+	assert_eq!(arrow.iter().map(arrow_array::RecordBatch::num_rows).sum::<usize>(), 61);
 	let parquet = weft_client::decode_parquet(&server.client.interpolate_as(&request, Format::Parquet).await.unwrap()).unwrap();
-	assert_eq!(parquet.iter().map(|b| b.num_rows()).sum::<usize>(), 61);
+	assert_eq!(parquet.iter().map(arrow_array::RecordBatch::num_rows).sum::<usize>(), 61);
 }
 
 #[tokio::test]
 async fn bench_runs() {
-	let Some(server) = server().await else { return };
 	use sha2::Digest as _;
+	let Some(server) = server().await else { return };
 	let id = format!("{:x}", sha2::Sha256::digest(MANIFEST));
 	let runs = server.client.bench_runs().await.unwrap();
 	assert_eq!(runs.iter().map(|r| (r.id.as_str(), r.path.as_str(), r.claim.as_deref())).collect::<Vec<_>>(), [(id.as_str(), "nightly/interp__weftdb.manifest.json", Some("sdk-live-rust"))]);

@@ -159,7 +159,7 @@ impl GapFillProfile {
 		let mut rng = ChaCha8Rng::seed_from_u64(p.seed);
 		let anchor = Utc.timestamp_opt(EPOCH_ANCHOR_SECS, 0).single().expect("valid fixed epoch anchor");
 		let n = p.point_count;
-		let instant = |i: usize| anchor + Duration::seconds(i as i64 * p.input_stride_secs);
+		let instant = |i: usize| anchor + Duration::seconds(crate::num::usize_to_i64(i) * p.input_stride_secs);
 		let step = |i: usize| bucket_index(p.bucket_resolution, &instant(i)).expect("indexable");
 		let (first, last) = (step(0), step(n - 1));
 		let removed = self.outages(&mut rng, first, last);
@@ -176,7 +176,7 @@ impl GapFillProfile {
 				entry.1 += 1;
 				continue;
 			}
-			let cents = ((clean + noise) * 100.0).round() as i64;
+			let cents = crate::num::f64_to_i64(((clean + noise) * 100.0).round());
 			points.push(Point { timestamp: instant(i), value: BigDecimal::new(cents.into(), 2) });
 		}
 		let start_of = |s: i64| self.start_of(s).expect("in range");
@@ -302,8 +302,8 @@ pub fn run_gap_fill_on(profile: &GapFillProfile, corpus: &GapFillCorpus, generat
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: p.seed ^ 0x_6A9F_C0DE_u64, ..BootstrapConfig::default() }));
-	let throughput_points_per_sec = if latency.mean_ns > 0 { corpus.points.len() as f64 / (latency.mean_ns as f64 / 1e9) } else { 0.0 };
-	let missingness_fraction = 1.0 - corpus.points.len() as f64 / corpus.generated as f64;
+	let throughput_points_per_sec = if latency.mean_ns > 0 { crate::num::usize_to_f64(corpus.points.len()) / (crate::num::u64_to_f64(latency.mean_ns) / 1e9) } else { 0.0 };
+	let missingness_fraction = 1.0 - crate::num::usize_to_f64(corpus.points.len()) / crate::num::usize_to_f64(corpus.generated);
 	let irregular = corpus.points.windows(3).any(|w| w[2].timestamp - w[1].timestamp != w[1].timestamp - w[0].timestamp);
 	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GAP_FILL.to_string(), reps, dataset: DatasetMeta { input_points: corpus.points.len(), output_points: grid.len(), irregular, missingness_fraction, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
 }
@@ -322,7 +322,7 @@ mod tests {
 		let corpus = profile.generate();
 		assert_eq!(profile.generate(), corpus, "seeded");
 		let grid_buckets = 6 * 60;
-		let share = corpus.truth.len() as f64 / f64::from(grid_buckets - 2);
+		let share = crate::num::usize_to_f64(corpus.truth.len()) / f64::from(grid_buckets - 2);
 		assert!((0.1..0.3).contains(&share), "removed share {share} should be near 20%");
 		assert!(corpus.truth.iter().all(|(t, _)| *t > corpus.span.0 && *t < corpus.span.1), "outages never touch the grid edges");
 		assert!(corpus.points.iter().all(|p| p.value.fractional_digit_count() == 2));

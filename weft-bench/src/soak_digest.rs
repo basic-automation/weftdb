@@ -143,10 +143,13 @@ fn finish_hex(hasher: Sha256) -> String {
 	out
 }
 
-/// The expected digest of a window: what the model wrote in ticks
+/// The expected digest of a window.
+///
+/// This is what the model wrote in ticks
 /// `start_tick..start_tick + tick_count`, regenerated from the model
 /// alone — the same regeneration the oracle judges against, hashed
 /// instead of compared cell by cell.
+///
 #[must_use]
 pub fn expected_window_digest(model: &WorkloadModel, start_tick: u64, tick_count: u64) -> WindowDigest {
 	let mut hasher = new_window_hasher();
@@ -299,7 +302,7 @@ mod tests {
 			(0..step.grid.series).find_map(|series| (0..step.grid.rows).find(|&row| step.grid.cell(series, row).is_none()).map(|row| (tick, series, row)))
 		});
 		if let Some((tick, series, row)) = absent {
-			read_back[(tick) as usize].1.push(ObservedPoint { series, row, timestamp_ns: model.timestamp_ns(tick, row), value: GridValue::Float(0.0) });
+			read_back[crate::num::u64_to_usize(tick)].1.push(ObservedPoint { series, row, timestamp_ns: model.timestamp_ns(tick, row), value: GridValue::Float(0.0) });
 			assert!(!expected.matches(&observed_window_digest(0, 4, &read_back)), "an unexpected point must change the digest");
 		}
 	}

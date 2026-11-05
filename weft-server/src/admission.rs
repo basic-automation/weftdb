@@ -29,8 +29,8 @@
 //!   store's own per-aspect maintenance locks still answer `409` for
 //!   conflicts below the whole class).
 //!
-//! The knobs live in the VarSpec registry (plan §3, PAC-5a/PAC-6 row:
-//! ROB-10's knob registry is absorbed by the VarSpec registry), not in
+//! The knobs live in the `VarSpec` registry (plan §3, PAC-5a/PAC-6 row:
+//! ROB-10's knob registry is absorbed by the `VarSpec` registry), not in
 //! a ROB-10-owned registry: the write budget is D-S14's
 //! `WEFT_INGEST_MAX_INFLIGHT_BYTES`, and the query cap is
 //! `WEFT_QUERY_MAX_INFLIGHT`. Maintenance exclusivity is the class's
@@ -52,19 +52,24 @@ use crate::routes::IngestAdmission;
 
 /// Environment variable naming the query class's in-flight cap
 /// (ROB-10): a positive whole number of requests, read once at
-/// startup. Registered in the VarSpec registry ([`crate::settings`]).
+/// startup. Registered in the `VarSpec` registry ([`crate::settings`]).
 pub const QUERY_MAX_INFLIGHT_ENV: &str = "WEFT_QUERY_MAX_INFLIGHT";
 
 /// The default query-class in-flight cap when `WEFT_QUERY_MAX_INFLIGHT`
-/// is unset: 128 concurrent reads/computes — far under the serve
+/// is unset.
+///
+/// 128 concurrent reads/computes — far under the serve
 /// path's connection cap (SEC-4), so a query flood is shed by class
 /// long before it can starve the listener, while a single client
 /// paging a store never comes near it.
+///
 pub const DEFAULT_QUERY_MAX_INFLIGHT: usize = 128;
 
 /// Admission I's limits (ROB-10), read once at startup and carried on
 /// the router state, so the registry the binary serves and a test's
-/// registry can carry different caps. The write class's byte budget
+/// registry can carry different caps.
+///
+/// The write class's byte budget
 /// is not here: it is D-S14's [`IngestConfig`](crate::ingest::IngestConfig),
 /// and the two configs travel side by side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +132,9 @@ impl Default for AdmissionConfig {
 }
 
 /// The serve path's admission state (ROB-10): one budget per
-/// [`AdmissionClass`](crate::routes::AdmissionClass) that sheds. The
+/// [`AdmissionClass`](crate::routes::AdmissionClass) that sheds.
+///
+/// The
 /// registry's gate holds one of these and charges each matched request
 /// against its class's budget before the handler runs; the permit is
 /// held by the gate's future across the handler call and released

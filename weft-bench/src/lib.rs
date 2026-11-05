@@ -230,8 +230,8 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	// reproducible yet decoupled from the dataset-generation RNG stream.
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		let secs = latency.mean_ns as f64 / 1e9;
-		let points = actual_output_points as f64;
+		let secs = crate::num::u64_to_f64(latency.mean_ns) / 1e9;
+		let points = crate::num::usize_to_f64(actual_output_points);
 		points / secs
 	} else {
 		0.0

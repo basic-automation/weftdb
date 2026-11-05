@@ -86,6 +86,7 @@ async fn the_default_point_batch_cap_refuses_the_10001st_instant() {
 	assert_eq!(store.read_points(ASPECT, &at_cap).await.expect("at the default cap").len(), 10_000);
 	let over_cap: Vec<i64> = (0..10_001).collect();
 	let err = store.read_points(ASPECT, &over_cap).await.expect_err("one over the default cap");
+	drop(store);
 	assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::PointBatchTooLarge { instants: 10_001, limit: 10_000, .. })), "{err:#}");
 }
 
@@ -107,6 +108,7 @@ async fn a_downsample_at_the_cap_answers_and_one_bucket_over_is_refused() {
 
 	// A refusal is not a poison: the store still answers under the cap.
 	let buckets = store.downsample_range(ASPECT, 0, 3, Resolution::Seconds, &aggs).await.expect("still readable");
+	drop(store);
 	assert_eq!(buckets.len(), 4);
 }
 
@@ -122,6 +124,7 @@ async fn the_merge_of_two_segments_is_bounded_as_it_folds() {
 	let aggs = [Aggregation::Avg];
 
 	let err = store.downsample_range(ASPECT, 0, 5, Resolution::Seconds, &aggs).await.expect_err("the merged grid is over the cap");
+	drop(store);
 	assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::DownsampleTooLarge { buckets: 6, limit: 4, .. })), "{err:#}");
 }
 
@@ -146,5 +149,6 @@ async fn a_width_downsample_is_bounded_on_the_grid_it_returns() {
 	// ten unit buckets, over the cap, on its way to four).
 	let width = BucketWidth::new(Resolution::Seconds, 3).expect("a width");
 	let buckets = store.downsample_range_width(ASPECT, 0, 9, width, &aggs).await.expect("the coarsened grid fits");
+	drop(store);
 	assert_eq!(buckets.len(), 4);
 }

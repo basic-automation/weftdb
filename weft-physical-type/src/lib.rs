@@ -388,6 +388,12 @@ pub fn is_non_finite_decimal_text(text: &str) -> bool {
 	word == "nan" || matches!(word.as_str(), "inf" | "infinity")
 }
 
+/// Checks that `value` lies inside the one decimal domain (ROB-6).
+///
+/// # Errors
+///
+/// Returns [`DecimalOutOfRange`] when the plain (non-exponent) form of `value`
+/// carries more than [`MAX_PLAIN_DIGITS`] digits.
 pub fn check_decimal_domain(value: &BigDecimal) -> Result<(), DecimalOutOfRange> {
 	let digits = plain_digit_count(value);
 	if digits > MAX_PLAIN_DIGITS {

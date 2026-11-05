@@ -283,14 +283,14 @@ pub const fn noise_label(gate: NoiseGate) -> &'static str {
 #[must_use]
 pub fn format_pct(value: f64) -> String {
 	if (value - value.round()).abs() < f64::EPSILON {
-		format!("{:.0}", value)
+		format!("{value:.0}")
 	} else {
 		format!("{value:.1}")
 	}
 }
 
 /// Why a comparison could not be made, or could not be trusted.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompareError {
 	/// A report could not be read.
 	Io {
@@ -824,7 +824,7 @@ fn adapters_of(report: &BenchReport) -> Vec<String> {
 	adapters
 }
 
-fn engine_kind(native_engine: bool) -> &'static str {
+const fn engine_kind(native_engine: bool) -> &'static str {
 	if native_engine {
 		"native engine"
 	} else {
@@ -832,7 +832,7 @@ fn engine_kind(native_engine: bool) -> &'static str {
 	}
 }
 
-fn spline_honour(honours_requested_spline: bool) -> &'static str {
+const fn spline_honour(honours_requested_spline: bool) -> &'static str {
 	if honours_requested_spline {
 		"honours the requested spline"
 	} else {

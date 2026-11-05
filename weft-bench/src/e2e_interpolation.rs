@@ -1,4 +1,6 @@
-//! End-to-end GPU interpolation benchmark (roadmap Phase 5, P5-e2e): storage read → decode →
+//! End-to-end GPU interpolation benchmark (roadmap Phase 5, P5-e2e).
+//!
+//! Storage read → decode →
 //! upload → kernel → readback → serialization, with p50/p95/p99 per stage, over output sizes
 //! and backends, through the **library path** and the **HTTP route**.
 //!

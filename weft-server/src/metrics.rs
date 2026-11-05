@@ -598,7 +598,9 @@ fn label_value(raw: &str) -> String {
 	raw.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
-/// Render the per-device GPU series (5.7). Nothing at all for an empty slice, so a server
+/// Render the per-device GPU series (5.7).
+///
+/// Nothing at all for an empty slice, so a server
 /// that never started the GPU exposes no GPU families. `device` is the index in
 /// `splimes::gpu_devices()`; device 0 is the one `splimes::gpu_info()` reports.
 pub fn render_gpu_devices(out: &mut String, devices: &[GpuDeviceRow]) {
