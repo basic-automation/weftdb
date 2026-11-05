@@ -3,6 +3,9 @@
 //! crash-matrix CI job leans on for its gate — a small matrix here, so the
 //! full seed set stays in `scripts/crash-matrix.sh`, where a slow run does
 //! not hold up every pull request.
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::io::Write as _;
 

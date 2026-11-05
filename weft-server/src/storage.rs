@@ -26,6 +26,13 @@
 //! `503 Service Unavailable`. An aspect that was never declared in the store is a
 //! `404 Not Found` (its timestamp unit / encoding is unknown, so there is nothing
 //! to read), and any other read failure is a `500`.
+//!
+//! Every read here is bounded (ROB-12, decision 12): a window wider than
+//! `WEFT_MAX_READ_ROWS` rows, a page over `WEFT_MAX_PAGE_ROWS`, a grid over
+//! `WEFT_MAX_DOWNSAMPLE_BUCKETS` or an `at-multi` batch over `WEFT_MAX_AT_MULTI_INSTANTS` is
+//! a `422 result_too_large` carrying the limit, and a read the server is still waiting on when
+//! `WEFT_READ_TIMEOUT_SECS` elapses is a `504 query_timeout`. A paginated read naming no page
+//! size gets [`read_limits::DEFAULT_PAGE_ROWS`] rows and pages with `next_cursor`.
 
 use axum::{
 	body::Body, extract::{Path, State}, http::header, response::{IntoResponse, Response}, Json
@@ -35,14 +42,50 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 
 use crate::{
-	error::{self, ApiError, StrictQuery}, state::AppState
+	error::{self, ApiError, SelectorQuery}, read_limits, state::AppState
 };
+
+/// The tags of the series a stored read served, as the JSON bodies report them (TAG-10):
+/// `{}` for the untagged series 0, `{key: value}` for a tagged one, and `null` when the
+/// selector matched no series (the body is then empty).
+pub type SeriesTags = Option<std::collections::BTreeMap<String, String>>;
+
+/// The one series a stored read targets, resolved once from the request's selector.
+struct Target {
+	/// The series to read, or `None` when the selector matched none: the read is empty.
+	series: Option<weftdb::SeriesId>,
+	/// What the JSON bodies report as `tags`.
+	tags: SeriesTags,
+}
+
+/// Resolve the request's [`SeriesSelector`](weftdb::SeriesSelector) against `aspect`
+/// (TAG-10, tags D4): no `tag.*` parameter is series 0 without a catalog read; otherwise
+/// [`resolve_series`](weftdb::SegmentStore::resolve_series) picks the one matching series
+/// (`400 ambiguous_series` for two or more), and its tags are read for the body.
+async fn resolve_target(store: &weftdb::SegmentStore, aspect: &str, selector: &weftdb::SeriesSelector) -> Result<Target, ApiError> {
+	let series = store.resolve_series(aspect, selector).await.map_err(|err| error::classify_read(&err))?;
+	let tags = match series {
+		Some(id) => {
+			let tags = store.series_tags(aspect, id).await.map_err(|err| error::classify_read(&err))?;
+			// The id came from the catalog a moment ago and ids are never reused, so a missing
+			// row for a tagged id means the catalog changed under the read. Reporting `{}` would
+			// name the untagged series for rows read from another, so it is a server fault.
+			match tags {
+				Some(tags) => Some(tags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+				None if id == weftdb::SeriesId::UNTAGGED => Some(std::collections::BTreeMap::new()),
+				None => return Err(ApiError::server(error::Code::SeriesBindingMismatch, format!("series {id:?} of aspect `{aspect}` has no catalog row"))),
+			}
+		}
+		None => None,
+	};
+	Ok(Target { series, tags })
+}
 
 /// Parse a `lo`/`hi` value-range bound into the one decimal domain (ROB-6):
 /// not-a-decimal is the caller's `400 bad_request` as before, and a decimal
 /// whose plain form is over the bound is `400 decimal_out_of_range`.
 fn parse_value_bound(name: &str, text: &str) -> Result<BigDecimal, ApiError> {
-	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
+	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
 }
 
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.
@@ -146,13 +189,22 @@ async fn require_schema(store: &weftdb::SegmentStore, aspect: &str) -> Result<we
 /// [`ApiError::unconfigured`] when no store is attached,
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared, and
 /// [`ApiError::internal`] on a read failure.
-pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<TimeRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
 	require_schema(&store, &aspect).await?;
-	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "csv")).await;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let (timestamps, values) = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => store.read_time_range_of(&aspect, series, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "csv")).await,
+			None => Ok((Vec::new(), Vec::new())),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
+	limits.check_rows(timestamps.len(), "this range export", None)?;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let body = tracing::info_span!("storage.range.serialize", format = "csv").in_scope(|| render_csv(timestamps.into_iter().zip(values)));
 	Ok(csv_response(body))
 }
@@ -168,15 +220,24 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 ///
 /// As [`storage_time_range_csv`], plus [`ApiError::bad_request`] when a value
 /// bound does not parse as a decimal.
-pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
 	require_schema(&store, &aspect).await?;
-	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let (timestamps, values) = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => store.read_value_range_of(&aspect, series, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "csv")).await,
+			None => Ok((Vec::new(), Vec::new())),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
+	limits.check_rows(timestamps.len(), "this value-range export", None)?;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let body = tracing::info_span!("storage.value_range.serialize", format = "csv").in_scope(|| render_csv(timestamps.into_iter().zip(values.into_iter().map(Some))));
 	Ok(csv_response(body))
 }
@@ -192,12 +253,22 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 /// [`ApiError::unconfigured`] when no store is attached,
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared, and
 /// [`ApiError::internal`] on a read/serialization failure.
-pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<TimeRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
-	let batch = weft_arrow_store::read_time_range_to_record_batch_typed(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await;
+	let schema = require_schema(&store, &aspect).await?;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let batch = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => weft_arrow_store::read_time_range_to_record_batch_typed_of(&store, &aspect, series, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "arrow")).await,
+			None => weft_arrow::columns_to_record_batch_typed(schema.timestamp_unit, schema.value, &[], &[]).map_err(anyhow::Error::from),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
+	limits.check_rows(batch.num_rows(), "this range export", None)?;
 	drop(store);
-	let batch = batch.map_err(|err| error::classify_read(&err))?;
 	let bytes = tracing::info_span!("storage.range.serialize", format = "arrow").in_scope(|| weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(arrow_stream_response(bytes))
 }
@@ -211,14 +282,24 @@ pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Pat
 ///
 /// As [`storage_time_range`], plus [`ApiError::bad_request`] when a value bound
 /// does not parse as a decimal.
-pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
-	let batch = weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await;
+	let schema = require_schema(&store, &aspect).await?;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let batch = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => weft_arrow_store::read_value_range_to_record_batch_of(&store, &aspect, series, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "arrow")).await,
+			None => weft_arrow::columns_to_record_batch(schema.timestamp_unit, &[], &[]).map_err(anyhow::Error::from),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
+	limits.check_rows(batch.num_rows(), "this value-range export", None)?;
 	drop(store);
-	let batch = batch.map_err(|err| error::classify_read(&err))?;
 	let bytes = tracing::info_span!("storage.value_range.serialize", format = "arrow").in_scope(|| weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(arrow_stream_response(bytes))
 }
@@ -234,12 +315,22 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 ///
 /// As [`storage_time_range`] (unconfigured store, undeclared aspect, or a
 /// read/serialization failure).
-pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<TimeRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
-	let batch = weft_arrow_store::read_time_range_to_record_batch_typed(&store, &aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await;
+	let schema = require_schema(&store, &aspect).await?;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let batch = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => weft_arrow_store::read_time_range_to_record_batch_typed_of(&store, &aspect, series, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "parquet")).await,
+			None => weft_arrow::columns_to_record_batch_typed(schema.timestamp_unit, schema.value, &[], &[]).map_err(anyhow::Error::from),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
+	limits.check_rows(batch.num_rows(), "this range export", None)?;
 	drop(store);
-	let batch = batch.map_err(|err| error::classify_read(&err))?;
 	let bytes = tracing::info_span!("storage.range.serialize", format = "parquet").in_scope(|| weft_arrow::write_parquet(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(parquet_response(bytes))
 }
@@ -254,14 +345,24 @@ pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspe
 ///
 /// As [`storage_value_range`], including [`ApiError::bad_request`] when a value
 /// bound does not parse as a decimal.
-pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValueRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
-	let batch = weft_arrow_store::read_value_range_to_record_batch(&store, &aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await;
+	let schema = require_schema(&store, &aspect).await?;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let batch = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => weft_arrow_store::read_value_range_to_record_batch_of(&store, &aspect, series, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "parquet")).await,
+			None => weft_arrow::columns_to_record_batch(schema.timestamp_unit, &[], &[]).map_err(anyhow::Error::from),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
+	limits.check_rows(batch.num_rows(), "this value-range export", None)?;
 	drop(store);
-	let batch = batch.map_err(|err| error::classify_read(&err))?;
 	let bytes = tracing::info_span!("storage.value_range.serialize", format = "parquet").in_scope(|| weft_arrow::write_parquet(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(parquet_response(bytes))
 }
@@ -290,8 +391,11 @@ pub struct StoredPoint {
 /// `take` is an alias for `limit` (the page size — `limit` wins if both are
 /// given), and `page` is a **1-based** page number that derives the offset from
 /// the page size (`offset = (page - 1) * page_size`). When `page` is present it
-/// supersedes any explicit `offset`; a `page` without a page size falls back to
-/// page 1 (offset 0).
+/// supersedes any explicit `offset`.
+///
+/// A request that names no page size gets this server's default page
+/// ([`DEFAULT_PAGE_ROWS`](read_limits::DEFAULT_PAGE_ROWS)) rather than the whole
+/// window, and follows `next_cursor` for the rest (ROB-12, decision 12).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointsRangeParams {
@@ -302,7 +406,8 @@ pub struct PointsRangeParams {
 	/// Skip this many leading rows of the window before returning (default 0).
 	#[serde(default)]
 	pub offset: Option<usize>,
-	/// Return at most this many rows (default: all remaining after `offset`).
+	/// Return at most this many rows (default: this server's page size, `MAX_PAGE_ROWS`
+	/// is the ceiling and is answered `422 result_too_large`).
 	#[serde(default)]
 	pub limit: Option<usize>,
 	/// Declarative alias for `limit` (the page size). `limit` takes precedence if
@@ -326,6 +431,9 @@ pub struct PointsRangeParams {
 pub struct StoredRangeResponse {
 	/// The aspect read.
 	pub aspect: String,
+	/// The tags of the series read (TAG-10): `{}` for the untagged series 0, `null` when
+	/// the `tag.*` selector matched no series.
+	pub tags: SeriesTags,
 	/// The aspect's declared timestamp unit token (e.g. `"seconds"`), so a consumer
 	/// can interpret the integer timestamps.
 	pub time_unit: &'static str,
@@ -336,8 +444,8 @@ pub struct StoredRangeResponse {
 	pub count: usize,
 	/// The number of leading rows skipped (the applied `offset`, 0 if none).
 	pub offset: usize,
-	/// The effective page size applied (the resolved `limit`/`take`); absent when
-	/// the read was unbounded.
+	/// The effective page size applied (the resolved `limit`/`take`, or the server's
+	/// default page when the request named neither).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub limit: Option<usize>,
 	/// The 1-based page number served, present only for a page-based request
@@ -370,42 +478,60 @@ pub struct StoredRangeResponse {
 /// [`ApiError::unconfigured`] when no store is attached,
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared (its timestamp unit is
 /// unknown), and [`ApiError::internal`] on a read failure.
-pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<PointsRangeParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<PointsRangeParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
 	let schema = store.schema_for(&aspect).await.map_err(|err| ApiError::internal(err.to_string()))?;
 	let Some(schema) = schema else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_time_range(&aspect, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "json")).await;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let (timestamps, values) = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => store.read_time_range_of(&aspect, series, params.start, params.end).instrument(tracing::info_span!("storage.range.read", %aspect, start = params.start, end = params.end, format = "json")).await,
+			None => Ok((Vec::new(), Vec::new())),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
 	drop(store);
-	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
 	let total = timestamps.len();
-	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
+	limits.check_rows(total, "this range read", Some("limit"))?;
+	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref(), &limits)?;
 	// Paginate + stringify under a serialize span: skip `offset` rows of the window,
 	// take at most `page_size`.
-	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| {
-		let paginated = timestamps.into_iter().zip(values).skip(offset);
-		match page_size {
-			Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
-			None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect(),
-		}
-	});
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| timestamps.into_iter().zip(values).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect());
 	let next_cursor = next_cursor(offset, points.len(), total);
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, next_cursor, points }))
+	Ok(Json(StoredRangeResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
 }
 
 /// Resolve the declarative B-rest pagination params shared by the JSON range reads
 /// into `(offset, page_size, page_echo)`.
 ///
-/// The page size is `limit` if present else the `take` alias. `page` (1-based)
-/// derives the offset (`(page - 1) * page_size`) and supersedes an explicit
-/// `offset`; a `page` without a page size falls back to page 1 (offset 0). The
-/// returned `page_echo` is the served 1-based page (only for a page-based request).
-fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>) -> (usize, Option<usize>, Option<usize>) {
-	let page_size = limit.or(take);
-	let offset = page.map_or_else(|| offset.unwrap_or(0), |page| page_size.map_or(0, |size| page.saturating_sub(1).saturating_mul(size)));
-	(offset, page_size, page.map(|page| page.max(1)))
+/// The page size is `limit` if present else the `take` alias, and, when the request
+/// names neither, this server's default page
+/// ([`read_limits::DEFAULT_PAGE_ROWS`]) — a range read is paged whether or not the
+/// client asked for pages, so no request can ask for a whole window (ROB-12). A named
+/// page size over [`read_limits::MAX_PAGE_ROWS`] is a `422 result_too_large` naming the
+/// cap, not a silently smaller page. `page` (1-based) derives the offset
+/// (`(page - 1) * page_size`) from a page size the request **named**, and supersedes an
+/// explicit `offset`; a `page` with no page size names a page of unknown size, so it is
+/// echoed and the first page is served.
+fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, limits: &read_limits::ReadLimits) -> Result<(usize, usize, Option<usize>), ApiError> {
+	let named = limit.or(take);
+	let page_size = limits.page_size(named, "limit")?;
+	// A `page` derives its offset from the page size **the request named**. This
+	// server's default page is not something the client chose to page by, so a
+	// `page` with no page size keeps the meaning it had before ROB-12: the number
+	// is echoed back, and the first page is served. Deriving an offset from the
+	// default would move a client that asked for nothing of the kind to row
+	// `(page - 1) * 10_000` of a window it never tried to skip.
+	let offset = match (page, named) {
+		(Some(page), Some(_)) => page.saturating_sub(1).saturating_mul(page_size),
+		_ => offset.unwrap_or(0),
+	};
+	Ok((offset, page_size, page.map(|page| page.max(1))))
 }
 
 /// Encode a forward-iteration position — a row offset in the deterministic read order
@@ -428,8 +554,8 @@ fn decode_cursor(token: &str) -> Option<usize> {
 /// A present `cursor` supersedes `offset`/`page` (it *is* the resolved start position,
 /// so the `page` echo is cleared); a malformed `cursor` is a `400`. Returns the
 /// `(offset, page_size, page_echo)` triple that drives the slice.
-fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, cursor: Option<&str>) -> Result<(usize, Option<usize>, Option<usize>), ApiError> {
-	let (offset, page_size, page) = resolve_pagination(offset, limit, take, page);
+fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, cursor: Option<&str>, limits: &read_limits::ReadLimits) -> Result<(usize, usize, Option<usize>), ApiError> {
+	let (offset, page_size, page) = resolve_pagination(offset, limit, take, page, limits)?;
 	match cursor {
 		Some(token) => {
 			let cursor_offset = decode_cursor(token).ok_or_else(|| ApiError::bad_request(format!("`cursor` is not a valid token: {token:?}")))?;
@@ -461,13 +587,14 @@ pub struct ValuePointsParams {
 	/// Skip this many leading rows before returning (default 0).
 	#[serde(default)]
 	pub offset: Option<usize>,
-	/// Return at most this many rows (default: all remaining after `offset`).
+	/// Return at most this many rows (default: this server's page size,
+	/// `DEFAULT_PAGE_ROWS`; over `MAX_PAGE_ROWS` is a `422 result_too_large`).
 	#[serde(default)]
 	pub limit: Option<usize>,
 	/// Declarative alias for `limit` (the page size). `limit` wins if both are given.
 	#[serde(default)]
 	pub take: Option<usize>,
-	/// 1-based page number; with a page size it derives the offset.
+	/// 1-based page number; it derives the offset from the resolved page size.
 	#[serde(default)]
 	pub page: Option<usize>,
 	/// Opaque forward-iteration cursor (from a prior response's `next_cursor`);
@@ -490,8 +617,9 @@ pub struct ValuePointsParams {
 /// [`ApiError::unconfigured`] (no store), [`ApiError::aspect_not_found`] (aspect
 /// undeclared), [`ApiError::bad_request`] when a value bound does not parse as a
 /// decimal, and [`ApiError::internal`] on a read failure.
-pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ValuePointsParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValuePointsParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -499,20 +627,22 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 	let Some(schema) = schema else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let result = store.read_value_range(&aspect, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "json")).await;
-	drop(store);
-	let (timestamps, values) = result.map_err(|err| error::classify_read(&err))?;
-	let total = timestamps.len();
-	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref())?;
-	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| {
-		let paginated = timestamps.into_iter().zip(values).skip(offset);
-		match page_size {
-			Some(size) => paginated.take(size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
-			None => paginated.map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect(),
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let (timestamps, values) = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => store.read_value_range_of(&aspect, series, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "json")).await,
+			None => Ok((Vec::new(), Vec::new())),
 		}
-	});
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
+	drop(store);
+	let total = timestamps.len();
+	limits.check_rows(total, "this value-range read", Some("limit"))?;
+	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref(), &limits)?;
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| timestamps.into_iter().zip(values).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect());
 	let next_cursor = next_cursor(offset, points.len(), total);
-	Ok(Json(StoredRangeResponse { aspect, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: page_size, page, next_cursor, points }))
+	Ok(Json(StoredRangeResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
 }
 
 /// Query parameters for the single-instant point lookup: the instant `t` to read
@@ -530,6 +660,9 @@ pub struct PointParams {
 pub struct StoredPointResponse {
 	/// The aspect read.
 	pub aspect: String,
+	/// The tags of the series read (TAG-10): `{}` for the untagged series 0, `null` when
+	/// the `tag.*` selector matched no series.
+	pub tags: SeriesTags,
 	/// The aspect's declared timestamp unit token (e.g. `"seconds"`), so a consumer
 	/// can interpret the integer timestamp.
 	pub time_unit: &'static str,
@@ -559,17 +692,26 @@ pub struct StoredPointResponse {
 ///
 /// [`ApiError::unconfigured`] when no store is attached,
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared (its timestamp unit is
-/// unknown), and [`ApiError::internal`] on a read failure.
-pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<PointParams>) -> Result<Json<StoredPointResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+/// unknown), a `504 query_timeout` when the lookup outlasts `WEFT_READ_TIMEOUT_SECS`,
+/// and [`ApiError::internal`] on a read failure.
+pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<PointParams>) -> Result<Json<StoredPointResponse>, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
-	let result = store.read_point(&aspect, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t, format = "json")).await;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let value = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => store.read_point_of(&aspect, series, params.t).instrument(tracing::info_span!("storage.point.read", %aspect, t = params.t, format = "json")).await,
+			None => Ok(None),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
 	drop(store);
-	let value = result.map_err(|err| error::classify_read(&err))?;
 	let body = tracing::info_span!("storage.point.serialize", format = "json").in_scope(|| {
 		let found = value.is_some();
-		StoredPointResponse { aspect, time_unit: schema.timestamp_unit.name(), timestamp: params.t, value: value.map(|v| v.to_string()), found }
+		StoredPointResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), timestamp: params.t, value: value.map(|v| v.to_string()), found }
 	});
 	Ok(Json(body))
 }
@@ -600,6 +742,9 @@ pub struct StoredPointEntry {
 pub struct StoredPointsResponse {
 	/// The aspect read.
 	pub aspect: String,
+	/// The tags of the series read (TAG-10): `{}` for the untagged series 0, `null` when
+	/// the `tag.*` selector matched no series.
+	pub tags: SeriesTags,
 	/// The aspect's declared timestamp unit token (e.g. `"seconds"`).
 	pub time_unit: &'static str,
 	/// One result per queried instant, aligned to the `t` list.
@@ -618,19 +763,31 @@ pub struct StoredPointsResponse {
 ///
 /// [`ApiError::unconfigured`] when no store is attached, [`ApiError::aspect_not_found`] when
 /// the aspect is undeclared, [`ApiError::bad_request`] when the `t` list has a non-integer
-/// entry, and [`ApiError::internal`] on a read failure.
-pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<MultiPointParams>) -> Result<Json<StoredPointsResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+/// entry, a `422 result_too_large` naming the limit when the list names more instants than
+/// `WEFT_MAX_AT_MULTI_INSTANTS` (refused before a segment is opened), a `504 query_timeout`
+/// when the batch outlasts `WEFT_READ_TIMEOUT_SECS`, and [`ApiError::internal`] on a read failure.
+pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<MultiPointParams>) -> Result<Json<StoredPointsResponse>, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	// Parse the comma-separated instants; a non-integer (or otherwise malformed) entry is a 400.
 	let ts: Vec<i64> = params.t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::parse::<i64>).collect::<Result<_, _>>().map_err(|e| ApiError::bad_request(format!("invalid `t` list {:?}: {e}", params.t)))?;
-	let result = store.read_points(&aspect, &ts).instrument(tracing::info_span!("storage.points.read", %aspect, count = ts.len(), format = "json")).await;
+	// The batch is the read: over the cap it is refused before a single segment opens.
+	limits.check_at_multi_instants(ts.len())?;
+	let target = resolve_target(&store, &aspect, &selector).await?;
+	let values = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => store.read_points_of(&aspect, series, &ts).instrument(tracing::info_span!("storage.points.read", %aspect, count = ts.len(), format = "json")).await,
+			None => Ok(vec![None; ts.len()]),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
 	drop(store);
-	let values = result.map_err(|err| error::classify_read(&err))?;
 	let body = tracing::info_span!("storage.points.serialize", count = ts.len(), format = "json").in_scope(|| {
 		let points = ts.iter().zip(values).map(|(&timestamp, v)| StoredPointEntry { timestamp, found: v.is_some(), value: v.map(|v| v.to_string()) }).collect();
-		StoredPointsResponse { aspect, time_unit: schema.timestamp_unit.name(), points }
+		StoredPointsResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), points }
 	});
 	Ok(Json(body))
 }
@@ -653,6 +810,12 @@ pub struct AspectInfo {
 	pub value_tolerance: String,
 	/// The declared timestamp unit token (e.g. `"seconds"`, `"millis"`).
 	pub timestamp_unit: &'static str,
+	/// The declared upsert keys (roadmap Phase 4.6): `"timestamp"` first, then the tag
+	/// keys every row's tags must fall inside. Absent when the aspect declares none, whose
+	/// identity is the timestamp and the full tag set. Carried by the schema endpoint and
+	/// the declare response; the aspect list leaves it out.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub upsert_keys: Option<Vec<String>>,
 }
 
 impl AspectInfo {
@@ -660,7 +823,14 @@ impl AspectInfo {
 	/// declaration fixed, scale included (FRE-7b schema read-back).
 	#[must_use]
 	pub fn declared(name: String, schema: &weft_physical_type::AspectSchema) -> Self {
-		Self { name, physical_type: schema.value.name(), scale: schema.value.scale(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() }
+		Self { name, physical_type: schema.value.name(), scale: schema.value.scale(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name(), upsert_keys: None }
+	}
+
+	/// This read-back with the aspect's declared upsert keys, in their wire form.
+	#[must_use]
+	pub fn with_upsert_keys(mut self, upsert_keys: Option<&weftdb::UpsertKeys>) -> Self {
+		self.upsert_keys = upsert_keys.map(weftdb::UpsertKeys::to_wire);
+		self
 	}
 }
 
@@ -777,7 +947,7 @@ async fn collect_catalog(store: &weftdb::SegmentStore) -> anyhow::Result<Vec<Cat
 /// [`ApiError::unconfigured`] when no store is attached, or
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_catalog(State(state): State<AppState>) -> Result<Json<CatalogResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let scope_database = store.database().to_string();
 	let scope_subject = store.subject().to_string();
@@ -809,7 +979,7 @@ async fn collect_aspects(store: &weftdb::SegmentStore) -> anyhow::Result<Vec<Asp
 /// [`ApiError::unconfigured`] when no store is attached, or
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_aspects(State(state): State<AppState>) -> Result<Json<AspectListResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let result = collect_aspects(&store).await;
 	drop(store);
@@ -835,15 +1005,17 @@ pub struct AspectSchemaResponse {
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared, and
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Json<AspectSchemaResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let result = store.schema_for(&aspect).await;
+	let keys = store.upsert_keys(&aspect).await;
 	drop(store);
 	let schema = result.map_err(|err| ApiError::internal(err.to_string()))?;
 	let Some(schema) = schema else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let aspect = AspectInfo::declared(aspect, &schema);
+	let keys = keys.map_err(|err| ApiError::internal(err.to_string()))?;
+	let aspect = AspectInfo::declared(aspect, &schema).with_upsert_keys(keys.as_ref());
 	Ok(Json(AspectSchemaResponse { aspect }))
 }
 
@@ -858,7 +1030,7 @@ pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): 
 /// [`ApiError::unconfigured`] when no store is attached, or
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Json<AspectStatsResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	// The O(1) rollup carries every field except the cross-segment overlap count,
 	// which has no incremental fold — a second, index-scanning `aspect_stats` supplies
@@ -883,7 +1055,7 @@ pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): P
 /// [`ApiError::unconfigured`] when no store is attached, or
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreStatsResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	// The O(1) rollup carries every field except the cross-segment overlap total,
 	// which has no incremental fold — a separate index-scanning aggregate supplies it.
@@ -936,16 +1108,27 @@ pub struct StorageDownsampleParams {
 /// range far larger than RAM still reduces — and with a `sketch_p*` reduction the
 /// per-bucket state is bounded too. An omitted bound spans the whole stored history.
 ///
+/// The grid itself is capped (ROB-12): more than `WEFT_MAX_DOWNSAMPLE_BUCKETS` buckets is a
+/// `422 result_too_large` naming the limit — refused from the request's own bounds when it
+/// names both, and from the grid actually produced otherwise, since a window naming no bounds
+/// is as wide as the stored history. The read is also the one a `WEFT_READ_TIMEOUT_SECS` wait
+/// answers `504 query_timeout` for.
+///
 /// Traced as `downsample.range` so a `RUST_LOG`/OTLP run attributes the stored
 /// reduction apart from the compute endpoints' `downsample.reduce`.
-pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams) -> Result<crate::downsample::DownsampleResponse, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams, selector: &weftdb::SeriesSelector) -> Result<crate::downsample::DownsampleResponse, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	let limits = state.read_limits();
+	let max_fill_buckets = state.interpolate_config().max_output_points();
 	drop(state);
 	let width = crate::downsample::parse_width_token(params.resolution.as_deref())?;
 	let aggregations = crate::downsample::parse_aggregations(params.agg.as_deref())?;
 	let method = crate::downsample::parse_fill(params.fill.as_deref())?;
 	// An undeclared aspect is a 404 before any read work, matching the sibling reads.
 	let schema = require_schema(&store, aspect).await?;
+	// A bound that cannot be placed in time at the aspect's unit is the same `422` the
+	// fill path already returns for it.
+	let bound_nanos = |epoch: i64| schema.timestamp_unit.to_nanos(epoch).ok_or_else(|| ApiError::new(error::Code::ValueNotRepresentable, format!("the bound {epoch} cannot be placed in time at the aspect's timestamp unit")));
 	// An omitted bound means "all of stored history" — the index prune is inclusive,
 	// so the saturating bounds simply select every segment.
 	let start = params.start.unwrap_or(i64::MIN);
@@ -953,19 +1136,39 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 	if end < start {
 		return Err(ApiError::bad_request(format!("`end` ({end}) must not be before `start` ({start})")));
 	}
+	// A request that names both bounds states its own grid, so an impossible one is
+	// refused before any segment is opened (ROB-12). A request that names neither is
+	// not refusals on a number it never gave: its grid is checked on the count the
+	// reduction actually produces, below.
+	if let (Some(start), Some(end)) = (params.start, params.end) {
+		let grid = read_limits::grid_buckets(i128::from(bound_nanos(start)?), i128::from(bound_nanos(end)?), width.step_nanos());
+		limits.check_downsample_buckets(grid)?;
+	}
 
+	let target = resolve_target(&store, aspect, selector).await?;
 	let span = tracing::info_span!("downsample.range", %aspect, start, end, resolution = %width, buckets = tracing::field::Empty);
-	let result = store.downsample_range_width(aspect, start, end, width, &aggregations).instrument(span.clone()).await;
+	let mut buckets = read_limits::within_deadline(&limits, async {
+		match target.series {
+			Some(series) => store.downsample_range_width_of(aspect, series, start, end, width, &aggregations).instrument(span.clone()).await,
+			None => Ok(Vec::new()),
+		}
+		.map_err(|err| error::classify_read(&err))
+	})
+	.await?;
 	drop(store);
-	let mut buckets = result.map_err(|err| error::classify_read(&err))?;
-	if let Some(method) = &method {
+	// A selector that matched no series reads empty: no fill grid is synthesised for it.
+	if let (Some(method), Some(_)) = (&method, target.series) {
 		// The fill bounds are the window's, as instants; an omitted bound is the stored data's.
-		let instant = |epoch: Option<i64>| epoch.map(|e| schema.timestamp_unit.to_nanos(e).map(chrono::DateTime::from_timestamp_nanos).ok_or_else(|| ApiError::new(error::Code::ValueNotRepresentable, format!("the bound {e} cannot be placed in time at the aspect's timestamp unit")))).transpose();
-		buckets = crate::downsample::apply_fill(&buckets, width, instant(params.start)?, instant(params.end)?, method)?;
+		let instant = |epoch: Option<i64>| epoch.map(|e| bound_nanos(e).map(chrono::DateTime::from_timestamp_nanos)).transpose();
+		buckets = crate::downsample::apply_fill(&buckets, width, instant(params.start)?, instant(params.end)?, method, max_fill_buckets)?;
 	}
 	let mut response = crate::downsample::buckets_to_response(buckets, width, &aggregations)?;
 	response.fill = method.is_some().then(|| params.fill.as_deref().unwrap_or_default().trim().to_string());
+	response.tags = Some(target.tags);
 	span.record("buckets", response.buckets);
+	// The grid that was actually produced, which is what an unbounded window's cap has
+	// to go on — and the last chance to refuse before the buckets are serialized.
+	limits.check_downsample_buckets(u128::try_from(response.buckets).unwrap_or(u128::MAX))?;
 	Ok(response)
 }
 
@@ -985,8 +1188,8 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 /// for an undeclared aspect, [`ApiError::bad_request`] for an unknown
 /// resolution/aggregation token or an inverted window, and [`ApiError::internal`]
 /// on a read or reduction failure.
-pub async fn storage_downsample(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<StorageDownsampleParams>) -> Result<Json<crate::downsample::DownsampleResponse>, ApiError> {
-	Ok(Json(storage_downsample_inner(state, &aspect, &params).await?))
+pub async fn storage_downsample(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<StorageDownsampleParams>) -> Result<Json<crate::downsample::DownsampleResponse>, ApiError> {
+	Ok(Json(storage_downsample_inner(state, &aspect, &params, &selector).await?))
 }
 
 /// Handle `GET|POST /api/v1/storage/{aspect}/downsample.csv`: the CSV-output
@@ -996,8 +1199,8 @@ pub async fn storage_downsample(State(state): State<AppState>, Path(aspect): Pat
 /// # Errors
 ///
 /// As [`storage_downsample`].
-pub async fn storage_downsample_csv(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<StorageDownsampleParams>) -> Result<Response, ApiError> {
-	let response = storage_downsample_inner(state, &aspect, &params).await?;
+pub async fn storage_downsample_csv(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<StorageDownsampleParams>) -> Result<Response, ApiError> {
+	let response = storage_downsample_inner(state, &aspect, &params, &selector).await?;
 	Ok(crate::downsample::downsample_response_to_csv(&response))
 }
 
@@ -1009,9 +1212,9 @@ pub async fn storage_downsample_csv(State(state): State<AppState>, Path(aspect):
 ///
 /// As [`storage_downsample`], plus [`ApiError::internal`] on an Arrow-encoding
 /// failure.
-pub async fn storage_downsample_arrow(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<StorageDownsampleParams>) -> Result<Response, ApiError> {
-	let response = storage_downsample_inner(state, &aspect, &params).await?;
-	Ok(crate::downsample::downsample_response_to_arrow(&response)?)
+pub async fn storage_downsample_arrow(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<StorageDownsampleParams>) -> Result<Response, ApiError> {
+	let response = storage_downsample_inner(state, &aspect, &params, &selector).await?;
+	crate::downsample::downsample_response_to_arrow(&response)
 }
 
 /// Handle `GET|POST /api/v1/storage/{aspect}/downsample.parquet`: the Parquet-output
@@ -1021,9 +1224,9 @@ pub async fn storage_downsample_arrow(State(state): State<AppState>, Path(aspect
 ///
 /// As [`storage_downsample`], plus [`ApiError::internal`] on a Parquet-encoding
 /// failure.
-pub async fn storage_downsample_parquet(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<StorageDownsampleParams>) -> Result<Response, ApiError> {
-	let response = storage_downsample_inner(state, &aspect, &params).await?;
-	Ok(crate::downsample::downsample_response_to_parquet(&response)?)
+pub async fn storage_downsample_parquet(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<StorageDownsampleParams>) -> Result<Response, ApiError> {
+	let response = storage_downsample_inner(state, &aspect, &params, &selector).await?;
+	crate::downsample::downsample_response_to_parquet(&response)
 }
 
 #[cfg(test)]
@@ -1262,12 +1465,13 @@ mod tests {
 	#[tokio::test]
 	async fn aspect_stats_reports_unsorted_segments_after_an_out_of_order_seal() {
 		let dir = TempDir::new().expect("temp dir");
-		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
 		// One ordered segment, then one whose timestamps step backwards.
 		store.seal_declared("price", &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("ordered");
 		store.seal_declared("price", &[100_i64, 130, 110], &[bd("4"), bd("5"), bd("6")]).await.expect("out of order");
-		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
 		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["segment_count"], 2);
@@ -1280,12 +1484,13 @@ mod tests {
 	#[tokio::test]
 	async fn aspect_stats_reports_cross_segment_overlap() {
 		let dir = TempDir::new().expect("temp dir");
-		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
 		// Two internally-sorted segments whose time windows overlap ([0,20] and [10,30]).
 		store.seal_declared("price", &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("first");
 		store.seal_declared("price", &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("overlapping");
-		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
 		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		// Both segments are internally sorted, but their windows overlap.
@@ -1344,7 +1549,7 @@ mod tests {
 		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=1000&end=2000").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["count"], 0);
-		assert!(body["points"].as_array().unwrap().is_empty());
+		assert_eq!(body["points"].as_array().unwrap().as_slice(), [] as [serde_json::Value; 0]);
 	}
 
 	#[tokio::test]
@@ -1457,7 +1662,7 @@ mod tests {
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["total"], 5);
 		assert_eq!(body["count"], 0);
-		assert!(body["points"].as_array().unwrap().is_empty());
+		assert_eq!(body["points"].as_array().unwrap().as_slice(), [] as [serde_json::Value; 0]);
 	}
 
 	#[tokio::test]
@@ -1469,8 +1674,10 @@ mod tests {
 		assert_eq!(body["total"], 5);
 		assert_eq!(body["count"], 5);
 		assert_eq!(body["offset"], 0);
-		// Unbounded read omits the `limit`/`page` echoes.
-		assert!(body.get("limit").is_none());
+		// ROB-12: a read that names no page size is a paged read at the default page,
+		// so `limit` reports the page that was applied; a read that named no `page`
+		// still omits the `page` echo.
+		assert_eq!(body["limit"], 10_000, "the applied page is reported even when it was not asked for");
 		assert!(body.get("page").is_none());
 	}
 
@@ -1538,7 +1745,9 @@ mod tests {
 		assert_eq!(body["offset"], 0);
 		assert_eq!(body["count"], 5);
 		assert_eq!(body["page"], 5);
-		assert!(body.get("limit").is_none());
+		// ROB-12: `page` without a page size takes the default page, and that page is
+		// what `limit` now reports.
+		assert_eq!(body["limit"], 10_000, "a `page` with no page size still gets the default page");
 	}
 
 	#[tokio::test]
@@ -1940,5 +2149,200 @@ mod tests {
 			let text = String::from_utf8(log.0.lock().expect("log buffer").clone()).expect("utf-8 log");
 			assert!(text.lines().any(|line| line.contains(span) && line.contains(&format!("format=\"{format}\""))), "{uri} closed no `{span}` span for format `{format}`:\n{text}");
 		}
+	}
+
+	// ── TAG-10: `tag.<k>=v` selectors on the stored reads ─────────────────────────────
+
+	/// `price` with the untagged rows of [`sealed_price_store`] (100..=140) plus three
+	/// tagged series: `{host=a}` at 200 and 210, `{host=a, region=eu}` at 300, and
+	/// `{host=b}` at 400.
+	async fn router_with_tagged_price() -> (TempDir, axum::Router) {
+		let dir = TempDir::new().expect("temp dir");
+		let store = sealed_price_store(&dir).await;
+		let series: [(&[(&str, &str)], &[(i64, &str)]); 3] = [(&[("host", "a")], &[(200, "7"), (210, "8")]), (&[("host", "a"), ("region", "eu")], &[(300, "9")]), (&[("host", "b")], &[(400, "10")])];
+		for (n, (tags, rows)) in series.into_iter().enumerate() {
+			let groups = weftdb::TagSet::from_pairs(tags.iter().copied()).expect("valid tags");
+			let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = rows.iter().map(|(t, v)| (*t, bd(v))).unzip();
+			store.ingest("price", &weftdb::IngestBatch::dense(format!("tagged-{n}"), ts, vs).with_groups(groups)).await.expect("ingests a tagged batch");
+		}
+		(dir, app_with_state(AppState::new().with_store(store)))
+	}
+
+	/// GET `uri` and parse the body as JSON.
+	async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+		let response = router.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+	}
+
+	/// The timestamps of a JSON points body.
+	fn timestamps_of(body: &serde_json::Value) -> Vec<i64> {
+		body["points"].as_array().expect("a points array").iter().map(|p| p["timestamp"].as_i64().expect("an integer timestamp")).collect()
+	}
+
+	#[tokio::test]
+	async fn a_tag_query_reads_only_that_series() {
+		let (_dir, router) = router_with_tagged_price().await;
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tag.host=a").await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+		assert_eq!(timestamps_of(&body), vec![200, 210], "exact by default: {{host=a, region=eu}} is not read");
+		assert_eq!(body["tags"], serde_json::json!({ "host": "a" }));
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tag.region=eu&tag.host=a").await;
+		assert_eq!((timestamps_of(&body), &body["tags"]), (vec![300], &serde_json::json!({ "host": "a", "region": "eu" })));
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/value-points?lo=0&hi=100&tag.host=b").await;
+		assert_eq!(timestamps_of(&body), vec![400]);
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/at?t=210&tag.host=a").await;
+		assert_eq!((&body["value"], &body["found"], &body["tags"]), (&serde_json::json!("8"), &serde_json::json!(true), &serde_json::json!({ "host": "a" })));
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/at?t=110&tag.host=a").await;
+		assert_eq!(body["found"], false, "series 0's row is not the tagged series' row");
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/at-multi?t=110,200,400&tag.host=a").await;
+		assert_eq!(body["points"].as_array().unwrap().iter().map(|p| p["found"].as_bool().unwrap()).collect::<Vec<_>>(), vec![false, true, false]);
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/downsample?resolution=seconds&agg=sum&tag.host=a").await;
+		assert_eq!((&body["input_points"], &body["tags"]), (&serde_json::json!(2), &serde_json::json!({ "host": "a" })), "{body}");
+		// POST takes the same selector as GET.
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/downsample?resolution=seconds&agg=sum&tag.host=a").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!((&body["input_points"], &body["tags"]), (&serde_json::json!(2), &serde_json::json!({ "host": "a" })), "{body}");
+	}
+
+	#[tokio::test]
+	async fn a_tag_query_reads_only_that_series_in_arrow_parquet_and_csv() {
+		use weft_arrow::read_parquet;
+		let (_dir, router) = router_with_tagged_price().await;
+		for uri in ["/api/v1/storage/price/range?start=0&end=1000&tag.host=a", "/api/v1/storage/price/value-range?lo=0&hi=100&tag.host=a"] {
+			let response = router.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{uri}");
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			let (ts, vs) = record_batches_to_columns(&read_ipc_stream(&bytes).expect("reads stream")).expect("columns");
+			assert_eq!((ts, vs), (vec![200, 210], vec![Some(bd("7")), Some(bd("8"))]), "{uri}");
+		}
+		for uri in ["/api/v1/storage/price/range.parquet?start=0&end=1000&tag.host=a", "/api/v1/storage/price/value-range.parquet?lo=0&hi=100&tag.host=a"] {
+			let response = router.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{uri}");
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			let (ts, _) = record_batches_to_columns(&read_parquet(&bytes).expect("reads parquet")).expect("columns");
+			assert_eq!(ts, vec![200, 210], "{uri}");
+		}
+		let (status, _, body) = get_text(router.clone(), "/api/v1/storage/price/range.csv?start=0&end=1000&tag.host=a").await;
+		assert_eq!((status, body.as_str()), (StatusCode::OK, "timestamp,value\n200,7\n210,8\n"));
+		let (_, _, body) = get_text(router.clone(), "/api/v1/storage/price/value-range.csv?lo=0&hi=100&tag.host=b").await;
+		assert_eq!(body, "timestamp,value\n400,10\n");
+		let (status, _, body) = get_text(router, "/api/v1/storage/price/downsample.csv?resolution=seconds&agg=sum&tag.host=a").await;
+		assert_eq!((status, body.lines().count()), (StatusCode::OK, 3), "a header and two buckets: {body}");
+	}
+
+	#[tokio::test]
+	async fn no_tag_query_reads_series_zero() {
+		let (_dir, router) = router_with_tagged_price().await;
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(timestamps_of(&body), vec![100, 110, 120, 130, 140], "tagged rows never reach an untagged read");
+		assert_eq!(body["tags"], serde_json::json!({}));
+		let (_, _, csv) = get_text(router.clone(), "/api/v1/storage/price/range.csv?start=0&end=1000").await;
+		assert_eq!(csv.lines().count(), 6);
+		// `tag_match=exact` with no `tag.*` parameter is the same untagged read.
+		let (_, body) = get_json(router, "/api/v1/storage/price/points?start=0&end=1000&tag_match=exact").await;
+		assert_eq!(timestamps_of(&body), vec![100, 110, 120, 130, 140]);
+	}
+
+	#[tokio::test]
+	async fn tag_subset_with_two_matches_is_ambiguous_series() {
+		let (_dir, router) = router_with_tagged_price().await;
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tag.host=a&tag_match=subset").await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("ambiguous_series")), "{body}");
+		// An absent matcher (`tag.region=`) narrows the subset to one series.
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tag.host=a&tag.region=&tag_match=subset").await;
+		assert_eq!((status, timestamps_of(&body)), (StatusCode::OK, vec![200, 210]), "{body}");
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tag.region=eu&tag_match=subset").await;
+		assert_eq!((timestamps_of(&body), &body["tags"]), (vec![300], &serde_json::json!({ "host": "a", "region": "eu" })));
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=0&end=1000&tag_match=fuzzy").await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("bad_request")), "{body}");
+	}
+
+	#[tokio::test]
+	async fn an_unmatched_selector_reads_empty() {
+		let (_dir, router) = router_with_tagged_price().await;
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tag.host=zzz").await;
+		assert_eq!((status, &body["count"], &body["tags"]), (StatusCode::OK, &serde_json::json!(0), &serde_json::Value::Null), "{body}");
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/at-multi?t=200,210&tag.host=zzz").await;
+		assert_eq!(body["points"].as_array().unwrap().len(), 2);
+		let (_, body) = get_json(router.clone(), "/api/v1/storage/price/downsample?resolution=seconds&tag.host=zzz").await;
+		assert_eq!((&body["buckets"], &body["tags"]), (&serde_json::json!(0), &serde_json::Value::Null), "{body}");
+		// A fill over given bounds synthesises no grid for a selector that matched nothing.
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/downsample?resolution=seconds&fill=0&start=0&end=1000&tag.host=zzz").await;
+		assert_eq!((status, &body["buckets"], &body["tags"]), (StatusCode::OK, &serde_json::json!(0), &serde_json::Value::Null), "{body}");
+		for uri in ["/api/v1/storage/price/range?start=0&end=1000&tag.host=zzz", "/api/v1/storage/price/value-range?lo=0&hi=100&tag.host=zzz"] {
+			let response = router.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{uri}");
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			assert_eq!(record_batches_to_columns(&read_ipc_stream(&bytes).expect("reads stream")).expect("columns").0, Vec::<i64>::new(), "{uri}");
+		}
+		for uri in ["/api/v1/storage/price/range.parquet?start=0&end=1000&tag.host=zzz", "/api/v1/storage/price/value-range.parquet?lo=0&hi=100&tag.host=zzz"] {
+			let response = router.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+			assert_eq!(response.status(), StatusCode::OK, "{uri}");
+			let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+			assert_eq!(record_batches_to_columns(&weft_arrow::read_parquet(&bytes).expect("reads parquet")).expect("columns").0, Vec::<i64>::new(), "{uri}");
+		}
+		for uri in ["/api/v1/storage/price/range.csv?start=0&end=1000&tag.host=zzz", "/api/v1/storage/price/value-range.csv?lo=0&hi=100&tag.host=zzz"] {
+			let (status, _, body) = get_text(router.clone(), uri).await;
+			assert_eq!((status, body.as_str()), (StatusCode::OK, "timestamp,value\n"), "{uri}");
+		}
+		// An undeclared aspect stays a 404 whatever the selector.
+		let (status, _) = get_json(router, "/api/v1/storage/never_declared/points?start=0&end=1&tag.host=a").await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+	}
+
+	#[tokio::test]
+	async fn an_invalid_tag_key_is_invalid_tag() {
+		let (_dir, router) = router_with_tagged_price().await;
+		for (query, key) in [("tag.9host=a", "9host"), ("tag.__sys=a", "__sys"), ("tag.host=a%01b", "host"), ("tag.=a", "")] {
+			let (status, body) = get_json(router.clone(), &format!("/api/v1/storage/price/points?start=0&end=1000&{query}")).await;
+			assert_eq!((status, &body["code"], &body["details"]["tag"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag"), &serde_json::json!(key)), "{query}: {body}");
+		}
+		let matchers: Vec<String> = (0..=weftdb::tags::MAX_TAGS).map(|n| format!("tag.k{n}=v")).collect();
+		let (status, body) = get_json(router, &format!("/api/v1/storage/price/points?start=0&end=1000&{}", matchers.join("&"))).await;
+		assert_eq!((status, &body["code"], &body["details"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag"), &serde_json::json!({ "count": weftdb::tags::MAX_TAGS + 1, "limit": weftdb::tags::MAX_TAGS })), "{body}");
+	}
+
+	#[tokio::test]
+	async fn a_repeated_tag_param_is_invalid_tag() {
+		let (_dir, router) = router_with_tagged_price().await;
+		for query in ["tag.host=a&tag.host=b", "tag.host=a&tag.host=", "tag.host=a&tag%2Ehost=a"] {
+			let (status, body) = get_json(router.clone(), &format!("/api/v1/storage/price/points?start=0&end=1000&{query}")).await;
+			assert_eq!((status, &body["code"], &body["details"]["tag"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag"), &serde_json::json!("host")), "{query}: {body}");
+		}
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=0&end=1000&tag_match=subset&tag_match=exact").await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("bad_request")));
+	}
+
+	#[tokio::test]
+	async fn a_percent_encoded_tag_param_is_decoded() {
+		let (_dir, router) = router_with_tagged_price().await;
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=0&end=1000&tag%2Ehost=%61").await;
+		assert_eq!((status, timestamps_of(&body)), (StatusCode::OK, vec![200, 210]), "{body}");
+	}
+
+	#[tokio::test]
+	async fn an_unknown_non_tag_param_is_still_bad_request() {
+		let (_dir, router) = router_with_tagged_price().await;
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tag.host=a&strat=1").await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("bad_request")), "{body}");
+		assert!(body["error"].as_str().unwrap().contains("unknown field `strat`"), "{body}");
+		// `tags.host` is not the `tag.` prefix: it is an unknown parameter, not a matcher.
+		let (status, _) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tags.host=a").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?end=1000&tag.host=a").await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("bad_request")), "a missing `start` is still refused: {body}");
+	}
+
+	#[tokio::test]
+	async fn tag_api_key_is_not_a_credential_param() {
+		let (_dir, router) = router_with_tagged_price().await;
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/points?start=0&end=1000&tag.api_key=a").await;
+		assert_eq!((status, &body["tags"]), (StatusCode::OK, &serde_json::Value::Null), "a tag named `api_key` is a matcher, not a credential: {body}");
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=0&end=1000&api_key=a").await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("credentials_in_query")), "{body}");
 	}
 }

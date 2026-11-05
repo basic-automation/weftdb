@@ -140,7 +140,6 @@ impl RangeFetchProfile {
 		let values: Vec<BigDecimal> = (0..n).map(|i| format!("10000000.{:02}", i % 97).parse().expect("literal decimal parses")).collect();
 		let timestamps: Vec<i64> = if self.regular {
 			// `n` is a row count (never near `i64::MAX`), so the index cast cannot wrap.
-			#[allow(clippy::cast_possible_wrap)]
 			(0..n as i64).map(|i| EPOCH_ANCHOR_MS + i * REGULAR_STRIDE_MS).collect()
 		} else {
 			let mut rng = ChaCha8Rng::seed_from_u64(self.seed ^ 0x_1F0E_2D3C_4B5A_6978);
@@ -181,9 +180,8 @@ impl RangeFetchProfile {
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
-#[allow(clippy::cast_possible_truncation)]
 fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 /// Fetch every window in `windows` against `bytes`, returning the per-window
@@ -280,16 +278,14 @@ pub fn run_range_fetch_on(profile: &RangeFetchProfile, timestamps: &[i64], value
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	// Throughput is rows fetched per second (a "point" here is one materialized row).
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		#[allow(clippy::cast_precision_loss)]
 		let secs = latency.mean_ns as f64 / 1e9;
-		#[allow(clippy::cast_precision_loss)]
 		let points = rows_fetched as f64;
 		points / secs
 	} else {
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_RANGE_FETCH.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: rows_fetched, irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_RANGE_FETCH.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: rows_fetched, irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction: 0.0, seed: profile.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
 }
 
 /// The digest of every window's rows, each row keyed by its window and timestamp.

@@ -14,6 +14,24 @@
 //! [`MAX_INTERPOLATE_POINTS_ENV`]. A larger grid is a `400`, refused before anything is
 //! allocated.
 //!
+//! ## GPU configuration, provenance and metrics (ROB-16)
+//!
+//! The compute backend is operator configuration, not a hardcoded default:
+//! [`GPU_BACKEND_ENV`] (`WEFT_GPU_BACKEND`) selects `auto` (the default — splimes
+//! chooses per grid size, using the thresholds the startup calibration in
+//! [`crate::gpu`] measures), `cpu`, `parallel` or `gpu` (an explicit GPU request
+//! surfaces GPU failures as errors instead of falling back). The same
+//! [`InterpolateConfig`] output cap also bounds the downsample endpoints' gap-fill
+//! grids, so one compute limit governs every grid a client can size.
+//!
+//! Every response carries its provenance: each point's `kind` is the open
+//! [`weftdb::ValueKind`] vocabulary (the wire tokens are the ones splimes'
+//! `PointKind` already sent — `raw` / `interpolated` / `extrapolated`), and the
+//! envelope names the `backend` that actually produced the values plus whether
+//! `auto` tried the GPU and fell back (`gpu_fallback`). The handlers feed the same
+//! facts to [`SharedMetrics`], which exports per-kind output-point counters and
+//! per-backend request counters on `/metrics`.
+//!
 //! ## Numeric boundary (deliberate, documented)
 //!
 //! The wire DTOs carry values as JSON `f64`. WeftDB's logical/API numeric type is
@@ -22,23 +40,51 @@
 //! convenience for this slice, not a precision decision. Schema-declared physical
 //! encodings (Phase 4) replace this with explicit, lossless-by-default types — at
 //! which point this endpoint gains a precision-preserving value representation.
+//!
+//! ## The `f64` engine path (roadmap Phase 5)
+//!
+//! Every range output this module serves — JSON, CSV, Arrow and Parquet, from the JSON
+//! body and from line protocol alike — carries the value as an `f64`, so none of them
+//! needs the exact `BigDecimal` series. They run splimes' `run_f64`, which computes the
+//! same `f64` kernel values but skips building one `BigDecimal` per output point (the
+//! shortest-decimal formatting) and narrowing it straight back, by far the largest
+//! per-point cost of the old path. Decided per format: no format here is exact, so all
+//! four take it; a future lossless format (Storage v2 physical types) would take
+//! `run` and keep the `BigDecimal`s. `/interpolate/point` still runs `run`: it produces
+//! one value, so there is nothing to save.
+//!
+//! The wire values are bit-identical to the `BigDecimal` path's for values of
+//! magnitude below `2^53` (about `9.0e15`; a differential test over `1e-19..1e15` pins
+//! it): an interpolated `f64` became its shortest round-trip decimal and that decimal
+//! narrowed back to the same `f64`, a raw sample came back as the `f64` it was sent
+//! as, and a negative zero became `0` (which [`wire_f64`] keeps). Above that the old
+//! answer could be the artefact: once a value's shortest decimal has an integer part
+//! wider than `2^53`, `BigDecimal::to_f64` can round twice and land one ulp off the
+//! kernel's value (observed at about `2.0e19`: `...146e19` computed, `...142e19`
+//! served), which this path returns as computed; and a value near `f64::MAX` that the
+//! old narrowing could overflow into a `not_finite` refusal is now returned, since it
+//! is finite. Both are documented wire changes, one ulp at most, only at those
+//! magnitudes.
 
 use std::num::NonZeroUsize;
 
 use axum::{
 	extract::State, http::header, response::{IntoResponse, Response}, Json
 };
-use bigdecimal::{BigDecimal, FromPrimitive};
+use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-/// Provenance of a reconstructed value: `raw` (the grid point coincides with an input
+/// The engine's own provenance type: `raw` (the grid point coincides with an input
 /// observation), `interpolated` (strictly inside the observed span) or `extrapolated`
-/// (outside it). splimes reports it for every output point, serialised as those
-/// lowercase tokens.
+/// (outside it). Splimes reports it for every output point; the wire carries the
+/// open [`ValueKind`] vocabulary instead (identical tokens today), so a future
+/// kind cannot break a client the way a new variant of this closed enum would.
+/// Retained as a re-export for callers that drive splimes directly.
 pub use splimes::PointKind;
-use splimes::{Interpolator, Point, Resolution, Spline};
+use splimes::{Backend, Interpolator, Point, Resolution, Spline};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
+use weftdb::ValueKind;
 
 use crate::{
 	downsample::wire_value, error::{ApiError, Code, StrictJson, StrictQuery}, metrics::SharedMetrics
@@ -50,7 +96,8 @@ use crate::{
 pub struct InputPoint {
 	/// Sample timestamp (RFC 3339).
 	pub timestamp: DateTime<Utc>,
-	/// Sample value. Widened to `BigDecimal` before the engine sees it.
+	/// Sample value. Widened to `BigDecimal` (the shortest decimal that round-trips to
+	/// it, `crate::downsample::widen_json_value`) before the engine sees it.
 	pub value: f64,
 }
 
@@ -59,13 +106,14 @@ pub struct InputPoint {
 pub struct OutputPoint {
 	/// Output-grid timestamp.
 	pub timestamp: DateTime<Utc>,
-	/// Interpolated value (narrowed from the engine's `BigDecimal`; a value with
-	/// no finite `f64` representation fails the request — no silent narrowing).
+	/// Interpolated value (the engine's `f64`; a value that is not finite fails the
+	/// request with `not_finite` — no silent substitute).
 	pub value: f64,
-	/// Provenance of this value: `raw` (the grid point coincides with an input
-	/// observation), `interpolated` (within the observed span), or `extrapolated`
-	/// (outside it).
-	pub kind: PointKind,
+	/// Provenance of this value, in the open [`ValueKind`] vocabulary: `raw`
+	/// (the grid point coincides with an input observation), `interpolated`
+	/// (within the observed span), or `extrapolated` (outside it). The wire
+	/// tokens are unchanged from the splimes kinds they replace.
+	pub kind: ValueKind,
 }
 
 /// The default for the most output points one interpolation request may produce
@@ -82,6 +130,10 @@ pub const MAX_INTERPOLATE_OUTPUT_POINTS: usize = 10_000_000;
 /// integer, read once at startup. Unset means [`MAX_INTERPOLATE_OUTPUT_POINTS`].
 pub const MAX_INTERPOLATE_POINTS_ENV: &str = "WEFT_MAX_INTERPOLATE_POINTS";
 
+/// Environment variable that sets the compute backend ([`InterpolateConfig::backend`]):
+/// `auto`, `cpu`, `parallel` or `gpu`, read once at startup. Unset means `auto`.
+pub const GPU_BACKEND_ENV: &str = "WEFT_GPU_BACKEND";
+
 /// The interpolation settings every `/api/v1/interpolate*` handler applies.
 ///
 /// Read once at startup ([`InterpolateConfig::from_env_value`]) and held in
@@ -90,16 +142,55 @@ pub const MAX_INTERPOLATE_POINTS_ENV: &str = "WEFT_MAX_INTERPOLATE_POINTS";
 pub struct InterpolateConfig {
 	/// The most output points one request may produce.
 	max_output_points: NonZeroUsize,
+	/// The compute backend every interpolation runs on.
+	backend: Backend,
 }
 
 impl InterpolateConfig {
-	/// The defaults: at most [`MAX_INTERPOLATE_OUTPUT_POINTS`] output points per request.
-	pub const DEFAULT: Self = Self { max_output_points: NonZeroUsize::new(MAX_INTERPOLATE_OUTPUT_POINTS).expect("the default cap is positive") };
+	/// The defaults: at most [`MAX_INTERPOLATE_OUTPUT_POINTS`] output points per
+	/// request, on [`Backend::Auto`].
+	pub const DEFAULT: Self = Self { max_output_points: NonZeroUsize::new(MAX_INTERPOLATE_OUTPUT_POINTS).expect("the default cap is positive"), backend: Backend::Auto };
 
-	/// Settings that allow at most `max_output_points` output points per request.
+	/// Settings that allow at most `max_output_points` output points per request,
+	/// on [`Backend::Auto`].
 	#[must_use]
 	pub const fn new(max_output_points: NonZeroUsize) -> Self {
-		Self { max_output_points }
+		Self { max_output_points, backend: Backend::Auto }
+	}
+
+	/// These settings with the compute backend every interpolation runs on.
+	#[must_use]
+	pub const fn with_backend(mut self, backend: Backend) -> Self {
+		self.backend = backend;
+		self
+	}
+
+	/// These settings with the backend named by a value of [`GPU_BACKEND_ENV`]
+	/// (`None` when it is unset, which keeps the current backend).
+	///
+	/// # Errors
+	///
+	/// A message naming the variable when the value is none of `auto`, `cpu`,
+	/// `parallel` or `gpu` (case and surrounding whitespace are ignored), so a
+	/// malformed setting fails startup instead of silently falling back to
+	/// `auto` — a typo that quietly moved every reconstruction off the GPU
+	/// would otherwise look exactly like a slow machine.
+	pub fn with_backend_from_env_value(self, value: Option<&str>) -> Result<Self, String> {
+		let Some(raw) = value else { return Ok(self) };
+		let backend = match raw.trim().to_ascii_lowercase().as_str() {
+			"auto" => Backend::Auto,
+			"cpu" => Backend::Cpu,
+			"parallel" => Backend::Parallel,
+			"gpu" => Backend::Gpu,
+			_ => return Err(format!("{GPU_BACKEND_ENV}={raw:?} is not a compute backend: use auto, cpu, parallel or gpu")),
+		};
+		Ok(self.with_backend(backend))
+	}
+
+	/// The compute backend every interpolation runs on.
+	#[must_use]
+	pub const fn backend(self) -> Backend {
+		self.backend
 	}
 
 	/// The settings for a value of [`MAX_INTERPOLATE_POINTS_ENV`] (`None` when it is
@@ -121,10 +212,10 @@ impl InterpolateConfig {
 	}
 
 	/// The interpolator every endpoint here runs: `spline` onto a `resolution` grid on
-	/// the default `Backend::Auto`, refusing grids above
+	/// the configured [`backend`](Self::backend), refusing grids above
 	/// [`max_output_points`](Self::max_output_points).
-	const fn interpolator(self, spline: Spline, resolution: Resolution) -> Interpolator {
-		Interpolator::new(spline, resolution).max_points(self.max_output_points())
+	pub(crate) const fn interpolator(self, spline: Spline, resolution: Resolution) -> Interpolator {
+		Interpolator::new(spline, resolution).backend(self.backend).max_points(self.max_output_points())
 	}
 }
 
@@ -248,6 +339,15 @@ pub struct InterpolateResponse {
 	pub input_points: usize,
 	/// Number of interpolated samples produced.
 	pub output_points: usize,
+	/// The compute backend that actually produced the values: `cpu`, `parallel`
+	/// or `gpu` (never the configured `auto` — the one that ran). The GPU
+	/// provenance lane (ROB-16): a value's `kind` says how it was derived, this
+	/// says what derived it.
+	pub backend: String,
+	/// Whether the configured `auto` backend tried the GPU for this request and
+	/// fell back to the CPU pool when it failed. Always `false` on an explicit
+	/// backend: `gpu` surfaces its failures as errors instead.
+	pub gpu_fallback: bool,
 	/// The interpolated series on the output grid.
 	pub points: Vec<OutputPoint>,
 }
@@ -258,7 +358,7 @@ pub struct InterpolateResponse {
 /// else is a `500`. `config` supplies the cap that an oversized grid's message names, and the
 /// `limit` the envelope carries with it so a client can size its next request without parsing
 /// the sentence.
-fn engine_error(err: &splimes::Error, config: InterpolateConfig) -> ApiError {
+pub(crate) fn engine_error(err: &splimes::Error, config: InterpolateConfig) -> ApiError {
 	use splimes::Error as E;
 	match err {
 		E::OutputTooLarge { points } => ApiError::new(Code::ResultTooLarge, format!("the output grid would have {points} points, more than the {} one request may produce; narrow `start`..`end` or use a coarser `resolution`", config.max_output_points())).with_limit(config.max_output_points() as u64),
@@ -298,38 +398,50 @@ pub async fn interpolate(State(metrics): State<SharedMetrics>, State(config): St
 }
 
 /// Update the interpolation counters from a finished request's outcome, so both
-/// the JSON and ILP handlers account identically.
+/// the JSON and ILP handlers account identically. A success also records its
+/// provenance — the backend that ran and the per-kind output counts — so
+/// `/metrics` can answer "how much of what we served was GPU work, and how
+/// much of it was reconstructed rather than raw" (ROB-16).
 fn record_outcome(metrics: &SharedMetrics, result: &Result<Json<InterpolateResponse>, ApiError>) {
 	match result {
-		Ok(response) => metrics.add_output_points(response.0.output_points as u64),
+		Ok(response) => {
+			metrics.add_output_points(response.0.output_points as u64);
+			metrics.record_interpolate_output(&response.0.backend, response.0.gpu_fallback, response.0.points.iter().map(|point| &point.kind));
+		}
 		Err(_) => metrics.record_interpolate_error(),
 	}
 }
 
-/// The core JSON-request handling: validate, lift to `BigDecimal` points, derive
-/// the range, then delegate to [`run_interpolation`].
+/// The core JSON-request handling: validate, split the samples into the timestamp and
+/// `f64` value columns the engine's `f64` path takes, derive the range, then delegate
+/// to [`run_interpolation`].
 async fn interpolate_inner(request: InterpolateRequest, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("`points` must not be empty"));
 	}
 
 	let input_points = request.points.len();
-	// `interpolate.parse` child span (roadmap Phase 3): the f64 → `BigDecimal` value
-	// lift of every input sample, timed apart from the engine call so a `RUST_LOG` run
-	// attributes value-conversion cost separately from the kernel.
-	let mut points: Vec<Point> = Vec::with_capacity(input_points);
+	// `interpolate.parse` child span (roadmap Phase 3): the split of every input sample
+	// into the engine's timestamp and value columns, timed apart from the engine call so
+	// a `RUST_LOG` run attributes input shaping separately from the kernel. The value
+	// stays the `f64` it arrived as (the `f64` engine path, see the module docs).
+	let mut timestamps: Vec<DateTime<Utc>> = Vec::with_capacity(input_points);
+	let mut values: Vec<f64> = Vec::with_capacity(input_points);
 	{
 		let _parse = tracing::info_span!("interpolate.parse", input_points).entered();
 		for sample in &request.points {
-			let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))?;
-			points.push(Point::new(sample.timestamp, value));
+			if !sample.value.is_finite() {
+				return Err(ApiError::bad_request("a point value is not a finite number"));
+			}
+			timestamps.push(sample.timestamp);
+			values.push(sample.value);
 		}
 	}
 
-	let start = request.start.unwrap_or_else(|| points.iter().map(|p| p.timestamp).min().unwrap_or_else(Utc::now));
-	let end = request.end.unwrap_or_else(|| points.iter().map(|p| p.timestamp).max().unwrap_or_else(Utc::now));
+	let start = request.start.unwrap_or_else(|| timestamps.iter().copied().min().unwrap_or_else(Utc::now));
+	let end = request.end.unwrap_or_else(|| timestamps.iter().copied().max().unwrap_or_else(Utc::now));
 
-	run_interpolation(points, start, end, request.spline.into(), request.resolution.into(), input_points, config).await
+	run_interpolation(timestamps, values, start, end, request.spline.into(), request.resolution.into(), input_points, config).await
 }
 
 /// Run the engine over a prepared point set and shape the response. Shared by
@@ -341,11 +453,15 @@ async fn interpolate_inner(request: InterpolateRequest, config: InterpolateConfi
 /// (`effective_spline`, which the response reports), so a `RUST_LOG`-enabled run
 /// attributes the dominant compute cost of an interpolate request to the engine call.
 /// Decomposed into `interpolate.compute` (the spline kernel) and
-/// `interpolate.serialize` (the `BigDecimal` → wire-f64 + provenance shaping) child
-/// spans; the f64 → `BigDecimal` input lift is timed by the sibling `interpolate.parse`
-/// span in [`interpolate_inner`].
+/// `interpolate.serialize` (the wire-f64 + provenance shaping) child spans; the input
+/// column split is timed by the sibling `interpolate.parse` span in
+/// [`interpolate_inner`].
+///
+/// Runs splimes' `f64` path (`run_f64`): every output format these results feed carries
+/// an `f64`, so no per-point `BigDecimal` is built (see the module docs).
 #[tracing::instrument(name = "interpolate.engine", skip_all, fields(input_points = input_points, spline = %spline, resolution = ?resolution, effective_spline = tracing::field::Empty, output_points = tracing::field::Empty))]
-async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
+#[allow(clippy::too_many_arguments)] // the two input columns travel separately, as `run_f64` takes them
+async fn run_interpolation(timestamps: Vec<DateTime<Utc>>, values: Vec<f64>, start: DateTime<Utc>, end: DateTime<Utc>, spline: Spline, resolution: Resolution, input_points: usize, config: InterpolateConfig) -> Result<Json<InterpolateResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`"));
 	}
@@ -356,12 +472,13 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	// itself, on tokio's blocking pool, isolated from the result shaping so the
 	// dominant compute cost is attributable on its own. splimes labels every output
 	// point raw / interpolated / extrapolated as it goes.
-	let output = config.interpolator(spline, resolution).run_async(points, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| engine_error(&err, config))?;
+	let output = config.interpolator(spline, resolution).run_f64_async(timestamps, values, start, end).instrument(tracing::info_span!("interpolate.compute")).await.map_err(|err| engine_error(&err, config))?;
 
-	// `interpolate.serialize` child span (roadmap Phase 3): the `BigDecimal` → wire-f64
-	// conversion of every output grid point, with its provenance — the result-shaping
-	// stage timed apart from the kernel.
-	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, value, kind)| wire_value(value, &format!("the interpolated value at {timestamp}")).map(|wire| OutputPoint { timestamp, value: wire, kind })).collect::<Result<Vec<OutputPoint>, ApiError>>())?;
+	// `interpolate.serialize` child span (roadmap Phase 3): the shaping of every output
+	// grid point into its wire form, with its provenance — the result-shaping stage
+	// timed apart from the kernel. splimes' `f64` path refuses a non-finite value itself
+	// (`NonFiniteResult`, mapped to `not_finite` above), so every value here is finite.
+	let points: Vec<OutputPoint> = tracing::info_span!("interpolate.serialize", output_points = output.len()).in_scope(|| output.iter().map(|(timestamp, &value, kind)| OutputPoint { timestamp, value: wire_f64(value), kind: ValueKind::from(kind) }).collect());
 
 	// The method splimes ran, which is simpler than the requested one when there were
 	// too few distinct input timestamps for it.
@@ -369,7 +486,20 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 	let span = tracing::Span::current();
 	span.record("effective_spline", effective_spline.as_str());
 	span.record("output_points", points.len());
-	Ok(Json(InterpolateResponse { spline: effective_spline, resolution: resolution_label, output_points: points.len(), input_points, points }))
+	Ok(Json(InterpolateResponse { spline: effective_spline, resolution: resolution_label, output_points: points.len(), input_points, backend: output.backend().to_string(), gpu_fallback: output.gpu_fallback().is_some(), points }))
+}
+
+/// The wire form of an engine `f64`: the value itself, except that a negative zero is
+/// sent as `0`.
+///
+/// The `BigDecimal` path this replaced had no signed zero (`-0.0` became the decimal
+/// `0`, which narrows to `0.0`), so a JSON body said `0.0` and a CSV said `0` where
+/// serialising the `f64` as-is would say `-0.0`. Adding `0.0` maps `-0.0` to `0.0`
+/// (IEEE 754 round-to-nearest) and leaves every other value, including `0.0`,
+/// unchanged, so the wire bytes stay what they were.
+#[inline]
+fn wire_f64(value: f64) -> f64 {
+	value + 0.0
 }
 
 /// Render an [`InterpolateResponse`] as a `timestamp,value,kind` CSV document.
@@ -382,9 +512,15 @@ async fn run_interpolation(points: Vec<Point>, start: DateTime<Utc>, end: DateTi
 /// the raw/interpolated/extrapolated provenance token. None of the three columns
 /// can contain a comma, so no field escaping is required.
 fn interpolate_response_to_csv(response: &InterpolateResponse) -> Response {
+	points_to_csv(&response.points)
+}
+
+/// The `timestamp,value,kind` CSV document for a reconstructed series, shared by the compute
+/// endpoints and the stored-range interpolation (`stored_interpolate`).
+pub(crate) fn points_to_csv(points: &[OutputPoint]) -> Response {
 	use std::fmt::Write as _;
 	let mut out = String::from("timestamp,value,kind\n");
-	for point in &response.points {
+	for point in points {
 		let _ = writeln!(out, "{},{},{}", point.timestamp.to_rfc3339(), point.value, point.kind.as_str());
 	}
 	([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response()
@@ -403,11 +539,11 @@ const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 ///
 /// Kept private and primitive-typed so no `arrow-*` type appears in this module's
 /// signatures — all Arrow knowledge stays inside `weft-arrow`.
-fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<&'static str>) {
-	let mut timestamps = Vec::with_capacity(response.points.len());
-	let mut values = Vec::with_capacity(response.points.len());
-	let mut kinds = Vec::with_capacity(response.points.len());
-	for point in &response.points {
+fn points_columns(points: &[OutputPoint]) -> (Vec<i64>, Vec<f64>, Vec<&str>) {
+	let mut timestamps = Vec::with_capacity(points.len());
+	let mut values = Vec::with_capacity(points.len());
+	let mut kinds = Vec::with_capacity(points.len());
+	for point in points {
 		timestamps.push(point.timestamp.timestamp_nanos_opt().unwrap_or_default());
 		values.push(point.value);
 		kinds.push(point.kind.as_str());
@@ -426,7 +562,17 @@ fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<
 ///
 /// Returns `internal` (`500`) if the Arrow encoding fails.
 fn interpolate_response_to_arrow(response: &InterpolateResponse) -> Result<Response, ApiError> {
-	let (timestamps, values, kinds) = response_columns(response);
+	points_to_arrow(&response.points)
+}
+
+/// The Arrow IPC stream for a reconstructed series (see [`interpolate_response_to_arrow`]),
+/// shared with the stored-range interpolation.
+///
+/// # Errors
+///
+/// Returns `internal` (`500`) if the Arrow encoding fails.
+pub(crate) fn points_to_arrow(points: &[OutputPoint]) -> Result<Response, ApiError> {
+	let (timestamps, values, kinds) = points_columns(points);
 	let bytes = weft_arrow::reconstructed_series_to_ipc_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
 	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
 }
@@ -439,7 +585,17 @@ fn interpolate_response_to_arrow(response: &InterpolateResponse) -> Result<Respo
 ///
 /// Returns `internal` (`500`) if the Parquet encoding fails.
 fn interpolate_response_to_parquet(response: &InterpolateResponse) -> Result<Response, ApiError> {
-	let (timestamps, values, kinds) = response_columns(response);
+	points_to_parquet(&response.points)
+}
+
+/// The Parquet file for a reconstructed series (see [`interpolate_response_to_parquet`]),
+/// shared with the stored-range interpolation.
+///
+/// # Errors
+///
+/// Returns `internal` (`500`) if the Parquet encoding fails.
+pub(crate) fn points_to_parquet(points: &[OutputPoint]) -> Result<Response, ApiError> {
+	let (timestamps, values, kinds) = points_columns(points);
 	let bytes = weft_arrow::reconstructed_series_to_parquet_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
 	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
 }
@@ -536,9 +692,16 @@ pub struct PointResponse {
 	/// The reconstructed value at the instant (narrowed from `BigDecimal`; a value
 	/// with no finite `f64` representation fails the request).
 	pub value: f64,
-	/// Whether the value is raw (coincides with an input), interpolated
-	/// (in-range), or extrapolated (out-of-range).
-	pub kind: PointKind,
+	/// The value's provenance, in the open [`ValueKind`] vocabulary: raw
+	/// (coincides with an input), interpolated (in-range), or extrapolated
+	/// (out-of-range).
+	pub kind: ValueKind,
+	/// The compute backend that actually produced the value: `cpu`, `parallel`
+	/// or `gpu`.
+	pub backend: String,
+	/// Whether the configured `auto` backend tried the GPU for this request and
+	/// fell back to the CPU pool when it failed.
+	pub gpu_fallback: bool,
 }
 
 /// Handle `POST /api/v1/interpolate/point`: evaluate the reconstructed signal at
@@ -553,7 +716,10 @@ pub async fn interpolate_point(State(metrics): State<SharedMetrics>, State(confi
 	metrics.record_interpolate_request();
 	let result = interpolate_point_inner(request, config).await;
 	match &result {
-		Ok(_) => metrics.add_output_points(1),
+		Ok(response) => {
+			metrics.add_output_points(1);
+			metrics.record_interpolate_output(&response.0.backend, response.0.gpu_fallback, std::iter::once(&response.0.kind));
+		}
 		Err(_) => metrics.record_interpolate_error(),
 	}
 	result
@@ -567,7 +733,7 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 
 	let mut points: Vec<Point> = Vec::with_capacity(input.len());
 	for sample in &input {
-		let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))?;
+		let value = crate::downsample::json_point_value(sample.value)?;
 		points.push(Point::new(sample.timestamp, value));
 	}
 
@@ -581,7 +747,7 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 	let (_, value, kind) = output.iter().next().ok_or_else(|| ApiError::internal("interpolation produced no value at the instant"))?;
 
 	// The method splimes ran, which may be simpler than the requested one.
-	Ok(Json(PointResponse { spline: output.spline().to_string(), instant, input_points: input.len(), value: wire_value(value, &format!("the interpolated value at {instant}"))?, kind }))
+	Ok(Json(PointResponse { spline: output.spline().to_string(), instant, input_points: input.len(), value: wire_value(value, &format!("the interpolated value at {instant}"))?, kind: ValueKind::from(kind), backend: output.backend().to_string(), gpu_fallback: output.gpu_fallback().is_some() }))
 }
 
 /// Query parameters for the ILP interpolation endpoint.
@@ -721,8 +887,19 @@ async fn interpolate_ilp_inner(params: &IlpParams, body: &str, config: Interpola
 		return Err(ApiError::bad_request("the line-protocol series spans zero time"));
 	}
 
+	// Into the `f64` engine path's columns. A line-protocol value is a finite `f64`, an
+	// `i64` or a `u64` (`FieldValue::as_big_decimal`), and `BigDecimal::to_f64` gives each
+	// of those its correctly rounded `f64` — the value the `BigDecimal` path fed the
+	// kernel and narrowed a `raw` point back to — so the output is unchanged.
 	let input_points = points.len();
-	run_interpolation(points, start, end, spline, resolution, input_points, config).await
+	let mut timestamps: Vec<DateTime<Utc>> = Vec::with_capacity(input_points);
+	let mut values: Vec<f64> = Vec::with_capacity(input_points);
+	for point in &points {
+		let value = point.value.to_f64().filter(|v| v.is_finite()).ok_or_else(|| ApiError::new(Code::ValueNotRepresentable, format!("the field `{}` value at {} has no finite f64 representation", params.field, point.timestamp)))?;
+		timestamps.push(point.timestamp);
+		values.push(value);
+	}
+	run_interpolation(timestamps, values, start, end, spline, resolution, input_points, config).await
 }
 
 /// Map an optional precision token to [`TimestampPrecision`] (default ns).
@@ -737,7 +914,7 @@ pub(crate) fn parse_precision_token(token: Option<&str>) -> Result<TimestampPrec
 }
 
 /// Map an optional spline token to [`Spline`] (default cubic).
-fn parse_spline_token(token: Option<&str>) -> Result<Spline, ApiError> {
+pub(crate) fn parse_spline_token(token: Option<&str>) -> Result<Spline, ApiError> {
 	match token.map(str::to_ascii_lowercase).as_deref() {
 		Some("linear") => Ok(Spline::Linear),
 		Some("quadratic") => Ok(Spline::Quadratic),
@@ -768,6 +945,7 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
+	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::TimeZone;
 	use tower::ServiceExt;
 
@@ -804,7 +982,7 @@ mod tests {
 		assert_eq!(body["input_points"], 2);
 		assert!(body["output_points"].as_u64().unwrap() >= 2);
 		let pts = body["points"].as_array().unwrap();
-		assert!(!pts.is_empty());
+		assert_ne!(pts.as_slice(), [] as [serde_json::Value; 0]);
 		// Monotonic, in-range values for a linear fill between 0 and 60.
 		for p in pts {
 			let v = p["value"].as_f64().unwrap();
@@ -881,6 +1059,79 @@ mod tests {
 		let (status, body) = post_text("/api/v1/interpolate/ilp?field=load&precision=s&spline=cubic&resolution=seconds", "cpu load=0 0\ncpu load=60 60\n").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["spline"], "Linear");
+	}
+
+	#[test]
+	fn gpu_backend_env_values_parse() {
+		// Unset keeps the current backend (Auto by default); the four tokens map
+		// case-insensitively; anything else is a startup error naming the variable.
+		assert_eq!(InterpolateConfig::DEFAULT.with_backend_from_env_value(None).unwrap().backend(), Backend::Auto);
+		for (token, want) in [("auto", Backend::Auto), ("CPU", Backend::Cpu), (" parallel ", Backend::Parallel), ("gpu", Backend::Gpu)] {
+			assert_eq!(InterpolateConfig::DEFAULT.with_backend_from_env_value(Some(token)).unwrap().backend(), want, "{token:?}");
+		}
+		let err = InterpolateConfig::DEFAULT.with_backend_from_env_value(Some("tpu")).unwrap_err();
+		assert!(err.contains("WEFT_GPU_BACKEND"), "{err}");
+	}
+
+	#[tokio::test]
+	async fn responses_name_the_backend_that_ran() {
+		// ROB-16's GPU provenance lane: with the backend pinned to the CPU, the
+		// envelope says so, and no fallback is reported.
+		let config = InterpolateConfig::DEFAULT.with_backend(Backend::Cpu);
+		let router = crate::app_with_state(crate::AppState::new().with_interpolate_config(config));
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let response = router.clone().oneshot(Request::builder().method("POST").uri("/api/v1/interpolate").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(body["backend"], "cpu", "body: {body}");
+		assert_eq!(body["gpu_fallback"], false, "body: {body}");
+		// The point endpoint reports the same provenance.
+		let body = serde_json::json!({
+			"spline": "linear",
+			"instant": ts(30),
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/interpolate/point").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(body["backend"], "cpu", "body: {body}");
+		assert_eq!(body["kind"], "interpolated", "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn provenance_reaches_the_metrics() {
+		// The same facts the response carries land in the shared metrics:
+		// per-kind output points and a per-backend request count.
+		let metrics = crate::SharedMetrics::default();
+		let router = crate::app_with_metrics(metrics.clone());
+		let body = serde_json::json!({
+			"spline": "linear",
+			"resolution": "seconds",
+			"points": [
+				{ "timestamp": ts(0), "value": 0.0 },
+				{ "timestamp": ts(60), "value": 60.0 },
+			],
+		});
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/interpolate").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let snap = metrics.snapshot();
+		// The two grid endpoints coincide with inputs (raw); the 59 interior
+		// seconds are interpolated; nothing is extrapolated.
+		assert_eq!(snap.interpolate.output_raw_points, 2);
+		assert_eq!(snap.interpolate.output_interpolated_points, 59);
+		assert_eq!(snap.interpolate.output_extrapolated_points, 0);
+		assert_eq!(snap.interpolate.backend_cpu_requests + snap.interpolate.backend_parallel_requests + snap.interpolate.backend_gpu_requests, 1);
+		assert_eq!(snap.interpolate.gpu_fallbacks, 0);
 	}
 
 	#[tokio::test]
@@ -1351,7 +1602,7 @@ mod tests {
 		assert_eq!(batches.len(), 1);
 		let (unit, timestamps, values, kinds) = weft_arrow::reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
 		assert_eq!(unit, weft_physical_type::TimeUnit::Nanos);
-		assert!(!timestamps.is_empty());
+		assert_ne!(timestamps, [] as [i64; 0]);
 		assert_eq!(timestamps.len(), values.len());
 		assert_eq!(timestamps.len(), kinds.len());
 		// First and last grid points coincide with input observations.
@@ -1429,7 +1680,7 @@ mod tests {
 		assert_eq!(&bytes[..4], b"PAR1");
 		let batches = weft_arrow::read_parquet(&bytes).expect("valid parquet");
 		let (_unit, timestamps, _values, kinds) = weft_arrow::reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
-		assert!(!timestamps.is_empty());
+		assert_ne!(timestamps, [] as [i64; 0]);
 		assert_eq!(kinds.first().map(String::as_str), Some("raw"));
 	}
 
@@ -1458,5 +1709,133 @@ mod tests {
 		let (status, body) = post_json("/api/v1/interpolate", body).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
 		assert_eq!(body["code"], "not_finite", "body: {body}");
+	}
+
+	/// The `BigDecimal` path every range endpoint ran before the `f64` engine path:
+	/// widen each sample, run `run`, narrow each output value with [`wire_value`]. Kept
+	/// here only as the reference the differential tests below hold the new path to.
+	async fn legacy_response(request: InterpolateRequest, config: InterpolateConfig) -> Result<InterpolateResponse, ApiError> {
+		let input_points = request.points.len();
+		let points: Vec<Point> = request.points.iter().map(|s| Point::new(s.timestamp, BigDecimal::from_f64(s.value).unwrap())).collect();
+		let start = request.start.unwrap_or_else(|| points.iter().map(|p| p.timestamp).min().unwrap());
+		let end = request.end.unwrap_or_else(|| points.iter().map(|p| p.timestamp).max().unwrap());
+		let spline: Spline = request.spline.into();
+		let resolution: Resolution = request.resolution.into();
+		let output = config.interpolator(spline, resolution).run_async(points, start, end).await.map_err(|err| engine_error(&err, config))?;
+		let points = output.iter().map(|(timestamp, value, kind)| wire_value(value, "the test value").map(|value| OutputPoint { timestamp, value, kind })).collect::<Result<Vec<_>, _>>()?;
+		Ok(InterpolateResponse { spline: output.spline().to_string(), resolution: format!("{resolution:?}"), input_points, output_points: points.len(), points })
+	}
+
+	async fn body_bytes(response: Response) -> Vec<u8> {
+		axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()
+	}
+
+	/// Assert the `f64` path and the legacy `BigDecimal` path give byte-identical JSON,
+	/// CSV, Arrow and Parquet for `request`, or the same error code and message.
+	async fn assert_paths_agree(request: serde_json::Value) {
+		let request: InterpolateRequest = serde_json::from_value(request).unwrap();
+		let config = InterpolateConfig::DEFAULT;
+		let new = interpolate_inner(request.clone(), config).await.map(|json| json.0);
+		let old = legacy_response(request, config).await;
+		match (new, old) {
+			(Ok(new), Ok(old)) => {
+				for (n, o) in new.points.iter().zip(&old.points) {
+					assert_eq!(n.value.to_bits(), o.value.to_bits(), "value at {} ({:?}): f64 path {:e}, BigDecimal path {:e}", n.timestamp, n.kind, n.value, o.value);
+				}
+				assert_eq!(serde_json::to_vec(&new).unwrap(), serde_json::to_vec(&old).unwrap(), "JSON bytes differ");
+				assert_eq!(body_bytes(interpolate_response_to_csv(&new)).await, body_bytes(interpolate_response_to_csv(&old)).await, "CSV bytes differ");
+				assert_eq!(body_bytes(interpolate_response_to_arrow(&new).unwrap()).await, body_bytes(interpolate_response_to_arrow(&old).unwrap()).await, "Arrow bytes differ");
+				assert_eq!(body_bytes(interpolate_response_to_parquet(&new).unwrap()).await, body_bytes(interpolate_response_to_parquet(&old).unwrap()).await, "Parquet bytes differ");
+			}
+			(Err(new), Err(old)) => {
+				assert_eq!(new.code(), old.code());
+				assert_eq!(new.message(), old.message());
+			}
+			(new, old) => panic!("the paths disagree on success: f64 path {:?}, BigDecimal path {:?}", new.map(|r| r.output_points), old.map(|r| r.output_points)),
+		}
+	}
+
+	#[tokio::test]
+	async fn the_f64_path_matches_the_bigdecimal_path_on_every_fixture() {
+		// The request bodies the tests in this module send to the range endpoints.
+		let fixtures = [
+			linear_ramp_body(),
+			serde_json::json!({ "spline": "linear", "resolution": "seconds", "points": [{ "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(60), "value": 60.0 }] }),
+			serde_json::json!({ "resolution": "minutes", "points": [{ "timestamp": ts(0), "value": 1.0 }, { "timestamp": ts(60), "value": 4.0 }, { "timestamp": ts(120), "value": 9.0 }, { "timestamp": ts(180), "value": 16.0 }] }),
+			serde_json::json!({ "spline": "cubic", "resolution": "seconds", "points": [{ "timestamp": ts(0), "value": 1.0 }, { "timestamp": ts(10), "value": 3.0 }, { "timestamp": ts(20), "value": 2.0 }] }),
+			serde_json::json!({ "resolution": "minutes", "points": [{ "timestamp": ts(0), "value": 42.5 }] }),
+			serde_json::json!({ "spline": { "polynomial": { "degree": 2 } }, "resolution": "seconds", "points": [{ "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(10), "value": 1.0 }, { "timestamp": ts(20), "value": 4.0 }] }),
+			serde_json::json!({ "spline": { "polynomial": { "degree": 2, "bounds_factor": 1.5 } }, "resolution": "seconds", "start": ts(-30), "end": ts(50), "points": [{ "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(10), "value": 1.0 }, { "timestamp": ts(20), "value": 4.0 }] }),
+			serde_json::json!({ "spline": "linear", "resolution": "minutes", "start": ts(0), "end": ts(1200), "points": [{ "timestamp": ts(0), "value": 0.0 }, { "timestamp": ts(60), "value": 1e307 }] }),
+			// Signed zeros: the legacy path had none, so neither may the new one.
+			serde_json::json!({ "spline": "linear", "resolution": "seconds", "start": ts(-20), "end": ts(80), "points": [{ "timestamp": ts(0), "value": -0.0 }, { "timestamp": ts(30), "value": -0.0 }, { "timestamp": ts(60), "value": 1.0 }] }),
+			// Cubic holds its edge values when extrapolating.
+			serde_json::json!({ "spline": "cubic", "resolution": "seconds", "start": ts(-30), "end": ts(90), "points": [{ "timestamp": ts(0), "value": 0.1 }, { "timestamp": ts(20), "value": 0.7 }, { "timestamp": ts(40), "value": -0.3 }, { "timestamp": ts(60), "value": 0.2 }] }),
+		];
+		for fixture in fixtures {
+			assert_paths_agree(fixture).await;
+		}
+	}
+
+	#[tokio::test]
+	async fn the_f64_path_matches_the_bigdecimal_path_on_random_series() {
+		// A fixed xorshift stream, so a failure reproduces. Magnitudes stay below 1e16,
+		// inside the `2^53` bound the module docs give for bit-identical values (above
+		// it the old narrowing can be one ulp off; see the module docs).
+		let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+		let mut next = move || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state
+		};
+		let splines = [serde_json::json!("linear"), serde_json::json!("quadratic"), serde_json::json!("cubic"), serde_json::json!({ "polynomial": { "degree": 3 } })];
+		for case in 0..64 {
+			let knots = 1 + (next() % 12) as i64;
+			let exponent = (next() % 35) as i32 - 19; // 1e-19 ..= 1e15
+			let mut t = 0_i64;
+			let mut points = Vec::new();
+			for _ in 0..knots {
+				t += 1 + (next() % 90) as i64;
+				let unit = (next() >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0;
+				points.push(serde_json::json!({ "timestamp": ts(t), "value": unit * 10_f64.powi(exponent) }));
+			}
+			let body = serde_json::json!({
+				"spline": splines[case % splines.len()],
+				"resolution": "seconds",
+				"start": ts(-((next() % 60) as i64)),
+				"end": ts(t + (next() % 60) as i64),
+				"points": points,
+			});
+			assert_paths_agree(body).await;
+		}
+	}
+
+	#[tokio::test]
+	async fn ilp_values_feed_the_f64_path_unchanged() {
+		// Float, integer and unsigned fields, including an integer above 2^53 that the f64
+		// column must round exactly as the BigDecimal path's narrowing did.
+		let payload = "m v=1.5 0\nm v=9007199254740993i 30000000000\nm v=7u 60000000000\nm v=-0.25 90000000000\n";
+		let (status, json) = post_text("/api/v1/interpolate/ilp?field=v&spline=linear&resolution=seconds", payload).await;
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		let points = json["points"].as_array().unwrap();
+		let raw: Vec<f64> = points.iter().filter(|p| p["kind"] == "raw").map(|p| p["value"].as_f64().unwrap()).collect();
+		assert_eq!(raw, [1.5, 9_007_199_254_740_992.0, 7.0, -0.25]);
+
+		// And every value, raw or not, is the one the BigDecimal path served.
+		let parsed = weft_line_protocol::parse_points(payload, "v", TimestampPrecision::Nanoseconds).unwrap();
+		let (start, end) = (parsed[0].timestamp, parsed[parsed.len() - 1].timestamp);
+		let legacy = InterpolateConfig::DEFAULT.interpolator(Spline::Linear, Resolution::Seconds).run(&parsed, start, end).unwrap();
+		let legacy: Vec<f64> = legacy.iter().map(|(_, v, _)| wire_value(v, "the test value").unwrap()).collect();
+		let served: Vec<f64> = points.iter().map(|p| p["value"].as_f64().unwrap()).collect();
+		assert_eq!(served.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), legacy.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn wire_f64_drops_only_the_sign_of_zero() {
+		assert_eq!(wire_f64(-0.0).to_bits(), 0.0_f64.to_bits());
+		for v in [0.0, 1.5, -1.5, f64::MIN_POSITIVE, -f64::MIN_POSITIVE, 5e-324, -5e-324, f64::MAX, f64::MIN] {
+			assert_eq!(wire_f64(v).to_bits(), v.to_bits(), "{v}");
+		}
 	}
 }

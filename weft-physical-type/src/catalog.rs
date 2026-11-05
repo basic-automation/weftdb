@@ -155,10 +155,8 @@ impl SegmentDescriptor {
 		if self.row_count == 0 {
 			return 0.0;
 		}
-		#[allow(clippy::cast_precision_loss)]
-		let n = self.row_count as f64;
-		#[allow(clippy::cast_precision_loss)]
-		let total = self.byte_len as f64;
+		let n = crate::cast::usize_to_f64(self.row_count);
+		let total = crate::cast::u64_to_f64(self.byte_len);
 		total / n
 	}
 
@@ -340,10 +338,8 @@ impl SegmentIndex {
 		if rows == 0 {
 			return 0.0;
 		}
-		#[allow(clippy::cast_precision_loss)]
-		let n = rows as f64;
-		#[allow(clippy::cast_precision_loss)]
-		let total = self.total_bytes() as f64;
+		let n = crate::cast::u64_to_f64(rows);
+		let total = crate::cast::u64_to_f64(self.total_bytes());
 		total / n
 	}
 
@@ -514,7 +510,7 @@ mod tests {
 		// A query covering everything opens all three.
 		assert_eq!(ids(index.prune_by_time(0, 290)), vec![0, 1, 2]);
 		// A query in a gap opens none.
-		assert!(index.prune_by_time(91, 99).is_empty());
+		assert_eq!(index.prune_by_time(91, 99).len(), 0);
 	}
 
 	#[test]
@@ -530,7 +526,7 @@ mod tests {
 		// Spans [0,9], [100,109], [200,209].
 		assert_eq!(ids(index.prune_by_value(&BigDecimal::from(102), &BigDecimal::from(108))), vec![1]);
 		assert_eq!(ids(index.prune_by_value(&BigDecimal::from(5), &BigDecimal::from(105))), vec![0, 1]);
-		assert!(index.prune_by_value(&BigDecimal::from(50), &BigDecimal::from(60)).is_empty());
+		assert_eq!(index.prune_by_value(&BigDecimal::from(50), &BigDecimal::from(60)).len(), 0);
 	}
 
 	#[test]
@@ -574,8 +570,7 @@ mod tests {
 		assert_eq!(index.total_bytes(), expected_bytes);
 		// Whole-index span covers the first segment's low edge to the last's high edge.
 		assert_eq!(index.time_range(), Some((0, 290)));
-		#[allow(clippy::cast_precision_loss)]
-		let expected_bpp = expected_bytes as f64 / 30.0;
+		let expected_bpp = crate::cast::u64_to_f64(expected_bytes) / 30.0;
 		assert!((index.bytes_per_point() - expected_bpp).abs() < f64::EPSILON);
 	}
 

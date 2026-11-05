@@ -568,7 +568,8 @@ impl Signals {
 			}
 
 			// Find the correlation for this signal
-			if let Some(correlation) = correlations.iter().find(|c| c.id() == s.correlation_id()) {
+			let value = correlations.iter().find(|c| c.id() == s.correlation_id());
+			if let Some(correlation) = value {
 				// Use average_distance if available, otherwise fall back to individual distance + error_rate
 				if let Some(avg_dist) = correlation.average_distance() {
 					let p = s.probability_with_average_distance(date, avg_dist)?;
@@ -685,7 +686,8 @@ impl Signals {
 			}
 
 			// Find the correlation for this signal
-			if let Some(correlation) = correlations.iter().find(|c| c.id() == s.correlation_id()) {
+			let value = correlations.iter().find(|c| c.id() == s.correlation_id());
+			if let Some(correlation) = value {
 				// Use average_distance if available, otherwise fall back to individual distance + error_rate
 				if let Some(avg_dist) = correlation.average_distance() {
 					// Find the previous manifestation's midpoint for this signal

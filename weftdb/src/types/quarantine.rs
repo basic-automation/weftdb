@@ -31,11 +31,13 @@
 use serde::{Deserialize, Serialize};
 use weft_physical_type::{crc32, SegmentDescriptor, WeftSegError};
 
-/// How long a corrupt quarantine record lives before [`SegmentStore::purge_expired_quarantine`](crate::SegmentStore::purge_expired_quarantine)
-/// may delete it: thirty days, counted from when the record was written. The plan
-/// names the TTL but no duration; thirty days is this slice's choice, recorded in
-/// DECISIONS.md for merge review, and long enough that an operator triaging a bad
-/// seal has weeks, not hours, before the file goes.
+/// How long a corrupt quarantine record lives before
+/// [`SegmentStore::purge_expired_quarantine`](crate::SegmentStore::purge_expired_quarantine) may delete
+/// it.
+///
+/// Thirty days, counted from when the record was written. The plan names the TTL but no duration;
+/// thirty days is this slice's choice, recorded in DECISIONS.md for merge review, and long enough that
+/// an operator triaging a bad seal has weeks, not hours, before the file goes.
 pub const QUARANTINE_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 /// The C5 class of a quarantined segment.
@@ -61,7 +63,7 @@ impl QuarantineClass {
 
 	/// Parse [`as_str`](Self::as_str) back; `None` for anything else.
 	#[must_use]
-	pub fn from_str(text: &str) -> Option<Self> {
+	pub fn parse(text: &str) -> Option<Self> {
 		match text {
 			"corrupt" => Some(Self::Corrupt),
 			"suspect" => Some(Self::Suspect),
@@ -129,11 +131,13 @@ pub struct QuarantinedRow {
 
 impl QuarantinedRow {
 	/// Serialize for the quarantine row's `descriptor_json` column.
+	#[must_use]
 	pub fn to_json(&self) -> String {
 		serde_json::to_string(self).unwrap_or_default()
 	}
 
 	/// Parse back; `None` when the stored JSON is not a row this build wrote.
+	#[must_use]
 	pub fn from_json(json: &str) -> Option<Self> {
 		serde_json::from_str(json).ok()
 	}
@@ -196,9 +200,10 @@ impl RecoveryReport {
 	}
 }
 
-/// Whether `bytes` end in a CRC-32 trailer that matches the body before it: the
-/// plain v5/v6 frame layout and the v7 envelope both close with a little-endian
-/// CRC-32 over everything before it, so one check covers both.
+/// Whether `bytes` end in a CRC-32 trailer that matches the body before it.
+///
+/// The plain v5/v6 frame layout and the v7 envelope both close with a little-endian CRC-32 over
+/// everything before it, so one check covers both.
 #[must_use]
 pub fn crc_verified(bytes: &[u8]) -> bool {
 	if bytes.len() < 11 {
@@ -229,7 +234,7 @@ pub fn classify_decode_failure(bytes: &[u8], error: &WeftSegError) -> Quarantine
 /// Whether a decode failure's cause is a frame version this build predates, the
 /// only case `/ready` reports as `incompatible_store`.
 #[must_use]
-pub fn is_newer_format(error: &WeftSegError) -> bool {
+pub const fn is_newer_format(error: &WeftSegError) -> bool {
 	matches!(error, WeftSegError::UnsupportedVersion { found } if *found > weft_physical_type::FRAME_VERSION_MAX_KNOWN)
 }
 
@@ -251,7 +256,7 @@ mod tests {
 	fn crc_verified_accepts_a_sound_frame_and_rejects_damage() {
 		let bytes = paged_bytes();
 		assert!(crc_verified(&bytes), "a frame this build wrote verifies");
-		let mut damaged = bytes.clone();
+		let mut damaged = bytes;
 		let middle = damaged.len() / 2;
 		damaged[middle] ^= 0xff;
 		assert!(!crc_verified(&damaged), "a flipped byte breaks the trailer");
@@ -293,7 +298,7 @@ mod tests {
 		assert_eq!(classify_decode_failure(&damaged, &WeftSegError::ChecksumMismatch { stored: 1, computed: 2 }), QuarantineClass::Corrupt);
 		let truncated = bytes[..bytes.len() / 2].to_vec();
 		assert_eq!(classify_decode_failure(&truncated, &WeftSegError::UnexpectedEof { needed: 10, remaining: 2 }), QuarantineClass::Corrupt);
-		let mut bad_magic = bytes.clone();
+		let mut bad_magic = bytes;
 		bad_magic[0] ^= 0xff;
 		assert_eq!(classify_decode_failure(&bad_magic, &WeftSegError::BadMagic), QuarantineClass::Corrupt);
 	}
@@ -308,8 +313,8 @@ mod tests {
 	#[test]
 	fn quarantine_class_round_trips_through_its_column_text() {
 		for class in [QuarantineClass::Corrupt, QuarantineClass::Suspect] {
-			assert_eq!(QuarantineClass::from_str(class.as_str()), Some(class));
+			assert_eq!(QuarantineClass::parse(class.as_str()), Some(class));
 		}
-		assert_eq!(QuarantineClass::from_str("bogus"), None);
+		assert_eq!(QuarantineClass::parse("bogus"), None);
 	}
 }

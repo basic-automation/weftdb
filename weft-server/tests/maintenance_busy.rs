@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Maintenance operations on one aspect take turns (basicautomation.io/projects/weftdb/docs/crash-consistency
 //! section 5.3, M1; slice S7). While another operation holds an aspect, the HTTP
 //! maintenance endpoints wait for it, up to the store's maintenance wait, and then answer

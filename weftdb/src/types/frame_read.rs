@@ -61,13 +61,13 @@ pub struct FrameFaultError {
 impl FrameFaultError {
 	/// The class a caller acts on.
 	#[must_use]
-	pub fn fault(&self) -> FrameFault {
+	pub const fn fault(&self) -> FrameFault {
 		self.fault
 	}
 
 	/// The decoder's own complaint.
 	#[must_use]
-	pub fn source(&self) -> &WeftSegError {
+	pub const fn source(&self) -> &WeftSegError {
 		&self.source
 	}
 }
@@ -88,7 +88,7 @@ impl std::error::Error for FrameFaultError {
 
 /// A whole frame, decoded, in whichever layout the frame itself declared.
 #[derive(Debug)]
-pub(crate) enum FullFrame {
+pub enum FullFrame {
 	/// Layout 5.
 	SingleBlock(Segment),
 	/// Layout 6.
@@ -97,7 +97,7 @@ pub(crate) enum FullFrame {
 
 impl FullFrame {
 	/// Rows per page, for the index columns that only mean something to a paged frame.
-	pub(crate) fn rows_per_page(&self) -> Option<usize> {
+	pub(crate) const fn rows_per_page(&self) -> Option<usize> {
 		match self {
 			Self::SingleBlock(_) => None,
 			Self::Paged(segment) => Some(segment.rows_per_page),
@@ -139,31 +139,51 @@ fn frame_is_paged(bytes: &[u8]) -> bool {
 }
 
 /// Decode a frame and return the physical (encoded) values in a time range.
-pub(crate) fn read_range_physical(path: &str, bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<PhysicalValue>>)> {
+///
+/// # Errors
+///
+/// A frame that does not decode, reported with its path and layout.
+pub fn read_range_physical(path: &str, bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<PhysicalValue>>)> {
 	let paged = frame_is_paged(bytes);
 	read_frame_range_physical(bytes, start, end).map_err(|error| decode_error(error, path, paged))
 }
 
 /// Decode a frame and return the values in a time range.
-pub(crate) fn read_range(path: &str, bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), anyhow::Error> {
+///
+/// # Errors
+///
+/// A frame that does not decode, reported with its path and layout.
+pub fn read_range(path: &str, bytes: &[u8], start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), anyhow::Error> {
 	let paged = frame_is_paged(bytes);
 	read_frame_range(bytes, start, end).map_err(|error| decode_error(error, path, paged))
 }
 
 /// Decode a frame and look up one timestamp.
-pub(crate) fn read_point(path: &str, bytes: &[u8], t: i64) -> Result<Option<BigDecimal>, anyhow::Error> {
+///
+/// # Errors
+///
+/// A frame that does not decode, reported with its path and layout.
+pub fn read_point(path: &str, bytes: &[u8], t: i64) -> Result<Option<BigDecimal>, anyhow::Error> {
 	let paged = frame_is_paged(bytes);
 	read_frame_point(bytes, t).map_err(|error| decode_error(error, path, paged))
 }
 
 /// Decode a frame and look up several timestamps.
-pub(crate) fn read_points(path: &str, bytes: &[u8], timestamps: &[i64]) -> Result<Vec<Option<BigDecimal>>, anyhow::Error> {
+///
+/// # Errors
+///
+/// A frame that does not decode, reported with its path and layout.
+pub fn read_points(path: &str, bytes: &[u8], timestamps: &[i64]) -> Result<Vec<Option<BigDecimal>>, anyhow::Error> {
 	let paged = frame_is_paged(bytes);
 	read_frame_points(bytes, timestamps).map_err(|error| decode_error(error, path, paged))
 }
 
 /// Decode a whole frame, keeping its layout so the caller can report rows per page.
-pub(crate) fn read_full(path: &str, bytes: &[u8]) -> Result<FullFrame> {
+///
+/// # Errors
+///
+/// A frame that does not decode, reported with its path and layout.
+pub fn read_full(path: &str, bytes: &[u8]) -> Result<FullFrame> {
 	match frame_layout_of(bytes) {
 		Ok(FrameLayout::Paged) => read_frame_paged_segment(bytes).map(FullFrame::Paged).map_err(|error| decode_error(error, path, true)),
 		Ok(FrameLayout::SingleBlock) => read_frame_segment(bytes).map(FullFrame::SingleBlock).map_err(|error| decode_error(error, path, false)),

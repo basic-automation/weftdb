@@ -8,11 +8,15 @@
 use std::net::SocketAddr;
 
 use weft_server::{
-	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ServeLimits, TlsConfig, AUTH_KEYS_MODE, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, QUERY_MAX_INFLIGHT_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
+	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ReadLimits, ServeLimits, TlsConfig, AUTH_KEYS_MODE, DEFAULT_PAGE_ROWS, GPU_BACKEND_ENV, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_AT_MULTI_INSTANTS_ENV, MAX_CONNECTIONS_ENV, MAX_DOWNSAMPLE_BUCKETS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, MAX_PAGE_ROWS_ENV, MAX_READ_ROWS_ENV, QUERY_MAX_INFLIGHT_ENV, READ_TIMEOUT_SECS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
 };
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
+
+/// The environment variable naming the probe-only admin listener's address
+/// (ROB-23r). Unset is the default and means no second listener at all.
+pub(crate) const ADMIN_ADDR_ENV: &str = "WEFT_ADMIN_ADDR";
 
 /// The address to bind, from `WEFT_SERVER_ADDR` (e.g. `0.0.0.0:9000`) or
 /// [`DEFAULT_ADDR`].
@@ -20,20 +24,46 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 /// # Errors
 ///
 /// A value that is not a parseable socket address.
-pub(crate) fn bind_addr() -> anyhow::Result<SocketAddr> {
+pub fn bind_addr() -> anyhow::Result<SocketAddr> {
 	Ok(std::env::var("WEFT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?)
 }
 
-/// Read the interpolation settings ([`InterpolateConfig`]) from
-/// `WEFT_MAX_INTERPOLATE_POINTS`, once, and log the output-grid cap in force.
+/// The address the probe-only admin listener binds (ROB-23r), from
+/// [`ADMIN_ADDR_ENV`]. Unset — the default, and how every deployment running
+/// today is configured — means there is no second listener and the probes stay
+/// on the ordinary address.
+///
+/// A configured address is put through the same C8 plaintext gate as the data
+/// plane, so a probe listener bound to a routable address still needs
+/// `WEFT_ALLOW_PLAINTEXT` (or `WEFT_AUTH=disabled`) to start without TLS: a
+/// listener that "only" answers `/health` is still a listener on the network.
 ///
 /// # Errors
 ///
-/// A value that is not a positive integer (a malformed operator config should fail
-/// loudly at start rather than silently default).
-pub(crate) fn interpolate_config() -> anyhow::Result<InterpolateConfig> {
-	let config = InterpolateConfig::from_env_value(std::env::var(MAX_INTERPOLATE_POINTS_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?;
-	println!("interpolation: at most {} output points per request (set {MAX_INTERPOLATE_POINTS_ENV} to change)", config.max_output_points());
+/// A value that is not a parseable socket address, or a plaintext exposure the
+/// C8 gate refuses.
+pub(crate) fn admin_addr() -> anyhow::Result<Option<SocketAddr>> {
+	let Some(raw) = std::env::var(ADMIN_ADDR_ENV).ok().filter(|value| !value.trim().is_empty()) else {
+		return Ok(None);
+	};
+	let addr: SocketAddr = raw.parse()?;
+	PlaintextGate::from_env().check(addr, None).map_err(anyhow::Error::msg)?;
+	println!("admin listener: probe-only surface (/health, /ready) on http://{addr}");
+	Ok(Some(addr))
+}
+
+/// Read the interpolation settings ([`InterpolateConfig`]) from
+/// `WEFT_MAX_INTERPOLATE_POINTS` and `WEFT_GPU_BACKEND`, once, and log the
+/// compute limits and the GPU configuration in force.
+///
+/// # Errors
+///
+/// A points value that is not a positive integer, or a backend value that
+/// names no backend (a malformed operator config should fail loudly at start
+/// rather than silently default).
+pub fn interpolate_config() -> anyhow::Result<InterpolateConfig> {
+	let config = InterpolateConfig::from_env_value(std::env::var(MAX_INTERPOLATE_POINTS_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?.with_backend_from_env_value(std::env::var(GPU_BACKEND_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?;
+	println!("interpolation: at most {} output points per request (set {MAX_INTERPOLATE_POINTS_ENV} to change), on the {} compute backend (set {GPU_BACKEND_ENV} to change)", config.max_output_points(), config.backend());
 	Ok(config)
 }
 
@@ -46,7 +76,7 @@ pub(crate) fn interpolate_config() -> anyhow::Result<InterpolateConfig> {
 ///
 /// A value that is not a positive integer (a malformed operator config should
 /// fail loudly at start rather than silently default).
-pub(crate) fn serve_limits() -> anyhow::Result<ServeLimits> {
+pub fn serve_limits() -> anyhow::Result<ServeLimits> {
 	let limits = ServeLimits::from_env().map_err(anyhow::Error::msg)?;
 	println!("listener limits: at most {} connections (set {MAX_CONNECTIONS_ENV} to change; the default is half the RLIMIT_NOFILE soft limit), header deadline {}s (set {HEADER_READ_TIMEOUT_ENV}), keep-alive deadline {}s (set {KEEP_ALIVE_TIMEOUT_ENV}), write-stall timeout {}s (set {WRITE_STALL_TIMEOUT_ENV}), shutdown grace {}s (set {SHUTDOWN_GRACE_SECS_ENV})", limits.max_connections(), limits.header_read_timeout().as_secs(), limits.keep_alive_timeout().as_secs(), limits.write_stall_timeout().as_secs(), limits.shutdown_grace().as_secs());
 	Ok(limits)
@@ -60,7 +90,7 @@ pub(crate) fn serve_limits() -> anyhow::Result<ServeLimits> {
 ///
 /// A value that is not a positive integer (a malformed operator config
 /// should fail loudly at start rather than silently default).
-pub(crate) fn ingest_config() -> anyhow::Result<IngestConfig> {
+pub fn ingest_config() -> anyhow::Result<IngestConfig> {
 	let config = IngestConfig::from_env().map_err(anyhow::Error::msg)?;
 	println!("ingest limits: body cap {} bytes (set {MAX_INGEST_BYTES_ENV} to change), in-flight budget {} bytes (set {INGEST_MAX_INFLIGHT_BYTES_ENV})", config.max_body_bytes(), config.max_inflight_bytes());
 	Ok(config)
@@ -76,10 +106,28 @@ pub(crate) fn ingest_config() -> anyhow::Result<IngestConfig> {
 ///
 /// A value that is not a positive integer (a malformed operator config
 /// should fail loudly at start rather than silently default).
-pub(crate) fn admission_config() -> anyhow::Result<AdmissionConfig> {
+pub fn admission_config() -> anyhow::Result<AdmissionConfig> {
 	let config = AdmissionConfig::from_env().map_err(anyhow::Error::msg)?;
 	println!("admission limits: at most {} query-class requests in flight (set {QUERY_MAX_INFLIGHT_ENV} to change); probes are never shed, maintenance is admitted one at a time", config.max_query_inflight());
 	Ok(config)
+}
+
+/// Read the read-path caps ([`ReadLimits`], ROB-12) from the environment,
+/// once, and log the caps in force: the largest page, the largest result,
+/// the largest downsample grid, the largest multi-instant list, and the
+/// deadline one read gets. Every read refuses what cannot fit them — with
+/// `422 result_too_large` for a page or a result over a cap, and `504
+/// query_timeout` when it runs past the deadline — rather than attempting
+/// an answer no client could hold.
+///
+/// # Errors
+///
+/// A value that is not a positive integer (a malformed operator config
+/// should fail loudly at start rather than silently default).
+pub(crate) fn read_limits() -> anyhow::Result<ReadLimits> {
+	let limits = ReadLimits::from_env().map_err(anyhow::Error::msg)?;
+	println!("read limits: a {DEFAULT_PAGE_ROWS}-row page by default and at most {} to a page (set {MAX_PAGE_ROWS_ENV}), at most {} rows to a read (set {MAX_READ_ROWS_ENV}), at most {} buckets to a downsample (set {MAX_DOWNSAMPLE_BUCKETS_ENV}), at most {} instants to a multi lookup (set {MAX_AT_MULTI_INSTANTS_ENV}), {} s to a read (set {READ_TIMEOUT_SECS_ENV})", limits.page_max(), limits.read_rows_max(), limits.downsample_buckets_max(), limits.at_multi_instants_max(), limits.read_timeout_secs());
+	Ok(limits)
 }
 
 /// Resolve the listener's transport for `addr` (SEC-5): TLS when a
@@ -93,7 +141,7 @@ pub(crate) fn admission_config() -> anyhow::Result<AdmissionConfig> {
 ///
 /// A half-configured TLS pair, TLS files that cannot be loaded, or the
 /// gate's refusal of an unopted plaintext exposure.
-pub(crate) fn transport(addr: SocketAddr) -> anyhow::Result<Option<TlsConfig>> {
+pub fn transport(addr: SocketAddr) -> anyhow::Result<Option<TlsConfig>> {
 	let tls = TlsConfig::from_env().map_err(anyhow::Error::msg)?;
 	let gate = PlaintextGate::from_env();
 	gate.check(addr, tls.as_ref()).map_err(anyhow::Error::msg)?;
@@ -117,7 +165,7 @@ pub(crate) fn transport(addr: SocketAddr) -> anyhow::Result<Option<TlsConfig>> {
 ///
 /// An unrecognised `WEFT_AUTH` value, `WEFT_AUTH=keys` with no keys
 /// file mounted, or a keys file that cannot be loaded.
-pub(crate) fn auth() -> anyhow::Result<AuthConfig> {
+pub fn auth() -> anyhow::Result<AuthConfig> {
 	let auth = AuthConfig::from_env().map_err(anyhow::Error::msg)?;
 	match &auth {
 		AuthConfig::Keys(store) => {
@@ -132,7 +180,7 @@ pub(crate) fn auth() -> anyhow::Result<AuthConfig> {
 
 /// Pick the request guard for the bound address `local` ([`HostGuard::for_bind`],
 /// honouring `WEFT_ALLOW_ANY_HOST`) and log which one is in force.
-pub(crate) fn host_guard_for(local: SocketAddr) -> HostGuard {
+pub fn host_guard_for(local: SocketAddr) -> HostGuard {
 	let allow_any_host = host_guard::allow_any_host_from_env(std::env::var(ALLOW_ANY_HOST_ENV).ok().as_deref());
 	let guard = HostGuard::for_bind(local, allow_any_host);
 	match guard {
@@ -150,6 +198,14 @@ pub(crate) fn host_guard_for(local: SocketAddr) -> HostGuard {
 ///
 /// A value that is not a socket address, or one that is not loopback (the listener is
 /// plaintext; [`weft_server::flight::flight_addr`] says why).
-pub(crate) fn flight_addr() -> anyhow::Result<Option<SocketAddr>> {
+/// Phase 5 (5.7): the GPU adapter and device mode `WEFT_GPU_ADAPTER` / `WEFT_GPU_DEVICES`
+/// ask for, or `None` when neither is set (splimes' single-device default). A malformed
+/// value refuses the start (exit 78) rather than silently running on another device.
+pub fn gpu_config() -> anyhow::Result<Option<splimes::GpuConfig>> {
+	use weft_server::gpu::{gpu_config_from_env, GPU_ADAPTER_ENV, GPU_DEVICES_ENV};
+	gpu_config_from_env(std::env::var(GPU_ADAPTER_ENV).ok().as_deref(), std::env::var(GPU_DEVICES_ENV).ok().as_deref()).map_err(anyhow::Error::msg)
+}
+
+pub fn flight_addr() -> anyhow::Result<Option<SocketAddr>> {
 	weft_server::flight::flight_addr(std::env::var(weft_server::flight::FLIGHT_ADDR_ENV).ok().as_deref()).map_err(anyhow::Error::msg)
 }

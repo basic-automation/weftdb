@@ -1,5 +1,6 @@
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 // The process allocator is this binary's choice, not a side effect of what a library it links
 // happens to depend on (PAC-3). turso used to carry it: its `mimalloc` feature installs a

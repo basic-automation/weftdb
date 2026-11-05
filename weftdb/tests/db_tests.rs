@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::str::FromStr;
 
 use ::weftdb::database::traits::{AspectStructure, Inputs};
@@ -31,7 +34,7 @@ async fn setup_test_database() -> Result<(TempDir, Database, Subject, Aspect)> {
 async fn add_test_measurements(db: &Database, aspect: &Aspect, base_time: DateTime<Utc>, count: usize) -> Result<()> {
 	// Changed parameter type
 	for i in 0..count {
-		let timestamp = base_time + Duration::seconds(i as i64);
+		let timestamp = base_time + Duration::seconds(i64::try_from(i).expect("fits an i64"));
 		let value = BigDecimal::from_str(&format!("{}.{}", i + 1, i * 10 % 100))?;
 		let measurement = InputMeasurement::new(timestamp, value);
 		db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await?;
@@ -129,6 +132,7 @@ async fn test_analyze_point_exact_match() -> Result<()> {
 	{
 		let databases = DATABASES.lock().await;
 		println!("Active databases: {}", databases.len());
+		drop(databases);
 	}
 
 	Ok(())
@@ -204,6 +208,7 @@ async fn test_analyze_point_invalid_aspect_error() -> Result<()> {
 	// Use a random aspect ID that doesn't exist
 	let invalid_aspect_id = weftdb::AspectId::new();
 	let result = db.analyze_point(&invalid_aspect_id, query_time, &Resolution::Milliseconds, &Spline::Linear).await;
+	drop(db);
 	assert!(result.is_err(), "Should return error for invalid aspect ID");
 
 	// Clean up - remove the test database
@@ -247,6 +252,7 @@ async fn test_analyze_point_single_measurement() -> Result<()> {
 	{
 		let databases = DATABASES.lock().await;
 		println!("Active databases after single measurement test: {}", databases.len());
+		drop(databases);
 	}
 
 	Ok(())
@@ -281,6 +287,7 @@ async fn test_analyze_point_large_time_gap() -> Result<()> {
 	{
 		let databases = DATABASES.lock().await;
 		println!("Active databases after large gap test: {}", databases.len());
+		drop(databases);
 	}
 
 	Ok(())
@@ -342,6 +349,7 @@ async fn test_analyze_point_cache_invalidation() -> Result<()> {
 	{
 		let databases = DATABASES.lock().await;
 		println!("Active databases after cache invalidation test: {}", databases.len());
+		drop(databases);
 	}
 
 	Ok(())
@@ -381,6 +389,7 @@ async fn test_analyze_point_concurrent_access() -> Result<()> {
 	{
 		let databases = DATABASES.lock().await;
 		println!("Active databases after concurrent test: {}", databases.len());
+		drop(databases);
 	}
 
 	Ok(())
@@ -434,8 +443,8 @@ struct BTC1MinRecord {
 
 fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: f64) -> Option<DateTime<Utc>> {
 	// Convert f64 timestamp to i64 seconds and u32 nanoseconds
-	let seconds = timestamp_seconds as i64;
-	let nanoseconds = ((timestamp_seconds - seconds as f64) * 1_000_000_000.0) as u32;
+	let seconds = bigdecimal::ToPrimitive::to_i64(&timestamp_seconds).expect("a representable timestamp");
+	let nanoseconds = bigdecimal::ToPrimitive::to_u32(&((timestamp_seconds - bigdecimal::ToPrimitive::to_f64(&seconds).expect("a number")) * 1_000_000_000.0)).expect("a sub-second count of nanoseconds");
 	DateTime::from_timestamp(seconds, nanoseconds)
 }
 
@@ -507,7 +516,8 @@ async fn test_create_btc_1min_database() -> Result<()> {
 	let needs_data = if has_btcusd {
 		if let Some((subject_id, _)) = subject_list.iter().find(|(_, name)| name.as_str() == "BTCUSD") {
 			let aspects = db.get_subject_aspects(subject_id).await?;
-			if let Some(aspect) = aspects.iter().find(|a| a.name() == "open") {
+			let value = aspects.iter().find(|a| a.name() == "open");
+			if let Some(aspect) = value {
 				// Check if the aspect has measurements
 				db.get_earliest_measurement(&aspect.id()).await?.is_none()
 			} else {
@@ -604,6 +614,10 @@ async fn test_create_btc_1min_database() -> Result<()> {
                                 db.batch_capture_measurements(close_aspect.id(), DatasetId::new(), close_measurements),
                                 db.batch_capture_measurements(volume_aspect.id(), DatasetId::new(), volume_measurements)
                         );
+			drop(open_aspect);
+			drop(high_aspect);
+			drop(low_aspect);
+			drop(volume_aspect);
 
 			// Check all results
 			open_result?;
@@ -620,11 +634,13 @@ async fn test_create_btc_1min_database() -> Result<()> {
 			// The point of running at all: assert the real-corpus ingest actually landed,
 			// rather than merely not erroring.
 			let earliest = db.get_earliest_measurement(&close_aspect.id()).await?;
+			drop(close_aspect);
 			assert!(earliest.is_some(), "the close aspect has measurements after the load");
 		} else {
 			debug!("Skipping BTC database test - CSV file not found at {}", csv_path);
 		}
 	}
+	drop(db);
 
 	Ok(())
 }
@@ -678,17 +694,14 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 	let real_csv = std::env::var("INGEST_PROFILE_CSV").ok().map(std::path::PathBuf::from).or_else(|| (std::env::var("INGEST_PROFILE_CORPUS").as_deref() == Ok("btc")).then(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("datasets").join("btc_1min.csv")));
 	let base = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
 	let skip_rows: usize = std::env::var("INGEST_PROFILE_SKIP_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-	let (corpus, ts_ms, values) = match &real_csv {
-		Some(path) => {
-			let (ts, vs) = read_close_series(path, n, skip_rows)?;
-			(format!("real {} (skip {skip_rows})", path.display()), ts, vs)
-		}
-		None => {
-			let price = |i: usize| format!("{}.{:02}", 20_000 + (i % 5_000), i % 100);
-			let ts: Vec<i64> = (0..n).map(|i| (base + Duration::minutes(i as i64)).timestamp_millis()).collect();
-			let vs: Vec<BigDecimal> = (0..n).map(|i| BigDecimal::from_str(&price(i)).unwrap()).collect();
-			("synthetic 1-minute grid".to_string(), ts, vs)
-		}
+	let (corpus, ts_ms, values) = if let Some(path) = &real_csv {
+		let (ts, vs) = read_close_series(path, n, skip_rows)?;
+		(format!("real {} (skip {skip_rows})", path.display()), ts, vs)
+	} else {
+		let price = |i: usize| format!("{}.{:02}", 20_000 + (i % 5_000), i % 100);
+		let ts: Vec<i64> = (0..n).map(|i| (base + Duration::minutes(i64::try_from(i).expect("fits an i64"))).timestamp_millis()).collect();
+		let vs: Vec<BigDecimal> = (0..n).map(|i| BigDecimal::from_str(&price(i)).unwrap()).collect();
+		("synthetic 1-minute grid".to_string(), ts, vs)
 	};
 	let n = ts_ms.len();
 	assert!(n > 0, "the corpus yielded no rows");
@@ -711,6 +724,8 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 		let measurements: Vec<InputMeasurement> = ts_ms.iter().zip(&values).map(|(ms, v)| InputMeasurement::new(Utc.timestamp_millis_opt(*ms).single().unwrap_or(base), v.clone())).collect();
 		let t0 = std::time::Instant::now();
 		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await?;
+		drop(db);
+		drop(aspect);
 		Some(t0.elapsed())
 	};
 
@@ -734,22 +749,20 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 	// The columnar path persisted all n rows.
 	assert_eq!(descriptor.row_count as usize, n, "columnar seal wrote every row");
 
-	let col_rps = n as f64 / columnar.as_secs_f64();
-	let bytes_per_point = descriptor.byte_len as f64 / n as f64;
+	let col_rps = bigdecimal::ToPrimitive::to_f64(&n).expect("a number") / columnar.as_secs_f64();
+	let bytes_per_point = bigdecimal::ToPrimitive::to_f64(&descriptor.byte_len).expect("a number") / bigdecimal::ToPrimitive::to_f64(&n).expect("a number");
 	eprintln!("INGEST PROFILE n={n} corpus={corpus}:");
 	eprintln!("  derived exact encoding : {:?}", recommended.physical_type);
-	match legacy {
-		Some(legacy) => {
-			let legacy_rps = n as f64 / legacy.as_secs_f64();
-			eprintln!("  legacy Turso row-store : {legacy:?}  ({legacy_rps:.0} rows/s)");
-			eprintln!("  columnar .weftseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
-			eprintln!("  columnar seal is {:.1}x faster on the write path", col_rps / legacy_rps);
-		}
-		None => {
-			eprintln!("  legacy Turso row-store : SKIPPED (INGEST_PROFILE_SKIP_LEGACY)");
-			eprintln!("  columnar .weftseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
-		}
+	if let Some(legacy) = legacy {
+		let legacy_rps = bigdecimal::ToPrimitive::to_f64(&n).expect("a number") / legacy.as_secs_f64();
+		eprintln!("  legacy Turso row-store : {legacy:?}  ({legacy_rps:.0} rows/s)");
+		eprintln!("  columnar .weftseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
+		eprintln!("  columnar seal is {:.1}x faster on the write path", col_rps / legacy_rps);
+	} else {
+		eprintln!("  legacy Turso row-store : SKIPPED (INGEST_PROFILE_SKIP_LEGACY)");
+		eprintln!("  columnar .weftseg seal  : {columnar:?}  ({col_rps:.0} rows/s, {bytes_per_point:.2} B/point framed)");
 	}
+	drop(store);
 	Ok(())
 }
 
@@ -827,15 +840,14 @@ fn read_close_series(path: &std::path::Path, n: usize, skip: usize) -> Result<(V
 }
 
 /// Release every in-process handle to the database `db_name`, so the next
-/// [`Database::existing`] is a **cold** open, exactly as after a process restart.
+/// [`Database::existing`] is a **cold** open, exactly as after a process restart. The
+/// caller drops its own `Database` value, whose id is `id`, first.
 ///
 /// Turso keeps one shared database per path in a process-wide registry of weak
 /// references, so the reopen only goes back to disk once nothing holds the old one: not
 /// the `Database` value, not its `DATABASES` entry (which also owns the subject and
 /// aspect handles), and not WeftDB's own connection cache.
-async fn release_database(db: Database, db_name: &str) {
-	let id = db.id();
-	drop(db);
+async fn release_database(id: weftdb::DatabaseId, db_name: &str) {
 	DATABASES.lock().await.remove(&id);
 	weftdb::clear_connection_cache_by_name(db_name).await;
 }
@@ -880,11 +892,11 @@ fn reinode_metadata_files(db_name: &str) -> Result<()> {
 	Ok(())
 }
 
-/// Release every handle to `db_name`, check that the acknowledged commits are still only in
+/// Release every handle to `db_name` (the caller has dropped its own), check that the acknowledged commits are still only in
 /// the logical log, then give the files fresh inodes, so the following
 /// [`Database::existing`] is a genuine cold open that must replay that log.
-async fn restart_with_uncheckpointed_log(db: Database, db_name: &str) -> Result<()> {
-	release_database(db, db_name).await;
+async fn restart_with_uncheckpointed_log(id: weftdb::DatabaseId, db_name: &str) -> Result<()> {
+	release_database(id, db_name).await;
 
 	// Precondition: the acknowledged commits are still only in the logical log. Without
 	// it the test would pass for the wrong reason (a checkpoint had already moved them).
@@ -925,7 +937,9 @@ async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 8, "the batch is queued before the restart");
 
 	drop((subject, aspect));
-	restart_with_uncheckpointed_log(db, &db_name).await?;
+	let released_id = db.id();
+	drop(db);
+	restart_with_uncheckpointed_log(released_id, &db_name).await?;
 
 	let reopened = Database::existing(&db_name).await.context("cold reopen of a database with acknowledged metadata commits")?;
 
@@ -944,7 +958,9 @@ async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	expected.extend(second.iter().map(InputMeasurement::timestamp));
 	reopened.batch_capture_measurements(aspect_id, DatasetId::new(), second).await?;
 	assert_eq!(reopened.count_unbatched_measurements(&aspect_id).await?, 16, "the second batch is queued before the second restart");
-	restart_with_uncheckpointed_log(reopened, &db_name).await?;
+	let released_id = reopened.id();
+	drop(reopened);
+	restart_with_uncheckpointed_log(released_id, &db_name).await?;
 
 	let reopened = Database::existing(&db_name).await.context("second cold reopen after appending to the replayed log")?;
 	assert!(reopened.list_subjects().await?.contains_key(&subject_id), "the subject survives the second reopen");
@@ -953,7 +969,11 @@ async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	expected.sort();
 	assert_eq!(queued, expected, "the queued timestamps from both batches survive the second reopen");
 
-	release_database(reopened, &db_name).await;
+	let released_id = reopened.id();
+
+	drop(reopened);
+
+	release_database(released_id, &db_name).await;
 	Ok(())
 }
 
@@ -983,7 +1003,9 @@ async fn zero_length_metadata_log_is_removed_on_cold_open() -> Result<()> {
 	// Fold the logical log into the main file; TRUNCATE leaves the `-log` in place at
 	// length zero.
 	truncate_checkpoint(db.metadata()).await?;
-	release_database(db, &db_name).await;
+	let released_id = db.id();
+	drop(db);
+	release_database(released_id, &db_name).await;
 
 	let log = metadata_log_path(&db_name);
 	assert_eq!(std::fs::metadata(&log).context("metadata.db-log is missing before the reopen")?.len(), 0, "precondition: the checkpoint left a zero-length log");
@@ -995,7 +1017,11 @@ async fn zero_length_metadata_log_is_removed_on_cold_open() -> Result<()> {
 	assert_eq!(std::fs::metadata(&probe)?.nlink(), 1, "the zero-length metadata.db-log was not removed by the cold open");
 	assert!(reopened.list_subjects().await?.contains_key(&subject_id), "the checkpointed subject is still readable");
 
-	release_database(reopened, &db_name).await;
+	let released_id = reopened.id();
+
+	drop(reopened);
+
+	release_database(released_id, &db_name).await;
 	Ok(())
 }
 
@@ -1020,7 +1046,9 @@ async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
 	let db_name = format!("coldrace_{}", Uuid::new_v4());
 	let db = Database::new(&db_name).await?;
 	let metadata_path = format!("{}/{}/metadata.db", Database::get_data_dir(), db_name);
-	release_database(db, &db_name).await;
+	let released_id = db.id();
+	drop(db);
+	release_database(released_id, &db_name).await;
 	let log = metadata_log_path(&db_name);
 
 	for round in 0..ROUNDS {
@@ -1029,7 +1057,7 @@ async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
 		truncate_checkpoint(&metadata).await?;
 		drop(metadata);
 		weftdb::clear_connection_cache_by_name(&db_name).await;
-		assert_eq!(std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0), 0, "precondition: round {round} starts from an empty log");
+		assert_eq!(std::fs::metadata(&log).map_or(0, |m| m.len()), 0, "precondition: round {round} starts from an empty log");
 
 		let first_path = metadata_path.clone();
 		let first = tokio::spawn(async move { Database::get_turso_database(&first_path).await });
@@ -1042,7 +1070,7 @@ async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
 		let (first, second) = (first.await??, second.await??);
 
 		first.connect()?.execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![Uuid::new_v4().to_string(), format!("race {round}"), 0]).await?;
-		let log_len = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+		let log_len = std::fs::metadata(&log).map_or(0, |m| m.len());
 		assert!(log_len > 0, "round {round} (stagger {stagger:?}): the acknowledged commit is not in the metadata.db-log on disk, so it went to an unlinked log");
 
 		// Release without a checkpoint, as a crash would.
@@ -1317,6 +1345,7 @@ async fn the_batch_tables_index_their_hashes() -> Result<()> {
 		// What a batch table created before the index looks like.
 		conn.execute("DROP INDEX idx_batches_hash", ()).await?;
 		assert!(!lookup_plan(&conn, "batches").await?.contains("idx_batches_hash"), "precondition: the index is gone");
+		drop(batches);
 	}
 	// The processed batches DB also records the batches extraction consumed, indexed the
 	// same way; a DB created before that record gets it when it is next opened.
@@ -1325,17 +1354,22 @@ async fn the_batch_tables_index_their_hashes() -> Result<()> {
 	assert!(plan.contains("idx_extracted_batches_hash"), "the extracted lookup does not use its hash index: {plan}");
 	conn.execute("DROP TABLE extracted_batches", ()).await?;
 	drop(conn);
-	release_database(db, &name).await;
+	let released_id = db.id();
+	drop(db);
+	release_database(released_id, &name).await;
 
 	let db = Database::existing(&name).await?;
 	for processed in [false, true] {
 		let batches = if processed { db.get_processed_batches_db(&aspect_id).await? } else { db.get_unprocessed_batches_db(&aspect_id).await? };
 		let plan = lookup_plan(&batches.connect()?, "batches").await?;
+		drop(batches);
 		assert!(plan.contains("idx_batches_hash"), "processed={processed}: reopening did not add the hash index: {plan}");
 	}
 	let plan = lookup_plan(&db.get_processed_batches_db(&aspect_id).await?.connect()?, "extracted_batches").await?;
 	assert!(plan.contains("idx_extracted_batches_hash"), "reopening did not add the extracted batches and their index: {plan}");
-	release_database(db, &name).await;
+	let released_id = db.id();
+	drop(db);
+	release_database(released_id, &name).await;
 	Ok(())
 }
 
@@ -1402,11 +1436,15 @@ mod database_new_crash {
 		drop((rows, metadata));
 		assert_eq!(stored_name, name);
 		assert_eq!(Path::new(&stored_path), database_dir(name).join("metadata.db"), "the row records the final metadata path, not the build directory's");
-		release_database(db, name).await;
+		let released_id = db.id();
+		drop(db);
+		release_database(released_id, name).await;
 
 		let reopened = Database::existing(name).await?;
 		assert!(reopened.list_subjects().await?.contains_key(&subject_id), "a subject written after the recovery survives a cold reopen");
-		release_database(reopened, name).await;
+		let released_id = reopened.id();
+		drop(reopened);
+		release_database(released_id, name).await;
 		Ok(())
 	}
 
@@ -1443,7 +1481,9 @@ mod database_new_crash {
 			if point == FaultPoint::LNewCreated {
 				assert!(!database_dir(&name).exists(), "{point}: a failed Database::new left a database folder behind");
 				let db = Database::new(&name).await.with_context(|| format!("retrying Database::new after a failure at {point}"))?;
-				release_database(db, &name).await;
+				let released_id = db.id();
+				drop(db);
+				release_database(released_id, &name).await;
 			} else {
 				assert!(database_dir(&name).join("metadata.db").exists(), "{point}: the published database stays in place");
 				let err = Database::new(&name).await.expect_err("the database exists, so new() refuses it");
@@ -1462,7 +1502,7 @@ mod database_new_crash {
 		let temp_dir = tempfile::tempdir()?;
 		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 		let listed = format!("listed_{}", Uuid::new_v4().simple());
-		release_database(Database::new(&listed).await?, &listed).await;
+		release_database(Database::new(&listed).await?.id(), &listed).await;
 
 		// A `new` paused after building, before its rename.
 		let pending = format!("pending_{}", Uuid::new_v4().simple());
@@ -1490,7 +1530,9 @@ mod database_new_crash {
 
 		resume.notify_one();
 		let db = creating.await?.context("the paused new() completes")?;
-		release_database(db, &pending).await;
+		let released_id = db.id();
+		drop(db);
+		release_database(released_id, &pending).await;
 		let mut expected = vec![listed.clone(), pending.clone()];
 		expected.sort();
 		assert_eq!(Database::list_stored_databases().await?, expected);
@@ -1562,7 +1604,9 @@ mod database_new_crash {
 				assert!(!database_dir(&name).exists(), "{point}: a crash before the rename must not leave a {name} folder");
 				assert_eq!(build_dirs(&name).len(), 1, "{point}: the crash leaves its build directory for the next sweep");
 				let db = Database::new(&name).await.with_context(|| format!("retrying Database::new after a crash at {point}"))?;
-				release_database(db, &name).await;
+				let released_id = db.id();
+				drop(db);
+				release_database(released_id, &name).await;
 				assert_eq!(build_dirs(&name), Vec::<String>::new(), "{point}: the retry swept the stale build directory");
 			} else {
 				assert!(database_dir(&name).join("metadata.db").exists(), "{point}: the renamed database is in place");

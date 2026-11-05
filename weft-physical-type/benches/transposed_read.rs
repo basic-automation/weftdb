@@ -31,13 +31,16 @@
 //!
 //! Needs the `bitsliced-codec` feature (`cargo bench -p weft-physical-type --features
 //! bitsliced-codec --bench transposed_read`).
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::hint::black_box;
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
 use weft_physical_type::{
-	timestamp::TimeUnit, weftseg::{frame_value_codec, read_segment, read_segment_point, read_segment_points, read_segment_range, FrameOptions}, Segment
+	cast, timestamp::TimeUnit, weftseg::{frame_value_codec, read_segment, read_segment_point, read_segment_points, read_segment_range, FrameOptions}, Segment
 };
 
 /// A zero-straddling small-magnitude corpus: two-decimal values in `[-5.00, 5.00]` on a
@@ -46,8 +49,8 @@ use weft_physical_type::{
 /// values inexact in binary floating point, so the zero-tolerance encoder picks `ScaledI64`
 /// (the only payload the transposed codec is defined over) rather than `F64`.
 fn corpus(n: usize) -> (Vec<i64>, Vec<BigDecimal>) {
-	let timestamps: Vec<i64> = (0..n as i64).map(|i| 1_000 + i * 10).collect();
-	let values: Vec<BigDecimal> = (0..n as i64).map(|i| BigDecimal::new((((i * 37) % 1_001) - 500).into(), 2)).collect();
+	let timestamps: Vec<i64> = (0..cast::usize_to_i64(n)).map(|i| 1_000 + i * 10).collect();
+	let values: Vec<BigDecimal> = (0..cast::usize_to_i64(n)).map(|i| BigDecimal::new((((i * 37) % 1_001) - 500).into(), 2)).collect();
 	(timestamps, values)
 }
 
@@ -62,11 +65,11 @@ fn bench_transposed_read(c: &mut Criterion) {
 	let transposed_codec = frame_value_codec(&transposed).expect("reads codec");
 	assert!(matches!(linear_codec, "scaled_blocked" | "scaled_bitpack"), "the corpus must pick a plain bit-pack codec by default, got {linear_codec}");
 	assert_eq!(transposed_codec, "scaled_transposed", "the transposed policy must admit this corpus");
-	eprintln!("frame bytes: linear ({linear_codec}) = {} · transposed = {} ({:+.2}%)", linear.len(), transposed.len(), (transposed.len() as f64 / linear.len() as f64 - 1.0) * 100.0);
+	eprintln!("frame bytes: linear ({linear_codec}) = {} · transposed = {} ({:+.2}%)", linear.len(), transposed.len(), (cast::usize_to_f64(transposed.len()) / cast::usize_to_f64(linear.len()) - 1.0) * 100.0);
 
 	// Correctness guards before timing: both frames decode to the same segment, and the
 	// streaming/windowed reads agree across layouts.
-	let t = 1_000 + (n as i64 / 2) * 10;
+	let t = 1_000 + (cast::usize_to_i64(n) / 2) * 10;
 	assert_eq!(read_segment(&linear).expect("reads"), read_segment(&transposed).expect("reads"));
 	assert_eq!(read_segment_point(&linear, t).expect("reads"), read_segment_point(&transposed, t).expect("reads"));
 	let (w_start, w_end) = (t, t + 10 * 999);

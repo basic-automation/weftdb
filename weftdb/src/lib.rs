@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! # High-Performance Time-Series Database
 //!
 //! A high-performance time-series database with advanced interpolation capabilities,
@@ -260,10 +263,6 @@
 //!   used once splimes' `calibrate` function has run. It is opt-in at the dependency level:
 //!   `weftdb` does not enable splimes' `gpu` feature, so a build that wants the GPU asks
 //!   for it explicitly.
-
-#![recursion_limit = "1024"]
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception, clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_precision_loss, clippy::option_if_let_else, clippy::needless_continue, clippy::manual_let_else)]
 
 mod types;
 

@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{admission::AdmissionConfig, audit::AuditLog, auth::AuthConfig, bench_runs::BenchRuns, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics, store_open::ServingScope};
+use crate::{admission::AdmissionConfig, audit::AuditLog, auth::AuthConfig, bench_runs::BenchRuns, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics, read_limits::ReadLimits, store_open::ServingScope};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -67,6 +67,11 @@ pub struct AppState {
 	/// Admission I's limits (ROB-10): the query class's in-flight cap
 	/// the registry builds its gate admission from.
 	admission: AdmissionConfig,
+	/// The read caps (ROB-12, decision 12): the largest page, the largest
+	/// result, the largest downsample grid, the largest multi-instant list, and
+	/// the deadline one read gets — every read handler refuses what cannot fit
+	/// them instead of attempting it.
+	read_limits: ReadLimits,
 	/// The fsynced audit log (SEC-9), present when the binary opened
 	/// one at startup — which it always does. Absent in the stateless
 	/// test states, where audited routes pass through unrecorded,
@@ -94,7 +99,7 @@ impl AppState {
 	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT, audit: None, bench_runs: None, serving: None }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT, read_limits: ReadLimits::defaults(), audit: None, bench_runs: None, serving: None }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -126,6 +131,14 @@ impl AppState {
 		self
 	}
 
+	/// Replace the read caps (the binary's five `WEFT_MAX_*`/
+	/// `WEFT_READ_TIMEOUT_SECS` settings, ROB-12).
+	#[must_use]
+	pub const fn with_read_limits(mut self, limits: ReadLimits) -> Self {
+		self.read_limits = limits;
+		self
+	}
+
 	/// Set the request guard (see [`host_guard`](crate::host_guard)); the binary passes
 	/// [`HostGuard::for_bind`] of the address it bound.
 	#[must_use]
@@ -150,6 +163,12 @@ impl AppState {
 	#[must_use]
 	pub const fn interpolate_config(&self) -> InterpolateConfig {
 		self.interpolate
+	}
+
+	/// The read caps every read handler enforces (ROB-12).
+	#[must_use]
+	pub const fn read_limits(&self) -> ReadLimits {
+		self.read_limits
 	}
 
 	/// The request guard the router enforces.

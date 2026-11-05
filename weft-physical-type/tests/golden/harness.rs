@@ -55,17 +55,12 @@ pub fn check_golden(name: &str, fresh: &[u8]) {
 			path.display()
 		)
 	});
-	if committed != fresh {
-		panic!("{}", mismatch_report(name, &committed, fresh));
-	}
+	assert!(committed == fresh, "{}", mismatch_report(name, &committed, fresh));
 }
 
 /// The body of the mismatch panic: lengths, checksums, and where the two parts first differ.
 fn mismatch_report(name: &str, committed: &[u8], fresh: &[u8]) -> String {
-	let first_diff = match committed.iter().zip(fresh).position(|(a, b)| a != b) {
-		Some(index) => index,
-		None => std::cmp::min(committed.len(), fresh.len()),
-	};
+	let first_diff = committed.iter().zip(fresh).position(|(a, b)| a != b).unwrap_or_else(|| std::cmp::min(committed.len(), fresh.len()));
 	format!(
 		"{name}: the bytes the writer produced are not the committed golden.\n\
 		 committed: {} bytes, crc32 {:#010x}\n\
@@ -108,13 +103,13 @@ pub fn check_golden_text(name: &str, fresh: &str) {
 		return;
 	}
 	let committed_line = committed.lines().zip(fresh.lines()).position(|(a, b)| a != b);
-	let (where_, left, right) = match committed_line {
-		Some(index) => (format!("line {}", index + 1), committed.lines().nth(index).unwrap_or_default().to_string(), fresh.lines().nth(index).unwrap_or_default().to_string()),
-		None => {
+	let (where_, left, right) = committed_line.map_or_else(
+		|| {
 			// Every line matches and the lengths differ: one rendering emitted more rows than the other.
 			(format!("line {}", std::cmp::min(committed.lines().count(), fresh.lines().count()) + 1), format!("<the committed golden has no line here; it runs to {} lines>", committed.lines().count()), format!("<the fresh rendering has no line here; it runs to {} lines>", fresh.lines().count()))
-		}
-	};
+		},
+		|index| (format!("line {}", index + 1), committed.lines().nth(index).unwrap_or_default().to_string(), fresh.lines().nth(index).unwrap_or_default().to_string()),
+	);
 	panic!("{name}: the encoding decision this golden pins has changed.\n\
 		 first difference at {where_}:\n\
 		 committed: {left}\n\
@@ -123,5 +118,5 @@ pub fn check_golden_text(name: &str, fresh: &str) {
 		 A codec whose split, width or selection moved writes different bytes from today even where \
 		 no frame fixture notices, because the frame writer picks one codec per column and a codec \
 		 it does not pick is invisible there. Read the diff, then re-record deliberately with \
-		 `{UPDATE_VAR}=1` and say what changed in the commit message.",)
+		 `{UPDATE_VAR}=1` and say what changed in the commit message.")
 }

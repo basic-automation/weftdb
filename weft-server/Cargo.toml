@@ -27,6 +27,9 @@ bitsliced-codec = ["weftdb/bitsliced-codec"]
 # `cargo test --workspace`, and weftdb's check that production builds keep them inert
 # (tests/durable_fault_disabled.rs) would compile to nothing.
 fault-injection = ["weftdb/fault-injection"]
+# Forwards weftdb's opt-in memory-mapped range reads so `WEFT_SEGMENT_MMAP_READS` takes effect
+# (roadmap Phase 5); without it the variable is ignored with a warning.
+mmap-reads = ["weftdb/mmap-reads"]
 
 [lib]
 name = "weft_server"
@@ -91,7 +94,22 @@ required-features = ["fault-injection"]
 name = "poison_exit"
 required-features = ["fault-injection"]
 
+# The JSON f64 input widening, from_f64 against the shortest round-trip decimal (roadmap
+# Phase 5): `cargo bench -p weft-server --bench json_widening`.
+[[bench]]
+name = "json_widening"
+harness = false
+
+# End-to-end stored interpolation through the HTTP route (Phase 5), hand-rolled for p50/p95:
+# `cargo bench -p weft-server --bench stored_interpolate`.
+[[bench]]
+name = "stored_interpolate"
+harness = false
+
 [dev-dependencies]
+arrow-array = { workspace = true }  # a RecordBatch with a raw IEEE-754 NaN, for the ingest non-finite test (production code keeps arrow types inside weft-arrow)
+arrow-schema = { workspace = true }  # the schema of that test batch
+criterion = { workspace = true }  # benches/interpolate_wire.rs, benches/json_widening.rs
 async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
 libc = { workspace = true }  # raise(SIGTERM) for the signal-before-serving test in tests/serve_path.rs
 rcgen = "0.14"  # self-signed certificate material for the TLS tests (tls.rs unit tests, tests/tls_serve.rs)
@@ -102,3 +120,7 @@ tonic = { version = "0.14", default-features = false, features = ["channel"] }  
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "interpolate_wire"
+harness = false

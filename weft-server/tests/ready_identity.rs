@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! `/ready` carries the store identity and build info the plan assigns to
 //! SOA-14/C-5 (§3, D-S12 row): `store_uuid`, durability class,
 //! `previous_clean_shutdown` and the build version, beside the counts the
@@ -34,6 +37,7 @@ async fn seal_one_frame(dir: &Path) {
 	store.declare("price", &schema()).await.expect("declares the aspect");
 	store.seal("price", &schema(), &[10], &[BigDecimal::from(1)]).await.expect("seals the frame");
 	store.shutdown().await.expect("shuts down cleanly");
+	drop(store);
 }
 
 /// `GET /ready` on `router`, returning status and the JSON body.
@@ -51,11 +55,12 @@ async fn ready_carries_the_store_identity_and_build_info() {
 
 	// Re-open the store and read the identity from the store itself: the
 	// response has to describe this store, not just carry plausible values.
-	let store = SegmentStore::open(dir.path()).await.expect("re-opens the store");
+	let store = Arc::new(SegmentStore::open(dir.path()).await.expect("re-opens the store"));
 	let store_uuid = store.store_uuid().to_string();
 	let previous_clean_shutdown = store.previous_clean_shutdown();
 	assert!(previous_clean_shutdown, "the seal step shut down cleanly, so the re-open must observe it");
-	let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+	let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+	drop(store);
 
 	let (status, body) = get_ready(&router).await;
 	assert_eq!(status, StatusCode::OK, "{body}");

@@ -101,6 +101,13 @@ pub struct DeclareAspectRequest {
 	pub value_tolerance: Option<String>,
 	/// The timestamp resolution token (e.g. `"seconds"`, `"millis"`).
 	pub timestamp_unit: String,
+	/// The aspect's upsert keys (roadmap Phase 4.6): `"timestamp"` exactly once, plus the
+	/// tag keys every ingested row's tags must fall inside. Omitted, the aspect declares
+	/// none, and its dedup identity is the timestamp and the full tag set. Immutable, like
+	/// the schema: a re-declaration with other keys (or none where some are declared) is
+	/// a `409 schema_conflict`.
+	#[serde(default)]
+	pub upsert_keys: Option<Vec<String>>,
 }
 
 /// Response body for a successful aspect declaration: the schema the store now
@@ -139,9 +146,10 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 /// server will create — it either breaks a rule every aspect name must keep (it would move a
 /// path, or Windows could not open it) or one that only a new name can keep (an ASCII capital,
 /// which could take another aspect's file name) — [`ApiError::bad_request`] when a physical type,
-/// time unit, scale or tolerance does not parse or breaks the scale rules,
+/// time unit, scale, tolerance or upsert-key list does not parse or breaks its rules,
 /// [`Code::SchemaConflict`](crate::error::Code::SchemaConflict) when the aspect is already
-/// declared under a schema this one does not equal or widen, and a `500` on a
+/// declared under a schema this one does not equal or widen, or with other upsert keys
+/// (none and some are different keys), and a `500` on a
 /// control-plane write failure.
 pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): StrictJson<DeclareAspectRequest>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
@@ -158,7 +166,8 @@ pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): 
 	// rule was written is never stranded by it.
 	weftdb::aspect_name::validate_new(&request.name).map_err(|err| error::aspect_name_refusal(&err))?;
 	let schema = schema_from_request(&request)?;
-	let result = store.declare(&request.name, &schema).await;
+	let upsert_keys = request.upsert_keys.as_ref().map(weftdb::UpsertKeys::from_wire).transpose().map_err(ApiError::bad_request)?;
+	let result = store.declare_with_upsert_keys(&request.name, &schema, upsert_keys.as_ref()).await;
 	// A refusal the store raises itself is classified the way a read's is — it rejects the same
 	// unsafe names, an immutable-declaration refusal is `409 schema_conflict`, and a root this
 	// binary will not open is `503 incompatible_store`. A write that failed for a reason the
@@ -167,9 +176,11 @@ pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): 
 	// Read the declaration back: the response is the schema the store holds
 	// (FRE-7b), which for a widening re-declaration is the widened schema.
 	let stored = store.schema_for(&request.name).await;
+	let keys = store.upsert_keys(&request.name).await;
 	drop(store);
 	let stored = stored.map_err(|err| ApiError::internal(&err))?.ok_or_else(|| ApiError::internal("the declared aspect has no schema on read-back"))?;
-	let aspect = AspectInfo::declared(request.name, &stored);
+	let keys = keys.map_err(|err| ApiError::internal(&err))?;
+	let aspect = AspectInfo::declared(request.name, &stored).with_upsert_keys(keys.as_ref());
 	Ok((StatusCode::CREATED, Json(DeclareAspectResponse { aspect })).into_response())
 }
 
@@ -415,5 +426,45 @@ mod tests {
 		assert_eq!(body["row_count"].as_u64(), Some(1), "the sealed frame is described: {body}");
 		drop(state);
 		drop(store);
+	}
+
+	/// Phase 4.6 upsert keys over HTTP: the declaration reads back on the declare response
+	/// and the schema endpoint, takes part in schema equality (other keys, or none, is a
+	/// `409 schema_conflict`), a list without `timestamp` is a `400`, and an ingest whose
+	/// tags name a key outside them is `400 invalid_tag` with the tag in `details`.
+	#[tokio::test]
+	async fn upsert_keys_are_declared_read_back_immutable_and_bound_ingested_tags() {
+		async fn declare(dir: &TempDir, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+			let router = router_with_empty_store(dir).await;
+			post_json(router, "/api/v1/storage/aspects", &body).await
+		}
+		let dir = TempDir::new().unwrap();
+		let keyed = serde_json::json!({ "name": "cpu", "physical_type": "f64", "timestamp_unit": "seconds", "upsert_keys": ["host", "timestamp"] });
+		let (status, body) = declare(&dir, keyed.clone()).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!(body["aspect"]["upsert_keys"], serde_json::json!(["timestamp", "host"]), "the keys read back in wire order: {body}");
+		let (status, _) = declare(&dir, keyed).await;
+		assert_eq!(status, StatusCode::CREATED, "the identical declaration again is a no-op");
+
+		let router = router_with_empty_store(&dir).await;
+		let response = router.oneshot(Request::builder().uri("/api/v1/storage/cpu/schema").body(Body::empty()).unwrap()).await.unwrap();
+		let read_back: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!(read_back["aspect"]["upsert_keys"], serde_json::json!(["timestamp", "host"]), "{read_back}");
+
+		for other in [serde_json::json!({ "name": "cpu", "physical_type": "f64", "timestamp_unit": "seconds", "upsert_keys": ["timestamp", "host", "region"] }), serde_json::json!({ "name": "cpu", "physical_type": "f64", "timestamp_unit": "seconds" })] {
+			let (status, body) = declare(&dir, other).await;
+			assert_eq!((status, &body["code"]), (StatusCode::CONFLICT, &serde_json::json!("schema_conflict")), "body: {body}");
+		}
+		let (status, body) = declare(&dir, serde_json::json!({ "name": "mem", "physical_type": "f64", "timestamp_unit": "seconds", "upsert_keys": ["host"] })).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("timestamp"), "body: {body}");
+
+		let router = router_with_empty_store(&dir).await;
+		let (status, body) = post_json(router, "/api/v1/storage/cpu/points", &serde_json::json!({ "tags": { "host": "a", "region": "eu" }, "points": [{ "timestamp": 1, "value": "1" }] })).await;
+		assert_eq!((status, &body["code"], &body["details"]["tag"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag"), &serde_json::json!("region")), "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("not an upsert key"), "body: {body}");
+		let router = router_with_empty_store(&dir).await;
+		let (status, body) = post_json(router, "/api/v1/storage/cpu/points", &serde_json::json!({ "tags": { "host": "a" }, "points": [{ "timestamp": 1, "value": "1" }] })).await;
+		assert!(status.is_success(), "a tag inside the keys is accepted: {status} {body}");
 	}
 }

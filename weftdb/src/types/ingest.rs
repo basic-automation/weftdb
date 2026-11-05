@@ -90,7 +90,7 @@ impl fmt::Display for IngestPhase {
 
 /// One batch offered to [`SegmentStore::ingest`](crate::SegmentStore::ingest):
 /// an idempotency key, a groups tag set, and its rows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestBatch {
 	/// The idempotency key, scoped to the aspect: the same key offered again
 	/// with the same batch replays the first commit's receipt; with a
@@ -283,7 +283,7 @@ pub struct LedgerEntry {
 struct Fnv1a(u64);
 
 impl Fnv1a {
-	fn new() -> Self {
+	const fn new() -> Self {
 		Self(0xcbf2_9ce4_8422_2325)
 	}
 
@@ -309,7 +309,7 @@ impl Fnv1a {
 		self.u64(value.cast_unsigned());
 	}
 
-	fn finish(&self) -> i64 {
+	const fn finish(&self) -> i64 {
 		self.0.cast_signed()
 	}
 }

@@ -74,7 +74,6 @@ pub const READ_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// # Errors
 ///
 /// Connecting, or (on Apple targets) setting the pragma.
-#[cfg_attr(not(target_vendor = "apple"), allow(clippy::unused_async, reason = "only Apple targets set a pragma on the new connection"))]
 pub async fn connect(db: &turso::Database) -> turso::Result<turso::Connection> {
 	let conn = db.connect()?;
 	#[cfg(target_vendor = "apple")]
@@ -391,6 +390,7 @@ mod tests {
 		assert_eq!(pragma(&conn, "SELECT 41 + 1").await.unwrap(), Value::Integer(42));
 		assert_eq!(pragma(&conn, "PRAGMA busy_timeout").await.unwrap(), Value::Integer(0), "a writer sees Busy at once");
 		let reader = connect_reader(&db).await.unwrap();
+		drop(db);
 		assert_eq!(pragma(&reader, "PRAGMA busy_timeout").await.unwrap(), Value::Integer(i64::try_from(READ_BUSY_TIMEOUT.as_millis()).unwrap()));
 		#[cfg(target_vendor = "apple")]
 		assert_eq!(pragma(&conn, "PRAGMA fullfsync").await.unwrap(), Value::Integer(1));

@@ -19,6 +19,9 @@
 //!
 //! Regenerating is [`WEFT_UPDATE_GOLDENS`], and it is a format change: see
 //! [`golden::harness`](harness).
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 #[path = "golden/harness.rs"]
 mod harness;
@@ -191,17 +194,14 @@ fn single_block_nullable(stamps: &[i64], values: &[Option<BigDecimal>], unit: Ti
 /// Build a paged (v6) frame.
 fn paged(stamps: &[i64], values: &[BigDecimal], unit: TimeUnit, rows_per_page: usize, stride: Option<usize>) -> Built {
 	let segment = PagedSegment::build(stamps, values, unit, &exact(), rows_per_page).expect("a paged frame always builds");
-	let bytes = match stride {
-		Some(stride) => segment.write_to_checkpointed(stride),
-		None => segment.write_to(),
-	};
+	let bytes = stride.map_or_else(|| segment.write_to(), |stride| segment.write_to_checkpointed(stride));
 	let (timestamps, values) = segment.decode_nullable();
 	Built { bytes, timestamps, values }
 }
 
 /// Wrap a v5 frame in the v7 envelope.
-fn envelope(inner: Built, extensions: Vec<FrameExtension>) -> Built {
-	let bytes = wrap_frame_envelope(&inner.bytes, &extensions).expect("a known body version always wraps");
+fn envelope(inner: Built, extensions: &[FrameExtension]) -> Built {
+	let bytes = wrap_frame_envelope(&inner.bytes, extensions).expect("a known body version always wraps");
 	Built { bytes, timestamps: inner.timestamps, values: inner.values }
 }
 
@@ -254,7 +254,7 @@ fn decode(case: &Case, bytes: &[u8]) -> (Vec<i64>, Vec<Option<BigDecimal>>) {
 	}
 }
 
-fn default_opts() -> FrameOptions {
+const fn default_opts() -> FrameOptions {
 	FrameOptions::DEFAULT
 }
 
@@ -358,7 +358,7 @@ fn case_paged_checkpointed() -> Built {
 }
 
 fn case_envelope_bare() -> Built {
-	envelope(case_scaled_bitpack(), Vec::new())
+	envelope(case_scaled_bitpack(), &[])
 }
 
 /// An envelope carrying a non-critical extension this build has never heard of — the mechanism
@@ -366,7 +366,7 @@ fn case_envelope_bare() -> Built {
 /// that knows the envelope skips what it does not know instead of refusing the file.
 fn case_envelope_unknown_extension() -> Built {
 	let extensions = vec![FrameExtension { id: 4_242, critical: false, payload: b"a payload the envelope never interprets".to_vec() }];
-	envelope(case_scaled_bitpack(), extensions)
+	envelope(case_scaled_bitpack(), &extensions)
 }
 
 /// The series key the tagged-frame fixture carries: two tags, so the canonical order and both
@@ -380,7 +380,7 @@ fn fixture_series_key() -> weft_physical_type::SeriesKey {
 /// payload is the canonical series key, around an unchanged v5 body.
 fn case_envelope_series_key() -> Built {
 	let extensions = vec![FrameExtension { id: weft_physical_type::EXT_SERIES_KEY, critical: true, payload: fixture_series_key().as_bytes().to_vec() }];
-	envelope(case_scaled_bitpack(), extensions)
+	envelope(case_scaled_bitpack(), &extensions)
 }
 
 /// Every committed frame fixture.
@@ -485,7 +485,7 @@ fn every_committed_fixture_is_named_by_a_case() {
 	let dir = golden_dir();
 	// This suite owns the `frame_` namespace of the shared golden directory; `enc_` belongs to
 	// `golden_codecs.rs`, whose fixtures are not frames and must not be judged by a frame test.
-	let entries: Vec<String> = std::fs::read_dir(&dir).expect("tests/golden must exist and be committed").filter_map(|entry| entry.ok().map(|entry| entry.file_name().to_string_lossy().into_owned())).filter(|name| name.starts_with("frame_") && name.ends_with(".bin")).collect();
+	let entries: Vec<String> = std::fs::read_dir(&dir).expect("tests/golden must exist and be committed").filter_map(|entry| entry.ok().map(|entry| entry.file_name().to_string_lossy().into_owned())).filter(|name| name.starts_with("frame_") && std::path::Path::new(name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))).collect();
 	for name in &entries {
 		// The all-features run owns a gated fixture's bytes; a default build neither writes nor
 		// reads it, so its presence in the directory is the gate working, not an orphan.
