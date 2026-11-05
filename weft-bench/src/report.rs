@@ -637,7 +637,7 @@ mod tests {
 	fn to_html_shows_the_first_rep_and_the_gpu_pool() {
 		let mut with_split = result_with_rmse("weftdb", 1.0);
 		with_split.cold_warm = crate::schema::ColdWarm::from_samples(&[2_500_000, 1_000_000, 1_100_000]);
-		with_split.gpu_pool = Some(crate::gpu_memory::GpuPoolSummary { max_pool_bytes: 512 << 20, rounds: 2, calls: 6, created: 2, created_after_first_round: 0, reused: 4, evicted: 0, peak_idle_bytes_first_round: 112 << 20, peak_idle_bytes_later: 112 << 20, final_idle_bytes: 112 << 20, stable: true });
+		with_split.gpu_pool = Some(crate::gpu_memory::GpuPoolSummary { max_pool_bytes: 512 << 20, rounds: 2, calls: 6, created: 2, created_after_first_round: 0, reused: 4, evicted: 0, peak_idle_bytes_first_round: 112 << 20, peak_idle_bytes_later: 112 << 20, final_idle_bytes: 112 << 20, stable: true, device_memory: None });
 		let html = BenchReport::with_results(metadata(), vec![with_split, result_with_rmse("baseline-linear", 1.2)]).to_html();
 		assert!(html.contains("<th>mean ms</th><th>1st ms</th>"), "{html}");
 		assert!(html.contains("<td>2.500</td>"), "the first rep in ms: {html}");
