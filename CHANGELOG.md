@@ -141,6 +141,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   canonical `SeriesKey` without building a `TagSet`.
 - **`WEFT_MAX_SERIES_PER_ASPECT`** (Tuning): the most tagged series one aspect may register,
   default 100,000; a malformed value stops the server from starting.
+- **Store read bounds (ROB-13).** The stored downsample and the batch point lookup are
+  bounded in `SegmentStore` itself, at 1.0 decision 12's numbers:
+  `SegmentStoreOptions::max_downsample_buckets` (`DEFAULT_MAX_DOWNSAMPLE_BUCKETS`,
+  1,000,000) and `max_point_batch` (`DEFAULT_MAX_POINT_BATCH`, 10,000 instants). A
+  downsample whose fold reaches one bucket more is refused with the typed
+  `StoreError::DownsampleTooLarge` while it runs (for a `BucketWidth` the bound is the
+  returned, coarsened grid); a wider point batch is refused with
+  `StoreError::PointBatchTooLarge` before the index is pruned. Over HTTP both are
+  `422 result_too_large` carrying the cap. The single point lookup names one instant
+  and needs no cap. The HTTP read ceilings themselves are ROB-12's.
 
 ### Changed
 
@@ -169,6 +179,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   aspect's catalog; read the id from `IngestReceipt::series_ids` instead. The method shipped
   in `weftdb` 0.2.0 on crates.io, so this is a breaking change, allowed in the next minor
   release by the pre-1.0 policy above.
+- **Seal-backed legacy aspects feed a change log, not the per-timestamp queue (S20).**
+  Each seal-store commit records one `segment_changes` row (epoch, time span, row count)
+  in its own index transaction, and the batch consumer rebuilds the windows a change's
+  span touches and acknowledges the row by epoch. Seal-backed ingest no longer writes
+  `unbatched_measurements` entries; rows-mode aspects keep the queue unchanged. This
+  closes the S20 half of the 0.2.0 "crash consistency is not finished" limitation.
 - The `503 unconfigured` sentence no longer names the segment store, since the bench-run
   routes answer it too: it reads "a subsystem this route needs is not configured on this
   server", and `details.subsystem` / `details.enabled_by` say which one and the variable that

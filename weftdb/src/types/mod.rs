@@ -30,11 +30,11 @@ pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState
 pub use quarantine::{QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS};
 pub use relative::Relative;
 pub use rows_mode::{discover, import_into, read_import_record, record_key, ImportRecord, ImportedAspect, LegacyAspect, LegacyCatalogAspect, LegacyTree, NotCarried, RowsModeError, DEFAULT_ROWS_PER_SEGMENT, IMPORT_RECORD_KEY, MEASUREMENTS_FILE, TIMESTAMP_COLUMN, TIMESTAMP_TIME_UNIT, TIMESTAMP_UNIT};
-pub use segment_index::SegmentIndexStore;
+pub use segment_index::{SegmentChange, SegmentIndexStore};
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;
-pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBreaker, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, DEFAULT_MAINTENANCE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_WAIT, DEFAULT_MAX_SERIES_PER_ASPECT};
+pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBreaker, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, DEFAULT_MAINTENANCE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_WAIT, DEFAULT_MAX_DOWNSAMPLE_BUCKETS, DEFAULT_MAX_POINT_BATCH, DEFAULT_MAX_SERIES_PER_ASPECT};
 pub use signal::{units_between, Distance, ErrVal, Signal, SignalType, Signals};
 pub use store_format::{StoreFormat, StoreScope, LEGACY_LAYOUT, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
 pub use subject::{Subject, SubjectId};

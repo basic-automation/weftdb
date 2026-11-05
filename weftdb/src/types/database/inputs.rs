@@ -292,16 +292,16 @@ impl Inputs for Database {
 	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
 		// Seal-backed aspects (slice D-S19): a one-row ingest through the
 		// seal store, followed by the store's O(1) fragmentation gate. The
-		// queue enqueue keeps the S18 write-ahead shape until D-S20.
+		// per-timestamp queue is never touched (slice D-S20): the ingest
+		// commit records the aspect's change-log row in its own index
+		// transaction, which is what the batch consumer reads.
 		if self.is_seal_backed(aspect_id).await? {
 			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 			let data_timestamp = measurement.timestamp();
-			self.enqueue_retrying(aspect_id, &[data_timestamp]).await?;
 			let rows = vec![(data_timestamp.timestamp_millis(), measurement.value().clone())];
 			let store = self.seal_store().await?;
 			let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
 			self.forget_cached_earliest_measurement(aspect_id).await;
-			self.requeue_committed(aspect_id, &[data_timestamp]).await;
 			if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&crate::legacy_seal::aspect_key(aspect_id), crate::legacy_seal::SQUASH_TARGET_ROWS).await {
 				tracing::debug!("Failed to run the fragmentation gate after capturing a measurement of aspect {aspect_id}; it is sealed: {e}");
 			}
@@ -427,18 +427,16 @@ impl Inputs for Database {
 
 		// Seal-backed aspects (slice D-S19): the whole call is one ingest
 		// transaction in the seal store under its derived key, so it is
-		// all-or-nothing and a retry replays it. The queue enqueue keeps
-		// the S18 write-ahead shape until D-S20 replaces the queue.
+		// all-or-nothing and a retry replays it. One call is one commit,
+		// so it records exactly one change-log row (slice D-S20) and never
+		// touches the per-timestamp queue.
 		if self.is_seal_backed(&aspect_id).await? {
 			let min_new = input_measurements.iter().map(InputMeasurement::timestamp).min().unwrap();
 			let max_new = input_measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
-			let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
-			self.enqueue_retrying(&aspect_id, &all_timestamps).await?;
 			let rows: Vec<(i64, bigdecimal::BigDecimal)> = input_measurements.iter().map(|m| (m.timestamp().timestamp_millis(), m.value().clone())).collect();
 			let store = self.seal_store().await?;
 			let tx_ids = crate::legacy_seal::ingest_batch(&store, &aspect_id, &dataset_id, &rows).await?;
 			self.forget_cached_earliest_measurement(&aspect_id).await;
-			self.requeue_committed(&aspect_id, &all_timestamps).await;
 			if let Err(e) = self.update_aspect_timestamps(&aspect_id, min_new, max_new).await {
 				tracing::warn!("[batch_capture] Failed to update aspect timestamps for {aspect_id}; the measurements are sealed: {e}");
 			}

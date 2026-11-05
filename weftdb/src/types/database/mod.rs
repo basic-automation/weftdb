@@ -23,6 +23,15 @@ pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::n
 // Add connection manager for Turso with connection pools
 static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, turso::Database>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// The seal store open over each legacy database's `segments_v2/` root, by
+/// root path (slice D-S20): a root can be open only once in a process, but
+/// several `Database` handles of one database coexist — `analyze_range`
+/// reopens the database by name for every chunk it fetches — so the one
+/// open is shared through this registry rather than held per handle. The
+/// registry holds the store weakly: when the last handle's store drops,
+/// the next open goes back to disk.
+static SEAL_STORES: LazyLock<Mutex<HashMap<std::path::PathBuf, std::sync::Weak<crate::SegmentStore>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub use config::{data_dir, default_data_dir};
 
 /// Clear all cached connections that contain the given name in their path.
@@ -1517,7 +1526,11 @@ impl Database {
 
 	/// This database's seal store (slice D-S19), opened on first use and
 	/// held by this handle: the root at `{db}/segments_v2/`, scoped
-	/// `(db, 'legacy')`. Clones of this handle share the one open.
+	/// `(db, 'legacy')`. Clones of this handle share the one open, and so
+	/// do the other handles of the same database in this process (slice
+	/// D-S20, see `SEAL_STORES`): a root can be open only once, and
+	/// `analyze_range`'s per-chunk reopened handles must reach the store
+	/// the ingest handle opened, not refuse it as locked.
 	///
 	/// # Errors
 	///
@@ -1528,7 +1541,17 @@ impl Database {
 			return Ok(store.clone());
 		}
 		let db_dir = Path::new(&self.metadata_path).parent().ok_or_else(|| anyhow::anyhow!("metadata path {} has no parent directory", self.metadata_path))?;
+		// The registry lock is held across the open, so two handles racing
+		// their first use share the one open instead of the second failing
+		// on the root's LOCK.
+		let mut registry = SEAL_STORES.lock().await;
+		let root = crate::legacy_seal::segments_root(db_dir);
+		if let Some(store) = registry.get(&root).and_then(std::sync::Weak::upgrade) {
+			*held = Some(store.clone());
+			return Ok(store);
+		}
 		let store = Arc::new(crate::legacy_seal::open_store(&self.name, db_dir).await?);
+		registry.insert(root, Arc::downgrade(&store));
 		*held = Some(store.clone());
 		Ok(store)
 	}
@@ -1547,6 +1570,40 @@ impl Database {
 			Some((min, max)) => (DateTime::from_timestamp_millis(min), DateTime::from_timestamp_millis(max)),
 			None => (None, None),
 		})
+	}
+
+	/// The pending change-log rows of a seal-backed aspect (slice D-S20):
+	/// one row per seal-store commit not yet acknowledged by the batch
+	/// consumer, in epoch order, each carrying the commit's time span (in
+	/// milliseconds, the legacy timestamp unit) and its row count. This replaces the per-timestamp
+	/// unbatched queue for seal-backed aspects; a rows-mode aspect has no
+	/// change log and reads as no changes (its consumer uses the queue).
+	///
+	/// # Errors
+	///
+	/// If the seal store cannot answer for the aspect.
+	pub async fn seal_changes(&self, aspect_id: &AspectId) -> Result<Vec<crate::SegmentChange>> {
+		if !self.is_seal_backed(aspect_id).await? {
+			return Ok(Vec::new());
+		}
+		let store = self.seal_store().await?;
+		store.changes_since(&crate::legacy_seal::aspect_key(aspect_id), 0).await
+	}
+
+	/// Acknowledge a seal-backed aspect's change-log rows at or below
+	/// `through_epoch` (slice D-S20): the batch consumer calls this once
+	/// it has batched the changes it read, as a queue consumer dequeues
+	/// what it batched. A no-op for a rows-mode aspect.
+	///
+	/// # Errors
+	///
+	/// If the seal store's acknowledgement commit fails.
+	pub async fn ack_seal_changes(&self, aspect_id: &AspectId, through_epoch: u64) -> Result<()> {
+		if !self.is_seal_backed(aspect_id).await? {
+			return Ok(());
+		}
+		let store = self.seal_store().await?;
+		store.ack_changes(&crate::legacy_seal::aspect_key(aspect_id), through_epoch).await
 	}
 
 	/// The cache key of an aspect's earliest measurement timestamp.
