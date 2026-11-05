@@ -149,9 +149,7 @@ impl DownsampleProfile {
 		let anchor = Self::anchor();
 		let n = self.point_count.max(2);
 		(0..n).map(|i| {
-			#[allow(clippy::cast_possible_wrap)]
 			let timestamp = anchor + Duration::seconds(i as i64 * self.input_stride_secs);
-			#[allow(clippy::cast_precision_loss)]
 			let phase = i as f64 / 500.0;
 			let noise = rng.random_range(-1.0..=1.0);
 			let signal = 20.0_f64.mul_add((phase * TAU).sin(), 50.0) + noise;
@@ -166,7 +164,6 @@ impl DownsampleProfile {
 	/// trailing zeros kept, as a price column stores them), or its exact binary expansion.
 	fn decimal(&self, signal: f64) -> BigDecimal {
 		let Some(places) = self.value_decimals else { return BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(50)) };
-		#[allow(clippy::cast_possible_truncation)]
 		let mantissa = (signal * 10_f64.powi(places.cast_signed())).round() as i64;
 		BigDecimal::new(mantissa.into(), i64::from(places))
 	}
@@ -190,9 +187,8 @@ fn scaled_column(points: &[Point]) -> Option<(Vec<i64>, Vec<i64>, u32)> {
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
-#[allow(clippy::cast_possible_truncation)]
 fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 /// Reduce `points` under the profile: one serial [`reduce`] pass, or — when
@@ -292,9 +288,7 @@ pub fn run_downsample_on(profile: &DownsampleProfile, points: &[Point], generati
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	// Throughput is input points reduced per second.
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		#[allow(clippy::cast_precision_loss)]
 		let secs = latency.mean_ns as f64 / 1e9;
-		#[allow(clippy::cast_precision_loss)]
 		let points_f = points.len() as f64;
 		points_f / secs
 	} else {

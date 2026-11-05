@@ -206,7 +206,6 @@ impl DerivedReadVerdict {
 	/// [`Self::mismatch_count`] is larger than the list kept.
 	#[must_use]
 	pub fn truncated(&self) -> bool {
-		#[allow(clippy::cast_possible_truncation)]
 		let kept = self.mismatches.len() as u64;
 		self.mismatch_count > kept
 	}
@@ -231,9 +230,7 @@ impl DerivedReadVerdict {
 fn sealed_value(value: &GridValue) -> Option<f64> {
 	match value {
 		GridValue::Float(value) => Some(*value),
-		#[allow(clippy::cast_precision_loss)]
 		GridValue::Integer(value) => Some(*value as f64),
-		#[allow(clippy::cast_precision_loss)]
 		GridValue::Unsigned(value) => Some(*value as f64),
 		GridValue::Boolean(_) | GridValue::Text(_) => None,
 	}
@@ -257,7 +254,6 @@ impl BucketAcc {
 	}
 
 	fn finish(self, timestamp_ns: i64) -> DerivedBucket {
-		#[allow(clippy::cast_precision_loss)]
 		let avg = self.sum / self.count as f64;
 		DerivedBucket { timestamp_ns, count: self.count, min: self.min, max: self.max, sum: self.sum, avg }
 	}

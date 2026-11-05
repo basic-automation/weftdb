@@ -61,7 +61,6 @@ struct Lane {
 /// do not strictly rise, if a knob is zero or the weights sum to zero, if a copy would leave the
 /// timestamp range, if a store operation fails, or if `on_lane` fails. A read that answers wrongly
 /// is not an error: it fails that lane's gate.
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 pub async fn run_query_mix(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: QueryMixParams, mut on_lane: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
 	anyhow::ensure!(timestamps.len() >= 2 && timestamps.len() == values.len(), "a query-mix corpus needs at least two rows and as many values as timestamps");
 	anyhow::ensure!(profile.batch_rows > 0 && params.ops > 0 && params.range_rows > 0 && params.rows > 0, "query mix needs rows, ops, range rows and a batch size above zero");

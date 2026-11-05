@@ -114,7 +114,6 @@ impl GapFillProfile {
 	/// The noise-free signal at sample `i`: a one-hour-period sinusoid around 50.
 	fn clean(&self, i: usize) -> f64 {
 		use std::f64::consts::TAU;
-		#[allow(clippy::cast_precision_loss)]
 		let seconds = (i as f64) * (self.params.input_stride_secs as f64);
 		20.0_f64.mul_add((seconds / 3_600.0 * TAU).sin(), 50.0)
 	}
@@ -160,7 +159,6 @@ impl GapFillProfile {
 		let mut rng = ChaCha8Rng::seed_from_u64(p.seed);
 		let anchor = Utc.timestamp_opt(EPOCH_ANCHOR_SECS, 0).single().expect("valid fixed epoch anchor");
 		let n = p.point_count;
-		#[allow(clippy::cast_possible_wrap)]
 		let instant = |i: usize| anchor + Duration::seconds(i as i64 * p.input_stride_secs);
 		let step = |i: usize| bucket_index(p.bucket_resolution, &instant(i)).expect("indexable");
 		let (first, last) = (step(0), step(n - 1));
@@ -178,7 +176,6 @@ impl GapFillProfile {
 				entry.1 += 1;
 				continue;
 			}
-			#[allow(clippy::cast_possible_truncation)]
 			let cents = ((clean + noise) * 100.0).round() as i64;
 			points.push(Point { timestamp: instant(i), value: BigDecimal::new(cents.into(), 2) });
 		}
@@ -227,9 +224,8 @@ impl GapFillProfile {
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
-#[allow(clippy::cast_possible_truncation)]
 fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 /// The gap-fill query: reduce, then fill the grid between the corpus bounds.
@@ -306,9 +302,7 @@ pub fn run_gap_fill_on(profile: &GapFillProfile, corpus: &GapFillCorpus, generat
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: p.seed ^ 0x_6A9F_C0DE_u64, ..BootstrapConfig::default() }));
-	#[allow(clippy::cast_precision_loss)]
 	let throughput_points_per_sec = if latency.mean_ns > 0 { corpus.points.len() as f64 / (latency.mean_ns as f64 / 1e9) } else { 0.0 };
-	#[allow(clippy::cast_precision_loss)]
 	let missingness_fraction = 1.0 - corpus.points.len() as f64 / corpus.generated as f64;
 	let irregular = corpus.points.windows(3).any(|w| w[2].timestamp - w[1].timestamp != w[1].timestamp - w[0].timestamp);
 	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GAP_FILL.to_string(), reps, dataset: DatasetMeta { input_points: corpus.points.len(), output_points: grid.len(), irregular, missingness_fraction, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
@@ -328,7 +322,6 @@ mod tests {
 		let corpus = profile.generate();
 		assert_eq!(profile.generate(), corpus, "seeded");
 		let grid_buckets = 6 * 60;
-		#[allow(clippy::cast_precision_loss)]
 		let share = corpus.truth.len() as f64 / f64::from(grid_buckets - 2);
 		assert!((0.1..0.3).contains(&share), "removed share {share} should be near 20%");
 		assert!(corpus.truth.iter().all(|(t, _)| *t > corpus.span.0 && *t < corpus.span.1), "outages never touch the grid edges");

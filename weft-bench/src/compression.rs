@@ -155,7 +155,6 @@ impl CompressionProfile {
 		let values: Vec<BigDecimal> = (0..n).map(|i| self.value_shape.value_at(i).parse().expect("literal decimal parses")).collect();
 		let timestamps: Vec<i64> = if self.regular {
 			// `n` is a row count (never near `i64::MAX`), so the index cast cannot wrap.
-			#[allow(clippy::cast_possible_wrap)]
 			(0..n as i64).map(|i| EPOCH_ANCHOR_MS + i * REGULAR_STRIDE_MS).collect()
 		} else {
 			let mut rng = ChaCha8Rng::seed_from_u64(self.seed ^ 0x_1F0E_2D3C_4B5A_6978);
@@ -171,9 +170,8 @@ impl CompressionProfile {
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
-#[allow(clippy::cast_possible_truncation)]
 fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 /// Run a compression profile for `reps` timed repetitions and return a
@@ -260,9 +258,7 @@ pub fn run_compression_on(run: &CorpusRun<'_>, timestamps: &[i64], values: &[Big
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: run.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	// Throughput is points decoded per second (the whole segment per rep).
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		#[allow(clippy::cast_precision_loss)]
 		let secs = latency.mean_ns as f64 / 1e9;
-		#[allow(clippy::cast_precision_loss)]
 		let points = timestamps.len() as f64;
 		points / secs
 	} else {

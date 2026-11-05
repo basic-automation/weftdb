@@ -2,7 +2,7 @@
 //!
 //! Before this module the router was one long `.route(...)` chain in `lib.rs`, and
 //! everything that needs to know the route table — an authorisation policy, the
-//! per-route admission classes ROB-10 wanted, the OpenAPI document FRE-9 will
+//! per-route admission classes ROB-10 wanted, the `OpenAPI` document FRE-9 will
 //! publish — would have had to keep its own copy of that table. Four copies is
 //! what C4 calls out: SEC-3's sealed builder, FRE-9's `OpenApiRouter`, FRE-24's
 //! roles and ROB-10's classes, each able to drift from the others and from the
@@ -23,7 +23,7 @@
 //!   [`Scope`] per route — the table SEC-6's Bearer gate will enforce;
 //! - the **class table** ([`RouteTable::class_table`]): [`AdmissionClass`] and
 //!   [`Tier`] per operation — ROB-10's per-route classes, folded in here;
-//! - the **OpenAPI document** ([`RouteTable::openapi_document`]): one operation
+//! - the **`OpenAPI` document** ([`RouteTable::openapi_document`]): one operation
 //!   per route, keyed by its frozen `operation_id`, carrying its spec as
 //!   `x-weft-*` extensions. FRE-9a later feeds utoipa-axum's `routes!()` output
 //!   *into* [`Routes::route`]; the document's shape does not change then, only
@@ -110,7 +110,7 @@ impl Scope {
 	/// changing it is a 1.0-policy change, not a route-adding act.
 	pub const ALL: [Self; 8] = [Self::Probe, Self::Metrics, Self::Read, Self::Compute, Self::Ingest, Self::Declare, Self::Maintain, Self::Backup];
 
-	/// The scope's name in the policy table, the OpenAPI extensions and (from
+	/// The scope's name in the policy table, the `OpenAPI` extensions and (from
 	/// SEC-6) the keys file. Frozen with the table.
 	#[must_use]
 	pub const fn as_str(self) -> &'static str {
@@ -187,7 +187,9 @@ impl Role {
 }
 
 /// Whether a route's calls are written to the audit log (SEC-9's fsynced
-/// JSONL file), and how. The registry records the requirement; SEC-9's
+/// JSONL file), and how.
+///
+/// The registry records the requirement; SEC-9's
 /// writer ([`crate::audit`]) owns the file, and a route whose spec says
 /// [`Audit::AttemptOutcome`] fails closed on `audit_unavailable` when
 /// its attempt or outcome record cannot be written.
@@ -202,7 +204,7 @@ pub enum Audit {
 }
 
 impl Audit {
-	/// The audit requirement's name in the OpenAPI extensions.
+	/// The audit requirement's name in the `OpenAPI` extensions.
 	#[must_use]
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -213,7 +215,9 @@ impl Audit {
 }
 
 /// How a route competes for admission when the server is loaded — ROB-10's
-/// per-route classes, folded into this registry by §3. Admission lives
+/// per-route classes, folded into this registry by §3.
+///
+/// Admission lives
 /// *inside* the gate (C10): D-S14 charged the write class's byte budget
 /// there, and ROB-10 (Admission I) generalised the gate to consult this
 /// class for every route — see [`crate::admission`].
@@ -236,7 +240,7 @@ pub enum AdmissionClass {
 }
 
 impl AdmissionClass {
-	/// The class's name in the class table and the OpenAPI extensions.
+	/// The class's name in the class table and the `OpenAPI` extensions.
 	#[must_use]
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -248,13 +252,12 @@ impl AdmissionClass {
 	}
 }
 
-/// The ingest routes' byte-weighted admission (D-S14, plan C10,
-/// crash-consistency §8): a shared in-flight byte budget the registry's
-/// gate charges each ingest request against, inside the gate — after
-/// the route is matched (so the charge knows the route's class) and
-/// before the handler runs (so a refused request never reaches a
-/// handler, and its `Idempotency-Key` is never read: key handling sits
-/// behind the gate, as C10 puts it).
+/// The ingest routes' byte-weighted admission (D-S14, plan C10, crash-consistency §8).
+///
+/// A shared in-flight byte budget the registry's gate charges each ingest request against,
+/// inside the gate — after the route is matched (so the charge knows the route's class) and
+/// before the handler runs (so a refused request never reaches a handler, and its
+/// `Idempotency-Key` is never read: key handling sits behind the gate, as C10 puts it).
 ///
 /// The charge is the request's `Content-Length` when it carries one;
 /// a request without one (a chunked body) is charged a single byte —
@@ -301,7 +304,7 @@ impl IngestAdmission {
 
 /// One route's contract, exactly the §3 field set: every route registered in
 /// this module carries one, and the four products (router, policy table,
-/// class table, OpenAPI) are all read off these values.
+/// class table, `OpenAPI`) are all read off these values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteSpec {
 	/// The [`Scope`] a caller must hold for this route (SEC-6 enforces).
@@ -320,7 +323,7 @@ pub struct RouteSpec {
 	pub tier: Tier,
 	/// The route's [`AdmissionClass`].
 	pub admission_class: AdmissionClass,
-	/// The route's stable operation name — its OpenAPI `operationId`, its
+	/// The route's stable operation name — its `OpenAPI` `operationId`, its
 	/// audit and metrics label, and its key in the class table. Unique
 	/// across the registry; registration panics on a duplicate.
 	pub operation_id: &'static str,
@@ -354,7 +357,9 @@ pub struct RouteEntry {
 	pub spec: RouteSpec,
 }
 
-/// The sealed registry's read side: the tables every consumer shares. Built
+/// The sealed registry's read side: the tables every consumer shares.
+///
+/// Built
 /// once by [`Routes::seal`]; there is no way to add to it afterwards, which
 /// is what "sealed" means here — the router and the tables cannot drift
 /// because both are this one value.
@@ -376,7 +381,7 @@ impl RouteTable {
 	/// registry knows it. The gate's whole decision is this lookup.
 	#[must_use]
 	pub fn lookup(&self, method: &Method, matched_path: &str) -> Option<&RouteEntry> {
-		self.entries.iter().find(|entry| &entry.method == method && entry.path == matched_path)
+		self.entries.iter().find(|entry| entry.method == method && entry.path == matched_path)
 	}
 
 	/// The entry whose spec carries `operation_id`, if any.
@@ -414,7 +419,7 @@ impl RouteTable {
 		self.entries.iter().map(|entry| ClassEntry { operation_id: entry.spec.operation_id, admission_class: entry.spec.admission_class, tier: entry.spec.tier }).collect()
 	}
 
-	/// The OpenAPI document for the whole surface, generated from the one
+	/// The `OpenAPI` document for the whole surface, generated from the one
 	/// registry: one path item per template, one operation per route,
 	/// keyed by the frozen `operation_id` and carrying the rest of the
 	/// spec as `x-weft-*` extensions, so a consumer that only reads the
@@ -491,8 +496,8 @@ fn template_matches(template: &str, concrete: &str) -> bool {
 	}
 }
 
-/// The OpenAPI key for a method (`get`, `post`, …).
-fn method_key(method: &Method) -> &'static str {
+/// The `OpenAPI` key for a method (`get`, `post`, …).
+const fn method_key(method: &Method) -> &'static str {
 	match *method {
 		Method::GET => "get",
 		Method::POST => "post",
@@ -505,7 +510,9 @@ fn method_key(method: &Method) -> &'static str {
 	}
 }
 
-/// The registry under construction. Routes enter only through
+/// The registry under construction.
+///
+/// Routes enter only through
 /// [`Routes::route`], called by the per-area registration functions;
 /// [`Routes::seal`] freezes the result into a [`SealedRoutes`], after
 /// which registration is impossible (the builder is consumed).
@@ -537,10 +544,12 @@ impl Routes {
 		assert!(self.entries.iter().all(|entry| entry.spec.operation_id != spec.operation_id), "duplicate operation_id `{}` in the route registry", spec.operation_id);
 		assert!(self.entries.iter().all(|entry| !(entry.method == method && entry.path == path)), "duplicate route {method} {path} in the route registry");
 		self.entries.push(RouteEntry { method, path, spec });
-		if let Some((_, existing)) = self.handlers.iter_mut().find(|(known, _)| *known == path) {
+		let known_position = self.handlers.iter().position(|(known, _)| *known == path);
+		if let Some(position) = known_position {
 			// A second method on a known path merges into its method
 			// router: axum keys the router by path, the registry by
 			// (method, path).
+			let existing = &mut self.handlers[position].1;
 			let merged = std::mem::take(existing).merge(handler);
 			*existing = merged;
 		} else {
@@ -571,13 +580,13 @@ pub struct SealedRoutes {
 }
 
 impl SealedRoutes {
-	/// The shared table (policy, classes, OpenAPI, gate lookups).
+	/// The shared table (policy, classes, `OpenAPI`, gate lookups).
 	#[must_use]
 	pub fn table(&self) -> Arc<RouteTable> {
 		Arc::clone(&self.table)
 	}
 
-	/// The OpenAPI document for this registry (see
+	/// The `OpenAPI` document for this registry (see
 	/// [`RouteTable::openapi_document`]).
 	#[must_use]
 	pub fn openapi_document(&self) -> Value {
@@ -588,7 +597,7 @@ impl SealedRoutes {
 	/// one (D-S14, ROB-10). The binary's registry always does; a
 	/// fixture registry sealed without one admits unconditionally.
 	#[must_use]
-	pub fn admission(&self) -> Option<&Arc<Admission>> {
+	pub const fn admission(&self) -> Option<&Arc<Admission>> {
 		self.admission.as_ref()
 	}
 
@@ -596,7 +605,6 @@ impl SealedRoutes {
 	/// The fail-closed gate layer and the registry fallback are part
 	/// of the product, so a router built any other way is not this
 	/// registry's router.
-	#[must_use]
 	pub fn router(self) -> Router<AppState> {
 		let gate_state = GateState { table: Arc::clone(&self.table), admission: self.admission };
 		let mut router = Router::new();
@@ -616,7 +624,9 @@ struct GateState {
 }
 
 /// The whole surface's registry, assembled from the per-area registration
-/// functions, with the default ingest limits (D-S14). This is the
+/// functions, with the default ingest limits (D-S14).
+///
+/// This is the
 /// registry the table tests read; the served router comes from
 /// [`build_registry_with_ingest_config`] via [`crate::app_with_state`].
 #[must_use]
@@ -624,19 +634,22 @@ pub fn build_registry() -> SealedRoutes {
 	build_registry_with_ingest_config(IngestConfig::DEFAULT)
 }
 
-/// The whole surface's registry, with the ingest wiring's limits
-/// (D-S14): the body cap rides on the ingest routes themselves, and the
-/// in-flight byte budget becomes the write class's admission the gate
-/// enforces. Admission I's own limits (ROB-10) take their defaults.
+/// The whole surface's registry, with the ingest wiring's limits (D-S14).
+///
+/// The body cap rides on the ingest routes themselves, and the in-flight byte budget becomes
+/// the write class's admission the gate enforces.
+///
+/// Admission I's own limits (ROB-10) take their defaults.
 #[must_use]
 pub fn build_registry_with_ingest_config(config: IngestConfig) -> SealedRoutes {
 	build_registry_with_limits(config, AdmissionConfig::DEFAULT)
 }
 
-/// The whole surface's registry, with the ingest wiring's limits
-/// (D-S14) and Admission I's limits (ROB-10): the sealed admission the
-/// gate enforces carries both — the write class's byte budget from
-/// `config`, the query class's cap from `admission_config`.
+/// The whole surface's registry, with the ingest wiring's limits (D-S14).
+///
+/// And Admission I's limits (ROB-10): the sealed admission the gate enforces carries both —
+/// the write class's byte budget from `config`, the query class's cap from
+/// `admission_config`.
 #[must_use]
 pub fn build_registry_with_limits(config: IngestConfig, admission_config: AdmissionConfig) -> SealedRoutes {
 	let mut routes = Routes::new();
@@ -654,7 +667,7 @@ pub fn build_registry_with_limits(config: IngestConfig, admission_config: Admiss
 	routes.seal(Some(Arc::new(Admission::new(IngestAdmission::new(config.max_inflight_bytes()), admission_config))))
 }
 
-/// The OpenAPI document for the whole surface, from the one registry.
+/// The `OpenAPI` document for the whole surface, from the one registry.
 #[must_use]
 pub fn openapi_document() -> Value {
 	build_registry().openapi_document()
@@ -693,31 +706,32 @@ async fn gate(axum::extract::State(state): axum::extract::State<GateState>, mut 
 			let _permit = if let Some(admission) = &state.admission {
 				match spec.admission_class {
 					AdmissionClass::Probe => None,
-					AdmissionClass::Query => match admission.try_admit_query() {
-						Some(permit) => Some(permit),
-						None => {
+					AdmissionClass::Query => {
+						if let Some(permit) = admission.try_admit_query() {
+							Some(permit)
+						} else {
 							tracing::warn!(route = %matched, limit = admission.query_limit(), in_flight = admission.query_in_flight(), "query admission refused: the query class is at its in-flight cap");
 							return ApiError::new(Code::Overloaded, format!("the query routes have {} request(s) in flight of a {}-request cap; retry after the in-flight queries drain", admission.query_in_flight(), admission.query_limit())).with_retry_after(1).into_response();
 						}
-					},
+					}
 					AdmissionClass::Write => {
 						let budget = admission.ingest();
 						let weight = request.headers().get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok()).unwrap_or(1);
-						match budget.try_admit(weight) {
-							Some(permit) => Some(permit),
-							None => {
-								tracing::warn!(route = %matched, weight, budget = budget.budget_bytes(), in_flight = budget.in_flight_bytes(), "write admission refused: the in-flight byte budget is exhausted");
-								return ApiError::new(Code::Overloaded, format!("the write routes have {} byte(s) in flight of a {}-byte budget; retry after the in-flight writes drain", budget.in_flight_bytes(), budget.budget_bytes())).with_retry_after(1).into_response();
-							}
+						if let Some(permit) = budget.try_admit(weight) {
+							Some(permit)
+						} else {
+							tracing::warn!(route = %matched, weight, budget = budget.budget_bytes(), in_flight = budget.in_flight_bytes(), "write admission refused: the in-flight byte budget is exhausted");
+							return ApiError::new(Code::Overloaded, format!("the write routes have {} byte(s) in flight of a {}-byte budget; retry after the in-flight writes drain", budget.in_flight_bytes(), budget.budget_bytes())).with_retry_after(1).into_response();
 						}
 					}
-					AdmissionClass::Maintenance => match admission.try_admit_maintenance() {
-						Some(permit) => Some(permit),
-						None => {
+					AdmissionClass::Maintenance => {
+						if let Some(permit) = admission.try_admit_maintenance() {
+							Some(permit)
+						} else {
 							tracing::warn!(route = %matched, "maintenance admission refused: a maintenance-class request is already running");
 							return ApiError::busy(format!("a maintenance-class request is already running; `{matched}` is admitted one at a time, retry after it finishes")).with_retry_after(1).into_response();
 						}
-					},
+					}
 				}
 			} else {
 				None
@@ -996,7 +1010,7 @@ mod tests {
 	}
 
 	/// The four products agree because they are one registry: the policy
-	/// table and the class table have one row per route, and the OpenAPI
+	/// table and the class table have one row per route, and the `OpenAPI`
 	/// document carries every operation id with its scope.
 	#[test]
 	fn one_registry_produces_policy_class_and_openapi() {
@@ -1123,10 +1137,10 @@ mod tests {
 	/// in-flight request completes normally once released.
 	#[tokio::test]
 	async fn query_admission_sheds_beyond_the_cap() {
-		let mut routes = Routes::new();
-		routes.route(Method::GET, "/slow-query", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "slow_query"), get(slow_query_handler));
+		let mut registry = Routes::new();
+		registry.route(Method::GET, "/slow-query", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "slow_query"), get(slow_query_handler));
 		let admission = Admission::new(IngestAdmission::new(1024), AdmissionConfig::with_max_query_inflight(1));
-		let router = routes.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
+		let router = registry.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
 
 		let first = tokio::spawn(router.clone().oneshot(Request::builder().uri("/slow-query").body(Body::empty()).unwrap()));
 		QUERY_ENTERED.notified().await;
@@ -1147,10 +1161,10 @@ mod tests {
 	/// the running one completes, and a later one is admitted.
 	#[tokio::test]
 	async fn maintenance_admission_is_exclusive_at_the_gate() {
-		let mut routes = Routes::new();
-		routes.route(Method::POST, "/slow-maintenance", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "slow_maintenance"), post(slow_maintenance_handler));
+		let mut registry = Routes::new();
+		registry.route(Method::POST, "/slow-maintenance", RouteSpec::stable(Scope::Maintain, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "slow_maintenance"), post(slow_maintenance_handler));
 		let admission = Admission::new(IngestAdmission::new(1024), AdmissionConfig::DEFAULT);
-		let router = routes.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
+		let router = registry.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
 
 		let first = tokio::spawn(router.clone().oneshot(Request::builder().method("POST").uri("/slow-maintenance").body(Body::empty()).unwrap()));
 		MAINTENANCE_ENTERED.notified().await;
@@ -1174,10 +1188,10 @@ mod tests {
 	#[tokio::test]
 	async fn probe_admission_never_sheds() {
 		let admission = Admission::new(IngestAdmission::new(1024), AdmissionConfig::with_max_query_inflight(0));
-		let mut routes = Routes::new();
-		routes.route(Method::GET, "/health", RouteSpec::stable(Scope::Probe, Audit::None, false, AdmissionClass::Probe, "get_health"), get(health));
-		routes.route(Method::GET, "/slow-query", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "slow_query"), get(slow_query_handler));
-		let router = routes.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
+		let mut registry = Routes::new();
+		registry.route(Method::GET, "/health", RouteSpec::stable(Scope::Probe, Audit::None, false, AdmissionClass::Probe, "get_health"), get(health));
+		registry.route(Method::GET, "/slow-query", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "slow_query"), get(slow_query_handler));
+		let router = registry.seal(Some(Arc::new(admission))).router().with_state(AppState::new());
 
 		let probe = router.clone().oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(probe.status(), StatusCode::OK);

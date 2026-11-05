@@ -341,7 +341,6 @@ const HTML_STYLE: &str = "body{font-family:system-ui,sans-serif;margin:2rem;colo
 const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>workload</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>1st ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th><th>enc</th><th>val B/pt</th><th>tot B/pt</th>";
 
 /// Nanoseconds rendered as fractional milliseconds for display.
-#[allow(clippy::cast_precision_loss)]
 fn ms(ns: u64) -> f64 {
 	ns as f64 / 1e6
 }
@@ -361,7 +360,6 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 		(None, None) => {}
 	}
 	if let Some(bytes) = m.total_memory_bytes {
-		#[allow(clippy::cast_precision_loss)]
 		let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 		parts.push(format!("{gib:.1} GiB RAM"));
 	}

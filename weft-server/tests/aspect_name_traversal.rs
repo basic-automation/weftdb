@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! SEC-11: aspect-name traversal, end to end over HTTP.
 //!
 //! An aspect name becomes part of every frame's file name (`segments/<aspect>-<id>`
@@ -52,11 +55,11 @@ async fn call(router: Router, method: &str, uri: &str, body: Option<(&str, Strin
 	(status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
 }
 
-fn json(text: String) -> Option<(&'static str, String)> {
-	Some(("application/json", text))
+const fn json(text: String) -> (&'static str, String) {
+	("application/json", text)
 }
 
-fn declare_body(name: &str) -> Option<(&'static str, String)> {
+fn declare_body(name: &str) -> (&'static str, String) {
 	json(serde_json::json!({ "name": name, "physical_type": "f64", "timestamp_unit": "seconds" }).to_string())
 }
 
@@ -94,7 +97,7 @@ type AspectRoute = (&'static str, String, Option<(&'static str, String)>);
 /// Every route that takes an aspect name in its path, addressed at the encoded
 /// aspect segment `enc`: the seals, the reads and the per-aspect maintenance.
 fn aspect_routes(enc: &str) -> Vec<AspectRoute> {
-	vec![("POST", format!("/api/v1/storage/{enc}/points"), json(POINTS.to_string())), ("POST", format!("/api/v1/storage/{enc}/ilp?measurement=m&field=v"), Some(("text/plain", "m v=1 0".to_string()))), ("POST", format!("/api/v1/storage/{enc}/csv"), Some(("text/plain", "0,1".to_string()))), ("GET", format!("/api/v1/storage/{enc}/points?start=0&end=10"), None), ("GET", format!("/api/v1/storage/{enc}/range?start=0&end=10"), None), ("GET", format!("/api/v1/storage/{enc}/range.csv?start=0&end=10"), None), ("GET", format!("/api/v1/storage/{enc}/at?t=0"), None), ("GET", format!("/api/v1/storage/{enc}/downsample"), None), ("GET", format!("/api/v1/storage/{enc}/value-points?lo=0&hi=1"), None), ("GET", format!("/api/v1/storage/{enc}/schema"), None), ("POST", format!("/api/v1/storage/{enc}/reconcile"), None), ("POST", format!("/api/v1/storage/{enc}/squash"), None), ("POST", format!("/api/v1/storage/{enc}/compact?target_rows=10"), None)]
+	vec![("POST", format!("/api/v1/storage/{enc}/points"), Some(json(POINTS.to_string()))), ("POST", format!("/api/v1/storage/{enc}/ilp?measurement=m&field=v"), Some(("text/plain", "m v=1 0".to_string()))), ("POST", format!("/api/v1/storage/{enc}/csv"), Some(("text/plain", "0,1".to_string()))), ("GET", format!("/api/v1/storage/{enc}/points?start=0&end=10"), None), ("GET", format!("/api/v1/storage/{enc}/range?start=0&end=10"), None), ("GET", format!("/api/v1/storage/{enc}/range.csv?start=0&end=10"), None), ("GET", format!("/api/v1/storage/{enc}/at?t=0"), None), ("GET", format!("/api/v1/storage/{enc}/downsample"), None), ("GET", format!("/api/v1/storage/{enc}/value-points?lo=0&hi=1"), None), ("GET", format!("/api/v1/storage/{enc}/schema"), None), ("POST", format!("/api/v1/storage/{enc}/reconcile"), None), ("POST", format!("/api/v1/storage/{enc}/squash"), None), ("POST", format!("/api/v1/storage/{enc}/compact?target_rows=10"), None)]
 }
 
 /// Declare refuses every spelling of a name that could move a path, alias a
@@ -110,7 +113,7 @@ async fn declare_refuses_every_traversal_spelling() {
 	let overlong = "x".repeat(weftdb::aspect_name::MAX_ASPECT_NAME_BYTES + 1);
 	let names: Vec<&str> = vec!["../x", "../../x", "..\\x", "..\\..\\x", "a/b", "a\\b", "a/../../x", "/tmp/x", "C:\\x", "C:/x", ".", "..", "...", ".hidden", "x/", "", "a\u{0}b", "a\nb", "a\u{7f}b", "trail.", "trail ", "CON", "nul:x", overlong.as_str()];
 	for name in &names {
-		let (status, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/aspects", declare_body(name)).await;
+		let (status, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/aspects", Some(declare_body(name))).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?} must be refused; body: {body}");
 		assert_eq!(body["code"], "invalid_aspect_name", "{name:?}: body: {body}");
 		assert_eq!(body["details"]["aspect"], serde_json::json!(name), "{name:?}: the refusal names the aspect; body: {body}");
@@ -118,10 +121,10 @@ async fn declare_refuses_every_traversal_spelling() {
 	}
 	// The reason says which rule, so a client is not left parsing prose: a
 	// separator is a separator, and the length cap reports the limit.
-	let (status, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/aspects", declare_body("a/b")).await;
+	let (status, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/aspects", Some(declare_body("a/b"))).await;
 	assert_eq!(status, StatusCode::BAD_REQUEST);
 	assert!(body["details"]["reason"].as_str().unwrap().contains("`/`"), "body: {body}");
-	let (_, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/aspects", declare_body(&overlong)).await;
+	let (_, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/aspects", Some(declare_body(&overlong))).await;
 	assert!(body["details"]["reason"].as_str().unwrap().contains("160"), "body: {body}");
 
 	let declared = store.list_declared_aspects().await.unwrap();
@@ -237,11 +240,11 @@ async fn encoded_text_is_a_literal_name_not_a_path() {
 	let dir = TempDir::new().unwrap();
 	let (store, state) = store_and_state(&dir).await;
 	for name in ["%2e%2e%2fx", "price"] {
-		let (status, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/aspects", declare_body(name)).await;
+		let (status, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/aspects", Some(declare_body(name))).await;
 		assert_eq!(status, StatusCode::CREATED, "{name:?}: body: {body}");
 		assert_eq!(body["aspect"]["name"], name, "body: {body}");
 	}
-	let (status, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/price/points", json(POINTS.to_string())).await;
+	let (status, body) = call(app_with_state(state.clone()), "POST", "/api/v1/storage/price/points", Some(json(POINTS.to_string()))).await;
 	assert_eq!(status, StatusCode::CREATED, "body: {body}");
 	// The double-encoded segment addresses the aspect whose name is the
 	// single-decoded text, and it reads as an ordinary empty aspect.

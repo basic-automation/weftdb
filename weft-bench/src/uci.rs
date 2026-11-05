@@ -65,7 +65,6 @@ pub struct UciCorpus {
 
 impl UciCorpus {
 	/// Share of examined rows dropped for a missing projected value.
-	#[allow(clippy::cast_precision_loss)]
 	pub fn missingness_fraction(&self) -> f64 {
 		if self.rows_seen == 0 {
 			0.0

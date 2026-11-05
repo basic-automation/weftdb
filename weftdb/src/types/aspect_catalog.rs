@@ -35,6 +35,25 @@ pub struct AspectCatalog {
 	db: turso::Database,
 }
 
+/// What a declaration says about the aspect's upsert keys.
+#[derive(Clone, Copy)]
+enum KeysOffer<'a> {
+	/// The declaration leaves the keys out of the comparison, and an aspect it creates has none.
+	Unchecked,
+	/// The declaration offers these keys (or none), and an existing aspect must hold the same.
+	Offered(Option<&'a crate::UpsertKeys>),
+}
+
+impl<'a> KeysOffer<'a> {
+	/// The keys the declaration would store, if it names any.
+	const fn offered(self) -> Option<&'a crate::UpsertKeys> {
+		match self {
+			Self::Unchecked => None,
+			Self::Offered(keys) => keys,
+		}
+	}
+}
+
 impl AspectCatalog {
 	/// The tables every `aspect_catalog.db` holds once opened. A snapshot missing any of them is
 	/// not a backup of this database (an empty file passes every other check), so
@@ -125,7 +144,7 @@ impl AspectCatalog {
 	/// not equal or widen; otherwise propagates any libSQL write failure or a
 	/// metadata-serialization failure.
 	pub async fn declare(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema) -> Result<()> {
-		self.declare_inner(database, subject, aspect, schema, None).await
+		self.declare_inner(database, subject, aspect, schema, KeysOffer::Unchecked).await
 	}
 
 	/// [`declare`](Self::declare) with the aspect's upsert-key declaration (Phase 4.6;
@@ -144,14 +163,14 @@ impl AspectCatalog {
 	/// [`StoreError::UpsertKeysConflict`](crate::StoreError::UpsertKeysConflict) when the
 	/// aspect is declared with other upsert keys. Nothing is written on any refusal.
 	pub async fn declare_with_upsert_keys(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema, upsert_keys: Option<&crate::UpsertKeys>) -> Result<()> {
-		self.declare_inner(database, subject, aspect, schema, Some(upsert_keys)).await
+		self.declare_inner(database, subject, aspect, schema, KeysOffer::Offered(upsert_keys)).await
 	}
 
 	/// The declaration both [`declare`](Self::declare) (`keys` [`None`]: the upsert keys
 	/// are not compared, and a new aspect has none) and
 	/// [`declare_with_upsert_keys`](Self::declare_with_upsert_keys) (`Some`) make.
-	async fn declare_inner(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema, keys: Option<Option<&crate::UpsertKeys>>) -> Result<()> {
-		let upsert_keys = keys.flatten().map_or(Value::Null, |keys| Value::Text(keys.to_catalog()));
+	async fn declare_inner(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema, keys: KeysOffer<'_>) -> Result<()> {
+		let upsert_keys = keys.offered().map_or(Value::Null, |keys| Value::Text(keys.to_catalog()));
 		let physical_type = serde_json::to_string(&schema.value)?;
 		let timestamp_unit = serde_json::to_string(&schema.timestamp_unit)?;
 		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
@@ -167,7 +186,7 @@ impl AspectCatalog {
 		};
 		// The keys an existing declaration holds, compared only when `keys` asks.
 		let keys_conflict = match (&existing, keys) {
-			(Some(_), Some(offered)) => match Self::upsert_keys_on(&conn, database, subject, aspect).await {
+			(Some(_), KeysOffer::Offered(offered)) => match Self::upsert_keys_on(&conn, database, subject, aspect).await {
 				Ok(declared) if declared.as_ref() == offered => None,
 				Ok(declared) => Some(crate::StoreError::UpsertKeysConflict { aspect: aspect.to_string(), declared, offered: offered.cloned() }),
 				Err(e) => {
@@ -391,7 +410,7 @@ mod tests {
 		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
 		let all = catalog.list_all().await.expect("lists");
 		drop(catalog);
-		assert!(all.is_empty());
+		assert_eq!(all, [] as [(String, String, String); 0]);
 	}
 
 	#[tokio::test]

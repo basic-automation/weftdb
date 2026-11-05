@@ -66,7 +66,7 @@ pub const PARTIAL_SIDECAR_VERSION: u16 = 4;
 /// per-bucket state stays constant-sized ([`Aggregation::is_sidecar_materializable`]).
 ///
 /// The six streaming reductions plus the four `sketch_p*` quantiles. A single
-/// `DdSketch`(weft_reduce::DdSketch) per bucket serves all four sketch quantiles, so
+/// `DdSketch`(`weft_reduce::DdSketch`) per bucket serves all four sketch quantiles, so
 /// including all four costs no extra state — the partial built from this set can finish
 /// *any* subset of these later. `avg` adds no state of its own (it is `sum / count` at
 /// finish), so it rides along for free.
@@ -266,7 +266,7 @@ impl PartialSidecar {
 			bail!("not a .weftpart frame (bad magic)");
 		}
 		let (covered, trailer) = bytes.split_at(bytes.len().checked_sub(4).context("a .weftpart frame is too short for its CRC trailer")?);
-		let stored = u32::from_le_bytes(trailer.try_into().expect("the trailer slice is four bytes"));
+		let stored = u32::from_le_bytes(trailer.try_into().context("the trailer slice is four bytes")?);
 		if crc32(covered) != stored {
 			bail!("partial sidecar CRC mismatch: the frame is torn or damaged");
 		}
@@ -514,7 +514,7 @@ mod tests {
 		assert_eq!(served, truth, "a reloaded tiered sidecar answers days exactly");
 	}
 
-	/// A small v4 frame for the damage tests: one hour bucket, stamped with FRAME_CRC.
+	/// A small v4 frame for the damage tests: one hour bucket, stamped with `FRAME_CRC`.
 	fn v4_bytes() -> Vec<u8> {
 		let partial = reduce_partial(&[pt(0, "1"), pt(30, "2")], Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");
 		PartialSidecar::new(Resolution::Hours, &descriptor(2, 12_345), FRAME_CRC, partial).to_bytes().expect("serializes")
@@ -568,7 +568,7 @@ mod tests {
 		// A stamp claiming more rows than any frame may hold is refused, not decoded
 		// into a partial the caller would trust.
 		let partial = reduce_partial(&[pt(0, "1"), pt(30, "2")], Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");
-		let huge = PartialSidecar::new(Resolution::Hours, &descriptor(weft_physical_type::MAX_FRAME_ROWS + 1, 12_345), FRAME_CRC, partial.clone());
+		let huge = PartialSidecar::new(Resolution::Hours, &descriptor(weft_physical_type::MAX_FRAME_ROWS + 1, 12_345), FRAME_CRC, partial);
 		assert!(PartialSidecar::from_bytes(&huge.to_bytes().expect("serializes")).is_err(), "a row claim past MAX_FRAME_ROWS is refused");
 		// A grid claiming more buckets than the segment has rows is self-refuting.
 		let two_buckets = reduce_partial(&[pt(0, "1"), pt(3600, "2")], Resolution::Hours, None, None, &SIDECAR_AGGREGATIONS).expect("partial");

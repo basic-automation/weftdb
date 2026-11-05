@@ -91,6 +91,9 @@ FORMAT RowBinary
 ";
 
 /// The raw knots a client fetches (class C), in instant order, the last of an instant last.
+/// The bytes the knots table occupies on disk, with the database bound as a server-side parameter.
+const STORAGE_SQL: &str = "SELECT sum(bytes_on_disk) FROM system.parts WHERE database = {db:String} AND table = 'knots' AND active FORMAT TSV";
+
 const FETCH_SQL: &str = "SELECT t, toFloat64(v) FROM {db}.knots ORDER BY t, seq FORMAT RowBinary";
 
 /// `(i64, f64)` rows from a `RowBinary` answer.
@@ -262,17 +265,19 @@ fn row_binary(timestamps: &[i64], values: &[[u8; 8]]) -> anyhow::Result<Vec<u8>>
 
 /// Little-endian 8-byte words from a `RowBinary` answer.
 fn words(bytes: &[u8]) -> impl Iterator<Item = [u8; 8]> + '_ {
-	bytes.chunks_exact(8).map(|c| <[u8; 8]>::try_from(c).unwrap_or_default())
+	bytes.as_chunks::<8>().0.iter().copied()
 }
 
 fn parse_grid(bytes: &[u8]) -> anyhow::Result<Vec<f64>> {
-	anyhow::ensure!(bytes.len() % 8 == 0, "clickhouse: a grid answer of {} bytes is not whole Float64s", bytes.len());
+	anyhow::ensure!(bytes.len().is_multiple_of(8), "clickhouse: a grid answer of {} bytes is not whole Float64s", bytes.len());
 	Ok(words(bytes).map(f64::from_le_bytes).collect())
 }
 
 fn parse_buckets(bytes: &[u8]) -> anyhow::Result<Vec<BucketRow>> {
-	anyhow::ensure!(bytes.len() % 40 == 0, "clickhouse: a bucket answer of {} bytes is not whole rows", bytes.len());
-	Ok(bytes.chunks_exact(40)
+	anyhow::ensure!(bytes.len().is_multiple_of(40), "clickhouse: a bucket answer of {} bytes is not whole rows", bytes.len());
+	Ok(bytes.as_chunks::<40>()
+		.0
+		.iter()
 		.map(|row| {
 			let mut w = words(row);
 			let mut next = || w.next().unwrap_or_default();
@@ -353,7 +358,7 @@ impl Arm for ClickHouse {
 
 	fn storage_bytes(&self) -> Option<u64> {
 		let db = self.db.as_ref()?;
-		let bytes = db.server.query("SELECT sum(bytes_on_disk) FROM system.parts WHERE database = {db:String} AND table = 'knots' AND active FORMAT TSV", &[("db", db.name.clone())], &[]).ok()?;
+		let bytes = db.server.query(STORAGE_SQL, &[("db", db.name.clone())], &[]).ok()?;
 		String::from_utf8(bytes).ok()?.trim().parse().ok()
 	}
 
@@ -364,24 +369,24 @@ impl Arm for ClickHouse {
 		let n = ds.grid_len();
 		match self.class {
 			ArmClass::Native => {
-				let bytes = self.on_db(move |server, db| server.query(&NATIVE_SQL.replace("{db}", db), &[("start", start.to_string()), ("end", end.to_string()), ("step", step.to_string())], &[])).await?;
+				let bytes = self.on_db(move |server, db| server.query(&crate::fill(NATIVE_SQL, &[("db", &db)]), &[("start", start.to_string()), ("end", end.to_string()), ("step", step.to_string())], &[])).await?;
 				return Ok(Output::Float(place(&parse_pairs(&bytes)?, start, step, n)));
 			}
 			ArmClass::ClientSide => {
-				let bytes = self.on_db(move |server, db| server.query(&FETCH_SQL.replace("{db}", db), &[], &[])).await?;
+				let bytes = self.on_db(move |server, db| server.query(&crate::fill(FETCH_SQL, &[("db", &db)]), &[], &[])).await?;
 				let (t, v): (Vec<i64>, Vec<f64>) = parse_pairs(&bytes)?.into_iter().unzip();
 				return Ok(Output::Float(client_linear(&t, &v, start, step, n)));
 			}
 			ArmClass::PortableSql => {}
 		}
 		let join = self.join;
-		let bytes = self.on_db(move |server, db| server.query(&INTERPOLATE_SQL.replace("{db}", db).replace("{join}", join), &[("start", start.to_string()), ("end", end.to_string()), ("step", step.to_string())], &[])).await?;
+		let bytes = self.on_db(move |server, db| server.query(&crate::fill(INTERPOLATE_SQL, &[("db", &db), ("join", &join)]), &[("start", start.to_string()), ("end", end.to_string()), ("step", step.to_string())], &[])).await?;
 		Ok(Output::Float(parse_grid(&bytes)?))
 	}
 
 	async fn downsample(&mut self, ds: &Dataset, _knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {
 		let width = ds.bucket.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("bucket width out of range"))?;
-		let bytes = self.on_db(move |server, db| server.query(&DOWNSAMPLE_SQL.replace("{db}", db), &[("width", width.to_string())], &[])).await?;
+		let bytes = self.on_db(move |server, db| server.query(&crate::fill(DOWNSAMPLE_SQL, &[("db", &db)]), &[("width", width.to_string())], &[])).await?;
 		parse_buckets(&bytes)
 	}
 }

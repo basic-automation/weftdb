@@ -202,7 +202,7 @@ pub async fn import(request: &Request) -> anyhow::Result<ImportRecord> {
 		anyhow::bail!("{} holds no subject {:?}; it holds {}", request.tree.display(), request.subject, if subjects.is_empty() { "no subject at all".to_string() } else { subjects.join(", ") });
 	}
 	let store = store_open::open_scoped_with_env_options(&root, &database, &request.subject).await?;
-	Ok(rows_mode::import_into(&store, &request.tree, &request.subject, request.rows_per_segment).await?)
+	rows_mode::import_into(&store, &request.tree, &request.subject, request.rows_per_segment).await
 }
 
 /// The command's whole job: parse, import, report.
@@ -380,7 +380,7 @@ mod tests {
 
 	#[test]
 	fn an_empty_database_falls_back_to_the_tree_rather_than_an_empty_scope() {
-		let error = parse(["import-rows-mode".to_string(), "tree".to_string(), "--subject".to_string(), "plant".to_string(), "--database".to_string(), "".to_string()]).expect_err("an empty database would open a scope nothing reads");
+		let error = parse(["import-rows-mode".to_string(), "tree".to_string(), "--subject".to_string(), "plant".to_string(), "--database".to_string(), String::new()]).expect_err("an empty database would open a scope nothing reads");
 		assert!(error.contains("--database"), "{error}");
 	}
 

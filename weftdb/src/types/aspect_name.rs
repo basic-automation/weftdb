@@ -217,9 +217,10 @@ const fn is_literal(byte: u8) -> bool {
 /// The uppercase hex digits [`encode`] escapes with.
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-/// The file-name form of an aspect name (crash-consistency design §4, `enc`): the bytes
-/// `[a-z0-9_]` as they are, and every other byte (uppercase letters, `-`, `.`, `/`, `~`,
-/// `%`, every non-ASCII byte) as `%XX` in uppercase hex.
+/// The file-name form of an aspect name (crash-consistency design §4, `enc`).
+///
+/// The bytes `[a-z0-9_]` as they are, and every other byte (uppercase letters, `-`, `.`, `/`, `~`, `%`,
+/// every non-ASCII byte) as `%XX` in uppercase hex.
 ///
 /// The result is plain ASCII with no `/`, `\`, `.`, `-`, `~` or `:`, so it can never
 /// leave the directory it is joined onto, and it never contains the `-{digits}` of a
@@ -243,11 +244,11 @@ pub fn encode(name: &str) -> String {
 	out
 }
 
-/// The aspect name [`encode`] turned into `encoded`, or `None` when no name encodes to
-/// exactly it: a byte that is neither a literal nor the start of an escape, an escape
-/// that is not two uppercase hex digits, an escape of a byte that `encode` writes as a
-/// literal (so `decode(&encode(n)) == Some(n)` and `encode` of a decoded name gives the
-/// input back), or bytes that are not UTF-8.
+/// The aspect name [`encode`] turned into `encoded`, or `None` when no name encodes to exactly it.
+///
+/// A byte that is neither a literal nor the start of an escape, an escape that is not two uppercase hex
+/// digits, an escape of a byte that `encode` writes as a literal (so `decode(&encode(n)) == Some(n)`
+/// and `encode` of a decoded name gives the input back), or bytes that are not UTF-8.
 #[must_use]
 pub fn decode(encoded: &str) -> Option<String> {
 	let hex = |digit: u8| HEX.iter().position(|&h| h == digit).and_then(|value| u8::try_from(value).ok());

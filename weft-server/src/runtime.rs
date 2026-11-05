@@ -47,7 +47,9 @@ use std::{future::Future, time::Duration};
 
 /// Environment variable naming the runtime's worker-thread count
 /// (ROB-11): a positive whole number of threads, read once by `main`
-/// before the runtime is built. Registered in the VarSpec registry
+/// before the runtime is built.
+///
+/// Registered in the `VarSpec` registry
 /// ([`crate::settings`]).
 pub const WORKER_THREADS_ENV: &str = "WEFT_WORKER_THREADS";
 
@@ -57,15 +59,19 @@ pub const WORKER_THREAD_NAME: &str = "weft-worker";
 
 /// How long the runtime waits for background work to finish once the
 /// process's own work is done, before the remaining tasks are
-/// abandoned and the process exits: the last step of plan C9's drain
+/// abandoned and the process exits.
+///
+/// The last step of plan C9's drain
 /// order ("runtime `shutdown_timeout(5 s)`").
 pub const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The runtime's shape (ROB-11), read once by `main` before anything
-/// async runs — the runtime must exist before the startup phases
+/// async runs.
+///
+/// The runtime must exist before the startup phases
 /// (strict configuration included) can execute, so a malformed value
 /// is refused by `main` itself, with the plan C7 configuration status
-/// (78); the VarSpec registry's strict check would report the same
+/// (78); the `VarSpec` registry's strict check would report the same
 /// value in the same words had it been able to run first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -130,7 +136,9 @@ impl Default for RuntimeConfig {
 	}
 }
 
-/// Build the process runtime [`run`] drives: multi-thread, every
+/// Build the process runtime [`run`] drives.
+///
+/// Multi-thread, every
 /// driver enabled, workers named [`WORKER_THREAD_NAME`], and as many
 /// of them as `config` asks for (the runtime's machine-sized default
 /// when it asks for none).
@@ -149,7 +157,9 @@ pub fn build_runtime(config: RuntimeConfig) -> std::io::Result<tokio::runtime::R
 }
 
 /// Run `future` to completion on a runtime built from `config`, then
-/// shut the runtime down with [`RUNTIME_SHUTDOWN_TIMEOUT`] — plan
+/// shut the runtime down with [`RUNTIME_SHUTDOWN_TIMEOUT`].
+///
+/// Plan
 /// C9's final drain step, bounding how long background work that
 /// outlived the serve path can hold the process open.
 ///

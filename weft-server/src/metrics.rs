@@ -152,9 +152,8 @@ pub struct LatencyHistogramSnapshot {
 impl LatencyHistogramSnapshot {
 	/// The summed observed latency in fractional seconds (Prometheus `_sum`).
 	#[must_use]
-	#[allow(clippy::cast_precision_loss)] // exact for any realistic total: f64 holds integers < 2^53.
 	pub fn sum_seconds(&self) -> f64 {
-		self.sum_micros as f64 / 1_000_000.0
+		crate::num::u64_to_f64(self.sum_micros) / 1_000_000.0
 	}
 
 	/// Estimate the `q`-quantile (`0.0..=1.0`) latency in seconds from the
@@ -164,21 +163,20 @@ impl LatencyHistogramSnapshot {
 	/// in the open-ended `+Inf` bucket is clamped to the largest finite bound
 	/// (the histogram cannot resolve a value beyond its last edge).
 	#[must_use]
-	#[allow(clippy::cast_precision_loss)] // counts < 2^53 in any realistic run; f64 is exact there.
 	pub fn quantile(&self, q: f64) -> Option<f64> {
 		if self.count == 0 {
 			return None;
 		}
-		let rank = q.clamp(0.0, 1.0) * self.count as f64;
+		let rank = q.clamp(0.0, 1.0) * crate::num::u64_to_f64(self.count);
 		let mut cum_prev = 0_u64;
 		let mut lower = 0.0_f64;
 		for (&bound, &in_bucket) in LATENCY_BUCKETS_SECS.iter().zip(self.buckets.iter()) {
 			let cum = cum_prev + in_bucket;
-			if cum as f64 >= rank {
+			if crate::num::u64_to_f64(cum) >= rank {
 				if in_bucket == 0 {
 					return Some(bound);
 				}
-				let frac = (rank - cum_prev as f64) / in_bucket as f64;
+				let frac = (rank - crate::num::u64_to_f64(cum_prev)) / crate::num::u64_to_f64(in_bucket);
 				return Some((bound - lower).mul_add(frac, lower));
 			}
 			cum_prev = cum;
@@ -228,7 +226,9 @@ pub struct ReconcileMetrics {
 }
 
 /// Counters for the online control-plane backup (`POST …/storage/backup`, roadmap
-/// Phase 7.4). An operator needs to see how many snapshots ran and the total bytes
+/// Phase 7.4).
+///
+/// An operator needs to see how many snapshots ran and the total bytes
 /// written to reason about backup cadence and storage growth — and, since EVI-18,
 /// whether the scheduled daemon is healthy: how many of its ticks failed, and when
 /// the last verified snapshot landed (`last_success_unix_secs`, 0 when none has
@@ -684,7 +684,7 @@ mod tests {
 		// 0.3 ms → first bucket (le=0.0005); 3 ms → le=0.005; 30 ms → le=0.05.
 		h.observe(Duration::from_micros(300));
 		h.observe(Duration::from_micros(3_000));
-		h.observe(Duration::from_micros(30_000));
+		h.observe(Duration::from_millis(30));
 		// 10 s exceeds the largest finite bound (2.5) → +Inf overflow.
 		h.observe(Duration::from_secs(10));
 		let snap = h.snapshot();

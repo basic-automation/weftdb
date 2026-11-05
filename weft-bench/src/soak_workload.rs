@@ -324,7 +324,6 @@ fn round2(value: f64) -> f64 {
 /// so a wrong series or row offset shows up in the values.
 fn signal(series: usize, row: usize) -> f64 {
 	use std::f64::consts::TAU;
-	#[allow(clippy::cast_precision_loss)]
 	let (series_f, row_f) = (series as f64, row as f64);
 	let amplitude = 10.0_f64.mul_add((series_f * 0.7).sin(), 30.0);
 	round2(amplitude.mul_add((row_f / 512.0 * TAU).sin(), series_f))
@@ -391,7 +390,6 @@ impl WorkloadModel {
 	pub fn grid_for(&self, tick: u64) -> ValueGrid {
 		let params = self.params;
 		let mut rng = rng_for(self.seed, tick, 0x6E1D);
-		#[allow(clippy::cast_precision_loss)]
 		let share = f64::from(params.density_percent) / 100.0;
 		let mut cells = Vec::with_capacity(params.series);
 		for series in 0..params.series {
@@ -404,12 +402,10 @@ impl WorkloadModel {
 						ValueFormat::Float => GridValue::Float(base),
 						ValueFormat::Integer =>
 						{
-							#[allow(clippy::cast_possible_truncation)]
 							GridValue::Integer(base.trunc() as i64)
 						}
 						ValueFormat::Unsigned =>
 						{
-							#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 							GridValue::Unsigned(base.abs().trunc() as u64)
 						}
 						ValueFormat::Boolean => GridValue::Boolean(base >= 0.0),

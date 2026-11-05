@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::{hint::black_box, str::FromStr, sync::Arc};
 
 use ::weftdb::{
@@ -34,7 +37,7 @@ impl BenchmarkContext {
 		// Add test measurements
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		for i in 0..measurement_count {
-			let measurement = InputMeasurement::new(base_time + Duration::seconds(i as i64 * 60), BigDecimal::from_str(&format!("{}.0", i + 10))?);
+			let measurement = InputMeasurement::new(base_time + Duration::seconds(i64::try_from(i).expect("fits an i64") * 60), BigDecimal::from_str(&format!("{}.0", i + 10))?);
 			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await?;
 		}
 

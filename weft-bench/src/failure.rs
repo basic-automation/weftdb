@@ -106,7 +106,6 @@ pub struct FailureParams {
 /// A knob of zero, a corpus too small, a child that cannot start or exits before it is killed, or
 /// a store operation the harness itself makes failing. What the reopened store holds is not an
 /// error: a wrong answer fails the result's gate.
-#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub async fn run_failure(failure: Failure, profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, params: &FailureParams) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(params.reps > 0 && params.rows >= 2 && profile.batch_rows > 0 && params.compact_to > 0, "failure tests need reps, rows, a batch size and a compaction target above zero");
 	anyhow::ensure!(timestamps.len() >= 2 && timestamps.len() == values.len(), "a failure-test corpus needs at least two rows and as many values as timestamps");

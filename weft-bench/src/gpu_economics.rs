@@ -286,21 +286,18 @@ fn knots(seed: u64, count: usize, points: usize) -> Knots {
 	offsets.extend([0, span]);
 	offsets.sort_unstable();
 	offsets.dedup();
-	#[allow(clippy::cast_precision_loss)]
 	let values = offsets.iter().map(|&o| 20.0_f64.mul_add((o as f64 / 600.0).sin(), 50.0) + rng.random_range(-1.0..=1.0)).collect();
 	(offsets.into_iter().map(|o| anchor() + Duration::seconds(o)).collect(), values)
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
-#[allow(clippy::cast_possible_truncation)]
 fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 /// Nanoseconds since the Unix epoch (the wall clock parent and child share).
-#[allow(clippy::cast_possible_truncation)]
 fn unix_ns() -> u64 {
-	SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
+	SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| crate::num::u128_to_u64(d.as_nanos()))
 }
 
 /// The median of `samples` (0 when empty).
@@ -311,7 +308,6 @@ fn median(samples: &[u64]) -> u64 {
 }
 
 /// Output points per second over `ns`.
-#[allow(clippy::cast_precision_loss)]
 fn throughput(points: usize, ns: u64) -> f64 {
 	if ns > 0 {
 		points as f64 / (ns as f64 / 1e9)
@@ -381,7 +377,6 @@ pub fn summarize_utilization(samples: &[SmiSample], baseline: &[SmiSample]) -> V
 	let mut indices: Vec<u32> = samples.iter().map(|s| s.index).collect();
 	indices.sort_unstable();
 	indices.dedup();
-	#[allow(clippy::cast_precision_loss)]
 	let mean = |of: &[&SmiSample]| (!of.is_empty()).then(|| of.iter().map(|s| f64::from(s.utilization_pct)).sum::<f64>() / of.len() as f64);
 	indices.into_iter()
 		.map(|index| {

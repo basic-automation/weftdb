@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! What the server says about the environment it was handed (1.0 plan PAC-5a,
 //! made strict by PAC-5b).
 //!

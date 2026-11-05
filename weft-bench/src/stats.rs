@@ -58,7 +58,6 @@ impl LatencyStats {
 		let max_ns = sorted[count - 1];
 
 		let sum: u128 = sorted.iter().map(|&v| u128::from(v)).sum();
-		#[allow(clippy::cast_possible_truncation)]
 		let mean_ns = (sum / count as u128) as u64;
 
 		let stddev_ns = population_stddev(&sorted, sum);
@@ -108,7 +107,6 @@ impl LatencyStats {
 				sum += u128::from(pick);
 			}
 			resample.sort_unstable();
-			#[allow(clippy::cast_possible_truncation)]
 			mean_dist.push((sum / n as u128) as u64);
 			stddev_dist.push(population_stddev(&resample, sum));
 			p50_dist.push(percentile(&resample, 0.50));
@@ -117,7 +115,6 @@ impl LatencyStats {
 		}
 
 		let sum: u128 = original.iter().map(|&v| u128::from(v)).sum();
-		#[allow(clippy::cast_possible_truncation)]
 		let mean_point = (sum / n as u128) as u64;
 
 		LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: interval_from(&mut mean_dist, mean_point, confidence), stddev: Some(interval_from(&mut stddev_dist, population_stddev(&original, sum), confidence)), p50: interval_from(&mut p50_dist, percentile(&original, 0.50), confidence), p95: interval_from(&mut p95_dist, percentile(&original, 0.95), confidence), p99: interval_from(&mut p99_dist, percentile(&original, 0.99), confidence) }
@@ -159,7 +156,6 @@ impl LatencyStats {
 			}
 			resample.sort_unstable();
 			let sum: u128 = resample.iter().map(|&v| u128::from(v)).sum();
-			#[allow(clippy::cast_possible_truncation)]
 			mean_dist.push((sum / resample.len() as u128) as u64);
 			stddev_dist.push(population_stddev(&resample, sum));
 			p50_dist.push(percentile(&resample, 0.50));
@@ -167,7 +163,6 @@ impl LatencyStats {
 			p99_dist.push(percentile(&resample, 0.99));
 		}
 		let sum: u128 = pooled.iter().map(|&v| u128::from(v)).sum();
-		#[allow(clippy::cast_possible_truncation)]
 		let mean_point = (sum / pooled.len() as u128) as u64;
 		LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: interval_from(&mut mean_dist, mean_point, confidence), stddev: Some(interval_from(&mut stddev_dist, population_stddev(&pooled, sum), confidence)), p50: interval_from(&mut p50_dist, percentile(&pooled, 0.50), confidence), p95: interval_from(&mut p95_dist, percentile(&pooled, 0.95), confidence), p99: interval_from(&mut p99_dist, percentile(&pooled, 0.99), confidence) }
 	}
@@ -238,9 +233,7 @@ fn population_stddev(samples: &[u64], sum: u128) -> u64 {
 	if samples.is_empty() {
 		return 0;
 	}
-	#[allow(clippy::cast_precision_loss)]
 	let mean = sum as f64 / samples.len() as f64;
-	#[allow(clippy::cast_precision_loss)]
 	let variance = samples
 		.iter()
 		.map(|&v| {
@@ -249,7 +242,6 @@ fn population_stddev(samples: &[u64], sum: u128) -> u64 {
 		})
 		.sum::<f64>()
 		/ samples.len() as f64;
-	#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 	let stddev = variance.sqrt().round() as u64;
 	stddev
 }
@@ -283,7 +275,6 @@ fn percentile(sorted: &[u64], q: f64) -> u64 {
 	if q >= 1.0 {
 		return sorted[n - 1];
 	}
-	#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 	let rank = (q * n as f64).ceil() as usize;
 	let idx = rank.saturating_sub(1).min(n - 1);
 	sorted[idx]

@@ -24,7 +24,9 @@
 //! here as a pure, unit-tested function rather than pulling a new dependency into
 //! the workspace.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{
 	path::{Path, PathBuf}, process::ExitCode
@@ -934,7 +936,6 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 		// the realized value codec, the value-column compression ratio (realized /
 		// naive fixed-width), and total bytes/point. Present once the run estimates it.
 		if let Some(s) = &r.storage {
-			#[allow(clippy::cast_precision_loss)]
 			let ratio = if s.estimated_value_bytes > 0 { s.realized_value_bytes as f64 / s.estimated_value_bytes as f64 } else { 1.0 };
 			println!("    storage      : codec={}{} ratio={ratio:.3} val={:.2} total={:.2} B/pt", s.value_codec, if s.is_exact { "" } else { "*" }, s.bytes_per_point, s.total_bytes_per_point);
 		}
@@ -951,7 +952,6 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 }
 
 /// Nanoseconds rendered as fractional milliseconds for display.
-#[allow(clippy::cast_precision_loss)]
 fn ms(ns: u64) -> f64 {
 	ns as f64 / 1e6
 }
@@ -1015,7 +1015,6 @@ impl CsvKnobs {
 /// only one with a known analytic ground truth, so it is the only one that yields
 /// accuracy metrics.
 // One field per on/off command-line flag; an enum per flag would only rename them.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 struct Cli {
 	/// Path to the `.lp` / TSBS line-protocol input file (line-protocol mode).

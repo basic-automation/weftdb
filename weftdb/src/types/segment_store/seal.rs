@@ -139,10 +139,7 @@ impl SegmentStore {
 		let mut by_id: HashMap<u64, SegmentDescriptor> = rows.iter().map(|row| (row.desc.id, row.desc.clone())).collect();
 		for op in ops {
 			match op {
-				IndexOp::InsertNew { row, .. } | IndexOp::Upsert { row, .. } => {
-					by_id.insert(row.desc.id, row.desc.clone());
-				}
-				IndexOp::ReplaceExpected { row, .. } => {
+				IndexOp::InsertNew { row, .. } | IndexOp::Upsert { row, .. } | IndexOp::ReplaceExpected { row, .. } => {
 					by_id.insert(row.desc.id, row.desc.clone());
 				}
 				IndexOp::DeleteExpected { expected, .. } => {
@@ -436,11 +433,10 @@ impl SegmentStore {
 			outputs.extend(ids.into_iter().zip(std::mem::take(&mut plan.outputs)));
 		}
 		drop(pending);
-		// M6.
-		if committed.is_empty() {
-			drop(commit);
-		} else {
-			self.finish_swap(held, commit, outputs, &deleted).await?;
+		// M6: the commit lock is released first either way.
+		drop(commit);
+		if !committed.is_empty() {
+			self.finish_swap(held, outputs, &deleted).await?;
 		}
 		Ok(outcomes.into_iter().map(|outcome| outcome.unwrap_or_else(|| Err(anyhow::anyhow!("a swap plan of aspect {aspect:?} has no outcome")))).collect())
 	}
@@ -559,18 +555,17 @@ impl SegmentStore {
 	}
 
 	/// What follows a swap's commit (design section 5.3, steps 4-6): the rollup is
-	/// already folded into the swap's transaction (S11), so this releases the lock,
-	/// refreshes the outputs' sidecars (each `(id, output)`), removes the
+	/// already folded into the swap's transaction (S11), and the caller has released the
+	/// commit lock, so this refreshes the outputs' sidecars (each `(id, output)`), removes the
 	/// sidecars beside the `deleted` members' frames, and hands the retired frames to the
 	/// reaper. The swap is done whatever these do, so their failures are logged, not
 	/// returned; only an error injected at `M-swapped` is.
-	pub(crate) async fn finish_swap(&self, held: &MaintGuard, commit: CommitGuard, outputs: Vec<(u64, WrittenOutput)>, deleted: &[String]) -> Result<()> {
+	pub(crate) async fn finish_swap(&self, held: &MaintGuard, outputs: Vec<(u64, WrittenOutput)>, deleted: &[String]) -> Result<()> {
 		let aspect = held.aspect();
-		drop(commit);
 		fault::hit(FaultPoint::MSwapped).await?;
 		for (id, output) in outputs {
 			let descriptor = SegmentDescriptor { id, ..output.descriptor };
-			self.refresh_output_sidecar(aspect, &descriptor, output.gen, output.prec, output.frame_crc, output.timestamps, output.values).await;
+			self.refresh_output_sidecar(aspect, &descriptor, SidecarSource { gen: output.gen, prec: output.prec, frame_crc: output.frame_crc, timestamps: output.timestamps, values: output.values }).await;
 		}
 		for frame in deleted {
 			if let Err(e) = self.remove_sidecar(frame).await {
@@ -721,7 +716,7 @@ impl SegmentStore {
 		};
 		phase = IngestPhase::WritingFrames;
 		crate::exec::set_ingest_phase(phase);
-		let mut written: Vec<(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::with_capacity(chunks.len());
+		let mut written: Vec<WrittenSegment> = Vec::with_capacity(chunks.len());
 		for (timestamps, values) in &chunks {
 			let segment = encode_ingest_chunk(&schema, timestamps, values, batch.rows_per_page).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
 			// A tagged frame is wrapped before it is written, so its `byte_len` and the CRC
@@ -757,7 +752,7 @@ impl SegmentStore {
 		// read accelerator, never failing the ingest.
 		for (descriptor, gen, crc, timestamps, values) in &written {
 			if self.partials.base_for(descriptor.row_count).is_some() {
-				if let Err(e) = self.write_partial_sidecar(aspect, descriptor, *gen, *gen, *crc, timestamps.clone(), values.clone()).await {
+				if let Err(e) = self.write_partial_sidecar(aspect, descriptor, SidecarSource { gen: *gen, prec: *gen, frame_crc: *crc, timestamps: timestamps.clone(), values: values.clone() }).await {
 					tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 				}
 			}
@@ -782,7 +777,7 @@ impl SegmentStore {
 	/// row never commits without its catalog row. Every row, the receipt and the ledger
 	/// record that id. Only ingest registers series, and only under the commit lock, so
 	/// a `Conflict` on the registration is not a race to retry but an error.
-	pub(crate) async fn publish_ingest(&self, aspect: &str, batch: &IngestBatch, fingerprint: i64, written: &[(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)]) -> Result<IngestReceipt> {
+	pub(crate) async fn publish_ingest(&self, aspect: &str, batch: &IngestBatch, fingerprint: i64, written: &[WrittenSegment]) -> Result<IngestReceipt> {
 		let mut commit = self.commit_lock(aspect).await?;
 		// The ledger is re-checked under the commit lock: a commit of the
 		// same key that landed while this ingest wrote its frames is a
@@ -1048,7 +1043,7 @@ impl SegmentStore {
 		// when the policy actually wants one, and never fail the seal on a sidecar error.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, frame_crc, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, SidecarSource { gen, prec: gen, frame_crc, timestamps: ts, values: vs }).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
@@ -1070,7 +1065,7 @@ impl SegmentStore {
 		// As `persist`: opt-in per-segment partial sidecar, never failing the seal.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, frame_crc, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, SidecarSource { gen, prec: gen, frame_crc, timestamps: ts, values: vs }).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
@@ -1160,7 +1155,8 @@ impl SegmentStore {
 	///
 	/// A sidecar is a *pure acceleration*: a failure to write one must never fail the seal,
 	/// so the persist paths call this and log-and-ignore any error rather than propagating.
-	pub(crate) async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, frame_crc: u32, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
+	pub(crate) async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, source: SidecarSource) -> Result<()> {
+		let SidecarSource { gen, prec, frame_crc, timestamps, values } = source;
 		let Some(bytes) = self.partial_sidecar_bytes(descriptor, frame_crc, timestamps, values)? else { return Ok(()) };
 		let path = self.sidecar_path(aspect, gen, prec)?;
 		self.fs.create_new_write(&path, bytes, SyncPolicy::None, WritePoints::NONE).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
@@ -1195,7 +1191,8 @@ impl SegmentStore {
 	/// under a `.tmp-*` name and renamed over the frame's, so a reader never sees half of one;
 	/// nothing is fsynced, since a sidecar is an accelerator a reader checks against the
 	/// frame. Best effort: a failure is logged, never returned.
-	pub(crate) async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, frame_crc: u32, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
+	pub(crate) async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, source: SidecarSource) {
+		let SidecarSource { gen, prec, frame_crc, timestamps, values } = source;
 		let result = async {
 			let path = self.sidecar_path(aspect, gen, prec)?;
 			let Some(bytes) = self.partial_sidecar_bytes(descriptor, frame_crc, timestamps, values)? else {

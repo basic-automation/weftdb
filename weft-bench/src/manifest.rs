@@ -694,7 +694,6 @@ fn push_result_measures(result: &BenchResult, measures: &mut Vec<Measure>) {
 	let adapter = result.adapter.as_str();
 	// Latency is a whole number of nanoseconds; f64 carries it exactly, so the cast is a
 	// representation change and not a rounding choice.
-	#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 	let as_f64 = |value: u64| value as f64;
 	measures.push(Measure { name: "latency.p50_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.p50_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
 	measures.push(Measure { name: "latency.mean_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.mean_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });

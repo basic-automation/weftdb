@@ -8,7 +8,7 @@ pub use batches::{
 pub use cache::{AnalysisResult, Cacheable, Connection, DatabaseCache};
 pub use catalog::CatalogStore;
 pub use compression::{AggressivenessScaling, CompressionConfig, CompressionPhase, CompressionProgress, CompressionResult, CompressionSummary, DetailedCompressionSummary, DirtyRegion, LastCompressionInfo, ProgressCallback, SizeBasedCompressionConfig, TierCompressionResult, TimeBasedCompressionConfig};
-pub use correlation::{Correlation, CorrelationID, Correlations};
+pub use correlation::{Correlation, CorrelationID, CorrelationKeys, Correlations};
 pub use database::{
 	clear_connection_cache_by_name, data_dir, default_data_dir, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, UnbatchedEntry, DATABASES
 };
@@ -45,7 +45,7 @@ pub use value_kind::{UnknownValueKind, ValueKind, RESERVED_VALUE_KIND_TOKENS};
 
 pub mod aspect;
 pub mod aspect_catalog;
-pub(crate) mod aspect_locks;
+pub mod aspect_locks;
 pub mod aspect_name;
 pub mod backup;
 pub mod batches;
@@ -61,9 +61,9 @@ pub mod durable;
 pub mod error;
 pub mod event;
 pub mod exec;
-pub(crate) mod frame_name;
-pub(crate) mod frame_read;
-pub(crate) mod index_txn;
+pub mod frame_name;
+pub mod frame_read;
+pub mod index_txn;
 pub mod ingest;
 pub mod input_measurement;
 pub mod interpolate_range;
@@ -71,13 +71,14 @@ pub mod legacy_seal;
 pub mod measurement;
 pub mod measurement_vector;
 pub mod metadata;
-pub(crate) mod migrations;
+pub mod migrations;
+mod num;
 pub mod occurrence;
 pub mod partial_sidecar;
 pub mod pattern;
 pub mod pipeline;
 pub mod quarantine;
-pub(crate) mod reaper;
+pub mod reaper;
 pub mod relative;
 pub mod rows_mode;
 pub mod segment_index;

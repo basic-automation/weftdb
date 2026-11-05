@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! The operator's migration route, end to end: a 0.1.x data directory in, a Storage v2
 //! store out, on the tree a real 0.1.x release wrote.
 //!
@@ -67,6 +70,7 @@ async fn a_0_1_x_tree_migrates_into_a_store_under_the_name_the_tree_gave_it() {
 	// under this scope, answers for the migrated aspects.
 	let store = store_open::open_scoped_with_env_options(&store_root, "v010_legacy", "plant").await.expect("the migrated store opens under the tree's scope");
 	let (timestamps, values) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("the migrated aspect reads back");
+	drop(store);
 	assert_eq!(timestamps.len(), 237, "every price row the tree held is in the store");
 	assert!(values.iter().all(Option::is_some), "a migrated row carries a value; the import skipped the grid's null rows rather than sealing them");
 
@@ -150,6 +154,7 @@ async fn the_record_the_command_reports_is_the_record_the_store_keeps() {
 
 	let store = store_open::open_scoped_with_env_options(&store_root, "v010_legacy", "plant").await.expect("the store opens");
 	let kept = weftdb::rows_mode::read_import_record(&store).await.expect("the record reads back").expect("the import left its record in the store's index");
+	drop(store);
 	assert_eq!(kept.source, reported.source);
 	assert_eq!((kept.database.as_str(), kept.subject.as_str()), (reported.database.as_str(), reported.subject.as_str()));
 	assert_eq!(kept.rows(), reported.rows(), "the operator's numbers and the store's numbers add up the same way");

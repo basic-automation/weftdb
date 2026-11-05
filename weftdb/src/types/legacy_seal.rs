@@ -19,7 +19,7 @@
 //! of the batch's canonical rows, `n` its row count), so the whole call is
 //! one transaction — all-or-nothing — and a retry of the same call replays
 //! the first commit's receipt instead of storing the rows twice. The
-//! returned TxIds are synthetic: UUIDv5 over the idempotency key and the row
+//! returned `TxIds` are synthetic: `UUIDv5` over the idempotency key and the row
 //! index (the only production caller ignores them). `capture_measurement`
 //! is a one-row ingest under the same derivation, followed by the store's
 //! O(1) fragmentation gate.
@@ -50,7 +50,7 @@
 //! id (the design's reader list for seal-backed aspects is raw, chunk,
 //! range, count, boundary and earliest/latest — none of which frames key by
 //! either), so a measurement read back from the store synthesises its id
-//! deterministically as UUIDv5 over `(aspect, timestamp, value, occurrence)`
+//! deterministically as `UUIDv5` over `(aspect, timestamp, value, occurrence)`
 //! and carries the nil dataset id. Two reads of the same stored row agree
 //! on the id, which is what the boundary reader's de-duplication needs.
 
@@ -74,9 +74,10 @@ pub const LEGACY_SCOPE_SUBJECT: &str = "legacy";
 /// seal-backed aspects' Storage-v2 root.
 pub const SEGMENTS_ROOT_DIR: &str = "segments_v2";
 
-/// The target segment size, in rows, of the fragmentation gate a one-row
-/// legacy ingest runs after sealing (design §8, S19): the gate itself is
-/// O(1) on the aspect's rollup, and a converged aspect is left alone.
+/// The target segment size, in rows, of the fragmentation gate a one-row legacy ingest runs after
+/// sealing (design §8, S19).
+///
+/// The gate itself is O(1) on the aspect's rollup, and a converged aspect is left alone.
 pub const SQUASH_TARGET_ROWS: usize = 100_000;
 
 /// How a legacy aspect stores its measurements, recorded on its
@@ -167,10 +168,10 @@ pub fn idempotency_key(dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> St
 	format!("legacy:{}:{:08x}:{}", dataset_id.as_uuid(), payload_crc(rows), rows.len())
 }
 
-/// A UUIDv5 (RFC 4122 §4.3, SHA-1 name-based) over `name` in the URL
-/// namespace. The workspace's `uuid` build does not enable its `v5`
-/// feature, and the synthetic ids of this module need no other hash, so
-/// the digest is computed here.
+/// A `UUIDv5` (RFC 4122 §4.3, SHA-1 name-based) over `name` in the URL namespace.
+///
+/// The workspace's `uuid` build does not enable its `v5` feature, and the synthetic ids of this module
+/// need no other hash, so the digest is computed here.
 #[must_use]
 pub fn uuid_v5(name: &[u8]) -> Uuid {
 	// The URL namespace, 6ba7b811-9dad-11d1-80b4-00c04fd430c8.
@@ -186,15 +187,15 @@ pub fn uuid_v5(name: &[u8]) -> Uuid {
 	Uuid::from_bytes(bytes)
 }
 
-/// The synthetic TxId of row `index` of the ingest call named `key`:
-/// UUIDv5 over the key and the row index (design §8, S19).
+/// The synthetic `TxId` of row `index` of the ingest call named `key`:
+/// `UUIDv5` over the key and the row index (design §8, S19).
 #[must_use]
 pub fn synthetic_tx_id(key: &str, index: usize) -> TxId {
 	TxId::from_uuid(uuid_v5(format!("{key}:{index}").as_bytes()))
 }
 
 /// The deterministic id of a measurement read back from a seal frame:
-/// UUIDv5 over the aspect key, the row's timestamp and plain value, and
+/// `UUIDv5` over the aspect key, the row's timestamp and plain value, and
 /// its occurrence among rows sharing that timestamp and value.
 #[must_use]
 pub fn synthetic_measurement_id(aspect_key: &str, timestamp_millis: i64, value: &BigDecimal, occurrence: usize) -> MeasurementId {
@@ -234,7 +235,7 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 
 /// Ingest one legacy batch into `store` under its derived key: the whole
 /// call is the store's one ingest transaction, and a retry replays it.
-/// Returns the synthetic TxIds, one per row, in row order.
+/// Returns the synthetic `TxIds`, one per row, in row order.
 ///
 /// # Errors
 ///
@@ -252,11 +253,12 @@ pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id
 	Ok((0..rows.len()).map(|index| synthetic_tx_id(&idem, index)).collect())
 }
 
-/// Every row of a seal-backed aspect in `[start, end]` (millis, inclusive;
-/// an open end is the store's extreme), sorted by timestamp with ingest
-/// order kept among equal timestamps — the order rows mode's
-/// `ORDER BY timestamp` reads produced. Null rows never occur in legacy
-/// data and are skipped if a frame somehow holds one.
+/// Every row of a seal-backed aspect in `[start, end]`, sorted by timestamp.
+///
+/// The bounds are millis, inclusive, and an open end is the store's extreme. Ingest order is
+/// kept among equal timestamps: the order rows mode's `ORDER BY timestamp` reads produced.
+///
+/// Null rows never occur in legacy data and are skipped if a frame somehow holds one.
 ///
 /// # Errors
 ///
@@ -305,7 +307,7 @@ struct Sha1 {
 }
 
 impl Sha1 {
-	fn new() -> Self {
+	const fn new() -> Self {
 		Self { state: [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0], len: 0, buf: [0; 64], buf_len: 0 }
 	}
 
@@ -353,33 +355,33 @@ impl Sha1 {
 	}
 
 	fn compress(&mut self, block: &[u8; 64]) {
-		let mut w = [0u32; 80];
+		let mut schedule = [0u32; 80];
 		for i in 0..16 {
-			w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+			schedule[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
 		}
 		for i in 16..80 {
-			w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+			schedule[i] = (schedule[i - 3] ^ schedule[i - 8] ^ schedule[i - 14] ^ schedule[i - 16]).rotate_left(1);
 		}
-		let (mut a, mut b, mut c, mut d, mut e) = (self.state[0], self.state[1], self.state[2], self.state[3], self.state[4]);
-		for (i, &word) in w.iter().enumerate() {
-			let (f, k) = match i {
-				0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
-				20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
-				40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
-				_ => (b ^ c ^ d, 0xCA62_C1D6),
+		let [mut h0, mut h1, mut h2, mut h3, mut h4] = self.state;
+		for (i, &word) in schedule.iter().enumerate() {
+			let (mix, round_const) = match i {
+				0..=19 => ((h1 & h2) | ((!h1) & h3), 0x5A82_7999u32),
+				20..=39 => (h1 ^ h2 ^ h3, 0x6ED9_EBA1),
+				40..=59 => ((h1 & h2) | (h1 & h3) | (h2 & h3), 0x8F1B_BCDC),
+				_ => (h1 ^ h2 ^ h3, 0xCA62_C1D6),
 			};
-			let tmp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(word);
-			e = d;
-			d = c;
-			c = b.rotate_left(30);
-			b = a;
-			a = tmp;
+			let tmp = h0.rotate_left(5).wrapping_add(mix).wrapping_add(h4).wrapping_add(round_const).wrapping_add(word);
+			h4 = h3;
+			h3 = h2;
+			h2 = h1.rotate_left(30);
+			h1 = h0;
+			h0 = tmp;
 		}
-		self.state[0] = self.state[0].wrapping_add(a);
-		self.state[1] = self.state[1].wrapping_add(b);
-		self.state[2] = self.state[2].wrapping_add(c);
-		self.state[3] = self.state[3].wrapping_add(d);
-		self.state[4] = self.state[4].wrapping_add(e);
+		self.state[0] = self.state[0].wrapping_add(h0);
+		self.state[1] = self.state[1].wrapping_add(h1);
+		self.state[2] = self.state[2].wrapping_add(h2);
+		self.state[3] = self.state[3].wrapping_add(h3);
+		self.state[4] = self.state[4].wrapping_add(h4);
 	}
 }
 

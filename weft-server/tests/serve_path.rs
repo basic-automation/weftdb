@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! SEC-4: `weft_server::serve::run` is the only serve path, and its
 //! pre-auth listener limits are observable from the wire — the connection
 //! cap refuses to *serve* (not merely to answer) beyond the limit, a peer
@@ -32,7 +35,7 @@ async fn spawn_server(limits: ServeLimits) -> (std::net::SocketAddr, oneshot::Se
 	(addr, shutdown_tx, handle)
 }
 
-fn limits(max_connections: usize) -> ServeLimits {
+const fn limits(max_connections: usize) -> ServeLimits {
 	ServeLimits::new(NonZeroUsize::new(max_connections).expect("positive cap"))
 }
 

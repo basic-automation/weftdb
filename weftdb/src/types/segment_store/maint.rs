@@ -22,10 +22,7 @@ impl SegmentStore {
 	/// Take `aspect`'s maintenance lock for a per-aspect maintenance entry point, waiting
 	/// up to [`maintenance_wait`](Self::maintenance_wait).
 	pub(crate) async fn maintain(&self, aspect: &str) -> Result<MaintGuard> {
-		match self.locks.maint_within(aspect, self.maintenance_wait).await {
-			Some(held) => Ok(held),
-			None => Err(MaintenanceBusy { aspect: aspect.to_string(), waited: self.maintenance_wait }.into()),
-		}
+		self.locks.maint_within(aspect, self.maintenance_wait).await.map_or_else(|| Err(MaintenanceBusy { aspect: aspect.to_string(), waited: self.maintenance_wait }.into()), Ok)
 	}
 
 	/// Whether a store-wide sweep may attempt `aspect` under its maintenance
@@ -59,7 +56,13 @@ impl SegmentStore {
 			state.remove(aspect);
 			return;
 		}
-		let aspect_state = state.entry(aspect.to_string()).or_default();
+		self.breaker_count_failure(aspect, state.entry(aspect.to_string()).or_default());
+		drop(state);
+	}
+
+	/// Count one more failure against `aspect_state`, opening the breaker when the
+	/// count reaches the threshold.
+	fn breaker_count_failure(&self, aspect: &str, aspect_state: &mut AspectBreakerState) {
 		aspect_state.consecutive_failures = aspect_state.consecutive_failures.saturating_add(1);
 		if aspect_state.consecutive_failures >= self.maintenance_breaker.failure_threshold {
 			let was_open = aspect_state.open_until.is_some_and(|until| until > Instant::now());
@@ -333,6 +336,10 @@ impl SegmentStore {
 	/// # Errors
 	///
 	/// As [`backup_store`](SegmentStore::backup_store).
+	///
+	/// # Panics
+	///
+	/// Never in practice: a whole-store build always reports the frames it took.
 	pub async fn backup_store_via(&self, fs: &dyn StoreFs, dest_dir: impl AsRef<Path>, verify: crate::VerifyMode, mode: crate::BackupMode) -> Result<WholeStoreBackup> {
 		let dir = dest_dir.as_ref().to_path_buf();
 		let (base, label) = crate::types::backup::split_dir(&dir).with_context(|| format!("choosing where to build backup {}", dir.display()))?;
@@ -400,8 +407,7 @@ impl SegmentStore {
 
 		// B3 (whole-store only): open the snapshot copy and link or copy every
 		// frame it references into the build directory's segments/.
-		let mut whole_frames = None;
-		if let Some(backup_mode) = whole {
+		let whole_frames = if let Some(backup_mode) = whole {
 			let snapshot_path = partial.join("segment_index.db");
 			let snapshot = crate::SegmentIndexStore::open_unmigrated(snapshot_path.to_str().with_context(|| format!("snapshot path {} is not UTF-8", snapshot_path.display()))?).await.context("opening the backup's segment_index snapshot")?;
 			let mut frames = Vec::new();
@@ -431,27 +437,28 @@ impl SegmentStore {
 							copied_bytes += bytes.len() as u64;
 							false
 						}
-						crate::BackupMode::Linked => match fs.hard_link(&src, &dest).await {
-							Ok(()) => {
+						crate::BackupMode::Linked => {
+							if matches!(fs.hard_link(&src, &dest).await, Ok(())) {
 								linked_bytes += bytes.len() as u64;
 								true
-							}
-							// EXDEV (another filesystem) or any other link
-							// refusal: copy and sync instead (B3).
-							Err(_) => {
+							} else {
+								// EXDEV (another filesystem) or any other link
+								// refusal: copy and sync instead (B3).
 								fs.copy_new(&src, &dest, SyncPolicy::Full).await.with_context(|| format!("copying frame {} into the backup after linking failed", src.display()))?;
 								copied_bytes += bytes.len() as u64;
 								false
 							}
-						},
+						}
 					};
 					frames.push(crate::ManifestFrame { name: file_name, bytes: bytes.len() as u64, frame_crc, linked });
 				}
 			}
 			drop(snapshot);
 			fs.sync_dir(&segments_partial).await.with_context(|| format!("syncing {}", segments_partial.display()))?;
-			whole_frames = Some((frames, allocators, linked_bytes, copied_bytes));
-		}
+			Some((frames, allocators, linked_bytes, copied_bytes))
+		} else {
+			None
+		};
 		fault::hit(FaultPoint::BLinks).await?;
 		// B4: the gc-hold is released before the manifest is written.
 		drop(gc_hold);
@@ -1017,7 +1024,7 @@ impl SegmentStore {
 			let mut starts: Vec<i64> = members.iter().filter_map(|member| member.desc.min_ts).collect();
 			starts.sort_unstable();
 			let cold_boundary = starts.get(1).copied().unwrap_or(i64::MIN);
-			let (all_ts, all_vs, identical) = self.merge_members_against_first(&members).await?;
+			let (all_ts, all_values, identical) = self.merge_members_against_first(&members).await?;
 			// Skip-identical (Phase 4.6, design 9b): the lowest-id member already holds
 			// every row the fold gives, so it is kept as it is and only the others are
 			// deleted. No frame is written, and the kept frame keeps its paging.
@@ -1039,7 +1046,7 @@ impl SegmentStore {
 			// cut at the timestamp where the suffix starts; the two are disjoint in time.
 			let cuts: &[i64] = if split { &[cold_boundary] } else { &[] };
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_vs, rows_per_page, cuts);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, cuts);
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}
@@ -1222,9 +1229,9 @@ impl SegmentStore {
 				None => schema.insert(self.require_schema(aspect).await?),
 			};
 			// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
-			let (all_ts, all_vs) = self.merge_members(&members).await?;
+			let (all_ts, all_values) = self.merge_members(&members).await?;
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_vs, rows_per_page, &[]);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &[]);
 			let plan_removes = plan.removes();
 			self.swap_plan(held, schema, plan).await?;
 			removed += plan_removes;
@@ -1408,9 +1415,9 @@ impl SegmentStore {
 			}
 			// One swap per group: its members folded oldest → newest (the most-recently-sealed
 			// value wins any residual tie) into one output under the group's lowest id.
-			let (all_ts, all_vs) = self.merge_members(&members).await?;
+			let (all_ts, all_values) = self.merge_members(&members).await?;
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_vs, rows_per_page, &[]);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &[]);
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}

@@ -96,12 +96,25 @@ pub struct Correlation {
 	average_distance: Option<Distance>,
 }
 
+/// What a [`Correlation`] relates: the dictionary, subject and aspect it was found in,
+/// and the pattern and event it ties together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrelationKeys {
+	pub dictionary_id: DictionaryId,
+	pub subject_id: SubjectId,
+	pub aspect_id: AspectId,
+	pub pattern_id: PatternID,
+	pub event_id: EventID,
+}
+
 impl Correlation {
+	/// A correlation between the pattern and event `keys` name, with a fresh id when
+	/// `id` is `None`.
 	#[must_use]
-	#[allow(clippy::too_many_arguments)]
-	pub fn new(id: Option<CorrelationID>, dictionary_id: DictionaryId, subject_id: SubjectId, aspect_id: &AspectId, pattern_id: PatternID, event_id: EventID, error_rate: HashMap<SignalType, ErrorRate>, occurrences: Vec<Occurrence>, average_distance: Option<Distance>) -> Self {
+	pub fn new(id: Option<CorrelationID>, keys: CorrelationKeys, error_rate: HashMap<SignalType, ErrorRate>, occurrences: Vec<Occurrence>, average_distance: Option<Distance>) -> Self {
 		let id = id.unwrap_or_default();
-		Self { id, dictionary_id, subject_id, aspect_id: *aspect_id, pattern_id, event_id, error_rate, occurrences, average_distance }
+		let CorrelationKeys { dictionary_id, subject_id, aspect_id, pattern_id, event_id } = keys;
+		Self { id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, error_rate, occurrences, average_distance }
 	}
 
 	/// Get the average distance from pattern occurrences to event manifestations

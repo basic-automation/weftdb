@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Strict request parsing (FRE-6b): a request that names a field or a parameter the
 //! endpoint does not have is refused, not silently narrowed to the request the server
 //! wishes it had been.

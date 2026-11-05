@@ -56,7 +56,6 @@ pub fn calculate_affected_windows(unbatched_timestamps: &[DateTime<Utc>], resolu
 
 	// Window duration is (batch_size - 1) * step since we have batch_size points
 	// with step intervals between consecutive points
-	#[allow(clippy::cast_possible_wrap)]
 	let window_duration_millis = (batch_size as i64 - 1) * step_millis;
 
 	// Align the earliest_measurement to the step boundary

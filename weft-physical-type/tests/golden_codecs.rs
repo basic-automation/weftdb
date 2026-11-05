@@ -22,6 +22,9 @@
 //!
 //! Regenerating is `WEFT_UPDATE_GOLDENS=1`, and it is a codec change: see
 //! [`golden::harness`](harness).
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 #[path = "golden/harness.rs"]
 mod harness;
@@ -29,7 +32,7 @@ mod harness;
 use std::fmt::Write as _;
 
 use harness::{check_golden, check_golden_text, updating};
-use weft_physical_type::{bitpack_encode, bitpack_width, encode_delta, encode_delta_of_delta, rle_encode, zigzag_varint_bytes, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
+use weft_physical_type::{bitpack_encode, bitpack_width, cast, encode_delta, encode_delta_of_delta, rle_encode, zigzag_varint_bytes, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 
 /// The unit the timestamp corpora are expressed in; irrelevant to the codecs' shapes, load-bearing
 /// for the rendered goldens (it is part of what a reader has to know).
@@ -73,7 +76,7 @@ fn scattered() -> Vec<i64> {
 	(0..128_i64)
 		.map(|_| {
 			state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-			(state >> 24) as i64 % 1_000_000
+			(state >> 24).cast_signed() % 1_000_000
 		})
 		.collect()
 }
@@ -145,7 +148,7 @@ fn render_delta_of_delta(column: &DeltaOfDeltaColumn) -> String {
 fn rle_goldens_pin_the_run_split() {
 	let mut fresh = String::new();
 	for (name, values) in corpora() {
-		fresh.push_str(&format!("# {name}\n{}\n", render_runs(&values)));
+		writeln!(fresh, "# {name}\n{}", render_runs(&values)).expect("writing to a String cannot fail");
 	}
 	check_golden_text("enc_ts_rle.txt", &fresh);
 }
@@ -154,7 +157,7 @@ fn rle_goldens_pin_the_run_split() {
 fn delta_goldens_pin_the_anchors_and_differences() {
 	let mut fresh = String::new();
 	for (name, values) in corpora() {
-		fresh.push_str(&format!("# {name} delta\n{}\n# {name} delta_of_delta\n{}\n", render_delta(&encode_delta(&values, UNIT)), render_delta_of_delta(&encode_delta_of_delta(&values, UNIT))));
+		writeln!(fresh, "# {name} delta\n{}\n# {name} delta_of_delta\n{}", render_delta(&encode_delta(&values, UNIT)), render_delta_of_delta(&encode_delta_of_delta(&values, UNIT))).expect("writing to a String cannot fail");
 	}
 	check_golden_text("enc_ts_delta.txt", &fresh);
 }
@@ -165,7 +168,7 @@ fn zigzag_goldens_pin_the_varint_sizing() {
 	// change to every file the blocked codec writes — including the frame fixture that pins it.
 	let mut fresh = String::new();
 	for (name, values) in corpora() {
-		writeln!(fresh, "{name}\ttotal={}\tmean={:.3}", zigzag_varint_bytes(&values), if values.is_empty() { 0.0 } else { zigzag_varint_bytes(&values) as f64 / values.len() as f64 }).expect("writing to a String cannot fail");
+		writeln!(fresh, "{name}\ttotal={}\tmean={:.3}", zigzag_varint_bytes(&values), if values.is_empty() { 0.0 } else { cast::usize_to_f64(zigzag_varint_bytes(&values)) / cast::usize_to_f64(values.len()) }).expect("writing to a String cannot fail");
 	}
 	check_golden_text("enc_ts_zigzag.txt", &fresh);
 }
@@ -179,20 +182,26 @@ fn zigzag_goldens_pin_the_varint_sizing() {
 /// input that rounds differently anywhere would make these goldens platform-dependent.
 #[cfg(feature = "experimental-codecs")]
 fn f64_corpora() -> Vec<(&'static str, Vec<f64>)> {
-	let eighths = |offset: i64, step: i64, n: usize| -> Vec<f64> { (0..n).map(|i| (offset + step * i as i64) as f64 / 8.0).collect() };
+	let eighths = |offset: i64, step: i64, n: usize| -> Vec<f64> { (0..n).map(|i| cast::i64_to_f64(offset + step * cast::usize_to_i64(i)) / 8.0).collect() };
 	let mut scattered = Vec::new();
 	let mut state = 0x9E37_79B9_7F4A_7C15_u64;
 	for _ in 0..128 {
 		state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-		scattered.push((state % 1_000_000) as f64 / 8.0);
+		scattered.push(cast::u64_to_f64(state % 1_000_000) / 8.0);
 	}
 	vec![("fine_ramp_128", eighths(0, 1, 128)), ("coarse_ramp_128", eighths(1_000_000, 512, 128)), ("constant_200", vec![42.25; 200]), ("alternating_200", (0..200).map(|i| if i % 2 == 0 { 42.25 } else { -42.25 }).collect()), ("scattered_128", scattered), ("empty", Vec::new()), ("single", vec![7.0])]
 }
 
-/// Every codec in the gated module, as (name, encoder). `elf_f64_encode` is `Option` because it
+/// A named f64 encoder.
+#[cfg(feature = "experimental-codecs")]
+type F64Codec = (&'static str, Box<dyn Fn(&[f64]) -> Option<Vec<u8>>>);
+
+/// Every codec in the gated module, as (name, encoder).
+///
+/// `elf_f64_encode` is `Option` because it
 /// declines some inputs; the golden pins *that* too, as a `declined` line in the selection table.
 #[cfg(feature = "experimental-codecs")]
-fn f64_codecs() -> Vec<(&'static str, Box<dyn Fn(&[f64]) -> Option<Vec<u8>>>)> {
+fn f64_codecs() -> Vec<F64Codec> {
 	vec![("xor", Box::new(|values: &[f64]| Some(weft_physical_type::xor_f64_encode(values)))), ("chimp", Box::new(|values: &[f64]| Some(weft_physical_type::chimp_f64_encode(values)))), ("chimp128", Box::new(|values: &[f64]| Some(weft_physical_type::chimp128_f64_encode(values)))), ("elf", Box::new(weft_physical_type::elf_f64_encode))]
 }
 

@@ -120,7 +120,6 @@ impl IngestProfile {
 /// A read-back mismatch is not an error: it fails the correctness gate in the
 /// returned [`BenchResult`], exactly as the other workloads report a failed
 /// gate, so the run is non-publishable and the binary exits non-zero.
-#[allow(clippy::cast_precision_loss)]
 pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, reps: usize) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(reps > 0, "reps must be > 0");
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
@@ -240,7 +239,6 @@ impl Tiled<'_> {
 /// `batch_rows == 0`, if `checkpoints` is empty or not strictly rising, if a copy would leave
 /// the timestamp range, if any store operation fails, or if `on_checkpoint` fails. A failed
 /// check is not an error: it fails that checkpoint's correctness gate.
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, checkpoints: &[u64], mut on_checkpoint: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
@@ -408,7 +406,6 @@ struct ReaderTally {
 /// `params.rows < 2` or a copy would leave the timestamp range, or if any store operation
 /// fails. A query that reads the wrong rows, or that the store refuses (a read can meet the
 /// writer's lock), is not an error: it is counted and fails the correctness gate.
-#[allow(clippy::cast_precision_loss)]
 pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: OnlineParams) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
@@ -624,9 +621,8 @@ pub fn count_label(n: u64) -> String {
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 #[cfg(test)]

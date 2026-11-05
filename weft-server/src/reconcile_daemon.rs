@@ -526,8 +526,8 @@ mod tests {
 		store.declare("a", &schema()).await.unwrap();
 		// A long cold base [0..100] + a small late tail re-entering only its end.
 		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
-		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
-		store.seal("a", &schema(), &base_ts, &base_vs).await.unwrap();
+		let base_values: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_values).await.unwrap();
 		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.unwrap();
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
 

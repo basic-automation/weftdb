@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Benchmark the **cross-segment downsample** (`SegmentStore::downsample_range`) —
 //! the bounded-memory reduction that folds each pruned segment into its own
 //! mergeable `PartialReduction` and merges once.

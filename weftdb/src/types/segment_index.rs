@@ -118,19 +118,24 @@ impl SeriesCatalogs {
 
 	/// Keep `series` as `aspect`'s catalog if no registration ran since `generation`.
 	fn put(&self, aspect: &str, generation: u64, series: std::sync::Arc<[(crate::SeriesId, crate::SeriesKey)]>) {
-		let mut catalogs = self.lock();
-		let cached = catalogs.entry(aspect.to_string()).or_default();
-		if cached.generation == generation {
-			cached.series = Some(series);
-		}
+		self.update(aspect, |cached| {
+			if cached.generation == generation {
+				cached.series = Some(series);
+			}
+		});
 	}
 
 	/// Forget `aspect`'s catalog: a series was (or may have been) registered in it.
 	fn invalidate(&self, aspect: &str) {
-		let mut catalogs = self.lock();
-		let cached = catalogs.entry(aspect.to_string()).or_default();
-		cached.generation += 1;
-		cached.series = None;
+		self.update(aspect, |cached| {
+			cached.generation += 1;
+			cached.series = None;
+		});
+	}
+
+	/// Run `change` on `aspect`'s cache entry, holding the lock for exactly that.
+	fn update(&self, aspect: &str, change: impl FnOnce(&mut CachedCatalog)) {
+		change(self.lock().entry(aspect.to_string()).or_default());
 	}
 }
 
@@ -340,7 +345,7 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// As [`apply`](Self::apply).
-	pub(crate) async fn apply_while(&self, txn: &IndexTxn, may_retry: impl Fn() -> bool) -> std::result::Result<TxnApplied, IndexTxnError> {
+	pub(crate) async fn apply_while(&self, txn: &IndexTxn, may_retry: impl Fn() -> bool + Send) -> std::result::Result<TxnApplied, IndexTxnError> {
 		self.widen_spans(txn);
 		let applied = txn.run_while(&self.db, may_retry).await;
 		self.forget_catalogs(txn);
@@ -426,7 +431,7 @@ impl SegmentIndexStore {
 	/// series-bound prune, the time index otherwise. A store without the named index
 	/// (both are best effort) falls back: the series-time index to the time index, the
 	/// time index to a scan.
-	async fn query_indexed<P: turso::IntoParams>(conn: &turso::Connection, series_bound: bool, sql: &impl Fn(&str) -> String, params: &impl Fn() -> P) -> Result<turso::Rows> {
+	async fn query_indexed<P: turso::IntoParams + Send>(conn: &turso::Connection, series_bound: bool, sql: &(impl Fn(&str) -> String + Sync), params: &(impl Fn() -> P + Sync)) -> Result<turso::Rows> {
 		let missing = |e: &turso::Error| e.to_string().contains("no such index");
 		if series_bound {
 			match conn.query(sql(&format!("INDEXED BY {SERIES_TIME_INDEX}")), params()).await {
@@ -444,11 +449,15 @@ impl SegmentIndexStore {
 
 	/// Note which index the last prune on this thread ran through (`""` for a scan), so
 	/// tests can assert the production query reached the index it names.
+	#[cfg(test)]
 	fn used(rows: turso::Rows, index: &'static str) -> turso::Rows {
-		#[cfg(test)]
 		LAST_PRUNE_INDEX.with(|cell| cell.set(Some(index)));
-		#[cfg(not(test))]
-		let _ = index;
+		rows
+	}
+
+	/// Outside tests nothing records the index: the rows pass through.
+	#[cfg(not(test))]
+	const fn used(rows: turso::Rows, _index: &'static str) -> turso::Rows {
 		rows
 	}
 
@@ -772,19 +781,13 @@ impl SegmentIndexStore {
 	pub(crate) async fn allocator_seed(&self, aspect: &str) -> Result<AllocatorSeed> {
 		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT next_id, next_gen, epoch FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
-		let persisted = match rows.next().await? {
-			Some(row) => {
-				let unsigned = |idx: usize| Self::opt_integer(&row, idx).and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
-				Some((unsigned(0), unsigned(1), unsigned(2)))
-			}
-			None => None,
-		};
+		let persisted = rows.next().await?.map(|row| {
+			let unsigned = |idx: usize| Self::opt_integer(&row, idx).and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
+			(unsigned(0), unsigned(1), unsigned(2))
+		});
 		drop(rows);
 		let mut rows = conn.query("SELECT MAX(gen) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
-		let max_gen = match rows.next().await? {
-			Some(row) => Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok()),
-			None => None,
-		};
+		let max_gen = rows.next().await?.and_then(|row| Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok()));
 		drop(rows);
 		Ok(AllocatorSeed { next_id: persisted.map(|(next_id, _, _)| next_id), next_gen: persisted.map(|(_, next_gen, _)| next_gen), epoch: persisted.map_or(0, |(_, _, epoch)| epoch), max_id: self.max_id(aspect).await?, max_gen })
 	}
@@ -880,10 +883,7 @@ impl SegmentIndexStore {
 	pub(crate) async fn next_series_id(&self, aspect: &str) -> Result<u64> {
 		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT next_series_id FROM aspect_seq WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
-		let next = match rows.next().await? {
-			Some(row) => Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok()),
-			None => None,
-		};
+		let next = rows.next().await?.and_then(|row| Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok()));
 		Ok(next.unwrap_or(1).max(1))
 	}
 
@@ -897,10 +897,7 @@ impl SegmentIndexStore {
 	pub(crate) async fn series_count(&self, aspect: &str) -> Result<usize> {
 		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT COUNT(*) FROM series WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
-		Ok(match rows.next().await? {
-			Some(row) => Self::opt_integer(&row, 0).and_then(|n| usize::try_from(n).ok()).unwrap_or(0),
-			None => 0,
-		})
+		Ok(rows.next().await?.and_then(|row| Self::opt_integer(&row, 0).and_then(|n| usize::try_from(n).ok())).unwrap_or(0))
 	}
 
 	/// Every aspect with at least one row in the series catalog, in name order: the
@@ -939,10 +936,7 @@ impl SegmentIndexStore {
 			return Ok(0);
 		}
 		let mut rows = conn.query("SELECT MAX(series_id) FROM series WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
-		Ok(match rows.next().await? {
-			Some(row) => Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok()).unwrap_or(0),
-			None => 0,
-		})
+		Ok(rows.next().await?.and_then(|row| Self::opt_integer(&row, 0).and_then(|n| u64::try_from(n).ok())).unwrap_or(0))
 	}
 
 	/// The `frame_journal` rows (design section 5.3) of `aspect`, or of every aspect for
@@ -1199,7 +1193,7 @@ fn decode_quarantine_row(row: &turso::Row) -> Result<crate::types::quarantine::Q
 	};
 	let unsigned = |idx: usize| -> Result<u64> { Ok(u64::try_from(integer(idx)?).unwrap_or(0)) };
 	let class_text = text(7)?;
-	let class = QuarantineClass::from_str(&class_text).ok_or_else(|| anyhow::anyhow!("segment_quarantine holds class {class_text:?}, which this build does not know"))?;
+	let class = QuarantineClass::parse(&class_text).ok_or_else(|| anyhow::anyhow!("segment_quarantine holds class {class_text:?}, which this build does not know"))?;
 	Ok(QuarantineRecord { aspect: text(0)?, id: unsigned(1)?, gen: unsigned(2)?, name: text(3)?, reason: text(4)?, descriptor_json: opt_text(5)?, quarantined_ms: integer(6)?, class, min_ts: opt_integer(8)?, max_ts: opt_integer(9)?, series_id: unsigned(10)? })
 }
 
@@ -1283,6 +1277,8 @@ async fn meta_value(conn: &turso::Connection, key: &str) -> Result<Option<String
 
 #[cfg(test)]
 mod tests {
+	use std::fmt::Write as _;
+
 	use weft_physical_type::{timestamp::TimeUnit, Segment};
 
 	use super::*;
@@ -1362,7 +1358,7 @@ mod tests {
 		let near = store.prune_by_time("aspect", 120, 150).await.expect("prunes");
 		drop(store);
 		let ids = |ds: &[SegmentDescriptor]| ds.iter().map(|d| d.id).collect::<Vec<_>>();
-		assert!(before.is_empty());
+		assert_eq!(before, [] as [weft_physical_type::SegmentDescriptor; 0]);
 		assert_eq!(ids(&far), vec![99]);
 		assert_eq!(ids(&near), vec![1, 99]);
 	}
@@ -1425,7 +1421,7 @@ mod tests {
 		assert_eq!(ids(&mid), vec![1]);
 		assert_eq!(ids(&straddle), vec![0, 1]);
 		assert_eq!(ids(&all), vec![0, 1, 2]);
-		assert!(gap.is_empty());
+		assert_eq!(gap, [] as [weft_physical_type::SegmentDescriptor; 0]);
 	}
 
 	#[tokio::test]
@@ -1529,7 +1525,7 @@ mod tests {
 		let pruned = store.prune_by_time("a", i64::MIN, i64::MAX).await.expect("prunes");
 		drop(store);
 		assert_eq!(count, 1);
-		assert!(pruned.is_empty());
+		assert_eq!(pruned, [] as [weft_physical_type::SegmentDescriptor; 0]);
 	}
 
 	/// The quality prune is the time prune plus "carries a present value": a fully null
@@ -1569,7 +1565,7 @@ mod tests {
 		drop(store);
 		drop(empty);
 		assert_eq!(aspects, vec!["humidity".to_string(), "temp".to_string()]);
-		assert!(none.is_empty());
+		assert_eq!(none, [] as [String; 0]);
 	}
 
 	/// Every file in `dir`, by name, with its bytes.
@@ -1774,7 +1770,7 @@ mod tests {
 		let mut detail = String::new();
 		while let Some(row) = plan.next().await.expect("reads the plan") {
 			for i in 0..row.column_count() {
-				detail.push_str(&format!("{:?} ", row.get_value(i).expect("a column")));
+				write!(detail, "{:?} ", row.get_value(i).expect("a column")).expect("a string takes a write");
 			}
 			detail.push('\n');
 		}
