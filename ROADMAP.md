@@ -63,7 +63,8 @@ Interchange and output are covered too: Parquet and CSV in, columnar Arrow/Parqu
   - [ ] **Flight SQL**: waits for the SQL surface (DataFusion, later): Flight SQL is SQL statements over Flight, and there is no SQL engine to answer them yet.
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
   - [x] **Grafana** (2026-11-04): `GET /api/v1/grafana`, `POST …/metrics` and `POST …/query` answer the community JSON datasource (`simpod-json-datasource`), experimental and in the `read` scope. A panel's targets are aspects; each is the stored downsample over the panel's range at its interval (capped at `maxDataPoints`), the reduction picked per target (`agg`, default `avg`). `packaging/grafana/weftdb-datasource.yaml` provisions it; the unit test in `weft-server/src/grafana.rs` charts a stored aspect through the router.
-  - [ ] **Prometheus remote write/read**: follows **B-tags**. A remote-write series is a metric plus a label set, and without per-measurement tags each label set would become its own aspect (DECISIONS 2026-11-04).
+  - [ ] **Prometheus remote write/read**: a remote-write series is a metric plus a label set (DECISIONS 2026-11-04).
+    *Unblocked 2026-11-05: B-tags landed (TAG-5..TAG-11, #552-#570), so a label set can map to tags on one aspect. Not started: there is no remote-write/read route yet.*
   - [x] **R/Arrow workflows** (2026-11-04): `clients/r` (package `weftdb`) reads stored windows, value bands and server-side downsamples as Arrow tables, pages the exact JSON rows, and writes data frames or Arrow tables as one Parquet batch with `Idempotency-Key`. Refusals are `weft_<code>` conditions. `tests/testthat/test-live.R` is the contract against a running server. It found that Parquet ingest refused Snappy, the default codec of R's arrow, pyarrow, pandas and Spark; the workspace's `parquet` now reads it.
 
 ### Phase 3 — Instrument everything · *Very high*
@@ -109,7 +110,7 @@ Every Phase 5 item is built and merged as of 2026-11-05, including the ones the 
 - [x] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
   - *2026-11-04: re-added (`submit_f64` -> `GpuHandle` with one shared non-blocking poller) and measured in splimes [#16](https://github.com/basic-automation/splimes/pull/16) (merged `1bc371c`) with `examples/handles.rs` (512 requests, 2 ms CPU parse each, Cubic 4,096 knots -> 1,048,576 points, depth 8). Median of runs 2-5: `run` 5,301 ms, `spawn_f64` 3,955 ms, `submit_f64` 4,056 ms; submit/spawn ranged 0.72x-1.28x under load average 29-42. Verdict: the handle API was dropped again; the existing `spawn_f64` (~1.3x over `run`) delivers the CPU/GPU overlap. The harness and splimes BENCHMARKS.md "Overlapping requests" were kept.*
 - [x] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
-  - *2026-11-04: [#585](https://github.com/basic-automation/weftdb/pull/585). The stored window becomes epoch-tick `f64` columns (no `DateTime` per knot, `weftdb/src/types/interpolate_range.rs:299`), runs through splimes `stream_epoch` on the blocking pool, and is sent as a chunked body with at most `STREAM_DEPTH` chunks of `STREAM_CHUNK_POINTS` ahead (`weft-server/src/stored_interpolate.rs:46`); `interpolate_range_stream(_of)` at `interpolate_range.rs:319`/`:329`. JSON and CSV stream; Arrow and Parquet stay buffered; the read/decode stage is not chunked per segment. Tests compare streamed output with the `f64` call bit for bit. Not built or measured yet: the `stored_interpolate` bench's time-to-first-byte columns run after the merge.*
+  - *2026-11-04: [#585](https://github.com/basic-automation/weftdb/pull/585). The stored window becomes epoch-tick `f64` columns (no `DateTime` per knot, `weftdb/src/types/interpolate_range.rs:299`), runs through splimes `stream_epoch` on the blocking pool, and is sent as a chunked body with at most `STREAM_DEPTH` chunks of `STREAM_CHUNK_POINTS` ahead (`weft-server/src/stored_interpolate.rs:216`); `interpolate_range_stream(_of)` at `interpolate_range.rs:319`/`:329`. JSON and CSV stream; Arrow and Parquet stay buffered; the read/decode stage is not chunked per segment. Tests compare streamed output with the `f64` call bit for bit. Not built or measured yet: the `stored_interpolate` bench's time-to-first-byte columns run after the merge.*
 - [x] 5.4 Hardware auto-tuning (calibrate CPU/GPU throughput, transfer cost, break-even sizes; auto-select)
   - *Audit 2026-10-27: checked — `weft-server/src/gpu.rs:82` `calibrate()` runs `splimes::calibrate()` at startup (`gpu.rs:95`), timing GPU, rayon pool and single core and installing the measured break-even thresholds that `Backend::Auto` then uses to auto-select (`gpu.rs:1-20`, `settings.rs:109` `WEFT_GPU_CALIBRATE`; tests at `gpu.rs:138-193`).*
 - [x] 5.5 GPU economics (cloud cost, CPU-only fallback, utilization/contention/cold-start, NVIDIA/AMD/Intel/Apple portability)
@@ -188,8 +189,11 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
   - [x] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
 - [ ] **7.3 Corruption detection**
   - [ ] Restoring *into a chosen new root* over HTTP
-  - [ ] Whole-store backup manifest (fold the `.weftseg` frames in beside the control plane)
-  - [ ] Document RPO/RTO against the measured snapshot cadence
+    *The offline path exists: `weft-server restore <BACKUP> --into <NEW_ROOT>` (PAC-13, `weft-server/src/restore.rs:65`); only the HTTP route is missing.*
+  - [x] Whole-store backup manifest (fold the `.weftseg` frames in beside the control plane)
+    *Closed 2026-11-05 (audit): done 2026-11-01 (D-S16, #483). The `weftdb-whole-store-backup/1` manifest (`weftdb/src/types/backup.rs:412`) lists the hard-linked `.weftseg` frames beside the four control-plane databases; `restore_store` and `weft-server restore` read it.*
+  - [x] Document RPO/RTO against the measured snapshot cadence
+    *Closed 2026-11-05 (audit): `docs/RPO-RTO.md` (EVI-19, #545); the soak backup lane records RPO/RTO by those formulas (SOA-11, #578).*
 - [ ] **7.5 Compaction**
 - [ ] **7.6 Quotas/limits**
 
@@ -223,7 +227,8 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 
 - [ ] **7.2 WAL & crash consistency**
 - [ ] **7.3 Corruption detection**
-- [ ] **7.4 Whole-store backup manifest**
+- [x] **7.4 Whole-store backup manifest**
+  *Closed 2026-11-05 (audit): whole-store manifest `weftdb-whole-store-backup/1` shipped in D-S16 (#483).*
 - [ ] **7.4 Documented RPO/RTO** against the measured snapshot cadence
 - [ ] **7.5 Compaction** with query consistency, cancellation, and resource limits
 - [ ] **7.6 Quotas/limits**
@@ -373,7 +378,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] seal lane
   - [ ] read lane
   - [x] → **ROB-13** Bounded stored downsample and point lookups
-  - [ ] **ROB-7** Ingest decode bounds
+  - [x] **ROB-7** Ingest decode bounds
+    *Closed 2026-11-05 (#551): non-finite input is `400 not_finite` in every ingest format (Parquet NaN no longer sealed as a null), plus decoded ceilings `WEFT_MAX_INGEST_ROWS` (413 too_many_rows) and `WEFT_MAX_INGEST_DECODED_BYTES` (413 payload_too_large), checked after parse and before the seal (`weft-server/src/ingest.rs:218`).*
   - [x] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
   - [x] **ROB-23r** Probe-only admin listener
   - [x] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
@@ -387,7 +393,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
 - [ ] **W8 · Tags core, memory budget**
   - [ ] open lane
-  - [ ] → **TAG-9** Frame error classes in recovery
+  - [x] → **TAG-9** Frame error classes in recovery
+    *Closed 2026-11-05 (audit): #556 (2026-11-04). Recovery and fsck adopt series-key frames into their series, class a malformed/empty/duplicate SERIES_KEY after a passing CRC as suspect (C5), rebind mismatched keys (`series_rebound`), and settle every held row (`held_cleared`).*
   - [ ] seal lane
   - [ ] → **ROB-17** Disk guard, headroom API and space gauges
   - [ ] maint lane
@@ -475,7 +482,8 @@ The backup cost was measured on 2026-09-23, and the diagnosis on record at the t
 - [ ] Lean on production MVCC concurrent writes for concurrent ingest + catalog updates under load *(Phase 7)*
 - [ ] Encryption at rest (AEAD pager) for catalog/metadata/pipeline-state DBs *(Phase 8)*
 - [ ] **Backup 7.4 residue (b) — incremental / WAL-streaming backup** beyond the full `VACUUM INTO`
-- [ ] **Backup 7.4 residue (d) — whole-store backup manifest**
+- [x] **Backup 7.4 residue (d) — whole-store backup manifest**
+  *Closed 2026-11-05 (audit): shipped in D-S16 (#483) with hard-linked frames (`weftdb/src/types/backup.rs:412`).*
 - [ ] **Backup cost residue (a) — the root cause is documented upstream, and it is per-call
 - [ ] **Backup cost residue (b) — (i) MEASURED 2026-10-08: `synchronous=OFF` is NOT a material win.**
 - [ ] **Backup cost residue (c) — DO NOT reach for Turso's experimental passive checkpoint.**
