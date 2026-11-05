@@ -68,6 +68,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- A panic inside a legacy queue-consumer write took the worker task with it and
+  left the write's transaction open. Every write of the `Inputs` and `Pipeline`
+  traits now runs inside `weftdb::exec`'s control-plane write scope (C22,
+  ROB-5), so the panic hook added by ROB-2 recognises it, aborts the control
+  plane during the unwind, and the process exits with the store's failure code
+  instead of dropping a request mid-transaction (#303).
+- `batch_capture_measurements` computed a batch's window with `.min().unwrap()`
+  and `.max().unwrap()`, which the method's own `# Panics` block documented as
+  reachable if the emptiness guard above ever changed. The window is a `Result`
+  now, and an empty batch is what it has always returned: no ids, no panic
+  (#303).
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
   under Turso's MVCC each delete cost milliseconds and grew with the swaps before it. One
   guarded statement now deletes a group's rows: squashing 10M UCI rows from 9,769 to 153

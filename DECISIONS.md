@@ -3863,3 +3863,47 @@ applies cleanly over EVI-18's health-metrics branch (which owns those). The
 one shared assertion to union at batch merge is the Prometheus `# TYPE`
 count in `metrics.rs`: EVI-18's gauge and this slice's histogram take it
 from 18 to 20.
+
+## 2026-11-04 — ROB-5: what "wraps legacy metadata writes" wraps (issue #303)
+
+**Ambiguous.** C22's line is "ROB-2 ships the engine-origin abort now. ROB-5
+wraps legacy metadata writes", and the 1.0 plan's ROB-5 row says the same thing
+in other words. Nothing in the tree is called a legacy metadata write: the
+legacy queue-consumer surface is the `Inputs` and `Pipeline` traits, whose
+methods open their own transactions — some 265
+`begin_immediate`/`begin_concurrent`/`commit_concurrent` call sites across
+`weftdb/src/types/database/` (`inputs.rs` 98, `outputs.rs` 50, `aspect.rs` 45,
+`mod.rs` 42, `pipeline.rs` 30). "Wrap the writes" cannot mean wrap those.
+
+**Chosen:** the scope goes at the **method** boundary, not the connection. One
+`pub(crate) async fn legacy_metadata_write<F: std::future::Future>(fut: F) ->
+F::Output` in `weftdb/src/types/database/mod.rs` calls
+`crate::types::exec::control_plane_write`, and the 59 write methods of the three
+impls run their whole body inside it — `Inputs` 45, `Pipeline` 9, and the five
+that record a transaction, log one, remove a subject, track an aspect and bump
+aspect timestamps in `mod.rs`. The boundary has to be the method because the
+scope marks a *write*, not a connection: a method opens with `begin_immediate`
+and commits later, and a panic between the two must reach ROB-2's hook as a
+control-plane panic. Reads that also use `begin_concurrent` are deliberately not
+wrapped — marking a read as a control-plane write would turn an ordinary read
+panic into an abort the plan never asks for. The helper is never called from
+inside `control_plane_write`: `index_txn.rs`'s
+`every_op_runs_inside_the_control_plane_write_scope` counts the scope entries a
+transaction produces, and a second nesting would quietly change what that test
+proves.
+
+**Converted panic sites.** `batch_capture_measurements` computed its window with
+`.min().unwrap()` and `.max().unwrap()` — four sites at `inputs.rs:433`, `:434`,
+`:449`, `:450` before this change — and its `# Panics` block documented the empty
+batch as one, true if the early return above it ever moved. Those became one
+`fn batch_bounds(measurements: &[InputMeasurement]) ->
+Result<(DateTime<Utc>, DateTime<Utc>)>`, whose error names the count it was
+given, and the `# Panics` block is gone: an empty batch is the documented no-op
+it has always been, answering no ids.
+
+**Rejected:** wrapping `Database::begin_immediate`/`begin_concurrent`. It covers
+the connection's acquisition, not the transaction: a panic after
+`commit_concurrent` returns, while the caller still holds the write, would be
+outside the scope. It also marks reads, which take the same call, and it would
+have made this slice a change to every caller in the crate instead of a change
+to the three impls that own the legacy writes.
