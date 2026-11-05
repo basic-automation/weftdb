@@ -68,9 +68,8 @@ assert_eq!(point.value, BigDecimal::from_str("21.25").unwrap());
 
 ## Status
 
-The library crates of this workspace are released together with the 1.0 cut and are not on
-crates.io before it; until then, depend on the git checkout. The version on this branch is
-in `[package].version` in [Cargo.toml](Cargo.toml), and
+Pre-beta: the API, configuration and on-disk format can change in any 0.x release. The
+library crates of this workspace are released together, on crates.io since 0.2.0, and
 [RELEASING.md](https://github.com/basic-automation/weftdb/blob/main/RELEASING.md) says what
 a release publishes.
 

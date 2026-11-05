@@ -308,11 +308,32 @@ pub async fn backup_tick(store: &SegmentStore, metrics: &SharedMetrics, base: &P
 	let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
 	let dest = fresh_dir(base, millis);
 	let span = tracing::info_span!("backup.tick", dir = %dest.display(), verify = "snapshot", rows = tracing::field::Empty, bytes = tracing::field::Empty);
+	// EVI-25: the tick's wall-clock duration is an RTO input, so it is
+	// observed into the backup histogram alongside the byte count — a failed
+	// tick never reaches here, so no failure duration is recorded.
+	let started = std::time::Instant::now();
 	let backup = store.backup_control_plane_with_verify(&dest, VerifyMode::SnapshotOnly).instrument(span.clone()).await?;
 	span.record("rows", backup.total_rows());
 	span.record("bytes", backup.total_bytes());
 	metrics.record_backup(backup.total_bytes());
+	metrics.observe_backup_duration(started.elapsed());
 	Ok(backup)
+}
+
+/// Build the daemon's ticker: one tick per `interval`, catch-up-free.
+///
+/// Tokio's default missed-tick behaviour is `Burst`: a snapshot that outlasts the
+/// interval (or a stalled process) is followed by back-to-back ticks until the
+/// schedule catches up, so a slow disk used to stampede the daemon into a burst of
+/// snapshots. `Skip` drops the missed ticks instead — the next tick fires at the
+/// next period boundary — so the daemon takes at most one snapshot per interval
+/// however far behind it fell.
+///
+/// Factored out so the behaviour is testable without waiting on a real interval.
+fn backup_ticker(interval: Duration) -> tokio::time::Interval {
+	let mut ticker = tokio::time::interval(interval);
+	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	ticker
 }
 
 /// Spawn the background backup daemon on `config.interval`.
@@ -322,10 +343,13 @@ pub async fn backup_tick(store: &SegmentStore, metrics: &SharedMetrics, base: &P
 ///
 /// The first snapshot fires one interval after start (the immediate `interval` tick is
 /// consumed first), so start-up is not stampeded by an eager backup. Each snapshot logs
-/// a one-line summary; a failed snapshot is logged and the loop continues (a transient
+/// a one-line summary; a failed snapshot is logged, counted in
+/// `weft_backup_failures_total`, and the loop continues (a transient
 /// control-plane error must not kill the daemon, and the next tick retries into a fresh
-/// directory). The stale-staging sweep runs at start, without waiting for the first
-/// interval, and again before every snapshot.
+/// directory). At start the daemon seeds `weft_backup_last_success_seconds` from the
+/// newest snapshot already on disk, so the health gauge survives a restart instead of
+/// reading 0 until the first tick. The stale-staging sweep runs at start, without
+/// waiting for the first interval, and again before every snapshot.
 #[must_use]
 pub fn spawn_backup_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, config: BackupDaemonConfig) -> tokio::task::JoinHandle<()> {
 	spawn_backup_daemon_with_clock(store, metrics, config, SystemTime::now)
@@ -342,7 +366,17 @@ where
 	tokio::spawn(async move {
 		// What a crash before this start left behind goes first.
 		sweep_stale_staging(&config.base, now()).await;
-		let mut ticker = tokio::time::interval(config.interval);
+		// The health gauge starts from what is already on disk, not from zero:
+		// a restart must not read as "no backup ever" until the first tick.
+		match list_generated_backups(&config.base).await {
+			Ok(listed) => {
+				if let Some((stamp, _)) = listed.last() {
+					metrics.seed_backup_last_success((stamp / 1_000).try_into().unwrap_or(u64::MAX));
+				}
+			}
+			Err(err) => eprintln!("backup daemon: could not list {} to seed the last-success gauge: {err}", config.base.display()),
+		}
+		let mut ticker = backup_ticker(config.interval);
 		// Consume the immediate first tick so the first snapshot waits one interval.
 		ticker.tick().await;
 		loop {
@@ -361,7 +395,10 @@ where
 						}
 					}
 				}
-				Err(err) => eprintln!("backup daemon: snapshot failed: {err}"),
+				Err(err) => {
+					metrics.record_backup_failure();
+					eprintln!("backup daemon: snapshot failed: {err}");
+				}
 			}
 		}
 	})
@@ -421,6 +458,7 @@ mod tests {
 		assert!(backup.total_rows() > 0, "the declared aspect + sealed segment are in the control plane");
 		assert_eq!(snap.backup.snapshots, 1, "the daemon tick records the same counter as the endpoint");
 		assert_eq!(snap.backup.bytes_written, backup.total_bytes());
+		assert!(metrics.render_prometheus().contains("weft_backup_duration_seconds_count 1"), "EVI-25: the tick observes its duration into the backup histogram");
 	}
 
 	#[tokio::test]
@@ -781,5 +819,76 @@ mod tests {
 		wait_until_gone(&second, "a tick sweeps what a crash left while the daemon was running").await;
 		daemon.abort();
 		let _ = daemon.await;
+	}
+
+	/// EVI-18: the ticker is catch-up-free. After the schedule falls three
+	/// periods behind, exactly one tick is owed — not the burst of back-to-back
+	/// ticks tokio's default `Burst` behaviour would deliver. The proof polls
+	/// the next tick once, by hand, without advancing the clock: with `Burst`
+	/// the 100 ms and 200 ms slots would already be pending, with `Skip`
+	/// nothing is due until the next period boundary.
+	#[tokio::test]
+	async fn the_ticker_skips_missed_ticks_instead_of_bursting() {
+		use std::task::{Context, Poll, Waker};
+
+		tokio::time::pause();
+		let mut ticker = backup_ticker(Duration::from_millis(100));
+		ticker.tick().await; // The immediate first tick.
+		tokio::time::advance(Duration::from_millis(350)).await;
+		ticker.tick().await; // The one tick the skipped schedule still owes.
+		let waker = Waker::noop();
+		let mut cx = Context::from_waker(&waker);
+		let mut next = Box::pin(ticker.tick());
+		assert!(matches!(std::future::Future::poll(next.as_mut(), &mut cx), Poll::Pending), "a missed tick must not burst: nothing is due until the next period boundary");
+	}
+
+	/// EVI-18: the daemon seeds the last-success gauge from the newest snapshot
+	/// already on disk, so a restart does not read as "no backup ever".
+	#[tokio::test]
+	async fn the_daemon_seeds_last_success_from_the_newest_snapshot_on_disk() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.unwrap());
+		let base = dir.path().join("backups");
+		plant_backups(&base, &["backup-1000", "backup-3000", "backup-2000"]);
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		let config = BackupDaemonConfig { interval: Duration::from_secs(3600), base: base.clone(), keep: None };
+		let daemon = spawn_backup_daemon_with_clock(Arc::clone(&store), Arc::clone(&metrics), config, SystemTime::now);
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		loop {
+			if metrics.snapshot().backup.last_success_unix_secs == 3 {
+				break;
+			}
+			assert!(std::time::Instant::now() < deadline, "the start-up seed never landed");
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+		daemon.abort();
+		let _ = daemon.await;
+	}
+
+	/// EVI-18: a tick that fails is counted, so a permanently failing daemon
+	/// stays visible in `weft_backup_failures_total` instead of only in logs.
+	#[tokio::test]
+	async fn a_failed_tick_is_counted_in_the_health_metrics() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.unwrap());
+		// A regular file where the backup base should be: every tick fails.
+		let base = dir.path().join("not-a-directory");
+		std::fs::write(&base, b"x").unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+
+		let config = BackupDaemonConfig { interval: Duration::from_millis(50), base: base.clone(), keep: None };
+		let daemon = spawn_backup_daemon_with_clock(Arc::clone(&store), Arc::clone(&metrics), config, SystemTime::now);
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		loop {
+			if metrics.snapshot().backup.failures >= 1 {
+				break;
+			}
+			assert!(std::time::Instant::now() < deadline, "no failed tick was counted");
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+		daemon.abort();
+		let _ = daemon.await;
+		assert_eq!(metrics.snapshot().backup.snapshots, 0, "no snapshot succeeded against the file base");
 	}
 }

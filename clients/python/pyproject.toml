@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weftdb"
+version = "0.1.0"
+description = "Python client for the WeftDB HTTP API"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Basic Automation" }]
+# The client itself is standard library only; pyarrow decodes the Arrow/Parquet answers.
+dependencies = []
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=14"]
+
+[project.urls]
+Repository = "https://github.com/basic-automation/weftdb"
+
+[tool.setuptools]
+packages = ["weftdb"]
+
+[tool.setuptools.package-data]
+weftdb = ["py.typed"]

@@ -30,8 +30,8 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
   - [x] **DONE (2026-11-01) — online ingest + query** (`weft-bench --ingest --ingest-online READERS`, #145): at 64k-row batches 100M rows ingest at 6.4M → 5.6M rows/s with 1 → 8 readers, every query exact; found reads costing ~1.8 µs per stored segment and, at 1,024-row batches, most concurrent reads refused with `database is locked`
   - [x] **DONE (2026-11-01) — compressed query** (`weft-bench --ingest --compressed-query QUERIES`, #145): in-store downsample is 2.2–2.9× faster than decode-then-reduce for a year window and equal below a day, where the per-segment prune cost sets the floor; every answer exact
   - [x] **DONE (2026-11-02) — analytics pipeline** (`weft-bench --ingest --analytics-pipeline ROWS`, #145): on UCI at 60-row batches every stage is timed and the detectors find exactly the raw extremes at 10k, 30k and 100k rows; preparation dominates and grows faster than the rows (82 s → 394 s → 1,290 s). Found `analyze_range` resampling off its step grid past 50k points, fixed
-    - [ ] **NEXT — preparation cost** (#505): a first run over 100k rows takes ~30 minutes, most of it `prepare_data`; profile it before the pipeline sees a larger corpus
-    - [ ] **NEXT — a chunk reads only one step past its edges** (#506), so a gap longer than a chunk (~35 days at minutes) interpolates without its far bracket
+    - [x] **DONE (2026-11-03) — preparation cost** (#505): profiled at 10k rows; the incremental queue build interpolated and committed each 60-point window alone (~300 s of ~420 s). It now interpolates each run of windows once and queues 500 batches to a transaction: `prepare_data` 204 s. What is left is 100-digit BigDecimal arithmetic, in `splimes`' interpolation (~41 s) and `Batch::process` (~120 s), whose precision the stored values depend on
+    - [x] **DONE (2026-11-03) — a chunk reads only one step past its edges** (#506): a chunk now widens its read until it holds the knots on both sides, so a gap longer than a chunk interpolates between its own brackets
 - [x] **DONE (2026-10-09) — first-rep/warm separation** (`BenchResult.cold_warm`, schema v21, every workload; console + Parquet)
   - [x] **DONE (2026-10-31) — OS-cold and post-restart runs** (`weft-xbench --cold-hook CMD --cold-reps N`, #146): each read phase also runs with the page cache dropped and after an engine restart, every rep gated; schema v4 `warmth`
 - [x] **DONE (2026-11-02) — Fair-protocol depth (Phase 1.1)** (#147)
@@ -44,9 +44,9 @@ The storage, read and aggregation workloads shipped on 2026-07-14, and gap fill 
   - [x] **DONE (2026-11-02) — a run manifest for `weft-xbench`**: input file and binary SHA-256, and with `--container` each engine container's image digest, command and environment (secrets redacted)
   - [x] **DONE (2026-11-02) — post-compaction reads** (`--compressed-query-compact ROWS`): the store's own squash (`squash_aspect_to_target_rows`), then the same seeded windows, gated on identical answers
   - [x] **DONE (2026-11-02) — failure tests** (`weft-bench --failure kill-ingest|kill-compaction|corrupt-segment`): a child process killed with SIGKILL mid-ingest or mid-compaction, or a flipped byte in a closed segment; the reopened store must hold every acknowledged row exactly and quarantine, never serve, a damaged segment (open-time recovery caught all 143 byte flips of a probe frame). Network retry is SOA-8's failure deck (#502); the CI crash matrix stays D-S21/SOA-9's
-    - [ ] **NEXT — compaction cost** (#507): squashing 10M rows from 9,769 to 153 segments took 694 s, and small windows read ~36× slower after it (whole 65k-row segments decoded); the year window held
+    - [x] **DONE (2026-11-03) — compaction cost** (#507): squashing 10M rows from 9,769 to 153 segments took 694 s (361 s on a quiet machine), nearly all of it one keyed index delete per merged segment under Turso's MVCC; one guarded delete per group makes it 31–43 s. Small windows read ~36× slower after it mostly because the index's deleted versions were never checkpointed; with a checkpoint after the squash an hour's p50 is 0.49 ms (0.22 ms before the squash, 2.2 ms without the checkpoint). The rest was decoding a 65k-row segment's value column from its start; merges now write 4,096-row pages, so an hour reads 0.18 → 0.25 ms across the squash for 1.341 → 1.357 B/pt (still below the 1.414 of the seals it replaces)
 - [x] **DONE (2026-11-02) — Fair interpolation comparisons (Phase 1.2)** (#148): every `weft-xbench` engine answers in three classes where it can — its native fill (A: TimescaleDB, QuestDB, InfluxDB 3, IoTDB, ClickHouse), portable SQL (B) and client-side (C, all six) — with native fills that compute another answer gated on shape and reported against the line, never raced; each ASOF strategy run and published (#393). A `tiny` run passed every arm on all five servers
-  - [ ] **NEXT — the pooled cross-engine evidence run** (#508): two full runs (`small,medium`, UCI, TSBS) combined with `weft-xbench combine`; the 2026-11-02 attempt stopped when ClickHouse ran out of memory beside an 82 GB local model server, so it waits for a quiet host. No cross-engine figure from the three classes is a published claim until then
+  - [x] **DONE (2026-11-02) — the pooled cross-engine evidence run** (#508): two full runs (`small,medium`, UCI, TSBS, all five servers) pooled with `weft-xbench combine`, in `bench/reports/phase1-pooled/`. 319 of 320 gates pass; the one failure is TimescaleDB's `double` downsample, whose answer differs between runs in the last bits, so `combine` refuses to pool it. 105 of 112 verdicts hold in both runs, and none flips between a win and a loss: 17 wins, all against portable SQL (five at `medium`, TSBS and UCI interpolation), 85 losses (every load, the stored downsample, and every comparison with client-side interpolation) and 3 within noise
 - [x] **DONE (2026-11-02) — Report surfaces beyond JSON/HTML/Parquet** (#149): Markdown, CSV and Prometheus text (`--markdown-report`, `--csv-report`, `--prom`, `weft-bench export`), and a Grafana dashboard over the Prometheus text (`bench/grafana/`)
 - [x] **DONE (2026-11-02) — Anti-Goodhart (Phase 1.3)** (#150): `scripts/bench/check-separation.py` in CI (no engine crate depends on or detects a benchmark crate); HONESTY.md maps every rule to what enforces it
 
@@ -57,7 +57,14 @@ The `axum` server is in place with the flagship `POST /api/v1/interpolate` over 
 Interchange and output are covered too: Parquet and CSV in, columnar Arrow/Parquet out of the compute endpoints, and cursor paging on the stored-range reads. Observability is wired in at the API, with Prometheus latency histograms and OpenTelemetry trace export alongside `/metrics`.
 
 - [ ] Python SDK → Rust SDK → Arrow Flight / Flight SQL → SQL surface / DataFusion (later)
+  - [x] **Python SDK** (2026-11-03): `clients/python` (package `weftdb`), standard-library only with `pyarrow` as the optional `arrow` extra. It covers every route: compute, catalog, the four ingest formats with `Idempotency-Key`, stored reads with cursor-following iterators, maintenance, backup and the bench runs. Storage values travel as `Decimal`/text and a `float` is refused at that boundary. The unit tests run against an in-process fake; `tests/test_live.py` is the contract test against a real `weft-server`, which CI runs on Linux after the build.
+  - [x] **Rust SDK** (2026-11-04): `weft-client`, async on `reqwest`, covering the same routes. Stored values are written from any `StoredValue` (decimal text, `BigDecimal`, integers) and read back as `BigDecimal`; `f64` does not implement `StoredValue`, so the float boundary is a compile error rather than a runtime refusal. Cursor-following reads are `Stream`s, refusals are one `Error` carrying the whole envelope, and an overloaded read is retried after `Retry-After`. Features: `rustls` (ring provider, platform or supplied roots) and `arrow` (Arrow IPC and Parquet to `RecordBatch`). `tests/fake.rs` pins the client's own behaviour against a fake server; `tests/live.rs` is the contract test against a real `weft-server`, which CI runs on Linux after the build.
+  - [x] **Arrow Flight** (2026-11-04): an opt-in, read-only gRPC listener (`WEFT_FLIGHT_ADDR`, experimental, loopback only since it is plaintext). `DoGet` takes a JSON ticket (`aspect` with `start`/`end`, or `lo`/`hi`) and streams the same typed record batch the Arrow range routes encode; `GetFlightInfo`, `GetSchema` and `ListFlights` describe the declared aspects. Keys and the `read` scope apply as on HTTP, denials are audited, a query gate sheds load as `UNAVAILABLE`, and refusals keep their envelope code in `x-weft-error-code`. `weft-server/tests/flight.rs` drives it with the Arrow project's `FlightClient`. Writes stay on HTTP.
+  - [ ] **Flight SQL**: waits for the SQL surface (DataFusion, later): Flight SQL is SQL statements over Flight, and there is no SQL engine to answer them yet.
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
+  - [x] **Grafana** (2026-11-04): `GET /api/v1/grafana`, `POST …/metrics` and `POST …/query` answer the community JSON datasource (`simpod-json-datasource`), experimental and in the `read` scope. A panel's targets are aspects; each is the stored downsample over the panel's range at its interval (capped at `maxDataPoints`), the reduction picked per target (`agg`, default `avg`). `packaging/grafana/weftdb-datasource.yaml` provisions it; the unit test in `weft-server/src/grafana.rs` charts a stored aspect through the router.
+  - [ ] **Prometheus remote write/read**: follows **B-tags**. A remote-write series is a metric plus a label set, and without per-measurement tags each label set would become its own aspect (DECISIONS 2026-11-04).
+  - [x] **R/Arrow workflows** (2026-11-04): `clients/r` (package `weftdb`) reads stored windows, value bands and server-side downsamples as Arrow tables, pages the exact JSON rows, and writes data frames or Arrow tables as one Parquet batch with `Idempotency-Key`. Refusals are `weft_<code>` conditions. `tests/testthat/test-live.R` is the contract against a running server. It found that Parquet ingest refused Snappy, the default codec of R's arrow, pyarrow, pandas and Spark; the workspace's `parquet` now reads it.
 
 ### Phase 3 — Instrument everything · *Very high*
 
@@ -69,8 +76,9 @@ Tracing has a `RUST_LOG`-driven foundation, a per-request root span, and per-sta
   - *Closed 2026-10-27: every stored read closes a `.serialize` span tagged with its `format` (CSV, Arrow, Parquet, JSON, point and at-multi). The Arrow and Parquet encode now runs as its own stage in the handler, so it is timed apart from the read. The point and at-multi `.read` spans carry `format` too. `every_stored_read_format_closes_its_serialize_span` in `weft-server/src/storage.rs` asserts each one. The downsample handlers' `downsample.range` span is not a `.read` span and is outside this item's list.*
 - [x] **`Statement::n_change()` accounting on the seal path's index write**
   - *Closed 2026-10-27: `publish_seal` wraps its `InsertNew` commit in a `control_plane.index.insert` span whose `rows_changed` is that op's affected-row count, taken from the `TxnApplied` the commit already returns. `weftdb/tests/seal_index_span.rs` asserts the span.*
-- [ ] `/bench/runs/:id` endpoint
-  - *Deferred 2026-10-27, not built, pending a design decision. Nothing on `main` names a run: the EVI-3 `RunManifest` keys a run on its report path, and no id is assigned. A route that serves run provenance (host hardware, paths) would also expose it before the exposure matrix and auth work (SEC-6, SEC-8) and before the public surface is frozen.*
+- [x] `/bench/runs/:id` endpoint
+  - *Deferred 2026-10-27, pending a design decision: nothing named a run, and serving provenance before SEC-6/SEC-8 would have exposed it.*
+  - *Closed 2026-11-03: a run id is the SHA-256 of the manifest file's bytes, content-addressed rather than assigned, so the manifest schema is unchanged and `weft-bench` prints the id beside the manifest path. With `WEFT_BENCH_RUNS_DIR` set, `GET /bench/runs` lists the manifests under it and `GET /bench/runs/{id}` serves one byte for byte, immutable, with the id as its `ETag`. An unknown id is `404 run_not_found`. Both routes sit in the `metrics` scope (maintainer and admin, behind SEC-8's exposure matrix) at the experimental tier, outside the 1.0 freeze. The tests in `weft-server/src/bench_runs.rs` cover the walk (depth cap, symlinks not followed), the bytes and `ETag`, 400/404/503, and the role check.*
 
 ### Phase 4 — Hot path: physical types & Storage v2 · *High*
 
@@ -86,31 +94,45 @@ Out-of-order data is fully handled (4.6): in-place per-segment sort, cross-segme
     - *Landed 2026-10-27 (`w2/qprune-read-path`). Three levels, each at the layer that owns the decision: `SegmentIndexStore::prune_present_descriptors` (`weftdb/src/types/segment_index.rs`) is the SQL mirror of `SegmentIndex::prune_present_by_time` (`weft-physical-type/src/catalog.rs:395`) and is what `SegmentStore::read_point`/`read_points` now prune with, so a segment indexed as all-null never has its file opened; `read_segment_point(s)`/`read_paged_segment_point(s)` (`weft-physical-type/src/weftseg.rs`) drop a fully null frame and fully null pages from the persisted stats, reached through `read_frame_point(s)`.*
     - *Deliberately not pruned: `read_time_range` returns null rows, so dropping a segment there would delete timestamps the caller asked for — a range read over a window holding a corrupt all-null frame still reports the damage, which is what pins this boundary in `point_reads_prune_an_all_null_segment_without_opening_it`. `read_segment_instant` — the last-writer-wins reader behind `Segment::query`/`query_as_of` — is not pruned either, because skipping a segment can change which segment wins. `prune_by_time` stays the ingest primitive for the same reason (`weft-reduce/src/windowed.rs:55`, `bounded.rs:57`). The page-level `prune_present_pages_by_time` (`page.rs:364`) stays a resident-index helper: the store's range reads stream values straight out of blocks, where an all-null page costs one u64 header compare and appending its nulls is cheaper than filtering them back out.*
     - *Extended 2026-10-28 (same branch): `downsample_range` now prunes with `prune_present_descriptors` too. A null row is part of a range read's answer but not of a bucket's: it enters no sum, count, min, max, first or last, and a partial holding nothing is dropped when buckets merge, so a window covered only by nulls yields no buckets rather than a run of empty ones. `an_all_null_segment_changes_no_bucket_of_a_downsample` pins that against the single-pass `reduce` over the live rows, at two resolutions and seven aggregations, including a window the null segment covers alone.*
-  - [ ] Tag pruning *(blocked on B-tags — per-measurement tags/labels don't exist yet)*
-- [ ] **4.6 Correctness semantics**
-  - [ ] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
+  - [x] Tag pruning
+    - *Landed 2026-11-04 (`p4/tag-pruning`, #158). A read of one series prunes in SQL before any file opens: migration `0007_series_time_index` (layout 2, best effort) adds `idx_segment_index_series_time` on `segment_index(aspect, series_id, min_ts, max_ts)`, which `prune_rows` names for a series-bound prune and falls back from to the time index, then to a scan (`weftdb/src/types/segment_index.rs`). The seek's span bound is kept per `(aspect, series)`, so one wide series no longer widens every other's seek. `resolve_series` reads a per-aspect catalog cache that every `RegisterSeries` transaction forgets once it runs, and matches with the zero-allocation `SeriesSelector::matches_key` (`weft-physical-type/src/tags.rs`). `a_tagged_read_among_a_thousand_series_opens_only_its_own_frames` overwrites every other series' frame with garbage and still reads its own.*
+- [x] **4.6 Correctness semantics**
+  - [x] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
+    - *Landed 2026-11-04 (`p4/upsert-skip-identical`). **Skip-identical:** when an overlap component's fold equals its lowest-id member's decoded rows (values compared in plain form, scale included, not by `BigDecimal ==`) and that member is time-sorted, `reconcile_overlaps` swaps a delete-only `SwapPlan::keep`: no frame is journaled or written, the kept row takes an unchanged `ReplaceExpected` as its version precondition, and only the other members are deleted, retired and lose their sidecars (`weftdb/src/types/segment_store.rs`, `seal.rs`, `maint.rs`). It is `Op::SkipIdentical` in the swap crash matrix (errors, power cuts and aborts at every point it passes), and `an_identical_replay_reconciles_without_writing_a_frame`, `a_racing_change_to_the_kept_row_conflicts` and `overlapping_count_reaches_zero_after_a_skip` pin it. **Upsert keys, narrowed:** an aspect may declare `upsert_keys = timestamp + K` (`SegmentStore::declare_with_upsert_keys`, `upsert_keys`; migration `0008_upsert_keys` at layout 2 adds the nullable `aspect_schema.upsert_keys`); an ingest whose tags leave K is `StoreError::NotAnUpsertKey` (`400 invalid_tag`), so the identity is `(timestamp, tags ∩ K)`, and undeclared stays `(timestamp, full tag set)`. The keys are immutable and part of declare equality over HTTP (`409 schema_conflict`). `value` as a key and dedup-off are not offered; DECISIONS.md says why.*
 
 ### Phase 5 — GPU interpolation flagship · *High (parallel w/ Phase 4)*
 
-Interpolation and extrapolation run on the GPU, supported by a size-tiered LRU buffer pool, persistent staging buffers and an async-handle scaffold. The storage half of the path is done, and the 2026-10-09 measurement showing where end-to-end time goes, and what the `f64` egress costs, is complete.
+Every Phase 5 item is built and merged as of 2026-11-05, including the ones the roadmap had gated (multi-GPU, memory-mapped GPU I/O and the post-1.0 HTTP route): the owner decided on 2026-11-04 to build them all, re-add and re-measure 5.1 and 5.2 although splimes had dropped them, and release splimes 1.3.0 (published on crates.io; WeftDB depends on `splimes = "1.3"`). 5.1 and 5.2 were re-measured in splimes and dropped again; multi-GPU ships opt-in because it measured slower than one device. The WeftDB code merged without a build under the owner's no-builds-before-merge rule, so the single build, tests, clippy and CI, and every WeftDB-side measurement (5.3, 5.5, 5.6, the E2E benchmark, mmap, the device-memory soak, the f64 widening and `run_f64` benches) are still to run after the merge. A ticked box below means the work merged; where it says numbers are pending, no number has been claimed.
 
-- [ ] 5.1 Command batching
-- [ ] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
-- [ ] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
+- [x] 5.1 Command batching
+  - *2026-11-04: re-added and measured in splimes [#12](https://github.com/basic-automation/splimes/pull/12) (merged `c62f2d7`, part of 1.3.0). `run_batch`/`run_f64_batch` (one encoder, one submit, one readback) beat per-call GPU 7-24x on 16-4096 small series, but rayon across series beat batched GPU in every multi-series case by 3.5-19x (splimes BENCHMARKS.md "Many series", 3 runs on an RTX 4070 Ti SUPER under load average 28-53). Verdict: the API was removed again (`0c8abaf`) and not shipped; the harness stays as splimes `benches/batch.rs`.*
+- [x] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
+  - *2026-11-04: re-added (`submit_f64` -> `GpuHandle` with one shared non-blocking poller) and measured in splimes [#16](https://github.com/basic-automation/splimes/pull/16) (merged `1bc371c`) with `examples/handles.rs` (512 requests, 2 ms CPU parse each, Cubic 4,096 knots -> 1,048,576 points, depth 8). Median of runs 2-5: `run` 5,301 ms, `spawn_f64` 3,955 ms, `submit_f64` 4,056 ms; submit/spawn ranged 0.72x-1.28x under load average 29-42. Verdict: the handle API was dropped again; the existing `spawn_f64` (~1.3x over `run`) delivers the CPU/GPU overlap. The harness and splimes BENCHMARKS.md "Overlapping requests" were kept.*
+- [x] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
+  - *2026-11-04: [#585](https://github.com/basic-automation/weftdb/pull/585). The stored window becomes epoch-tick `f64` columns (no `DateTime` per knot, `weftdb/src/types/interpolate_range.rs:299`), runs through splimes `stream_epoch` on the blocking pool, and is sent as a chunked body with at most `STREAM_DEPTH` chunks of `STREAM_CHUNK_POINTS` ahead (`weft-server/src/stored_interpolate.rs:46`); `interpolate_range_stream(_of)` at `interpolate_range.rs:319`/`:329`. JSON and CSV stream; Arrow and Parquet stay buffered; the read/decode stage is not chunked per segment. Tests compare streamed output with the `f64` call bit for bit. Not built or measured yet: the `stored_interpolate` bench's time-to-first-byte columns run after the merge.*
 - [x] 5.4 Hardware auto-tuning (calibrate CPU/GPU throughput, transfer cost, break-even sizes; auto-select)
   - *Audit 2026-10-27: checked — `weft-server/src/gpu.rs:82` `calibrate()` runs `splimes::calibrate()` at startup (`gpu.rs:95`), timing GPU, rayon pool and single core and installing the measured break-even thresholds that `Backend::Auto` then uses to auto-select (`gpu.rs:1-20`, `settings.rs:109` `WEFT_GPU_CALIBRATE`; tests at `gpu.rs:138-193`).*
-- [ ] 5.5 GPU economics (cloud cost, CPU-only fallback, utilization/contention/cold-start, NVIDIA/AMD/Intel/Apple portability)
-- [ ] 5.6 wgpu/WGSL portability & determinism (conformance matrix, numerical drift, published tolerances)
-- [ ] 5.7 Multi-GPU *(deferred until single-GPU wins are proven)*
-- [ ] Memory-mapped GPU I/O *(only after transfer bottlenecks are measured)*
-- [ ] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
+- [x] 5.5 GPU economics (cloud cost, CPU-only fallback, utilization/contention/cold-start, NVIDIA/AMD/Intel/Apple portability)
+  - *2026-11-04: [#569](https://github.com/basic-automation/weftdb/pull/569). `weft-bench --gpu-economics` (`weft-bench/src/gpu_economics.rs`, result schema v29) measures cold start, no adapter, CPU fallback, contention at 1-16 callers and `nvidia-smi` utilization; `bench/reports/gpu-economics/README.md` turns them into cloud $/billion points and a portability table. Scope is local: an RTX 4070 Ti SUPER (`f64`/`f32`) and the CPU. AMD, Intel, Apple and lavapipe are not measured. The report's numbers are still `⟦MEASURE⟧` placeholders until the post-merge run fills them.*
+- [x] 5.6 wgpu/WGSL portability & determinism (conformance matrix, numerical drift, published tolerances)
+  - *2026-11-04: [#573](https://github.com/basic-automation/weftdb/pull/573). `weft-bench/src/conformance.rs` (corpus, 60-digit exact reference, error against splimes' contract bound of 1e-13 `f64` / 1e-5 GPU `f32`, run-to-run bit identity, cross-target drift) and `weft-bench/src/bin/weft-gpu-conformance.rs` (one child process per adapter, writes `matrix.md`/`matrix.json`); tolerances published in `docs/gpu-conformance.md`. Scope is local: the RTX 4070 Ti SUPER and the CPU backends; AMD, Intel, Apple and lavapipe are not covered. The matrix is not measured yet (a first attempt stalled under heavy I/O load and produced nothing); `matrix --size full --repeats 5` runs after the merge.*
+- [x] 5.7 Multi-GPU *(the owner lifted the "deferred until single-GPU wins are proven" gate on 2026-11-04; shipped opt-in)*
+  - *2026-11-04: splimes [#14](https://github.com/basic-automation/splimes/pull/14) (`ffb06c0`, in 1.3.0) adds `gpu_adapters()`, `GpuConfig::with_adapter` and `with_devices` (One/All/List), a device work queue, per-device stats and device-lost failover. Measured there (BENCHMARKS.md "More than one GPU (5.7)", RTX 4070 Ti SUPER plus the Ryzen iGPU, loaded machine): All/List was slower than One in every case, `f64` by up to 3.6x. WeftDB half in [#584](https://github.com/basic-automation/weftdb/pull/584): `WEFT_GPU_ADAPTER`/`WEFT_GPU_DEVICES` (`weft-server/src/gpu.rs:134` `gpu_config_from_env`, read at `startup/config.rs:156`, registered at `settings.rs:114`/`:116`), per-device `/metrics` (`metrics.rs:525` `render_gpu_devices`). Unset keeps the single-device default. Not built yet.*
+- [x] Memory-mapped GPU I/O *(the owner lifted the "only after transfer bottlenecks are measured" gate on 2026-11-04)*
+  - *2026-11-04: [#587](https://github.com/basic-automation/weftdb/pull/587). Opt-in `mmap-reads` cargo feature plus `WEFT_SEGMENT_MMAP_READS` (`weft-server/src/settings.rs:142`) / `SegmentStoreOptions::mmap_reads`; the mapping is in `weftdb/src/types/segment_store/mapped.rs`, used by `read_time_range_of` (`segment_store/read.rs:136`); `weft-e2e-interp --mmap-reads`. It removes only the file-to-heap copy: frames are compressed, so decode and the splimes upload remain. No before/after numbers yet; they come from the post-merge E2E run.*
+- [x] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
+  - *2026-11-04: [#586](https://github.com/basic-automation/weftdb/pull/586). `weft-bench/src/e2e_interpolation.rs` and `weft-bench/src/bin/weft-e2e-interp.rs` (result schema v31, `weft-bench/src/schema.rs:104`) report p50/p95/p99 per stage (storage read with frame decode, decode to `f64` knots, splimes `run_epoch`, serialization, total) across sizes and the cpu/parallel/gpu/gpu-f32/auto backends, plus the HTTP route's ttfb/body/total. Upload/readback come from a wgpu transfer probe because splimes 1.3 exposes no stage timings, so kernel time is derived. Not run yet: the transfer share is still unmeasured.*
   - [x] **FOUND (2026-10-11, runtime) — `POST /api/v1/downsample` rejected the documented multi-word tokens. Closed 2026-10-28 (FRE-5, the spelling half):** the JSON body reads `Aggregation::from_token`, so `twa_linear`, `sketch_p99` and the aliases parse as they do in a query string, and the bare lowercase names still parse. Tokens are exact-case as of 2026-10-29 (FRE-5's first clause, which breaks v0.1.0's case folding; see the CHANGELOG): `Min` and `MEDIAN` are a `400`. The rest of FRE-5, "no silent narrowing", closed 2026-11-01 (FRE-5): a computed value with no finite `f64` representation now fails the compute request with `not_finite` instead of returning a substitute `0.0`.
-  - [ ] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138` …
-  - [ ] **NEXT — the compute endpoints pay the same tax:**
+  - [x] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138` …
+    - *2026-11-04: closed by [#553](https://github.com/basic-automation/weftdb/pull/553). The compute endpoints widen JSON `f64` through the shortest round-trip decimal (`weft-server/src/downsample.rs:292` `widen_json_value`, mirroring splimes' `shortest_decimal`), so `99.92` widens to `99.92`; the not-finite rejection stays. `serde_json`'s `arbitrary_precision` was rejected as a workspace-wide behaviour flip. Tests: a 200k-value property test against `to_string().parse::<BigDecimal>()`. Bench `weft-server/benches/json_widening.rs`; no speedup is claimed until it runs after the merge.*
+  - [x] **NEXT — the compute endpoints pay the same tax:**
+    - *2026-11-04: closed by [#575](https://github.com/basic-automation/weftdb/pull/575). `POST /api/v1/interpolate` range outputs (JSON/CSV/Arrow/Parquet, ILP) run splimes `run_f64` (`weft-server/src/interpolate.rs:380`) instead of building a `BigDecimal` per output point; `/interpolate/point` keeps `run`. Bit-identical below 2^53; above it the kernel's value replaces a possibly 1-ulp-off narrowing. Differential tests compare the paths; the 1M-point `interpolate_wire` bench runs after the merge.*
   - [x] **Reconcile with EVI-10A** (2026-10-19: the API now has an input cap, `interpolate_range::MAX_KNOTS`, a `pub` const the review may keep, turn into an option or drop)
-  - [ ] **NEXT (post-1.0 per decision 18) — the HTTP endpoint:**
+  - [x] **DONE (2026-11-04, owner override of decision 18) — the HTTP endpoint:**
+    - *[#572](https://github.com/basic-automation/weftdb/pull/572). `GET /api/v1/storage/{aspect}/interpolate` plus `.csv`, `.arrow` and `.parquet` (`weft-server/src/routes.rs:894`, handler `weft-server/src/stored_interpolate.rs:367`) over the stored window, capped by `WEFT_MAX_INTERPOLATE_POINTS` and `MAX_KNOTS` (`422 result_too_large`), with the storage reads' policy (read scope, query admission, stable tier). DECISIONS.md records the amendment to decision 18. 11 tests and `weft-server/benches/stored_interpolate.rs` are written and not yet run.*
 - [x] **DONE (2026-10-09) — GPU memory-stability + pool-eviction benchmark** (`weft-bench --gpu-memory`, `gpu_pool` in schema v22)
-  - [ ] **NEXT — device memory, not just pool bytes:**
+  - [x] **DONE (2026-11-05) — device memory, not just pool bytes:**
+    - *splimes `gpu_memory_report()` (wgpu's allocator report on Vulkan/DX12) landed in splimes [#11](https://github.com/basic-automation/splimes/pull/11)/[#15](https://github.com/basic-automation/splimes/pull/15) with `tests/gpu_memory.rs`. WeftDB [#583](https://github.com/basic-automation/weftdb/pull/583): `weft-bench --gpu-memory` samples it after every call plus `nvidia-smi memory.used`, soaks for `--gm-soak-secs`, and records `gpu_pool.device_memory` (`DeviceMemorySoak`, `weft-bench/src/gpu_memory.rs:103`; schema v30); monotonic growth after round 1 fails the run as a leak. The 30-minute soaks (default pool and `--gm-pool-mib 32`) run after the merge.*
 
 ### Phase 6 — Compression v2 · *High*
 
@@ -154,16 +176,16 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
 - [ ] **7.1 Online ingest**
 - [ ] **7.2 WAL & crash consistency.**
   - [x] **S10** Write-once durable seal with id assigned at commit *(~8 h; after S9)*
-  - [ ] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
+  - [x] **S11** Rollup into segment_index.db, folded in the seal and swap transactions *(~7 h; after S10)*
   - [x] **S12** Startup recovery, quarantine with TTL, fsck endpoint, /ready report *(~8 h; after S11)*
   - [x] **S13** Idempotent atomic ingest entry point (library) *(~7 h; after S12)*
   - [x] **S14** HTTP ingest wiring
-  - [ ] **S15** Partial sidecar v4
+  - [x] **S15** Partial sidecar v4
   - [x] **S16** Whole-store backup with hard-linked frames
   - [ ] **S17** Relaxed durability mode with synced_epoch watermark (optional for 1.0) *(~6 h; after S12)*
-  - [ ] **S19** Seal-backed legacy aspects
-  - [ ] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*
-  - [ ] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
+  - [x] **S19** Seal-backed legacy aspects
+  - [x] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*
+  - [x] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
 - [ ] **7.3 Corruption detection**
   - [ ] Restoring *into a chosen new root* over HTTP
   - [ ] Whole-store backup manifest (fold the `.weftseg` frames in beside the control plane)
@@ -212,7 +234,7 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 `splimes` 1.0 is released and WeftDB depends on it, and the control-plane engine decision is made.
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
-- [ ] **B-tags**
+- [x] **B-tags**
 
 ### Security & packaging *(Phase 8 minimum)*
 
@@ -255,7 +277,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 
   On the release and identity side, the release pipeline (PAC-1a) and the canonical `TagSet`, `SeriesKey` and `SeriesSelector` types with their frozen caps (TAG-1) are in, and GitHub private vulnerability reporting is turned on (owner step).
 
-- [ ] **W1 · Baseline release, server split, goldens**
+- [x] **W1 · Baseline release, server split, goldens**
   - [x] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
   - [x] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
   - [x] **TAG-3** Open `ValueKind` in weftdb, provenance scope
@@ -267,7 +289,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] `weft-bench --sparse`: a seeded (series × block) grid of nullable cells, the block-aligned mean scan over it, and the observed missingness recorded in the report beside the grid that produced it
   - [x] `--scale tiny|small|medium|large` for the sized workloads (`--sparse`, `--gap-fill`, `--downsample`), filling only the size knobs left at their default, and naming the preset in the profile so two grid sizes never compare as one run
   - [x] **SOA-1** Soak harness skeleton
-- [ ] **W2 · Error contract, frame format, portable builds**
+- [x] **W2 · Error contract, frame format, portable builds**
   - [x] Legacy lane
     - [x] **FRE-14c** operator route: `weft-server import-rows-mode` reads one 0.1.x subject into a Storage v2 store, prints what stays behind and why, and records the run so a second read refuses
     - [x] **FRE-14c** streaming rows-mode read: a whole aspect must not have to fit in memory
@@ -283,8 +305,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-2** Soak preflight, device resolution, run metadata and secret redaction
   - [x] **SOA-3** Open-loop scheduler, HDR interval logs, harness self-monitoring and null server
   - [x] **SOA-4** Deterministic workload model, lanes, format-exact value grids and body encoders
-- [ ] **W3 · Gate, serve path, input domain**
-  - [ ] Store lane
+- [x] **W3 · Gate, serve path, input domain**
+  - [x] Store lane
   - [x] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)
   - [x] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions
   - [x] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
@@ -293,8 +315,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-8B** Benchmark adapter v2 II
   - [x] **SOA-5** Soak ingest client
   - [x] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
-- [ ] **W4 · Auth, config, ILP fix**
-  - [ ] Store lane
+- [x] **W4 · Auth, config, ILP fix**
+  - [x] Store lane
   - [x] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
   - [x] **SEC-5** TLS listener (rustls with ring) on the shared serve path
   - [x] **SEC-6** API keys, Bearer authentication, keys file and keygen
@@ -304,11 +326,11 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] L-FMT: **ROB-8** Frame decode hardening
   - [x] **EVI-11** Stored WeftDB benchmark adapter
   - [x] **SOA-6** Soak oracle core
-- [ ] **W5 · Ingest wiring, whole-store backup, legacy seal**
-  - [ ] Store lane
+- [x] **W5 · Ingest wiring, whole-store backup, legacy seal**
+  - [x] Store lane
   - [x] → **D-S15** Partial sidecar v4
   - [x] → **D-S19** Seal-backed legacy aspects
-  - [ ] L-INGEST
+  - [x] L-INGEST
   - [x] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
   - [x] **ROB-10** Admission I
   - [x] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth
@@ -321,28 +343,34 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-7** Window digests and the oracle self-test
   - [x] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
 - [ ] **W6 · Durability CI, store split, scheduler**
-  - [ ] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
+  - [x] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
   - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
-  - [ ] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
-  - [ ] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
-  - [ ] **FRE-6b** Strict request parsing and caller updates
-  - [ ] **SEC-7** Key reload
-  - [ ] **SEC-9** Audit
-  - [ ] **SEC-11** Aspect-name traversal HTTP regression tests
-  - [ ] **PAC-7** Operator CLI, exit-code contract and store identity at startup
-  - [ ] → **ROB-11** Admission II
-  - [ ] **ROB-19** Maintenance scheduler, compaction on by default, per-aspect circuit breaker
-  - [ ] **SOA-10** Derived-read checks
-  - [ ] **SOA-14** Server hooks
+  - [x] Store: **X-SPLIT-STORE** Split segment_store.rs into `open`/`read`/`seal`/`maint`/`stats` submodules
+  - [x] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
+  - [x] **FRE-6b** Strict request parsing and caller updates
+  - [x] **SEC-7** Key reload
+  - [x] **SEC-9** Audit
+  - [x] **SEC-11** Aspect-name traversal HTTP regression tests
+  - [x] **PAC-7** Operator CLI, exit-code contract and store identity at startup
+  - [x] → **ROB-11** Admission II
+  - [x] **ROB-19** Maintenance scheduler, compaction on by default, per-aspect circuit breaker
+  - [x] **SOA-10** Derived-read checks
+  - [x] **SOA-14** Server hooks
+
   - [x] **EVI-14** DuckDB adapter II
-  - [ ] **EVI-18** Backup health metrics and catch-up-free ticking
-  - [ ] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
+  - [x] **EVI-18** Backup health metrics and catch-up-free ticking
+  - [x] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
 - [ ] **W7 · Post-split lanes open; security and packaging close**
   - [ ] open lane
-  - [ ] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code
+  - [x] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code
+    - The pin refuses a start whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` differ from the
+      scope the store root's own `STORE_FORMAT` records (exit 65, the class the exit table has
+      always named for a scope mismatch; `WEFT_STORE_SCOPE_PIN=off` serves the root anyway).
+      `GET /api/v1/version` answers build, layout, scope-pin and exit-code state from process
+      state alone, so it answers while a store is being refused. DECISIONS 2026-11-03
   - [ ] seal lane
   - [ ] read lane
-  - [ ] → **ROB-13** Bounded stored downsample and point lookups
+  - [x] → **ROB-13** Bounded stored downsample and point lookups
   - [ ] **ROB-7** Ingest decode bounds
   - [ ] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
   - [ ] **ROB-23r** Probe-only admin listener
@@ -353,8 +381,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
   - [x] **EVI-15** First cross-engine report
   - [x] Write or approve the cross-engine report narrative *(owner)*
-  - [ ] **EVI-19** Documented RPO/RTO
-  - [ ] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
+  - [x] **EVI-19** Documented RPO/RTO
+  - [x] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
 - [ ] **W8 · Tags core, memory budget**
   - [ ] open lane
   - [ ] → **TAG-9** Frame error classes in recovery
@@ -379,12 +407,12 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] maint lane
   - [ ] open lane
   - [ ] L-INGEST
-  - [ ] storage read handlers lane
+  - [x] storage read handlers lane (TAG-10)
   - [ ] **FRE-10a** Contract tests
   - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [ ] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
-  - [ ] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
+  - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
   - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
   - [ ] read lane
   - [ ] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
@@ -420,7 +448,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 
 The interpolation item (B-interp, Phase 5) is done.
 
-- [ ] **B-tags** *(Phase 2/4 · absent)*
+- [x] **B-tags** *(Phase 2/4 · done: TAG-5..TAG-11)*
 - [ ] **B-conn** *(Phase 2/7 · absent)*
 - [ ] **B-ilp** *(Phase 2 · partial)*
 - [ ] **B-rest** *(Phase 2 · partial)*

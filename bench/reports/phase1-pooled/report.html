@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WeftDB cross-engine benchmark</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:72rem;margin:2rem auto;padding:0 1rem;color:#1b1b1b;background:#fff}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #ccc;padding:.25rem .5rem;text-align:left}th{background:#f3f3f3}
+code{font:13px ui-monospace,monospace;background:#f3f3f3;padding:0 .2rem}
+@media (prefers-color-scheme:dark){body{color:#e8e8e8;background:#161616}th,code{background:#262626}th,td{border-color:#444}}
+</style>
+</head>
+<body>
+<h1>WeftDB cross-engine benchmark</h1>
+<p>Generated 2026-11-02T18:07:10.047287125+00:00 on AMD Ryzen 9 7950X3D 16-Core Processor (linux x86_64). Engines: weftdb 0.1.0, duckdb v2.0.0, clickhouse 26.10.3.7, timescaledb 2.31.0 (PostgreSQL 17.11), questdb 10.1.0 (commit mode sync), influxdb3 InfluxDB 3 Core 3.12.2, iotdb 2.0.11. Source commit: 4531d48347167ad4d9749fec45dcc3a060ec7316. Seed: 1592649491.</p>
+<p><strong>At least one result failed its correctness gate. Its timing is not a valid comparison; see the failures below.</strong></p>
+<h2>Results</h2>
+<p>Latency in milliseconds: p50 with its bootstrap interval, and p95. Accuracy is RMSE against the analytic ground truth, for synthetic datasets. B/pt is the store's size on disk after a load, divided by the points loaded (whole files: indexes and headers included). A phase marked <code>os-cold</code> ran each rep after the OS page cache was dropped, and one marked <code>restarted</code> after the engine restarted as well; unmarked phases are warm, back-to-back reps.</p>
+<table>
+<thead><tr><th>dataset</th><th>phase</th><th>arm</th><th>class</th><th>input</th><th>p50 [CI]</th><th>p95</th><th>reps</th><th>gate</th><th>RMSE</th><th>B/pt</th></tr></thead>
+<tbody>
+<tr><td>mcar-small</td><td>interpolate</td><td>weftdb-memory</td><td>A · native</td><td>86245</td><td>21.038 [20.555, 23.052]</td><td>24.295</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>weftdb-memory</td><td>A · native</td><td>86245</td><td>1.676 [1.657, 1.697]</td><td>1.719</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>weftdb-stored</td><td>A · native</td><td>86245</td><td>910.332 [888.116, 926.149]</td><td>974.335</td><td>6</td><td>—</td><td>—</td><td>7.98</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>weftdb-stored</td><td>A · native</td><td>86245</td><td>26.247 [25.947, 27.180]</td><td>29.080</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>weftdb-stored</td><td>A · native</td><td>86245</td><td>4.019 [3.823, 4.179]</td><td>4.382</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>weftdb-stored-f64</td><td>A · native</td><td>86245</td><td>897.594 [886.717, 900.041]</td><td>912.970</td><td>6</td><td>—</td><td>—</td><td>7.98</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>weftdb-stored-f64</td><td>A · native</td><td>86245</td><td>8.910 [8.130, 10.677]</td><td>10.804</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>weftdb-stored-bulk</td><td>A · native</td><td>86245</td><td>305.404 [302.807, 316.666]</td><td>316.666</td><td>6</td><td>—</td><td>—</td><td>7.48</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>A · native</td><td>86245</td><td>27.742 [26.887, 29.395]</td><td>30.801</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>weftdb-stored-bulk</td><td>A · native</td><td>86245</td><td>4.048 [3.438, 4.598]</td><td>4.875</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>duckdb-double</td><td>B · portable SQL</td><td>86245</td><td>46.406 [44.856, 47.831]</td><td>50.602</td><td>6</td><td>—</td><td>—</td><td>12.30</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>duckdb-double</td><td>B · portable SQL</td><td>86245</td><td>24.475 [23.925, 25.686]</td><td>27.644</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>duckdb-double</td><td>B · portable SQL</td><td>86245</td><td>2.080 [1.860, 2.249]</td><td>3.111</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>86245</td><td>53.108 [51.679, 54.136]</td><td>58.844</td><td>6</td><td>—</td><td>—</td><td>12.30</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>86245</td><td>25.842 [24.698, 27.243]</td><td>29.461</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>86245</td><td>2.139 [2.044, 2.323]</td><td>3.261</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>duckdb-client</td><td>C · client-side</td><td>86245</td><td>9.098 [8.172, 9.462]</td><td>10.060</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>clickhouse-double</td><td>B · portable SQL</td><td>86245</td><td>34.519 [33.802, 37.681]</td><td>37.681</td><td>6</td><td>—</td><td>—</td><td>19.11</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>clickhouse-double</td><td>B · portable SQL</td><td>86245</td><td>76.994 [70.849, 83.226]</td><td>90.481</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>clickhouse-double</td><td>B · portable SQL</td><td>86245</td><td>3.055 [2.787, 3.295]</td><td>3.975</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>86245</td><td>35.356 [33.839, 101.102]</td><td>101.102</td><td>6</td><td>—</td><td>—</td><td>16.36</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>86245</td><td>79.517 [73.435, 85.329]</td><td>89.715</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>86245</td><td>3.044 [2.576, 3.256]</td><td>3.842</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>clickhouse-double-merge</td><td>B · portable SQL</td><td>86245</td><td>82.669 [77.321, 85.367]</td><td>90.090</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>clickhouse-native</td><td>A · native</td><td>86245</td><td>21.003 [20.173, 21.151]</td><td>22.059</td><td>20</td><td>own answer</td><td>1.0586</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>clickhouse-client</td><td>C · client-side</td><td>86245</td><td>5.534 [5.189, 6.309]</td><td>6.480</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>timescaledb-double</td><td>B · portable SQL</td><td>86245</td><td>153.592 [148.772, 157.911]</td><td>157.911</td><td>6</td><td>—</td><td>—</td><td>95.94</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>timescaledb-double</td><td>B · portable SQL</td><td>86245</td><td>477.924 [469.024, 480.215]</td><td>488.147</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>timescaledb-double</td><td>B · portable SQL</td><td>86245</td><td>11.276 [11.142, 11.430]</td><td>12.341</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>86245</td><td>139.348 [133.073, 142.787]</td><td>142.787</td><td>6</td><td>—</td><td>—</td><td>104.58</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>86245</td><td>531.527 [520.312, 536.888]</td><td>555.982</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>86245</td><td>16.424 [15.858, 16.719]</td><td>17.386</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>timescaledb-native</td><td>A · native</td><td>86245</td><td>73.610 [71.243, 76.353]</td><td>77.888</td><td>20</td><td>own answer</td><td>1.0031</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>timescaledb-client</td><td>C · client-side</td><td>86245</td><td>20.295 [20.150, 20.979]</td><td>22.324</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>questdb-double</td><td>B · portable SQL</td><td>86245</td><td>77.388 [75.468, 92.168]</td><td>92.168</td><td>6</td><td>—</td><td>—</td><td>583.59</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>questdb-double</td><td>B · portable SQL</td><td>86245</td><td>179.369 [176.765, 186.554]</td><td>211.543</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>questdb-double</td><td>B · portable SQL</td><td>86245</td><td>2.394 [2.328, 2.473]</td><td>4.293</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>questdb-decimal</td><td>B · portable SQL</td><td>86245</td><td>81.879 [77.230, 83.399]</td><td>83.399</td><td>6</td><td>—</td><td>—</td><td>583.59</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>questdb-decimal</td><td>B · portable SQL</td><td>86245</td><td>178.661 [174.935, 182.673]</td><td>197.238</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>questdb-decimal</td><td>B · portable SQL</td><td>86245</td><td>2.925 [2.854, 3.101]</td><td>5.208</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>questdb-double-linear</td><td>B · portable SQL</td><td>86245</td><td>178.721 [176.392, 189.016]</td><td>195.166</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>questdb-native</td><td>A · native</td><td>86245</td><td>14.672 [14.334, 15.206]</td><td>16.154</td><td>20</td><td>own answer</td><td>1.0031</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>questdb-client</td><td>C · client-side</td><td>86245</td><td>9.360 [8.849, 9.410]</td><td>10.297</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>influxdb3-double</td><td>B · portable SQL</td><td>86245</td><td>997.537 [366.123, 1000.103]</td><td>1133.957</td><td>6</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>influxdb3-double</td><td>B · portable SQL</td><td>86245</td><td>128.466 [113.676, 152.568]</td><td>153.935</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>influxdb3-double</td><td>B · portable SQL</td><td>86245</td><td>9.190 [8.703, 9.449]</td><td>10.255</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>influxdb3-native</td><td>A · native</td><td>86245</td><td>27.793 [26.996, 29.167]</td><td>31.575</td><td>20</td><td>own answer</td><td>1.0031</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>influxdb3-client</td><td>C · client-side</td><td>86245</td><td>15.526 [14.663, 16.152]</td><td>16.704</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>load</td><td>iotdb-double</td><td>B · portable SQL</td><td>86245</td><td>279.266 [210.188, 336.374]</td><td>336.374</td><td>6</td><td>—</td><td>—</td><td>11.08</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>iotdb-double</td><td>B · portable SQL</td><td>86245</td><td>91.252 [83.475, 275.368]</td><td>278.276</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>downsample</td><td>iotdb-double</td><td>B · portable SQL</td><td>86245</td><td>12.388 [11.861, 28.754]</td><td>29.059</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>iotdb-native</td><td>A · native</td><td>86245</td><td>68.810 [62.391, 171.542]</td><td>177.035</td><td>20</td><td>own answer</td><td>1.0031</td><td>—</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>iotdb-client</td><td>C · client-side</td><td>86245</td><td>49.812 [46.610, 85.649]</td><td>86.560</td><td>20</td><td>PASS</td><td>0.9430</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>weftdb-memory</td><td>A · native</td><td>68751</td><td>18.856 [18.487, 19.012]</td><td>19.875</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>weftdb-memory</td><td>A · native</td><td>68751</td><td>1.402 [1.373, 1.444]</td><td>1.547</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>weftdb-stored</td><td>A · native</td><td>68751</td><td>765.650 [750.745, 785.202]</td><td>786.887</td><td>6</td><td>—</td><td>—</td><td>8.05</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>weftdb-stored</td><td>A · native</td><td>68751</td><td>22.706 [22.167, 24.168]</td><td>25.099</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>weftdb-stored</td><td>A · native</td><td>68751</td><td>3.433 [3.296, 3.544]</td><td>3.818</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>weftdb-stored-f64</td><td>A · native</td><td>68751</td><td>793.051 [758.936, 811.900]</td><td>811.900</td><td>6</td><td>—</td><td>—</td><td>8.05</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>weftdb-stored-f64</td><td>A · native</td><td>68751</td><td>8.324 [7.537, 8.825]</td><td>9.279</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>weftdb-stored-bulk</td><td>A · native</td><td>68751</td><td>288.435 [283.686, 291.728]</td><td>292.664</td><td>6</td><td>—</td><td>—</td><td>7.56</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>A · native</td><td>68751</td><td>22.613 [22.249, 23.107]</td><td>23.403</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>weftdb-stored-bulk</td><td>A · native</td><td>68751</td><td>3.219 [3.110, 3.626]</td><td>3.855</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>duckdb-double</td><td>B · portable SQL</td><td>68751</td><td>41.738 [40.556, 43.553]</td><td>44.192</td><td>6</td><td>—</td><td>—</td><td>15.43</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>duckdb-double</td><td>B · portable SQL</td><td>68751</td><td>23.080 [23.017, 23.477]</td><td>25.949</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>duckdb-double</td><td>B · portable SQL</td><td>68751</td><td>1.891 [1.783, 2.089]</td><td>2.957</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>68751</td><td>45.935 [45.300, 49.175]</td><td>49.175</td><td>6</td><td>—</td><td>—</td><td>15.43</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>68751</td><td>23.792 [22.768, 24.691]</td><td>29.150</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>68751</td><td>1.854 [1.739, 1.968]</td><td>2.828</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>duckdb-client</td><td>C · client-side</td><td>68751</td><td>7.974 [7.212, 8.410]</td><td>9.304</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>clickhouse-double</td><td>B · portable SQL</td><td>68751</td><td>34.266 [32.051, 35.490]</td><td>36.013</td><td>6</td><td>—</td><td>—</td><td>19.32</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>clickhouse-double</td><td>B · portable SQL</td><td>68751</td><td>65.828 [62.978, 71.011]</td><td>73.026</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>clickhouse-double</td><td>B · portable SQL</td><td>68751</td><td>2.623 [2.539, 2.703]</td><td>3.686</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>68751</td><td>32.899 [31.244, 33.282]</td><td>33.282</td><td>6</td><td>—</td><td>—</td><td>16.55</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>68751</td><td>68.370 [65.856, 70.071]</td><td>75.663</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>68751</td><td>2.445 [2.269, 2.711]</td><td>3.563</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>clickhouse-double-merge</td><td>B · portable SQL</td><td>68751</td><td>72.095 [70.677, 73.701]</td><td>76.636</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>clickhouse-native</td><td>A · native</td><td>68751</td><td>23.481 [23.046, 23.708]</td><td>24.689</td><td>20</td><td>own answer</td><td>1.4646</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>clickhouse-client</td><td>C · client-side</td><td>68751</td><td>5.050 [4.747, 5.502]</td><td>5.846</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>timescaledb-double</td><td>B · portable SQL</td><td>68751</td><td>126.235 [124.365, 131.393]</td><td>139.097</td><td>6</td><td>—</td><td>—</td><td>100.69</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>timescaledb-double</td><td>B · portable SQL</td><td>68751</td><td>472.848 [469.730, 477.526]</td><td>479.884</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>timescaledb-double</td><td>B · portable SQL</td><td>68751</td><td>9.117 [9.003, 9.264]</td><td>10.232</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>68751</td><td>116.348 [113.801, 117.852]</td><td>127.535</td><td>6</td><td>—</td><td>—</td><td>111.53</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>68751</td><td>527.687 [522.971, 531.298]</td><td>539.358</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>68751</td><td>13.428 [12.754, 13.879]</td><td>14.182</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>timescaledb-native</td><td>A · native</td><td>68751</td><td>58.735 [55.123, 62.025]</td><td>64.609</td><td>20</td><td>own answer</td><td>0.9623</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>timescaledb-client</td><td>C · client-side</td><td>68751</td><td>16.831 [16.312, 18.113]</td><td>19.911</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>questdb-double</td><td>B · portable SQL</td><td>68751</td><td>73.564 [72.398, 76.959]</td><td>83.039</td><td>6</td><td>—</td><td>—</td><td>732.09</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>questdb-double</td><td>B · portable SQL</td><td>68751</td><td>153.732 [152.015, 161.523]</td><td>167.367</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>questdb-double</td><td>B · portable SQL</td><td>68751</td><td>2.000 [1.909, 2.334]</td><td>4.516</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>questdb-decimal</td><td>B · portable SQL</td><td>68751</td><td>76.702 [73.813, 80.541]</td><td>90.779</td><td>6</td><td>—</td><td>—</td><td>732.09</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>questdb-decimal</td><td>B · portable SQL</td><td>68751</td><td>153.055 [144.584, 157.374]</td><td>182.172</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>questdb-decimal</td><td>B · portable SQL</td><td>68751</td><td>2.295 [2.245, 2.476]</td><td>4.386</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>questdb-double-linear</td><td>B · portable SQL</td><td>68751</td><td>153.792 [149.185, 160.493]</td><td>177.901</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>questdb-native</td><td>A · native</td><td>68751</td><td>13.877 [13.804, 14.135]</td><td>15.313</td><td>20</td><td>own answer</td><td>0.9623</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>questdb-client</td><td>C · client-side</td><td>68751</td><td>7.232 [7.015, 7.540]</td><td>8.041</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>influxdb3-double</td><td>B · portable SQL</td><td>68751</td><td>878.327 [651.977, 1080.013]</td><td>1080.013</td><td>6</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>influxdb3-double</td><td>B · portable SQL</td><td>68751</td><td>115.557 [107.791, 129.842]</td><td>139.266</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>influxdb3-double</td><td>B · portable SQL</td><td>68751</td><td>8.502 [8.135, 8.636]</td><td>9.352</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>influxdb3-native</td><td>A · native</td><td>68751</td><td>23.915 [23.376, 25.148]</td><td>26.533</td><td>20</td><td>own answer</td><td>0.9623</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>influxdb3-client</td><td>C · client-side</td><td>68751</td><td>15.532 [14.834, 15.913]</td><td>17.625</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>load</td><td>iotdb-double</td><td>B · portable SQL</td><td>68751</td><td>248.486 [218.069, 351.293]</td><td>351.293</td><td>6</td><td>—</td><td>—</td><td>10.96</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>iotdb-double</td><td>B · portable SQL</td><td>68751</td><td>80.952 [75.569, 232.893]</td><td>237.533</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>block-small</td><td>downsample</td><td>iotdb-double</td><td>B · portable SQL</td><td>68751</td><td>11.241 [10.472, 26.595]</td><td>27.524</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>iotdb-native</td><td>A · native</td><td>68751</td><td>64.552 [59.714, 128.607]</td><td>141.689</td><td>20</td><td>own answer</td><td>0.9623</td><td>—</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>iotdb-client</td><td>C · client-side</td><td>68751</td><td>39.981 [37.688, 55.492]</td><td>63.145</td><td>20</td><td>PASS</td><td>0.9504</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>weftdb-memory</td><td>A · native</td><td>604689</td><td>141.324 [136.726, 147.831]</td><td>148.617</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>weftdb-memory</td><td>A · native</td><td>604689</td><td>7.683 [7.479, 8.962]</td><td>9.280</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>weftdb-stored</td><td>A · native</td><td>604689</td><td>5134.862 [5086.870, 5210.488]</td><td>5249.037</td><td>6</td><td>—</td><td>—</td><td>7.17</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>weftdb-stored</td><td>A · native</td><td>604689</td><td>177.728 [173.097, 209.990]</td><td>211.421</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>weftdb-stored</td><td>A · native</td><td>604689</td><td>17.094 [16.481, 18.432]</td><td>19.920</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>weftdb-stored-f64</td><td>A · native</td><td>604689</td><td>5227.047 [5136.176, 5333.270]</td><td>5369.573</td><td>6</td><td>—</td><td>—</td><td>7.17</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>weftdb-stored-f64</td><td>A · native</td><td>604689</td><td>65.351 [59.928, 71.107]</td><td>76.561</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>weftdb-stored-bulk</td><td>A · native</td><td>604689</td><td>964.077 [957.507, 983.608]</td><td>983.608</td><td>6</td><td>—</td><td>—</td><td>6.66</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>A · native</td><td>604689</td><td>174.457 [169.953, 183.249]</td><td>187.428</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>weftdb-stored-bulk</td><td>A · native</td><td>604689</td><td>27.480 [25.816, 28.540]</td><td>29.032</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>duckdb-double</td><td>B · portable SQL</td><td>604689</td><td>183.078 [181.256, 187.364]</td><td>187.364</td><td>6</td><td>—</td><td>—</td><td>8.26</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>duckdb-double</td><td>B · portable SQL</td><td>604689</td><td>49.438 [45.675, 51.711]</td><td>54.083</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>duckdb-double</td><td>B · portable SQL</td><td>604689</td><td>5.090 [4.764, 6.404]</td><td>6.980</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>604689</td><td>222.565 [221.559, 230.873]</td><td>234.995</td><td>6</td><td>—</td><td>—</td><td>8.26</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>604689</td><td>48.425 [46.462, 51.121]</td><td>56.201</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>604689</td><td>4.707 [4.327, 5.485]</td><td>5.684</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>duckdb-client</td><td>C · client-side</td><td>604689</td><td>35.763 [34.259, 39.493]</td><td>40.516</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>clickhouse-double</td><td>B · portable SQL</td><td>604689</td><td>122.965 [116.947, 125.459]</td><td>126.136</td><td>6</td><td>—</td><td>—</td><td>18.83</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>clickhouse-double</td><td>B · portable SQL</td><td>604689</td><td>172.583 [160.054, 185.157]</td><td>199.801</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>clickhouse-double</td><td>B · portable SQL</td><td>604689</td><td>6.374 [6.062, 7.268]</td><td>7.757</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>604689</td><td>123.692 [122.104, 140.494]</td><td>140.494</td><td>6</td><td>—</td><td>—</td><td>16.00</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>604689</td><td>177.828 [161.836, 186.747]</td><td>193.895</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>604689</td><td>5.852 [5.166, 6.400]</td><td>6.525</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>clickhouse-double-merge</td><td>B · portable SQL</td><td>604689</td><td>245.240 [239.627, 261.722]</td><td>267.588</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>clickhouse-native</td><td>A · native</td><td>604689</td><td>22.052 [21.699, 22.903]</td><td>23.722</td><td>20</td><td>own answer</td><td>0.4432</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>clickhouse-client</td><td>C · client-side</td><td>604689</td><td>15.327 [14.194, 16.992]</td><td>17.450</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>timescaledb-double</td><td>B · portable SQL</td><td>604689</td><td>996.179 [980.640, 1008.145]</td><td>1109.766</td><td>6</td><td>—</td><td>—</td><td>93.71</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>timescaledb-double</td><td>B · portable SQL</td><td>604689</td><td>507.145 [503.362, 510.056]</td><td>519.850</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>timescaledb-double</td><td>B · portable SQL</td><td>604689</td><td>35.161 [34.730, 72.086]</td><td>76.388</td><td>20</td><td>FAIL (max diff 1.421e-13)</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>604689</td><td>899.393 [874.544, 918.305]</td><td>952.833</td><td>6</td><td>—</td><td>—</td><td>101.89</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>604689</td><td>565.980 [561.194, 574.061]</td><td>576.083</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>604689</td><td>47.763 [43.306, 98.277]</td><td>98.824</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>timescaledb-native</td><td>A · native</td><td>604689</td><td>159.312 [156.591, 161.622]</td><td>172.683</td><td>20</td><td>own answer</td><td>0.4432</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>timescaledb-client</td><td>C · client-side</td><td>604689</td><td>132.391 [131.443, 137.265]</td><td>146.152</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>questdb-double</td><td>B · portable SQL</td><td>604689</td><td>350.754 [342.108, 361.899]</td><td>361.899</td><td>6</td><td>—</td><td>—</td><td>83.24</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>questdb-double</td><td>B · portable SQL</td><td>604689</td><td>741.903 [706.548, 784.587]</td><td>908.236</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>questdb-double</td><td>B · portable SQL</td><td>604689</td><td>11.498 [4.159, 17.506]</td><td>25.489</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>questdb-decimal</td><td>B · portable SQL</td><td>604689</td><td>358.913 [357.109, 367.757]</td><td>367.757</td><td>6</td><td>—</td><td>—</td><td>83.24</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>questdb-decimal</td><td>B · portable SQL</td><td>604689</td><td>734.746 [715.090, 747.094]</td><td>844.568</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>questdb-decimal</td><td>B · portable SQL</td><td>604689</td><td>14.722 [4.949, 17.542]</td><td>21.325</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>questdb-double-linear</td><td>B · portable SQL</td><td>604689</td><td>713.888 [709.929, 759.519]</td><td>860.159</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>questdb-native</td><td>A · native</td><td>604689</td><td>31.842 [31.538, 32.945]</td><td>33.350</td><td>20</td><td>own answer</td><td>0.4432</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>questdb-client</td><td>C · client-side</td><td>604689</td><td>51.877 [51.621, 52.561]</td><td>52.990</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>influxdb3-double</td><td>B · portable SQL</td><td>604689</td><td>994.887 [907.298, 1350.346]</td><td>1350.346</td><td>6</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>influxdb3-double</td><td>B · portable SQL</td><td>604689</td><td>334.866 [331.672, 340.763]</td><td>350.666</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>influxdb3-double</td><td>B · portable SQL</td><td>604689</td><td>15.273 [14.593, 15.579]</td><td>16.851</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>influxdb3-native</td><td>A · native</td><td>604689</td><td>36.262 [35.296, 38.541]</td><td>38.952</td><td>20</td><td>own answer</td><td>0.4432</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>influxdb3-client</td><td>C · client-side</td><td>604689</td><td>64.187 [62.897, 65.413]</td><td>67.250</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>load</td><td>iotdb-double</td><td>B · portable SQL</td><td>604689</td><td>514.924 [476.279, 544.563]</td><td>544.563</td><td>6</td><td>—</td><td>—</td><td>10.51</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>iotdb-double</td><td>B · portable SQL</td><td>604689</td><td>646.550 [641.326, 654.440]</td><td>662.157</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>downsample</td><td>iotdb-double</td><td>B · portable SQL</td><td>604689</td><td>44.921 [43.802, 45.723]</td><td>46.446</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>iotdb-native</td><td>A · native</td><td>604689</td><td>81.136 [79.149, 82.592]</td><td>83.435</td><td>20</td><td>own answer</td><td>0.4432</td><td>—</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>iotdb-client</td><td>C · client-side</td><td>604689</td><td>348.960 [343.595, 397.574]</td><td>408.635</td><td>20</td><td>PASS</td><td>0.9407</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>weftdb-memory</td><td>A · native</td><td>481252</td><td>110.443 [106.326, 115.200]</td><td>116.826</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>weftdb-memory</td><td>A · native</td><td>481252</td><td>5.759 [5.294, 6.143]</td><td>6.305</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>weftdb-stored</td><td>A · native</td><td>481252</td><td>4114.217 [4074.115, 4254.024]</td><td>4254.024</td><td>6</td><td>—</td><td>—</td><td>7.13</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>weftdb-stored</td><td>A · native</td><td>481252</td><td>138.624 [135.420, 140.869]</td><td>141.204</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>weftdb-stored</td><td>A · native</td><td>481252</td><td>14.034 [13.794, 15.510]</td><td>16.077</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>weftdb-stored-f64</td><td>A · native</td><td>481252</td><td>4116.308 [4056.346, 4288.108]</td><td>4288.108</td><td>6</td><td>—</td><td>—</td><td>7.13</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>weftdb-stored-f64</td><td>A · native</td><td>481252</td><td>42.948 [40.685, 43.620]</td><td>47.723</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>weftdb-stored-bulk</td><td>A · native</td><td>481252</td><td>807.529 [793.549, 822.967]</td><td>823.335</td><td>6</td><td>—</td><td>—</td><td>6.62</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>A · native</td><td>481252</td><td>129.454 [127.909, 131.528]</td><td>135.569</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>weftdb-stored-bulk</td><td>A · native</td><td>481252</td><td>16.770 [16.589, 17.033]</td><td>19.673</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>duckdb-double</td><td>B · portable SQL</td><td>481252</td><td>150.112 [144.663, 154.639]</td><td>155.029</td><td>6</td><td>—</td><td>—</td><td>8.74</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>duckdb-double</td><td>B · portable SQL</td><td>481252</td><td>40.857 [39.893, 42.405]</td><td>45.929</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>duckdb-double</td><td>B · portable SQL</td><td>481252</td><td>4.209 [3.571, 4.632]</td><td>4.876</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>481252</td><td>184.138 [178.544, 188.190]</td><td>189.860</td><td>6</td><td>—</td><td>—</td><td>8.20</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>481252</td><td>41.810 [40.650, 44.626]</td><td>49.106</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>481252</td><td>3.669 [3.457, 3.831]</td><td>5.074</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>duckdb-client</td><td>C · client-side</td><td>481252</td><td>28.691 [27.855, 29.565]</td><td>30.253</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>clickhouse-double</td><td>B · portable SQL</td><td>481252</td><td>103.066 [96.867, 103.834]</td><td>104.370</td><td>6</td><td>—</td><td>—</td><td>18.84</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>clickhouse-double</td><td>B · portable SQL</td><td>481252</td><td>141.771 [134.233, 147.764]</td><td>152.444</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>clickhouse-double</td><td>B · portable SQL</td><td>481252</td><td>5.610 [4.662, 5.744]</td><td>6.667</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>481252</td><td>103.870 [98.744, 110.443]</td><td>114.501</td><td>6</td><td>—</td><td>—</td><td>16.01</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>481252</td><td>146.107 [140.043, 168.118]</td><td>169.266</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>481252</td><td>5.924 [5.095, 6.317]</td><td>7.081</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>clickhouse-double-merge</td><td>B · portable SQL</td><td>481252</td><td>205.158 [197.838, 212.113]</td><td>216.619</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>clickhouse-native</td><td>A · native</td><td>481252</td><td>24.647 [23.806, 25.050]</td><td>25.715</td><td>20</td><td>own answer</td><td>1.1935</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>clickhouse-client</td><td>C · client-side</td><td>481252</td><td>12.783 [12.586, 13.134]</td><td>13.825</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>timescaledb-double</td><td>B · portable SQL</td><td>481252</td><td>805.109 [791.317, 867.757]</td><td>867.757</td><td>6</td><td>—</td><td>—</td><td>93.64</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>timescaledb-double</td><td>B · portable SQL</td><td>481252</td><td>501.981 [498.005, 510.038]</td><td>510.698</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>timescaledb-double</td><td>B · portable SQL</td><td>481252</td><td>31.556 [29.651, 57.879]</td><td>61.805</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>481252</td><td>707.615 [702.277, 804.120]</td><td>804.120</td><td>6</td><td>—</td><td>—</td><td>101.73</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>481252</td><td>561.222 [555.519, 566.941]</td><td>597.440</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>481252</td><td>78.778 [35.093, 81.432]</td><td>84.591</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>timescaledb-native</td><td>A · native</td><td>481252</td><td>126.032 [122.623, 127.240]</td><td>130.989</td><td>20</td><td>own answer</td><td>0.4756</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>timescaledb-client</td><td>C · client-side</td><td>481252</td><td>102.550 [100.973, 104.369]</td><td>110.510</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>questdb-double</td><td>B · portable SQL</td><td>481252</td><td>293.766 [291.872, 300.230]</td><td>300.230</td><td>6</td><td>—</td><td>—</td><td>104.58</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>questdb-double</td><td>B · portable SQL</td><td>481252</td><td>599.544 [578.828, 685.320]</td><td>692.956</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>questdb-double</td><td>B · portable SQL</td><td>481252</td><td>11.166 [9.877, 11.914]</td><td>13.060</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>questdb-decimal</td><td>B · portable SQL</td><td>481252</td><td>301.417 [296.342, 304.859]</td><td>304.859</td><td>6</td><td>—</td><td>—</td><td>104.58</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>questdb-decimal</td><td>B · portable SQL</td><td>481252</td><td>593.305 [577.755, 629.573]</td><td>701.687</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>questdb-decimal</td><td>B · portable SQL</td><td>481252</td><td>11.164 [10.496, 12.574]</td><td>14.564</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>questdb-double-linear</td><td>B · portable SQL</td><td>481252</td><td>583.844 [577.947, 592.829]</td><td>723.284</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>questdb-native</td><td>A · native</td><td>481252</td><td>28.000 [27.547, 28.739]</td><td>29.319</td><td>20</td><td>own answer</td><td>0.4756</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>questdb-client</td><td>C · client-side</td><td>481252</td><td>42.156 [41.481, 43.099]</td><td>43.653</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>influxdb3-double</td><td>B · portable SQL</td><td>481252</td><td>1001.042 [874.797, 1391.796]</td><td>1391.796</td><td>6</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>influxdb3-double</td><td>B · portable SQL</td><td>481252</td><td>287.780 [281.939, 290.472]</td><td>306.648</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>influxdb3-double</td><td>B · portable SQL</td><td>481252</td><td>14.230 [13.659, 14.870]</td><td>15.532</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>influxdb3-native</td><td>A · native</td><td>481252</td><td>33.155 [32.492, 34.422]</td><td>34.616</td><td>20</td><td>own answer</td><td>0.4756</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>influxdb3-client</td><td>C · client-side</td><td>481252</td><td>55.222 [54.164, 56.967]</td><td>58.892</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>load</td><td>iotdb-double</td><td>B · portable SQL</td><td>481252</td><td>481.262 [430.989, 498.912]</td><td>500.359</td><td>6</td><td>—</td><td>—</td><td>10.51</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>iotdb-double</td><td>B · portable SQL</td><td>481252</td><td>441.523 [438.391, 449.951]</td><td>450.865</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>block-medium</td><td>downsample</td><td>iotdb-double</td><td>B · portable SQL</td><td>481252</td><td>36.833 [36.240, 37.213]</td><td>38.364</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>iotdb-native</td><td>A · native</td><td>481252</td><td>75.365 [74.737, 78.470]</td><td>139.973</td><td>20</td><td>own answer</td><td>0.4756</td><td>—</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>iotdb-client</td><td>C · client-side</td><td>481252</td><td>314.432 [305.169, 333.840]</td><td>342.192</td><td>20</td><td>PASS</td><td>0.9357</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>weftdb-memory</td><td>A · native</td><td>86400</td><td>18.860 [18.347, 19.134]</td><td>19.573</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>weftdb-memory</td><td>A · native</td><td>86400</td><td>1.662 [1.641, 1.692]</td><td>2.119</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>weftdb-stored</td><td>A · native</td><td>86400</td><td>887.359 [877.694, 938.577]</td><td>938.577</td><td>6</td><td>—</td><td>—</td><td>2.38</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>weftdb-stored</td><td>A · native</td><td>86400</td><td>23.142 [22.569, 23.552]</td><td>24.360</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>weftdb-stored</td><td>A · native</td><td>86400</td><td>3.529 [3.028, 3.689]</td><td>4.074</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>weftdb-stored-f64</td><td>A · native</td><td>86400</td><td>894.241 [884.074, 922.815]</td><td>925.809</td><td>6</td><td>—</td><td>—</td><td>2.38</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>weftdb-stored-f64</td><td>A · native</td><td>86400</td><td>9.044 [8.725, 9.494]</td><td>10.626</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>weftdb-stored-bulk</td><td>A · native</td><td>86400</td><td>305.982 [302.985, 317.458]</td><td>317.458</td><td>6</td><td>—</td><td>—</td><td>1.90</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>A · native</td><td>86400</td><td>23.009 [22.064, 23.530]</td><td>24.693</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>weftdb-stored-bulk</td><td>A · native</td><td>86400</td><td>3.230 [3.114, 3.502]</td><td>3.901</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>duckdb-double</td><td>B · portable SQL</td><td>86400</td><td>46.721 [44.770, 47.916]</td><td>48.658</td><td>6</td><td>—</td><td>—</td><td>6.21</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>duckdb-double</td><td>B · portable SQL</td><td>86400</td><td>24.499 [23.966, 24.992]</td><td>28.159</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>duckdb-double</td><td>B · portable SQL</td><td>86400</td><td>2.181 [2.041, 2.398]</td><td>3.290</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>86400</td><td>51.980 [49.659, 54.299]</td><td>54.299</td><td>6</td><td>—</td><td>—</td><td>6.21</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>86400</td><td>26.333 [25.655, 26.617]</td><td>30.258</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>86400</td><td>2.151 [1.876, 2.458]</td><td>3.116</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>duckdb-client</td><td>C · client-side</td><td>86400</td><td>8.819 [8.386, 9.513]</td><td>10.717</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>clickhouse-double</td><td>B · portable SQL</td><td>86400</td><td>34.024 [32.414, 42.553]</td><td>42.553</td><td>6</td><td>—</td><td>—</td><td>14.45</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>clickhouse-double</td><td>B · portable SQL</td><td>86400</td><td>79.190 [76.344, 83.086]</td><td>86.770</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>clickhouse-double</td><td>B · portable SQL</td><td>86400</td><td>3.536 [3.189, 3.772]</td><td>4.441</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>86400</td><td>37.834 [33.762, 42.123]</td><td>42.123</td><td>6</td><td>—</td><td>—</td><td>14.20</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>86400</td><td>84.036 [78.719, 90.389]</td><td>94.045</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>86400</td><td>3.444 [3.126, 3.908]</td><td>4.600</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>clickhouse-double-merge</td><td>B · portable SQL</td><td>86400</td><td>82.464 [79.229, 88.773]</td><td>91.164</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>clickhouse-native</td><td>A · native</td><td>86400</td><td>16.612 [16.353, 17.183]</td><td>17.868</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>clickhouse-client</td><td>C · client-side</td><td>86400</td><td>5.585 [5.430, 5.671]</td><td>5.990</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>timescaledb-double</td><td>B · portable SQL</td><td>86400</td><td>153.439 [152.779, 157.894]</td><td>157.894</td><td>6</td><td>—</td><td>—</td><td>97.19</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>timescaledb-double</td><td>B · portable SQL</td><td>86400</td><td>479.300 [476.477, 480.850]</td><td>485.491</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>timescaledb-double</td><td>B · portable SQL</td><td>86400</td><td>11.169 [11.002, 11.372]</td><td>12.715</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>86400</td><td>137.927 [136.730, 139.541]</td><td>139.541</td><td>6</td><td>—</td><td>—</td><td>97.47</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>86400</td><td>504.645 [497.656, 508.704]</td><td>513.683</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>86400</td><td>16.353 [16.162, 16.484]</td><td>17.252</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>timescaledb-native</td><td>A · native</td><td>86400</td><td>85.848 [83.328, 91.148]</td><td>93.657</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>timescaledb-client</td><td>C · client-side</td><td>86400</td><td>21.351 [20.682, 21.900]</td><td>22.822</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>questdb-double</td><td>B · portable SQL</td><td>86400</td><td>78.569 [72.556, 83.703]</td><td>84.473</td><td>6</td><td>—</td><td>—</td><td>588.66</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>questdb-double</td><td>B · portable SQL</td><td>86400</td><td>165.913 [161.564, 173.978]</td><td>191.606</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>questdb-double</td><td>B · portable SQL</td><td>86400</td><td>2.607 [2.411, 2.691]</td><td>4.605</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>questdb-decimal</td><td>B · portable SQL</td><td>86400</td><td>80.138 [76.724, 91.598]</td><td>93.400</td><td>6</td><td>—</td><td>—</td><td>588.66</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>questdb-decimal</td><td>B · portable SQL</td><td>86400</td><td>165.419 [158.331, 170.668]</td><td>192.650</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>questdb-decimal</td><td>B · portable SQL</td><td>86400</td><td>2.780 [2.741, 3.020]</td><td>5.666</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>questdb-double-linear</td><td>B · portable SQL</td><td>86400</td><td>167.536 [163.892, 173.637]</td><td>194.080</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>questdb-native</td><td>A · native</td><td>86400</td><td>12.922 [12.272, 13.207]</td><td>16.339</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>questdb-client</td><td>C · client-side</td><td>86400</td><td>8.626 [7.962, 8.835]</td><td>9.414</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>influxdb3-double</td><td>B · portable SQL</td><td>86400</td><td>993.039 [687.728, 1091.889]</td><td>1091.889</td><td>6</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>influxdb3-double</td><td>B · portable SQL</td><td>86400</td><td>1562.529 [1439.304, 1667.512]</td><td>1735.277</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>influxdb3-double</td><td>B · portable SQL</td><td>86400</td><td>178.681 [172.573, 189.993]</td><td>203.816</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>influxdb3-native</td><td>A · native</td><td>86400</td><td>220.622 [217.376, 227.621]</td><td>231.786</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>influxdb3-client</td><td>C · client-side</td><td>86400</td><td>197.326 [184.772, 210.794]</td><td>230.762</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>load</td><td>iotdb-double</td><td>B · portable SQL</td><td>86400</td><td>282.040 [252.941, 367.469]</td><td>367.469</td><td>6</td><td>—</td><td>—</td><td>6.44</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>iotdb-double</td><td>B · portable SQL</td><td>86400</td><td>75.538 [72.502, 103.300]</td><td>167.757</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>downsample</td><td>iotdb-double</td><td>B · portable SQL</td><td>86400</td><td>12.880 [11.863, 13.387]</td><td>13.568</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>iotdb-native</td><td>A · native</td><td>86400</td><td>60.586 [59.715, 63.010]</td><td>65.537</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>iotdb-client</td><td>C · client-side</td><td>86400</td><td>46.790 [46.044, 52.201]</td><td>66.335</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>weftdb-memory</td><td>A · native</td><td>600863</td><td>137.223 [134.020, 138.183]</td><td>140.847</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>weftdb-memory</td><td>A · native</td><td>600863</td><td>16.609 [16.168, 17.264]</td><td>17.446</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>weftdb-stored</td><td>A · native</td><td>600863</td><td>5296.517 [5043.202, 5359.775]</td><td>5384.884</td><td>6</td><td>—</td><td>—</td><td>1.89</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>weftdb-stored</td><td>A · native</td><td>600863</td><td>168.009 [166.622, 170.627]</td><td>173.702</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>weftdb-stored</td><td>A · native</td><td>600863</td><td>22.471 [21.391, 22.707]</td><td>24.194</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>weftdb-stored-f64</td><td>A · native</td><td>600863</td><td>5129.886 [5042.645, 5357.531]</td><td>5357.531</td><td>6</td><td>—</td><td>—</td><td>1.89</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>weftdb-stored-f64</td><td>A · native</td><td>600863</td><td>53.453 [50.381, 56.713]</td><td>58.570</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>weftdb-stored-bulk</td><td>A · native</td><td>600863</td><td>922.635 [903.270, 934.850]</td><td>934.850</td><td>6</td><td>—</td><td>—</td><td>1.39</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>A · native</td><td>600863</td><td>162.153 [158.548, 169.396]</td><td>174.820</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>weftdb-stored-bulk</td><td>A · native</td><td>600863</td><td>30.869 [29.527, 31.618]</td><td>31.835</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>duckdb-double</td><td>B · portable SQL</td><td>600863</td><td>182.071 [175.185, 187.751]</td><td>191.431</td><td>6</td><td>—</td><td>—</td><td>3.07</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>duckdb-double</td><td>B · portable SQL</td><td>600863</td><td>82.015 [79.342, 84.446]</td><td>88.519</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>duckdb-double</td><td>B · portable SQL</td><td>600863</td><td>5.893 [5.596, 6.289]</td><td>6.555</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>600863</td><td>219.022 [216.348, 220.232]</td><td>227.568</td><td>6</td><td>—</td><td>—</td><td>3.07</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>600863</td><td>83.996 [82.067, 85.240]</td><td>93.989</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>600863</td><td>5.859 [5.724, 6.468]</td><td>7.363</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>duckdb-client</td><td>C · client-side</td><td>600863</td><td>42.021 [40.555, 43.868]</td><td>45.982</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>clickhouse-double</td><td>B · portable SQL</td><td>600863</td><td>111.679 [109.096, 126.007]</td><td>126.007</td><td>6</td><td>—</td><td>—</td><td>14.05</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>clickhouse-double</td><td>B · portable SQL</td><td>600863</td><td>307.616 [295.814, 315.261]</td><td>323.835</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>clickhouse-double</td><td>B · portable SQL</td><td>600863</td><td>7.598 [7.527, 8.050]</td><td>8.633</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>600863</td><td>119.927 [116.453, 130.576]</td><td>130.576</td><td>6</td><td>—</td><td>—</td><td>13.83</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>600863</td><td>311.874 [300.806, 323.548]</td><td>329.657</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>600863</td><td>8.045 [7.962, 8.988]</td><td>9.015</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>clickhouse-double-merge</td><td>B · portable SQL</td><td>600863</td><td>299.502 [295.464, 309.098]</td><td>311.098</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>clickhouse-native</td><td>A · native</td><td>600863</td><td>84.868 [83.493, 87.289]</td><td>88.918</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>clickhouse-client</td><td>C · client-side</td><td>600863</td><td>20.093 [19.769, 21.052]</td><td>21.388</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>timescaledb-double</td><td>B · portable SQL</td><td>600863</td><td>991.661 [972.257, 1006.343]</td><td>1006.343</td><td>6</td><td>—</td><td>—</td><td>93.08</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>timescaledb-double</td><td>B · portable SQL</td><td>600863</td><td>3326.176 [3302.281, 3352.172]</td><td>3376.507</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>timescaledb-double</td><td>B · portable SQL</td><td>600863</td><td>79.600 [78.345, 80.757]</td><td>81.209</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>600863</td><td>858.025 [852.423, 865.965]</td><td>888.196</td><td>6</td><td>—</td><td>—</td><td>93.12</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>600863</td><td>3469.782 [3445.106, 3497.320]</td><td>3521.880</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>600863</td><td>112.496 [110.368, 114.094]</td><td>115.266</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>timescaledb-native</td><td>A · native</td><td>600863</td><td>697.737 [685.471, 715.389]</td><td>738.130</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>timescaledb-client</td><td>C · client-side</td><td>600863</td><td>134.988 [133.574, 136.163]</td><td>146.204</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>questdb-double</td><td>B · portable SQL</td><td>600863</td><td>349.734 [346.148, 355.736]</td><td>363.103</td><td>6</td><td>—</td><td>—</td><td>105.48</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>questdb-double</td><td>B · portable SQL</td><td>600863</td><td>906.736 [891.876, 1008.708]</td><td>1077.197</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>questdb-double</td><td>B · portable SQL</td><td>600863</td><td>13.652 [13.110, 28.061]</td><td>76.361</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>questdb-decimal</td><td>B · portable SQL</td><td>600863</td><td>367.129 [357.270, 373.050]</td><td>374.677</td><td>6</td><td>—</td><td>—</td><td>105.48</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>questdb-decimal</td><td>B · portable SQL</td><td>600863</td><td>910.426 [881.823, 931.898]</td><td>1083.205</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>questdb-decimal</td><td>B · portable SQL</td><td>600863</td><td>13.632 [12.737, 29.442]</td><td>52.347</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>questdb-double-linear</td><td>B · portable SQL</td><td>600863</td><td>908.965 [875.140, 928.271]</td><td>1036.450</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>questdb-native</td><td>A · native</td><td>600863</td><td>99.885 [94.542, 106.324]</td><td>115.445</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>questdb-client</td><td>C · client-side</td><td>600863</td><td>58.920 [57.475, 59.520]</td><td>64.599</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>influxdb3-double</td><td>B · portable SQL</td><td>600863</td><td>1014.495 [988.308, 1754.797]</td><td>1754.797</td><td>6</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>influxdb3-double</td><td>B · portable SQL</td><td>600863</td><td>12184.948 [11634.071, 13068.641]</td><td>13558.799</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>influxdb3-double</td><td>B · portable SQL</td><td>600863</td><td>1616.750 [1554.916, 1665.431]</td><td>1720.368</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>influxdb3-native</td><td>A · native</td><td>600863</td><td>1762.081 [1713.672, 1811.463]</td><td>1894.466</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>influxdb3-client</td><td>C · client-side</td><td>600863</td><td>1578.967 [1552.450, 1645.501]</td><td>1722.055</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>load</td><td>iotdb-double</td><td>B · portable SQL</td><td>600863</td><td>992.226 [922.106, 1161.799]</td><td>1161.799</td><td>6</td><td>—</td><td>—</td><td>5.41</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>iotdb-double</td><td>B · portable SQL</td><td>600863</td><td>904.216 [891.862, 984.216]</td><td>1048.165</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>downsample</td><td>iotdb-double</td><td>B · portable SQL</td><td>600863</td><td>54.859 [54.332, 55.371]</td><td>56.514</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>iotdb-native</td><td>A · native</td><td>600863</td><td>465.488 [454.175, 509.679]</td><td>513.445</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>iotdb-client</td><td>C · client-side</td><td>600863</td><td>371.475 [358.665, 392.542]</td><td>393.325</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>weftdb-memory</td><td>A · native</td><td>8641</td><td>5.039 [4.744, 5.502]</td><td>5.773</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>weftdb-memory</td><td>A · native</td><td>8641</td><td>0.929 [0.909, 0.943]</td><td>1.330</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>weftdb-stored</td><td>A · native</td><td>8641</td><td>256.239 [251.721, 256.877]</td><td>268.816</td><td>6</td><td>—</td><td>—</td><td>9.62</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>weftdb-stored</td><td>A · native</td><td>8641</td><td>5.988 [5.883, 6.124]</td><td>7.351</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>weftdb-stored</td><td>A · native</td><td>8641</td><td>1.546 [1.441, 1.869]</td><td>2.398</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>weftdb-stored-f64</td><td>A · native</td><td>8641</td><td>267.731 [254.247, 274.228]</td><td>282.747</td><td>6</td><td>—</td><td>—</td><td>9.62</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>weftdb-stored-f64</td><td>A · native</td><td>8641</td><td>2.177 [1.780, 2.587]</td><td>3.246</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>weftdb-stored-bulk</td><td>A · native</td><td>8641</td><td>199.962 [196.078, 201.646]</td><td>202.664</td><td>6</td><td>—</td><td>—</td><td>9.20</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>A · native</td><td>8641</td><td>5.568 [5.379, 6.251]</td><td>7.174</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>weftdb-stored-bulk</td><td>A · native</td><td>8641</td><td>1.496 [1.464, 1.556]</td><td>2.157</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>duckdb-double</td><td>B · portable SQL</td><td>8641</td><td>21.036 [20.745, 23.835]</td><td>23.835</td><td>6</td><td>—</td><td>—</td><td>62.10</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>duckdb-double</td><td>B · portable SQL</td><td>8641</td><td>17.739 [17.149, 18.765]</td><td>20.192</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>duckdb-double</td><td>B · portable SQL</td><td>8641</td><td>1.117 [1.036, 1.206]</td><td>2.328</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>8641</td><td>22.564 [22.413, 23.131]</td><td>23.574</td><td>6</td><td>—</td><td>—</td><td>62.10</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>8641</td><td>19.236 [18.266, 19.996]</td><td>21.237</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>8641</td><td>1.254 [1.175, 1.285]</td><td>2.148</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>duckdb-client</td><td>C · client-side</td><td>8641</td><td>2.295 [2.257, 2.462]</td><td>3.860</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>clickhouse-double</td><td>B · portable SQL</td><td>8641</td><td>20.702 [19.315, 21.425]</td><td>83.325</td><td>6</td><td>—</td><td>—</td><td>15.14</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>clickhouse-double</td><td>B · portable SQL</td><td>8641</td><td>38.591 [36.051, 41.912]</td><td>46.363</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>clickhouse-double</td><td>B · portable SQL</td><td>8641</td><td>1.379 [1.302, 1.456]</td><td>2.367</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>8641</td><td>20.248 [19.806, 22.108]</td><td>22.986</td><td>6</td><td>—</td><td>—</td><td>15.13</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>8641</td><td>37.086 [35.592, 38.347]</td><td>40.313</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>8641</td><td>1.369 [1.310, 1.625]</td><td>2.376</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>clickhouse-double-merge</td><td>B · portable SQL</td><td>8641</td><td>35.896 [34.080, 37.134]</td><td>37.523</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>clickhouse-native</td><td>A · native</td><td>8641</td><td>28.291 [27.683, 28.556]</td><td>29.979</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>clickhouse-client</td><td>C · client-side</td><td>8641</td><td>2.030 [1.993, 2.181]</td><td>2.714</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>timescaledb-double</td><td>B · portable SQL</td><td>8641</td><td>28.428 [28.069, 30.244]</td><td>30.244</td><td>6</td><td>—</td><td>—</td><td>102.39</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>timescaledb-double</td><td>B · portable SQL</td><td>8641</td><td>464.880 [461.261, 468.685]</td><td>471.291</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>timescaledb-double</td><td>B · portable SQL</td><td>8641</td><td>2.243 [2.166, 2.281]</td><td>3.492</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>8641</td><td>30.047 [29.867, 30.413]</td><td>33.282</td><td>6</td><td>—</td><td>—</td><td>105.23</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>8641</td><td>474.372 [472.143, 483.366]</td><td>486.284</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>8641</td><td>3.800 [3.746, 3.864]</td><td>5.070</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>timescaledb-native</td><td>A · native</td><td>8641</td><td>18.731 [18.449, 19.678]</td><td>20.149</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>timescaledb-client</td><td>C · client-side</td><td>8641</td><td>2.977 [2.905, 3.145]</td><td>4.035</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>questdb-double</td><td>B · portable SQL</td><td>8641</td><td>49.039 [47.562, 52.625]</td><td>52.625</td><td>6</td><td>—</td><td>—</td><td>5824.75</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>questdb-double</td><td>B · portable SQL</td><td>8641</td><td>40.209 [39.367, 41.128]</td><td>46.567</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>questdb-double</td><td>B · portable SQL</td><td>8641</td><td>0.585 [0.525, 0.695]</td><td>2.604</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>questdb-decimal</td><td>B · portable SQL</td><td>8641</td><td>49.321 [48.302, 51.901]</td><td>51.901</td><td>6</td><td>—</td><td>—</td><td>5824.75</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>questdb-decimal</td><td>B · portable SQL</td><td>8641</td><td>40.881 [39.941, 41.824]</td><td>47.105</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>questdb-decimal</td><td>B · portable SQL</td><td>8641</td><td>0.692 [0.615, 0.725]</td><td>2.573</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>questdb-double-linear</td><td>B · portable SQL</td><td>8641</td><td>42.334 [40.264, 43.596]</td><td>47.666</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>questdb-native</td><td>A · native</td><td>8641</td><td>12.509 [11.844, 13.190]</td><td>15.593</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>questdb-client</td><td>C · client-side</td><td>8641</td><td>1.818 [1.735, 1.857]</td><td>2.535</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>influxdb3-double</td><td>B · portable SQL</td><td>8641</td><td>820.278 [329.530, 999.770]</td><td>999.770</td><td>6</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>influxdb3-double</td><td>B · portable SQL</td><td>8641</td><td>79.196 [77.436, 81.832]</td><td>94.511</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>influxdb3-double</td><td>B · portable SQL</td><td>8641</td><td>6.653 [6.238, 7.132]</td><td>7.518</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>influxdb3-native</td><td>A · native</td><td>8641</td><td>19.660 [19.456, 20.280]</td><td>21.425</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>influxdb3-client</td><td>C · client-side</td><td>8641</td><td>6.776 [6.492, 7.013]</td><td>8.073</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>load</td><td>iotdb-double</td><td>B · portable SQL</td><td>8641</td><td>231.234 [201.032, 249.696]</td><td>252.978</td><td>6</td><td>—</td><td>—</td><td>0.82</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>iotdb-double</td><td>B · portable SQL</td><td>8641</td><td>52.289 [51.452, 52.832]</td><td>53.925</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>downsample</td><td>iotdb-double</td><td>B · portable SQL</td><td>8641</td><td>5.554 [5.408, 5.828]</td><td>7.130</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>iotdb-native</td><td>A · native</td><td>8641</td><td>46.526 [46.249, 47.363]</td><td>47.780</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>iotdb-client</td><td>C · client-side</td><td>8641</td><td>8.404 [8.039, 9.228]</td><td>11.166</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>weftdb-memory</td><td>A · native</td><td>60481</td><td>23.340 [23.152, 23.700]</td><td>24.993</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>weftdb-memory</td><td>A · native</td><td>60481</td><td>6.652 [6.356, 6.999]</td><td>7.764</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>weftdb-stored</td><td>A · native</td><td>60481</td><td>618.212 [616.102, 634.663]</td><td>642.046</td><td>6</td><td>—</td><td>—</td><td>5.18</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>weftdb-stored</td><td>A · native</td><td>60481</td><td>27.900 [26.174, 28.711]</td><td>29.849</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>weftdb-stored</td><td>A · native</td><td>60481</td><td>9.320 [8.441, 11.276]</td><td>11.704</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>weftdb-stored-f64</td><td>A · native</td><td>60481</td><td>636.215 [622.742, 645.643]</td><td>645.879</td><td>6</td><td>—</td><td>—</td><td>5.19</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>weftdb-stored-f64</td><td>A · native</td><td>60481</td><td>10.258 [9.589, 10.924]</td><td>11.599</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>weftdb-stored-bulk</td><td>A · native</td><td>60481</td><td>211.896 [210.626, 215.850]</td><td>215.850</td><td>6</td><td>—</td><td>—</td><td>4.74</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>weftdb-stored-bulk</td><td>A · native</td><td>60481</td><td>27.226 [26.787, 28.657]</td><td>29.774</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>weftdb-stored-bulk</td><td>A · native</td><td>60481</td><td>10.179 [9.973, 10.318]</td><td>10.448</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>duckdb-double</td><td>B · portable SQL</td><td>60481</td><td>33.787 [33.302, 36.648]</td><td>37.931</td><td>6</td><td>—</td><td>—</td><td>8.87</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>duckdb-double</td><td>B · portable SQL</td><td>60481</td><td>62.302 [59.693, 63.598]</td><td>66.593</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>duckdb-double</td><td>B · portable SQL</td><td>60481</td><td>3.051 [2.914, 3.541]</td><td>4.114</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>60481</td><td>42.216 [40.046, 43.552]</td><td>46.382</td><td>6</td><td>—</td><td>—</td><td>8.87</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>60481</td><td>63.232 [60.661, 68.824]</td><td>72.184</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>duckdb-decimal</td><td>B · portable SQL</td><td>60481</td><td>3.374 [3.138, 3.660]</td><td>4.098</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>duckdb-client</td><td>C · client-side</td><td>60481</td><td>13.429 [13.094, 13.831]</td><td>15.558</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>clickhouse-double</td><td>B · portable SQL</td><td>60481</td><td>27.291 [25.533, 41.155]</td><td>79.843</td><td>6</td><td>—</td><td>—</td><td>13.55</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>clickhouse-double</td><td>B · portable SQL</td><td>60481</td><td>187.035 [185.489, 189.217]</td><td>199.375</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>clickhouse-double</td><td>B · portable SQL</td><td>60481</td><td>3.344 [3.093, 3.554]</td><td>4.703</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>60481</td><td>29.060 [27.507, 33.474]</td><td>33.474</td><td>6</td><td>—</td><td>—</td><td>13.54</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>60481</td><td>196.024 [191.983, 202.305]</td><td>209.257</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>clickhouse-decimal</td><td>B · portable SQL</td><td>60481</td><td>3.250 [2.878, 3.611]</td><td>4.437</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>clickhouse-double-merge</td><td>B · portable SQL</td><td>60481</td><td>119.971 [116.541, 122.820]</td><td>124.739</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>clickhouse-native</td><td>A · native</td><td>60481</td><td>178.578 [176.651, 181.065]</td><td>185.406</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>clickhouse-client</td><td>C · client-side</td><td>60481</td><td>11.199 [10.692, 11.520]</td><td>11.683</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>timescaledb-double</td><td>B · portable SQL</td><td>60481</td><td>100.977 [96.691, 101.213]</td><td>102.813</td><td>6</td><td>—</td><td>—</td><td>100.23</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>timescaledb-double</td><td>B · portable SQL</td><td>60481</td><td>3184.885 [3173.014, 3251.057]</td><td>3262.144</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>timescaledb-double</td><td>B · portable SQL</td><td>60481</td><td>16.135 [15.554, 16.776]</td><td>17.791</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>60481</td><td>102.567 [101.360, 108.167]</td><td>108.167</td><td>6</td><td>—</td><td>—</td><td>100.64</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>60481</td><td>3297.711 [3275.404, 3318.156]</td><td>3340.394</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>timescaledb-numeric</td><td>B · portable SQL</td><td>60481</td><td>28.884 [26.657, 29.593]</td><td>29.722</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>timescaledb-native</td><td>A · native</td><td>60481</td><td>132.038 [128.028, 136.737]</td><td>145.150</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>timescaledb-client</td><td>C · client-side</td><td>60481</td><td>21.239 [20.493, 22.186]</td><td>24.018</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>questdb-double</td><td>B · portable SQL</td><td>60481</td><td>65.075 [64.138, 70.065]</td><td>70.619</td><td>6</td><td>—</td><td>—</td><td>832.19</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>questdb-double</td><td>B · portable SQL</td><td>60481</td><td>340.574 [336.514, 348.902]</td><td>352.278</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>questdb-double</td><td>B · portable SQL</td><td>60481</td><td>12.243 [10.970, 12.620]</td><td>14.380</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>questdb-decimal</td><td>B · portable SQL</td><td>60481</td><td>70.778 [69.892, 72.415]</td><td>77.452</td><td>6</td><td>—</td><td>—</td><td>832.19</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>questdb-decimal</td><td>B · portable SQL</td><td>60481</td><td>344.503 [339.071, 348.604]</td><td>353.693</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>questdb-decimal</td><td>B · portable SQL</td><td>60481</td><td>12.385 [11.109, 13.174]</td><td>24.080</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>questdb-double-linear</td><td>B · portable SQL</td><td>60481</td><td>342.917 [338.124, 346.505]</td><td>351.371</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>questdb-native</td><td>A · native</td><td>60481</td><td>96.026 [94.453, 97.417]</td><td>104.135</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>questdb-client</td><td>C · client-side</td><td>60481</td><td>12.318 [12.103, 12.530]</td><td>13.207</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>influxdb3-double</td><td>B · portable SQL</td><td>60481</td><td>826.136 [689.989, 1003.309]</td><td>1168.415</td><td>6</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>influxdb3-double</td><td>B · portable SQL</td><td>60481</td><td>439.650 [434.536, 457.379]</td><td>465.910</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>influxdb3-double</td><td>B · portable SQL</td><td>60481</td><td>26.036 [24.802, 27.896]</td><td>29.538</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>influxdb3-native</td><td>A · native</td><td>60481</td><td>97.431 [95.202, 97.861]</td><td>101.367</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>influxdb3-client</td><td>C · client-side</td><td>60481</td><td>31.514 [30.544, 34.841]</td><td>37.638</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>load</td><td>iotdb-double</td><td>B · portable SQL</td><td>60481</td><td>235.469 [196.082, 244.804]</td><td>246.479</td><td>6</td><td>—</td><td>—</td><td>0.83</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>iotdb-double</td><td>B · portable SQL</td><td>60481</td><td>349.864 [347.780, 356.095]</td><td>372.611</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>downsample</td><td>iotdb-double</td><td>B · portable SQL</td><td>60481</td><td>18.290 [17.597, 18.772]</td><td>19.032</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>iotdb-native</td><td>A · native</td><td>60481</td><td>386.432 [383.575, 390.644]</td><td>391.667</td><td>20</td><td>own answer</td><td>—</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>iotdb-client</td><td>C · client-side</td><td>60481</td><td>37.099 [35.952, 38.163]</td><td>39.271</td><td>20</td><td>PASS</td><td>—</td><td>—</td></tr>
+</tbody>
+</table>
+<h2>Interpolation classes</h2>
+<p>Each engine is asked for the grid three ways where it can be (fair protocol 1.2): <strong>A · native</strong>, the engine's own interpolation or fill; <strong>B · portable SQL</strong>, the linear reconstruction written in its SQL; <strong>C · client-side</strong>, every knot fetched into this Rust client and interpolated there, end to end. B and C answer the question WeftDB answers, so they are gated against its grid and timed against it. A native fill that computes something else is gated only on the grid's shape, and is shown below with how far its answer lies from the reconstruction instead of being raced against it. DuckDB has no native interpolation, so it has no class A arm.</p>
+<table>
+<thead><tr><th>dataset</th><th>phase</th><th>native fill</th><th>p50 [CI]</th><th>unfilled instants</th><th>max diff from the line</th><th>RMSE vs truth</th></tr></thead>
+<tbody>
+<tr><td>mcar-small</td><td>interpolate</td><td>clickhouse-native</td><td>21.003 [20.173, 21.151]</td><td>0</td><td>3.826e0</td><td>1.0586</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>timescaledb-native</td><td>73.610 [71.243, 76.353]</td><td>1</td><td>3.826e0</td><td>1.0031</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>questdb-native</td><td>14.672 [14.334, 15.206]</td><td>1</td><td>3.826e0</td><td>1.0031</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>influxdb3-native</td><td>27.793 [26.996, 29.167]</td><td>1</td><td>3.826e0</td><td>1.0031</td></tr>
+<tr><td>mcar-small</td><td>interpolate</td><td>iotdb-native</td><td>68.810 [62.391, 171.542]</td><td>1</td><td>3.826e0</td><td>1.0031</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>clickhouse-native</td><td>23.481 [23.046, 23.708]</td><td>0</td><td>9.654e0</td><td>1.4646</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>timescaledb-native</td><td>58.735 [55.123, 62.025]</td><td>2</td><td>3.806e0</td><td>0.9623</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>questdb-native</td><td>13.877 [13.804, 14.135]</td><td>2</td><td>3.806e0</td><td>0.9623</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>influxdb3-native</td><td>23.915 [23.376, 25.148]</td><td>2</td><td>3.806e0</td><td>0.9623</td></tr>
+<tr><td>block-small</td><td>interpolate</td><td>iotdb-native</td><td>64.552 [59.714, 128.607]</td><td>2</td><td>3.806e0</td><td>0.9623</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>clickhouse-native</td><td>22.052 [21.699, 22.903]</td><td>0</td><td>3.204e0</td><td>0.4432</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>timescaledb-native</td><td>159.312 [156.591, 161.622]</td><td>1</td><td>3.204e0</td><td>0.4432</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>questdb-native</td><td>31.842 [31.538, 32.945]</td><td>1</td><td>3.204e0</td><td>0.4432</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>influxdb3-native</td><td>36.262 [35.296, 38.541]</td><td>1</td><td>3.204e0</td><td>0.4432</td></tr>
+<tr><td>mcar-medium</td><td>interpolate</td><td>iotdb-native</td><td>81.136 [79.149, 82.592]</td><td>1</td><td>3.204e0</td><td>0.4432</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>clickhouse-native</td><td>24.647 [23.806, 25.050]</td><td>0</td><td>1.101e1</td><td>1.1935</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>timescaledb-native</td><td>126.032 [122.623, 127.240]</td><td>1</td><td>2.971e0</td><td>0.4756</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>questdb-native</td><td>28.000 [27.547, 28.739]</td><td>1</td><td>2.971e0</td><td>0.4756</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>influxdb3-native</td><td>33.155 [32.492, 34.422]</td><td>1</td><td>2.971e0</td><td>0.4756</td></tr>
+<tr><td>block-medium</td><td>interpolate</td><td>iotdb-native</td><td>75.365 [74.737, 78.470]</td><td>1</td><td>2.971e0</td><td>0.4756</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>clickhouse-native</td><td>16.612 [16.353, 17.183]</td><td>0</td><td>3.987e-1</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>timescaledb-native</td><td>85.848 [83.328, 91.148]</td><td>0</td><td>5.829e-16</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>questdb-native</td><td>12.922 [12.272, 13.207]</td><td>0</td><td>5.829e-16</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>influxdb3-native</td><td>220.622 [217.376, 227.621]</td><td>0</td><td>5.829e-16</td><td>—</td></tr>
+<tr><td>uci-small</td><td>interpolate</td><td>iotdb-native</td><td>60.586 [59.715, 63.010]</td><td>0</td><td>5.829e-16</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>clickhouse-native</td><td>84.868 [83.493, 87.289]</td><td>0</td><td>1.789e0</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>timescaledb-native</td><td>697.737 [685.471, 715.389]</td><td>0</td><td>8.882e-16</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>questdb-native</td><td>99.885 [94.542, 106.324]</td><td>0</td><td>8.882e-16</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>influxdb3-native</td><td>1762.081 [1713.672, 1811.463]</td><td>0</td><td>8.882e-16</td><td>—</td></tr>
+<tr><td>uci-medium</td><td>interpolate</td><td>iotdb-native</td><td>465.488 [454.175, 509.679]</td><td>0</td><td>8.882e-16</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>clickhouse-native</td><td>28.291 [27.683, 28.556]</td><td>0</td><td>3.600e0</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>timescaledb-native</td><td>18.731 [18.449, 19.678]</td><td>0</td><td>1.421e-14</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>questdb-native</td><td>12.509 [11.844, 13.190]</td><td>0</td><td>1.421e-14</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>influxdb3-native</td><td>19.660 [19.456, 20.280]</td><td>0</td><td>1.421e-14</td><td>—</td></tr>
+<tr><td>tsbs-small</td><td>interpolate</td><td>iotdb-native</td><td>46.526 [46.249, 47.363]</td><td>0</td><td>1.421e-14</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>clickhouse-native</td><td>178.578 [176.651, 181.065]</td><td>0</td><td>3.600e0</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>timescaledb-native</td><td>132.038 [128.028, 136.737]</td><td>0</td><td>1.421e-14</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>questdb-native</td><td>96.026 [94.453, 97.417]</td><td>0</td><td>1.421e-14</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>influxdb3-native</td><td>97.431 [95.202, 97.861]</td><td>0</td><td>1.421e-14</td><td>—</td></tr>
+<tr><td>tsbs-medium</td><td>interpolate</td><td>iotdb-native</td><td>386.432 [383.575, 390.644]</td><td>0</td><td>1.421e-14</td><td>—</td></tr>
+</tbody>
+</table>
+<ul>
+<li><code>clickhouse-native</code> computes the average of the knots in each grid-step bucket, carried forward unchanged across empty buckets (last observation carried forward, not a line), and 0 (the column's default) before the first knot.</li>
+<li><code>influxdb3-native</code> computes the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones; nothing before the first knot's bucket or after the last's.</li>
+<li><code>iotdb-native</code> computes the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones; nothing before the first knot's bucket or after the last's.</li>
+<li><code>questdb-native</code> computes the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones.</li>
+<li><code>timescaledb-native</code> computes the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones; nothing before the first knot's bucket or after the last's.</li>
+</ul>
+<h2>Honesty</h2>
+<p>Generated from the results above. A WeftDB arm wins or loses only when its p50 interval does not overlap the fastest other engine's; overlapping intervals are within noise.</p>
+<h3>Correctness failures</h3>
+<ul>
+<li><code>mcar-medium</code> downsample <code>timescaledb-double</code> disagrees with the in-memory reference: Some(Correctness { expected_points: 1440, actual_points: 1440, values_finite: true, max_abs_diff_vs_reference: 1.4210854715202006e-13, tolerance: 9.1980871e-8, passed: false, unfilled_points: 0, answer_sha256: None }).</li>
+</ul>
+<h3>Where WeftDB wins</h3>
+<ul>
+<li><code>mcar-small</code> interpolate vs B · portable SQL: <code>weftdb-memory</code> p50 21.038 ms vs <code>duckdb-double</code> 24.475 ms (weftdb-memory 1.2× faster).</li>
+<li><code>mcar-small</code> downsample vs B · portable SQL: <code>weftdb-memory</code> p50 1.676 ms vs <code>duckdb-double</code> 2.080 ms (weftdb-memory 1.2× faster).</li>
+<li><code>mcar-small</code> interpolate vs B · portable SQL: <code>weftdb-stored-f64</code> p50 8.910 ms vs <code>duckdb-double</code> 24.475 ms (weftdb-stored-f64 2.7× faster).</li>
+<li><code>block-small</code> interpolate vs B · portable SQL: <code>weftdb-memory</code> p50 18.856 ms vs <code>duckdb-double</code> 23.080 ms (weftdb-memory 1.2× faster).</li>
+<li><code>block-small</code> downsample vs B · portable SQL: <code>weftdb-memory</code> p50 1.402 ms vs <code>duckdb-decimal</code> 1.854 ms (weftdb-memory 1.3× faster).</li>
+<li><code>block-small</code> interpolate vs B · portable SQL: <code>weftdb-stored-f64</code> p50 8.324 ms vs <code>duckdb-double</code> 23.080 ms (weftdb-stored-f64 2.8× faster).</li>
+<li><code>uci-small</code> interpolate vs B · portable SQL: <code>weftdb-memory</code> p50 18.860 ms vs <code>duckdb-double</code> 24.499 ms (weftdb-memory 1.3× faster).</li>
+<li><code>uci-small</code> downsample vs B · portable SQL: <code>weftdb-memory</code> p50 1.662 ms vs <code>duckdb-decimal</code> 2.151 ms (weftdb-memory 1.3× faster).</li>
+<li><code>uci-small</code> interpolate vs B · portable SQL: <code>weftdb-stored</code> p50 23.142 ms vs <code>duckdb-double</code> 24.499 ms (weftdb-stored 1.1× faster).</li>
+<li><code>uci-small</code> interpolate vs B · portable SQL: <code>weftdb-stored-f64</code> p50 9.044 ms vs <code>duckdb-double</code> 24.499 ms (weftdb-stored-f64 2.7× faster).</li>
+<li><code>uci-small</code> interpolate vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 23.009 ms vs <code>duckdb-double</code> 24.499 ms (weftdb-stored-bulk 1.1× faster).</li>
+<li><code>uci-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored-f64</code> p50 53.453 ms vs <code>duckdb-double</code> 82.015 ms (weftdb-stored-f64 1.5× faster).</li>
+<li><code>tsbs-small</code> interpolate vs B · portable SQL: <code>weftdb-memory</code> p50 5.039 ms vs <code>duckdb-double</code> 17.739 ms (weftdb-memory 3.5× faster).</li>
+<li><code>tsbs-small</code> interpolate vs B · portable SQL: <code>weftdb-stored</code> p50 5.988 ms vs <code>duckdb-double</code> 17.739 ms (weftdb-stored 3.0× faster).</li>
+<li><code>tsbs-small</code> interpolate vs B · portable SQL: <code>weftdb-stored-f64</code> p50 2.177 ms vs <code>duckdb-double</code> 17.739 ms (weftdb-stored-f64 8.2× faster).</li>
+<li><code>tsbs-small</code> interpolate vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 5.568 ms vs <code>duckdb-double</code> 17.739 ms (weftdb-stored-bulk 3.2× faster).</li>
+<li><code>tsbs-medium</code> interpolate vs B · portable SQL: <code>weftdb-memory</code> p50 23.340 ms vs <code>duckdb-double</code> 62.302 ms (weftdb-memory 2.7× faster).</li>
+<li><code>tsbs-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored</code> p50 27.900 ms vs <code>duckdb-double</code> 62.302 ms (weftdb-stored 2.2× faster).</li>
+<li><code>tsbs-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored-f64</code> p50 10.258 ms vs <code>duckdb-double</code> 62.302 ms (weftdb-stored-f64 6.1× faster).</li>
+<li><code>tsbs-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 27.226 ms vs <code>duckdb-double</code> 62.302 ms (weftdb-stored-bulk 2.3× faster).</li>
+</ul>
+<h3>Where WeftDB loses</h3>
+<ul>
+<li><code>mcar-small</code> interpolate vs C · client-side: <code>weftdb-memory</code> p50 21.038 ms vs <code>clickhouse-client</code> 5.534 ms (clickhouse-client 3.8× faster).</li>
+<li><code>mcar-small</code> load vs B · portable SQL: <code>weftdb-stored</code> p50 910.332 ms vs <code>clickhouse-double</code> 34.519 ms (clickhouse-double 26.4× faster).</li>
+<li><code>mcar-small</code> interpolate vs B · portable SQL: <code>weftdb-stored</code> p50 26.247 ms vs <code>duckdb-double</code> 24.475 ms (duckdb-double 1.1× faster).</li>
+<li><code>mcar-small</code> interpolate vs C · client-side: <code>weftdb-stored</code> p50 26.247 ms vs <code>clickhouse-client</code> 5.534 ms (clickhouse-client 4.7× faster).</li>
+<li><code>mcar-small</code> downsample vs B · portable SQL: <code>weftdb-stored</code> p50 4.019 ms vs <code>duckdb-double</code> 2.080 ms (duckdb-double 1.9× faster).</li>
+<li><code>mcar-small</code> load vs B · portable SQL: <code>weftdb-stored-f64</code> p50 897.594 ms vs <code>clickhouse-double</code> 34.519 ms (clickhouse-double 26.0× faster).</li>
+<li><code>mcar-small</code> interpolate vs C · client-side: <code>weftdb-stored-f64</code> p50 8.910 ms vs <code>clickhouse-client</code> 5.534 ms (clickhouse-client 1.6× faster).</li>
+<li><code>mcar-small</code> load vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 305.404 ms vs <code>clickhouse-double</code> 34.519 ms (clickhouse-double 8.8× faster).</li>
+<li><code>mcar-small</code> interpolate vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 27.742 ms vs <code>duckdb-double</code> 24.475 ms (duckdb-double 1.1× faster).</li>
+<li><code>mcar-small</code> interpolate vs C · client-side: <code>weftdb-stored-bulk</code> p50 27.742 ms vs <code>clickhouse-client</code> 5.534 ms (clickhouse-client 5.0× faster).</li>
+<li><code>mcar-small</code> downsample vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 4.048 ms vs <code>duckdb-double</code> 2.080 ms (duckdb-double 1.9× faster).</li>
+<li><code>block-small</code> interpolate vs C · client-side: <code>weftdb-memory</code> p50 18.856 ms vs <code>clickhouse-client</code> 5.050 ms (clickhouse-client 3.7× faster).</li>
+<li><code>block-small</code> load vs B · portable SQL: <code>weftdb-stored</code> p50 765.650 ms vs <code>clickhouse-decimal</code> 32.899 ms (clickhouse-decimal 23.3× faster).</li>
+<li><code>block-small</code> interpolate vs C · client-side: <code>weftdb-stored</code> p50 22.706 ms vs <code>clickhouse-client</code> 5.050 ms (clickhouse-client 4.5× faster).</li>
+<li><code>block-small</code> downsample vs B · portable SQL: <code>weftdb-stored</code> p50 3.433 ms vs <code>duckdb-decimal</code> 1.854 ms (duckdb-decimal 1.9× faster).</li>
+<li><code>block-small</code> load vs B · portable SQL: <code>weftdb-stored-f64</code> p50 793.051 ms vs <code>clickhouse-decimal</code> 32.899 ms (clickhouse-decimal 24.1× faster).</li>
+<li><code>block-small</code> interpolate vs C · client-side: <code>weftdb-stored-f64</code> p50 8.324 ms vs <code>clickhouse-client</code> 5.050 ms (clickhouse-client 1.6× faster).</li>
+<li><code>block-small</code> load vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 288.435 ms vs <code>clickhouse-decimal</code> 32.899 ms (clickhouse-decimal 8.8× faster).</li>
+<li><code>block-small</code> interpolate vs C · client-side: <code>weftdb-stored-bulk</code> p50 22.613 ms vs <code>clickhouse-client</code> 5.050 ms (clickhouse-client 4.5× faster).</li>
+<li><code>block-small</code> downsample vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 3.219 ms vs <code>duckdb-decimal</code> 1.854 ms (duckdb-decimal 1.7× faster).</li>
+<li><code>mcar-medium</code> interpolate vs B · portable SQL: <code>weftdb-memory</code> p50 141.324 ms vs <code>duckdb-decimal</code> 48.425 ms (duckdb-decimal 2.9× faster).</li>
+<li><code>mcar-medium</code> interpolate vs C · client-side: <code>weftdb-memory</code> p50 141.324 ms vs <code>clickhouse-client</code> 15.327 ms (clickhouse-client 9.2× faster).</li>
+<li><code>mcar-medium</code> downsample vs B · portable SQL: <code>weftdb-memory</code> p50 7.683 ms vs <code>duckdb-decimal</code> 4.707 ms (duckdb-decimal 1.6× faster).</li>
+<li><code>mcar-medium</code> load vs B · portable SQL: <code>weftdb-stored</code> p50 5134.862 ms vs <code>clickhouse-double</code> 122.965 ms (clickhouse-double 41.8× faster).</li>
+<li><code>mcar-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored</code> p50 177.728 ms vs <code>duckdb-decimal</code> 48.425 ms (duckdb-decimal 3.7× faster).</li>
+<li><code>mcar-medium</code> interpolate vs C · client-side: <code>weftdb-stored</code> p50 177.728 ms vs <code>clickhouse-client</code> 15.327 ms (clickhouse-client 11.6× faster).</li>
+<li><code>mcar-medium</code> downsample vs B · portable SQL: <code>weftdb-stored</code> p50 17.094 ms vs <code>duckdb-decimal</code> 4.707 ms (duckdb-decimal 3.6× faster).</li>
+<li><code>mcar-medium</code> load vs B · portable SQL: <code>weftdb-stored-f64</code> p50 5227.047 ms vs <code>clickhouse-double</code> 122.965 ms (clickhouse-double 42.5× faster).</li>
+<li><code>mcar-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored-f64</code> p50 65.351 ms vs <code>duckdb-decimal</code> 48.425 ms (duckdb-decimal 1.3× faster).</li>
+<li><code>mcar-medium</code> interpolate vs C · client-side: <code>weftdb-stored-f64</code> p50 65.351 ms vs <code>clickhouse-client</code> 15.327 ms (clickhouse-client 4.3× faster).</li>
+<li><code>mcar-medium</code> load vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 964.077 ms vs <code>clickhouse-double</code> 122.965 ms (clickhouse-double 7.8× faster).</li>
+<li><code>mcar-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 174.457 ms vs <code>duckdb-decimal</code> 48.425 ms (duckdb-decimal 3.6× faster).</li>
+<li><code>mcar-medium</code> interpolate vs C · client-side: <code>weftdb-stored-bulk</code> p50 174.457 ms vs <code>clickhouse-client</code> 15.327 ms (clickhouse-client 11.4× faster).</li>
+<li><code>mcar-medium</code> downsample vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 27.480 ms vs <code>duckdb-decimal</code> 4.707 ms (duckdb-decimal 5.8× faster).</li>
+<li><code>block-medium</code> interpolate vs B · portable SQL: <code>weftdb-memory</code> p50 110.443 ms vs <code>duckdb-double</code> 40.857 ms (duckdb-double 2.7× faster).</li>
+<li><code>block-medium</code> interpolate vs C · client-side: <code>weftdb-memory</code> p50 110.443 ms vs <code>clickhouse-client</code> 12.783 ms (clickhouse-client 8.6× faster).</li>
+<li><code>block-medium</code> downsample vs B · portable SQL: <code>weftdb-memory</code> p50 5.759 ms vs <code>duckdb-decimal</code> 3.669 ms (duckdb-decimal 1.6× faster).</li>
+<li><code>block-medium</code> load vs B · portable SQL: <code>weftdb-stored</code> p50 4114.217 ms vs <code>clickhouse-double</code> 103.066 ms (clickhouse-double 39.9× faster).</li>
+<li><code>block-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored</code> p50 138.624 ms vs <code>duckdb-double</code> 40.857 ms (duckdb-double 3.4× faster).</li>
+<li><code>block-medium</code> interpolate vs C · client-side: <code>weftdb-stored</code> p50 138.624 ms vs <code>clickhouse-client</code> 12.783 ms (clickhouse-client 10.8× faster).</li>
+<li><code>block-medium</code> downsample vs B · portable SQL: <code>weftdb-stored</code> p50 14.034 ms vs <code>duckdb-decimal</code> 3.669 ms (duckdb-decimal 3.8× faster).</li>
+<li><code>block-medium</code> load vs B · portable SQL: <code>weftdb-stored-f64</code> p50 4116.308 ms vs <code>clickhouse-double</code> 103.066 ms (clickhouse-double 39.9× faster).</li>
+<li><code>block-medium</code> interpolate vs C · client-side: <code>weftdb-stored-f64</code> p50 42.948 ms vs <code>clickhouse-client</code> 12.783 ms (clickhouse-client 3.4× faster).</li>
+<li><code>block-medium</code> load vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 807.529 ms vs <code>clickhouse-double</code> 103.066 ms (clickhouse-double 7.8× faster).</li>
+<li><code>block-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 129.454 ms vs <code>duckdb-double</code> 40.857 ms (duckdb-double 3.2× faster).</li>
+<li><code>block-medium</code> interpolate vs C · client-side: <code>weftdb-stored-bulk</code> p50 129.454 ms vs <code>clickhouse-client</code> 12.783 ms (clickhouse-client 10.1× faster).</li>
+<li><code>block-medium</code> downsample vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 16.770 ms vs <code>duckdb-decimal</code> 3.669 ms (duckdb-decimal 4.6× faster).</li>
+<li><code>uci-small</code> interpolate vs C · client-side: <code>weftdb-memory</code> p50 18.860 ms vs <code>clickhouse-client</code> 5.585 ms (clickhouse-client 3.4× faster).</li>
+<li><code>uci-small</code> load vs B · portable SQL: <code>weftdb-stored</code> p50 887.359 ms vs <code>clickhouse-double</code> 34.024 ms (clickhouse-double 26.1× faster).</li>
+<li><code>uci-small</code> interpolate vs C · client-side: <code>weftdb-stored</code> p50 23.142 ms vs <code>clickhouse-client</code> 5.585 ms (clickhouse-client 4.1× faster).</li>
+<li><code>uci-small</code> downsample vs B · portable SQL: <code>weftdb-stored</code> p50 3.529 ms vs <code>duckdb-decimal</code> 2.151 ms (duckdb-decimal 1.6× faster).</li>
+<li><code>uci-small</code> load vs B · portable SQL: <code>weftdb-stored-f64</code> p50 894.241 ms vs <code>clickhouse-double</code> 34.024 ms (clickhouse-double 26.3× faster).</li>
+<li><code>uci-small</code> interpolate vs C · client-side: <code>weftdb-stored-f64</code> p50 9.044 ms vs <code>clickhouse-client</code> 5.585 ms (clickhouse-client 1.6× faster).</li>
+<li><code>uci-small</code> load vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 305.982 ms vs <code>clickhouse-double</code> 34.024 ms (clickhouse-double 9.0× faster).</li>
+<li><code>uci-small</code> interpolate vs C · client-side: <code>weftdb-stored-bulk</code> p50 23.009 ms vs <code>clickhouse-client</code> 5.585 ms (clickhouse-client 4.1× faster).</li>
+<li><code>uci-small</code> downsample vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 3.230 ms vs <code>duckdb-decimal</code> 2.151 ms (duckdb-decimal 1.5× faster).</li>
+<li><code>uci-medium</code> interpolate vs B · portable SQL: <code>weftdb-memory</code> p50 137.223 ms vs <code>duckdb-double</code> 82.015 ms (duckdb-double 1.7× faster).</li>
+<li><code>uci-medium</code> interpolate vs C · client-side: <code>weftdb-memory</code> p50 137.223 ms vs <code>clickhouse-client</code> 20.093 ms (clickhouse-client 6.8× faster).</li>
+<li><code>uci-medium</code> downsample vs B · portable SQL: <code>weftdb-memory</code> p50 16.609 ms vs <code>duckdb-decimal</code> 5.859 ms (duckdb-decimal 2.8× faster).</li>
+<li><code>uci-medium</code> load vs B · portable SQL: <code>weftdb-stored</code> p50 5296.517 ms vs <code>clickhouse-double</code> 111.679 ms (clickhouse-double 47.4× faster).</li>
+<li><code>uci-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored</code> p50 168.009 ms vs <code>duckdb-double</code> 82.015 ms (duckdb-double 2.0× faster).</li>
+<li><code>uci-medium</code> interpolate vs C · client-side: <code>weftdb-stored</code> p50 168.009 ms vs <code>clickhouse-client</code> 20.093 ms (clickhouse-client 8.4× faster).</li>
+<li><code>uci-medium</code> downsample vs B · portable SQL: <code>weftdb-stored</code> p50 22.471 ms vs <code>duckdb-decimal</code> 5.859 ms (duckdb-decimal 3.8× faster).</li>
+<li><code>uci-medium</code> load vs B · portable SQL: <code>weftdb-stored-f64</code> p50 5129.886 ms vs <code>clickhouse-double</code> 111.679 ms (clickhouse-double 45.9× faster).</li>
+<li><code>uci-medium</code> interpolate vs C · client-side: <code>weftdb-stored-f64</code> p50 53.453 ms vs <code>clickhouse-client</code> 20.093 ms (clickhouse-client 2.7× faster).</li>
+<li><code>uci-medium</code> load vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 922.635 ms vs <code>clickhouse-double</code> 111.679 ms (clickhouse-double 8.3× faster).</li>
+<li><code>uci-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 162.153 ms vs <code>duckdb-double</code> 82.015 ms (duckdb-double 2.0× faster).</li>
+<li><code>uci-medium</code> interpolate vs C · client-side: <code>weftdb-stored-bulk</code> p50 162.153 ms vs <code>clickhouse-client</code> 20.093 ms (clickhouse-client 8.1× faster).</li>
+<li><code>uci-medium</code> downsample vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 30.869 ms vs <code>duckdb-decimal</code> 5.859 ms (duckdb-decimal 5.3× faster).</li>
+<li><code>tsbs-small</code> interpolate vs C · client-side: <code>weftdb-memory</code> p50 5.039 ms vs <code>questdb-client</code> 1.818 ms (questdb-client 2.8× faster).</li>
+<li><code>tsbs-small</code> downsample vs B · portable SQL: <code>weftdb-memory</code> p50 0.929 ms vs <code>questdb-double</code> 0.585 ms (questdb-double 1.6× faster).</li>
+<li><code>tsbs-small</code> load vs B · portable SQL: <code>weftdb-stored</code> p50 256.239 ms vs <code>clickhouse-decimal</code> 20.248 ms (clickhouse-decimal 12.7× faster).</li>
+<li><code>tsbs-small</code> interpolate vs C · client-side: <code>weftdb-stored</code> p50 5.988 ms vs <code>questdb-client</code> 1.818 ms (questdb-client 3.3× faster).</li>
+<li><code>tsbs-small</code> downsample vs B · portable SQL: <code>weftdb-stored</code> p50 1.546 ms vs <code>questdb-double</code> 0.585 ms (questdb-double 2.6× faster).</li>
+<li><code>tsbs-small</code> load vs B · portable SQL: <code>weftdb-stored-f64</code> p50 267.731 ms vs <code>clickhouse-decimal</code> 20.248 ms (clickhouse-decimal 13.2× faster).</li>
+<li><code>tsbs-small</code> load vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 199.962 ms vs <code>clickhouse-decimal</code> 20.248 ms (clickhouse-decimal 9.9× faster).</li>
+<li><code>tsbs-small</code> interpolate vs C · client-side: <code>weftdb-stored-bulk</code> p50 5.568 ms vs <code>questdb-client</code> 1.818 ms (questdb-client 3.1× faster).</li>
+<li><code>tsbs-small</code> downsample vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 1.496 ms vs <code>questdb-double</code> 0.585 ms (questdb-double 2.6× faster).</li>
+<li><code>tsbs-medium</code> interpolate vs C · client-side: <code>weftdb-memory</code> p50 23.340 ms vs <code>clickhouse-client</code> 11.199 ms (clickhouse-client 2.1× faster).</li>
+<li><code>tsbs-medium</code> downsample vs B · portable SQL: <code>weftdb-memory</code> p50 6.652 ms vs <code>duckdb-double</code> 3.051 ms (duckdb-double 2.2× faster).</li>
+<li><code>tsbs-medium</code> load vs B · portable SQL: <code>weftdb-stored</code> p50 618.212 ms vs <code>clickhouse-double</code> 27.291 ms (clickhouse-double 22.7× faster).</li>
+<li><code>tsbs-medium</code> interpolate vs C · client-side: <code>weftdb-stored</code> p50 27.900 ms vs <code>clickhouse-client</code> 11.199 ms (clickhouse-client 2.5× faster).</li>
+<li><code>tsbs-medium</code> downsample vs B · portable SQL: <code>weftdb-stored</code> p50 9.320 ms vs <code>duckdb-double</code> 3.051 ms (duckdb-double 3.1× faster).</li>
+<li><code>tsbs-medium</code> load vs B · portable SQL: <code>weftdb-stored-f64</code> p50 636.215 ms vs <code>clickhouse-double</code> 27.291 ms (clickhouse-double 23.3× faster).</li>
+<li><code>tsbs-medium</code> load vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 211.896 ms vs <code>clickhouse-double</code> 27.291 ms (clickhouse-double 7.8× faster).</li>
+<li><code>tsbs-medium</code> interpolate vs C · client-side: <code>weftdb-stored-bulk</code> p50 27.226 ms vs <code>clickhouse-client</code> 11.199 ms (clickhouse-client 2.4× faster).</li>
+<li><code>tsbs-medium</code> downsample vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 10.179 ms vs <code>duckdb-double</code> 3.051 ms (duckdb-double 3.3× faster).</li>
+</ul>
+<h3>Within noise</h3>
+<ul>
+<li><code>block-small</code> interpolate vs B · portable SQL: <code>weftdb-stored</code> p50 22.706 ms vs <code>duckdb-double</code> 23.080 ms (intervals overlap).</li>
+<li><code>block-small</code> interpolate vs B · portable SQL: <code>weftdb-stored-bulk</code> p50 22.613 ms vs <code>duckdb-double</code> 23.080 ms (intervals overlap).</li>
+<li><code>block-medium</code> interpolate vs B · portable SQL: <code>weftdb-stored-f64</code> p50 42.948 ms vs <code>duckdb-double</code> 40.857 ms (intervals overlap).</li>
+<li><code>tsbs-small</code> interpolate vs C · client-side: <code>weftdb-stored-f64</code> p50 2.177 ms vs <code>questdb-client</code> 1.818 ms (intervals overlap).</li>
+<li><code>tsbs-medium</code> interpolate vs C · client-side: <code>weftdb-stored-f64</code> p50 10.258 ms vs <code>clickhouse-client</code> 11.199 ms (intervals overlap).</li>
+</ul>
+<h3>Not tested</h3>
+<ul>
+<li><code>mcar</code> ran at 2 of 3 scales (medium, small).</li>
+<li><code>block</code> ran at 2 of 3 scales (medium, small).</li>
+<li><code>uci</code> ran at 2 of 3 scales (medium, small).</li>
+<li><code>tsbs</code> ran at 2 of 3 scales (medium, small).</li>
+<li>OS-cold and post-restart reads: every rep in this run was warm (pass <code>--cold-hook</code> for cold ones).</li>
+<li>TSBS's query suite (<code>cpu-max-all</code>, <code>high-cpu</code>, <code>groupby-orderby-limit</code>, <code>lastpoint</code> and the rest): those queries group many hosts' series by tag, which WeftDB stores only once tagged ingest lands (TAG-11); the <code>tsbs</code> datasets run TSBS's data through this benchmark's own phases, one host at a time.</li>
+<li>Gap fill, point and range reads: measured by <code>weft-bench</code> against WeftDB's own baselines, not against another engine.</li>
+<li>Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB, QuestDB, InfluxDB 3 and IoTDB has a built-in spline in the SQL these arms use (IoTDB's optional UDF library has one for its tree model, not loaded here), so only linear interpolation is compared.</li>
+<li>Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.</li>
+<li>Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).</li>
+<li>kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.</li>
+<li>GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report.</li>
+</ul>
+<h3>Known limitations</h3>
+<ul>
+<li>DuckDB has no interpolation function. Its arm is hand-written SQL (two <code>ASOF JOIN</code>s and the first/last segment extended), which is what a DuckDB user would write, and it is gated against WeftDB's grid.</li>
+<li>WeftDB has no last-observation-carried-forward fill on stored data in 1.0, so no LOCF comparison is made.</li>
+<li>Every dataset is a single series; the grid is fixed per dataset, so input size grows with scale while output size does not.</li>
+<li>Load layouts differ by arm: <code>weftdb-stored</code> and <code>weftdb-stored-f64</code> seal 1,024-row durable segments (the layout the stored read path is measured on), <code>weftdb-stored-bulk</code> seals one segment per load, and DuckDB does one bulk append and one CHECKPOINT. <code>weftdb-stored-bulk</code> is the like-for-like load comparison.</li>
+<li><code>duckdb-decimal</code> stores the knots exactly as <code>DECIMAL(18, s)</code>, but its interpolation line is computed in <code>DOUBLE</code> (DuckDB's <code>DECIMAL × DOUBLE</code> is <code>DOUBLE</code>), as is WeftDB's (splimes computes in <code>f64</code>). Neither engine interpolates in exact decimal arithmetic.</li>
+<li>ClickHouse's own gap filling (<code>WITH FILL … INTERPOLATE</code>) carries the previous row's expression forward rather than drawing a line between neighbours, so its arm runs the same hand-written <code>ASOF JOIN</code> SQL as DuckDB's, gated the same way.</li>
+<li>ClickHouse is a server; the other engines run in-process. Its timings include a loopback HTTP round trip and <code>RowBinary</code> encoding both ways, which is what a ClickHouse client pays, and its load is one <code>INSERT</code> into a <code>MergeTree</code> part with <code>fsync_after_insert</code> on.</li>
+<li><code>clickhouse-decimal</code> stores the knots exactly as <code>Decimal64(s)</code>; its interpolation line is computed in <code>Float64</code>, since ClickHouse refuses <code>Decimal × Float64</code> without a cast.</li>
+<li>TimescaleDB's <code>time_bucket_gapfill</code> with <code>interpolate()</code> draws its line between bucket aggregates at bucket boundaries, not between the knots, and does not extend past the data, so on jittered knots it computes a different answer. Its arm is the SQL a PostgreSQL user writes without <code>ASOF JOIN</code>: two index-backed <code>LATERAL … LIMIT 1</code> lookups per grid instant, gated like every arm.</li>
+<li>TimescaleDB is a PostgreSQL server; its timings include the loopback wire protocol, and its load is one text <code>COPY</code> committed with <code>synchronous_commit</code> on, into a hypertable whose one chunk spans the dataset. The hypertable stays in the row store: TimescaleDB's columnstore (compression) is not enabled, so its bytes on disk are uncompressed.</li>
+<li>QuestDB's <code>SAMPLE BY … FILL(LINEAR)</code> fills between bucket aggregates, not between the knots, so its arm builds segments with the native <code>LT JOIN</code> and finds each grid instant's segment with an <code>ASOF JOIN</code>, gated like every arm.</li>
+<li>Open-source QuestDB acknowledges that a write was received, not that it is durable (a durable acknowledgement needs Enterprise). Its load is timed from the first QWP frame until the WAL is applied and the rows are visible, and the engine line records the server's <code>cairo.commit.mode</code>; under <code>sync</code> each commit is synced to disk. In <code>questdb-decimal</code> the bucket mean is <code>avg(v::double)</code>: QuestDB's own <code>avg</code> of a <code>DECIMAL</code> column rounds the mean to the column's scale. Its bytes on disk are <code>table_partitions()</code>'s, which include the space QuestDB reserves ahead in the active partition, so small tables report far more than they hold.</li>
+<li>InfluxDB 3 has no decimal type, so it has one arm, <code>influxdb3-double</code>, and no exact-decimal comparison. Its SQL engine (DataFusion) has no <code>ASOF JOIN</code> and <code>date_bin_gapfill</code>'s <code>interpolate()</code> fills between bucket aggregates, so the arm merges the grid with the knots and finds each grid row's neighbouring knots with running <code>max</code>/<code>min</code> windows over the knot instants, gated like every arm.</li>
+<li>InfluxDB 3's write answers once the WAL file holding the rows is persisted (<code>no_sync=false</code>, its default), and the server flushes its WAL every second (<code>--wal-flush-interval</code>, default <code>1s</code>), so a load takes about a second however small it is; a load is sent as concurrent writes of at most 8 MiB, under the server's 10 MiB request cap, so they share the WAL flush. A series and an instant are its key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none). Its bytes on disk are not reported: the rows sit in the WAL until the server snapshots them to Parquet on its own schedule. InfluxDB 3 Core refuses a query that would read more than 432 Parquet files, and it writes a file per ten minutes of data time with no compaction, so the four-year UCI series is about 200,000 files once snapshotted; the reference server raises that cap with <code>--query-file-limit 300000</code>, and the UCI interpolation times show the cost of reading that many files.</li>
+<li>IoTDB has no decimal type, so it has one arm, <code>iotdb-double</code>, and no exact-decimal comparison. Its SQL has no series generator, so the grid comes from <code>date_bin_gapfill</code> over the grid's span; segments are paired by <code>lead</code> and found by a native <code>ASOF LEFT JOIN</code>. A device and an instant are IoTDB's key, so a second write at the same instant replaces the first: buckets count a duplicated instant once where the reference counts every row (this benchmark's datasets have none).</li>
+<li>IoTDB is reached through its table-model REST API, which answers in JSON; its own clients speak Thrift, which has no Rust client, so its reads carry a text encoding the binary paths of the other servers do not. Writes are <code>insertTablet</code> requests of 100,000 rows in time order, each answered once its WAL entry is synced (<code>wal_mode=SYNC</code>, which the reference server sets; IoTDB's default is <code>ASYNC</code>). Its bytes on disk are the table's TsFiles after a <code>FLUSH</code> issued once the timed loads are done.</li>
+<li>The <code>tsbs</code> datasets are one host's (<code>host_0</code>) <code>usage_user</code> from TSBS's <code>cpu-only</code> generator: an integer random walk read every ten seconds with no gaps, over the synthetic datasets' span, reconstructed per second. So each grid instant falls between knots ten seconds apart, and nine in ten instants are interpolated; there is no ground truth, so only the reference gate applies.</li>
+</ul>
+<h3>Configuration caveats</h3>
+<ul>
+<li>Hardware: AMD Ryzen 9 7950X3D 16-Core Processor (16 physical / 16 logical cores, 125 GiB memory). The working directory was on a ssd ext4 disk at /mnt/weftbench.</li>
+<li>The in-process engines wrote their stores to <code>/mnt/weftbench/tmp</code> (<code>TMPDIR</code>), which may be a different disk from the working directory.</li>
+<li>The IoTDB server stored its data in its own data directory, which this report cannot see; check the reproduction notes for where it was mounted.</li>
+<li>The InfluxDB 3 server stored its data in its own object-store directory, which this report cannot see; check the reproduction notes for where it was mounted.</li>
+<li>The QuestDB server stored its data in its own data directory, which this report cannot see; check the reproduction notes for where it was mounted.</li>
+<li>The TimescaleDB server stored its data in its own data directory, which this report cannot see; check the reproduction notes for where it was mounted.</li>
+<li>The ClickHouse server stored its data in its own data directory, which this report cannot see; check the reproduction notes for where it was mounted.</li>
+<li>Pooled from 2 separate runs; every interval is drawn runs-first and a win or loss needs every run's median to agree. The widest p50 spread between runs was 200.0%.</li>
+<li><strong>Runs answered differently</strong> for mcar-medium / timescaledb-double, which fails those gates.</li>
+<li>Some results have only 6 reps, so their intervals are wide and fewer comparisons can separate from noise.</li>
+</ul>
+<h3>Reproduction</h3>
+<h3>Run manifest</h3>
+<ul>
+<li>uci <code>/mnt/weftbench/data/uci-household-power/household_power_consumption.txt</code>: 132960755 bytes, sha256 <code>4259c9d7ece5dbee9ab8d53682baac68d791c864f0f64a52b4043cb3b90894b7</code>.</li>
+<li>tsbs <code>/mnt/weftbench/tsbs/cpu-only.lp</code>: 207025857 bytes, sha256 <code>30cd624efb6a2d11cec55d4822ddbab8df20fd570f26124ddd92c51fedcee659</code>.</li>
+<li>run <code>/mnt/weftbench/xbench-508-run1/xbench.json</code>: 976144 bytes, sha256 <code>a260b080e12b56830395a44232d148b24eddf45e8a1b7d18c511af840a1f76b1</code>.</li>
+<li>run <code>/mnt/weftbench/xbench-508-run2/xbench.json</code>: 975919 bytes, sha256 <code>9c1042801750b697989183678bcc11457baef8e634cc1757f0a5cd8713d210eb</code>.</li>
+<li>Binary sha256 <code>fa55d4e1eea9d356ff632befad8239c7b4b514dbea5a8465916290f69df7e6f9</code>.</li>
+<li>clickhouse container <code>weft-xbench-clickhouse</code>: image <code>clickhouse/clickhouse-server:latest</code> (<code>sha256:739e099abd1157390960a59e4532d21781d8fde57e6e4151cb920ea02c30b1ce</code>), command <code>/entrypoint.sh</code>, environment <code>CLICKHOUSE_SKIP_USER_SETUP=1 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG=en_US.UTF-8 TZ=UTC CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml</code>.</li>
+<li>timescaledb container <code>weft-xbench-timescale</code>: image <code>timescale/timescaledb:latest-pg17</code> (<code>sha256:b56a3f51991df1f79d0c1a0841cad5c5fa8058fdd6a3ee6886394a6d4c174538</code>), command <code>docker-entrypoint.sh postgres -c timescaledb.telemetry_level=off</code>, environment <code>POSTGRES_PASSWORD=&lt;redacted&gt; POSTGRES_DB=xbench PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin GOSU_VERSION=1.19 LANG=en_US.utf8 PG_MAJOR=17 PG_VERSION=17.11 PG_SHA256=dd27f2b3c59e73ed14aa3324901242bf69a032a6347805f274e6260322d42979 DOCKER_PG_LLVM_DEPS=llvm21-dev 		clang21 PGDATA=/var/lib/postgresql/data</code>.</li>
+<li>questdb container <code>weft-xbench-questdb</code>: image <code>questdb/questdb:latest</code> (<code>sha256:3b11dc5f77aa299c7c9191b10cf50124c9e97663ce93bc50df5040374e87efc9</code>), command <code>/docker-entrypoint.sh</code>, environment <code>QDB_TELEMETRY_ENABLED=false QDB_CAIRO_COMMIT_MODE=sync PATH=/usr/local/bin:/usr/bin container=oci</code>.</li>
+<li>influxdb3 container <code>weft-xbench-influxdb3</code>: image <code>influxdb:3-core</code> (<code>sha256:26875ba5ae6e843fdbd208b1ac4a55fa1d2ec3aa7faf2d0d1b5035cb1f998990</code>), command <code>/usr/bin/entrypoint.sh influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000</code>, environment <code>PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin INFLUXDB_VERSION=3.12.2 INFLUXDB3_PLUGIN_DIR=/plugins INFLUXDB3_DATA_DIR=/home/influxdb3/.influxdb3 INFLUXDB3_SERVE_INVOCATION_METHOD=docker-hub INFLUXDB_IOX_DB_DIR=/var/lib/influxdb3 INFLUXDB3_LOG_FILTER=info</code>.</li>
+<li>iotdb container <code>weft-xbench-iotdb</code>: image <code>apache/iotdb:2.0.11-standalone</code> (<code>sha256:5ace0f3eceff892dd349d02288224c966f3fdeb11d08c4f575b642a110b82338</code>), command <code>/usr/bin/dumb-init -- bash -c entrypoint.sh all</code>, environment <code>timestamp_precision=ns wal_mode=SYNC rest_query_default_row_size_limit=10000000 enable_rest_service=true PATH=/iotdb/sbin/:/iotdb/tools/:/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin JAVA_HOME=/opt/java/openjdk LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8 JAVA_VERSION=jdk-17.0.15+6 IOTDB_HOME=/iotdb VERSION=2.0.11</code>.</li>
+</ul>
+<ul>
+<li>Check out commit <code>4531d48347167ad4d9749fec45dcc3a060ec7316</code>.</li>
+<li>Build: <code>cargo build --release --manifest-path weft-xbench/Cargo.toml</code> (DuckDB compiles from C++; put <code>CARGO_TARGET_DIR</code> on a fast local disk).</li>
+<li>Run: <code>TMPDIR=&lt;scratch on the disk under test&gt; weft-xbench --clickhouse http://127.0.0.1:18123 --timescale postgresql://postgres:&lt;redacted&gt;@127.0.0.1:15432/xbench --questdb 127.0.0.1:19000 --influxdb3 http://127.0.0.1:18181 --iotdb http://127.0.0.1:18080 --out /mnt/weftbench/xbench-508-run1 --scales small,medium --reps 10 --load-reps 3 --uci /mnt/weftbench/data/uci-household-power/household_power_consumption.txt --tsbs /mnt/weftbench/tsbs/cpu-only.lp --container clickhouse=weft-xbench-clickhouse --container timescaledb=weft-xbench-timescale --container questdb=weft-xbench-questdb --container influxdb3=weft-xbench-influxdb3 --container iotdb=weft-xbench-iotdb</code>.</li>
+<li>For the ClickHouse arms, a server on the same disk: <code>docker run -d -p 127.0.0.1:8123:8123 -v &lt;disk under test&gt;/clickhouse:/var/lib/clickhouse clickhouse/clickhouse-server:&lt;version above&gt;</code>, then <code>--clickhouse http://127.0.0.1:8123</code>.</li>
+<li>For the TimescaleDB arms, likewise: <code>docker run -d -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=&lt;password&gt; -e POSTGRES_DB=xbench -v &lt;disk under test&gt;/timescale:/var/lib/postgresql/data timescale/timescaledb:&lt;version above&gt; postgres -c timescaledb.telemetry_level=off</code>, then <code>--timescale postgresql://postgres:&lt;password&gt;@127.0.0.1:5432/xbench</code>.</li>
+<li>For the QuestDB arms: <code>docker run -d -p 127.0.0.1:9000:9000 -e QDB_TELEMETRY_ENABLED=false -e QDB_CAIRO_COMMIT_MODE=sync -v &lt;disk under test&gt;/questdb:/var/lib/questdb questdb/questdb:&lt;version above&gt;</code>, then <code>--questdb 127.0.0.1:9000</code>.</li>
+<li>For the InfluxDB 3 arm: <code>docker run -d -p 127.0.0.1:8181:8181 -v &lt;disk under test&gt;/influxdb3:/var/lib/influxdb3 influxdb:&lt;version above&gt; influxdb3 serve --node-id xbench --object-store file --data-dir /var/lib/influxdb3 --without-auth --disable-telemetry-upload --query-file-limit 300000</code>, then <code>--influxdb3 http://127.0.0.1:8181</code>.</li>
+<li>For the IoTDB arm: <code>docker run -d -p 127.0.0.1:18080:18080 -e enable_rest_service=true -e timestamp_precision=ns -e wal_mode=SYNC -e rest_query_default_row_size_limit=10000000 -v &lt;disk under test&gt;/iotdb:/iotdb/data apache/iotdb:&lt;version above&gt;-standalone</code> (the precision must be set before the first start), then <code>--iotdb http://127.0.0.1:18080</code>.</li>
+<li>For the <code>tsbs</code> datasets: build TSBS's generator at the pinned commit, <code>GOBIN=&lt;dir&gt; go install github.com/timescale/tsbs/cmd/tsbs_generate_data@8323e59c74027b108f4ad5ec5d3e498b0101a02e</code>, write a week of <code>cpu-only</code> data, <code>tsbs_generate_data --use-case=cpu-only --seed=123 --scale=10 --log-interval=10s --timestamp-start=2016-01-01T00:00:00Z --timestamp-end=2016-01-08T00:00:10Z --format=influx &gt; cpu-only.lp</code>, then <code>--tsbs cpu-only.lp</code>.</li>
+<li>Render: <code>weft-xbench render &lt;xbench.json&gt; --out &lt;dir&gt;</code>. The synthetic datasets are regenerated from seed 1592649491.</li>
+</ul>
+</body>
+</html>

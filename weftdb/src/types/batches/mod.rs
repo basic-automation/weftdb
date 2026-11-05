@@ -13,7 +13,6 @@ pub mod batch;
 pub mod batched_measurements;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(clippy::unsafe_derive_deserialize)]
 pub struct Batches(Vec<Batch>);
 
 impl Batches {

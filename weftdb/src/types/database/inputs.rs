@@ -34,6 +34,12 @@ const QUEUE_WRITE_ATTEMPTS: u32 = 10;
 /// one per this many entries (a run used to dequeue in a single commit).
 const DEQUEUE_CHUNK: usize = 5_000;
 
+/// The most batches one transaction of `batch_insert_unprocessed_batches` queues. Each
+/// transaction is a synced commit, so this sets that call's commit count (it used to be one
+/// per batch), while keeping a transaction short enough that a consumer moving batches to
+/// the processed table waits for one chunk, not the whole insert.
+const QUEUE_BATCH_CHUNK: usize = 500;
+
 /// The environment variable that sets, in whole seconds, how long the processed batches DB
 /// remembers a batch pattern extraction consumed (its `extracted_batches` row), and so
 /// how long the queue's duplicate check recognises that batch (crash-consistency design,
@@ -166,9 +172,8 @@ impl Inputs for Database {
 			return Ok(());
 		}
 
-		let metadata_db = self.metadata();
 		let metadata_db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(self.metadata(), metadata_db_path, Some(self.cache.clone())).await?;
 
 		// Process in chunks to avoid SQLite variable limits
 		let chunk_size = 500;
@@ -205,9 +210,8 @@ impl Inputs for Database {
 			return Ok(());
 		}
 
-		let metadata_db = self.metadata();
 		let metadata_db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(self.metadata(), metadata_db_path, Some(self.cache.clone())).await?;
 
 		// Process in chunks to avoid SQLite variable limits
 		let chunk_size = 500;
@@ -257,9 +261,8 @@ impl Inputs for Database {
 
 	/// Clear all unbatched measurements for an aspect
 	async fn clear_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<()> {
-		let metadata_db = self.metadata();
 		let metadata_db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(metadata_db, metadata_db_path, Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(self.metadata(), metadata_db_path, Some(self.cache.clone())).await?;
 
 		let delete_sql = "DELETE FROM unbatched_measurements WHERE aspect_id = ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![aspect_id.as_uuid().to_string()]).await;
@@ -286,19 +289,20 @@ impl Inputs for Database {
 	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
 		// Seal-backed aspects (slice D-S19): a one-row ingest through the
 		// seal store, followed by the store's O(1) fragmentation gate. The
-		// queue enqueue keeps the S18 write-ahead shape until D-S20.
+		// per-timestamp queue is never touched (slice D-S20): the ingest
+		// commit records the aspect's change-log row in its own index
+		// transaction, which is what the batch consumer reads.
 		if self.is_seal_backed(aspect_id).await? {
 			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 			let data_timestamp = measurement.timestamp();
-			self.enqueue_retrying(aspect_id, &[data_timestamp]).await?;
 			let rows = vec![(data_timestamp.timestamp_millis(), measurement.value().clone())];
 			let store = self.seal_store().await?;
 			let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
 			self.forget_cached_earliest_measurement(aspect_id).await;
-			self.requeue_committed(aspect_id, &[data_timestamp]).await;
 			if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&crate::legacy_seal::aspect_key(aspect_id), crate::legacy_seal::SQUASH_TARGET_ROWS).await {
 				tracing::debug!("Failed to run the fragmentation gate after capturing a measurement of aspect {aspect_id}; it is sealed: {e}");
 			}
+			drop(store);
 			return Ok(tx_ids.into_iter().next().unwrap_or_default());
 		}
 		let db = self.get_measurement_db(aspect_id).await?;
@@ -346,6 +350,7 @@ impl Inputs for Database {
 		if let Err(e) = Self::checkpoint_wal_passive(&db).await {
 			tracing::debug!("Failed to checkpoint after capturing a measurement; it is committed: {e}");
 		}
+		drop(db);
 
 		// Check if this measurement falls in a previously compressed range and mark dirty if so
 		if let Err(e) = self.mark_dirty_region_if_needed(aspect_id, data_timestamp).await {
@@ -395,6 +400,7 @@ impl Inputs for Database {
 
 		// Checkpoint WAL to ensure measurement is persisted
 		Self::checkpoint_wal_passive(&db).await?;
+		drop(db);
 
 		// Enqueue measurement for incremental batch processing. The enqueue is an upsert, so
 		// it writes an entry that is already queued and can lose an MVCC conflict to a
@@ -421,22 +427,11 @@ impl Inputs for Database {
 
 		// Seal-backed aspects (slice D-S19): the whole call is one ingest
 		// transaction in the seal store under its derived key, so it is
-		// all-or-nothing and a retry replays it. The queue enqueue keeps
-		// the S18 write-ahead shape until D-S20 replaces the queue.
+		// all-or-nothing and a retry replays it. One call is one commit,
+		// so it records exactly one change-log row (slice D-S20) and never
+		// touches the per-timestamp queue.
 		if self.is_seal_backed(&aspect_id).await? {
-			let min_new = input_measurements.iter().map(InputMeasurement::timestamp).min().unwrap();
-			let max_new = input_measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
-			let all_timestamps: Vec<chrono::DateTime<chrono::Utc>> = input_measurements.iter().map(InputMeasurement::timestamp).collect();
-			self.enqueue_retrying(&aspect_id, &all_timestamps).await?;
-			let rows: Vec<(i64, bigdecimal::BigDecimal)> = input_measurements.iter().map(|m| (m.timestamp().timestamp_millis(), m.value().clone())).collect();
-			let store = self.seal_store().await?;
-			let tx_ids = crate::legacy_seal::ingest_batch(&store, &aspect_id, &dataset_id, &rows).await?;
-			self.forget_cached_earliest_measurement(&aspect_id).await;
-			self.requeue_committed(&aspect_id, &all_timestamps).await;
-			if let Err(e) = self.update_aspect_timestamps(&aspect_id, min_new, max_new).await {
-				tracing::warn!("[batch_capture] Failed to update aspect timestamps for {aspect_id}; the measurements are sealed: {e}");
-			}
-			return Ok(tx_ids);
+			return self.batch_capture_sealed(&aspect_id, &dataset_id, &input_measurements).await;
 		}
 
 		// Compute min/max upfront
@@ -506,26 +501,7 @@ impl Inputs for Database {
 			let chunk_tx_ids: Vec<TxId> = (0..chunk.len()).map(|_| TxId::new()).collect();
 
 			// Build bulk INSERT statement with all measurements
-			let placeholder_str = "(?, ?, ?, ?)";
-			let mut placeholders_str = String::with_capacity(chunk.len() * (placeholder_str.len() + 2));
-			for i in 0..chunk.len() {
-				if i > 0 {
-					placeholders_str.push_str(", ");
-				}
-				placeholders_str.push_str(placeholder_str);
-			}
-
-			let bulk_sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders_str}");
-
-			// Prepare all parameters
-			let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 4);
-			for (i, input_measurement) in chunk.iter().enumerate() {
-				let measurement = Measurement::from_input_measurement(&dataset_id, input_measurement);
-				params.push(chunk_tx_ids[i].as_uuid().to_string());
-				params.push(dataset_id_str.clone());
-				params.push(measurement.timestamp().timestamp_millis().to_string());
-				params.push(measurement.value().to_string());
-			}
+			let (bulk_sql, params) = Self::bulk_insert_statement(chunk, &chunk_tx_ids, &dataset_id, &dataset_id_str);
 
 			if chunk_idx < 3 {
 				tracing::debug!("[batch_capture] Chunk {}: executing INSERT for {} measurements...", chunk_idx, chunk.len());
@@ -599,21 +575,22 @@ impl Inputs for Database {
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Generate TxIds for this chunk only
 		let chunk_tx_ids: Vec<TxId> = (0..chunk.len()).map(|_| TxId::new()).collect();
 
 		// Build bulk INSERT statement with all measurements
 		let placeholder_str = "(?, ?, ?, ?)";
-		let mut placeholders_str = String::with_capacity(chunk.len() * (placeholder_str.len() + 2));
+		let mut placeholder_list = String::with_capacity(chunk.len() * (placeholder_str.len() + 2));
 		for i in 0..chunk.len() {
 			if i > 0 {
-				placeholders_str.push_str(", ");
+				placeholder_list.push_str(", ");
 			}
-			placeholders_str.push_str(placeholder_str);
+			placeholder_list.push_str(placeholder_str);
 		}
 
-		let bulk_sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholders_str}");
+		let bulk_sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholder_list}");
 
 		// Flatten all parameters into a single vector with pre-allocated capacity
 		let dataset_id_str = dataset_id.as_uuid().to_string();
@@ -651,11 +628,11 @@ impl Inputs for Database {
 	}
 
 	/// Capture new measurement chunk (implement missing trait method - simple loop)
-	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>> {
+	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], tx_ids: &[TxId]) -> Result<Vec<TxId>> {
 		let mut successful = Vec::new();
 		let mut successful_timestamps = Vec::new();
 		for (i, m) in chunk.iter().enumerate() {
-			let tx_id = &all_tx_ids[tx_id_offset + i];
+			let tx_id = &tx_ids[i];
 			let measurement = Measurement::from_input_measurement(dataset_id, m);
 			// Simple INSERT - no unique constraints with MVCC
 			let insert_sql = r"
@@ -737,15 +714,20 @@ impl Inputs for Database {
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let processed = self.get_processed_batches_db(aspect_id).await?.connect()?;
 
-		for (i, b) in batches.into_iter().enumerate() {
-			if !self.queue_batch_unless_known(aspect_id, &b, &db, &db_path, &processed).await? {
-				skipped += 1;
-			}
-			tx_ids.push(TxId::new());
+		// One transaction per chunk, not per batch (#505): a commit cost ~11 ms, so 7.5k
+		// windows spent ~85 s committing. Each batch is still checked as
+		// `queue_batch_unless_known` checks one, queued first and inside the transaction
+		// (which also sees the chunk's own earlier inserts), then processed, then extracted.
+		let mut done = 0usize;
+		for chunk in batches.chunks(QUEUE_BATCH_CHUNK) {
+			skipped += chunk.len() - self.queue_batches_unless_known(aspect_id, chunk, &db, &db_path, &processed).await?;
+			tx_ids.extend(chunk.iter().map(|_| TxId::new()));
 
 			// Report progress intermittently
-			if (i + 1) % report_interval == 0 || i + 1 == total {
-				tracing::debug!("Inserted unprocessed batches: {}/{}", i + 1, total);
+			let before = done;
+			done += chunk.len();
+			if before / report_interval != done / report_interval || done == total {
+				tracing::debug!("Inserted unprocessed batches: {done}/{total}");
 			}
 		}
 		if skipped > 0 {
@@ -787,6 +769,7 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let delete_sql = r"DELETE FROM batches WHERE id = ?";
 
@@ -806,6 +789,7 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let delete_sql = r"DELETE FROM batches";
 
@@ -827,6 +811,7 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let delete_sql = r"DELETE FROM batches WHERE created_at < ?";
 
@@ -853,6 +838,7 @@ impl Inputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let insert_sql = r"INSERT INTO batches (id, aspect_id, database_id, size, resolution, measurements, batch_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 		let batch_metadata_size: i64 = match i64::try_from(batch.metadata.size) {
@@ -898,6 +884,7 @@ impl Inputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let delete_sql = r"DELETE FROM batches WHERE id = ?";
 
@@ -922,6 +909,7 @@ impl Inputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Process in sub-chunks to avoid SQLite variable limits
 		let sub_chunk_size = 500;
@@ -950,6 +938,7 @@ impl Inputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let extracted_at = chrono::Utc::now().timestamp_millis();
 		let expired_before = extracted_at.saturating_sub(extracted_batch_retention_millis());
 
@@ -980,6 +969,7 @@ impl Inputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// The extracted-batch record goes with the batches: a full rebuild clears them to
 		// batch, process and extract every window again, which the duplicate check would
@@ -1006,6 +996,7 @@ impl Inputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let delete_sql = r"DELETE FROM batches WHERE created_at < ?";
 
@@ -1032,6 +1023,7 @@ impl Inputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Process in sub-chunks of 100 to avoid SQLite variable limits
 		// SQLite has a limit of ~32,766 variables per statement
@@ -1080,6 +1072,7 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Process in sub-chunks to avoid SQLite variable limits
 		let sub_chunk_size = 500;
@@ -1124,6 +1117,7 @@ impl Inputs for Database {
 		let db = self.get_patterns_db(aspect_id).await?;
 		let db_path = self.get_patterns_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Insert into patterns table
 		let insert_patterns_sql = r"INSERT INTO patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
@@ -1195,6 +1189,7 @@ impl Inputs for Database {
 		let db = self.get_patterns_db(aspect_id).await?;
 		let db_path = self.get_patterns_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let delete_sql = r"DELETE FROM patterns WHERE id = ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![pattern.to_string()]).await;
 		match res {
@@ -1214,6 +1209,7 @@ impl Inputs for Database {
 		let db = self.get_patterns_db(aspect_id).await?;
 		let db_path = self.get_patterns_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let delete_sql = r"DELETE FROM patterns";
 		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
 		match res {
@@ -1248,6 +1244,7 @@ impl Inputs for Database {
 		let event_id = event.id().to_string();
 		let event_name = event.name().to_string();
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let res = conn.as_ref().execute("INSERT INTO events (id, database_id, name, manifestations, created_at) VALUES (?, ?, ?, ?, ?)", turso::params![event_id.clone(), self.id().as_uuid().to_string(), event_name.clone(), manifestations_json.clone(), chrono::Utc::now().timestamp_millis()]).await;
 		match res {
@@ -1281,6 +1278,7 @@ impl Inputs for Database {
 		let db = self.get_events_db(aspect_id).await?;
 		let db_path = self.get_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let delete_sql = r"DELETE FROM events WHERE id = ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![event_id.to_string()]).await;
 		match res {
@@ -1301,6 +1299,7 @@ impl Inputs for Database {
 		let db = self.get_events_db(aspect_id).await?;
 		let db_path = self.get_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let delete_sql = r"DELETE FROM events";
 		let res = conn.as_ref().execute(delete_sql, turso::params![]).await;
 		match res {
@@ -1324,6 +1323,7 @@ impl Inputs for Database {
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
 		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
+		drop(aspect);
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		// Create the schema FIRST, in an exclusive transaction. Turso rejects DDL inside
 		// `BEGIN CONCURRENT` ("DDL statements require an exclusive transaction"), so the
@@ -1373,6 +1373,7 @@ impl Inputs for Database {
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_name = &self.name;
 		let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
+		drop(aspect);
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
@@ -1452,7 +1453,9 @@ impl Inputs for Database {
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let db = aspect.correlations().await?;
 		let db_path = aspect.correlations_path();
+		drop(aspect);
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Insert into correlations table with average_distance
 		let (avg_dist_value, avg_dist_units) = correlation.average_distance().map_or((None, None), |dist| (Some(dist.value().to_string()), Some(dist.units().to_string())));
@@ -1514,7 +1517,9 @@ impl Inputs for Database {
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let db = aspect.correlations().await?;
 		let db_path = aspect.correlations_path();
+		drop(aspect);
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Update correlations table with all fields including average_distance
 		let (avg_dist_value, avg_dist_units) = correlation.average_distance().map_or((None, None), |dist| (Some(dist.value().to_string()), Some(dist.units().to_string())));
@@ -1599,6 +1604,7 @@ impl Inputs for Database {
 		let db = self.get_correlations_db(aspect_id).await?;
 		let db_path = self.get_correlations_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Delete error rates first
 		let delete_err_sql = r"DELETE FROM correlation_error_rates WHERE correlation_id = ?";
@@ -1644,6 +1650,7 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_events_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let _manifestations_json = serde_json::to_string(event.manifestations()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestations: {e}")))?;
 		let event_id = event.id().to_string();
 		let description = event.description().clone().unwrap_or_default();
@@ -1679,6 +1686,7 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_events_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Delete manifestations first
 		let delete_manifestations_sql = r"DELETE FROM event_manifestations WHERE event_id = ?";
@@ -1710,6 +1718,7 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_events_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let delete_manifestations_sql = r"DELETE FROM event_manifestations";
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![]).await;
 		match res {
@@ -1740,6 +1749,7 @@ impl Inputs for Database {
 		let db = self.get_unprocessed_events_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let delete_sql = r"DELETE FROM events WHERE created_at < ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
 		match res {
@@ -1763,6 +1773,7 @@ impl Inputs for Database {
 		let db = self.get_processed_events_db(aspect_id).await?;
 		let db_path = self.get_processed_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let _manifestations_json = serde_json::to_string(event.manifestations()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestations: {e}")))?;
 		let event_id = event.id().to_string();
 		let description = event.description().clone().unwrap_or_default();
@@ -1797,6 +1808,7 @@ impl Inputs for Database {
 		let db = self.get_processed_events_db(aspect_id).await?;
 		let db_path = self.get_processed_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Delete manifestations first
 		let delete_manifestations_sql = r"DELETE FROM event_manifestations WHERE event_id = ?";
@@ -1828,6 +1840,7 @@ impl Inputs for Database {
 		let db = self.get_processed_events_db(aspect_id).await?;
 		let db_path = self.get_processed_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let delete_manifestations_sql = r"DELETE FROM event_manifestations";
 		let res = conn.as_ref().execute(delete_manifestations_sql, turso::params![]).await;
 		match res {
@@ -1858,6 +1871,7 @@ impl Inputs for Database {
 		let db = self.get_processed_events_db(aspect_id).await?;
 		let db_path = self.get_processed_events_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let delete_sql = r"DELETE FROM events WHERE created_at < ?";
 		let res = conn.as_ref().execute(delete_sql, turso::params![older_than.timestamp_millis()]).await;
 		match res {
@@ -1895,6 +1909,7 @@ impl Inputs for Database {
 
 			Self::commit_concurrent(&conn).await?;
 			Self::checkpoint_wal_passive(&db).await?;
+			drop(db);
 			return Ok(());
 		}
 
@@ -1938,6 +1953,7 @@ impl Inputs for Database {
 
 		Self::commit_concurrent(&conn).await?;
 		Self::checkpoint_wal_passive(&db).await?;
+		drop(db);
 
 		// Invalidate cache
 		let cache_key = format!("aspect_measurements_{}", aspect_id.as_uuid());
@@ -2045,6 +2061,38 @@ impl Database {
 		Ok(true)
 	}
 
+	/// [`queue_batch_unless_known`](Self::queue_batch_unless_known) for every batch of
+	/// `batches` in one transaction, returning how many were inserted. Each batch is checked
+	/// in the same order, its queued check inside the transaction, so a repeat within
+	/// `batches` finds the first one queued.
+	async fn queue_batches_unless_known(&self, aspect_id: &AspectId, batches: &[Batch], db: &turso::Database, db_path: &str, processed: &turso::Connection) -> Result<usize> {
+		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
+		let mut inserted = 0usize;
+		for batch in batches {
+			let queued = async {
+				let (measurements_json, batch_hash) = Self::batch_identity(batch)?;
+				let known = if Self::batch_hash_stored(conn.as_ref(), aspect_id, &batch_hash).await? { Some("queued") } else { Self::processed_or_extracted(processed, aspect_id, &batch_hash).await? };
+				if let Some(state) = known {
+					tracing::debug!("Batch {} for aspect {aspect_id} is already {state} (hash {batch_hash}); not queuing it again", batch.id());
+					return Ok(false);
+				}
+				self.insert_unprocessed_batch_row(&conn, aspect_id, batch, measurements_json, batch_hash).await?;
+				Ok::<bool, anyhow::Error>(true)
+			}
+			.await;
+			match queued {
+				Ok(true) => inserted += 1,
+				Ok(false) => {}
+				Err(e) => {
+					let _ = Self::rollback_concurrent(&conn).await;
+					return Err(e);
+				}
+			}
+		}
+		Self::commit_concurrent(&conn).await?;
+		Ok(inserted)
+	}
+
 	/// Queue `timestamps` again once their rows are committed (crash-consistency design,
 	/// S18).
 	///
@@ -2064,6 +2112,46 @@ impl Database {
 		if let Err(e) = self.enqueue_retrying(aspect_id, timestamps).await {
 			tracing::warn!("Could not queue {} committed timestamps of aspect {aspect_id} again; they stay queued unless a batch consumer ran during this ingest: {e}", timestamps.len());
 		}
+	}
+
+	/// [`batch_capture_measurements`](Inputs::batch_capture_measurements) for a
+	/// seal-backed aspect (slice D-S19): the whole call is one ingest transaction in the
+	/// seal store under its derived key. `input_measurements` is not empty.
+	async fn batch_capture_sealed(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurements: &[InputMeasurement]) -> Result<Vec<TxId>> {
+		let min_new = input_measurements.iter().map(InputMeasurement::timestamp).min().unwrap();
+		let max_new = input_measurements.iter().map(InputMeasurement::timestamp).max().unwrap();
+		let rows: Vec<(i64, bigdecimal::BigDecimal)> = input_measurements.iter().map(|m| (m.timestamp().timestamp_millis(), m.value().clone())).collect();
+		let store = self.seal_store().await?;
+		let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
+		drop(store);
+		self.forget_cached_earliest_measurement(aspect_id).await;
+		if let Err(e) = self.update_aspect_timestamps(aspect_id, min_new, max_new).await {
+			tracing::warn!("[batch_capture] Failed to update aspect timestamps for {aspect_id}; the measurements are sealed: {e}");
+		}
+		Ok(tx_ids)
+	}
+
+	/// The bulk `INSERT` of one chunk of measurements and its parameters, `tx_ids[i]`
+	/// naming `chunk[i]`.
+	fn bulk_insert_statement(chunk: &[InputMeasurement], tx_ids: &[TxId], dataset_id: &DatasetId, dataset_id_str: &str) -> (String, Vec<String>) {
+		let placeholder_str = "(?, ?, ?, ?)";
+		let mut placeholder_list = String::with_capacity(chunk.len() * (placeholder_str.len() + 2));
+		for i in 0..chunk.len() {
+			if i > 0 {
+				placeholder_list.push_str(", ");
+			}
+			placeholder_list.push_str(placeholder_str);
+		}
+		let bulk_sql = format!("INSERT INTO measurements (id, dataset_id, timestamp, value) VALUES {placeholder_list}");
+		let mut params: Vec<String> = Vec::with_capacity(chunk.len() * 4);
+		for (tx_id, input_measurement) in tx_ids.iter().zip(chunk) {
+			let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
+			params.push(tx_id.as_uuid().to_string());
+			params.push(dataset_id_str.to_string());
+			params.push(measurement.timestamp().timestamp_millis().to_string());
+			params.push(measurement.value().to_string());
+		}
+		(bulk_sql, params)
 	}
 
 	/// Enqueue `timestamps`, retrying an MVCC write-write conflict with another write to the
@@ -2160,6 +2248,7 @@ impl Database {
 		if let Some((start_millis, end_millis)) = compressed_range {
 			// Open a new connection for the write
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			let now = chrono::Utc::now();
 
@@ -2214,6 +2303,7 @@ impl Database {
 
 		if !compressed_ranges.is_empty() {
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 			let now = chrono::Utc::now();
 
 			for (start_millis, end_millis) in &compressed_ranges {
@@ -2260,6 +2350,7 @@ impl Database {
 	async fn register_dictionary_if_absent_once(&self, aspect_id: &AspectId, dictionary_name: &str, metadata: &DictionaryMetadata) -> Result<bool> {
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_path = Self::aspect_dictionaries_db_path(self.name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
+		drop(aspect);
 		let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
 		Aspect::ensure_dictionary_tables(&db).await?;
 		let conn = Self::begin_concurrent(&db, &self.name, Some(self.cache.clone())).await?;

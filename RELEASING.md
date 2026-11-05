@@ -5,9 +5,8 @@ cross-platform binaries on the GitHub release. They are separate steps on purpos
 order: prepare, dry-run the binaries, tag (which drafts the GitHub release), publish
 the crates, then publish the GitHub release.
 
-The library crates are not on crates.io yet: v0.1.0 was a binaries-only baseline and
-published none, and the crates go up with the 1.0 cut. Everything below is written for
-the release that does publish them, and `scripts/publish.sh` refuses to upload anything
+The library crates have been on crates.io since v0.2.0; v0.1.0 was a binaries-only
+baseline and published none. `scripts/publish.sh` refuses to upload anything
 whose metadata is out of step (see [Which crates are published](#which-crates-are-published)).
 
 ## 0. Before the first release
@@ -270,7 +269,7 @@ somewhere else is how a crate joins the workspace and then never joins the regis
 As of writing that is:
 
 Published: `weft-physical-type`, `weft-reduce`, `weft-line-protocol`,
-`weft-arrow`, `weftdb`, `weft-arrow-store`, `weft-orchestration`.
+`weft-arrow`, `weftdb`, `weft-arrow-store`, `weft-orchestration`, `weft-client`.
 
 `splimes` is released from its own repository
 ([basic-automation/splimes](https://github.com/basic-automation/splimes)) and consumed

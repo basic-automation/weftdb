@@ -1,0 +1,76 @@
+name: crash matrix
+
+# D-S21's crash-matrix CI (SOA-9 `crash_kill9`): the subprocess SIGKILL soak
+# plus the fault-injection crash matrix, as one scripted run
+# (`scripts/crash-matrix.sh`), with the matrix report published through
+# EVI-4's artifact pipeline (the `bench-report` artifact, 90-day retention).
+# A matrix cell either holds or it does not, so there is no nightly compare
+# gate here: the first successful run becomes the baseline by hand, and a red
+# run is a durability failure, not a regression to triage.
+#
+# Linux only: the soak kills a child with SIGKILL and the fault-injection
+# matrix checks the child's SIGABRT, neither of which a Windows or macOS
+# runner provides. This is a separate workflow, not a ci.yml job, so the
+# matrix's longer soak does not hold up every push: it runs on crash-path
+# pull requests, weekly, and on dispatch.
+#
+# What this workflow does not claim: power-loss durability. A kill soak
+# cannot see a missing fsync; the privileged power-loss validation stays
+# the owner task the 1.0 plan names (decision 20).
+
+on:
+  pull_request:
+    paths:
+      - weft-bench/**
+      - weftdb/**
+      - weft-orchestration/**
+      - weft-server/**
+      - scripts/crash-matrix.sh
+      - scripts/bench/stage-artifacts.sh
+      - .github/workflows/crash-matrix.yml
+  schedule:
+    # Sundays 08:00 UTC: after ci.yml's nightly run, so the two do not
+    # compete for the same runners.
+    - cron: "0 8 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  crash-matrix:
+    name: crash matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the crash matrix
+        shell: bash
+        run: |
+          RUSTUP_TOOLCHAIN="$(tr -d '[:space:]' < .github/release-toolchain)"
+          export RUSTUP_TOOLCHAIN
+          bash scripts/crash-matrix.sh --stage bench-stage
+      # EVI-4 artifact pipeline: staged flat by the script, uploaded even
+      # when the matrix failed, because a red matrix's report is the
+      # evidence of which cell failed.
+      - name: Upload the matrix report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-report
+          path: bench-stage
+          if-no-files-found: error
+          retention-days: 90

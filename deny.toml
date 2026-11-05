@@ -36,6 +36,10 @@ exceptions = [
 	{ allow = ["MPL-2.0"], crate = "option-ext" },
 	# Only reachable on targets WeftDB doesn't ship for (via crossterm's Windows/terminfo path).
 	{ allow = ["WTFPL"], crate = "terminfo" },
+	# CDLA-Permissive-2.0 is the Mozilla CA list's data licence. Only reachable on wasm32
+	# (rustls-platform-verifier's bundled roots, via weft-client's `rustls` feature), a target
+	# WeftDB doesn't build for; no shipped binary links it.
+	{ allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
 ]
 
 [bans]

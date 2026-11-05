@@ -328,10 +328,8 @@ impl PagedSegment {
 		if self.stats.row_count == 0 {
 			return 0.0;
 		}
-		#[allow(clippy::cast_precision_loss)]
-		let n = self.stats.row_count as f64;
-		#[allow(clippy::cast_precision_loss)]
-		let total = self.total_bytes() as f64;
+		let n = crate::cast::usize_to_f64(self.stats.row_count);
+		let total = crate::cast::usize_to_f64(self.total_bytes());
 		total / n
 	}
 
@@ -439,9 +437,7 @@ impl PagedSegment {
 			return 1.0;
 		}
 		let blocked: usize = self.pages.iter().map(|p| p.timestamps.blocked_estimated_bytes()).sum();
-		#[allow(clippy::cast_precision_loss)]
-		let ratio = blocked as f64 / best as f64;
-		ratio
+		crate::cast::usize_to_f64(blocked) / crate::cast::usize_to_f64(best)
 	}
 
 	/// Read a paged segment back from a `.weftseg` byte frame, verifying its checksum.
@@ -546,7 +542,7 @@ mod tests {
 		assert_eq!(seg.value_at(200), None);
 		// Every stored instant round-trips through the point lookup.
 		for (i, &t) in timestamps.iter().enumerate() {
-			assert_eq!(seg.value_at(t), Some(BigDecimal::from(i as i64)), "miss at {t}");
+			assert_eq!(seg.value_at(t), Some(BigDecimal::from(i64::try_from(i).expect("fits i64"))), "miss at {t}");
 		}
 	}
 
@@ -654,8 +650,8 @@ mod tests {
 		assert!((seg.bytes_per_point() - 0.0).abs() < f64::EPSILON);
 		assert_eq!(seg.prune_pages_by_time(i64::MIN, i64::MAX), Vec::<usize>::new());
 		let (ts, vs) = seg.decode_nullable();
-		assert!(ts.is_empty());
-		assert!(vs.is_empty());
+		assert_eq!(ts.len(), 0);
+		assert_eq!(vs.len(), 0);
 	}
 
 	#[test]

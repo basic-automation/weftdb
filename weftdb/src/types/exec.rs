@@ -1,7 +1,8 @@
-//! The execution scopes the process's panic handling keys off (robustness
-//! track ROB-2 and ROB-3, release plan C12): this module is the
-//! `weftdb::exec` entry point — the one place a host runs work whose panics
-//! it means to classify, rather than a place that decides what a panic costs.
+//! The execution scopes the process's panic handling keys off (robustness track ROB-2 and ROB-3,
+//! release plan C12).
+//!
+//! This module is the `weftdb::exec` entry point — the one place a host runs work whose panics it means
+//! to classify, rather than a place that decides what a panic costs.
 //!
 //! ## The control-plane write scope (ROB-2)
 //!
@@ -23,7 +24,7 @@
 //! ## The ingest phase scope and the panic catch (ROB-3)
 //!
 //! ROB-3's catch is the only layer that catches panics (plan C12; the
-//! CatchPanicLayer FRE-6a proposed was dropped in X-ERR for exactly this).
+//! `CatchPanicLayer` FRE-6a proposed was dropped in X-ERR for exactly this).
 //! [`catch`] is that catch's library half: it runs a future under
 //! `catch_unwind` and, when the future panics, hands the caller a
 //! [`CaughtPanic`] — the payload rendered safely, and the
@@ -115,19 +116,13 @@ pub struct CaughtPanic {
 	pub ingest_phase: Option<IngestPhase>,
 }
 
-/// Render a panic payload as text without ever formatting an arbitrary
-/// payload: only `&str` and `String` payloads — the kinds `panic!` itself
-/// produces — are shown; anything else is reported as unprintable rather
-/// than risking a `Display` impl that panics inside panic handling.
+/// Render a panic payload as text without ever formatting an arbitrary payload.
+///
+/// Only `&str` and `String` payloads — the kinds `panic!` itself produces — are shown; anything else is
+/// reported as unprintable rather than risking a `Display` impl that panics inside panic handling.
 #[must_use]
 pub fn panic_message(payload: &(dyn Any + Send)) -> String {
-	if let Some(text) = payload.downcast_ref::<&str>() {
-		(*text).to_owned()
-	} else if let Some(text) = payload.downcast_ref::<String>() {
-		text.clone()
-	} else {
-		"a panic whose payload could not be printed".to_owned()
-	}
+	payload.downcast_ref::<&str>().map_or_else(|| payload.downcast_ref::<String>().map_or_else(|| "a panic whose payload could not be printed".to_owned(), String::clone), |text| (*text).to_owned())
 }
 
 /// Run `fut` and catch any panic it raises, as a [`CaughtPanic`].

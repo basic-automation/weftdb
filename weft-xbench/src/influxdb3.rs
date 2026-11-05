@@ -284,7 +284,10 @@ fn load_db(server: Server, name: String, body: &str) -> anyhow::Result<Db> {
 	// pieces go concurrently, as a bulk loader's batches would, and share that flush instead of
 	// waiting for one each in turn.
 	std::thread::scope(|scope| {
-		let writes: Vec<_> = chunks(body, MAX_WRITE_BYTES).into_iter().map(|piece| scope.spawn(|| db.server.write(&db.name, piece.as_bytes()))).collect();
+		let mut writes = Vec::new();
+		for piece in chunks(body, MAX_WRITE_BYTES) {
+			writes.push(scope.spawn(|| db.server.write(&db.name, piece.as_bytes())));
+		}
 		writes.into_iter().try_for_each(|w| w.join().map_err(|_| anyhow::anyhow!("influxdb3: a write thread panicked"))?)
 	})?;
 	Ok(db)
@@ -350,7 +353,7 @@ impl Arm for Influx {
 		let n = ds.grid_len();
 		match self.class {
 			ArmClass::Native => {
-				let sql = NATIVE_SQL.replace("{start}", &start.to_string()).replace("{end}", &end.to_string()).replace("{step}", &step.to_string());
+				let sql = crate::fill(NATIVE_SQL, &[("start", &start), ("end", &end), ("step", &step)]);
 				let rows = self.on_db(move |server, db| parse_pairs(server.query(db, &sql)?)).await?;
 				return Ok(Output::Float(place(&rows, start, step, n)));
 			}
@@ -360,13 +363,13 @@ impl Arm for Influx {
 			}
 			ArmClass::PortableSql => {}
 		}
-		let sql = INTERPOLATE_SQL.replace("{start}", &start.to_string()).replace("{end}", &end.to_string()).replace("{step}", &step.to_string());
+		let sql = crate::fill(INTERPOLATE_SQL, &[("start", &start), ("end", &end), ("step", &step)]);
 		Ok(Output::Float(self.on_db(move |server, db| parse_grid(server.query(db, &sql)?)).await?))
 	}
 
 	async fn downsample(&mut self, ds: &Dataset, _knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {
 		let width = ds.bucket.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("bucket width out of range"))?;
-		let sql = DOWNSAMPLE_SQL.replace("{width}", &width.to_string());
+		let sql = crate::fill(DOWNSAMPLE_SQL, &[("width", &width)]);
 		self.on_db(move |server, db| parse_buckets(server.query(db, &sql)?)).await
 	}
 }

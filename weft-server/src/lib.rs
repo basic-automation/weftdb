@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! # weft-server
 //!
 //! The benchmark-grade HTTP API surface for WeftDB (roadmap Phase 2). A commercial
@@ -12,7 +15,7 @@
 //!   route registry in [`routes`] (SEC-3): the registry is the single place
 //!   routes are registered, so tests exercise the exact router the binary
 //!   serves (no divergence between test and production wiring), and the same
-//!   registry produces the policy table, the class table and the OpenAPI
+//!   registry produces the policy table, the class table and the `OpenAPI`
 //!   document.
 //! - Liveness vs readiness are kept distinct, matching standard orchestration
 //!   probes: `health` reports the process is up (`GET /health`), `ready`
@@ -31,63 +34,90 @@
 
 // Proving the axum handler bounds for the full router exceeds the default limit of 128;
 // rustc warns that overflowing it will become a hard error.
-#![recursion_limit = "256"]
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 pub mod admission;
+/// SEC-9's fsynced audit log: attempt/outcome records for audited
+/// routes, fail-closed, plus the `weft_audit` events (see [`audit`]).
+pub mod audit;
 pub mod auth;
 pub mod backup_daemon;
 pub mod backup_routes;
+/// The Phase 3 benchmark-run routes.
+///
+/// Run manifests served by content hash (see [`bench_runs`]).
+pub mod bench_runs;
+/// PAC-7's operator CLI.
+///
+/// The one dispatch over the binary's commands and the plan C7 exit-code table the
+/// process's statuses are read against (see [`cli`]).
+pub mod cli;
 /// ROB-3's Daemons registry: supervised background tasks and the shared
 /// shutdown watch (see [`daemons`]).
 pub mod daemons;
 pub mod declare;
 pub mod downsample;
 pub mod error;
+pub mod flight;
 pub mod gpu;
+pub mod grafana;
 pub mod host_guard;
-/// FRE-14c's operator route: `weft-server import-rows-mode`, which reads a 0.1.x data
-/// directory into a Storage v2 store. It is a library module rather than code in `main` so
+/// FRE-14c's operator route: `weft-server import-rows-mode`.
+///
+/// It reads a 0.1.x data directory into a Storage v2 store. It is a library module rather than code in `main` so
 /// its argument parsing and its report are testable, like every other server behaviour.
 pub mod import_rows_mode;
 pub mod ingest;
 pub mod interpolate;
-/// SEC-6's operator tool: `weft-server keygen`, which mints an API key and
-/// records only its hash in the keys file. A library module for the same
+/// SEC-6's operator tool: `weft-server keygen`.
+///
+/// It mints an API key and records only its hash in the keys file. A library module for the same
 /// reason as [`import_rows_mode`]: its parsing and file handling are testable.
 pub mod keygen;
 pub mod maintain;
 pub mod metrics;
+mod num;
 /// ROB-3's single panic-catch layer (see [`panic_catch`]).
 pub mod panic_catch;
 pub mod panic_hook;
 pub mod reconcile_daemon;
-/// SEC-10's secret hygiene for the server's own output: values that can
-/// carry a credential (a URL's userinfo above all) are only ever printed
+/// SEC-10's secret hygiene for the server's own output.
+///
+/// Values that can carry a credential (a URL's userinfo above all) are only ever printed
 /// redacted (see [`redact`]).
 pub mod redact;
-/// PAC-13's operator command: `weft-server restore`, which puts a backup back on disk as a
-/// store root while nothing serves it. A library module for the same reason as
+/// PAC-13's operator command: `weft-server restore`.
+///
+/// It puts a backup back on disk as a store root while nothing serves it. A library module for the same reason as
 /// [`import_rows_mode`]: its parsing, its report and the exit code it refuses with are
 /// testable.
 pub mod restore;
 pub mod routes;
+/// ROB-11's runtime builder: the explicit tokio runtime the binary
+/// runs on (see [`runtime`]).
+pub mod runtime;
 pub mod serve;
 pub mod settings;
 pub mod state;
 pub mod storage;
 pub mod store_open;
+pub mod stored_interpolate;
 #[cfg(test)]
 mod test_fs;
 #[cfg(test)]
 mod test_support;
 pub mod tls;
 pub mod trace;
+/// `GET /api/v1/version` (FRE-12b).
+///
+/// Which build this is, which store it serves, and what its exit statuses mean.
+pub mod version;
 
 pub use admission::{Admission, AdmissionConfig, DEFAULT_QUERY_MAX_INFLIGHT, QUERY_MAX_INFLIGHT_ENV};
-pub use auth::{AuthConfig, GeneratedKey, KeyStore, Principal, AUTH_KEYS_MODE, TOKEN_PREFIX};
+pub use audit::{AuditLog, AUDIT_FILE_ENV, AUDIT_FILE_NAME};
+pub use auth::{spawn_key_reload_watcher, AuthConfig, GeneratedKey, KeyStore, Principal, SharedKeyStore, AUTH_KEYS_MODE, TOKEN_PREFIX};
 use axum::{middleware, Router};
 pub use backup_daemon::{backup_tick, list_generated_backups, prune_generated_backups, spawn_backup_daemon, BackupDaemonConfig};
+pub use bench_runs::{BenchRuns, BENCH_RUNS_DIR_ENV};
 pub use daemons::{DaemonSnapshot, DaemonState, Daemons, RESTART_DELAY};
 pub use downsample::{downsample, downsample_arrow, downsample_csv, downsample_ilp, downsample_ilp_arrow, downsample_ilp_csv, downsample_ilp_parquet, downsample_parquet, Aggregation, DownsampleRequest, DownsampleResponse};
 pub use error::{ApiError, Code};
@@ -96,11 +126,13 @@ pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpola
 pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyHistogram, LatencyHistogramSnapshot, LatencyProfile, Metrics, MetricsSnapshot, ProfileReport, SharedMetrics};
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};
 pub use routes::{build_registry_with_ingest_config, build_registry_with_limits, AdmissionClass, Audit, ClassEntry, IngestAdmission, PolicyEntry, Role, RouteEntry, RouteSpec, RouteTable, Routes, Scope, SealedRoutes};
+pub use runtime::{RuntimeConfig, RUNTIME_SHUTDOWN_TIMEOUT, WORKER_THREADS_ENV};
 use serde::Serialize;
 pub use serve::{ServeLimits, ShutdownSignals, HEADER_READ_TIMEOUT_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV};
 pub use state::AppState;
 pub use storage::{storage_aspect_schema, storage_aspect_stats, storage_aspects, storage_catalog, storage_downsample, storage_downsample_arrow, storage_downsample_csv, storage_downsample_parquet, storage_point, storage_points, storage_stats, storage_time_range, storage_time_range_csv, storage_time_range_json, storage_time_range_parquet, storage_value_range, storage_value_range_csv, storage_value_range_json, storage_value_range_parquet, AspectInfo, AspectListResponse, AspectSchemaResponse, AspectStatsResponse, CatalogDatabase, CatalogResponse, MultiPointParams, PointParams, StorageDownsampleParams, StoreStatsResponse, StoredPoint, StoredPointEntry, StoredPointResponse, StoredPointsResponse, StoredRangeResponse, TimeRangeParams, ValuePointsParams, ValueRangeParams};
 pub use tls::{PlaintextGate, TlsConfig, ALLOW_PLAINTEXT_ENV, AUTH_DISABLED, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV};
+pub use version::{build_info, version, BuildInfo, ScopeInfo, ScopePinInfo, StoreIdentity, VersionResponse};
 
 pub use crate::{
 	declare::{declare_aspect, DeclareAspectRequest, DeclareAspectResponse}, ingest::{ingest_csv, ingest_ilp, ingest_parquet, ingest_points, CsvIngestParams, IlpIngestParams, IngestConfig, IngestPoint, IngestRequest, IngestResponse, ParquetIngestParams, DEFAULT_MAX_INGEST_BYTES, INGEST_MAX_INFLIGHT_BYTES_ENV, MAX_INGEST_BYTES_ENV}, maintain::{fsck_store, purge_expired_quarantine, quarantine_list, quarantine_purge, quarantine_release, reconcile_aspect, reconcile_store, PurgeExpiredResponse, QuarantineParams, ReconcileResponse, ReconcileStoreResponse, SweepFailure}
@@ -132,7 +164,6 @@ impl Default for HealthResponse {
 
 /// Response body for the readiness probe (`GET /ready`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[allow(clippy::struct_excessive_bools, reason = "a probe body is a set of independent flags that orchestrators and operators read by name")]
 pub struct ReadyResponse {
 	/// `true` once the service can accept traffic. The stateless API is always
 	/// ready; this gains further dependency checks as more of the control plane is
@@ -147,16 +178,10 @@ pub struct ReadyResponse {
 	/// Whether a segment store is configured — i.e. the storage-query endpoints
 	/// (`/api/v1/storage/...`) are live rather than answering `503`.
 	pub segment_store: bool,
-	/// Whether the segment store is write-poisoned: a control-plane COMMIT failed in a
-	/// way that may still have committed (not a conflict found while validating it), and
-	/// the store refuses every write until the server restarts. Reads keep working, so
-	/// `ready` stays `true`.
-	pub poisoned: bool,
-	/// Whether the server must be restarted to accept writes again. The restart's open
-	/// replays the control plane's log, which settles the ambiguous commit.
-	pub restart_required: bool,
-	/// Why the store is poisoned, while it is.
-	pub poison_reason: Option<String>,
+	/// The store's write poison (flattened: `poisoned`, `restart_required` and
+	/// `poison_reason` are top-level fields of the body).
+	#[serde(flatten)]
+	pub write: WritePoison,
 	/// The store's identity (`store_uuid` of its `STORE_FORMAT` marker), when a
 	/// store is configured. D-S12.
 	pub store_uuid: Option<String>,
@@ -176,9 +201,24 @@ pub struct ReadyResponse {
 	pub incompatible_store: bool,
 }
 
+/// The write-poison part of [`ReadyResponse`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct WritePoison {
+	/// Whether the segment store is write-poisoned: a control-plane COMMIT failed in a
+	/// way that may still have committed (not a conflict found while validating it), and
+	/// the store refuses every write until the server restarts. Reads keep working, so
+	/// `ready` stays `true`.
+	pub poisoned: bool,
+	/// Whether the server must be restarted to accept writes again. The restart's open
+	/// replays the control plane's log, which settles the ambiguous commit.
+	pub restart_required: bool,
+	/// Why the store is poisoned, while it is.
+	pub poison_reason: Option<String>,
+}
+
 impl Default for ReadyResponse {
 	fn default() -> Self {
-		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false, poisoned: false, restart_required: false, poison_reason: None, store_uuid: None, durability_class: None, previous_clean_shutdown: None, quarantined: 0, suspect: 0, incompatible_store: false }
+		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false, write: WritePoison::default(), store_uuid: None, durability_class: None, previous_clean_shutdown: None, quarantined: 0, suspect: 0, incompatible_store: false }
 	}
 }
 
@@ -187,7 +227,7 @@ impl ReadyResponse {
 	#[must_use]
 	pub fn with_poison(self, poison: Option<weftdb::Poisoned>) -> Self {
 		let poisoned = poison.is_some();
-		Self { poisoned, restart_required: poisoned, poison_reason: poison.map(|p| p.reason), ..self }
+		Self { write: WritePoison { poisoned, restart_required: poisoned, poison_reason: poison.map(|p| p.reason) }, ..self }
 	}
 }
 
@@ -225,6 +265,13 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// inserts, and a refused request never reaches a handler. With no keys
 /// configured in the state it is a pass-through.
 ///
+/// The audit layer ([`audit::audit_route`], SEC-9) sits inside the auth
+/// layer and outside the gate: a request auth refuses is an audit *event*,
+/// never an attempt, and a request the audit layer cannot record an
+/// attempt for never reaches its handler (fail-closed,
+/// `503 audit_unavailable`). With no audit log in the state it is a
+/// pass-through; the binary always attaches one.
+///
 /// The panic-catch layer ([`panic_catch::catch_panic`], ROB-3) sits inside
 /// the trace layer (so a caught panic's envelope still gets its
 /// `request_id`) and outside every other layer: it is the one layer that
@@ -233,7 +280,7 @@ pub fn app_with_metrics(metrics: SharedMetrics) -> Router {
 /// panic inside a control-plane write never reaches it: ROB-2's hook
 /// aborts during the unwind first.
 pub fn app_with_state(state: AppState) -> Router {
-	routes::build_registry_with_limits(state.ingest_config(), state.admission_config()).router().layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
+	routes::build_registry_with_limits(state.ingest_config(), state.admission_config()).router().layer(middleware::from_fn_with_state(state.clone(), audit::audit_route)).layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
 }
 
 /// Mark stored-data reads incomplete when the store holds suspect segments

@@ -21,8 +21,9 @@
 //!   below.
 //! - **Conflict**: a precondition failed. [`IndexOp::ReplaceExpected`] and
 //!   [`IndexOp::DeleteExpected`] must each change exactly the one row whose
-//!   `(aspect, id, gen, frame_crc)` the caller read, and [`IndexOp::InsertNew`] must not
-//!   find its key taken. Another writer got there first; nothing was written.
+//!   `(aspect, id, gen, frame_crc)` the caller read ([`IndexOp::DeleteEveryExpected`]
+//!   each of its rows), and [`IndexOp::InsertNew`] must not find its key taken. Another
+//!   writer got there first; nothing was written.
 //! - **Definite**: any other error before COMMIT. Nothing was written.
 //! - **Ambiguous**: COMMIT itself returned an error. Turso fsyncs the MVCC log inside
 //!   COMMIT and returns a sync error with `?`, so the transaction may be durable even
@@ -41,7 +42,8 @@
 //! **Which conflicts are retried.** A retry re-runs every op on a snapshot that now holds
 //! the commit of the writer that won the conflict, so it is only safe for an op that
 //! re-checks, on that snapshot, what its caller decided from: [`IndexOp::InsertNew`],
-//! [`IndexOp::ReplaceExpected`] and [`IndexOp::DeleteExpected`] are guarded, and a race
+//! [`IndexOp::ReplaceExpected`], [`IndexOp::DeleteExpected`] and
+//! [`IndexOp::DeleteEveryExpected`] are guarded, and a race
 //! they lost turns into a [`TxnErrorKind::Conflict`] on the retry. [`IndexOp::SeqBump`]
 //! only ever raises the allocator row, so running it again over another writer's raise
 //! keeps the larger value; [`IndexOp::RaiseFloor`] only ever raises the floors, and
@@ -56,7 +58,7 @@
 //! (`InsertNew` and `SeqBump`, since S7, plus the rollup fold, since S11) get the retries, and so do the write-once swaps
 //! of every maintenance operation (reconcile and split since S8, the overlap merge,
 //! squash and compaction since S9), whose ops are all guarded: `ReplaceExpected`,
-//! `DeleteExpected`, `InsertNew`, the journal ops and `SeqBump`.
+//! `DeleteEveryExpected`, `InsertNew`, the journal ops and `SeqBump`.
 //!
 //! **The write scope** (robustness track ROB-2). Every transaction runs inside
 //! [`control_plane_write`](crate::exec::control_plane_write), so the process's panic hook
@@ -106,19 +108,22 @@ pub struct IndexRow {
 	pub frame_crc: Option<u32>,
 	/// The aspect epoch the row committed in. `None` on legacy rows.
 	pub commit_epoch: Option<u64>,
-	/// The tag series the row's frame holds (tags A7): 0, the empty tag set, for every row
-	/// until tagged ingest lands.
+	/// The tag series the row's frame holds (tags A7): 0, the empty tag set, for an untagged
+	/// row; otherwise the id the aspect's series catalog holds for the series key the frame's
+	/// envelope carries (TAG-7), which the commit that inserts the row resolved.
 	pub series_id: u64,
 }
 
 impl IndexRow {
 	/// A legacy row: generation 0, nothing bound. What every seal and in-place rewrite
 	/// writes until the write-once protocols take over (S7-S10).
+	#[must_use]
 	pub const fn legacy(desc: SegmentDescriptor) -> Self {
 		Self { desc, gen: 0, prec: None, frame_crc: None, commit_epoch: None, series_id: 0 }
 	}
 
 	/// The identity a precondition on this row names.
+	#[must_use]
 	pub const fn version(&self) -> RowVersion {
 		RowVersion { id: self.desc.id, gen: self.gen, frame_crc: self.frame_crc }
 	}
@@ -143,6 +148,12 @@ pub enum IndexOp {
 	ReplaceExpected { aspect: String, expected: RowVersion, row: IndexRow },
 	/// Delete the row matching `expected`. Exactly one row must match.
 	DeleteExpected { aspect: String, expected: RowVersion },
+	/// Delete the row matching each of `expected`, which name distinct ids: as many
+	/// [`DeleteExpected`](Self::DeleteExpected)s, each row exactly at its version, but in
+	/// a statement per [`DELETE_CHUNK`] rows rather than one per row (#507). Under Turso's
+	/// MVCC each keyed delete cost milliseconds, growing with the versions earlier swaps
+	/// left behind, so a squash of 10M rows spent ~350 s deleting its members one at a time.
+	DeleteEveryExpected { aspect: String, expected: Vec<RowVersion> },
 	/// Insert `row`, replacing any row with its `(aspect, id)` (`INSERT OR REPLACE`): the
 	/// legacy [`SegmentIndexStore::insert`](crate::SegmentIndexStore::insert). No path of
 	/// the store writes it any more: seals insert with [`InsertNew`](Self::InsertNew) (S7)
@@ -204,6 +215,17 @@ pub enum IndexOp {
 	/// (R10, D-S12), creating the row if the aspect has none, and never lowering
 	/// it: a series id, once handed out, is never handed out again.
 	SeedSeries { aspect: String, next_series_id: u64 },
+	/// Register `series_key` as series `series_id` of `aspect` in the series catalog
+	/// (TAG-5): a plain `INSERT` on the `(aspect, series_key)` primary key, never
+	/// `OR REPLACE`, so a key already registered is a [`TxnErrorKind::Conflict`] and its
+	/// first id stands. The id comes from the aspect's allocator, so a caller always
+	/// pairs this with a [`SeedSeries`](Self::SeedSeries) raising
+	/// `next_series_id` past it, in the same transaction as the rows that use the
+	/// series. The insert also re-checks that no key of `aspect` holds `series_id`, so
+	/// a taken id is a `Conflict` as well. The empty key is series 0 and is never
+	/// registered: registering it, or any key as series 0, is refused as
+	/// [`TxnErrorKind::Definite`] before any statement runs.
+	RegisterSeries { aspect: String, series_id: crate::SeriesId, series_key: crate::SeriesKey },
 	/// Record an ingest batch in `ingest_ledger` (D-S13): a plain `INSERT`
 	/// on the `(aspect, key)` primary key, never `OR REPLACE` — a key already
 	/// recorded is a [`TxnErrorKind::Conflict`], because the ledger row is
@@ -212,6 +234,26 @@ pub enum IndexOp {
 	/// and rollup fold travel in the same transaction, so the ledger row
 	/// exists if and only if the batch's segments do.
 	RecordIngest { entry: crate::types::ingest::LedgerEntry },
+	/// Record one commit in the aspect's change log, `segment_changes`
+	/// (D-S20): one row per commit epoch, carrying the commit's time span
+	/// and row count, in place of one queue entry per timestamp. A plain
+	/// `INSERT` on the `(aspect, epoch)` primary key: epochs are handed
+	/// out under the aspect's commit lock and never reused, so a taken key
+	/// is a [`TxnErrorKind::Conflict`]. The segment rows, allocator raise
+	/// and rollup fold of the same commit travel in the same transaction,
+	/// so the change row exists if and only if the commit's segments do —
+	/// there is no write-ahead entry for a commit that never landed, and
+	/// no committed commit without its change row. On a store whose
+	/// registry has not created `segment_changes` the op records nothing
+	/// (see [`record_change`]): such a store has no change log to write
+	/// and must not gain one outside a migration.
+	RecordChange { aspect: String, epoch: u64, min_ts: Option<i64>, max_ts: Option<i64>, row_count: u64 },
+	/// Delete `aspect`'s change-log rows at or below `through_epoch`
+	/// (D-S20): the change log's dequeue, run by a consumer that has
+	/// batched the changes it read. Rows above the epoch stay, including
+	/// any a commit landed after the consumer's read. On a store without
+	/// `segment_changes` the op deletes nothing (see [`delete_changes`]).
+	DeleteChanges { aspect: String, through_epoch: u64 },
 }
 
 impl IndexOp {
@@ -224,33 +266,43 @@ impl IndexOp {
 			// running them again over another writer's commit changes nothing that writer
 			// did.
 			//
+			// A series registration finds a taken key, and a taken id, a conflict, as
+			// `InsertNew` does a taken segment id, so running it again over another
+			// writer's registration fails rather than rebinding the key or reusing the id.
+			//
 			// A journal insert finds a taken name a conflict, as `InsertNew` does a taken id,
 			// and a journal delete removes the row of a name that is never reused, so
 			// running it again removes nothing another writer made.
+			//
+			// A change-log insert names an epoch that is never reused, as a journal
+			// insert names a frame that is never reused, and a change-log delete
+			// removes only epochs a consumer already read: a commit that lands
+			// after the read takes a higher epoch and is never deleted by it.
+			// (A store whose registry never created the log probes absent on
+			// every attempt alike, so its skip is stable under retry too.)
 			//
 			// A rollup write is guarded only because its callers hold the aspect's
 			// commit lock across the whole transaction, retries included, so no other
 			// writer of that aspect's rollup row can commit between attempts: a retry
 			// re-runs the same fold over the same index state. An `IndexTxn` run
 			// without that lock must not rely on it.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::JournalHeld { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } => true,
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::DeleteEveryExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RegisterSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::JournalHeld { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } | Self::RecordChange { .. } | Self::DeleteChanges { .. } => true,
 			// `QuarantineInsert` replaces a record of the same key and
 			// `QuarantineDelete` deletes one if it exists, so neither re-checks
 			// what its caller decided from, like `Upsert` and `Delete`.
-			Self::QuarantineInsert { .. } | Self::QuarantineDelete { .. } => false,
+			Self::QuarantineInsert { .. } | Self::QuarantineDelete { .. } | Self::Upsert { .. } | Self::Delete { .. } | Self::MetaSet { .. } => false,
 			// `MetaSet` replaces the value, so a retry would overwrite what another writer
 			// committed in between. (Its one writer today is the open, under the root's
 			// LOCK, which nothing races.)
-			Self::Upsert { .. } | Self::Delete { .. } | Self::MetaSet { .. } => false,
 		}
 	}
 }
 
-/// The fault points one [`IndexTxn`] hits, so the crash tests can stop it between its
-/// steps. The protocol that builds a transaction passes its own (a seal's `S-*`, a
-/// swap's `M-*`, from S8 and S10 on). Every transaction S6 commits passes
-/// [`NONE`](Self::NONE): a point that every seal hit could not be armed in-process
-/// while other tests seal alongside.
+/// The fault points one [`IndexTxn`] hits, so the crash tests can stop it between its steps.
+///
+/// The protocol that builds a transaction passes its own (a seal's `S-*`, a swap's `M-*`, from S8 and
+/// S10 on). Every transaction S6 commits passes [`NONE`](Self::NONE): a point that every seal hit could
+/// not be armed in-process while other tests seal alongside.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TxnPoints {
 	/// Hit right after `BEGIN CONCURRENT`: `S-txn-begun`, `M-swap-begun`.
@@ -331,6 +383,7 @@ impl IndexTxnError {
 	}
 
 	/// Whether the transaction may have committed although it reported an error.
+	#[must_use]
 	pub fn is_ambiguous(&self) -> bool {
 		self.kind == TxnErrorKind::Ambiguous
 	}
@@ -373,15 +426,25 @@ impl std::error::Error for IndexTxnError {}
 
 impl IndexTxn {
 	/// A transaction of `ops`, hitting no fault points.
+	#[must_use]
 	pub const fn new(ops: Vec<IndexOp>) -> Self {
 		Self { ops, points: TxnPoints::NONE }
 	}
 
 	/// The time span (`max_ts - min_ts`) of every segment row the transaction writes,
-	/// with its aspect: what the prune's span bound must cover before it commits.
-	pub(crate) fn row_spans(&self) -> impl Iterator<Item = (&str, i64)> {
+	/// with its aspect and series: what the prune's span bounds must cover before it commits.
+	pub(crate) fn row_spans(&self) -> impl Iterator<Item = (&str, crate::SeriesId, i64)> {
 		self.ops.iter().filter_map(|op| match op {
-			IndexOp::InsertNew { aspect, row } | IndexOp::Upsert { aspect, row } | IndexOp::ReplaceExpected { aspect, row, .. } => Some((aspect.as_str(), row.desc.max_ts?.saturating_sub(row.desc.min_ts?))),
+			IndexOp::InsertNew { aspect, row } | IndexOp::Upsert { aspect, row } | IndexOp::ReplaceExpected { aspect, row, .. } => Some((aspect.as_str(), crate::SeriesId(row.series_id), row.desc.max_ts?.saturating_sub(row.desc.min_ts?))),
+			_ => None,
+		})
+	}
+
+	/// The aspects whose series catalog this transaction registers a series in: what a
+	/// catalog cache must forget once it has run.
+	pub(crate) fn registered_aspects(&self) -> impl Iterator<Item = &str> {
+		self.ops.iter().filter_map(|op| match op {
+			IndexOp::RegisterSeries { aspect, .. } => Some(aspect.as_str()),
 			_ => None,
 		})
 	}
@@ -413,7 +476,7 @@ impl IndexTxn {
 	/// # Errors
 	///
 	/// As [`run`](Self::run).
-	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool) -> Result<TxnApplied, IndexTxnError> {
+	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool + Send) -> Result<TxnApplied, IndexTxnError> {
 		crate::exec::control_plane_write(async {
 			let mut attempts = 1;
 			loop {
@@ -508,6 +571,26 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 			let changed = conn.execute(sql, version_values(aspect, *expected)).await.map_err(|e| statement_error(&format!("deleting {aspect:?} segment {}", expected.id), &e))?;
 			expect_one(changed, "delete", aspect, *expected)
 		}
+		IndexOp::DeleteEveryExpected { aspect, expected } => {
+			let mut changed = 0;
+			for chunk in expected.chunks(DELETE_CHUNK) {
+				let versions = vec!["(id = ? AND gen = ? AND frame_crc IS ?)"; chunk.len()].join(" OR ");
+				let sql = format!("DELETE FROM segment_index WHERE aspect = ? AND ({versions})");
+				let mut params = vec![Value::Text(aspect.clone())];
+				for version in chunk {
+					params.extend(version_values(aspect, *version).into_iter().skip(1));
+				}
+				let deleted = conn.execute(sql, params).await.map_err(|e| statement_error(&format!("deleting {} {aspect:?} segments", chunk.len()), &e))?;
+				// The ids are distinct, so the count falls short exactly when some row is not
+				// at the version its caller read.
+				if deleted != chunk.len() as u64 {
+					let ids = chunk.iter().map(|version| version.id.to_string()).collect::<Vec<_>>().join(", ");
+					return Err((TxnErrorKind::Conflict, format!("delete expected the {} {aspect:?} rows with ids {ids} at the versions read, and matched {deleted}", chunk.len())));
+				}
+				changed += deleted;
+			}
+			Ok(changed)
+		}
 		IndexOp::Delete { aspect, id } => conn.execute("DELETE FROM segment_index WHERE aspect = ? AND id = ?", vec![Value::Text(aspect.clone()), integer(*id)]).await.map_err(|e| statement_error(&format!("deleting {aspect:?} segment {id}"), &e)),
 		IndexOp::SeqBump { aspect, next_id, next_gen, epoch } => {
 			// A new row's `next_gen` is at least 1: generation 0 names the legacy
@@ -558,12 +641,75 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 		}
 		IndexOp::QuarantineDelete { aspect, id, gen } => conn.execute("DELETE FROM segment_quarantine WHERE aspect = ? AND id = ? AND gen = ?", vec![Value::Text(aspect.clone()), integer(*id), integer(*gen)]).await.map_err(|e| statement_error(&format!("deleting the quarantine record of {aspect:?} segment {id}"), &e)),
 		IndexOp::SeedSeries { aspect, next_series_id } => conn.execute("INSERT INTO aspect_seq (aspect, next_id, next_gen, epoch, next_series_id) VALUES (?, 1, 0, 0, ?) ON CONFLICT (aspect) DO UPDATE SET next_series_id = MAX(next_series_id, excluded.next_series_id)", vec![Value::Text(aspect.clone()), integer(*next_series_id)]).await.map_err(|e| statement_error(&format!("seeding the {aspect:?} next_series_id"), &e)),
+		IndexOp::RegisterSeries { aspect, series_id, series_key } => register_series(conn, aspect, *series_id, series_key).await,
 		IndexOp::RecordIngest { entry } => {
 			let series_ids = entry.series_ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
 			conn.execute("INSERT INTO ingest_ledger (aspect, key, fingerprint, row_count, min_ts, max_ts, id_lo, id_hi, receipt_json, commit_epoch, created_ms, series_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", vec![Value::Text(entry.aspect.clone()), Value::Text(entry.key.clone()), Value::Integer(entry.fingerprint), integer(entry.row_count as u64), entry.min_ts.map_or(Value::Null, Value::Integer), entry.max_ts.map_or(Value::Null, Value::Integer), entry.id_lo.map_or(Value::Null, integer), entry.id_hi.map_or(Value::Null, integer), Value::Text(entry.receipt_json.clone()), integer(entry.commit_epoch), Value::Integer(entry.created_ms), Value::Text(series_ids)]).await.map_err(|e| statement_error(&format!("recording the ingest of {:?} under key {:?}", entry.aspect, entry.key), &e))
 		}
+		IndexOp::RecordChange { aspect, epoch, min_ts, max_ts, row_count } => record_change(conn, aspect, *epoch, *min_ts, *max_ts, *row_count).await,
+		IndexOp::DeleteChanges { aspect, through_epoch } => delete_changes(conn, aspect, *through_epoch).await,
 	}
 }
+
+/// [`IndexOp::RecordChange`]: write the commit's row in the change log,
+/// unless this store's registry has not created `segment_changes`. A
+/// store a newer layout opened without migrating (FRE-12a) has no change
+/// log for this build to write and must not gain one — no migration may
+/// run — and the change-log reader reads the missing table as no
+/// changes, so the write agrees: it records nothing and the commit
+/// proceeds.
+async fn record_change(conn: &turso::Connection, aspect: &str, epoch: u64, min_ts: Option<i64>, max_ts: Option<i64>, row_count: u64) -> Result<u64, (TxnErrorKind, String)> {
+	if !change_log_exists(conn, aspect).await? {
+		return Ok(0);
+	}
+	conn.execute("INSERT INTO segment_changes (aspect, epoch, min_ts, max_ts, row_count) VALUES (?, ?, ?, ?, ?)", vec![Value::Text(aspect.to_string()), integer(epoch), min_ts.map_or(Value::Null, Value::Integer), max_ts.map_or(Value::Null, Value::Integer), integer(row_count)]).await.map_err(|e| (statement_error_kind(&e), format!("recording the change of {aspect:?} at epoch {epoch}: {e}")))
+}
+
+/// [`IndexOp::DeleteChanges`]: drop the change-log rows a consumer has
+/// batched, under the same missing-table agreement as [`record_change`]:
+/// a store without `segment_changes` has nothing to delete.
+async fn delete_changes(conn: &turso::Connection, aspect: &str, through_epoch: u64) -> Result<u64, (TxnErrorKind, String)> {
+	if !change_log_exists(conn, aspect).await? {
+		return Ok(0);
+	}
+	conn.execute("DELETE FROM segment_changes WHERE aspect = ? AND epoch <= ?", vec![Value::Text(aspect.to_string()), integer(through_epoch)]).await.map_err(|e| (statement_error_kind(&e), format!("deleting the changes of {aspect:?} through epoch {through_epoch}: {e}")))
+}
+
+/// Whether this store's registry has created `segment_changes`, probed
+/// on the transaction's own connection — the probe the change-log
+/// reader runs before it queries the table.
+async fn change_log_exists(conn: &turso::Connection, aspect: &str) -> Result<bool, (TxnErrorKind, String)> {
+	super::migrations::table_exists(conn, "segment_changes").await.map_err(|e| {
+		let kind = e.downcast_ref::<turso::Error>().map_or(TxnErrorKind::Definite, statement_error_kind);
+		(kind, format!("checking for the change log of {aspect:?}: {e}"))
+	})
+}
+
+/// [`IndexOp::RegisterSeries`]: refuse series 0 and the empty key, then insert the
+/// registration only if neither its key nor its id is taken in `aspect`.
+async fn register_series(conn: &turso::Connection, aspect: &str, series_id: crate::SeriesId, series_key: &crate::SeriesKey) -> Result<u64, (TxnErrorKind, String)> {
+	// Series 0 is the empty tag set, implicit and never registered: a row for
+	// either would give the empty tag set, or a non-empty key, two ids.
+	if series_id == crate::SeriesId::UNTAGGED || series_key.is_empty() {
+		return Err((TxnErrorKind::Definite, format!("registering {aspect:?} series {series_id} for key {:?}: series 0 and the empty key are implicit and never registered", series_key.as_str())));
+	}
+	// The primary key guards the key (a taken key is a constraint error, so a
+	// `Conflict`); the `NOT EXISTS` guards the id, so a retry whose id another
+	// writer registered in between inserts nothing and is a `Conflict` too.
+	let sql = "INSERT INTO series (aspect, series_key, series_id) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM series WHERE aspect = ? AND series_id = ?)";
+	let params = vec![Value::Text(aspect.to_string()), Value::Text(series_key.as_str().to_string()), integer(series_id.0), Value::Text(aspect.to_string()), integer(series_id.0)];
+	let changed = conn.execute(sql, params).await.map_err(|e| (statement_error_kind(&e), format!("registering {aspect:?} series {series_id}: {e}")))?;
+	if changed == 1 {
+		Ok(changed)
+	} else {
+		Err((TxnErrorKind::Conflict, format!("registering {aspect:?} series {series_id}: the id is already registered to another key")))
+	}
+}
+
+/// The rows one statement of [`IndexOp::DeleteEveryExpected`] deletes: a squash group's
+/// members in one (64 for 65,536-row segments over 1,024-row seals), while the
+/// `OR` chain stays inside Turso's expression depth of 100, which refuses 256 terms.
+const DELETE_CHUNK: usize = 64;
 
 /// A precondition holds when the guarded statement changed exactly one row.
 fn expect_one(changed: u64, what: &str, aspect: &str, expected: RowVersion) -> Result<u64, (TxnErrorKind, String)> {
@@ -917,8 +1063,8 @@ mod tests {
 		for (next_id, next_gen, epoch) in [(5, 0, 2), (3, 4, 1), (9, 2, 0), (9, 7, 4)] {
 			let applied = index.apply(&bump(ASPECT, next_id, next_gen, epoch)).await.expect("bumps");
 			assert_eq!(applied.changes, vec![1], "bump to ({next_id}, {next_gen}, {epoch})");
-			let seed = index.allocator_seed(ASPECT).await.expect("reads");
-			seen.push((seed.next_id, seed.next_gen, seed.epoch));
+			let allocator_seed = index.allocator_seed(ASPECT).await.expect("reads");
+			seen.push((allocator_seed.next_id, allocator_seed.next_gen, allocator_seed.epoch));
 		}
 		index.apply(&bump("other", 1, 0, 0)).await.expect("bumps another aspect");
 		let other = index.allocator_seed("other").await.expect("reads");
@@ -971,8 +1117,77 @@ mod tests {
 		let shown: Vec<_> = journal.iter().map(|e| (e.name.as_str(), e.aspect.as_str(), e.state, e.retire_epoch)).collect();
 		assert_eq!(shown, vec![("a-0.weftseg", ASPECT, crate::types::reaper::JournalState::Retired, Some(3)), ("a~g1~p0.weftseg", ASPECT, crate::types::reaper::JournalState::Pending, None)]);
 		assert_eq!(cleared.changes, vec![1, 1, 0]);
-		assert!(after.is_empty());
+		assert_eq!(after, [] as [crate::types::reaper::JournalEntry; 0]);
 		assert!([pending("x"), retire("x"), clear("x")].iter().all(IndexOp::is_guarded), "a swap of guarded ops is retried");
+	}
+
+	/// TAG-5: a series key is registered once per aspect. Registering a taken key is a
+	/// `Conflict` that writes nothing, its paired allocator raise included, and the key
+	/// keeps its first id; the same key in another aspect is that aspect's own. The op
+	/// is retry-safe, so the seal that carries it is retried on an MVCC conflict.
+	#[tokio::test]
+	async fn register_series_conflicts_on_a_taken_key() {
+		use crate::{SeriesId, TagSet};
+
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let key = TagSet::from_pairs([("host", "a")]).expect("valid tags").series_key().clone();
+		let register = |aspect: &str, id: u64| vec![IndexOp::RegisterSeries { aspect: aspect.to_string(), series_id: SeriesId(id), series_key: key.clone() }, IndexOp::SeedSeries { aspect: aspect.to_string(), next_series_id: id + 1 }];
+		let first = index.apply(&IndexTxn::new(register(ASPECT, 1))).await.expect("registers");
+		let taken = index.apply(&IndexTxn::new(register(ASPECT, 7))).await.expect_err("a key is registered once per aspect");
+		let other = index.apply(&IndexTxn::new(register("b", 1))).await.expect("another aspect registers the same key");
+		let (id, next, catalog) = (index.series_id_for(ASPECT, &key).await.expect("reads"), index.next_series_id(ASPECT).await.expect("reads"), index.series_of(ASPECT).await.expect("reads"));
+		let other_id = index.series_id_for("b", &key).await.expect("reads");
+		drop(index);
+		assert_eq!(first.changes, vec![1, 1]);
+		assert_eq!((taken.kind, taken.op), (TxnErrorKind::Conflict, Some(0)), "{taken}");
+		assert_eq!(other.changes, vec![1, 1]);
+		assert_eq!(id, Some(SeriesId(1)), "the key keeps its first id");
+		assert_eq!(next, 2, "the conflicting transaction's allocator raise rolled back with it");
+		assert_eq!(catalog, vec![(SeriesId(1), key.clone())]);
+		assert_eq!(other_id, Some(SeriesId(1)));
+		assert!(register(ASPECT, 1).iter().all(IndexOp::is_guarded), "a seal that registers a series is retried on a conflict");
+	}
+
+	/// TAG-5 review: a registration re-checks the id as well as the key, so a second
+	/// key registered under a taken id is a `Conflict` that writes nothing.
+	#[tokio::test]
+	async fn register_series_conflicts_on_a_taken_id() {
+		use crate::{SeriesId, TagSet};
+
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let a = TagSet::from_pairs([("host", "a")]).expect("valid tags").series_key().clone();
+		let b = TagSet::from_pairs([("host", "b")]).expect("valid tags").series_key().clone();
+		let register = |key: &crate::SeriesKey| vec![IndexOp::RegisterSeries { aspect: ASPECT.to_string(), series_id: SeriesId(5), series_key: key.clone() }, IndexOp::SeedSeries { aspect: ASPECT.to_string(), next_series_id: 6 }];
+		index.apply(&IndexTxn::new(register(&a))).await.expect("registers");
+		let taken = index.apply(&IndexTxn::new(register(&b))).await.expect_err("an id is registered once per aspect");
+		let (catalog, b_id) = (index.series_of(ASPECT).await.expect("reads"), index.series_id_for(ASPECT, &b).await.expect("reads"));
+		drop(index);
+		assert_eq!((taken.kind, taken.op), (TxnErrorKind::Conflict, Some(0)), "{taken}");
+		assert_eq!(catalog, vec![(SeriesId(5), a)]);
+		assert_eq!(b_id, None);
+	}
+
+	/// TAG-5 review: series 0 and the empty key are implicit. Registering either is
+	/// refused as `Definite` before any statement runs, and nothing is written, the
+	/// paired allocator raise included.
+	#[tokio::test]
+	async fn register_series_refuses_series_zero_and_the_empty_key() {
+		use crate::{SeriesId, TagSet};
+
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let key = TagSet::from_pairs([("host", "a")]).expect("valid tags").series_key().clone();
+		let empty = crate::SeriesKey::default();
+		assert!(empty.is_empty());
+		let register = |id: u64, key: &crate::SeriesKey| vec![IndexOp::SeedSeries { aspect: ASPECT.to_string(), next_series_id: 9 }, IndexOp::RegisterSeries { aspect: ASPECT.to_string(), series_id: SeriesId(id), series_key: key.clone() }];
+		let zero = index.apply(&IndexTxn::new(register(0, &key))).await.expect_err("series 0 is never registered");
+		let blank = index.apply(&IndexTxn::new(register(3, &empty))).await.expect_err("the empty key is never registered");
+		let (catalog, next, key_id) = (index.series_of(ASPECT).await.expect("reads"), index.next_series_id(ASPECT).await.expect("reads"), index.series_id_for(ASPECT, &key).await.expect("reads"));
+		drop(index);
+		assert_eq!((zero.kind, zero.op), (TxnErrorKind::Definite, Some(1)), "{zero}");
+		assert_eq!((blank.kind, blank.op), (TxnErrorKind::Definite, Some(1)), "{blank}");
+		assert!(catalog.is_empty(), "{catalog:?}");
+		assert_eq!(next, 1, "the paired allocator raise rolled back");
+		assert_eq!(key_id, None);
 	}
 
 	/// Robustness track ROB-2: every op of every transaction runs inside the control-plane
@@ -1064,6 +1279,35 @@ mod tests {
 		drop(index);
 		assert_eq!(applied.changes, vec![1, 1, 1]);
 		assert_eq!(rows, vec![a, row(2, 2, None)]);
+	}
+
+	/// A delete of many rows at once is guarded as its rows one at a time would be: one row
+	/// that is not at the version read, or not there, fails it `Conflict` and leaves every
+	/// row, in any chunk; at their versions, it deletes them all, past a chunk's worth too.
+	#[tokio::test]
+	async fn a_delete_of_many_rows_is_every_row_or_none() {
+		let index = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let rows: Vec<IndexRow> = (0..DELETE_CHUNK as u64 + 10).map(|id| row(id, 1, (id % 2 == 0).then(|| u32::try_from(id).expect("small id")))).collect();
+		index.apply(&IndexTxn::new(rows.iter().cloned().map(insert).collect())).await.expect("commits the rows");
+		let every = |versions: Vec<RowVersion>| IndexOp::DeleteEveryExpected { aspect: ASPECT.to_string(), expected: versions };
+		let versions: Vec<RowVersion> = rows.iter().map(IndexRow::version).collect();
+		let with = |at: usize, version: RowVersion| {
+			let mut versions = versions.clone();
+			versions[at] = version;
+			versions
+		};
+		let stale = [("a generation that changed", with(3, RowVersion { gen: 2, ..versions[3] })), ("a CRC where the row has none", with(1, RowVersion { frame_crc: Some(0), ..versions[1] })), ("no CRC where the row has one", with(DELETE_CHUNK + 2, RowVersion { frame_crc: None, ..versions[DELETE_CHUNK + 2] })), ("a row that does not exist", with(DELETE_CHUNK + 5, row(9_999, 1, None).version()))];
+		for (what, expected) in stale {
+			let err = index.apply(&IndexTxn::new(vec![every(expected)])).await.expect_err(what);
+			assert_eq!((err.kind, err.op), (TxnErrorKind::Conflict, Some(0)), "{what}: {err}");
+			assert_eq!(rows_of(&index, ASPECT).await, rows, "{what}: every row is still there");
+		}
+		let applied = index.apply(&IndexTxn::new(vec![every(versions)])).await.expect("commits");
+		let left = rows_of(&index, ASPECT).await;
+		drop(index);
+		assert_eq!(applied.changes, vec![rows.len() as u64]);
+		assert!(left.is_empty(), "every row is deleted: {left:?}");
+		assert!(every(Vec::new()).is_guarded(), "its rows are checked, so a retry is safe");
 	}
 
 	/// Set only in the child process [`run_txn_child`] starts: the index database to open.

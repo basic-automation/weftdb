@@ -16,7 +16,12 @@ exist under .github/workflows/ and must contain an upload-artifact step for an
 artifact of that name. The registry never invents provenance, and a workflow
 that stops publishing an artifact it is cited for fails here.
 
-Usage: tools/check_claims.py [--registry bench/claims.json] [--readme README.md]
+Usage: tools/check_claims.py [--registry bench/claims.json] [--readme README.md] [--root DIR]
+
+`--readme` is the document that carries the figures (CI passes docs/reference.md, where the
+full reference lives). Registry source paths and .github/workflows resolve against `--root`,
+the repository root, which defaults to that document's directory; the document's own relative
+links resolve against its directory.
 """
 
 from __future__ import annotations
@@ -116,9 +121,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--registry", default="bench/claims.json")
     ap.add_argument("--readme", default="README.md")
+    ap.add_argument("--root", default=None)
     args = ap.parse_args()
 
-    root = Path(args.readme).resolve().parent
+    docdir = Path(args.readme).resolve().parent
+    root = Path(args.root).resolve() if args.root else docdir
     lines = Path(args.readme).read_text(encoding="utf-8").splitlines()
     doc = "\n".join(lines)
 
@@ -197,7 +204,7 @@ def main() -> int:
             if "://" in target or target.startswith(("#", "mailto:")):
                 continue
             path = target.split("#", 1)[0]
-            if path and not (root / path).exists():
+            if path and not (docdir / path).exists():
                 errors.append(f"{args.readme}:{no + 1} links to {target!r}, which is not in the tree")
 
     for err in errors:

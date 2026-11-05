@@ -35,6 +35,25 @@ pub struct AspectCatalog {
 	db: turso::Database,
 }
 
+/// What a declaration says about the aspect's upsert keys.
+#[derive(Clone, Copy)]
+enum KeysOffer<'a> {
+	/// The declaration leaves the keys out of the comparison, and an aspect it creates has none.
+	Unchecked,
+	/// The declaration offers these keys (or none), and an existing aspect must hold the same.
+	Offered(Option<&'a crate::UpsertKeys>),
+}
+
+impl<'a> KeysOffer<'a> {
+	/// The keys the declaration would store, if it names any.
+	const fn offered(self) -> Option<&'a crate::UpsertKeys> {
+		match self {
+			Self::Unchecked => None,
+			Self::Offered(keys) => keys,
+		}
+	}
+}
+
 impl AspectCatalog {
 	/// The tables every `aspect_catalog.db` holds once opened. A snapshot missing any of them is
 	/// not a backup of this database (an empty file passes every other check), so
@@ -125,6 +144,33 @@ impl AspectCatalog {
 	/// not equal or widen; otherwise propagates any libSQL write failure or a
 	/// metadata-serialization failure.
 	pub async fn declare(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema) -> Result<()> {
+		self.declare_inner(database, subject, aspect, schema, KeysOffer::Unchecked).await
+	}
+
+	/// [`declare`](Self::declare) with the aspect's upsert-key declaration (Phase 4.6;
+	/// see [`UpsertKeys`](crate::UpsertKeys)): `upsert_keys` is [`None`] for an aspect
+	/// with none, whose dedup identity is the timestamp and the full tag set.
+	///
+	/// The keys are as immutable as the schema, and take part in the equality that makes a
+	/// re-declaration a no-op: declaring a declared aspect with other keys, or with keys
+	/// when it has none, or without when it has some, is refused. Plain
+	/// [`declare`](Self::declare) leaves the keys out of the comparison, and an aspect it
+	/// creates has none.
+	///
+	/// # Errors
+	///
+	/// As [`declare`](Self::declare) for the schema, then
+	/// [`StoreError::UpsertKeysConflict`](crate::StoreError::UpsertKeysConflict) when the
+	/// aspect is declared with other upsert keys. Nothing is written on any refusal.
+	pub async fn declare_with_upsert_keys(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema, upsert_keys: Option<&crate::UpsertKeys>) -> Result<()> {
+		self.declare_inner(database, subject, aspect, schema, KeysOffer::Offered(upsert_keys)).await
+	}
+
+	/// The declaration both [`declare`](Self::declare) (`keys` [`None`]: the upsert keys
+	/// are not compared, and a new aspect has none) and
+	/// [`declare_with_upsert_keys`](Self::declare_with_upsert_keys) (`Some`) make.
+	async fn declare_inner(&self, database: &str, subject: &str, aspect: &str, schema: &AspectSchema, keys: KeysOffer<'_>) -> Result<()> {
+		let upsert_keys = keys.offered().map_or(Value::Null, |keys| Value::Text(keys.to_catalog()));
 		let physical_type = serde_json::to_string(&schema.value)?;
 		let timestamp_unit = serde_json::to_string(&schema.timestamp_unit)?;
 		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
@@ -138,14 +184,33 @@ impl AspectCatalog {
 				return Err(e);
 			}
 		};
-		let res = match &existing {
-			None => conn.execute("INSERT INTO aspect_schema (database, subject, aspect, physical_type, value_tolerance, timestamp_unit) VALUES (?, ?, ?, ?, ?, ?)", turso::params![database.to_string(), subject.to_string(), aspect.to_string(), physical_type.clone(), schema.value_tolerance.to_plain_string(), timestamp_unit.clone()]).await.map(|_| ()).map_err(anyhow::Error::from),
-			// The identical declaration again: immutable, and already so.
-			Some(declared) if declared == schema => Ok(()),
-			// A widening of the value encoding alone (FRE-7b's one permitted
-			// change, the move widen_value_encoding performs for D-S19/D-S20).
-			Some(declared) if declared.value_tolerance == schema.value_tolerance && declared.timestamp_unit == schema.timestamp_unit && weft_physical_type::is_value_widening(declared.value, schema.value) => conn.execute("UPDATE aspect_schema SET physical_type = ? WHERE database = ? AND subject = ? AND aspect = ?", turso::params![physical_type, database.to_string(), subject.to_string(), aspect.to_string()]).await.map(|_| ()).map_err(anyhow::Error::from),
-			Some(declared) => Err(anyhow::Error::new(crate::StoreError::DeclarationConflict { aspect: aspect.to_string(), declared: declared.clone(), offered: schema.clone() })),
+		// The keys an existing declaration holds, compared only when `keys` asks.
+		let keys_conflict = match (&existing, keys) {
+			(Some(_), KeysOffer::Offered(offered)) => match Self::upsert_keys_on(&conn, database, subject, aspect).await {
+				Ok(declared) if declared.as_ref() == offered => None,
+				Ok(declared) => Some(crate::StoreError::UpsertKeysConflict { aspect: aspect.to_string(), declared, offered: offered.cloned() }),
+				Err(e) => {
+					conn.execute("ROLLBACK", turso::params![]).await.ok();
+					return Err(e);
+				}
+			},
+			_ => None,
+		};
+		// The schema would stand or widen, but the upsert keys differ: refused whole. A
+		// schema that conflicts itself is reported as that, below.
+		let schema_accepted = existing.as_ref().is_some_and(|declared| declared == schema || (declared.value_tolerance == schema.value_tolerance && declared.timestamp_unit == schema.timestamp_unit && weft_physical_type::is_value_widening(declared.value, schema.value)));
+		let res = if let Some(conflict) = keys_conflict.filter(|_| schema_accepted) {
+			Err(anyhow::Error::new(conflict))
+		} else {
+			match &existing {
+				None => conn.execute("INSERT INTO aspect_schema (database, subject, aspect, physical_type, value_tolerance, timestamp_unit, upsert_keys) VALUES (?, ?, ?, ?, ?, ?, ?)", turso::params![database.to_string(), subject.to_string(), aspect.to_string(), physical_type.clone(), schema.value_tolerance.to_plain_string(), timestamp_unit.clone(), upsert_keys]).await.map(|_| ()).map_err(anyhow::Error::from),
+				// The identical declaration again: immutable, and already so.
+				Some(declared) if declared == schema => Ok(()),
+				// A widening of the value encoding alone (FRE-7b's one permitted
+				// change, the move widen_value_encoding performs for D-S19/D-S20).
+				Some(declared) if declared.value_tolerance == schema.value_tolerance && declared.timestamp_unit == schema.timestamp_unit && weft_physical_type::is_value_widening(declared.value, schema.value) => conn.execute("UPDATE aspect_schema SET physical_type = ? WHERE database = ? AND subject = ? AND aspect = ?", turso::params![physical_type, database.to_string(), subject.to_string(), aspect.to_string()]).await.map(|_| ()).map_err(anyhow::Error::from),
+				Some(declared) => Err(anyhow::Error::new(crate::StoreError::DeclarationConflict { aspect: aspect.to_string(), declared: declared.clone(), offered: schema.clone() })),
+			}
 		};
 		match res {
 			Ok(()) => {
@@ -176,6 +241,30 @@ impl AspectCatalog {
 			}
 			None => Ok(None),
 		}
+	}
+
+	/// The upsert keys `(database, subject, aspect)` is declared with, read on an open
+	/// connection, or [`None`] when it has none (or no declaration at all).
+	async fn upsert_keys_on(conn: &turso::Connection, database: &str, subject: &str, aspect: &str) -> Result<Option<crate::UpsertKeys>> {
+		let mut rows = conn.query("SELECT upsert_keys FROM aspect_schema WHERE database = ? AND subject = ? AND aspect = ?", turso::params![database.to_string(), subject.to_string(), aspect.to_string()]).await?;
+		match rows.next().await? {
+			Some(row) => match row.get_value(0)? {
+				Value::Text(text) => Ok(Some(crate::UpsertKeys::from_catalog(&text)?)),
+				_ => Ok(None),
+			},
+			None => Ok(None),
+		}
+	}
+
+	/// The upsert keys `(database, subject, aspect)` is declared with (Phase 4.6), or
+	/// [`None`] when it declares none (or is not declared).
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure, or stored keys that do not parse.
+	pub async fn upsert_keys(&self, database: &str, subject: &str, aspect: &str) -> Result<Option<crate::UpsertKeys>> {
+		let conn = crate::types::durable::control_plane::connect(&self.db).await?;
+		Self::upsert_keys_on(&conn, database, subject, aspect).await
 	}
 
 	/// The declared schema for `(database, subject, aspect)`, or [`None`] if the
@@ -321,7 +410,7 @@ mod tests {
 		let catalog = AspectCatalog::open_migrated(":memory:").await.expect("opens");
 		let all = catalog.list_all().await.expect("lists");
 		drop(catalog);
-		assert!(all.is_empty());
+		assert_eq!(all, [] as [(String, String, String); 0]);
 	}
 
 	#[tokio::test]

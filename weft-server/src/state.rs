@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{admission::AdmissionConfig, auth::AuthConfig, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics};
+use crate::{admission::AdmissionConfig, audit::AuditLog, auth::AuthConfig, bench_runs::BenchRuns, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics, store_open::ServingScope};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -67,6 +67,18 @@ pub struct AppState {
 	/// Admission I's limits (ROB-10): the query class's in-flight cap
 	/// the registry builds its gate admission from.
 	admission: AdmissionConfig,
+	/// The fsynced audit log (SEC-9), present when the binary opened
+	/// one at startup — which it always does. Absent in the stateless
+	/// test states, where audited routes pass through unrecorded,
+	/// exactly as they pass unauthenticated with no keys configured.
+	audit: Option<Arc<AuditLog>>,
+	/// The benchmark-run manifests `GET /bench/runs` serves, present when
+	/// the binary was given `WEFT_BENCH_RUNS_DIR`.
+	bench_runs: Option<Arc<BenchRuns>>,
+	/// The scope this process serves and the pin it was opened under (FRE-12b),
+	/// reported by `GET /api/v1/version`. Absent exactly when no store root is
+	/// configured: a stateless server serves no namespace.
+	serving: Option<ServingScope>,
 }
 
 impl AppState {
@@ -82,7 +94,7 @@ impl AppState {
 	/// the counters), the default interpolation settings and no segment store.
 	#[must_use]
 	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT }
+		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT, audit: None, bench_runs: None, serving: None }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -90,6 +102,21 @@ impl AppState {
 	pub fn with_store(mut self, store: Arc<SegmentStore>) -> Self {
 		self.store = Some(store);
 		self
+	}
+
+	/// Attach the scope the store was opened under and the pin mode the start ran
+	/// under (FRE-12b); `GET /api/v1/version` reports both beside the scope the
+	/// store's own marker records.
+	#[must_use]
+	pub fn with_serving_scope(mut self, scope: ServingScope) -> Self {
+		self.serving = Some(scope);
+		self
+	}
+
+	/// The scope this process serves, or `None` when no store root is configured.
+	#[must_use]
+	pub const fn serving_scope(&self) -> Option<&ServingScope> {
+		self.serving.as_ref()
 	}
 
 	/// Replace the interpolation settings (the binary's `WEFT_MAX_INTERPOLATE_POINTS`).
@@ -172,6 +199,35 @@ impl AppState {
 	#[must_use]
 	pub const fn admission_config(&self) -> AdmissionConfig {
 		self.admission
+	}
+
+	/// Attach the fsynced audit log (SEC-9); the binary passes the
+	/// [`AuditLog`] it opened at startup.
+	#[must_use]
+	pub fn with_audit_log(mut self, audit: Arc<AuditLog>) -> Self {
+		self.audit = Some(audit);
+		self
+	}
+
+	/// The fsynced audit log the router records into, when one is
+	/// attached.
+	#[must_use]
+	pub const fn audit_log(&self) -> Option<&Arc<AuditLog>> {
+		self.audit.as_ref()
+	}
+
+	/// Serve the benchmark-run manifests under `runs` on `/bench/runs`;
+	/// the binary passes the directory `WEFT_BENCH_RUNS_DIR` names.
+	#[must_use]
+	pub fn with_bench_runs(mut self, runs: BenchRuns) -> Self {
+		self.bench_runs = Some(Arc::new(runs));
+		self
+	}
+
+	/// The benchmark-run directory, when one is configured.
+	#[must_use]
+	pub const fn bench_runs(&self) -> Option<&Arc<BenchRuns>> {
+		self.bench_runs.as_ref()
 	}
 }
 

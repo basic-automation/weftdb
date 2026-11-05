@@ -24,7 +24,9 @@
 //! here as a pure, unit-tested function rather than pulling a new dependency into
 //! the workspace.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{
 	path::{Path, PathBuf}, process::ExitCode
@@ -48,6 +50,16 @@ fn main() -> ExitCode {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(e) => {
 				eprintln!("{PROG} {}: {e:#}", weft_bench::failure::CHILD_COMMAND);
+				ExitCode::FAILURE
+			}
+		};
+	}
+	if args.first().map(String::as_str) == Some(weft_bench::gpu_economics::CHILD_COMMAND) {
+		// A GPU-economics child: one cold start or the no-adapter check, one result line.
+		return match weft_bench::gpu_economics::child(&args[1..]) {
+			Ok(()) => ExitCode::SUCCESS,
+			Err(e) => {
+				eprintln!("{PROG} {}: {e:#}", weft_bench::gpu_economics::CHILD_COMMAND);
 				ExitCode::FAILURE
 			}
 		};
@@ -137,6 +149,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.mode == InputMode::GpuMemory {
 		return run_gpu_memory_workload(&cli);
+	}
+	if cli.mode == InputMode::GpuEconomics {
+		return run_gpu_economics_workload(&cli);
 	}
 	if cli.mode == InputMode::Ingest {
 		return run_ingest_workload(&cli).await;
@@ -366,10 +381,50 @@ fn run_gpu_memory_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let result = weft_bench::gpu_memory::run_gpu_memory(&profile).map_err(|e| anyhow::anyhow!("gpu-memory benchmark run failed: {e}"))?;
 	if let Some(pool) = &result.gpu_pool {
 		println!("gpu pool: cap {} MiB; created {} ({} after round 1), reused {}, evicted {}; idle peak {} MiB (round 1) / {} MiB (later), final {} MiB; stable: {}", pool.max_pool_bytes >> 20, pool.created, pool.created_after_first_round, pool.reused, pool.evicted, pool.peak_idle_bytes_first_round >> 20, pool.peak_idle_bytes_later >> 20, pool.final_idle_bytes >> 20, pool.stable);
+		if let Some(d) = &pool.device_memory {
+			println!("device memory: {} rounds in {} s, {} samples; allocated peak {} MiB (round 1) / {} MiB (later), final {} MiB allocated / {} MiB reserved; growth (leak): {}", pool.rounds, d.elapsed_secs, d.samples, d.peak_allocated_bytes_first_round >> 20, d.peak_allocated_bytes_later >> 20, d.final_allocated_bytes >> 20, d.final_reserved_bytes >> 20, d.allocated_growth);
+			for t in &d.smi {
+				println!("nvidia-smi gpu {}: {} samples, memory.used trend {:?} MiB; growth: {}", t.gpu_index, t.samples, t.memory_used_trend_mib, t.growth);
+			}
+		}
 	}
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(Some(engine));
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
+}
+
+/// Run the GPU economics workload (roadmap 5.5): the cold-start and no-adapter children first,
+/// then start the GPU here and run the fallback and contention lanes, one report per lane.
+fn run_gpu_economics_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	use weft_bench::gpu_economics as ge;
+	let profile_name = cli.name.clone().unwrap_or_else(|| "gpu-economics".to_string());
+	let profile = ge::GpuEconomicsProfile::new(profile_name, ge::GpuEconomicsParams { seed: cli.seed, ..cli.gpu_economics.clone() });
+	let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
+	let mut code = ExitCode::SUCCESS;
+	let mut write = |metadata: &RunMetadata, result: BenchResult| -> anyhow::Result<()> {
+		println!("economics {:<36}: {:>5} samples  p50 {:>10.3} ms p95 {:>10.3} ms p99 {:>10.3} ms  {:>14.0} pts/s  {}", result.profile, result.reps, ms(result.latency.p50_ns), ms(result.latency.p95_ns), ms(result.latency.p99_ns), result.throughput_points_per_sec, if result.correctness.passed() { "PASS" } else { "FAIL" });
+		if finish(cli, &BenchReport::with_results(metadata.clone(), vec![result]))? != ExitCode::SUCCESS {
+			code = ExitCode::FAILURE;
+		}
+		Ok(())
+	};
+	let baseline = ge::sample_baseline(&profile.params);
+	let exe = std::env::current_exe().map_err(|e| anyhow::anyhow!("cannot find this executable for the child processes: {e}"))?;
+	let child_metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	ge::run_child_lanes(&profile, &exe, |r| write(&child_metadata, r))?;
+	let engine = match ge::start_gpu() {
+		Ok(engine) => {
+			println!("engine: GPU {}", engine.describe_gpu().unwrap_or_default());
+			Some(engine)
+		}
+		Err(e) => {
+			eprintln!("gpu-economics: GPU lanes skipped: {e}");
+			None
+		}
+	};
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(engine.clone());
+	ge::run_in_process_lanes(&profile, engine.is_some(), &baseline, |r| write(&metadata, r)).map_err(|e| anyhow::anyhow!("gpu-economics run failed: {e}"))?;
+	Ok(code)
 }
 
 /// Run the ingest workload: load one column of a UCI household-power file,
@@ -438,6 +493,9 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 		.map_err(|e| anyhow::anyhow!("compressed-query run failed: {e}"))?;
 		return Ok(code);
 	}
+	if cli.crash_matrix {
+		return run_crash_matrix(cli, &profile, &corpus).await;
+	}
 	if !cli.failure.is_empty() {
 		return run_failures(cli, &profile, &corpus).await;
 	}
@@ -474,6 +532,35 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
+}
+
+/// Run the crash matrix (D-S21, SOA-9 `crash_kill9`): every failure test at
+/// every matrix seed, one report per cell, its profile naming the failure and
+/// the seed. One report each, as `--failure` and the query mix write, because
+/// a run manifest grades one result: several results in one report repeat
+/// every measure name, and the manifest refuses that. The exit is the matrix's
+/// verdict — non-zero when any cell's gate failed — so a scripted caller gates
+/// on the exit code, and the per-cell lines below are the matrix itself, not a
+/// summary of it.
+async fn run_crash_matrix(cli: &Cli, profile: &IngestProfile, corpus: &weft_bench::UciCorpus) -> anyhow::Result<ExitCode> {
+	let uci = cli.uci.clone().ok_or_else(|| anyhow::anyhow!("--crash-matrix needs --uci"))?;
+	let params = weft_bench::failure::FailureParams { uci, column: cli.uci_column.clone(), corpus_rows: cli.ingest_rows, rows: cli.failure_rows, reps: cli.failure_reps, compact_to: cli.failure_compact_to, kill_within: std::time::Duration::from_millis(cli.failure_kill_within_ms), seed: cli.seed, exe: std::env::current_exe()? };
+	let seeds: Vec<u64> = (0..cli.crash_matrix_seeds as u64).map(|offset| cli.seed.wrapping_add(offset)).collect();
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let cells = weft_bench::crash_matrix::run_matrix(profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, &params, &seeds).await.map_err(|e| anyhow::anyhow!("crash matrix failed to run: {e:#}"))?;
+	let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
+	for cell in &cells {
+		println!("crash-matrix {:<16} seed {}: {} reps  reopen p50 {:>9.3} ms max {:>9.3} ms  {}", cell.failure.as_str(), cell.seed, cell.result.reps, ms(cell.result.latency.p50_ns), ms(cell.result.latency.max_ns), if cell.passed() { "PASS" } else { "FAIL" });
+	}
+	let mut code = ExitCode::SUCCESS;
+	for cell in cells {
+		let mut result = cell.result;
+		result.profile = format!("{}-seed{}", result.profile, cell.seed);
+		if finish(cli, &BenchReport::with_results(metadata.clone(), vec![result]))? != ExitCode::SUCCESS {
+			code = ExitCode::FAILURE;
+		}
+	}
+	Ok(code)
 }
 
 /// Persist a completed report (JSON, and optionally HTML) and print the summary,
@@ -549,6 +636,9 @@ fn finish(cli: &Cli, report: &BenchReport) -> anyhow::Result<ExitCode> {
 	print_summary(report, &out_path);
 	if let Some(path) = &manifest_path {
 		println!("  run manifest : {}", path.display());
+		if let Ok(id) = weft_bench::manifest::run_id(path) {
+			println!("  run id       : {id}");
+		}
 	}
 	if let Some(path) = &html_path {
 		println!("  html report  : {}", path.display());
@@ -678,6 +768,9 @@ fn combine_runs(runs: &[PathBuf], out: &Path, no_manifest: bool) -> ExitCode {
 		}
 		if let Some(path) = manifest_path {
 			println!("  run manifest : {}", path.display());
+			if let Ok(id) = weft_bench::manifest::run_id(&path) {
+				println!("  run id       : {id}");
+			}
 		}
 		Ok(if combined.is_publishable() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 	})();
@@ -849,7 +942,6 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 		// the realized value codec, the value-column compression ratio (realized /
 		// naive fixed-width), and total bytes/point. Present once the run estimates it.
 		if let Some(s) = &r.storage {
-			#[allow(clippy::cast_precision_loss)]
 			let ratio = if s.estimated_value_bytes > 0 { s.realized_value_bytes as f64 / s.estimated_value_bytes as f64 } else { 1.0 };
 			println!("    storage      : codec={}{} ratio={ratio:.3} val={:.2} total={:.2} B/pt", s.value_codec, if s.is_exact { "" } else { "*" }, s.bytes_per_point, s.total_bytes_per_point);
 		}
@@ -866,7 +958,6 @@ fn print_summary(report: &BenchReport, out_path: &std::path::Path) {
 }
 
 /// Nanoseconds rendered as fractional milliseconds for display.
-#[allow(clippy::cast_precision_loss)]
 fn ms(ns: u64) -> f64 {
 	ns as f64 / 1e6
 }
@@ -930,7 +1021,6 @@ impl CsvKnobs {
 /// only one with a known analytic ground truth, so it is the only one that yields
 /// accuracy metrics.
 // One field per on/off command-line flag; an enum per flag would only rename them.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 struct Cli {
 	/// Path to the `.lp` / TSBS line-protocol input file (line-protocol mode).
@@ -969,6 +1059,8 @@ struct Cli {
 	scale: Option<ScalePreset>,
 	/// GPU-memory mode: the workload knobs (the seed comes from `--seed`).
 	gpu_memory: weft_bench::gpu_memory::GpuMemoryParams,
+	/// GPU-economics mode: the workload knobs (the seed comes from `--seed`).
+	gpu_economics: weft_bench::gpu_economics::GpuEconomicsParams,
 	/// Ingest mode: UCI household-power file to load (`--uci`, required).
 	uci: Option<PathBuf>,
 	/// Ingest mode: UCI column to project (`--uci-column`).
@@ -1002,6 +1094,10 @@ struct Cli {
 	failure_compact_to: u64,
 	/// Ingest mode: upper bound of the seeded delay before a compaction is killed (`--failure-kill-within-ms`).
 	failure_kill_within_ms: u64,
+	/// Ingest mode: run the crash matrix (D-S21/SOA-9) instead of one failure test (`--crash-matrix`).
+	crash_matrix: bool,
+	/// Ingest mode: seeds the crash matrix runs, derived from `--seed` (`--crash-matrix-seeds`).
+	crash_matrix_seeds: usize,
 	/// Ingest mode: operations in a seeded query mix (`--query-mix`); 0 for none.
 	query_mix: usize,
 	/// Ingest mode: rows the query-mix store starts with (`--query-mix-rows`); `None` for the corpus once.
@@ -1109,6 +1205,8 @@ enum InputMode {
 	Sparse,
 	/// The GPU memory-stability workload (repeated mixed-size GPU interpolations).
 	GpuMemory,
+	/// The GPU economics workload (cold start, CPU fallback, contention, utilization).
+	GpuEconomics,
 	/// The ingest workload (EVI-6): load a UCI household-power column and seal
 	/// it into a fresh SegmentStore in batches, gated on an exact read-back.
 	Ingest,
@@ -1243,9 +1341,11 @@ impl Cli {
 		let (mut ingest_online, mut ingest_online_rows, mut ingest_online_window): (usize, Option<u64>, usize) = (0, None, 1_440);
 		let (mut compressed_query, mut compressed_query_rows, mut compressed_query_compact): (usize, Option<u64>, Option<u64>) = (0, None, None);
 		let (mut failure, mut failure_rows, mut failure_reps, mut failure_compact_to, mut failure_kill_within_ms): (Vec<weft_bench::failure::Failure>, u64, usize, u64, u64) = (Vec::new(), 1_000_000, 5, 65_536, 2_000);
+		let (mut crash_matrix, mut crash_matrix_seeds): (bool, usize) = (false, 3);
 		let (mut query_mix, mut query_mix_rows, mut query_mix_range, mut query_mix_weights): (usize, Option<u64>, u64, weft_bench::LaneWeights) = (0, None, 1_440, weft_bench::LaneWeights::default());
 		let (mut analytics_rows, mut analytics_tail, mut analytics_batch): (Option<u64>, Option<u64>, usize) = (None, None, 1_440);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
+		let (mut gpu_economics_mode, mut gpu_economics) = (false, weft_bench::gpu_economics::GpuEconomicsParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
 		let (mut ds_aggs, mut ds_parallel, mut ds_decimals) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1), ds_defaults.value_decimals);
@@ -1305,6 +1405,8 @@ impl Cli {
 				flag if SPARSE_FLAGS.contains(&flag) => set_sparse_knob(&mut sparse, flag, &take_value(&key)?)?,
 				"--scale" => scale = Some(ScalePreset::parse(&take_value(&key)?).ok_or_else(|| format!("--scale must name a preset ({})", ScalePreset::names()))?),
 				"--gpu-memory" => gpu_memory_mode = true,
+				"--gpu-economics" => gpu_economics_mode = true,
+				flag if GPU_ECONOMICS_FLAGS.contains(&flag) => set_gpu_economics_knob(&mut gpu_economics, flag, &take_value(&key)?)?,
 				"--ingest" => ingest_mode = true,
 				"--uci" => uci = Some(PathBuf::from(take_value(&key)?)),
 				"--uci-column" => uci_column = take_value(&key)?,
@@ -1327,6 +1429,8 @@ impl Cli {
 				"--failure-reps" => failure_reps = parse_positive(&key, &take_value(&key)?)?,
 				"--failure-compact-to" => failure_compact_to = parse_positive(&key, &take_value(&key)?)? as u64,
 				"--failure-kill-within-ms" => failure_kill_within_ms = parse_positive(&key, &take_value(&key)?)? as u64,
+				"--crash-matrix" => crash_matrix = true,
+				"--crash-matrix-seeds" => crash_matrix_seeds = parse_positive(&key, &take_value(&key)?)?,
 				"--query-mix" => query_mix = parse_positive(&key, &take_value(&key)?)?,
 				"--query-mix-rows" => query_mix_rows = Some(parse_growth_checkpoints(&take_value(&key)?).map_err(|_| "--query-mix-rows needs one row count of at least 2 (e.g. 10M)".to_string()).and_then(|v| if v.len() == 1 { Ok(v[0]) } else { Err("--query-mix-rows takes one row count".to_string()) })?),
 				"--query-mix-range" => query_mix_range = parse_positive(&key, &take_value(&key)?)? as u64,
@@ -1386,7 +1490,7 @@ impl Cli {
 		}
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (sparse_mode, InputMode::Sparse), (gpu_memory_mode, InputMode::GpuMemory), (ingest_mode, InputMode::Ingest)])?;
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (sparse_mode, InputMode::Sparse), (gpu_memory_mode, InputMode::GpuMemory), (gpu_economics_mode, InputMode::GpuEconomics), (ingest_mode, InputMode::Ingest)])?;
 		if let Some(preset) = scale {
 			apply_scale_preset(preset, &mut ds_points, &mut gap_fill, &mut sparse);
 		}
@@ -1430,6 +1534,14 @@ impl Cli {
 		if !failure.is_empty() && (mode != InputMode::Ingest || query_mix > 0 || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some()) {
 			return Err("`--failure` needs `--ingest` and is a run of its own".to_string());
 		}
+		if crash_matrix {
+			if !failure.is_empty() {
+				return Err("`--crash-matrix` runs every failure test; do not combine it with `--failure`".to_string());
+			}
+			if mode != InputMode::Ingest || query_mix > 0 || compressed_query > 0 || ingest_online > 0 || !ingest_growth.is_empty() || analytics_rows.is_some() {
+				return Err("`--crash-matrix` needs `--ingest` and is a run of its own".to_string());
+			}
+		}
 		if query_mix_rows.is_some() && query_mix == 0 {
 			return Err("`--query-mix-rows` needs `--query-mix <OPS>`".to_string());
 		}
@@ -1440,7 +1552,7 @@ impl Cli {
 			return Err("`--compressed-query` is a run of its own, apart from `--ingest-online` and `--ingest-growth`".to_string());
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, failure, failure_rows, failure_reps, failure_compact_to, failure_kill_within_ms, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, exports, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, gpu_economics, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, failure, failure_rows, failure_reps, failure_compact_to, failure_kill_within_ms, crash_matrix, crash_matrix_seeds, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, exports, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1586,7 +1698,7 @@ fn parse_label(token: &str) -> Result<(String, String), String> {
 fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
 	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
 	if selected.len() > 1 {
-		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --sparse / --gpu-memory / --ingest)".to_string());
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --sparse / --gpu-memory / --gpu-economics / --ingest)".to_string());
 	}
 	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
@@ -1603,6 +1715,7 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 		InputMode::GapFill => Some("--gap-fill"),
 		InputMode::Sparse => Some("--sparse"),
 		InputMode::GpuMemory => Some("--gpu-memory"),
+		InputMode::GpuEconomics => Some("--gpu-economics"),
 		InputMode::Ingest => Some("--ingest"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
@@ -1651,7 +1764,7 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory | InputMode::Ingest => unreachable!("handled by self_generating_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory | InputMode::GpuEconomics | InputMode::Ingest => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -1869,7 +1982,7 @@ fn set_gap_fill_knob(params: &mut GapFillParams, flag: &str, value: &str) -> Res
 }
 
 /// The GPU-memory workload's knob flags, each taking one value ([`set_gpu_memory_knob`]).
-const GPU_MEMORY_FLAGS: [&str; 4] = ["--gm-rounds", "--gm-sizes", "--gm-knots", "--gm-pool-mib"];
+const GPU_MEMORY_FLAGS: [&str; 6] = ["--gm-rounds", "--gm-sizes", "--gm-knots", "--gm-pool-mib", "--gm-soak-secs", "--gm-smi-ms"];
 
 /// Apply one GPU-memory knob (`flag` from [`GPU_MEMORY_FLAGS`]) to `params`.
 fn set_gpu_memory_knob(params: &mut weft_bench::gpu_memory::GpuMemoryParams, flag: &str, value: &str) -> Result<(), String> {
@@ -1879,7 +1992,39 @@ fn set_gpu_memory_knob(params: &mut weft_bench::gpu_memory::GpuMemoryParams, fla
 		"--gm-knots" => params.knots = positive("--gm-knots", value)?.max(2),
 		"--gm-sizes" => params.sizes = value.split(',').map(|v| positive("--gm-sizes", v.trim()).map(|n| n.max(2))).collect::<Result<_, _>>()?,
 		"--gm-pool-mib" => params.pool_mib = Some(value.parse::<u64>().map_err(|_| "--gm-pool-mib must be a whole number of MiB".to_string())?),
+		"--gm-soak-secs" => params.soak_secs = Some(u64::try_from(positive("--gm-soak-secs", value)?).unwrap_or(u64::MAX)),
+		"--gm-smi-ms" => params.smi_interval_ms = value.parse::<u64>().map_err(|_| "--gm-smi-ms must be a whole number of milliseconds".to_string())?,
 		_ => unreachable!("only GPU_MEMORY_FLAGS are dispatched here"),
+	}
+	Ok(())
+}
+
+/// The GPU-economics workload's knob flags, each taking one value ([`set_gpu_economics_knob`]).
+const GPU_ECONOMICS_FLAGS: [&str; 10] = ["--ge-points", "--ge-knots", "--ge-calls", "--ge-lanes", "--ge-concurrency", "--ge-calls-per-caller", "--ge-contention", "--ge-cold-spawns", "--ge-no-adapter", "--ge-smi-ms"];
+
+/// Apply one GPU-economics knob (`flag` from [`GPU_ECONOMICS_FLAGS`]) to `params`.
+fn set_gpu_economics_knob(params: &mut weft_bench::gpu_economics::GpuEconomicsParams, flag: &str, value: &str) -> Result<(), String> {
+	use weft_bench::gpu_economics::Lane;
+	let positive = |v: &str| v.trim().parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("{flag} must be a positive whole number"));
+	let lanes = |v: &str| v.split(',').map(|l| Lane::parse(l.trim()).ok_or_else(|| format!("{flag}: {:?} is not cpu, parallel, gpu-f64, gpu-f32 or auto", l.trim()))).collect::<Result<Vec<_>, _>>();
+	match flag {
+		"--ge-points" => params.points = positive(value)?.max(2),
+		"--ge-knots" => params.knots = positive(value)?.max(2),
+		"--ge-calls" => params.calls = positive(value)?,
+		"--ge-lanes" => params.lanes = lanes(value)?,
+		"--ge-concurrency" => params.concurrency = value.split(',').map(positive).collect::<Result<_, _>>()?,
+		"--ge-calls-per-caller" => params.calls_per_caller = positive(value)?,
+		"--ge-contention" => params.contention = lanes(value)?,
+		"--ge-cold-spawns" => params.cold_spawns = value.parse().map_err(|_| "--ge-cold-spawns must be a whole number (0 skips the cold-start lanes)".to_string())?,
+		"--ge-no-adapter" => {
+			params.no_adapter = match value {
+				"on" => true,
+				"off" => false,
+				_ => return Err("--ge-no-adapter must be on or off".to_string()),
+			};
+		}
+		"--ge-smi-ms" => params.smi_interval_ms = value.parse().map_err(|_| "--ge-smi-ms must be a whole number of milliseconds (0 turns sampling off)".to_string())?,
+		_ => unreachable!("only GPU_ECONOMICS_FLAGS are dispatched here"),
 	}
 	Ok(())
 }
@@ -1961,6 +2106,7 @@ USAGE:
     weft-bench --gap-fill [GAP-FILL OPTIONS]
     weft-bench --sparse [BLOCK-MISSINGNESS OPTIONS]
     weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
+    weft-bench --gpu-economics [GPU-ECONOMICS OPTIONS]
     weft-bench --ingest --uci <FILE.txt> [INGEST OPTIONS]
     weft-bench verify <RUN.manifest.json> [--accept-advisories]
     weft-bench combine --out <FILE.json> [--no-manifest] <RUN.json> <RUN.json>...
@@ -2141,6 +2287,11 @@ INGEST OPTIONS (with --ingest):
                              Segment rows the killed compaction aims at [default: 65536]
         --failure-kill-within-ms <MS>
                              The compaction is killed a seeded 0..MS ms in [default: 2000]
+        --crash-matrix       Crash matrix instead (D-S21, SOA-9 crash_kill9): every
+                             failure test at every matrix seed, one report holding
+                             every cell; the run fails if any cell fails
+        --crash-matrix-seeds <N>
+                             Seeds per failure, derived from --seed [default: 3]
         --query-mix <OPS>
                              Seeded query mix instead: seal the corpus, then run OPS
                              operations whose lanes (ingest a batch, look up a point,
@@ -2172,6 +2323,28 @@ GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
                                                [default: 16384,1048576,4194304]
         --gm-knots <N>       Input knots per call                    [default: 1000]
         --gm-pool-mib <N>    Start the GPU with this pool cap  [default: splimes' 512]
+        --gm-soak-secs <N>   Keep running rounds (at least --gm-rounds) for N seconds;
+                             device memory is sampled after every call, and steady
+                             growth after round 1 fails the run as a leak
+        --gm-smi-ms <N>      nvidia-smi memory.used cross-check interval; 0 = off
+                                                                    [default: 1000]
+
+GPU-ECONOMICS OPTIONS (with --gpu-economics; GPU lanes skip without a GPU; seeded by --seed):
+        --ge-points <N>      Output points per call                [default: 1048576]
+        --ge-knots <N>       Input knots per call                    [default: 10000]
+        --ge-calls <N>       Timed calls per fallback lane             [default: 30]
+        --ge-lanes <LIST>    Fallback lanes: cpu,parallel,gpu-f64,gpu-f32,auto
+                                                                   [default: all five]
+        --ge-concurrency <LIST>
+                             Concurrent callers per step        [default: 1,2,4,8,16]
+        --ge-calls-per-caller <N>
+                             Calls per contention caller               [default: 10]
+        --ge-contention <LIST>
+                             Contention lanes                   [default: gpu-f64,cpu]
+        --ge-cold-spawns <N> Child processes per cold-start mode; 0 skips [default: 5]
+        --ge-no-adapter <on|off>
+                             Run the hidden-driver child            [default: on]
+        --ge-smi-ms <N>      nvidia-smi sampling interval; 0 is off   [default: 100]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -2321,6 +2494,16 @@ mod tests {
 		assert_eq!((cli.failure.len(), cli.failure_rows, cli.failure_reps), (3, 2_000_000, 3));
 		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-ingest"]).failure, [weft_bench::failure::Failure::KillIngest]);
 		for bad in [&["--ingest", "--uci", "u.txt", "--failure", "power-loss"][..], &["--failure", "kill-ingest"][..], &["--ingest", "--uci", "u.txt", "--failure", "all", "--query-mix", "3"][..]] {
+			assert!(run_cli(bad).is_err(), "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn crash_matrix_stands_alone_and_takes_a_seed_count() {
+		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--crash-matrix", "--crash-matrix-seeds", "5"]);
+		assert_eq!((cli.crash_matrix, cli.crash_matrix_seeds), (true, 5));
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--crash-matrix"]).crash_matrix_seeds, 3);
+		for bad in [&["--ingest", "--uci", "u.txt", "--crash-matrix", "--failure", "all"][..], &["--crash-matrix"][..], &["--ingest", "--uci", "u.txt", "--crash-matrix", "--query-mix", "3"][..]] {
 			assert!(run_cli(bad).is_err(), "{bad:?}");
 		}
 	}
@@ -2555,6 +2738,22 @@ mod tests {
 	}
 
 	#[test]
+	fn gpu_economics_mode_parses_its_knobs() {
+		use weft_bench::gpu_economics::Lane;
+		let cli = expect_run(&["--gpu-economics"]);
+		assert_eq!(cli.mode, InputMode::GpuEconomics);
+		assert_eq!(cli.gpu_economics, weft_bench::gpu_economics::GpuEconomicsParams::default());
+		let cli = expect_run(&["--gpu-economics", "--ge-points", "65536", "--ge-knots", "50", "--ge-calls", "3", "--ge-lanes", "cpu, gpu-f32", "--ge-concurrency", "1,4", "--ge-calls-per-caller", "2", "--ge-contention", "parallel", "--ge-cold-spawns", "0", "--ge-no-adapter", "off", "--ge-smi-ms", "0"]);
+		let p = &cli.gpu_economics;
+		assert_eq!((p.points, p.knots, p.calls, p.calls_per_caller, p.cold_spawns, p.no_adapter, p.smi_interval_ms), (65_536, 50, 3, 2, 0, false, 0));
+		assert_eq!((p.lanes.clone(), p.contention.clone(), p.concurrency.clone()), (vec![Lane::Cpu, Lane::GpuF32], vec![Lane::Parallel], vec![1, 4]));
+		assert!(run_cli(&["--gpu-economics", "--ge-lanes", "tpu"]).unwrap_err().contains("--ge-lanes"));
+		assert!(run_cli(&["--gpu-economics", "--ge-concurrency", "0"]).unwrap_err().contains("--ge-concurrency"));
+		assert!(run_cli(&["--gpu-economics", "--ge-no-adapter", "yes"]).unwrap_err().contains("--ge-no-adapter"));
+		assert!(run_cli(&["--gpu-economics", "--gpu-memory"]).unwrap_err().contains("only one workload mode"));
+	}
+
+	#[test]
 	fn gpu_memory_mode_parses_its_knobs() {
 		let cli = expect_run(&["--gpu-memory"]);
 		assert_eq!(cli.mode, InputMode::GpuMemory);
@@ -2563,6 +2762,10 @@ mod tests {
 		assert_eq!((cli.gpu_memory.rounds, cli.gpu_memory.sizes.clone(), cli.gpu_memory.knots, cli.gpu_memory.pool_mib), (5, vec![1_024, 65_536], 50, Some(32)));
 		assert!(run_cli(&["--gpu-memory", "--gm-sizes", "10,x"]).unwrap_err().contains("--gm-sizes"));
 		assert!(run_cli(&["--gpu-memory", "--gm-rounds", "0"]).unwrap_err().contains("--gm-rounds"));
+		let cli = expect_run(&["--gpu-memory", "--gm-soak-secs", "1800", "--gm-smi-ms", "0"]);
+		assert_eq!((cli.gpu_memory.soak_secs, cli.gpu_memory.smi_interval_ms), (Some(1_800), 0));
+		assert!(run_cli(&["--gpu-memory", "--gm-soak-secs", "0"]).unwrap_err().contains("--gm-soak-secs"));
+		assert!(run_cli(&["--gpu-memory", "--gm-smi-ms", "x"]).unwrap_err().contains("--gm-smi-ms"));
 		assert!(run_cli(&["--gpu-memory", "-g"]).unwrap_err().contains("only one workload mode"));
 	}
 

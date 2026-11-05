@@ -1,5 +1,6 @@
-//! Startup phase 4 — the background tasks the operator asked for: the reconcile
-//! daemon, the backup daemon, and the one-shot GPU calibration.
+//! Startup phase 4 — the background tasks the operator asked for: the maintenance
+//! scheduler (the reconcile daemon, on by default since ROB-19), the backup daemon,
+//! the key-reload watcher (SEC-7), and the one-shot GPU calibration.
 //!
 //! None of them is required for the server to serve. Since ROB-3 they are
 //! not spawned detached with their handles dropped: each is registered in
@@ -17,7 +18,7 @@
 use std::{sync::Arc, time::Duration};
 
 use weft_server::{
-	gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, spawn_backup_daemon, spawn_reconcile_daemon, AppState, BackupDaemonConfig, Daemons, ReconcileDaemonConfig
+	gpu::{self, CalibrationMode, GPU_CALIBRATE_ENV}, spawn_backup_daemon, spawn_key_reload_watcher, spawn_reconcile_daemon, AppState, BackupDaemonConfig, Daemons, ReconcileDaemonConfig
 };
 
 /// Await one spawned daemon task, re-raising its panic in the calling
@@ -33,9 +34,28 @@ async fn await_supervised(handle: tokio::task::JoinHandle<()>) {
 	}
 }
 
-/// Environment variable enabling the background reconcile daemon: its sweep
-/// interval in seconds. Unset or `0` disables the daemon.
+/// Environment variable setting the background maintenance scheduler's sweep
+/// interval in seconds (ROB-19: the scheduler is decision 17's daemon, on by
+/// default). Unset → [`DEFAULT_MAINTENANCE_INTERVAL_SECS`]; `0` disables the
+/// scheduler.
 const RECONCILE_INTERVAL_ENV: &str = "WEFT_RECONCILE_INTERVAL_SECS";
+
+/// How often the maintenance scheduler sweeps when
+/// `WEFT_RECONCILE_INTERVAL_SECS` is unset (ROB-19): the maintenance and
+/// compaction daemon is **on by default** once D-S9 has landed (release plan
+/// decision 17), so an operator who configures nothing still gets scheduled
+/// reconciliation and compaction; `WEFT_RECONCILE_INTERVAL_SECS=0` is the
+/// opt-out.
+pub const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 60;
+
+/// The compaction target, in rows per segment, the maintenance scheduler
+/// coalesces toward when `WEFT_COMPACT_TARGET_ROWS` is unset (ROB-19 —
+/// compaction on by default). Between the checkpoint floor (8,192 rows) and
+/// the ~200k-row single segment the `downsample_range` knee measured reading
+/// slowly: large enough that ordinary ingest batches are not rewritten every
+/// tick (the fragmentation gate skips aspects already at their ideal count),
+/// small enough to keep several segments per aspect for cross-segment reads.
+pub const DEFAULT_COMPACT_TARGET_ROWS: usize = 65_536;
 
 /// Environment variable for the daemon's out-of-order backlog trigger threshold
 /// (defaults to 1 — reconcile any aspect with at least one out-of-order segment).
@@ -66,11 +86,12 @@ const RECONCILE_SPLIT_MIN_BYTES_ENV: &str = "WEFT_RECONCILE_SPLIT_MIN_BYTES";
 /// no squash runs.
 const RECONCILE_MAX_SPLITS_ENV: &str = "WEFT_RECONCILE_MAX_SPLITS";
 
-/// Environment variable naming the **target segment size in rows** for the daemon's
-/// size-aware compaction pass (roadmap Phase 4.6). When set, each tick also coalesces
-/// every aspect's segments toward ~this many rows per segment (leaving already-large
-/// segments untouched), holding fragmentation near the read-optimal size rather than
-/// folding to one (`WEFT_RECONCILE_MAX_SPLITS`). When unset, no size-aware compaction runs.
+/// Environment variable naming the **target segment size in rows** for the scheduler's
+/// size-aware compaction pass (roadmap Phase 4.6). Each tick coalesces every aspect's
+/// segments toward ~this many rows per segment (leaving already-large segments
+/// untouched), holding fragmentation near the read-optimal size rather than folding
+/// to one (`WEFT_RECONCILE_MAX_SPLITS`). When unset, the pass runs at
+/// [`DEFAULT_COMPACT_TARGET_ROWS`] (ROB-19: compaction is on by default).
 const COMPACT_TARGET_ROWS_ENV: &str = "WEFT_COMPACT_TARGET_ROWS";
 
 /// Environment variable enabling the background **control-plane backup** daemon
@@ -90,49 +111,62 @@ const BACKUP_DIR_ENV: &str = "WEFT_BACKUP_DIR";
 /// never a prune candidate.
 const BACKUP_KEEP_ENV: &str = "WEFT_BACKUP_KEEP";
 
-/// Start the background reconcile daemon (roadmap Phase 4.6) when a store is
-/// configured and `WEFT_RECONCILE_INTERVAL_SECS` names a positive interval.
+/// Resolve the maintenance scheduler's configuration from the environment
+/// (read through `get`, so tests can drive it without touching the process
+/// environment). `Ok(None)` is the one opt-out: `WEFT_RECONCILE_INTERVAL_SECS=0`.
 ///
-/// A no-op when no store is attached (nothing to reconcile) or the interval is
-/// unset/`0`/unparseable-as-positive. The daemon is registered in
-/// `daemons` (ROB-3): supervised, restarted after a panic, and stopped by
-/// the registry's shutdown watch.
+/// ROB-19 defaults: an unset interval resolves to
+/// [`DEFAULT_MAINTENANCE_INTERVAL_SECS`] and an unset compaction target to
+/// [`DEFAULT_COMPACT_TARGET_ROWS`] — the scheduler and its compaction pass run
+/// unless the operator turns them off.
 ///
 /// # Errors
 ///
-/// Propagates a non-numeric `WEFT_RECONCILE_THRESHOLD` (a malformed operator config
+/// A non-numeric value in any numeric variable (a malformed operator config
 /// should fail loudly at start rather than silently default).
-pub(crate) fn spawn_reconcile_if_configured(state: &AppState, daemons: &Daemons) -> anyhow::Result<()> {
+fn resolve_maintenance_config(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Option<ReconcileDaemonConfig>> {
+	let numeric = |var: &str| -> anyhow::Result<Option<u64>> { get(var).map(|raw| raw.parse::<u64>().map_err(|e| anyhow::anyhow!("{var}={raw:?} is not a non-negative integer: {e}"))).transpose() };
+	let interval_secs = numeric(RECONCILE_INTERVAL_ENV)?.unwrap_or(DEFAULT_MAINTENANCE_INTERVAL_SECS);
+	if interval_secs == 0 {
+		return Ok(None);
+	}
+	let threshold = usize::try_from(numeric(RECONCILE_THRESHOLD_ENV)?.unwrap_or(1)).unwrap_or(usize::MAX);
+	let truthy = |var: &str| get(var).is_some_and(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+	let hot_cold = truthy(RECONCILE_HOT_COLD_ENV);
+	let overlaps = truthy(RECONCILE_OVERLAPS_ENV);
+	let split_min_bytes = numeric(RECONCILE_SPLIT_MIN_BYTES_ENV)?;
+	let squash_max_segments = numeric(RECONCILE_MAX_SPLITS_ENV)?.map(|raw| usize::try_from(raw).unwrap_or(usize::MAX));
+	let compact_target_rows = Some(numeric(COMPACT_TARGET_ROWS_ENV)?.map_or(DEFAULT_COMPACT_TARGET_ROWS, |raw| usize::try_from(raw).unwrap_or(usize::MAX)));
+	Ok(Some(ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps, split_min_bytes, squash_max_segments, compact_target_rows }))
+}
+
+/// Start the background maintenance scheduler (the reconcile daemon, roadmap
+/// Phase 4.6) when a store is configured — **by default** (ROB-19, release plan
+/// decision 17): with nothing configured it sweeps every
+/// [`DEFAULT_MAINTENANCE_INTERVAL_SECS`] seconds and compacts toward
+/// [`DEFAULT_COMPACT_TARGET_ROWS`] rows per segment.
+/// `WEFT_RECONCILE_INTERVAL_SECS=0` opts out.
+///
+/// A no-op when no store is attached (nothing to maintain) or the interval is
+/// `0`. The daemon is registered in `daemons` (ROB-3): supervised, restarted
+/// after a panic, and stopped by the registry's shutdown watch.
+///
+/// # Errors
+///
+/// Propagates a non-numeric numeric setting (a malformed operator config
+/// should fail loudly at start rather than silently default).
+pub fn spawn_reconcile_if_configured(state: &AppState, daemons: &Daemons) -> anyhow::Result<()> {
 	let Some(store) = state.store() else { return Ok(()) };
 	// Owned, so the registry's factory can hold it for the process lifetime.
 	let store = Arc::clone(store);
-	let interval_secs: u64 = match std::env::var(RECONCILE_INTERVAL_ENV) {
-		Ok(raw) => raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_INTERVAL_ENV}={raw:?} is not a non-negative integer: {e}"))?,
-		Err(_) => 0,
-	};
-	if interval_secs == 0 {
-		return Ok(());
-	}
-	let threshold: usize = match std::env::var(RECONCILE_THRESHOLD_ENV) {
-		Ok(raw) => raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_THRESHOLD_ENV}={raw:?} is not a non-negative integer: {e}"))?,
-		Err(_) => 1,
-	};
-	let truthy = |var: &str| std::env::var(var).map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false);
-	let hot_cold = truthy(RECONCILE_HOT_COLD_ENV);
-	let overlaps = truthy(RECONCILE_OVERLAPS_ENV);
-	let split_min_bytes: Option<u64> = match std::env::var(RECONCILE_SPLIT_MIN_BYTES_ENV) {
-		Ok(raw) => Some(raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_SPLIT_MIN_BYTES_ENV}={raw:?} is not a non-negative integer: {e}"))?),
-		Err(_) => None,
-	};
-	let squash_max_segments: Option<usize> = match std::env::var(RECONCILE_MAX_SPLITS_ENV) {
-		Ok(raw) => Some(raw.parse().map_err(|e| anyhow::anyhow!("{RECONCILE_MAX_SPLITS_ENV}={raw:?} is not a non-negative integer: {e}"))?),
-		Err(_) => None,
-	};
-	let compact_target_rows: Option<usize> = match std::env::var(COMPACT_TARGET_ROWS_ENV) {
-		Ok(raw) => Some(raw.parse().map_err(|e| anyhow::anyhow!("{COMPACT_TARGET_ROWS_ENV}={raw:?} is not a non-negative integer: {e}"))?),
-		Err(_) => None,
-	};
-	let config = ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps, split_min_bytes, squash_max_segments, compact_target_rows };
+	let Some(config) = resolve_maintenance_config(|var| std::env::var(var).ok())? else { return Ok(()) };
+	let interval_secs = config.interval.as_secs();
+	let threshold = config.threshold;
+	let hot_cold = config.hot_cold;
+	let overlaps = config.overlaps;
+	let split_min_bytes = config.split_min_bytes;
+	let squash_max_segments = config.squash_max_segments;
+	let compact_target_rows = config.compact_target_rows;
 	// Registered with the Daemons registry (ROB-3): the factory re-spawns
 	// the daemon after a panic, under the registry's supervision.
 	let metrics = state.metrics().clone();
@@ -148,7 +182,7 @@ pub(crate) fn spawn_reconcile_if_configured(state: &AppState, daemons: &Daemons)
 	};
 	let squash_note = squash_max_segments.map_or_else(String::new, |max| format!(" + squash (max {max} segment(s))"));
 	let compact_note = compact_target_rows.map_or_else(String::new, |target| format!(" + compact (target {target} row(s)/segment)"));
-	println!("reconcile daemon: enabled ({mode} mode{overlap_note}{squash_note}{compact_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
+	println!("maintenance scheduler: enabled ({mode} mode{overlap_note}{squash_note}{compact_note}, every {interval_secs}s, threshold {threshold} out-of-order segment(s))");
 	Ok(())
 }
 
@@ -164,7 +198,7 @@ pub(crate) fn spawn_reconcile_if_configured(state: &AppState, daemons: &Daemons)
 ///
 /// Propagates a non-numeric `WEFT_BACKUP_INTERVAL_SECS`/`WEFT_BACKUP_KEEP` (a malformed
 /// operator config should fail loudly at start rather than silently default).
-pub(crate) fn spawn_backup_if_configured(state: &AppState, daemons: &Daemons) -> anyhow::Result<()> {
+pub fn spawn_backup_if_configured(state: &AppState, daemons: &Daemons) -> anyhow::Result<()> {
 	let Some(store) = state.store() else { return Ok(()) };
 	// Owned, so the registry's factory can hold it for the process lifetime.
 	let store = Arc::clone(store);
@@ -193,12 +227,38 @@ pub(crate) fn spawn_backup_if_configured(state: &AppState, daemons: &Daemons) ->
 	Ok(())
 }
 
+/// Register the key-reload watcher (SEC-7) when authentication is on:
+/// it waits for `SIGHUP` and reloads the keys file in force, so an
+/// operator who edits the file — adds a key, removes one, changes a
+/// role — applies the edit with `kill -HUP` instead of a restart. A
+/// malformed edit is refused by the reload itself and the keys in
+/// force stay; the watcher logs either outcome. Registered in the
+/// Daemons registry (ROB-3) like the other background tasks:
+/// supervised, and stopped by the registry's shutdown watch.
+///
+/// A no-op when authentication is off or explicitly disabled: there is
+/// no keys file to reload.
+pub fn spawn_key_reload_if_configured(state: &AppState, daemons: &Daemons) {
+	if !state.auth().is_enabled() {
+		return;
+	}
+	// Owned, so the registry's factory can hold it for the process
+	// lifetime; every clone enforces (and reloads) the same shared
+	// store the router's state carries.
+	let auth = state.auth().clone();
+	drop(daemons.spawn("key-reload", move || {
+		let handle = spawn_key_reload_watcher(auth.clone());
+		await_supervised(handle)
+	}));
+	println!("key reload: enabled (SIGHUP reloads the keys file in force; a malformed edit is refused and the keys in force stay)");
+}
+
 /// Start the GPU calibration ([`gpu::calibrate`]) in the background on tokio's blocking
 /// pool unless `WEFT_GPU_CALIBRATE` opts out; it prints what it found when it finishes.
 /// Returns at once: the server serves while it runs, interpolating on the CPU until the
 /// measured thresholds are in force. Never fails: a missing GPU, a software adapter, a
 /// failed calibration, or even a panicking one only leaves splimes' defaults in force.
-pub(crate) fn spawn_gpu_calibration_if_enabled(daemons: &Daemons) {
+pub fn spawn_gpu_calibration_if_enabled(daemons: &Daemons) {
 	let mode = CalibrationMode::from_env_value(std::env::var(GPU_CALIBRATE_ENV).ok().as_deref());
 	if mode == CalibrationMode::Off {
 		println!("gpu calibration: skipped ({GPU_CALIBRATE_ENV} is off); interpolation stays on the CPU with the default thresholds");
@@ -212,4 +272,70 @@ pub(crate) fn spawn_gpu_calibration_if_enabled(daemons: &Daemons) {
 	drop(daemons.spawn_once("gpu-calibration", async move {
 		let _ = gpu::spawn_in_background(move || gpu::calibrate(mode)).await;
 	}));
+}
+
+/// Phase 2: bind and start the opt-in Arrow Flight listener at `addr`. It stops on the
+/// registry's shutdown watch but is not supervised by it: the supervisor aborts its task
+/// on that watch, which would cut the listener's own grace short. The caller joins the
+/// handle after serving ends and before the store shuts down, so open streams get
+/// [`weft_server::flight::FLIGHT_SHUTDOWN_GRACE`] to finish first.
+///
+/// # Errors
+///
+/// The bind's failure: an address in use stops the start rather than leaving Flight off.
+pub async fn spawn_flight(addr: std::net::SocketAddr, state: &AppState, daemons: &Daemons) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+	let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| anyhow::anyhow!("cannot bind the Flight listener on {addr}: {error}"))?;
+	println!("flight: Arrow Flight, read-only, on {} (experimental; {} turns it off)", listener.local_addr()?, weft_server::flight::FLIGHT_ADDR_ENV);
+	let state = state.clone();
+	let shutdown = daemons.shutdown_watch();
+	Ok(tokio::spawn(async move {
+		if let Err(error) = weft_server::flight::serve(listener, state, shutdown).await {
+			tracing::error!(%error, "the Flight listener stopped");
+		}
+	}))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use super::*;
+
+	fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+		let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (String::from(*k), String::from(*v))).collect();
+		move |var| map.get(var).cloned()
+	}
+
+	/// ROB-19: with nothing configured, the scheduler resolves to ON — the
+	/// default interval, and a compaction pass at the default target rows.
+	#[test]
+	fn maintenance_scheduler_is_on_by_default_with_compaction() {
+		let config = resolve_maintenance_config(env(&[])).expect("resolves").expect("enabled by default");
+		assert_eq!(config.interval, Duration::from_secs(DEFAULT_MAINTENANCE_INTERVAL_SECS));
+		assert_eq!(config.compact_target_rows, Some(DEFAULT_COMPACT_TARGET_ROWS), "compaction runs by default");
+		assert_eq!(config.threshold, 1);
+		assert!(!config.hot_cold && !config.overlaps);
+		assert_eq!(config.split_min_bytes, None);
+		assert_eq!(config.squash_max_segments, None);
+	}
+
+	/// ROB-19: `WEFT_RECONCILE_INTERVAL_SECS=0` is the opt-out, and an explicit
+	/// interval and compaction target still win over the defaults.
+	#[test]
+	fn maintenance_scheduler_opt_out_and_overrides() {
+		assert!(resolve_maintenance_config(env(&[(RECONCILE_INTERVAL_ENV, "0")])).expect("resolves").is_none(), "0 disables the scheduler");
+		let config = resolve_maintenance_config(env(&[(RECONCILE_INTERVAL_ENV, "5"), (COMPACT_TARGET_ROWS_ENV, "1000"), (RECONCILE_THRESHOLD_ENV, "3")])).expect("resolves").expect("enabled");
+		assert_eq!(config.interval, Duration::from_secs(5));
+		assert_eq!(config.compact_target_rows, Some(1000));
+		assert_eq!(config.threshold, 3);
+	}
+
+	/// A malformed numeric setting still stops the server (the phase-4
+	/// exception), for the interval and for the compaction target alike.
+	#[test]
+	fn maintenance_scheduler_rejects_malformed_numbers() {
+		assert!(resolve_maintenance_config(env(&[(RECONCILE_INTERVAL_ENV, "soon")])).is_err());
+		assert!(resolve_maintenance_config(env(&[(COMPACT_TARGET_ROWS_ENV, "many")])).is_err());
+		assert!(resolve_maintenance_config(env(&[(RECONCILE_THRESHOLD_ENV, "some")])).is_err());
+	}
 }

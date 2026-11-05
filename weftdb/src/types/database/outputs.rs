@@ -30,7 +30,6 @@ type CorrelationRowData = (CorrelationID, DictionaryId, SubjectId, AspectId, Pat
 const MAX_PAGES_FOR_POINT_ANALYSIS: usize = 10;
 
 // Avoid triggering pedantic 'too_many_lines' on this large impl
-#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl crate::types::database::traits::outputs::Outputs for Database {
 	//
@@ -39,9 +38,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Get all unbatched measurement timestamps for an aspect
 	async fn get_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<Vec<DateTime<Utc>>> {
-		let db = self.metadata();
 		let db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(self.metadata(), db_path, Some(self.cache.clone())).await?;
 
 		let sql = r"
 			SELECT data_timestamp FROM unbatched_measurements
@@ -64,9 +62,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Get every unbatched queue entry for an aspect, with its `queued_at`
 	async fn get_unbatched_entries(&self, aspect_id: &AspectId) -> Result<Vec<UnbatchedEntry>> {
-		let db = self.metadata();
 		let db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(self.metadata(), db_path, Some(self.cache.clone())).await?;
 
 		let sql = r"
 			SELECT data_timestamp, queued_at FROM unbatched_measurements
@@ -90,9 +87,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Count unbatched measurements for an aspect
 	async fn count_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<u64> {
-		let db = self.metadata();
 		let db_path = self.metadata_path();
-		let conn = Self::begin_concurrent(db, db_path, Some(self.cache.clone())).await?;
+		let conn = Self::begin_concurrent(self.metadata(), db_path, Some(self.cache.clone())).await?;
 
 		let sql = "SELECT COUNT(*) FROM unbatched_measurements WHERE aspect_id = ?";
 		let mut rows = conn.as_ref().query(sql, turso::params![aspect_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to count unbatched measurements: {e}")))?;
@@ -113,6 +109,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let sql = "SELECT COUNT(*) FROM batches";
 		let mut rows = conn.as_ref().query(sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to count unprocessed batches: {e}")))?;
@@ -133,6 +130,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let sql = "SELECT COUNT(*) FROM batches";
 		let mut rows = conn.as_ref().query(sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to count processed batches: {e}")))?;
@@ -156,6 +154,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		if self.is_seal_backed(aspect_id).await? {
 			let store = self.seal_store().await?;
 			let all = crate::legacy_seal::read_measurements(&store, aspect_id, None, None).await?;
+			drop(store);
 			let mut boundary: Vec<Measurement> = all.iter().take(2).cloned().collect();
 			for latest in all.iter().rev().take(2).rev() {
 				if !boundary.iter().any(|m| m.id() == latest.id()) {
@@ -169,6 +168,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let mut all_measurements: Vec<Measurement> = Vec::new();
 
@@ -243,6 +243,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		if self.is_seal_backed(aspect_id).await? {
 			let store = self.seal_store().await?;
 			let stats = store.aspect_stats(&crate::legacy_seal::aspect_key(aspect_id)).await?;
+			drop(store);
 			return usize::try_from(stats.total_rows).map_err(|_| Error::DatabaseError("Seal-backed measurement count does not fit usize".to_string()).into());
 		}
 		let measurement_db = self.get_measurement_db(aspect_id).await?;
@@ -250,6 +251,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		let count_sql = "SELECT COUNT(*) FROM measurements";
 		let conn: cache::Connection = Self::begin_concurrent(&measurement_db, &db_path, Some(self.cache.clone())).await?;
+		drop(measurement_db);
 		let mut rows: turso::Rows = conn.as_ref().query(count_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to count measurements: {e}")))?;
 
 		Self::commit_concurrent(&conn).await?;
@@ -257,7 +259,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get count row: {e}")))? {
 			let count_value = row.get_value(0)?;
 			let count = if let Some(int_val) = count_value.as_integer() {
-				*int_val as usize
+				crate::types::num::i64_to_usize(*int_val)
 			} else if let Some(text_val) = count_value.as_text() {
 				text_val.parse().map_err(|e| Error::DatabaseError(format!("Invalid count format: {e}")))?
 			} else {
@@ -429,6 +431,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// Calculate overlap needed for interpolation method (its degree)
 		let overlap_points = method.degree();
 		let overlap_duration = step_duration * i32::try_from(overlap_points).unwrap_or(3);
+		// The knots a chunk needs past each edge, however far away they are (#506).
+		let bracket_knots = overlap_points.max(1);
 
 		// Target ~50,000 output points per chunk for responsive streaming
 		let chunk_size = 50_000i64;
@@ -493,6 +497,11 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 					Ok(m) => m,
 					Err(e) => return Some((Err(e), (chunk_end, None, true))),
 				};
+				let measurements = match Self::widen_to_brackets(&db, &aspect_id, measurements, BracketWindows { chunk: (current_chunk_start, chunk_end), fetch: (fetch_start, fetch_end), range: (range_start, end_time) }, bracket_knots, chunk_dur).await {
+					Ok(m) => m,
+					Err(e) => return Some((Err(e), (chunk_end, None, true))),
+				};
+				drop(db);
 
 				if measurements.is_empty() {
 					// No data for this chunk, move to next
@@ -535,16 +544,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 						let mut new_iter = interpolated.into_points().into_iter();
 
 						// Return first point and set up iterator for the rest
-						match new_iter.next() {
-							Some(first_point) => Some((Ok(first_point), (chunk_end, Some(new_iter), is_last_chunk))),
-							None => {
-								if is_last_chunk {
-									None
-								} else {
-									Some((Ok(Point { timestamp: current_chunk_start, value: BigDecimal::from(0) }), (chunk_end, None, false)))
-								}
-							}
-						}
+						new_iter.next().map_or_else(|| if is_last_chunk { None } else { Some((Ok(Point { timestamp: current_chunk_start, value: BigDecimal::from(0) }), (chunk_end, None, false))) }, |first_point| Some((Ok(first_point), (chunk_end, Some(new_iter), is_last_chunk))))
 					}
 					Err(e) => Some((Err(e.into()), (chunk_end, None, true))),
 				}
@@ -556,10 +556,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// extreme survives.
 		let mut last_emitted = None;
 		let stream = stream.filter(move |item| {
-			let keep = match item {
-				Ok(point) => last_emitted.is_none_or(|last| point.timestamp > last),
-				Err(_) => true,
-			};
+			let keep = item.as_ref().map_or(true, |point| last_emitted.is_none_or(|last| point.timestamp > last));
 			if let (true, Ok(point)) = (keep, item) {
 				last_emitted = Some(point.timestamp);
 			}
@@ -584,7 +581,6 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 					let delay = MVCC_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
 					tracing::debug!(attempt = attempt + 1, delay_ms = delay, "Transient MVCC error during fetch_measurements_for_range, retrying...");
 					tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-					continue;
 				}
 				Err(e) => return Err(e),
 			}
@@ -607,7 +603,6 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 					let delay = MVCC_RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
 					tracing::debug!(attempt = attempt + 1, delay_ms = delay, "Transient MVCC error during fetch_measurements_for_chunk, retrying...");
 					tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-					continue;
 				}
 				Err(e) => return Err(e),
 			}
@@ -622,7 +617,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		// Try to get from cache first
 		if let Some(cached_batches) = self.cache.lock().await.get::<Vec<Batch>>(&cache_key).await {
-			if let Some(batch) = cached_batches.iter().find(|b| *b.batch_id() == *batch_id) {
+			let value = cached_batches.iter().find(|b| *b.batch_id() == *batch_id);
+			if let Some(batch) = value {
 				return Ok(batch.clone());
 			}
 		}
@@ -643,7 +639,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		Self::commit_concurrent(&conn).await?;
 
-		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
+		let next_row = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))?;
+		if let Some(row) = next_row {
 			let batch = Self::parse_batch_row_helper(&row, self.name(), &db_path)?;
 
 			// Cache the single batch (as a vec with one element)
@@ -670,6 +667,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db = self.get_unprocessed_batches_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Query matches schema: id, aspect_id, database_id, size, resolution, measurements, batch_hash
 		let query_sql = r"
@@ -682,23 +680,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query unprocessed batches: {e}")))?;
 
 		// Collect all batches first to avoid async issues in the stream
-		let mut batches = Vec::new();
-		let db_name = self.name();
-		let db_path_clone = db_path.clone();
-
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
-			if let Ok(batch) = Self::parse_batch_row_helper(&row, db_name, &db_path_clone) {
-				batches.push(batch);
-			} else {
-				// Log error but continue processing other batches
-				tracing::warn!("Failed to parse batch row");
-			}
-		}
+		let batches = Self::collect_batch_rows(&mut rows, self.name(), &db_path).await?;
 
 		// Cache the results for future queries
-		if !batches.is_empty() {
-			self.cache.lock().await.store(&cache_key, batches.clone()).await;
-		}
+		self.cache_nonempty(&cache_key, &batches).await;
 
 		// Convert to stream
 		let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
@@ -716,7 +701,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// Try to get from cache first
 		if let Some(cached_batches) = self.cache.lock().await.get::<Vec<Batch>>(&cache_key).await {
 			// Since we're looking for a specific batch, find it in the cached results
-			if let Some(batch) = cached_batches.into_iter().find(|b| *b.batch_id() == *batch_id) {
+			let value = cached_batches.into_iter().find(|b| *b.batch_id() == *batch_id);
+			if let Some(batch) = value {
 				return Ok(batch);
 			}
 			// If not found in cache, fall through to database query
@@ -736,7 +722,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![batch_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query batch: {e}")))?;
 
-		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
+		let next_row = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))?;
+		if let Some(row) = next_row {
 			let batch = Self::parse_batch_row_helper(&row, self.name(), &db_path)?;
 
 			// Cache the single batch (as a vec with one element)
@@ -764,6 +751,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db = self.get_processed_batches_db(aspect_id).await?;
 		let db_path = self.get_processed_batches_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Query matches schema: id, aspect_id, database_id, size, resolution, measurements, batch_hash
 		let query_sql = r"
@@ -776,25 +764,12 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![aspect_id.as_uuid().to_string(), self.id().as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query processed batches: {e}")))?;
 
 		// Collect all batches first to avoid async issues in the stream
-		let mut batches = Vec::new();
-		let db_name = self.name();
-		let db_path_clone = db_path.clone();
-
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? {
-			if let Ok(batch) = Self::parse_batch_row_helper(&row, db_name, &db_path_clone) {
-				batches.push(batch);
-			} else {
-				// Log error but continue processing other batches
-				tracing::warn!("Failed to parse batch row");
-			}
-		}
+		let batches = Self::collect_batch_rows(&mut rows, self.name(), &db_path).await?;
 
 		Self::commit_concurrent(&conn).await?;
 
 		// Cache the results for future queries
-		if !batches.is_empty() {
-			self.cache.lock().await.store(&cache_key, batches.clone()).await;
-		}
+		self.cache_nonempty(&cache_key, &batches).await;
 
 		// Convert to stream
 		let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
@@ -817,6 +792,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// each dictionary's metadata is cached by `get_dictionary_metadata`.
 		let aspect = self.get_aspect(aspect_id).await?;
 		let dictionaries_path = Self::aspect_dictionaries_path(&self.name, aspect.subject_name(), aspect.name());
+		drop(aspect);
 		let mut entries = match tokio::fs::read_dir(&dictionaries_path).await {
 			Ok(entries) => entries,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -826,7 +802,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		while let Some(entry) = entries.next_entry().await.map_err(|e| Error::DatabaseError(format!("Failed to read dictionaries directory '{dictionaries_path}': {e}")))? {
 			// `<name>.db` only, not Turso's `<name>.db-wal` and `<name>.db-log` beside it.
 			let path = entry.path();
-			if !path.extension().is_some_and(|ext| ext == "db") {
+			if path.extension().is_none_or(|ext| ext != "db") {
 				continue;
 			}
 			// A regular file only. Reading a dictionary opens its file, which sets its journal
@@ -891,7 +867,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern: {e}")))?;
 		Self::commit_concurrent(&conn).await?;
 
-		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))? {
+		let next_row = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))?;
+		if let Some(row) = next_row {
 			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
 			let sum_value_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Sum value is not text".to_string()))?.clone();
 			let abs_sum_value_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Abs sum value is not text".to_string()))?.clone();
@@ -918,7 +895,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
                         ";
 			let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern occurrences: {e}")))?;
 			let mut occurrences: Vec<Occurrence> = Vec::new();
-			while let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence row: {e}")))? {
+			loop {
+				let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence row: {e}")))? else {
+					break;
+				};
 				// Column indices: 0=pattern_id, 1=aspect_id, 2=resolution, 3=size, 4=database_info, 5=beginning_timestamp, 6=end_timestamp
 				let occ_pattern_id_str = occ_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
 				let occ_aspect_id_str = occ_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
@@ -949,7 +929,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 			let mut rel_rows: turso::Rows = conn.as_ref().query(relatives_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern relatives: {e}")))?;
 			let mut relatives: Vec<Relative> = Vec::new();
-			while let Some(rel_row) = rel_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern relative row: {e}")))? {
+			loop {
+				let Some(rel_row) = rel_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern relative row: {e}")))? else {
+					break;
+				};
 				let _rel_pattern_id_str = rel_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Pattern ID is not text".to_string()))?.clone();
 				let _rel_relative_index: usize = usize::try_from(*rel_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Relative Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Relative index out of range: {e}")))?;
 				let rel_value_json = rel_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Value is not text".to_string()))?.clone();
@@ -981,29 +964,17 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		// Get from database
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		drop(db);
 		let query_sql = r"
                         SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value
                         FROM patterns 
                 ";
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query patterns: {e}")))?;
 		// Collect all patterns first to avoid async issues in the stream
-		let mut patterns = Vec::new();
-		while let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))? {
-			let pattern_id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
-			let pattern_id = PatternID::from_uuid(Uuid::parse_str(&pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
-			// Use get_dictionary_pattern to get the full pattern with occurrences and relatives
-			if let Ok(pattern) = self.get_dictionary_pattern(aspect_id, dictionary_name, &pattern_id).await {
-				patterns.push(pattern);
-			} else {
-				// Log error but continue processing other patterns
-				tracing::warn!("Failed to parse pattern row for ID {pattern_id_str}");
-			}
-		}
+		let patterns = self.collect_pattern_rows(&mut rows, aspect_id, dictionary_name).await?;
 		Self::commit_concurrent(&conn).await?;
 		// Cache the results for future queries
-		if !patterns.is_empty() {
-			self.cache.lock().await.store(&cache_key, patterns.clone()).await;
-		}
+		self.cache_nonempty(&cache_key, &patterns).await;
 		// Convert to stream
 		let pattern_stream = futures::stream::iter(patterns.into_iter().map(Ok));
 		Ok(Box::pin(pattern_stream))
@@ -1034,7 +1005,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				";
 
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation: {e}")))?;
-		if let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation row: {e}")))? {
+		let next_row = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation row: {e}")))?;
+		if let Some(row) = next_row {
 			// Parse the row using shared helper
 			let (id, dictionary_id, subject_id, aspect_id_parsed, pattern_id, event_id, average_distance) = Self::parse_correlation_row(&row)?;
 
@@ -1042,7 +1014,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 			let error_rate: HashMap<SignalType, ErrorRate> = Self::load_correlation_error_rates(&conn, &id).await?;
 			let occurrences: Vec<Occurrence> = Self::load_correlation_occurrences(&conn, &id).await?;
 
-			let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences, average_distance);
+			let correlation = Correlation::new(Some(id), crate::CorrelationKeys { dictionary_id, subject_id, aspect_id: aspect_id_parsed, pattern_id, event_id }, error_rate, occurrences, average_distance);
 
 			// Cache the correlation
 			self.cache.lock().await.store(&cache_key, correlation.clone()).await;
@@ -1060,13 +1032,10 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 		// Get database connection info upfront for the streaming closure
 		let mut aspect = self.get_aspect(aspect_id).await?;
-		let db = aspect.correlations().await?;
-		let db_path = aspect.correlations_path();
-		let cache = self.cache.clone();
-		let aspect_id_owned = *aspect_id;
+		let initial_state: CorrelationStreamState = (0i64, Vec::<CorrelationID>::new(), aspect.correlations().await?, aspect.correlations_path(), self.cache.clone(), *aspect_id);
+		drop(aspect);
 
 		// Use unfold to create a true streaming iterator that fetches in chunks
-		let initial_state: (i64, Vec<CorrelationID>, turso::Database, String, std::sync::Arc<tokio::sync::Mutex<cache::DatabaseCache>>, AspectId) = (0i64, Vec::<CorrelationID>::new(), db, db_path, cache, aspect_id_owned);
 		let stream = futures::stream::unfold(initial_state, move |(offset, mut current_ids, db, db_path, cache, aspect_id)| {
 			async move {
 				// If we have IDs in the current batch, pop one and fetch it
@@ -1171,6 +1140,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db = self.get_unprocessed_events_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let query_sql = r"
                         SELECT id, name, description
@@ -1238,6 +1208,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db = self.get_unprocessed_events_db(aspect_id).await?;
 		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let query_sql = r"
                         SELECT id
                         FROM events 
@@ -1280,6 +1251,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db = self.get_processed_events_db(aspect_id).await?;
 		let db_path = self.get_processed_events_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let query_sql = r"
                                 SELECT id, name, description
@@ -1321,6 +1293,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let db = self.get_processed_events_db(aspect_id).await?;
 		let db_path = self.get_processed_events_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let query_sql = r"
                                 SELECT id
                                 FROM processed_events 
@@ -1353,13 +1326,15 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		if self.is_seal_backed(aspect_id).await? {
 			let store = self.seal_store().await?;
 			let all = crate::legacy_seal::read_measurements(&store, aspect_id, start.map(|t| t.timestamp_millis()), end.map(|t| t.timestamp_millis())).await?;
+			drop(store);
 			let offset = page.saturating_mul(max_per_page);
-			let measurements: Vec<Measurement> = all.into_iter().skip(offset).take(max_per_page).collect();
-			return Ok(Box::pin(futures::stream::iter(measurements.into_iter().map(Ok))));
+
+			return Ok(Box::pin(futures::stream::iter(all.into_iter().skip(offset).take(max_per_page).map(Ok))));
 		}
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Safely convert page and max_per_page to i64 to avoid potential wrapping on 64-bit targets
 		let page_i64 = i64::try_from(page).map_err(|_| Error::DatabaseError("Page value too large".to_string()))?;
@@ -1394,7 +1369,68 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 }
 
 /// Helper methods for retry-with-MVCC operations
+/// The time windows [`Database::widen_to_brackets`] works within: the chunk being
+/// served, what has been fetched for it so far, and the whole requested range.
+#[derive(Clone, Copy)]
+struct BracketWindows {
+	chunk: (DateTime<Utc>, DateTime<Utc>),
+	fetch: (DateTime<Utc>, DateTime<Utc>),
+	range: (DateTime<Utc>, DateTime<Utc>),
+}
+
+/// The state the correlation stream unfolds: the next offset, the ids fetched but not yet
+/// read, and what a fetch needs.
+type CorrelationStreamState = (i64, Vec<CorrelationID>, turso::Database, String, std::sync::Arc<tokio::sync::Mutex<cache::DatabaseCache>>, AspectId);
+
 impl Database {
+	/// Every batch row `rows` holds, parsed; a row that does not parse is logged and skipped.
+	async fn collect_batch_rows(rows: &mut turso::Rows, db_name: &str, db_path: &str) -> Result<Vec<Batch>> {
+		let mut batches = Vec::new();
+		loop {
+			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get batch row: {e}")))? else {
+				break;
+			};
+			if let Ok(batch) = Self::parse_batch_row_helper(&row, db_name, db_path) {
+				batches.push(batch);
+			} else {
+				// Log error but continue processing other batches
+				tracing::warn!("Failed to parse batch row");
+			}
+		}
+		Ok(batches)
+	}
+
+	/// The full pattern (occurrences and relatives) behind each pattern id `rows` holds;
+	/// a pattern that does not load is logged and skipped.
+	async fn collect_pattern_rows(&self, rows: &mut turso::Rows, aspect_id: &AspectId, dictionary_name: &str) -> Result<Vec<Pattern>> {
+		let mut patterns = Vec::new();
+		loop {
+			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))? else {
+				break;
+			};
+			let pattern_id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
+			let pattern_id = PatternID::from_uuid(Uuid::parse_str(&pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
+			// Use get_dictionary_pattern to get the full pattern with occurrences and relatives
+			if let Ok(pattern) = crate::types::database::traits::Outputs::get_dictionary_pattern(self, aspect_id, dictionary_name, &pattern_id).await {
+				patterns.push(pattern);
+			} else {
+				// Log error but continue processing other patterns
+				tracing::warn!("Failed to parse pattern row for ID {pattern_id_str}");
+			}
+		}
+		Ok(patterns)
+	}
+
+	/// Cache `items` under `cache_key` unless there are none to cache.
+	async fn cache_nonempty<T: Clone + Sync>(&self, cache_key: &str, items: &[T])
+	where
+		Vec<T>: cache::Cacheable,
+	{
+		if !items.is_empty() {
+			self.cache.lock().await.store(cache_key, items.to_vec()).await;
+		}
+	}
+
 	/// Inner implementation of `fetch_measurements_for_range` without retry
 	async fn fetch_measurements_for_range_inner_impl(&self, aspect_id: &AspectId, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<Vec<Measurement>> {
 		// Seal-backed aspects (slice D-S19): the range comes from the seal store.
@@ -1405,6 +1441,7 @@ impl Database {
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		// Query all measurements in range without LIMIT - we need all data for accurate interpolation
 		let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC";
@@ -1431,6 +1468,7 @@ impl Database {
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let query_sql = "SELECT id, dataset_id, timestamp, value FROM measurements WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC";
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![chunk_start.timestamp_millis(), chunk_end.timestamp_millis()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query measurements: {e}")))?;
@@ -1448,6 +1486,52 @@ impl Database {
 
 /// Helper methods for streaming operations that don't require &self
 impl Database {
+	/// Extends one `analyze_range` chunk's measurements until `knots` lie past each edge of the
+	/// chunk, or the requested range runs out (#506).
+	///
+	/// The chunk fetch reaches only `degree` steps past the chunk, which is enough on a series
+	/// sampled every step. Across a gap longer than that it is not: a chunk inside the gap read
+	/// nothing and came out as one `0`, and a chunk at its edge was interpolated without the knot
+	/// that closes it. So each side is probed outward through the same chunk fetch, doubling the
+	/// window from one chunk's span, until the knots are found or the range's own bound is
+	/// reached. The bound is kept because `analyze_range` does not extrapolate past the requested
+	/// range. On dense data the first fetch already holds the knots and nothing more is read.
+	async fn widen_to_brackets(db: &Self, aspect_id: &AspectId, mut measurements: Vec<Measurement>, windows: BracketWindows, knots: usize, span: chrono::Duration) -> Result<Vec<Measurement>> {
+		let BracketWindows { chunk: (chunk_start, chunk_end), fetch: (fetch_start, fetch_end), range: (range_start, range_end) } = windows;
+		let span = span.max(chrono::Duration::milliseconds(1));
+
+		let mut after = measurements.iter().filter(|m| m.timestamp() > chunk_end).count();
+		let (mut low, mut width) = (fetch_end, span);
+		while after < knots && low < range_end {
+			let high = low.checked_add_signed(width).map_or(range_end, |h| h.min(range_end));
+			// The fetch is inclusive at both ends, and `low` was the previous window's `high`.
+			let more: Vec<Measurement> = <Self as crate::types::database::traits::outputs::Outputs>::fetch_measurements_for_chunk(db, aspect_id, low, high).await?.into_iter().filter(|m| m.timestamp() > low).collect();
+			after += more.len();
+			measurements.extend(more);
+			low = high;
+			width = width + width;
+		}
+
+		let mut before = measurements.iter().filter(|m| m.timestamp() < chunk_start).count();
+		let (mut high, mut width) = (fetch_start, span);
+		let mut earlier: Vec<Measurement> = Vec::new();
+		while before < knots && high > range_start {
+			let low = high.checked_sub_signed(width).map_or(range_start, |l| l.max(range_start));
+			let mut more: Vec<Measurement> = <Self as crate::types::database::traits::outputs::Outputs>::fetch_measurements_for_chunk(db, aspect_id, low, high).await?.into_iter().filter(|m| m.timestamp() < high).collect();
+			before += more.len();
+			// Each window is older than everything gathered so far.
+			more.append(&mut earlier);
+			earlier = more;
+			high = low;
+			width = width + width;
+		}
+		if !earlier.is_empty() {
+			earlier.append(&mut measurements);
+			measurements = earlier;
+		}
+		Ok(measurements)
+	}
+
 	/// Fetch a correlation by ID without requiring &self (for use in streaming closures)
 	async fn fetch_correlation_by_id(db: &turso::Database, db_path: &str, cache: &std::sync::Arc<tokio::sync::Mutex<cache::DatabaseCache>>, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<Correlation> {
 		// Check cache first
@@ -1475,7 +1559,7 @@ impl Database {
 		let error_rate: HashMap<SignalType, ErrorRate> = Self::load_correlation_error_rates(&conn, &id).await?;
 		let occurrences: Vec<Occurrence> = Self::load_correlation_occurrences(&conn, &id).await?;
 
-		let correlation = Correlation::new(Some(id), dictionary_id, subject_id, &aspect_id_parsed, pattern_id, event_id, error_rate, occurrences, average_distance);
+		let correlation = Correlation::new(Some(id), crate::CorrelationKeys { dictionary_id, subject_id, aspect_id: aspect_id_parsed, pattern_id, event_id }, error_rate, occurrences, average_distance);
 
 		// Cache the correlation
 		cache.lock().await.store(&cache_key, correlation.clone()).await;
@@ -1558,7 +1642,10 @@ impl Database {
 		let mut occurrences: Vec<Occurrence> = Vec::new();
 		// load occurrences in order of occurrence_index
 		let mut occ_map: HashMap<usize, Occurrence> = HashMap::new();
-		while let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation occurrence row: {e}")))? {
+		loop {
+			let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation occurrence row: {e}")))? else {
+				break;
+			};
 			let occ_index: usize = usize::try_from(*occ_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence index out of range: {e}")))?;
 			let occ_aspect_id_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
 			let occ_resolution_str = occ_row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
@@ -1591,7 +1678,6 @@ impl Database {
 	/// Helper function to parse a batch row from the database with aspect context
 	///
 	/// Expected columns: `id(0)`, `aspect_id(1)`, `database_id(2)`, `size(3)`, `resolution(4)`, `measurements(5)`, `batch_hash(6)`
-	#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 	fn parse_batch_row_helper(row: &turso::Row, db_name: &str, db_path: &str) -> Result<Batch> {
 		let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Batch ID is not text".to_string()))?.clone();
 		let batch_id = BatchId::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for batch ID: {e}")))?);
@@ -1599,7 +1685,7 @@ impl Database {
 		let aspect_id_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Aspect ID is not text".to_string()))?.clone();
 		let aspect_id = AspectId::from_uuid(Uuid::parse_str(&aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for aspect ID: {e}")))?);
 
-		let size = *row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Size is not an integer".to_string()))? as usize;
+		let size = crate::types::num::i64_to_usize(*row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Size is not an integer".to_string()))?);
 
 		let resolution_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Resolution is not text".to_string()))?.clone();
 		let resolution = Resolution::from_str(&resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
@@ -1692,6 +1778,7 @@ impl Database {
 		// dictionary), not the error `get_dictionary_db` gives for a missing file.
 		let aspect = self.get_aspect(aspect_id).await?;
 		let db_path = Self::aspect_dictionaries_db_path(&self.name, aspect.subject_name(), aspect.name(), dictionary_name)?;
+		drop(aspect);
 		if !tokio::fs::try_exists(&db_path).await? {
 			return Ok(None);
 		}
@@ -1701,6 +1788,7 @@ impl Database {
 		let generation = self.cache.lock().await.generation(&cache_key).await;
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		drop(db);
 		let registration = match Self::read_dictionary_registration(&conn, dictionary_name).await {
 			Ok(registration) => registration,
 			Err(e) => {

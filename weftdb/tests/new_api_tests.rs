@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::str::FromStr;
 
 use ::weftdb::database::traits::{AspectStructure, Inputs};
@@ -63,6 +66,8 @@ async fn test_database_lifecycle() {
 	let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
 	let end_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 10, 0).unwrap();
 	let mut range_stream = db.analyze_range(&aspect.id(), start_time, end_time, Resolution::Seconds, Spline::Linear).await.expect("Failed to analyze range");
+	drop(db);
+	drop(aspect);
 	let first_point = match range_stream.next().await {
 		Some(Ok(point)) => point,
 		Some(Err(err)) => panic!("Range analysis produced error: {err}"),
@@ -89,6 +94,8 @@ async fn test_existing_database() {
 
 	// Add some data
 	db.capture_measurement(&aspect.id(), &DatasetId::new(), &InputMeasurement::new(Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap(), BigDecimal::from_str("45.0").unwrap())).await.expect("Failed to capture measurement");
+	drop(db);
+	drop(aspect);
 
 	// Test loading existing database
 	let loaded_db = Database::existing(&db_name).await.expect("Failed to load existing database");
@@ -138,10 +145,14 @@ async fn test_multiple_subjects_and_aspects() {
 	let analysis_time = base_time + chrono::Duration::minutes(10);
 
 	let temp1_result = db.analyze_point(&temp_aspect1.id(), analysis_time, &Resolution::Seconds, &Spline::Linear).await.expect("Failed to analyze temperature for subject 1");
+	drop(temp_aspect1);
 
 	let humidity1_result = db.analyze_point(&humidity_aspect1.id(), analysis_time, &Resolution::Seconds, &Spline::Linear).await.expect("Failed to analyze humidity for subject 1");
+	drop(humidity_aspect1);
 
 	let temp2_result = db.analyze_point(&temp_aspect2.id(), analysis_time, &Resolution::Seconds, &Spline::Linear).await.expect("Failed to analyze temperature for subject 2");
+	drop(db);
+	drop(temp_aspect2);
 
 	// Verify results are different for different aspects/subjects
 	assert_ne!(temp1_result.value, humidity1_result.value);
@@ -162,10 +173,12 @@ async fn test_error_conditions() {
 	let _db = Database::new(&db_name).await.expect("Failed to create database");
 	let duplicate_result = Database::new(&db_name).await;
 	assert!(duplicate_result.is_err(), "Should fail to create duplicate database");
+	drop(duplicate_result);
 
 	// Test loading non-existent database
 	let non_existent_result = Database::existing("non_existent_db").await;
 	assert!(non_existent_result.is_err(), "Should fail to load non-existent database");
+	drop(non_existent_result);
 
 	// Clean up
 	common::remove_database(&db_name);
@@ -229,6 +242,8 @@ async fn test_interpolation_methods() {
 
 	// Test that the methods produce consistent results when called again with the same parameters
 	let linear_result2 = db.analyze_point(&aspect.id(), linear_target, &Resolution::Seconds, &Spline::Linear).await.expect("Failed to analyze with linear interpolation (second call)");
+	drop(db);
+	drop(aspect);
 
 	assert_eq!(linear_result.value, linear_result2.value, "Linear interpolation should be consistent");
 	assert_eq!(linear_result.timestamp, linear_result2.timestamp, "Linear interpolation timestamps should match");
@@ -264,6 +279,8 @@ async fn test_caching_behavior() {
 	// Second call should be faster due to caching
 	let start = std::time::Instant::now();
 	let result2 = db.analyze_point(&aspect.id(), target_time, &Resolution::Seconds, &Spline::Linear).await.expect("Failed to analyze point (second call)");
+	drop(db);
+	drop(aspect);
 	let second_duration = start.elapsed();
 
 	// Results should be identical
@@ -283,6 +300,7 @@ async fn test_caching_behavior() {
 async fn set_stored_interpolation(db: &Database, aspect_id: &weftdb::AspectId, dictionary: &str, from: &str, to: &str) {
 	let dictionary_db = db.get_dictionary_db(aspect_id, dictionary).await.expect("Failed to open dictionary database");
 	let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+	drop(dictionary_db);
 	let changed = conn.execute("UPDATE dictionary_constraints SET steps_interpolation = ? WHERE steps_interpolation = ?", turso::params![to, from]).await.expect("Failed to rewrite steps_interpolation");
 	assert_eq!(changed, 1, "one stored `{from}` to rewrite");
 }
@@ -325,6 +343,8 @@ async fn test_dictionary_metadata_validates_stored_interpolation() {
 
 	// `list_dictionaries` reads each of the aspect's dictionaries the same way.
 	let listed = db.list_dictionaries(&aspect.id()).await.expect("Failed to list dictionaries");
+	drop(db);
+	drop(aspect);
 	assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["stepped", "unstepped"]);
 
 	common::remove_database(&db_name);
@@ -334,14 +354,15 @@ async fn test_dictionary_metadata_validates_stored_interpolation() {
 async fn dictionary_rows(db: &Database, aspect_id: &weftdb::AspectId, dictionary: &str, table: &str) -> i64 {
 	let dictionary_db = db.get_dictionary_db(aspect_id, dictionary).await.expect("Failed to open dictionary database");
 	let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+	drop(dictionary_db);
 	let mut rows = conn.query(format!("SELECT COUNT(*) FROM {table}"), ()).await.expect("Failed to count rows");
 	let row = rows.next().await.expect("Failed to read count").expect("a count");
 	*row.get_value(0).expect("count column").as_integer().expect("integer count")
 }
 
 /// Variabilities as text (`AverageStatic(2.5)`), to compare: `VariablilityType` has no `PartialEq`.
-fn variability_parts(variabilities: Option<&Vec<VariablilityType>>) -> Option<Vec<String>> {
-	variabilities.map(|v| v.iter().map(ToString::to_string).collect())
+fn variability_parts(variabilities: &[VariablilityType]) -> Vec<String> {
+	variabilities.iter().map(ToString::to_string).collect()
 }
 
 fn variability(kind: fn(Variability) -> VariablilityType, value: &str) -> VariablilityType {
@@ -374,7 +395,7 @@ async fn test_set_dictionary_metadata_registers_and_replaces() {
 	assert_eq!((stored.id, stored.name.as_str(), stored.description.as_str()), (first.id, "pipeline", "first"));
 	let steps = stored.constraints.steps().as_ref().expect("stored steps");
 	assert_eq!((steps.count(), *steps.interpolation()), (12, Spline::Cubic));
-	assert_eq!(variability_parts(stored.constraints.variabilities().as_ref()), variability_parts(Some(&variabilities)));
+	assert_eq!(stored.constraints.variabilities().as_deref().map(variability_parts), Some(variability_parts(&variabilities)));
 
 	// Setting it again replaces it: one row in each table, and the read (cached above)
 	// sees the new registration.
@@ -389,7 +410,7 @@ async fn test_set_dictionary_metadata_registers_and_replaces() {
 	assert_eq!((stored.id, stored.description.as_str()), (second.id, "second"));
 	let steps = stored.constraints.steps().as_ref().expect("stored steps");
 	assert_eq!((steps.count(), *steps.interpolation()), (4, Spline::Linear));
-	assert_eq!(variability_parts(stored.constraints.variabilities().as_ref()), Some(vec!["SumStatic(7)".to_string()]));
+	assert_eq!(stored.constraints.variabilities().as_deref().map(variability_parts), Some(vec!["SumStatic(7)".to_string()]));
 
 	// No steps and no variabilities store NULLs and no rows, and read back as `None`.
 	let bare = DictionaryMetadata { id: DictionaryId::new(), name: "pipeline".to_string(), description: String::new(), constraints: DictionaryConstraints::new(None, Some(Vec::new())) };
@@ -413,6 +434,10 @@ async fn test_set_dictionary_metadata_registers_and_replaces() {
 /// absolute name replaced the whole path.
 #[tokio::test]
 async fn test_dictionary_names_are_checked_before_they_become_paths() {
+	fn assert_invalid(err: &anyhow::Error, name: &str) {
+		let invalid = err.downcast_ref::<weftdb::InvalidDictionaryName>().unwrap_or_else(|| panic!("{name:?} is an InvalidDictionaryName: {err:#}"));
+		assert_eq!(invalid.name(), name);
+	}
 	let db_name = format!("test_dictionary_names_{}", Uuid::new_v4());
 	common::remove_database(&db_name);
 
@@ -423,10 +448,6 @@ async fn test_dictionary_names_are_checked_before_they_become_paths() {
 	let absolute = common::data_dir().join("escaped");
 	let absolute = absolute.to_str().expect("a UTF-8 temp dir");
 
-	fn assert_invalid(err: &anyhow::Error, name: &str) {
-		let invalid = err.downcast_ref::<weftdb::InvalidDictionaryName>().unwrap_or_else(|| panic!("{name:?} is an InvalidDictionaryName: {err:#}"));
-		assert_eq!(invalid.name(), name);
-	}
 	for name in ["../escape", absolute, "", "..", "a\\b", "NUL"] {
 		let metadata = DictionaryMetadata { id: DictionaryId::new(), name: name.to_string(), description: String::new(), constraints: DictionaryConstraints::default() };
 		assert_invalid(&aspect.new_dictionary(name, "", &DictionaryConstraints::default()).await.expect_err("new_dictionary"), name);
@@ -442,6 +463,8 @@ async fn test_dictionary_names_are_checked_before_they_become_paths() {
 	created.sort();
 	assert!(created.is_empty(), "no dictionary file was created: {created:?}");
 	assert!(db.list_dictionaries(&aspect.id()).await.expect("Failed to list dictionaries").is_empty());
+	drop(db);
+	drop(aspect);
 
 	common::remove_database(&db_name);
 }
@@ -473,6 +496,7 @@ async fn test_dictionary_writes_report_a_write_write_conflict() {
 	// a registration replaces the one before it conflicts.
 	let dictionary_db = db.get_dictionary_db(&aspect.id(), "contended").await.expect("Failed to open dictionary database");
 	let holder = dictionary_db.connect().expect("Failed to connect to dictionary database");
+	drop(dictionary_db);
 	holder.execute("BEGIN CONCURRENT", ()).await.expect("Failed to begin the holder's transaction");
 	holder.execute("DELETE FROM dictionary_metadata WHERE name = 'contended'", ()).await.expect("Failed to delete in the holder's transaction");
 
@@ -488,6 +512,7 @@ async fn test_dictionary_writes_report_a_write_write_conflict() {
 	let stored = db.get_dictionary_metadata(&aspect.id(), "contended").await.expect("Failed to load dictionary metadata").expect("registered");
 	assert_eq!(stored.description, "first");
 	assert_eq!(dictionary_rows(&db, &aspect.id(), "contended", "dictionary_metadata").await, 1);
+	drop(db);
 
 	common::remove_database(&db_name);
 }
@@ -539,6 +564,7 @@ async fn test_register_dictionary_if_absent_keeps_a_complete_registration() {
 	{
 		let dictionary_db = db.get_dictionary_db(&aspect.id(), "legacy").await.expect("Failed to open dictionary database");
 		let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+		drop(dictionary_db);
 		conn.execute("DELETE FROM dictionary_constraints", ()).await.expect("Failed to delete the constraints");
 		conn.execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, 'legacy', 'pipeline', 0)", turso::params![Uuid::new_v4().to_string()]).await.expect("Failed to insert an old metadata row");
 	}
@@ -596,6 +622,7 @@ async fn test_register_dictionary_if_absent_reports_a_persistent_conflict() {
 	aspect.new_dictionary("healing", "pipeline", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
 	let dictionary_db = db.get_dictionary_db(&aspect.id(), "healing").await.expect("Failed to open dictionary database");
 	let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+	drop(dictionary_db);
 	conn.execute("DELETE FROM dictionary_constraints", ()).await.expect("Failed to delete the constraints");
 
 	// Another healer has deleted the old row and not committed yet.
@@ -612,6 +639,7 @@ async fn test_register_dictionary_if_absent_reports_a_persistent_conflict() {
 	assert!(db.register_dictionary_if_absent(&aspect.id(), "healing", &metadata).await.expect("Failed to register"));
 	assert_eq!(retries.load(std::sync::atomic::Ordering::SeqCst), 1, "a write without a conflict is not retried");
 	assert_eq!(dictionary_rows(&db, &aspect.id(), "healing", "dictionary_metadata").await, 1);
+	drop(db);
 
 	common::remove_database(&db_name);
 }
@@ -622,23 +650,23 @@ async fn test_register_dictionary_if_absent_reports_a_persistent_conflict() {
 /// incomplete rows is unregistered, and registering it again leaves one row.
 #[tokio::test]
 async fn test_dictionary_metadata_reads_past_duplicate_rows() {
+	// Add metadata rows the way the old `set_dictionary_metadata` did: no constraints, a
+	// fresh id, and (here) a later timestamp.
+	async fn add_old_rows(db: &Database, aspect_id: &weftdb::AspectId, dictionary: &str) {
+		let dictionary_db = db.get_dictionary_db(aspect_id, dictionary).await.expect("Failed to open dictionary database");
+		let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+		drop(dictionary_db);
+		for later in 1..=2_i64 {
+			let created_at = Utc::now().timestamp_millis() + later * 1000;
+			conn.execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![Uuid::new_v4().to_string(), dictionary, "pipeline", created_at]).await.expect("Failed to insert an old metadata row");
+		}
+	}
 	let db_name = format!("test_dictionary_duplicates_{}", Uuid::new_v4());
 	common::remove_database(&db_name);
 
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("dictionary_subject").await.expect("Failed to add subject");
 	let aspect = db.track_aspect(&subject.id(), "pressure", &Resolution::Seconds, None).await.expect("Failed to track aspect");
-
-	// Add metadata rows the way the old `set_dictionary_metadata` did: no constraints, a
-	// fresh id, and (here) a later timestamp.
-	async fn add_old_rows(db: &Database, aspect_id: &weftdb::AspectId, dictionary: &str) {
-		let dictionary_db = db.get_dictionary_db(aspect_id, dictionary).await.expect("Failed to open dictionary database");
-		let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
-		for later in 1..=2_i64 {
-			let created_at = Utc::now().timestamp_millis() + later * 1000;
-			conn.execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![Uuid::new_v4().to_string(), dictionary, "pipeline", created_at]).await.expect("Failed to insert an old metadata row");
-		}
-	}
 
 	// A complete registration with newer incomplete rows beside it still reads.
 	let constraints = DictionaryConstraints::new(Some(Steps::new(6, Spline::Quadratic)), Some(vec![variability(VariablilityType::AbsoluteAveragePercentile, "0.5")]));
@@ -648,13 +676,14 @@ async fn test_dictionary_metadata_reads_past_duplicate_rows() {
 	let stored = db.get_dictionary_metadata(&aspect.id(), "created").await.expect("Failed to load dictionary metadata").expect("registered");
 	assert_eq!(stored.description, "created first");
 	assert_eq!(stored.constraints.steps().as_ref().map(|s| (s.count(), *s.interpolation())), Some((6, Spline::Quadratic)));
-	assert_eq!(variability_parts(stored.constraints.variabilities().as_ref()), Some(vec!["AbsoluteAveragePercentile(0.5)".to_string()]));
+	assert_eq!(stored.constraints.variabilities().as_deref().map(variability_parts), Some(vec!["AbsoluteAveragePercentile(0.5)".to_string()]));
 
 	// Only incomplete rows: unregistered, until it is registered again.
 	aspect.new_dictionary("loaded", "pipeline", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
 	{
 		let dictionary_db = db.get_dictionary_db(&aspect.id(), "loaded").await.expect("Failed to open dictionary database");
 		let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+		drop(dictionary_db);
 		conn.execute("DELETE FROM dictionary_constraints", ()).await.expect("Failed to delete the constraints");
 	}
 	add_old_rows(&db, &aspect.id(), "loaded").await;
@@ -678,6 +707,7 @@ async fn test_dictionary_metadata_reads_past_duplicate_rows() {
 	{
 		let dictionary_db = db.get_dictionary_db(&aspect.id(), "twice").await.expect("Failed to open dictionary database");
 		let conn = dictionary_db.connect().expect("Failed to connect to dictionary database");
+		drop(dictionary_db);
 		for (description, offset_ms, count, interpolation) in [("newest", 60_000_i64, 3_i64, "Cubic"), ("oldest", -60_000, 5, "Quadratic")] {
 			let id = Uuid::new_v4().to_string();
 			conn.execute("INSERT INTO dictionary_metadata (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![id.as_str(), "twice", description, Utc::now().timestamp_millis() + offset_ms]).await.expect("Failed to insert a registration");
@@ -686,6 +716,8 @@ async fn test_dictionary_metadata_reads_past_duplicate_rows() {
 	}
 	assert_eq!(dictionary_rows(&db, &aspect.id(), "twice", "dictionary_constraints").await, 3);
 	let stored = db.get_dictionary_metadata(&aspect.id(), "twice").await.expect("Failed to load dictionary metadata").expect("registered");
+	drop(db);
+	drop(aspect);
 	assert_eq!(stored.description, "newest");
 	assert_eq!(stored.constraints.steps().as_ref().map(|s| (s.count(), *s.interpolation())), Some((3, Spline::Cubic)));
 
@@ -720,6 +752,9 @@ async fn test_a_dictionary_file_without_tables_is_unregistered() {
 	db.set_dictionary_metadata(&aspect.id(), "bare", &metadata).await.expect("Failed to set dictionary metadata");
 	assert_eq!(db.get_dictionary_metadata(&aspect.id(), "bare").await.expect("Failed to load dictionary metadata").expect("registered").id, metadata.id);
 	db.insert_pattern_into_dictionary(&aspect.id(), "bare", &pattern).await.expect("the tables exist now");
+	drop(db);
+	drop(aspect);
+	drop(pattern);
 
 	common::remove_database(&db_name);
 }
@@ -762,6 +797,8 @@ async fn test_list_dictionaries_skips_what_it_cannot_list() {
 	// read this time (as under contention).
 	std::fs::write(dictionaries.join("corrupt.db"), vec![0xA5_u8; 8192]).expect("Failed to write a corrupt dictionary");
 	let err = db.list_dictionaries(&aspect.id()).await.expect_err("a dictionary that cannot be read fails the listing");
+	drop(db);
+	drop(aspect);
 	assert!(format!("{err:#}").contains("not a database"), "{err:#}");
 
 	common::remove_database(&db_name);
@@ -790,11 +827,14 @@ async fn test_list_dictionaries_lists_the_aspects_dictionaries() {
 	other.new_dictionary("gamma", "elsewhere", &DictionaryConstraints::default()).await.expect("Failed to create dictionary");
 
 	let listed = db.list_dictionaries(&aspect.id()).await.expect("Failed to list dictionaries");
-	let summary: Vec<_> = listed.iter().map(|d| (d.name.as_str(), d.description.as_str(), d.constraints.steps().as_ref().map(|s| (s.count(), *s.interpolation())), variability_parts(d.constraints.variabilities().as_ref()))).collect();
+	drop(aspect);
+	let summary: Vec<_> = listed.iter().map(|d| (d.name.as_str(), d.description.as_str(), d.constraints.steps().as_ref().map(|s| (s.count(), *s.interpolation())), d.constraints.variabilities().as_deref().map(variability_parts))).collect();
 	assert_eq!(summary, [("alpha", "registered", Some((16, Spline::Cubic)), None), ("beta", "created", Some((8, Spline::Linear)), Some(vec!["MaximumPercentile(0.25)".to_string(), "AbsoluteSumStatic(3)".to_string()]))]);
 	assert_eq!(listed[0].id, registered.id);
 
 	let listed = db.list_dictionaries(&other.id()).await.expect("Failed to list dictionaries");
+	drop(db);
+	drop(other);
 	assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["gamma"]);
 
 	common::remove_database(&db_name);
@@ -807,6 +847,9 @@ async fn test_list_dictionaries_lists_the_aspects_dictionaries() {
 #[tokio::test]
 async fn a_chunked_range_keeps_to_its_step_grid() {
 	let db_name = format!("test_chunk_grid_{}", Uuid::new_v4());
+	// As every test here does first: it also points this binary at its own data dir, without
+	// which a runner with no `~/.weftdb/data` cannot create the database.
+	common::remove_database(&db_name);
 	let db = Database::new(&db_name).await.expect("Failed to create database");
 	let subject = db.observe_subject("grid").await.expect("Failed to add subject");
 	let aspect = db.track_aspect(&subject.id(), "value", &Resolution::Minutes, None).await.expect("Failed to track aspect").id();
@@ -819,6 +862,7 @@ async fn a_chunked_range_keeps_to_its_step_grid() {
 
 	let end = start + chrono::Duration::minutes(minutes);
 	let mut stream = db.analyze_range(&aspect, start, end, Resolution::Minutes, Spline::Linear).await.expect("Failed to analyze range");
+	drop(db);
 	let mut points = Vec::new();
 	while let Some(point) = stream.next().await {
 		points.push(point.expect("a point"));
@@ -829,6 +873,48 @@ async fn a_chunked_range_keeps_to_its_step_grid() {
 	assert_eq!(points.len(), usize::try_from(minutes + 1).unwrap());
 	let peak = points.iter().max_by(|a, b| a.value.cmp(&b.value)).expect("points");
 	assert_eq!((peak.timestamp, peak.value.clone()), (start + chrono::Duration::minutes(spike), BigDecimal::from(100)));
+
+	common::remove_database(&db_name);
+}
+
+/// A gap longer than a chunk is interpolated between the knots on either side of it (#506).
+/// Each chunk read only `degree` steps past its edges, so a chunk inside the gap found no
+/// measurement and came out as one `0` at its start, and the chunks at the gap's edges ran
+/// without the knot that closes it. The series is `value = minute`, so a straight line across
+/// the gap must give every minute its own index back.
+#[tokio::test]
+async fn a_gap_longer_than_a_chunk_keeps_both_brackets() {
+	let db_name = format!("test_chunk_gap_{}", Uuid::new_v4());
+	common::remove_database(&db_name);
+	let db = Database::new(&db_name).await.expect("Failed to create database");
+	let subject = db.observe_subject("gap").await.expect("Failed to add subject");
+	let aspect = db.track_aspect(&subject.id(), "value", &Resolution::Minutes, None).await.expect("Failed to track aspect").id();
+	let start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+	// 149,990 minutes without a sample: three of the range's four 50,000-step chunks hold none.
+	let minutes: Vec<i64> = (0..=10).chain(150_000..=150_010).collect();
+	let measurements: Vec<_> = minutes.iter().map(|&m| InputMeasurement::new(start + chrono::Duration::minutes(m), BigDecimal::from(m))).collect();
+	db.capture_measurement_chunk(&aspect, DatasetId::new(), &measurements).await.expect("Failed to capture");
+
+	let last = 150_010_i64;
+	let mut stream = db.analyze_range(&aspect, start, start + chrono::Duration::minutes(last), Resolution::Minutes, Spline::Linear).await.expect("Failed to analyze range");
+	drop(db);
+	let mut points = Vec::new();
+	while let Some(point) = stream.next().await {
+		points.push(point.expect("a point"));
+	}
+
+	assert_eq!(points.len(), usize::try_from(last + 1).unwrap(), "one point per minute of the range");
+	let wrong: Vec<_> = points
+		.iter()
+		.enumerate()
+		.filter(|(i, p)| {
+			let minute = i64::try_from(*i).unwrap();
+			p.timestamp != start + chrono::Duration::minutes(minute) || (bigdecimal::ToPrimitive::to_f64(&p.value).unwrap() - bigdecimal::ToPrimitive::to_f64(&minute).expect("a number")).abs() > 1e-6
+		})
+		.map(|(_, p)| (p.timestamp, p.value.to_string()))
+		.take(3)
+		.collect();
+	assert!(wrong.is_empty(), "every minute lies on the line across the gap, but these do not: {wrong:?}");
 
 	common::remove_database(&db_name);
 }

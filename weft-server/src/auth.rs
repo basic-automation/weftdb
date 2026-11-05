@@ -38,8 +38,31 @@
 //! key list — is a startup error, never a partially enforced table.
 //! [`generate_api_key`] plus the `weft-server keygen` command
 //! ([`crate::keygen`]) mint a key and its `key_hash` entry; the plaintext
-//! key exists only in that command's output. Key *reload* without a
-//! restart is SEC-7, not this slice: the file is read once, at startup.
+//! key exists only in that command's output.
+//!
+//! ## Key reload (SEC-7)
+//!
+//! The store in force is a [`SharedKeyStore`]: the [`KeyStore`] the
+//! startup load produced, behind a lock, swappable while the server
+//! runs. [`SharedKeyStore::reload`] re-reads the file the store was
+//! loaded from and re-validates it whole; only a file that parses
+//! clean replaces the table in force, atomically — a malformed edit is
+//! refused and the keys in force stay, which is SEC-6's "never a
+//! partially enforced table" carried into the edit path. A reload that
+//! succeeds takes effect on the next request: a new key authenticates,
+//! a removed key stops authenticating, and a role change applies, all
+//! without a restart.
+//!
+//! The binary's trigger is `SIGHUP`: the startup sequence registers
+//! [`spawn_key_reload_watcher`] with the Daemons registry whenever
+//! authentication is on, and each hangup reloads and logs the outcome
+//! (the new key count, or the refusal and its reason). A signal is the
+//! operator saying the edit is finished; the file is never polled, so a
+//! half-written edit is never picked up. The plan names the capability
+//! but not the trigger, so this choice — and the fail-closed reading of
+//! a bad edit — is recorded in SEC-7's `DECISIONS.md` entry, flagged
+//! for merge review. Certificate hot reload is a different slice,
+//! deferred past 1.0 (plan §10, SEC-12): this is the API-key file only.
 //!
 //! ## Modes ([`AUTH_ENV`], `WEFT_AUTH`)
 //!
@@ -122,13 +145,14 @@
 //! namespace would silently break it.
 
 use std::{
-	fs, path::{Path, PathBuf}, sync::{Arc, OnceLock}
+	fs, path::{Path, PathBuf}, sync::{Arc, OnceLock, PoisonError, RwLock}
 };
 
 use axum::{
 	extract::{MatchedPath, State}, http::{header, HeaderValue, Request}, middleware::Next, response::{IntoResponse, Response}
 };
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -182,7 +206,9 @@ struct KeyEntry {
 }
 
 /// The loaded keys file: the principals this server accepts, and where
-/// they came from. Read once at startup; SEC-7 owns reloading it.
+/// they came from. One immutable snapshot of the file; the store in
+/// force is a [`SharedKeyStore`] holding the current snapshot, which a
+/// reload (SEC-7) replaces whole.
 #[derive(Debug, Clone)]
 pub struct KeyStore {
 	entries: Vec<KeyEntry>,
@@ -307,6 +333,82 @@ impl KeyStore {
 	}
 }
 
+/// The keys file in force (SEC-7): the current [`KeyStore`] snapshot
+/// behind a lock, so [`reload`](Self::reload) can swap it while the
+/// server runs and every request authenticates against the snapshot
+/// its moment sees. Cheap to clone — the lock is `Arc`-backed, like
+/// the [`AuthConfig`] that carries it.
+#[derive(Debug, Clone)]
+pub struct SharedKeyStore {
+	current: Arc<RwLock<Arc<KeyStore>>>,
+}
+
+impl SharedKeyStore {
+	/// The shared store in force, starting from `store` (the startup
+	/// load, in the binary).
+	#[must_use]
+	pub fn new(store: KeyStore) -> Self {
+		Self { current: Arc::new(RwLock::new(Arc::new(store))) }
+	}
+
+	/// The snapshot currently in force.
+	#[must_use]
+	pub fn snapshot(&self) -> Arc<KeyStore> {
+		self.current.read().unwrap_or_else(PoisonError::into_inner).clone()
+	}
+
+	/// Who `token` is under the snapshot in force; see
+	/// [`KeyStore::authenticate`].
+	#[must_use]
+	pub fn authenticate(&self, token: &str) -> Option<Principal> {
+		self.snapshot().authenticate(token)
+	}
+
+	/// How many keys the snapshot in force holds.
+	#[must_use]
+	pub fn len(&self) -> usize {
+		self.snapshot().len()
+	}
+
+	/// Whether the snapshot in force holds no keys (never, for a
+	/// loaded store; see [`KeyStore::is_empty`]).
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.snapshot().is_empty()
+	}
+
+	/// The path the snapshot in force was loaded from, when it was
+	/// loaded from one. Owned, because the next reload may replace the
+	/// snapshot it was read from.
+	#[must_use]
+	pub fn path(&self) -> Option<PathBuf> {
+		self.snapshot().path().map(Path::to_path_buf)
+	}
+
+	/// Reload the keys file: re-read and re-validate the file the
+	/// snapshot in force was loaded from, and swap it in as the table
+	/// every later request is checked against. The swap happens only
+	/// once the new file has parsed whole — a file [`KeyStore::parse`]
+	/// rejects changes nothing, so a bad edit can neither empty the
+	/// table nor partially apply.
+	///
+	/// # Errors
+	///
+	/// The store was not loaded from a file (nothing to reload), or
+	/// whatever [`KeyStore::load`] rejects about the file as it now
+	/// stands; the message names the path and the reason. On error the
+	/// keys in force are exactly the keys before the call.
+	pub fn reload(&self) -> Result<usize, String> {
+		let Some(path) = self.snapshot().path().map(Path::to_path_buf) else {
+			return Err("the keys in force were not loaded from a file, so there is no file to reload".to_string());
+		};
+		let fresh = KeyStore::load(&path)?;
+		let count = fresh.len();
+		*self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(fresh);
+		Ok(count)
+	}
+}
+
 /// The role a frozen role name denotes, if it is one of the six.
 #[must_use]
 pub fn role_from_name(name: &str) -> Option<Role> {
@@ -409,8 +511,10 @@ pub enum AuthConfig {
 	/// offs differ in exactly the proxied-request rule.
 	Disabled,
 	/// Authentication on: every non-probe route needs a key from this
-	/// store whose role holds the route's scope.
-	Keys(Arc<KeyStore>),
+	/// store whose role holds the route's scope. The store is shared
+	/// (SEC-7): a reload swaps the snapshot in force in every clone of
+	/// this configuration at once.
+	Keys(SharedKeyStore),
 }
 
 impl AuthConfig {
@@ -437,7 +541,7 @@ impl AuthConfig {
 	/// Authentication on, enforcing `store`.
 	#[must_use]
 	pub fn with_keys(store: KeyStore) -> Self {
-		Self::Keys(Arc::new(store))
+		Self::Keys(SharedKeyStore::new(store))
 	}
 
 	/// Whether requests are authenticated at all.
@@ -446,12 +550,30 @@ impl AuthConfig {
 		matches!(self, Self::Keys(_))
 	}
 
-	/// The key store in force, when authentication is on.
+	/// The key store in force, when authentication is on. A clone of
+	/// the shared handle: it observes (and can make) the same reloads
+	/// as the configuration the router enforces.
 	#[must_use]
-	pub fn key_store(&self) -> Option<&KeyStore> {
+	pub fn key_store(&self) -> Option<SharedKeyStore> {
 		match self {
 			Self::Off | Self::Disabled => None,
-			Self::Keys(store) => Some(store),
+			Self::Keys(store) => Some(store.clone()),
+		}
+	}
+
+	/// Reload the keys file in force (SEC-7); see
+	/// [`SharedKeyStore::reload`]. Authentication off or explicitly
+	/// disabled has no file to reload and reports `Ok(None)` — a
+	/// reload request there is a no-op, not a failure.
+	///
+	/// # Errors
+	///
+	/// Whatever [`SharedKeyStore::reload`] rejects; the keys in force
+	/// are unchanged.
+	pub fn reload_keys(&self) -> Result<Option<usize>, String> {
+		match self {
+			Self::Off | Self::Disabled => Ok(None),
+			Self::Keys(store) => store.reload().map(Some),
 		}
 	}
 
@@ -506,7 +628,7 @@ fn policy_table() -> &'static RouteTable {
 }
 
 /// What the `Authorization` header carried, before any role check.
-enum Presented {
+pub(crate) enum Presented {
 	/// No header at all: the anonymous principal.
 	Absent,
 	/// A header that is malformed, or a key the file does not hold:
@@ -516,8 +638,10 @@ enum Presented {
 	Principal(Principal),
 }
 
-/// Read the `Authorization` header of a request against `store`.
-fn presented(headers: &axum::http::HeaderMap, store: &KeyStore) -> Presented {
+/// Read the `Authorization` header of a request against the store in
+/// force (the [`SharedKeyStore`]'s current snapshot, so a reload
+/// SEC-7 landed is the table this request is checked against).
+pub(crate) fn presented(headers: &axum::http::HeaderMap, store: &SharedKeyStore) -> Presented {
 	let mut values = headers.get_all(header::AUTHORIZATION).iter();
 	let Some(value) = values.next() else {
 		return Presented::Absent;
@@ -580,6 +704,31 @@ fn request_is_proxied(headers: &axum::http::HeaderMap) -> bool {
 /// auth-off guard's proxied-request refusal (SEC-8). The one refusal no
 /// mode passes through is a credential in the query string, which is
 /// refused before any of the mode branches run (SEC-10).
+/// Record an authentication refusal in the audit log as a `weft_audit`
+/// event (SEC-9, decision 8: "auth denials … emit weft_audit events").
+/// The event names the refusal's code, the route and the principal when
+/// one authenticated — never the presented credential, which is not
+/// recorded anywhere. A denial is not an audited *operation* (nothing
+/// was attempted against the store), so it is an event, not an attempt
+/// record; and the denial itself is the safe answer, so a failed event
+/// write is logged by [`AuditLog::emit_event`](crate::audit::AuditLog::emit_event)
+/// and the refusal stands.
+fn emit_auth_denial(state: &AppState, request: &Request<axum::body::Body>, code: Code, operation: Option<&str>, principal: Option<&Principal>) {
+	if let Some(log) = state.audit_log() {
+		log.emit_event(
+			"auth_denied",
+			json!({
+				"code": code.as_str(),
+				"method": request.method().as_str(),
+				"path": request.uri().path(),
+				"operation": operation,
+				"principal": principal.map(|principal| principal.id.clone()),
+				"role": principal.map(|principal| principal.role.as_str()),
+			}),
+		);
+	}
+}
+
 pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::body::Body>, next: Next) -> Response {
 	// The credentials-in-query refusal runs first, in every authentication
 	// mode (SEC-10): the harm it prevents — the credential landing in a
@@ -587,6 +736,7 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 	// would have accepted the key, and with authentication off or disabled
 	// nothing else in this layer looks at the request at all.
 	if query_carries_a_credential(request.uri().query()) {
+		emit_auth_denial(&state, &request, Code::CredentialsInQuery, None, None);
 		return ApiError::new(Code::CredentialsInQuery, "credentials belong in the `Authorization: Bearer <key>` header, not in the query string, where they are recorded by proxies and logs").into_response();
 	}
 	let Some(store) = state.auth().key_store() else {
@@ -594,6 +744,7 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 			return next.run(request).await;
 		}
 		if request_is_proxied(request.headers()) {
+			emit_auth_denial(&state, &request, Code::ProxiedRequestRequiresAuth, None, None);
 			return ApiError::new(Code::ProxiedRequestRequiresAuth, "this request arrived through a proxy (it carries a Forwarded or X-Forwarded-* header) and authentication is off: a proxied request requires authentication — mount a keys file (WEFT_KEYS_FILE), or set WEFT_AUTH=disabled when a gateway in front of this server owns authentication").into_response();
 		}
 		return next.run(request).await;
@@ -609,19 +760,68 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 		return next.run(request).await;
 	};
 	let scope = entry.spec.scope;
-	match presented(request.headers(), store) {
+	let operation = entry.spec.operation_id;
+	match presented(request.headers(), &store) {
 		Presented::Absent if scope == Scope::Probe => next.run(request).await,
-		Presented::Absent => unauthenticated(format!("this route needs the `{}` scope, and the request carries no key: send `Authorization: Bearer <key>` with a key whose role grants it", scope.as_str())),
-		Presented::Refused => unauthenticated("the request's credentials are not a key this server holds: send `Authorization: Bearer <key>` with the key exactly as `weft-server keygen` printed it".to_string()),
+		Presented::Absent => {
+			emit_auth_denial(&state, &request, Code::Unauthenticated, Some(operation), None);
+			unauthenticated(format!("this route needs the `{}` scope, and the request carries no key: send `Authorization: Bearer <key>` with a key whose role grants it", scope.as_str()))
+		}
+		Presented::Refused => {
+			emit_auth_denial(&state, &request, Code::Unauthenticated, Some(operation), None);
+			unauthenticated("the request's credentials are not a key this server holds: send `Authorization: Bearer <key>` with the key exactly as `weft-server keygen` printed it".to_string())
+		}
 		Presented::Principal(principal) => {
 			if principal.role.allows(scope) {
 				request.extensions_mut().insert(principal);
 				next.run(request).await
 			} else {
+				emit_auth_denial(&state, &request, Code::Forbidden, Some(operation), Some(&principal));
 				ApiError::new(Code::Forbidden, format!("key `{}` holds the {} role, which does not grant the `{}` scope this route needs", principal.id, principal.role.as_str(), scope.as_str())).into_response()
 			}
 		}
 	}
+}
+
+/// Spawn the key-reload watcher (SEC-7): a task that waits for
+/// `SIGHUP` and, on each one, reloads the keys file `auth` enforces
+/// and logs the outcome — the new key count on success, or the refusal
+/// and its reason (in which case the keys in force stay; see
+/// [`SharedKeyStore::reload`]). The startup sequence registers it with
+/// the Daemons registry when authentication is on; the registry's
+/// factory may call this again after a panic, and re-registering the
+/// signal stream is all a restart does.
+///
+/// On platforms without `SIGHUP` the task simply never fires: the
+/// reload API ([`AuthConfig::reload_keys`]) is the whole mechanism
+/// there, driven by whoever embeds the library.
+pub fn spawn_key_reload_watcher(auth: AuthConfig) -> tokio::task::JoinHandle<()> {
+	tokio::spawn(async move {
+		#[cfg(unix)]
+		{
+			use tokio::signal::unix::{signal, SignalKind};
+			let mut hangup = match signal(SignalKind::hangup()) {
+				Ok(stream) => stream,
+				Err(error) => {
+					eprintln!("key reload: cannot register the SIGHUP handler ({error}); in this process the keys reload only through a restart");
+					return;
+				}
+			};
+			println!("key reload: watching for SIGHUP; send it after editing the keys file to reload the keys in force without restarting");
+			while hangup.recv().await.is_some() {
+				match auth.reload_keys() {
+					Ok(Some(count)) => println!("key reload: SIGHUP received; the keys file was reloaded ({count} key(s) now in force)"),
+					Ok(None) => println!("key reload: SIGHUP received, but authentication is not on; nothing was reloaded"),
+					Err(error) => eprintln!("key reload: SIGHUP received, but the keys file was NOT reloaded — the keys in force stay: {error}"),
+				}
+			}
+		}
+		#[cfg(not(unix))]
+		{
+			let _ = &auth;
+			std::future::pending::<()>().await;
+		}
+	})
 }
 
 #[cfg(test)]
@@ -718,8 +918,8 @@ mod tests {
 		fs::write(&path, keys_json()).expect("write keys");
 		let config = AuthConfig::from_env_values(None, path.to_str()).expect("on");
 		assert!(config.is_enabled());
-		assert_eq!(config.key_store().map(KeyStore::len), Some(3));
-		assert_eq!(config.key_store().and_then(KeyStore::path), Some(path.as_path()));
+		assert_eq!(config.key_store().map(|store| store.len()), Some(3));
+		assert_eq!(config.key_store().and_then(|store| store.path()), Some(path.clone()));
 		// A mounted file that is not a keys file refuses startup.
 		fs::write(&path, "{}").expect("write non-keys");
 		assert!(AuthConfig::from_env_values(None, path.to_str()).is_err());
@@ -884,6 +1084,75 @@ mod tests {
 		assert_eq!(body["code"], "unauthenticated");
 		assert!(request_is_proxied(&axum::http::HeaderMap::from_iter([(axum::http::HeaderName::from_static("x-forwarded-host"), HeaderValue::from_static("example.com"))])));
 		assert!(!request_is_proxied(&axum::http::HeaderMap::new()));
+	}
+
+	/// SEC-7: a reload swaps the whole table — a key added to the file
+	/// authenticates, a key removed from it stops, and a role change
+	/// applies — while a malformed edit is refused and the table in
+	/// force is exactly the table before the call.
+	#[test]
+	fn a_reload_swaps_the_table_and_a_bad_edit_keeps_the_old_one() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let path = dir.path().join("keys.json");
+		fs::write(&path, keys_json()).expect("write keys");
+		let shared = SharedKeyStore::new(KeyStore::load(&path).expect("load"));
+		assert_eq!(shared.len(), 3);
+		assert_eq!(shared.authenticate(READER_TOKEN).map(|p| p.role), Some(Role::Reader));
+
+		// The operator edits the file: the reader is promoted to
+		// admin, the writer is removed, and a maintainer is added.
+		let edited = format!("{{\n  \"version\": 1,\n  \"keys\": [\n    {{ \"id\": \"reader-1\", \"role\": \"admin\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"maint-1\", \"role\": \"maintainer\", \"key_hash\": \"{}\" }}\n  ]\n}}", format_key_hash(READER_TOKEN), format_key_hash("weft_maint_token_for_tests"));
+		fs::write(&path, edited).expect("edit keys");
+		assert_eq!(shared.reload(), Ok(2));
+		assert_eq!(shared.authenticate(READER_TOKEN).map(|p| p.role), Some(Role::Admin), "the role change applies");
+		assert_eq!(shared.authenticate("weft_maint_token_for_tests").map(|p| p.id), Some("maint-1".to_string()), "the added key authenticates");
+		assert_eq!(shared.authenticate(WRITER_TOKEN), None, "the removed key stops authenticating");
+		assert_eq!(shared.authenticate(ADMIN_TOKEN), None);
+
+		// A malformed edit is refused, and nothing about the table moves.
+		fs::write(&path, "{\"version\": 1, \"keys\": []}").expect("write malformed");
+		let error = shared.reload().expect_err("refused");
+		assert!(error.contains("holds no keys"), "{error}");
+		assert_eq!(shared.len(), 2);
+		assert_eq!(shared.authenticate(READER_TOKEN).map(|p| p.role), Some(Role::Admin));
+		// A file that vanished mid-edit is the same story.
+		fs::remove_file(&path).expect("remove keys");
+		assert!(shared.reload().is_err());
+		assert_eq!(shared.authenticate(READER_TOKEN).map(|p| p.role), Some(Role::Admin));
+	}
+
+	/// SEC-7: a store that was parsed, not loaded from a file, has
+	/// nothing to reload — and the off/disabled configurations report
+	/// a no-op rather than an error.
+	#[test]
+	fn a_reload_without_a_file_is_an_error_and_off_is_a_no_op() {
+		let shared = SharedKeyStore::new(store());
+		let error = shared.reload().expect_err("no file");
+		assert!(error.contains("not loaded from a file"), "{error}");
+		assert_eq!(AuthConfig::off().reload_keys(), Ok(None));
+		assert_eq!(AuthConfig::disabled().reload_keys(), Ok(None));
+	}
+
+	/// SEC-7 end to end: the router enforces the reloaded table on the
+	/// next request, with no restart — the admin key that reached
+	/// `/metrics` is demoted by an edit plus a reload, and the same
+	/// request is then the ordinary 403.
+	#[tokio::test]
+	async fn a_reloaded_table_is_what_the_router_enforces() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let path = dir.path().join("keys.json");
+		fs::write(&path, keys_json()).expect("write keys");
+		let auth = AuthConfig::from_env_values(None, path.to_str()).expect("auth on");
+		let router = crate::app_with_state(AppState::new().with_auth(auth.clone()));
+		let (status, _, _) = send(router.clone(), "GET", "/metrics", Some(&bearer(ADMIN_TOKEN))).await;
+		assert_eq!(status, StatusCode::OK);
+
+		let demoted = keys_json().replace("\"role\": \"admin\"", "\"role\": \"reader\"");
+		fs::write(&path, demoted).expect("demote the admin");
+		assert_eq!(auth.reload_keys(), Ok(Some(3)));
+		let (status, _, body) = send(router, "GET", "/metrics", Some(&bearer(ADMIN_TOKEN))).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+		assert_eq!(body["code"], "forbidden");
 	}
 
 	/// Decision 17's metrics rule, stated as its own test (SEC-8): when

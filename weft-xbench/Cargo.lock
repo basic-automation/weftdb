@@ -502,6 +502,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1890,6 +1891,9 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "rayon",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -4630,7 +4634,7 @@ dependencies = [
 
 [[package]]
 name = "weft-arrow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -4643,7 +4647,7 @@ dependencies = [
 
 [[package]]
 name = "weft-bench"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4660,8 +4664,10 @@ dependencies = [
  "splimes",
  "sysinfo",
  "tokio",
+ "uuid",
  "weft-arrow",
  "weft-line-protocol",
+ "weft-orchestration",
  "weft-physical-type",
  "weft-reduce",
  "weftdb",
@@ -4669,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "weft-line-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -4677,8 +4683,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "weft-orchestration"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bigdecimal",
+ "chrono",
+ "futures",
+ "indexmap",
+ "num_cpus",
+ "rand 0.10.3",
+ "rayon",
+ "serde",
+ "serde_json",
+ "splimes",
+ "sysinfo",
+ "tokio",
+ "tracing",
+ "uuid",
+ "weftdb",
+ "wide",
+]
+
+[[package]]
 name = "weft-physical-type"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bigdecimal",
  "serde",
@@ -4686,7 +4715,7 @@ dependencies = [
 
 [[package]]
 name = "weft-reduce"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -4697,7 +4726,7 @@ dependencies = [
 
 [[package]]
 name = "weft-xbench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4712,6 +4741,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "splimes",
  "tokio",
  "tokio-postgres",
@@ -4725,7 +4755,7 @@ dependencies = [
 
 [[package]]
 name = "weftdb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",

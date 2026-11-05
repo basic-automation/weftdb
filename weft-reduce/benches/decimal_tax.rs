@@ -21,6 +21,9 @@
 //!
 //! Before timing, the three are checked against each other: the integer sums must equal the
 //! `BigDecimal` sums exactly, and the `f64` averages must agree to 1e-9 relative.
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{
 	hint::black_box, io::{BufRead, BufReader}, str::FromStr
@@ -128,14 +131,16 @@ fn bench_decimal_tax(c: &mut Criterion) {
 	assert_eq!(reduce_scaled(&nanos, &corpus.mantissas, scale_u32, Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces"), Some(avg_only), "reduce_scaled must equal reduce bucket for bucket");
 	eprintln!("decimal_tax: {} hourly buckets over {N} real closes; all four paths agree", exact.len());
 
-	let mut group = c.benchmark_group("hourly_avg_1mi_btc");
-	group.sample_size(10);
-	group.throughput(Throughput::Elements(N as u64));
-	group.bench_function("bigdecimal_reduce", |b| b.iter(|| black_box(reduce(black_box(&corpus.points), Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces"))));
-	group.bench_function("f64_loop", |b| b.iter(|| black_box(f64_hourly_avg(black_box(&corpus.seconds), black_box(&corpus.floats)))));
-	group.bench_function("reduce_scaled", |b| b.iter(|| black_box(reduce_scaled(black_box(&nanos), black_box(&corpus.mantissas), scale_u32, Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces"))));
-	group.bench_function("scaled_i64_loop", |b| b.iter(|| black_box(scaled_hourly_sums(black_box(&corpus.seconds), black_box(&corpus.mantissas)))));
-	group.finish();
+	{
+		let mut group = c.benchmark_group("hourly_avg_1mi_btc");
+		group.sample_size(10);
+		group.throughput(Throughput::Elements(N as u64));
+		group.bench_function("bigdecimal_reduce", |b| b.iter(|| black_box(reduce(black_box(&corpus.points), Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces"))));
+		group.bench_function("f64_loop", |b| b.iter(|| black_box(f64_hourly_avg(black_box(&corpus.seconds), black_box(&corpus.floats)))));
+		group.bench_function("reduce_scaled", |b| b.iter(|| black_box(reduce_scaled(black_box(&nanos), black_box(&corpus.mantissas), scale_u32, Resolution::Hours, None, None, &[Aggregation::Avg]).expect("reduces"))));
+		group.bench_function("scaled_i64_loop", |b| b.iter(|| black_box(scaled_hourly_sums(black_box(&corpus.seconds), black_box(&corpus.mantissas)))));
+		group.finish();
+	}
 
 	// The same two shipped paths with `sum` only, which isolates the per-bucket `avg` division
 	// (a `BigDecimal` division at its default precision) from the per-sample accumulation.
@@ -170,10 +175,7 @@ fn segment_scaled(bytes: &[u8], aggs: &[Aggregation]) -> Vec<Bucket> {
 	}
 	// As `SegmentStore::segment_partial` does, a request the integer path declines takes the
 	// BigDecimal route.
-	match reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Hours, None, None, aggs).expect("reduces") {
-		Some(partial) => partial.finish(Resolution::Hours, aggs).expect("finishes"),
-		None => segment_bigdecimal(bytes, aggs),
-	}
+	reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Hours, None, None, aggs).expect("reduces").map_or_else(|| segment_bigdecimal(bytes, aggs), |partial| partial.finish(Resolution::Hours, aggs).expect("finishes"))
 }
 
 fn bench_segment_downsample(c: &mut Criterion) {

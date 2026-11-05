@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Benchmark the **control-plane backup tick** (`SegmentStore::backup_control_plane_with_verify`)
 //! — the four `VACUUM INTO` snapshots plus their verification that the backup daemon
 //! runs every `WEFT_BACKUP_INTERVAL_SECS` (roadmap Phase 7.4).

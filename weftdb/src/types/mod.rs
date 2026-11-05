@@ -8,7 +8,7 @@ pub use batches::{
 pub use cache::{AnalysisResult, Cacheable, Connection, DatabaseCache};
 pub use catalog::CatalogStore;
 pub use compression::{AggressivenessScaling, CompressionConfig, CompressionPhase, CompressionProgress, CompressionResult, CompressionSummary, DetailedCompressionSummary, DirtyRegion, LastCompressionInfo, ProgressCallback, SizeBasedCompressionConfig, TierCompressionResult, TimeBasedCompressionConfig};
-pub use correlation::{Correlation, CorrelationID, Correlations};
+pub use correlation::{Correlation, CorrelationID, CorrelationKeys, Correlations};
 pub use database::{
 	clear_connection_cache_by_name, data_dir, default_data_dir, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, UnbatchedEntry, DATABASES
 };
@@ -30,21 +30,22 @@ pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState
 pub use quarantine::{QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS};
 pub use relative::Relative;
 pub use rows_mode::{discover, import_into, read_import_record, record_key, ImportRecord, ImportedAspect, LegacyAspect, LegacyCatalogAspect, LegacyTree, NotCarried, RowsModeError, DEFAULT_ROWS_PER_SEGMENT, IMPORT_RECORD_KEY, MEASUREMENTS_FILE, TIMESTAMP_COLUMN, TIMESTAMP_TIME_UNIT, TIMESTAMP_UNIT};
-pub use segment_index::SegmentIndexStore;
+pub use segment_index::{SegmentChange, SegmentIndexStore};
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;
-pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_WAIT};
+pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBreaker, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, DEFAULT_MAINTENANCE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_WAIT, DEFAULT_MAX_DOWNSAMPLE_BUCKETS, DEFAULT_MAX_POINT_BATCH, DEFAULT_MAX_SERIES_PER_ASPECT};
 pub use signal::{units_between, Distance, ErrVal, Signal, SignalType, Signals};
 pub use store_format::{StoreFormat, StoreScope, LEGACY_LAYOUT, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
 pub use trend::Trend;
+pub use upsert_keys::{UpsertKeys, TIMESTAMP_UPSERT_KEY};
 pub use value_kind::{UnknownValueKind, ValueKind, RESERVED_VALUE_KIND_TOKENS};
 
 pub mod aspect;
 pub mod aspect_catalog;
-pub(crate) mod aspect_locks;
+pub mod aspect_locks;
 pub mod aspect_name;
 pub mod backup;
 pub mod batches;
@@ -60,9 +61,9 @@ pub mod durable;
 pub mod error;
 pub mod event;
 pub mod exec;
-pub(crate) mod frame_name;
-pub(crate) mod frame_read;
-pub(crate) mod index_txn;
+pub mod frame_name;
+pub mod frame_read;
+pub mod index_txn;
 pub mod ingest;
 pub mod input_measurement;
 pub mod interpolate_range;
@@ -70,13 +71,14 @@ pub mod legacy_seal;
 pub mod measurement;
 pub mod measurement_vector;
 pub mod metadata;
-pub(crate) mod migrations;
+pub mod migrations;
+mod num;
 pub mod occurrence;
 pub mod partial_sidecar;
 pub mod pattern;
 pub mod pipeline;
 pub mod quarantine;
-pub(crate) mod reaper;
+pub mod reaper;
 pub mod relative;
 pub mod rows_mode;
 pub mod segment_index;
@@ -86,6 +88,7 @@ pub mod store_format;
 pub mod subject;
 pub mod transaction;
 pub mod trend;
+pub mod upsert_keys;
 pub mod value_kind;
 
 pub use error::*;

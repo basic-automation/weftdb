@@ -33,6 +33,7 @@ fn maintenance_error(err: &anyhow::Error) -> ApiError {
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/reconcile`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReconcileParams {
 	/// Optional order-health trigger threshold (roadmap Phase 4.6). When present,
 	/// the pass runs **only** if the aspect's `unsorted_segments` backlog is at or
@@ -121,7 +122,7 @@ pub struct ReconcileResponse {
 /// [`ApiError::busy`] when another maintenance operation held the aspect for the
 /// whole wait, and [`ApiError::internal`] on a read/seal/control-plane failure.
 pub async fn reconcile_aspect(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<ReconcileParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
 	let result = reconcile_aspect_inner(&store, &aspect, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
@@ -231,6 +232,13 @@ pub struct ReconcileStoreResponse {
 	/// failed aspect is counted in `aspects_scanned` only. Failing to list the aspects at
 	/// all is still a `500`.
 	pub failed: Vec<SweepFailure>,
+	/// The aspects the sweep did not attempt because their per-aspect maintenance
+	/// circuit breaker is tripped (ROB-19, [`weftdb::MaintenanceBreaker`]): each has
+	/// failed enough consecutive sweep passes that sweeps leave it alone until its
+	/// cooldown passes. A tripped aspect counts in `aspects_scanned` only; the
+	/// per-aspect endpoints are never gated, so an operator can still reconcile it
+	/// directly. Empty when no breaker is tripped.
+	pub tripped: Vec<String>,
 }
 
 /// Handle `POST /api/v1/storage/reconcile`: sweep **every** declared aspect,
@@ -272,7 +280,7 @@ pub struct ReconcileStoreResponse {
 /// the whole wait, and [`ApiError::internal`] when the aspect list or the post-sweep
 /// store stats cannot be read.
 pub async fn reconcile_store(State(state): State<AppState>, StrictQuery(params): StrictQuery<ReconcileParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let metrics = state.metrics().clone();
 	drop(state);
 	let result = reconcile_store_inner(&store, params.threshold, params.hot_cold, params.overlaps, params.split_min_bytes, &metrics).await;
@@ -286,7 +294,7 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 	let threshold = threshold.unwrap_or(1).max(1);
 	// Wait out a daemon pass (or another request) on an aspect rather than skip it.
 	let wait = MaintenanceWait::Wait(store.maintenance_wait());
-	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed, busy) = if overlaps {
+	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed, busy, tripped) = if overlaps {
 		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
 		// default 50 MiB floor (every aspect's small components full-rewrite).
 		let sweep = match split_min_bytes {
@@ -296,19 +304,19 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 		}
-		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy)
+		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
 	} else if hot_cold {
 		let sweep = store.reconcile_all_hot_cold(threshold, wait).await.map_err(|err| ApiError::internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 		}
-		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed), sweep.busy)
+		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
 	} else {
 		let sweep = store.reconcile_all_over_threshold(threshold, wait).await.map_err(|err| ApiError::internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 		}
-		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy)
+		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
 	};
 	if !failed.is_empty() {
 		metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
@@ -318,11 +326,12 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 	}
 	let unsorted_segments = store.store_stats().await.map_err(|err| ApiError::internal(err.to_string()))?.unsorted_segments;
 	let overlapping_segments = store.store_overlapping_segments().await.map_err(|err| ApiError::internal(err.to_string()))?;
-	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments, failed })).into_response())
+	Ok((StatusCode::OK, Json(ReconcileStoreResponse { threshold, mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, unsorted_segments, overlapping_segments, failed, tripped })).into_response())
 }
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/squash`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SquashParams {
 	/// Optional segment-count cap (roadmap Phase 4.6): squash **only** when the aspect
 	/// has more than this many segments — the `QuestDB`-`max.splits`-style trigger that
@@ -369,7 +378,7 @@ pub struct SquashResponse {
 /// [`ApiError::busy`] when another maintenance operation held the aspect for the
 /// whole wait, and [`ApiError::internal`] on a read/seal/control-plane failure.
 pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<SquashParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	// Undeclared aspect → 404 (mirrors the reconcile/read surfaces).
 	if store.schema_for(&aspect).await.map_err(|err| error::classify_read(&err))?.is_none() {
@@ -386,6 +395,7 @@ pub async fn squash_aspect(State(state): State<AppState>, Path(aspect): Path<Str
 
 /// Query parameters for `POST /api/v1/storage/{aspect}/compact`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactParams {
 	/// The target segment size in **rows** (required). The aspect's segments are
 	/// coalesced toward ~this many rows per segment, leaving already-large segments
@@ -426,7 +436,7 @@ pub struct CompactResponse {
 /// [`ApiError::busy`] when another maintenance operation held the aspect for the
 /// whole wait, and [`ApiError::internal`] on a read/seal/control-plane failure.
 pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<CompactParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let target_rows = params.target_rows.ok_or_else(|| ApiError::bad_request("compact requires a target_rows query parameter".to_string()))?;
 	// Undeclared aspect → 404 (mirrors the reconcile/squash surfaces).
@@ -442,6 +452,7 @@ pub async fn compact_aspect(State(state): State<AppState>, Path(aspect): Path<St
 /// Query parameters for `GET /api/v1/storage/quarantine`: restrict the listing to
 /// one aspect when present, list every aspect when absent.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuarantineParams {
 	/// The aspect to list, when present.
 	pub aspect: Option<String>,
@@ -449,10 +460,17 @@ pub struct QuarantineParams {
 
 /// Handle `POST /api/v1/storage/fsck`: run the recovery pass now, with repair
 /// (never report-only: an operator asking for fsck is asking for the repair),
-/// and answer with its counts. The same pass runs at startup, where a
+/// and answer with its counts.
+///
+/// The same pass runs at startup, where a
 /// newer-layout store gets the report-only form instead.
+///
+/// # Errors
+///
+/// The unconfigured-store refusal when no store is configured; otherwise the store's refusal, mapped
+/// by `maintenance_error`.
 pub async fn fsck_store(State(state): State<AppState>) -> Result<Json<weftdb::RecoveryReport>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let report = store.fsck(false).await.map_err(|err| maintenance_error(&err))?;
 	drop(store);
@@ -460,11 +478,18 @@ pub async fn fsck_store(State(state): State<AppState>) -> Result<Json<weftdb::Re
 }
 
 /// Handle `GET /api/v1/storage/quarantine`: list the quarantine records, of one
-/// aspect for `?aspect=` or of every aspect without it. Records, not segment
+/// aspect for `?aspect=` or of every aspect without it.
+///
+/// Records, not segment
 /// contents: the listing names what recovery removed and why, and the file
 /// under `segments/quarantine/` is what an operator inspects.
+///
+/// # Errors
+///
+/// The unconfigured-store refusal when no store is configured; otherwise the store's refusal, mapped
+/// by `maintenance_error`.
 pub async fn quarantine_list(State(state): State<AppState>, StrictQuery(params): StrictQuery<QuarantineParams>) -> Result<Json<Vec<weftdb::QuarantineRecord>>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let records = store.quarantine_list(params.aspect.as_deref()).await.map_err(|err| maintenance_error(&err))?;
 	drop(store);
@@ -472,11 +497,18 @@ pub async fn quarantine_list(State(state): State<AppState>, StrictQuery(params):
 }
 
 /// Handle `POST /api/v1/storage/quarantine/{aspect}/{id}/{gen}/release`: put one
-/// quarantined segment back into reads, exactly as quarantine recorded it. A
+/// quarantined segment back into reads, exactly as quarantine recorded it.
+///
+/// A
 /// record that does not exist is a 404, following the backup routes' precedent
 /// for a missing named resource.
+///
+/// # Errors
+///
+/// The unconfigured-store refusal when no store is configured, a 404 when no such quarantine record
+/// exists; otherwise the store's refusal, mapped by `maintenance_error`.
 pub async fn quarantine_release(State(state): State<AppState>, Path((aspect, id, gen)): Path<(String, u64, u64)>) -> Result<Json<weftdb::QuarantineRecord>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let record = store.quarantine_release(&aspect, id, gen).await.map_err(|err| if err.to_string().starts_with("no quarantine record") { ApiError::aspect_not_found(err.to_string()) } else { maintenance_error(&err) })?;
 	drop(store);
@@ -484,10 +516,17 @@ pub async fn quarantine_release(State(state): State<AppState>, Path((aspect, id,
 }
 
 /// Handle `POST /api/v1/storage/quarantine/{aspect}/{id}/{gen}/purge`: delete one
-/// quarantine record and unlink its file, of either class. The operator's
+/// quarantine record and unlink its file, of either class.
+///
+/// The operator's
 /// explicit purge is the only purge a suspect record ever gets.
+///
+/// # Errors
+///
+/// The unconfigured-store refusal when no store is configured, a 404 when no such quarantine record
+/// exists; otherwise the store's refusal, mapped by `maintenance_error`.
 pub async fn quarantine_purge(State(state): State<AppState>, Path((aspect, id, gen)): Path<(String, u64, u64)>) -> Result<Json<weftdb::QuarantineRecord>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let record = store.quarantine_purge(&aspect, id, gen).await.map_err(|err| if err.to_string().starts_with("no quarantine record") { ApiError::aspect_not_found(err.to_string()) } else { maintenance_error(&err) })?;
 	drop(store);
@@ -505,8 +544,13 @@ pub struct PurgeExpiredResponse {
 
 /// Handle `POST /api/v1/storage/quarantine/purge-expired`: purge every corrupt
 /// quarantine record whose TTL has passed, and report how many went.
+///
+/// # Errors
+///
+/// The unconfigured-store refusal when no store is configured; otherwise the store's refusal, mapped
+/// by `maintenance_error`.
 pub async fn purge_expired_quarantine(State(state): State<AppState>) -> Result<Json<PurgeExpiredResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let purged = store.purge_expired_quarantine().await.map_err(|err| maintenance_error(&err))?;
 	drop(store);
@@ -514,7 +558,6 @@ pub async fn purge_expired_quarantine(State(state): State<AppState>) -> Result<J
 }
 
 #[cfg(test)]
-
 mod tests {
 
 	use std::sync::Arc;
@@ -673,6 +716,46 @@ mod tests {
 		}
 	}
 
+	/// ROB-19: once an aspect's maintenance circuit breaker has tripped, the
+	/// store-wide sweep response lists it in `tripped` and records no new
+	/// failure for it, while the healthy aspects are still swept.
+	#[tokio::test]
+	async fn reconcile_store_endpoint_lists_a_tripped_aspect() {
+		let dir = TempDir::new().unwrap();
+		let sc = weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds);
+		let v = |s: &str| -> bigdecimal::BigDecimal { s.parse().unwrap() };
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens").with_maintenance_breaker(weftdb::MaintenanceBreaker { failure_threshold: 1, cooldown: std::time::Duration::from_secs(60) }));
+		store.declare("bad", &sc).await.expect("declares bad");
+		store.declare("good", &sc).await.expect("declares good");
+		let first = store.seal("bad", &sc, &[100_i64, 130, 110], &[v("1"), v("3"), v("2")]).await.expect("seal bad");
+		store.seal("good", &sc, &[100_i64, 130, 110], &[v("1"), v("3"), v("2")]).await.expect("seal good");
+		let file = std::fs::OpenOptions::new().write(true).open(&first.path).expect("opens frame");
+		let len = file.metadata().expect("stats frame").len();
+		file.set_len(len / 2).expect("truncates frame");
+		drop(file);
+
+		// First sweep: the damaged aspect fails (and trips its breaker); the
+		// healthy one reconciles. Nothing is tripped yet.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(json["failed"].as_array().map(Vec::len), Some(1), "the damaged aspect fails: {json}");
+		assert_eq!(json["tripped"], serde_json::json!([]), "nothing tripped on the first sweep: {json}");
+
+		// Second sweep: the tripped aspect is listed in `tripped` and no new
+		// failure is recorded for it.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/reconcile").body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		drop(store);
+		assert_eq!(status, StatusCode::OK, "body: {json}");
+		assert_eq!(json["tripped"], serde_json::json!(["bad"]), "the tripped aspect is listed: {json}");
+		assert_eq!(json["failed"], serde_json::json!([]), "a tripped aspect records no new failure: {json}");
+	}
+
 	#[tokio::test]
 	async fn compact_endpoint_coalesces_toward_target_and_requires_the_param() {
 		let dir = TempDir::new().unwrap();
@@ -737,8 +820,8 @@ mod tests {
 		store.declare("a", &sc).await.expect("declares a");
 		// A dominant cold base + a small late tail that re-enters it.
 		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
-		let base_vs: Vec<bigdecimal::BigDecimal> = (0..=10).map(|i| i.to_string().parse().unwrap()).collect();
-		store.seal("a", &sc, &base_ts, &base_vs).await.expect("base");
+		let base_values: Vec<bigdecimal::BigDecimal> = (0..=10).map(|i| i.to_string().parse().unwrap()).collect();
+		store.seal("a", &sc, &base_ts, &base_values).await.expect("base");
 		store.seal("a", &sc, &[90_i64, 100, 110], &["900".parse().unwrap(), "1000".parse().unwrap(), "1100".parse().unwrap()]).await.expect("late");
 
 		let router = app_with_state(AppState::new().with_store(store.clone()));
@@ -846,8 +929,8 @@ mod tests {
 		store.declare("a", &sc).await.expect("declares a");
 		// A long cold base [0..100] plus a small late tail [90,100,110] that re-enters it.
 		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
-		let base_vs: Vec<bigdecimal::BigDecimal> = (0..=10).map(|i| i.to_string().parse().unwrap()).collect();
-		store.seal("a", &sc, &base_ts, &base_vs).await.expect("base");
+		let base_values: Vec<bigdecimal::BigDecimal> = (0..=10).map(|i| i.to_string().parse().unwrap()).collect();
+		store.seal("a", &sc, &base_ts, &base_values).await.expect("base");
 		store.seal("a", &sc, &[90_i64, 100, 110], &["900".parse().unwrap(), "1000".parse().unwrap(), "1100".parse().unwrap()]).await.expect("late");
 
 		let router = app_with_state(AppState::new().with_store(store.clone()));

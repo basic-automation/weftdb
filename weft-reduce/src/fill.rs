@@ -120,8 +120,9 @@ pub fn fill(buckets: &[Bucket], resolution: Resolution, start: Option<DateTime<U
 	fill_width(buckets, BucketWidth::from(resolution), start, end, method, max_buckets)
 }
 
-/// [`fill`] on the grid of a [`BucketWidth`] (`5s`, `15m`), for buckets from
-/// [`reduce_width`](crate::reduce_width): one bucket per width, epoch-aligned. A spline fill
+/// [`fill`] on the grid of a [`BucketWidth`] (`5s`, `15m`).
+///
+/// For buckets from [`reduce_width`](crate::reduce_width): one bucket per width, epoch-aligned. A spline fill
 /// interpolates on the width's unit grid and keeps the points at bucket starts.
 ///
 /// # Errors

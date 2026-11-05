@@ -377,8 +377,7 @@ pub fn first_order_violation(timestamps: &[i64]) -> Option<(usize, i64, i64)> {
 #[must_use]
 pub const fn zigzag_varint_len(value: i64) -> usize {
 	// Zig-zag into u64 without overflow: (value << 1) ^ (value >> 63).
-	#[allow(clippy::cast_sign_loss)]
-	let zz = ((value << 1) ^ (value >> 63)) as u64;
+	let zz = ((value << 1) ^ (value >> 63)).cast_unsigned();
 	// LEB128: one byte per 7 bits, at least one byte for zero.
 	let mut bits = 64 - zz.leading_zeros();
 	if bits == 0 {
@@ -444,7 +443,6 @@ pub fn rle_decode(runs: &[(i64, usize)]) -> Vec<i64> {
 /// delta-of-delta sets up and RLE realizes.
 #[must_use]
 pub fn rle_varint_bytes(runs: &[(i64, usize)]) -> usize {
-	#[allow(clippy::cast_possible_truncation)]
 	runs.iter().map(|&(value, count)| zigzag_varint_len(value) + uvarint_len(count as u64)).sum()
 }
 
@@ -496,16 +494,14 @@ fn write_bits(out: &mut [u8], bit: usize, value: u64, width: usize) {
 /// Zig-zag a signed `i64` into an unsigned `u64` (`0,-1,1,-2 -> 0,1,2,3`), so
 /// small-magnitude negatives stay numerically small. Inverse of [`unzigzag`].
 #[must_use]
-#[allow(clippy::cast_sign_loss)] // the bit pattern is exactly the zig-zag mapping.
 const fn zigzag(value: i64) -> u64 {
-	((value << 1) ^ (value >> 63)) as u64
+	((value << 1) ^ (value >> 63)).cast_unsigned()
 }
 
 /// Invert [`zigzag`], recovering the original signed `i64` from its zig-zag code.
 #[must_use]
-#[allow(clippy::cast_possible_wrap)] // `z >> 1` fits `i64`; the XOR restores the sign.
 const fn unzigzag(z: u64) -> i64 {
-	((z >> 1) as i64) ^ -((z & 1) as i64)
+	(z >> 1).cast_signed() ^ -((z & 1).cast_signed())
 }
 
 /// The fixed bit width needed to hold every value of a difference stream once
@@ -957,17 +953,15 @@ pub fn transpose_bitpack_decode_range(bytes: &[u8], tile: usize, count: usize, s
 /// [`for_reconstruct`]. Kept in `u64` (not `i128`) so the packed width is the block's
 /// *range*, never its magnitude.
 #[must_use]
-#[allow(clippy::cast_sign_loss)] // the bit pattern is the wrapping difference; exact for v >= min.
 const fn for_residual(v: i64, min: i64) -> u64 {
-	(v as u64).wrapping_sub(min as u64)
+	v.cast_unsigned().wrapping_sub(min.cast_unsigned())
 }
 
 /// Reconstruct a value from its block reference `min` and unsigned residual `r` —
 /// the exact inverse of [`for_residual`] (`min + r` in the wrapping `u64` domain).
 #[must_use]
-#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)] // undoes the wrapping subtraction; round-trips exactly.
 const fn for_reconstruct(min: i64, r: u64) -> i64 {
-	(min as u64).wrapping_add(r) as i64
+	min.cast_unsigned().wrapping_add(r).cast_signed()
 }
 
 /// Append `value` to `out` as an unsigned LEB128 varint (a standalone mirror of
@@ -976,7 +970,6 @@ const fn for_reconstruct(min: i64, r: u64) -> i64 {
 /// zig-zag-coded reference.
 fn for_push_uvarint(out: &mut Vec<u8>, mut value: u64) {
 	loop {
-		#[allow(clippy::cast_possible_truncation)] // masked to the low 7 bits.
 		let mut byte = (value & 0x7F) as u8;
 		value >>= 7;
 		if value != 0 {
@@ -1479,7 +1472,6 @@ fn gorilla_get_bits(bytes: &[u8], bit: &mut usize, n: usize) -> u64 {
 /// size actually stored. Exact inverse: [`decode_gorilla_dods`]. *(src: Gorilla,
 /// VLDB'15.)*
 #[must_use]
-#[allow(clippy::cast_sign_loss)] // offset-binary payload is non-negative by construction; the D bucket stores the raw two's-complement bit pattern.
 pub fn encode_gorilla_dods(dods: &[i64]) -> Vec<u8> {
 	let total_bits: usize = dods.iter().map(|&d| gorilla_dod_bits(d)).sum();
 	let mut out = vec![0_u8; total_bits.div_ceil(8)];
@@ -1493,10 +1485,10 @@ pub fn encode_gorilla_dods(dods: &[i64]) -> Vec<u8> {
 			gorilla_put_bits(&mut out, &mut bit, 0, 1);
 		}
 		if width == 64 {
-			gorilla_put_bits(&mut out, &mut bit, dod as u64, 64);
+			gorilla_put_bits(&mut out, &mut bit, dod.cast_unsigned(), 64);
 		} else if width > 0 {
 			let bias = (1_i64 << (width - 1)) - 1;
-			gorilla_put_bits(&mut out, &mut bit, (dod + bias) as u64, width as usize);
+			gorilla_put_bits(&mut out, &mut bit, (dod + bias).cast_unsigned(), width as usize);
 		}
 	}
 	out
@@ -1525,7 +1517,6 @@ const fn gorilla_control(dod: i64) -> (u32, u32) {
 /// a `0` for the first four classes) then its offset-binary payload, undoing the
 /// `+ (2^(w-1) - 1)` bias. Exact inverse of [`encode_gorilla_dods`].
 #[must_use]
-#[allow(clippy::cast_possible_wrap)] // each payload is < 2^12 (or the D bucket's exact 64-bit round-trip), so the i64 cast never wraps meaningfully.
 pub fn decode_gorilla_dods(bytes: &[u8], count: usize) -> Vec<i64> {
 	let mut out = Vec::with_capacity(count);
 	let mut bit = 0_usize;
@@ -1536,10 +1527,10 @@ pub fn decode_gorilla_dods(bytes: &[u8], count: usize) -> Vec<i64> {
 		}
 		let dod = match ones {
 			0 => 0,
-			1 => gorilla_get_bits(bytes, &mut bit, 7) as i64 - ((1_i64 << 6) - 1),
-			2 => gorilla_get_bits(bytes, &mut bit, 9) as i64 - ((1_i64 << 8) - 1),
-			3 => gorilla_get_bits(bytes, &mut bit, 12) as i64 - ((1_i64 << 11) - 1),
-			_ => gorilla_get_bits(bytes, &mut bit, 64) as i64,
+			1 => gorilla_get_bits(bytes, &mut bit, 7).cast_signed() - ((1_i64 << 6) - 1),
+			2 => gorilla_get_bits(bytes, &mut bit, 9).cast_signed() - ((1_i64 << 8) - 1),
+			3 => gorilla_get_bits(bytes, &mut bit, 12).cast_signed() - ((1_i64 << 11) - 1),
+			_ => gorilla_get_bits(bytes, &mut bit, 64).cast_signed(),
 		};
 		out.push(dod);
 	}
@@ -2151,7 +2142,7 @@ mod tests {
 		let (first, step) = encode_delta_of_delta(&regular, TimeUnit::Millis).arithmetic_stride().expect("regular");
 		assert_eq!((first, step), (1_000, 7));
 		for (i, &v) in regular.iter().enumerate() {
-			assert_eq!(first + i as i64 * step, v);
+			assert_eq!(first + i64::try_from(i).expect("fits i64") * step, v);
 		}
 		// A decreasing regular column reports a negative step (callers gate on time_sorted).
 		assert_eq!(encode_delta_of_delta(&[100, 90, 80, 70], TimeUnit::Seconds).arithmetic_stride(), Some((100, -10)));
@@ -2174,7 +2165,7 @@ mod tests {
 		// An empty input anchors at 0 and reconstructs a lone anchor by convention.
 		let empty = encode_delta(&[], TimeUnit::Seconds);
 		assert_eq!(empty.first, 0);
-		assert!(empty.deltas.is_empty());
+		assert_eq!(empty.deltas.len(), 0);
 	}
 
 	#[test]
@@ -2208,8 +2199,8 @@ mod tests {
 		assert_eq!(runs, vec![(0, 3), (5, 2), (-1, 1), (0, 2)]);
 		assert_eq!(rle_decode(&runs), values);
 		// Empty in, empty out.
-		assert!(rle_encode(&[]).is_empty());
-		assert!(rle_decode(&[]).is_empty());
+		assert_eq!(rle_encode(&[]).len(), 0);
+		assert_eq!(rle_decode(&[]).len(), 0);
 	}
 
 	#[test]
@@ -2298,7 +2289,7 @@ mod tests {
 		for i in 0..500 {
 			t += if i % 8 == 7 { 2_500 } else { 1_000 };
 			jitter.push(t);
-			m += 1_000 + (i as i64 % 300);
+			m += 1_000 + (i64::from(i) % 300);
 			mono.push(m);
 		}
 		for series in [&regular, &jitter, &mono] {
@@ -2426,8 +2417,8 @@ mod tests {
 		for vals in [vec![0_i64; 6], (0..40).map(|i| (i % 13) - 6).collect::<Vec<_>>(), vec![i64::MIN, i64::MAX, 0, -1, 1, 123_456_789, -987_654_321]] {
 			let (width, packed) = bitpack_encode(&vals);
 			let full = bitpack_decode(width, &packed, vals.len());
-			for i in 0..vals.len() {
-				assert_eq!(bitpack_decode_at(width, &packed, i), full[i], "width={width} index={i}");
+			for (i, &expected) in full.iter().enumerate().take(vals.len()) {
+				assert_eq!(bitpack_decode_at(width, &packed, i), expected, "width={width} index={i}");
 			}
 		}
 	}
@@ -2492,7 +2483,7 @@ mod tests {
 			assert_eq!(blocked_bitpack_decode(&bytes, block, vals.len()), vals, "round trip must be exact (block={block})");
 		}
 		// Empty stream encodes to nothing and decodes to nothing.
-		assert!(blocked_bitpack_encode(&[], 64).is_empty());
+		assert_eq!(blocked_bitpack_encode(&[], 64).len(), 0);
 		assert_eq!(blocked_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
 	}
 
@@ -2513,7 +2504,7 @@ mod tests {
 		assert_eq!(enc.len(), for_bitpack_bytes(&extremes, 4));
 		assert_eq!(for_bitpack_decode(&enc, 4, extremes.len()), extremes);
 		// Empty stream encodes to nothing and decodes to nothing.
-		assert!(for_bitpack_encode(&[], 64).is_empty());
+		assert_eq!(for_bitpack_encode(&[], 64).len(), 0);
 		assert_eq!(for_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
 	}
 
@@ -2539,8 +2530,8 @@ mod tests {
 				}
 			}
 			// A start at or past the end yields nothing.
-			assert!(blocked_bitpack_decode_range(&blocked, block, n, n, 10).is_empty());
-			assert!(for_bitpack_decode_range(&for_bytes, block, n, n + 5, 10).is_empty());
+			assert_eq!(blocked_bitpack_decode_range(&blocked, block, n, n, 10).len(), 0);
+			assert_eq!(for_bitpack_decode_range(&for_bytes, block, n, n + 5, 10).len(), 0);
 		}
 	}
 
@@ -2564,8 +2555,9 @@ mod tests {
 		let block = 32;
 		let dods: Vec<i64> = (0..256)
 			.map(|i| {
-				let base = 1_000_000 * (1 + (i / block) as i64); // steps each block
-				base + (i % 7) as i64 - 3 // ±3 wiggle within the block
+				let base = 1_000_000 * (1 + i64::try_from(i / block).expect("fits i64")); // steps each block
+				base + i64::try_from(i % 7).expect("fits i64") - 3
+				// ±3 wiggle within the block
 			})
 			.collect();
 		let for_bytes = for_bitpack_bytes(&dods, block);
@@ -2596,8 +2588,8 @@ mod tests {
 		assert!(col.best_estimated_bytes() <= col.blocked_estimated_bytes());
 	}
 
-	/// A DoD column whose second differences are mostly narrow ±1 jitter with one
-	/// contiguous wide window (blocks 96..128 fall inside a single 64-wide block) — the
+	/// A `DoD` column whose second differences are mostly narrow ±1 jitter with one
+	/// contiguous wide window (blocks `96..128` fall inside a single 64-wide block) — the
 	/// mixed-magnitude regime where per-block adaptive bit-packing is the strict winner.
 	fn mixed_magnitude_dod_column() -> DeltaOfDeltaColumn {
 		let dods: Vec<i64> = (0..256).map(|i| if (96..128).contains(&i) { 500_000_000 + i } else { (i % 3) - 1 }).collect();
@@ -2625,7 +2617,7 @@ mod tests {
 		assert_eq!(bitpack_width(&[0, 0, 0]), 0);
 		let (w, packed) = bitpack_encode(&[0, 0, 0]);
 		assert_eq!(w, 0);
-		assert!(packed.is_empty());
+		assert_eq!(packed.len(), 0);
 		assert_eq!(bitpack_decode(0, &[], 3), vec![0, 0, 0]);
 		// An all-zero stream packs to just the width header byte.
 		assert_eq!(bitpack_bytes(&[0, 0, 0]), 1);
@@ -2687,7 +2679,7 @@ mod tests {
 		assert_eq!(enc.len(), transpose_bitpack_bytes(&extremes, 4));
 		assert_eq!(transpose_bitpack_decode(&enc, 4, extremes.len()), extremes);
 		// Empty stream encodes to nothing and decodes to nothing.
-		assert!(transpose_bitpack_encode(&[], 64).is_empty());
+		assert_eq!(transpose_bitpack_encode(&[], 64).len(), 0);
 		assert_eq!(transpose_bitpack_decode(&[], 64, 0), Vec::<i64>::new());
 	}
 
