@@ -16,9 +16,7 @@
 //! plane.
 
 use axum::{
-	body::Body,
-	http::{Request, StatusCode},
-	Router,
+	body::Body, http::{Request, StatusCode}, Router
 };
 use tower::ServiceExt;
 use weft_server::{app_with_state, probe_app_with_state, AppState};

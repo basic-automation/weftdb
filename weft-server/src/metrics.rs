@@ -152,9 +152,8 @@ pub struct LatencyHistogramSnapshot {
 impl LatencyHistogramSnapshot {
 	/// The summed observed latency in fractional seconds (Prometheus `_sum`).
 	#[must_use]
-	#[allow(clippy::cast_precision_loss)] // exact for any realistic total: f64 holds integers < 2^53.
 	pub fn sum_seconds(&self) -> f64 {
-		self.sum_micros as f64 / 1_000_000.0
+		crate::num::u64_to_f64(self.sum_micros) / 1_000_000.0
 	}
 
 	/// Estimate the `q`-quantile (`0.0..=1.0`) latency in seconds from the
@@ -164,21 +163,20 @@ impl LatencyHistogramSnapshot {
 	/// in the open-ended `+Inf` bucket is clamped to the largest finite bound
 	/// (the histogram cannot resolve a value beyond its last edge).
 	#[must_use]
-	#[allow(clippy::cast_precision_loss)] // counts < 2^53 in any realistic run; f64 is exact there.
 	pub fn quantile(&self, q: f64) -> Option<f64> {
 		if self.count == 0 {
 			return None;
 		}
-		let rank = q.clamp(0.0, 1.0) * self.count as f64;
+		let rank = q.clamp(0.0, 1.0) * crate::num::u64_to_f64(self.count);
 		let mut cum_prev = 0_u64;
 		let mut lower = 0.0_f64;
 		for (&bound, &in_bucket) in LATENCY_BUCKETS_SECS.iter().zip(self.buckets.iter()) {
 			let cum = cum_prev + in_bucket;
-			if cum as f64 >= rank {
+			if crate::num::u64_to_f64(cum) >= rank {
 				if in_bucket == 0 {
 					return Some(bound);
 				}
-				let frac = (rank - cum_prev as f64) / in_bucket as f64;
+				let frac = (rank - crate::num::u64_to_f64(cum_prev)) / crate::num::u64_to_f64(in_bucket);
 				return Some((bound - lower).mul_add(frac, lower));
 			}
 			cum_prev = cum;
@@ -228,7 +226,9 @@ pub struct ReconcileMetrics {
 }
 
 /// Counters for the online control-plane backup (`POST …/storage/backup`, roadmap
-/// Phase 7.4). An operator needs to see how many snapshots ran and the total bytes
+/// Phase 7.4).
+///
+/// An operator needs to see how many snapshots ran and the total bytes
 /// written to reason about backup cadence and storage growth — and, since EVI-18,
 /// whether the scheduled daemon is healthy: how many of its ticks failed, and when
 /// the last verified snapshot landed (`last_success_unix_secs`, 0 when none has
@@ -483,7 +483,62 @@ impl Metrics {
 		self.downsample_latency.render_prometheus(&mut out, "weft_downsample_duration_seconds", "End-to-end handling latency for the downsample endpoints (POST /api/v1/downsample and /downsample/ilp).");
 		self.ingest_latency.render_prometheus(&mut out, "weft_ingest_duration_seconds", "Seal-path latency for the storage-ingest endpoints (JSON / CSV / ILP).");
 		self.backup_latency.render_prometheus(&mut out, "weft_backup_duration_seconds", "Wall-clock duration of each completed, verified control-plane backup snapshot (manual endpoint and backup daemon alike).");
+		// Phase 5 (5.7): splimes' open GPU devices, one series per device; nothing until
+		// the GPU has started.
+		let devices: Vec<GpuDeviceRow> = splimes::gpu_devices().into_iter().map(|device| GpuDeviceRow { name: device.info.name, api: device.info.api, device_type: device.info.device_type, calls: device.calls, chunks: device.chunks, in_flight: device.in_flight as u64, lost: device.lost, idle_pool_bytes: device.pool.idle_bytes }).collect();
+		render_gpu_devices(&mut out, &devices);
 		out
+	}
+}
+
+/// One open GPU device as `/metrics` reports it: the fields of `splimes::GpuDeviceStats`
+/// the exposition uses (that type cannot be built outside splimes, so the renderer takes
+/// this one and stays testable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuDeviceRow {
+	/// Adapter name.
+	pub name: String,
+	/// Graphics API.
+	pub api: String,
+	/// `discrete`, `integrated`, `virtual`, `cpu` or `other`.
+	pub device_type: String,
+	/// Calls, or shares of a split call, the device has run.
+	pub calls: u64,
+	/// Chunks it has dispatched.
+	pub chunks: u64,
+	/// Calls, or shares of one, running on it now.
+	pub in_flight: u64,
+	/// Whether the device was lost (it gets no more work).
+	pub lost: bool,
+	/// Bytes its buffer pool holds idle.
+	pub idle_pool_bytes: u64,
+}
+
+/// Escape a Prometheus label value (backslash, double quote, newline).
+fn label_value(raw: &str) -> String {
+	raw.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+/// Render the per-device GPU series (5.7). Nothing at all for an empty slice, so a server
+/// that never started the GPU exposes no GPU families. `device` is the index in
+/// `splimes::gpu_devices()`; device 0 is the one `splimes::gpu_info()` reports.
+pub fn render_gpu_devices(out: &mut String, devices: &[GpuDeviceRow]) {
+	use std::fmt::Write as _;
+	if devices.is_empty() {
+		return;
+	}
+	let _ = writeln!(out, "# HELP weft_gpu_device_info The GPU devices splimes opened (1 per device; WEFT_GPU_DEVICES opens more than one).");
+	let _ = writeln!(out, "# TYPE weft_gpu_device_info gauge");
+	for (index, device) in devices.iter().enumerate() {
+		let _ = writeln!(out, "weft_gpu_device_info{{device=\"{index}\",name=\"{}\",api=\"{}\",type=\"{}\"}} 1", label_value(&device.name), label_value(&device.api), label_value(&device.device_type));
+	}
+	let families: [(&str, &str, &str, fn(&GpuDeviceRow) -> u64); 5] = [("weft_gpu_device_calls_total", "counter", "Interpolation calls, or shares of a split call, the device has run.", |d| d.calls), ("weft_gpu_device_chunks_total", "counter", "Chunks the device has dispatched.", |d| d.chunks), ("weft_gpu_device_in_flight", "gauge", "Calls, or shares of one, running on the device now.", |d| d.in_flight), ("weft_gpu_device_lost", "gauge", "1 when the device was lost and gets no more work, else 0.", |d| u64::from(d.lost)), ("weft_gpu_device_pool_idle_bytes", "gauge", "Bytes the device's buffer pool holds idle for reuse.", |d| d.idle_pool_bytes)];
+	for (name, kind, help, value) in families {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} {kind}");
+		for (index, device) in devices.iter().enumerate() {
+			let _ = writeln!(out, "{name}{{device=\"{index}\"}} {}", value(device));
+		}
 	}
 }
 
@@ -612,6 +667,25 @@ mod tests {
 		assert_eq!(snap.interpolate.output_points, 70);
 	}
 
+	/// 5.7: no devices, no GPU families; two devices, one series each, labels escaped.
+	#[test]
+	fn gpu_devices_are_rendered_per_device() {
+		let mut out = String::new();
+		render_gpu_devices(&mut out, &[]);
+		assert!(out.is_empty(), "a server that never started the GPU reports none");
+		let row = |name: &str, device_type: &str, calls: u64, lost: bool| GpuDeviceRow { name: name.to_string(), api: "vulkan".to_string(), device_type: device_type.to_string(), calls, chunks: calls * 2, in_flight: 0, lost, idle_pool_bytes: 1024 };
+		render_gpu_devices(&mut out, &[row("NVIDIA GeForce RTX 4070 Ti SUPER", "discrete", 7, false), row("AMD \"Radeon\" Graphics", "integrated", 3, true)]);
+		assert!(out.contains("weft_gpu_device_info{device=\"0\",name=\"NVIDIA GeForce RTX 4070 Ti SUPER\",api=\"vulkan\",type=\"discrete\"} 1"), "{out}");
+		assert!(out.contains("name=\"AMD \\\"Radeon\\\" Graphics\""), "quotes are escaped: {out}");
+		assert!(out.contains("weft_gpu_device_calls_total{device=\"0\"} 7"));
+		assert!(out.contains("weft_gpu_device_calls_total{device=\"1\"} 3"));
+		assert!(out.contains("weft_gpu_device_chunks_total{device=\"0\"} 14"));
+		assert!(out.contains("weft_gpu_device_lost{device=\"1\"} 1"));
+		assert!(out.contains("weft_gpu_device_lost{device=\"0\"} 0"));
+		assert!(out.contains("weft_gpu_device_pool_idle_bytes{device=\"1\"} 1024"));
+		assert_eq!(out.matches("# TYPE ").count(), 6);
+	}
+
 	#[test]
 	fn prometheus_text_is_well_formed() {
 		let m = Metrics::default();
@@ -630,7 +704,9 @@ mod tests {
 		// No value line is left dangling without a preceding TYPE line: 16
 		// counters + the backup last-success gauge + the 4 latency histograms
 		// (EVI-25 adds the backup one).
-		assert_eq!(text.matches("# TYPE ").count(), 21);
+		// (The GPU device families appear only once a GPU has started, which another test
+		// in this process may do, so they are left out of the count.)
+		assert_eq!(text.lines().filter(|line| line.starts_with("# TYPE ") && !line.starts_with("# TYPE weft_gpu_")).count(), 21);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE weft_downsample_requests_total counter"));
 		// And the storage-ingest counters.
@@ -684,7 +760,7 @@ mod tests {
 		// 0.3 ms → first bucket (le=0.0005); 3 ms → le=0.005; 30 ms → le=0.05.
 		h.observe(Duration::from_micros(300));
 		h.observe(Duration::from_micros(3_000));
-		h.observe(Duration::from_micros(30_000));
+		h.observe(Duration::from_millis(30));
 		// 10 s exceeds the largest finite bound (2.5) → +Inf overflow.
 		h.observe(Duration::from_secs(10));
 		let snap = h.snapshot();

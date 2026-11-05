@@ -96,6 +96,20 @@
 //! another positive limit. It is read once at startup, and a value that is not a
 //! positive integer stops the server from starting.
 //!
+//! ## Read caps
+//!
+//! Every read answers in full, so it is bounded before it starts
+//! (`weft_server::ReadLimits`, ROB-12): a page defaults to 10,000 rows and
+//! `WEFT_MAX_PAGE_ROWS` sets the largest one a client may ask for (100,000),
+//! `WEFT_MAX_READ_ROWS` the most rows one read may return (5,000,000),
+//! `WEFT_MAX_DOWNSAMPLE_BUCKETS` the most buckets one downsample may return
+//! (1,000,000), `WEFT_MAX_AT_MULTI_INSTANTS` the most instants one
+//! `POST /api/v1/at` may name (10,000), and `WEFT_READ_TIMEOUT_SECS` how long
+//! one read may take (30 s). A page or a result over a cap is refused with
+//! `422 result_too_large` and a read past the deadline with `504
+//! query_timeout`; a value that is not a positive integer stops the server
+//! from starting.
+//!
 //! ## GPU calibration
 //!
 //! Once the listener is bound, the server calibrates the interpolation engine's backend
@@ -105,6 +119,8 @@
 //! with splimes' default thresholds. A CPU/software adapter (llvmpipe, lavapipe, WARP) is
 //! not calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips
 //! calibration altogether. It never stops the server from starting.
+//! `WEFT_GPU_ADAPTER` picks the adapter and `WEFT_GPU_DEVICES` opens several devices
+//! (5.7); both are read before the store opens, and a malformed value refuses the start.
 //! Before the first phase, strict configuration (PAC-5b) checks the environment against
 //! the registry of every variable the workspace reads: a `WEFT_` name no crate reads, a
 //! test harness's own channel set on a real server, or a value outside the shape its
@@ -114,17 +130,17 @@
 //! filesystem before opening it, and a store-open refusal that needs operator action
 //! exits 65 (75 for a locked root).
 
-pub(crate) mod config;
-pub(crate) mod daemons;
-pub(crate) mod hooks;
-pub(crate) mod serve;
-pub(crate) mod state;
+pub mod config;
+pub mod daemons;
+pub mod hooks;
+pub mod serve;
+pub mod state;
 
 /// The startup phases in the order [`run`] executes them (SEC-8). The
 /// module docs above describe each one; the test below pins this list
 /// against `run`'s actual call order, so reordering a phase means
 /// editing this list and the docs in the same change — never silently.
-pub(crate) const PHASES: [&str; 7] = ["strict-config", "hooks", "signals", "config", "state", "daemons", "serve"];
+pub const PHASES: [&str; 7] = ["strict-config", "hooks", "signals", "config", "state", "daemons", "serve"];
 
 /// Run every startup phase, in order, until the server stops serving.
 ///
@@ -143,7 +159,7 @@ fn exit_config(error: &anyhow::Error) -> ! {
 	std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
 }
 
-pub(crate) async fn run() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
 	// First, before any phase reads a setting or opens a store: strict
 	// configuration (PAC-5b). What PAC-5a's registry only warned about — an
 	// unknown `WEFT_` name, a test-harness channel set on a real server, a
@@ -188,6 +204,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// wiring's, so the gate the registry builds carries the operator's
 	// query-class cap rather than the default.
 	let admission = config::admission_config().unwrap_or_else(|error| exit_config(&error));
+	// ROB-12: the read caps, read once beside the other limits, so every
+	// read handler refuses what it cannot answer instead of attempting it.
+	let read_limits = config::read_limits().unwrap_or_else(|error| exit_config(&error));
 	// SEC-5: resolve the transport (TLS when configured) and run the C8
 	// plaintext gate against the address about to be bound, before the
 	// store opens — a refused exposure starts nothing at all.
@@ -199,8 +218,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// Phase 2: the opt-in Arrow Flight listener's address, refused here (exit 78) when it
 	// is not loopback, before anything opens.
 	let flight_addr = config::flight_addr().unwrap_or_else(|error| exit_config(&error));
+	// Phase 5 (5.7): the GPU adapter / multi-device choice, refused here (exit 78) when
+	// malformed, and installed before anything can start the GPU.
+	if let Some(gpu_config) = config::gpu_config().unwrap_or_else(|error| exit_config(&error)) {
+		println!("{}", weft_server::gpu::apply_config(gpu_config));
+	}
 	let state = match state::build().await {
-		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth).with_ingest_config(ingest).with_admission_config(admission),
+		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth).with_ingest_config(ingest).with_admission_config(admission).with_read_limits(read_limits),
 		Err(error) => match weft_server::store_open::exit_code_for_store_error(&error) {
 			// A store that needs operator action (65) or a locked root (75):
 			// the plan C7 class, not a generic failure.
@@ -228,21 +252,24 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	};
 
 	let listener = serve::bind(addr, tls.is_some()).await?;
-	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
+	// The served state is the built one plus the guard the bound address calls for; the
+	// built one is done with once the guard is on.
+	let serving = state.clone().with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
+	drop(state);
 	// ROB-23r: the second listener, after the data plane's bind so a failure to
 	// bind the ordinary address still stops startup first. Its own guard comes
 	// from its own address, and it fails startup just as a bad data-plane bind
 	// does: a supervisor configured to probe a port that never came up would
 	// otherwise be told the process is healthy by nothing at all.
 	let admin = match admin_addr {
-		Some(probe_addr) => Some(serve::AdminListener::bind(state.clone(), probe_addr, limits).await?),
+		Some(probe_addr) => Some(serve::AdminListener::bind(serving.clone(), probe_addr, limits).await?),
 		None => None,
 	};
 
 	// After the bind and in the background, so serving never waits for it.
 	daemons::spawn_gpu_calibration_if_enabled(&daemons);
 
-	serve::run(listener, state.clone(), otel_provider, limits, tls, &mut shutdown).await?;
+	serve::run(listener, serving.clone(), otel_provider, limits, tls, &mut shutdown).await?;
 	// The probe listener drains with the data plane rather than after the store:
 	// it answers about this process, so it stops the moment serving does and
 	// never accepts a probe against a store that has begun closing.
@@ -258,20 +285,23 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	if let Some(flight) = flight {
 		let _ = flight.await;
 	}
-	// C9's drain order: serve → SEC-9 TaskTracker → store.shutdown().
-	// The audit tracker drains next, so an audited handler still in
-	// flight when serving ended writes its outcome record before the
-	// store closes under it.
+	drain_after_serving(serving).await
+}
+
+/// The last steps of C9's drain order, once serving and the daemons have stopped:
+/// serve → SEC-9 `TaskTracker` → `store.shutdown()`.
+///
+/// The audit tracker drains first, so an audited handler still in flight when serving
+/// ended writes its outcome record before the store closes under it. Then the store
+/// shuts down — the closing reaper pass, then the clean-shutdown commit (D-S14's
+/// `SegmentStore::shutdown`, crash-consistency §5.5) — so the next open's `/ready` can
+/// report `previous_clean_shutdown: true` (D-S12). Only a clean stop (including a signal
+/// before serving, which exits 0 without accepting a connection) gets here: a serve
+/// failure is not a clean shutdown, and leaves the flag at the `0` the open wrote.
+async fn drain_after_serving(state: weft_server::AppState) -> anyhow::Result<()> {
 	if let Some(log) = state.audit_log() {
 		log.close_and_drain().await;
 	}
-	// Serving stopped cleanly (including a signal before serving, which exits 0
-	// without accepting a connection): shut the store down — the closing
-	// reaper pass, then the clean-shutdown commit (D-S14's
-	// `SegmentStore::shutdown`, crash-consistency §5.5) — so the next
-	// open's `/ready` can report `previous_clean_shutdown: true` (D-S12). A
-	// serve failure is not a clean shutdown, and leaves the flag at the `0`
-	// the open wrote.
 	if let Some(store) = state.store() {
 		store.shutdown().await?;
 	}

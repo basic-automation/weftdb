@@ -39,14 +39,15 @@
 //!   the failure deck's phases, recovery windows and SIGTERM verdict
 //!   ([`crate::soak_failure`]) on the record and takes v4; SOA-10 records
 //!   the derived-read verdict ([`crate::soak_read`]) on the record and
-//!   takes v5.
+//!   takes v5; SOA-11 records the backup lane's verdict
+//!   ([`crate::soak_backup`]) on the record and takes v6.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	redaction, report::{DiskInfo, RunMetadata}, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict
+	redaction, report::{DiskInfo, RunMetadata}, soak_backup::BackupLaneVerdict, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict
 };
 
 /// Version of the soak run record. Bump on any breaking field change to
@@ -62,7 +63,9 @@ use crate::{
 /// SIGTERM verdict on [`SoakRun`], the same way.
 /// v5 (SOA-10) adds the optional derived-read verdict on [`SoakRun`],
 /// the same way.
-pub const SOAK_SCHEMA_VERSION: u32 = 5;
+/// v6 (SOA-11) adds the optional backup lane verdict on [`SoakRun`],
+/// the same way.
+pub const SOAK_SCHEMA_VERSION: u32 = 6;
 
 /// Configuration for one soak run.
 ///
@@ -182,6 +185,13 @@ pub struct SoakRun {
 	/// nobody checked, which must never read as a passed verdict.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub derived: Option<DerivedReadVerdict>,
+	/// The backup lane's verdict on this run (SOA-11), recorded through
+	/// [`SoakHarness::record_backup_verdict`] once the lane's online
+	/// backup has been prefix-checked and its final restore verified.
+	/// `None` until then — and forever for a run with no backup lane,
+	/// which must never read as a passed lane.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub backup: Option<BackupLaneVerdict>,
 }
 
 impl SoakRun {
@@ -346,7 +356,7 @@ impl SoakHarness {
 	/// [`RunMetadata::capture`]), not a second probe.
 	#[must_use]
 	pub const fn new(config: SoakConfig, metadata: RunMetadata) -> Self {
-		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None, derived: None } }
+		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None, derived: None, backup: None } }
 	}
 
 	/// Current lifecycle state.
@@ -469,6 +479,30 @@ impl SoakHarness {
 		anyhow::ensure!(self.run.state == SoakState::Running, "soak derived-read verdict can only be recorded while Running, not {:?}", self.run.state);
 		anyhow::ensure!(self.run.derived.is_none(), "soak derived-read verdict has already been recorded for this run");
 		self.run.derived = Some(verdict);
+		Ok(())
+	}
+
+	/// Record the backup lane's verdict on this run (SOA-11): the
+	/// judgement of the lane's online backup (an exact prefix of the
+	/// acknowledged history) and of the store its final restore
+	/// published through PAC-13's restore path, plus the RPO/RTO the
+	/// lane measured, kept in the run record beside the oracle and
+	/// derived-read verdicts so a published run carries the evidence
+	/// that its backups restore.
+	///
+	/// Recorded exactly once, while `Running` — the driver judges the
+	/// lane, records the verdict, and then finishes the run. A second
+	/// recording is refused rather than overwriting the first: a
+	/// verdict that can be quietly replaced is not evidence.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when a
+	/// verdict has already been recorded.
+	pub fn record_backup_verdict(&mut self, verdict: BackupLaneVerdict) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak backup verdict can only be recorded while Running, not {:?}", self.run.state);
+		anyhow::ensure!(self.run.backup.is_none(), "soak backup verdict has already been recorded for this run");
+		self.run.backup = Some(verdict);
 		Ok(())
 	}
 
@@ -652,7 +686,7 @@ mod tests {
 		harness.start().expect("start");
 		let record = harness.run_record();
 		assert_eq!(record.soak_schema_version, SOAK_SCHEMA_VERSION);
-		assert_eq!(record.soak_schema_version, 5, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, v5 from SOA-10's derived-read field, independent of the bench schema");
+		assert_eq!(record.soak_schema_version, 6, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, v5 from SOA-10's derived-read field, v6 from SOA-11's backup-lane field, independent of the bench schema");
 		// Reuse, not redefinition: the record's metadata is EVI-3's capture,
 		// with the same crate version / OS / arch / timestamp it was built from.
 		assert!(!record.metadata.weft_bench_version.is_empty(), "metadata must carry the bench crate version");
@@ -770,6 +804,29 @@ mod tests {
 		json.as_object_mut().expect("object").remove("derived");
 		let back: SoakRun = serde_json::from_value(json).expect("v4-shaped record deserializes");
 		assert!(back.derived.is_none(), "an absent derived field reads as no verdict, never a pass");
+	}
+
+	#[test]
+	fn backup_verdict_is_recorded_once_while_running() {
+		use crate::soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict};
+
+		let verdict = BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 4, ticks_in_backup: 2, cut_tick: Some(1), points_expected: 32, points_in_backup: 32, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 4, points_expected: 64, points_restored: 64, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1_000, backup_duration_ms: 120, restore_duration_ms: 340 } };
+		let mut harness = SoakHarness::new(config(), metadata());
+		assert!(harness.run_record().backup.is_none(), "no verdict before one is recorded");
+		assert!(harness.record_backup_verdict(verdict.clone()).is_err(), "a verdict cannot be recorded before the run starts");
+		harness.start().expect("start");
+		harness.record_backup_verdict(verdict.clone()).expect("record while Running");
+		assert_eq!(harness.run_record().backup.as_ref(), Some(&verdict), "the recorded verdict is on the run record");
+		assert_eq!(harness.run_record().backup.as_ref().map(BackupLaneVerdict::rpo_ms), Some(1_120), "the recorded verdict carries the lane's RPO");
+		assert!(harness.record_backup_verdict(verdict).is_err(), "a second verdict must not overwrite the first");
+		harness.finish().expect("finish");
+		assert!(harness.run_record().backup.is_some(), "the verdict survives the finish");
+		// The field is additive: a v5 artifact without it deserializes
+		// with no verdict.
+		let mut json = serde_json::to_value(harness.run_record().redacted_copy()).expect("record to json");
+		json.as_object_mut().expect("object").remove("backup");
+		let back: SoakRun = serde_json::from_value(json).expect("v5-shaped record deserializes");
+		assert!(back.backup.is_none(), "an absent backup field reads as no verdict, never a pass");
 	}
 
 	#[test]

@@ -400,7 +400,6 @@ impl SimFs {
 	/// `InvalidInput` if `dest` is inside the root, `AlreadyExists` if it holds
 	/// anything, or any error reading the root or writing the image.
 	// The model lock is held throughout so the image is one instant's state.
-	#[allow(clippy::significant_drop_tightening)]
 	pub fn power_cut(&self, seed: u64, dest: &Path) -> io::Result<()> {
 		let model = self.lock();
 		if dest.starts_with(&self.root) {
@@ -461,6 +460,7 @@ impl SimFs {
 				std::fs::write(name, &bytes)?;
 			}
 		}
+		drop(model);
 		Ok(())
 	}
 
@@ -646,7 +646,6 @@ impl SimFs {
 // and the directory never disagree about the order those happened in.
 // `create_new_write` lets go after the create: its fault points may pause, and the
 // content writes that follow have no order to keep.
-#[allow(clippy::significant_drop_tightening)]
 #[async_trait]
 impl StoreFs for SimFs {
 	async fn create_new_write(&self, path: &Path, bytes: Vec<u8>, policy: SyncPolicy, points: WritePoints) -> io::Result<()> {
@@ -690,6 +689,7 @@ impl StoreFs for SimFs {
 			*current = bytes;
 		}
 		model.file_syncs += 1;
+		drop(model);
 		Ok(())
 	}
 
@@ -701,6 +701,7 @@ impl StoreFs for SimFs {
 		let durable = with_dependencies(&model.pending, in_dir);
 		model.commit(&durable);
 		model.dir_syncs += 1;
+		drop(model);
 		Ok(())
 	}
 
@@ -716,6 +717,7 @@ impl StoreFs for SimFs {
 		std::fs::hard_link(src, dst)?;
 		model.live.insert(dst_slot.clone(), ino);
 		model.pending.push(DirOp::Add { slot: dst_slot, ino });
+		drop(model);
 		Ok(())
 	}
 
@@ -733,6 +735,7 @@ impl StoreFs for SimFs {
 			model.live.remove(&from_slot);
 			model.live.insert(to_slot.clone(), ino);
 			model.pending.push(DirOp::Rename { from: from_slot, to: to_slot, ino });
+			drop(model);
 		}
 		Ok(())
 	}
@@ -749,6 +752,7 @@ impl StoreFs for SimFs {
 		self.reconcile(&mut model, &slot, path)?;
 		remove_file_blocking(path)?;
 		model.remove(slot);
+		drop(model);
 		Ok(())
 	}
 
@@ -758,6 +762,7 @@ impl StoreFs for SimFs {
 		self.reconcile(&mut model, &slot, path)?;
 		std::fs::create_dir(path)?;
 		model.add(slot, Node::Dir);
+		drop(model);
 		Ok(())
 	}
 
@@ -775,6 +780,7 @@ impl StoreFs for SimFs {
 		self.remove_tree(&mut model, ino, path)?;
 		std::fs::remove_dir(path)?;
 		model.remove(slot);
+		drop(model);
 		Ok(())
 	}
 
@@ -842,7 +848,7 @@ mod tests {
 
 	/// A frame-shaped payload with no zero bytes, so zero fill is recognisable.
 	fn payload(len: usize, salt: u8) -> Vec<u8> {
-		(0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(salt) | 1).collect()
+		(0..len).map(|i| u8::try_from(i & 0xFF).unwrap_or(u8::MAX).wrapping_mul(31).wrapping_add(salt) | 1).collect()
 	}
 
 	/// A store root with `segments/` and `backup/` directories, and the `SimFs` over
@@ -968,7 +974,7 @@ mod tests {
 			assert!(matches!((tmp, fin), (Outcome::Complete, Outcome::Absent) | (Outcome::Absent, Outcome::Complete)), "seed {seed}: exactly one name survives, intact ({tmp:?}, {fin:?})");
 			renamed += usize::from(fin == Outcome::Complete);
 		}
-		assert!(renamed > 0 && renamed < SEEDS as usize, "both sides of the pending rename occur ({renamed} of {SEEDS})");
+		assert!(renamed > 0 && renamed < usize::try_from(SEEDS).expect("SEEDS fits a usize"), "both sides of the pending rename occur ({renamed} of {SEEDS})");
 
 		sim.sync_dir(&segments).await.unwrap();
 		let image = cut(&sim, 0);
@@ -1308,7 +1314,7 @@ mod tests {
 			assert!(matches!((old, new), (Outcome::Complete, Outcome::Absent) | (Outcome::Absent, Outcome::Complete)), "seed {seed}: the subtree is under exactly one name, intact ({old:?}, {new:?})");
 			renamed += usize::from(new == Outcome::Complete);
 		}
-		assert!(renamed > 0 && renamed < SEEDS as usize, "both sides of the pending rename occur ({renamed} of {SEEDS})");
+		assert!(renamed > 0 && renamed < usize::try_from(SEEDS).expect("SEEDS fits a usize"), "both sides of the pending rename occur ({renamed} of {SEEDS})");
 
 		sim.sync_dir(root.path()).await.unwrap();
 		for seed in 0..16 {

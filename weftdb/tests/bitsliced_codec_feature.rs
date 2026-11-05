@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` keeps working as a name in every build, but only a
 //! build with the `bitsliced-codec` feature acts on it: without the feature the bit-sliced
 //! value codec is not compiled in, so the variable is ignored (with a warning) rather than

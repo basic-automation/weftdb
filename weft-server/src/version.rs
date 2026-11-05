@@ -310,6 +310,7 @@ mod tests {
 		let store = std::sync::Arc::new(weftdb::SegmentStore::open_scoped(dir.path().join("store"), "market", "BTCUSD").await.expect("opens a store"));
 		let state = AppState::new().with_store(store).with_serving_scope(ServingScope::new("market", "BTCUSD", ScopePin::Enforced));
 		let body = VersionResponse::of(&state);
+		drop(state);
 		assert!(body.store.configured);
 		assert!(body.store.store_uuid.as_deref().is_some_and(|uuid| uuid.len() == 36), "the same identity /ready reports");
 		assert_eq!(body.store.layout_version, Some(weftdb::SUPPORTED_LAYOUT), "a new store is in this build's layout");

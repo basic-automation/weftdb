@@ -25,7 +25,9 @@
 //! Features: `rustls` for HTTPS (ring provider, platform or caller-supplied roots), and
 //! `arrow` to decode Arrow IPC and Parquet answers (`decode_arrow` and
 //! `decode_parquet`, both behind the `arrow` feature).
-
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 #![warn(missing_docs)]
 
 mod client;

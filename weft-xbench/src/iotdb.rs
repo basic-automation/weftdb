@@ -288,11 +288,11 @@ impl Arm for IoTdb {
 		let start = ds.start.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid start out of range"))?;
 		let end = ds.end.timestamp_nanos_opt().ok_or_else(|| anyhow::anyhow!("grid end out of range"))?;
 		let step = ds.resolution.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("grid step out of range"))?;
-		let sql = INTERPOLATE_SQL.replace("{start}", &start.to_string()).replace("{end}", &end.to_string()).replace("{step}", &step.to_string()).replace("{lo}", &(start - step).to_string()).replace("{hi}", &(end + step).to_string());
+		let sql = crate::fill(INTERPOLATE_SQL, &[("start", &start), ("end", &end), ("step", &step), ("lo", &(start - step)), ("hi", &(end + step))]);
 		let rows = ds.grid_len();
 		match self.class {
 			ArmClass::Native => {
-				let sql = NATIVE_SQL.replace("{start}", &start.to_string()).replace("{end}", &end.to_string()).replace("{step}", &step.to_string());
+				let sql = crate::fill(NATIVE_SQL, &[("start", &start), ("end", &end), ("step", &step)]);
 				let pairs = self.on_db(move |server, db| server.query(db, &sql, rows)?.iter().map(|r| Ok((i64_cell(r.get(0))?, f64_cell(r.get(1))?))).collect::<anyhow::Result<Vec<_>>>()).await?;
 				return Ok(Output::Float(place(&pairs, start, step, rows)));
 			}
@@ -308,7 +308,7 @@ impl Arm for IoTdb {
 
 	async fn downsample(&mut self, ds: &Dataset, _knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {
 		let width = ds.bucket.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("bucket width out of range"))?;
-		let sql = DOWNSAMPLE_SQL.replace("{width}", &width.to_string());
+		let sql = crate::fill(DOWNSAMPLE_SQL, &[("width", &width)]);
 		let rows = ds.points.len();
 		self.on_db(move |server, db| server.query(db, &sql, rows)?.iter().map(|r| Ok(BucketRow { start_ns: i64_cell(r.get(0))?, count: i64_cell(r.get(1))?.unsigned_abs(), min: f64_cell(r.get(2))?, max: f64_cell(r.get(3))?, avg: f64_cell(r.get(4))? })).collect()).await
 	}

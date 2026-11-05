@@ -47,7 +47,9 @@ pub const FRAME_PAGED: u16 = 6;
 /// moved offset.
 pub const FRAME_ENVELOPE: u16 = 7;
 
-/// The highest frame version this build can read. Anything above it came from a newer
+/// The highest frame version this build can read.
+///
+/// Anything above it came from a newer
 /// server, which is the difference between "this file is broken" and "this file is
 /// ahead of me" — see [`FrameFault::Undecodable`].
 pub const FRAME_VERSION_MAX_KNOWN: u16 = FRAME_ENVELOPE;
@@ -107,8 +109,9 @@ pub struct FrameExtensionSpec {
 	pub name: &'static str,
 }
 
-/// The extension carrying a frame's tag-set series key (tags A3, 1.0 plan §5
-/// D-S16): the payload is the canonical series-key bytes of the series the
+/// The extension carrying a frame's tag-set series key (tags A3, 1.0 plan §5 D-S16).
+///
+/// The payload is the canonical series-key bytes of the series the
 /// frame's rows belong to. Since TAG-7 every frame of a tagged series is a v7
 /// envelope carrying exactly this one extension, marked critical, around an
 /// unchanged v5 or v6 body; an untagged frame has no envelope at all. A reader
@@ -325,7 +328,7 @@ mod tests {
 		// The row bound must stay above the plan's own row caps, so a frame a
 		// writer can produce is never refused for its height alone: decision
 		// 12's read/export cap is 5,000,000 rows.
-		assert!(MAX_FRAME_ROWS > 5_000_000);
+		const { assert!(MAX_FRAME_ROWS > 5_000_000) };
 		assert!(DecodeLimits::DEFAULT.rows_ok(MAX_FRAME_ROWS));
 		assert!(!DecodeLimits::DEFAULT.rows_ok(MAX_FRAME_ROWS + 1));
 		assert!(DecodeLimits::DEFAULT.pages_ok(MAX_FRAME_PAGES));

@@ -22,6 +22,20 @@ use crate::logging::LogBuffer;
 /// Resolution steps from finest to coarsest for +/- navigation
 const RESOLUTION_ORDER: [Resolution; 10] = [Resolution::Nanoseconds, Resolution::Microseconds, Resolution::Milliseconds, Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days, Resolution::Weeks, Resolution::Months, Resolution::Years];
 
+/// Borrowed view of the compression configuration form fields.
+#[derive(Clone, Copy)]
+pub struct CompressionForm<'a> {
+	pub mode: &'a CompressionMode,
+	pub time_pure_days: &'a str,
+	pub time_tier_days: &'a str,
+	pub time_max_tiers: &'a str,
+	pub time_scaling_index: usize,
+	pub size_target_gb: &'a str,
+	pub size_min_agg: &'a str,
+	pub size_max_agg: &'a str,
+	pub base_resolution_index: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum AppState {
 	SelectingMode,
@@ -90,7 +104,7 @@ pub enum AppState {
 }
 
 /// Compression mode type
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompressionMode {
 	TimeBased,
 	SizeBased,
@@ -98,7 +112,7 @@ pub enum CompressionMode {
 }
 
 /// Fields in the compression configuration form
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompressionField {
 	TimePureDays,
 	TimeTierDays,
@@ -219,7 +233,7 @@ impl App {
 	pub async fn new(log_buffer: LogBuffer) -> Self {
 		let databases = match list_databases().await {
 			Ok(dbs) => dbs,
-			Err(e) => return Self { state: AppState::Error(format!("Failed to list databases: {}", e)), databases: vec![], subjects: vec![], aspects: vec![], selected_database: None, selected_subject: None, selected_aspect: None, measurements: vec![], view_resolution: Resolution::Days, list_state: ListState::default(), mode_list_state: ListState::default(), database_name_input: String::new(), database_name_cursor: 0, error_message: None, loading_receiver: None, loading_cancel: None, csv_import_progress: None, log_buffer, loading_in_progress: false, compression_status: None, compression_list_state: ListState::default(), compression_receiver: None, compression_cancel: None },
+			Err(e) => return Self { state: AppState::Error(format!("Failed to list databases: {e}")), databases: vec![], subjects: vec![], aspects: vec![], selected_database: None, selected_subject: None, selected_aspect: None, measurements: vec![], view_resolution: Resolution::Days, list_state: ListState::default(), mode_list_state: ListState::default(), database_name_input: String::new(), database_name_cursor: 0, error_message: None, loading_receiver: None, loading_cancel: None, csv_import_progress: None, log_buffer, loading_in_progress: false, compression_status: None, compression_list_state: ListState::default(), compression_receiver: None, compression_cancel: None },
 		};
 		let mut mode_list_state = ListState::default();
 		mode_list_state.select(Some(0));
@@ -347,7 +361,7 @@ impl App {
 						// Clear CSV import progress on error
 						self.csv_import_progress = None;
 						self.loading_in_progress = false;
-						new_state = Some(AppState::Error(format!("Failed to load measurements: {}", e)));
+						new_state = Some(AppState::Error(format!("Failed to load measurements: {e}")));
 						should_clear = true;
 					}
 				}
@@ -374,6 +388,11 @@ impl App {
 		self.poll_compression();
 	}
 
+	/// Handles one key event, returning `true` when the app should quit.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the handler for the current screen fails.
 	pub async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
 		// Global quit: allow 'q' or 'Q' to exit from any state (except text input states)
 		if key.kind == KeyEventKind::Press {
@@ -388,21 +407,21 @@ impl App {
 			}
 		}
 		match self.state.clone() {
-			AppState::SelectingMode => self.handle_mode_selection(key).await,
-			AppState::EnteringDatabaseName { .. } => self.handle_database_name_input(key).await,
-			AppState::CreatingDatabase { .. } => self.handle_creating_database(key).await,
-			AppState::EnteringSubjectName { .. } => self.handle_subject_name_input(key).await,
-			AppState::CreatingSubject { .. } => self.handle_creating_subject(key).await,
-			AppState::EnteringAspectName { .. } => self.handle_aspect_name_input(key).await,
-			AppState::CreatingAspect { .. } => self.handle_creating_aspect(key).await,
-			AppState::EnteringCsvPath { .. } => self.handle_csv_path_input(key).await,
-			AppState::SelectingDatabase => self.handle_database_selection(key).await,
-			AppState::SelectingSubject => self.handle_subject_selection(key).await,
-			AppState::SelectingAspect => self.handle_aspect_selection(key).await,
-			AppState::Loading { .. } => self.handle_loading(key).await,
+			AppState::SelectingMode => Ok(self.handle_mode_selection(key)),
+			AppState::EnteringDatabaseName { .. } => Ok(self.handle_database_name_input(key)),
+			AppState::CreatingDatabase { .. } => Ok(self.handle_creating_database(key)),
+			AppState::EnteringSubjectName { .. } => Ok(self.handle_subject_name_input(key)),
+			AppState::CreatingSubject { .. } => Ok(self.handle_creating_subject(key)),
+			AppState::EnteringAspectName { .. } => Ok(self.handle_aspect_name_input(key)),
+			AppState::CreatingAspect { .. } => Ok(self.handle_creating_aspect(key)),
+			AppState::EnteringCsvPath { .. } => Ok(self.handle_csv_path_input(key)),
+			AppState::SelectingDatabase => Ok(self.handle_database_selection(key)),
+			AppState::SelectingSubject => Ok(self.handle_subject_selection(key)),
+			AppState::SelectingAspect => Ok(self.handle_aspect_selection(key)),
+			AppState::Loading { .. } => Ok(self.handle_loading(key)),
 			AppState::Plotting => self.handle_plotting(key).await,
-			AppState::SelectingCompressionMode { .. } => self.handle_compression_mode_selection(key).await,
-			AppState::ConfiguringCompression { .. } => self.handle_compression_config(key).await,
+			AppState::SelectingCompressionMode { .. } => Ok(self.handle_compression_mode_selection(key)),
+			AppState::ConfiguringCompression { .. } => Ok(self.handle_compression_config(key)),
 			AppState::Error(_) => {
 				if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
 					self.refresh_database_list().await;
@@ -419,9 +438,9 @@ impl App {
 		}
 	}
 
-	async fn handle_loading(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_loading(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 		// Allow canceling the load with Esc
 		if key.code == KeyCode::Esc {
@@ -433,12 +452,12 @@ impl App {
 			self.state = AppState::SelectingAspect;
 			self.list_state.select(Some(0));
 		}
-		Ok(false)
+		false
 	}
 
-	async fn handle_mode_selection(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_mode_selection(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		match key.code {
@@ -474,17 +493,17 @@ impl App {
 			}
 			_ => {}
 		}
-		Ok(false)
+		false
 	}
 
-	async fn handle_database_name_input(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_database_name_input(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		let (mut input, mut cursor, _) = match &self.state {
 			AppState::EnteringDatabaseName { input, cursor_position, validation_error } => (input.clone(), *cursor_position, validation_error.clone()),
-			_ => return Ok(false),
+			_ => return false,
 		};
 
 		match key.code {
@@ -514,18 +533,18 @@ impl App {
 				// Validate
 				if let Some(error) = validate_database_name(&input, &self.databases) {
 					self.state = AppState::EnteringDatabaseName { input, cursor_position: cursor, validation_error: Some(error) };
-					return Ok(false);
+					return false;
 				}
 
 				// Start creation
 				self.start_creating_database(input.clone());
 				self.state = AppState::CreatingDatabase { name: input };
-				return Ok(false);
+				return false;
 			}
 			KeyCode::Esc => {
 				self.state = AppState::SelectingMode;
 				self.mode_list_state.select(Some(0));
-				return Ok(false);
+				return false;
 			}
 			_ => {}
 		}
@@ -533,10 +552,10 @@ impl App {
 		// Update state if still in input mode
 		self.state = AppState::EnteringDatabaseName { input, cursor_position: cursor, validation_error: None };
 
-		Ok(false)
+		false
 	}
 
-	async fn handle_creating_database(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_creating_database(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
 			if let Some(cancel) = &self.loading_cancel {
 				cancel.store(true, Ordering::SeqCst);
@@ -546,7 +565,7 @@ impl App {
 			self.state = AppState::SelectingMode;
 			self.mode_list_state.select(Some(0));
 		}
-		Ok(false)
+		false
 	}
 
 	fn start_creating_database(&mut self, db_name: String) {
@@ -570,7 +589,7 @@ impl App {
 				}
 				Err(e) => {
 					error!("Failed to create database '{}': {}", db_name, e);
-					let _ = tx.send(LoadingMessage::Error(format!("Failed to create: {}", e))).await;
+					let _ = tx.send(LoadingMessage::Error(format!("Failed to create: {e}"))).await;
 				}
 			}
 		});
@@ -588,14 +607,14 @@ impl App {
 		}
 	}
 
-	async fn handle_subject_name_input(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_subject_name_input(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		let (mut input, mut cursor, _) = match &self.state {
 			AppState::EnteringSubjectName { input, cursor_position, validation_error } => (input.clone(), *cursor_position, validation_error.clone()),
-			_ => return Ok(false),
+			_ => return false,
 		};
 
 		match key.code {
@@ -625,26 +644,26 @@ impl App {
 				if let Some(error) = validate_subject_name(&input) {
 					warn!("Subject name validation failed: {}", error);
 					self.state = AppState::EnteringSubjectName { input, cursor_position: cursor, validation_error: Some(error) };
-					return Ok(false);
+					return false;
 				}
 				info!("Valid subject name, starting creation process");
 				self.start_creating_subject(input.clone());
 				self.state = AppState::CreatingSubject { name: input };
-				return Ok(false);
+				return false;
 			}
 			KeyCode::Esc => {
 				self.state = AppState::SelectingSubject;
-				return Ok(false);
+				return false;
 			}
 			_ => {}
 		}
 
 		self.state = AppState::EnteringSubjectName { input, cursor_position: cursor, validation_error: None };
 
-		Ok(false)
+		false
 	}
 
-	async fn handle_creating_subject(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_creating_subject(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
 			if let Some(cancel) = &self.loading_cancel {
 				cancel.store(true, Ordering::SeqCst);
@@ -653,17 +672,17 @@ impl App {
 			self.loading_cancel = None;
 			self.state = AppState::SelectingSubject;
 		}
-		Ok(false)
+		false
 	}
 
-	async fn handle_aspect_name_input(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_aspect_name_input(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		let (mut input, mut cursor, _, mut selected_resolution) = match &self.state {
 			AppState::EnteringAspectName { input, cursor_position, validation_error, selected_resolution } => (input.clone(), *cursor_position, validation_error.clone(), *selected_resolution),
-			_ => return Ok(false),
+			_ => return false,
 		};
 
 		let resolutions = vec![Resolution::Nanoseconds, Resolution::Microseconds, Resolution::Milliseconds, Resolution::Seconds, Resolution::Minutes, Resolution::Hours, Resolution::Days, Resolution::Weeks, Resolution::Months, Resolution::Years];
@@ -701,26 +720,26 @@ impl App {
 			KeyCode::Enter => {
 				if let Some(error) = validate_aspect_name(&input) {
 					self.state = AppState::EnteringAspectName { input, cursor_position: cursor, validation_error: Some(error), selected_resolution };
-					return Ok(false);
+					return false;
 				}
 				let resolution = resolutions[selected_resolution];
 				self.start_creating_aspect(input.clone(), resolution);
 				self.state = AppState::CreatingAspect { name: input, resolution };
-				return Ok(false);
+				return false;
 			}
 			KeyCode::Esc => {
 				self.state = AppState::SelectingAspect;
-				return Ok(false);
+				return false;
 			}
 			_ => {}
 		}
 
 		self.state = AppState::EnteringAspectName { input, cursor_position: cursor, validation_error: None, selected_resolution };
 
-		Ok(false)
+		false
 	}
 
-	async fn handle_creating_aspect(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_creating_aspect(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
 			if let Some(cancel) = &self.loading_cancel {
 				cancel.store(true, Ordering::SeqCst);
@@ -729,17 +748,17 @@ impl App {
 			self.loading_cancel = None;
 			self.state = AppState::SelectingAspect;
 		}
-		Ok(false)
+		false
 	}
 
-	async fn handle_csv_path_input(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_csv_path_input(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		let (mut input, mut cursor, _) = match &self.state {
 			AppState::EnteringCsvPath { input, cursor_position, validation_error } => (input.clone(), *cursor_position, validation_error.clone()),
-			_ => return Ok(false),
+			_ => return false,
 		};
 
 		match key.code {
@@ -769,7 +788,7 @@ impl App {
 				if let Some(error) = validate_csv_path(&input) {
 					warn!("CSV path validation failed: {}", error);
 					self.state = AppState::EnteringCsvPath { input, cursor_position: cursor, validation_error: Some(error) };
-					return Ok(false);
+					return false;
 				}
 				// Strip quotes from path (handles Windows clipboard paste with quotes)
 				let clean_path = input.trim().trim_matches('"').trim_matches('\'').to_string();
@@ -777,18 +796,18 @@ impl App {
 				self.csv_import_progress = Some((0, 0, "Starting CSV import...".to_string()));
 				self.start_importing_csv(clean_path);
 				self.state = AppState::Plotting;
-				return Ok(false);
+				return false;
 			}
 			KeyCode::Esc => {
 				self.state = AppState::Plotting;
-				return Ok(false);
+				return false;
 			}
 			_ => {}
 		}
 
 		self.state = AppState::EnteringCsvPath { input, cursor_position: cursor, validation_error: None };
 
-		Ok(false)
+		false
 	}
 
 	fn start_creating_subject(&mut self, subject_name: String) {
@@ -799,18 +818,15 @@ impl App {
 		self.loading_receiver = Some(rx);
 		self.loading_cancel = Some(cancel);
 
-		let db_name = match self.selected_database.clone() {
-			Some(name) => {
-				debug!("Using database: {}", name);
-				name
-			}
-			None => {
-				error!("No database selected when creating subject");
-				drop(tokio::spawn(async move {
-					let _ = tx.send(LoadingMessage::Error("No database selected".to_string())).await;
-				}));
-				return;
-			}
+		let db_name = if let Some(name) = self.selected_database.clone() {
+			debug!("Using database: {}", name);
+			name
+		} else {
+			error!("No database selected when creating subject");
+			drop(tokio::spawn(async move {
+				let _ = tx.send(LoadingMessage::Error("No database selected".to_string())).await;
+			}));
+			return;
 		};
 
 		tokio::spawn(async move {
@@ -830,19 +846,19 @@ impl App {
 								}
 								Err(e) => {
 									error!("Failed to reload subjects: {}", e);
-									let _ = tx.send(LoadingMessage::Error(format!("Failed to reload subjects: {}", e))).await;
+									let _ = tx.send(LoadingMessage::Error(format!("Failed to reload subjects: {e}"))).await;
 								}
 							}
 						}
 						Err(e) => {
 							error!("Failed to create subject '{}': {}", subject_name, e);
-							let _ = tx.send(LoadingMessage::Error(format!("Failed to create subject: {}", e))).await;
+							let _ = tx.send(LoadingMessage::Error(format!("Failed to create subject: {e}"))).await;
 						}
 					}
 				}
 				Err(e) => {
 					error!("Failed to open database '{}': {}", db_name, e);
-					let _ = tx.send(LoadingMessage::Error(format!("Failed to open database: {}", e))).await;
+					let _ = tx.send(LoadingMessage::Error(format!("Failed to open database: {e}"))).await;
 				}
 			}
 		});
@@ -865,23 +881,23 @@ impl App {
 							let _ = tx.send(LoadingMessage::Aspects(aspects)).await;
 						}
 						Err(e) => {
-							let _ = tx.send(LoadingMessage::Error(format!("Failed to reload aspects: {}", e))).await;
+							let _ = tx.send(LoadingMessage::Error(format!("Failed to reload aspects: {e}"))).await;
 						}
 					},
 					Err(e) => {
-						let _ = tx.send(LoadingMessage::Error(format!("Failed to create aspect: {}", e))).await;
+						let _ = tx.send(LoadingMessage::Error(format!("Failed to create aspect: {e}"))).await;
 					}
 				},
 				Err(e) => {
-					let _ = tx.send(LoadingMessage::Error(format!("Failed to open database: {}", e))).await;
+					let _ = tx.send(LoadingMessage::Error(format!("Failed to open database: {e}"))).await;
 				}
 			}
 		});
 	}
 
-	async fn handle_database_selection(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_database_selection(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 		match key.code {
 			KeyCode::Down => {
@@ -911,17 +927,17 @@ impl App {
 			}
 			_ => {}
 		}
-		Ok(false)
+		false
 	}
 
-	async fn handle_subject_selection(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_subject_selection(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		if self.subjects.is_empty() {
 			match key.code {
-				KeyCode::Char('n') | KeyCode::Char('N') => {
+				KeyCode::Char('n' | 'N') => {
 					self.state = AppState::EnteringSubjectName { input: String::new(), cursor_position: 0, validation_error: None };
 				}
 				KeyCode::Esc => {
@@ -930,7 +946,7 @@ impl App {
 				}
 				_ => {}
 			}
-			return Ok(false);
+			return false;
 		}
 
 		match key.code {
@@ -950,9 +966,8 @@ impl App {
 				if let Some(i) = self.list_state.selected() {
 					self.selected_subject = Some(self.subjects[i].clone());
 					let db_name = self.selected_database.as_ref().unwrap().clone();
-					let subject = self.subjects[i].clone();
 					// Spawn background loading of aspects
-					self.start_loading_aspects(db_name, subject);
+					self.start_loading_aspects(db_name, self.subjects[i].clone());
 					self.state = AppState::Loading { loaded_count: 0, total_scanned: 0, status: "Initializing...".to_string() };
 				}
 			}
@@ -962,17 +977,17 @@ impl App {
 			}
 			_ => {}
 		}
-		Ok(false)
+		false
 	}
 
-	async fn handle_aspect_selection(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_aspect_selection(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		if self.aspects.is_empty() {
 			match key.code {
-				KeyCode::Char('n') | KeyCode::Char('N') => {
+				KeyCode::Char('n' | 'N') => {
 					self.state = AppState::EnteringAspectName { input: String::new(), cursor_position: 0, validation_error: None, selected_resolution: 0 };
 				}
 				KeyCode::Esc => {
@@ -981,7 +996,7 @@ impl App {
 				}
 				_ => {}
 			}
-			return Ok(false);
+			return false;
 		}
 
 		match key.code {
@@ -1011,7 +1026,7 @@ impl App {
 			}
 			_ => {}
 		}
-		Ok(false)
+		false
 	}
 
 	async fn handle_plotting(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
@@ -1038,19 +1053,19 @@ impl App {
 					self.state = AppState::Loading { loaded_count: 0, total_scanned: 0, status: "Initializing...".to_string() };
 				}
 			}
-			KeyCode::Char('c') | KeyCode::Char('C') => {
+			KeyCode::Char('c' | 'C') => {
 				// Enter compression mode selection
 				debug!("Compression key pressed");
 				self.compression_list_state.select(Some(0));
 				self.state = AppState::SelectingCompressionMode { selected_index: 0 };
 			}
-			KeyCode::Char('i') | KeyCode::Char('I') => {
+			KeyCode::Char('i' | 'I') => {
 				debug!("Import CSV key pressed");
 				self.state = AppState::EnteringCsvPath { input: String::new(), cursor_position: 0, validation_error: None };
 			}
-			KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
+			KeyCode::Esc | KeyCode::Char('b' | 'B') => {
 				// If compression pane is showing (complete or error), dismiss it
-				if matches!(self.compression_status, Some(CompressionStatus::Complete { .. }) | Some(CompressionStatus::Error(_))) {
+				if matches!(self.compression_status, Some(CompressionStatus::Complete { .. } | CompressionStatus::Error(_))) {
 					self.dismiss_compression_pane();
 				} else if self.compression_status.is_some() {
 					// If compression is running, cancel it
@@ -1084,17 +1099,17 @@ impl App {
 	}
 
 	/// Handle compression mode selection screen
-	async fn handle_compression_mode_selection(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_compression_mode_selection(&mut self, key: crossterm::event::KeyEvent) -> bool {
+		const NUM_OPTIONS: usize = 7;
+
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		let selected_index = match &self.state {
 			AppState::SelectingCompressionMode { selected_index } => *selected_index,
-			_ => return Ok(false),
+			_ => return false,
 		};
-
-		const NUM_OPTIONS: usize = 7;
 
 		match key.code {
 			KeyCode::Down => {
@@ -1161,23 +1176,23 @@ impl App {
 			}
 			_ => {}
 		}
-		Ok(false)
+		false
 	}
 
 	/// Handle compression configuration screen
-	async fn handle_compression_config(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
+	fn handle_compression_config(&mut self, key: crossterm::event::KeyEvent) -> bool {
 		if key.kind != KeyEventKind::Press {
-			return Ok(false);
+			return false;
 		}
 
 		// Extract current state
 		let (mode, mut time_pure_days, mut time_tier_days, mut time_max_tiers, mut time_scaling_index, mut size_target_gb, mut size_min_agg, mut size_max_agg, mut base_resolution_index, mut focused_field) = match &self.state {
 			AppState::ConfiguringCompression { mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index, size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field, .. } => (mode.clone(), time_pure_days.clone(), time_tier_days.clone(), time_max_tiers.clone(), *time_scaling_index, size_target_gb.clone(), size_min_agg.clone(), size_max_agg.clone(), *base_resolution_index, focused_field.clone()),
-			_ => return Ok(false),
+			_ => return false,
 		};
 
 		// Get list of available fields based on mode
-		let fields = self.get_compression_fields_for_mode(&mode);
+		let fields = Self::get_compression_fields_for_mode(&mode);
 
 		match key.code {
 			KeyCode::Up => {
@@ -1200,15 +1215,7 @@ impl App {
 				// Cycle dropdown values
 				match focused_field {
 					CompressionField::TimeScaling => {
-						time_scaling_index = if key.code == KeyCode::Right {
-							(time_scaling_index + 1) % 2
-						} else {
-							if time_scaling_index == 0 {
-								1
-							} else {
-								0
-							}
-						};
+						time_scaling_index = if key.code == KeyCode::Right { (time_scaling_index + 1) % 2 } else { usize::from(time_scaling_index == 0) };
 					}
 					CompressionField::BaseResolution => {
 						// 0=Nanoseconds, ..., 9=Years
@@ -1255,15 +1262,15 @@ impl App {
 			}
 			KeyCode::Enter => {
 				// Validate and run compression
-				match self.build_and_run_compression(&mode, &time_pure_days, &time_tier_days, &time_max_tiers, time_scaling_index, &size_target_gb, &size_min_agg, &size_max_agg, base_resolution_index) {
+				match self.build_and_run_compression(&CompressionForm { mode: &mode, time_pure_days: &time_pure_days, time_tier_days: &time_tier_days, time_max_tiers: &time_max_tiers, time_scaling_index, size_target_gb: &size_target_gb, size_min_agg: &size_min_agg, size_max_agg: &size_max_agg, base_resolution_index }) {
 					Ok(()) => {
 						self.state = AppState::Plotting;
-						return Ok(false);
+						return false;
 					}
 					Err(e) => {
 						// Show validation error
 						self.state = AppState::ConfiguringCompression { mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index, size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field, validation_error: Some(e.to_string()) };
-						return Ok(false);
+						return false;
 					}
 				}
 			}
@@ -1278,11 +1285,11 @@ impl App {
 		// Update state with new values
 		self.state = AppState::ConfiguringCompression { mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index, size_target_gb, size_min_agg, size_max_agg, base_resolution_index, focused_field, validation_error: None };
 
-		Ok(false)
+		false
 	}
 
 	/// Get list of fields available for the given compression mode
-	fn get_compression_fields_for_mode(&self, mode: &CompressionMode) -> Vec<CompressionField> {
+	fn get_compression_fields_for_mode(mode: &CompressionMode) -> Vec<CompressionField> {
 		match mode {
 			CompressionMode::TimeBased => vec![CompressionField::TimePureDays, CompressionField::TimeTierDays, CompressionField::TimeMaxTiers, CompressionField::TimeScaling, CompressionField::BaseResolution],
 			CompressionMode::SizeBased => vec![CompressionField::SizeTargetGb, CompressionField::SizeMinAgg, CompressionField::SizeMaxAgg, CompressionField::BaseResolution],
@@ -1316,7 +1323,7 @@ impl App {
 					let _ = tx.send(CompressionMessage::Complete { original_count: 0, compressed_count: 0, compression_ratio: 0.0, final_size_bytes: 0, time_based_tiers: 0, size_based_iterations: 0, duration_ms: 0 }).await;
 				}
 				Err(e) => {
-					let _ = tx.send(CompressionMessage::Error(format!("Failed to open database: {}", e))).await;
+					let _ = tx.send(CompressionMessage::Error(format!("Failed to open database: {e}"))).await;
 				}
 			}
 		});
@@ -1348,8 +1355,8 @@ impl App {
 	}
 
 	/// Build compression config from form fields and run compression
-	#[allow(clippy::too_many_arguments)] // Form processing requires all these fields
-	fn build_and_run_compression(&mut self, mode: &CompressionMode, time_pure_days: &str, time_tier_days: &str, time_max_tiers: &str, time_scaling_index: usize, size_target_gb: &str, size_min_agg: &str, size_max_agg: &str, base_resolution_index: usize) -> Result<()> {
+	fn build_and_run_compression(&mut self, form: &CompressionForm<'_>) -> Result<()> {
+		let CompressionForm { mode, time_pure_days, time_tier_days, time_max_tiers, time_scaling_index, size_target_gb, size_min_agg, size_max_agg, base_resolution_index } = *form;
 		// Parse and validate fields
 		let base_resolution = RESOLUTION_ORDER[base_resolution_index];
 
@@ -1373,7 +1380,7 @@ impl App {
 					return Err(anyhow!("Aggressiveness must be between 0 and 1"));
 				}
 
-				let target_bytes = (target_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+				let target_bytes = crate::num::saturating_from_f64::<u64>(target_gb * 1024.0 * 1024.0 * 1024.0);
 				let mut size_config = SizeBasedCompressionConfig::new(target_bytes);
 				size_config.min_aggressiveness = min_agg;
 				size_config.max_aggressiveness = max_agg;
@@ -1396,7 +1403,7 @@ impl App {
 					return Err(anyhow!("Aggressiveness must be between 0 and 1"));
 				}
 
-				let target_bytes = (target_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+				let target_bytes = crate::num::saturating_from_f64::<u64>(target_gb * 1024.0 * 1024.0 * 1024.0);
 				let mut size_config = SizeBasedCompressionConfig::new(target_bytes);
 				size_config.min_aggressiveness = min_agg;
 				size_config.max_aggressiveness = max_agg;
@@ -1414,7 +1421,7 @@ impl App {
 		let (tx, rx) = mpsc::channel(100);
 		let cancel = Arc::new(AtomicBool::new(false));
 		self.compression_receiver = Some(rx);
-		self.compression_cancel = Some(cancel.clone());
+		self.compression_cancel = Some(cancel);
 		self.compression_status = Some(CompressionStatus::Running { phase: "Starting compression...".to_string(), progress_percent: None, current_tier: None, total_tiers: None, aggressiveness: None, time_range: None });
 
 		let db_name = self.selected_database.clone().unwrap();
@@ -1439,8 +1446,8 @@ impl App {
 					let tx_progress = tx.clone();
 					let progress_callback: weftdb::ProgressCallback = std::sync::Arc::new(move |progress| {
 						let phase_str = format!("{}", progress.phase);
-						let progress_percent = if progress.total_tiers > 0 { Some(((progress.current_tier as f64 / progress.total_tiers as f64) * 100.0) as u8) } else { None };
-						let time_range = if progress.time_range_start != progress.time_range_end { Some((progress.time_range_start, progress.time_range_end)) } else { None };
+						let progress_percent = if progress.total_tiers > 0 { Some(crate::num::saturating_from_f64::<u8>((f64::from(progress.current_tier) / f64::from(progress.total_tiers)) * 100.0)) } else { None };
+						let time_range = if progress.time_range_start == progress.time_range_end { None } else { Some((progress.time_range_start, progress.time_range_end)) };
 						// Use blocking send since we're in a sync callback
 						let _ = tx_progress.try_send(CompressionMessage::Progress { phase: phase_str, progress_percent, current_tier: Some(progress.current_tier), total_tiers: Some(progress.total_tiers), aggressiveness: Some(progress.aggressiveness), time_range });
 					});
@@ -1451,7 +1458,7 @@ impl App {
 					info!(">>> compress_with_progress returned");
 					match compression_result {
 						Ok(detailed_summary) => {
-							let duration_ms = compression_start.elapsed().as_millis() as u64;
+							let duration_ms = u64::try_from(compression_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 							info!(">>> Compression returned Ok, duration_ms={}", duration_ms);
 
 							// Config was already persisted before compression started
@@ -1478,7 +1485,7 @@ impl App {
 					}
 				}
 				Err(e) => {
-					let _ = tx.send(CompressionMessage::Error(format!("Failed to open database: {}", e))).await;
+					let _ = tx.send(CompressionMessage::Error(format!("Failed to open database: {e}"))).await;
 				}
 			}
 		});
@@ -1538,13 +1545,11 @@ impl App {
 
 	/// Start background task to load compression stats for the selected aspect
 	fn start_loading_compression_stats(&mut self) {
-		let db_name = match self.selected_database.clone() {
-			Some(name) => name,
-			None => return,
+		let Some(db_name) = self.selected_database.clone() else {
+			return;
 		};
-		let aspect = match self.selected_aspect.clone() {
-			Some(a) => a,
-			None => return,
+		let Some(aspect) = self.selected_aspect.clone() else {
+			return;
 		};
 
 		let (tx, rx) = mpsc::channel(10);
@@ -1598,22 +1603,14 @@ impl App {
 		// Immediately notify UI that loading has started so spinner/progress updates.
 		let _ = tx.try_send(LoadingMessage::Progress { loaded: 0, scanned: 0, status: "Initializing...".to_string() });
 
-		let db_name = match self.selected_database.clone() {
-			Some(name) => name,
-			None => {
-				warn!("start_loading_measurements called with no database selected");
-				return;
-			}
+		let Some(db_name) = self.selected_database.clone() else {
+			warn!("start_loading_measurements called with no database selected");
+			return;
 		};
-		let aspect = match self.selected_aspect.as_ref() {
-			Some(a) => a,
-			None => {
-				warn!("start_loading_measurements called with no aspect selected");
-				return;
-			}
+		let Some((aspect_id, native_resolution)) = self.selected_aspect.as_ref().map(|a| (a.id(), a.resolution())) else {
+			warn!("start_loading_measurements called with no aspect selected");
+			return;
 		};
-		let aspect_id = aspect.id();
-		let native_resolution = aspect.resolution();
 		let view_resolution = self.view_resolution;
 
 		tokio::spawn(async move {
@@ -1632,7 +1629,7 @@ impl App {
 		let (tx, rx) = mpsc::channel(10);
 		let cancel = Arc::new(AtomicBool::new(false));
 		self.loading_receiver = Some(rx);
-		self.loading_cancel = Some(cancel.clone());
+		self.loading_cancel = Some(cancel);
 
 		// Notify UI that loading of subjects has started
 		let _ = tx.try_send(LoadingMessage::Progress { loaded: 0, scanned: 0, status: "Initializing...".to_string() });
@@ -1655,7 +1652,7 @@ impl App {
 		let (tx, rx) = mpsc::channel(10);
 		let cancel = Arc::new(AtomicBool::new(false));
 		self.loading_receiver = Some(rx);
-		self.loading_cancel = Some(cancel.clone());
+		self.loading_cancel = Some(cancel);
 
 		// Notify UI that loading of aspects has started
 		let _ = tx.try_send(LoadingMessage::Progress { loaded: 0, scanned: 0, status: "Initializing...".to_string() });
@@ -1691,12 +1688,12 @@ impl App {
 
 		tokio::spawn(async move {
 			match import_csv_background(file_path.clone(), db_name.clone(), subject_id, aspect_id, view_resolution, tx.clone(), cancel.clone()).await {
-				Ok(_) => {
+				Ok(()) => {
 					info!("CSV import completed successfully");
 				}
 				Err(e) => {
 					error!("CSV import failed: {}", e);
-					let _ = tx.send(LoadingMessage::Error(format!("CSV import failed: {}", e))).await;
+					let _ = tx.send(LoadingMessage::Error(format!("CSV import failed: {e}"))).await;
 				}
 			}
 		});
@@ -1705,25 +1702,21 @@ impl App {
 
 /// Background task for loading measurements
 async fn load_measurements_background(db_name: String, aspect_id: weftdb::AspectId, native_resolution: Resolution, view_resolution: Resolution, tx: mpsc::Sender<LoadingMessage>, cancel: Arc<AtomicBool>) -> Result<()> {
+	const MIN_POINTS_PER_UPDATE: usize = 1000;
+
 	let db = Database::existing(&db_name).await?;
 
 	// Notify UI that loading has started
 	let _ = tx.send(LoadingMessage::Progress { loaded: 0, scanned: 0, status: "Initializing...".to_string() }).await;
 
 	// Get time range of data
-	let start = match db.get_earliest_measurement(&aspect_id).await? {
-		Some(s) => s,
-		None => {
-			let _ = tx.send(LoadingMessage::CompleteMeasurements(Vec::new())).await;
-			return Ok(());
-		}
+	let Some(start) = db.get_earliest_measurement(&aspect_id).await? else {
+		let _ = tx.send(LoadingMessage::CompleteMeasurements(Vec::new())).await;
+		return Ok(());
 	};
-	let end = match db.get_latest_measurement(&aspect_id).await? {
-		Some(e) => e,
-		None => {
-			let _ = tx.send(LoadingMessage::CompleteMeasurements(Vec::new())).await;
-			return Ok(());
-		}
+	let Some(end) = db.get_latest_measurement(&aspect_id).await? else {
+		let _ = tx.send(LoadingMessage::CompleteMeasurements(Vec::new())).await;
+		return Ok(());
 	};
 
 	// Always use the user's selected view_resolution
@@ -1738,9 +1731,10 @@ async fn load_measurements_background(db_name: String, aspect_id: weftdb::Aspect
 		Ok(s) => s,
 		Err(e) => {
 			warn!("analyze_range failed: {}", e);
-			return Err(anyhow!("analyze_range failed: {}", e));
+			return Err(anyhow!("analyze_range failed: {e}"));
 		}
 	};
+	drop(db);
 
 	let mut measurements = Vec::new();
 	let mut scanned = 0usize;
@@ -1750,7 +1744,6 @@ async fn load_measurements_background(db_name: String, aspect_id: weftdb::Aspect
 	let mut last_update_time = Instant::now();
 	let mut last_update_duration = std::time::Duration::from_millis(50);
 	let mut points_since_last_update = 0usize;
-	const MIN_POINTS_PER_UPDATE: usize = 1000;
 
 	while let Some(r) = point_stream.next().await {
 		if cancel.load(Ordering::SeqCst) {
@@ -1781,7 +1774,7 @@ async fn load_measurements_background(db_name: String, aspect_id: weftdb::Aspect
 		if points_since_last_update >= MIN_POINTS_PER_UPDATE && elapsed >= adaptive_interval {
 			let update_start = Instant::now();
 			let _ = tx.send(LoadingMessage::UpdateMeasurements(measurements.clone())).await;
-			let _ = tx.send(LoadingMessage::Progress { loaded: measurements.len(), scanned, status: format!("Streaming at {:?} resolution...", view_resolution) }).await;
+			let _ = tx.send(LoadingMessage::Progress { loaded: measurements.len(), scanned, status: format!("Streaming at {view_resolution:?} resolution...") }).await;
 			last_update_duration = update_start.elapsed();
 			last_update_time = Instant::now();
 			points_since_last_update = 0;
@@ -1800,7 +1793,7 @@ fn validate_database_name(name: &str, existing: &[String]) -> Option<String> {
 	if name.len() > 50 {
 		return Some("Name too long (max 50 characters)".to_string());
 	}
-	if name.chars().next().map(|c| c.is_numeric()).unwrap_or(false) {
+	if name.chars().next().is_some_and(char::is_numeric) {
 		return Some("Cannot start with a number".to_string());
 	}
 	if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
@@ -1856,10 +1849,10 @@ async fn list_databases() -> Result<Vec<String>> {
 
 async fn list_subjects(db_name: &str) -> Result<Vec<Subject>> {
 	let data_dir = weftdb::data_dir();
-	let db_path = format!("{}/{}", data_dir, db_name);
-	let metadata_path = format!("{}/metadata.db", db_path);
+	let db_path = format!("{data_dir}/{db_name}");
+	let metadata_path = format!("{db_path}/metadata.db");
 	if !std::path::Path::new(&metadata_path).exists() {
-		return Err(anyhow!("Database metadata file not found at: {}", metadata_path));
+		return Err(anyhow!("Database metadata file not found at: {metadata_path}"));
 	}
 
 	// Debug: Try to read what names are stored in the database table
@@ -1867,13 +1860,8 @@ async fn list_subjects(db_name: &str) -> Result<Vec<Subject>> {
 		Ok(db) => db,
 		Err(e) => {
 			// If it fails, try to query the metadata.db directly to see what's stored
-			return Err(anyhow!(
-				"Failed to open database '{}' (folder exists at {}): {}. \
-                Check if the database name in metadata.db matches the folder name.",
-				db_name,
-				db_path,
-				e
-			));
+			return Err(anyhow!("Failed to open database '{db_name}' (folder exists at {db_path}): {e}. \
+                Check if the database name in metadata.db matches the folder name."));
 		}
 	};
 	let db_info = db.get_database_info().await?;
@@ -1895,15 +1883,15 @@ fn parse_timestamp(s: &str) -> Result<DateTime<Utc>> {
 		// If it looks like a Unix timestamp (between 1970 and 2286)
 		if (1_000_000_000.0..10_000_000_000.0).contains(&num_f64) {
 			// Assume seconds with possible fractional part
-			let secs = num_f64.floor() as i64;
-			let nanos = ((num_f64.fract() * 1_000_000_000.0) as u32).min(999_999_999);
+			let secs = crate::num::saturating_from_f64::<i64>(num_f64.floor());
+			let nanos = crate::num::saturating_from_f64::<u32>(num_f64.fract() * 1_000_000_000.0).min(999_999_999);
 			if let Some(dt) = DateTime::from_timestamp(secs, nanos) {
 				return Ok(dt);
 			}
 		}
 		// If 13+ digits, assume milliseconds
 		if num_f64 >= 1_000_000_000_000.0 {
-			let millis = num_f64 as i64;
+			let millis = crate::num::saturating_from_f64::<i64>(num_f64);
 			if let Some(dt) = DateTime::from_timestamp_millis(millis) {
 				return Ok(dt);
 			}
@@ -1946,32 +1934,19 @@ fn parse_timestamp(s: &str) -> Result<DateTime<Utc>> {
 		}
 	}
 
-	Err(anyhow!("Could not parse timestamp: {}", s))
+	Err(anyhow!("Could not parse timestamp: {s}"))
 }
 
 /// Background task for importing CSV measurements
 /// Debounces UI updates to prevent excessive redrawing on large files
-async fn import_csv_background(file_path: String, db_name: String, _subject_id: weftdb::SubjectId, aspect_id: weftdb::AspectId, view_resolution: Resolution, tx: mpsc::Sender<LoadingMessage>, cancel: Arc<AtomicBool>) -> Result<()> {
-	use std::{str::FromStr, time::Instant};
-
-	use bigdecimal::BigDecimal;
-
-	info!("CSV import started: {}", file_path);
-
-	// Read file as string to handle quote formatting issues (use async I/O)
-	let file_content = tokio::fs::read_to_string(&file_path).await?;
-	let lines: Vec<&str> = file_content.lines().collect();
-
-	if lines.is_empty() {
-		return Err(anyhow!("CSV file is empty"));
-	}
-
+/// Locates the timestamp and value columns in a CSV header line.
+fn csv_column_indices(header_row: &str) -> Result<(usize, usize)> {
 	// Parse header line - remove quotes and split by comma
-	let header_line = lines[0].trim().trim_matches('"').to_lowercase();
+	let header_line = header_row.trim().trim_matches('"').to_lowercase();
 
 	debug!("CSV header line (cleaned): '{}'", header_line);
 
-	let header_parts: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
+	let header_parts: Vec<&str> = header_line.split(',').map(str::trim).collect();
 	debug!("CSV headers: {:?}", header_parts);
 
 	let mut timestamp_idx = None;
@@ -1988,16 +1963,20 @@ async fn import_csv_background(file_path: String, db_name: String, _subject_id: 
 		}
 	}
 
-	let timestamp_idx = timestamp_idx.ok_or_else(|| anyhow!("No 'timestamp' column found in headers: {:?}", header_parts))?;
-	let value_idx = value_idx.ok_or_else(|| anyhow!("No 'value' column found in headers: {:?}", header_parts))?;
+	let timestamp_idx = timestamp_idx.ok_or_else(|| anyhow!("No 'timestamp' column found in headers: {header_parts:?}"))?;
+	let value_idx = value_idx.ok_or_else(|| anyhow!("No 'value' column found in headers: {header_parts:?}"))?;
 
-	info!("CSV columns: timestamp at {}, value at {}", timestamp_idx, value_idx);
+	Ok((timestamp_idx, value_idx))
+}
 
-	// Send initial progress message
+/// Parses the CSV data rows into measurements, reporting progress. Returns `None` when cancelled.
+async fn parse_csv_rows(lines: &[&str], timestamp_idx: usize, value_idx: usize, tx: &mpsc::Sender<LoadingMessage>, cancel: &AtomicBool) -> Result<Option<(Vec<InputMeasurement>, u32)>> {
+	use std::str::FromStr;
+
+	use bigdecimal::BigDecimal;
+
 	let total_rows = lines.len().saturating_sub(1); // Subtract header
-	let _ = tx.send(LoadingMessage::Progress { loaded: 0, scanned: total_rows, status: format!("Parsing CSV ({} rows)...", total_rows) }).await;
-
-	// Parse measurements from CSV
+							// Parse measurements from CSV
 	let mut measurements = Vec::new();
 	let mut error_count = 0u32;
 	let mut row_num = 1usize;
@@ -2006,7 +1985,7 @@ async fn import_csv_background(file_path: String, db_name: String, _subject_id: 
 	for line in &lines[1..] {
 		if cancel.load(Ordering::SeqCst) {
 			info!("CSV import cancelled");
-			return Ok(());
+			return Ok(None);
 		}
 
 		row_num += 1;
@@ -2058,7 +2037,7 @@ async fn import_csv_background(file_path: String, db_name: String, _subject_id: 
 
 		// Send progress update every 5000 rows and yield to let other tasks run
 		if row_num - last_progress_update >= 5000 || row_num == lines.len() {
-			let percent = if total_rows > 0 { ((row_num as f64 / total_rows as f64) * 100.0) as u32 } else { 0 };
+			let percent = crate::num::percent::<u32, _>(row_num, total_rows);
 			let _ = tx
 				.send(LoadingMessage::Progress {
 					loaded: row_num,     // Current row position (for progress bar)
@@ -2072,32 +2051,16 @@ async fn import_csv_background(file_path: String, db_name: String, _subject_id: 
 		}
 	}
 
-	info!("Parsed {} measurements from CSV (skipped {} errors)", measurements.len(), error_count);
+	Ok(Some((measurements, error_count)))
+}
 
-	if measurements.is_empty() {
-		return Err(anyhow!("No valid measurements parsed from CSV"));
-	}
-
-	// Send progress update after parsing complete
-	let _ = tx.send(LoadingMessage::Progress { loaded: measurements.len(), scanned: measurements.len(), status: format!("CSV parsed successfully! Importing {} measurements...", measurements.len()) }).await;
-
-	// Import measurements in batches
-	let db = Database::existing(&db_name).await?;
-	let chunk_size = if measurements.len() > 500_000 { 500_000 } else { 250_000 };
-	let mut last_progress_update = Instant::now();
-	let progress_interval = std::time::Duration::from_millis(500); // Update progress bar every 500ms
-	let dataset_id = DatasetId::new();
-
-	info!("Starting import of {} measurements in chunks of {} (dataset_id: {:?})", measurements.len(), chunk_size, dataset_id);
-
-	// Spawn a separate task to update plot during import
-	// Uses adaptive debouncing: waits 2x the duration of the last update before starting the next
-	// This naturally slows down when updates are expensive (large datasets)
-	let db_name_clone = db_name.clone();
+/// Spawns the task that periodically reloads the plot while a CSV import runs.
+fn spawn_import_plot_updates(db_name: &str, aspect_id: weftdb::AspectId, view_resolution: Resolution, tx: &mpsc::Sender<LoadingMessage>, cancel: &Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+	let db_name_clone = db_name.to_owned();
 	let aspect_id_clone = aspect_id;
 	let tx_clone = tx.clone();
-	let cancel_clone = cancel.clone();
-	let plot_task = tokio::spawn(async move {
+	let cancel_clone = Arc::clone(cancel);
+	tokio::spawn(async move {
 		let min_interval = std::time::Duration::from_secs(2);
 		let mut last_update_duration = std::time::Duration::from_secs(1);
 		let import_start = std::time::Instant::now();
@@ -2158,7 +2121,57 @@ async fn import_csv_background(file_path: String, db_name: String, _subject_id: 
 			last_update_duration = update_start.elapsed();
 			debug!("Plot update completed in {:?}", last_update_duration);
 		}
-	});
+	})
+}
+
+async fn import_csv_background(file_path: String, db_name: String, _subject_id: weftdb::SubjectId, aspect_id: weftdb::AspectId, view_resolution: Resolution, tx: mpsc::Sender<LoadingMessage>, cancel: Arc<AtomicBool>) -> Result<()> {
+	use std::time::Instant;
+
+	info!("CSV import started: {}", file_path);
+
+	// Read file as string to handle quote formatting issues (use async I/O)
+	let file_content = tokio::fs::read_to_string(&file_path).await?;
+	let lines: Vec<&str> = file_content.lines().collect();
+
+	if lines.is_empty() {
+		return Err(anyhow!("CSV file is empty"));
+	}
+
+	let (timestamp_idx, value_idx) = csv_column_indices(lines[0])?;
+
+	info!("CSV columns: timestamp at {}, value at {}", timestamp_idx, value_idx);
+
+	// Send initial progress message
+	let total_rows = lines.len().saturating_sub(1); // Subtract header
+	let _ = tx.send(LoadingMessage::Progress { loaded: 0, scanned: total_rows, status: format!("Parsing CSV ({total_rows} rows)...") }).await;
+
+	// Parse measurements from CSV
+	let Some((measurements, error_count)) = parse_csv_rows(&lines, timestamp_idx, value_idx, &tx, &cancel).await? else {
+		return Ok(());
+	};
+
+	info!("Parsed {} measurements from CSV (skipped {} errors)", measurements.len(), error_count);
+
+	if measurements.is_empty() {
+		return Err(anyhow!("No valid measurements parsed from CSV"));
+	}
+
+	// Send progress update after parsing complete
+	let _ = tx.send(LoadingMessage::Progress { loaded: measurements.len(), scanned: measurements.len(), status: format!("CSV parsed successfully! Importing {} measurements...", measurements.len()) }).await;
+
+	// Import measurements in batches
+	let db = Database::existing(&db_name).await?;
+	let chunk_size = if measurements.len() > 500_000 { 500_000 } else { 250_000 };
+	let mut last_progress_update = Instant::now();
+	let progress_interval = std::time::Duration::from_millis(500); // Update progress bar every 500ms
+	let dataset_id = DatasetId::new();
+
+	info!("Starting import of {} measurements in chunks of {} (dataset_id: {:?})", measurements.len(), chunk_size, dataset_id);
+
+	// Spawn a separate task to update plot during import
+	// Uses adaptive debouncing: waits 2x the duration of the last update before starting the next
+	// This naturally slows down when updates are expensive (large datasets)
+	let plot_task = spawn_import_plot_updates(&db_name, aspect_id, view_resolution, &tx, &cancel);
 
 	for (chunk_idx, chunk) in measurements.chunks(chunk_size).enumerate() {
 		if cancel.load(Ordering::SeqCst) {
@@ -2175,7 +2188,7 @@ async fn import_csv_background(file_path: String, db_name: String, _subject_id: 
 			}
 			Err(e) => {
 				error!("Failed to import chunk {}: {}", chunk_idx, e);
-				let _ = tx.send(LoadingMessage::Error(format!("Import failed at chunk {}: {}", chunk_idx, e))).await;
+				let _ = tx.send(LoadingMessage::Error(format!("Import failed at chunk {chunk_idx}: {e}"))).await;
 				return Err(e);
 			}
 		}
@@ -2184,11 +2197,13 @@ async fn import_csv_background(file_path: String, db_name: String, _subject_id: 
 		let processed = (chunk_idx + 1) * chunk_size;
 		if last_progress_update.elapsed() >= progress_interval {
 			debug!("Progress: {}/{} measurements", processed, measurements.len());
-			let percent = if !measurements.is_empty() { (processed as f64 / measurements.len() as f64 * 100.0) as u32 } else { 0 };
+			let percent = crate::num::percent::<u32, _>(processed, measurements.len());
 			let _ = tx.send(LoadingMessage::Progress { loaded: processed, scanned: measurements.len(), status: format!("Importing CSV: {}% complete ({} of {} rows)", percent, processed, measurements.len()) }).await;
 			last_progress_update = Instant::now();
 		}
 	}
+
+	drop(db);
 
 	// Stop the background plot update task
 	cancel.store(true, Ordering::SeqCst);

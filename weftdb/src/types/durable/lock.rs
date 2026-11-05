@@ -278,7 +278,8 @@ mod tests {
 		let root = tempfile::tempdir().unwrap();
 		let held = RootLock::acquire(root.path()).unwrap();
 		// Still holds the lock once the RootLock is gone, as a spawning child's copy does.
-		let elsewhere = held._file.try_clone().unwrap();
+		let RootLock { _file: lock_file, .. } = &held;
+		let elsewhere = lock_file.try_clone().unwrap();
 		drop(held);
 		let pid = std::process::id();
 		let host = HOST.clone().unwrap_or_default();
@@ -318,7 +319,8 @@ mod tests {
 	fn a_lock_still_shared_with_a_spawning_child_is_waited_out() {
 		let root = tempfile::tempdir().unwrap();
 		let held = RootLock::acquire(root.path()).unwrap();
-		let inherited = held._file.try_clone().unwrap();
+		let RootLock { _file: lock_file, .. } = &held;
+		let inherited = lock_file.try_clone().unwrap();
 		drop(held);
 		let child = thread::spawn(move || {
 			thread::sleep(Duration::from_millis(100));

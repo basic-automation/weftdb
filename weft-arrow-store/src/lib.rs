@@ -45,7 +45,9 @@
 //! (hard constraint #4). A range that spans several `.weftseg` segments of
 //! differing physical encodings collapses cleanly into one logical Arrow batch.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use anyhow::{bail, Context, Result};
 use arrow_array::RecordBatch;
@@ -339,8 +341,29 @@ pub async fn ingest_parquet_into_aspect(store: &SegmentStore, aspect: &str, byte
 /// file or carry no WeftDB columns, and the `out-of-order timestamp`
 /// refusal described above.
 pub fn decode_parquet_columns(bytes: &[u8], require_sorted: bool) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+	decode_parquet_columns_with(bytes, require_sorted, false)
+}
+
+/// Decode a Parquet ingest body under the ingest rules (ROB-7): a `NaN` or infinite
+/// value in the body is a [`weft_arrow::ConvertError::NonFinite`] naming its row
+/// rather than a `None` in the decoded column.
+///
+/// The lenient [`decode_parquet_columns`] maps a non-finite float to a null, which is
+/// right for an export that lost a sample and wrong for a body someone is asking the
+/// server to store: the row count they get back would not be the row count they sent.
+/// The HTTP ingest route calls this one.
+///
+/// # Errors
+///
+/// Every error [`decode_parquet_columns`] returns, plus
+/// [`weft_arrow::ConvertError::NonFinite`].
+pub fn decode_parquet_columns_strict(bytes: &[u8], require_sorted: bool) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+	decode_parquet_columns_with(bytes, require_sorted, true)
+}
+
+fn decode_parquet_columns_with(bytes: &[u8], require_sorted: bool, strict: bool) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 	let batches = weft_arrow::read_parquet(bytes)?;
-	let (timestamps, values) = weft_arrow::record_batches_to_columns(&batches)?;
+	let (timestamps, values) = if strict { weft_arrow::record_batches_to_columns_strict(&batches)? } else { weft_arrow::record_batches_to_columns(&batches)? };
 	if require_sorted {
 		if let Some((index, previous, current)) = first_order_violation(&timestamps) {
 			bail!("out-of-order timestamp at row {index}: {current} < previous {previous} (require_sorted was set)");
@@ -522,7 +545,7 @@ mod tests {
 
 		// Storage → Arrow → IPC stream bytes, the portable wire form.
 		let bytes = read_time_range_to_ipc_bytes(&store, "price", 2, 4).await.expect("serializes");
-		assert!(!bytes.is_empty());
+		assert_ne!(bytes.len(), 0);
 
 		// A consumer with only weft-arrow recovers the columns from the bytes.
 		let batches = read_ipc_stream(&bytes).expect("reads stream");

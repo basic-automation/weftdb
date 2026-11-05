@@ -117,11 +117,13 @@ pub struct IndexRow {
 impl IndexRow {
 	/// A legacy row: generation 0, nothing bound. What every seal and in-place rewrite
 	/// writes until the write-once protocols take over (S7-S10).
+	#[must_use]
 	pub const fn legacy(desc: SegmentDescriptor) -> Self {
 		Self { desc, gen: 0, prec: None, frame_crc: None, commit_epoch: None, series_id: 0 }
 	}
 
 	/// The identity a precondition on this row names.
+	#[must_use]
 	pub const fn version(&self) -> RowVersion {
 		RowVersion { id: self.desc.id, gen: self.gen, frame_crc: self.frame_crc }
 	}
@@ -232,6 +234,26 @@ pub enum IndexOp {
 	/// and rollup fold travel in the same transaction, so the ledger row
 	/// exists if and only if the batch's segments do.
 	RecordIngest { entry: crate::types::ingest::LedgerEntry },
+	/// Record one commit in the aspect's change log, `segment_changes`
+	/// (D-S20): one row per commit epoch, carrying the commit's time span
+	/// and row count, in place of one queue entry per timestamp. A plain
+	/// `INSERT` on the `(aspect, epoch)` primary key: epochs are handed
+	/// out under the aspect's commit lock and never reused, so a taken key
+	/// is a [`TxnErrorKind::Conflict`]. The segment rows, allocator raise
+	/// and rollup fold of the same commit travel in the same transaction,
+	/// so the change row exists if and only if the commit's segments do —
+	/// there is no write-ahead entry for a commit that never landed, and
+	/// no committed commit without its change row. On a store whose
+	/// registry has not created `segment_changes` the op records nothing
+	/// (see [`record_change`]): such a store has no change log to write
+	/// and must not gain one outside a migration.
+	RecordChange { aspect: String, epoch: u64, min_ts: Option<i64>, max_ts: Option<i64>, row_count: u64 },
+	/// Delete `aspect`'s change-log rows at or below `through_epoch`
+	/// (D-S20): the change log's dequeue, run by a consumer that has
+	/// batched the changes it read. Rows above the epoch stay, including
+	/// any a commit landed after the consumer's read. On a store without
+	/// `segment_changes` the op deletes nothing (see [`delete_changes`]).
+	DeleteChanges { aspect: String, through_epoch: u64 },
 }
 
 impl IndexOp {
@@ -252,29 +274,35 @@ impl IndexOp {
 			// and a journal delete removes the row of a name that is never reused, so
 			// running it again removes nothing another writer made.
 			//
+			// A change-log insert names an epoch that is never reused, as a journal
+			// insert names a frame that is never reused, and a change-log delete
+			// removes only epochs a consumer already read: a commit that lands
+			// after the read takes a higher epoch and is never deleted by it.
+			// (A store whose registry never created the log probes absent on
+			// every attempt alike, so its skip is stable under retry too.)
+			//
 			// A rollup write is guarded only because its callers hold the aspect's
 			// commit lock across the whole transaction, retries included, so no other
 			// writer of that aspect's rollup row can commit between attempts: a retry
 			// re-runs the same fold over the same index state. An `IndexTxn` run
 			// without that lock must not rely on it.
-			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::DeleteEveryExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RegisterSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::JournalHeld { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } => true,
+			Self::InsertNew { .. } | Self::ReplaceExpected { .. } | Self::DeleteExpected { .. } | Self::DeleteEveryExpected { .. } | Self::SeqBump { .. } | Self::SeedSeries { .. } | Self::RegisterSeries { .. } | Self::RaiseFloor { .. } | Self::RecordMigration { .. } | Self::JournalPending { .. } | Self::JournalRetire { .. } | Self::JournalHeld { .. } | Self::ClearJournal { .. } | Self::PutRollup { .. } | Self::RecordIngest { .. } | Self::RecordChange { .. } | Self::DeleteChanges { .. } => true,
 			// `QuarantineInsert` replaces a record of the same key and
 			// `QuarantineDelete` deletes one if it exists, so neither re-checks
 			// what its caller decided from, like `Upsert` and `Delete`.
-			Self::QuarantineInsert { .. } | Self::QuarantineDelete { .. } => false,
+			Self::QuarantineInsert { .. } | Self::QuarantineDelete { .. } | Self::Upsert { .. } | Self::Delete { .. } | Self::MetaSet { .. } => false,
 			// `MetaSet` replaces the value, so a retry would overwrite what another writer
 			// committed in between. (Its one writer today is the open, under the root's
 			// LOCK, which nothing races.)
-			Self::Upsert { .. } | Self::Delete { .. } | Self::MetaSet { .. } => false,
 		}
 	}
 }
 
-/// The fault points one [`IndexTxn`] hits, so the crash tests can stop it between its
-/// steps. The protocol that builds a transaction passes its own (a seal's `S-*`, a
-/// swap's `M-*`, from S8 and S10 on). Every transaction S6 commits passes
-/// [`NONE`](Self::NONE): a point that every seal hit could not be armed in-process
-/// while other tests seal alongside.
+/// The fault points one [`IndexTxn`] hits, so the crash tests can stop it between its steps.
+///
+/// The protocol that builds a transaction passes its own (a seal's `S-*`, a swap's `M-*`, from S8 and
+/// S10 on). Every transaction S6 commits passes [`NONE`](Self::NONE): a point that every seal hit could
+/// not be armed in-process while other tests seal alongside.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TxnPoints {
 	/// Hit right after `BEGIN CONCURRENT`: `S-txn-begun`, `M-swap-begun`.
@@ -355,6 +383,7 @@ impl IndexTxnError {
 	}
 
 	/// Whether the transaction may have committed although it reported an error.
+	#[must_use]
 	pub fn is_ambiguous(&self) -> bool {
 		self.kind == TxnErrorKind::Ambiguous
 	}
@@ -397,15 +426,25 @@ impl std::error::Error for IndexTxnError {}
 
 impl IndexTxn {
 	/// A transaction of `ops`, hitting no fault points.
+	#[must_use]
 	pub const fn new(ops: Vec<IndexOp>) -> Self {
 		Self { ops, points: TxnPoints::NONE }
 	}
 
 	/// The time span (`max_ts - min_ts`) of every segment row the transaction writes,
-	/// with its aspect: what the prune's span bound must cover before it commits.
-	pub(crate) fn row_spans(&self) -> impl Iterator<Item = (&str, i64)> {
+	/// with its aspect and series: what the prune's span bounds must cover before it commits.
+	pub(crate) fn row_spans(&self) -> impl Iterator<Item = (&str, crate::SeriesId, i64)> {
 		self.ops.iter().filter_map(|op| match op {
-			IndexOp::InsertNew { aspect, row } | IndexOp::Upsert { aspect, row } | IndexOp::ReplaceExpected { aspect, row, .. } => Some((aspect.as_str(), row.desc.max_ts?.saturating_sub(row.desc.min_ts?))),
+			IndexOp::InsertNew { aspect, row } | IndexOp::Upsert { aspect, row } | IndexOp::ReplaceExpected { aspect, row, .. } => Some((aspect.as_str(), crate::SeriesId(row.series_id), row.desc.max_ts?.saturating_sub(row.desc.min_ts?))),
+			_ => None,
+		})
+	}
+
+	/// The aspects whose series catalog this transaction registers a series in: what a
+	/// catalog cache must forget once it has run.
+	pub(crate) fn registered_aspects(&self) -> impl Iterator<Item = &str> {
+		self.ops.iter().filter_map(|op| match op {
+			IndexOp::RegisterSeries { aspect, .. } => Some(aspect.as_str()),
 			_ => None,
 		})
 	}
@@ -437,7 +476,7 @@ impl IndexTxn {
 	/// # Errors
 	///
 	/// As [`run`](Self::run).
-	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool) -> Result<TxnApplied, IndexTxnError> {
+	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool + Send) -> Result<TxnApplied, IndexTxnError> {
 		crate::exec::control_plane_write(async {
 			let mut attempts = 1;
 			loop {
@@ -607,7 +646,43 @@ async fn apply(conn: &turso::Connection, op: &IndexOp) -> Result<u64, (TxnErrorK
 			let series_ids = entry.series_ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
 			conn.execute("INSERT INTO ingest_ledger (aspect, key, fingerprint, row_count, min_ts, max_ts, id_lo, id_hi, receipt_json, commit_epoch, created_ms, series_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", vec![Value::Text(entry.aspect.clone()), Value::Text(entry.key.clone()), Value::Integer(entry.fingerprint), integer(entry.row_count as u64), entry.min_ts.map_or(Value::Null, Value::Integer), entry.max_ts.map_or(Value::Null, Value::Integer), entry.id_lo.map_or(Value::Null, integer), entry.id_hi.map_or(Value::Null, integer), Value::Text(entry.receipt_json.clone()), integer(entry.commit_epoch), Value::Integer(entry.created_ms), Value::Text(series_ids)]).await.map_err(|e| statement_error(&format!("recording the ingest of {:?} under key {:?}", entry.aspect, entry.key), &e))
 		}
+		IndexOp::RecordChange { aspect, epoch, min_ts, max_ts, row_count } => record_change(conn, aspect, *epoch, *min_ts, *max_ts, *row_count).await,
+		IndexOp::DeleteChanges { aspect, through_epoch } => delete_changes(conn, aspect, *through_epoch).await,
 	}
+}
+
+/// [`IndexOp::RecordChange`]: write the commit's row in the change log,
+/// unless this store's registry has not created `segment_changes`. A
+/// store a newer layout opened without migrating (FRE-12a) has no change
+/// log for this build to write and must not gain one — no migration may
+/// run — and the change-log reader reads the missing table as no
+/// changes, so the write agrees: it records nothing and the commit
+/// proceeds.
+async fn record_change(conn: &turso::Connection, aspect: &str, epoch: u64, min_ts: Option<i64>, max_ts: Option<i64>, row_count: u64) -> Result<u64, (TxnErrorKind, String)> {
+	if !change_log_exists(conn, aspect).await? {
+		return Ok(0);
+	}
+	conn.execute("INSERT INTO segment_changes (aspect, epoch, min_ts, max_ts, row_count) VALUES (?, ?, ?, ?, ?)", vec![Value::Text(aspect.to_string()), integer(epoch), min_ts.map_or(Value::Null, Value::Integer), max_ts.map_or(Value::Null, Value::Integer), integer(row_count)]).await.map_err(|e| (statement_error_kind(&e), format!("recording the change of {aspect:?} at epoch {epoch}: {e}")))
+}
+
+/// [`IndexOp::DeleteChanges`]: drop the change-log rows a consumer has
+/// batched, under the same missing-table agreement as [`record_change`]:
+/// a store without `segment_changes` has nothing to delete.
+async fn delete_changes(conn: &turso::Connection, aspect: &str, through_epoch: u64) -> Result<u64, (TxnErrorKind, String)> {
+	if !change_log_exists(conn, aspect).await? {
+		return Ok(0);
+	}
+	conn.execute("DELETE FROM segment_changes WHERE aspect = ? AND epoch <= ?", vec![Value::Text(aspect.to_string()), integer(through_epoch)]).await.map_err(|e| (statement_error_kind(&e), format!("deleting the changes of {aspect:?} through epoch {through_epoch}: {e}")))
+}
+
+/// Whether this store's registry has created `segment_changes`, probed
+/// on the transaction's own connection — the probe the change-log
+/// reader runs before it queries the table.
+async fn change_log_exists(conn: &turso::Connection, aspect: &str) -> Result<bool, (TxnErrorKind, String)> {
+	super::migrations::table_exists(conn, "segment_changes").await.map_err(|e| {
+		let kind = e.downcast_ref::<turso::Error>().map_or(TxnErrorKind::Definite, statement_error_kind);
+		(kind, format!("checking for the change log of {aspect:?}: {e}"))
+	})
 }
 
 /// [`IndexOp::RegisterSeries`]: refuse series 0 and the empty key, then insert the
@@ -988,8 +1063,8 @@ mod tests {
 		for (next_id, next_gen, epoch) in [(5, 0, 2), (3, 4, 1), (9, 2, 0), (9, 7, 4)] {
 			let applied = index.apply(&bump(ASPECT, next_id, next_gen, epoch)).await.expect("bumps");
 			assert_eq!(applied.changes, vec![1], "bump to ({next_id}, {next_gen}, {epoch})");
-			let seed = index.allocator_seed(ASPECT).await.expect("reads");
-			seen.push((seed.next_id, seed.next_gen, seed.epoch));
+			let allocator_seed = index.allocator_seed(ASPECT).await.expect("reads");
+			seen.push((allocator_seed.next_id, allocator_seed.next_gen, allocator_seed.epoch));
 		}
 		index.apply(&bump("other", 1, 0, 0)).await.expect("bumps another aspect");
 		let other = index.allocator_seed("other").await.expect("reads");
@@ -1042,7 +1117,7 @@ mod tests {
 		let shown: Vec<_> = journal.iter().map(|e| (e.name.as_str(), e.aspect.as_str(), e.state, e.retire_epoch)).collect();
 		assert_eq!(shown, vec![("a-0.weftseg", ASPECT, crate::types::reaper::JournalState::Retired, Some(3)), ("a~g1~p0.weftseg", ASPECT, crate::types::reaper::JournalState::Pending, None)]);
 		assert_eq!(cleared.changes, vec![1, 1, 0]);
-		assert!(after.is_empty());
+		assert_eq!(after, [] as [crate::types::reaper::JournalEntry; 0]);
 		assert!([pending("x"), retire("x"), clear("x")].iter().all(IndexOp::is_guarded), "a swap of guarded ops is retried");
 	}
 

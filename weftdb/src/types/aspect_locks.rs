@@ -149,6 +149,7 @@ pub struct CommitGuard {
 
 impl CommitGuard {
 	/// The allocator as it stands.
+	#[must_use]
 	pub const fn state(&self) -> AspectState {
 		self.state
 	}
@@ -185,12 +186,14 @@ impl MaintGuard {
 	/// A guard for `aspect` that holds no lock: what a maintenance operation that ignores
 	/// the maintenance lock runs under, for the tests that stage one racing another.
 	#[cfg(test)]
+	#[must_use]
 	pub fn unlocked(aspect: &str) -> Self {
 		let free = Arc::new(Mutex::new(()));
 		Self { aspect: aspect.to_string(), _held: free.try_lock_owned().unwrap_or_else(|_| unreachable!("a new mutex is free")) }
 	}
 
 	/// The aspect this guard holds.
+	#[must_use]
 	pub fn aspect(&self) -> &str {
 		&self.aspect
 	}
@@ -261,11 +264,11 @@ mod tests {
 			async move { locks.commit("a", seeded(0)).await.map(|guard| guard.state()) }
 		});
 		tokio::time::sleep(Duration::from_millis(50)).await;
-		let waited = !waiter.is_finished();
+		let was_blocked = !waiter.is_finished();
 		drop(held);
 		let state = waiter.await.expect("joins").expect("takes the lock once it is free");
 		drop(other);
-		assert!(waited, "a second taker of one aspect's lock waits");
+		assert!(was_blocked, "a second taker of one aspect's lock waits");
 		assert_eq!(state.next_id, 0);
 	}
 
@@ -284,10 +287,10 @@ mod tests {
 		});
 		tokio::time::sleep(Duration::from_millis(50)).await;
 		drop(held);
-		let waited = waiter.await.expect("joins");
+		let was_blocked = waiter.await.expect("joins");
 		assert!(!tried, "try_maint does not take a held lock");
 		assert!(!expired, "a wait that runs out does not take it");
 		assert_eq!(other.as_deref(), Some("b"), "another aspect's lock is free");
-		assert_eq!(waited.as_deref(), Some("a"), "a wait the lock is released within takes it");
+		assert_eq!(was_blocked.as_deref(), Some("a"), "a wait the lock is released within takes it");
 	}
 }

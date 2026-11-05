@@ -46,13 +46,13 @@ impl ClientBuilder {
 	}
 
 	/// The whole-request timeout (default 30 s).
-	pub fn timeout(mut self, timeout: Duration) -> Self {
+	pub const fn timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = timeout;
 		self
 	}
 
 	/// The connect timeout (default 10 s).
-	pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+	pub const fn connect_timeout(mut self, timeout: Duration) -> Self {
 		self.connect_timeout = timeout;
 		self
 	}
@@ -60,7 +60,7 @@ impl ClientBuilder {
 	/// How many times a read refused `503 overloaded` is retried after the server's
 	/// `Retry-After` (default 2). Writes are never retried by the client: send them with
 	/// an idempotency key and retry them yourself.
-	pub fn max_retries(mut self, retries: u32) -> Self {
+	pub const fn max_retries(mut self, retries: u32) -> Self {
 		self.max_retries = retries;
 		self
 	}
@@ -576,13 +576,14 @@ impl Client {
 	}
 
 	/// `POST /api/v1/storage/{aspect}/ilp`: seal one field of a Line Protocol body
-	/// (`options.precision` is the body's timestamp precision).
+	/// (`options.precision` is the body's timestamp precision, `options.measurement` the
+	/// measurement sealed, which the server requires).
 	///
 	/// # Errors
 	///
 	/// The server's refusal, or a transport failure.
 	pub async fn write_ilp(&self, aspect: &str, field: &str, body: impl Into<Vec<u8>>, options: &WriteOptions) -> Result<WriteSummary> {
-		let call = Call::post(&["api", "v1", "storage", aspect, "ilp"]).param("field", Some(field)).param("precision", options.precision.as_ref()).write_options(options).bytes(body.into(), "text/plain");
+		let call = Call::post(&["api", "v1", "storage", aspect, "ilp"]).param("measurement", options.measurement.as_ref()).param("field", Some(field)).param("precision", options.precision.as_ref()).write_options(options).bytes(body.into(), "text/plain");
 		self.send(call).await?.json()
 	}
 
@@ -745,10 +746,7 @@ impl Client {
 	///
 	/// The server's refusal, or a transport failure.
 	pub async fn reconcile(&self, aspect: Option<&str>, params: &[(&'static str, String)]) -> Result<serde_json::Value> {
-		let path: Vec<&str> = match aspect {
-			Some(aspect) => vec!["api", "v1", "storage", aspect, "reconcile"],
-			None => vec!["api", "v1", "storage", "reconcile"],
-		};
+		let path: Vec<&str> = aspect.map_or_else(|| vec!["api", "v1", "storage", "reconcile"], |aspect| vec!["api", "v1", "storage", aspect, "reconcile"]);
 		let mut call = Call::post(&path);
 		call.query = params.to_vec();
 		self.send(call).await?.json()

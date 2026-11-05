@@ -113,6 +113,7 @@ impl Subject {
 
 		// Query the database for the metadata_path field of the first item in the database table
 		let conn = Database::begin_concurrent(&turso_db, &turso_db_path, None).await?;
+		drop(turso_db);
 		let mut rows = conn.as_ref().query("SELECT metadata_path FROM database", turso::params![]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database metadata not found"))?;
 		let metadata_path: String = row.get(0)?;
