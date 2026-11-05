@@ -56,7 +56,7 @@ use std::collections::BTreeMap;
 use axum::{
 	extract::State, http::header, response::{IntoResponse, Response}, Json
 };
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution};
@@ -687,6 +687,8 @@ mod tests {
 	};
 	use chrono::TimeZone;
 	use tower::ServiceExt;
+
+	use bigdecimal::FromPrimitive;
 
 	use super::*;
 	use crate::app;
