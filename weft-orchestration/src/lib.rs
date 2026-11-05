@@ -825,7 +825,7 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 				.map(|m| m.get_measurement_timestamp())
 				.max()
 				.copied()
-				.ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no maximum timestamp", batch.batch_id()))?
+				.ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no maximum timestamp", batch.batch_id()))?;
 
 			// Create an occurrence for this pattern
 			let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
