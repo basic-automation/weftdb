@@ -93,10 +93,15 @@ use crate::{
 /// `analytics`, an `analytics_pipeline` run's stages ([`crate::analytics::AnalyticsPoint`]). v28
 /// added `samples_ns`, the raw samples behind every latency summary, and
 /// `correctness.result_sha256`, a digest of the output, and `between_run`, the spread of the
-/// separate runs `weft-bench combine` pooled. All
+/// separate runs `weft-bench combine` pooled. v29 added `gpu_economics`, one lane of a
+/// `gpu_economics` run ([`crate::gpu_economics::GpuEconomicsPoint`]). v30 added
+/// `gpu_pool.device_memory`, the device allocator's and `nvidia-smi`'s memory over a
+/// `gpu_memory` run ([`crate::gpu_memory::DeviceMemorySoak`]). v31 added the end-to-end GPU
+/// interpolation report ([`crate::e2e_interpolation::E2eReport`], written by
+/// `weft-e2e-interp`), which carries this version beside, not inside, `BenchResult`. All
 /// optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 31;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -489,7 +494,6 @@ fn per_point(bytes: usize, count: usize) -> f64 {
 	if count == 0 {
 		return 0.0;
 	}
-	#[allow(clippy::cast_precision_loss)]
 	let (bytes, count) = (bytes as f64, count as f64);
 	bytes / count
 }
@@ -582,6 +586,10 @@ pub struct BenchResult {
 	/// v28); `None` for a single run.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub between_run: Option<BetweenRun>,
+	/// One lane of a `gpu_economics` run (schema v29): cold start, no adapter, a fallback
+	/// backend or a contention step; `None` for every other workload and for older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub gpu_economics: Option<crate::gpu_economics::GpuEconomicsPoint>,
 }
 
 /// The first timed repetition apart from the remaining ones.
@@ -614,7 +622,6 @@ impl ColdWarm {
 	/// warm-up cost); `None` when the warm median is zero.
 	#[must_use]
 	pub fn first_rep_ratio(&self) -> Option<f64> {
-		#[allow(clippy::cast_precision_loss)]
 		(self.warm.p50_ns > 0).then(|| self.first_rep_ns as f64 / self.warm.p50_ns as f64)
 	}
 }
@@ -697,6 +704,7 @@ mod tests {
 			analytics: None,
 			samples_ns: samples.to_vec(),
 			between_run: None,
+			gpu_economics: None,
 		}
 	}
 
@@ -880,7 +888,6 @@ mod tests {
 		// realized codec (v10), which packs these tiny mantissas well below 8 B each.
 		assert_eq!(est.estimated_value_bytes, 4 * 8);
 		assert!(est.realized_value_bytes < est.estimated_value_bytes);
-		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = est.realized_value_bytes as f64 / 4.0;
 		assert!((est.bytes_per_point - expected_bpp).abs() < f64::EPSILON, "headline {} must be the realized rate {expected_bpp}", est.bytes_per_point);
 		assert!(est.bytes_per_point < 8.0, "realized bytes/point must undercut the naive 8 B/pt");
@@ -1040,7 +1047,6 @@ mod tests {
 		assert_eq!(est.realized_value_bytes, seg.serialized_value_bytes(), "bench realized bytes must match the sealed segment");
 		// The headline derives from the realized figure and sits far below the naive
 		// fixed-width baseline (mantissas near 1e8 pack to a few residual bits each).
-		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = est.realized_value_bytes as f64 / est.value_count as f64;
 		assert!((est.bytes_per_point - expected_bpp).abs() < f64::EPSILON, "headline {} must be the realized rate {expected_bpp}", est.bytes_per_point);
 		assert!(est.realized_value_bytes * 4 < est.estimated_value_bytes, "realized {} must be well below the naive {} baseline", est.realized_value_bytes, est.estimated_value_bytes);

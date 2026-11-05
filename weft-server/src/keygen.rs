@@ -73,7 +73,9 @@ pub enum Invocation {
 
 /// Read `argv` (starting with the subcommand word, as `main` hands it
 /// over) into an [`Invocation`], in the shape of
-/// [`crate::import_rows_mode::parse`]: an unknown word or option is an
+/// [`crate::import_rows_mode::parse`].
+///
+/// An unknown word or option is an
 /// error naming what was wrong, never a silent default.
 ///
 /// # Errors
@@ -135,7 +137,9 @@ fn entry_json(request: &Request, key_hash: &str) -> Value {
 }
 
 /// Append `entry` to the keys file at `path`, creating the document
-/// when the file does not exist yet. An existing file must parse as a
+/// when the file does not exist yet.
+///
+/// An existing file must parse as a
 /// keys file and must not already hold the entry's id or hash —
 /// redefining a principal by appending is exactly what the loader
 /// refuses, so the tool refuses it first, with the same message.
@@ -180,7 +184,7 @@ fn write_keys_file(path: &std::path::Path, contents: &str) -> Result<(), String>
 		}
 		let mut file = options.open(path).map_err(|e| format!("{}: cannot write the keys file: {e}", path.display()))?;
 		file.write_all(contents.as_bytes()).map_err(|e| format!("{}: cannot write the keys file: {e}", path.display()))?;
-		return Ok(());
+		Ok(())
 	}
 	#[cfg(not(unix))]
 	{
@@ -211,32 +215,27 @@ pub fn run<I: IntoIterator<Item = String>>(arguments: I) -> anyhow::Result<()> {
 		}
 	};
 	match invocation {
-		Invocation::Help => {
-			println!("{USAGE}");
-			Ok(())
-		}
+		Invocation::Help => println!("{USAGE}"),
 		Invocation::Generate(request) => {
 			let generated = generate_api_key().map_err(anyhow::Error::msg)?;
 			let entry = entry_json(&request, &generated.key_hash);
-			match &request.keys_file {
-				Some(path) => append_to_keys_file(path, &entry).map_err(anyhow::Error::msg)?,
-				None => {}
+			if let Some(path) = &request.keys_file {
+				append_to_keys_file(path, &entry).map_err(anyhow::Error::msg)?;
 			}
 			println!("API key for `{}` ({} role) — shown once, store it now:", request.id, request.role.as_str());
 			println!();
 			println!("    {}", generated.token);
 			println!();
-			match &request.keys_file {
-				Some(path) => println!("Its hash is recorded in {} — restart the server for the key to take effect.", path.display()),
-				None => {
-					println!("Add this entry to your keys file (WEFT_KEYS_FILE):");
-					println!();
-					println!("{}", serde_json::to_string_pretty(&entry)?);
-				}
+			if let Some(path) = &request.keys_file {
+				println!("Its hash is recorded in {} — restart the server for the key to take effect.", path.display());
+			} else {
+				println!("Add this entry to your keys file (WEFT_KEYS_FILE):");
+				println!();
+				println!("{}", serde_json::to_string_pretty(&entry)?);
 			}
-			Ok(())
 		}
 	}
+	Ok(())
 }
 
 #[cfg(test)]

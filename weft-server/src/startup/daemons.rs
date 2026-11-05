@@ -46,7 +46,7 @@ const RECONCILE_INTERVAL_ENV: &str = "WEFT_RECONCILE_INTERVAL_SECS";
 /// decision 17), so an operator who configures nothing still gets scheduled
 /// reconciliation and compaction; `WEFT_RECONCILE_INTERVAL_SECS=0` is the
 /// opt-out.
-pub(crate) const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 60;
+pub const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 60;
 
 /// The compaction target, in rows per segment, the maintenance scheduler
 /// coalesces toward when `WEFT_COMPACT_TARGET_ROWS` is unset (ROB-19 —
@@ -55,7 +55,7 @@ pub(crate) const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 60;
 /// slowly: large enough that ordinary ingest batches are not rewritten every
 /// tick (the fragmentation gate skips aspects already at their ideal count),
 /// small enough to keep several segments per aspect for cross-segment reads.
-pub(crate) const DEFAULT_COMPACT_TARGET_ROWS: usize = 65_536;
+pub const DEFAULT_COMPACT_TARGET_ROWS: usize = 65_536;
 
 /// Environment variable for the daemon's out-of-order backlog trigger threshold
 /// (defaults to 1 — reconcile any aspect with at least one out-of-order segment).
@@ -125,26 +125,18 @@ const BACKUP_KEEP_ENV: &str = "WEFT_BACKUP_KEEP";
 /// A non-numeric value in any numeric variable (a malformed operator config
 /// should fail loudly at start rather than silently default).
 fn resolve_maintenance_config(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Option<ReconcileDaemonConfig>> {
-	let numeric = |var: &str| -> anyhow::Result<Option<u64>> {
-		match get(var) {
-			Some(raw) => raw.parse::<u64>().map(Some).map_err(|e| anyhow::anyhow!("{var}={raw:?} is not a non-negative integer: {e}")),
-			None => Ok(None),
-		}
-	};
+	let numeric = |var: &str| -> anyhow::Result<Option<u64>> { get(var).map(|raw| raw.parse::<u64>().map_err(|e| anyhow::anyhow!("{var}={raw:?} is not a non-negative integer: {e}"))).transpose() };
 	let interval_secs = numeric(RECONCILE_INTERVAL_ENV)?.unwrap_or(DEFAULT_MAINTENANCE_INTERVAL_SECS);
 	if interval_secs == 0 {
 		return Ok(None);
 	}
 	let threshold = usize::try_from(numeric(RECONCILE_THRESHOLD_ENV)?.unwrap_or(1)).unwrap_or(usize::MAX);
-	let truthy = |var: &str| get(var).map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false);
+	let truthy = |var: &str| get(var).is_some_and(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
 	let hot_cold = truthy(RECONCILE_HOT_COLD_ENV);
 	let overlaps = truthy(RECONCILE_OVERLAPS_ENV);
 	let split_min_bytes = numeric(RECONCILE_SPLIT_MIN_BYTES_ENV)?;
 	let squash_max_segments = numeric(RECONCILE_MAX_SPLITS_ENV)?.map(|raw| usize::try_from(raw).unwrap_or(usize::MAX));
-	let compact_target_rows = Some(match numeric(COMPACT_TARGET_ROWS_ENV)? {
-		Some(raw) => usize::try_from(raw).unwrap_or(usize::MAX),
-		None => DEFAULT_COMPACT_TARGET_ROWS,
-	});
+	let compact_target_rows = Some(numeric(COMPACT_TARGET_ROWS_ENV)?.map_or(DEFAULT_COMPACT_TARGET_ROWS, |raw| usize::try_from(raw).unwrap_or(usize::MAX)));
 	Ok(Some(ReconcileDaemonConfig { interval: Duration::from_secs(interval_secs), threshold, hot_cold, overlaps, split_min_bytes, squash_max_segments, compact_target_rows }))
 }
 
@@ -163,7 +155,7 @@ fn resolve_maintenance_config(get: impl Fn(&str) -> Option<String>) -> anyhow::R
 ///
 /// Propagates a non-numeric numeric setting (a malformed operator config
 /// should fail loudly at start rather than silently default).
-pub(crate) fn spawn_reconcile_if_configured(state: &AppState, daemons: &Daemons) -> anyhow::Result<()> {
+pub fn spawn_reconcile_if_configured(state: &AppState, daemons: &Daemons) -> anyhow::Result<()> {
 	let Some(store) = state.store() else { return Ok(()) };
 	// Owned, so the registry's factory can hold it for the process lifetime.
 	let store = Arc::clone(store);
@@ -206,7 +198,7 @@ pub(crate) fn spawn_reconcile_if_configured(state: &AppState, daemons: &Daemons)
 ///
 /// Propagates a non-numeric `WEFT_BACKUP_INTERVAL_SECS`/`WEFT_BACKUP_KEEP` (a malformed
 /// operator config should fail loudly at start rather than silently default).
-pub(crate) fn spawn_backup_if_configured(state: &AppState, daemons: &Daemons) -> anyhow::Result<()> {
+pub fn spawn_backup_if_configured(state: &AppState, daemons: &Daemons) -> anyhow::Result<()> {
 	let Some(store) = state.store() else { return Ok(()) };
 	// Owned, so the registry's factory can hold it for the process lifetime.
 	let store = Arc::clone(store);
@@ -246,7 +238,7 @@ pub(crate) fn spawn_backup_if_configured(state: &AppState, daemons: &Daemons) ->
 ///
 /// A no-op when authentication is off or explicitly disabled: there is
 /// no keys file to reload.
-pub(crate) fn spawn_key_reload_if_configured(state: &AppState, daemons: &Daemons) {
+pub fn spawn_key_reload_if_configured(state: &AppState, daemons: &Daemons) {
 	if !state.auth().is_enabled() {
 		return;
 	}
@@ -266,7 +258,7 @@ pub(crate) fn spawn_key_reload_if_configured(state: &AppState, daemons: &Daemons
 /// Returns at once: the server serves while it runs, interpolating on the CPU until the
 /// measured thresholds are in force. Never fails: a missing GPU, a software adapter, a
 /// failed calibration, or even a panicking one only leaves splimes' defaults in force.
-pub(crate) fn spawn_gpu_calibration_if_enabled(daemons: &Daemons) {
+pub fn spawn_gpu_calibration_if_enabled(daemons: &Daemons) {
 	let mode = CalibrationMode::from_env_value(std::env::var(GPU_CALIBRATE_ENV).ok().as_deref());
 	if mode == CalibrationMode::Off {
 		println!("gpu calibration: skipped ({GPU_CALIBRATE_ENV} is off); interpolation stays on the CPU with the default thresholds");
@@ -280,6 +272,27 @@ pub(crate) fn spawn_gpu_calibration_if_enabled(daemons: &Daemons) {
 	drop(daemons.spawn_once("gpu-calibration", async move {
 		let _ = gpu::spawn_in_background(move || gpu::calibrate(mode)).await;
 	}));
+}
+
+/// Phase 2: bind and start the opt-in Arrow Flight listener at `addr`. It stops on the
+/// registry's shutdown watch but is not supervised by it: the supervisor aborts its task
+/// on that watch, which would cut the listener's own grace short. The caller joins the
+/// handle after serving ends and before the store shuts down, so open streams get
+/// [`weft_server::flight::FLIGHT_SHUTDOWN_GRACE`] to finish first.
+///
+/// # Errors
+///
+/// The bind's failure: an address in use stops the start rather than leaving Flight off.
+pub async fn spawn_flight(addr: std::net::SocketAddr, state: &AppState, daemons: &Daemons) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+	let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| anyhow::anyhow!("cannot bind the Flight listener on {addr}: {error}"))?;
+	println!("flight: Arrow Flight, read-only, on {} (experimental; {} turns it off)", listener.local_addr()?, weft_server::flight::FLIGHT_ADDR_ENV);
+	let state = state.clone();
+	let shutdown = daemons.shutdown_watch();
+	Ok(tokio::spawn(async move {
+		if let Err(error) = weft_server::flight::serve(listener, state, shutdown).await {
+			tracing::error!(%error, "the Flight listener stopped");
+		}
+	}))
 }
 
 #[cfg(test)]
@@ -325,25 +338,4 @@ mod tests {
 		assert!(resolve_maintenance_config(env(&[(COMPACT_TARGET_ROWS_ENV, "many")])).is_err());
 		assert!(resolve_maintenance_config(env(&[(RECONCILE_THRESHOLD_ENV, "some")])).is_err());
 	}
-}
-
-/// Phase 2: bind and start the opt-in Arrow Flight listener at `addr`. It stops on the
-/// registry's shutdown watch but is not supervised by it: the supervisor aborts its task
-/// on that watch, which would cut the listener's own grace short. The caller joins the
-/// handle after serving ends and before the store shuts down, so open streams get
-/// [`weft_server::flight::FLIGHT_SHUTDOWN_GRACE`] to finish first.
-///
-/// # Errors
-///
-/// The bind's failure: an address in use stops the start rather than leaving Flight off.
-pub(crate) async fn spawn_flight(addr: std::net::SocketAddr, state: &AppState, daemons: &Daemons) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-	let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| anyhow::anyhow!("cannot bind the Flight listener on {addr}: {error}"))?;
-	println!("flight: Arrow Flight, read-only, on {} (experimental; {} turns it off)", listener.local_addr()?, weft_server::flight::FLIGHT_ADDR_ENV);
-	let state = state.clone();
-	let shutdown = daemons.shutdown_watch();
-	Ok(tokio::spawn(async move {
-		if let Err(error) = weft_server::flight::serve(listener, state, shutdown).await {
-			tracing::error!(%error, "the Flight listener stopped");
-		}
-	}))
 }

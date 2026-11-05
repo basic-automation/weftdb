@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::{hint::black_box, str::FromStr};
 
 use ::weftdb::{
@@ -64,7 +67,7 @@ fn benchmark_cache_miss_vs_hit(c: &mut Criterion) {
 		});
 	});
 
-	group.finish();
+	drop(group);
 
 	// Cleanup
 	rt.block_on(async {
@@ -99,8 +102,10 @@ fn benchmark_cache_invalidation(c: &mut Criterion) {
 
 				let analyze_time = base_time + Duration::seconds(300);
 				let result = db.analyze_point(&aspect.id(), analyze_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
+				drop(aspect);
 
 				db.close().await.unwrap();
+				drop(db);
 				common::discard_database(&db_name).await;
 				black_box(result)
 			})
@@ -140,10 +145,12 @@ fn benchmark_concurrent_cache_access(c: &mut Criterion) {
 					let handle = tokio::spawn(async move { db_clone.analyze_point(&aspect_id, analyze_time, &Resolution::Seconds, &Spline::Linear).await });
 					handles.push(handle);
 				}
+				drop(aspect);
 
 				let results: Vec<_> = futures::future::join_all(handles).await.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
 
 				db.close().await.unwrap();
+				drop(db);
 				common::discard_database(&db_name).await;
 				black_box(results)
 			})
@@ -184,13 +191,15 @@ fn benchmark_cache_memory_usage(c: &mut Criterion) {
 					// "Insufficient measurements provided for interpolation" panics.
 					let mut results = vec![];
 					for j in 0..10 {
-						let offset = (j as i64 * 60) % (size as i64 * 60);
+						let offset = (i64::from(j) * 60) % (i64::from(size) * 60);
 						let analyze_time = base_time + Duration::seconds(offset);
 						let result = db.analyze_point(&aspect.id(), analyze_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
 						results.push(result);
 					}
+					drop(aspect);
 
 					db.close().await.unwrap();
+					drop(db);
 					common::discard_database(&db_name).await;
 					black_box(results)
 				})
@@ -229,8 +238,10 @@ fn benchmark_cache_eviction_strategies(c: &mut Criterion) {
 					let result = db.analyze_point(&aspect.id(), analyze_time, &Resolution::Seconds, &Spline::Linear).await.unwrap();
 					results.push(result);
 				}
+				drop(aspect);
 
 				db.close().await.unwrap();
+				drop(db);
 				common::discard_database(&db_name).await;
 				black_box(results)
 			})

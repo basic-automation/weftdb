@@ -113,7 +113,6 @@ pub struct Aspect {
 
 #[async_trait::async_trait]
 impl AspectStructure for Aspect {
-	#[allow(clippy::too_many_lines)]
 	#[instrument(skip(metadata_conn), fields(aspect_name = %name, subject_id = %subject_id))]
 	async fn new(id: Option<AspectId>, name: &str, subject_id: &SubjectId, resolution: &Resolution, metadata_conn: &Connection) -> Result<Self> {
 		let id = id.unwrap_or_default();
@@ -407,6 +406,7 @@ impl AspectStructure for Aspect {
 
 		// Query the database for the metadata_path field of the first item in the database table
 		let conn = Database::begin_concurrent(&turso_db, &turso_db_path, None).await?;
+		drop(turso_db);
 		let mut rows = conn.as_ref().query("SELECT metadata_path FROM database", turso::params![]).await?;
 		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("Database metadata not found"))?;
 		let metadata_path: String = row.get(0)?;
@@ -1758,6 +1758,7 @@ impl Aspect {
 		let db = self.measurements().await?;
 		tracing::info!(">>> ensure_compression_tables: beginning immediate transaction");
 		let schema_conn = Database::begin_immediate(&db).await?;
+		drop(db);
 		tracing::info!(">>> ensure_compression_tables: wireframing tables");
 		Self::wireframe_compression_stats_tables_direct(&schema_conn).await?;
 		tracing::info!(">>> ensure_compression_tables: committing");
@@ -1809,6 +1810,7 @@ impl Aspect {
 		let turso_db = Database::get_turso_database(&self.database_metadata_db_path).await?;
 		tracing::info!(">>> set_compression_config: beginning concurrent transaction");
 		let conn = Database::begin_concurrent(&turso_db, &self.database_metadata_db_path, None).await?;
+		drop(turso_db);
 
 		tracing::info!(">>> set_compression_config: serializing config json");
 		let config_json = config.map(|c| serde_json::to_string(&c)).transpose()?;
@@ -1924,7 +1926,7 @@ impl Aspect {
 		summary.final_size_bytes = size::SizeEstimate::from_count(final_count).best_estimate();
 
 		let completed_at = chrono::Utc::now();
-		let total_duration_ms = (completed_at - started_at).num_milliseconds().max(0) as u64;
+		let total_duration_ms = (completed_at - started_at).num_milliseconds().max(0).cast_unsigned();
 
 		// Report complete
 		tracing::info!(">>> About to send CompressionPhase::Complete callback");
@@ -1977,7 +1979,7 @@ impl Aspect {
 		let total_duration = pure_cutoff - earliest;
 		let tier_duration_millis = time_config.tier_duration.num_milliseconds().max(1);
 		let total_duration_millis = total_duration.num_milliseconds().max(0);
-		let total_tiers = ((total_duration_millis as f64 / tier_duration_millis as f64).ceil() as u32).min(time_config.max_tiers);
+		let total_tiers = crate::types::num::f64_to_u32((crate::types::num::to_f64(total_duration_millis) / crate::types::num::to_f64(tier_duration_millis)).ceil()).min(time_config.max_tiers);
 
 		let mut results = Vec::new();
 		let mut tier_details = Vec::new();
@@ -2007,7 +2009,7 @@ impl Aspect {
 
 				let tier_start_time = std::time::Instant::now();
 				let result = self.compress_time_range(database, tier_start, tier_end, aggressiveness, config).await?;
-				let tier_duration_ms = tier_start_time.elapsed().as_millis() as u64;
+				let tier_duration_ms = crate::types::num::u128_to_u64(tier_start_time.elapsed().as_millis());
 
 				if result.original_count > 0 {
 					tracing::info!(
@@ -2089,7 +2091,7 @@ impl Aspect {
 
 					let iter_start_time = std::time::Instant::now();
 					let result = self.compress_time_range(database, start, chunk_end, aggressiveness, config).await?;
-					let iter_duration_ms = iter_start_time.elapsed().as_millis() as u64;
+					let iter_duration_ms = crate::types::num::u128_to_u64(iter_start_time.elapsed().as_millis());
 
 					if result.original_count > 0 {
 						tracing::info!(
@@ -2176,18 +2178,19 @@ impl Aspect {
 		let db = self.measurements().await?;
 		tracing::info!(">>> save_compression_history: beginning concurrent transaction");
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
+		drop(db);
 		tracing::info!(">>> save_compression_history: generating id and config json");
 
 		let id = uuid::Uuid::new_v4().to_string();
 		let config_json = serde_json::to_string(config)?;
 
 		// Insert into compression_history
-		conn.as_ref().execute("INSERT INTO compression_history (id, started_at, completed_at, duration_ms, original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), summary.started_at.timestamp_millis(), summary.completed_at.timestamp_millis(), summary.total_duration_ms as i64, summary.summary.total_original_count as i64, summary.summary.total_compressed_count as i64, summary.summary.overall_compression_ratio(), summary.summary.final_size_bytes as i64, summary.summary.time_based_results.len() as i64, summary.summary.size_based_results.len() as i64, config_json,]).await?;
+		conn.as_ref().execute("INSERT INTO compression_history (id, started_at, completed_at, duration_ms, original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, config_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), summary.started_at.timestamp_millis(), summary.completed_at.timestamp_millis(), summary.total_duration_ms.cast_signed(), crate::types::num::usize_to_i64(summary.summary.total_original_count), crate::types::num::usize_to_i64(summary.summary.total_compressed_count), summary.summary.overall_compression_ratio(), summary.summary.final_size_bytes.cast_signed(), crate::types::num::usize_to_i64(summary.summary.time_based_results.len()), crate::types::num::usize_to_i64(summary.summary.size_based_results.len()), config_json,]).await?;
 
 		// Insert tier results
 		for tier_result in &summary.tier_results {
 			let phase_str = format!("{}", tier_result.phase);
-			conn.as_ref().execute("INSERT INTO compression_tier_results (history_id, tier_number, phase, original_count, compressed_count, compression_ratio, aggressiveness, time_range_start, time_range_end, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), i64::from(tier_result.tier_number), phase_str, tier_result.original_count as i64, tier_result.compressed_count as i64, tier_result.compression_ratio, tier_result.aggressiveness, tier_result.time_range_start.timestamp_millis(), tier_result.time_range_end.timestamp_millis(), tier_result.duration_ms as i64,]).await?;
+			conn.as_ref().execute("INSERT INTO compression_tier_results (history_id, tier_number, phase, original_count, compressed_count, compression_ratio, aggressiveness, time_range_start, time_range_end, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), i64::from(tier_result.tier_number), phase_str, crate::types::num::usize_to_i64(tier_result.original_count), crate::types::num::usize_to_i64(tier_result.compressed_count), tier_result.compression_ratio, tier_result.aggressiveness, tier_result.time_range_start.timestamp_millis(), tier_result.time_range_end.timestamp_millis(), tier_result.duration_ms.cast_signed(),]).await?;
 		}
 
 		// Update compression_state singleton
@@ -2211,19 +2214,20 @@ impl Aspect {
 	pub async fn get_last_compression(&mut self) -> Result<Option<crate::compression::LastCompressionInfo>> {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
+		drop(db);
 
 		let mut rows = conn.as_ref().query("SELECT id, completed_at, original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, duration_ms FROM compression_history ORDER BY completed_at DESC LIMIT 1", turso::params![]).await?;
 
 		let result = if let Some(row) = rows.next().await? {
 			let id = row.get_value(0)?.as_text().cloned().unwrap_or_default();
 			let completed_at_millis = *row.get_value(1)?.as_integer().unwrap_or(&0);
-			let original_count = *row.get_value(2)?.as_integer().unwrap_or(&0) as usize;
-			let compressed_count = *row.get_value(3)?.as_integer().unwrap_or(&0) as usize;
+			let original_count = crate::types::num::i64_to_usize(*row.get_value(2)?.as_integer().unwrap_or(&0));
+			let compressed_count = crate::types::num::i64_to_usize(*row.get_value(3)?.as_integer().unwrap_or(&0));
 			let compression_ratio = *row.get_value(4)?.as_real().unwrap_or(&0.0);
-			let final_size_bytes = *row.get_value(5)?.as_integer().unwrap_or(&0) as u64;
-			let time_based_tiers = *row.get_value(6)?.as_integer().unwrap_or(&0) as usize;
-			let size_based_iterations = *row.get_value(7)?.as_integer().unwrap_or(&0) as usize;
-			let duration_ms = *row.get_value(8)?.as_integer().unwrap_or(&0) as u64;
+			let final_size_bytes = (*row.get_value(5)?.as_integer().unwrap_or(&0)).cast_unsigned();
+			let time_based_tiers = crate::types::num::i64_to_usize(*row.get_value(6)?.as_integer().unwrap_or(&0));
+			let size_based_iterations = crate::types::num::i64_to_usize(*row.get_value(7)?.as_integer().unwrap_or(&0));
+			let duration_ms = (*row.get_value(8)?.as_integer().unwrap_or(&0)).cast_unsigned();
 
 			Some(crate::compression::LastCompressionInfo { id, completed_at: chrono::DateTime::from_timestamp_millis(completed_at_millis).unwrap_or_default(), original_count, compressed_count, compression_ratio, final_size_bytes, time_based_tiers, size_based_iterations, duration_ms })
 		} else {
@@ -2242,10 +2246,11 @@ impl Aspect {
 	pub async fn get_dirty_regions_count(&mut self) -> Result<usize> {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
+		drop(db);
 
 		let mut rows = conn.as_ref().query("SELECT COUNT(*) FROM dirty_regions", turso::params![]).await?;
 
-		let count = if let Some(row) = rows.next().await? { *row.get_value(0)?.as_integer().unwrap_or(&0) as usize } else { 0 };
+		let count = if let Some(row) = rows.next().await? { crate::types::num::i64_to_usize(*row.get_value(0)?.as_integer().unwrap_or(&0)) } else { 0 };
 
 		Database::commit_concurrent(&conn).await?;
 		Ok(count)
@@ -2259,6 +2264,7 @@ impl Aspect {
 	pub async fn get_dirty_regions(&mut self) -> Result<Vec<crate::compression::DirtyRegion>> {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
+		drop(db);
 
 		let mut rows = conn.as_ref().query("SELECT id, region_start, region_end, marked_at, reason FROM dirty_regions ORDER BY region_start ASC", turso::params![]).await?;
 
@@ -2304,6 +2310,7 @@ impl Aspect {
 
 		Database::commit_concurrent(&conn).await?;
 		Database::checkpoint_wal_passive(&db).await?;
+		drop(db);
 
 		tracing::debug!(
 			region_start = %region_start,
@@ -2336,6 +2343,7 @@ impl Aspect {
 
 		Database::commit_concurrent(&conn).await?;
 		Database::checkpoint_wal_passive(&db).await?;
+		drop(db);
 
 		tracing::debug!(before = %before, "Cleared dirty regions");
 		Ok(())
@@ -2355,6 +2363,7 @@ impl Aspect {
 	pub async fn get_compressed_range_containing(&mut self, timestamp: chrono::DateTime<chrono::Utc>) -> Result<Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>> {
 		let db = self.measurements().await?;
 		let conn = Database::begin_concurrent(&db, &self.measurements_path, None).await?;
+		drop(db);
 
 		// Query tier results to find if timestamp falls within any compressed range
 		let mut rows = conn.as_ref().query("SELECT time_range_start, time_range_end FROM compression_tier_results WHERE time_range_start <= ? AND time_range_end >= ? LIMIT 1", turso::params![timestamp.timestamp_millis(), timestamp.timestamp_millis()]).await?;

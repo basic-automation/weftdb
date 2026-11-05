@@ -94,31 +94,45 @@ Out-of-order data is fully handled (4.6): in-place per-segment sort, cross-segme
     - *Landed 2026-10-27 (`w2/qprune-read-path`). Three levels, each at the layer that owns the decision: `SegmentIndexStore::prune_present_descriptors` (`weftdb/src/types/segment_index.rs`) is the SQL mirror of `SegmentIndex::prune_present_by_time` (`weft-physical-type/src/catalog.rs:395`) and is what `SegmentStore::read_point`/`read_points` now prune with, so a segment indexed as all-null never has its file opened; `read_segment_point(s)`/`read_paged_segment_point(s)` (`weft-physical-type/src/weftseg.rs`) drop a fully null frame and fully null pages from the persisted stats, reached through `read_frame_point(s)`.*
     - *Deliberately not pruned: `read_time_range` returns null rows, so dropping a segment there would delete timestamps the caller asked for — a range read over a window holding a corrupt all-null frame still reports the damage, which is what pins this boundary in `point_reads_prune_an_all_null_segment_without_opening_it`. `read_segment_instant` — the last-writer-wins reader behind `Segment::query`/`query_as_of` — is not pruned either, because skipping a segment can change which segment wins. `prune_by_time` stays the ingest primitive for the same reason (`weft-reduce/src/windowed.rs:55`, `bounded.rs:57`). The page-level `prune_present_pages_by_time` (`page.rs:364`) stays a resident-index helper: the store's range reads stream values straight out of blocks, where an all-null page costs one u64 header compare and appending its nulls is cheaper than filtering them back out.*
     - *Extended 2026-10-28 (same branch): `downsample_range` now prunes with `prune_present_descriptors` too. A null row is part of a range read's answer but not of a bucket's: it enters no sum, count, min, max, first or last, and a partial holding nothing is dropped when buckets merge, so a window covered only by nulls yields no buckets rather than a run of empty ones. `an_all_null_segment_changes_no_bucket_of_a_downsample` pins that against the single-pass `reduce` over the live rows, at two resolutions and seven aggregations, including a window the null segment covers alone.*
-  - [ ] Tag pruning *(blocked on B-tags — per-measurement tags/labels don't exist yet)*
-- [ ] **4.6 Correctness semantics**
-  - [ ] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
+  - [x] Tag pruning
+    - *Landed 2026-11-04 (`p4/tag-pruning`, #158). A read of one series prunes in SQL before any file opens: migration `0007_series_time_index` (layout 2, best effort) adds `idx_segment_index_series_time` on `segment_index(aspect, series_id, min_ts, max_ts)`, which `prune_rows` names for a series-bound prune and falls back from to the time index, then to a scan (`weftdb/src/types/segment_index.rs`). The seek's span bound is kept per `(aspect, series)`, so one wide series no longer widens every other's seek. `resolve_series` reads a per-aspect catalog cache that every `RegisterSeries` transaction forgets once it runs, and matches with the zero-allocation `SeriesSelector::matches_key` (`weft-physical-type/src/tags.rs`). `a_tagged_read_among_a_thousand_series_opens_only_its_own_frames` overwrites every other series' frame with garbage and still reads its own.*
+- [x] **4.6 Correctness semantics**
+  - [x] Out-of-order **reconciliation — configurable upsert keys + skip-identical**:
+    - *Landed 2026-11-04 (`p4/upsert-skip-identical`). **Skip-identical:** when an overlap component's fold equals its lowest-id member's decoded rows (values compared in plain form, scale included, not by `BigDecimal ==`) and that member is time-sorted, `reconcile_overlaps` swaps a delete-only `SwapPlan::keep`: no frame is journaled or written, the kept row takes an unchanged `ReplaceExpected` as its version precondition, and only the other members are deleted, retired and lose their sidecars (`weftdb/src/types/segment_store.rs`, `seal.rs`, `maint.rs`). It is `Op::SkipIdentical` in the swap crash matrix (errors, power cuts and aborts at every point it passes), and `an_identical_replay_reconciles_without_writing_a_frame`, `a_racing_change_to_the_kept_row_conflicts` and `overlapping_count_reaches_zero_after_a_skip` pin it. **Upsert keys, narrowed:** an aspect may declare `upsert_keys = timestamp + K` (`SegmentStore::declare_with_upsert_keys`, `upsert_keys`; migration `0008_upsert_keys` at layout 2 adds the nullable `aspect_schema.upsert_keys`); an ingest whose tags leave K is `StoreError::NotAnUpsertKey` (`400 invalid_tag`), so the identity is `(timestamp, tags ∩ K)`, and undeclared stays `(timestamp, full tag set)`. The keys are immutable and part of declare equality over HTTP (`409 schema_conflict`). `value` as a key and dedup-off are not offered; DECISIONS.md says why.*
 
 ### Phase 5 — GPU interpolation flagship · *High (parallel w/ Phase 4)*
 
-Interpolation and extrapolation run on the GPU, supported by a size-tiered LRU buffer pool, persistent staging buffers and an async-handle scaffold. The storage half of the path is done, and the 2026-10-09 measurement showing where end-to-end time goes, and what the `f64` egress costs, is complete.
+Every Phase 5 item is built and merged as of 2026-11-05, including the ones the roadmap had gated (multi-GPU, memory-mapped GPU I/O and the post-1.0 HTTP route): the owner decided on 2026-11-04 to build them all, re-add and re-measure 5.1 and 5.2 although splimes had dropped them, and release splimes 1.3.0 (published on crates.io; WeftDB depends on `splimes = "1.3"`). 5.1 and 5.2 were re-measured in splimes and dropped again; multi-GPU ships opt-in because it measured slower than one device. The WeftDB code merged without a build under the owner's no-builds-before-merge rule, so the single build, tests, clippy and CI, and every WeftDB-side measurement (5.3, 5.5, 5.6, the E2E benchmark, mmap, the device-memory soak, the f64 widening and `run_f64` benches) are still to run after the merge. A ticked box below means the work merged; where it says numbers are pending, no number has been claimed.
 
-- [ ] 5.1 Command batching
-- [ ] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
-- [ ] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
+- [x] 5.1 Command batching
+  - *2026-11-04: re-added and measured in splimes [#12](https://github.com/basic-automation/splimes/pull/12) (merged `c62f2d7`, part of 1.3.0). `run_batch`/`run_f64_batch` (one encoder, one submit, one readback) beat per-call GPU 7-24x on 16-4096 small series, but rayon across series beat batched GPU in every multi-series case by 3.5-19x (splimes BENCHMARKS.md "Many series", 3 runs on an RTX 4070 Ti SUPER under load average 28-53). Verdict: the API was removed again (`0c8abaf`) and not shipped; the harness stays as splimes `benches/batch.rs`.*
+- [x] 5.2 True async GPU handles (non-blocking; CPU parse/read overlaps GPU)
+  - *2026-11-04: re-added (`submit_f64` -> `GpuHandle` with one shared non-blocking poller) and measured in splimes [#16](https://github.com/basic-automation/splimes/pull/16) (merged `1bc371c`) with `examples/handles.rs` (512 requests, 2 ms CPU parse each, Cubic 4,096 knots -> 1,048,576 points, depth 8). Median of runs 2-5: `run` 5,301 ms, `spawn_f64` 3,955 ms, `submit_f64` 4,056 ms; submit/spawn ranged 0.72x-1.28x under load average 29-42. Verdict: the handle API was dropped again; the existing `spawn_f64` (~1.3x over `run`) delivers the CPU/GPU overlap. The harness and splimes BENCHMARKS.md "Overlapping requests" were kept.*
+- [x] 5.3 CPU/GPU overlap (chunked read → decode → upload → kernel → stream output)
+  - *2026-11-04: [#585](https://github.com/basic-automation/weftdb/pull/585). The stored window becomes epoch-tick `f64` columns (no `DateTime` per knot, `weftdb/src/types/interpolate_range.rs:299`), runs through splimes `stream_epoch` on the blocking pool, and is sent as a chunked body with at most `STREAM_DEPTH` chunks of `STREAM_CHUNK_POINTS` ahead (`weft-server/src/stored_interpolate.rs:46`); `interpolate_range_stream(_of)` at `interpolate_range.rs:319`/`:329`. JSON and CSV stream; Arrow and Parquet stay buffered; the read/decode stage is not chunked per segment. Tests compare streamed output with the `f64` call bit for bit. Not built or measured yet: the `stored_interpolate` bench's time-to-first-byte columns run after the merge.*
 - [x] 5.4 Hardware auto-tuning (calibrate CPU/GPU throughput, transfer cost, break-even sizes; auto-select)
   - *Audit 2026-10-27: checked — `weft-server/src/gpu.rs:82` `calibrate()` runs `splimes::calibrate()` at startup (`gpu.rs:95`), timing GPU, rayon pool and single core and installing the measured break-even thresholds that `Backend::Auto` then uses to auto-select (`gpu.rs:1-20`, `settings.rs:109` `WEFT_GPU_CALIBRATE`; tests at `gpu.rs:138-193`).*
-- [ ] 5.5 GPU economics (cloud cost, CPU-only fallback, utilization/contention/cold-start, NVIDIA/AMD/Intel/Apple portability)
-- [ ] 5.6 wgpu/WGSL portability & determinism (conformance matrix, numerical drift, published tolerances)
-- [ ] 5.7 Multi-GPU *(deferred until single-GPU wins are proven)*
-- [ ] Memory-mapped GPU I/O *(only after transfer bottlenecks are measured)*
-- [ ] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
+- [x] 5.5 GPU economics (cloud cost, CPU-only fallback, utilization/contention/cold-start, NVIDIA/AMD/Intel/Apple portability)
+  - *2026-11-04: [#569](https://github.com/basic-automation/weftdb/pull/569). `weft-bench --gpu-economics` (`weft-bench/src/gpu_economics.rs`, result schema v29) measures cold start, no adapter, CPU fallback, contention at 1-16 callers and `nvidia-smi` utilization; `bench/reports/gpu-economics/README.md` turns them into cloud $/billion points and a portability table. Scope is local: an RTX 4070 Ti SUPER (`f64`/`f32`) and the CPU. AMD, Intel, Apple and lavapipe are not measured. The report's numbers are still `⟦MEASURE⟧` placeholders until the post-merge run fills them.*
+- [x] 5.6 wgpu/WGSL portability & determinism (conformance matrix, numerical drift, published tolerances)
+  - *2026-11-04: [#573](https://github.com/basic-automation/weftdb/pull/573). `weft-bench/src/conformance.rs` (corpus, 60-digit exact reference, error against splimes' contract bound of 1e-13 `f64` / 1e-5 GPU `f32`, run-to-run bit identity, cross-target drift) and `weft-bench/src/bin/weft-gpu-conformance.rs` (one child process per adapter, writes `matrix.md`/`matrix.json`); tolerances published in `docs/gpu-conformance.md`. Scope is local: the RTX 4070 Ti SUPER and the CPU backends; AMD, Intel, Apple and lavapipe are not covered. The matrix is not measured yet (a first attempt stalled under heavy I/O load and produced nothing); `matrix --size full --repeats 5` runs after the merge.*
+- [x] 5.7 Multi-GPU *(the owner lifted the "deferred until single-GPU wins are proven" gate on 2026-11-04; shipped opt-in)*
+  - *2026-11-04: splimes [#14](https://github.com/basic-automation/splimes/pull/14) (`ffb06c0`, in 1.3.0) adds `gpu_adapters()`, `GpuConfig::with_adapter` and `with_devices` (One/All/List), a device work queue, per-device stats and device-lost failover. Measured there (BENCHMARKS.md "More than one GPU (5.7)", RTX 4070 Ti SUPER plus the Ryzen iGPU, loaded machine): All/List was slower than One in every case, `f64` by up to 3.6x. WeftDB half in [#584](https://github.com/basic-automation/weftdb/pull/584): `WEFT_GPU_ADAPTER`/`WEFT_GPU_DEVICES` (`weft-server/src/gpu.rs:134` `gpu_config_from_env`, read at `startup/config.rs:156`, registered at `settings.rs:114`/`:116`), per-device `/metrics` (`metrics.rs:525` `render_gpu_devices`). Unset keeps the single-device default. Not built yet.*
+- [x] Memory-mapped GPU I/O *(the owner lifted the "only after transfer bottlenecks are measured" gate on 2026-11-04)*
+  - *2026-11-04: [#587](https://github.com/basic-automation/weftdb/pull/587). Opt-in `mmap-reads` cargo feature plus `WEFT_SEGMENT_MMAP_READS` (`weft-server/src/settings.rs:142`) / `SegmentStoreOptions::mmap_reads`; the mapping is in `weftdb/src/types/segment_store/mapped.rs`, used by `read_time_range_of` (`segment_store/read.rs:136`); `weft-e2e-interp --mmap-reads`. It removes only the file-to-heap copy: frames are compressed, so decode and the splimes upload remain. No before/after numbers yet; they come from the post-merge E2E run.*
+- [x] End-to-end GPU interpolation benchmark (storage read → … → API serialization, with p95)
+  - *2026-11-04: [#586](https://github.com/basic-automation/weftdb/pull/586). `weft-bench/src/e2e_interpolation.rs` and `weft-bench/src/bin/weft-e2e-interp.rs` (result schema v31, `weft-bench/src/schema.rs:104`) report p50/p95/p99 per stage (storage read with frame decode, decode to `f64` knots, splimes `run_epoch`, serialization, total) across sizes and the cpu/parallel/gpu/gpu-f32/auto backends, plus the HTTP route's ttfb/body/total. Upload/readback come from a wgpu transfer probe because splimes 1.3 exposes no stage timings, so kernel time is derived. Not run yet: the transfer share is still unmeasured.*
   - [x] **FOUND (2026-10-11, runtime) — `POST /api/v1/downsample` rejected the documented multi-word tokens. Closed 2026-10-28 (FRE-5, the spelling half):** the JSON body reads `Aggregation::from_token`, so `twa_linear`, `sketch_p99` and the aliases parse as they do in a query string, and the bare lowercase names still parse. Tokens are exact-case as of 2026-10-29 (FRE-5's first clause, which breaks v0.1.0's case folding; see the CHANGELOG): `Min` and `MEDIAN` are a `400`. The rest of FRE-5, "no silent narrowing", closed 2026-11-01 (FRE-5): a computed value with no finite `f64` representation now fails the compute request with `not_finite` instead of returning a substitute `0.0`.
-  - [ ] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138` …
-  - [ ] **NEXT — the compute endpoints pay the same tax:**
+  - [x] **FOUND (2026-10-09) — the compute endpoints widen JSON `f64` values with `BigDecimal::from_f64`** (`weft-server/src/downsample.rs:138` …
+    - *2026-11-04: closed by [#553](https://github.com/basic-automation/weftdb/pull/553). The compute endpoints widen JSON `f64` through the shortest round-trip decimal (`weft-server/src/downsample.rs:292` `widen_json_value`, mirroring splimes' `shortest_decimal`), so `99.92` widens to `99.92`; the not-finite rejection stays. `serde_json`'s `arbitrary_precision` was rejected as a workspace-wide behaviour flip. Tests: a 200k-value property test against `to_string().parse::<BigDecimal>()`. Bench `weft-server/benches/json_widening.rs`; no speedup is claimed until it runs after the merge.*
+  - [x] **NEXT — the compute endpoints pay the same tax:**
+    - *2026-11-04: closed by [#575](https://github.com/basic-automation/weftdb/pull/575). `POST /api/v1/interpolate` range outputs (JSON/CSV/Arrow/Parquet, ILP) run splimes `run_f64` (`weft-server/src/interpolate.rs:380`) instead of building a `BigDecimal` per output point; `/interpolate/point` keeps `run`. Bit-identical below 2^53; above it the kernel's value replaces a possibly 1-ulp-off narrowing. Differential tests compare the paths; the 1M-point `interpolate_wire` bench runs after the merge.*
   - [x] **Reconcile with EVI-10A** (2026-10-19: the API now has an input cap, `interpolate_range::MAX_KNOTS`, a `pub` const the review may keep, turn into an option or drop)
-  - [ ] **NEXT (post-1.0 per decision 18) — the HTTP endpoint:**
+  - [x] **DONE (2026-11-04, owner override of decision 18) — the HTTP endpoint:**
+    - *[#572](https://github.com/basic-automation/weftdb/pull/572). `GET /api/v1/storage/{aspect}/interpolate` plus `.csv`, `.arrow` and `.parquet` (`weft-server/src/routes.rs:894`, handler `weft-server/src/stored_interpolate.rs:367`) over the stored window, capped by `WEFT_MAX_INTERPOLATE_POINTS` and `MAX_KNOTS` (`422 result_too_large`), with the storage reads' policy (read scope, query admission, stable tier). DECISIONS.md records the amendment to decision 18. 11 tests and `weft-server/benches/stored_interpolate.rs` are written and not yet run.*
 - [x] **DONE (2026-10-09) — GPU memory-stability + pool-eviction benchmark** (`weft-bench --gpu-memory`, `gpu_pool` in schema v22)
-  - [ ] **NEXT — device memory, not just pool bytes:**
+  - [x] **DONE (2026-11-05) — device memory, not just pool bytes:**
+    - *splimes `gpu_memory_report()` (wgpu's allocator report on Vulkan/DX12) landed in splimes [#11](https://github.com/basic-automation/splimes/pull/11)/[#15](https://github.com/basic-automation/splimes/pull/15) with `tests/gpu_memory.rs`. WeftDB [#583](https://github.com/basic-automation/weftdb/pull/583): `weft-bench --gpu-memory` samples it after every call plus `nvidia-smi memory.used`, soaks for `--gm-soak-secs`, and records `gpu_pool.device_memory` (`DeviceMemorySoak`, `weft-bench/src/gpu_memory.rs:103`; schema v30); monotonic growth after round 1 fails the run as a leak. The 30-minute soaks (default pool and `--gm-pool-mib 32`) run after the merge.*
 
 ### Phase 6 — Compression v2 · *High*
 
@@ -170,7 +184,7 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
   - [x] **S16** Whole-store backup with hard-linked frames
   - [ ] **S17** Relaxed durability mode with synced_epoch watermark (optional for 1.0) *(~6 h; after S12)*
   - [x] **S19** Seal-backed legacy aspects
-  - [ ] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*
+  - [x] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects *(~7 h; after S19)*
   - [x] **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
 - [ ] **7.3 Corruption detection**
   - [ ] Restoring *into a chosen new root* over HTTP
@@ -220,7 +234,7 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 `splimes` 1.0 is released and WeftDB depends on it, and the control-plane engine decision is made.
 
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
-- [ ] **B-tags**
+- [x] **B-tags**
 
 ### Security & packaging *(Phase 8 minimum)*
 
@@ -356,10 +370,10 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
       state alone, so it answers while a store is being refused. DECISIONS 2026-11-03
   - [ ] seal lane
   - [ ] read lane
-  - [ ] → **ROB-13** Bounded stored downsample and point lookups
+  - [x] → **ROB-13** Bounded stored downsample and point lookups
   - [ ] **ROB-7** Ingest decode bounds
   - [x] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
-  - [ ] **ROB-23r** Probe-only admin listener
+  - [x] **ROB-23r** Probe-only admin listener
   - [x] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
   - [ ] **ROB-5** Legacy queue-consumer panics
   - [ ] **SEC-13** Security acceptance
@@ -368,7 +382,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-15** First cross-engine report
   - [x] Write or approve the cross-engine report narrative *(owner)*
   - [x] **EVI-19** Documented RPO/RTO
-  - [ ] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
+  - [x] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
 - [ ] **W8 · Tags core, memory budget**
   - [ ] open lane
   - [ ] → **TAG-9** Frame error classes in recovery
@@ -393,12 +407,12 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] maint lane
   - [ ] open lane
   - [ ] L-INGEST
-  - [ ] storage read handlers lane
+  - [x] storage read handlers lane (TAG-10)
   - [ ] **FRE-10a** Contract tests
   - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [ ] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
-  - [ ] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
+  - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
   - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
   - [ ] read lane
   - [ ] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
@@ -434,7 +448,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 
 The interpolation item (B-interp, Phase 5) is done.
 
-- [ ] **B-tags** *(Phase 2/4 · absent)*
+- [x] **B-tags** *(Phase 2/4 · done: TAG-5..TAG-11)*
 - [ ] **B-conn** *(Phase 2/7 · absent)*
 - [ ] **B-ilp** *(Phase 2 · partial)*
 - [ ] **B-rest** *(Phase 2 · partial)*

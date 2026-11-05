@@ -192,7 +192,6 @@ pub fn observed_window_digest(start_tick: u64, tick_count: u64, ticks: &[(u64, V
 	for (tick, series, row, timestamp_ns, _, value) in &points {
 		feed_point(&mut hasher, *tick, *series, *row, *timestamp_ns, value);
 	}
-	#[allow(clippy::cast_possible_truncation)]
 	let point_count = points.len() as u64;
 	WindowDigest { start_tick, tick_count, point_count, sha256: finish_hex(hasher) }
 }

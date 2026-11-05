@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! `GET /ready` reports the write poison of the segment store the server serves
 //! (basicautomation.io/projects/weftdb/docs/crash-consistency section 5.1): `poisoned`, `restart_required` and the
 //! reason, while `ready` stays `true`, because reads keep working. The handler reads the

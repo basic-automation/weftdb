@@ -45,14 +45,12 @@ fn round2(value: f64) -> f64 {
 /// sinusoid, so a scan does real floating-point work and a wrong block offset shows up.
 fn signal(series: usize, row: usize) -> f64 {
 	use std::f64::consts::TAU;
-	#[allow(clippy::cast_precision_loss)]
 	let (series_f, row_f) = (series as f64, row as f64);
 	round2((30.0 + 10.0 * (series_f * 0.7).sin()) * (row_f / 512.0 * TAU).sin() + series_f)
 }
 
 /// The mean of `sum` over `count` values, or 0.0 for an empty count.
 fn mean(sum: f64, count: usize) -> f64 {
-	#[allow(clippy::cast_precision_loss)]
 	if count > 0 {
 		sum / count as f64
 	} else {
@@ -230,12 +228,10 @@ pub fn run_sparse(profile: &SparseProfile, reps: usize) -> anyhow::Result<BenchR
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.params.seed ^ 0x50A8_C1EC_7B10, ..BootstrapConfig::default() }));
-	#[allow(clippy::cast_precision_loss)]
 	let throughput_points_per_sec = if latency.mean_ns > 0 { table.populated as f64 / (latency.mean_ns as f64 / 1e9) } else { 0.0 };
-	#[allow(clippy::cast_precision_loss)]
 	let missingness_fraction = if table.capacity > 0 { 1.0 - table.populated as f64 / table.capacity as f64 } else { 0.0 };
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_SPARSE.to_string(), reps, dataset: DatasetMeta { input_points: table.populated, output_points: scanned.len(), irregular: false, missingness_fraction, seed: profile.params.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_SPARSE.to_string(), reps, dataset: DatasetMeta { input_points: table.populated, output_points: scanned.len(), irregular: false, missingness_fraction, seed: profile.params.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
 }
 
 /// The nanoseconds elapsed since `since`, saturating at `u64::MAX`.

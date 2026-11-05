@@ -15,8 +15,7 @@ pub(crate) fn safe_usize_to_f64(value: usize) -> std::result::Result<f64, Error>
 	if value_u64 > max_exact {
 		return Err(Error::NumericConversionError(format!("Value {value} exceeds f64 precision limit (max exact integer is {max_exact})")));
 	}
-	#[allow(clippy::cast_precision_loss)]
-	Ok(value_u64 as f64)
+	Ok(crate::types::num::to_f64(value_u64))
 }
 
 pub(crate) fn safe_i64_to_f64(value: i64) -> std::result::Result<f64, Error> {
@@ -26,8 +25,7 @@ pub(crate) fn safe_i64_to_f64(value: i64) -> std::result::Result<f64, Error> {
 	if abs_u64 > max_exact {
 		return Err(Error::NumericConversionError(format!("Value {value} exceeds f64 precision limit (max exact integer is {max_exact})")));
 	}
-	#[allow(clippy::cast_precision_loss)]
-	Ok(value as f64)
+	Ok(crate::types::num::to_f64(value))
 }
 
 pub(crate) fn safe_ratio(numerator: usize, denominator: usize) -> std::result::Result<f64, Error> {

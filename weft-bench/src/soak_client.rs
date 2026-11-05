@@ -213,11 +213,11 @@ impl IngestTarget {
 		format!("{}:{}", self.host, self.port)
 	}
 
-	/// The ingest route for this target: the aspect's ILP endpoint with the field
-	/// and precision the body is written in.
+	/// The ingest route for this target: the aspect's ILP endpoint with the
+	/// measurement (required since TAG-11), field and precision the body is written in.
 	#[must_use]
 	pub fn ingest_path(&self) -> String {
-		format!("/api/v1/storage/{}/ilp?field={}&precision={}", self.aspect, self.field, self.precision)
+		format!("/api/v1/storage/{}/ilp?measurement={}&field={}&precision={}", self.aspect, crate::soak_workload::SOAK_WORKLOAD_MEASUREMENT, self.field, self.precision)
 	}
 
 	/// The route that declares an aspect's schema.
@@ -846,7 +846,7 @@ mod tests {
 		assert_eq!(target.physical_type, SOAK_CLIENT_PHYSICAL_TYPE);
 		assert_eq!(target.timestamp_unit, SOAK_CLIENT_TIMESTAMP_UNIT);
 		assert_eq!(target.authority(), "127.0.0.1:8080");
-		assert_eq!(target.ingest_path(), "/api/v1/storage/soak/ilp?field=value&precision=ns");
+		assert_eq!(target.ingest_path(), "/api/v1/storage/soak/ilp?measurement=soak&field=value&precision=ns");
 		assert_eq!(target.declare_path(), "/api/v1/storage/aspects");
 		assert!(target.declare_body().contains(r#""name":"soak""#), "the declaration names the aspect: {}", target.declare_body());
 		assert!(target.declare_body().contains(r#""physical_type":"f64""#), "the declaration names the encoding: {}", target.declare_body());

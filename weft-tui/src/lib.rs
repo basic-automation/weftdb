@@ -1,4 +1,6 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::io;
 
@@ -8,10 +10,17 @@ use tracing::info;
 
 pub mod app;
 pub mod logging;
+mod num;
 pub mod ui;
 
 pub type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
+/// Runs the TUI until the user quits, restoring the terminal afterwards.
+///
+/// # Errors
+///
+/// Returns an error if the terminal cannot be set up or restored, or if drawing or reading
+/// input fails.
 pub async fn run(log_buffer: logging::LogBuffer) -> Result<()> {
 	info!("Setting up terminal");
 	let mut terminal = setup_terminal()?;

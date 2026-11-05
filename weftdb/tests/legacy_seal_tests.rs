@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Seal-backed legacy aspects (slice D-S19): an aspect created while
 //! `WEFT_LEGACY_DEFAULT_STORAGE=segments` stores through the seal store,
 //! reads back through it, replays a retried batch instead of duplicating
@@ -55,7 +58,7 @@ async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	let raw: Vec<_> = db.get_raw_measurements(&aspect_id, None, None, 100, 0).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
 	assert_eq!(raw.len(), 5);
 	for (i, m) in raw.iter().enumerate() {
-		assert_eq!(m.timestamp(), base + Duration::seconds(i as i64));
+		assert_eq!(m.timestamp(), base + Duration::seconds(i64::try_from(i).expect("fits an i64")));
 		assert_eq!(*m.value(), bd(&format!("{}.5", i + 1)));
 	}
 
@@ -66,8 +69,8 @@ async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	assert_eq!(db.get_latest_measurement(&aspect_id).await?, Some(base + Duration::seconds(4)));
 	let boundary: Vec<_> = db.get_boundary_measurements(&aspect_id).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
 	assert_eq!(boundary.len(), 4, "earliest two and latest two");
-	assert_eq!(boundary.first().map(|m| m.timestamp()), Some(base));
-	assert_eq!(boundary.last().map(|m| m.timestamp()), Some(base + Duration::seconds(4)));
+	assert_eq!(boundary.first().map(weftdb::Measurement::timestamp), Some(base));
+	assert_eq!(boundary.last().map(weftdb::Measurement::timestamp), Some(base + Duration::seconds(4)));
 
 	// A single capture is a one-row ingest.
 	db.capture_measurement(&aspect_id, &dataset, &InputMeasurement::new(base + Duration::seconds(10), bd("99.25"))).await?;
@@ -81,6 +84,7 @@ async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	db.batch_capture_measurements(aspect_id, dataset, vec![InputMeasurement::new(base + Duration::seconds(20), bd(wide))]).await?;
 	let store = db.seal_store().await?;
 	let schema = store.schema_for(&weftdb::legacy_seal::aspect_key(&aspect_id)).await?.expect("the aspect is declared");
+	drop(store);
 	assert_eq!(schema.value, weft_physical_type::PhysicalType::BigDecimalText, "the declaration widened through widen_value_encoding");
 	let all: Vec<_> = db.get_raw_measurements(&aspect_id, None, None, 100, 0).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
 	assert_eq!(all.len(), 7);
@@ -108,11 +112,13 @@ async fn rows_mode_is_the_default_and_compression_forces_it() -> Result<()> {
 	// Even with the variable set, a compression config keeps rows mode.
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 	let compressed = db.track_aspect(&subject.id(), "compressed", &splimes::Resolution::Milliseconds, Some(weftdb::CompressionConfig::default())).await;
+	drop(subject);
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
-	if let Ok(compressed) = compressed {
+	if let Ok(compressed) = &compressed {
 		assert_eq!(compressed.storage_mode(), StorageMode::Rows, "compression deletes ranges, so it stays rows mode");
 		assert_eq!(db.aspect_storage_mode(&compressed.id()).await?, StorageMode::Rows);
 	}
+	drop(compressed);
 
 	// The rows-mode aspect still stores and reads as before.
 	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();

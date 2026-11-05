@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! The store-scope pin (FRE-12b) at the process boundary: a `weft-server` whose
 //! `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` name a namespace the store root does not
 //! record must refuse the start with the operator-action exit (plan C7's 65), because
