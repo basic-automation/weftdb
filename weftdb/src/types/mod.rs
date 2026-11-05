@@ -34,12 +34,13 @@ pub use segment_index::SegmentIndexStore;
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;
-pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBreaker, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, DEFAULT_MAINTENANCE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_WAIT};
+pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBreaker, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, DEFAULT_MAINTENANCE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_WAIT, DEFAULT_MAX_SERIES_PER_ASPECT};
 pub use signal::{units_between, Distance, ErrVal, Signal, SignalType, Signals};
 pub use store_format::{StoreFormat, StoreScope, LEGACY_LAYOUT, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
 pub use trend::Trend;
+pub use upsert_keys::{UpsertKeys, TIMESTAMP_UPSERT_KEY};
 pub use value_kind::{UnknownValueKind, ValueKind, RESERVED_VALUE_KIND_TOKENS};
 
 pub mod aspect;
@@ -86,6 +87,7 @@ pub mod store_format;
 pub mod subject;
 pub mod transaction;
 pub mod trend;
+pub mod upsert_keys;
 pub mod value_kind;
 
 pub use error::*;

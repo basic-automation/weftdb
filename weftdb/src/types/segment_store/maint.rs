@@ -783,8 +783,9 @@ impl SegmentStore {
 	/// "squash non-active partitions each commit, defer the active partition until the
 	/// split threshold" policy. *(src: <https://questdb.com/docs/concepts/partitions/>)*
 	///
-	/// The **hot tail** is the segment with the largest id — ids are assigned
-	/// monotonically on seal, so the newest is the append target. An already-sorted hot
+	/// The **hot tail** is, per series, the segment with the largest id — ids are assigned
+	/// monotonically on seal, so each series' newest is its append target (TAG-6: every
+	/// series keeps its own tail hot; the backlog `threshold` stays aspect-wide). An already-sorted hot
 	/// tail needs no rewrite regardless. The backlog is the aspect's out-of-order
 	/// segment count observed at entry (before any rewrite this pass), so the hot-tail
 	/// decision does not shift as cold segments drop out of the count.
@@ -809,13 +810,13 @@ impl SegmentStore {
 		self.writable()?;
 		aspect_name::validate(held.aspect())?;
 		let threshold = threshold.max(1);
-		let descriptors = self.index.all(held.aspect()).await?;
-		let hot_tail_id = descriptors.iter().map(|d| d.id).max();
-		let unsorted: Vec<u64> = descriptors.iter().filter(|d| !d.time_sorted).map(|d| d.id).collect();
+		let rows = self.index.rows(held.aspect()).await?;
+		let hot_tails: std::collections::BTreeSet<u64> = by_series(rows.clone()).iter().filter_map(|series| series.iter().map(|row| row.desc.id).max()).collect();
+		let unsorted: Vec<u64> = rows.iter().filter(|row| !row.desc.time_sorted).map(|row| row.desc.id).collect();
 		let hot_fires = unsorted.len() >= threshold;
 		let mut out = HotColdReconcile::default();
 		for id in unsorted {
-			if Some(id) == hot_tail_id {
+			if hot_tails.contains(&id) {
 				// The hot tail is deferred until the backlog reaches the threshold.
 				if hot_fires && self.reconcile_segment_held(held, id).await? {
 					out.hot_reconciled += 1;
@@ -889,8 +890,8 @@ impl SegmentStore {
 	/// disorder (the [`unsorted_segments`](AspectStorageStats::unsorted_segments) signal),
 	/// this fixes *cross*-segment overlap (the
 	/// [`overlapping_segments`](AspectStorageStats::overlapping_segments) signal): two
-	/// internally-sorted segments whose windows intersect. Each connected component of
-	/// overlapping segments (transitive time overlap) is merged into one segment under the
+	/// internally-sorted segments of one series whose windows intersect. Each connected component of
+	/// overlapping segments (transitive time overlap, within a series: TAG-6) is merged into one segment under the
 	/// component's **lowest id** and the other members are deleted, so afterwards
 	/// [`SegmentIndex::overlapping_count`](weft_physical_type::SegmentIndex::overlapping_count)
 	/// is zero and a point/range read over the merged window opens a single segment.
@@ -925,6 +926,13 @@ impl SegmentStore {
 	/// component either as it was or merged, whole. A member another operation changed
 	/// meanwhile fails the swap with a `Conflict`, which writes nothing back. The
 	/// materialized rollup is rebuilt after each component's swap.
+	///
+	/// **Skip-identical** (Phase 4.6). When the fold is exactly the lowest-id member's own
+	/// rows (a replay of rows it already holds, say) and that member is time-sorted, no
+	/// frame is written: the swap keeps the member's row as it is, under the same
+	/// version precondition a rewrite takes (a racing change to it is a `Conflict`), and
+	/// only deletes and retires the others. Values are compared in their plain form,
+	/// scale included, so `-3` never stands in for `-3.0`.
 	///
 	/// Returns the net reduction in segment count across all components — `members − 1`
 	/// per fully-rewritten component and `members − 2` per split one (a split keeps two
@@ -1009,7 +1017,16 @@ impl SegmentStore {
 			let mut starts: Vec<i64> = members.iter().filter_map(|member| member.desc.min_ts).collect();
 			starts.sort_unstable();
 			let cold_boundary = starts.get(1).copied().unwrap_or(i64::MIN);
-			let (all_ts, all_vs) = self.merge_members(&members).await?;
+			let (all_ts, all_vs, identical) = self.merge_members_against_first(&members).await?;
+			// Skip-identical (Phase 4.6, design 9b): the lowest-id member already holds
+			// every row the fold gives, so it is kept as it is and only the others are
+			// deleted. No frame is written, and the kept frame keeps its paging.
+			if identical {
+				let plan = SwapPlan::keep(members);
+				removed += plan.removes();
+				self.swap_plan(held, &schema, plan).await?;
+				continue;
+			}
 			// The cold prefix: merged rows strictly before the second member's start.
 			let prefix_len = all_ts.partition_point(|&t| t < cold_boundary);
 			// Estimate prefix/suffix bytes from the component's uniform per-row size.
@@ -1117,7 +1134,7 @@ impl SegmentStore {
 				continue;
 			};
 			let pass = async {
-				let had_overlap = self.index.load_index(aspect).await?.overlapping_count() > 0;
+				let had_overlap = series_overlapping_count(&self.index.rows(aspect).await?) > 0;
 				let removed = self.reconcile_overlaps_held(&held, policy).await?;
 				anyhow::Ok((had_overlap, removed))
 			};
@@ -1158,8 +1175,11 @@ impl SegmentStore {
 	/// A seal that commits meanwhile is not one of them, keeps its own id and row, and
 	/// outranks the output where they share a timestamp.
 	///
-	/// Returns the number of segments removed (`count − 1`); zero when the aspect has
-	/// fewer than two segments (nothing to squash).
+	/// Each series is squashed on its own (TAG-6: one plan, and one swap, per series, so an
+	/// output never mixes series, invariant I12), into one segment per series.
+	///
+	/// Returns the number of segments removed (`Σ (series count − 1)`; `count − 1` for an
+	/// untagged aspect); zero when no series has two segments (nothing to squash).
 	///
 	/// # Errors
 	///
@@ -1179,26 +1199,43 @@ impl SegmentStore {
 	/// [`squash_aspect`](Self::squash_aspect) under the maintenance lock `held`.
 	pub(crate) async fn squash_aspect_held(&self, held: &MaintGuard) -> Result<usize> {
 		self.writable()?;
+		aspect_name::validate(held.aspect())?;
+		// M1: every row, ascending by id, as the swaps' preconditions will name them.
+		let series = by_series(self.index.rows(held.aspect()).await?);
+		self.squash_series_held(held, series, 1).await
+	}
+
+	/// Squash each of `series` (the rows of one series each, ascending by id) that holds
+	/// more than `max_segments` segments into one segment, one swap per series (TAG-6),
+	/// so no swap nears [`MAX_PLANS_PER_TXN`] and no output mixes series. Returns the
+	/// segments removed. Series squashed before a failure stay squashed.
+	async fn squash_series_held(&self, held: &MaintGuard, series: Vec<Vec<IndexRow>>, max_segments: usize) -> Result<usize> {
 		let aspect = held.aspect();
-		aspect_name::validate(aspect)?;
-		// M1: every row, ascending by id, as the swap's preconditions will name them.
-		let members = self.index.rows(aspect).await?;
-		if members.len() < 2 {
-			return Ok(0);
+		let mut removed = 0;
+		let mut schema = None;
+		for members in series {
+			if members.len() < 2 || members.len() <= max_segments {
+				continue;
+			}
+			let schema = match &schema {
+				Some(schema) => schema,
+				None => schema.insert(self.require_schema(aspect).await?),
+			};
+			// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
+			let (all_ts, all_vs) = self.merge_members(&members).await?;
+			let rows_per_page = merge_rows_per_page(all_ts.len());
+			let plan = SwapPlan::cut(members, all_ts, all_vs, rows_per_page, &[]);
+			let plan_removes = plan.removes();
+			self.swap_plan(held, schema, plan).await?;
+			removed += plan_removes;
 		}
-		let schema = self.require_schema(aspect).await?;
-		// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
-		let (all_ts, all_vs) = self.merge_members(&members).await?;
-		let rows_per_page = merge_rows_per_page(all_ts.len());
-		let plan = SwapPlan::cut(members, all_ts, all_vs, rows_per_page, &[]);
-		let removed = plan.removes();
-		self.swap_plan(held, &schema, plan).await?;
 		Ok(removed)
 	}
 
 	/// **Threshold-triggered squash** (roadmap Phase 4.6): run
-	/// [`squash_aspect`](SegmentStore::squash_aspect) **only** when `aspect` has more than
-	/// `max_segments` segments, otherwise leave it untouched.
+	/// [`squash_aspect`](SegmentStore::squash_aspect) **only** on the series of `aspect`
+	/// that hold more than `max_segments` segments (TAG-6: the cap is per series; an
+	/// untagged aspect is one series), otherwise leave it untouched.
 	///
 	/// The trigger a background compaction pass keys on to cap split-path fragmentation,
 	/// modeled on `QuestDB`'s `cairo.o3.last.partition.max.splits` squash threshold: below
@@ -1207,9 +1244,9 @@ impl SegmentStore {
 	/// dominates and a squash fires. A `max_segments` of 0 clamps to 1 (an aspect can
 	/// never squash below a single segment).
 	///
-	/// Returns `Some(removed)` when the squash fired (the count was `> max_segments`) and
-	/// `None` when it held. The count is read from the durable index, so a caller can
-	/// poll cheaply and pay the rewrite only when it fires.
+	/// Returns `Some(removed)` when the squash fired (a series' count was `> max_segments`)
+	/// and `None` when it held. The aspect-wide count is read from the durable index first,
+	/// so a caller can poll cheaply and pay the rewrite only when it fires.
 	///
 	/// # Errors
 	///
@@ -1227,10 +1264,15 @@ impl SegmentStore {
 		self.writable()?;
 		aspect_name::validate(held.aspect())?;
 		let max_segments = max_segments.max(1);
+		// No series holds more segments than the aspect, so the cheap count settles most ticks.
 		if self.index.count(held.aspect()).await? <= max_segments {
 			return Ok(None);
 		}
-		Ok(Some(self.squash_aspect_held(held).await?))
+		let series = by_series(self.index.rows(held.aspect()).await?);
+		if series.iter().all(|members| members.len() <= max_segments) {
+			return Ok(None);
+		}
+		Ok(Some(self.squash_series_held(held, series, max_segments).await?))
 	}
 
 	/// **Store-wide threshold squash** (roadmap Phase 4.6): apply the
@@ -1292,7 +1334,8 @@ impl SegmentStore {
 	/// 200k-row segment measured ~32.8 ms vs ~9.7 ms for sixteen ~12.5k-row segments — a
 	/// single segment offers no cross-segment parallelism and decodes its whole column in
 	/// one shot, while too many segments pay a per-segment fixed cost). This compaction
-	/// instead coalesces **consecutive** (seal-id-ordered) segments into groups whose
+	/// instead coalesces **consecutive** (seal-id-ordered) segments of one series (TAG-6:
+	/// a group never spans two series) into groups whose
 	/// combined row count first reaches `target_rows`, merging each multi-segment group
 	/// into one segment under the group's lowest id and leaving already-large segments
 	/// untouched — folding an over-fragmented aspect toward ~`target_rows`-sized segments
@@ -1334,24 +1377,28 @@ impl SegmentStore {
 		if rows.len() < 2 {
 			return Ok(0);
 		}
-		// Greedily group consecutive ids until a group's cumulative row count first reaches
-		// the target; a trailing partial group is kept as-is. A group that stays a singleton
-		// (a segment already ≥ target, or the lone tail) is skipped below — never rewritten.
-		// A group is a run of consecutive live ids, so no other row's id falls between its
-		// members' (the precedence argument of P1).
+		// Per series (TAG-6), greedily group consecutive ids until a group's cumulative row
+		// count first reaches the target; a trailing partial group is kept as-is. A group that
+		// stays a singleton (a segment already ≥ target, or the lone tail) is skipped below —
+		// never rewritten. A group is a run of consecutive live ids of its series, so no other
+		// row of the series has an id between its members' (the precedence argument of P1,
+		// which holds per series because a read targets one series, tags D4); a row of
+		// another series between them is never compared with the output.
 		let mut groups: Vec<Vec<IndexRow>> = Vec::new();
-		let mut group: Vec<IndexRow> = Vec::new();
-		let mut group_rows = 0usize;
-		for row in rows {
-			group_rows += row.desc.row_count;
-			group.push(row);
-			if group_rows >= target_rows {
-				groups.push(std::mem::take(&mut group));
-				group_rows = 0;
+		for series in by_series(rows) {
+			let mut group: Vec<IndexRow> = Vec::new();
+			let mut group_rows = 0usize;
+			for row in series {
+				group_rows += row.desc.row_count;
+				group.push(row);
+				if group_rows >= target_rows {
+					groups.push(std::mem::take(&mut group));
+					group_rows = 0;
+				}
 			}
-		}
-		if !group.is_empty() {
-			groups.push(group);
+			if !group.is_empty() {
+				groups.push(group);
+			}
 		}
 		let schema = self.require_schema(aspect).await?;
 		let mut removed = 0usize;
@@ -1465,6 +1512,16 @@ impl SegmentStore {
 		let ideal = meta.total_rows.div_ceil(target_rows as u64).max(1);
 		if (meta.segment_count as u64) <= ideal {
 			return Ok(None);
+		}
+		// TAG-6: compaction never folds two series together, so a tagged aspect's ideal is the
+		// sum of its series' (at least one segment each). That sum is never below the
+		// aspect-wide ideal, so the rollup check above settles a converged aspect alone; only
+		// an aspect with registered series that it did not settle reads its rows.
+		if self.index.series_count(held.aspect()).await? > 0 {
+			let series_ideal: u64 = by_series(self.index.rows(held.aspect()).await?).iter().map(|members| members.iter().map(|row| row.desc.row_count as u64).sum::<u64>().div_ceil(target_rows as u64).max(1)).sum();
+			if (meta.segment_count as u64) <= series_ideal {
+				return Ok(None);
+			}
 		}
 		Ok(Some(self.squash_aspect_to_target_rows_held(held, target_rows).await?))
 	}

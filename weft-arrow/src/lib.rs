@@ -490,6 +490,11 @@ fn build_record_batch(unit: TimeUnit, physical_type_name: &str, version: u16, ti
 pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
 	let ts_col = batch.column_by_name(TIMESTAMP_COLUMN).ok_or(ConvertError::MissingColumn(TIMESTAMP_COLUMN))?;
 	let ts_array = ts_col.as_any().downcast_ref::<Int64Array>().ok_or(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64" })?;
+	// `values()` ignores the validity bitmap: a null timestamp would read as whatever its
+	// slot holds (0, the epoch), and the row would be stored at an instant nobody sent.
+	if ts_array.null_count() > 0 {
+		return Err(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64 with no nulls" });
+	}
 	let timestamps: Vec<i64> = ts_array.values().to_vec();
 
 	let val_col = batch.column_by_name(VALUE_COLUMN).ok_or(ConvertError::MissingColumn(VALUE_COLUMN))?;
@@ -1496,6 +1501,29 @@ mod tests {
 	#[test]
 	fn parquet_write_rejects_an_empty_batch_set() {
 		assert_eq!(write_parquet(&[]), Err(ConvertError::EmptyBatchSet));
+	}
+
+	/// Snappy is the default codec of the writers clients ingest from (pyarrow, R's arrow,
+	/// pandas, Spark): a reader built without it refuses their files outright.
+	#[test]
+	fn parquet_reads_a_snappy_compressed_file() {
+		use parquet::{basic::Compression, file::properties::WriterProperties};
+		let schema = Arc::new(Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, DataType::Utf8, true)]));
+		let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1_i64, 2])), Arc::new(StringArray::from(vec![Some("1.25"), None]))]).expect("constructs");
+		let mut bytes = Vec::new();
+		let properties = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
+		let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties)).expect("a snappy writer");
+		writer.write(&batch).expect("writes");
+		writer.close().expect("closes");
+		let read = read_parquet(&bytes).expect("snappy reads");
+		assert_eq!(read[0].column(1).as_ref(), batch.column(1).as_ref());
+	}
+
+	#[test]
+	fn a_null_timestamp_is_refused_not_read_as_the_epoch() {
+		let schema = Arc::new(Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, true), Field::new(VALUE_COLUMN, DataType::Utf8, true)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(5_i64), None])), Arc::new(StringArray::from(vec![Some("1"), Some("2")]))]).expect("constructs");
+		assert_eq!(record_batch_to_columns(&batch), Err(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64 with no nulls" }));
 	}
 
 	#[test]

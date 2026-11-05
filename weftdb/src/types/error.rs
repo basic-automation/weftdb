@@ -11,6 +11,12 @@ fn describe_schema(schema: &AspectSchema) -> String {
 	format!("{value} (tolerance {}, timestamps in {})", schema.value_tolerance, schema.timestamp_unit.name())
 }
 
+/// Upsert keys as an error message names them: the wire list, or `none (timestamp and
+/// the full tag set)` for an undeclared aspect.
+fn describe_upsert_keys(keys: Option<&crate::UpsertKeys>) -> String {
+	keys.map_or_else(|| "none (timestamp and the full tag set)".to_string(), ToString::to_string)
+}
+
 #[derive(Debug, ThisError)]
 pub enum Error {
 	#[error("Insufficient measurements provided for interpolation")]
@@ -220,14 +226,73 @@ pub enum StoreError {
 		/// The fingerprint of the batch just offered.
 		offered_fingerprint: i64,
 	},
-	/// An ingest batch carried a non-empty `groups` tag set before the tags
-	/// gate flips (1.0 plan §5 D-S13, §4 C1/A4): until then the only group an
-	/// ingest may name is the empty [`TagSet`](crate::TagSet), series 0.
-	/// Nothing was written.
+	/// **Reserved; no longer produced.** An ingest batch carried a non-empty
+	/// `groups` tag set before the tags gate flipped (1.0 plan §5 D-S13, §4
+	/// C1/A4). The library gate opened in TAG-8: a tagged batch now seals as its
+	/// series. The variant stays so that matching code keeps compiling.
 	#[error("aspect {aspect:?}: ingest groups are not accepted yet (only the empty tag set, series 0, before the tags gate flips); nothing was written")]
 	GroupsUnsupported {
 		/// The aspect the batch was offered to.
 		aspect: String,
+	},
+	/// An ingest batch named a series `aspect` has not registered, and the aspect
+	/// already holds `limit` series, the most
+	/// [`SegmentStoreOptions::max_series_per_aspect`](crate::SegmentStoreOptions::max_series_per_aspect)
+	/// allows (TAG-7). Series already registered stay writable; only a new key is
+	/// refused. Nothing was committed.
+	#[error("aspect {aspect:?} already holds {limit} series, the most it may hold; a batch for a new series was refused and nothing was committed (series already registered stay writable)")]
+	SeriesLimit {
+		/// The aspect the batch was offered to.
+		aspect: String,
+		/// The per-aspect series cap in force.
+		limit: usize,
+	},
+	/// An ingest batch's `groups` named a tag key with the reserved `__` prefix
+	/// ([`RESERVED_TAG_KEY_PREFIX`](crate::tags::RESERVED_TAG_KEY_PREFIX)), which a
+	/// [`TagSet`](crate::TagSet) converted from a stored
+	/// [`SeriesKey`](crate::SeriesKey) may carry but an ingest may not write
+	/// (TAG-8). Nothing was written.
+	#[error("aspect {aspect:?}: the tag key {key:?} starts with `__`, which is reserved for system dimensions; nothing was written")]
+	ReservedTagKey {
+		/// The aspect the batch was offered to.
+		aspect: String,
+		/// The reserved key the batch named.
+		key: String,
+	},
+	/// An ingest batch's `groups` named a tag key outside the aspect's declared
+	/// [`UpsertKeys`](crate::UpsertKeys) (Phase 4.6): with upsert keys declared, every row's
+	/// tags must fall inside them, because a tag outside the key has no per-row storage to
+	/// carry it once rows that differ only in it fold into one. Nothing was written.
+	#[error("aspect {aspect:?}: the tag key {key:?} is not an upsert key (the aspect declares upsert keys {declared}); nothing was written")]
+	NotAnUpsertKey {
+		/// The aspect the batch was offered to.
+		aspect: String,
+		/// The tag key outside the declaration.
+		key: String,
+		/// The declared upsert keys.
+		declared: crate::UpsertKeys,
+	},
+	/// A declaration named upsert keys other than the ones `aspect` is declared with
+	/// (Phase 4.6): like the schema, an upsert-key declaration is immutable once made, and
+	/// no declaration is a declaration too. Nothing was written.
+	#[error("aspect {aspect:?} is declared with upsert keys {} and they are immutable; the offered {} was refused and nothing was written", describe_upsert_keys(declared.as_ref()), describe_upsert_keys(offered.as_ref()))]
+	UpsertKeysConflict {
+		/// The aspect that was re-declared.
+		aspect: String,
+		/// The upsert keys it is declared with ([`None`]: undeclared).
+		declared: Option<crate::UpsertKeys>,
+		/// The upsert keys the refused declaration offered.
+		offered: Option<crate::UpsertKeys>,
+	},
+	/// A [`SeriesSelector`](crate::SeriesSelector) matched more than one series
+	/// of `aspect`, and a store read targets exactly one (TAG-8, tags D4). Narrow
+	/// the selector, or select exactly. Nothing was read.
+	#[error("aspect {aspect:?}: the series selector matched {matched} series, and a read targets exactly one; narrow the selector")]
+	AmbiguousSeries {
+		/// The aspect the selector was resolved in.
+		aspect: String,
+		/// How many series it matched (two or more).
+		matched: usize,
 	},
 	/// An ingest batch held no rows. Nothing was written, and the key is not
 	/// recorded: an empty batch has no receipt to replay.

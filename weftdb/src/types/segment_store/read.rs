@@ -43,6 +43,28 @@ impl SegmentStore {
 		tokio::task::spawn_blocking(move || fold_newest_wins(frames)).await.context("merging maintenance inputs")
 	}
 
+	/// [`merge_members`](Self::merge_members), and whether the fold is exactly the
+	/// lowest-id member's own rows (Phase 4.6 skip-identical, design 9b): the member is
+	/// `time_sorted`, and its decoded rows equal the folded ones row for row, each value
+	/// compared in its plain form, scale included ([`same_rows`]), so `-3` and `-3.0` are
+	/// different rows here even though `BigDecimal` calls them equal (critique F23).
+	/// When it is, a reconcile can keep that member as it is instead of writing the fold.
+	pub(crate) async fn merge_members_against_first(&self, members: &[IndexRow]) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>, bool)> {
+		let mut frames = Vec::with_capacity(members.len());
+		for member in members {
+			frames.push(self.read_bound_frame(member).await?);
+		}
+		let sorted_first = members.first().is_some_and(|first| first.desc.time_sorted);
+		tokio::task::spawn_blocking(move || {
+			let first = frames.first().filter(|_| sorted_first).map(|frame| (frame.timestamps.clone(), frame.values.clone()));
+			let (timestamps, values) = fold_newest_wins(frames);
+			let identical = first.is_some_and(|(first_ts, first_vs)| same_rows(&first_ts, &first_vs, &timestamps, &values));
+			(timestamps, values, identical)
+		})
+		.await
+		.context("merging maintenance inputs")
+	}
+
 	/// The file holding `descriptor`'s frame: its recorded path, resolved against this
 	/// store's root (see [`resolve_frame_path`]), so that a root that was moved or
 	/// restored elsewhere still reads its own frames.
@@ -100,9 +122,21 @@ impl SegmentStore {
 	/// failure carrying a [`crate::FrameFaultError`] — the C5 fault class (`integrity`,
 	/// `newer_format` or `undecodable`) for a corrupt or unreadable `.weftseg`.
 	pub async fn read_time_range(&self, aspect: &str, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+		self.read_time_range_of(aspect, crate::SeriesId::UNTAGGED, start, end).await
+	}
+
+	/// [`read_time_range`](Self::read_time_range) of one series (TAG-8): only the rows of
+	/// `series` are read. [`read_time_range`](Self::read_time_range) is this with
+	/// [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED). A series with no rows (or an id
+	/// the aspect never registered) reads empty.
+	///
+	/// # Errors
+	///
+	/// As [`read_time_range`](Self::read_time_range).
+	pub async fn read_time_range_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
-		let descriptors = self.index.prune_by_time(aspect, start, end).await?;
+		let descriptors: Vec<SegmentDescriptor> = self.index.prune_series_rows_by_time(aspect, series, start, end).await?.into_iter().map(|row| row.desc).collect();
 		let mut timestamps = Vec::new();
 		let mut values = Vec::new();
 		for descriptor in &descriptors {
@@ -144,7 +178,16 @@ impl SegmentStore {
 	/// stored epoch falls outside the representable instant range, or if the reduction
 	/// fails.
 	pub async fn downsample_range(&self, aspect: &str, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
-		let partial = self.downsample_partial(aspect, start, end, resolution, aggregations).await?;
+		self.downsample_range_of(aspect, crate::SeriesId::UNTAGGED, start, end, resolution, aggregations).await
+	}
+
+	/// [`downsample_range`](Self::downsample_range) of one series (TAG-8).
+	///
+	/// # Errors
+	///
+	/// As [`downsample_range`](Self::downsample_range).
+	pub async fn downsample_range_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		let partial = self.downsample_partial(aspect, series, start, end, resolution, aggregations).await?;
 		partial.map_or_else(|| Ok(Vec::new()), |p| p.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")))
 	}
 
@@ -158,7 +201,16 @@ impl SegmentStore {
 	///
 	/// As [`downsample_range`](Self::downsample_range).
 	pub async fn downsample_range_width(&self, aspect: &str, start: i64, end: i64, width: weft_reduce::BucketWidth, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
-		let partial = self.downsample_partial(aspect, start, end, width.unit(), aggregations).await?;
+		self.downsample_range_width_of(aspect, crate::SeriesId::UNTAGGED, start, end, width, aggregations).await
+	}
+
+	/// [`downsample_range_width`](Self::downsample_range_width) of one series (TAG-8).
+	///
+	/// # Errors
+	///
+	/// As [`downsample_range`](Self::downsample_range).
+	pub async fn downsample_range_width_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, width: weft_reduce::BucketWidth, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		let partial = self.downsample_partial(aspect, series, start, end, width.unit(), aggregations).await?;
 		let Some(partial) = partial else { return Ok(Vec::new()) };
 		partial.coarsen(width.count()).and_then(|p| p.finish_width(width, aggregations)).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"))
 	}
@@ -167,7 +219,7 @@ impl SegmentStore {
 	/// `None` when no row falls there: the fold behind
 	/// [`downsample_range`](Self::downsample_range) and
 	/// [`downsample_range_width`](Self::downsample_range_width).
-	pub(crate) async fn downsample_partial(&self, aspect: &str, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
+	pub(crate) async fn downsample_partial(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		let schema = self.require_schema(aspect).await?;
@@ -178,7 +230,7 @@ impl SegmentStore {
 		// is never opened. `read_time_range` right above deliberately keeps the time-only
 		// prune: its answer *is* the rows, nulls included, so dropping that segment there
 		// would delete timestamps the caller asked for.
-		let (descriptors, frame_crcs): (Vec<SegmentDescriptor>, Vec<Option<u32>>) = self.index.prune_present_rows(aspect, start, end).await?.into_iter().map(|row| (row.desc, row.frame_crc)).unzip();
+		let (descriptors, frame_crcs): (Vec<SegmentDescriptor>, Vec<Option<u32>>) = self.index.prune_series_present_rows(aspect, series, start, end).await?.into_iter().map(|row| (row.desc, row.frame_crc)).unzip();
 
 		// A persisted per-segment partial can *substitute* for decoding a segment only when
 		// it can answer this exact query: every requested reduction must be one the sidecar
@@ -280,9 +332,18 @@ impl SegmentStore {
 	/// failure carrying a [`crate::FrameFaultError`] — the C5 fault class (`integrity`,
 	/// `newer_format` or `undecodable`) for a corrupt or unreadable `.weftseg`.
 	pub async fn read_point(&self, aspect: &str, t: i64) -> Result<Option<BigDecimal>> {
+		self.read_point_of(aspect, crate::SeriesId::UNTAGGED, t).await
+	}
+
+	/// [`read_point`](Self::read_point) of one series (TAG-8).
+	///
+	/// # Errors
+	///
+	/// As [`read_point`](Self::read_point).
+	pub async fn read_point_of(&self, aspect: &str, series: crate::SeriesId, t: i64) -> Result<Option<BigDecimal>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
-		let descriptors = self.index.prune_present_descriptors(aspect, t, t).await?;
+		let descriptors = self.series_present_descriptors(aspect, series, t, t).await?;
 		let mut found = None;
 		for descriptor in &descriptors {
 			let bytes = self.read_frame(descriptor).await?;
@@ -317,6 +378,15 @@ impl SegmentStore {
 	/// failure carrying a [`crate::FrameFaultError`] — the C5 fault class (`integrity`,
 	/// `newer_format` or `undecodable`) for a corrupt or unreadable `.weftseg`.
 	pub async fn read_points(&self, aspect: &str, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>> {
+		self.read_points_of(aspect, crate::SeriesId::UNTAGGED, ts).await
+	}
+
+	/// [`read_points`](Self::read_points) of one series (TAG-8).
+	///
+	/// # Errors
+	///
+	/// As [`read_points`](Self::read_points).
+	pub async fn read_points_of(&self, aspect: &str, series: crate::SeriesId, ts: &[i64]) -> Result<Vec<Option<BigDecimal>>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		if ts.is_empty() {
@@ -324,7 +394,7 @@ impl SegmentStore {
 		}
 		// Prune the index once by the batch's whole span (safe: every instant lies within it).
 		let (lo, hi) = ts.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &t| (lo.min(t), hi.max(t)));
-		let descriptors = self.index.prune_present_descriptors(aspect, lo, hi).await?;
+		let descriptors = self.series_present_descriptors(aspect, series, lo, hi).await?;
 		let mut found = vec![None; ts.len()];
 		for descriptor in &descriptors {
 			let bytes = self.read_frame(descriptor).await?;
@@ -356,9 +426,19 @@ impl SegmentStore {
 	/// failure carrying a [`crate::FrameFaultError`] — the C5 fault class (`integrity`,
 	/// `newer_format` or `undecodable`) for a corrupt or unreadable `.weftseg`.
 	pub async fn read_value_range(&self, aspect: &str, lo: &BigDecimal, hi: &BigDecimal) -> Result<(Vec<i64>, Vec<BigDecimal>)> {
+		self.read_value_range_of(aspect, crate::SeriesId::UNTAGGED, lo, hi).await
+	}
+
+	/// [`read_value_range`](Self::read_value_range) of one series (TAG-8): the resident
+	/// index it prunes by value is built from that series' rows only.
+	///
+	/// # Errors
+	///
+	/// As [`read_value_range`](Self::read_value_range).
+	pub async fn read_value_range_of(&self, aspect: &str, series: crate::SeriesId, lo: &BigDecimal, hi: &BigDecimal) -> Result<(Vec<i64>, Vec<BigDecimal>)> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
-		let index = self.index.load_index(aspect).await?;
+		let index = self.index.load_series_index(aspect, series).await?;
 		let mut timestamps = Vec::new();
 		let mut values = Vec::new();
 		for descriptor in index.prune_by_value(lo, hi) {
@@ -373,6 +453,65 @@ impl SegmentStore {
 			}
 		}
 		Ok((timestamps, values))
+	}
+
+	/// The present-value descriptors of `series` overlapping `[start, end]`: the
+	/// series-scoped [`prune_present_descriptors`](SegmentIndexStore::prune_present_descriptors).
+	async fn series_present_descriptors(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<Vec<SegmentDescriptor>> {
+		Ok(self.index.prune_series_present_rows(aspect, series, start, end).await?.into_iter().map(|row| row.desc).collect())
+	}
+
+	/// Resolve `selector` to the one series of `aspect` it names (TAG-8, tags D4), once,
+	/// for the `_of` reads.
+	///
+	/// - [`SeriesSelector::untagged`](crate::SeriesSelector::untagged) is
+	///   [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED) without touching the catalog.
+	/// - Otherwise every registered series whose [`TagSet`](crate::TagSet) the selector
+	///   [matches](crate::SeriesSelector::matches_key) is a candidate, read from the
+	///   index's per-aspect catalog cache (no SQL once loaded), and series 0 is one
+	///   only when the selector matches the empty tag set **and** series 0 holds rows
+	///   (series 0 has no catalog row; without the existence test a loose selector would
+	///   always be ambiguous on a tagged aspect).
+	/// - No candidate is `Ok(None)`: the read is empty.
+	///
+	/// # Errors
+	///
+	/// [`StoreError::AmbiguousSeries`] when two or more series match, an invalid
+	/// `aspect` name, or a libSQL read failure.
+	pub async fn resolve_series(&self, aspect: &str, selector: &crate::SeriesSelector) -> Result<Option<crate::SeriesId>> {
+		aspect_name::validate(aspect)?;
+		if *selector == crate::SeriesSelector::untagged() {
+			return Ok(Some(crate::SeriesId::UNTAGGED));
+		}
+		let mut matched = Vec::new();
+		if selector.matches(&crate::TagSet::new()) && self.index.series_has_rows(aspect, crate::SeriesId::UNTAGGED).await? {
+			matched.push(crate::SeriesId::UNTAGGED);
+		}
+		for (id, key) in self.index.cached_series_of(aspect).await?.iter() {
+			if selector.matches_key(key) {
+				matched.push(*id);
+			}
+		}
+		match matched.as_slice() {
+			[] => Ok(None),
+			[one] => Ok(Some(*one)),
+			_ => Err(StoreError::AmbiguousSeries { aspect: aspect.to_string(), matched: matched.len() }.into()),
+		}
+	}
+
+	/// The tags of one series of `aspect` (TAG-10): the empty set for
+	/// [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED), the decoded catalog key for a
+	/// registered series, and `None` for an id the catalog does not hold. A read route
+	/// reports this beside the rows of the series [`resolve_series`](Self::resolve_series)
+	/// picked.
+	///
+	/// # Errors
+	///
+	/// An invalid `aspect` name, a libSQL read failure, or a stored key that is not
+	/// canonical.
+	pub async fn series_tags(&self, aspect: &str, series: crate::SeriesId) -> Result<Option<crate::TagSet>> {
+		aspect_name::validate(aspect)?;
+		Ok(self.index.series_key_of(aspect, series).await?.map(crate::TagSet::from))
 	}
 
 	/// Read and fully decode one segment file (frame-version aware), returning all

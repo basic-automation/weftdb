@@ -120,7 +120,7 @@ async fn the_other_ingest_formats_seal() {
 	client.declare_aspect(&AspectDeclaration::new("load", "bigdecimal_text", "seconds")).await.unwrap();
 	let csv = client.write_csv("load", "timestamp,value\n1,0.5\n2,0.75\n", &WriteOptions::default()).await.unwrap();
 	assert_eq!(csv.row_count, 2);
-	let ilp = client.write_ilp("load", "load", "cpu,host=a load=1.5 3\ncpu,host=a load=2 4\n", &WriteOptions::default().precision("s")).await.unwrap();
+	let ilp = client.write_ilp("load", "load", "cpu load=1.5 3\ncpu load=2 4\n", &WriteOptions::default().precision("s").measurement("cpu")).await.unwrap();
 	assert_eq!(ilp.row_count, 2);
 	let all: Vec<_> = client.points_stream("load", 0, 10, 100).try_collect().await.unwrap();
 	assert_eq!(all.len(), 4);
