@@ -16,8 +16,9 @@ pub trait DatabaseStructure {
 	///
 	/// Creation is atomic: an error or a crash leaves either no `{name}` folder (so the
 	/// call can simply be retried) or the complete database (which `existing` opens).
-	#[allow(clippy::new_ret_no_self)]
-	async fn new(name: &str) -> Result<Database>;
+	async fn new(name: &str) -> Result<Self>
+	where
+		Self: Sized;
 
 	/// Load an existing Database
 	async fn existing(name: &str) -> Result<Database>;

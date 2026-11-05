@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! # High-Performance Time-Series Database
 //!
 //! A high-performance time-series database with advanced interpolation capabilities,
@@ -261,10 +264,6 @@
 //!   `weftdb` does not enable splimes' `gpu` feature, so a build that wants the GPU asks
 //!   for it explicitly.
 
-#![recursion_limit = "1024"]
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception, clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_precision_loss, clippy::option_if_let_else, clippy::needless_continue, clippy::manual_let_else)]
-
 mod types;
 
 // Export all public types from the types module
@@ -275,6 +274,29 @@ pub use types::*;
 // canonical series key, and re-exported here so a weftdb user need not depend on that
 // crate. `weftdb::tags` also carries the frozen caps and separators.
 pub use weft_physical_type::tags::{self, SeriesKey, SeriesSelector, TagError, TagSet};
+
+/// The id a store gave one series of an aspect: the handle its reads target and the value
+/// `segment_index.series_id` records.
+///
+/// An id means something only inside the store and aspect that handed it out, which is
+/// why a frame records its [`SeriesKey`] and never its id. Ids are allocated per aspect
+/// from 1 upwards and never reused; [`SeriesId::UNTAGGED`], series 0, is the empty tag
+/// set, which every untagged write lands in and which no catalog row names. It is a
+/// newtype rather than a bare `u64` so that a series id cannot be passed where a segment
+/// id is meant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SeriesId(pub u64);
+
+impl SeriesId {
+	/// Series 0: the empty tag set, implicit in every aspect.
+	pub const UNTAGGED: Self = Self(0);
+}
+
+impl std::fmt::Display for SeriesId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.fmt(f)
+	}
+}
 
 #[cfg(test)]
 mod tests {

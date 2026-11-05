@@ -37,9 +37,10 @@ pub const MAX_PLAIN_STEM_BYTES: usize = 200;
 /// How much of an over-long encoded aspect a hashed stem keeps, at most.
 const HASHED_PREFIX_BYTES: usize = 160;
 
-/// The stem every write-once frame of `aspect` starts with: its encoded name, or for a
-/// name that encodes past [`MAX_PLAIN_STEM_BYTES`], a prefix of that followed by `~h`
-/// and the name's hash (see the module documentation).
+/// The stem every write-once frame of `aspect` starts with.
+///
+/// Its encoded name, or for a name that encodes past [`MAX_PLAIN_STEM_BYTES`], a prefix of that
+/// followed by `~h` and the name's hash (see the module documentation).
 #[must_use]
 pub fn stem(aspect: &str) -> String {
 	let encoded = aspect_name::encode(aspect);
@@ -65,10 +66,11 @@ pub fn frame_name(aspect: &str, gen: u64, prec: u64) -> String {
 	format!("{}~g{gen}~p{prec}{EXTENSION}", stem(aspect))
 }
 
-/// The file name of the partial-reduction sidecar beside that frame: the same stem,
-/// generation and precedence, with the `.weftpart` extension. A sidecar is named by
-/// its frame, not by the segment id the commit assigns — the frame name is never
-/// reused, while an id may be taken by a later output.
+/// The file name of the partial-reduction sidecar beside that frame.
+///
+/// The same stem, generation and precedence, with the `.weftpart` extension. A sidecar is named by its
+/// frame, not by the segment id the commit assigns — the frame name is never reused, while an id may be
+/// taken by a later output.
 #[must_use]
 pub fn sidecar_name(aspect: &str, gen: u64, prec: u64) -> String {
 	format!("{}~g{gen}~p{prec}.weftpart", stem(aspect))
@@ -94,9 +96,11 @@ impl FrameName {
 	}
 }
 
-/// Parse `name` as a write-once frame name: exactly what [`frame_name`] writes, with a
-/// canonical stem and canonical decimal fields, so `frame_name` of the parts gives `name`
-/// back. `None` for anything else, including every legacy `{aspect}-{id}.weftseg` name.
+/// Parse `name` as a write-once frame name.
+///
+/// Exactly what [`frame_name`] writes, with a canonical stem and canonical decimal fields, so
+/// `frame_name` of the parts gives `name` back. `None` for anything else, including every legacy
+/// `{aspect}-{id}.weftseg` name.
 #[must_use]
 pub fn parse(name: &str) -> Option<FrameName> {
 	let body = name.strip_suffix(EXTENSION)?;

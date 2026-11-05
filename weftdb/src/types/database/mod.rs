@@ -23,6 +23,15 @@ pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::n
 // Add connection manager for Turso with connection pools
 static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, turso::Database>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// The seal store open over each legacy database's `segments_v2/` root, by
+/// root path (slice D-S20): a root can be open only once in a process, but
+/// several `Database` handles of one database coexist — `analyze_range`
+/// reopens the database by name for every chunk it fetches — so the one
+/// open is shared through this registry rather than held per handle. The
+/// registry holds the store weakly: when the last handle's store drops,
+/// the next open goes back to disk.
+static SEAL_STORES: LazyLock<Mutex<HashMap<std::path::PathBuf, std::sync::Weak<crate::SegmentStore>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub use config::{data_dir, default_data_dir};
 
 /// Run a legacy (turso) metadata write inside the control-plane write scope (ROB-2), so a
@@ -144,7 +153,7 @@ impl DatabaseStructure for Database {
 				Err(e) => tracing::warn!("Could not stat MVCC log file {}: {}; leaving it in place", log_path, e),
 			}
 			// Only remove WAL files if they're empty (indicating incomplete transactions)
-			if Path::new(&wal_path).exists() && std::fs::metadata(&wal_path).map(|m| m.len() == 0).unwrap_or(false) {
+			if Path::new(&wal_path).exists() && std::fs::metadata(&wal_path).is_ok_and(|m| m.len() == 0) {
 				match std::fs::remove_file(&wal_path) {
 					Ok(()) => tracing::debug!("Removed empty WAL file: {}", wal_path),
 					Err(e) => tracing::warn!("Could not remove WAL file {}: {}", wal_path, e),
@@ -570,7 +579,10 @@ impl DatabaseStructure for Database {
 		let () = db_info.set_metadata_path(Some(metadata_db_path.clone()));
 
 		// Manually construct subjects from rows
-		while let Some(row) = subject_rows.next().await? {
+		loop {
+			let Some(row) = subject_rows.next().await? else {
+				break;
+			};
 			let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
 			let subject_name = Self::value_to_string(&row.get_value(2)?, "Subject name").await?;
 			let subject_id = SubjectId::from_uuid(Uuid::parse_str(&subject_id_str)?);
@@ -579,7 +591,10 @@ impl DatabaseStructure for Database {
 			// Load aspects for this subject
 			let mut aspect_rows = conn.as_ref().query("SELECT id, name, table_name, resolution FROM aspects WHERE subject_id = ?", turso::params![subject_id.as_uuid().to_string()]).await?;
 
-			while let Some(aspect_row) = aspect_rows.next().await? {
+			loop {
+				let Some(aspect_row) = aspect_rows.next().await? else {
+					break;
+				};
 				let aspect_id_str = Self::value_to_string(&aspect_row.get_value(0)?, "Aspect ID").await?;
 				let aspect_name = Self::value_to_string(&aspect_row.get_value(1)?, "Aspect name").await?;
 				let resolution_str = Self::value_to_string(&aspect_row.get_value(3)?, "Resolution").await?;
@@ -780,7 +795,8 @@ impl DatabaseStructure for Database {
 
 		let subject = match res {
 			Ok(mut rows) => {
-				if let Some(row) = rows.next().await? {
+				let next_row = rows.next().await?;
+				if let Some(row) = next_row {
 					tracing::debug!("Found subject row for ID {}", id.as_uuid());
 					let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
 					let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
@@ -809,7 +825,8 @@ impl DatabaseStructure for Database {
 		// Read-only subject lookup with busy_timeout and retry; avoid transactions to reduce lock contention
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
 		let mut rows = conn.as_ref().query("SELECT id, name, database_id FROM subjects WHERE name = ?", turso::params![name]).await?;
-		if let Some(row) = rows.next().await? {
+		let next_row = rows.next().await?;
+		if let Some(row) = next_row {
 			let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
 			let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
 			let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
@@ -836,7 +853,6 @@ impl DatabaseStructure for Database {
 		legacy_metadata_write(async move {
 			// Retrieve subject from metadata database
 			let subject = self.get_subject(id).await?;
-			let metadata_db = &self.metadata;
 			let metadata_db_path = self.metadata_path.clone();
 
 			// Delete the subject folder and all child files and folders
@@ -846,7 +862,7 @@ impl DatabaseStructure for Database {
 			// Remove subject from database metadata
 			let id_str = id.as_uuid().to_string();
 
-			let conn = Self::begin_concurrent(metadata_db, &metadata_db_path, Some(self.cache.clone())).await?;
+			let conn = Self::begin_concurrent(&self.metadata, &metadata_db_path, Some(self.cache.clone())).await?;
 			let res = conn.as_ref().execute("DELETE FROM subjects WHERE id = ?", turso::params![id_str.clone()]).await;
 			match res {
 				Ok(_) => tracing::debug!("Deleted subject with ID {}", id.as_uuid()),
@@ -859,6 +875,7 @@ impl DatabaseStructure for Database {
 
 			// Log the transaction
 			self.record_transaction(&format!("Removed subject '{}'", subject.name())).await?;
+			drop(subject);
 
 			// Checkpoint metadata WAL to ensure deletion is persisted
 			Self::checkpoint_wal_passive(&self.metadata).await?;
@@ -883,7 +900,10 @@ impl DatabaseStructure for Database {
 		Self::commit_concurrent(&conn).await?;
 
 		let mut raw_rows: Vec<(String, String, String)> = Vec::new();
-		while let Some(row) = rows.next().await? {
+		loop {
+			let Some(row) = rows.next().await? else {
+				break;
+			};
 			let subject_id_str = Self::value_to_string(&row.get_value(0)?, "Subject ID").await?;
 			let name = Self::value_to_string(&row.get_value(1)?, "Subject name").await?;
 			let database_id_str = Self::value_to_string(&row.get_value(2)?, "Database ID").await?;
@@ -908,7 +928,10 @@ impl DatabaseStructure for Database {
 		match result {
 			Ok(mut rows) => {
 				let mut raw_rows: Vec<(String, String, String, String)> = Vec::new();
-				while let Some(row) = rows.next().await? {
+				loop {
+					let Some(row) = rows.next().await? else {
+						break;
+					};
 					let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
 					let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
 					let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
@@ -1060,7 +1083,8 @@ impl DatabaseStructure for Database {
 
 		let aspect = match res {
 			Ok(mut rows) => {
-				if let Some(row) = rows.next().await? {
+				let next_row = rows.next().await?;
+				if let Some(row) = next_row {
 					let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
 					let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
 					let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
@@ -1103,7 +1127,8 @@ impl DatabaseStructure for Database {
 
 		let aspect = match query_res {
 			Ok(mut rows) => {
-				if let Some(row) = rows.next().await? {
+				let next_row = rows.next().await?;
+				if let Some(row) = next_row {
 					let aspect_id_str = Self::value_to_string(&row.get_value(0)?, "Aspect ID").await?;
 					let name = Self::value_to_string(&row.get_value(1)?, "Aspect name").await?;
 					let subject_id_str = Self::value_to_string(&row.get_value(2)?, "Subject ID").await?;
@@ -1153,6 +1178,7 @@ impl DatabaseStructure for Database {
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let _cache_key = format!("measurement_db_{aspect_id}");
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let res = conn.as_ref().query("SELECT MAX(timestamp) FROM measurements", turso::params![]).await;
 		match res {
 			Ok(mut rows) => {
@@ -1183,17 +1209,16 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_aspect_resolution(&self, aspect_id: &AspectId) -> Result<Resolution> {
-		let aspect = self.get_aspect(aspect_id).await?;
-		let resolution = aspect.resolution();
+		let resolution = self.get_aspect(aspect_id).await?.resolution();
+
 		Ok(resolution)
 	}
 
 	async fn update_aspect_timestamps(&self, aspect_id: &AspectId, min_new: DateTime<Utc>, max_new: DateTime<Utc>) -> Result<()> {
 		legacy_metadata_write(async move {
-			let metadata_db = &self.metadata;
 			let metadata_db_path = self.metadata_path.clone();
 
-			let conn = Self::begin_concurrent(metadata_db, &metadata_db_path, Some(self.cache.clone())).await?;
+			let conn = Self::begin_concurrent(&self.metadata, &metadata_db_path, Some(self.cache.clone())).await?;
 			let res = conn.as_ref().execute("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?", turso::params![min_new.to_rfc3339(), max_new.to_rfc3339(), aspect_id.as_uuid().to_string()]).await;
 			match res {
 				Ok(_) => tracing::debug!("Updated aspect timestamps for aspect {aspect_id}"),
@@ -1232,8 +1257,9 @@ impl DatabaseStructure for Database {
 		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
 			return Ok(path);
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
-		let measurements_path = aspect.measurements_path();
+
+		let measurements_path = self.get_aspect(aspect_id).await?.measurements_path();
+
 		self.cache.lock().await.store(&cache_key, measurements_path.clone()).await;
 		Ok(measurements_path)
 	}
@@ -1254,8 +1280,9 @@ impl DatabaseStructure for Database {
 		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
 			return Ok(path);
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
-		let unprocessed_batches_path = aspect.unprocessed_batches_path();
+
+		let unprocessed_batches_path = self.get_aspect(aspect_id).await?.unprocessed_batches_path();
+
 		self.cache.lock().await.store(&cache_key, unprocessed_batches_path.clone()).await;
 		Ok(unprocessed_batches_path)
 	}
@@ -1276,8 +1303,9 @@ impl DatabaseStructure for Database {
 		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
 			return Ok(path);
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
-		let processed_batches_path = aspect.processed_batches_path();
+
+		let processed_batches_path = self.get_aspect(aspect_id).await?.processed_batches_path();
+
 		self.cache.lock().await.store(&cache_key, processed_batches_path.clone()).await;
 		Ok(processed_batches_path)
 	}
@@ -1299,8 +1327,9 @@ impl DatabaseStructure for Database {
 		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
 			return Ok(path);
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
-		let patterns_path = aspect.patterns_path();
+
+		let patterns_path = self.get_aspect(aspect_id).await?.patterns_path();
+
 		self.cache.lock().await.store(&cache_key, patterns_path.clone()).await;
 		Ok(patterns_path)
 	}
@@ -1321,8 +1350,9 @@ impl DatabaseStructure for Database {
 		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
 			return Ok(path);
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
-		let events_db_path = aspect.events_path();
+
+		let events_db_path = self.get_aspect(aspect_id).await?.events_path();
+
 		self.cache.lock().await.store(&cache_key, events_db_path.clone()).await;
 		Ok(events_db_path)
 	}
@@ -1343,8 +1373,9 @@ impl DatabaseStructure for Database {
 		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
 			return Ok(path);
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
-		let events_db_path = aspect.unprocessed_events_path();
+
+		let events_db_path = self.get_aspect(aspect_id).await?.unprocessed_events_path();
+
 		self.cache.lock().await.store(&cache_key, events_db_path.clone()).await;
 		Ok(events_db_path)
 	}
@@ -1365,8 +1396,9 @@ impl DatabaseStructure for Database {
 		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
 			return Ok(path);
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
-		let events_db_path = aspect.processed_events_path();
+
+		let events_db_path = self.get_aspect(aspect_id).await?.processed_events_path();
+
 		self.cache.lock().await.store(&cache_key, events_db_path.clone()).await;
 		Ok(events_db_path)
 	}
@@ -1387,8 +1419,9 @@ impl DatabaseStructure for Database {
 		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
 			return Ok(path);
 		}
-		let aspect = self.get_aspect(aspect_id).await?;
-		let correlations_path = aspect.correlations_path();
+
+		let correlations_path = self.get_aspect(aspect_id).await?.correlations_path();
+
 		self.cache.lock().await.store(&cache_key, correlations_path.clone()).await;
 		Ok(correlations_path)
 	}
@@ -1448,12 +1481,9 @@ impl DatabaseStructure for Database {
 
 		// Get aspect details from cache to find the database path
 		// If not cached, we can't check it, so return false to allow the import to proceed
-		let measurement_db_path = match self.get_measurement_db_path(aspect_id).await {
-			Ok(path) => path,
-			Err(_) => {
-				// Can't determine path, assume not locked to avoid blocking
-				return false;
-			}
+		let Ok(measurement_db_path) = self.get_measurement_db_path(aspect_id).await else {
+			// Can't determine path, assume not locked to avoid blocking
+			return false;
 		};
 
 		// Try to create a fresh connection to just this measurement database
@@ -1550,7 +1580,11 @@ impl Database {
 
 	/// This database's seal store (slice D-S19), opened on first use and
 	/// held by this handle: the root at `{db}/segments_v2/`, scoped
-	/// `(db, 'legacy')`. Clones of this handle share the one open.
+	/// `(db, 'legacy')`. Clones of this handle share the one open, and so
+	/// do the other handles of the same database in this process (slice
+	/// D-S20, see `SEAL_STORES`): a root can be open only once, and
+	/// `analyze_range`'s per-chunk reopened handles must reach the store
+	/// the ingest handle opened, not refuse it as locked.
 	///
 	/// # Errors
 	///
@@ -1561,7 +1595,17 @@ impl Database {
 			return Ok(store.clone());
 		}
 		let db_dir = Path::new(&self.metadata_path).parent().ok_or_else(|| anyhow::anyhow!("metadata path {} has no parent directory", self.metadata_path))?;
+		// The registry lock is held across the open, so two handles racing
+		// their first use share the one open instead of the second failing
+		// on the root's LOCK.
+		let mut registry = SEAL_STORES.lock().await;
+		let root = crate::legacy_seal::segments_root(db_dir);
+		if let Some(store) = registry.get(&root).and_then(std::sync::Weak::upgrade) {
+			*held = Some(store.clone());
+			return Ok(store);
+		}
 		let store = Arc::new(crate::legacy_seal::open_store(&self.name, db_dir).await?);
+		registry.insert(root, Arc::downgrade(&store));
 		*held = Some(store.clone());
 		Ok(store)
 	}
@@ -1576,10 +1620,45 @@ impl Database {
 	pub async fn seal_time_range(&self, aspect_id: &AspectId) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
 		let store = self.seal_store().await?;
 		let stats = store.aspect_stats(&crate::legacy_seal::aspect_key(aspect_id)).await?;
+		drop(store);
 		Ok(match stats.time_range {
 			Some((min, max)) => (DateTime::from_timestamp_millis(min), DateTime::from_timestamp_millis(max)),
 			None => (None, None),
 		})
+	}
+
+	/// The pending change-log rows of a seal-backed aspect (slice D-S20):
+	/// one row per seal-store commit not yet acknowledged by the batch
+	/// consumer, in epoch order, each carrying the commit's time span (in
+	/// milliseconds, the legacy timestamp unit) and its row count. This replaces the per-timestamp
+	/// unbatched queue for seal-backed aspects; a rows-mode aspect has no
+	/// change log and reads as no changes (its consumer uses the queue).
+	///
+	/// # Errors
+	///
+	/// If the seal store cannot answer for the aspect.
+	pub async fn seal_changes(&self, aspect_id: &AspectId) -> Result<Vec<crate::SegmentChange>> {
+		if !self.is_seal_backed(aspect_id).await? {
+			return Ok(Vec::new());
+		}
+		let store = self.seal_store().await?;
+		store.changes_since(&crate::legacy_seal::aspect_key(aspect_id), 0).await
+	}
+
+	/// Acknowledge a seal-backed aspect's change-log rows at or below
+	/// `through_epoch` (slice D-S20): the batch consumer calls this once
+	/// it has batched the changes it read, as a queue consumer dequeues
+	/// what it batched. A no-op for a rows-mode aspect.
+	///
+	/// # Errors
+	///
+	/// If the seal store's acknowledgement commit fails.
+	pub async fn ack_seal_changes(&self, aspect_id: &AspectId, through_epoch: u64) -> Result<()> {
+		if !self.is_seal_backed(aspect_id).await? {
+			return Ok(());
+		}
+		let store = self.seal_store().await?;
+		store.ack_changes(&crate::legacy_seal::aspect_key(aspect_id), through_epoch).await
 	}
 
 	/// The cache key of an aspect's earliest measurement timestamp.
@@ -1619,6 +1698,7 @@ impl Database {
 		let db = self.get_measurement_db(aspect_id).await?;
 		let db_path = self.get_measurement_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 		let res = conn.as_ref().query("SELECT MIN(timestamp) FROM measurements", turso::params![]).await;
 
 		let timestamp = match res {

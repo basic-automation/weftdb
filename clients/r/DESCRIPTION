@@ -1,0 +1,21 @@
+Package: weftdb
+Type: Package
+Title: Client for the WeftDB Time-Series Server
+Version: 0.1.0
+Authors@R: person("Justin", "Icenhour", role = c("aut", "cre"), email = "justin@eggersmannusa.com")
+Description: Reads and writes WeftDB stored series over the weft-server HTTP API
+    as Apache Arrow tables: stored windows and value bands, stored downsampling,
+    interpolation, and lossless ingest from data frames or Arrow tables.
+License: MIT + file LICENSE | Apache License 2.0
+Encoding: UTF-8
+Depends: R (>= 4.1)
+Imports:
+    arrow (>= 14.0.0),
+    bit64 (>= 4.0.0),
+    curl (>= 5.0.0),
+    jsonlite (>= 1.8.0)
+Suggests:
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+URL: https://github.com/basic-automation/weftdb
+BugReports: https://github.com/basic-automation/weftdb/issues

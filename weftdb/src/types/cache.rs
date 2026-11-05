@@ -342,11 +342,8 @@ impl DatabaseCache {
 	/// a reader that took the previous one does not store what it read. A writer calls it
 	/// after its commit.
 	pub async fn invalidate_generation(&self, cache_key: &str) {
-		let mut cache = self.cache.write().await;
-		cache.remove(cache_key);
-		let mut generations = self.generations.write().await;
-		let generation = generations.entry(cache_key.to_string()).or_insert(0);
-		*generation = generation.wrapping_add(1);
+		self.cache.write().await.remove(cache_key);
+		self.generations.write().await.entry(cache_key.to_string()).and_modify(|generation| *generation = generation.wrapping_add(1)).or_insert(1);
 	}
 
 	/// [`store`](Self::store) `value` under `cache_key` unless the key was invalidated with

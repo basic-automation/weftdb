@@ -105,11 +105,13 @@ pub const MAX_MAX_CONNECTIONS: usize = 65_536;
 /// 5 s of C9's drain order.
 pub const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
-/// Environment variable naming the shutdown grace, in seconds
-/// (registered by C-2, given to this drain by D-S14, plan C9): how long
-/// the serve side waits for live connections to finish after the
-/// shutdown future resolves, before startup proceeds to the next drain
-/// step. Positive whole number; default [`SHUTDOWN_DRAIN`].
+/// Environment variable naming the shutdown grace, in seconds (registered by C-2, given to
+/// this drain by D-S14, plan C9).
+///
+/// How long the serve side waits for live connections to finish after the shutdown future
+/// resolves, before startup proceeds to the next drain step.
+///
+/// Positive whole number; default [`SHUTDOWN_DRAIN`].
 pub const SHUTDOWN_GRACE_SECS_ENV: &str = "WEFT_SHUTDOWN_GRACE_SECS";
 
 /// The pre-auth listener limits [`run`] enforces, read once at startup.

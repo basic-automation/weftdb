@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::{hint::black_box, str::FromStr};
 
 use ::weftdb::{
@@ -67,6 +70,7 @@ fn benchmark_data_insertion(c: &mut Criterion) {
 				let measurement = InputMeasurement::new(time, BigDecimal::from_str("42.0").unwrap());
 				let aspect = db.get_aspect(&aspect_id).await.unwrap();
 				db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
+				drop(aspect);
 				counter += 1;
 			});
 		});
@@ -190,7 +194,7 @@ fn benchmark_range_analysis(c: &mut Criterion) {
 			})
 		});
 	});
-	group.finish();
+	drop(group);
 
 	// Cleanup
 	rt.block_on(async {

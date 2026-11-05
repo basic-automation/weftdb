@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Robustness track **ROB-2** (release plan C12, C22): a panic while the process is
 //! writing the control plane ends the process instead of being answered.
 //!

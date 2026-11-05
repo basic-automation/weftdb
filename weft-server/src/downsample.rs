@@ -27,7 +27,9 @@
 //! every output format, so it is never passed off as measured, and a reduction the
 //! method leaves without a value (`null`, or a line past the last measured bucket)
 //! is missing from the JSON map, an empty CSV cell and an Arrow/Parquet null. The
-//! grid is bounded by [`MAX_FILL_BUCKETS`]; a longer one is refused with `400`.
+//! grid is bounded by the configured compute limit ([`InterpolateConfig`]'s
+//! output cap, [`MAX_FILL_BUCKETS`] by default); a longer one is refused with
+//! `400`. One limit governs every grid a client can size (ROB-16).
 //!
 //! ## Bucket widths (`width`, `?resolution=15m`)
 //!
@@ -46,13 +48,17 @@
 //! precision-preserving representation). The narrowing is never silent: a
 //! computed value with no finite `f64` representation fails the request with a
 //! `not_finite` error rather than returning a substitute such as `0.0` (FRE-5).
+//!
+//! The input boundary is the mirror image: each JSON `f64` is widened to the
+//! shortest decimal that round-trips to it ([`widen_json_value`]), so a client's
+//! `99.92` is reduced as `99.92`, not as its 49-digit binary expansion.
 
 use std::collections::BTreeMap;
 
 use axum::{
 	extract::State, http::header, response::{IntoResponse, Response}, Json
 };
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use splimes::{Point, Resolution};
@@ -63,7 +69,7 @@ pub use weft_reduce::Aggregation;
 use weft_reduce::{reduce_width, BucketWidth, Fill};
 
 use crate::{
-	error::{self, ApiError, Code, StrictJson, StrictQuery}, interpolate::{InputPoint, ResolutionSpec}, metrics::SharedMetrics
+	error::{self, ApiError, Code, StrictJson, StrictQuery}, interpolate::{InputPoint, InterpolateConfig, ResolutionSpec}, metrics::SharedMetrics
 };
 
 /// Request body for `POST /api/v1/downsample`.
@@ -96,8 +102,11 @@ pub struct DownsampleRequest {
 	pub fill: Option<String>,
 }
 
-/// The most buckets a gap fill may emit: the interpolation endpoint's default output
-/// cap, since a filled grid is an output grid of the same kind.
+/// The default for the most buckets a gap fill may emit: the interpolation
+/// endpoint's default output cap, since a filled grid is an output grid of the
+/// same kind. The handlers pass the operator's configured cap
+/// ([`InterpolateConfig::max_output_points`]) to [`apply_fill`], which is this
+/// value unless `WEFT_MAX_INTERPOLATE_POINTS` changed it (ROB-16).
 pub const MAX_FILL_BUCKETS: usize = crate::interpolate::MAX_INTERPOLATE_OUTPUT_POINTS;
 
 /// Parse a bucket-width token: a resolution name (`minutes`, the default), or a count and a
@@ -127,10 +136,11 @@ pub(crate) fn parse_fill(token: Option<&str>) -> Result<Option<Fill>, ApiError> 
 ///
 /// # Errors
 ///
-/// `bad_request` when the grid would exceed [`MAX_FILL_BUCKETS`] or a spline fill fails,
+/// `bad_request` when the grid would exceed `max_buckets` (the configured
+/// compute limit; [`MAX_FILL_BUCKETS`] by default) or a spline fill fails,
 /// and `value_not_representable` when a bound has no bucket at the resolution.
-pub(crate) fn apply_fill(buckets: &[weft_reduce::Bucket], width: BucketWidth, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, method: &Fill) -> Result<Vec<weft_reduce::Bucket>, ApiError> {
-	weft_reduce::fill_width(buckets, width, start, end, method, MAX_FILL_BUCKETS).map_err(|err| match err {
+pub(crate) fn apply_fill(buckets: &[weft_reduce::Bucket], width: BucketWidth, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, method: &Fill, max_buckets: usize) -> Result<Vec<weft_reduce::Bucket>, ApiError> {
+	weft_reduce::fill_width(buckets, width, start, end, method, max_buckets).map_err(|err| match err {
 		weft_reduce::FillError::TooManyBuckets { grid, max } => ApiError::bad_request(format!("a fill over this window would emit {grid} buckets, more than the {max} allowed; narrow the window or coarsen the resolution")),
 		weft_reduce::FillError::TimestampRange | weft_reduce::FillError::BucketStartOverflow => ApiError::new(error::Code::ValueNotRepresentable, "a bound of the fill window cannot be placed in a bucket at the resolution you asked for"),
 		weft_reduce::FillError::Spline(reason) => ApiError::bad_request(format!("the spline fill failed: {reason}")),
@@ -167,6 +177,11 @@ pub struct DownsampleResponse {
 	/// The fill method, when the request named one.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub fill: Option<String>,
+	/// The tags of the stored series reduced (TAG-10), on the stored downsample only:
+	/// `{}` for the untagged series 0, `null` when the `tag.*` selector matched no series.
+	/// Absent from the compute endpoint, which reduces a series the caller sent.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tags: Option<crate::storage::SeriesTags>,
 }
 
 /// Handle `POST /api/v1/downsample`: reduce a series into grid-aligned buckets.
@@ -179,10 +194,10 @@ pub struct DownsampleResponse {
 /// Returns `bad_request` (`400`) for an empty point set, a non-finite value,
 /// or an inverted range, and `internal` (`500`) if a timestamp cannot be
 /// mapped onto the resolution grid.
-pub async fn downsample(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Json<DownsampleResponse>, ApiError> {
+pub async fn downsample(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Json<DownsampleResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_downsample_request();
-	let result = downsample_inner(request);
+	let result = downsample_inner(request, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -197,7 +212,7 @@ const DEFAULT_AGGREGATIONS: [Aggregation; 3] = Aggregation::DEFAULT;
 
 /// The JSON path: validate, lift to `BigDecimal` points, derive the window, then
 /// delegate to [`run_downsample`]. Synchronous — no engine call is needed.
-fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleResponse>, ApiError> {
+fn downsample_inner(request: DownsampleRequest, config: InterpolateConfig) -> Result<Json<DownsampleResponse>, ApiError> {
 	let DownsampleRequest { resolution, aggregations, start, end, points: input, width, fill } = request;
 	let method = parse_fill(fill.as_deref())?;
 	let width = match width.as_deref() {
@@ -217,7 +232,7 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 	{
 		let _parse = tracing::info_span!("downsample.parse", candidate_points = input.len()).entered();
 		for sample in &input {
-			let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number".to_string()))?;
+			let value = json_point_value(sample.value)?;
 			points.push(Point::new(sample.timestamp, value));
 		}
 		points.sort_by_key(|p| p.timestamp);
@@ -225,7 +240,7 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 	let start = start.unwrap_or_else(|| points.first().map_or_else(Utc::now, |p| p.timestamp));
 	let end = end.unwrap_or_else(|| points.last().map_or_else(Utc::now, |p| p.timestamp));
 
-	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, fill.as_deref().unwrap_or_default())))
+	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, fill.as_deref().unwrap_or_default())), config.max_output_points())
 }
 
 /// Run the bucketed reduction over a prepared point set and shape the response.
@@ -242,14 +257,14 @@ fn downsample_inner(request: DownsampleRequest) -> Result<Json<DownsampleRespons
 /// bucket count on completion, so a `RUST_LOG`-enabled run sees the reduction pass's
 /// fan-in and fan-out.
 #[tracing::instrument(name = "downsample.reduce", skip_all, fields(candidate_points = points.len(), resolution = %width, input_points = tracing::field::Empty, buckets = tracing::field::Empty))]
-fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, width: BucketWidth, aggregations: &[Aggregation], fill: Option<(&Fill, &str)>) -> Result<Json<DownsampleResponse>, ApiError> {
+fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, width: BucketWidth, aggregations: &[Aggregation], fill: Option<(&Fill, &str)>, max_fill_buckets: usize) -> Result<Json<DownsampleResponse>, ApiError> {
 	if end < start {
 		return Err(ApiError::bad_request("`end` must not be before `start`".to_string()));
 	}
 
 	let mut buckets = reduce_width(points, width, Some(start), Some(end), aggregations).map_err(|err| error::from_reduce_error(&err))?;
 	if let Some((method, _)) = fill {
-		buckets = apply_fill(&buckets, width, Some(start), Some(end), method)?;
+		buckets = apply_fill(&buckets, width, Some(start), Some(end), method, max_fill_buckets)?;
 	}
 	let mut response = buckets_to_response(buckets, width, aggregations)?;
 	response.fill = fill.map(|(_, token)| token.trim().to_string());
@@ -258,6 +273,80 @@ fn run_downsample(points: &[Point], start: DateTime<Utc>, end: DateTime<Utc>, wi
 	span.record("input_points", response.input_points);
 	span.record("buckets", response.buckets);
 	Ok(Json(response))
+}
+
+/// Widen a JSON `f64` input value to the shortest decimal that round-trips to it,
+/// or `None` if it is not finite.
+///
+/// The compute endpoints receive values as JSON numbers deserialised to `f64`.
+/// `BigDecimal::from_f64` widens such a value to its exact binary expansion: a
+/// client's `99.92` became `99.9200000000000017053025658242404460906982421875`,
+/// and every `BigDecimal` reduction over ~50-digit operands costs an order of
+/// magnitude more than over the decimals the client wrote (roadmap Phase 5,
+/// FOUND 2026-10-09: 13.7x hourly `avg`, 13.1x exact `p99` at 500k points).
+///
+/// The shortest round-trip decimal is the value `f64::to_string` prints and is
+/// numerically equal to `f.to_string().parse::<BigDecimal>()`. It is the decimal
+/// the client wrote whenever that text has at most 15 significant digits (every
+/// such decimal is the shortest representative of its nearest `f64`), and it
+/// names the same `f64`, so the interpolation engine (which computes in `f64`)
+/// sees bit-identical inputs. Values an `f64` holds exactly as a short decimal
+/// (integers, `0.5`, `99.25`) widen to the same number as before.
+///
+/// Integral values are kept at scale 0 (`100`, not `1e2`), as `from_f64` gives them.
+#[must_use]
+pub fn widen_json_value(value: f64) -> Option<BigDecimal> {
+	use std::fmt::Write as _;
+	if !value.is_finite() {
+		return None;
+	}
+	// `{:e}` is Rust's shortest round-trip formatting (`-d.ddde-x`, at most 17
+	// significant digits, so the mantissa fits an i64). Reading the digits and the
+	// exponent directly avoids `BigDecimal::from_str`'s general parser.
+	let mut buf = FloatText { bytes: [0; 32], len: 0 };
+	write!(buf, "{value:e}").ok()?;
+	let text = &buf.bytes[..buf.len];
+	let (negative, text) = match text.split_first() {
+		Some((b'-', rest)) => (true, rest),
+		_ => (false, text),
+	};
+	let e = text.iter().position(|&b| b == b'e')?;
+	let mut mantissa: i64 = 0;
+	let mut fraction_digits: i64 = 0;
+	let mut seen_point = false;
+	for &b in &text[..e] {
+		if b == b'.' {
+			seen_point = true;
+		} else {
+			mantissa = mantissa * 10 + i64::from(b - b'0');
+			fraction_digits += i64::from(seen_point);
+		}
+	}
+	let exponent: i64 = std::str::from_utf8(&text[e + 1..]).ok()?.parse().ok()?;
+	let mantissa = if negative { -mantissa } else { mantissa };
+	// value = mantissa x 10^(exponent - fraction_digits); BigDecimal's scale is its negation.
+	let decimal = BigDecimal::new(mantissa.into(), fraction_digits - exponent);
+	Some(if decimal.fractional_digit_count() < 0 { decimal.with_scale(0) } else { decimal })
+}
+
+/// [`widen_json_value`] for a request's point value, refusing a non-finite one.
+pub(crate) fn json_point_value(value: f64) -> Result<BigDecimal, ApiError> {
+	widen_json_value(value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))
+}
+
+/// A fixed buffer for formatting one `f64`; `{:e}` of an `f64` is at most 24 bytes.
+struct FloatText {
+	bytes: [u8; 32],
+	len: usize,
+}
+
+impl std::fmt::Write for FloatText {
+	fn write_str(&mut self, s: &str) -> std::fmt::Result {
+		let end = self.len + s.len();
+		self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?.copy_from_slice(s.as_bytes());
+		self.len = end;
+		Ok(())
+	}
 }
 
 /// Convert a computed [`BigDecimal`] to the wire `f64`, refusing a value that
@@ -298,7 +387,7 @@ pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, width: Buck
 		}
 		series.push(DownsampleBucket { timestamp: b.timestamp, count: b.count, aggregations: values });
 	}
-	Ok(DownsampleResponse { resolution: width.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series, fill: None })
+	Ok(DownsampleResponse { resolution: width.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series, fill: None, tags: None })
 }
 
 /// Render a [`DownsampleResponse`] as a `timestamp,count,<agg>…` CSV document.
@@ -406,9 +495,9 @@ pub(crate) fn downsample_response_to_parquet(response: &DownsampleResponse) -> R
 /// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
 /// value, or an inverted range, and `internal` (`500`) on a grid-mapping or
 /// Arrow-encoding failure.
-pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_inner(request);
+	let result = downsample_inner(request, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -430,9 +519,9 @@ pub async fn downsample_arrow(State(metrics): State<SharedMetrics>, StrictJson(r
 /// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
 /// value, or an inverted range, and `internal` (`500`) on a grid-mapping or
 /// Parquet-encoding failure.
-pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_inner(request);
+	let result = downsample_inner(request, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -452,9 +541,9 @@ pub async fn downsample_parquet(State(metrics): State<SharedMetrics>, StrictJson
 /// As [`downsample`]: `bad_request` (`400`) for an empty point set, a non-finite
 /// value, or an inverted range, and `internal` (`500`) if a timestamp cannot be
 /// mapped onto the resolution grid.
-pub async fn downsample_csv(State(metrics): State<SharedMetrics>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
+pub async fn downsample_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictJson(request): StrictJson<DownsampleRequest>) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_inner(request);
+	let result = downsample_inner(request, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -497,10 +586,10 @@ pub struct DownsampleIlpParams {
 /// Returns `bad_request` (`400`) for an unknown precision/resolution/aggregation
 /// token, a malformed payload, or fewer than one usable point, and
 /// `internal` (`500`) if a timestamp cannot be mapped onto the grid.
-pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Json<DownsampleResponse>, ApiError> {
+pub async fn downsample_ilp(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Json<DownsampleResponse>, ApiError> {
 	let start = std::time::Instant::now();
 	metrics.record_downsample_request();
-	let result = downsample_ilp_inner(&params, &body);
+	let result = downsample_ilp_inner(&params, &body, config);
 	match &result {
 		Ok(response) => metrics.add_downsample_buckets(response.0.buckets as u64),
 		Err(_) => metrics.record_downsample_error(),
@@ -530,9 +619,9 @@ fn record_downsample_outcome(metrics: &SharedMetrics, result: &Result<Json<Downs
 /// # Errors
 ///
 /// As [`downsample_ilp`].
-pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_ilp_inner(&params, &body);
+	let result = downsample_ilp_inner(&params, &body, config);
 	record_downsample_outcome(&metrics, &result);
 	Ok(downsample_response_to_csv(&result?.0))
 }
@@ -546,9 +635,9 @@ pub async fn downsample_ilp_csv(State(metrics): State<SharedMetrics>, StrictQuer
 /// # Errors
 ///
 /// As [`downsample_ilp`], plus `internal` (`500`) on an Arrow-encoding failure.
-pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_ilp_inner(&params, &body);
+	let result = downsample_ilp_inner(&params, &body, config);
 	record_downsample_outcome(&metrics, &result);
 	downsample_response_to_arrow(&result?.0)
 }
@@ -562,14 +651,14 @@ pub async fn downsample_ilp_arrow(State(metrics): State<SharedMetrics>, StrictQu
 /// # Errors
 ///
 /// As [`downsample_ilp`], plus `internal` (`500`) on a Parquet-encoding failure.
-pub async fn downsample_ilp_parquet(State(metrics): State<SharedMetrics>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
+pub async fn downsample_ilp_parquet(State(metrics): State<SharedMetrics>, State(config): State<InterpolateConfig>, StrictQuery(params): StrictQuery<DownsampleIlpParams>, body: String) -> Result<Response, ApiError> {
 	metrics.record_downsample_request();
-	let result = downsample_ilp_inner(&params, &body);
+	let result = downsample_ilp_inner(&params, &body, config);
 	record_downsample_outcome(&metrics, &result);
 	downsample_response_to_parquet(&result?.0)
 }
 
-fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json<DownsampleResponse>, ApiError> {
+fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str, config: InterpolateConfig) -> Result<Json<DownsampleResponse>, ApiError> {
 	let precision = crate::interpolate::parse_precision_token(params.precision.as_deref())?;
 	let width = parse_width_token(params.resolution.as_deref())?;
 	let aggregations = parse_aggregations(params.agg.as_deref())?;
@@ -583,7 +672,7 @@ fn downsample_ilp_inner(params: &DownsampleIlpParams, body: &str) -> Result<Json
 	let start = points.first().map_or_else(Utc::now, |p| p.timestamp);
 	let end = points.last().map_or_else(Utc::now, |p| p.timestamp);
 
-	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, params.fill.as_deref().unwrap_or_default())))
+	run_downsample(&points, start, end, width, &aggregations, method.as_ref().map(|m| (m, params.fill.as_deref().unwrap_or_default())), config.max_output_points())
 }
 
 /// Parse a comma-separated aggregation list (default `[min, max, avg]`).
@@ -607,6 +696,7 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
+	use bigdecimal::FromPrimitive;
 	use chrono::TimeZone;
 	use tower::ServiceExt;
 
@@ -954,6 +1044,20 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn the_fill_grid_obeys_the_configured_compute_limit() {
+		// ROB-16: one compute limit governs every grid a client can size. The
+		// gapped body fills 4 minute buckets; a server configured with a cap of
+		// 3 (WEFT_MAX_INTERPOLATE_POINTS=3) refuses it, naming the limit, where
+		// the default server above serves it.
+		let config = InterpolateConfig::new(std::num::NonZeroUsize::new(3).unwrap());
+		let router = crate::app_with_state(crate::AppState::new().with_interpolate_config(config));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/downsample").header("content-type", "application/json").body(Body::from(serde_json::to_vec(&gapped_body("linear")).unwrap())).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert!(body.to_string().contains("more than the 3 allowed"), "{body}");
+	}
+
+	#[tokio::test]
 	async fn a_bucket_width_is_a_whole_number_of_steps_and_epoch_aligned() {
 		let body = serde_json::json!({
 			"width": "5s",
@@ -1130,5 +1234,105 @@ mod tests {
 		let (status, body) = post_json("/api/v1/downsample", body).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
 		assert_eq!(body["code"], "not_finite", "body: {body}");
+	}
+
+	// Phase 5 FOUND 2026-10-09: JSON f64 inputs widen through the shortest
+	// round-trip decimal, not the exact binary expansion.
+
+	fn dec(text: &str) -> BigDecimal {
+		text.parse().expect("decimal")
+	}
+
+	#[test]
+	fn a_json_value_widens_to_the_decimal_the_client_wrote() {
+		let widened = widen_json_value(99.92).expect("finite");
+		assert_eq!(widened.to_string(), "99.92");
+		assert_ne!(widened, BigDecimal::from_f64(99.92).expect("finite"), "from_f64 is the 49-digit binary expansion");
+		for (v, text) in [(0.1, "0.1"), (-1234.5, "-1234.5"), (1e-300, "1e-300"), (6.022_140_76e23, "602214076000000000000000"), (-0.0, "0"), (100.0, "100")] {
+			assert_eq!(widen_json_value(v), Some(dec(text)), "{v}");
+		}
+		// Integral values stay at scale 0, as from_f64 gives them.
+		assert_eq!(widen_json_value(100.0).expect("finite").fractional_digit_count(), 0);
+		assert_eq!(widen_json_value(1e300).expect("finite").fractional_digit_count(), 0);
+	}
+
+	#[test]
+	fn non_finite_json_values_are_still_refused() {
+		for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+			assert_eq!(widen_json_value(v), None);
+			assert!(json_point_value(v).is_err(), "{v}");
+		}
+	}
+
+	#[test]
+	fn exactly_representable_values_widen_unchanged() {
+		// Values an f64 holds exactly as a short decimal: the shortest decimal and the
+		// exact binary expansion are the same number, so results do not move.
+		for v in [0.0, 1.0, -1.0, 0.5, -0.25, 99.25, 1_048_576.125, 9_007_199_254_740_992.0, 1e300, f64::MAX, -f64::MAX, 2.0_f64.powi(-20)] {
+			assert_eq!(widen_json_value(v), BigDecimal::from_f64(v), "{v}");
+		}
+		for i in -100_000_i32..100_000 {
+			let v = f64::from(i) / 8.0;
+			assert_eq!(widen_json_value(v), BigDecimal::from_f64(v), "{v}");
+		}
+	}
+
+	/// splitmix64: a seeded, dependency-free bit source for the property test.
+	fn splitmix(state: &mut u64) -> u64 {
+		*state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+		let mut z = *state;
+		z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+		z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+		z ^ (z >> 31)
+	}
+
+	#[test]
+	fn widening_matches_the_shortest_round_trip_text_for_every_finite_f64() {
+		let mut state = 0x5EED_F64_u64;
+		let mut checked = 0;
+		while checked < 200_000 {
+			// Alternate random bit patterns (every exponent, subnormals) with short decimals
+			// such as prices and sensor readings carry.
+			let v = if checked % 2 == 0 {
+				f64::from_bits(splitmix(&mut state))
+			} else {
+				#[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+				let mantissa = (splitmix(&mut state) % 10_000_000) as i64 - 5_000_000;
+				#[allow(clippy::cast_possible_truncation)]
+				let places = (splitmix(&mut state) % 7) as i32;
+				#[allow(clippy::cast_precision_loss)]
+				let v = mantissa as f64 / 10_f64.powi(places);
+				v
+			};
+			if !v.is_finite() {
+				continue;
+			}
+			let widened = widen_json_value(v).expect("finite");
+			assert_eq!(widened, v.to_string().parse::<BigDecimal>().expect("shortest text parses"), "{v:e}");
+			// The widened decimal names the same f64 (correctly rounded through text).
+			assert_eq!(widened.to_string().parse::<f64>().expect("parses"), v, "{v:e}");
+			checked += 1;
+		}
+	}
+
+	#[tokio::test]
+	async fn the_compute_endpoint_reduces_the_values_the_client_wrote() {
+		let body = serde_json::json!({
+			"points": [
+				{ "timestamp": ts(0), "value": 99.92 },
+				{ "timestamp": ts(10), "value": 99.94 },
+				{ "timestamp": ts(20), "value": 0.1 },
+			],
+			"resolution": "minutes",
+			"aggregations": ["min", "max", "avg", "sum"]
+		});
+		let (status, resp) = post_json("/api/v1/downsample", body).await;
+		assert_eq!(status, StatusCode::OK, "body: {resp}");
+		let bucket = &resp["series"][0]["aggregations"];
+		assert_eq!(bucket["min"], 0.1);
+		assert_eq!(bucket["max"], 99.94);
+		assert_eq!(bucket["sum"], 199.96);
+		// (99.92 + 99.94 + 0.1) / 3 = 66.65333…, computed on the decimals.
+		assert_eq!(bucket["avg"], (dec("199.96") / BigDecimal::from(3)).to_f64().unwrap());
 	}
 }

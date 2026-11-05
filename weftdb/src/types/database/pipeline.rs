@@ -18,6 +18,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			let now = Utc::now().timestamp_millis();
 			let spline_str = serde_json::to_string(&config.spline_method).map_err(|e| Error::DatabaseError(format!("Failed to serialize spline method: {e}")))?;
@@ -47,6 +48,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			let last_run = state.last_run.map(|dt| dt.timestamp_millis());
 			let run_count_i64 = i64::try_from(state.run_count).map_err(|e| Error::DatabaseError(format!("Run count too large: {e}")))?;
@@ -76,6 +78,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			// Delete all pipeline data
 			conn.as_ref().execute("DELETE FROM pipeline_config WHERE id = 1", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline config: {e}")))?;
@@ -94,6 +97,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			let now = Utc::now().timestamp_millis();
 
@@ -117,6 +121,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			let sql = "DELETE FROM pipeline_dictionaries WHERE dictionary_name = ?";
 			conn.as_ref().execute(sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove dictionary: {e}")))?;
@@ -132,6 +137,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			conn.as_ref().execute("DELETE FROM pipeline_dictionaries", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear dictionaries: {e}")))?;
 
@@ -146,6 +152,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			let now = Utc::now().timestamp_millis();
 			let detector_type_str = serde_json::to_string(metadata.detector_type()).map_err(|e| Error::DatabaseError(format!("Failed to serialize detector type: {e}")))?;
@@ -170,6 +177,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			conn.as_ref().execute("DELETE FROM pipeline_detectors WHERE detector_id = ?", turso::params![detector_id]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove detector: {e}")))?;
 
@@ -184,6 +192,7 @@ impl PipelineInputs for Database {
 			let db = self.get_pipeline_db(aspect_id).await?;
 			let db_path = self.get_pipeline_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
 			conn.as_ref().execute("DELETE FROM pipeline_detectors", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear detectors: {e}")))?;
 
@@ -200,6 +209,7 @@ impl PipelineOutputs for Database {
 		let db = self.get_pipeline_db(aspect_id).await?;
 		let db_path = self.get_pipeline_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let sql = "SELECT spline_method, batch_size FROM pipeline_config WHERE id = 1";
 		let mut rows = conn.as_ref().query(sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pipeline config: {e}")))?;
@@ -224,6 +234,7 @@ impl PipelineOutputs for Database {
 		let db = self.get_pipeline_db(aspect_id).await?;
 		let db_path = self.get_pipeline_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let sql = "SELECT last_run, run_count, version FROM pipeline_state WHERE id = 1";
 		let mut rows = conn.as_ref().query(sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pipeline state: {e}")))?;
@@ -250,6 +261,7 @@ impl PipelineOutputs for Database {
 		let db = self.get_pipeline_db(aspect_id).await?;
 		let db_path = self.get_pipeline_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let sql = "SELECT dictionary_name FROM pipeline_dictionaries ORDER BY added_at ASC";
 		let mut rows = conn.as_ref().query(sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query dictionaries: {e}")))?;
@@ -268,6 +280,7 @@ impl PipelineOutputs for Database {
 		let db = self.get_pipeline_db(aspect_id).await?;
 		let db_path = self.get_pipeline_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let sql = "SELECT detector_id, detector_name, description, detector_type, config_json FROM pipeline_detectors ORDER BY added_at ASC";
 		let mut rows = conn.as_ref().query(sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query detectors: {e}")))?;
@@ -293,6 +306,7 @@ impl PipelineOutputs for Database {
 		let db = self.get_pipeline_db(aspect_id).await?;
 		let db_path = self.get_pipeline_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let sql = "SELECT detector_id, detector_name, description, detector_type, config_json FROM pipeline_detectors WHERE detector_id = ?";
 		let mut rows = conn.as_ref().query(sql, turso::params![detector_id]).await.map_err(|e| Error::DatabaseError(format!("Failed to query detector: {e}")))?;
@@ -319,6 +333,7 @@ impl PipelineOutputs for Database {
 		let db = self.get_pipeline_db(aspect_id).await?;
 		let db_path = self.get_pipeline_db_path(aspect_id).await?;
 		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
 
 		let sql = "SELECT 1 FROM pipeline_config WHERE id = 1 LIMIT 1";
 		let mut rows = conn.as_ref().query(sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to check config: {e}")))?;

@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! The X-FX gate (1.0 plan): open what the **v0.1.0** release wrote with **this** build.
 //!
 //! `compat/fixtures/v0.1.0/` holds three trees written by v0.1.0 binaries — a Storage-v2
@@ -14,7 +17,7 @@
 //!   so the migrated tree is stable rather than rewritten on every start;
 //! - the three segment shapes a v0.1.0 store could hold — overlapping batches, a batch
 //!   reconciled in place, and a squashed aspect — all still read;
-//! - the encoding a v0.1.0 declared aspect carries (scaled_i64 scale 4, seconds) survives,
+//! - the encoding a v0.1.0 declared aspect carries (`scaled_i64` scale 4, seconds) survives,
 //!   and null rows keep being nulls;
 //! - what a v0.1.0 backup actually contains, which is **not** the segment data. That is a
 //!   finding, not an aspiration: see [`v010_backup_covers_the_control_plane_only`].
@@ -97,14 +100,11 @@ fn restore_uncarried_directories(tree: &Path) {
 }
 
 /// A decimal as canonical text, so a scale difference is not mistaken for a different
-/// number: a v0.1.0 scaled_i64 column reads back as `100.2500` while a re-encoded one may
+/// number: a v0.1.0 `scaled_i64` column reads back as `100.2500` while a re-encoded one may
 /// say `100.25`. These tests compare values, not formatting.
 fn canonical(text: &str) -> String {
 	let text = text.trim();
-	let (sign, rest) = match text.strip_prefix('-') {
-		Some(rest) => ("-", rest),
-		None => ("", text),
-	};
+	let (sign, rest) = text.strip_prefix('-').map_or(("", text), |rest| ("-", rest));
 	match rest.split_once('.') {
 		Some((int, frac)) => {
 			let frac = frac.trim_end_matches('0');
@@ -175,7 +175,7 @@ fn files_under(root: &Path) -> Vec<String> {
 		for entry in std::fs::read_dir(&dir).unwrap_or_else(|err| panic!("reading {}: {err}", dir.display())) {
 			let entry = entry.expect("a readable directory entry");
 			let (name, file_type) = (entry.file_name().to_string_lossy().into_owned(), entry.file_type().expect("a file type"));
-			let relative = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+			let relative = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
 			if file_type.is_dir() {
 				pending.push((entry.path(), relative));
 			} else {
@@ -237,6 +237,7 @@ async fn a_v010_store_migrates_forward_and_keeps_reading_its_own_values() {
 		let got: Vec<(i64, Option<String>)> = timestamps.iter().zip(values.iter()).map(|(ts, value)| (*ts, value.as_ref().map(|v| canonical(&v.to_string())))).collect();
 		assert_eq!(got, want, "the migrated store and the reopened store disagree about {aspect} [{start},{end}]");
 	}
+	drop(reopened);
 }
 
 #[tokio::test]
@@ -253,12 +254,13 @@ async fn a_v010_aspect_keeps_its_declared_encoding_and_its_nulls() {
 	// The fixture's `temp` aspect holds seven null rows, sealed by a version that predates
 	// this build's quality-mask handling; a null must still read as a null, not as zero and
 	// not as a missing row.
-	let (timestamps, values) = store.read_time_range("temp", 1767225600, 1767232999).await.expect("reading temp");
+	let (timestamps, values) = store.read_time_range("temp", 1_767_225_600, 1_767_232_999).await.expect("reading temp");
 	let nulls = values.iter().filter(|value| value.is_none()).count();
 	assert_eq!(timestamps.len(), 72, "temp holds 60 grid rows plus a 12-row out-of-order batch");
 	assert_eq!(nulls, 7, "seven of them are null; this build reads {nulls}");
 
-	let at = store.read_point("price", 1767225660).await.expect("reading one point").expect("that timestamp is in the fixture");
+	let at = store.read_point("price", 1_767_225_660).await.expect("reading one point").expect("that timestamp is in the fixture");
+	drop(store);
 	assert_eq!(canonical(&at.to_string()), "102", "the v0.1.0 server answered 102.0000 for that point");
 }
 
@@ -279,8 +281,8 @@ async fn v010_segments_carry_the_three_shapes_a_reader_can_meet() {
 async fn v010_backup_covers_the_control_plane_only() {
 	let listing = files_under(&fixture().join("backup"));
 	assert!(!listing.is_empty(), "the backup tree is part of the fixture");
-	let databases: Vec<&String> = listing.iter().filter(|name| name.ends_with(".db")).collect();
-	assert!(!databases.is_empty(), "the v0.1.0 backup holds the store's control-plane databases; found {listing:?}");
+
+	assert!(listing.iter().any(|name| std::path::Path::new(name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("db"))), "the v0.1.0 backup holds the store's control-plane databases; found {listing:?}");
 	assert!(listing.iter().all(|name| !name.contains("segments/")), "a v0.1.0 backup contains no segment file: {listing:?}");
 	// This is a finding about the released behaviour, stated plainly because it bounds what
 	// a restore across versions can promise: at v0.1.0 `POST /api/v1/storage/backup` copied
@@ -307,14 +309,14 @@ async fn v010_legacy_tree_is_a_rows_mode_database_of_the_expected_shape() {
 	// `price` aspect, 6 on `temp`. The store reports 14 and 7 — one extra `temp` null its
 	// out-of-order batch re-seals over a window that already held one, and price's nulls
 	// arriving twice because two ingest routes carried them.)
-	let grid_nulls = std::fs::read_to_string(fixture().join("rows.csv")).expect("the shared grid is part of the fixture").lines().filter(|line| line.ends_with(",")).count();
+	let grid_nulls = std::fs::read_to_string(fixture().join("rows.csv")).expect("the shared grid is part of the fixture").lines().filter(|line| line.ends_with(',')).count();
 	assert_eq!(grid_nulls, 13, "the shared grid carries 13 null rows for Storage-v2 to seal; the grid changed");
 }
 
 /// The shape 0.1.x left behind when it kept one database per aspect: a root with a
 /// control-plane `metadata.db` and `<subject>/<aspect>/measurements.db` below it. This
 /// build reads stores, and opening that root would otherwise succeed: `metadata.db` is one
-/// of `[`weftdb::CONTROL_PLANE_FILES`]`, so the open finds a control plane, creates the three
+/// of `[``weftdb::CONTROL_PLANE_FILES``]`, so the open finds a control plane, creates the three
 /// databases it is missing, adds `segments/`, writes a marker beside the old data, and
 /// reports an **empty** store. The refusal has to be loud, and it has to leave nothing.
 #[tokio::test]
@@ -326,10 +328,7 @@ async fn a_v010_rows_mode_directory_is_refused_and_writes_nothing() {
 	restore_uncarried_directories(&root);
 	let before = files_under(&root);
 
-	let error = match SegmentStore::open(&root).await {
-		Ok(_) => panic!("a rows-mode directory is not a store, and saying so is the whole point"),
-		Err(error) => error,
-	};
+	let Err(error) = SegmentStore::open(&root).await else { panic!("a rows-mode directory is not a store, and saying so is the whole point") };
 	let typed = error.downcast_ref::<StoreError>().unwrap_or_else(|| panic!("the refusal is typed, not a sentence: {error:#}"));
 	let StoreError::RowsModeDataDirectory { aspects } = typed else {
 		panic!("the refusal names the rows-mode shape: {error:#}");
@@ -351,10 +350,7 @@ async fn a_v010_rows_mode_directory_is_refused_and_writes_nothing() {
 	assert!(!before.iter().any(|name| name == "STORE_FORMAT"), "the fixture never had a marker, and the refusal does not add one");
 
 	// A second open refuses the same way: the refusal is not a state transition.
-	let again = match SegmentStore::open(&root).await {
-		Ok(_) => panic!("the same directory is refused twice"),
-		Err(error) => error,
-	};
+	let Err(again) = SegmentStore::open(&root).await else { panic!("the same directory is refused twice") };
 	assert!(format!("{again:#}").contains("a WeftDB 0.1.x data directory"), "{again:#}");
 }
 
@@ -364,7 +360,7 @@ async fn measured(store: &SegmentStore, aspect: &str) -> Vec<u64> {
 	let stats = store.aspect_stats(aspect).await.expect("the aspect is declared");
 	let meta = store.aspect_metadata(aspect).await.expect("the aspect has metadata");
 	let (lo, hi) = stats.time_range.expect("a sealed aspect covers a span");
-	vec![stats.segment_count as u64, stats.total_rows, meta.total_nulls, stats.total_bytes, stats.unsorted_segments as u64, stats.overlapping_segments as u64, lo as u64, hi as u64]
+	vec![stats.segment_count as u64, stats.total_rows, meta.total_nulls, stats.total_bytes, stats.unsorted_segments as u64, stats.overlapping_segments as u64, lo.cast_unsigned(), hi.cast_unsigned()]
 }
 
 /// The same eight facts as v0.1.0 wrote them into `aspect_stats.txt`.
@@ -381,7 +377,7 @@ fn recorded(recorded: &serde_json::Value, keys: [&str; 6]) -> Vec<u64> {
 async fn measured_store(store: &SegmentStore) -> Vec<u64> {
 	let stats = store.store_stats().await.expect("the store reports itself");
 	let (lo, hi) = stats.time_range.expect("a store with segments covers a span");
-	vec![stats.aspect_count as u64, stats.segment_count as u64, stats.total_rows, stats.total_nulls, stats.total_bytes, stats.unsorted_segments as u64, lo as u64, hi as u64]
+	vec![stats.aspect_count as u64, stats.segment_count as u64, stats.total_rows, stats.total_nulls, stats.total_bytes, stats.unsorted_segments as u64, lo.cast_unsigned(), hi.cast_unsigned()]
 }
 
 /// The X-FX gate the plan asks for in one place: the measurements a v0.1.0 release counted
@@ -449,6 +445,7 @@ async fn the_migrated_measurements_are_the_ones_v010_counted() {
 	// shipped, which is why the byte totals above can be trusted as identity.
 	let frames = files_under(&to).into_iter().filter(|name| name.ends_with(".weftseg")).collect::<Vec<_>>();
 	assert_eq!(frames.iter().filter(|name| name.starts_with("segments/")).count(), 6, "the upgrade moved six frames forward and did not rewrite or add any: {frames:?}");
+	drop(moved);
 }
 
 /// One row of `rows.csv`: subject, aspect, the instant in **seconds** as the grid spells it,
@@ -515,7 +512,7 @@ async fn the_v010_rows_mode_tree_reads_into_a_store_of_its_own_database() {
 	assert!(refused.contains("metadata.db"), "the 0.1.x catalog stays behind, and says why: {refused:?}");
 	assert!(refused.contains("plant/price/dictionaries"), "an aspect's compression dictionaries stay behind: {refused:?}");
 	for file in files_under(&tree) {
-		if !file.ends_with(".db") || file.ends_with("/measurements.db") {
+		if !std::path::Path::new(&file).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("db")) || file.ends_with("/measurements.db") {
 			continue;
 		}
 		assert!(refused.contains(file.as_str()) || refused.iter().any(|entry| file.starts_with(&format!("{entry}/"))), "{file} is a database in the tree that the readable leg neither carries nor names");

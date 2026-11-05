@@ -41,12 +41,14 @@ use weft_line_protocol::TimestampPrecision;
 use weft_physical_type::{first_order_violation, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION};
 
 use crate::{
-	error::{self, ApiError, StrictBody, StrictJson, StrictQuery, StrictText}, panic_catch, state::AppState
+	error::{self, ApiError, StrictBody, StrictJson, StrictQuery, StrictText, TaggedQuery}, panic_catch, state::AppState
 };
 
 /// Environment variable naming the one body cap for the ingest routes
 /// (plan C11, crash-consistency §8): a positive whole number of bytes,
-/// read once at startup. Every other route keeps its own limits — this
+/// read once at startup.
+///
+/// Every other route keeps its own limits — this
 /// cap applies to the four ingest routes only, as a
 /// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit) the registry
 /// installs at registration.
@@ -54,15 +56,40 @@ pub const MAX_INGEST_BYTES_ENV: &str = "WEFT_MAX_INGEST_BYTES";
 
 /// Environment variable naming the ingest routes' in-flight byte budget
 /// (crash-consistency §8): the byte-weighted admission the registry's
-/// gate enforces inside itself (plan C10). A request whose body would
+/// gate enforces inside itself (plan C10).
+///
+/// A request whose body would
 /// push the in-flight total past the budget is refused
 /// `503 overloaded` with `Retry-After`, instead of queueing without
 /// bound behind the ingests already running.
 pub const INGEST_MAX_INFLIGHT_BYTES_ENV: &str = "WEFT_INGEST_MAX_INFLIGHT_BYTES";
 
+/// Environment variable naming the row cap for the four ingest routes (ROB-7, plan
+/// C11's row limit): a positive whole number of rows, counted on the decoded columns
+/// — the rows the seal would write, whichever format carried them. A body over it is
+/// refused `413 too_many_rows` with the limit.
+pub const MAX_INGEST_ROWS_ENV: &str = "WEFT_MAX_INGEST_ROWS";
+
+/// Environment variable naming the decoded-byte cap for the four ingest routes
+/// (ROB-7, plan C11's decoded-byte limit): a positive whole number of bytes of
+/// *decoded* columns, not of body. `WEFT_MAX_INGEST_BYTES` bounds what arrives on the
+/// socket, which says nothing about what a compressed Parquet body expands to.
+pub const MAX_INGEST_DECODED_BYTES_ENV: &str = "WEFT_MAX_INGEST_DECODED_BYTES";
+
 /// The default body cap when `WEFT_MAX_INGEST_BYTES` is unset:
 /// 256 MiB (crash-consistency §8).
 pub const DEFAULT_MAX_INGEST_BYTES: usize = 256 * 1024 * 1024;
+
+/// The default row cap when `WEFT_MAX_INGEST_ROWS` is unset: 10 million rows. A batch
+/// that size is a ~240 MB seal — the same order as the 256 MiB body cap, so the row
+/// ceiling sits where the body ceiling already stands, and it bites on a Parquet body
+/// that the body cap lets through.
+pub const DEFAULT_MAX_INGEST_ROWS: usize = 10_000_000;
+
+/// The default decoded-byte cap when `WEFT_MAX_INGEST_DECODED_BYTES` is unset: 1 GiB,
+/// four times the default body cap, so a compressed body gets room to expand without
+/// the decode being able to grow past what a node's memory is sized for.
+pub const DEFAULT_MAX_INGEST_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The ingest wiring's two limits (D-S14), read once at startup and
 /// carried on the router state, so the registry the binary serves and a
@@ -71,26 +98,42 @@ pub const DEFAULT_MAX_INGEST_BYTES: usize = 256 * 1024 * 1024;
 pub struct IngestConfig {
 	max_body_bytes: usize,
 	max_inflight_bytes: u64,
+	max_rows: usize,
+	max_decoded_bytes: u64,
 }
 
 impl IngestConfig {
 	/// The defaults: a 256 MiB body cap, and an in-flight budget of the
 	/// same 256 MiB — one max-size body in flight by default, or any
 	/// number of smaller ones whose bodies sum under it.
-	pub const DEFAULT: Self = Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64 };
+	pub const DEFAULT: Self = Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64, max_rows: DEFAULT_MAX_INGEST_ROWS, max_decoded_bytes: DEFAULT_MAX_INGEST_DECODED_BYTES };
 
 	/// A configuration with an explicit body cap and the default
 	/// in-flight budget (tests, embedders).
 	#[must_use]
 	pub const fn with_max_body_bytes(max_body_bytes: usize) -> Self {
-		Self { max_body_bytes, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64 }
+		Self { max_body_bytes, ..Self::DEFAULT }
 	}
 
 	/// A configuration with an explicit in-flight byte budget and the
 	/// default body cap (tests, embedders).
 	#[must_use]
 	pub const fn with_max_inflight_bytes(max_inflight_bytes: u64) -> Self {
-		Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes }
+		Self { max_inflight_bytes, ..Self::DEFAULT }
+	}
+
+	/// A configuration with an explicit row cap and everything else at its
+	/// default (tests, embedders).
+	#[must_use]
+	pub const fn with_max_rows(max_rows: usize) -> Self {
+		Self { max_rows, ..Self::DEFAULT }
+	}
+
+	/// A configuration with an explicit decoded-byte cap and everything else at its
+	/// default (tests, embedders).
+	#[must_use]
+	pub const fn with_max_decoded_bytes(max_decoded_bytes: u64) -> Self {
+		Self { max_decoded_bytes, ..Self::DEFAULT }
 	}
 
 	/// The limits the two `WEFT_*` values describe (`None` for an unset
@@ -101,7 +144,7 @@ impl IngestConfig {
 	/// A message naming the variable when a value is not a positive
 	/// whole number, so a malformed setting fails startup instead of
 	/// silently falling back to a default the operator did not ask for.
-	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>) -> Result<Self, String> {
+	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>, max_rows: Option<&str>, max_decoded_bytes: Option<&str>) -> Result<Self, String> {
 		let mut config = Self::DEFAULT;
 		if let Some(raw) = max_body_bytes {
 			config.max_body_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
@@ -115,6 +158,18 @@ impl IngestConfig {
 				return Err(format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest"));
 			}
 		}
+		if let Some(raw) = max_rows {
+			config.max_rows = raw.parse().map_err(|e| format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: {e}"))?;
+			if config.max_rows == 0 {
+				return Err(format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: zero would refuse every ingest body"));
+			}
+		}
+		if let Some(raw) = max_decoded_bytes {
+			config.max_decoded_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.max_decoded_bytes == 0 {
+				return Err(format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest body"));
+			}
+		}
 		Ok(config)
 	}
 
@@ -125,7 +180,7 @@ impl IngestConfig {
 	///
 	/// A set variable whose value is not a positive whole number.
 	pub fn from_env() -> Result<Self, String> {
-		Self::from_env_values(std::env::var(MAX_INGEST_BYTES_ENV).ok().as_deref(), std::env::var(INGEST_MAX_INFLIGHT_BYTES_ENV).ok().as_deref())
+		Self::from_env_values(std::env::var(MAX_INGEST_BYTES_ENV).ok().as_deref(), std::env::var(INGEST_MAX_INFLIGHT_BYTES_ENV).ok().as_deref(), std::env::var(MAX_INGEST_ROWS_ENV).ok().as_deref(), std::env::var(MAX_INGEST_DECODED_BYTES_ENV).ok().as_deref())
 	}
 
 	/// The one body cap for the ingest routes, in bytes.
@@ -139,6 +194,49 @@ impl IngestConfig {
 	pub const fn max_inflight_bytes(self) -> u64 {
 		self.max_inflight_bytes
 	}
+
+	/// The row cap on one decoded ingest body (ROB-7).
+	#[must_use]
+	pub const fn max_rows(self) -> usize {
+		self.max_rows
+	}
+
+	/// The decoded-byte cap on one ingest body (ROB-7).
+	#[must_use]
+	pub const fn max_decoded_bytes(self) -> u64 {
+		self.max_decoded_bytes
+	}
+}
+
+/// Refuse a decoded body that is too big to seal (ROB-7, plan C11's two limits).
+///
+/// Both ceilings are measured here, on the columns the format's parser produced,
+/// rather than on the body: a body cap cannot bound what a compressed Parquet file
+/// expands to, and a row count cannot bound what those rows weigh when the decimals
+/// are wide. Every format reaches the same two numbers, so a client that sizes a
+/// batch for one format is sized for all four.
+fn check_decoded_size(timestamps: &[i64], values: &[Option<BigDecimal>], limits: IngestConfig) -> Result<(), ApiError> {
+	if timestamps.len() > limits.max_rows() {
+		return Err(error::too_many_ingest_rows(timestamps.len(), limits.max_rows()));
+	}
+	let decoded = decoded_column_bytes(timestamps, values);
+	if decoded > limits.max_decoded_bytes() {
+		return Err(error::decoded_too_large(decoded, limits.max_decoded_bytes()));
+	}
+	Ok(())
+}
+
+/// The decoded columns' byte cost (ROB-7): a slot per row in each column, plus the
+/// mantissa bytes each decimal actually carries.
+///
+/// An estimate, and deliberately generous about the fixed part: what it must not do is
+/// read the cap as satisfied because the *body* was small. The mantissa term is what
+/// makes a wide decimal cost more than a narrow one, which is the difference between
+/// this and a row count.
+fn decoded_column_bytes(timestamps: &[i64], values: &[Option<BigDecimal>]) -> u64 {
+	let slots = (timestamps.len() + values.len()) as u64;
+	let mantissas: u64 = values.iter().flatten().map(|value| value.as_bigint_and_exponent().0.bits() as u64 / 8 + 1).sum();
+	slots * 16 + mantissas
 }
 
 impl Default for IngestConfig {
@@ -188,6 +286,53 @@ pub struct IngestRequest {
 	/// sent. Same rule as the header: visible ASCII, at most 128 bytes.
 	#[serde(default)]
 	pub batch_id: Option<String>,
+	/// The tags naming the one series the batch writes (TAG-11), as a JSON object of
+	/// string values. Absent, `null` or `{}` is the untagged series 0. A key given twice
+	/// is refused `400 invalid_tag` rather than letting the last one win, as are a
+	/// reserved `__` key and anything else the tag grammar refuses.
+	#[serde(default)]
+	pub tags: Option<JsonTags>,
+}
+
+/// The `tags` object of a JSON ingest body, kept as the pairs it was written as: a
+/// plain map would silently keep the last of two equal keys, so the pairs go to
+/// [`TagSet::from_pairs`](weftdb::TagSet::from_pairs), which refuses the repeat.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsonTags(pub Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for JsonTags {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		/// Collects every entry of the object, repeats included.
+		struct Pairs;
+		impl<'de> serde::de::Visitor<'de> for Pairs {
+			type Value = JsonTags;
+
+			fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				formatter.write_str("an object of string tag values")
+			}
+
+			fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+				let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(0).min(weftdb::tags::MAX_TAGS + 1));
+				while let Some((key, value)) = map.next_entry::<String, String>()? {
+					pairs.push((key, value));
+				}
+				Ok(JsonTags(pairs))
+			}
+		}
+		deserializer.deserialize_map(Pairs)
+	}
+}
+
+impl JsonTags {
+	/// The tag set these pairs name.
+	///
+	/// # Errors
+	///
+	/// `400 invalid_tag` for a repeated key, a reserved or malformed key, a bad value, or
+	/// too many tags ([`error::from_tag_error`]).
+	fn to_tag_set(&self) -> Result<weftdb::TagSet, ApiError> {
+		weftdb::TagSet::from_pairs(self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))).map_err(|e| error::from_tag_error(&e))
+	}
 }
 
 /// Response body for a successful ingest: the sealed segment's descriptor summary,
@@ -198,7 +343,10 @@ pub struct IngestResponse {
 	pub aspect: String,
 	/// The id assigned to the new segment (monotonic within the aspect).
 	pub segment_id: u64,
-	/// The `.weftseg` frame format version sealed (5 single-block, 6 paged).
+	/// The `.weftseg` frame format version sealed (5 single-block, 6 paged): the
+	/// body's layout. A tagged series' frame is that body inside a v7 envelope
+	/// carrying its series key (TAG-7); the envelope is not reported here, and
+	/// `byte_len` counts it.
 	pub format_version: u16,
 	/// Total rows sealed (present and null).
 	pub row_count: usize,
@@ -222,6 +370,12 @@ pub struct IngestResponse {
 	/// `segment_id` stays as the first id for the clients that predate
 	/// the list.
 	pub segment_ids: Vec<u64>,
+	/// The id of the series the batch wrote (TAG-11): `0` for the untagged series,
+	/// otherwise the id the aspect's catalog holds for [`tags`](Self::tags), assigned
+	/// by the commit that first wrote the series.
+	pub series_id: u64,
+	/// The tags of the series the batch wrote: `{}` for the untagged series 0.
+	pub tags: std::collections::BTreeMap<String, String>,
 	/// Whether this response is a replay: the request's idempotency key
 	/// was already committed with the same batch, so nothing was written
 	/// again and the recorded receipt is answered back (with status
@@ -308,7 +462,8 @@ fn ephemeral_key() -> String {
 /// propagated (the audit log is poisoned by it, and the next audited
 /// operation refuses fail-closed).
 fn emit_ingest_audit(audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, format: &str, keyed: bool, receipt: &weftdb::IngestReceipt) {
-	tracing::info!(target: "weft_audit", event = "ingest", aspect, format, keyed, rows = receipt.row_count, segments = receipt.segment_ids.len(), commit_epoch = receipt.commit_epoch, "ingest committed");
+	let series_id = receipt_series_id(receipt);
+	tracing::info!(target: "weft_audit", event = "ingest", aspect, format, keyed, rows = receipt.row_count, segments = receipt.segment_ids.len(), commit_epoch = receipt.commit_epoch, series_id, "ingest committed");
 	if let Some(audit) = audit {
 		audit.emit_event(
 			"ingest",
@@ -319,9 +474,16 @@ fn emit_ingest_audit(audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, 
 				"rows": receipt.row_count,
 				"segments": receipt.segment_ids.len(),
 				"commit_epoch": receipt.commit_epoch,
+				"series_id": series_id,
 			}),
 		);
 	}
+}
+
+/// The one series a committed batch wrote: an HTTP ingest is one series per request
+/// (TAG-11), so its receipt names exactly one id, `0` for the untagged series.
+fn receipt_series_id(receipt: &weftdb::IngestReceipt) -> u64 {
+	receipt.series_ids.first().copied().unwrap_or(0)
 }
 
 /// Commit one parsed batch through the store's ingest entry point, in a
@@ -335,7 +497,8 @@ fn emit_ingest_audit(audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, 
 /// (plan D21, the ROB-3 table); a panic that still escapes as a
 /// `JoinError` is mapped the same way, with no phase to key on (the
 /// pre-commit arm: nothing the task could have committed is claimed).
-async fn commit_ingest(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, format: &'static str, keyed: bool, batch: weftdb::IngestBatch, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<Response, ApiError> {
+async fn commit_ingest(target: IngestTarget<'_>, format: &'static str, keyed: bool, batch: weftdb::IngestBatch, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<Response, ApiError> {
+	let IngestTarget { store, metrics, audit, aspect, headers: _, limits: _ } = target;
 	// An undeclared aspect is a clean 404 (its encoding is unknown),
 	// answered here as the handlers always answered it — the store's
 	// entry point would also refuse, but only after its name check,
@@ -345,6 +508,7 @@ async fn commit_ingest(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metri
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	}
 	let rows_per_page = batch.rows_per_page;
+	let tags: std::collections::BTreeMap<String, String> = batch.groups.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 	let task_store = Arc::clone(store);
 	let task_aspect = aspect.to_string();
 	let handle = tokio::spawn(async move { weftdb::exec::ingest_phase_scope(weftdb::exec::catch(async move { task_store.ingest(&task_aspect, &batch).await })).await });
@@ -372,7 +536,7 @@ async fn commit_ingest(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metri
 			metrics.record_ingest_extra_segments(u64::try_from(receipt.segment_ids.len() - 1).unwrap_or(u64::MAX));
 		}
 	}
-	Ok(ingest_response(store, aspect, &receipt, timestamps, values, rows_per_page).await)
+	Ok(ingest_response(store, aspect, &receipt, tags, timestamps, values, rows_per_page).await)
 }
 
 /// Build an ingest response from a commit's receipt: the additive shape
@@ -383,13 +547,14 @@ async fn commit_ingest(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metri
 /// answer, say) falls back to the values the request itself determines,
 /// because the commit has already happened and its receipt is the
 /// answer that matters.
-async fn ingest_response(store: &Arc<weftdb::SegmentStore>, aspect: &str, receipt: &weftdb::IngestReceipt, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Response {
+async fn ingest_response(store: &Arc<weftdb::SegmentStore>, aspect: &str, receipt: &weftdb::IngestReceipt, tags: std::collections::BTreeMap<String, String>, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Response {
 	let first_id = receipt.segment_ids.first().copied();
 	let descriptor = match first_id {
 		Some(id) => store.index().all(aspect).await.ok().and_then(|descriptors| descriptors.into_iter().find(|d| d.id == id)),
 		None => None,
 	};
-	let response = IngestResponse { aspect: aspect.to_string(), segment_id: first_id.unwrap_or(0), format_version: descriptor.as_ref().map_or(if rows_per_page.is_some() { PAGED_SEGMENT_FORMAT_VERSION } else { SEGMENT_FORMAT_VERSION }, |d| d.format_version), row_count: receipt.row_count, null_count: descriptor.as_ref().filter(|_| receipt.segment_ids.len() == 1).map_or_else(|| values.iter().filter(|v| v.is_none()).count(), |d| d.null_count), byte_len: descriptor.as_ref().map_or(0, |d| d.byte_len), min_ts: receipt.min_ts, max_ts: receipt.max_ts, time_sorted: first_order_violation(timestamps).is_none(), segment_ids: receipt.segment_ids.clone(), replayed: receipt.duplicate };
+	let requested_format_version = if rows_per_page.is_some() { PAGED_SEGMENT_FORMAT_VERSION } else { SEGMENT_FORMAT_VERSION };
+	let response = IngestResponse { aspect: aspect.to_string(), segment_id: first_id.unwrap_or(0), format_version: descriptor.as_ref().map_or(requested_format_version, |d| d.format_version), row_count: receipt.row_count, null_count: descriptor.as_ref().filter(|_| receipt.segment_ids.len() == 1).map_or_else(|| values.iter().filter(|v| v.is_none()).count(), |d| d.null_count), byte_len: descriptor.as_ref().map_or(0, |d| d.byte_len), min_ts: receipt.min_ts, max_ts: receipt.max_ts, time_sorted: first_order_violation(timestamps).is_none(), segment_ids: receipt.segment_ids.clone(), series_id: receipt_series_id(receipt), tags, replayed: receipt.duplicate };
 	let status = if receipt.duplicate { StatusCode::OK } else { StatusCode::CREATED };
 	let mut response = (status, Json(response)).into_response();
 	if receipt.duplicate {
@@ -422,11 +587,14 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
 	// file as well as the tracing pipeline (see `emit_ingest_audit`).
 	let audit = state.audit_log().cloned();
+	// Read the ingest ceilings before the state is dropped: the handler owns the
+	// `AppState` by value and the inner call takes the limits, not the state.
+	let limits = state.ingest_config();
 	drop(state);
 	// Time the commit path (not the store-unconfigured fast-fail above): this is the
 	// ingest side of the north-star "predictable p95/p99 under ingest + query".
 	let start = std::time::Instant::now();
-	let result = ingest_points_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, request).await;
+	let result = ingest_points_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, request).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -435,13 +603,28 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 	result
 }
 
+/// Where an ingest request commits, and the request headers it carries: the pieces every
+/// ingest format's body shares.
+#[derive(Clone, Copy)]
+struct IngestTarget<'a> {
+	store: &'a Arc<weftdb::SegmentStore>,
+	metrics: &'a crate::metrics::SharedMetrics,
+	audit: Option<&'a Arc<crate::audit::AuditLog>>,
+	aspect: &'a str,
+	headers: &'a HeaderMap,
+	/// The decoded-size ceilings (ROB-7) every format checks before sealing.
+	limits: IngestConfig,
+}
+
 /// The body of [`ingest_points`], split out so the handler can record an error
 /// metric for any failure path uniformly.
-async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, request: IngestRequest) -> Result<Response, ApiError> {
+async fn ingest_points_inner(target: IngestTarget<'_>, request: IngestRequest) -> Result<Response, ApiError> {
+	let IngestTarget { headers, limits, .. } = target;
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("no points to ingest (`points` is empty)".to_string()));
 	}
 	let (key, keyed) = resolve_idempotency_key(headers, request.batch_id.as_deref())?;
+	let tags = request.tags.as_ref().map(JsonTags::to_tag_set).transpose()?.unwrap_or_default();
 	let point_count = request.points.len();
 	let mut timestamps = Vec::with_capacity(point_count);
 	let mut values = Vec::with_capacity(point_count);
@@ -456,22 +639,30 @@ async fn ingest_points_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate:
 			match &point.value {
 				None => values.push(None),
 				Some(text) => {
-					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
+					// A `NaN` or infinity is not "not a decimal" — it is a value with no
+					// decimal form, and it gets the code the read side already uses for
+					// the same condition (ROB-7).
+					if weft_physical_type::is_non_finite_decimal_text(text) {
+						return Err(error::non_finite_value(format!("value {text:?} (at timestamp {})", point.timestamp)));
+					}
+					let parsed: BigDecimal = weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("value {text:?} (at timestamp {}) is not a decimal", point.timestamp))))?;
 					values.push(Some(parsed));
 				}
 			}
 		}
 	}
 
+	check_decoded_size(&timestamps, &values, limits)?;
 	enforce_order_if_required(request.require_sorted, &timestamps)?;
 	// `storage.ingest.seal` child span (roadmap Phase 3): the typed-column encode +
 	// `.weftseg` write + control-plane index update — the write stage timed apart from
 	// value parsing.
-	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(request.rows_per_page);
-	commit_ingest(store, metrics, audit, aspect, "json", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "json")).await
+	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(request.rows_per_page).with_groups(tags);
+	commit_ingest(target, "json", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "json")).await
 }
 
-/// Query parameters for the CSV ingest endpoint: an optional page height.
+/// Query parameters for the CSV ingest endpoint: an optional page height. The
+/// series is named by `tag.<key>=value` parameters beside these ([`TaggedQuery`]).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CsvIngestParams {
@@ -529,8 +720,11 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 		if value_text.is_empty() {
 			any_null = true;
 			values.push(None);
+		} else if weft_physical_type::is_non_finite_decimal_text(value_text) {
+			// ROB-7: a `NaN` cell is refused with the reason, not stored as a hole.
+			return Err(error::non_finite_value(format!("CSV line {}: value {value_text:?}", index + 1)));
 		} else {
-			let parsed: BigDecimal = weft_physical_type::parse_decimal(value_text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1))))?;
+			let parsed: BigDecimal = weft_physical_type::parse_decimal(value_text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("CSV line {}: value {value_text:?} is not a decimal", index + 1))))?;
 			values.push(Some(parsed));
 		}
 		timestamps.push(timestamp);
@@ -557,7 +751,7 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 /// undeclared), [`ApiError::bad_request`] (malformed CSV, empty body, or values
 /// unrepresentable under the declared encoding/tolerance), and
 /// [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictQuery(params): StrictQuery<CsvIngestParams>, StrictText(body): StrictText) -> Result<Response, ApiError> {
+pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, TaggedQuery(params, tags): TaggedQuery<CsvIngestParams>, StrictText(body): StrictText) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
@@ -567,9 +761,12 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
 	// file as well as the tracing pipeline (see `emit_ingest_audit`).
 	let audit = state.audit_log().cloned();
+	// Read the ingest ceilings before the state is dropped: the handler owns the
+	// `AppState` by value and the inner call takes the limits, not the state.
+	let limits = state.ingest_config();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_csv_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_csv_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, tags, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -582,15 +779,17 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 /// any failure path uniformly. Shares the commit path and
 /// `error::classify_ingest` with the JSON ingest path, so a CSV-committed batch
 /// is byte-identical to a JSON-committed one.
-async fn ingest_csv_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
+async fn ingest_csv_inner(target: IngestTarget<'_>, tags: weftdb::TagSet, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
+	let IngestTarget { headers, limits, .. } = target;
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
 	// `(timestamp, value)` columns, timed apart from the commit.
 	let ParsedCsv { timestamps, values, any_null } = tracing::info_span!("storage.ingest.parse", format = "csv").in_scope(|| parse_csv_points(body))?;
+	check_decoded_size(&timestamps, &values, limits)?;
 	enforce_order_if_required(require_sorted, &timestamps)?;
 	let point_count = timestamps.len();
-	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page);
-	commit_ingest(store, metrics, audit, aspect, "csv", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await
+	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page).with_groups(tags);
+	commit_ingest(target, "csv", keyed, batch, &timestamps, &values).instrument(tracing::info_span!("storage.ingest.seal", point_count, any_null, format = "csv")).await
 }
 
 /// Query parameters for the ILP ingest endpoint: which field to seal, the wire
@@ -601,6 +800,10 @@ pub struct IlpIngestParams {
 	/// The line-protocol field key whose numeric values are sealed (one aspect ==
 	/// one field).
 	pub field: String,
+	/// The line-protocol measurement whose records are sealed (TAG-11, required).
+	/// Records of any other measurement are skipped; the records of this one that
+	/// carry `field` must share one tag set, which names the series the batch writes.
+	pub measurement: String,
 	/// The wire timestamp precision token (`ns`/`us`/`ms`/`s`, default `ns`) —
 	/// how the integer timestamps **in the payload** are interpreted. The stored
 	/// epochs are then rescaled to the aspect's declared [`TimeUnit`].
@@ -649,14 +852,57 @@ const fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 	}
 }
 
+/// Project a line-protocol payload onto the one series an ILP ingest writes (TAG-11):
+/// the records of `measurement` that carry `field` with a timestamp, sorted by
+/// timestamp, and the tag set they share.
+///
+/// Records of another measurement, and records without the field or a timestamp, are
+/// skipped (an ILP file may interleave many). Before TAG-11 the tags of the contributing
+/// records were checked for agreement and then dropped, so a tagged payload was written
+/// to the untagged series; now they name the series.
+///
+/// # Errors
+///
+/// A malformed payload ([`error::from_line_protocol_error`]), `400 ambiguous_series`
+/// when the contributing records carry two different tag sets (TAG-0: one series per
+/// request), and `400 invalid_tag` when their tags break the tag grammar (a reserved
+/// `__` key, a repeated key, too many tags, ...).
+fn project_ilp_series(body: &str, measurement: &str, field: &str, precision: TimestampPrecision) -> Result<(Vec<splimes::Point>, weftdb::TagSet), ApiError> {
+	let records = weft_line_protocol::parse(body).map_err(|err| error::from_line_protocol_error(&err))?;
+	let mut points = Vec::new();
+	let mut series: Option<(weft_line_protocol::SeriesKey, String)> = None;
+	for record in records.iter().filter(|record| record.measurement == measurement) {
+		let Some(point) = record.to_point(field, precision) else {
+			continue;
+		};
+		let key = record.series_key();
+		match &series {
+			None => series = Some((key, record.describe_series())),
+			Some((first, first_described)) if *first != key => {
+				return Err(ApiError::new(error::Code::AmbiguousSeries, format!("field `{field}` of measurement `{measurement}` carries points from more than one series: `{first_described}` and `{}`; one request writes one series — split the payload by series", record.describe_series())));
+			}
+			Some(_) => {}
+		}
+		points.push(point);
+	}
+	points.sort_by_key(|p| p.timestamp);
+	let tags = match series {
+		Some(((_, tags), _)) => weftdb::TagSet::from_pairs(tags).map_err(|e| error::from_tag_error(&e))?,
+		None => weftdb::TagSet::new(),
+	};
+	Ok((points, tags))
+}
+
 /// Handle `POST /api/v1/storage/{aspect}/ilp`.
 ///
 /// Parses an InfluxDB-Line-Protocol payload (the wire format TSBS / `InfluxDB` /
 /// `QuestDB` speak) and seals the chosen field's values into `aspect`'s declared
 /// schema.
 ///
-/// The payload is the request body (`text/plain`); `field`, `precision`, and
-/// `rows_per_page` are query parameters. The parser is the shared, vendor-neutral
+/// The payload is the request body (`text/plain`); `measurement` (required since
+/// TAG-11), `field`, `precision`, and `rows_per_page` are query parameters. The
+/// records of `measurement` carrying `field` must share one tag set, which names the
+/// series the batch writes (no tags: the untagged series 0). The parser is the shared, vendor-neutral
 /// `weft-line-protocol` crate, so the storage ingest path and the interpolation ILP
 /// path accept the exact same dialect. Each point's absolute instant is rescaled to
 /// the aspect's declared [`TimeUnit`] before sealing. ILP fields are always present,
@@ -669,7 +915,8 @@ const fn epoch_in_unit(instant: DateTime<Utc>, unit: TimeUnit) -> Option<i64> {
 /// payload, no points carrying the field, a timestamp outside the declared unit's
 /// range, or values unrepresentable under the declared encoding/tolerance),
 /// `ambiguous_series` (the field's points span more than one series; TAG-0),
-/// and [`ApiError::internal`] on a filesystem/control-plane failure.
+/// `invalid_tag` (the series' tags break the tag grammar), `series_limit` (a new
+/// series beyond `WEFT_MAX_SERIES_PER_ASPECT`), and [`ApiError::internal`] on a filesystem/control-plane failure.
 pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictQuery(params): StrictQuery<IlpIngestParams>, StrictText(body): StrictText) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
@@ -680,9 +927,12 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
 	// file as well as the tracing pipeline (see `emit_ingest_audit`).
 	let audit = state.audit_log().cloned();
+	// Read the ingest ceilings before the state is dropped: the handler owns the
+	// `AppState` by value and the inner call takes the limits, not the state.
+	let limits = state.ingest_config();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_ilp_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, &params, &body).await;
+	let result = ingest_ilp_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, &params, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -693,7 +943,8 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 
 /// The body of [`ingest_ilp`], split out so the handler records an error metric for
 /// any failure path uniformly.
-async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
+async fn ingest_ilp_inner(target: IngestTarget<'_>, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
+	let IngestTarget { store, aspect, headers, limits, .. } = target;
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(ApiError::bad_request)?;
 	let Some(schema) = store.schema_for(aspect).await.map_err(|err| error::classify_read(&err))? else {
@@ -701,9 +952,9 @@ async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::me
 	};
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the line-protocol text →
 	// typed points, timed apart from the timestamp normalization and the seal.
-	let points = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field).in_scope(|| weft_line_protocol::parse_points(body, &params.field, precision)).map_err(|err| error::from_line_protocol_error(&err))?;
+	let (points, tags) = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field, measurement = %params.measurement).in_scope(|| project_ilp_series(body, &params.measurement, &params.field, precision))?;
 	if points.is_empty() {
-		return Err(ApiError::bad_request(format!("no points carrying field `{}` with a timestamp in the payload", params.field)));
+		return Err(ApiError::bad_request(format!("no points carrying field `{}` with a timestamp in measurement `{}` of the payload", params.field, params.measurement)));
 	}
 
 	// `storage.ingest.normalize` span (roadmap Phase 3): rescale each wire epoch to the
@@ -731,11 +982,13 @@ async fn ingest_ilp_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::me
 	// ILP fields are always present, so the batch's value column is dense
 	// text widened to the nullable shape the one entry point takes.
 	let nullable_values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
-	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), nullable_values.clone()).with_rows_per_page(params.rows_per_page);
-	commit_ingest(store, metrics, audit, aspect, "ilp", keyed, batch, &timestamps, &nullable_values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "ilp")).await
+	check_decoded_size(&timestamps, &nullable_values, limits)?;
+	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), nullable_values.clone()).with_rows_per_page(params.rows_per_page).with_groups(tags);
+	commit_ingest(target, "ilp", keyed, batch, &timestamps, &nullable_values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "ilp")).await
 }
 
-/// Query parameters for the Parquet ingest endpoint: an optional page height.
+/// Query parameters for the Parquet ingest endpoint: an optional page height. The
+/// series is named by `tag.<key>=value` parameters beside these ([`TaggedQuery`]).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParquetIngestParams {
@@ -764,7 +1017,7 @@ pub struct ParquetIngestParams {
 /// undeclared), [`ApiError::bad_request`] (empty/malformed Parquet body or values
 /// unrepresentable under the declared encoding/tolerance), and
 /// [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictQuery(params): StrictQuery<ParquetIngestParams>, StrictBody(body): StrictBody) -> Result<Response, ApiError> {
+pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, TaggedQuery(params, tags): TaggedQuery<ParquetIngestParams>, StrictBody(body): StrictBody) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
@@ -774,9 +1027,12 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 	// SEC-9: the committed-ingest `weft_audit` event goes to the audit
 	// file as well as the tracing pipeline (see `emit_ingest_audit`).
 	let audit = state.audit_log().cloned();
+	// Read the ingest ceilings before the state is dropped: the handler owns the
+	// `AppState` by value and the inner call takes the limits, not the state.
+	let limits = state.ingest_config();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_parquet_inner(&store, &metrics, audit.as_ref(), &aspect, &headers, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_parquet_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, tags, params.rows_per_page, params.require_sorted, &body).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -787,7 +1043,8 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 
 /// The body of [`ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate::metrics::SharedMetrics, audit: Option<&Arc<crate::audit::AuditLog>>, aspect: &str, headers: &HeaderMap, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
+async fn ingest_parquet_inner(target: IngestTarget<'_>, tags: weftdb::TagSet, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
+	let IngestTarget { aspect, headers, limits, .. } = target;
 	if body.is_empty() {
 		return Err(ApiError::bad_request("empty Parquet body".to_string()));
 	}
@@ -800,14 +1057,18 @@ async fn ingest_parquet_inner(store: &Arc<weftdb::SegmentStore>, metrics: &crate
 	// decoded columns commit through the same entry point as the other three
 	// formats (D-S14) — the decode is the only Parquet-specific step left.
 	let commit = async {
-		let (timestamps, values) = weft_arrow_store::decode_parquet_columns(body, require_sorted).map_err(|err| error::classify_ingest(&err))?;
-		let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page);
-		commit_ingest(store, metrics, audit, aspect, "parquet", keyed, batch, &timestamps, &values).await
+		// The strict decode (ROB-7): a `NaN` or infinite value in the file is refused
+		// with its row, not mapped to a null the sender never asked for.
+		let (timestamps, values) = weft_arrow_store::decode_parquet_columns_strict(body, require_sorted).map_err(|err| error::classify_ingest(&err))?;
+		// The two ceilings (ROB-7) land here rather than on the body: a Parquet file is
+		// the one format whose body size says nothing about what it decodes to.
+		check_decoded_size(&timestamps, &values, limits)?;
+		let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page).with_groups(tags);
+		commit_ingest(target, "parquet", keyed, batch, &timestamps, &values).await
 	};
 	commit.instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await
 }
 #[cfg(test)]
-
 mod tests {
 
 	use std::sync::Arc;
@@ -933,7 +1194,8 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let store = Arc::new(SegmentStore::open(dir.path()).await.unwrap());
 		store.declare("counts", &weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::ScaledI64 { scale: 0 }, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds)).await.unwrap();
-		let router = app_with_state(AppState::new().with_store(store));
+		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
 		let body = serde_json::json!({ "points": [{ "timestamp": 1, "value": "1.5" }] });
 		let (status, body) = post_json(router, "/api/v1/storage/counts/points", &body).await;
 		// The request was well-formed and the batch was readable; what cannot be represented is
@@ -1013,7 +1275,7 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let router = router_with_declared_temp(&dir).await;
 		let payload = "weather temp=1.5 100\nweather temp=2.5 90\n";
-		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s&require_sorted=true", payload).await;
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=s&require_sorted=true", payload).await;
 		assert_eq!(status, StatusCode::CREATED, "body: {body}");
 		assert_eq!(body["min_ts"], 90);
 		assert_eq!(body["max_ts"], 100);
@@ -1025,28 +1287,164 @@ mod tests {
 		// Declare `temp` as F64 / seconds, then ingest an ILP payload at second precision.
 		let router = router_with_declared_temp(&dir).await;
 		let payload = "weather,loc=a temp=1.5 100\nweather,loc=a temp=2.5 110\nweather,loc=a temp=3.5 120\n";
-		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", payload).await;
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=s", payload).await;
 		assert_eq!(status, StatusCode::CREATED, "body: {body}");
 		assert_eq!(body["aspect"], "temp");
 		assert_eq!(body["row_count"], 3);
 		assert_eq!(body["null_count"], 0);
 		assert_eq!(body["min_ts"], 100);
 		assert_eq!(body["max_ts"], 120);
+		// TAG-11: the payload's tags name the series, no longer silently dropped.
+		assert_eq!(body["tags"], serde_json::json!({ "loc": "a" }), "body: {body}");
+		assert_eq!(body["series_id"], 1, "the first tagged series of the aspect: {body}");
 
-		// Read it back through the JSON range endpoint.
+		// Read it back through the JSON range endpoint, selecting the series.
 		let router = router_with_declared_temp_reopened(&dir).await;
-		let response = router.oneshot(Request::builder().uri("/api/v1/storage/temp/points?start=100&end=120").body(Body::empty()).unwrap()).await.unwrap();
-		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-		let read: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		let (_, read) = get_json(router, "/api/v1/storage/temp/points?start=100&end=120&tag.loc=a").await;
 		assert_eq!(read["count"], 3);
 		assert_eq!(read["points"][0]["value"], "1.5");
+		// The untagged series holds nothing: the rows are not in series 0.
+		let router = router_with_declared_temp_reopened(&dir).await;
+		let (_, untagged) = get_json(router, "/api/v1/storage/temp/points?start=100&end=120").await;
+		assert_eq!(untagged["count"], 0, "{untagged}");
+	}
+
+	#[tokio::test]
+	async fn untagged_ilp_with_measurement_is_series_zero() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		// A record of another measurement is skipped, tags and all.
+		let payload = "weather temp=1.5 100\nother,loc=b temp=9 105\nweather temp=2.5 110\n";
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=s", payload).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!((body["row_count"].clone(), body["series_id"].clone(), body["tags"].clone()), (serde_json::json!(2), serde_json::json!(0), serde_json::json!({})), "body: {body}");
+		let router = router_with_declared_temp_reopened(&dir).await;
+		let (_, read) = get_json(router, "/api/v1/storage/temp/points?start=0&end=200").await;
+		assert_eq!(read["count"], 2, "{read}");
+	}
+
+	#[tokio::test]
+	async fn ilp_without_measurement_is_bad_request() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", "weather temp=1 100\n").await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("bad_request")), "body: {body}");
+		assert!(body["error"].as_str().unwrap().contains("measurement"), "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn ilp_with_two_series_is_still_ambiguous_series() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		let payload = "weather,loc=a temp=1 100\nweather,loc=b temp=2 110\n";
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=s", payload).await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("ambiguous_series")), "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn reserved_tag_key_is_invalid_tag() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=s", "weather,__dim=a temp=1 100\n").await;
+		assert_eq!((status, &body["code"], &body["details"]["tag"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag"), &serde_json::json!("__dim")), "ilp: {body}");
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (status, body) = post_json(router, "/api/v1/storage/temp/points", &serde_json::json!({ "tags": { "__dim": "a" }, "points": [{ "timestamp": 1, "value": "1" }] })).await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag")), "json: {body}");
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/temp/csv?tag.__dim=a", "1,1\n").await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag")), "csv: {body}");
+	}
+
+	#[tokio::test]
+	async fn json_duplicate_tag_key_is_invalid_tag() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		// Written as raw text: a JSON value cannot hold a repeated key.
+		let raw = r#"{"tags":{"host":"a","host":"b"},"points":[{"timestamp":1,"value":"1"}]}"#;
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/points").header("content-type", "application/json").body(Body::from(raw)).unwrap()).await.unwrap();
+		let status = response.status();
+		let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+		assert_eq!((status, &body["code"], &body["details"]["tag"]), (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_tag"), &serde_json::json!("host")), "body: {body}");
+	}
+
+	#[tokio::test]
+	async fn csv_ingest_tag_params_name_the_series() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv?tag.host=a&rows_per_page=2", "100,1.5\n110,2.5\n").await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		assert_eq!((body["series_id"].clone(), body["tags"].clone()), (serde_json::json!(1), serde_json::json!({ "host": "a" })), "body: {body}");
+		// An empty value, `tag_match`, and a repeated key are refused on a write.
+		for (query, code) in [("tag.host=", "invalid_tag"), ("tag.host=a&tag_match=subset", "bad_request"), ("tag.host=a&tag.host=b", "invalid_tag")] {
+			let router = router_with_declared_price_reopened(&dir).await;
+			let (status, body) = post_text(router, &format!("/api/v1/storage/price/csv?{query}"), "1,1\n").await;
+			assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!(code)), "{query}: {body}");
+		}
+	}
+
+	#[tokio::test]
+	async fn series_limit_is_400_series_limit() {
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_max_series_per_aspect(1)).await.unwrap());
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.unwrap();
+		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		let point = |host: &str| serde_json::json!({ "tags": { "host": host }, "points": [{ "timestamp": 1, "value": "1" }] });
+		let (status, body) = post_json(router.clone(), "/api/v1/storage/price/points", &point("a")).await;
+		assert_eq!(status, StatusCode::CREATED, "the first series fits: {body}");
+		let (status, body) = post_json(router.clone(), "/api/v1/storage/price/points", &point("b")).await;
+		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("series_limit")), "body: {body}");
+		// A registered series stays writable, and series 0 does not count.
+		let (status, body) = post_json(router.clone(), "/api/v1/storage/price/points", &point("a")).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+		let (status, body) = post_json(router, "/api/v1/storage/price/points", &serde_json::json!({ "points": [{ "timestamp": 2, "value": "2" }] })).await;
+		assert_eq!(status, StatusCode::CREATED, "body: {body}");
+	}
+
+	/// The end-to-end check that closes the tag core (TAG-5..TAG-11, #233): a tagged write
+	/// over HTTP in each format is read back over HTTP by its selector, and only by it.
+	#[tokio::test]
+	async fn tagged_write_then_tagged_read_round_trips() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		// JSON into host=a (tags given out of key order), ILP into host=b, CSV into host=c,
+		// Parquet into host=d, untagged into series 0.
+		let (status, body) = post_json(router, "/api/v1/storage/price/points", &serde_json::json!({ "tags": { "region": "eu", "host": "a" }, "points": [{ "timestamp": 100, "value": "1.5" }, { "timestamp": 110, "value": "2.5" }] })).await;
+		assert_eq!((status, body["series_id"].clone(), body["tags"].clone()), (StatusCode::CREATED, serde_json::json!(1), serde_json::json!({ "host": "a", "region": "eu" })), "json: {body}");
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/ilp?measurement=cpu&field=v&precision=s", "cpu,host=b v=7.5 100\n").await;
+		assert_eq!((status, body["series_id"].clone()), (StatusCode::CREATED, serde_json::json!(2)), "ilp: {body}");
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (status, body) = post_text(router, "/api/v1/storage/price/csv?tag.host=c", "100,8.5\n").await;
+		assert_eq!((status, body["series_id"].clone()), (StatusCode::CREATED, serde_json::json!(3)), "csv: {body}");
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (status, body) = post_parquet(router, "/api/v1/storage/price/parquet?tag.host=d", price_parquet_body(&[100], &[Some(bd("9.5"))])).await;
+		assert_eq!((status, body["series_id"].clone()), (StatusCode::CREATED, serde_json::json!(4)), "parquet: {body}");
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (status, body) = post_json(router, "/api/v1/storage/price/points", &serde_json::json!({ "points": [{ "timestamp": 100, "value": "0.5" }] })).await;
+		assert_eq!((status, body["series_id"].clone(), body["tags"].clone()), (StatusCode::CREATED, serde_json::json!(0), serde_json::json!({})), "untagged: {body}");
+
+		for (query, values, tags) in [("&tag.host=a&tag.region=eu", vec!["1.5", "2.5"], serde_json::json!({ "host": "a", "region": "eu" })), ("&tag.host=b", vec!["7.5"], serde_json::json!({ "host": "b" })), ("&tag.host=c", vec!["8.5"], serde_json::json!({ "host": "c" })), ("&tag.host=d", vec!["9.5"], serde_json::json!({ "host": "d" })), ("", vec!["0.5"], serde_json::json!({}))] {
+			let router = router_with_declared_price_reopened(&dir).await;
+			let (status, read) = get_json(router, &format!("/api/v1/storage/price/points?start=0&end=200{query}")).await;
+			assert_eq!(status, StatusCode::OK, "{query}: {read}");
+			let got: Vec<&str> = read["points"].as_array().unwrap().iter().map(|p| p["value"].as_str().unwrap()).collect();
+			assert_eq!((got, &read["tags"]), (values, &tags), "{query}: {read}");
+		}
+		// The selector `host=a` alone is exact, so it does not match `{host=a, region=eu}`.
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (_, read) = get_json(router, "/api/v1/storage/price/points?start=0&end=200&tag.host=a").await;
+		assert_eq!(read["count"], 0, "{read}");
+		// Loose matching finds it.
+		let router = router_with_declared_price_reopened(&dir).await;
+		let (_, read) = get_json(router, "/api/v1/storage/price/points?start=0&end=200&tag.host=a&tag_match=subset").await;
+		assert_eq!(read["count"], 2, "{read}");
 	}
 
 	#[tokio::test]
 	async fn ilp_ingest_into_undeclared_aspect_is_not_found() {
 		let dir = TempDir::new().unwrap();
 		let router = router_with_empty_store(&dir).await;
-		let (status, _body) = post_text(router, "/api/v1/storage/ghost/ilp?field=temp&precision=s", "weather temp=1 100\n").await;
+		let (status, _body) = post_text(router, "/api/v1/storage/ghost/ilp?measurement=weather&field=temp&precision=s", "weather temp=1 100\n").await;
 		assert_eq!(status, StatusCode::NOT_FOUND);
 	}
 
@@ -1054,7 +1452,7 @@ mod tests {
 	async fn ilp_ingest_unknown_precision_is_bad_request() {
 		let dir = TempDir::new().unwrap();
 		let router = router_with_declared_temp(&dir).await;
-		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=fortnights", "weather temp=1 100\n").await;
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=fortnights", "weather temp=1 100\n").await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
 		assert!(body["error"].as_str().unwrap().contains("unknown precision"));
 	}
@@ -1064,7 +1462,7 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let router = router_with_declared_temp(&dir).await;
 		// The payload carries `humidity`, but we ask for `temp`: no usable points.
-		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", "weather humidity=50 100\n").await;
+		let (status, body) = post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=s", "weather humidity=50 100\n").await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
 		assert!(body["error"].as_str().unwrap().contains("no points carrying field"));
 	}
@@ -1072,7 +1470,7 @@ mod tests {
 	#[tokio::test]
 	async fn ilp_ingest_without_store_is_unavailable() {
 		let router = app_with_state(AppState::new());
-		let (status, _body) = post_text(router, "/api/v1/storage/temp/ilp?field=temp", "weather temp=1 100\n").await;
+		let (status, _body) = post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp", "weather temp=1 100\n").await;
 		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 	}
 
@@ -1188,7 +1586,8 @@ mod tests {
 		// Build state carrying both an observable metrics handle and a declared store.
 		let store = Arc::new(SegmentStore::open(dir.path()).await.unwrap());
 		store.declare("price", &weft_physical_type::AspectSchema::new(weft_physical_type::PhysicalType::F64, "0".parse().unwrap(), weft_physical_type::TimeUnit::Seconds)).await.unwrap();
-		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(store));
+		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(Arc::clone(&store)));
+		drop(store);
 
 		// A good ingest of three rows.
 		let body = serde_json::json!({ "points": [
@@ -1216,7 +1615,8 @@ mod tests {
 		let metrics = SharedMetrics::default();
 		let store = Arc::new(SegmentStore::open(dir.path()).await.unwrap());
 		// No aspect declared -> the ingest 404s and must count one request + one error.
-		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(store));
+		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(Arc::clone(&store)));
+		drop(store);
 		let body = serde_json::json!({ "points": [{ "timestamp": 1, "value": "1" }] });
 		let (status, _body) = post_json(router, "/api/v1/storage/ghost/points", &body).await;
 		assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1242,11 +1642,7 @@ mod tests {
 
 		let dir = TempDir::new().expect("temp dir");
 
-		let store = SegmentStore::open(dir.path()).await.expect("opens store");
-
-		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
-
-		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let router = router_with_declared_empty_price(&dir).await;
 
 		// An out-of-order Parquet batch (row 1: 90 < 100).
 
@@ -1356,7 +1752,8 @@ mod tests {
 
 		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("reopens"));
 
-		let router = app_with_state(AppState::new().with_store(store));
+		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
 
 		let (status, read) = get_json(router, "/api/v1/storage/price/points?start=100&end=120").await;
 
@@ -1375,7 +1772,8 @@ mod tests {
 		let metrics = SharedMetrics::default();
 		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
-		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(store));
+		let router = app_with_state(AppState::with_metrics(metrics.clone()).with_store(Arc::clone(&store)));
+		drop(store);
 
 		let body = price_parquet_body(&[100, 110, 120], &[Some(bd("1.5")), Some(bd("2.5")), Some(bd("3.5"))]);
 		let (status, json) = post_parquet(router, "/api/v1/storage/price/parquet", body).await;
@@ -1495,8 +1893,7 @@ mod tests {
 		// scale: the one body cap (C11) refuses the body before the
 		// handler runs, as 413 with the limit.
 		let dir = TempDir::new().unwrap();
-		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
-		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let store = store_with_declared_f64(&dir, "price").await;
 		let config = super::IngestConfig::with_max_body_bytes(32);
 		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(config));
 		let body = "timestamp,value\n100,1.5\n110,2.5\n120,3.5\n130,4.5\n";
@@ -1506,13 +1903,135 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn a_json_nan_value_is_refused_as_not_finite() {
+		// ROB-7: `"NaN"` parses as an `f64`, and a float with no decimal form used to
+		// reach the seal as a value the operator never sent. `not_finite` is the code the
+		// read side already uses for the same fact about a value.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let body = serde_json::json!({ "points": [ { "timestamp": 100, "value": "NaN" } ] });
+		let (status, json) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn a_csv_nan_cell_is_refused_as_not_finite() {
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/price/csv", "timestamp,value\n100,1.5\n110,-Infinity\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn an_infinity_value_is_refused_as_not_finite() {
+		// The other spelling a float parser accepts: `"Infinity"` reaches `f64` as a
+		// positive infinity through the JSON route, and is the same fact `"NaN"` is.
+		//
+		// This covers the JSON route's second spelling rather than a fifth ingest
+		// format: the server's ingest formats are JSON points, ILP, CSV and Parquet —
+		// there is no NDJSON route to POST to, so the earlier version of this test
+		// asserted a 404.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let body = serde_json::json!({ "points": [ { "timestamp": 110, "value": "Infinity" } ] });
+		let (status, json) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn a_parquet_nan_cell_is_refused_as_not_finite() {
+		// The issue's last open question: `null_count: 0` alongside a row the producer
+		// never sent. A NaN Parquet cell is refused at the route, not sealed as a null.
+		//
+		// The bytes are a real Parquet file whose value column holds a raw IEEE-754 NaN,
+		// built by `weft_arrow::write_raw_float_parquet` — the typed column builder in this
+		// crate maps a non-finite float to a null, which is exactly the lenient behaviour
+		// under test, so the file cannot be produced with it.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_price(&dir).await;
+		let body = {
+			use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
+			use arrow_schema::{DataType, Field, Schema};
+			let schema = std::sync::Arc::new(Schema::new(vec![Field::new(weft_arrow::TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(weft_arrow::VALUE_COLUMN, DataType::Float64, false)]));
+			let batch = RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(vec![100, 110])) as ArrayRef, std::sync::Arc::new(Float64Array::from(vec![1.5, f64::NAN])) as ArrayRef]).expect("builds a batch whose second value is a NaN");
+			weft_arrow::write_parquet(std::slice::from_ref(&batch)).expect("writes parquet")
+		};
+		let (status, json) = post_parquet(router, "/api/v1/storage/price/parquet", body).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "a NaN Parquet cell is refused, not sealed as a null: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn an_ilp_nan_field_is_refused_as_not_finite() {
+		// The ILP hole was the quietest one: the line parsed, then dropped, so the
+		// response counted one row fewer than the sender sent and stored a gap.
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_temp(&dir).await;
+		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", "weather temp=1 100\nweather temp=NaN 110\n").await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+		assert_eq!(json["code"], "not_finite", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn a_batch_over_the_row_cap_is_too_many_rows() {
+		// ROB-7's row ceiling: the body cap cannot express "too many rows" for a
+		// compressed Parquet body, so the decoded row count is checked before the seal.
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(super::IngestConfig::with_max_rows(2)));
+		let body = serde_json::json!({ "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 110, "value": "2.5" },
+			{ "timestamp": 120, "value": "3.5" },
+		] });
+		let (status, json) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {json}");
+		assert_eq!(json["code"], "too_many_rows", "body: {json}");
+		assert!(json["error"].as_str().unwrap().contains("WEFT_MAX_INGEST_ROWS"), "an operator ceiling names itself: {json}");
+	}
+
+	#[tokio::test]
+	async fn a_decoded_column_set_over_the_byte_cap_is_payload_too_large() {
+		// The decoded ceiling, at test scale: three seconds-resolution rows are 96 bytes
+		// of columns plus their mantissas, so a 64-byte ceiling refuses them.
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(super::IngestConfig::with_max_decoded_bytes(64)));
+		let body = serde_json::json!({ "points": [
+			{ "timestamp": 100, "value": "1.5" },
+			{ "timestamp": 110, "value": "2.5" },
+			{ "timestamp": 120, "value": "3.5" },
+		] });
+		let (status, json) = post_json(router, "/api/v1/storage/price/points", &body).await;
+		assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {json}");
+		assert_eq!(json["code"], "payload_too_large", "body: {json}");
+		assert!(json["error"].as_str().unwrap().contains("WEFT_MAX_INGEST_DECODED_BYTES"), "the ceiling names itself: {json}");
+	}
+
+	#[test]
+	fn the_parquet_route_decodes_under_the_ingest_rules() {
+		// The Parquet half of ROB-7 is a choice of entry point, and the only honest
+		// proof of a choice is the source: the lenient decoder must stay on the export
+		// and re-seal paths, never on the write path (weft-arrow's no-panic lint is the
+		// same shape of test, over the production half for the same reason).
+		let source = include_str!("ingest.rs");
+		let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+		assert!(production.contains("decode_parquet_columns_strict("), "the Parquet route must decode strict, or a NaN body stores a null");
+		assert!(!production.contains("decode_parquet_columns("), "the lenient decoder has no business on a write path");
+	}
+
+	#[tokio::test]
 	async fn admission_refuses_an_ingest_over_the_inflight_budget() {
 		// D-S14, inside the gate (C10): a request whose declared body
 		// alone exceeds the in-flight budget is refused 503 overloaded
 		// with Retry-After, before any handler runs.
 		let dir = TempDir::new().unwrap();
-		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
-		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+		let store = store_with_declared_f64(&dir, "price").await;
 		let config = super::IngestConfig::with_max_inflight_bytes(8);
 		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(config));
 		let payload = serde_json::to_vec(&price_batch()).unwrap();
@@ -1526,12 +2045,17 @@ mod tests {
 
 	#[test]
 	fn ingest_config_parses_and_refuses_zero() {
-		let config = super::IngestConfig::from_env_values(Some("1024"), Some("2048")).expect("valid");
+		let config = super::IngestConfig::from_env_values(Some("1024"), Some("2048"), Some("40"), Some("8192")).expect("valid");
 		assert_eq!(config.max_body_bytes(), 1024);
 		assert_eq!(config.max_inflight_bytes(), 2048);
-		let defaults = super::IngestConfig::from_env_values(None, None).expect("defaults");
+		let defaults = super::IngestConfig::from_env_values(None, None, None, None).expect("defaults");
 		assert_eq!(defaults.max_body_bytes(), super::DEFAULT_MAX_INGEST_BYTES);
-		assert!(super::IngestConfig::from_env_values(Some("0"), None).is_err());
-		assert!(super::IngestConfig::from_env_values(None, Some("many")).is_err());
+		assert!(super::IngestConfig::from_env_values(Some("0"), None, None, None).is_err());
+		assert!(super::IngestConfig::from_env_values(None, Some("many"), None, None).is_err());
+		// ROB-7: the two new ceilings refuse a zero the same way, because a zero row
+		// cap or decoded cap refuses every body.
+		assert!(super::IngestConfig::from_env_values(None, None, Some("0"), None).is_err());
+		assert!(super::IngestConfig::from_env_values(None, None, None, Some("0")).is_err());
+		assert_eq!(super::IngestConfig::from_env_values(None, None, Some("40"), Some("8192")).expect("valid").max_rows(), 40);
 	}
 }

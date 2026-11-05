@@ -93,7 +93,7 @@ use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, write_new_durable, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
+		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, segment_index::SegmentChange, store_format::{self, StoreFormat, StoreScope}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
@@ -394,22 +394,75 @@ pub struct SegmentStoreOptions {
 	/// ([`MaintenanceBreaker::default`]): decision 17's scheduler is on by
 	/// default, and the breaker is part of it.
 	pub breaker: MaintenanceBreaker,
+	/// The most series one aspect may register (TAG-7):
+	/// [`DEFAULT_MAX_SERIES_PER_ASPECT`] unless changed. An ingest that would register
+	/// one more is refused with [`StoreError::SeriesLimit`](crate::StoreError::SeriesLimit);
+	/// series already registered stay writable. Series 0, the empty tag set, is implicit
+	/// and does not count.
+	pub max_series_per_aspect: usize,
+	/// The most buckets one stored downsample may produce (ROB-13, 1.0 plan
+	/// decision 12): [`DEFAULT_MAX_DOWNSAMPLE_BUCKETS`] unless changed. A
+	/// downsample whose fold reaches one bucket more is refused with
+	/// [`StoreError::DownsampleTooLarge`](crate::StoreError::DownsampleTooLarge),
+	/// so the partial state a caller can make the store hold is bounded here,
+	/// for every caller of the library — the HTTP handlers' own ceilings
+	/// (ROB-12) refuse the request earlier where they can name its grid.
+	pub max_downsample_buckets: usize,
+	/// The most instants one batch point lookup may name (ROB-13, 1.0 plan
+	/// decision 12's `at-multi` number): [`DEFAULT_MAX_POINT_BATCH`] unless
+	/// changed. A wider batch is refused with
+	/// [`StoreError::PointBatchTooLarge`](crate::StoreError::PointBatchTooLarge)
+	/// before the index is pruned. The single point lookup names one instant
+	/// and is bounded by construction.
+	pub max_point_batch: usize,
+	/// Whether range reads ([`SegmentStore::read_time_range`], and so the interpolation
+	/// read path) memory-map their `.weftseg` frames instead of reading them into a heap
+	/// buffer (roadmap Phase 5, memory-mapped GPU I/O). Off by default, and only honoured
+	/// in a build with the `mmap-reads` cargo feature; without it the reads stay buffered.
+	/// The rows returned are the same either way. See the `mapped` module for the safety
+	/// argument and its one residual risk (a file truncated by another process while mapped).
+	pub mmap_reads: bool,
 }
+
+/// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
+/// whole number, or [`DEFAULT_MAX_SERIES_PER_ASPECT`] when it is unset or anything
+/// else (the server's strict configuration check refuses a malformed value at
+/// startup, so this leniency only reaches library embedders).
+fn max_series_per_aspect_from(value: Option<&str>) -> usize {
+	value.and_then(|v| v.trim().parse::<usize>().ok()).filter(|limit| *limit > 0).unwrap_or(DEFAULT_MAX_SERIES_PER_ASPECT)
+}
+
+/// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
+/// 100,000 series.
+pub const DEFAULT_MAX_SERIES_PER_ASPECT: usize = 100_000;
+
+/// The default stored-downsample bucket cap,
+/// [`SegmentStoreOptions::max_downsample_buckets`]: 1,000,000 buckets
+/// (1.0 plan decision 12).
+pub const DEFAULT_MAX_DOWNSAMPLE_BUCKETS: usize = 1_000_000;
+
+/// The default batch point-lookup cap, [`SegmentStoreOptions::max_point_batch`]:
+/// 10,000 instants (1.0 plan decision 12).
+pub const DEFAULT_MAX_POINT_BATCH: usize = 10_000;
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default() }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false }
 	}
 }
 
 impl SegmentStoreOptions {
 	/// The options the environment describes: [`CheckpointPolicy::from_env`],
-	/// [`PartialSidecarPolicy::from_env`], [`TransposedPolicy::from_env`] and
-	/// [`MaintenanceBreaker::from_env`], each as lenient as it documents.
-	/// Explicit: nothing in the library calls it.
+	/// [`PartialSidecarPolicy::from_env`], [`TransposedPolicy::from_env`],
+	/// [`MaintenanceBreaker::from_env`], `WEFT_MAX_SERIES_PER_ASPECT`
+	/// ([`max_series_per_aspect`](Self::max_series_per_aspect); absent or not a
+	/// positive whole number → [`DEFAULT_MAX_SERIES_PER_ASPECT`]) and
+	/// `WEFT_SEGMENT_MMAP_READS` ([`mmap_reads`](Self::mmap_reads); on for
+	/// `1`/`true`/`on`/`yes`, any case, off otherwise), each as lenient
+	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env() }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()) }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -437,6 +490,38 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_breaker(mut self, breaker: MaintenanceBreaker) -> Self {
 		self.breaker = breaker;
+		self
+	}
+
+	/// These options with `limit` as the per-aspect series cap (see
+	/// [`max_series_per_aspect`](Self::max_series_per_aspect)).
+	#[must_use]
+	pub const fn with_max_series_per_aspect(mut self, limit: usize) -> Self {
+		self.max_series_per_aspect = limit;
+		self
+	}
+
+	/// These options with `limit` as the stored-downsample bucket cap (see
+	/// [`max_downsample_buckets`](Self::max_downsample_buckets)).
+	#[must_use]
+	pub const fn with_max_downsample_buckets(mut self, limit: usize) -> Self {
+		self.max_downsample_buckets = limit;
+		self
+	}
+
+	/// These options with `limit` as the batch point-lookup cap (see
+	/// [`max_point_batch`](Self::max_point_batch)).
+	#[must_use]
+	pub const fn with_max_point_batch(mut self, limit: usize) -> Self {
+		self.max_point_batch = limit;
+		self
+	}
+
+	/// These options with memory-mapped range reads on or off (see
+	/// [`mmap_reads`](Self::mmap_reads)).
+	#[must_use]
+	pub const fn with_mmap_reads(mut self, on: bool) -> Self {
+		self.mmap_reads = on;
 		self
 	}
 }
@@ -695,15 +780,17 @@ fn resolve_frame_path(root: &Path, stored: &str) -> Result<PathBuf> {
 }
 
 /// Refuse the outputs of `members` that would take fresh ids (rule P2 of the release
-/// plan's D17), given the aspect's `rows`, when one of `rows` with an id above every
-/// member overlaps one of their spans `extra`: such an output takes an id above every row,
-/// so at the timestamps they share it would outrank that newer row (design section 5.3,
-/// M2; `split_segment`'s rule). Rows without a time range, and outputs without one,
-/// overlap nothing.
+/// plan's D17), given the aspect's `rows`, when one of `rows` of the members' series with
+/// an id above every member overlaps one of their spans `extra`: such an output takes an
+/// id above every row, so at the timestamps they share it would outrank that newer row
+/// (design section 5.3, M2; `split_segment`'s rule). Precedence only matters within a
+/// series (a read targets one series, tags D4; TAG-6), so a newer row of another series
+/// never refuses. Rows without a time range, and outputs without one, overlap nothing.
 fn refuse_outranking_outputs(aspect: &str, members: &[IndexRow], extra: impl IntoIterator<Item = Option<(i64, i64)>>, rows: &[IndexRow]) -> Result<()> {
 	let Some(newest_member) = members.iter().map(|member| member.desc.id).max() else { return Ok(()) };
+	let series_id = members.first().map_or(0, |member| member.series_id);
 	for (lo, hi) in extra.into_iter().flatten() {
-		if let Some(newer) = rows.iter().find(|row| row.desc.id > newest_member && row.desc.time_range().is_some_and(|(min, max)| min <= hi && lo <= max)) {
+		if let Some(newer) = rows.iter().find(|row| row.series_id == series_id && row.desc.id > newest_member && row.desc.time_range().is_some_and(|(min, max)| min <= hi && lo <= max)) {
 			let ids: Vec<u64> = members.iter().map(|member| member.desc.id).collect();
 			bail!("refusing to swap segment(s) {ids:?} of aspect {aspect:?}: segment {} is newer and overlaps [{lo}, {hi}], where an output under a new id would outrank it", newer.desc.id);
 		}
@@ -761,7 +848,7 @@ enum IngestSegment {
 
 impl IngestSegment {
 	/// The segment's row count (present and null rows).
-	fn row_count(&self) -> usize {
+	const fn row_count(&self) -> usize {
 		match self {
 			Self::Single(segment) => segment.stats.row_count,
 			Self::Paged(segment) => segment.stats.row_count,
@@ -802,19 +889,63 @@ impl IngestSegment {
 	}
 }
 
+/// The most bytes a series-key envelope ([`tag_frame`]) adds to a frame carrying `key`:
+/// the envelope's 16 bytes (a 12-byte header and a 4-byte CRC trailer) plus one
+/// extension entry, charged as the envelope writer sizes it (6 bytes of id, flag and
+/// length prefix) plus the key itself. A canonical key is at most
+/// [`MAX_SERIES_KEY_BYTES`](weft_physical_type::tags::MAX_SERIES_KEY_BYTES) long, so this
+/// is at most 1,046 bytes.
+pub(crate) fn series_envelope_overhead(key: &crate::SeriesKey) -> u64 {
+	(16 + 6_u64).saturating_add(u64::try_from(key.as_bytes().len()).unwrap_or(u64::MAX))
+}
+
+/// The encoded-frame target an ingest of `groups` cuts its rows to:
+/// [`MAX_ENCODED_FRAME_BYTES`](crate::MAX_ENCODED_FRAME_BYTES) for an untagged batch,
+/// and that less [`series_envelope_overhead`] for a tagged one, so that the frame on
+/// disk, envelope included, still fits the target. Only tagged batches pay it.
+pub(crate) fn ingest_frame_target(groups: &crate::TagSet) -> u64 {
+	if groups.is_empty() {
+		crate::MAX_ENCODED_FRAME_BYTES
+	} else {
+		crate::MAX_ENCODED_FRAME_BYTES.saturating_sub(series_envelope_overhead(groups.series_key()))
+	}
+}
+
+/// Wrap the complete frame `bytes` for series `key` (tags D3): `None` (series 0, the
+/// empty tag set) returns the bytes untouched, so an untagged frame is byte-identical to
+/// one sealed before tags; `Some` wraps them in a v7 envelope with one
+/// [`EXT_SERIES_KEY`](weft_physical_type::EXT_SERIES_KEY) extension, `critical: true`,
+/// whose payload is the canonical key. The frame records the key, never the id: an id
+/// means nothing outside its store, while the key can be bound again after a restore.
+///
+/// The envelope ends in its own CRC, so the trailer the durable write reads as
+/// `frame_crc`, and the `byte_len` a row records, are the wrapped frame's.
+///
+/// # Errors
+///
+/// The envelope writer's refusal of a frame it cannot read, which a frame this build
+/// just encoded never is.
+pub(crate) fn tag_frame(bytes: Vec<u8>, key: Option<&crate::SeriesKey>) -> Result<Vec<u8>> {
+	match key {
+		Some(key) if !key.is_empty() => {
+			let extension = weft_physical_type::FrameExtension { id: weft_physical_type::EXT_SERIES_KEY, critical: true, payload: key.as_bytes().to_vec() };
+			weft_physical_type::wrap_frame_envelope(&bytes, &[extension]).map_err(|e| anyhow::anyhow!("wrapping a frame in its series-key envelope failed: {e}"))
+		}
+		_ => Ok(bytes),
+	}
+}
+
 /// Encode one ingest chunk under `schema`, in the batch's frame shape:
 /// paged when `rows_per_page` is set, single-block otherwise. The error
 /// is the shape's seal failure, worded as the direct seal paths word it.
 fn encode_ingest_chunk(schema: &AspectSchema, timestamps: &[i64], values: &[Option<BigDecimal>], rows_per_page: Option<usize>) -> Result<IngestSegment> {
-	match rows_per_page {
-		Some(rows_per_page) => schema.seal_paged_nullable(timestamps, values, rows_per_page).map(IngestSegment::Paged).map_err(paged_seal_failed),
-		None => schema.seal_nullable(timestamps, values).map(IngestSegment::Single).map_err(seal_failed),
-	}
+	rows_per_page.map_or_else(|| schema.seal_nullable(timestamps, values).map(IngestSegment::Single).map_err(seal_failed), |rows_per_page| schema.seal_paged_nullable(timestamps, values, rows_per_page).map(IngestSegment::Paged).map_err(paged_seal_failed))
 }
 
-/// Cut an ingest batch's rows into chunks of at most
-/// [`MAX_ENCODED_FRAME_BYTES`](crate::MAX_ENCODED_FRAME_BYTES) of encoded
-/// frame, by a conservative per-row estimate (D-S13): each row is charged
+/// Cut an ingest batch's rows into chunks of at most `target` bytes of encoded
+/// frame ([`ingest_frame_target`]: [`MAX_ENCODED_FRAME_BYTES`](crate::MAX_ENCODED_FRAME_BYTES),
+/// less the series-key envelope for a tagged batch), by a conservative per-row
+/// estimate (D-S13): each row is charged
 /// 24 bytes plus its value's bounded plain-form length (at most
 /// [`MAX_PLAIN_DIGITS`](weft_physical_type::MAX_PLAIN_DIGITS) digits, so
 /// the estimate can be computed arithmetically, without materialising the
@@ -822,8 +953,8 @@ fn encode_ingest_chunk(schema: &AspectSchema, timestamps: &[i64], values: &[Opti
 /// holding a run holds all of it, so a chunk may exceed the estimate —
 /// the caller proves each chunk's real frame against the target, and a
 /// single timestamp run is the smallest cut there is.
-fn chunk_ingest_rows(timestamps: &[i64], values: &[Option<BigDecimal>]) -> Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> {
-	let target = usize::try_from(crate::MAX_ENCODED_FRAME_BYTES).unwrap_or(usize::MAX);
+fn chunk_ingest_rows(timestamps: &[i64], values: &[Option<BigDecimal>], target: u64) -> Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+	let target = usize::try_from(target).unwrap_or(usize::MAX);
 	let mut chunks: Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::new();
 	let mut start = 0usize;
 	while start < timestamps.len() {
@@ -854,12 +985,41 @@ fn span_of(timestamps: &[i64]) -> Option<(i64, i64)> {
 	Some((*lo, *hi))
 }
 
-/// The connected components of `rows` that overlap in time, transitively: the spans are
-/// swept in `(min_ts, max_ts)` order, and a new component starts whenever a span begins
-/// after the running end of the current one. So no row outside a component overlaps its
-/// span (the closure property design section 5.3's M2 relies on). A row without a time
-/// range is in none.
+/// `rows` partitioned by series (TAG-6): one run per series id present, in ascending
+/// series order, each keeping the order `rows` had. An untagged aspect is one run.
+fn by_series(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
+	let mut series: std::collections::BTreeMap<u64, Vec<IndexRow>> = std::collections::BTreeMap::new();
+	for row in rows {
+		series.entry(row.series_id).or_default().push(row);
+	}
+	series.into_values().collect()
+}
+
+/// The aspect's [`overlapping_count`](weft_physical_type::SegmentIndex::overlapping_count)
+/// per series (TAG-6): the sum over one [`SegmentIndex`](weft_physical_type::SegmentIndex)
+/// per series of `rows`, so two series sharing a window do not count as overlap (a read
+/// targets one series, tags D4). An untagged aspect counts exactly as its whole index.
+fn series_overlapping_count(rows: &[IndexRow]) -> usize {
+	let mut series: std::collections::BTreeMap<u64, weft_physical_type::SegmentIndex> = std::collections::BTreeMap::new();
+	for row in rows {
+		series.entry(row.series_id).or_default().push(row.desc.clone());
+	}
+	series.values().map(weft_physical_type::SegmentIndex::overlapping_count).sum()
+}
+
+/// The connected components of `rows` that overlap in time, transitively, within each
+/// series (TAG-6: rows are partitioned by `series_id` first, so a component never mixes
+/// series, invariant I12): per series the spans are swept in `(min_ts, max_ts)` order,
+/// and a new component starts whenever a span begins after the running end of the
+/// current one. So no row of the series outside a component overlaps its span (the
+/// closure property design section 5.3's M2 relies on, per series: a read targets one
+/// series, tags D4). A row without a time range is in none.
 fn overlap_components(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
+	by_series(rows).into_iter().flat_map(series_overlap_components).collect()
+}
+
+/// [`overlap_components`] of the rows of one series.
+fn series_overlap_components(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
 	let mut spanned: Vec<(i64, i64, IndexRow)> = rows.into_iter().filter_map(|row| row.desc.time_range().map(|(lo, hi)| (lo, hi, row))).collect();
 	spanned.sort_by_key(|(lo, hi, _)| (*lo, *hi));
 	let mut components: Vec<Vec<IndexRow>> = Vec::new();
@@ -894,6 +1054,23 @@ fn fold_newest_wins(frames: Vec<DecodedFrame>) -> (Vec<i64>, Vec<Option<BigDecim
 	merged.into_iter().unzip()
 }
 
+/// Whether two runs of rows are the same, row for row: equal timestamps, and values equal
+/// in their **plain form**, scale included (`-3` and `-3.0` differ), nulls equal to nulls.
+/// `BigDecimal`'s own `==` ignores scale, and the store keeps the scale a value was
+/// written with, so a numeric comparison could keep a frame that reads back different
+/// text from the fold (Phase 4.6 skip-identical, critique F23).
+fn same_rows(held_timestamps: &[i64], held_values: &[Option<BigDecimal>], offered_timestamps: &[i64], offered_values: &[Option<BigDecimal>]) -> bool {
+	held_timestamps == offered_timestamps
+		&& held_values.len() == offered_values.len()
+		&& held_values.iter().zip(offered_values).all(|(left, right)| match (left, right) {
+			(None, None) => true,
+			// Same digits at the same scale is the same plain form; otherwise the plain forms
+			// decide (`1E+2` and `100` read back alike).
+			(Some(left), Some(right)) => left.as_bigint_and_scale() == right.as_bigint_and_scale() || left.to_plain_string() == right.to_plain_string(),
+			_ => false,
+		})
+}
+
 /// Rows per page of a maintenance merge's output once it holds more than one page.
 ///
 /// A merge writes outputs far larger than the seals it folds (a squash to 65,536-row
@@ -918,8 +1095,8 @@ pub(crate) const fn merge_rows_per_page(rows: usize) -> Option<usize> {
 }
 
 /// How many independent plans one swap transaction may carry: the default of
-/// `WEFT_MAINT_PLANS_PER_TXN` (tags amendment A5), which per-series compaction batches up
-/// to. Every caller today swaps one plan at a time.
+/// `WEFT_MAINT_PLANS_PER_TXN` (tags amendment A5). Every caller today swaps one plan at a
+/// time, so per-series maintenance (TAG-6) loops one series at a time and never nears it.
 const MAX_PLANS_PER_TXN: usize = 32;
 
 /// The rows of one output a swap plans, in time order, and the frame kind it is written
@@ -943,9 +1120,15 @@ struct PlanOutput {
 /// or a run of consecutive ids, and a row committed after the snapshot has a higher id
 /// (see the module documentation for the seals of the S7-S10 interim), so outputs under
 /// member ids outrank exactly what their members did.
+///
+/// A **keep** plan (Phase 4.6 skip-identical, design 9b) writes no output at all: its
+/// lowest-id member already holds exactly the rows the fold would write, so it stays as
+/// it is, under an expected-version precondition, and only the other members are deleted
+/// and retired.
 pub(crate) struct SwapPlan {
 	members: Vec<IndexRow>,
 	outputs: Vec<PlanOutput>,
+	keep: bool,
 }
 
 impl SwapPlan {
@@ -975,12 +1158,21 @@ impl SwapPlan {
 			outputs.push(PlanOutput { timestamps, values, rows_per_page });
 		}
 		outputs.reverse();
-		Self { members, outputs }
+		Self { members, outputs, keep: false }
 	}
 
-	/// How many segments the swap removes from the aspect: its members less its outputs.
+	/// A delete-only plan over `members` (Phase 4.6 skip-identical): the lowest-id member
+	/// is kept as it is, since its rows are already what a fold of every member gives, and
+	/// the others are deleted. No frame is written.
+	fn keep(mut members: Vec<IndexRow>) -> Self {
+		members.sort_by_key(|member| member.desc.id);
+		Self { members, outputs: Vec::new(), keep: true }
+	}
+
+	/// How many segments the swap removes from the aspect: its members less its outputs
+	/// (the kept member counting as one).
 	const fn removes(&self) -> usize {
-		self.members.len().saturating_sub(self.outputs.len())
+		self.members.len().saturating_sub(self.outputs.len() + self.keep as usize)
 	}
 
 	/// The spans of the outputs that take fresh ids (P2), in time order.
@@ -999,6 +1191,8 @@ pub(crate) struct Swapped {
 /// outputs once written.
 pub(crate) struct PreparedPlan {
 	members: Vec<IndexRow>,
+	/// Whether this is a keep plan ([`SwapPlan::keep`]): no outputs, its first member kept.
+	keep: bool,
 	retired: Vec<String>,
 	series_id: u64,
 	prec: u64,
@@ -1012,6 +1206,16 @@ impl PreparedPlan {
 		self.outputs.iter().map(|output| output.name.clone()).collect()
 	}
 
+	/// How many members keep their row: one per output, or the kept member of a keep
+	/// plan. The rest are deleted.
+	const fn taken(&self) -> usize {
+		if self.keep {
+			1
+		} else {
+			self.outputs.len()
+		}
+	}
+
 	/// How many of the plan's outputs take fresh ids.
 	const fn extra(&self) -> usize {
 		self.outputs.len().saturating_sub(self.members.len())
@@ -1020,21 +1224,33 @@ impl PreparedPlan {
 	/// The id each output takes, in time order: the members' ids in ascending order (P1),
 	/// then the fresh ones (P2).
 	fn output_ids(&self) -> Vec<u64> {
+		if self.keep {
+			return self.members.iter().take(1).map(|member| member.desc.id).collect();
+		}
 		self.members.iter().map(|member| member.desc.id).chain(self.fresh.iter().copied()).take(self.outputs.len()).collect()
 	}
 
 	/// The members no output takes the id of, which the swap deletes: their frame
 	/// paths, whose sidecars a merge removes by frame name.
 	fn deleted_frames(&self) -> Vec<String> {
-		self.members.iter().skip(self.outputs.len()).map(|member| member.desc.path.clone()).collect()
+		self.members.iter().skip(self.taken()).map(|member| member.desc.path.clone()).collect()
 	}
 
 	/// Step M5's ops for this plan, committing in aspect epoch `epoch` (design section 5.3):
 	/// `ReplaceExpected` on the member whose id each output takes (against the version M1
 	/// read) or `InsertNew` under a fresh id, one `DeleteEveryExpected` for the members left over,
-	/// `JournalRetire` for every member's frame, and `ClearJournal` for every output's
-	/// pending row.
+	/// `JournalRetire` for every retired member's frame, and `ClearJournal` for every output's
+	/// pending row. A keep plan has no outputs: its kept member gets an unchanged
+	/// `ReplaceExpected` instead, a pure precondition, and is not retired.
 	fn ops(&self, aspect: &str, epoch: u64, created_ms: i64, ops: &mut Vec<IndexOp>) {
+		if self.keep {
+			// The kept member is rewritten as itself: the op changes nothing, but it is a
+			// precondition on the version M1 read, so a racing change to it is a `Conflict`
+			// and the other members are not deleted under a row that no longer folds them.
+			if let Some(kept) = self.members.first() {
+				ops.push(IndexOp::ReplaceExpected { aspect: aspect.to_string(), expected: kept.version(), row: kept.clone() });
+			}
+		}
 		for (j, (output, id)) in self.outputs.iter().zip(self.output_ids()).enumerate() {
 			let row = output.row(id, epoch, self.series_id);
 			match self.members.get(j) {
@@ -1042,7 +1258,7 @@ impl PreparedPlan {
 				None => ops.push(IndexOp::InsertNew { aspect: aspect.to_string(), row }),
 			}
 		}
-		let deleted: Vec<RowVersion> = self.members.iter().skip(self.outputs.len()).map(IndexRow::version).collect();
+		let deleted: Vec<RowVersion> = self.members.iter().skip(self.taken()).map(IndexRow::version).collect();
 		if !deleted.is_empty() {
 			ops.push(IndexOp::DeleteEveryExpected { aspect: aspect.to_string(), expected: deleted });
 		}
@@ -1122,6 +1338,39 @@ fn seq_bump(aspect: &str, commit: &CommitGuard, next_gen: u64, epoch: u64) -> In
 	IndexOp::SeqBump { aspect: aspect.to_string(), next_id: state.next_id, next_gen, epoch }
 }
 
+/// What [`SegmentStore::adopt_orphan`] did with one orphan frame.
+enum Adoption {
+	/// The frame's row committed under this aspect.
+	Adopted(String),
+	/// The frame's aspect has no declared schema in this store's scope.
+	Undeclared(String),
+	/// The frame's name names no aspect, or it holds no rows.
+	Skipped,
+}
+
+/// The series key a frame's `SERIES_KEY` extension carries (TAG-9): the empty
+/// key for a frame with no such extension (an untagged frame), otherwise its
+/// payload decoded through [`SeriesKey::from_canonical`](crate::SeriesKey::from_canonical).
+///
+/// # Errors
+///
+/// The reason the frame cannot be bound, when it carries more than one
+/// `SERIES_KEY` extension, an empty payload (an untagged frame has no envelope
+/// at all), or a payload that is not a canonical series key.
+fn frame_series_key(info: &weft_physical_type::FrameInfo) -> std::result::Result<crate::SeriesKey, String> {
+	let mut payloads = info.extensions.iter().filter(|ext| ext.id == weft_physical_type::EXT_SERIES_KEY);
+	let Some(first) = payloads.next() else {
+		return Ok(crate::SeriesKey::default());
+	};
+	if payloads.next().is_some() {
+		return Err("the frame carries more than one SERIES_KEY extension".to_string());
+	}
+	if first.payload.is_empty() {
+		return Err("the SERIES_KEY extension is empty, but an untagged frame carries no envelope".to_string());
+	}
+	crate::SeriesKey::from_canonical(&first.payload).map_err(|error| format!("the SERIES_KEY payload is not a canonical series key: {error}"))
+}
+
 /// The aspect and id a legacy-named file carries: a frame `{aspect}-{id}.weftseg` or its
 /// sidecar `{aspect}-{id}.weftpart`. The id is the digits after the last `-`, so an aspect
 /// name that itself contains `-` still parses exactly. `None` for any other name.
@@ -1187,11 +1436,29 @@ pub(crate) struct PlannedOutput {
 	timestamps: Vec<i64>,
 	values: Vec<Option<BigDecimal>>,
 	rows_per_page: Option<usize>,
+	/// The series key of the plan's series, when it is not series 0: the output is
+	/// written in a v7 envelope carrying it ([`tag_frame`]), exactly as the ingest that
+	/// sealed its members wrote them, so no committed row of a tagged series ever names
+	/// an untagged frame.
+	series_key: Option<crate::SeriesKey>,
 }
 
 /// A maintenance output encoded off the async workers: its frame bytes, its descriptor
 /// (without its id), and the rows it was encoded from, handed back for its sidecar.
 type EncodedOutput = (Vec<u8>, SegmentDescriptor, Vec<i64>, Vec<Option<BigDecimal>>);
+
+/// A segment an ingest has written: its descriptor, generation, frame CRC and rows.
+pub(crate) type WrittenSegment = (SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>);
+
+/// What a segment's partial sidecar is built from and named by: the frame's generation,
+/// adoption order and CRC, and its rows.
+pub(crate) struct SidecarSource {
+	pub(crate) gen: u64,
+	pub(crate) prec: u64,
+	pub(crate) frame_crc: u32,
+	pub(crate) timestamps: Vec<i64>,
+	pub(crate) values: Vec<Option<BigDecimal>>,
+}
 
 /// An output a maintenance swap has written and synced (M4): its frame's file name, its
 /// generation, adoption order and CRC, its descriptor (whose `id` the swap sets), and its
@@ -1341,6 +1608,18 @@ pub struct SegmentStore {
 	/// The per-aspect circuit breaker store-wide maintenance sweeps run under
 	/// (ROB-19): its policy, from the open options.
 	maintenance_breaker: MaintenanceBreaker,
+	/// The most series one aspect may register, from the open options
+	/// ([`SegmentStoreOptions::max_series_per_aspect`]).
+	max_series_per_aspect: usize,
+	/// The most buckets one stored downsample may produce, from the open
+	/// options ([`SegmentStoreOptions::max_downsample_buckets`]) (ROB-13).
+	max_downsample_buckets: usize,
+	/// The most instants one batch point lookup may name, from the open
+	/// options ([`SegmentStoreOptions::max_point_batch`]) (ROB-13).
+	max_point_batch: usize,
+	/// Whether range reads memory-map their frames, from the open options
+	/// ([`SegmentStoreOptions::mmap_reads`]); always buffered without the `mmap-reads` feature.
+	mmap_reads: bool,
 	/// Each aspect's circuit-breaker state (consecutive sweep failures and, once
 	/// tripped, when the cooldown ends), guarded by a plain mutex: it is only
 	/// ever held for a map touch, never across an await.
@@ -1460,10 +1739,7 @@ async fn control_plane_present(root: &Path) -> bool {
 /// their layout, or `format` itself when there are none: the marker an open writes before
 /// it runs them (freeze design §4.3, step 5). Floors only ever go up.
 fn raised_for(format: &StoreFormat, migrations: &[&migrations::Migration]) -> StoreFormat {
-	match migrations::floors(migrations.iter().copied()) {
-		Some(needs) => StoreFormat { min_read_layout: format.min_read_layout.max(needs.min_read), min_write_layout: format.min_write_layout.max(needs.min_write), migrating_to: Some(format.migrating_to.unwrap_or(0).max(needs.layout)), ..format.clone() },
-		None => format.clone(),
-	}
+	migrations::floors(migrations.iter().copied()).map_or_else(|| format.clone(), |needs| StoreFormat { min_read_layout: format.min_read_layout.max(needs.min_read), min_write_layout: format.min_write_layout.max(needs.min_write), migrating_to: Some(format.migrating_to.unwrap_or(0).max(needs.layout)), ..format.clone() })
 }
 
 /// The marker an open leaves once its migrations are done (freeze design §4.3, steps 9
@@ -1535,12 +1811,7 @@ impl ControlPlaneDbs {
 /// A failed read, or a layout key that does not hold a layout number.
 async fn recorded_format(index: &SegmentIndexStore, name: &str, scope: StoreScope) -> Result<Option<StoreFormat>> {
 	let text = |key: &'static str| async move { index.meta(key).await.with_context(|| format!("{name}: reading store_meta {key}")) };
-	let layout = |key: &'static str| async move {
-		match text(key).await? {
-			Some(value) => value.trim().parse::<u32>().map(Some).with_context(|| format!("{name}: store_meta records {key} {value:?}, which is not a layout number")),
-			None => Ok(None),
-		}
-	};
+	let layout = |key: &'static str| async move { text(key).await?.map_or_else(|| Ok(None), |value| value.trim().parse::<u32>().map(Some).with_context(|| format!("{name}: store_meta records {key} {value:?}, which is not a layout number"))) };
 	let Some(min_write_layout) = layout("min_write_layout").await? else { return Ok(None) };
 	let layout_version = layout("layout_version").await?.unwrap_or(min_write_layout);
 	let min_read_layout = layout("min_read_layout").await?.unwrap_or(min_write_layout);
@@ -1557,6 +1828,7 @@ fn process_poisoned() -> Option<Poisoned> {
 }
 
 mod maint;
+mod mapped;
 mod open;
 mod read;
 mod seal;
@@ -1738,40 +2010,129 @@ impl SegmentStore {
 		Ok(())
 	}
 
-	/// Adopt one orphan frame in restore mode (R8): rebuild its descriptor
-	/// from the frame itself and insert its row under a fresh id above every
-	/// id the aspect's restored rows and allocator hold, seeding the
-	/// allocator past it in the same transaction. Returns the aspect, or
-	/// `None` when the frame's name names no aspect, the aspect has no
-	/// declared schema in this store's scope (its data has no home here), or
-	/// the frame holds no rows. The caller has already classified the frame
-	/// through `describe_frame`: decodable, no `SERIES_KEY` extension.
-	async fn adopt_orphan(&self, name: &str, bytes: &[u8]) -> Result<Option<String>> {
+	/// What [`adopt_orphan`](Self::adopt_orphan) would do with `name`, without
+	/// committing anything: the aspect, generation, precision and decoded frame
+	/// to adopt, or the [`Adoption::Undeclared`] / [`Adoption::Skipped`]
+	/// outcome. A report-only pass counts through this, so it counts exactly
+	/// what a real pass adopts.
+	async fn plan_adoption(&self, name: &str, bytes: &[u8]) -> Result<std::result::Result<(String, u64, Option<u64>, frame_read::FullFrame), Adoption>> {
 		let (aspect, gen, prec) = match frame_name::parse(name) {
 			Some(parsed) => match parsed.aspect() {
 				Some(aspect) => (aspect, parsed.gen, Some(parsed.prec)),
-				None => return Ok(None),
+				None => return Ok(Err(Adoption::Skipped)),
 			},
 			None => match legacy_file_id(name) {
 				Some((aspect, _)) => (aspect.to_string(), 0, None),
-				None => return Ok(None),
+				None => return Ok(Err(Adoption::Skipped)),
 			},
 		};
 		if self.schema_for(&aspect).await?.is_none() {
-			return Ok(None);
+			return Ok(Err(Adoption::Undeclared(aspect)));
 		}
 		let frame = frame_read::read_full(name, bytes)?;
 		if frame.descriptor(0, String::new(), 0).row_count == 0 {
-			return Ok(None);
+			return Ok(Err(Adoption::Skipped));
 		}
-		let seed = self.index.allocator_seed(&aspect).await?;
-		let id = seed.next_id.unwrap_or(1).max(seed.max_id.map_or(1, |max| max + 1)).max(1);
+		Ok(Ok((aspect, gen, prec, frame)))
+	}
+
+	/// The outcome [`adopt_orphan`](Self::adopt_orphan) would report for
+	/// `name`, with nothing committed (a report-only pass).
+	async fn would_adopt(&self, name: &str, bytes: &[u8]) -> Result<Adoption> {
+		Ok(match self.plan_adoption(name, bytes).await? {
+			Ok((aspect, ..)) => Adoption::Adopted(aspect),
+			Err(outcome) => outcome,
+		})
+	}
+
+	/// Whether [`quarantine_orphan`](Self::quarantine_orphan) can file `name`:
+	/// its name names an aspect, write-once or legacy.
+	fn orphan_names_aspect(name: &str) -> bool {
+		frame_name::parse(name).and_then(|parsed| parsed.aspect()).is_some() || legacy_file_id(name).is_some()
+	}
+
+	/// Adopt one orphan frame (R8, TAG-9): rebuild its descriptor from the
+	/// frame itself and insert its row under the aspect's next id, raising
+	/// the allocator past it in the same transaction, under the aspect's
+	/// commit lock. A tagged frame (`series_key` is `Some` non-empty key)
+	/// resolves its key in the frame's aspect — the catalog's id, or the
+	/// aspect's next series id registered with
+	/// [`RegisterSeries`](IndexOp::RegisterSeries) and
+	/// [`SeedSeries`](IndexOp::SeedSeries) — in that same transaction, so the
+	/// row never commits without its catalog row. Recovery does not apply the
+	/// per-aspect series cap: the data already exists, and refusing it would
+	/// leave it invisible. With `clear_journal` the transaction also clears
+	/// the frame's journal row (a held frame released by a later pass).
+	///
+	/// Returns [`Adoption::Undeclared`] when the frame's aspect has no
+	/// declared schema in this store's scope (its data has no home here yet),
+	/// and [`Adoption::Skipped`] when its name names no aspect or it holds no
+	/// rows. The caller has already classified the frame through
+	/// `describe_frame` and read `series_key` from it with [`frame_series_key`].
+	async fn adopt_orphan(&self, name: &str, bytes: &[u8], series_key: Option<crate::SeriesKey>, clear_journal: bool) -> Result<Adoption> {
+		let (aspect, gen, prec, frame) = match self.plan_adoption(name, bytes).await? {
+			Ok(plan) => plan,
+			Err(outcome) => return Ok(outcome),
+		};
+		let mut commit = self.commit_lock(&aspect).await?;
+		let mut ops: Vec<IndexOp> = Vec::with_capacity(5);
+		let series_id = match &series_key {
+			Some(key) => self.resolve_series_key(&aspect, key, &mut ops).await?,
+			None => crate::SeriesId::UNTAGGED,
+		};
+		let id = commit.allocate()?;
 		let path = self.root.join("segments").join(name).to_string_lossy().into_owned();
 		let desc = frame.descriptor(id, path, bytes.len() as u64);
 		let trailer = bytes.len().checked_sub(4).map(|body| u32::from_le_bytes([bytes[body], bytes[body + 1], bytes[body + 2], bytes[body + 3]]));
-		let row = IndexRow { desc, gen, prec, frame_crc: trailer, commit_epoch: None, series_id: 0 };
-		self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.clone(), row }, IndexOp::SeqBump { aspect: aspect.clone(), next_id: id + 1, next_gen: gen + 1, epoch: seed.epoch }])).await?;
-		Ok(Some(aspect))
+		let row = IndexRow { desc, gen, prec, frame_crc: trailer, commit_epoch: None, series_id: series_id.0 };
+		ops.push(IndexOp::InsertNew { aspect: aspect.clone(), row });
+		ops.push(seq_bump(&aspect, &commit, gen.saturating_add(1), commit.state().epoch));
+		if clear_journal {
+			ops.push(IndexOp::ClearJournal { name: name.to_string() });
+		}
+		self.commit_index(&IndexTxn::new(ops)).await?;
+		drop(commit);
+		Ok(Adoption::Adopted(aspect))
+	}
+
+	/// Quarantine one indexed row's frame under `class`: the record and the
+	/// row delete commit together, then the file (when it exists) moves to
+	/// `segments/quarantine/`. Returns whether a file moved.
+	async fn quarantine_indexed_row(&self, aspect: &str, row: &IndexRow, file_name: &str, path: &Path, class: QuarantineClass, reason: String) -> Result<bool> {
+		let desc = &row.desc;
+		let record = QuarantineRecord { aspect: aspect.to_string(), id: desc.id, gen: row.gen, name: file_name.to_string(), class, reason, min_ts: desc.min_ts, max_ts: desc.max_ts, series_id: row.series_id, quarantined_ms: now_ms(), descriptor_json: Some(QuarantinedRow { desc: desc.clone(), gen: row.gen, prec: row.prec, frame_crc: row.frame_crc, commit_epoch: row.commit_epoch, series_id: row.series_id }.to_json()) };
+		self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineInsert { record }, IndexOp::DeleteExpected { aspect: aspect.to_string(), expected: row.version() }])).await?;
+		if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+			return Ok(false);
+		}
+		let quarantine_dir = self.root.join("segments").join("quarantine");
+		tokio::fs::create_dir_all(&quarantine_dir).await.with_context(|| format!("creating {}", quarantine_dir.display()))?;
+		let to = contained_file(&quarantine_dir, file_name)?;
+		self.fs.rename(path, &to).await.with_context(|| format!("quarantining {} to {}", path.display(), to.display()))?;
+		Ok(true)
+	}
+
+	/// Quarantine one orphan frame under `class`: its record commits with
+	/// `extra` in one transaction, then the file moves to
+	/// `segments/quarantine/`. Returns whether a file moved: `false` when the
+	/// name names no aspect, and nothing is done.
+	async fn quarantine_orphan(&self, name: &str, path: &Path, class: QuarantineClass, reason: String, extra: Vec<IndexOp>) -> Result<bool> {
+		let (aspect, id, gen) = match frame_name::parse(name).and_then(|parsed| parsed.aspect().map(|aspect| (aspect, parsed.gen))) {
+			Some((aspect, gen)) => (aspect, 0, gen),
+			None => match legacy_file_id(name) {
+				Some((aspect, id)) => (aspect.to_string(), id, 0),
+				None => return Ok(false),
+			},
+		};
+		let record = QuarantineRecord { aspect, id, gen, name: name.to_string(), class, reason, min_ts: None, max_ts: None, series_id: 0, quarantined_ms: now_ms(), descriptor_json: None };
+		let mut ops = vec![IndexOp::QuarantineInsert { record }];
+		ops.extend(extra);
+		self.commit_index(&IndexTxn::new(ops)).await?;
+		let quarantine_dir = self.root.join("segments").join("quarantine");
+		tokio::fs::create_dir_all(&quarantine_dir).await.with_context(|| format!("creating {}", quarantine_dir.display()))?;
+		let to = contained_file(&quarantine_dir, name)?;
+		self.fs.rename(path, &to).await.with_context(|| format!("quarantining orphan {} to {}", path.display(), to.display()))?;
+		Ok(true)
 	}
 
 	/// Startup recovery and the fsck pass, in one: classify every indexed frame
@@ -1793,15 +2154,29 @@ impl SegmentStore {
 	///   differs: its generation and adoption order from the frame's file name,
 	///   and the frame's own CRC trailer when the row's `frame_crc` is unset or
 	///   disagrees with it. An aspect re-bind moves the row to the aspect the
-	///   frame's name names. A row that already matches its frame is untouched.
+	///   frame's name names. A row that already matches its frame is untouched;
+	/// - TAG-9: the frame's `SERIES_KEY` (none for an untagged frame) must be
+	///   the key the catalog holds under the row's series id. A malformed,
+	///   empty or repeated payload in a frame that decoded is suspect (C5); a
+	///   key that differs is rebound with one `ReplaceExpected` to the key's
+	///   id, registered in the same transaction when the catalog lacks it; a
+	///   row moving aspect has its key resolved again in the target aspect
+	///   rather than carrying a foreign id. Counted in `series_rebound`.
 	///
-	/// Then, for each aspect, R10 seeds `aspect_seq.next_series_id` past the
-	/// largest series id any row holds, and the aspect's rollup is rebuilt when
-	/// the pass changed its rows. Orphan `.weftseg` files — no index row and no
+	/// Before any row is checked, for each aspect the index or the series
+	/// catalog names, R10 seeds `aspect_seq.next_series_id` past the largest
+	/// series id any row holds or the catalog registered, so a rebind that
+	/// registers a key never reuses an id. Each aspect's rollup is rebuilt,
+	/// after the orphan pass, when the pass changed its rows. Orphan `.weftseg` files — no index row and no
 	/// journal entry claims them — are counted; one that fails to decode is
 	/// quarantined the same way (a decodable orphan is left where it is: with
-	/// no row behind it there is no id to adopt it under, and adoption is a
-	/// later slice's job). Finally the TTL purge runs over pre-existing corrupt
+	/// no row behind it there is no id to adopt it under outside a restore).
+	/// Held journal rows — tagged frames a restore could not bind because their
+	/// aspect was undeclared — are adopted through the same path once the
+	/// aspect is declared, the journal row cleared in the adopting
+	/// transaction (TAG-9); one whose frame no longer decodes or whose key is
+	/// malformed is quarantined with its journal row cleared, and one whose
+	/// frame is gone or holds no rows is cleared (`held_cleared`). Finally the TTL purge runs over pre-existing corrupt
 	/// records.
 	///
 	/// With `report_only` the pass counts everything it would do and changes
@@ -1829,159 +2204,343 @@ impl SegmentStore {
 	/// Orphans are classified through
 	/// [`describe_frame`](weft_physical_type::describe_frame) (tags A3): a
 	/// decodable orphan is **adopted** — descriptor rebuilt from the frame,
-	/// fresh id above every restored id — and one carrying a `SERIES_KEY`
-	/// extension is journaled `held` until TAG-9, never adopted and never
-	/// reaped. Invalid orphans quarantine as in a normal pass.
+	/// fresh id above every restored id. One carrying a `SERIES_KEY` extension
+	/// is adopted into the series its key names, registered in the same
+	/// transaction when the catalog lacks it (TAG-9); only when its aspect is
+	/// not declared is it journaled `held` — never reaped — for a later pass
+	/// to adopt. A malformed or repeated `SERIES_KEY` payload is suspect.
+	/// Invalid orphans quarantine as in a normal pass.
 	async fn fsck_restore(&self) -> Result<RecoveryReport> {
 		self.fsck_inner(false, true).await
 	}
 
 	async fn fsck_inner(&self, report_only: bool, restore_mode: bool) -> Result<RecoveryReport> {
-		let segments_dir = self.root.join("segments");
-		let quarantine_dir = segments_dir.join("quarantine");
-		let mut report = RecoveryReport { report_only, ..RecoveryReport::default() };
-		let journal_names: HashSet<String> = self.index.journal(None).await?.into_iter().map(|entry| entry.name).collect();
-		let mut live_names: HashSet<String> = HashSet::new();
-		let mut moved = false;
-		let mut changed_aspects: Vec<String> = Vec::new();
-		for aspect in self.index.list_aspects().await? {
-			let rows = self.index.rows(&aspect).await?;
-			let mut max_series_id = 0u64;
+		let mut pass = FsckPass { report_only, restore_mode, segments_dir: self.root.join("segments"), report: RecoveryReport { report_only, ..RecoveryReport::default() }, journal_names: self.index.journal(None).await?.into_iter().map(|entry| entry.name).collect(), live_names: HashSet::new(), moved: false, changed_aspects: Vec::new() };
+		// R10 seeds every aspect the index or the series catalog names: an aspect whose
+		// rows were all quarantined keeps its catalog rows, and their ids must not be
+		// handed out again if its allocator row is lost.
+		let mut aspects: std::collections::BTreeSet<String> = self.index.list_aspects().await?.into_iter().collect();
+		aspects.extend(self.index.series_aspects().await?);
+		// R10 runs before any row is checked: a row rebound below may register its key,
+		// and `resolve_series_key` takes the id from `next_series_id`, which must already
+		// sit past every id the catalog and the rows hold — in every aspect, since a row
+		// can move to an aspect that sorts later.
+		self.fsck_seed_series(&mut pass, &aspects).await?;
+		for aspect in aspects {
 			let mut aspect_changed = false;
-			for row in &rows {
-				report.checked += 1;
-				max_series_id = max_series_id.max(row.series_id);
-				let desc = &row.desc;
-				let Some(file_name) = Path::new(&desc.path).file_name().and_then(|name| name.to_str()) else {
-					report.skipped_outside_segments += 1;
-					continue;
-				};
-				// Containment: the row's file must be a direct child of segments/.
-				let Ok(path) = contained_file(&segments_dir, file_name) else {
-					report.skipped_outside_segments += 1;
-					continue;
-				};
-				// The name is claimed by a row whatever spelling its path
-				// uses, so the orphan pass below never treats a live frame
-				// as unclaimed — a restored root's rows name the old root's
-				// paths, and their frames are live, not orphans (D-S16).
-				live_names.insert(file_name.to_string());
-				if path != Path::new(&desc.path) {
-					// The row names its file through a different spelling (a
-					// symlinked parent, a redundant separator): recovery acts
-					// only on the contained form, and leaves such a row alone
-					// rather than moving a file it did not resolve itself.
-					report.skipped_outside_segments += 1;
-					continue;
-				}
-				let bytes = match tokio::fs::read(&path).await {
-					Ok(bytes) => bytes,
-					Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-						let record = QuarantineRecord { aspect: aspect.clone(), id: desc.id, gen: row.gen, name: file_name.to_string(), class: QuarantineClass::Corrupt, reason: "missing: the indexed frame is not under segments/".to_string(), min_ts: desc.min_ts, max_ts: desc.max_ts, series_id: row.series_id, quarantined_ms: now_ms(), descriptor_json: Some(QuarantinedRow { desc: desc.clone(), gen: row.gen, prec: row.prec, frame_crc: row.frame_crc, commit_epoch: row.commit_epoch, series_id: row.series_id }.to_json()) };
-						if !report_only {
-							self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineInsert { record }, IndexOp::DeleteExpected { aspect: aspect.clone(), expected: row.version() }])).await?;
-							aspect_changed = true;
-						}
-						report.quarantined += 1;
-						continue;
-					}
-					Err(error) => return Err(error).with_context(|| format!("reading segment {}", path.display())),
-				};
-				match frame_read::read_full(file_name, &bytes) {
-					Ok(_) => {
-						let computed_crc = bytes.len().checked_sub(4).map(|body| {
-							let trailer = &bytes[body..];
-							u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]])
-						});
-						let mut rebound = row.clone();
-						let mut changed = false;
-						let mut new_aspect: Option<String> = None;
-						if let Some(parsed) = frame_name::parse(file_name) {
-							if let Some(frame_aspect) = parsed.aspect() {
-								if frame_aspect != aspect {
-									// Identity mismatch: re-bind the row to the
-									// frame's key. The file stays where it is;
-									// only the row moves, to the aspect the
-									// frame's own name names.
-									new_aspect = Some(frame_aspect);
-									changed = true;
-								}
-							}
-							if parsed.gen != row.gen {
-								rebound.gen = parsed.gen;
-								changed = true;
-							}
-							if parsed.prec != row.prec.unwrap_or(0) && !(row.prec.is_none() && parsed.prec == 0) {
-								rebound.prec = Some(parsed.prec);
-								changed = true;
-							}
-						}
-						if row.frame_crc != computed_crc {
-							rebound.frame_crc = computed_crc;
-							changed = true;
-						}
-						if changed {
-							if !report_only {
-								// Same-aspect re-bind is one guarded replace: a
-								// DeleteExpected first would remove the row the
-								// ReplaceExpected then has to match, and the
-								// transaction fails with "matched 0". Only a
-								// move to a different aspect deletes then
-								// inserts.
-								let ops = match new_aspect.as_deref() {
-									Some(new_aspect) if new_aspect != aspect => vec![IndexOp::DeleteExpected { aspect: aspect.clone(), expected: row.version() }, IndexOp::InsertNew { aspect: new_aspect.to_string(), row: rebound }],
-									_ => vec![IndexOp::ReplaceExpected { aspect: aspect.clone(), expected: row.version(), row: rebound }],
-								};
-								self.commit_index(&IndexTxn::new(ops)).await?;
-								aspect_changed = true;
-							}
-							report.rebound += 1;
-						}
-					}
-					Err(error) => {
-						let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
-						let (class, newer) = match &source {
-							Some(source) => (classify_decode_failure(&bytes, source), is_newer_format(source)),
-							None => (QuarantineClass::Corrupt, false),
-						};
-						if newer {
-							report.incompatible_store = true;
-						}
-						let record = QuarantineRecord { aspect: aspect.clone(), id: desc.id, gen: row.gen, name: file_name.to_string(), class, reason: format!("{error:#}"), min_ts: desc.min_ts, max_ts: desc.max_ts, series_id: row.series_id, quarantined_ms: now_ms(), descriptor_json: Some(QuarantinedRow { desc: desc.clone(), gen: row.gen, prec: row.prec, frame_crc: row.frame_crc, commit_epoch: row.commit_epoch, series_id: row.series_id }.to_json()) };
-						if !report_only {
-							self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineInsert { record }, IndexOp::DeleteExpected { aspect: aspect.clone(), expected: row.version() }])).await?;
-							aspect_changed = true;
-							if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-								tokio::fs::create_dir_all(&quarantine_dir).await.with_context(|| format!("creating {}", quarantine_dir.display()))?;
-								let to = contained_file(&quarantine_dir, file_name)?;
-								self.fs.rename(&path, &to).await.with_context(|| format!("quarantining {} to {}", path.display(), to.display()))?;
-								moved = true;
-							}
-						}
-						match class {
-							QuarantineClass::Corrupt => report.quarantined += 1,
-							QuarantineClass::Suspect => report.suspected += 1,
-						}
-					}
-				}
+			for row in &self.index.rows(&aspect).await? {
+				aspect_changed |= self.fsck_check_row(&mut pass, &aspect, row).await?;
 			}
-			// R10: seed next_series_id past every series id the aspect holds.
-			if !report_only {
-				self.commit_index(&IndexTxn::new(vec![IndexOp::SeedSeries { aspect: aspect.clone(), next_series_id: max_series_id.saturating_add(1).max(1) }])).await?;
-			}
-			report.seeded += 1;
 			if aspect_changed {
-				changed_aspects.push(aspect);
+				pass.changed_aspects.push(aspect);
 			}
 		}
-		for aspect in &changed_aspects {
-			if !report_only {
+		self.fsck_release_held(&mut pass).await?;
+		self.fsck_orphans(&mut pass).await?;
+		// Rollups are rebuilt after the orphan pass, so adopted frames count.
+		for aspect in &pass.changed_aspects {
+			if !pass.report_only {
 				self.rebuild_aspect_metadata(aspect).await?;
 			}
 		}
+		if pass.moved {
+			self.sync_segments().await?;
+		}
+		if !pass.report_only {
+			pass.report.purged = self.purge_expired_quarantine().await?;
+		}
+		*self.recovery.write().unwrap_or_else(PoisonError::into_inner) = pass.report.clone();
+		self.refresh_suspect_present().await?;
+		Ok(pass.report)
+	}
+
+	/// R10 of [`fsck_inner`](Self::fsck_inner): seed each aspect's series allocator past
+	/// every id its catalog and rows hold.
+	async fn fsck_seed_series(&self, pass: &mut FsckPass, aspects: &std::collections::BTreeSet<String>) -> Result<()> {
+		for aspect in aspects {
+			let mut max_series_id = self.index.max_registered_series_id(aspect).await?;
+			for row in self.index.rows(aspect).await? {
+				max_series_id = max_series_id.max(row.series_id);
+			}
+			if !pass.report_only {
+				self.commit_index(&IndexTxn::new(vec![IndexOp::SeedSeries { aspect: aspect.clone(), next_series_id: max_series_id.saturating_add(1).max(1) }])).await?;
+			}
+			pass.report.seeded += 1;
+		}
+		Ok(())
+	}
+
+	/// Check one index row of `aspect` against its frame: quarantine a missing or
+	/// undecodable frame, re-bind a row whose frame says otherwise. Whether the aspect
+	/// changed.
+	async fn fsck_check_row(&self, pass: &mut FsckPass, aspect: &str, row: &IndexRow) -> Result<bool> {
+		let mut aspect_changed = false;
+		pass.report.checked += 1;
+		let desc = &row.desc;
+		let Some(file_name) = Path::new(&desc.path).file_name().and_then(|name| name.to_str()) else {
+			pass.report.skipped_outside_segments += 1;
+			return Ok(aspect_changed);
+		};
+		// Containment: the row's file must be a direct child of segments/.
+		let Ok(path) = contained_file(&pass.segments_dir, file_name) else {
+			pass.report.skipped_outside_segments += 1;
+			return Ok(aspect_changed);
+		};
+		// The name is claimed by a row whatever spelling its path
+		// uses, so the orphan pass below never treats a live frame
+		// as unclaimed — a restored root's rows name the old root's
+		// paths, and their frames are live, not orphans (D-S16).
+		pass.live_names.insert(file_name.to_string());
+		if path != Path::new(&desc.path) {
+			// The row names its file through a different spelling (a
+			// symlinked parent, a redundant separator): recovery acts
+			// only on the contained form, and leaves such a row alone
+			// rather than moving a file it did not resolve itself.
+			pass.report.skipped_outside_segments += 1;
+			return Ok(aspect_changed);
+		}
+		let bytes = match tokio::fs::read(&path).await {
+			Ok(bytes) => bytes,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				let record = QuarantineRecord { aspect: aspect.to_string(), id: desc.id, gen: row.gen, name: file_name.to_string(), class: QuarantineClass::Corrupt, reason: "missing: the indexed frame is not under segments/".to_string(), min_ts: desc.min_ts, max_ts: desc.max_ts, series_id: row.series_id, quarantined_ms: now_ms(), descriptor_json: Some(QuarantinedRow { desc: desc.clone(), gen: row.gen, prec: row.prec, frame_crc: row.frame_crc, commit_epoch: row.commit_epoch, series_id: row.series_id }.to_json()) };
+				if !pass.report_only {
+					self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineInsert { record }, IndexOp::DeleteExpected { aspect: aspect.to_string(), expected: row.version() }])).await?;
+					aspect_changed = true;
+				}
+				pass.report.quarantined += 1;
+				return Ok(aspect_changed);
+			}
+			Err(error) => return Err(error).with_context(|| format!("reading segment {}", path.display())),
+		};
+		match frame_read::read_full(file_name, &bytes) {
+			Ok(_) => {
+				aspect_changed |= self.fsck_rebind_row(pass, aspect, row, (file_name, &path), &bytes).await?;
+			}
+			Err(error) => {
+				let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
+				let (class, newer) = source.as_ref().map_or((QuarantineClass::Corrupt, false), |source| (classify_decode_failure(&bytes, source), is_newer_format(source)));
+				if newer {
+					pass.report.incompatible_store = true;
+				}
+				if !pass.report_only {
+					pass.moved |= self.quarantine_indexed_row(aspect, row, file_name, &path, class, format!("{error:#}")).await?;
+					aspect_changed = true;
+				}
+				match class {
+					QuarantineClass::Corrupt => pass.report.quarantined += 1,
+					QuarantineClass::Suspect => pass.report.suspected += 1,
+				}
+			}
+		}
+		Ok(aspect_changed)
+	}
+
+	/// A row whose frame decoded: re-bind it to what the frame's name, CRC and series key
+	/// say, or quarantine it suspect when the key cannot be bound. Whether the aspect changed.
+	async fn fsck_rebind_row(&self, pass: &mut FsckPass, aspect: &str, row: &IndexRow, (file_name, path): (&str, &Path), bytes: &[u8]) -> Result<bool> {
+		let mut aspect_changed = false;
+		// TAG-9: the frame's own series key. A SERIES_KEY payload that is
+		// malformed, empty or repeated, in a frame whose CRC verified and
+		// whose body decoded, is not damage but a frame this build cannot
+		// bind: suspect under C5, never purged.
+		let frame_key = match weft_physical_type::describe_frame(bytes) {
+			Ok(info) => frame_series_key(&info),
+			Err(error) => Err(format!("describing the frame: {error:?}")),
+		};
+		let frame_key = match frame_key {
+			Ok(key) => key,
+			Err(reason) => {
+				if !pass.report_only {
+					pass.moved |= self.quarantine_indexed_row(aspect, row, file_name, path, QuarantineClass::Suspect, reason).await?;
+					aspect_changed = true;
+				}
+				pass.report.suspected += 1;
+				return Ok(aspect_changed);
+			}
+		};
+		let (mut rebound, mut changed, new_aspect) = Self::rebound_from_frame(aspect, row, file_name, bytes);
+		// TAG-9: the row's series must be the one the frame's key names in
+		// the aspect the row ends up in. Catalogs are per aspect (D2), so a
+		// row moving to another aspect has its key resolved again there
+		// rather than carrying a foreign id; a row staying put is rebound
+		// when its catalog key differs from the frame's.
+		let target = new_aspect.clone().unwrap_or_else(|| aspect.to_string());
+		let mut series_ops: Vec<IndexOp> = Vec::new();
+		let mut series_lock = None;
+		let catalog_matches = new_aspect.is_none() && self.index.series_key_of(aspect, crate::SeriesId(row.series_id)).await?.as_ref() == Some(&frame_key);
+		if !catalog_matches {
+			let resolved = if pass.report_only {
+				self.index.series_id_for(&target, &frame_key).await?
+			} else {
+				series_lock = Some(self.commit_lock(&target).await?);
+				Some(self.resolve_series_key(&target, &frame_key, &mut series_ops).await?)
+			};
+			if resolved != Some(crate::SeriesId(row.series_id)) {
+				if let Some(id) = resolved {
+					rebound.series_id = id.0;
+				}
+				pass.report.series_rebound += 1;
+				changed = true;
+			}
+		}
+		if changed {
+			if !pass.report_only {
+				// Same-aspect re-bind is one guarded replace: a
+				// DeleteExpected first would remove the row the
+				// ReplaceExpected then has to match, and the
+				// transaction fails with "matched 0". Only a
+				// move to a different aspect deletes then
+				// inserts.
+				// The series registration, if any, commits first in the
+				// same transaction, so the row never names an id its
+				// catalog lacks.
+				let mut ops = series_ops;
+				match new_aspect.as_deref() {
+					Some(new_aspect) if new_aspect != aspect => ops.extend([IndexOp::DeleteExpected { aspect: aspect.to_string(), expected: row.version() }, IndexOp::InsertNew { aspect: new_aspect.to_string(), row: rebound }]),
+					_ => ops.push(IndexOp::ReplaceExpected { aspect: aspect.to_string(), expected: row.version(), row: rebound }),
+				}
+				self.commit_index(&IndexTxn::new(ops)).await?;
+				aspect_changed = true;
+			}
+			pass.report.rebound += 1;
+		}
+		drop(series_lock);
+		Ok(aspect_changed)
+	}
+
+	/// What a row's frame says the row should be, from its name and its CRC trailer:
+	/// the re-bound row, whether it differs, and the aspect the frame's name names when
+	/// that is not `aspect`.
+	fn rebound_from_frame(aspect: &str, row: &IndexRow, file_name: &str, bytes: &[u8]) -> (IndexRow, bool, Option<String>) {
+		let computed_crc = bytes.len().checked_sub(4).map(|body| {
+			let trailer = &bytes[body..];
+			u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]])
+		});
+		let mut rebound = row.clone();
+		let mut changed = false;
+		let mut new_aspect: Option<String> = None;
+		if let Some(parsed) = frame_name::parse(file_name) {
+			if let Some(frame_aspect) = parsed.aspect() {
+				if frame_aspect != aspect {
+					// Identity mismatch: re-bind the row to the
+					// frame's key. The file stays where it is;
+					// only the row moves, to the aspect the
+					// frame's own name names.
+					new_aspect = Some(frame_aspect);
+					changed = true;
+				}
+			}
+			if parsed.gen != row.gen {
+				rebound.gen = parsed.gen;
+				changed = true;
+			}
+			if parsed.prec != row.prec.unwrap_or(0) && !(row.prec.is_none() && parsed.prec == 0) {
+				rebound.prec = Some(parsed.prec);
+				changed = true;
+			}
+		}
+		if row.frame_crc != computed_crc {
+			rebound.frame_crc = computed_crc;
+			changed = true;
+		}
+		(rebound, changed, new_aspect)
+	}
+
+	/// TAG-9 of [`fsck_inner`](Self::fsck_inner): adopt, keep, quarantine or clear each
+	/// frame an earlier pass journaled held.
+	async fn fsck_release_held(&self, pass: &mut FsckPass) -> Result<()> {
+		// TAG-9: release the frames an earlier pass journaled held — tagged
+		// orphans whose aspect was not declared then — through the same adoption
+		// path, clearing the journal row in the adopting transaction. A frame
+		// whose aspect is still undeclared stays held; one whose key cannot be
+		// bound is quarantined suspect and its journal row cleared.
+		for entry in self.index.journal(None).await? {
+			if entry.state != crate::types::reaper::JournalState::Held {
+				continue;
+			}
+			let Ok(path) = contained_file(&pass.segments_dir, &entry.name) else { continue };
+			let clear = vec![IndexOp::ClearJournal { name: entry.name.clone() }];
+			let bytes = match tokio::fs::read(&path).await {
+				Ok(bytes) => bytes,
+				Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+					// Nothing left to adopt: the row is cleared, not kept forever.
+					if !pass.report_only {
+						self.commit_index(&IndexTxn::new(clear)).await?;
+					}
+					pass.report.held_cleared += 1;
+					continue;
+				}
+				Err(error) => return Err(error).with_context(|| format!("reading held frame {}", path.display())),
+			};
+			// A held frame that no longer decodes (it decayed since it was held)
+			// is quarantined under its decode class, and its journal row cleared
+			// in the same transaction; one that decodes but whose key cannot be
+			// bound is suspect.
+			let key = match weft_physical_type::describe_frame(&bytes) {
+				Ok(info) if info.decodable() => frame_series_key(&info).map_err(|reason| (QuarantineClass::Suspect, reason)),
+				_ => Err(match frame_read::read_full(&entry.name, &bytes) {
+					Err(error) => {
+						let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
+						let class = source.as_ref().map_or(QuarantineClass::Corrupt, |source| {
+							if is_newer_format(source) {
+								pass.report.incompatible_store = true;
+							}
+							classify_decode_failure(&bytes, source)
+						});
+						(class, format!("{error:#}"))
+					}
+					Ok(_) => (QuarantineClass::Suspect, "describing the frame: not decodable".to_string()),
+				}),
+			};
+			match key {
+				Ok(key) => {
+					let tagged = !key.is_empty();
+					let outcome = if pass.report_only { self.would_adopt(&entry.name, &bytes).await? } else { self.adopt_orphan(&entry.name, &bytes, tagged.then_some(key), true).await? };
+					match outcome {
+						Adoption::Adopted(aspect) => {
+							pass.report.adopted += 1;
+							if !pass.report_only && !pass.changed_aspects.contains(&aspect) {
+								pass.changed_aspects.push(aspect);
+							}
+						}
+						// Its aspect is still undeclared: it stays held.
+						Adoption::Undeclared(_) => {}
+						// No rows, or a name that names no aspect: nothing will ever adopt it.
+						Adoption::Skipped => {
+							if !pass.report_only {
+								self.commit_index(&IndexTxn::new(clear)).await?;
+							}
+							pass.report.held_cleared += 1;
+						}
+					}
+				}
+				Err((class, reason)) => {
+					if Self::orphan_names_aspect(&entry.name) {
+						if !pass.report_only {
+							pass.moved |= self.quarantine_orphan(&entry.name, &path, class, format!("held: {reason}"), clear).await?;
+						}
+						match class {
+							QuarantineClass::Corrupt => pass.report.quarantined += 1,
+							QuarantineClass::Suspect => pass.report.suspected += 1,
+						}
+					} else {
+						if !pass.report_only {
+							self.commit_index(&IndexTxn::new(clear)).await?;
+						}
+						pass.report.held_cleared += 1;
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// The orphan pass of [`fsck_inner`](Self::fsck_inner): files no row and no journal
+	/// entry claims.
+	async fn fsck_orphans(&self, pass: &mut FsckPass) -> Result<()> {
 		// Orphans: files no row and no journal entry claims.
-		let mut entries = self.fs.read_dir(&segments_dir).await.with_context(|| format!("listing {}", segments_dir.display()))?;
-		if restore_mode {
+		let mut entries = self.fs.read_dir(&pass.segments_dir).await.with_context(|| format!("listing {}", pass.segments_dir.display()))?;
+		if pass.restore_mode {
 			// R8's order: legacy-named orphans first, in id order; then
 			// write-once orphans in ascending (prec, gen) order, so
 			// happens-before is preserved among the adopted.
@@ -1994,84 +2553,90 @@ impl SegmentStore {
 					(2, 0, 0)
 				}
 			};
-			entries.sort_by(|a, b| key(&a.name.to_string_lossy()).cmp(&key(&b.name.to_string_lossy())));
+			entries.sort_by_key(|a| key(&a.name.to_string_lossy()));
 		}
 		for entry in entries {
 			if entry.is_dir {
 				continue;
 			}
 			let name = entry.name.to_string_lossy().into_owned();
-			if !name.ends_with(".weftseg") || live_names.contains(&name) || journal_names.contains(&name) {
+			if !name.ends_with(".weftseg") || pass.live_names.contains(&name) || pass.journal_names.contains(&name) {
 				continue;
 			}
-			report.orphans += 1;
-			let path = match contained_file(&segments_dir, &name) {
-				Ok(path) => path,
-				Err(_) => continue,
-			};
+			pass.report.orphans += 1;
+			let Ok(path) = contained_file(&pass.segments_dir, &name) else { continue };
 			let Ok(bytes) = tokio::fs::read(&path).await else { continue };
-			if restore_mode && !report_only {
-				match weft_physical_type::describe_frame(&bytes) {
-					Ok(info) if info.extensions.iter().any(|ext| ext.id == weft_physical_type::EXT_SERIES_KEY) => {
-						let aspect = frame_name::parse(&name).and_then(|parsed| parsed.aspect()).or_else(|| legacy_file_id(&name).map(|(aspect, _)| aspect.to_string()));
-						if let Some(aspect) = aspect {
-							self.commit_index(&IndexTxn::new(vec![IndexOp::JournalHeld { aspect, name: name.clone(), created_ms: now_ms() }])).await?;
-							report.held += 1;
-						}
-						continue;
-					}
-					Ok(info) if info.decodable() => {
-						if let Some(aspect) = self.adopt_orphan(&name, &bytes).await? {
-							report.adopted += 1;
-							if !changed_aspects.contains(&aspect) {
-								changed_aspects.push(aspect);
+			if pass.restore_mode && !pass.report_only {
+				if let Ok(info) = weft_physical_type::describe_frame(&bytes) {
+					if info.decodable() {
+						match frame_series_key(&info) {
+							Ok(key) => {
+								let tagged = !key.is_empty();
+								match self.adopt_orphan(&name, &bytes, tagged.then_some(key), false).await? {
+									Adoption::Adopted(aspect) => {
+										pass.report.adopted += 1;
+										if !pass.changed_aspects.contains(&aspect) {
+											pass.changed_aspects.push(aspect);
+										}
+									}
+									// A tagged frame whose aspect is not declared has no
+									// catalog to bind its key in yet: it is journaled held,
+									// never reaped, and a later pass adopts it once the
+									// aspect is declared.
+									Adoption::Undeclared(aspect) if tagged => {
+										self.commit_index(&IndexTxn::new(vec![IndexOp::JournalHeld { aspect, name: name.clone(), created_ms: now_ms() }])).await?;
+										pass.report.held += 1;
+									}
+									Adoption::Undeclared(_) | Adoption::Skipped => {}
+								}
+							}
+							Err(reason) => {
+								if Self::orphan_names_aspect(&name) {
+									pass.moved |= self.quarantine_orphan(&name, &path, QuarantineClass::Suspect, format!("orphan: no index row claims this frame: {reason}"), Vec::new()).await?;
+									pass.report.suspected += 1;
+								}
 							}
 						}
 						continue;
 					}
-					_ => {}
 				}
 			}
 			if let Err(error) = frame_read::read_full(&name, &bytes) {
 				let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
-				let (class, newer) = match &source {
-					Some(source) => (classify_decode_failure(&bytes, source), is_newer_format(source)),
-					None => (QuarantineClass::Corrupt, false),
-				};
+				let (class, newer) = source.as_ref().map_or((QuarantineClass::Corrupt, false), |source| (classify_decode_failure(&bytes, source), is_newer_format(source)));
 				if newer {
-					report.incompatible_store = true;
+					pass.report.incompatible_store = true;
 				}
-				let (aspect, id, gen) = match frame_name::parse(&name).and_then(|parsed| parsed.aspect().map(|aspect| (aspect, parsed.gen))) {
-					Some((aspect, gen)) => (aspect, 0, gen),
-					None => match legacy_file_id(&name) {
-						Some((aspect, id)) => (aspect.to_string(), id, 0),
-						None => continue,
-					},
-				};
-				let record = QuarantineRecord { aspect, id, gen, name: name.clone(), class, reason: format!("orphan: no index row claims this frame: {error:#}"), min_ts: None, max_ts: None, series_id: 0, quarantined_ms: now_ms(), descriptor_json: None };
-				if !report_only {
-					self.commit_index(&IndexTxn::new(vec![IndexOp::QuarantineInsert { record }])).await?;
-					tokio::fs::create_dir_all(&quarantine_dir).await.with_context(|| format!("creating {}", quarantine_dir.display()))?;
-					let to = contained_file(&quarantine_dir, &name)?;
-					self.fs.rename(&path, &to).await.with_context(|| format!("quarantining orphan {} to {}", path.display(), to.display()))?;
-					moved = true;
+				if !Self::orphan_names_aspect(&name) {
+					continue;
+				}
+				if !pass.report_only {
+					pass.moved |= self.quarantine_orphan(&name, &path, class, format!("orphan: no index row claims this frame: {error:#}"), Vec::new()).await?;
 				}
 				match class {
-					QuarantineClass::Corrupt => report.quarantined += 1,
-					QuarantineClass::Suspect => report.suspected += 1,
+					QuarantineClass::Corrupt => pass.report.quarantined += 1,
+					QuarantineClass::Suspect => pass.report.suspected += 1,
 				}
 			}
 		}
-		if moved {
-			self.sync_segments().await?;
-		}
-		if !report_only {
-			report.purged = self.purge_expired_quarantine().await?;
-		}
-		*self.recovery.write().unwrap_or_else(PoisonError::into_inner) = report.clone();
-		self.refresh_suspect_present().await?;
-		Ok(report)
+		Ok(())
 	}
+}
+
+/// The state one [`SegmentStore::fsck_inner`] pass carries between its steps.
+struct FsckPass {
+	report_only: bool,
+	restore_mode: bool,
+	segments_dir: PathBuf,
+	report: RecoveryReport,
+	/// The frames the reaper's journal names: never orphans.
+	journal_names: HashSet<String>,
+	/// The frames an index row claims: never orphans.
+	live_names: HashSet<String>,
+	/// Whether a frame was moved, so `segments/` needs a sync.
+	moved: bool,
+	/// The aspects whose rollups need rebuilding.
+	changed_aspects: Vec<String>,
 }
 
 impl SegmentStore {
@@ -2109,7 +2674,7 @@ impl SegmentStore {
 
 	/// **Store-wide cross-segment overlap count** (roadmap Phase 4.6): the total
 	/// number of segments across every aspect whose time window overlaps another
-	/// segment *in the same aspect* — the store-wide form of
+	/// segment *of the same series of the same aspect* (TAG-6) — the store-wide form of
 	/// [`AspectStorageStats::overlapping_segments`](AspectStorageStats::overlapping_segments).
 	///
 	/// Unlike [`store_stats`](SegmentStore::store_stats) — which reads O(1)
@@ -2128,7 +2693,7 @@ impl SegmentStore {
 		let aspects = self.index.list_aspects().await?;
 		let mut total = 0;
 		for aspect in &aspects {
-			total += self.index.load_index(aspect).await?.overlapping_count();
+			total += series_overlapping_count(&self.index.rows(aspect).await?);
 		}
 		Ok(total)
 	}
@@ -2168,9 +2733,10 @@ pub struct ReconcileSweep {
 }
 
 /// The cold-vs-hot split of a hot/cold reconcile pass over one aspect, returned by
-/// [`SegmentStore::reconcile_aspect_hot_cold`]. A cold segment (any out-of-order
-/// segment that is not the aspect's most-recently-sealed one) is always reconciled;
-/// the hot tail is reconciled only when the aspect's backlog reached the threshold.
+/// [`SegmentStore::reconcile_aspect_hot_cold`].
+///
+/// A cold segment (any out-of-order segment that is not the aspect's most-recently-sealed one) is
+/// always reconciled; the hot tail is reconciled only when the aspect's backlog reached the threshold.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HotColdReconcile {
 	/// Cold (non-hot-tail) out-of-order segments rewritten sorted — always paid.
@@ -2402,10 +2968,8 @@ impl StoreStorageStats {
 		if self.total_rows == 0 {
 			return 0.0;
 		}
-		#[allow(clippy::cast_precision_loss)]
-		let n = self.total_rows as f64;
-		#[allow(clippy::cast_precision_loss)]
-		let total = self.total_bytes as f64;
+		let n = crate::types::num::to_f64(self.total_rows);
+		let total = crate::types::num::to_f64(self.total_bytes);
 		total / n
 	}
 }
@@ -2433,7 +2997,8 @@ pub struct AspectStorageStats {
 	/// construction. See [`SegmentIndex::unsorted_count`](weft_physical_type::SegmentIndex::unsorted_count).
 	pub unsorted_segments: usize,
 	/// The number of sealed segments whose time span **overlaps at least one other
-	/// segment's** — the *cross-segment* order-health signal (roadmap Phase 4.6),
+	/// segment's** of the same series (TAG-6: each series is counted on its own, so two
+	/// series sharing a window are not overlap) — the *cross-segment* order-health signal (roadmap Phase 4.6),
 	/// distinct from [`unsorted_segments`](AspectStorageStats::unsorted_segments)
 	/// (which counts *intra*-segment disorder). A non-zero count means late data
 	/// re-entered an already-covered window, so a point lookup may have to consult
@@ -2451,6 +3016,17 @@ mod tests {
 	use weft_physical_type::{timestamp::TimeUnit, PhysicalType, PAGED_SEGMENT_FORMAT_VERSION};
 
 	use super::*;
+
+	/// `WEFT_MAX_SERIES_PER_ASPECT` (TAG-11): a positive whole number sets the cap;
+	/// unset, zero, or anything else keeps the default.
+	#[test]
+	fn max_series_per_aspect_reads_a_positive_whole_number() {
+		assert_eq!(max_series_per_aspect_from(Some("7")), 7);
+		assert_eq!(max_series_per_aspect_from(Some(" 12 ")), 12);
+		for other in [None, Some(""), Some("0"), Some("-1"), Some("many")] {
+			assert_eq!(max_series_per_aspect_from(other), DEFAULT_MAX_SERIES_PER_ASPECT, "{other:?}");
+		}
+	}
 	use crate::{types::index_txn::TxnPoints, STORE_FORMAT_FILE};
 
 	fn bd(s: &str) -> BigDecimal {
@@ -2545,6 +3121,7 @@ mod tests {
 		assert!(second.duplicate, "the paged batch replays under its key");
 		assert_eq!(second.segment_ids, first.segment_ids);
 		let (ts, vs) = store.read_time_range("price", 0, 30).await.expect("reads");
+		drop(store);
 		assert_eq!(ts, vec![0, 10, 20, 30]);
 		assert_eq!(vs.len(), 4);
 	}
@@ -2579,9 +3156,10 @@ mod tests {
 		let err = store.seal_declared("undeclared", &[0], &[bd("1")]).await.expect_err("seal_declared shares require_schema");
 		assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::UnknownAspect { .. })), "{err:#}");
 		store.declare("price", &schema()).await.expect("declares");
-		let grouped = batch.clone().with_groups(crate::TagSet::from_pairs([("host", "a")]).expect("valid tags"));
-		let err = store.ingest("price", &grouped).await.expect_err("non-empty groups before the gate flips");
-		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::GroupsUnsupported { aspect: "price".to_string() }), "{err:#}");
+		// TAG-8: the library gate is open, but a reserved `__` key is still refused.
+		let reserved = batch.clone().with_groups(crate::TagSet::from(crate::SeriesKey::from_canonical(b"__dim\x1fs").expect("a stored reserved key")));
+		let err = store.ingest("price", &reserved).await.expect_err("a reserved tag key");
+		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::ReservedTagKey { aspect: "price".to_string(), key: "__dim".to_string() }), "{err:#}");
 		let err = store.ingest("price", &IngestBatch::dense("k", vec![], vec![])).await.expect_err("an empty batch");
 		assert_eq!(err.downcast_ref::<StoreError>(), Some(&StoreError::EmptyIngestBatch { aspect: "price".to_string() }), "{err:#}");
 		let err = store.ingest("price", &IngestBatch::new("k", vec![0, 10], vec![Some(bd("1"))])).await.expect_err("mismatched columns");
@@ -2600,7 +3178,7 @@ mod tests {
 		let big = bd("1e200000");
 		let timestamps: Vec<i64> = (0..2_000).map(|i| i / 3).collect();
 		let values: Vec<Option<BigDecimal>> = (0..2_000).map(|_| Some(big.clone())).collect();
-		let chunks = chunk_ingest_rows(&timestamps, &values);
+		let chunks = chunk_ingest_rows(&timestamps, &values, crate::MAX_ENCODED_FRAME_BYTES);
 		assert!(chunks.len() >= 3, "a ~400 MB batch is cut: {} chunk(s)", chunks.len());
 		let mut flat_ts: Vec<i64> = Vec::new();
 		for (chunk_ts, chunk_vs) in &chunks {
@@ -2644,6 +3222,7 @@ mod tests {
 		assert_eq!(descriptors.iter().map(|desc| desc.id).collect::<Vec<_>>(), vec![0, 1]);
 		assert_eq!(descriptors.iter().map(|desc| desc.path.clone()).collect::<Vec<_>>(), vec![first.path.clone(), second.path.clone()]);
 		let (ts, vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		drop(store);
 		assert_eq!(ts, vec![0, 10, 20, 30]);
 		assert_eq!(vs.into_iter().flatten().map(|v| v.to_plain_string()).collect::<Vec<_>>(), vec!["1", "2", "3", "4"]);
 	}
@@ -2775,7 +3354,7 @@ mod tests {
 	}
 
 	/// D-S16: a whole-store backup links the frames its snapshot references,
-	/// its manifest embeds the store's STORE_FORMAT and allocators, a
+	/// its manifest embeds the store's `STORE_FORMAT` and allocators, a
 	/// control-plane restore refuses it, and `restore_store` round-trips it
 	/// into a fresh root that opens and reads — with the live root gone.
 	#[tokio::test]
@@ -2822,7 +3401,7 @@ mod tests {
 		drop(reopened);
 	}
 
-	/// D-S16: a backup whose embedded STORE_FORMAT floor is newer than this
+	/// D-S16: a backup whose embedded `STORE_FORMAT` floor is newer than this
 	/// build is refused before anything is staged.
 	#[tokio::test]
 	#[serial(backup_fault_points)]
@@ -2842,13 +3421,14 @@ mod tests {
 		assert!(!dir.path().join("restored").exists(), "a refused restore publishes nothing");
 	}
 
-	/// D-S16, R8: at the restored root's first open, a post-backup orphan is
-	/// adopted via describe_frame under a fresh id, and an orphan carrying a
-	/// SERIES_KEY extension is journaled held instead — never adopted, never
-	/// reaped.
+	/// D-S16, R8, TAG-9: at the restored root's first open, a post-backup
+	/// orphan is adopted via `describe_frame` under a fresh id, and an orphan
+	/// carrying a canonical `SERIES_KEY` extension is adopted into the series its
+	/// key names — registered in the catalog in the same transaction — rather
+	/// than held.
 	#[tokio::test]
 	#[serial(backup_fault_points)]
-	async fn restore_mode_adopts_orphans_and_holds_series_key_frames() {
+	async fn restore_mode_adopts_series_key_frames_into_their_series() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
 		let store = populated_store(&root).await;
@@ -2860,28 +3440,345 @@ mod tests {
 		// Two post-backup frames appear beside the restored ones (the
 		// restore-beside-newer-frames case): one plain, one SERIES_KEY.
 		write_frame(&restored_root, "price", 7, &[(30, "4"), (40, "5")]);
-		let segment = schema().seal(&[50, 60], &[bd("6"), bd("7")]).expect("encodes");
-		let wrapped = weft_physical_type::wrap_frame_envelope(&segment.write_to(), &[weft_physical_type::FrameExtension { id: weft_physical_type::EXT_SERIES_KEY, critical: false, payload: b"price|a=1".to_vec() }]).expect("wraps");
-		std::fs::write(restored_root.join("segments").join("price-8.weftseg"), wrapped).unwrap();
+		std::fs::write(restored_root.join("segments").join("price-8.weftseg"), tagged_frame(&[50, 60], b"a\x1f1")).unwrap();
 
 		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
 		let report = reopened.recovery_report();
-		assert_eq!(report.adopted, 1, "the plain orphan is adopted: {report:?}");
-		assert_eq!(report.held, 1, "the SERIES_KEY orphan is held: {report:?}");
+		assert_eq!(report.adopted, 2, "both orphans are adopted: {report:?}");
+		assert_eq!(report.held, 0, "a tagged orphan of a declared aspect is not held: {report:?}");
 		let (times, _) = reopened.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
-		assert_eq!(times, vec![0, 10, 20, 30, 40], "the adopted frame's rows are readable; the held frame's are not served");
-		let journal = reopened.index().journal(None).await.expect("journal");
-		let held: Vec<_> = journal.iter().filter(|entry| entry.state == crate::types::reaper::JournalState::Held).collect();
-		assert_eq!(held.len(), 1);
-		assert_eq!(held[0].name, "price-8.weftseg");
-		assert!(restored_root.join("segments").join("price-8.weftseg").exists(), "a held frame stays on disk");
+		// Reads target one series (TAG-8): series 0 serves the plain frame's rows, and
+		// the tagged frame's rows are read from the series its key names.
+		assert_eq!(times, vec![0, 10, 20, 30, 40], "the plain adopted frame's rows are series 0's");
+		let key = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		let id = reopened.index().series_id_for("price", &key).await.expect("catalog").expect("the key is registered");
+		let (times, _) = reopened.read_time_range_of("price", id, i64::MIN, i64::MAX).await.expect("reads");
+		assert_eq!(times, vec![50, 60], "the tagged adopted frame's rows are readable in their series");
+		assert_ne!(id, crate::SeriesId::UNTAGGED);
+		let rows = reopened.index().rows("price").await.expect("rows");
+		let tagged: Vec<_> = rows.iter().filter(|row| row.desc.path.ends_with("price-8.weftseg")).collect();
+		assert_eq!(tagged.len(), 1);
+		assert_eq!(tagged[0].series_id, id.0, "the adopted row names the key's series");
+		assert!(reopened.index().journal(None).await.expect("journal").is_empty(), "nothing is held");
+		// The rollup is rebuilt after the orphan pass, so it counts both adopted frames.
+		let metadata = reopened.aspect_metadata("price").await.expect("metadata");
+		assert_eq!(metadata.total_rows, 7, "{metadata:?}");
+		assert_eq!(metadata.time_range.map(|(_, max)| max), Some(60), "{metadata:?}");
 		drop(reopened);
-		// A second open keeps the held frame and its journal row.
+		// A second open finds the frame indexed and rebinds nothing.
 		let reopened = SegmentStore::open(&restored_root).await.expect("reopens");
-		let journal = reopened.index().journal(None).await.expect("journal");
-		assert_eq!(journal.iter().filter(|entry| entry.state == crate::types::reaper::JournalState::Held).count(), 1, "held survives the journal replay");
-		assert!(restored_root.join("segments").join("price-8.weftseg").exists());
+		let report = reopened.recovery_report();
+		assert_eq!((report.rebound, report.series_rebound, report.orphans), (0, 0, 0), "{report:?}");
 		drop(reopened);
+	}
+
+	/// TAG-9: a tagged orphan of an aspect the restored store has not declared
+	/// is held at the restore; once the aspect is declared, the next open
+	/// adopts it into its series and clears the journal row.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_held_frame_is_adopted_on_the_next_open() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("whole");
+		store.backup_store(&backup_dir, crate::BackupMode::Linked).await.expect("whole-store backup");
+		drop(store);
+		let restored_root = dir.path().join("restored");
+		crate::restore_store(&backup_dir, &restored_root).await.expect("restores");
+		std::fs::write(restored_root.join("segments").join("volume-1.weftseg"), tagged_frame(&[50, 60], b"a\x1f1")).unwrap();
+
+		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		let report = reopened.recovery_report();
+		assert_eq!((report.adopted, report.held), (0, 1), "the undeclared aspect's tagged orphan is held: {report:?}");
+		reopened.declare("volume", &schema()).await.expect("declares");
+		drop(reopened);
+
+		let reopened = SegmentStore::open(&restored_root).await.expect("reopens");
+		let report = reopened.recovery_report();
+		assert_eq!((report.adopted, report.held), (1, 0), "the held frame is released: {report:?}");
+		assert!(reopened.index().journal(None).await.expect("journal").is_empty(), "the journal row is cleared with the adoption");
+		let key = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		let id = reopened.index().series_id_for("volume", &key).await.expect("catalog").expect("registered");
+		let rows = reopened.index().rows("volume").await.expect("rows");
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0].series_id, id.0);
+		drop(reopened);
+	}
+
+	/// Restore a populated store, hold a tagged `volume-1.weftseg` orphan (its
+	/// aspect undeclared at the restore), then declare `volume`. Returns the
+	/// restored root, the held frame's path and the still-open store.
+	async fn restored_with_held_frame(dir: &TempDir) -> (PathBuf, PathBuf, SegmentStore) {
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("whole");
+		store.backup_store(&backup_dir, crate::BackupMode::Linked).await.expect("whole-store backup");
+		drop(store);
+		let restored_root = dir.path().join("restored");
+		crate::restore_store(&backup_dir, &restored_root).await.expect("restores");
+		let held = restored_root.join("segments").join("volume-1.weftseg");
+		std::fs::write(&held, tagged_frame(&[50, 60], b"a\x1f1")).unwrap();
+		let reopened = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		assert_eq!(reopened.recovery_report().held, 1);
+		reopened.declare("volume", &schema()).await.expect("declares");
+		(restored_root, held, reopened)
+	}
+
+	/// TAG-9: a held frame whose `SERIES_KEY` payload is malformed is quarantined
+	/// suspect on the next open, its journal row cleared in the same pass.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_held_frame_with_a_malformed_key_is_suspect() {
+		let dir = TempDir::new().unwrap();
+		let (root, held, store) = restored_with_held_frame(&dir).await;
+		drop(store);
+		std::fs::write(&held, tagged_frame(&[50, 60], b"volume|a=1")).unwrap();
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!((report.suspected, report.adopted, report.held_cleared), (1, 0, 0), "{report:?}");
+		assert!(store.index().journal(None).await.expect("journal").is_empty(), "the journal row is cleared");
+		drop(store);
+		assert!(root.join("segments").join("quarantine").join("volume-1.weftseg").exists(), "the frame moved to quarantine");
+		assert!(!held.exists());
+	}
+
+	/// TAG-9: a held frame that decayed (its CRC no longer verifies) is
+	/// quarantined under its decode class rather than kept held forever.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_decayed_held_frame_is_quarantined() {
+		let dir = TempDir::new().unwrap();
+		let (root, held, store) = restored_with_held_frame(&dir).await;
+		drop(store);
+		let mut bytes = std::fs::read(&held).unwrap();
+		let middle = bytes.len() / 2;
+		bytes[middle] ^= 0xff;
+		std::fs::write(&held, bytes).unwrap();
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!(report.quarantined + report.suspected, 1, "{report:?}");
+		assert_eq!(report.adopted, 0, "{report:?}");
+		assert!(store.index().journal(None).await.expect("journal").is_empty(), "the journal row is cleared");
+		drop(store);
+		assert!(!held.exists(), "the frame left segments/");
+	}
+
+	/// TAG-9: a held row whose frame is gone is cleared and counted, not kept.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_held_row_without_its_frame_is_cleared() {
+		let dir = TempDir::new().unwrap();
+		let (root, held, store) = restored_with_held_frame(&dir).await;
+		drop(store);
+		std::fs::remove_file(&held).unwrap();
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!((report.held_cleared, report.adopted), (1, 0), "{report:?}");
+		assert_eq!(store.index().journal(None).await.expect("journal"), [] as [crate::types::reaper::JournalEntry; 0]);
+		drop(store);
+	}
+
+	/// TAG-9: a report-only pass over a held row counts the adoption it would
+	/// make and leaves the journal row, the catalog and the index untouched.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn report_only_leaves_a_held_row_alone() {
+		let dir = TempDir::new().unwrap();
+		let (_, _, store) = restored_with_held_frame(&dir).await;
+		let journal = store.index().journal(None).await.expect("journal");
+		assert_eq!(journal.len(), 1, "the row is held before the pass");
+		let report = store.fsck(true).await.expect("fsck");
+		assert_eq!((report.adopted, report.held_cleared), (1, 0), "{report:?}");
+		assert_eq!(store.index().journal(None).await.expect("journal").len(), 1, "the journal row stays");
+		assert!(store.index().rows("volume").await.expect("rows").is_empty(), "nothing is indexed");
+		assert!(store.index().series_of("volume").await.expect("catalog").is_empty(), "nothing is registered");
+	}
+
+	/// TAG-9: a restore-mode orphan whose `SERIES_KEY` payload is malformed is
+	/// quarantined suspect, not adopted.
+	#[tokio::test]
+	#[serial(backup_fault_points)]
+	async fn a_restore_orphan_with_a_malformed_key_is_suspect() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("live");
+		let store = populated_store(&root).await;
+		let backup_dir = dir.path().join("whole");
+		store.backup_store(&backup_dir, crate::BackupMode::Linked).await.expect("whole-store backup");
+		drop(store);
+		let restored_root = dir.path().join("restored");
+		crate::restore_store(&backup_dir, &restored_root).await.expect("restores");
+		std::fs::write(restored_root.join("segments").join("price-8.weftseg"), tagged_frame(&[50, 60], b"price|a=1")).unwrap();
+		let store = SegmentStore::open(&restored_root).await.expect("restored store opens");
+		let report = store.recovery_report();
+		assert_eq!((report.suspected, report.adopted, report.held), (1, 0, 0), "{report:?}");
+		let records = store.quarantine_list(None).await.expect("records");
+		drop(store);
+		assert_eq!(records.len(), 1);
+		assert_eq!(records[0].class, QuarantineClass::Suspect);
+	}
+
+	/// TAG-9: a `SERIES_KEY` extension marked non-critical is still the frame's
+	/// key: the row is rebound to it, not refused.
+	#[tokio::test]
+	async fn a_non_critical_series_key_is_accepted() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		let rows = store.index().rows("price").await.expect("rows");
+		let values: Vec<BigDecimal> = [0i64, 10, 20].iter().map(|ts| bd(&(ts / 10).to_string())).collect();
+		let segment = schema().seal(&[0, 10, 20], &values).expect("encodes");
+		let bytes = weft_physical_type::wrap_frame_envelope(&segment.write_to(), &[weft_physical_type::FrameExtension { id: weft_physical_type::EXT_SERIES_KEY, critical: false, payload: b"a\x1f1".to_vec() }]).expect("wraps");
+		std::fs::write(&rows[0].desc.path, bytes).unwrap();
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!((report.series_rebound, report.suspected, report.quarantined), (1, 0, 0), "{report:?}");
+		let key = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		assert!(store.index().series_id_for("price", &key).await.expect("catalog").is_some());
+		drop(store);
+	}
+
+	/// TAG-9: an untagged store's fsck rebinds nothing and registers nothing.
+	#[tokio::test]
+	async fn an_untagged_store_sees_no_series_work() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!((report.series_rebound, report.rebound, report.suspected, report.quarantined), (0, 0, 0, 0), "{report:?}");
+		assert_eq!(store.index().series_of("price").await.expect("catalog"), [] as [(crate::SeriesId, weft_physical_type::SeriesKey); 0]);
+		assert!(store.index().rows("price").await.expect("rows").iter().all(|row| row.series_id == 0));
+		drop(store);
+	}
+
+	/// TAG-9, R10: with the allocator row lost but the catalog intact, a row
+	/// rebound during recovery registers its key past the catalog's ids rather
+	/// than colliding with one (the seed runs before any row is checked).
+	#[tokio::test]
+	async fn a_rebind_after_a_lost_allocator_does_not_reuse_a_catalog_id() {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("store");
+		let store = populated_store(&root).await;
+		let taken = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		store.commit_index(&IndexTxn::new(vec![IndexOp::RegisterSeries { aspect: "price".to_string(), series_id: crate::SeriesId(1), series_key: taken.clone() }, IndexOp::SeedSeries { aspect: "price".to_string(), next_series_id: 2 }])).await.expect("registers");
+		retag_indexed_frame(&store, b"b\x1f2").await;
+		drop(store);
+		on_raw_index(&root, &["DELETE FROM aspect_seq"]).await;
+		let store = SegmentStore::open(&root).await.expect("recovery succeeds");
+		let report = store.recovery_report();
+		assert_eq!(report.series_rebound, 1, "{report:?}");
+		let key = crate::SeriesKey::from_canonical(b"b\x1f2").unwrap();
+		let id = store.index().series_id_for("price", &key).await.expect("catalog").expect("registered");
+		assert_eq!(id, crate::SeriesId(2), "past the catalog's id 1");
+		assert_eq!(store.index().series_id_for("price", &taken).await.expect("catalog"), Some(crate::SeriesId(1)));
+		assert_eq!(store.index().rows("price").await.expect("rows")[0].series_id, 2);
+		drop(store);
+	}
+
+	/// A v7 frame of `[(ts, ts / 10)]` rows wrapped with one critical
+	/// `SERIES_KEY` extension carrying `payload`.
+	fn tagged_frame(timestamps: &[i64], payload: &[u8]) -> Vec<u8> {
+		let values: Vec<BigDecimal> = timestamps.iter().map(|ts| bd(&(ts / 10).to_string())).collect();
+		let segment = schema().seal(timestamps, &values).expect("encodes");
+		weft_physical_type::wrap_frame_envelope(&segment.write_to(), &[weft_physical_type::FrameExtension { id: weft_physical_type::EXT_SERIES_KEY, critical: true, payload: payload.to_vec() }]).expect("wraps")
+	}
+
+	/// Rewrite the populated store's one indexed frame as a tagged frame
+	/// carrying `payload`, keeping its rows, and return the row.
+	async fn retag_indexed_frame(store: &SegmentStore, payload: &[u8]) -> IndexRow {
+		let rows = store.index().rows("price").await.expect("rows");
+		assert_eq!(rows.len(), 1);
+		std::fs::write(&rows[0].desc.path, tagged_frame(&[0, 10, 20], payload)).unwrap();
+		rows[0].clone()
+	}
+
+	/// TAG-9, C5: an indexed frame whose CRC verifies and whose body decodes
+	/// but whose `SERIES_KEY` payload is not canonical is suspect: quarantined,
+	/// never purged, its row deleted.
+	#[tokio::test]
+	async fn a_malformed_series_key_payload_is_suspect() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		retag_indexed_frame(&store, b"price|a=1").await;
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!((report.suspected, report.quarantined, report.series_rebound), (1, 0, 0), "{report:?}");
+		assert!(store.index().rows("price").await.expect("rows").is_empty(), "the row is deleted");
+		let records = store.quarantine_list(None).await.expect("records");
+		drop(store);
+		assert_eq!(records.len(), 1);
+		assert_eq!(records[0].class, QuarantineClass::Suspect);
+		assert!(records[0].reason.contains("SERIES_KEY"), "{}", records[0].reason);
+	}
+
+	/// TAG-9: an indexed row whose series id names a different key than its
+	/// frame's `SERIES_KEY` is rebound to the frame's series, registered in the
+	/// same transaction.
+	#[tokio::test]
+	async fn a_series_key_mismatch_rebinds_the_row() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		let before = retag_indexed_frame(&store, b"a\x1f1").await;
+		assert_eq!(before.series_id, 0);
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!((report.series_rebound, report.rebound, report.suspected), (1, 1, 0), "{report:?}");
+		let key = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		let id = store.index().series_id_for("price", &key).await.expect("catalog").expect("registered");
+		let rows = store.index().rows("price").await.expect("rows");
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0].series_id, id.0, "the row names the frame's series");
+		assert_eq!(rows[0].desc.id, before.desc.id, "only the series binding changed");
+		let again = store.fsck(false).await.expect("fsck");
+		drop(store);
+		assert_eq!((again.series_rebound, again.rebound), (0, 0), "a second pass finds nothing to rebind: {again:?}");
+	}
+
+	/// TAG-9, critique E19: a row moved back to the aspect its frame's name
+	/// names does not carry the series id it held in the wrong aspect — its
+	/// frame's key is resolved again in the target aspect's own catalog.
+	#[tokio::test]
+	async fn an_aspect_rebind_resolves_the_key_in_the_target_aspect() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		let row = retag_indexed_frame(&store, b"a\x1f1").await;
+		let key = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		// Misfile the row under `volume`, as series 3 of volume's catalog.
+		let misfiled = IndexRow { series_id: 3, ..row.clone() };
+		store.commit_index(&IndexTxn::new(vec![IndexOp::RegisterSeries { aspect: "volume".to_string(), series_id: crate::SeriesId(3), series_key: key.clone() }, IndexOp::SeedSeries { aspect: "volume".to_string(), next_series_id: 4 }, IndexOp::DeleteExpected { aspect: "price".to_string(), expected: row.version() }, IndexOp::InsertNew { aspect: "volume".to_string(), row: misfiled }])).await.expect("misfiles");
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!((report.rebound, report.series_rebound), (1, 1), "{report:?}");
+		assert!(store.index().rows("volume").await.expect("rows").is_empty(), "the row left the wrong aspect");
+		let id = store.index().series_id_for("price", &key).await.expect("catalog").expect("registered in price");
+		assert_eq!(id, crate::SeriesId(1), "price's catalog hands out its own first id, not volume's 3");
+		let rows = store.index().rows("price").await.expect("rows");
+		drop(store);
+		assert_eq!(rows.len(), 1);
+		assert_eq!(rows[0].series_id, id.0);
+	}
+
+	/// TAG-9: a report-only pass counts the series rebind it would make and
+	/// changes nothing: no catalog row, no row rewrite.
+	#[tokio::test]
+	async fn report_only_rebinds_nothing() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		let before = retag_indexed_frame(&store, b"a\x1f1").await;
+		let report = store.fsck(true).await.expect("fsck");
+		assert_eq!(report.series_rebound, 1, "{report:?}");
+		let key = crate::SeriesKey::from_canonical(b"a\x1f1").unwrap();
+		assert_eq!(store.index().series_id_for("price", &key).await.expect("catalog"), None, "no series is registered");
+		let rows = store.index().rows("price").await.expect("rows");
+		drop(store);
+		assert_eq!(rows, vec![before], "the row is untouched");
+	}
+
+	/// TAG-9: a report-only pass leaves a malformed `SERIES_KEY` frame in place.
+	#[tokio::test]
+	async fn report_only_leaves_a_malformed_series_key_frame_alone() {
+		let dir = TempDir::new().unwrap();
+		let store = populated_store(dir.path()).await;
+		let before = retag_indexed_frame(&store, b"price|a=1").await;
+		let report = store.fsck(true).await.expect("fsck");
+		assert_eq!(report.suspected, 1, "{report:?}");
+		assert_eq!(store.index().rows("price").await.expect("rows"), vec![before]);
+		assert_eq!(store.quarantine_list(None).await.expect("records"), [] as [crate::types::quarantine::QuarantineRecord; 0]);
+		drop(store);
 	}
 
 	#[tokio::test]
@@ -3000,6 +3897,7 @@ mod tests {
 		assert!(!names_in(&restored_root).iter().any(|n| Path::new(n).extension().is_some_and(|ext| ext == "tmp")), "the staged copies were renamed into place");
 		let reopened = SegmentStore::open(&restored_root).await.expect("opens");
 		let (times, _) = reopened.read_time_range("price", 0, 20).await.expect("reads");
+		drop(reopened);
 		assert_eq!(times, vec![0_i64, 10, 20]);
 	}
 
@@ -3187,7 +4085,7 @@ mod tests {
 			assert_eq!(err.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>()).and_then(injected_point), Some(point), "{point}: {err:#}");
 
 			if point == FaultPoint::BRenamed {
-				assert_eq!(names_in(&base), [label.clone()], "{point}: published before the error");
+				assert_eq!(names_in(&base), std::slice::from_ref(&label), "{point}: published before the error");
 				assert!(crate::is_complete_backup(&base.join(&label)).await.unwrap(), "{point}");
 				let again = store.backup_control_plane_with_verify(base.join(&label), crate::VerifyMode::SnapshotOnly).await;
 				assert!(again.is_err(), "{point}: the label is taken");
@@ -3242,6 +4140,7 @@ mod tests {
 		assert_eq!(restored.segment_count("price").await.expect("counts"), 1);
 		assert_eq!(restored.segment_count("volume").await.expect("counts"), 1);
 		let mut aspects = restored.index().rollup_aspects().await.expect("lists");
+		drop(restored);
 		aspects.sort();
 		assert_eq!(aspects, vec!["price".to_string(), "volume".to_string()]);
 	}
@@ -3268,8 +4167,8 @@ mod tests {
 		assert_eq!(ts, vec![110, 120, 130]);
 		assert_eq!(vs, vec![Some(bd("101")), Some(bd("102")), Some(bd("103"))]);
 		assert_eq!(ts2, vec![30, 40, 100, 110]);
-		assert!(ts3.is_empty());
-		assert!(vs3.is_empty());
+		assert_eq!(ts3, [] as [i64; 0]);
+		assert_eq!(vs3, [] as [Option<bigdecimal::BigDecimal>; 0]);
 	}
 
 	#[tokio::test]
@@ -3397,6 +4296,7 @@ mod tests {
 		}
 		// A window the null segment covers alone answers empty, not a run of empty buckets.
 		assert!(store.downsample_range("temp", 600, 899, Resolution::Minutes, &aggs).await.expect("downsamples the null-only window").is_empty(), "a window of nothing but nulls yields no buckets");
+		drop(store);
 	}
 
 	#[tokio::test]
@@ -3504,8 +4404,8 @@ mod tests {
 		assert_eq!(vs, vec![bd("101"), bd("102"), bd("103")]);
 		assert_eq!(ts, vec![110, 120, 130]);
 		assert_eq!(allts.len(), 15);
-		assert!(gts.is_empty());
-		assert!(gvs.is_empty());
+		assert_eq!(gts, [] as [i64; 0]);
+		assert_eq!(gvs, [] as [bigdecimal::BigDecimal; 0]);
 	}
 
 	#[tokio::test]
@@ -3558,7 +4458,7 @@ mod tests {
 		// Spot-check the values: 20 -> 2, 120 -> 102, 0 -> 0, 140 -> 104; misses are None.
 		assert_eq!(got, vec![Some(bd("102")), Some(bd("2")), None, None, Some(bd("102")), None, Some(bd("0")), Some(bd("104"))]);
 		// An empty batch and an undeclared aspect are clean.
-		assert!(store.read_points("a", &[]).await.expect("reads").is_empty());
+		assert_eq!(store.read_points("a", &[]).await.expect("reads"), [] as [Option<bigdecimal::BigDecimal>; 0]);
 		assert_eq!(store.read_points("none", &[0, 1]).await.expect("reads"), vec![None, None]);
 	}
 
@@ -3643,6 +4543,7 @@ mod tests {
 		let aggs = [Aggregation::Min, Aggregation::Max, Aggregation::Sum, Aggregation::First, Aggregation::Last];
 		std::fs::remove_file(&new_desc.path).expect("removes the reconciled frame");
 		let served = store.downsample_range("a", i64::MIN, i64::MAX, Resolution::Hours, &aggs).await.expect("serves from the regenerated sidecar");
+		drop(store);
 		assert_eq!(served, reduce(&all, Resolution::Hours, None, None, &aggs).expect("reduces"), "the regenerated sidecar reproduces the downsample with no frame on disk");
 	}
 
@@ -3948,8 +4849,8 @@ mod tests {
 		// A long cold base [0..100] and a small late batch [90,100,110] that re-enters
 		// only its tail (newer wins at 90 and 100).
 		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
-		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
-		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("base");
+		let base_values: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_values).await.expect("base");
 		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("late");
 		assert_eq!(store.aspect_stats("a").await.expect("stats").overlapping_segments, 2);
 		// A tiny-floor policy makes the dominant cold prefix ([0..80], 9 rows) split off
@@ -3974,19 +4875,19 @@ mod tests {
 
 	#[tokio::test]
 	async fn split_reconcile_leaves_the_cold_prefix_untouched_on_a_later_merge() {
+		// The cold-prefix segment on disk after a split (id 0): a write-once frame.
+		async fn cold_frame(store: &SegmentStore) -> PathBuf {
+			PathBuf::from(store.index().all("a").await.expect("reads").into_iter().find(|d| d.id == 0).map(|d| d.path).expect("the cold prefix"))
+		}
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
 		store.declare("a", &schema()).await.expect("declares");
 		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
-		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
-		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("base");
+		let base_values: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_values).await.expect("base");
 		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("late");
 		// First reconcile splits: cold prefix [0..80] stays at id 0, hot suffix takes id 1.
 		store.reconcile_overlaps_with_policy("a", SplitPolicy::new(1)).await.expect("splits");
-		// The cold-prefix segment on disk after the split (id 0): a write-once frame.
-		async fn cold_frame(store: &SegmentStore) -> PathBuf {
-			PathBuf::from(store.index().all("a").await.expect("reads").into_iter().find(|d| d.id == 0).map(|d| d.path).expect("the cold prefix"))
-		}
 		let cold_path = cold_frame(&store).await;
 		let cold_before = std::fs::read(&cold_path).expect("cold prefix file");
 		// A second late arrival re-enters only the hot window [90,110]; it must NOT pull
@@ -4019,8 +4920,8 @@ mod tests {
 		// The same cold-base + late-tail shape, but under the default 50 MiB split floor
 		// these tiny segments never clear it → a single fully-rewritten segment.
 		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
-		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
-		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("base");
+		let base_values: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_values).await.expect("base");
 		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("late");
 		let removed = store.reconcile_overlaps("a").await.expect("merges");
 		let stats = store.aspect_stats("a").await.expect("stats");
@@ -4104,8 +5005,8 @@ mod tests {
 		store.declare("b", &schema()).await.expect("declares b");
 		// a: a dominant cold prefix + late tail (splits under a tiny floor, net removed 0).
 		let base_ts: Vec<i64> = (0..=10).map(|i| i * 10).collect();
-		let base_vs: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
-		store.seal("a", &schema(), &base_ts, &base_vs).await.expect("a base");
+		let base_values: Vec<BigDecimal> = (0..=10).map(BigDecimal::from).collect();
+		store.seal("a", &schema(), &base_ts, &base_values).await.expect("a base");
 		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.expect("a late");
 		// b: no overlap.
 		store.seal("b", &schema(), &[0_i64, 10], &[bd("7"), bd("8")]).await.expect("b lo");
@@ -5094,8 +5995,7 @@ mod tests {
 		assert_eq!(stats.time_range, Some((0, 140)));
 		// Both seals were in order, so the aspect is fully sorted.
 		assert_eq!(stats.unsorted_segments, 0);
-		#[allow(clippy::cast_precision_loss)]
-		let expected_bpp = expected_bytes as f64 / 10.0;
+		let expected_bpp = crate::types::num::to_f64(expected_bytes) / 10.0;
 		assert!((stats.bytes_per_point - expected_bpp).abs() < f64::EPSILON);
 		// Empty aspect.
 		assert_eq!(empty.segment_count, 0);
@@ -5182,8 +6082,7 @@ mod tests {
 		assert_eq!(stats.total_bytes, temp.total_bytes + humidity.total_bytes);
 		// The time span is the union across aspects.
 		assert_eq!(stats.time_range, Some((0, 120)));
-		#[allow(clippy::cast_precision_loss)]
-		let expected_bpp = stats.total_bytes as f64 / 5.0;
+		let expected_bpp = crate::types::num::to_f64(stats.total_bytes) / 5.0;
 		assert!((stats.bytes_per_point() - expected_bpp).abs() < f64::EPSILON);
 		// Both aspects sealed in order, so the store-wide order-health count is clean,
 		// and it equals the sum of the per-aspect rollups.
@@ -5302,6 +6201,7 @@ mod tests {
 		let store = SegmentStore::open(dir.path()).await.expect("reopens");
 		let temp_after = store.aspect_metadata("temp").await.expect("metadata");
 		let humidity_after = store.aspect_metadata("humidity").await.expect("metadata");
+		drop(store);
 		assert_eq!(temp_after.total_rows, temp.total_rows);
 		assert_eq!(temp_after.total_nulls, temp.total_nulls);
 		assert_eq!(humidity_after.total_rows, humidity.total_rows);
@@ -5396,6 +6296,7 @@ mod tests {
 		let batch = vec![ts[10], ts[8_000], 999_999_999, ts[11_000]];
 		assert_eq!(cp.read_points("temp", &batch).await.expect("reads"), plain.read_points("temp", &batch).await.expect("reads"), "batch read must match");
 		assert_eq!(cp.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), plain.read_time_range("temp", ts[100], ts[200]).await.expect("reads"), "range read must match");
+		drop(plain);
 	}
 
 	/// End-to-end through the real store: an enabled [`TransposedPolicy`] seals the value
@@ -5437,6 +6338,7 @@ mod tests {
 		let batch = vec![ts[10], ts[1_023], 999_999_999, ts[2_048]];
 		assert_eq!(tr.read_points("temp", &batch).await.expect("reads"), plain.read_points("temp", &batch).await.expect("reads"), "batch read must match");
 		assert_eq!(tr.read_time_range("temp", ts[1_020], ts[1_030]).await.expect("reads"), plain.read_time_range("temp", ts[1_020], ts[1_030]).await.expect("reads"), "range read across a tile boundary must match");
+		drop(plain);
 	}
 
 	/// End-to-end through the real store: an enabled partial-sidecar policy writes a
@@ -5475,6 +6377,7 @@ mod tests {
 		let mut stale = descriptor.clone();
 		stale.byte_len += 1;
 		assert!(store.load_partial_sidecar("temp", &stale, None).await.expect("reads").is_none(), "a mismatched stamp is treated as no sidecar");
+		drop(store);
 
 		// An unconfigured store writes nothing beside the segment.
 		let plain_dir = TempDir::new().expect("tempdir");
@@ -5482,6 +6385,7 @@ mod tests {
 		assert_eq!(plain.partial_sidecar_policy(), PartialSidecarPolicy::DISABLED, "off by default");
 		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
 		assert!(plain.load_partial_sidecar("temp", &plain_desc, None).await.expect("reads").is_none(), "no sidecar without a policy");
+		drop(plain);
 	}
 
 	/// `scaled_rows` admits a window to the integer path only when every present in-window
@@ -5546,6 +6450,7 @@ mod tests {
 		// overlap) — it must equal the single pass just as the concurrent branch does.
 		let (s_start, s_end) = (0_i64, 89 * 60);
 		let one = store.downsample_range("temp", s_start, s_end, Resolution::Hours, &aggs).await.expect("downsamples");
+		drop(store);
 		let in_one: Vec<Point> = all.iter().filter(|p| (s_start..=s_end).contains(&p.timestamp.timestamp())).cloned().collect();
 		assert_eq!(one, reduce(&in_one, Resolution::Hours, None, None, &aggs).expect("reduces"), "the single-segment fast path must equal the single pass");
 	}
@@ -5612,11 +6517,11 @@ mod tests {
 		store.seal(ASPECT, &scaled, &c_ts, &(0..200).rev().map(|i| value(i + 2_000)).collect::<Vec<_>>()).await.expect("seals c");
 		// A nullable segment, and a paged nullable one overlapping its tail.
 		let d_ts: Vec<i64> = (0..250).map(|i| base + 6_000_000 + i * 5_000).collect();
-		let d_vs: Vec<Option<BigDecimal>> = (0..250).map(|i| (i % 5 != 0).then(|| value(i + 3_000))).collect();
-		store.seal_nullable(ASPECT, &scaled, &d_ts, &d_vs).await.expect("seals d");
+		let d_values: Vec<Option<BigDecimal>> = (0..250).map(|i| (i % 5 != 0).then(|| value(i + 3_000))).collect();
+		store.seal_nullable(ASPECT, &scaled, &d_ts, &d_values).await.expect("seals d");
 		let e_ts: Vec<i64> = (0..300).map(|i| base + 7_000_001 + i * 3_000).collect();
-		let e_vs: Vec<Option<BigDecimal>> = (0..300).map(|i| (i % 7 != 3).then(|| value(i + 4_000))).collect();
-		let paged = store.seal_paged_nullable(ASPECT, &scaled, &e_ts, &e_vs, 32).await.expect("seals e");
+		let e_values: Vec<Option<BigDecimal>> = (0..300).map(|i| (i % 7 != 3).then(|| value(i + 4_000))).collect();
+		let paged = store.seal_paged_nullable(ASPECT, &scaled, &e_ts, &e_values, 32).await.expect("seals e");
 		assert_eq!(paged.format_version, PAGED_SEGMENT_FORMAT_VERSION, "e is a paged frame");
 		let stats = store.aspect_stats(ASPECT).await.expect("stats");
 		assert!(stats.unsorted_segments >= 1 && stats.overlapping_segments >= 4, "the fixture holds unsorted and overlapping segments: {stats:?}");
@@ -5703,6 +6608,7 @@ mod tests {
 		assert!(store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Minutes, &aggs).await.is_err(), "a non-base resolution must decode, so it fails without frames");
 		// (c) a window cutting inside a segment cannot use the whole-segment partial.
 		assert!(store.downsample_range("temp", 30 * 60, 200 * 60, Resolution::Hours, &aggs).await.is_err(), "a segment-splitting window must decode, so it fails without frames");
+		drop(store);
 	}
 
 	/// The **re-bucketing** path: a sidecar materialized at a fine base (MINUTES) answers a
@@ -5742,6 +6648,7 @@ mod tests {
 		// re-keyed from a minute base, so with frames gone it must fail.
 		assert_eq!(store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Minutes, &aggs).await.expect("serves base"), reduce(&all, Resolution::Minutes, None, None, &aggs).expect("reduces"), "the exact base resolution is served directly");
 		assert!(store.downsample_range("temp", i64::MIN, i64::MAX, Resolution::Seconds, &aggs).await.is_err(), "a resolution finer than the base must decode, so it fails without frames");
+		drop(store);
 	}
 
 	/// The single-segment **fast path** in isolation: an aspect with exactly one sealed
@@ -5785,16 +6692,19 @@ mod tests {
 		let plain_dir = TempDir::new().expect("tempdir");
 		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
 		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		drop(plain);
 
 		let cp_dir = TempDir::new().expect("tempdir");
 		let cp = SegmentStore::open(cp_dir.path()).await.expect("opens").with_checkpoint_policy(policy);
 		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		drop(cp);
 
 		assert_eq!(cp_desc.byte_len, plain_desc.byte_len, "an RLE-shaped column must be byte-for-byte identical — the codec gate refused to checkpoint it");
 		// Raising the ceiling lets it through, proving the gate (not the shape) is what refused.
 		let loose_dir = TempDir::new().expect("tempdir");
 		let loose = SegmentStore::open(loose_dir.path()).await.expect("opens").with_checkpoint_policy(CheckpointPolicy { max_codec_overhead: 100.0, ..policy });
 		let loose_desc = loose.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		drop(loose);
 		assert!(loose_desc.byte_len > plain_desc.byte_len, "with the ceiling lifted the same column IS checkpointed ({} vs {}) — and pays for it", loose_desc.byte_len, plain_desc.byte_len);
 	}
 
@@ -5809,10 +6719,12 @@ mod tests {
 		let plain_dir = TempDir::new().expect("tempdir");
 		let plain = SegmentStore::open(plain_dir.path()).await.expect("opens");
 		let plain_desc = plain.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		drop(plain);
 
 		let cp_dir = TempDir::new().expect("tempdir");
 		let cp = SegmentStore::open(cp_dir.path()).await.expect("opens").with_checkpoint_policy(policy);
 		let cp_desc = cp.seal("temp", &schema(), &ts, &vs).await.expect("seals");
+		drop(cp);
 
 		assert_eq!(cp_desc.byte_len, plain_desc.byte_len, "a regular column must be byte-for-byte identical — no index written");
 	}
@@ -5827,12 +6739,12 @@ mod tests {
 			store.declare(aspect, &schema).await.expect("declares");
 		}
 		let dense_ts: Vec<i64> = (0..10).map(|i| i * 10).collect();
-		let dense_vs: Vec<BigDecimal> = (0..10).map(|i| bd(&format!("{i}.5"))).collect();
-		store.seal("price", &schema, &dense_ts, &dense_vs).await.expect("seals the dense segment");
+		let dense_values: Vec<BigDecimal> = (0..10).map(|i| bd(&format!("{i}.5"))).collect();
+		store.seal("price", &schema, &dense_ts, &dense_values).await.expect("seals the dense segment");
 		store.seal_nullable("price", &schema, &[100, 110, 120, 130, 140, 150], &[Some(bd("7.25")), None, Some(bd("-3")), None, Some(bd("12")), Some(bd("0.125"))]).await.expect("seals the nullable segment");
 		let paged_ts: Vec<i64> = (0..12).map(|i| 200 + i * 10).collect();
-		let paged_vs: Vec<BigDecimal> = (0..12).map(|i| BigDecimal::from(100 - i * 3)).collect();
-		store.seal_paged("price", &schema, &paged_ts, &paged_vs, 4).await.expect("seals the paged segment");
+		let paged_values: Vec<BigDecimal> = (0..12).map(|i| BigDecimal::from(100 - i * 3)).collect();
+		store.seal_paged("price", &schema, &paged_ts, &paged_values, 4).await.expect("seals the paged segment");
 		store.seal("price", &schema, &[55, 45, 65], &[bd("9"), bd("8"), bd("7")]).await.expect("seals the out-of-order segment");
 		store.seal("temp", &schema, &[0, 60, 120, 180], &[bd("20.5"), bd("21"), bd("21.5"), bd("22")]).await.expect("seals temp");
 	}
@@ -5977,16 +6889,16 @@ mod tests {
 		assert_eq!(schemas[1], schemas[0], "the second open changes nothing the first did not");
 		assert_eq!(schemas[2], schemas[0], "nor does the third");
 
-		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false };
+		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false };
 		let settled = OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: false };
 		assert_eq!(reports, vec![migrated, settled.clone(), settled], "the first open migrates from layout 1 through the registry, and the later ones find nothing pending");
 		let (format, uuid) = formats[0].clone();
-		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0005_d_s13".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
+		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0008_upsert_keys".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
 		assert!(formats.iter().all(|seen| seen == &formats[0]), "the marker and the store's identity stay put: {formats:?}");
 		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads the marker"), Some(format));
 
 		let schema = &schemas[0];
-		for table in ["aspect_metadata", "aspect_seq", "frame_journal", "ingest_ledger", "segment_changes", "segment_index", "segment_quarantine", "store_meta", "store_migrations"] {
+		for table in ["aspect_metadata", "aspect_seq", "frame_journal", "ingest_ledger", "segment_changes", "segment_index", "segment_quarantine", "series", "store_meta", "store_migrations"] {
 			assert!(schema.contains(&format!("table {table}: ")), "{table} exists:\n{schema}");
 		}
 		assert!(schema.contains("| Text(\"gen\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0) | Text(\"prec\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"frame_crc\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"commit_epoch\") Text(\"INTEGER\") Integer(0) Null Integer(0) | Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains gen (NOT NULL DEFAULT 0), prec, frame_crc, commit_epoch and series_id (NOT NULL DEFAULT 0):\n{schema}");
@@ -5997,13 +6909,13 @@ mod tests {
 			assert!(row.contains("/var/tmp/weft-pre-v2-fixture/root/segments/"), "the stored path is left as the pre-v2 build wrote it: {row}");
 			assert!(row.ends_with(" Integer(0) Null Null Null Integer(0)"), "a legacy row is generation 0 and series 0, with no prec, frame_crc or commit_epoch: {row}");
 		}
-		for (key, value) in [("applied_through", "0005_d_s13"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
+		for (key, value) in [("applied_through", "0008_upsert_keys"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
 			assert!(schema.contains(&format!("meta Text(\"{key}\") Text(\"{value}\")\n")), "store_meta mirrors the marker's {key}:\n{schema}");
 		}
 		assert!(uuid::Uuid::parse_str(&uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
 		let migrations: Vec<&str> = schema.lines().filter_map(|line| line.strip_prefix("migration ")).collect();
-		assert_eq!(migrations.len(), 5, "{schema}");
-		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) "), "{migrations:?}");
+		assert_eq!(migrations.len(), 8, "{schema}");
+		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) ") && migrations[5].starts_with("Text(\"0006_tag5_series\") Integer(2) ") && migrations[6].starts_with("Text(\"0007_series_time_index\") Integer(2) ") && migrations[7].starts_with("Text(\"0008_upsert_keys\") Integer(2) "), "{migrations:?}");
 	}
 
 	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
@@ -6077,9 +6989,9 @@ mod tests {
 		let (last, databases) = &markers[1];
 		assert_eq!(databases, &CONTROL_PLANE_FILES.to_vec(), "the final marker follows the databases");
 		assert_eq!(last, &format);
-		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0005_d_s13".into()), ..first.clone() }, "the final marker is the first, settled");
+		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0008_upsert_keys".into()), ..first.clone() }, "the final marker is the first, settled");
 		assert_eq!((format.store_uuid.as_str(), &format.scope), (uuid.as_str(), &StoreScope { database: "market".into(), subject: "BTCUSD".into() }));
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
 		let reopened = SegmentStore::open_scoped(&root, "market", "BTCUSD").await.expect("reopens");
 		let again = (reopened.open_report().created_new, reopened.store_uuid().to_string());
 		drop(reopened);
@@ -6131,9 +7043,8 @@ mod tests {
 		let metadata = AspectMetadataStore::open_unmigrated(&names[1]).await.expect("opens");
 		let catalog = AspectCatalog::open_unmigrated(&names[2]).await.expect("opens");
 		let registry = CatalogStore::open_unmigrated(&names[3]).await.expect("opens");
-		let cp = migrations::ControlPlane { index: Some(migrations::Db { db: index.database(), name: &names[0] }), metadata: Some(migrations::Db { db: metadata.database(), name: &names[1] }), aspect_catalog: Some(migrations::Db { db: catalog.database(), name: &names[2] }), catalog: Some(migrations::Db { db: registry.database(), name: &names[3] }) };
 		let all: Vec<&migrations::Migration> = migrations::REGISTRY.iter().collect();
-		let ran = migrations::run(&cp, &all).await.expect("runs every migration again");
+		let ran = migrations::run(&migrations::ControlPlane { index: Some(migrations::Db { db: index.database(), name: &names[0] }), metadata: Some(migrations::Db { db: metadata.database(), name: &names[1] }), aspect_catalog: Some(migrations::Db { db: catalog.database(), name: &names[2] }), catalog: Some(migrations::Db { db: registry.database(), name: &names[3] }) }, &all).await.expect("runs every migration again");
 		drop((index, metadata, catalog, registry));
 		let after = control_plane_schema(&root).await;
 
@@ -6141,7 +7052,7 @@ mod tests {
 		let applied = store.open_report().applied.clone();
 		let reads = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
-		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13"]);
+		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index", "0008_upsert_keys"]);
 		assert!(before.contains("store_migrations") && before.contains("0002_s6_s7"), "{before}");
 		assert_eq!(after, before, "a second run of every migration changed nothing");
 		assert!(applied.is_empty(), "nothing is pending: {applied:?}");
@@ -6320,7 +7231,7 @@ mod tests {
 				let settled = store.store_format();
 				let reads = if legacy { Some(fixture_reads(&store).await) } else { None };
 				drop(store);
-				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0005_d_s13")), "{}", image.display());
+				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0008_upsert_keys")), "{}", image.display());
 				if let Some(reads) = reads {
 					assert_eq!(reads, expected_reads, "{}: the image reads what the fixture holds", image.display());
 				}
@@ -6472,7 +7383,7 @@ mod tests {
 		let uuid = store.store_uuid().to_string();
 		drop(store);
 		std::fs::remove_file(root.join(STORE_FORMAT_FILE)).expect("removes the marker");
-		on_raw_index(&root, &["DROP TABLE store_migrations", "DELETE FROM store_meta WHERE key <> 'store_uuid'", "INSERT INTO store_meta (key, value) VALUES ('layout_version', '2')", "ALTER TABLE segment_index DROP COLUMN series_id", "ALTER TABLE aspect_seq DROP COLUMN next_series_id"]).await;
+		on_raw_index(&root, &["DROP TABLE store_migrations", "DELETE FROM store_meta WHERE key <> 'store_uuid'", "INSERT INTO store_meta (key, value) VALUES ('layout_version', '2')", "DROP INDEX idx_segment_index_series_time", "ALTER TABLE segment_index DROP COLUMN series_id", "ALTER TABLE aspect_seq DROP COLUMN next_series_id"]).await;
 		let (tables, index_columns, seq_columns) = (index_tables(&root).await, index_columns(&root, "segment_index").await, index_columns(&root, "aspect_seq").await);
 		assert!(!tables.contains(&"store_migrations".to_string()) && index_columns.contains(&"gen".to_string()) && !index_columns.contains(&"series_id".to_string()) && !seq_columns.contains(&"next_series_id".to_string()), "the S6/S7 shape: {tables:?} {index_columns:?} {seq_columns:?}");
 
@@ -6482,12 +7393,81 @@ mod tests {
 		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
 		let schema = index_schema(&root).await;
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
 		assert_eq!(kept, uuid, "the S6 store_uuid is kept");
 		assert!(schema.contains("| Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains series_id (NOT NULL DEFAULT 0):\n{schema}");
 		assert!(schema.contains("| Text(\"next_series_id\") Text(\"INTEGER\") Integer(1) Text(\"1\") Integer(0)\n"), "aspect_seq gains next_series_id (NOT NULL DEFAULT 1):\n{schema}");
 		assert_eq!(sealed.expect("the store seals"), 1);
 		assert_eq!(ts, vec![0, 10, 20]);
+	}
+
+	/// TAG-5: a layout-2 store written before the series catalog (its registry through
+	/// `0005_d_s13`, no `series` table) gains the catalog at its next open with nothing
+	/// else changed: only `0006_tag5_series` (and `0007_series_time_index` after it, whose
+	/// index the pre-TAG-5 shape lacks too) applies, the layout and both floors stay 2
+	/// (so it is not reported as migrated from an older layout), the store keeps its
+	/// identity, and its rows and reads are what they were.
+	#[tokio::test]
+	async fn a_layout_2_store_gains_the_series_catalog_and_keeps_its_identity() {
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let (format, before) = (store.store_format(), store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads"));
+		drop(store);
+		put_marker(&root, &StoreFormat { applied_through: Some("0005_d_s13".into()), ..format.clone() });
+		on_raw_index(&root, &["DROP TABLE series", "DROP INDEX idx_segment_index_series_time", "DELETE FROM store_migrations WHERE id IN ('0006_tag5_series', '0007_series_time_index', '0008_upsert_keys')", "UPDATE store_meta SET value = '0005_d_s13' WHERE key = 'applied_through'"]).await;
+		assert!(!index_tables(&root).await.contains(&"series".to_string()), "the pre-TAG-5 shape");
+		let rows_before: Vec<String> = index_schema(&root).await.lines().filter(|line| line.starts_with("row ")).map(str::to_string).collect();
+
+		let store = SegmentStore::open(&root).await.expect("a pre-TAG-5 layout-2 store opens");
+		let (report, settled, uuid) = (store.open_report().clone(), store.store_format(), store.store_uuid().to_string());
+		let after = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		let catalog = store.index().series_of("price").await.expect("the catalog reads");
+		drop(store);
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: vec!["0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
+		assert_eq!(settled, StoreFormat { applied_through: Some("0008_upsert_keys".into()), ..format.clone() }, "layout, floors and identity unchanged");
+		assert_eq!((settled.layout_version, settled.min_read_layout, settled.min_write_layout), (2, 2, 2), "the catalog is a layout-2 migration (DECISIONS: TAG-5)");
+		assert_eq!(uuid, format.store_uuid, "the store keeps its identity");
+		assert_eq!(after, before, "reads are unchanged");
+		assert!(catalog.is_empty(), "the migration registers no series: series 0 is implicit");
+		let schema = index_schema(&root).await;
+		assert!(schema.contains("table series: Text(\"aspect\") Text(\"TEXT\") Integer(1) Null Integer(1) | Text(\"series_key\") Text(\"TEXT\") Integer(1) Null Integer(2) | Text(\"series_id\") Text(\"INTEGER\") Integer(1) Null Integer(0)\n"), "series(aspect, series_key, series_id), keyed on (aspect, series_key):\n{schema}");
+		let rows_after: Vec<String> = schema.lines().filter(|line| line.starts_with("row ")).map(str::to_string).collect();
+		assert_eq!(rows_after, rows_before, "no segment_index row is rewritten");
+		assert!(schema.contains("meta Text(\"applied_through\") Text(\"0008_upsert_keys\")\n"), "{schema}");
+	}
+
+	/// TAG-5, R10: the repair pass seeds each aspect's series allocator past the ids its
+	/// catalog registered as well as the ids its rows hold, and seeds an aspect the
+	/// catalog names even when the index holds none of its rows. So an allocator row
+	/// lost after every row of a series was quarantined cannot hand that id out again.
+	#[tokio::test]
+	async fn r10_seeds_next_series_id_past_the_catalog_as_well_as_the_rows() {
+		use crate::{
+			types::index_txn::{IndexOp, IndexTxn}, SeriesId, TagSet
+		};
+
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		let store = SegmentStore::open(&root).await.expect("creates the store");
+		store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals series 0");
+		let key = TagSet::from_pairs([("host", "a")]).expect("valid tags").series_key().clone();
+		let register = |aspect: &str, id: u64| [IndexOp::RegisterSeries { aspect: aspect.to_string(), series_id: SeriesId(id), series_key: key.clone() }, IndexOp::SeedSeries { aspect: aspect.to_string(), next_series_id: id + 1 }];
+		store.commit_index(&IndexTxn::new(register("price", 5).into_iter().chain(register("ghost", 3)).collect())).await.expect("registers");
+		drop(store);
+		// Lose every allocator row: only the rows and the catalog are left to seed from.
+		on_raw_index(&root, &["DELETE FROM aspect_seq"]).await;
+
+		let store = SegmentStore::open(&root).await.expect("reopens");
+		let report = store.fsck(false).await.expect("fsck");
+		let (price, ghost) = (store.index().next_series_id("price").await.expect("reads"), store.index().next_series_id("ghost").await.expect("reads"));
+		let ghost_rows = store.index().rows("ghost").await.expect("reads");
+		drop(store);
+		assert!(ghost_rows.is_empty(), "ghost has catalog rows only");
+		assert_eq!(report.seeded, 2, "both the indexed aspect and the catalog-only one are seeded: {report:?}");
+		assert_eq!(price, 6, "past the catalog's id 5, though every row of price is series 0");
+		assert_eq!(ghost, 4, "past the catalog's id 3, though the index holds no ghost row");
 	}
 
 	/// An open that stopped part way leaves its marker unsettled, and the next open reports
@@ -6507,7 +7487,7 @@ mod tests {
 		let store = SegmentStore::open(&root).await.expect("finishes the creation");
 		let (report, uuid) = (store.open_report().clone(), store.store_uuid().to_string());
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
 		assert_eq!(uuid, format.store_uuid);
 
 		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
@@ -6518,7 +7498,7 @@ mod tests {
 		let store = SegmentStore::open(&legacy).await.expect("finishes the upgrade");
 		let report = store.open_report().clone();
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
 	}
 
 	/// FRE-12a's `ensure_floor`: raising a floor writes the marker first, fsynced, and
@@ -6545,7 +7525,7 @@ mod tests {
 		store.commit_index(&IndexTxn::new(op.clone().into_iter().collect())).await.expect("the caller's transaction commits");
 		let meta_after = (store.index().meta("min_read_layout").await.expect("reads"), store.index().meta("min_write_layout").await.expect("reads"));
 		let again = store.ensure_floor(2).await.expect("ensures again");
-		let too_new = store.ensure_floor(SUPPORTED_LAYOUT + 1).await.err().expect("a newer level is refused").to_string();
+		let too_new = store.ensure_floor(SUPPORTED_LAYOUT + 1).await.expect_err("a newer level is refused").to_string();
 		drop(store);
 		assert_eq!(op, Some(IndexOp::RaiseFloor { level: 2 }));
 		assert_eq!((marker.min_read_layout, marker.min_write_layout), (2, 2), "the marker is raised before the op is handed back");
@@ -6885,7 +7865,7 @@ mod tests {
 		let store = SegmentStore::open(&original).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at(Resolution::Minutes, 1));
 		seal_legacy_layout(&store).await;
 		let before = fixture_reads(&store).await;
-		let (range_ts, range_vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
+		let (range_ts, range_values) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
 
 		let moved = dir.path().join("moved");
@@ -6900,16 +7880,16 @@ mod tests {
 		let reconciled = store.reconcile_segment("price", 3).await.expect("reconciles a frame of the moved root");
 		let split = store.split_segment("price", 0, 70).await.expect("splits a frame of the moved root");
 		let squashed = store.squash_aspect("price").await.expect("squashes the moved root's frames");
-		let (squashed_ts, squashed_vs) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads the squashed aspect");
+		let (squashed_ts, squashed_values) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads the squashed aspect");
 		drop(store);
 		assert_eq!(after, before, "the moved root reads exactly what the original did");
 		assert!(reconciled);
 		assert!(split.is_some());
 		assert_eq!(squashed, 4, "five segments (after the split) squash into one");
 		// No two segments share a timestamp, so the squash is their union in time order.
-		let mut union: Vec<(i64, Option<BigDecimal>)> = range_ts.into_iter().zip(range_vs).collect();
+		let mut union: Vec<(i64, Option<BigDecimal>)> = range_ts.into_iter().zip(range_values).collect();
 		union.sort_by_key(|(t, _)| *t);
-		assert_eq!(squashed_ts.into_iter().zip(squashed_vs).collect::<Vec<_>>(), union);
+		assert_eq!(squashed_ts.into_iter().zip(squashed_values).collect::<Vec<_>>(), union);
 	}
 
 	/// Batch `i` of the concurrency tests: ten rows from `i * 1000` on, ten apart, each
@@ -6943,8 +7923,8 @@ mod tests {
 		let mut lost = Vec::new();
 		for i in 0..count {
 			let (ts, vs) = numbered_batch(i);
-			let (read_ts, read_vs) = store.read_time_range(aspect, ts[0], ts[ts.len() - 1]).await.expect("reads the batch's window");
-			if read_ts != ts || read_vs != vs.into_iter().map(Some).collect::<Vec<_>>() {
+			let (read_ts, read_values) = store.read_time_range(aspect, ts[0], ts[ts.len() - 1]).await.expect("reads the batch's window");
+			if read_ts != ts || read_values != vs.into_iter().map(Some).collect::<Vec<_>>() {
 				lost.push(i);
 			}
 		}
@@ -7257,7 +8237,7 @@ mod tests {
 	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
 	async fn a_busy_aspect_is_refused_skipped_or_waited_for() {
 		let dir = TempDir::new().expect("tempdir");
-		let store = SegmentStore::open(dir.path()).await.expect("opens").with_maintenance_wait(std::time::Duration::from_millis(100));
+		let mut store = std::sync::Arc::new(SegmentStore::open(dir.path()).await.expect("opens").with_maintenance_wait(std::time::Duration::from_millis(100)));
 		store.declare("price", &schema()).await.expect("declares");
 		// Out of order and overlapping, so every operation would have work to do.
 		store.seal("price", &schema(), &[30, 10, 20], &[bd("3"), bd("1"), bd("2")]).await.expect("seals");
@@ -7267,7 +8247,7 @@ mod tests {
 		let started = std::time::Instant::now();
 		let waited = store.reconcile_aspect("price").await.expect_err("the aspect is busy");
 		let elapsed = started.elapsed();
-		let store = store.with_maintenance_wait(std::time::Duration::ZERO);
+		std::sync::Arc::get_mut(&mut store).expect("no other handle to the store yet").maintenance_wait = std::time::Duration::ZERO;
 		let before = tree_bytes(dir.path());
 		let policy = SplitPolicy::new(1);
 		let per_aspect: Vec<(&str, Result<()>)> = vec![("reconcile_segment", store.reconcile_segment("price", 0).await.map(drop)), ("split_segment", store.split_segment("price", 1, 20).await.map(drop)), ("reconcile_aspect", store.reconcile_aspect("price").await.map(drop)), ("reconcile_aspect_if_unsorted_exceeds", store.reconcile_aspect_if_unsorted_exceeds("price", 1).await.map(drop)), ("reconcile_aspect_hot_cold", store.reconcile_aspect_hot_cold("price", 1).await.map(drop)), ("reconcile_overlaps", store.reconcile_overlaps("price").await.map(drop)), ("reconcile_overlaps_with_policy", store.reconcile_overlaps_with_policy("price", policy).await.map(drop)), ("squash_aspect", store.squash_aspect("price").await.map(drop)), ("squash_aspect_if_exceeds", store.squash_aspect_if_exceeds("price", 1).await.map(drop)), ("squash_aspect_to_target_rows", store.squash_aspect_to_target_rows("price", 10).await.map(drop)), ("squash_aspect_to_target_rows_if_fragmented", store.squash_aspect_to_target_rows_if_fragmented("price", 10).await.map(drop))];
@@ -7276,7 +8256,6 @@ mod tests {
 		let after = tree_bytes(dir.path());
 		let sealed = tokio::time::timeout(std::time::Duration::from_secs(30), store.seal("price", &schema(), &[50, 40], &[bd("8"), bd("7")])).await;
 
-		let store = std::sync::Arc::new(store);
 		let release = tokio::spawn(async move {
 			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 			drop(held);
@@ -7299,7 +8278,7 @@ mod tests {
 		let changed: Vec<&PathBuf> = before.keys().chain(after.keys()).filter(|path| before.get(*path) != after.get(*path)).collect();
 		assert!(changed.is_empty(), "no refused or skipped operation changed a file: {changed:?}");
 		assert!(sealed.is_ok_and(|sealed| sealed.is_ok()), "a seal does not wait for maintenance");
-		assert_eq!(waited_for.busy, Vec::<String>::new(), "a waiting sweep takes the aspect once it is let go");
+		assert_eq!(waited_for.busy, Vec::<String>::new(), "a store sweep takes the aspect once it is let go");
 		assert_eq!(waited_for.aspects_reconciled, 1);
 		assert_eq!(unsorted, 0, "and maintains it");
 	}
@@ -7422,7 +8401,7 @@ mod tests {
 		assert_eq!(store.segment_count("price").await.expect("counts"), 0);
 	}
 
-	/// D-S12: fsck binds a row's frame_crc when it is unset, and the next pass
+	/// D-S12: fsck binds a row's `frame_crc` when it is unset, and the next pass
 	/// finds nothing to re-bind.
 	#[tokio::test]
 	async fn fsck_binds_an_unset_frame_crc() {
@@ -7442,6 +8421,7 @@ mod tests {
 		let rows = store.index().rows("price").await.expect("rows");
 		assert!(rows[0].frame_crc.is_some());
 		let report = store.fsck(false).await.expect("fsck again");
+		drop(store);
 		assert_eq!(report.rebound, 0, "a bound row is untouched");
 	}
 
@@ -7459,6 +8439,7 @@ mod tests {
 		drop(store);
 		let store = SegmentStore::open(dir.path()).await.expect("reopens again");
 		assert!(!store.previous_clean_shutdown(), "an open without a clean shutdown resets the flag");
+		drop(store);
 	}
 
 	/// D-S14: `shutdown()` is the closing sequence in one call — the
@@ -7472,6 +8453,7 @@ mod tests {
 		drop(store);
 		let store = SegmentStore::open(dir.path()).await.expect("reopens");
 		assert!(store.previous_clean_shutdown(), "shutdown() committed the clean-shutdown flag");
+		drop(store);
 	}
 
 	/// D-S12: the TTL purge removes an expired corrupt record and its file, and
@@ -7499,6 +8481,7 @@ mod tests {
 		let purged = store.purge_expired_quarantine().await.expect("purges");
 		assert_eq!(purged, 1, "only the expired record purges");
 		let remaining = store.quarantine_list(Some("price")).await.expect("lists");
+		drop(store);
 		assert_eq!(remaining.len(), 1);
 		assert!(!dir.path().join("segments/quarantine").join(Path::new(&first.path).file_name().unwrap()).exists(), "the purged file is unlinked");
 		assert!(dir.path().join("segments/quarantine").join(Path::new(&second.path).file_name().unwrap()).exists(), "the fresh record's file stays");
@@ -7513,3 +8496,28 @@ mod swap_tests;
 /// A sidecar-served downsample keeps the column's decimal scale.
 #[cfg(test)]
 mod sidecar_scale_tests;
+
+/// TAG-7: tagged batches seal series-key envelopes under catalog-resolved series ids.
+#[cfg(test)]
+mod tag_seal_tests;
+
+/// TAG-6: every maintenance pass plans within one series.
+#[cfg(test)]
+mod tag_maint_tests;
+
+/// TAG-8: every store read targets one series; selectors resolve to one.
+#[cfg(test)]
+mod tag_read_tests;
+
+/// Phase 4.6: declared upsert keys bound the tags an ingest may carry.
+#[cfg(test)]
+mod upsert_keys_tests;
+
+/// ROB-13: the stored downsample and the batch point lookup are bounded in
+/// the store, at decision 12's numbers.
+#[cfg(test)]
+mod read_limits_tests;
+
+/// Phase 5 memory-mapped GPU I/O: a mapped range read returns exactly the buffered read's rows.
+#[cfg(test)]
+mod mapped_read_tests;

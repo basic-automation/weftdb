@@ -44,7 +44,7 @@ fn rows(seg: &Seg, scale: i64) -> (Vec<i64>, Vec<BigDecimal>) {
 	let mut vs = Vec::new();
 	for k in 0..10 {
 		for (j, &m) in PATTERNS[(seg.pattern)(k)].iter().enumerate() {
-			ts.push(seg.start + (k as i64) * 60 + (j as i64) * 10);
+			ts.push(seg.start + i64::try_from(k).expect("small") * 60 + i64::try_from(j).expect("small") * 10);
 			vs.push(BigDecimal::new(BigInt::from(m), scale));
 		}
 	}

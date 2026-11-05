@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Fault points are inert in a build without the `fault-injection` feature.
 //!
 //! An integration test links the library as production code does: without

@@ -1,5 +1,7 @@
 // Increase recursion limit for complex async type checking
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 //! # Dataset Management - Time-Series Pattern Recognition and Signal Generation
 //!
@@ -420,9 +422,6 @@
 //! }
 //! ```
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::multiple_crate_versions, clippy::used_underscore_binding, clippy::similar_names, clippy::module_name_repetitions, clippy::module_inception, clippy::cast_precision_loss)]
-
 use std::{collections::HashMap, sync::LazyLock};
 
 use anyhow::Result;
@@ -777,10 +776,7 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &weftdb
 /// - Pattern creation fails due to invalid batch data
 /// - Dictionary import fails during pattern merging
 ///
-/// # Panics
-///
-/// This function will panic if active measurements exist in a batch but have no timestamps,
-/// which should not happen under normal circumstances.
+/// Returns an error if a batch has active measurements but extracting min/max timestamps fails.
 pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::AspectId, dictionary: &mut Dictionary) -> Result<()> {
 	let mut stream = database.get_processed_batches(aspect_id).await?;
 
@@ -816,8 +812,9 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 				continue; // Skip batches with no active measurements
 			}
 
-			let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().copied().unwrap();
-			let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().copied().unwrap();
+			// Get min/max timestamps from active measurements
+			let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().copied().ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no minimum timestamp", batch.batch_id()))?;
+			let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().copied().ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no maximum timestamp", batch.batch_id()))?;
 
 			// Create an occurrence for this pattern
 			let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
@@ -1929,13 +1926,13 @@ mod tests {
 
 		#[rustfmt::skip]
                 let mut dictionary = Dictionary::new(
-                        "TestDictionary".to_string(), 
-                        "A dictionary for testing purposes".to_string(), 
-                        DictionaryConstraints::new( 
-                                Some(Steps::new( 
+                        "TestDictionary".to_string(),
+                        "A dictionary for testing purposes".to_string(),
+                        DictionaryConstraints::new(
+                                Some(Steps::new(
                                         10,
-                                        Spline::Linear 
-                                )), 
+                                        Spline::Linear
+                                )),
                                 Some(vec![
                                         VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.000_000_001).unwrap())),
                                 ]) ));

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use weft_server::{audit, store_open, AppState, AuditLog, BenchRuns, AUDIT_FILE_ENV, BENCH_RUNS_DIR_ENV};
 
 /// Environment variable naming the segment-store root directory (optional).
-pub(crate) const STORE_ROOT_ENV: &str = "WEFT_SEGMENT_STORE_ROOT";
+pub const STORE_ROOT_ENV: &str = "WEFT_SEGMENT_STORE_ROOT";
 
 /// Build the router state, opening a segment store when `WEFT_SEGMENT_STORE_ROOT`
 /// is set and logging which mode the server runs in.
@@ -27,30 +27,28 @@ pub(crate) const STORE_ROOT_ENV: &str = "WEFT_SEGMENT_STORE_ROOT";
 /// # Errors
 ///
 /// Propagates a failure to open the segment store at the configured root.
-pub(crate) async fn build() -> anyhow::Result<AppState> {
-	let (state, store_root) = match std::env::var(STORE_ROOT_ENV) {
-		Ok(root) => {
-			// PAC-5b's store filesystem check: a root the filesystem cannot
-			// hold a store on is refused here, exit 78 (a filesystem refusal,
-			// plan C7), before the open writes anything into it.
-			if let Err(problem) = store_open::check_store_root(std::path::Path::new(&root)) {
-				eprintln!("weft-server: {problem}");
-				std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
-			}
-			let store = Arc::new(store_open::open_from_env(&root).await?);
-			// PAC-7: the store's identity is reported at startup — root,
-			// store_uuid, scope, layout and the previous shutdown's
-			// cleanliness, in the one line `store_open` formats.
-			println!("{}", store_open::store_identity_line(&store));
-			if store.open_report().recovery_report_only {
-				println!("segment store: its layout is newer than this build's; it opened without migrating");
-			}
-			(AppState::new().with_store(store), Some(root))
+pub async fn build() -> anyhow::Result<AppState> {
+	let (state, store_root) = if let Ok(root) = std::env::var(STORE_ROOT_ENV) {
+		// PAC-5b's store filesystem check: a root the filesystem cannot
+		// hold a store on is refused here, exit 78 (a filesystem refusal,
+		// plan C7), before the open writes anything into it.
+		if let Err(problem) = store_open::check_store_root(std::path::Path::new(&root)) {
+			eprintln!("weft-server: {problem}");
+			std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
 		}
-		Err(_) => {
-			println!("segment store: not configured (set {STORE_ROOT_ENV} to enable the /api/v1/storage endpoints)");
-			(AppState::new(), None)
+		let (store, serving) = store_open::open_and_pin_from_env(&root).await?;
+		let store = Arc::new(store);
+		// PAC-7: the store's identity is reported at startup — root,
+		// store_uuid, scope, layout and the previous shutdown's
+		// cleanliness, in the one line `store_open` formats.
+		println!("{}", store_open::store_identity_line(&store));
+		if store.open_report().recovery_report_only {
+			println!("segment store: its layout is newer than this build's; it opened without migrating");
 		}
+		(AppState::new().with_store(store).with_serving_scope(serving), Some(root))
+	} else {
+		println!("segment store: not configured (set {STORE_ROOT_ENV} to enable the /api/v1/storage endpoints)");
+		(AppState::new(), None)
 	};
 	let state = state.with_audit_log(open_audit_log(store_root.as_deref()));
 	Ok(match std::env::var(BENCH_RUNS_DIR_ENV) {

@@ -14,13 +14,16 @@
 //!
 //! The corpus is a sorted *irregular* column (a monotone series with varying gaps) —
 //! the shape the closed form cannot serve and the one this index exists for.
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{hint::black_box, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use criterion::{criterion_group, criterion_main, Criterion};
 use weft_physical_type::{
-	page::PagedSegment, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}, weftseg::{read_paged_segment_point, read_segment_point, write_paged_segment, write_paged_segment_checkpointed, write_segment, write_segment_checkpointed}, Segment
+	cast, page::PagedSegment, timestamp::{decode_delta_of_delta, encode_delta_of_delta, DeltaOfDeltaColumn, TimeUnit}, weftseg::{read_paged_segment_point, read_segment_point, write_paged_segment, write_paged_segment_checkpointed, write_segment, write_segment_checkpointed}, Segment
 };
 
 /// A deterministic sorted-irregular epoch column: a base stride of ~1000 ms perturbed by
@@ -109,7 +112,7 @@ fn bench_frame(c: &mut Criterion) {
 		let frame = write_segment_checkpointed(&seg, stride);
 		// Report the storage cost of the index alongside the speed — the trade-off is the
 		// whole reason default adoption is owner-gated.
-		let overhead = (frame.len() as f64 - plain.len() as f64) / plain.len() as f64 * 100.0;
+		let overhead = (cast::usize_to_f64(frame.len()) - cast::usize_to_f64(plain.len())) / cast::usize_to_f64(plain.len()) * 100.0;
 		println!("checkpointed stride={stride}: {} B vs plain {} B ({overhead:+.2}% frame bytes)", frame.len(), plain.len());
 		group.bench_function(format!("checkpointed_frame_stride_{stride}"), |b| {
 			b.iter(|| {
@@ -145,7 +148,7 @@ fn bench_paged_frame(c: &mut Criterion) {
 	});
 	for stride in [256_usize, 1024] {
 		let frame = write_paged_segment_checkpointed(&seg, stride);
-		let overhead = (frame.len() as f64 - plain.len() as f64) / plain.len() as f64 * 100.0;
+		let overhead = (cast::usize_to_f64(frame.len()) - cast::usize_to_f64(plain.len())) / cast::usize_to_f64(plain.len()) * 100.0;
 		println!("checkpointed paged stride={stride}: {} B vs plain {} B ({overhead:+.2}% frame bytes)", frame.len(), plain.len());
 		group.bench_function(format!("checkpointed_paged_frame_stride_{stride}"), |b| {
 			b.iter(|| {
@@ -189,7 +192,7 @@ fn report_codec_override_cost(_c: &mut Criterion) {
 		let col = encode_delta_of_delta(&values, TimeUnit::Millis);
 		let best = col.best_estimated_bytes();
 		let blocked = col.blocked_estimated_bytes();
-		let pct = (blocked as f64 - best as f64) / best as f64 * 100.0;
+		let pct = (cast::usize_to_f64(blocked) - cast::usize_to_f64(best)) / cast::usize_to_f64(best) * 100.0;
 		println!("{name:32} best={:<8} ({:<24}) blocked={:<8} override {pct:+7.2}%", best, col.best_encoding_name(), blocked);
 	}
 	println!("--- (the checkpoint index itself is extra, ~rows/stride entries) ---\n");

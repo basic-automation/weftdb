@@ -39,7 +39,14 @@ impl SegmentStore {
 	///
 	/// Propagates any libSQL read failure.
 	pub async fn aspect_stats(&self, aspect: &str) -> Result<AspectStorageStats> {
-		let index = self.index.load_index(aspect).await?;
-		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range(), unsorted_segments: index.unsorted_count(), overlapping_segments: index.overlapping_count() })
+		// One read of the rows: the whole index for the aspect-wide figures, and the
+		// per-series overlap count (TAG-6), which for an untagged aspect is the same.
+		let rows = self.index.rows(aspect).await?;
+		let overlapping_segments = series_overlapping_count(&rows);
+		let mut index = weft_physical_type::SegmentIndex::new();
+		for row in rows {
+			index.push(row.desc);
+		}
+		Ok(AspectStorageStats { segment_count: index.len(), total_rows: index.total_rows(), total_bytes: index.total_bytes(), bytes_per_point: index.bytes_per_point(), time_range: index.time_range(), unsorted_segments: index.unsorted_count(), overlapping_segments })
 	}
 }

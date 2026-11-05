@@ -34,7 +34,9 @@
 //! The timestamp's unit is caller-declared via [`TimestampPrecision`]; ILP's
 //! default is nanoseconds.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Utc};
@@ -112,6 +114,19 @@ impl FieldValue {
 			Self::Boolean(_) | Self::Str(_) => None,
 		}
 	}
+
+	/// Whether this field is a float that has no decimal form — `NaN` or an
+	/// infinity (ROB-7).
+	///
+	/// [`Self::as_big_decimal`] answers `None` for these, and it answers `None` for a
+	/// boolean or string field too, so a caller cannot tell "not a number at all"
+	/// (a line this projection skips, by design) from "a number WeftDB cannot store"
+	/// (a line it must refuse). This is the distinction that makes the second one an
+	/// error instead of a silently missing row.
+	#[must_use]
+	pub fn is_non_finite_float(&self) -> bool {
+		matches!(self, Self::Float(f) if !f.is_finite())
+	}
 }
 
 /// A single parsed line-protocol record.
@@ -147,6 +162,15 @@ impl LineRecord {
 	#[must_use]
 	pub fn field(&self, key: &str) -> Option<&FieldValue> {
 		self.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+	}
+
+	/// Whether this record's named field is a float with no decimal form (ROB-7).
+	///
+	/// A convenience over [`FieldValue::is_non_finite_float`] for the one question the
+	/// ingest path asks: `None` means the field is absent or not a float at all.
+	#[must_use]
+	pub fn field_is_non_finite(&self, key: &str) -> bool {
+		self.field(key).is_some_and(FieldValue::is_non_finite_float)
 	}
 
 	/// Project this record into a [`Point`] using numeric field `field`.
@@ -204,6 +228,10 @@ pub enum ParseErrorKind {
 	/// The input is well-formed but a single-series projection would have to
 	/// merge points from more than one series (see [`parse_points`]).
 	AmbiguousSeries,
+	/// A line's named field carries `NaN` or an infinity (ROB-7): a value with no
+	/// decimal representation, which the caller hears about instead of the line
+	/// being dropped.
+	NonFiniteValue,
 }
 
 /// What went wrong parsing a document, with the 1-based line number.
@@ -228,6 +256,11 @@ impl ParseError {
 	/// from.
 	const fn ambiguous_series(line: usize, message: String) -> Self {
 		Self { line, message, kind: ParseErrorKind::AmbiguousSeries }
+	}
+
+	/// A non-finite-field error at `line` (ROB-7).
+	const fn non_finite(line: usize, message: String) -> Self {
+		Self { line, message, kind: ParseErrorKind::NonFiniteValue }
 	}
 }
 
@@ -297,6 +330,13 @@ pub fn parse_points(input: &str, field: &str, precision: TimestampPrecision) -> 
 	// contributed on, and its wire form for the refusal message.
 	let mut series: Option<(SeriesKey, usize, String)> = None;
 	for (line, record) in parse_indexed(input)? {
+		// A line whose named field is `NaN` or an infinity used to fall through the
+		// `continue` below with every other unprojectable line, so the payload
+		// silently stored one row fewer than the caller sent. Rob-7: a value that
+		// has no decimal form is the caller's to hear about, not ours to drop.
+		if record.field_is_non_finite(field) {
+			return Err(ParseError::non_finite(line, format!("field `{field}` is not a finite number; WeftDB values are exact decimals, so NaN and infinity have no representation to store")));
+		}
 		let Some(point) = record.to_point(field, precision) else {
 			continue;
 		};
@@ -474,7 +514,7 @@ mod tests {
 		let records = parse("weather temp=21.3").expect("parse");
 		let r = &records[0];
 		assert_eq!(r.measurement, "weather");
-		assert!(r.tags.is_empty());
+		assert_eq!(r.tags.len(), 0);
 		assert_eq!(r.field("temp"), Some(&FieldValue::Float(21.3)));
 		assert_eq!(r.timestamp, None);
 	}
@@ -618,5 +658,21 @@ mod tests {
 		assert!(FieldValue::Float(f64::INFINITY).as_big_decimal().is_none());
 		assert!(FieldValue::Boolean(true).as_big_decimal().is_none());
 		assert!(FieldValue::Str("x".to_string()).as_big_decimal().is_none());
+	}
+
+	#[test]
+	fn a_non_finite_field_is_refused_instead_of_dropped() {
+		// ROB-7: `temp=NaN` parsed into `FieldValue::Float(NaN)`, which
+		// `as_big_decimal` turns into `None`, and the point-building step skipped such
+		// a line — a 201 reporting one row fewer than the sender sent.
+		assert!(FieldValue::Float(f64::NAN).is_non_finite_float());
+		assert!(FieldValue::Float(f64::NEG_INFINITY).is_non_finite_float());
+		assert!(!FieldValue::Float(1.5).is_non_finite_float());
+		assert!(!FieldValue::Integer(1).is_non_finite_float());
+		let kept = parse_points("weather temp=1 100\nweather temp=2 110\n", "temp", TimestampPrecision::Seconds).expect("finite lines parse");
+		assert_eq!(kept.len(), 2);
+		let err = parse_points("weather temp=1 100\nweather temp=NaN 110\n", "temp", TimestampPrecision::Seconds).expect_err("a NaN field is refused, not skipped");
+		assert_eq!(err.kind, ParseErrorKind::NonFiniteValue);
+		assert_eq!(err.line, 2, "the refusal names the line the sender counts");
 	}
 }

@@ -68,13 +68,7 @@ pub fn install() {
 /// would abort the hook itself, so an unusable payload is reported as its type instead.
 fn shown(info: &std::panic::PanicHookInfo<'_>) -> String {
 	let payload = info.payload();
-	let payload = if let Some(text) = payload.downcast_ref::<&str>() {
-		(*text).to_owned()
-	} else if let Some(text) = payload.downcast_ref::<String>() {
-		text.clone()
-	} else {
-		"a panic whose payload could not be printed".to_owned()
-	};
+	let payload = payload.downcast_ref::<&str>().map(|text| (*text).to_owned()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic whose payload could not be printed".to_owned());
 	match info.location() {
 		Some(location) => format!("{payload} (at {}:{})", location.file(), location.line()),
 		None => payload,

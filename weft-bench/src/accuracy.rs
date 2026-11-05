@@ -117,7 +117,6 @@ impl AccuracyMetrics {
 			}
 		}
 
-		#[allow(clippy::cast_precision_loss)]
 		let n = predicted.len() as f64;
 		Ok(Self { count: predicted.len(), rmse: (sum_sq / n).sqrt(), mae: sum_abs / n, max_abs_error: max_abs, bias: sum_signed / n })
 	}

@@ -1204,22 +1204,18 @@ impl Pipeline {
 
 	/// Returns a reference to the first dictionary (for backwards compatibility).
 	///
-	/// # Panics
-	///
-	/// Panics if no dictionaries are registered.
+	/// Returns `None` if no dictionaries are registered.
 	#[must_use]
-	pub fn dictionary(&self) -> &Dictionary {
-		self.dictionaries.values().next().expect("No dictionaries registered")
+	pub fn dictionary(&self) -> Option<&Dictionary> {
+		self.dictionaries.values().next()
 	}
 
 	/// Returns a mutable reference to the first dictionary (for backwards compatibility).
 	///
-	/// # Panics
-	///
-	/// Panics if no dictionaries are registered.
+	/// Returns `None` if no dictionaries are registered.
 	#[must_use]
-	pub fn dictionary_mut(&mut self) -> &mut Dictionary {
-		self.dictionaries.values_mut().next().expect("No dictionaries registered")
+	pub fn dictionary_mut(&mut self) -> Option<&mut Dictionary> {
+		self.dictionaries.values_mut().next()
 	}
 }
 

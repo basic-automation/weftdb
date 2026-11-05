@@ -29,13 +29,13 @@
 //! use weftdb::ValueKind;
 //!
 //! fn describe(kind: &ValueKind) -> String {
-//! 	match kind {
-//! 		ValueKind::Raw => "a stored sample".to_string(),
-//! 		// Every other kind — this build's interpolated and extrapolated, any reserved token
-//! 		// that arrives as `Unknown`, and any variant added in a later release — is handled
-//! 		// by this arm, which is why the enum can stay open.
-//! 		other => format!("a derived value ({})", other.as_str()),
-//! 	}
+//!     match kind {
+//!         ValueKind::Raw => "a stored sample".to_string(),
+//!         // Every other kind — this build's interpolated and extrapolated, any reserved token
+//!         // that arrives as `Unknown`, and any variant added in a later release — is handled
+//!         // by this arm, which is why the enum can stay open.
+//!         other => format!("a derived value ({})", other.as_str()),
+//!     }
 //! }
 //!
 //! assert_eq!(describe(&ValueKind::Raw), "a stored sample");
@@ -268,7 +268,7 @@ mod tests {
 		for (point_kind, kind) in [(PointKind::Raw, ValueKind::Raw), (PointKind::Interpolated, ValueKind::Interpolated), (PointKind::Extrapolated, ValueKind::Extrapolated)] {
 			let widened = ValueKind::from(point_kind);
 			assert_eq!(widened, kind);
-			assert_eq!(PointKind::try_from(widened.clone()).expect("splimes can express a kind it reported"), point_kind);
+			assert_eq!(PointKind::try_from(widened).expect("splimes can express a kind it reported"), point_kind);
 		}
 		// The other direction is where the vocabulary is wider, and the refusal carries the token.
 		let err = PointKind::try_from(ValueKind::parse("compressed")).expect_err("splimes has no such kind");

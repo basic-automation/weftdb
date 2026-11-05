@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! A store root belongs to one process (basicautomation.io/projects/weftdb/docs/crash-consistency section 5.5,
 //! OPEN step 1). A second `weft-server` pointed at the same `WEFT_SEGMENT_STORE_ROOT`
 //! must fail fast, naming the process that holds the root, instead of racing the
