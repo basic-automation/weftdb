@@ -4,6 +4,71 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-04 — W7 start: the two reds that gated the wave, and what was chosen about each (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** W7's in-flight PRs (#559 D-S20, #546 ROB-12, #551 ROB-7) were red on checks that had
+nothing to do with their diffs, and `main` was red too. Two causes: `msrv (1.95)` fails on `main`,
+and `test (ubuntu-latest)` fails at the end of the R-client step. Neither told us what to do about
+the code they touched — the first is a test that asserts on a debug-build side effect, the second is
+a file mode no diff shows.
+
+**Chosen (#560, `w7/msrv-expect-fix`):** hoist the `debug_assert!`-gated side effects out of the
+surrounding `assert!` at `weftdb/src/types/segment_store/tests.rs:1625` and
+`weftdb/src/types/segment_store/write.rs:283`, rather than pinning `expect!` strings per profile or
+raising the MSRV. Under `--release` the `debug_assert!` calls — `prune_present_rows()` and
+`prune_present_descriptors()` — were arguments inside an `assert!` whose other arguments are
+themselves `debug_assert!`-gated, so in a release build the whole expression was dead code, the
+prunes never ran, and the `expect![[3, 0, 3, 0, 3, 0]]`/`expect![[1, 1]]` strings saw unpruned
+descriptors. It is one bug seen twice (CI's `cargo test --workspace` and its `cargo build
+--release --locked` are the two views), so both call sites move together.
+
+**Chosen, and the part worth re-reading:** those two prunes are now `#[cfg(test)]`. Nothing outside
+tests called `prune_present_rows`; `prune_present_descriptors` had exactly one non-test caller, the
+series-scoped `prune_series_present_descriptors` that TAG-8 added for the aspect-wide→per-series
+split, so the aspect-wide form became dead the moment its caller stopped delegating to it.
+A `debug_assert!` is allowed to leave data unpruned in release, so making the release build *call*
+the prune to satisfy the macro would have changed shipped behaviour to serve a test — worse than
+testing only the build where the assertion is live. Keeping the functions compiled in release would
+have left two `#[allow(dead_code)]`-style holes in the library's public surface for no benefit; the
+doc comments that linked them now name them in plain text, because rustdoc's intra-doc links resolve
+against the documented build, which has no `cfg(test)`.
+
+**Chosen (#564, `w7/ci-script-exec-bit`, stacked on #560):** `scripts/clients/test-r.sh` arrived with
+#557 at mode `100644` while `ci.yml:206` runs it directly, so every pull request — `main`'s own run
+41918147616 included — dies with `Permission denied` / exit 126, an error the runner attributes to
+the shell rather than to the file. `git update-index --chmod=+x` restores the bit. The gate is new:
+`scripts/contrib/check_exec_bits.py` scans every `run:` body in `.github/workflows` and fails if a
+`scripts/`, `tools/` or `clients/` script invoked as the first token of a command line is not
+executable. It ignores interpreter-invoked scripts (`python3 scripts/crates/check.py`, `bash
+scripts/crash-matrix.sh`) since those need no bit, globs and `${VAR}` expansions since they name no
+single command, backslash-folded continuation lines since they are arguments not command heads, and
+`paths:` filter entries since a path is not a command; it *does* report a script that is gone from
+the tree but whose directory exists, because a rename produces the same red-after-merge. It sits in
+the actionlint + shellcheck job, and its tests ride the existing `unittest discover -s
+scripts/contrib`. Because #560 is red only on this defect and #564 was red only on #560's defect,
+#564 branches from #560 rather than main: neither is green alone, and stacking is cheaper than
+explaining a known-red required check to a reviewer.
+
+**Also decided:** the two half-finished W7 workers' worktrees were kept, not reused. `w7/rob-23r-admin-listener`
+had been committed and pushed but never opened as a pull request; `weftdb-wt-rob5` still holds
+uncommitted changes under a *different* branch name (`w7/rob-5-legacy-write-scope`) than the pushed
+`w7/rob-5-queue-panics`, so the two are different work and were not conflated. The uncommitted diff
+is saved outside the repo at `/mnt/deepmem/Development/handoff/rob5.patch` (4104 lines) so it cannot
+be lost by a worktree prune, and left in place untouched for its owner's slice.
+
+**Verified locally, per PR:** `cargo +1.95.0 check -p weftdb --tests` clean and
+`RUSTDOCFLAGS='-D warnings' cargo doc -p weftdb --no-deps` clean (the two failures #560 removes);
+`cargo +1.95.0 check -p weftdb --profile release --tests` builds; `cargo +1.95.0 test -p weftdb
+--lib` passes with the new tests. The default toolchain is nightly-2026-10-31 per
+`rust-toolchain.toml`, so every MSRV claim here is from an explicit `+1.95.0` run. #564 verifies with
+`check_exec_bits.py` before (one problem, `ci.yml:206`) and after (16 call sites clean) the mode fix,
+and `python3 -m unittest discover -s scripts/contrib -p 'test_*.py'` → `Ran 72 tests ... OK`.
+
+**Needs human:** #560 and #564 are both CI/test-only and green except for each other's defect; merging
+#564 (merge commit, not squash) lands both commits and auto-closes #560. Also note `patches/branches`
+still fails to build on the local nightly — that is the vendored upstream breakage CI marks
+advisory, not something these two PRs touch.
+
 ## 2026-11-04 — Phase 2 integrations: what was built, and the two items left with a reason (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** Phase 2's two remaining roadmap lines chain six items with arrows —
