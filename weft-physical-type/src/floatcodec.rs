@@ -780,14 +780,14 @@ mod tests {
 
 	#[test]
 	fn empty_column_encodes_to_nothing() {
-		assert!(xor_f64_encode(&[]).is_empty());
+		assert_eq!(xor_f64_encode(&[]).len(), 0);
 		assert_eq!(xor_f64_decode(&[], 0), Vec::<f64>::new());
 		assert_eq!(xor_f64_bytes(&[]), 0);
 	}
 
 	#[test]
 	fn single_value_stores_the_raw_pattern() {
-		let values = [3.141_592_653_589_793];
+		let values = [std::f64::consts::PI];
 		round_trips(&values);
 		// One value is 64 bits = 8 bytes exactly.
 		assert_eq!(xor_f64_bytes(&values), 8);
@@ -811,7 +811,7 @@ mod tests {
 		// only a few bits are written per value. (Contrast a signal that crosses zero: its
 		// exponent sweeps wildly, the XOR spans the full width, and Gorilla cannot help —
 		// an honest limitation, so this test does not claim a win it cannot deliver.)
-		let values: Vec<f64> = (0..256).map(|i| 1000.0 + f64::from(i) * 0.001).collect();
+		let values: Vec<f64> = (0..256).map(|i| f64::from(i).mul_add(0.001, 1000.0)).collect();
 		round_trips(&values);
 		let raw = values.len() * 8;
 		let coded = xor_f64_bytes(&values);
@@ -858,7 +858,7 @@ mod tests {
 			state ^= state >> 12;
 			state ^= state << 25;
 			state ^= state >> 27;
-			let step = ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1_u64 << 53) as f64) - 0.5;
+			let step = (crate::cast::u64_to_f64(state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) / crate::cast::u64_to_f64(1_u64 << 53)) - 0.5;
 			x += step;
 			values.push(x);
 		}
@@ -883,7 +883,7 @@ mod tests {
 		// both far below raw. Chimp's real advantage is the new-window trim regime
 		// (`chimp_beats_gorilla_on_fresh_windows_with_long_trailing_runs`); the big win is
 		// Chimp128's 128-value reference window, filed as the next slice.
-		let values: Vec<f64> = (0..256).map(|i| 1000.0 + f64::from(i) * 0.001).collect();
+		let values: Vec<f64> = (0..256).map(|i| f64::from(i).mul_add(0.001, 1000.0)).collect();
 		round_trips(&values);
 		let gorilla = xor_f64_bytes(&values);
 		let chimp = chimp_f64_bytes(&values);
@@ -897,7 +897,7 @@ mod tests {
 	fn best_f64_selector_picks_the_true_min_and_never_exceeds_raw() {
 		// The selector must equal the smallest of {raw, gorilla, chimp} on every corpus, and
 		// its label must name that codec.
-		let ramp: Vec<f64> = (0..128).map(|i| 500.0 + f64::from(i) * 0.01).collect();
+		let ramp: Vec<f64> = (0..128).map(|i| f64::from(i).mul_add(0.01, 500.0)).collect();
 		let walk_seed_state = 0x1234_5678_9abc_def0_u64;
 		let mut s = walk_seed_state;
 		let mut x = 42.0;
@@ -906,7 +906,7 @@ mod tests {
 			s ^= s >> 12;
 			s ^= s << 25;
 			s ^= s >> 27;
-			x += ((s >> 40) as f64 / (1_u64 << 24) as f64) - 0.5;
+			x += (crate::cast::u64_to_f64(s >> 40) / crate::cast::u64_to_f64(1_u64 << 24)) - 0.5;
 			walk.push(x);
 		}
 		for series in [&ramp, &walk] {
@@ -987,7 +987,7 @@ mod tests {
 		// A series longer than the 128-value window with a long-period revisit (period 96 < 128)
 		// verifies the ring buffer and the `count - cand < PREVIOUS_VALUES` window guard across a
 		// wrap: references older than 128 must be rejected, fresher ones honoured.
-		let values: Vec<f64> = (0..400).map(|i| f64::from(i % 96) * 2.5 + 10.0).collect();
+		let values: Vec<f64> = (0..400).map(|i| f64::from(i % 96).mul_add(2.5, 10.0)).collect();
 		round_trips(&values);
 	}
 
@@ -1053,8 +1053,8 @@ mod tests {
 		// 8 B/value on data with real structure. Chimp128's 128-value reference window is the
 		// slice that turns this into a decisive win (filed on the roadmap). Both a smooth ramp
 		// and a repeated-window series stay under raw.
-		let ramp: Vec<f64> = (0..128).map(|i| 500.0 + f64::from(i) * 0.01).collect();
-		let stepped: Vec<f64> = (0..128).map(|i| f64::from_bits(0x4000_0000_0000_0000_u64 + ((i as u64 % 8) << 46))).collect();
+		let ramp: Vec<f64> = (0..128).map(|i| f64::from(i).mul_add(0.01, 500.0)).collect();
+		let stepped: Vec<f64> = (0..128_u64).map(|i| f64::from_bits(0x4000_0000_0000_0000_u64 + ((i % 8) << 46))).collect();
 		for series in [&ramp, &stepped] {
 			round_trips(series);
 			assert!(chimp_f64_bytes(series) < series.len() * 8, "chimp must beat raw on structured data");
@@ -1075,7 +1075,7 @@ mod tests {
 	fn chimp_long_trailing_run_uses_the_trim_path() {
 		// Values differing only in high mantissa bits give the XOR a long trailing-zero run
 		// (> 6), exercising Chimp's flag-`01` trim branch across many values.
-		let values: Vec<f64> = (0..96).map(|i| f64::from_bits(0x4000_0000_0000_0000_u64 + ((i as u64) << 40))).collect();
+		let values: Vec<f64> = (0..96_u64).map(|i| f64::from_bits(0x4000_0000_0000_0000_u64 + (i << 40))).collect();
 		round_trips(&values);
 	}
 }

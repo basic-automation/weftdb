@@ -1,0 +1,38 @@
+# /usr/lib/tmpfiles.d/weftdb.conf — the runtime directory a host install of WeftDB expects.
+#
+# Part of PAC-11 (1.0 plan): the systemd unit, the user and the env file. `systemd-tmpfiles
+# --create` reads this at boot (and `systemd-tmpfiles-setup.service` runs it for you), and
+# `RuntimeDirectory=` in the unit creates `/run/weftdb` as well, so the two mechanisms must
+# agree — which raises the obvious question of why this file exists at all.
+#
+# # Why both
+#
+# `RuntimeDirectory=weftdb` in the unit creates the directory *when the service starts*, owned by
+# the service user, mode 0755 minus the umask — and removes it when the service stops. That is
+# right for scratch state and wrong for a keys file: an operator who puts `/run/weftdb/api.keys`
+# in place before first boot has the directory re-created under the service, and an operator who
+# starts the server outside systemd (`weft-server serve` by hand, which is a normal thing to do
+# while debugging) gets no directory at all and a confusing "No such file or directory (os error
+# 2)" naming the keys path.
+#
+# So the unit does not set `RuntimeDirectory=` — it is left to this file, which creates the
+# directory at boot with an explicit mode and owner, and leaves it alone when the service stops.
+# The cost is that nothing removes stale files here automatically; `/run` is a tmpfs and is gone
+# at the next boot, which is the same lifetime, and a keys file that should survive a reboot
+# belongs in `/etc/weftdb` anyway.
+#
+# # Fields
+#
+# `d path mode uid gid age argument` — an age of `-` means "never clean up".
+#
+# The mode is 0750 rather than the 0755 `RuntimeDirectory=` would have given: this is where the
+# keys file goes by default, and the directory holding it should not be world-listable. The
+# group is the service group so an operator can add a keys file as a member of `weftdb` without
+# going through root.
+d /run/weftdb 0750 weftdb weftdb -
+
+# The parent of the state directory is `/var/lib`, which the distribution owns and which needs
+# nothing from us; only `/var/lib/weftdb` itself is ours, and the sysusers file creates it. This
+# file carries no `d /var/lib/weftdb` line on purpose — two files creating the same path with two
+# different modes is a race that `systemd-tmpfiles` resolves by taking the last line it reads,
+# and the sysusers copy is the one the installer documents.

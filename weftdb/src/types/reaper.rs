@@ -65,7 +65,7 @@ use crate::{
 
 /// The state of a `frame_journal` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JournalState {
+pub enum JournalState {
 	/// A maintenance output that is written, or about to be, and not yet swapped in.
 	Pending,
 	/// A frame a committed swap took out of the index, awaiting the reaper.
@@ -95,7 +95,7 @@ impl JournalState {
 
 /// One `frame_journal` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct JournalEntry {
+pub struct JournalEntry {
 	/// The frame's file name, directly under `segments/`.
 	pub name: String,
 	/// The aspect whose maintenance journaled it.
@@ -108,7 +108,7 @@ pub(crate) struct JournalEntry {
 /// The reclaim epochs of one store: which reads are running since which epoch, which
 /// retired frames they may still open, and whether a backup holds the reaper off.
 #[derive(Debug, Default)]
-pub(crate) struct ReclaimEpochs {
+pub struct ReclaimEpochs {
 	state: Mutex<Epochs>,
 	/// How many [`GcHold`]s are alive.
 	gc_hold: AtomicU64,
@@ -196,7 +196,7 @@ impl ReclaimEpochs {
 /// a read future dropped half way, by a timeout or a cancelled request, releases it too.
 #[derive(Debug)]
 #[must_use = "a pin protects the frames a read opens only while it is held"]
-pub(crate) struct ReadPin<'a> {
+pub struct ReadPin<'a> {
 	epochs: &'a ReclaimEpochs,
 	epoch: u64,
 }
@@ -217,7 +217,7 @@ impl Drop for ReadPin<'_> {
 /// retired frame is unlinked. Released on drop.
 #[derive(Debug)]
 #[must_use = "the reaper is held off only while the hold is alive"]
-pub(crate) struct GcHold<'a> {
+pub struct GcHold<'a> {
 	epochs: &'a ReclaimEpochs,
 }
 
@@ -229,7 +229,7 @@ impl Drop for GcHold<'_> {
 
 /// What an aspect's live rows reference: the file names of their frames and their ids.
 #[derive(Debug, Default)]
-pub(crate) struct LiveFrames {
+pub struct LiveFrames {
 	names: HashSet<String>,
 	ids: HashSet<u64>,
 }
@@ -248,13 +248,14 @@ impl LiveFrames {
 
 /// The file name a stored frame path ends in (split on both `/` and `\`, as the readers
 /// resolve it), or `None` for a path with no name.
-pub(crate) fn frame_file_name(stored: &str) -> Option<&str> {
+#[must_use]
+pub fn frame_file_name(stored: &str) -> Option<&str> {
 	stored.split(['/', '\\']).rfind(|part| !part.is_empty() && *part != ".")
 }
 
 /// What one [`Reaper::sweep`] did with the journal rows it was given.
 #[derive(Debug, Default)]
-pub(crate) struct Swept {
+pub struct Swept {
 	/// The rows to delete: their frame is gone, or was kept on purpose (a live row
 	/// references it). `segments/` must be synced before they are deleted when
 	/// `unlinked` is not zero.
@@ -274,7 +275,7 @@ pub(crate) struct Swept {
 /// The reaper of one store: the filesystem it unlinks through, the `segments/`
 /// directory and its directory syncer, and the reclaim epochs that say what it may take.
 #[derive(Debug)]
-pub(crate) struct Reaper {
+pub struct Reaper {
 	fs: Arc<dyn StoreFs>,
 	segments: PathBuf,
 	syncer: DirSyncer,
@@ -434,11 +435,13 @@ impl Reaper {
 	}
 }
 
-/// Whether an unlink that failed with `e` should simply be retried later: a Windows
-/// sharing or lock violation (another process has the file open without sharing
-/// deletion, an antivirus scanner say) or a busy file (`EBUSY`). The release plan's D-S8
-/// amendment: such a frame is not an error, it is reaped on a later pass.
-pub(crate) fn retry_later(e: &io::Error) -> bool {
+/// Whether an unlink that failed with `e` should simply be retried later.
+///
+/// A Windows sharing or lock violation (another process has the file open without sharing deletion, an
+/// antivirus scanner say) or a busy file (`EBUSY`). The release plan's D-S8 amendment: such a frame is
+/// not an error, it is reaped on a later pass.
+#[must_use]
+pub fn retry_later(e: &io::Error) -> bool {
 	unlink_busy(e, cfg!(windows))
 }
 
@@ -449,11 +452,12 @@ fn unlink_busy(e: &io::Error, windows: bool) -> bool {
 	e.kind() == io::ErrorKind::ResourceBusy || (windows && matches!(e.raw_os_error(), Some(32 | 33)))
 }
 
-/// A [`StoreFs`] for the tests of the reaper's "retry later": the real filesystem, except
-/// that unlinking a file whose name is marked busy fails as a busy file does
-/// (`ErrorKind::ResourceBusy`, what a Windows sharing violation is to the reaper).
+/// A [`StoreFs`] for the tests of the reaper's "retry later".
+///
+/// The real filesystem, except that unlinking a file whose name is marked busy fails as a busy file
+/// does (`ErrorKind::ResourceBusy`, what a Windows sharing violation is to the reaper).
 #[cfg(test)]
-pub(crate) mod testing {
+pub mod testing {
 	use std::{
 		collections::HashSet, io, path::Path, sync::{Mutex, PoisonError}
 	};
@@ -463,7 +467,7 @@ pub(crate) mod testing {
 	use crate::types::durable::{FsEntry, FsMetadata, RealFs, StoreFs, SyncPolicy, WritePoints};
 
 	#[derive(Debug, Default)]
-	pub(crate) struct BusyFs {
+	pub struct BusyFs {
 		busy: Mutex<HashSet<String>>,
 	}
 
@@ -605,11 +609,11 @@ mod tests {
 		let pinned = reaper.sweep(&entries, &HashMap::new(), true).await;
 		drop(pin);
 		let hold = reaper.epochs().hold();
-		let held = reaper.sweep(&entries[..1], &HashMap::new(), true).await;
+		let held_result = reaper.sweep(&entries[..1], &HashMap::new(), true).await;
 		drop(hold);
 		let free = reaper.sweep(&entries[..1], &HashMap::new(), true).await;
 		assert_eq!((pinned.waiting, pinned.processed.as_slice()), (1, ["a~g1~p0.weftseg".to_string()].as_slice()), "the pending output goes, the pinned frame waits");
-		assert_eq!((held.waiting, held.processed.len()), (1, 0), "a hold keeps it too");
+		assert_eq!((held_result.waiting, held_result.processed.len()), (1, 0), "a hold keeps it too");
 		assert_eq!((free.unlinked, free.processed.as_slice()), (1, ["a-1.weftseg".to_string()].as_slice()));
 	}
 
@@ -642,11 +646,11 @@ mod tests {
 		epochs.retire(["old".to_string()]);
 		let hold = epochs.hold();
 		let second = epochs.hold();
-		let held = (epochs.reclaimable("old"), epochs.reclaimable("unknown"));
+		let held_result = (epochs.reclaimable("old"), epochs.reclaimable("unknown"));
 		drop(hold);
 		let still = epochs.reclaimable("old");
 		drop(second);
-		assert_eq!(held, (false, false));
+		assert_eq!(held_result, (false, false));
 		assert!(!still, "one hold is still alive");
 		assert!(epochs.reclaimable("old"));
 	}

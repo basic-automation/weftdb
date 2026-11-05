@@ -102,7 +102,9 @@ pub const DATABASE_ENV: &str = "WEFT_STORE_DATABASE";
 pub const SUBJECT_ENV: &str = "WEFT_STORE_SUBJECT";
 
 /// The scope `weftdb::SegmentStore::open` uses, and the scope a server runs under when
-/// neither [`DATABASE_ENV`] nor [`SUBJECT_ENV`] is set. Spelled out here rather than
+/// neither [`DATABASE_ENV`] nor [`SUBJECT_ENV`] is set.
+///
+/// Spelled out here rather than
 /// imported because `weftdb` keeps its copy private, and a server that drifted from it
 /// would silently open a different store than `cargo run -p weftdb` does.
 pub const DEFAULT_SCOPE_DATABASE: &str = "default";
@@ -234,9 +236,10 @@ const SCOPE_PIN_TRUTHY: &[&str] = &["on", "1", "true", "yes"];
 pub const SCOPE_PIN_VALUES: &str = "`on`/`1`/`true`/`yes` keep the pin on and `off`/`0`/`false`/`no` turn it off (any case)";
 
 /// A store root that records a scope other than the one this server is configured to
-/// serve (FRE-12b): the refusal startup exits 65 with, because the operator has to fix
-/// either the environment or the root before the server can serve the data it is pointed
-/// at.
+/// serve (FRE-12b).
+///
+/// The refusal startup exits 65 with, because the operator has to fix either the environment
+/// or the root before the server can serve the data it is pointed at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeMismatch {
 	/// The root that refused.
@@ -315,7 +318,9 @@ pub fn store_root_from_env() -> anyhow::Result<std::path::PathBuf> {
 
 /// Why the store filesystem check (PAC-5b) refuses a root before the store is
 /// opened: the root is not a usable directory on a filesystem this build can be
-/// durable on. Every variant is a filesystem refusal in plan C7's terms, so the
+/// durable on.
+///
+/// Every variant is a filesystem refusal in plan C7's terms, so the
 /// server exits it with [`crate::settings::CONFIG_EXIT_CODE`] (78).
 #[derive(Debug)]
 pub enum StoreRootProblem {
@@ -344,10 +349,13 @@ impl std::error::Error for StoreRootProblem {
 	}
 }
 
-/// The store filesystem check (PAC-5b): refuse `root` before the store opens when
-/// the filesystem cannot hold a store — the root exists as a file, cannot be
-/// created or listed, is not writable, or (on Unix) its directory entry cannot be
-/// synced, which is the durability every store write assumes. A missing root is
+/// The store filesystem check (PAC-5b).
+///
+/// Refuse `root` before the store opens when the filesystem cannot hold a store — the root
+/// exists as a file, cannot be created or listed, is not writable, or (on Unix) its directory
+/// entry cannot be synced, which is the durability every store write assumes.
+///
+/// A missing root is
 /// created, as the open itself would create it, and then probed. The probe file
 /// is removed before this returns, success or failure.
 ///
@@ -394,6 +402,7 @@ fn sync_directory(_dir: &Path) -> std::io::Result<()> {
 }
 
 /// The exit status (plan C7) a store-open failure maps to, when it maps to one:
+///
 /// [`crate::settings::ROOT_LOCKED_EXIT_CODE`] (75) for a root another process
 /// holds, [`crate::settings::STORE_EXIT_CODE`] (65) for a [`weftdb::StoreError`]
 /// — the store needs operator action. Anything else keeps the caller's default.
@@ -426,16 +435,20 @@ pub async fn open_from_env(root: impl AsRef<Path>) -> anyhow::Result<SegmentStor
 	open_and_pin_from_env(root).await.map(|(store, _)| store)
 }
 
-/// The scope this process serves, and the pin mode the start runs under
-/// ([`ServingScope`], FRE-12b) — the same read [`open_and_pin_from_env`] pins with,
-/// so what `GET /api/v1/version` reports is what the refusal was measured with.
+/// The scope this process serves, and the pin mode the start runs under ([`ServingScope`],
+/// FRE-12b).
+///
+/// The same read [`open_and_pin_from_env`] pins with, so what `GET /api/v1/version` reports
+/// is what the refusal was measured with.
 #[must_use]
 pub fn serving_scope_from_env() -> ServingScope {
 	let (database, subject) = store_scope_from_env();
 	ServingScope::new(database, subject, ScopePin::from_env())
 }
 
-/// [`open_from_env`], also yielding the [`ServingScope`] it opened under: startup
+/// [`open_from_env`], also yielding the [`ServingScope`] it opened under.
+///
+/// Startup
 /// keeps that pair so `GET /api/v1/version` reports the scope and the pin mode of the
 /// open that actually happened rather than a second read of the environment.
 ///
@@ -471,6 +484,7 @@ pub async fn open_scoped_with_env_options(root: impl AsRef<Path>, database: &str
 }
 
 /// The store identity line startup prints once the store is open (PAC-7):
+///
 /// one line naming the store the process is actually serving — its root,
 /// its `store_uuid`, the `(database, subject)` scope it was opened under,
 /// its layout as opened, whether the previous shutdown was clean, and

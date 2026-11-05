@@ -341,7 +341,6 @@ const HTML_STYLE: &str = "body{font-family:system-ui,sans-serif;margin:2rem;colo
 const HTML_HEAD_CELLS: &str = "<th>adapter</th><th>workload</th><th>shape</th><th>in</th><th>out</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>mean ms</th><th>1st ms</th><th>pts/s</th><th>correct</th><th>rmse</th><th>mae</th><th>max</th><th>bias</th><th>enc</th><th>val B/pt</th><th>tot B/pt</th>";
 
 /// Nanoseconds rendered as fractional milliseconds for display.
-#[allow(clippy::cast_precision_loss)]
 fn ms(ns: u64) -> f64 {
 	ns as f64 / 1e6
 }
@@ -361,7 +360,6 @@ fn hardware_meta_html(m: &RunMetadata) -> String {
 		(None, None) => {}
 	}
 	if let Some(bytes) = m.total_memory_bytes {
-		#[allow(clippy::cast_precision_loss)]
 		let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 		parts.push(format!("{gib:.1} GiB RAM"));
 	}
@@ -437,7 +435,7 @@ mod tests {
 	};
 
 	fn sample_result(adapter: &str, publishable: bool) -> BenchResult {
-		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: crate::schema::TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: if publishable { 1000 } else { 0 }, values_finite: publishable, result_sha256: None }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: Vec::new(), between_run: None }
+		BenchResult { schema_version: SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: crate::schema::TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: if publishable { 1000 } else { 0 }, values_finite: publishable, result_sha256: None }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: Vec::new(), between_run: None, gpu_economics: None }
 	}
 
 	/// A publishable result for `adapter` carrying an accuracy report with the given
@@ -639,7 +637,7 @@ mod tests {
 	fn to_html_shows_the_first_rep_and_the_gpu_pool() {
 		let mut with_split = result_with_rmse("weftdb", 1.0);
 		with_split.cold_warm = crate::schema::ColdWarm::from_samples(&[2_500_000, 1_000_000, 1_100_000]);
-		with_split.gpu_pool = Some(crate::gpu_memory::GpuPoolSummary { max_pool_bytes: 512 << 20, rounds: 2, calls: 6, created: 2, created_after_first_round: 0, reused: 4, evicted: 0, peak_idle_bytes_first_round: 112 << 20, peak_idle_bytes_later: 112 << 20, final_idle_bytes: 112 << 20, stable: true });
+		with_split.gpu_pool = Some(crate::gpu_memory::GpuPoolSummary { max_pool_bytes: 512 << 20, rounds: 2, calls: 6, created: 2, created_after_first_round: 0, reused: 4, evicted: 0, peak_idle_bytes_first_round: 112 << 20, peak_idle_bytes_later: 112 << 20, final_idle_bytes: 112 << 20, stable: true, device_memory: None });
 		let html = BenchReport::with_results(metadata(), vec![with_split, result_with_rmse("baseline-linear", 1.2)]).to_html();
 		assert!(html.contains("<th>mean ms</th><th>1st ms</th>"), "{html}");
 		assert!(html.contains("<td>2.500</td>"), "the first rep in ms: {html}");

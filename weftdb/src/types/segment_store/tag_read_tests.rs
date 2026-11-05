@@ -62,9 +62,9 @@ async fn untagged_reads_see_series_zero_only() {
 	let width = weft_reduce::BucketWidth::new(Resolution::Seconds, 30).expect("a width");
 	assert_eq!(mixed.downsample_range_width(ASPECT, 0, 100, width, &aggs).await.expect("downsamples"), plain.downsample_range_width(ASPECT, 0, 100, width, &aggs).await.expect("downsamples"));
 	let linear = Interpolator::new(Spline::Linear, Resolution::Seconds);
-	let (got, want) = (mixed.interpolate_range(ASPECT, 0, 90, 0, linear.clone()).await.expect("interpolates"), plain.interpolate_range(ASPECT, 0, 90, 0, linear.clone()).await.expect("interpolates"));
+	let (got, want) = (mixed.interpolate_range(ASPECT, 0, 90, 0, linear).await.expect("interpolates"), plain.interpolate_range(ASPECT, 0, 90, 0, linear).await.expect("interpolates"));
 	assert_eq!(got.values(), want.values());
-	let (got, want) = (mixed.interpolate_range_f64(ASPECT, 0, 90, 0, linear.clone()).await.expect("interpolates"), plain.interpolate_range_f64(ASPECT, 0, 90, 0, linear).await.expect("interpolates"));
+	let (got, want) = (mixed.interpolate_range_f64(ASPECT, 0, 90, 0, linear).await.expect("interpolates"), plain.interpolate_range_f64(ASPECT, 0, 90, 0, linear).await.expect("interpolates"));
 	assert_eq!(got.values(), want.values());
 }
 
@@ -92,7 +92,7 @@ async fn of_reads_answer_one_series() {
 	let buckets = store.downsample_range_width_of(ASPECT, b, 0, 100, width, &[Aggregation::Max]).await.expect("downsamples");
 	assert_eq!(buckets.iter().map(|b| b.values["max"].clone()).collect::<Vec<_>>(), vec![bd("90000")]);
 	let linear = Interpolator::new(Spline::Linear, Resolution::Seconds);
-	let curve = store.interpolate_range_of(ASPECT, a, 40, 50, 0, linear.clone()).await.expect("interpolates");
+	let curve = store.interpolate_range_of(ASPECT, a, 40, 50, 0, linear).await.expect("interpolates");
 	assert_eq!(curve.values()[5], bd("4500"));
 	let curve = store.interpolate_range_f64_of(ASPECT, b, 40, 50, 0, linear).await.expect("interpolates");
 	assert!((curve.values()[5] - 45_000.0).abs() < 1e-9);

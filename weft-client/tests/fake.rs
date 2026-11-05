@@ -1,6 +1,9 @@
 //! The client's own behaviour against a fake server: what it sends, how it follows cursors,
 //! when it retries, and what it refuses to believe. The wire contract against the real
 //! server is `tests/live.rs`.
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::sync::{
 	atomic::{AtomicUsize, Ordering}, Arc, Mutex

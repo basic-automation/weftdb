@@ -2619,6 +2619,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memmem"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3416,9 +3425,9 @@ dependencies = [
 
 [[package]]
 name = "pollster"
-version = "0.4.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
 
 [[package]]
 name = "polyval"
@@ -4460,9 +4469,9 @@ dependencies = [
 
 [[package]]
 name = "splimes"
-version = "1.0.0"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80b4d2f8d35dd1dbfc07ea986a1c2198fbe368edfa8785ed0d03e8295e1247ea"
+checksum = "2b10f7881f2979cff4b2d10db6c9aca9df4ca8fd67ce65b8309e8aab1d8eab85"
 dependencies = [
  "bigdecimal",
  "bytemuck",
@@ -5612,6 +5621,7 @@ dependencies = [
  "async-trait",
  "bigdecimal",
  "chrono",
+ "pollster",
  "rand 0.10.3",
  "rand_chacha 0.10.0",
  "rayon",
@@ -5628,6 +5638,7 @@ dependencies = [
  "weft-physical-type",
  "weft-reduce",
  "weftdb",
+ "wgpu",
 ]
 
 [[package]]
@@ -5729,6 +5740,7 @@ dependencies = [
  "axum",
  "bigdecimal",
  "chrono",
+ "criterion",
  "futures",
  "hyper",
  "hyper-util",
@@ -5797,6 +5809,7 @@ dependencies = [
  "futures",
  "libc",
  "md5",
+ "memmap2",
  "num_cpus",
  "once_cell",
  "postcard",

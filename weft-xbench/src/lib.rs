@@ -27,7 +27,9 @@
 //! Both engines write to [`std::env::temp_dir`]; point `TMPDIR` at the reference volume (decision
 //! 19: `/mnt/weftbench`) so they share a disk.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 pub mod clickhouse;
 pub mod combine;
@@ -39,6 +41,17 @@ pub mod render;
 pub mod timescale;
 pub mod tsbs;
 pub mod weft;
+
+/// A count or timestamp as `f64`, `NaN` in the case a type has no `f64` form (no integer type is in that case).
+#[must_use]
+pub fn as_f64<T: ToPrimitive + Copy>(v: T) -> f64 {
+	v.to_f64().unwrap_or(f64::NAN)
+}
+
+/// Substitute each `{name}` in a SQL template with the value paired with `name`.
+pub(crate) fn fill(template: &str, args: &[(&str, &dyn std::fmt::Display)]) -> String {
+	args.iter().fold(template.to_owned(), |sql, (name, value)| sql.replace(&format!("{{{name}}}"), &value.to_string()))
+}
 
 use std::time::Instant;
 
@@ -187,8 +200,7 @@ impl Dataset {
 		let (points, missingness_fraction) = if kind == DatasetKind::Block {
 			let before = generated.len();
 			let kept = remove_blocks(generated, MISSINGNESS, seed);
-			#[allow(clippy::cast_precision_loss)]
-			let removed = (before - kept.len()) as f64 / before as f64;
+			let removed = as_f64(before - kept.len()) / as_f64(before);
 			(kept, removed)
 		} else {
 			(generated, MISSINGNESS)
@@ -249,8 +261,7 @@ fn remove_blocks(points: Vec<Point>, fraction: f64, seed: u64) -> Vec<Point> {
 		return points;
 	}
 	let run = (n / 200).max(10).min(n / 4).max(1);
-	#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-	let target = (n as f64 * fraction) as usize;
+	let target = (as_f64(n) * fraction).to_usize().unwrap_or(0);
 	let mut drop = vec![false; n];
 	let mut dropped = 0;
 	let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xB10C);
@@ -340,15 +351,18 @@ pub fn client_linear(t: &[i64], v: &[f64], start: i64, step: i64, n: usize) -> V
 	let mut out = Vec::with_capacity(n);
 	let mut seg = 0;
 	for i in 0..n {
-		#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-		let g = start + i as i64 * step;
+		let g = start + i64::try_from(i).unwrap_or(i64::MAX) * step;
 		while seg + 2 < kt.len() && kt[seg + 1] <= g {
 			seg += 1;
 		}
 		let (a_t, a_v, b_t, b_v) = (kt[seg], kv[seg], kt[seg + 1], kv[seg + 1]);
 		// The SQL arms' arithmetic, not a fused multiply-add, so the classes compute alike.
-		#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
-		out.push(if g == a_t { a_v } else { a_v + (b_v - a_v) * ((g - a_t) as f64 / (b_t - a_t) as f64) });
+		out.push(if g == a_t {
+			a_v
+		} else {
+			let rise = (b_v - a_v) * (as_f64(g - a_t) / as_f64(b_t - a_t));
+			a_v + rise
+		});
 	}
 	out
 }
@@ -1207,12 +1221,12 @@ mod tests {
 			std::thread::sleep(std::time::Duration::from_millis(200));
 		}
 
-		async fn reopen(&mut self) -> anyhow::Result<()> {
-			Ok(())
+		fn reopen(&mut self) -> impl std::future::Future<Output = anyhow::Result<()>> {
+			std::future::ready(Ok(()))
 		}
 
-		async fn load(&mut self, _ds: &Dataset) -> anyhow::Result<()> {
-			Ok(())
+		fn load(&mut self, _ds: &Dataset) -> impl std::future::Future<Output = anyhow::Result<()>> {
+			std::future::ready(Ok(()))
 		}
 
 		async fn interpolate(&mut self, ds: &Dataset, knots: Vec<splimes::Point>) -> anyhow::Result<Output> {
@@ -1244,13 +1258,13 @@ mod tests {
 
 		fn unload(&mut self) {}
 
-		async fn load(&mut self, _ds: &Dataset) -> anyhow::Result<()> {
-			Ok(())
+		fn load(&mut self, _ds: &Dataset) -> impl std::future::Future<Output = anyhow::Result<()>> {
+			std::future::ready(Ok(()))
 		}
 
-		async fn reopen(&mut self) -> anyhow::Result<()> {
+		fn reopen(&mut self) -> impl std::future::Future<Output = anyhow::Result<()>> {
 			self.0 += 1;
-			Ok(())
+			std::future::ready(Ok(()))
 		}
 
 		async fn interpolate(&mut self, ds: &Dataset, knots: Vec<splimes::Point>) -> anyhow::Result<Output> {

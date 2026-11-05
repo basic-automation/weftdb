@@ -197,7 +197,6 @@ impl OracleVerdict {
 	/// [`Self::mismatch_count`] is larger than the list kept.
 	#[must_use]
 	pub fn truncated(&self) -> bool {
-		#[allow(clippy::cast_possible_truncation)]
 		let listed = self.mismatches.len() as u64;
 		self.mismatch_count > listed
 	}
@@ -468,13 +467,10 @@ impl SoakOracle {
 		let step = self.model.step(tick);
 		let grid = &step.grid;
 		verdict.ticks_judged = verdict.ticks_judged.saturating_add(1);
-		#[allow(clippy::cast_possible_truncation)]
 		let cells = (grid.series as u64).saturating_mul(grid.rows as u64);
 		verdict.cells_checked = verdict.cells_checked.saturating_add(cells);
-		#[allow(clippy::cast_possible_truncation)]
 		let present = grid.present_count() as u64;
 		verdict.cells_present = verdict.cells_present.saturating_add(present);
-		#[allow(clippy::cast_possible_truncation)]
 		let supplied = observed.len() as u64;
 		verdict.points_observed = verdict.points_observed.saturating_add(supplied);
 

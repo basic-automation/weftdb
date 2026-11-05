@@ -99,7 +99,7 @@ impl SegmentStore {
 		// The seal's index write, spanned like `SegmentIndexStore::insert` (roadmap Phase 3). Its
 		// `rows_changed` is the affected-row count of the first op, the `InsertNew`.
 		let span = tracing::debug_span!("control_plane.index.insert", aspect, id = descriptor.id, rows_changed = tracing::field::Empty);
-		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row }, seq_bump(aspect, &commit, gen.saturating_add(1), epoch), IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup }])).instrument(span.clone()).await?;
+		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row }, seq_bump(aspect, &commit, gen.saturating_add(1), epoch), IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup }, IndexOp::RecordChange { aspect: aspect.to_string(), epoch, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, row_count: u64::try_from(descriptor.row_count).unwrap_or(u64::MAX) }])).instrument(span.clone()).await?;
 		span.record("rows_changed", applied.changes.first().copied().unwrap_or(0));
 		commit.set_epoch(epoch);
 		drop(commit);
@@ -139,10 +139,7 @@ impl SegmentStore {
 		let mut by_id: HashMap<u64, SegmentDescriptor> = rows.iter().map(|row| (row.desc.id, row.desc.clone())).collect();
 		for op in ops {
 			match op {
-				IndexOp::InsertNew { row, .. } | IndexOp::Upsert { row, .. } => {
-					by_id.insert(row.desc.id, row.desc.clone());
-				}
-				IndexOp::ReplaceExpected { row, .. } => {
+				IndexOp::InsertNew { row, .. } | IndexOp::Upsert { row, .. } | IndexOp::ReplaceExpected { row, .. } => {
 					by_id.insert(row.desc.id, row.desc.clone());
 				}
 				IndexOp::DeleteExpected { expected, .. } => {
@@ -362,15 +359,16 @@ impl SegmentStore {
 		}
 		let mut prepared = Vec::with_capacity(plans.len());
 		let mut rows = Vec::with_capacity(plans.len());
-		for SwapPlan { members, outputs } in plans {
+		for SwapPlan { members, outputs, keep } in plans {
 			let Some(series_id) = members.first().map(|first| first.series_id) else { bail!("a swap plan of aspect {aspect:?} has no members") };
 			// Tags I12: a maintenance output never folds rows of different series.
 			if members.iter().any(|member| member.series_id != series_id) {
 				bail!("a swap plan of aspect {aspect:?} mixes the series of segments {:?}", members.iter().map(|member| (member.desc.id, member.series_id)).collect::<Vec<_>>());
 			}
-			let retired = members.iter().map(|member| self.retired_name(member)).collect::<Result<Vec<String>>>()?;
+			// A keep plan retires only the members it deletes: the kept one stays live.
+			let retired = members.iter().skip(usize::from(keep)).map(|member| self.retired_name(member)).collect::<Result<Vec<String>>>()?;
 			let prec = members.iter().map(|member| member.prec.unwrap_or(0)).max().unwrap_or(0);
-			prepared.push(PreparedPlan { members, retired, series_id, prec, fresh: Vec::new(), outputs: Vec::new() });
+			prepared.push(PreparedPlan { members, keep, retired, series_id, prec, fresh: Vec::new(), outputs: Vec::new() });
 			rows.push(outputs);
 		}
 		// Each tagged plan's outputs carry its series key (TAG-7), looked up once per plan:
@@ -390,16 +388,22 @@ impl SegmentStore {
 		// M2: a run of fresh generations for every output, in plan and time order.
 		let counts: Vec<usize> = rows.iter().map(Vec::len).collect();
 		let count: usize = counts.iter().sum();
-		let mut gen = self.allocate_gens(aspect, u64::try_from(count).unwrap_or(u64::MAX)).await?;
-		let mut planned = Vec::with_capacity(count);
-		for ((outputs, plan), series_key) in rows.into_iter().zip(&prepared).zip(keys) {
-			for PlanOutput { timestamps, values, rows_per_page } in outputs {
-				planned.push(PlannedOutput { gen, prec: plan.prec, timestamps, values, rows_per_page, series_key: series_key.clone() });
-				gen = gen.saturating_add(1);
+		// Only keep plans (skip-identical): nothing to allocate, journal or write, so
+		// M2-M4 are skipped whole and the swap goes straight to its commit.
+		let (written, mut pending) = if count == 0 {
+			(Vec::new(), PendingOutputs { store: self, aspect: aspect.to_string(), names: Vec::new() })
+		} else {
+			let mut gen = self.allocate_gens(aspect, u64::try_from(count).unwrap_or(u64::MAX)).await?;
+			let mut planned = Vec::with_capacity(count);
+			for ((outputs, plan), series_key) in rows.into_iter().zip(&prepared).zip(keys) {
+				for PlanOutput { timestamps, values, rows_per_page } in outputs {
+					planned.push(PlannedOutput { gen, prec: plan.prec, timestamps, values, rows_per_page, series_key: series_key.clone() });
+					gen = gen.saturating_add(1);
+				}
 			}
-		}
-		// M3, M4.
-		let (written, mut pending) = self.write_outputs(aspect, schema, planned).await?;
+			// M3, M4.
+			self.write_outputs(aspect, schema, planned).await?
+		};
 		if written.len() != count {
 			pending.discard_all().await;
 			bail!("a swap of aspect {aspect:?} wrote {} outputs of {count}", written.len());
@@ -429,11 +433,10 @@ impl SegmentStore {
 			outputs.extend(ids.into_iter().zip(std::mem::take(&mut plan.outputs)));
 		}
 		drop(pending);
-		// M6.
-		if committed.is_empty() {
-			drop(commit);
-		} else {
-			self.finish_swap(held, commit, outputs, &deleted).await?;
+		// M6: the commit lock is released first either way.
+		drop(commit);
+		if !committed.is_empty() {
+			self.finish_swap(held, outputs, &deleted).await?;
 		}
 		Ok(outcomes.into_iter().map(|outcome| outcome.unwrap_or_else(|| Err(anyhow::anyhow!("a swap plan of aspect {aspect:?} has no outcome")))).collect())
 	}
@@ -552,18 +555,17 @@ impl SegmentStore {
 	}
 
 	/// What follows a swap's commit (design section 5.3, steps 4-6): the rollup is
-	/// already folded into the swap's transaction (S11), so this releases the lock,
-	/// refreshes the outputs' sidecars (each `(id, output)`), removes the
+	/// already folded into the swap's transaction (S11), and the caller has released the
+	/// commit lock, so this refreshes the outputs' sidecars (each `(id, output)`), removes the
 	/// sidecars beside the `deleted` members' frames, and hands the retired frames to the
 	/// reaper. The swap is done whatever these do, so their failures are logged, not
 	/// returned; only an error injected at `M-swapped` is.
-	pub(crate) async fn finish_swap(&self, held: &MaintGuard, commit: CommitGuard, outputs: Vec<(u64, WrittenOutput)>, deleted: &[String]) -> Result<()> {
+	pub(crate) async fn finish_swap(&self, held: &MaintGuard, outputs: Vec<(u64, WrittenOutput)>, deleted: &[String]) -> Result<()> {
 		let aspect = held.aspect();
-		drop(commit);
 		fault::hit(FaultPoint::MSwapped).await?;
 		for (id, output) in outputs {
 			let descriptor = SegmentDescriptor { id, ..output.descriptor };
-			self.refresh_output_sidecar(aspect, &descriptor, output.gen, output.prec, output.frame_crc, output.timestamps, output.values).await;
+			self.refresh_output_sidecar(aspect, &descriptor, SidecarSource { gen: output.gen, prec: output.prec, frame_crc: output.frame_crc, timestamps: output.timestamps, values: output.values }).await;
 		}
 		for frame in deleted {
 			if let Err(e) = self.remove_sidecar(frame).await {
@@ -628,6 +630,8 @@ impl SegmentStore {
 	/// [`UnknownAspect`](StoreError::UnknownAspect) when `aspect` has no
 	/// declared schema; [`ReservedTagKey`](StoreError::ReservedTagKey) when
 	/// `batch.groups` names a reserved `__` key;
+	/// [`NotAnUpsertKey`](StoreError::NotAnUpsertKey) when the aspect declares upsert keys
+	/// and `batch.groups` names a key outside them;
 	/// [`SeriesLimit`](StoreError::SeriesLimit) for a new series past
 	/// [`SegmentStoreOptions::max_series_per_aspect`];
 	/// [`EmptyIngestBatch`](StoreError::EmptyIngestBatch) for a batch with
@@ -651,6 +655,16 @@ impl SegmentStore {
 		// ingest may write one (critique D17).
 		if let Some((key, _)) = batch.groups.iter().find(|(key, _)| key.starts_with(crate::tags::RESERVED_TAG_KEY_PREFIX)) {
 			return Err(StoreError::ReservedTagKey { aspect: aspect.to_string(), key: key.to_string() }.into());
+		}
+		// Declared upsert keys (Phase 4.6) bound the tags a row may carry: a tag outside
+		// them has no per-row storage once rows differing only in it fold into one. The
+		// untagged path never reads the declaration.
+		if !batch.groups.is_empty() {
+			if let Some(declared) = self.upsert_keys(aspect).await? {
+				if let Some(key) = declared.first_outside(&batch.groups) {
+					return Err(StoreError::NotAnUpsertKey { aspect: aspect.to_string(), key: key.to_string(), declared }.into());
+				}
+			}
 		}
 		if batch.timestamps.len() != batch.values.len() {
 			return Err(StoreError::IngestLengthMismatch { timestamps: batch.timestamps.len(), values: batch.values.len() }.into());
@@ -702,7 +716,7 @@ impl SegmentStore {
 		};
 		phase = IngestPhase::WritingFrames;
 		crate::exec::set_ingest_phase(phase);
-		let mut written: Vec<(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::with_capacity(chunks.len());
+		let mut written: Vec<WrittenSegment> = Vec::with_capacity(chunks.len());
 		for (timestamps, values) in &chunks {
 			let segment = encode_ingest_chunk(&schema, timestamps, values, batch.rows_per_page).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
 			// A tagged frame is wrapped before it is written, so its `byte_len` and the CRC
@@ -738,7 +752,7 @@ impl SegmentStore {
 		// read accelerator, never failing the ingest.
 		for (descriptor, gen, crc, timestamps, values) in &written {
 			if self.partials.base_for(descriptor.row_count).is_some() {
-				if let Err(e) = self.write_partial_sidecar(aspect, descriptor, *gen, *gen, *crc, timestamps.clone(), values.clone()).await {
+				if let Err(e) = self.write_partial_sidecar(aspect, descriptor, SidecarSource { gen: *gen, prec: *gen, frame_crc: *crc, timestamps: timestamps.clone(), values: values.clone() }).await {
 					tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 				}
 			}
@@ -763,7 +777,7 @@ impl SegmentStore {
 	/// row never commits without its catalog row. Every row, the receipt and the ledger
 	/// record that id. Only ingest registers series, and only under the commit lock, so
 	/// a `Conflict` on the registration is not a race to retry but an error.
-	pub(crate) async fn publish_ingest(&self, aspect: &str, batch: &IngestBatch, fingerprint: i64, written: &[(SegmentDescriptor, u64, u32, Vec<i64>, Vec<Option<BigDecimal>>)]) -> Result<IngestReceipt> {
+	pub(crate) async fn publish_ingest(&self, aspect: &str, batch: &IngestBatch, fingerprint: i64, written: &[WrittenSegment]) -> Result<IngestReceipt> {
 		let mut commit = self.commit_lock(aspect).await?;
 		// The ledger is re-checked under the commit lock: a commit of the
 		// same key that landed while this ingest wrote its frames is a
@@ -800,6 +814,7 @@ impl SegmentStore {
 		ops.push(seq_bump(aspect, &commit, max_gen.saturating_add(1), epoch));
 		ops.push(IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup });
 		ops.push(IndexOp::RecordIngest { entry });
+		ops.push(IndexOp::RecordChange { aspect: aspect.to_string(), epoch, min_ts, max_ts, row_count: u64::try_from(batch.timestamps.len()).unwrap_or(u64::MAX) });
 		self.commit_index(&IndexTxn::new(ops)).await?;
 		commit.set_epoch(epoch);
 		drop(commit);
@@ -861,6 +876,40 @@ impl SegmentStore {
 		if held >= self.max_series_per_aspect {
 			return Err(StoreError::SeriesLimit { aspect: aspect.to_string(), limit: self.max_series_per_aspect }.into());
 		}
+		Ok(())
+	}
+
+	/// The change-log rows of `aspect` at epochs after `after_epoch`, in
+	/// epoch order (slice D-S20): one row per seal or ingest commit, each
+	/// carrying that commit's time span and row count. This is the log
+	/// that replaces the per-timestamp unbatched queue for seal-backed
+	/// aspects: a consumer reads the rows since the last epoch it
+	/// acknowledged, rebuilds the batch windows their spans touch, and
+	/// acknowledges them with [`ack_changes`](Self::ack_changes).
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn changes_since(&self, aspect: &str, after_epoch: u64) -> Result<Vec<SegmentChange>> {
+		self.index.changes_after(aspect, after_epoch).await
+	}
+
+	/// Acknowledge `aspect`'s change-log rows at or below `through_epoch`
+	/// (slice D-S20): delete them, as a queue consumer dequeues what it
+	/// has batched. A commit that lands after the consumer's read takes a
+	/// higher epoch, so it is never deleted here; a crash before the
+	/// acknowledgement leaves the rows, and the next run rebuilds the
+	/// same windows, whose batches the store's dedupe skips.
+	///
+	/// # Errors
+	///
+	/// A control-plane write failure (an ambiguous COMMIT poisons the
+	/// store, as for every write).
+	pub async fn ack_changes(&self, aspect: &str, through_epoch: u64) -> Result<()> {
+		if through_epoch == 0 {
+			return Ok(());
+		}
+		self.commit_index(&IndexTxn::new(vec![IndexOp::DeleteChanges { aspect: aspect.to_string(), through_epoch }])).await?;
 		Ok(())
 	}
 
@@ -994,7 +1043,7 @@ impl SegmentStore {
 		// when the policy actually wants one, and never fail the seal on a sidecar error.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, frame_crc, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, SidecarSource { gen, prec: gen, frame_crc, timestamps: ts, values: vs }).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
@@ -1016,7 +1065,7 @@ impl SegmentStore {
 		// As `persist`: opt-in per-segment partial sidecar, never failing the seal.
 		if self.partials.base_for(segment.stats.row_count).is_some() {
 			let (ts, vs) = segment.decode_nullable();
-			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, gen, gen, frame_crc, ts, vs).await {
+			if let Err(e) = self.write_partial_sidecar(aspect, &descriptor, SidecarSource { gen, prec: gen, frame_crc, timestamps: ts, values: vs }).await {
 				tracing::warn!(aspect, id = descriptor.id, error = %e, "failed to write partial sidecar; downsample will fall back to a full decode");
 			}
 		}
@@ -1106,7 +1155,8 @@ impl SegmentStore {
 	///
 	/// A sidecar is a *pure acceleration*: a failure to write one must never fail the seal,
 	/// so the persist paths call this and log-and-ignore any error rather than propagating.
-	pub(crate) async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, frame_crc: u32, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<()> {
+	pub(crate) async fn write_partial_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, source: SidecarSource) -> Result<()> {
+		let SidecarSource { gen, prec, frame_crc, timestamps, values } = source;
 		let Some(bytes) = self.partial_sidecar_bytes(descriptor, frame_crc, timestamps, values)? else { return Ok(()) };
 		let path = self.sidecar_path(aspect, gen, prec)?;
 		self.fs.create_new_write(&path, bytes, SyncPolicy::None, WritePoints::NONE).await.with_context(|| format!("writing partial sidecar {}", path.display()))?;
@@ -1141,7 +1191,8 @@ impl SegmentStore {
 	/// under a `.tmp-*` name and renamed over the frame's, so a reader never sees half of one;
 	/// nothing is fsynced, since a sidecar is an accelerator a reader checks against the
 	/// frame. Best effort: a failure is logged, never returned.
-	pub(crate) async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, gen: u64, prec: u64, frame_crc: u32, timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) {
+	pub(crate) async fn refresh_output_sidecar(&self, aspect: &str, descriptor: &SegmentDescriptor, source: SidecarSource) {
+		let SidecarSource { gen, prec, frame_crc, timestamps, values } = source;
 		let result = async {
 			let path = self.sidecar_path(aspect, gen, prec)?;
 			let Some(bytes) = self.partial_sidecar_bytes(descriptor, frame_crc, timestamps, values)? else {

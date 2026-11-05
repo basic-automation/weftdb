@@ -8,7 +8,6 @@ use crate::{cache::Connection, AspectId, Batch, BatchId, Correlation, Correlatio
 ///
 /// Add a Subject for observation -> track various aspects of the subject
 #[async_trait::async_trait]
-#[allow(clippy::too_many_arguments)]
 pub trait Inputs {
 	//
 	// Unbatched Measurements Queue
@@ -171,7 +170,8 @@ pub trait Inputs {
 	/// If a measurement with the same timestamp already exists, the measurement is skipped.
 	async fn batch_capture_new_measurements(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
 
-	/// Capture a chunk of new measurements with batch processing
+	/// Capture a chunk of new measurements with batch processing; `tx_ids[i]` is the
+	/// transaction id of `chunk[i]`.
 	///
 	/// # Errors
 	///
@@ -179,7 +179,7 @@ pub trait Inputs {
 	/// so an error from the enqueue fails the call although the rows are stored; an MVCC
 	/// conflict with a consumer dequeuing the same entries is retried first, as for
 	/// [`capture_new_measurement`](Self::capture_new_measurement).
-	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], all_tx_ids: &[TxId], tx_id_offset: usize) -> Result<Vec<TxId>>;
+	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], tx_ids: &[TxId]) -> Result<Vec<TxId>>;
 
 	//
 	// Unprocessed Batches

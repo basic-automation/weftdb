@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! PAC-7's operator CLI, end to end against the binary itself: the
 //! dispatch, the plan C7 exit-code contract, and the store identity
 //! reported at startup.
