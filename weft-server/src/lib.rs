@@ -265,6 +265,18 @@ pub fn app_with_state(state: AppState) -> Router {
 	routes::build_registry_with_limits(state.ingest_config(), state.admission_config()).router().layer(middleware::from_fn_with_state(state.clone(), audit::audit_route)).layer(middleware::from_fn_with_state(state.clone(), auth::enforce)).layer(middleware::from_fn_with_state(state.clone(), incomplete_header)).layer(middleware::from_fn_with_state(state.host_guard(), host_guard::enforce)).layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
 }
 
+/// The probe-only router the admin listener serves (ROB-23r): the registry's
+/// probe routes and nothing else.
+///
+/// No auth, no host guard, no audit, no metrics: the listener is bound to
+/// loopback only (the bind **is** the protection), and every path not in
+/// [`routes::build_probe_registry`] is refused with `route_not_found` rather than
+/// reaching a data handler. The panic catcher and trace span stay, so a probe
+/// that panics is caught and a probe that times out is visible in traces.
+pub fn probe_app_with_state(state: AppState) -> Router {
+	routes::build_probe_registry().router().layer(middleware::from_fn(panic_catch::catch_panic)).layer(middleware::from_fn(trace::request_span)).with_state(state)
+}
+
 /// Mark stored-data reads incomplete when the store holds suspect segments
 /// (D-S12, C5): a suspect segment is removed from reads, so a range, point or
 /// downsample answer over a store holding one is missing data the store still

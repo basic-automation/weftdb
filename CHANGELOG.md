@@ -10,6 +10,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Probe-only admin listener** (ROB-23r). With `WEFT_ADMIN_ADDR` set to a loopback address
+  (e.g. `127.0.0.1:9095`), `weft-server` binds a second listener serving only `/health`,
+  `/ready`, `/healthz` and `/readyz` — with no auth, no host guard, and no other route. An
+  HTTP/1.0 probe with no `Host` header passes (the bind itself is the protection), and
+  supervisors (systemd, Docker `HEALTHCHECK`, k8s) need not expose or route to the data
+  listener. Unset (the default) means no second listener.
 - **R client** (`clients/r`, package `weftdb`): stored windows, value bands and server-side
   downsamples as Arrow tables, exact JSON rows paged by cursor, interpolation, and ingest of a
   data frame or Arrow table as one Parquet batch with `Idempotency-Key`. Refusals are

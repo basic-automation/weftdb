@@ -654,6 +654,23 @@ pub fn build_registry_with_limits(config: IngestConfig, admission_config: Admiss
 	routes.seal(Some(Arc::new(Admission::new(IngestAdmission::new(config.max_inflight_bytes()), admission_config))))
 }
 
+/// The probe-only registry (ROB-23r): `/health` and `/ready`, from the same
+/// [`RouteSpec`]s the full registry registers, and nothing else.
+///
+/// This is not a second routing table to keep in step: it calls the same
+/// [`register_probe_routes`], so a probe that gains a route gains it on both
+/// listeners. Because the gate layer looks a request up in *this* registry's
+/// table, a data, ingest, declare or maintenance path on the admin listener has
+/// no entry and is refused by the same fallback with `route_not_found` — the
+/// admin listener cannot reach stored data even by a path the operator forgot
+/// to firewall.
+#[must_use]
+pub fn build_probe_registry() -> SealedRoutes {
+	let mut routes = Routes::new();
+	register_probe_routes(&mut routes);
+	routes.seal(None)
+}
+
 /// The OpenAPI document for the whole surface, from the one registry.
 #[must_use]
 pub fn openapi_document() -> Value {
@@ -768,10 +785,14 @@ async fn route_not_found(Extension(table): Extension<Arc<RouteTable>>, method: M
 // area's function here (or adds a function for a new area and one call in
 // `build_registry`); `lib.rs` never changes again for a route.
 
-/// Probes: liveness and readiness.
+/// Probes: liveness and readiness. ROB-23r adds `/healthz` and `/readyz` as
+/// aliases for `/health` and `/ready`, so k8s probes work the same way on both
+/// the data listener and the admin listener.
 fn register_probe_routes(routes: &mut Routes) {
 	routes.route(Method::GET, "/health", RouteSpec::stable(Scope::Probe, Audit::None, false, AdmissionClass::Probe, "get_health"), get(health));
+	routes.route(Method::GET, "/healthz", RouteSpec::stable(Scope::Probe, Audit::None, false, AdmissionClass::Probe, "get_health_z"), get(health));
 	routes.route(Method::GET, "/ready", RouteSpec::stable(Scope::Probe, Audit::None, false, AdmissionClass::Probe, "get_ready"), get(ready));
+	routes.route(Method::GET, "/readyz", RouteSpec::stable(Scope::Probe, Audit::None, false, AdmissionClass::Probe, "get_ready_z"), get(ready));
 }
 
 /// Liveness probe: the process is up and can serve a request.

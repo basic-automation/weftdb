@@ -4,6 +4,53 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-04 — ROB-23r: probe-only admin listener
+
+**Context:** `weft-server` binds one listener by default (`WEFT_SERVER_ADDR`, defaulting to
+`127.0.0.1:8080`) serving the full API surface — data, ingest, admin, metrics and probes.
+Supervisors (systemd, Docker, k8s) probe `/health` and `/ready` to decide process liveness and
+readiness. Today those probes share the data listener's address, port and firewall rules.
+
+Today's loopback `Host` guard (SEC-3) refuses an HTTP/1.0 health check with no `Host` header
+(`403 Forbidden`, `host_not_allowed`), which forces probe configuration to send a loopback host
+or turns the guard off (`WEFT_ALLOW_ANY_HOST=1`). Turning it off for a probe weakens the DNS
+rebinding protection for every path on that listener. Issue #301 asked for a probe-only admin
+listener serving health checks and nothing else.
+
+**Chosen:**
+
+1. **Separate listener, loopback-only by default, no auth, no host guard.** `WEFT_ADMIN_ADDR`
+   (unset by default, so every deployment running today is unchanged). When set to a loopback
+   address (e.g. `127.0.0.1:9095`), a second listener binds and serves only the probe routes
+   (`/health`, `/ready`, `/healthz`, `/readyz`) with no middleware beyond panic-catch and trace.
+   The loopback bind **is** the protection: no auth gate, no host guard, no audit, no metrics
+   collection. An HTTP/1.0 probe sending no `Host` header passes. Every other path — data,
+   ingest, metrics, version, admin — answers `404 route_not_found`, so the admin listener
+   cannot reach stored data even by a path the operator forgot to firewall.
+
+2. **Separate port, not a second path on the data listener.** The data listener's existing
+   behavior is unchanged: probes there still pass through the host guard and answer when their
+   `Host` is loopback. Deployments that probe the data port today keep working. The admin
+   listener is opt-in via `WEFT_ADMIN_ADDR`.
+
+3. **Default port `127.0.0.1:9095`.** The documented value and suggested examples use 9095.
+   Unset — the default — means no second listener at all.
+
+4. **`WEFT_ADMIN_ADDR` is `Tier::Tuning`, not `Tier::Stable`.** The stable tier promises the
+   variable's name and shape will not change without a deprecation cycle. Adding a variable to
+   stable costs that cycle later. `Tier::Tuning` means the name stays but the default port or
+   bind behavior may change in a minor release. This is a new feature being introduced now, and
+   most deployments do not use it yet (unset by default). If it proves stable in practice, a
+   later decision can promote it to stable.
+
+5. **`/healthz` and `/readyz` added as aliases** (ROB-23r). These paths work on both the data
+   listener and the admin listener, so k8s-style probes work unchanged on either port. The
+   registry's single `register_probe_routes` function defines both.
+
+6. **Shares the process shutdown future.** `SIGTERM` drains both listeners, and the admin
+   listener stops accepting probes when the server enters drain, never after the store has
+   closed.
+
 ## 2026-11-04 — Phase 2 integrations: what was built, and the two items left with a reason (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** Phase 2's two remaining roadmap lines chain six items with arrows —

@@ -14,6 +14,10 @@ use weft_server::{
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
 const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
+/// The environment variable naming the probe-only admin listener's address
+/// (ROB-23r). Unset is the default and means no second listener at all.
+pub(crate) const ADMIN_ADDR_ENV: &str = "WEFT_ADMIN_ADDR";
+
 /// The address to bind, from `WEFT_SERVER_ADDR` (e.g. `0.0.0.0:9000`) or
 /// [`DEFAULT_ADDR`].
 ///
@@ -22,6 +26,30 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 /// A value that is not a parseable socket address.
 pub(crate) fn bind_addr() -> anyhow::Result<SocketAddr> {
 	Ok(std::env::var("WEFT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?)
+}
+
+/// The address the probe-only admin listener binds (ROB-23r), from
+/// [`ADMIN_ADDR_ENV`]. Unset — the default, and how every deployment running
+/// today is configured — means there is no second listener and the probes stay
+/// on the ordinary address.
+///
+/// A configured address is put through the same C8 plaintext gate as the data
+/// plane, so a probe listener bound to a routable address still needs
+/// `WEFT_ALLOW_PLAINTEXT` (or `WEFT_AUTH=disabled`) to start without TLS: a
+/// listener that "only" answers `/health` is still a listener on the network.
+///
+/// # Errors
+///
+/// A value that is not a parseable socket address, or a plaintext exposure the
+/// C8 gate refuses.
+pub(crate) fn admin_addr() -> anyhow::Result<Option<SocketAddr>> {
+	let Some(raw) = std::env::var(ADMIN_ADDR_ENV).ok().filter(|value| !value.trim().is_empty()) else {
+		return Ok(None);
+	};
+	let addr: SocketAddr = raw.parse()?;
+	PlaintextGate::from_env().check(addr, None).map_err(anyhow::Error::msg)?;
+	println!("admin listener: probe-only surface (/health, /ready) on http://{addr}");
+	Ok(Some(addr))
 }
 
 /// Read the interpolation settings ([`InterpolateConfig`]) from

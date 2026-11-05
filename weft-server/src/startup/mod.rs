@@ -176,6 +176,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	let addr = config::bind_addr().unwrap_or_else(|error| exit_config(&error));
 	let interpolate = config::interpolate_config().unwrap_or_else(|error| exit_config(&error));
 	let limits = config::serve_limits().unwrap_or_else(|error| exit_config(&error));
+	// ROB-23r: the probe-only admin listener's address, read once like every
+	// other setting. Unset — the default, and every deployment running today —
+	// means there is no second listener and the probes stay on `addr`.
+	let admin_addr = config::admin_addr().unwrap_or_else(|error| exit_config(&error));
 	// D-S14: the ingest wiring's limits, read once like every other
 	// setting, so the registry the state builds carries the operator's
 	// body cap and in-flight budget rather than the defaults.
@@ -225,11 +229,26 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
 	let listener = serve::bind(addr, tls.is_some()).await?;
 	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
+	// ROB-23r: the second listener, after the data plane's bind so a failure to
+	// bind the ordinary address still stops startup first. Its own guard comes
+	// from its own address, and it fails startup just as a bad data-plane bind
+	// does: a supervisor configured to probe a port that never came up would
+	// otherwise be told the process is healthy by nothing at all.
+	let admin = match admin_addr {
+		Some(probe_addr) => Some(serve::AdminListener::bind(state.clone(), probe_addr, limits).await?),
+		None => None,
+	};
 
 	// After the bind and in the background, so serving never waits for it.
 	daemons::spawn_gpu_calibration_if_enabled(&daemons);
 
 	serve::run(listener, state.clone(), otel_provider, limits, tls, &mut shutdown).await?;
+	// The probe listener drains with the data plane rather than after the store:
+	// it answers about this process, so it stops the moment serving does and
+	// never accepts a probe against a store that has begun closing.
+	if let Some(admin) = admin {
+		admin.shutdown().await?;
+	}
 	// Serving is over: raise the registry's shutdown watch so no daemon
 	// outlives the server it maintains, and none restarts from here.
 	daemons.shutdown();
