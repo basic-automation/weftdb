@@ -768,6 +768,7 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
+	use bigdecimal::BigDecimal;
 	use chrono::TimeZone;
 	use tower::ServiceExt;
 
