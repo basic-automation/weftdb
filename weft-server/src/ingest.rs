@@ -871,7 +871,12 @@ fn project_ilp_series(body: &str, measurement: &str, field: &str, precision: Tim
 	let records = weft_line_protocol::parse(body).map_err(|err| error::from_line_protocol_error(&err))?;
 	let mut points = Vec::new();
 	let mut series: Option<(weft_line_protocol::SeriesKey, String)> = None;
-	for record in records.iter().filter(|record| record.measurement == measurement) {
+	for (index, record) in records.iter().enumerate().filter(|(_, record)| record.measurement == measurement) {
+		// ROB-7: `to_point` has no decimal for NaN or infinity and would drop the
+		// record, storing a gap the sender never meant; refuse it instead.
+		if record.field_is_non_finite(field) {
+			return Err(error::non_finite_value(format!("record {} field `{field}`", index + 1)));
+		}
 		let Some(point) = record.to_point(field, precision) else {
 			continue;
 		};
@@ -1970,7 +1975,7 @@ mod tests {
 		// response counted one row fewer than the sender sent and stored a gap.
 		let dir = TempDir::new().unwrap();
 		let router = router_with_declared_temp(&dir).await;
-		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", "weather temp=1 100\nweather temp=NaN 110\n").await;
+		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=s", "weather temp=1 100\nweather temp=NaN 110\n").await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
 		assert_eq!(json["code"], "not_finite", "body: {json}");
 	}
