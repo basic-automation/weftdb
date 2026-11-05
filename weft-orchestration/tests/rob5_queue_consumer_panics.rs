@@ -12,8 +12,7 @@ use serial_test::serial;
 use splimes::{Resolution, Spline};
 use weft_orchestration::{build_patterns_queue, DictionaryConstraints};
 use weftdb::{
-	database::traits::{AspectStructure, DatabaseStructure, Inputs},
-	AspectId, Database, DatasetId, Dictionary, InputMeasurement,
+	database::traits::{AspectStructure, DatabaseStructure, Inputs}, AspectId, Database, DatasetId, Dictionary, InputMeasurement
 };
 
 /// Helper to create a test database with measurements
@@ -36,7 +35,7 @@ async fn test_build_patterns_queue_no_panic_on_empty_batch() -> Result<()> {
 	// Create a batch with no active measurements - this would previously panic at the unwrap
 	// We need to manually insert a processed batch since normal flow would skip empty batches
 	let start_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-	
+
 	// Insert some measurements to make it past the early guards
 	for i in 0..3 {
 		let timestamp = start_time + chrono::Duration::minutes(i);
@@ -54,10 +53,8 @@ async fn test_build_patterns_queue_no_panic_on_empty_batch() -> Result<()> {
 
 	// This should not panic - the is_empty() guard protects the min/max operations
 	// Spawn in a task to catch any panics as JoinError
-	let handle = tokio::spawn(async move {
-		build_patterns_queue(&db, &aspect_id, &mut dictionary).await
-	});
-	
+	let handle = tokio::spawn(async move { build_patterns_queue(&db, &aspect_id, &mut dictionary).await });
+
 	let join_result = handle.await;
 	assert!(join_result.is_ok(), "Task panicked: {:?}", join_result.err());
 	let call_result = join_result.unwrap();
@@ -80,10 +77,8 @@ async fn test_pipeline_dictionary_no_panic() -> Result<()> {
 
 	// This should return None instead of panicking
 	// Spawn in a task to catch any panics as JoinError
-	let handle = tokio::spawn(async move {
-		pipeline.dictionary().is_none()
-	});
-	
+	let handle = tokio::spawn(async move { pipeline.dictionary().is_none() });
+
 	let join_result = handle.await;
 	assert!(join_result.is_ok(), "Task panicked: {:?}", join_result.err());
 	assert!(join_result.unwrap(), "Expected None for empty dictionaries, got Some");
@@ -109,7 +104,7 @@ async fn test_pipeline_dictionary_mut_no_panic() -> Result<()> {
 		let mut pipeline = pipeline;
 		pipeline.dictionary_mut().is_none()
 	});
-	
+
 	let join_result = handle.await;
 	assert!(join_result.is_ok(), "Task panicked: {:?}", join_result.err());
 	assert!(join_result.unwrap(), "Expected None for empty dictionaries, got Some");
@@ -144,10 +139,8 @@ async fn test_patterns_queue_with_valid_measurements() -> Result<()> {
 
 	// Build patterns - should not panic
 	// Spawn in a task to catch any panics as JoinError
-	let handle = tokio::spawn(async move {
-		build_patterns_queue(&db, &aspect_id, &mut dictionary).await
-	});
-	
+	let handle = tokio::spawn(async move { build_patterns_queue(&db, &aspect_id, &mut dictionary).await });
+
 	let join_result = handle.await;
 	assert!(join_result.is_ok(), "Task panicked: {:?}", join_result.err());
 	let call_result = join_result.unwrap();

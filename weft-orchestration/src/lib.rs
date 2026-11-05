@@ -814,18 +814,8 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 			}
 
 			// Get min/max timestamps from active measurements
-			let beginning = active_measurements
-				.iter()
-				.map(|m| m.get_measurement_timestamp())
-				.min()
-				.copied()
-				.ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no minimum timestamp", batch.batch_id()))?;
-			let end = active_measurements
-				.iter()
-				.map(|m| m.get_measurement_timestamp())
-				.max()
-				.copied()
-				.ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no maximum timestamp", batch.batch_id()))?;
+			let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().copied().ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no minimum timestamp", batch.batch_id()))?;
+			let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().copied().ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no maximum timestamp", batch.batch_id()))?;
 
 			// Create an occurrence for this pattern
 			let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
@@ -1937,13 +1927,13 @@ mod tests {
 
 		#[rustfmt::skip]
                 let mut dictionary = Dictionary::new(
-                        "TestDictionary".to_string(), 
-                        "A dictionary for testing purposes".to_string(), 
-                        DictionaryConstraints::new( 
-                                Some(Steps::new( 
+                        "TestDictionary".to_string(),
+                        "A dictionary for testing purposes".to_string(),
+                        DictionaryConstraints::new(
+                                Some(Steps::new(
                                         10,
-                                        Spline::Linear 
-                                )), 
+                                        Spline::Linear
+                                )),
                                 Some(vec![
                                         VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.000_000_001).unwrap())),
                                 ]) ));
