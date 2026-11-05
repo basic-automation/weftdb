@@ -402,6 +402,14 @@ pub struct SegmentStoreOptions {
 	pub max_series_per_aspect: usize,
 }
 
+/// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
+/// whole number, or [`DEFAULT_MAX_SERIES_PER_ASPECT`] when it is unset or anything
+/// else (the server's strict configuration check refuses a malformed value at
+/// startup, so this leniency only reaches library embedders).
+fn max_series_per_aspect_from(value: Option<&str>) -> usize {
+	value.and_then(|v| v.trim().parse::<usize>().ok()).filter(|limit| *limit > 0).unwrap_or(DEFAULT_MAX_SERIES_PER_ASPECT)
+}
+
 /// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
 /// 100,000 series.
 pub const DEFAULT_MAX_SERIES_PER_ASPECT: usize = 100_000;
@@ -414,12 +422,14 @@ impl Default for SegmentStoreOptions {
 
 impl SegmentStoreOptions {
 	/// The options the environment describes: [`CheckpointPolicy::from_env`],
-	/// [`PartialSidecarPolicy::from_env`], [`TransposedPolicy::from_env`] and
-	/// [`MaintenanceBreaker::from_env`], each as lenient as it documents.
-	/// Explicit: nothing in the library calls it.
+	/// [`PartialSidecarPolicy::from_env`], [`TransposedPolicy::from_env`],
+	/// [`MaintenanceBreaker::from_env`] and `WEFT_MAX_SERIES_PER_ASPECT`
+	/// ([`max_series_per_aspect`](Self::max_series_per_aspect); absent or not a
+	/// positive whole number → [`DEFAULT_MAX_SERIES_PER_ASPECT`]), each as lenient
+	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()) }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -2838,6 +2848,17 @@ mod tests {
 	use weft_physical_type::{timestamp::TimeUnit, PhysicalType, PAGED_SEGMENT_FORMAT_VERSION};
 
 	use super::*;
+
+	/// `WEFT_MAX_SERIES_PER_ASPECT` (TAG-11): a positive whole number sets the cap;
+	/// unset, zero, or anything else keeps the default.
+	#[test]
+	fn max_series_per_aspect_reads_a_positive_whole_number() {
+		assert_eq!(max_series_per_aspect_from(Some("7")), 7);
+		assert_eq!(max_series_per_aspect_from(Some(" 12 ")), 12);
+		for other in [None, Some(""), Some("0"), Some("-1"), Some("many")] {
+			assert_eq!(max_series_per_aspect_from(other), DEFAULT_MAX_SERIES_PER_ASPECT, "{other:?}");
+		}
+	}
 	use crate::{types::index_txn::TxnPoints, STORE_FORMAT_FILE};
 
 	fn bd(s: &str) -> BigDecimal {
@@ -6671,11 +6692,11 @@ mod tests {
 		assert_eq!(schemas[1], schemas[0], "the second open changes nothing the first did not");
 		assert_eq!(schemas[2], schemas[0], "nor does the third");
 
-		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false };
+		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false };
 		let settled = OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: false };
 		assert_eq!(reports, vec![migrated, settled.clone(), settled], "the first open migrates from layout 1 through the registry, and the later ones find nothing pending");
 		let (format, uuid) = formats[0].clone();
-		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0006_tag5_series".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
+		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0007_series_time_index".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
 		assert!(formats.iter().all(|seen| seen == &formats[0]), "the marker and the store's identity stay put: {formats:?}");
 		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads the marker"), Some(format));
 
@@ -6691,13 +6712,13 @@ mod tests {
 			assert!(row.contains("/var/tmp/weft-pre-v2-fixture/root/segments/"), "the stored path is left as the pre-v2 build wrote it: {row}");
 			assert!(row.ends_with(" Integer(0) Null Null Null Integer(0)"), "a legacy row is generation 0 and series 0, with no prec, frame_crc or commit_epoch: {row}");
 		}
-		for (key, value) in [("applied_through", "0006_tag5_series"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
+		for (key, value) in [("applied_through", "0007_series_time_index"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
 			assert!(schema.contains(&format!("meta Text(\"{key}\") Text(\"{value}\")\n")), "store_meta mirrors the marker's {key}:\n{schema}");
 		}
 		assert!(uuid::Uuid::parse_str(&uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
 		let migrations: Vec<&str> = schema.lines().filter_map(|line| line.strip_prefix("migration ")).collect();
-		assert_eq!(migrations.len(), 6, "{schema}");
-		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) ") && migrations[5].starts_with("Text(\"0006_tag5_series\") Integer(2) "), "{migrations:?}");
+		assert_eq!(migrations.len(), 7, "{schema}");
+		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) ") && migrations[5].starts_with("Text(\"0006_tag5_series\") Integer(2) ") && migrations[6].starts_with("Text(\"0007_series_time_index\") Integer(2) "), "{migrations:?}");
 	}
 
 	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
@@ -6771,9 +6792,9 @@ mod tests {
 		let (last, databases) = &markers[1];
 		assert_eq!(databases, &CONTROL_PLANE_FILES.to_vec(), "the final marker follows the databases");
 		assert_eq!(last, &format);
-		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0006_tag5_series".into()), ..first.clone() }, "the final marker is the first, settled");
+		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0007_series_time_index".into()), ..first.clone() }, "the final marker is the first, settled");
 		assert_eq!((format.store_uuid.as_str(), &format.scope), (uuid.as_str(), &StoreScope { database: "market".into(), subject: "BTCUSD".into() }));
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
 		let reopened = SegmentStore::open_scoped(&root, "market", "BTCUSD").await.expect("reopens");
 		let again = (reopened.open_report().created_new, reopened.store_uuid().to_string());
 		drop(reopened);
@@ -6835,7 +6856,7 @@ mod tests {
 		let applied = store.open_report().applied.clone();
 		let reads = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
-		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series"]);
+		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
 		assert!(before.contains("store_migrations") && before.contains("0002_s6_s7"), "{before}");
 		assert_eq!(after, before, "a second run of every migration changed nothing");
 		assert!(applied.is_empty(), "nothing is pending: {applied:?}");
@@ -7014,7 +7035,7 @@ mod tests {
 				let settled = store.store_format();
 				let reads = if legacy { Some(fixture_reads(&store).await) } else { None };
 				drop(store);
-				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0006_tag5_series")), "{}", image.display());
+				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0007_series_time_index")), "{}", image.display());
 				if let Some(reads) = reads {
 					assert_eq!(reads, expected_reads, "{}: the image reads what the fixture holds", image.display());
 				}
@@ -7166,7 +7187,7 @@ mod tests {
 		let uuid = store.store_uuid().to_string();
 		drop(store);
 		std::fs::remove_file(root.join(STORE_FORMAT_FILE)).expect("removes the marker");
-		on_raw_index(&root, &["DROP TABLE store_migrations", "DELETE FROM store_meta WHERE key <> 'store_uuid'", "INSERT INTO store_meta (key, value) VALUES ('layout_version', '2')", "ALTER TABLE segment_index DROP COLUMN series_id", "ALTER TABLE aspect_seq DROP COLUMN next_series_id"]).await;
+		on_raw_index(&root, &["DROP TABLE store_migrations", "DELETE FROM store_meta WHERE key <> 'store_uuid'", "INSERT INTO store_meta (key, value) VALUES ('layout_version', '2')", "DROP INDEX idx_segment_index_series_time", "ALTER TABLE segment_index DROP COLUMN series_id", "ALTER TABLE aspect_seq DROP COLUMN next_series_id"]).await;
 		let (tables, index_columns, seq_columns) = (index_tables(&root).await, index_columns(&root, "segment_index").await, index_columns(&root, "aspect_seq").await);
 		assert!(!tables.contains(&"store_migrations".to_string()) && index_columns.contains(&"gen".to_string()) && !index_columns.contains(&"series_id".to_string()) && !seq_columns.contains(&"next_series_id".to_string()), "the S6/S7 shape: {tables:?} {index_columns:?} {seq_columns:?}");
 
@@ -7176,7 +7197,7 @@ mod tests {
 		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
 		let schema = index_schema(&root).await;
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
 		assert_eq!(kept, uuid, "the S6 store_uuid is kept");
 		assert!(schema.contains("| Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains series_id (NOT NULL DEFAULT 0):\n{schema}");
 		assert!(schema.contains("| Text(\"next_series_id\") Text(\"INTEGER\") Integer(1) Text(\"1\") Integer(0)\n"), "aspect_seq gains next_series_id (NOT NULL DEFAULT 1):\n{schema}");
@@ -7186,7 +7207,8 @@ mod tests {
 
 	/// TAG-5: a layout-2 store written before the series catalog (its registry through
 	/// `0005_d_s13`, no `series` table) gains the catalog at its next open with nothing
-	/// else changed: only `0006_tag5_series` applies, the layout and both floors stay 2
+	/// else changed: only `0006_tag5_series` (and `0007_series_time_index` after it, whose
+	/// index the pre-TAG-5 shape lacks too) applies, the layout and both floors stay 2
 	/// (so it is not reported as migrated from an older layout), the store keeps its
 	/// identity, and its rows and reads are what they were.
 	#[tokio::test]
@@ -7198,7 +7220,7 @@ mod tests {
 		let (format, before) = (store.store_format(), store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads"));
 		drop(store);
 		put_marker(&root, &StoreFormat { applied_through: Some("0005_d_s13".into()), ..format.clone() });
-		on_raw_index(&root, &["DROP TABLE series", "DELETE FROM store_migrations WHERE id = '0006_tag5_series'", "UPDATE store_meta SET value = '0005_d_s13' WHERE key = 'applied_through'"]).await;
+		on_raw_index(&root, &["DROP TABLE series", "DROP INDEX idx_segment_index_series_time", "DELETE FROM store_migrations WHERE id IN ('0006_tag5_series', '0007_series_time_index')", "UPDATE store_meta SET value = '0005_d_s13' WHERE key = 'applied_through'"]).await;
 		assert!(!index_tables(&root).await.contains(&"series".to_string()), "the pre-TAG-5 shape");
 		let rows_before: Vec<String> = index_schema(&root).await.lines().filter(|line| line.starts_with("row ")).map(str::to_string).collect();
 
@@ -7207,8 +7229,8 @@ mod tests {
 		let after = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		let catalog = store.index().series_of("price").await.expect("the catalog reads");
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: vec!["0006_tag5_series".into()], recovery_report_only: false });
-		assert_eq!(settled, StoreFormat { applied_through: Some("0006_tag5_series".into()), ..format.clone() }, "layout, floors and identity unchanged");
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: vec!["0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
+		assert_eq!(settled, StoreFormat { applied_through: Some("0007_series_time_index".into()), ..format.clone() }, "layout, floors and identity unchanged");
 		assert_eq!((settled.layout_version, settled.min_read_layout, settled.min_write_layout), (2, 2, 2), "the catalog is a layout-2 migration (DECISIONS: TAG-5)");
 		assert_eq!(uuid, format.store_uuid, "the store keeps its identity");
 		assert_eq!(after, before, "reads are unchanged");
@@ -7217,7 +7239,7 @@ mod tests {
 		assert!(schema.contains("table series: Text(\"aspect\") Text(\"TEXT\") Integer(1) Null Integer(1) | Text(\"series_key\") Text(\"TEXT\") Integer(1) Null Integer(2) | Text(\"series_id\") Text(\"INTEGER\") Integer(1) Null Integer(0)\n"), "series(aspect, series_key, series_id), keyed on (aspect, series_key):\n{schema}");
 		let rows_after: Vec<String> = schema.lines().filter(|line| line.starts_with("row ")).map(str::to_string).collect();
 		assert_eq!(rows_after, rows_before, "no segment_index row is rewritten");
-		assert!(schema.contains("meta Text(\"applied_through\") Text(\"0006_tag5_series\")\n"), "{schema}");
+		assert!(schema.contains("meta Text(\"applied_through\") Text(\"0007_series_time_index\")\n"), "{schema}");
 	}
 
 	/// TAG-5, R10: the repair pass seeds each aspect's series allocator past the ids its
@@ -7269,7 +7291,7 @@ mod tests {
 		let store = SegmentStore::open(&root).await.expect("finishes the creation");
 		let (report, uuid) = (store.open_report().clone(), store.store_uuid().to_string());
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
 		assert_eq!(uuid, format.store_uuid);
 
 		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
@@ -7280,7 +7302,7 @@ mod tests {
 		let store = SegmentStore::open(&legacy).await.expect("finishes the upgrade");
 		let report = store.open_report().clone();
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
 	}
 
 	/// FRE-12a's `ensure_floor`: raising a floor writes the marker first, fsynced, and

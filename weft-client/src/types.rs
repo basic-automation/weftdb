@@ -565,6 +565,9 @@ pub struct WriteOptions {
 	pub idempotency_key: Option<String>,
 	/// The Line Protocol body's timestamp precision (`write_ilp` only).
 	pub precision: Option<String>,
+	/// The Line Protocol measurement whose records are sealed (`write_ilp` only). The
+	/// server requires it since TAG-11; the records' own tags name the series.
+	pub measurement: Option<String>,
 }
 
 impl WriteOptions {
@@ -584,6 +587,13 @@ impl WriteOptions {
 	#[must_use]
 	pub fn precision(mut self, precision: impl Into<String>) -> Self {
 		self.precision = Some(precision.into());
+		self
+	}
+
+	/// The Line Protocol measurement to seal (`write_ilp` only; required by the server).
+	#[must_use]
+	pub fn measurement(mut self, measurement: impl Into<String>) -> Self {
+		self.measurement = Some(measurement.into());
 		self
 	}
 

@@ -142,6 +142,14 @@ jobs:
       # Linux runners have no GPU. Mesa's lavapipe is a software Vulkan driver, so splimes'
       # wgpu path runs for real under WeftDB's tests. (splimes' own CI requires a GPU
       # adapter; see github.com/basic-automation/splimes.)
+      # The debug build of the whole workspace (Arrow Flight and tonic among it) no
+      # longer fits the hosted Linux runner's free disk; drop preinstalled SDKs we never use.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Install software Vulkan (lavapipe)
         if: runner.os == 'Linux'
         run: |

@@ -59,7 +59,7 @@
 //! ```json
 //! {"v":1,"seq":41,"ts_ms":1762137600000,"kind":"attempt","operation":"storage_aspect_declare","method":"POST","path":"/api/v1/storage/aspects","principal":"operator","role":"admin"}
 //! {"v":1,"seq":42,"ts_ms":1762137600123,"kind":"outcome","audit_id":41,"operation":"storage_aspect_declare","status":201,"result":"ok","duration_ms":7}
-//! {"v":1,"seq":43,"ts_ms":1762137600456,"kind":"event","event":"ingest","aspect":"price","format":"json","rows":120,"segments":1,"commit_epoch":9,"keyed":true}
+//! {"v":1,"seq":43,"ts_ms":1762137600456,"kind":"event","event":"ingest","aspect":"price","format":"json","rows":120,"segments":1,"commit_epoch":9,"series_id":0,"keyed":true}
 //! ```
 //!
 //! - `seq` is a per-file monotonic counter. Opening an existing file

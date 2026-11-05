@@ -104,8 +104,43 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `SeriesSelector` into the one series it names, or refuses with the typed
   `StoreError::AmbiguousSeries` (`400 ambiguous_series`) when it matches several. HTTP
   ingest still refuses tags until TAG-11.
+- **Stored reads take a series selector (TAG-10).** Every storage data read (`range`,
+  `points`, `value-range`, `value-points`, `at`, `at-multi`, `downsample`; 18 routes over
+  their formats and verbs) accepts `tag.<key>=<value>` query parameters, matched exactly
+  by default and loosely with `tag_match=subset`; `tag.<key>=` requires the tag to be
+  absent. No `tag.*` parameter reads the untagged series as before. No match reads empty,
+  two or more matches are `400 ambiguous_series`, and a bad, repeated or reserved key or
+  more than 16 matchers is `400 invalid_tag`. The JSON read bodies gain a `tags` field; untagged `points`, `value-points`, `at`, `at-multi` and stored `downsample` responses now include `"tags":{}` too, so their bodies are not byte-identical to before (an additive field).
+  `SegmentStore::series_tags` reads one series' tags.
+- **Tagged ingest over HTTP (TAG-11).** Each ingest request writes one series. The JSON
+  body takes `"tags": {"host": "a"}`, CSV and Parquet take `tag.<key>=<value>` query
+  parameters, and an ILP payload's own tags name the series. A repeated key (in a JSON
+  object or the query), a reserved `__` key, an empty value or anything else outside the
+  tag grammar is `400 invalid_tag`; a new series beyond the per-aspect cap is
+  `400 series_limit`. Every ingest response gains `series_id` (`0` for the untagged series)
+  and `tags` (`{}` untagged), and the `ingest` audit event gains `series_id`.
+- **Tag pruning (Phase 4).** Migration `0007_series_time_index` adds
+  `idx_segment_index_series_time` on `segment_index(aspect, series_id, min_ts, max_ts)`
+  (layout 2, best effort: a store that cannot build it still opens and its series reads use
+  the time index). A read of one tagged series seeks that index, bounds its seek by that
+  series' own widest segment rather than the whole aspect's, and resolves its selector from
+  an in-memory copy of the aspect's series catalog, so it opens only its own series'
+  segments however many series share the window. `SeriesSelector::matches_key` tests a
+  canonical `SeriesKey` without building a `TagSet`.
+- **`WEFT_MAX_SERIES_PER_ASPECT`** (Tuning): the most tagged series one aspect may register,
+  default 100,000; a malformed value stops the server from starting.
 
 ### Changed
+
+- **Breaking (HTTP): the storage ILP ingest requires `measurement=` (TAG-11).**
+  `POST /api/v1/storage/{aspect}/ilp` now seals only the records of the named measurement,
+  and a request without the parameter is `400 bad_request`. This fixes a silent tag drop:
+  before, a tagged single-series payload was checked for one tag set and then written to the
+  untagged series, its tags discarded. Now those tags name the series the rows land in, and
+  two tag sets in one request are still `400 ambiguous_series`. The Rust SDK's `write_ilp`
+  sends it from the new `WriteOptions::measurement`; the Python client's `write_ilp` does
+  not yet (design PR 7b). The compute routes
+  (`/api/v1/{interpolate,downsample}/ilp`) are unchanged.
 
 - **Reads without a series mean the untagged series (TAG-8).** The existing read methods
   answer series 0 only. A store with no tagged writes answers exactly as before; on an aspect
