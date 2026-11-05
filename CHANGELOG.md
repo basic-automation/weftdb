@@ -10,6 +10,35 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **GPU configuration, compute limits, interpolation provenance and metrics** (ROB-16).
+  `WEFT_GPU_BACKEND` (`auto` / `cpu` / `parallel` / `gpu`) pins the compute backend the
+  interpolation endpoints run on, beside the existing startup calibration; the configured
+  `WEFT_MAX_INTERPOLATE_POINTS` cap now also bounds the downsample gap-fill grids, which
+  previously used the 10,000,000 default constant regardless of the setting. Interpolate
+  responses carry each point's provenance in the open `ValueKind` vocabulary (the wire
+  tokens `raw` / `interpolated` / `extrapolated` are unchanged) and name the backend that
+  actually produced the values (`backend`, plus `gpu_fallback` when `auto` tried the GPU
+  and fell back); `/metrics` gains per-kind output-point counters, per-backend request
+  counters and a GPU-fallback counter, also present in `/debug/profile/current`.
+
+- **Probe-only admin listener** (ROB-23r). With `WEFT_ADMIN_ADDR` set to a loopback address
+  (e.g. `127.0.0.1:9095`), `weft-server` binds a second listener serving only `/health`,
+  `/ready`, `/healthz` and `/readyz` — with no auth, no host guard, and no other route. An
+  HTTP/1.0 probe with no `Host` header passes (the bind itself is the protection), and
+  supervisors (systemd, Docker `HEALTHCHECK`, k8s) need not expose or route to the data
+  listener. Unset (the default) means no second listener.
+- **Upsert keys** (Phase 4.6). `POST /api/v1/storage/aspects` takes an optional
+  `upsert_keys` list, `"timestamp"` plus tag keys (`SegmentStore::declare_with_upsert_keys`
+  in the library). Every ingested row's tags must then fall inside those keys: a tag outside
+  them is `400 invalid_tag` (`details.reason` `not an upsert key`). The keys are immutable and
+  part of the declaration, so other keys (or none) on a re-declare is `409 schema_conflict`,
+  and the declare response and the schema endpoint echo them. Store migration
+  `0008_upsert_keys` (layout 2) adds the nullable column they live in; an older layout-2
+  build opens the store and ignores the declaration.
+- **Skip-identical overlap merge** (Phase 4.6). When an overlap group's newer-wins fold is
+  exactly its oldest member's own rows (a replayed batch), the merge writes no new frame:
+  it keeps that member and deletes the rest. Values are compared with their scale, so a
+  replay of `5` as `5.0` is still rewritten.
 - **R client** (`clients/r`, package `weftdb`): stored windows, value bands and server-side
   downsamples as Arrow tables, exact JSON rows paged by cursor, interpolation, and ingest of a
   data frame or Arrow table as one Parquet batch with `Idempotency-Key`. Refusals are
@@ -49,6 +78,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   directory and serves one byte for byte by its run id, the SHA-256 of the manifest file;
   `weft-bench` prints the id beside the manifest path. An unknown id is the new
   `404 run_not_found`.
+
+- **Ingest ceilings (ROB-7).** Two more numbers bound what one ingest body can
+  become, in all four formats: `WEFT_MAX_INGEST_ROWS` (default 10,000,000 rows,
+  refused `413 too_many_rows`) and `WEFT_MAX_INGEST_DECODED_BYTES` (default
+  1 GiB, refused `413 payload_too_large`). Both are measured on the columns the
+  format's parser produced rather than on the bytes that arrived — a body cap
+  cannot bound what a compressed Parquet file expands to, and a row count cannot
+  bound what those rows weigh once the decimals are wide. The byte ceiling counts
+  a 16-byte slot per timestamp and per value, plus the mantissa bytes the
+  non-null decimals actually need.
 - **RPO/RTO (EVI-19).** New [`docs/RPO-RTO.md`](docs/RPO-RTO.md) pins the
   recovery-point and recovery-time objectives against the snapshot cadence: the
   corrected formula `RPO = max(I, d_max) + d_max`, the backup settings that set
@@ -71,6 +110,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   scope the store records, and the whole exit-status table — from process state alone, so it
   answers while a store is being refused. It takes a key where keys are mounted: `/health` and
   `/ready` stay the anonymous surface.
+- **Read ceilings (ROB-12, decision 12).** `weft-server` refuses a read whose
+  result shape is too big instead of attempting it: a page over
+  `WEFT_MAX_PAGE_ROWS` (100,000 rows), a window over `WEFT_MAX_READ_ROWS`
+  (5,000,000 rows), a downsample grid over `WEFT_MAX_DOWNSAMPLE_BUCKETS`
+  (1,000,000 buckets) and an `at-multi` batch over `WEFT_MAX_AT_MULTI_INSTANTS`
+  (10,000 instants) are each a `422 result_too_large` carrying the limit it hit,
+  and a read still running when `WEFT_READ_TIMEOUT_SECS` (30) expires is a
+  `504 query_timeout`. The page ceiling is enforced before the store is opened;
+  the row ceiling bounds the window rather than the page, because the store
+  materializes the rows a read names; the bucket ceiling is counted from the
+  request's own bounds when it names both and from the grid produced otherwise.
+  `/ready` and `/health` are never bounded by the read deadline.
 
 - **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
   (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
@@ -104,8 +155,85 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `SeriesSelector` into the one series it names, or refuses with the typed
   `StoreError::AmbiguousSeries` (`400 ambiguous_series`) when it matches several. HTTP
   ingest still refuses tags until TAG-11.
+- **Stored reads take a series selector (TAG-10).** Every storage data read (`range`,
+  `points`, `value-range`, `value-points`, `at`, `at-multi`, `downsample`; 18 routes over
+  their formats and verbs) accepts `tag.<key>=<value>` query parameters, matched exactly
+  by default and loosely with `tag_match=subset`; `tag.<key>=` requires the tag to be
+  absent. No `tag.*` parameter reads the untagged series as before. No match reads empty,
+  two or more matches are `400 ambiguous_series`, and a bad, repeated or reserved key or
+  more than 16 matchers is `400 invalid_tag`. The JSON read bodies gain a `tags` field; untagged `points`, `value-points`, `at`, `at-multi` and stored `downsample` responses now include `"tags":{}` too, so their bodies are not byte-identical to before (an additive field).
+  `SegmentStore::series_tags` reads one series' tags.
+- **Tagged ingest over HTTP (TAG-11).** Each ingest request writes one series. The JSON
+  body takes `"tags": {"host": "a"}`, CSV and Parquet take `tag.<key>=<value>` query
+  parameters, and an ILP payload's own tags name the series. A repeated key (in a JSON
+  object or the query), a reserved `__` key, an empty value or anything else outside the
+  tag grammar is `400 invalid_tag`; a new series beyond the per-aspect cap is
+  `400 series_limit`. Every ingest response gains `series_id` (`0` for the untagged series)
+  and `tags` (`{}` untagged), and the `ingest` audit event gains `series_id`.
+- **Tag pruning (Phase 4).** Migration `0007_series_time_index` adds
+  `idx_segment_index_series_time` on `segment_index(aspect, series_id, min_ts, max_ts)`
+  (layout 2, best effort: a store that cannot build it still opens and its series reads use
+  the time index). A read of one tagged series seeks that index, bounds its seek by that
+  series' own widest segment rather than the whole aspect's, and resolves its selector from
+  an in-memory copy of the aspect's series catalog, so it opens only its own series'
+  segments however many series share the window. `SeriesSelector::matches_key` tests a
+  canonical `SeriesKey` without building a `TagSet`.
+- **`WEFT_MAX_SERIES_PER_ASPECT`** (Tuning): the most tagged series one aspect may register,
+  default 100,000; a malformed value stops the server from starting.
+- **Store read bounds (ROB-13).** The stored downsample and the batch point lookup are
+  bounded in `SegmentStore` itself, at 1.0 decision 12's numbers:
+  `SegmentStoreOptions::max_downsample_buckets` (`DEFAULT_MAX_DOWNSAMPLE_BUCKETS`,
+  1,000,000) and `max_point_batch` (`DEFAULT_MAX_POINT_BATCH`, 10,000 instants). A
+  downsample whose fold reaches one bucket more is refused with the typed
+  `StoreError::DownsampleTooLarge` while it runs (for a `BucketWidth` the bound is the
+  returned, coarsened grid); a wider point batch is refused with
+  `StoreError::PointBatchTooLarge` before the index is pruned. Over HTTP both are
+  `422 result_too_large` carrying the cap. The single point lookup names one instant
+  and needs no cap. The HTTP read ceilings themselves are ROB-12's.
+
+- **Stored-range interpolation route** (Phase 5): `GET /api/v1/storage/{aspect}/interpolate`
+  and its `.csv`, `.arrow` and `.parquet` forms interpolate a stored window server side. The grid
+  is capped by `WEFT_MAX_INTERPOLATE_POINTS` and the knots by `MAX_KNOTS` (`422
+  result_too_large`); the route takes the `read` scope and query admission like the other
+  storage reads. JSON and CSV stream their body in chunks as the points are computed; Arrow and
+  Parquet are buffered. This ships before 1.0 by an owner amendment to decision 18 (DECISIONS.md).
+- **GPU adapter selection and multi-device mode** (experimental, Phase 5.7): `WEFT_GPU_ADAPTER`
+  picks the one adapter splimes opens (index, `api:<api>` or a name match) and
+  `WEFT_GPU_DEVICES` (`one`, `all` or a list) spreads interpolation over several. `/metrics`
+  reports each open device (`weft_gpu_device_info`, `weft_gpu_device_calls_total`,
+  `weft_gpu_device_chunks_total`, `weft_gpu_device_in_flight`, `weft_gpu_device_lost`,
+  `weft_gpu_device_pool_idle_bytes`). Unset keeps the single-device default; several devices
+  measured slower than one in splimes, so it is opt-in.
+- **Memory-mapped range reads** (experimental, Phase 5): with the `mmap-reads` cargo feature,
+  `WEFT_SEGMENT_MMAP_READS=on` (`SegmentStoreOptions::mmap_reads` in the library) maps sealed
+  `.weftseg` frames instead of copying each into a heap buffer. A frame truncated by another
+  process while mapped can stop the server with `SIGBUS`, which is why it is off by default.
+- **Phase 5 benchmarks**: `weft-bench --gpu-economics` (report schema v29), a device-memory
+  soak in `weft-bench --gpu-memory` (`gpu_pool.device_memory`, schema v30), the end-to-end
+  interpolation benchmark `weft-e2e-interp` (schema v31) and the GPU conformance matrix
+  `weft-gpu-conformance` with tolerances published in `docs/gpu-conformance.md`. Their
+  results are not recorded yet.
 
 ### Changed
+
+- **splimes 1.3** (Phase 5): WeftDB depends on `splimes = "1.3"` (was 1.0; `pollster` moves to
+  1.0.1 with it). Stored interpolation now feeds splimes epoch ticks (`run_epoch`,
+  `stream_epoch`) instead of building a `DateTime` per knot.
+- **`POST /api/v1/interpolate` range outputs compute in `f64`** (splimes `run_f64`) instead of
+  a `BigDecimal` per output point; `/interpolate/point` is unchanged. Results are bit-identical
+  below 2^53; above it the kernel's value replaces a narrowing that could be 1 ulp off.
+- **The compute endpoints widen JSON `f64` through the shortest round-trip decimal** instead of
+  `BigDecimal::from_f64`, so an input of `99.92` is computed as `99.92`, not its binary
+  expansion. Non-finite inputs are still rejected.
+- **Breaking (HTTP): the storage ILP ingest requires `measurement=` (TAG-11).**
+  `POST /api/v1/storage/{aspect}/ilp` now seals only the records of the named measurement,
+  and a request without the parameter is `400 bad_request`. This fixes a silent tag drop:
+  before, a tagged single-series payload was checked for one tag set and then written to the
+  untagged series, its tags discarded. Now those tags name the series the rows land in, and
+  two tag sets in one request are still `400 ambiguous_series`. The Rust SDK's `write_ilp`
+  sends it from the new `WriteOptions::measurement`; the Python client's `write_ilp` does
+  not yet (design PR 7b). The compute routes
+  (`/api/v1/{interpolate,downsample}/ilp`) are unchanged.
 
 - **Reads without a series mean the untagged series (TAG-8).** The existing read methods
   answer series 0 only. A store with no tagged writes answers exactly as before; on an aspect
@@ -122,6 +250,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   aspect's catalog; read the id from `IngestReceipt::series_ids` instead. The method shipped
   in `weftdb` 0.2.0 on crates.io, so this is a breaking change, allowed in the next minor
   release by the pre-1.0 policy above.
+- **Seal-backed legacy aspects feed a change log, not the per-timestamp queue (S20).**
+  Each seal-store commit records one `segment_changes` row (epoch, time span, row count)
+  in its own index transaction, and the batch consumer rebuilds the windows a change's
+  span touches and acknowledges the row by epoch. Seal-backed ingest no longer writes
+  `unbatched_measurements` entries; rows-mode aspects keep the queue unchanged. This
+  closes the S20 half of the 0.2.0 "crash consistency is not finished" limitation.
 - The `503 unconfigured` sentence no longer names the segment store, since the bench-run
   routes answer it too: it reads "a subsystem this route needs is not configured on this
   server", and `details.subsystem` / `details.enabled_by` say which one and the variable that
@@ -133,6 +267,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   65,536-row segments an hour reads in 0.25 ms (0.18 ms before the squash, 0.50 ms with
   single-block output) and the year window in 11.3 ms (13.8 ms before). The squashed store is
   1.357 B/pt rather than 1.341, still below the 1.414 of the 1,024-row seals it replaced.
+- A stored read that names no page size is a paged read (ROB-12). It returns this
+  server's default page of 10,000 rows — or `WEFT_MAX_PAGE_ROWS`, when an operator
+  set it lower — plus `next_cursor`, instead of every row in the window. A client
+  that wanted the whole window already had to page through it; a client that named
+  nothing asked for unbounded work. `limit` in the response now reports the page
+  actually served.
+
 - `weft-server` builds its tokio runtime explicitly (ROB-11, Admission II's runtime-builder
   side): workers are named `weft-worker`, the new `WEFT_WORKER_THREADS` setting sizes the
   pool (unset keeps one worker per available core), and the runtime is shut down with plan
@@ -162,6 +303,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   the other aspect's series id. Untagged frames and reads are unchanged; a restore's adopted
   orphans now take ids from the commit allocator (which may skip past legacy ids) and their
   aspect's rollup is rebuilt in the same pass.
+- **A `NaN` or infinity in an ingest body is refused, not stored as a hole or a
+  skipped row (ROB-7).** A Parquet body's `Float64`/`Float32` column turned
+  `NaN`/`±Infinity` into nulls on the way through the Arrow converter (a decimal
+  has no representation for them, and `None` was the path of least resistance),
+  and an ILP line carrying `temp=NaN` was dropped by the projection that could
+  not convert it — while the response still answered `rows: 1`, so the sender
+  believed the line had been written. All four formats now answer `400 not_finite`
+  naming the row (and, for Parquet, the column); JSON and CSV answer it for the
+  text spellings (`NaN`, `inf`, `+Infinity`) that a float parser accepts, and an
+  empty CSV cell stays a null, which is what an absent measurement means. The
+  read side already refused the same values with this code, so it was only ever
+  the write side that was lenient.
 - Squashing an aspect deleted its merged segments' index rows one statement at a time, and
   under Turso's MVCC each delete cost milliseconds and grew with the swaps before it. One
   guarded statement now deletes a group's rows: squashing 10M UCI rows from 9,769 to 153

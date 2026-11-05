@@ -89,6 +89,7 @@ async fn untagged_ingest_bytes_are_unchanged() {
 	let (ts, vs): (Vec<i64>, Vec<Option<BigDecimal>>) = rows_in.iter().map(|(t, v)| (*t, Some(bd(v)))).unzip();
 	let segment = schema().seal_nullable(&ts, &vs).expect("encodes");
 	let expected = segment.write_to_with(&store.frame_options(segment.row_count(), segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
+	drop(store);
 	assert_eq!(bytes, expected, "the untagged frame is the plain encoding of its rows");
 	assert_eq!(describe_frame(&bytes).expect("a frame").version, FRAME_SINGLE_BLOCK, "no envelope");
 	assert_eq!(crc32(&bytes), 0x2144_df1c, "the untagged frame's bytes are pinned to what origin/main sealed before TAG-7");
@@ -220,6 +221,7 @@ async fn series_limit_refuses_the_next_new_key_and_keeps_existing_ones_writable(
 	// The commit's own check refuses too, for a new key that got past the early one.
 	let mut ops = Vec::new();
 	let err = store.commit_series_id(ASPECT, &tags("c"), &mut ops).await.expect_err("the commit-time check");
+	drop(store);
 	assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::SeriesLimit { limit: 2, .. })), "{err:#}");
 	assert!(ops.is_empty(), "nothing to register");
 }
@@ -274,6 +276,7 @@ async fn a_tagged_compaction_output_keeps_its_series_key() {
 	assert_eq!(split.iter().map(|row| row.desc.id).collect::<Vec<_>>(), vec![id, fresh]);
 	split.iter().for_each(check);
 	let (ts, vs) = store.read_time_range_of(ASPECT, SeriesId(split[0].series_id), i64::MIN, i64::MAX).await.expect("reads");
+	drop(store);
 	assert_eq!(ts, vec![0, 10, 20, 30, 40]);
 	assert_eq!(vs, ["1", "20", "3", "4", "5"].iter().map(|v| Some(bd(v))).collect::<Vec<_>>(), "the newer value wins at 10");
 }
@@ -293,6 +296,7 @@ async fn tag_seal_crash_child() {
 	crate::types::durable::fault::suppress_core_dump();
 	let store = store_at(Path::new(&root), SegmentStoreOptions::default()).await;
 	let result = ingest_tagged(&store, &batch("k", tags("a"), &[(0, "1"), (10, "2")])).await;
+	drop(store);
 	panic!("the tagged ingest was to abort at S-dir-synced, and returned {result:?}");
 }
 
@@ -323,4 +327,5 @@ async fn a_power_cut_between_tagged_frames_leaves_no_catalog_row_without_rows() 
 	assert_eq!(retried.series_ids, vec![1]);
 	assert_eq!(rows(&store).await.iter().map(|row| row.series_id).collect::<Vec<_>>(), vec![1]);
 	assert_eq!(store.index.series_of(ASPECT).await.expect("reads"), vec![(SeriesId(1), tags("a").series_key().clone())]);
+	drop(store);
 }

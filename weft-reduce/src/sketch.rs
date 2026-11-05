@@ -73,8 +73,7 @@ fn scaled_to_f64(mantissa: i64, scale: i64) -> Option<f64> {
 		return None;
 	}
 	let power = EXACT_POWERS_OF_TEN.get(usize::try_from(scale).ok()?)?;
-	#[allow(clippy::cast_precision_loss)]
-	let m = mantissa as f64;
+	let m = mantissa.to_f64()?;
 	Some(m / power)
 }
 
@@ -282,12 +281,9 @@ impl DdSketch {
 	/// The bucket index for a strictly-positive `v`: `⌈log_γ v⌉`.
 	fn index(&self, v: f64) -> Result<i32, SketchError> {
 		let raw = (v.ln() / self.log_gamma).ceil();
-		if !raw.is_finite() || raw < f64::from(i32::MIN) || raw > f64::from(i32::MAX) {
-			return Err(SketchError::ValueRange);
-		}
-		// `raw` is finite and inside i32's range, so the cast is exact.
-		#[allow(clippy::cast_possible_truncation)]
-		Ok(raw as i32)
+		// `to_i32` is `None` for NaN, infinities and anything outside i32's range; `raw` is
+		// already integral (`ceil`), so the conversion is exact otherwise.
+		raw.to_i32().ok_or(SketchError::ValueRange)
 	}
 
 	/// [`index`](Self::index) for a positive `v`, through the [`BinCache`] when `v` is safely
@@ -410,8 +406,7 @@ impl DdSketch {
 		// matter (q is a fixed 0.5/0.9/0.95/0.99 here). Values sort negative (descending
 		// |v|) → zeros → positive, so accumulate in that order and take the bucket whose
 		// cumulative count first reaches the ordinal.
-		#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-		let ordinal = ((q * (self.count as f64)).ceil() as u64).clamp(1, self.count);
+		let ordinal = (q * self.count.to_f64().unwrap_or(f64::MAX)).ceil().to_u64().unwrap_or(0).clamp(1, self.count);
 		let mut seen: u64 = 0;
 		// Negatives, most-negative first: that is descending bucket index of |v|.
 		for (&i, &c) in self.negative.iter().rev() {
@@ -503,9 +498,8 @@ mod tests {
 				values.push(boundary * (1.0 + rel));
 			}
 		}
-		#[allow(clippy::cast_precision_loss)]
 		let walk = (0..20_000).scan(100.0_f64, |price, _| {
-			*price *= ((next() % 2_001) as f64 - 1_000.0).mul_add(1e-6, 1.0);
+			*price *= (f64::from(u16::try_from(next() % 2_001).expect("below 2001")) - 1_000.0).mul_add(1e-6, 1.0);
 			Some(*price)
 		});
 		values.extend(walk);
@@ -563,8 +557,7 @@ mod tests {
 		for &q in &[0.0, 0.01, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0] {
 			// The sketch's rank convention is WeftDB's nearest-rank — 1-based ordinal
 			// ceil(q*n), clamped — the same sample the exact percentiles name.
-			#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-			let ordinal = ((q * (sorted.len() as f64)).ceil() as usize).clamp(1, sorted.len());
+			let ordinal = (q * f64::from(u32::try_from(sorted.len()).expect("small test sample"))).ceil().to_usize().unwrap_or(0).clamp(1, sorted.len());
 			let exact = sorted[ordinal - 1];
 			let got = s.quantile(q).expect("non-empty");
 			let rel = (got - exact).abs() / exact.abs();
@@ -718,8 +711,7 @@ mod tests {
 		// ...and the budget is loose enough that a realistic column never collapses.
 		let exact = (1..=10_000).map(f64::from).collect::<Vec<_>>();
 		let got = s.quantile(0.99).expect("non-empty");
-		#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-		let want = exact[(0.99_f64 * 9_999.0).floor() as usize];
+		let want = exact[(0.99_f64 * 9_999.0).floor().to_usize().expect("a small non-negative index")];
 		assert!((got - want).abs() / want <= 0.01, "no collapse on a realistic range, so p99 keeps alpha");
 	}
 

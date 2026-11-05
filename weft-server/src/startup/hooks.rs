@@ -32,25 +32,22 @@ const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 ///
 /// When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an **OTLP/gRPC exporter** is attached
 /// beside the `fmt` layer (the same shipped spans are exported to a collector like
-/// Jaeger/Tempo/an OTel Collector) and the returned [`SdkTracerProvider`] is handed to
+/// Jaeger/Tempo/an `OTel` Collector) and the returned [`SdkTracerProvider`] is handed to
 /// the caller to hold for the process lifetime and shut down on exit. When it is unset
 /// there is no exporter and no network dependency — tracing stays on the `fmt` path.
 ///
 /// `try_init` is a no-op when a subscriber is already installed, so this never panics.
-pub(crate) fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+pub fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
 	use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _, Layer as _};
 
 	let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 	let fmt_layer = tracing_subscriber::fmt::layer().with_target(false).with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
 
-	let (otel_layer, provider) = match build_otlp_provider() {
-		Some(provider) => {
-			use opentelemetry::trace::TracerProvider as _;
-			let tracer = provider.tracer(SERVICE);
-			(Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed()), Some(provider))
-		}
-		None => (None, None),
-	};
+	let (otel_layer, provider) = build_otlp_provider().map_or((None, None), |provider| {
+		use opentelemetry::trace::TracerProvider as _;
+		let tracer = provider.tracer(SERVICE);
+		(Some(tracing_opentelemetry::layer().with_tracer(tracer).boxed()), Some(provider))
+	});
 
 	let _ = tracing_subscriber::registry().with(filter).with(fmt_layer).with(otel_layer).try_init();
 	if provider.is_some() {
@@ -67,7 +64,7 @@ pub(crate) fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvid
 /// installing it first would leave the tracing subscriber's hook calling it, and every
 /// panic would print twice. It is a no-op when this crate already installed one, so a test
 /// that installs the hook itself does not change what startup does.
-pub(crate) fn init_panic_hook() {
+pub fn init_panic_hook() {
 	weft_server::panic_hook::install();
 }
 

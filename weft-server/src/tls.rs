@@ -29,7 +29,7 @@
 //!   plaintext it additionally needs [`ALLOW_PLAINTEXT_ENV`]
 //!   acknowledging the traffic is unencrypted; over TLS the keys alone
 //!   suffice.
-//! - [`AUTH_ENV`]`=disabled` is the explicit statement that
+//! - [`AUTH_ENV`] set to `disabled` is the explicit statement that
 //!   authentication is off because a gateway in front of the server owns
 //!   it, and it carries any non-loopback bind, plaintext or TLS.
 //! - Non-loopback with **no keys and no `disabled`** refuses to start —
@@ -63,19 +63,24 @@ pub const TLS_CERT_FILE_ENV: &str = "WEFT_TLS_CERT_FILE";
 /// [`TLS_CERT_FILE_ENV`]: set together with it, read once at startup.
 pub const TLS_KEY_FILE_ENV: &str = "WEFT_TLS_KEY_FILE";
 
-/// Environment variable naming the API keys file. SEC-6 defines its format
+/// Environment variable naming the API keys file.
+///
+/// SEC-6 defines its format
 /// and enforces the keys; SEC-5's gate reads its *presence*: a mounted
 /// keys file is one half of the plaintext opt-in on a non-loopback bind
 /// (C8), because it is what the Docker image mounts.
 pub const KEYS_FILE_ENV: &str = "WEFT_KEYS_FILE";
 
 /// Environment variable that explicitly opts in to unencrypted traffic:
+///
 /// with a mounted keys file it lets a non-loopback bind serve plaintext
 /// (C8). `1`/`true`/`yes`/`on` opts in; unset, `0` or anything else does
 /// not.
 pub const ALLOW_PLAINTEXT_ENV: &str = "WEFT_ALLOW_PLAINTEXT";
 
-/// Environment variable carrying the authentication mode. The only value
+/// Environment variable carrying the authentication mode.
+///
+/// The only value
 /// this slice reads is [`AUTH_DISABLED`]: authentication explicitly off,
 /// which on a non-loopback bind is the gateway deployment's plaintext
 /// opt-in (C8, decision 7). SEC-6 owns the modes that turn auth on.
@@ -194,7 +199,7 @@ pub struct PlaintextGate {
 	pub keys_file: Option<PathBuf>,
 	/// [`ALLOW_PLAINTEXT_ENV`] opted in.
 	pub allow_plaintext: bool,
-	/// [`AUTH_ENV`]`=disabled` was set explicitly.
+	/// [`AUTH_ENV`] was set to `disabled` explicitly.
 	pub auth_disabled: bool,
 }
 
@@ -234,10 +239,7 @@ impl PlaintextGate {
 			return Ok(());
 		}
 		if !self.keys_file_mounted() {
-			let keys = match &self.keys_file {
-				Some(path) => format!("{KEYS_FILE_ENV}={} does not name a mounted file", path.display()),
-				None => format!("no keys file is mounted ({KEYS_FILE_ENV} is unset)"),
-			};
+			let keys = self.keys_file.as_ref().map_or_else(|| format!("no keys file is mounted ({KEYS_FILE_ENV} is unset)"), |path| format!("{KEYS_FILE_ENV}={} does not name a mounted file", path.display()));
 			let transport = if tls.is_some() { "with TLS but no authentication" } else { "plaintext" };
 			return Err(format!("refusing to serve {transport} on the non-loopback address {bind}: {keys}. A non-loopback bind requires authentication: mount a keys file ({KEYS_FILE_ENV}; `weft-server keygen` mints one), or set {AUTH_ENV}=disabled when a gateway in front of this server owns authentication (plan C8, decision 7)"));
 		}
@@ -258,7 +260,7 @@ mod tests {
 		SocketAddr::new(ip, 8080)
 	}
 
-	const NON_LOOPBACK: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
+	const NON_LOOPBACK: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
 
 	#[test]
 	fn loopback_plaintext_needs_no_opt_in() {
@@ -320,7 +322,7 @@ mod tests {
 		assert!(both.check(bind(IpAddr::V4(NON_LOOPBACK)), None).is_ok());
 
 		// Keys without the opt-in: refused, saying which half is missing.
-		let keys_only = PlaintextGate { keys_file: Some(keys.clone()), ..PlaintextGate::default() };
+		let keys_only = PlaintextGate { keys_file: Some(keys), ..PlaintextGate::default() };
 		let err = keys_only.check(bind(IpAddr::V4(NON_LOOPBACK)), None).expect_err("refused");
 		assert!(err.contains(ALLOW_PLAINTEXT_ENV), "{err}");
 

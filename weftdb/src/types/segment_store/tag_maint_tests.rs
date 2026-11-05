@@ -94,6 +94,7 @@ async fn swap_plan_refuses_mixed_series() {
 	assert!(format!("{err:#}").contains("mixes the series"), "{err:#}");
 	drop(held);
 	assert_eq!(rows_of(&store, ASPECT).await, before, "nothing was swapped");
+	drop(store);
 	let frames = std::fs::read_dir(dir.path().join("segments")).expect("lists").filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x == "weftseg")).count();
 	assert_eq!(frames, before.len(), "no output frame was left behind");
 }
@@ -134,6 +135,7 @@ async fn two_series_sharing_a_window_are_not_overlapping() {
 	assert_eq!(store.aspect_stats(ASPECT).await.expect("stats").overlapping_segments, 2);
 	assert_eq!(store.store_overlapping_segments().await.expect("stats"), 2);
 	let sweep = store.reconcile_all_overlaps(MaintenanceWait::Skip).await.expect("sweeps");
+	drop(store);
 	assert_eq!((sweep.aspects_reconciled, sweep.segments_removed), (1, 1));
 }
 
@@ -182,6 +184,7 @@ async fn target_rows_groups_within_a_series_only() {
 	let sweep = store.squash_all_to_target_rows_if_fragmented(4, MaintenanceWait::Skip).await.expect("sweeps");
 	assert_eq!((sweep.aspects_squashed, sweep.segments_removed), (0, 0));
 	assert_eq!(per_series(&store, ASPECT).await, BTreeMap::from([(1, 1), (2, 1)]));
+	drop(store);
 }
 
 /// Every series keeps its own newest segment hot under the hot/cold reconcile, while the
@@ -204,8 +207,9 @@ async fn hot_cold_keeps_every_series_tail_hot() {
 	// At the aspect-wide threshold the tails are reconciled too.
 	let outcome = store.reconcile_aspect_hot_cold(ASPECT, 2).await.expect("reconciles");
 	assert_eq!((outcome.cold_reconciled, outcome.hot_reconciled), (0, 2));
-	assert!(unsorted(&rows_of(&store, ASPECT).await).is_empty());
+	assert_eq!(unsorted(&rows_of(&store, ASPECT).await), [] as [u64; 0]);
 	assert_eq!(per_series(&store, ASPECT).await, BTreeMap::from([(0, 1), (1, 2), (2, 1)]), "a reconcile keeps each segment's series");
+	drop(store);
 }
 
 /// A split's suffix takes a fresh id; only a newer overlapping segment of the *same*
@@ -224,6 +228,7 @@ async fn split_is_refused_only_by_a_newer_segment_of_its_own_series() {
 	let newest = rows_of(&store, ASPECT).await.into_iter().filter(|row| row.series_id == 1).map(|row| row.desc.id).max().expect("a row");
 	seal(&store, ASPECT, &tags("a"), &[45, 65]).await;
 	let err = store.split_segment(ASPECT, newest, 55).await.expect_err("a newer overlapping segment of the series refuses");
+	drop(store);
 	assert!(format!("{err:#}").contains("outrank"), "{err:#}");
 }
 
@@ -269,6 +274,7 @@ async fn every_sweep_kind_isolates_a_truncated_frame_beside_a_two_series_aspect(
 		assert_eq!(series[&2], 1, "{kind}: series b is never folded into a");
 		assert_eq!(series_timestamps(&store, "s3", 2).await, vec![100, 110, 170], "{kind}: series b keeps exactly its rows");
 		let a = series_timestamps(&store, "s3", 1).await;
+		drop(store);
 		assert_eq!(a, vec![100, 110, 120, 125, 130, 140, 145, 150, 170], "{kind}: series a keeps exactly its rows");
 	}
 }

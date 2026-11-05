@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! The Arrow Flight listener over real gRPC: what a Flight client sees.
 //!
 //! Each test stores rows through the HTTP router (the write path a client would use), then
@@ -111,7 +114,7 @@ async fn refusals_keep_their_envelope_codes() {
 	let put = server.client.do_put(futures::stream::empty()).await;
 	let put = match put {
 		Err(error) => status_of(error),
-		Ok(mut results) => status_of(results.try_next().await.err().expect("a refused put")),
+		Ok(mut results) => status_of(results.try_next().await.expect_err("a refused put")),
 	};
 	assert_eq!(put.code(), tonic::Code::Unimplemented, "read-only");
 }

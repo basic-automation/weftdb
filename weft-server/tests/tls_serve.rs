@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! SEC-5: the TLS listener is the SEC-4 serve path with a rustls (ring)
 //! handshake in front of it, and the binary's plaintext gate refuses an
 //! unopted non-loopback exposure at startup.
@@ -55,7 +58,7 @@ async fn spawn_tls_server(limits: ServeLimits, tls: &TlsConfig) -> (std::net::So
 	(addr, shutdown_tx, handle)
 }
 
-fn limits(max_connections: usize) -> ServeLimits {
+const fn limits(max_connections: usize) -> ServeLimits {
 	ServeLimits::new(NonZeroUsize::new(max_connections).expect("positive cap"))
 }
 

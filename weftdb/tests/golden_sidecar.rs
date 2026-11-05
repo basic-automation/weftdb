@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! The bytes a `.weftpart` sidecar writes, pinned as a committed golden (roadmap slice **FRE-3**).
 //!
 //! [`weft_physical_type`'s golden suite](../../../weft-physical-type/tests/golden_frames.rs) pins
@@ -64,7 +67,7 @@ fn check_golden(name: &str, fresh: &[u8]) {
 		return;
 	}
 	let first_diff = committed.iter().zip(fresh).position(|(a, b)| a != b);
-	let shown = first_diff.unwrap_or(std::cmp::min(committed.len(), fresh.len()));
+	let shown = first_diff.unwrap_or_else(|| std::cmp::min(committed.len(), fresh.len()));
 	let window = |bytes: &[u8]| bytes.iter().skip(shown.saturating_sub(8)).take(24).map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ");
 	panic!(
 		"{name}: the sidecar bytes are not the committed golden.\n\
@@ -80,7 +83,7 @@ fn check_golden(name: &str, fresh: &[u8]) {
 		committed.len(),
 		fresh.len(),
 		window(&committed),
-		window(&fresh),
+		window(fresh),
 	)
 }
 

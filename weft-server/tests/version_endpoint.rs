@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! `GET /api/v1/version` (FRE-12b): which build this is, which store it serves, and what
 //! its exit statuses mean.
 //!
@@ -76,7 +79,7 @@ async fn a_stateless_server_says_so_and_still_answers() {
 #[tokio::test]
 async fn the_body_carries_the_exit_statuses_the_process_exits_with() {
 	let (_, body) = get(app_with_state(AppState::new()), "/api/v1/version", None).await;
-	let codes: Vec<i32> = body["exit_codes"].as_array().expect("a table").iter().map(|row| row["code"].as_i64().expect("a code") as i32).collect();
+	let codes: Vec<i32> = body["exit_codes"].as_array().expect("a table").iter().map(|row| i32::try_from(row["code"].as_i64().expect("a code")).expect("an exit code fits an i32")).collect();
 	assert_eq!(codes, [0, 1, 2, 65, 70, 75, 78], "plan C7's table, so a supervisor can read the number it just saw: {body}");
 	let incompatible = body["exit_codes"].as_array().expect("a table").iter().find(|row| row["code"] == 65).expect("65 is in the table");
 	assert!(incompatible["meaning"].as_str().is_some_and(|m| m.contains("scope mismatch")), "and 65 says a scope mismatch is one of its causes: {incompatible}");
@@ -95,7 +98,8 @@ async fn a_pin_turned_off_leaves_the_mismatch_on_the_record() {
 	let store = store_at(&root, "default", "default").await;
 	assert!(store.previous_clean_shutdown(), "the open behind this one called shutdown, so the flag is set");
 
-	let router = app_with_state(AppState::new().with_store(store).with_serving_scope(ServingScope::new("default", "default", ScopePin::Off)));
+	let router = app_with_state(AppState::new().with_store(Arc::clone(&store)).with_serving_scope(ServingScope::new("default", "default", ScopePin::Off)));
+	drop(store);
 	let (status, body) = get(router, "/api/v1/version", None).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	assert_eq!(body["scope_pin"]["mode"], "off");

@@ -36,3 +36,7 @@ DETAILED_CHANGES.txt
 
 # Python bytecode (scripts/contrib)
 __pycache__
+
+# Audit-log artifact: the audit sink writes ./weft-audit.jsonl in the crate
+# directory when a test runs it without a temp-dir override.
+weft-audit.jsonl

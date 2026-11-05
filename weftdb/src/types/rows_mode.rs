@@ -210,7 +210,7 @@ struct SealingChunk {
 }
 
 impl SealingChunk {
-	fn new(limit: usize) -> Self {
+	const fn new(limit: usize) -> Self {
 		Self { rows: Vec::new(), limit }
 	}
 
@@ -524,7 +524,7 @@ pub async fn discover(tree: &Path) -> Result<LegacyTree> {
 		let subject_name = subject.file_name().to_string_lossy().into_owned();
 		for sibling in files(&subject.path()).await? {
 			let name = sibling.file_name().to_string_lossy().into_owned();
-			if is_sidecar(&name) || !name.ends_with(".db") {
+			if is_sidecar(&name) || !std::path::Path::new(&name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("db")) {
 				continue;
 			}
 			not_carried.push(NotCarried { path: format!("{subject_name}/{name}"), reason: SUBJECT_LEVEL.to_string() });
@@ -538,7 +538,7 @@ pub async fn discover(tree: &Path) -> Result<LegacyTree> {
 			}
 			for sibling in files(&aspect.path()).await? {
 				let name = sibling.file_name().to_string_lossy().into_owned();
-				if is_sidecar(&name) || !name.ends_with(".db") || name == MEASUREMENTS_FILE {
+				if is_sidecar(&name) || !std::path::Path::new(&name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("db")) || name == MEASUREMENTS_FILE {
 					continue;
 				}
 				not_carried.push(NotCarried { path: format!("{subject_name}/{aspect_name}/{name}"), reason: ASPECT_SIBLING.to_string() });
@@ -588,7 +588,7 @@ async fn entries(dir: &Path) -> Result<Vec<tokio::fs::DirEntry>> {
 	while let Some(entry) = reader.next_entry().await.with_context(|| format!("reading the 0.1.x directory {}", dir.display()))? {
 		found.push(entry);
 	}
-	found.sort_by_key(|entry| entry.file_name());
+	found.sort_by_key(tokio::fs::DirEntry::file_name);
 	Ok(found)
 }
 
@@ -625,7 +625,6 @@ async fn survey(subject: &str, name: &str, database: &Path) -> Result<LegacyAspe
 	let conn = open(database, "series").await?;
 	let columns = columns_of(&conn, database).await?;
 	pick_value_column(database, &columns)?;
-	#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 	let total = u64::try_from(scalar(&conn, database, "SELECT count(*) FROM measurements").await?).unwrap_or(u64::MAX);
 	let mut rows = conn.query("SELECT min(timestamp), max(timestamp) FROM measurements", ()).await.with_context(|| format!("asking {} for the span of its series", database.display()))?;
 	let row = rows.next().await?.with_context(|| format!("{} answers the span query with no row", database.display()))?;
@@ -639,7 +638,6 @@ async fn survey(subject: &str, name: &str, database: &Path) -> Result<LegacyAspe
 		Value::Null => None,
 		other => return Err(anyhow::Error::new(RowsModeError::RowShape { path: database.to_path_buf(), rowid: 0, detail: format!("`max(timestamp)` is {other:?}, and 0.1.x wrote `timestamp INTEGER NOT NULL`") })),
 	};
-	#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 	let distinct = u64::try_from(scalar(&conn, database, "SELECT count(DISTINCT timestamp) FROM measurements").await?).unwrap_or(0);
 	Ok(LegacyAspect { subject: subject.to_string(), name: name.to_string(), database: database.to_path_buf(), rows: total, first_timestamp: first, last_timestamp: last, duplicate_timestamps: total.saturating_sub(distinct) })
 }
@@ -671,14 +669,8 @@ async fn read_catalog(catalog: &Path) -> Result<Vec<LegacyCatalogAspect>> {
 	let mut rows = conn.query("SELECT s.name, a.name, a.id, a.resolution, a.created_at, a.earliest_measurement, a.latest_measurement, a.compression_config FROM aspects a LEFT JOIN subjects s ON a.subject_id = s.id ORDER BY s.name, a.name", ()).await.map_err(|error| anyhow::Error::new(RowsModeError::NoCatalogSchema { path: catalog.to_path_buf(), detail: format!("its `aspects`/`subjects` tables cannot be read: {error}") }))?;
 	let mut found = Vec::new();
 	while let Some(row) = rows.next().await.map_err(|error| anyhow::Error::new(RowsModeError::NoCatalogSchema { path: catalog.to_path_buf(), detail: format!("its `aspects`/`subjects` tables cannot be read: {error}") }))? {
-		let subject = match catalog_text(&row, 0, catalog, "subjects.name")? {
-			Some(name) => name,
-			None => continue,
-		};
-		let name = match catalog_text(&row, 1, catalog, "aspects.name")? {
-			Some(name) => name,
-			None => continue,
-		};
+		let Some(subject) = catalog_text(&row, 0, catalog, "subjects.name")? else { continue };
+		let Some(name) = catalog_text(&row, 1, catalog, "aspects.name")? else { continue };
 		found.push(LegacyCatalogAspect { subject, name, legacy_aspect_id: catalog_text(&row, 2, catalog, "aspects.id")?, resolution: catalog_text(&row, 3, catalog, "aspects.resolution")?, created_at: catalog_int(&row, 4, catalog, "aspects.created_at")?, earliest_measurement: catalog_text(&row, 5, catalog, "aspects.earliest_measurement")?, latest_measurement: catalog_text(&row, 6, catalog, "aspects.latest_measurement")?, compression_config: catalog_text(&row, 7, catalog, "aspects.compression_config")? });
 	}
 	Ok(found)
@@ -729,7 +721,7 @@ async fn open(database: &Path, role: &str) -> Result<turso::Connection> {
 	// `Builder::new_local` takes a `&str`; a lossy conversion is fine here because the path
 	// came off the disk, and a name that is not valid UTF-8 still reads the same file.
 	let db = Builder::new_local(&database.to_string_lossy()).build().await.with_context(|| format!("opening the 0.1.x {role} database {}", database.display()))?;
-	Ok(db.connect().with_context(|| format!("connecting to the 0.1.x {role} database {}", database.display()))?)
+	db.connect().with_context(|| format!("connecting to the 0.1.x {role} database {}", database.display()))
 }
 
 /// The table every rows-mode database keeps its series in.
@@ -745,11 +737,11 @@ async fn columns_of(conn: &turso::Connection, database: &Path) -> Result<Vec<(St
 	let mut columns = Vec::new();
 	while let Some(row) = rows.next().await? {
 		let name = match row.get_value(1)? {
-			Value::Text(name) => name.to_string(),
+			Value::Text(name) => name,
 			other => bail!("{} names a column of {} as {other:?}", database.display(), LEGACY_TABLE),
 		};
 		let declared = match row.get_value(2)? {
-			Value::Text(declared) => declared.to_string(),
+			Value::Text(declared) => declared,
 			Value::Null => String::new(),
 			other => bail!("{} declares column {name:?} of {} as {other:?}", database.display(), LEGACY_TABLE),
 		};
@@ -825,7 +817,7 @@ fn parse_row(row: &turso::Row, database: &Path, position: i64) -> Result<(i64, B
 	};
 	let value = match row.get_value(1)? {
 		Value::Text(text) => {
-			let shown = format!("{text}");
+			let shown = text;
 			BigDecimal::from_str(&shown).map_err(|error| RowsModeError::ValueNotDecimal { path: database.to_path_buf(), rowid: position, found: format!("{shown:?} ({error})") })?
 		}
 		// 0.1.x wrote its `BigDecimal` as the text of it, so a numeric or NULL value cell
@@ -1108,7 +1100,7 @@ pub async fn import_into(store: &SegmentStore, tree: &Path, subject: &str, rows_
 
 	// The record speaks for this scope: it lists what stayed in the tree under this
 	// subject's directory, and the tree-level files, and not another subject's series.
-	let not_carried = legacy.not_carried.iter().filter(|entry| entry.path.split_once('/').map_or(true, |(head, _)| head == subject)).cloned().collect();
+	let not_carried = legacy.not_carried.iter().filter(|entry| entry.path.split_once('/').is_none_or(|(head, _)| head == subject)).cloned().collect();
 	let record = ImportRecord { source: tree.display().to_string(), database: legacy.database.clone(), subject: subject.to_string(), timestamp_unit: TIMESTAMP_UNIT.to_string(), rows_per_segment, aspects: imported, not_carried, imported_at: Utc::now().to_rfc3339() };
 	write_import_record(store, &record).await?;
 	Ok(record)
@@ -1130,6 +1122,7 @@ mod tests {
 		}
 		let db = Builder::new_local(&database.to_string_lossy()).build().await.expect("a local database of the 0.1.x shape");
 		let conn = db.connect().expect("a connection to it");
+		drop(db);
 		// The table 0.1.x's server ran, column for column
 		// (`v0.1.0:weftdb/src/types/aspect.rs:475`), identifiers included. A caller that wants a
 		// shape 0.1.x did *not* write passes another value column, which is what the refusal test
@@ -1165,12 +1158,13 @@ mod tests {
 		let path = root.join("metadata.db");
 		let db = Builder::new_local(&path.to_string_lossy()).build().await.expect("a local database of the 0.1.x shape");
 		let conn = db.connect().expect("a connection to it");
+		drop(db);
 		conn.execute("CREATE TABLE IF NOT EXISTS transactions (id TEXT NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL)", ()).await.expect("0.1.x created its transactions table with this DDL");
 		conn.execute("CREATE TABLE IF NOT EXISTS database (id TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL, metadata_path TEXT NOT NULL)", ()).await.expect("0.1.x created its database table with this DDL");
 		conn.execute("CREATE TABLE IF NOT EXISTS subjects (id TEXT NOT NULL, database_id TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL)", ()).await.expect("0.1.x created its subjects table with this DDL");
 		conn.execute("CREATE TABLE IF NOT EXISTS aspects (id TEXT NOT NULL, subject_id TEXT NOT NULL, database_id TEXT NOT NULL, name TEXT NOT NULL, table_name TEXT NOT NULL, resolution TEXT NOT NULL, created_at INTEGER NOT NULL, earliest_measurement TEXT, latest_measurement TEXT, compression_config TEXT)", ()).await.expect("0.1.x created its aspects table with this DDL");
 		let name = root.file_name().expect("the tree's directory names its database").to_string_lossy().into_owned();
-		conn.execute("INSERT INTO database (id, name, created_at, metadata_path) VALUES (?1, ?2, ?3, ?4)", turso::params!["legacy-database-id", name, 1767225600000i64, path.to_string_lossy().into_owned()]).await.expect("0.1.x recorded its database row");
+		conn.execute("INSERT INTO database (id, name, created_at, metadata_path) VALUES (?1, ?2, ?3, ?4)", turso::params!["legacy-database-id", name, 1_767_225_600_000_i64, path.to_string_lossy().into_owned()]).await.expect("0.1.x recorded its database row");
 		let mut checkpoint = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await.expect("the rows are in the database file");
 		while checkpoint.next().await.expect("the checkpoint answers once").is_some() {}
 		drop(conn);
@@ -1182,10 +1176,22 @@ mod tests {
 		let path = root.join("metadata.db");
 		let db = Builder::new_local(&path.to_string_lossy()).build().await.expect("a local database of the 0.1.x shape");
 		let conn = db.connect().expect("a connection to it");
+		drop(db);
 		conn.execute("INSERT INTO subjects (id, database_id, name, created_at) VALUES (?1, ?2, ?3, ?4)", turso::params![format!("subject-{subject}"), "legacy-database-id", subject, created_at]).await.expect("0.1.x recorded its subject row");
 		let mut checkpoint = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await.expect("the rows are in the database file");
 		while checkpoint.next().await.expect("the checkpoint answers once").is_some() {}
 		drop(conn);
+	}
+
+	/// One aspect row of a 0.1.x catalog, as [`write_catalog_aspect`] records it.
+	struct CatalogAspect<'a> {
+		subject: &'a str,
+		aspect: &'a str,
+		resolution: &'a str,
+		created_at: i64,
+		earliest: &'a str,
+		latest: &'a str,
+		compression_config: Option<&'a str>,
 	}
 
 	/// Adds one aspect row to the catalog [`write_catalog`] made, the way 0.1.x's own
@@ -1193,11 +1199,12 @@ mod tests {
 	/// time, the span its catalog recorded, and its compression config. The subject
 	/// row must already be there ([`write_catalog_subject`]). A test that wants an
 	/// aspect with no catalog row simply does not call this for it.
-	#[allow(clippy::too_many_arguments)]
-	async fn write_catalog_aspect(root: &Path, subject: &str, aspect: &str, resolution: &str, created_at: i64, earliest: &str, latest: &str, compression_config: Option<&str>) {
+	async fn write_catalog_aspect(root: &Path, row: CatalogAspect<'_>) {
+		let CatalogAspect { subject, aspect, resolution, created_at, earliest, latest, compression_config } = row;
 		let path = root.join("metadata.db");
 		let db = Builder::new_local(&path.to_string_lossy()).build().await.expect("a local database of the 0.1.x shape");
 		let conn = db.connect().expect("a connection to it");
+		drop(db);
 		conn.execute("INSERT INTO aspects (id, subject_id, database_id, name, table_name, resolution, created_at, earliest_measurement, latest_measurement, compression_config) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", turso::params![format!("aspect-{subject}-{aspect}"), format!("subject-{subject}"), "legacy-database-id", aspect, aspect, resolution, created_at, earliest, latest, compression_config.map_or(turso::Value::Null, |text| turso::Value::Text(text.to_string()))]).await.expect("0.1.x recorded its aspect row");
 		let mut checkpoint = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await.expect("the rows are in the database file");
 		while checkpoint.next().await.expect("the checkpoint answers once").is_some() {}
@@ -1209,9 +1216,9 @@ mod tests {
 	/// a dictionary directory beside the series.
 	async fn build_tree(root: &Path) {
 		write_catalog(root).await;
-		write_series(&root.join("pump-01/temperature/measurements.db"), "value", &[(1767225600000, "100.2500"), (1767225601000, "101.0000"), (1767225602000, "99.5000")]).await;
-		write_series(&root.join("pump-01/vibration/measurements.db"), "value", &[(1767225600000, "0.1250"), (1767225601000, "0.2500")]).await;
-		write_series(&root.join("pump-02/temperature/measurements.db"), "value", &[(1767225600000, "-3.5000")]).await;
+		write_series(&root.join("pump-01/temperature/measurements.db"), "value", &[(1_767_225_600_000, "100.2500"), (1_767_225_601_000, "101.0000"), (1_767_225_602_000, "99.5000")]).await;
+		write_series(&root.join("pump-01/vibration/measurements.db"), "value", &[(1_767_225_600_000, "0.1250"), (1_767_225_601_000, "0.2500")]).await;
+		write_series(&root.join("pump-02/temperature/measurements.db"), "value", &[(1_767_225_600_000, "-3.5000")]).await;
 		tokio::fs::write(root.join("pump-01/ingestion.db"), b"0.1.x kept its ingestion state beside the rows").await.expect("a subject-level database");
 		tokio::fs::create_dir_all(root.join("pump-02/dictionaries")).await.expect("a dictionary directory");
 	}
@@ -1251,7 +1258,7 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path().join("plant");
 		write_catalog(&root).await;
-		write_series(&root.join("pump-01/flow/measurements.db"), "flow", &[(1767225600000, "1.5000")]).await;
+		write_series(&root.join("pump-01/flow/measurements.db"), "flow", &[(1_767_225_600_000, "1.5000")]).await;
 		let error = discover(&root).await.expect_err("a series database whose value column is not the one 0.1.x created is a shape this build does not guess at");
 		assert!(matches!(error.downcast_ref::<RowsModeError>(), Some(RowsModeError::NoSeries { .. })), "{error}");
 		let detail = error.to_string();
@@ -1269,14 +1276,15 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path().join("plant");
 		write_catalog(&root).await;
-		write_series(&root.join("pump-01/dataset_id/measurements.db"), "value", &[(1767225600000, "1.5000"), (1767225601000, "2.5000")]).await;
+		write_series(&root.join("pump-01/dataset_id/measurements.db"), "value", &[(1_767_225_600_000, "1.5000"), (1_767_225_601_000, "2.5000")]).await;
 		let tree = discover(&root).await.expect("an aspect called dataset_id is a name 0.1.x allowed, and the directory is what names the series");
 		assert_eq!(tree.aspects.iter().map(|aspect| (aspect.subject.as_str(), aspect.name.as_str(), aspect.rows)).collect::<Vec<_>>(), [("pump-01", "dataset_id", 2)], "the aspect keeps its directory's name even where it collides with a column");
 		let store = store_at(&dir.path().join("store"), "plant", "pump-01").await;
 		let record = import_into(&store, &root, "pump-01", NonZeroUsize::new(8).unwrap()).await.expect("the series reads in");
 		assert_eq!((record.rows(), record.aspects.len()), (2, 1), "nothing of the identifier column crossed");
 		let (timestamps, values) = store.read_time_range("dataset_id", i64::MIN, i64::MAX).await.expect("the aspect reads back under its directory name");
-		assert_eq!(timestamps, [1767225600000, 1767225601000], "and it reads back under the name the operator will type");
+		drop(store);
+		assert_eq!(timestamps, [1_767_225_600_000, 1_767_225_601_000], "and it reads back under the name the operator will type");
 		let want: Vec<BigDecimal> = ["1.5000", "2.5000"].map(|text| BigDecimal::from_str(text).expect("a decimal the tree would hold")).to_vec();
 		assert_eq!(values.iter().flatten().cloned().collect::<Vec<_>>(), want, "the values come from `value`, not from the column that shares the aspect's name");
 	}
@@ -1295,7 +1303,7 @@ mod tests {
 		assert_eq!(series, [("pump-01", "temperature", 3), ("pump-01", "vibration", 2), ("pump-02", "temperature", 1)], "one database per aspect, read from the directory that names it");
 		assert_eq!(tree.for_subject("pump-01").iter().map(|aspect| aspect.name.as_str()).collect::<Vec<_>>(), ["temperature", "vibration"], "the series of one subject, which is the size of a scoped store's import");
 		let temperature = tree.aspects.iter().find(|aspect| aspect.subject == "pump-01").expect("the tree holds pump-01's temperature");
-		assert_eq!((temperature.first_timestamp, temperature.last_timestamp), (Some(1767225600000), Some(1767225602000)), "the span is the instants as stored, in milliseconds");
+		assert_eq!((temperature.first_timestamp, temperature.last_timestamp), (Some(1_767_225_600_000), Some(1_767_225_602_000)), "the span is the instants as stored, in milliseconds");
 		let reported: Vec<&str> = tree.not_carried.iter().map(|entry| entry.path.as_str()).collect();
 		assert_eq!(reported, ["metadata.db", "pump-01/ingestion.db", "pump-02/dictionaries"], "the catalog, 0.1.x's own state beside the rows, and the dictionaries are each named with a reason");
 	}
@@ -1318,12 +1326,12 @@ mod tests {
 		assert_eq!((record.rows(), record.segments()), (5, 3), "the record totals what the store took");
 
 		let (timestamps, values) = store.read_time_range("temperature", i64::MIN, i64::MAX).await.expect("the aspect reads back");
-		assert_eq!(timestamps, [1767225600000, 1767225601000, 1767225602000], "the instants cross the boundary unchanged: no division, and no unit read off how big they look");
+		assert_eq!(timestamps, [1_767_225_600_000, 1_767_225_601_000, 1_767_225_602_000], "the instants cross the boundary unchanged: no division, and no unit read off how big they look");
 		let want: Vec<BigDecimal> = ["100.2500", "101.0000", "99.5000"].map(|text| BigDecimal::from_str(text).expect("a decimal the tree would hold")).to_vec();
 		assert_eq!(values.iter().flatten().cloned().collect::<Vec<_>>(), want, "the values are the ones the tree held, to the last digit");
 
 		// What the other subject holds is not in this store, and never was.
-		assert_eq!(store.read_time_range("temperature", 1767225600000, 1767225600000).await.expect("a one-instant window").1.iter().flatten().count(), 1, "the window holds pump-01's row and not pump-02's");
+		assert_eq!(store.read_time_range("temperature", 1_767_225_600_000, 1_767_225_600_000).await.expect("a one-instant window").1.iter().flatten().count(), 1, "the window holds pump-01's row and not pump-02's");
 		for aspect in ["temperature", "vibration"] {
 			let declared = store.schema_for(aspect).await.expect("the store answers for its schema").unwrap_or_else(|| panic!("the leg declared {aspect} before sealing it"));
 			let named = record.aspects.iter().find(|entry| entry.aspect == aspect).expect("the record names each aspect it read");
@@ -1331,6 +1339,7 @@ mod tests {
 			assert_eq!(declared.timestamp_unit, TIMESTAMP_TIME_UNIT, "the unit is declared, per aspect");
 			assert_eq!(declared.value_tolerance, BigDecimal::from(0), "exactness across a version boundary, not tolerance");
 		}
+		drop(store);
 	}
 
 	/// A second reading of the same tree would double the rows, and a migrated row and a row
@@ -1361,6 +1370,7 @@ mod tests {
 
 		let store = store_at(&dir.path().join("store"), "plant", "pump-01").await;
 		let nested = import_into(&store, &root, "pump-01", NonZeroUsize::new(2).unwrap()).await.expect_err("the readable leg does not read an incomplete tree into a store");
+		drop(store);
 		assert!(nested.to_string().contains("metadata.db"), "the refusal says what the tree is missing: {nested}");
 	}
 
@@ -1374,7 +1384,7 @@ mod tests {
 		build_tree(&root).await;
 		let store = store_at(&dir.path().join("store"), "greenhouse", "pump-01").await;
 		let wrong = import_into(&store, &root, "pump-01", NonZeroUsize::new(2).unwrap()).await.expect_err("the tree is `plant` and this store is `greenhouse`");
-		assert!(matches!(wrong.downcast_ref::<RowsModeError>(), Some(RowsModeError::ScopeMismatch { tree_database: _, store_database: _, .. })), "{wrong}");
+		assert!(matches!(wrong.downcast_ref::<RowsModeError>(), Some(RowsModeError::ScopeMismatch { .. })), "{wrong}");
 		assert!(wrong.to_string().contains("greenhouse") && wrong.to_string().contains("plant"), "the refusal names both sides of the mismatch: {wrong}");
 		assert_eq!(store.list_declared_aspects().await.expect("the store answers for its declared aspects").len(), 0, "the refusal declared nothing");
 	}
@@ -1389,12 +1399,13 @@ mod tests {
 		let store = store_at(&dir.path().join("store"), "plant", "pump-01").await;
 		let schema = AspectSchema { value: PhysicalType::ScaledI64 { scale: 4 }, value_tolerance: BigDecimal::from(0), timestamp_unit: TIMESTAMP_TIME_UNIT };
 		store.declare("temperature", &schema).await.expect("the aspect is declared before the store takes a row of its own");
-		store.seal_declared("temperature", &[1767225699000], &[BigDecimal::from_str("7.0000").expect("a decimal a 0.1.x tree would hold")]).await.expect("a row the store wrote itself");
+		store.seal_declared("temperature", &[1_767_225_699_000], &[BigDecimal::from_str("7.0000").expect("a decimal a 0.1.x tree would hold")]).await.expect("a row the store wrote itself");
 		let clashing = import_into(&store, &root, "pump-01", NonZeroUsize::new(2).unwrap()).await.expect_err("the store holds temperature already, and reading the tree again would add to it");
 		assert!(matches!(clashing.downcast_ref::<RowsModeError>(), Some(RowsModeError::AspectNotEmpty { aspect, segments: 1 }) if aspect == "temperature"), "{clashing}");
 		let (timestamps, _) = store.read_time_range("temperature", i64::MIN, i64::MAX).await.expect("the aspect reads back");
-		assert_eq!(timestamps, [1767225699000], "the row the store wrote is the only one it holds: the tree's rows were not added to it");
+		assert_eq!(timestamps, [1_767_225_699_000], "the row the store wrote is the only one it holds: the tree's rows were not added to it");
 		assert!(read_import_record(&store).await.expect("the index answers for its own keys").is_none(), "a reading that stopped wrote no record for a later run to trust");
+		drop(store);
 	}
 
 	/// The same guard from the store's other side: an aspect that is declared but holds nothing.
@@ -1409,7 +1420,7 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path().join("plant");
 		write_catalog(&root).await;
-		write_series(&root.join("pump-01/temperature/measurements.db"), "value", &[(1767225600000, "100.2500"), (1767225601000, "101.0000")]).await;
+		write_series(&root.join("pump-01/temperature/measurements.db"), "value", &[(1_767_225_600_000, "100.2500"), (1_767_225_601_000, "101.0000")]).await;
 		let store = store_at(&dir.path().join("store"), "plant", "pump-01").await;
 		// The schema the tree's own rows call for, in every field but the unit: the refusal is
 		// about the unit and nothing else.
@@ -1424,6 +1435,7 @@ mod tests {
 		let (timestamps, _) = store.read_time_range("temperature", i64::MIN, i64::MAX).await.expect("an empty aspect answers");
 		assert!(timestamps.is_empty(), "and nothing was written at either scale: {timestamps:?}");
 		assert!(read_import_record(&store).await.expect("the index answers for its own keys").is_none(), "nor was anything recorded as having crossed");
+		drop(store);
 	}
 
 	/// A value cell that is not the text of a decimal is not a row 0.1.x wrote. Carrying the
@@ -1435,8 +1447,8 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path().join("plant");
 		write_catalog(&root).await;
-		write_series(&root.join("pump-01/temperature/measurements.db"), "value", &[(1767225600000, "100.2500")]).await;
-		write_series(&root.join("pump-01/vibration/measurements.db"), "value", &[(1767225600000, "bearing-worn")]).await;
+		write_series(&root.join("pump-01/temperature/measurements.db"), "value", &[(1_767_225_600_000, "100.2500")]).await;
+		write_series(&root.join("pump-01/vibration/measurements.db"), "value", &[(1_767_225_600_000, "bearing-worn")]).await;
 		let store = store_at(&dir.path().join("store"), "plant", "pump-01").await;
 		let broken = import_into(&store, &root, "pump-01", NonZeroUsize::new(2).unwrap()).await.expect_err("one of the tree's value cells is not a number");
 		assert!(matches!(broken.downcast_ref::<RowsModeError>(), Some(RowsModeError::ValueNotDecimal { .. })), "the refusal is typed, and it is the value refusals rather than a shape one: {broken}");
@@ -1450,6 +1462,7 @@ mod tests {
 		let crossed = store.read_time_range("temperature", i64::MIN, i64::MAX).await.expect("the aspect that read cleanly reads back");
 		assert_eq!(crossed.0.len(), 1, "the leg writes one aspect at a time, so `temperature` crossed before `vibration` stopped it");
 		let retry = import_into(&store, &root, "pump-01", NonZeroUsize::new(2).unwrap()).await.expect_err("the half-read tree cannot be read again quietly: the aspect it already sealed would be doubled");
+		drop(store);
 		assert!(matches!(retry.downcast_ref::<RowsModeError>(), Some(RowsModeError::AspectNotEmpty { aspect, .. }) if aspect.as_str() == "temperature"), "the retry refuses on the aspect already in the store, which is the trap 14c has to design around: {retry}");
 	}
 
@@ -1485,6 +1498,7 @@ mod tests {
 		drop(store);
 		let reopened = store_at(&at, "plant", "pump-01").await;
 		let read_back = read_import_record(&reopened).await.expect("the record is in the store's index, not in memory").expect("a store an import wrote has a record");
+		drop(reopened);
 		let round_trip = serde_json::to_string(&read_back).expect("the record is JSON by construction");
 		assert_eq!(round_trip, serde_json::to_string(&written).expect("the record the leg returned"), "the record the leg returned is the record the store kept");
 		assert_eq!(read_back.not_carried.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(), ["metadata.db", "pump-01/ingestion.db"], "the record keeps the tree's catalog and this subject's own state beside the rows; pump-02's dictionary directory is not this reading's to report");
@@ -1513,11 +1527,11 @@ mod tests {
 		let chunks = chunked(&rows, 2);
 		let instants: Vec<Vec<i64>> = chunks.iter().map(|chunk| chunk.iter().map(|(when, _)| *when).collect()).collect();
 		assert_eq!(instants, vec![vec![0, 1, 1, 1], vec![2, 3, 3], vec![4]], "the four rows at instant 1 go into one segment though the caller asked for two rows each: a segment a few rows longer than asked is cheaper than the reconciliation that folds two segments and keeps only the newer row at an instant they share");
-		assert_eq!(chunks.iter().map(|chunk| chunk.len()).sum::<usize>(), rows.len(), "and no row is lost or sealed twice on the way");
+		assert_eq!(chunks.iter().map(std::vec::Vec::len).sum::<usize>(), rows.len(), "and no row is lost or sealed twice on the way");
 		assert!(chunks.iter().all(|chunk| !chunk.is_empty()), "a chunk always has rows, so no seal call is asked to write an empty segment");
 		assert!(chunked(&[], 3).is_empty(), "an empty series seals nothing at all");
 		let even: Vec<(i64, BigDecimal)> = [1i64, 2, 3, 4].iter().map(|when| (*when, BigDecimal::from(*when))).collect();
-		assert_eq!(chunked(&even, 2).iter().map(|chunk| chunk.len()).collect::<Vec<_>>(), vec![2, 2], "a series with one row per instant still gets the chunk size it asked for");
+		assert_eq!(chunked(&even, 2).iter().map(std::vec::Vec::len).collect::<Vec<_>>(), vec![2, 2], "a series with one row per instant still gets the chunk size it asked for");
 	}
 
 	/// The streaming survey and the whole-column recommendation must agree: the
@@ -1529,7 +1543,7 @@ mod tests {
 		for values in cases {
 			let dir = tempfile::tempdir().unwrap();
 			let path = dir.path().join("measurements.db");
-			let rows: Vec<(i64, &str)> = values.iter().enumerate().map(|(position, value)| (1767225600000 + i64::try_from(position).unwrap_or(0), *value)).collect();
+			let rows: Vec<(i64, &str)> = values.iter().enumerate().map(|(position, value)| (1_767_225_600_000 + i64::try_from(position).unwrap_or(0), *value)).collect();
 			write_series(&path, "value", &rows).await;
 			let conn = open(&path, "series").await.expect("the series database opens");
 			let columns = columns_of(&conn, &path).await.expect("the series database describes itself");
@@ -1543,14 +1557,14 @@ mod tests {
 		// decimal no binary float holds exactly is the scaled integer at its scale.
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("measurements.db");
-		write_series(&path, "value", &[(1767225600000, "1"), (1767225601000, "2")]).await;
+		write_series(&path, "value", &[(1_767_225_600_000, "1"), (1_767_225_601_000, "2")]).await;
 		let conn = open(&path, "series").await.expect("the series database opens");
 		let columns = columns_of(&conn, &path).await.expect("the series database describes itself");
 		let value_column = pick_value_column(&path, &columns).expect("the series database has the column 0.1.x wrote");
 		assert_eq!(survey_encoding(&conn, &path, &value_column).await.expect("the survey reads the series"), PhysicalType::F32, "small integers are f32");
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("measurements.db");
-		write_series(&path, "value", &[(1767225600000, "0.1")]).await;
+		write_series(&path, "value", &[(1_767_225_600_000, "0.1")]).await;
 		let conn = open(&path, "series").await.expect("the series database opens");
 		let columns = columns_of(&conn, &path).await.expect("the series database describes itself");
 		let value_column = pick_value_column(&path, &columns).expect("the series database has the column 0.1.x wrote");
@@ -1571,7 +1585,7 @@ mod tests {
 		let mut rows: Vec<(i64, String)> = Vec::new();
 		for group in 0..200i64 {
 			for member in 0..10i64 {
-				rows.push((1767225600000 + group * 1000, format!("{}.5000", group * 10 + member)));
+				rows.push((1_767_225_600_000 + group * 1000, format!("{}.5000", group * 10 + member)));
 			}
 		}
 		let borrowed: Vec<(i64, &str)> = rows.iter().map(|(when, value)| (*when, value.as_str())).collect();
@@ -1581,6 +1595,7 @@ mod tests {
 		let aspect = record.aspects.iter().find(|entry| entry.aspect == "temperature").expect("the aspect crossed");
 		assert_eq!((aspect.rows, aspect.segments), (2000, 20), "every chunk extends past the group it cut into, so twenty hundred-row segments hold two thousand rows");
 		let (timestamps, values) = store.read_time_range("temperature", i64::MIN, i64::MAX).await.expect("the aspect reads back");
+		drop(store);
 		assert_eq!(timestamps.len(), 2000, "no row was lost at a chunk boundary");
 		let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
 		for when in &timestamps {
@@ -1608,22 +1623,23 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path().join("plant");
 		write_catalog(&root).await;
-		write_catalog_subject(&root, "pump-01", 1767225600000).await;
-		write_catalog_aspect(&root, "pump-01", "temperature", "seconds", 1767225600000, "1767225600000", "1767225602000", Some("{\"codec\":\"zstd\"}")).await;
-		write_catalog_aspect(&root, "pump-01", "vibration", "minutes", 1767225601000, "1767225600000", "1767225601000", None).await;
-		write_series(&root.join("pump-01/temperature/measurements.db"), "value", &[(1767225600000, "100.2500"), (1767225601000, "101.0000"), (1767225602000, "99.5000")]).await;
-		write_series(&root.join("pump-01/vibration/measurements.db"), "value", &[(1767225600000, "0.1250"), (1767225601000, "0.2500")]).await;
-		write_series(&root.join("pump-01/pressure/measurements.db"), "value", &[(1767225600000, "7.5000")]).await;
+		write_catalog_subject(&root, "pump-01", 1_767_225_600_000).await;
+		write_catalog_aspect(&root, CatalogAspect { subject: "pump-01", aspect: "temperature", resolution: "seconds", created_at: 1_767_225_600_000, earliest: "1767225600000", latest: "1767225602000", compression_config: Some("{\"codec\":\"zstd\"}") }).await;
+		write_catalog_aspect(&root, CatalogAspect { subject: "pump-01", aspect: "vibration", resolution: "minutes", created_at: 1_767_225_601_000, earliest: "1767225600000", latest: "1767225601000", compression_config: None }).await;
+		write_series(&root.join("pump-01/temperature/measurements.db"), "value", &[(1_767_225_600_000, "100.2500"), (1_767_225_601_000, "101.0000"), (1_767_225_602_000, "99.5000")]).await;
+		write_series(&root.join("pump-01/vibration/measurements.db"), "value", &[(1_767_225_600_000, "0.1250"), (1_767_225_601_000, "0.2500")]).await;
+		write_series(&root.join("pump-01/pressure/measurements.db"), "value", &[(1_767_225_600_000, "7.5000")]).await;
 		let tree = discover(&root).await.expect("the tree reads with its catalog");
 		assert_eq!(tree.catalog.iter().map(|row| (row.subject.as_str(), row.name.as_str())).collect::<Vec<_>>(), [("pump-01", "temperature"), ("pump-01", "vibration")], "discovery reports the catalog rows, in order");
 		let temperature = tree.catalog.iter().find(|row| row.name == "temperature").expect("the temperature row is there");
-		assert_eq!((temperature.legacy_aspect_id.as_deref(), temperature.resolution.as_deref(), temperature.created_at, temperature.earliest_measurement.as_deref(), temperature.latest_measurement.as_deref(), temperature.compression_config.as_deref()), (Some("aspect-pump-01-temperature"), Some("seconds"), Some(1767225600000), Some("1767225600000"), Some("1767225602000"), Some("{\"codec\":\"zstd\"}")), "the row carries what 0.1.x recorded, not just the name");
+		assert_eq!((temperature.legacy_aspect_id.as_deref(), temperature.resolution.as_deref(), temperature.created_at, temperature.earliest_measurement.as_deref(), temperature.latest_measurement.as_deref(), temperature.compression_config.as_deref()), (Some("aspect-pump-01-temperature"), Some("seconds"), Some(1_767_225_600_000), Some("1767225600000"), Some("1767225602000"), Some("{\"codec\":\"zstd\"}")), "the row carries what 0.1.x recorded, not just the name");
 		let at = dir.path().join("store");
 		let store = store_at(&at, "plant", "pump-01").await;
 		import_into(&store, &root, "pump-01", NonZeroUsize::new(2).unwrap()).await.expect("the tree reads in, catalog rows and all");
 		drop(store);
 		let db = Builder::new_local(&at.join("metadata.db").to_string_lossy()).build().await.expect("the store's metadata.db opens");
 		let conn = db.connect().expect("a connection to it");
+		drop(db);
 		let mut rows = conn.query("SELECT database, subject, aspect, legacy_aspect_id, resolution, created_at, earliest_measurement, latest_measurement, compression_config FROM legacy_catalog ORDER BY aspect", ()).await.expect("the migration's table reads");
 		let mut carried = Vec::new();
 		while let Some(row) = rows.next().await.expect("a catalog row") {
@@ -1639,7 +1655,7 @@ mod tests {
 			};
 			carried.push((text(0), text(1), text(2), text(3), text(4), number(5), text(6), text(7), text(8)));
 		}
-		assert_eq!(carried, vec![(Some("plant".to_string()), Some("pump-01".to_string()), Some("temperature".to_string()), Some("aspect-pump-01-temperature".to_string()), Some("seconds".to_string()), Some(1767225600000), Some("1767225600000".to_string()), Some("1767225602000".to_string()), Some("{\"codec\":\"zstd\"}".to_string())), (Some("plant".to_string()), Some("pump-01".to_string()), Some("vibration".to_string()), Some("aspect-pump-01-vibration".to_string()), Some("minutes".to_string()), Some(1767225601000), Some("1767225600000".to_string()), Some("1767225601000".to_string()), None),], "the store's metadata.db holds the catalog rows of the aspects that crossed, and no row for the aspect with no catalog row");
+		assert_eq!(carried, vec![(Some("plant".to_string()), Some("pump-01".to_string()), Some("temperature".to_string()), Some("aspect-pump-01-temperature".to_string()), Some("seconds".to_string()), Some(1_767_225_600_000), Some("1767225600000".to_string()), Some("1767225602000".to_string()), Some("{\"codec\":\"zstd\"}".to_string())), (Some("plant".to_string()), Some("pump-01".to_string()), Some("vibration".to_string()), Some("aspect-pump-01-vibration".to_string()), Some("minutes".to_string()), Some(1_767_225_601_000), Some("1767225600000".to_string()), Some("1767225601000".to_string()), None),], "the store's metadata.db holds the catalog rows of the aspects that crossed, and no row for the aspect with no catalog row");
 	}
 
 	/// A `metadata.db` that is not the catalog 0.1.x wrote refuses discovery: a
@@ -1654,6 +1670,7 @@ mod tests {
 		let path = root.join("metadata.db");
 		let db = Builder::new_local(&path.to_string_lossy()).build().await.expect("a database file");
 		let conn = db.connect().expect("a connection to it");
+		drop(db);
 		conn.execute("CREATE TABLE foo (x INTEGER)", ()).await.expect("an unrelated table");
 		drop(conn);
 		let error = discover(&root).await.expect_err("a database without the catalog's tables is not a catalog");

@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 
 use ::weftdb::database::traits::{AspectStructure, Inputs};
@@ -35,7 +38,7 @@ async fn test_multiple_aspects_same_subject() {
 	for (aspect_idx, aspect) in aspects.iter().enumerate() {
 		for i in 0..100i64 {
 			// Make i explicitly i64
-			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.{}", aspect_idx * 10 + (i as usize % 10), i % 100)).unwrap());
+			let measurement = InputMeasurement::new(base_time + Duration::minutes(i), BigDecimal::from_str(&format!("{}.{}", aspect_idx * 10 + usize::try_from(i % 10).expect("non-negative"), i % 100)).unwrap());
 			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.expect("Failed to capture multi-aspect measurement");
 		}
 	}
@@ -44,8 +47,10 @@ async fn test_multiple_aspects_same_subject() {
 	let target_time = base_time + Duration::minutes(50);
 	for aspect in &aspects {
 		let result = db.analyze_point(&aspect.id(), target_time, &Resolution::Seconds, &Spline::Linear).await.expect("Failed to analyze multi-aspect point");
-		assert!(!result.value.to_string().is_empty());
+		assert_ne!(result.value.to_string(), "");
 	}
+	drop(db);
+	drop(aspects);
 
 	common::remove_database(&db_name);
 }
@@ -80,17 +85,19 @@ async fn test_high_frequency_measurements() {
 	}
 
 	let capture_duration = start.elapsed();
-	println!("Captured {} measurements in {:?} ({:.2} measurements/sec)", num_measurements, capture_duration, num_measurements as f64 / capture_duration.as_secs_f64());
+	println!("Captured {} measurements in {:?} ({:.2} measurements/sec)", num_measurements, capture_duration, bigdecimal::ToPrimitive::to_f64(&num_measurements).expect("a number") / capture_duration.as_secs_f64());
 
 	// Test analysis with a time that's definitely within the dataset
 	let analysis_start = std::time::Instant::now();
 	let target_time = base_time + Duration::minutes(5); // Middle of 10-minute dataset
 	let result = db.analyze_point(&aspect.id(), target_time, &Resolution::Seconds, &Spline::Linear).await.expect("Failed to analyze point");
+	drop(db);
+	drop(aspect);
 	let analysis_duration = analysis_start.elapsed();
 
 	println!("Analysis completed in {analysis_duration:?}");
 	// Don't assert exact timestamp match since interpolation may adjust it
-	assert!(!result.value.to_string().is_empty());
+	assert_ne!(result.value.to_string(), "");
 
 	// Clean up
 	common::remove_database(&db_name);
@@ -113,9 +120,10 @@ async fn test_concurrent_access() {
 	// Clean up any existing test data
 	common::remove_database(&db_name);
 
-	let db = Database::new(&db_name).await.expect("Failed to create database");
+	// Shared by every task below.
+	let db = Arc::new(Database::new(&db_name).await.expect("Failed to create database"));
 	let subject = db.observe_subject("concurrent_subject").await.expect("Failed to add subject");
-	let aspect = db.track_aspect(&subject.id(), "concurrent_aspect", &splimes::Resolution::Milliseconds, None).await.expect("Failed to track aspect");
+	let aspect = Arc::new(db.track_aspect(&subject.id(), "concurrent_aspect", &splimes::Resolution::Milliseconds, None).await.expect("Failed to track aspect"));
 
 	// Add some initial data
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();
@@ -132,8 +140,6 @@ async fn test_concurrent_access() {
 
 	let semaphore = Arc::new(Semaphore::new(4)); // Lower concurrency limit
 	let start = std::time::Instant::now();
-	let db = Arc::new(db); // Share the database instance
-	let aspect = Arc::new(aspect); // Share the aspect
 
 	let tasks: Vec<_> = (0..num_concurrent_tasks)
 		.map(|task_id| {
@@ -158,6 +164,8 @@ async fn test_concurrent_access() {
 			})
 		})
 		.collect();
+	drop(db);
+	drop(aspect);
 
 	// Add timeout to prevent hanging
 	let results = timeout(
@@ -171,11 +179,11 @@ async fn test_concurrent_access() {
 
 	// Verify all tasks completed successfully
 	for (i, result) in results.iter().enumerate() {
-		assert_eq!(result.as_ref().unwrap(), &(i as i64));
+		assert_eq!(result.as_ref().unwrap(), &i64::try_from(i).expect("fits an i64"));
 	}
 
 	let total_operations = num_concurrent_tasks * operations_per_task;
-	println!("Completed {} concurrent operations in {:?} ({:.2} ops/sec)", total_operations, duration, total_operations as f64 / duration.as_secs_f64());
+	println!("Completed {} concurrent operations in {:?} ({:.2} ops/sec)", total_operations, duration, bigdecimal::ToPrimitive::to_f64(&total_operations).expect("a number") / duration.as_secs_f64());
 
 	// Clean up
 	common::remove_database(&db_name);
@@ -212,7 +220,7 @@ async fn test_large_dataset_analysis() {
 
 	for i in 0..num_measurements {
 		let timestamp = base_time + time_interval * i;
-		let value = (f64::from(i) / 100.0).sin() * 50.0 + 50.0;
+		let value = f64::mul_add((f64::from(i) / 100.0).sin(), 50.0, 50.0);
 
 		let measurement = InputMeasurement::new(timestamp, BigDecimal::from_str(&format!("{value:.2}")).unwrap());
 
@@ -243,6 +251,8 @@ async fn test_large_dataset_analysis() {
 		assert!(result.value >= BigDecimal::from_str("0.0").unwrap());
 		assert!(result.value <= BigDecimal::from_str("100.0").unwrap());
 	}
+	drop(db);
+	drop(aspect);
 
 	// Clean up
 	common::remove_database(&db_name);
@@ -291,6 +301,8 @@ async fn test_memory_usage_stability() {
 			tokio::task::yield_now().await;
 		}
 	}
+	drop(db);
+	drop(aspect);
 
 	println!("Memory stability test completed successfully");
 
@@ -315,8 +327,8 @@ async fn test_edge_case_scenarios() {
 	println!("Testing sparse data scenario...");
 	let sparse_measurements = vec![
 		(0, "10.0"),
-		(86400, "20.0"),  // 1 day later
-		(172800, "30.0"), // 2 days later
+		(86400, "20.0"),   // 1 day later
+		(172_800, "30.0"), // 2 days later
 	];
 
 	for (seconds_offset, value) in sparse_measurements {
@@ -362,6 +374,8 @@ async fn test_edge_case_scenarios() {
 	// Analyze between extreme values
 	let extreme_target = extreme_base + Duration::seconds(30);
 	let extreme_result = db.analyze_point(&aspect.id(), extreme_target, &Resolution::Seconds, &Spline::Linear).await.expect("Failed to analyze extreme data");
+	drop(db);
+	drop(aspect);
 
 	// Should interpolate between extreme values
 	assert!(extreme_result.value < BigDecimal::from_str("999999999.999999").unwrap());

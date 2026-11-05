@@ -18,10 +18,21 @@
 //! [`GPU_CALIBRATE_ENV`] selects the [`CalibrationMode`]: `0` skips calibration, and
 //! `force` runs it even when the adapter is a CPU/software rasteriser, which it otherwise
 //! skips ([`is_software_adapter`]).
+//!
+//! ## Adapter selection and multi-GPU (Phase 5, 5.7)
+//!
+//! [`GPU_ADAPTER_ENV`] picks the adapter splimes opens (by index from
+//! `splimes::gpu_adapters()`, by `api:<name>`, or by a name substring), and
+//! [`GPU_DEVICES_ENV`] opens more than one device (`all`, or a comma-separated list of
+//! selectors). Both are read once at startup ([`gpu_config_from_env`]) and applied with
+//! `splimes::configure_gpu` ([`apply_config`]) before calibration or any request touches
+//! the GPU. Unset, nothing is configured and splimes' single-device default is unchanged.
+//! Multi-device is opt-in: splimes' own measurement (its BENCHMARKS.md, "More than one
+//! GPU") found it slower than one device on a discrete-plus-integrated machine.
 
 use std::time::Instant;
 
-use splimes::AutoThresholds;
+use splimes::{AdapterSelector, AutoThresholds, GpuConfig, GpuDevices};
 use tokio::task::JoinHandle;
 
 /// Environment variable that controls the startup calibration ([`CalibrationMode`]).
@@ -55,6 +66,118 @@ impl CalibrationMode {
 			_ => Self::Auto,
 		}
 	}
+}
+
+/// Environment variable naming the one adapter splimes opens (5.7): a whole number is an
+/// index into `splimes::gpu_adapters()`, `api:<api>` the first adapter on that graphics
+/// API, `name:<text>` (or any other text) the first adapter whose name contains it,
+/// ignoring case. Unset: splimes' own choice (`WGPU_ADAPTER_NAME`, else the
+/// high-performance adapter).
+pub const GPU_ADAPTER_ENV: &str = "WEFT_GPU_ADAPTER";
+
+/// Environment variable choosing how many devices splimes opens (5.7): `one` (the
+/// default), `all` (every hardware adapter), or a comma-separated list of adapter
+/// selectors in [`GPU_ADAPTER_ENV`]'s syntax, opened in that order.
+pub const GPU_DEVICES_ENV: &str = "WEFT_GPU_DEVICES";
+
+/// Parse one adapter selector ([`GPU_ADAPTER_ENV`]'s syntax).
+///
+/// # Errors
+///
+/// An empty selector, or an empty `api:` / `name:` value.
+pub fn parse_adapter_selector(raw: &str) -> Result<AdapterSelector, String> {
+	let raw = raw.trim();
+	if raw.is_empty() {
+		return Err("an adapter selector is empty".to_string());
+	}
+	if let Ok(index) = raw.parse::<usize>() {
+		return Ok(AdapterSelector::Index(index));
+	}
+	let lower = raw.to_ascii_lowercase();
+	let (kind, value) = if lower.starts_with("api:") {
+		("api", raw[4..].trim())
+	} else if lower.starts_with("name:") {
+		("name", raw[5..].trim())
+	} else {
+		("name", raw)
+	};
+	if value.is_empty() {
+		return Err(format!("the adapter selector {raw:?} names no {kind}"));
+	}
+	Ok(if kind == "api" { AdapterSelector::Api(value.to_string()) } else { AdapterSelector::Name(value.to_string()) })
+}
+
+/// Parse [`GPU_DEVICES_ENV`]: `one`, `all` (any case), or a comma-separated list of
+/// adapter selectors.
+///
+/// # Errors
+///
+/// An empty value, or a list with an empty or malformed selector.
+pub fn parse_devices(raw: &str) -> Result<GpuDevices, String> {
+	let trimmed = raw.trim();
+	match trimmed.to_ascii_lowercase().as_str() {
+		"" => Err("the device list is empty".to_string()),
+		"one" => Ok(GpuDevices::One),
+		"all" => Ok(GpuDevices::All),
+		_ => trimmed.split(',').map(parse_adapter_selector).collect::<Result<Vec<_>, _>>().map(GpuDevices::List),
+	}
+}
+
+/// The GPU configuration [`GPU_ADAPTER_ENV`] and [`GPU_DEVICES_ENV`] ask for (`None` for
+/// a variable that is unset or blank). `Ok(None)` when neither asks for anything, so the
+/// server leaves splimes' default (one device, splimes' own adapter choice) untouched.
+///
+/// # Errors
+///
+/// A value that does not parse, or an adapter together with `all` or a list: splimes reads
+/// the adapter only for a single device, and silently ignoring it would hide the mistake.
+pub fn gpu_config_from_env(adapter: Option<&str>, devices: Option<&str>) -> Result<Option<GpuConfig>, String> {
+	let adapter = adapter.filter(|raw| !raw.trim().is_empty());
+	let devices = devices.filter(|raw| !raw.trim().is_empty());
+	if adapter.is_none() && devices.is_none() {
+		return Ok(None);
+	}
+	let devices = devices.map(parse_devices).transpose().map_err(|error| format!("{GPU_DEVICES_ENV}: {error}"))?.unwrap_or_default();
+	let mut config = GpuConfig::default();
+	if let Some(adapter) = adapter {
+		if devices != GpuDevices::One {
+			return Err(format!("{GPU_ADAPTER_ENV} picks the adapter for a single device, but {GPU_DEVICES_ENV} opens several; name the adapters in {GPU_DEVICES_ENV} instead"));
+		}
+		config = config.with_adapter(parse_adapter_selector(adapter).map_err(|error| format!("{GPU_ADAPTER_ENV}: {error}"))?);
+	}
+	Ok(Some(config.with_devices(devices)))
+}
+
+/// Install `config` with `splimes::configure_gpu`, returning the log line. Call it once at
+/// startup, before calibration or any request starts the GPU. A refusal (the GPU already
+/// started) is reported, not fatal: interpolation still works on splimes' defaults.
+#[must_use]
+pub fn apply_config(config: GpuConfig) -> String {
+	let described = describe_config(&config);
+	match splimes::configure_gpu(config) {
+		Ok(()) => format!("gpu: configured {described}"),
+		Err(err) => format!("gpu: configuration {described} not applied ({err}); splimes' defaults stay"),
+	}
+}
+
+/// A [`GpuConfig`]'s device choice in words, e.g. `devices: all` or `devices: one (adapter name "4070")`.
+fn describe_config(config: &GpuConfig) -> String {
+	let selector = |selector: &AdapterSelector| match selector {
+		AdapterSelector::Index(index) => format!("#{index}"),
+		AdapterSelector::Name(name) => format!("name {name:?}"),
+		AdapterSelector::Api(api) => format!("api {api:?}"),
+		other => format!("{other:?}"),
+	};
+	let devices = match &config.devices {
+		GpuDevices::One => match &config.adapter {
+			Some(adapter) => format!("one (adapter {})", selector(adapter)),
+			None => "one".to_string(),
+		},
+		GpuDevices::All => "all".to_string(),
+		GpuDevices::List(list) => format!("list [{}]", list.iter().map(selector).collect::<Vec<_>>().join(", ")),
+		other => format!("{other:?}"),
+	};
+	format!("devices: {devices}")
 }
 
 /// Whether a GPU adapter is really the CPU.
@@ -96,7 +219,12 @@ pub fn calibrate(mode: CalibrationMode) -> Vec<String> {
 		Ok(calibration) => format!("gpu calibration: done in {:.1} s: {}", started.elapsed().as_secs_f64(), describe_thresholds(calibration.thresholds)),
 		Err(err) => format!("gpu calibration: failed ({err}); keeping the default thresholds ({})", describe_thresholds(splimes::auto_thresholds())),
 	};
-	vec![gpu, thresholds]
+	let mut lines = vec![gpu, thresholds];
+	let devices = splimes::gpu_devices();
+	if devices.len() > 1 {
+		lines.push(format!("gpu devices: {}", devices.iter().enumerate().map(|(index, device)| format!("#{index} {} ({}, {})", device.info.name, device.info.api, device.info.device_type)).collect::<Vec<_>>().join("; ")));
+	}
+	lines
 }
 
 /// Run `work` (normally `move || calibrate(mode)`) in the background.
@@ -146,6 +274,62 @@ mod tests {
 		for force in ["force", "FORCE", " Force "] {
 			assert_eq!(CalibrationMode::from_env_value(Some(force)), CalibrationMode::Force, "{force:?} forces it");
 		}
+	}
+
+	/// 5.7: unset or blank, nothing is configured, so splimes' single-device default holds.
+	#[test]
+	fn no_gpu_settings_leave_the_default_alone() {
+		assert_eq!(gpu_config_from_env(None, None), Ok(None));
+		assert_eq!(gpu_config_from_env(Some(""), Some("  ")), Ok(None));
+		assert_eq!(GpuConfig::default().devices, GpuDevices::One, "splimes' default is one device");
+	}
+
+	#[test]
+	fn adapter_selectors_parse() {
+		assert_eq!(parse_adapter_selector("0"), Ok(AdapterSelector::Index(0)));
+		assert_eq!(parse_adapter_selector(" 2 "), Ok(AdapterSelector::Index(2)));
+		assert_eq!(parse_adapter_selector("api:vulkan"), Ok(AdapterSelector::Api("vulkan".to_string())));
+		assert_eq!(parse_adapter_selector("API: Metal"), Ok(AdapterSelector::Api("Metal".to_string())));
+		assert_eq!(parse_adapter_selector("name:4070"), Ok(AdapterSelector::Name("4070".to_string())));
+		assert_eq!(parse_adapter_selector("NVIDIA GeForce"), Ok(AdapterSelector::Name("NVIDIA GeForce".to_string())));
+		for bad in ["", "  ", "api:", "name: "] {
+			assert!(parse_adapter_selector(bad).is_err(), "{bad:?} is refused");
+		}
+	}
+
+	#[test]
+	fn device_modes_parse() {
+		assert_eq!(parse_devices("one"), Ok(GpuDevices::One));
+		assert_eq!(parse_devices("ALL"), Ok(GpuDevices::All));
+		assert_eq!(parse_devices("0,1"), Ok(GpuDevices::List(vec![AdapterSelector::Index(0), AdapterSelector::Index(1)])));
+		assert_eq!(parse_devices("name:4070, api:vulkan"), Ok(GpuDevices::List(vec![AdapterSelector::Name("4070".to_string()), AdapterSelector::Api("vulkan".to_string())])));
+		for bad in ["", "0,", ",1", "0,,1"] {
+			assert!(parse_devices(bad).is_err(), "{bad:?} is refused");
+		}
+	}
+
+	#[test]
+	fn settings_build_the_splimes_config() {
+		let one = gpu_config_from_env(Some("1"), None).unwrap().unwrap();
+		assert_eq!(one, GpuConfig::default().with_adapter(AdapterSelector::Index(1)));
+		let explicit_one = gpu_config_from_env(Some("api:vulkan"), Some("one")).unwrap().unwrap();
+		assert_eq!(explicit_one.devices, GpuDevices::One);
+		assert_eq!(explicit_one.adapter, Some(AdapterSelector::Api("vulkan".to_string())));
+		let all = gpu_config_from_env(None, Some("all")).unwrap().unwrap();
+		assert_eq!(all, GpuConfig::default().with_devices(GpuDevices::All));
+		assert_eq!(all.max_pool_bytes, GpuConfig::DEFAULT.max_pool_bytes, "the other settings keep splimes' defaults");
+		let error = gpu_config_from_env(Some("0"), Some("all")).unwrap_err();
+		assert!(error.contains(GPU_ADAPTER_ENV) && error.contains(GPU_DEVICES_ENV), "{error}");
+		assert!(gpu_config_from_env(None, Some("0,")).unwrap_err().starts_with(GPU_DEVICES_ENV));
+		assert!(gpu_config_from_env(Some("api:"), None).unwrap_err().starts_with(GPU_ADAPTER_ENV));
+	}
+
+	#[test]
+	fn configurations_are_described() {
+		assert_eq!(describe_config(&GpuConfig::default()), "devices: one");
+		assert_eq!(describe_config(&GpuConfig::default().with_adapter(AdapterSelector::Name("4070".to_string()))), "devices: one (adapter name \"4070\")");
+		assert_eq!(describe_config(&GpuConfig::default().with_devices(GpuDevices::All)), "devices: all");
+		assert_eq!(describe_config(&GpuConfig::default().with_devices(GpuDevices::List(vec![AdapterSelector::Index(0), AdapterSelector::Api("vulkan".to_string())]))), "devices: list [#0, api \"vulkan\"]");
 	}
 
 	#[test]

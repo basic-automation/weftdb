@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! SEC-9's audit log, end to end over HTTP: the attempt/outcome pair per
 //! audited operation, the `weft_audit` events (committed ingest, auth
 //! denial), reads leaving no trace, and the fail-closed refusal when the
@@ -147,9 +150,9 @@ async fn a_log_that_cannot_be_written_refuses_the_operation() {
 	let mut saved = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 	unsafe {
 		libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-		assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut saved), 0);
+		assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut saved), 0);
 		let limit = libc::rlimit { rlim_cur: 0, rlim_max: saved.rlim_max };
-		assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0, "the rlimit is set");
+		assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit), 0, "the rlimit is set");
 	}
 	let audit = Arc::new(AuditLog::open(&dir.path().join("audit.jsonl")).expect("the audit file opens; only its writes are capped"));
 	let router = app_with_state(AppState::new().with_store(store).with_audit_log(audit));
@@ -166,6 +169,6 @@ async fn a_log_that_cannot_be_written_refuses_the_operation() {
 
 	// Restore the cap before the store's drop writes its shutdown mark.
 	unsafe {
-		assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &saved), 0, "the rlimit is restored");
+		assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const saved), 0, "the rlimit is restored");
 	}
 }

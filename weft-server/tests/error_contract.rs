@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! The error contract, end to end: every refusal this server produces answers with the
 //! same JSON shape, a code from the §4 table, and the request id in the body as well as
 //! in the header.
