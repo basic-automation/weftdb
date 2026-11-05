@@ -358,7 +358,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
       state alone, so it answers while a store is being refused. DECISIONS 2026-11-03
   - [ ] seal lane
   - [ ] read lane
-  - [ ] → **ROB-13** Bounded stored downsample and point lookups
+  - [x] → **ROB-13** Bounded stored downsample and point lookups
   - [ ] **ROB-7** Ingest decode bounds
   - [ ] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
   - [ ] **ROB-23r** Probe-only admin listener

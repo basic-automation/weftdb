@@ -4561,3 +4561,69 @@ the transaction's connection and record/delete nothing when it is
 absent, the agreement the change-log reader already kept: a store with
 no change log has no consumer to notify, and this build must not create
 the table outside a migration.
+## 2026-11-04 — ROB-13: the decision 12 bounds live in the store too — the ROB-12/ROB-13 split (FLAGGED FOR MERGE REVIEW)
+
+**Context:** 1.0-plan §3 gives ROB-12 / ROB-13 / ROB-15 "one set of read limits
+(decision 12)" and does not itemize the split; the queue notes for both slices
+carry that as an open question, with only ROB-13's part named (ROADMAP line
+359: "Bounded stored downsample and point lookups"). ROB-12 (peer PR #546)
+took the HTTP layer: one `ReadLimits` in weft-server caps every read a client
+can size — page, rows, the stored downsample's grid, the `at-multi` batch —
+with `422 result_too_large` and a `504` deadline, and its DECISIONS entry
+records the two things it deliberately did not do: its deadline "bounds the
+wait, not the work", and counting or bounding inside `SegmentStore` was "a
+store change outside this slice". §3 likewise puts ROB-13 in the store lane
+(it carries the `segment_store.rs` rustdoc item removed from EVI-1, which
+"stays out of the store lane"). What was left unbuilt is the work bound
+itself: a caller that is not an HTTP handler (an embedder, the bench, a
+future Flight/Grafana surface) could still make the store fold an unbounded
+grid, and the one HTTP shape whose grid cannot be counted from the request —
+an unbounded stored downsample — could only be refused by ROB-12 *after* its
+buckets were produced.
+
+**Chosen:**
+
+1. **The bounds are the store's, at decision 12's numbers.**
+   `SegmentStoreOptions` gains `max_downsample_buckets` (default
+   1,000,000) and `max_point_batch` (default 10,000), with
+   `DEFAULT_MAX_DOWNSAMPLE_BUCKETS` / `DEFAULT_MAX_POINT_BATCH` constants
+   and `with_*` builders — the exact shape TAG-7's `max_series_per_aspect`
+   set for a store limit. No new `WEFT_*` variables: the library reads none
+   on its own (decision 1(d)); the server's `WEFT_MAX_DOWNSAMPLE_BUCKETS` /
+   `WEFT_MAX_AT_MULTI_INSTANTS` stay ROB-12's HTTP ceilings, at the same
+   defaults.
+2. **Refusals are typed.** `StoreError::DownsampleTooLarge { aspect,
+   buckets, limit }` and `StoreError::PointBatchTooLarge { aspect, instants,
+   limit }` land beside `SeriesLimit` in the store's one typed error, and
+   `classify_typed` maps both to `422 result_too_large` with the cap in the
+   envelope's `limit` — over HTTP the store's refusal is the same answer
+   ROB-12's ceilings give, never the match's wildcard `503
+   incompatible_store`.
+3. **The downsample bound bites during the fold, not after it.**
+   `downsample_partial` takes the cap and checks a single segment's partial
+   and the merged accumulator as each segment folds in; the first count over
+   the cap refuses and the remaining partials drop with it. For
+   `BucketWidth` requests the fold runs at the width's unit, so its cap is
+   the bucket cap × `count`, and the coarsened grid is checked against the
+   cap itself: the bound is the grid the caller gets (ten one-second buckets
+   coarsened by 3 answer under a cap of 4; coarsened by 2 the same rows are
+   refused from the fold, whose scaled cap they necessarily cross). A fold
+   refusal therefore reports the unit count against the scaled cap; a
+   plain-resolution refusal reports decision 12's numbers unchanged.
+4. **Point lookups:** `read_points_of` refuses an over-cap batch before the
+   index prune — the batch is the read. `read_point` names one instant and
+   is bounded by construction; nothing is added there.
+5. **The §3 rustdoc item is not applicable at pick time.** The cited lines
+   (`segment_store.rs:772-773`) were in the pre-split file; the reads have
+   since moved to `segment_store/read.rs`, and the crate's rustdoc builds
+   clean under `-D warnings` on this branch, so no doc defect remains at
+   the cited place to fix.
+
+**Alternatives considered:** duplicating ROB-12's two named ceilings in
+`weft-server/src/storage.rs` (double-builds the peer's open PR in the same
+functions, and still leaves every non-HTTP caller unbounded); counting the
+grid from the requested window before the fold (an unbounded window counts
+as the whole `i64` span and would refuse the common shape — the reason
+ROB-12 pre-checks only named bounds); a cancellation token threaded into
+the store so ROB-12's deadline stops the work (real, but ROB-15's plumbing
+per ROB-12's own DECISIONS entry, not this slice's).
