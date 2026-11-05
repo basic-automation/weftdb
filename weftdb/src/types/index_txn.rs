@@ -402,10 +402,19 @@ impl IndexTxn {
 	}
 
 	/// The time span (`max_ts - min_ts`) of every segment row the transaction writes,
-	/// with its aspect: what the prune's span bound must cover before it commits.
-	pub(crate) fn row_spans(&self) -> impl Iterator<Item = (&str, i64)> {
+	/// with its aspect and series: what the prune's span bounds must cover before it commits.
+	pub(crate) fn row_spans(&self) -> impl Iterator<Item = (&str, crate::SeriesId, i64)> {
 		self.ops.iter().filter_map(|op| match op {
-			IndexOp::InsertNew { aspect, row } | IndexOp::Upsert { aspect, row } | IndexOp::ReplaceExpected { aspect, row, .. } => Some((aspect.as_str(), row.desc.max_ts?.saturating_sub(row.desc.min_ts?))),
+			IndexOp::InsertNew { aspect, row } | IndexOp::Upsert { aspect, row } | IndexOp::ReplaceExpected { aspect, row, .. } => Some((aspect.as_str(), crate::SeriesId(row.series_id), row.desc.max_ts?.saturating_sub(row.desc.min_ts?))),
+			_ => None,
+		})
+	}
+
+	/// The aspects whose series catalog this transaction registers a series in: what a
+	/// catalog cache must forget once it has run.
+	pub(crate) fn registered_aspects(&self) -> impl Iterator<Item = &str> {
+		self.ops.iter().filter_map(|op| match op {
+			IndexOp::RegisterSeries { aspect, .. } => Some(aspect.as_str()),
 			_ => None,
 		})
 	}
