@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use splimes::Interpolation;
 use tracing::Instrument as _;
 use weft_physical_type::TimeUnit;
-use weftdb::interpolate_range::{StoredWindowError, MAX_KNOTS};
+use weftdb::interpolate_range::StoredWindowError;
 
 use crate::{
 	error::{self, ApiError, Code, StrictQuery}, interpolate::{self, InterpolateConfig, OutputPoint}, state::AppState
@@ -188,7 +188,7 @@ async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, as
 /// `400 bad_request` for an unknown token, an inverted window, a negative margin, or a window
 /// with no stored sample; `422 value_not_representable` for a bound outside the representable
 /// range; `422 result_too_large` (with `limit`) for a grid over the output cap or a read window
-/// over [`MAX_KNOTS`] stored rows; `400 not_finite` for a computed value with no finite `f64`;
+/// over [`MAX_KNOTS`](weftdb::interpolate_range::MAX_KNOTS) stored rows; `400 not_finite` for a computed value with no finite `f64`;
 /// and `500 internal` on a read or engine failure.
 pub async fn storage_interpolate(State(state): State<AppState>, State(config): State<InterpolateConfig>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<StoredInterpolateParams>) -> Result<Json<StoredInterpolateResponse>, ApiError> {
 	Ok(Json(stored_interpolate_inner(state, config, &aspect, &params).await?))
@@ -413,7 +413,7 @@ mod tests {
 
 	#[test]
 	fn the_knot_cap_is_result_too_large_with_its_limit() {
-		let err = anyhow::Error::from(StoredWindowError::TooManyRows { aspect: "line".to_string(), lo: 0, hi: 10, rows: MAX_KNOTS + 1, limit: MAX_KNOTS });
+		let err = anyhow::Error::from(StoredWindowError::TooManyRows { aspect: "line".to_string(), lo: 0, hi: 10, rows: weftdb::interpolate_range::MAX_KNOTS + 1, limit: weftdb::interpolate_range::MAX_KNOTS });
 		let api = classify(&err.context("interpolating"), InterpolateConfig::DEFAULT);
 		assert_eq!(api.code(), Code::ResultTooLarge);
 		assert!(api.message().contains("narrow the window"), "{}", api.message());
