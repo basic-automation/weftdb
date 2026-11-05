@@ -8,7 +8,7 @@
 //! `synchronous_commit = on`: durable, as a WeftDB seal is.
 //!
 //! The hypertable's chunk interval is the dataset's whole span, so every load is one chunk: each
-//! dataset fits in memory many times over, which is the size TimescaleDB's guidance picks chunks
+//! dataset fits in memory many times over, which is the size `TimescaleDB`'s guidance picks chunks
 //! for, and it is the counterpart of `weftdb-stored-bulk`'s one segment. A fixed one-day interval
 //! was tried first and is the wrong configuration here: the four-year UCI series became 420 chunks,
 //! and each per-instant index lookup walked all of them, 58× slower on the same query.
@@ -31,7 +31,9 @@
 //! `avg` are read back as `double precision`. The hypertable is left in the row store: the
 //! columnstore (compression) is a separate configuration, not this arm's.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+	fmt::Write as _, sync::atomic::{AtomicU64, Ordering}
+};
 
 use bigdecimal::ToPrimitive;
 use futures_util::SinkExt;
@@ -190,7 +192,7 @@ impl Timescale {
 fn copy_text(timestamps: &[i64], values: &[String]) -> String {
 	let mut out = String::with_capacity(timestamps.len() * 40);
 	for (seq, (t, v)) in timestamps.iter().zip(values).enumerate() {
-		out.push_str(&format!("{seq}\t{t}\t{v}\n"));
+		let _ = writeln!(out, "{seq}\t{t}\t{v}");
 	}
 	out
 }

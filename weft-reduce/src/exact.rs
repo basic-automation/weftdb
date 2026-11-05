@@ -13,6 +13,8 @@
 //! parses `"0e-3"` back to `0.000`, and still parses the `"0"` an older partial holds (at
 //! scale 0).
 
+use std::borrow::Borrow;
+
 use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
@@ -39,15 +41,18 @@ pub fn decimal<S: Serializer>(value: &BigDecimal, serializer: S) -> Result<S::Ok
 }
 
 /// An `Option<BigDecimal>` field.
-#[allow(clippy::ref_option)] // `serialize_with` passes a reference to the field.
-pub fn option<S: Serializer>(value: &Option<BigDecimal>, serializer: S) -> Result<S::Ok, S::Error> {
-	value.as_ref().map(Exact).serialize(serializer)
+///
+/// Generic over `Borrow` because `serialize_with` hands over a reference to the field, which
+/// would otherwise make the signature `&Option<_>`.
+pub fn option<S: Serializer, O: Borrow<Option<BigDecimal>>>(value: &O, serializer: S) -> Result<S::Ok, S::Error> {
+	value.borrow().as_ref().map(Exact).serialize(serializer)
 }
 
 /// An `Option<(DateTime<Utc>, BigDecimal)>` field.
-#[allow(clippy::ref_option)] // `serialize_with` passes a reference to the field.
-pub fn stamped<S: Serializer>(value: &Option<(DateTime<Utc>, BigDecimal)>, serializer: S) -> Result<S::Ok, S::Error> {
-	value.as_ref().map(|(t, v)| (t, Exact(v))).serialize(serializer)
+///
+/// Generic over `Borrow` for the same reason as [`option`].
+pub fn stamped<S: Serializer, O: Borrow<Option<(DateTime<Utc>, BigDecimal)>>>(value: &O, serializer: S) -> Result<S::Ok, S::Error> {
+	value.borrow().as_ref().map(|(t, v)| (t, Exact(v))).serialize(serializer)
 }
 
 /// A `Vec<(DateTime<Utc>, BigDecimal)>` field.

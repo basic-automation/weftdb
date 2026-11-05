@@ -140,7 +140,6 @@ impl SignalShape {
 				// Six half-periods alternating 20/80 with sharp edges. `phase` is
 				// in `[0, 1]`, so `phase * 6.0` is in `[0, 6]` and the cast cannot
 				// wrap; truncation toward zero equals `floor` for a non-negative.
-				#[allow(clippy::cast_possible_truncation)]
 				let half = (phase * 6.0) as i64;
 				if half % 2 == 0 {
 					20.0
@@ -364,7 +363,6 @@ impl InterpolationProfile {
 	/// [`Self::start`] over the total `span`); instants outside `[start, end]` are
 	/// clamped into the span so a boundary grid point still yields a defined value.
 	#[must_use]
-	#[allow(clippy::cast_precision_loss)]
 	pub fn clean_signal_at(&self, t: DateTime<Utc>) -> Option<f64> {
 		if !matches!(self.source, DatasetSource::Generated) {
 			return None;
@@ -400,13 +398,11 @@ impl InterpolationProfile {
 		// Candidate count is inflated so that, after dropping `missingness`, we
 		// still land near `input_points`.
 		let keep = 1.0 - self.missingness_fraction.clamp(0.0, 0.95);
-		#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 		let candidates = ((self.input_points as f64) / keep.max(0.05)).ceil() as usize;
 		let candidates = candidates.max(2);
 
 		// `candidates` is small (bounded by ~input_points); the i64 casts of the
 		// loop index and count cannot wrap in practice.
-		#[allow(clippy::cast_possible_wrap)]
 		let nominal_step_ns = span_ns / candidates as i64;
 
 		let mut points: Vec<Point> = Vec::with_capacity(self.input_points);
@@ -417,11 +413,9 @@ impl InterpolationProfile {
 			}
 
 			// Irregular spacing: nominal grid instant plus bounded jitter.
-			#[allow(clippy::cast_possible_wrap)]
 			let base_offset = nominal_step_ns.saturating_mul(i as i64);
 			// Jitter span is a small fraction of one step; precision/truncation
 			// in the f64 round-trip is intended and harmless.
-			#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 			let jitter_span = (nominal_step_ns as f64 * self.jitter_fraction) as i64;
 			let jitter = if jitter_span > 0 { rng.random_range(-jitter_span..=jitter_span) } else { 0 };
 			let offset_ns = (base_offset + jitter).clamp(0, span_ns);
@@ -431,14 +425,12 @@ impl InterpolationProfile {
 			// The signal is the shared analytic ground truth (see [`SignalShape`])
 			// evaluated through `self.signal_shape`, so accuracy scoring can never
 			// drift from what was generated.
-			#[allow(clippy::cast_precision_loss)]
 			let phase = offset_ns as f64 / span_ns as f64;
 			// A zero (or negative) amplitude means a noise-free sample sitting
 			// exactly on the analytic ground truth; `random_range` requires a
 			// non-empty range, so guard the degenerate case explicitly.
 			let noise = if self.noise_amplitude > 0.0 { rng.random_range(-self.noise_amplitude..=self.noise_amplitude) } else { 0.0 };
 			let signal = self.signal_shape.evaluate(phase) + noise;
-			#[allow(clippy::cast_possible_truncation)]
 			let rounded = |places: u32| BigDecimal::new(((signal * 10_f64.powi(places.cast_signed())).round() as i64).into(), i64::from(places));
 			let value = self.value_decimals.map_or_else(|| BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(0)), rounded);
 			points.push(Point { timestamp, value });

@@ -142,6 +142,14 @@ jobs:
       # Linux runners have no GPU. Mesa's lavapipe is a software Vulkan driver, so splimes'
       # wgpu path runs for real under WeftDB's tests. (splimes' own CI requires a GPU
       # adapter; see github.com/basic-automation/splimes.)
+      # The debug build of the whole workspace (Arrow Flight and tonic among it) no
+      # longer fits the hosted Linux runner's free disk; drop preinstalled SDKs we never use.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Install software Vulkan (lavapipe)
         if: runner.os == 'Linux'
         run: |
@@ -199,6 +207,11 @@ jobs:
         env:
           # Absolute: cargo runs an integration test from its package directory.
           WEFT_SERVER_BIN: ${{ github.workspace }}/target/debug/weft-server
+      # The R client's offline checks and its contract against the same server, in a pinned
+      # rocker/r-ver container (scripts/clients/test-r.sh), so the runner needs no R.
+      - name: R client (clients/r)
+        if: runner.os == 'Linux'
+        run: scripts/clients/test-r.sh target/debug/weft-server
       # Tests create their legacy databases in a temporary data dir (weftdb/tests/common,
       # weft-orchestration's test_support, db_tests' own temp dirs), never in the default
       # ~/.weftdb/data. A fresh runner has no ~/.weftdb, so one here was written by a test.
@@ -371,6 +384,13 @@ jobs:
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
           args: -color
+      # A `run:` step that starts with a repository path executes that file, so the file needs
+      # the executable bit in the tree - and an editor or an agent that writes the script sets
+      # none. The R client step landed that way and made the ubuntu test job red on every open
+      # pull request with the least useful error a runner produces: `Permission denied`, exit
+      # code 126. This gate names the file and the workflow line instead.
+      - name: workflow-invoked scripts are executable
+        run: python3 scripts/contrib/check_exec_bits.py
       # The release pipeline scripts, the fixture generator X-FX added, and the license
       # bundle generator: none of them has any other gate on it, and all three run at
       # release time against a real tag rather than a mocked one. The bench artifact
@@ -383,7 +403,7 @@ jobs:
         run: |
           shellcheck --version
           shellcheck scripts/release/*.sh scripts/compat/*.sh \
-            scripts/licenses/*.sh scripts/bench/*.sh scripts/packaging/*.sh
+            scripts/licenses/*.sh scripts/bench/*.sh scripts/packaging/*.sh scripts/clients/*.sh
       - name: verify.sh tests
         run: scripts/release/test-verify.sh
       - name: stage.sh tests

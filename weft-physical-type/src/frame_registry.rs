@@ -47,7 +47,9 @@ pub const FRAME_PAGED: u16 = 6;
 /// moved offset.
 pub const FRAME_ENVELOPE: u16 = 7;
 
-/// The highest frame version this build can read. Anything above it came from a newer
+/// The highest frame version this build can read.
+///
+/// Anything above it came from a newer
 /// server, which is the difference between "this file is broken" and "this file is
 /// ahead of me" — see [`FrameFault::Undecodable`].
 pub const FRAME_VERSION_MAX_KNOWN: u16 = FRAME_ENVELOPE;
@@ -107,6 +109,17 @@ pub struct FrameExtensionSpec {
 	pub name: &'static str,
 }
 
+/// The extension carrying a frame's tag-set series key (tags A3, 1.0 plan §5 D-S16).
+///
+/// The payload is the canonical series-key bytes of the series the
+/// frame's rows belong to. Since TAG-7 every frame of a tagged series is a v7
+/// envelope carrying exactly this one extension, marked critical, around an
+/// unchanged v5 or v6 body; an untagged frame has no envelope at all. A reader
+/// that does not bind series keys must still not adopt or reap such a frame as
+/// if it were untagged: since TAG-9 recovery binds the key to the frame's series,
+/// journaling an orphan `held` only while its aspect is undeclared.
+pub const EXT_SERIES_KEY: u32 = 1;
+
 /// The extension numbers this build implements.
 ///
 /// Append-only, on exactly the rule stated for frame versions at the top of this
@@ -114,13 +127,6 @@ pub struct FrameExtensionSpec {
 /// next free number. It held only the *mechanism* until D-S16 named the first
 /// extension, [`EXT_SERIES_KEY`]: the envelope lets a slice put a block in front of
 /// a frozen body without moving a byte inside it.
-/// The extension carrying a frame's tag-set series key (tags A3, 1.0 plan §5
-/// D-S16): the payload is the canonical series-key bytes of the series the
-/// frame's rows belong to. A reader that does not bind series keys yet must
-/// still not adopt or reap such a frame as if it were untagged: D-S16 journals
-/// frames carrying it `held` until TAG-9 binds them.
-pub const EXT_SERIES_KEY: u32 = 1;
-
 pub const KNOWN_EXTENSIONS: &[FrameExtensionSpec] = &[FrameExtensionSpec { id: EXT_SERIES_KEY, name: "SERIES_KEY: the canonical series key of the tag set the frame's rows belong to" }];
 
 /// Whether this build knows what to do with extension `id`.
@@ -198,10 +204,11 @@ pub const MAX_FRAME_PAGES: usize = 1_048_576;
 
 /// The most extension entries one v7 envelope may declare (ROB-8).
 ///
-/// The envelope ships with no extensions at all ([`KNOWN_EXTENSIONS`] is
-/// empty), so any table a real writer produces today has zero entries;
-/// this leaves room for a later writer's table while refusing a count the
-/// frame's own bytes could never back.
+/// [`KNOWN_EXTENSIONS`] holds one extension, [`EXT_SERIES_KEY`], and a real
+/// writer produces a table of at most one entry today (a tagged frame's
+/// series key; an untagged frame has no envelope); this leaves room for a
+/// later writer's table while refusing a count the frame's own bytes could
+/// never back.
 pub const MAX_FRAME_EXTENSIONS: usize = 1_024;
 
 /// The limits a frame decode enforces (ROB-8; the `DecodeLimits` the plan's
@@ -321,7 +328,7 @@ mod tests {
 		// The row bound must stay above the plan's own row caps, so a frame a
 		// writer can produce is never refused for its height alone: decision
 		// 12's read/export cap is 5,000,000 rows.
-		assert!(MAX_FRAME_ROWS > 5_000_000);
+		const { assert!(MAX_FRAME_ROWS > 5_000_000) };
 		assert!(DecodeLimits::DEFAULT.rows_ok(MAX_FRAME_ROWS));
 		assert!(!DecodeLimits::DEFAULT.rows_ok(MAX_FRAME_ROWS + 1));
 		assert!(DecodeLimits::DEFAULT.pages_ok(MAX_FRAME_PAGES));

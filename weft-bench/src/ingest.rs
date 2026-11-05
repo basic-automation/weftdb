@@ -120,7 +120,6 @@ impl IngestProfile {
 /// A read-back mismatch is not an error: it fails the correctness gate in the
 /// returned [`BenchResult`], exactly as the other workloads report a failed
 /// gate, so the run is non-publishable and the binary exits non-zero.
-#[allow(clippy::cast_precision_loss)]
 pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, reps: usize) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(reps > 0, "reps must be > 0");
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
@@ -170,7 +169,7 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST.to_string(), reps, dataset: DatasetMeta { input_points: timestamps.len(), output_points: read_ts.len(), irregular: timestamps.windows(3).any(|w| w[2] - w[1] != w[1] - w[0]), missingness_fraction, seed: 0, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
 }
 
 /// What the store held at one checkpoint of an ingest growth curve (schema v24).
@@ -240,7 +239,6 @@ impl Tiled<'_> {
 /// `batch_rows == 0`, if `checkpoints` is empty or not strictly rising, if a copy would leave
 /// the timestamp range, if any store operation fails, or if `on_checkpoint` fails. A failed
 /// check is not an error: it fails that checkpoint's correctness gate.
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, checkpoints: &[u64], mut on_checkpoint: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
@@ -312,7 +310,7 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 		let growth = GrowthPoint { rows_total: checkpoint, rows_stage, corpus_copies: checkpoint as f64 / n as f64, segments: stats.segment_count, segment_bytes: stats.total_bytes, bytes_per_point: stats.bytes_per_point, rows_verified, verify_read_ns };
 		let correctness = CorrectnessReport { output_count_ok: accounted && exact, expected_output_points: usize::try_from(checkpoint)?, actual_output_points: usize::try_from(stats.total_rows)?, values_finite: finite, result_sha256: Some(digest.finish()) };
 		let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(stage_start) };
-		on_checkpoint(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, count_label(checkpoint)), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST_GROWTH.to_string(), reps: samples_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(checkpoint)?, output_points: usize::try_from(stats.total_rows)?, irregular, missingness_fraction, seed: 0, signal_shape: None }, latency: LatencyStats::from_samples(&samples_ns), latency_ci: None, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: Some(growth), online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })?;
+		on_checkpoint(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, count_label(checkpoint)), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST_GROWTH.to_string(), reps: samples_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(checkpoint)?, output_points: usize::try_from(stats.total_rows)?, irregular, missingness_fraction, seed: 0, signal_shape: None }, latency: LatencyStats::from_samples(&samples_ns), latency_ci: None, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: Some(growth), online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })?;
 	}
 	drop(store);
 	Ok(())
@@ -408,7 +406,6 @@ struct ReaderTally {
 /// `params.rows < 2` or a copy would leave the timestamp range, or if any store operation
 /// fails. A query that reads the wrong rows, or that the store refuses (a read can meet the
 /// writer's lock), is not an error: it is counted and fails the correctness gate.
-#[allow(clippy::cast_precision_loss)]
 pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: OnlineParams) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
@@ -445,7 +442,7 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 	let point = OnlinePoint { readers: params.readers, window_rows: params.window_rows, rows, ingest_alone_rows_per_sec: throughput(alone_ns), tail_queries: online.tail_queries, idle_queries: idle.samples_ns.len(), idle_p50_ns: idle_latency.p50_ns, idle_p99_ns: idle_latency.p99_ns, rows_verified: online.rows_verified + idle.rows_verified, mismatched_queries, failed_queries, first_error: online.first_error.or(idle.first_error) };
 	let correctness = CorrectnessReport { output_count_ok: accounted && mismatched_queries == 0 && failed_queries == 0, expected_output_points: usize::try_from(point.rows_verified)?, actual_output_points: usize::try_from(online.rows_read + idle.rows_read)?, values_finite: online.finite && idle.finite, result_sha256: None };
 	let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns: online_ns, end_to_end_ns: span_ns(run_start).saturating_add(generation_ns) };
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name, adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST_ONLINE.to_string(), reps: online.samples_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(rows)?, output_points: usize::try_from(stats.0)?, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, latency: LatencyStats::from_samples(&online.samples_ns), latency_ci: None, throughput_points_per_sec: throughput(online_ns), timing, correctness, accuracy: None, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&online.samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: Some(point), compressed_query: None, analytics: None, samples_ns: online.samples_ns.clone(), between_run: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name, adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST_ONLINE.to_string(), reps: online.samples_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(rows)?, output_points: usize::try_from(stats.0)?, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, latency: LatencyStats::from_samples(&online.samples_ns), latency_ci: None, throughput_points_per_sec: throughput(online_ns), timing, correctness, accuracy: None, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&online.samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: Some(point), compressed_query: None, analytics: None, samples_ns: online.samples_ns.clone(), between_run: None, gpu_economics: None })
 }
 
 /// A fresh store with the aspect declared, in a directory removed when the guard drops.
@@ -624,9 +621,8 @@ pub fn count_label(n: u64) -> String {
 }
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64`.
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 #[cfg(test)]

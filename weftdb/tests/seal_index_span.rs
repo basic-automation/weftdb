@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! The seal's index write is spanned and counted (roadmap Phase 3): sealing a segment closes a
 //! `control_plane.index.insert` span whose `rows_changed` is the one row the insert changed.
 
@@ -48,6 +51,7 @@ async fn sealing_closes_an_index_insert_span_with_one_row_changed() {
 	let store = SegmentStore::open(dir.path()).await.expect("opens store");
 	store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares aspect");
 	store.seal_declared("price", &[100_i64, 110, 120], &[bd("1.5"), bd("2.5"), bd("3.5")]).await.expect("seals");
+	drop(store);
 
 	let text = String::from_utf8(log.0.lock().expect("log buffer").clone()).expect("utf-8 log");
 	assert!(text.lines().any(|line| line.contains("control_plane.index.insert") && line.contains("rows_changed=1")), "the seal closed no index insert span with one row changed:\n{text}");

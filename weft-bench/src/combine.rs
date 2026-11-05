@@ -77,7 +77,6 @@ fn combine_result(runs: &[&BenchResult]) -> anyhow::Result<BenchResult> {
 	}
 	let run_p50_ns: Vec<u64> = runs.iter().map(|run| run.latency.p50_ns).collect();
 	let (fastest, slowest) = (run_p50_ns.iter().copied().min().unwrap_or(0), run_p50_ns.iter().copied().max().unwrap_or(0));
-	#[allow(clippy::cast_precision_loss, reason = "a ratio of two latencies")]
 	let p50_spread = if fastest > 0 { slowest as f64 / fastest as f64 - 1.0 } else { 0.0 };
 	combined.between_run = Some(BetweenRun { runs: runs.len(), run_p50_ns, run_mean_ns: runs.iter().map(|run| run.latency.mean_ns).collect(), p50_spread, digests_agree });
 	Ok(combined)
@@ -101,7 +100,7 @@ mod tests {
 
 	fn run(level: u64, digest: &str) -> BenchReport {
 		let samples: Vec<u64> = (0..20).map(|i| level + i % 4).collect();
-		let result = BenchResult { schema_version: SCHEMA_VERSION, profile: "p".into(), adapter: "weftdb".into(), workload: "w".into(), reps: samples.len(), dataset: DatasetMeta { input_points: 100, output_points: 10, irregular: false, missingness_fraction: 0.0, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &BootstrapConfig::default())), throughput_points_per_sec: 1.0, timing: TimingBreakdown { dataset_generation_ns: 1, measured_ns: samples.iter().sum(), end_to_end_ns: 2 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 10, actual_output_points: 10, values_finite: true, result_sha256: Some(digest.into()) }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples, between_run: None };
+		let result = BenchResult { schema_version: SCHEMA_VERSION, profile: "p".into(), adapter: "weftdb".into(), workload: "w".into(), reps: samples.len(), dataset: DatasetMeta { input_points: 100, output_points: 10, irregular: false, missingness_fraction: 0.0, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&samples), latency_ci: Some(LatencyStats::bootstrap_cis(&samples, &BootstrapConfig::default())), throughput_points_per_sec: 1.0, timing: TimingBreakdown { dataset_generation_ns: 1, measured_ns: samples.iter().sum(), end_to_end_ns: 2 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 10, actual_output_points: 10, values_finite: true, result_sha256: Some(digest.into()) }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples, between_run: None, gpu_economics: None };
 		BenchReport::with_results(RunMetadata::capture("2026-11-02T00:00:00Z".into()), vec![result])
 	}
 

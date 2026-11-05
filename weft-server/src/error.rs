@@ -81,7 +81,9 @@ pub enum Code {
 	InvalidTag,
 	/// A selector matched more than one series where exactly one was required.
 	AmbiguousSeries,
-	/// The request asked for tags on a store whose layout predates them.
+	/// Reserved: the request asked for tags where they cannot be stored. Since TAG-11
+	/// every ingest route accepts tags, so nothing answers with it today; the code stays
+	/// in the table so a later refusal of this kind keeps its documented name.
 	TagsUnsupported,
 	/// The request would create or touch more series than the configured cap allows.
 	SeriesLimit,
@@ -246,7 +248,7 @@ impl Code {
 	/// The one sentence a `5xx` client is allowed to see for this code. The real cause goes
 	/// to the log; this is what the body carries. Kept free of anything that names a path,
 	/// a subsystem version, or an internal type.
-	const fn redacted_message(self) -> &'static str {
+	pub(crate) const fn redacted_message(self) -> &'static str {
 		match self {
 			Self::Internal => "the server could not complete the request",
 			Self::CommitFailed => "the write did not commit and the store was not modified",
@@ -590,6 +592,204 @@ where
 	}
 }
 
+/// The query-string prefix that names a series tag on a stored read (TAG-10, tags D6):
+/// `tag.<key>=<value>` matches tag `key` equal to `value`, and `tag.<key>=` (an empty
+/// value) matches series without tag `key`.
+pub const TAG_PARAM_PREFIX: &str = "tag.";
+
+/// The query parameter that picks the selector's matching mode: absent or `exact` matches
+/// the series whose tags equal the valued `tag.*` parameters, `subset` matches every series
+/// that carries them (other tags allowed).
+pub const TAG_MATCH_PARAM: &str = "tag_match";
+
+/// [`StrictQuery`] for a stored read that also takes a series selector (TAG-10).
+///
+/// The raw query is split before anything is bound: every `tag.<key>` parameter and the
+/// one `tag_match` parameter build the [`SeriesSelector`](weftdb::SeriesSelector), and the
+/// rest bind `T` exactly as [`StrictQuery`] binds it, so `deny_unknown_fields` still refuses
+/// a misspelt parameter with the same message.
+///
+/// - No `tag.*` parameter and no `tag_match` is [`SeriesSelector::untagged`](weftdb::SeriesSelector::untagged):
+///   series 0, the read every untagged client already makes.
+/// - `tag.<key>=` with an empty value means the tag is absent.
+/// - Matching is exact by default; `tag_match=subset` matches loosely
+///   ([`SeriesSelector::new`](weftdb::SeriesSelector::new)). Any other `tag_match`, or a
+///   repeated one, is `400 bad_request`.
+/// - A repeated `tag.<key>`, a key or value the tag grammar refuses, and more than
+///   [`MAX_TAGS`](weftdb::tags::MAX_TAGS) matchers are `400 invalid_tag` with
+///   `details.tag` naming the key where there is one.
+///
+/// Names and values are percent-decoded as `application/x-www-form-urlencoded`, so
+/// `tag%2Ehost=a` is `tag.host=a`.
+#[derive(Debug)]
+pub struct SelectorQuery<T>(pub T, pub weftdb::SeriesSelector);
+
+impl<T, S> FromRequestParts<S> for SelectorQuery<T>
+where
+	T: DeserializeOwned,
+	S: Send + Sync,
+{
+	type Rejection = ApiError;
+
+	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+		let (rest, selector) = split_selector(parts.uri.query().unwrap_or_default())?;
+		let uri: axum::http::Uri = format!("/?{rest}").parse().map_err(|_| ApiError::bad_request("the query string is not a valid URI query".to_string()))?;
+		let Query(params) = Query::<T>::try_from_uri(&uri).map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+		Ok(Self(params, selector))
+	}
+}
+
+/// The `tag.*` / `tag_match` parameters of a raw query, taken apart from the rest.
+struct TagParams<'q> {
+	/// The pieces that are not tag parameters, still encoded.
+	rest: Vec<&'q str>,
+	/// Every `tag.<key>` parameter in request order: an empty value is `None`.
+	matchers: Vec<(String, Option<String>)>,
+	/// The one `tag_match` value, if given.
+	mode: Option<String>,
+}
+
+/// Split a raw query into its tag parameters and the rest (TAG-10, shared by the
+/// read-side [`SelectorQuery`] and the ingest-side [`TaggedQuery`]).
+///
+/// # Errors
+///
+/// `400 bad_request` for a repeated `tag_match`, and `400 invalid_tag` with
+/// `details: {count, limit}` for more than [`MAX_TAGS`](weftdb::tags::MAX_TAGS) tag
+/// parameters. A repeated key is left to the tag builder, which refuses it as
+/// `TagError::DuplicateKey` (the empty-value spelling included).
+fn split_tag_params(query: &str) -> Result<TagParams<'_>, ApiError> {
+	let mut params = TagParams { rest: Vec::new(), matchers: Vec::new(), mode: None };
+	for piece in query.split('&') {
+		let (raw_name, raw_value) = piece.split_once('=').unwrap_or((piece, ""));
+		let name = form_decode(raw_name);
+		if name == TAG_MATCH_PARAM {
+			if params.mode.is_some() {
+				return Err(ApiError::bad_request(format!("`{TAG_MATCH_PARAM}` is given more than once")));
+			}
+			params.mode = Some(form_decode(raw_value));
+		} else if let Some(key) = name.strip_prefix(TAG_PARAM_PREFIX) {
+			let value = form_decode(raw_value);
+			params.matchers.push((key.to_string(), (!value.is_empty()).then_some(value)));
+		} else {
+			params.rest.push(piece);
+		}
+	}
+	if params.matchers.len() > weftdb::tags::MAX_TAGS {
+		return Err(ApiError::new(Code::InvalidTag, format!("{} tag matchers given; a selector holds at most {}", params.matchers.len(), weftdb::tags::MAX_TAGS)).with_details(serde_json::json!({ "count": params.matchers.len(), "limit": weftdb::tags::MAX_TAGS })));
+	}
+	Ok(params)
+}
+
+/// Split a raw query into the pieces that are not selector parameters (rejoined, still
+/// encoded) and the selector the `tag.*` / `tag_match` parameters build.
+fn split_selector(query: &str) -> Result<(String, weftdb::SeriesSelector), ApiError> {
+	let TagParams { rest, matchers, mode } = split_tag_params(query)?;
+	let selector = match mode.as_deref() {
+		None | Some("exact") if matchers.is_empty() => weftdb::SeriesSelector::untagged(),
+		None | Some("exact") => weftdb::SeriesSelector::exact(matchers).map_err(|e| from_tag_error(&e))?,
+		Some("subset") => weftdb::SeriesSelector::new(matchers).map_err(|e| from_tag_error(&e))?,
+		Some(other) => return Err(ApiError::bad_request(format!("`{TAG_MATCH_PARAM}` must be `exact` or `subset`, not {other:?}"))),
+	};
+	Ok((rest.join("&"), selector))
+}
+
+/// [`StrictQuery`] for an ingest route whose body carries no tags of its own (CSV,
+/// Parquet): the `tag.<key>=value` parameters name the one series the batch writes
+/// (TAG-11), and the rest bind `T` exactly as [`StrictQuery`] binds it.
+///
+/// - No `tag.*` parameter is the empty [`TagSet`](weftdb::TagSet): series 0, the write
+///   every untagged client already makes.
+/// - The parameters are split by the same code as [`SelectorQuery`]'s, so the encoding,
+///   the repeated-key refusal and the [`MAX_TAGS`](weftdb::tags::MAX_TAGS) cap read
+///   the same on both sides.
+/// - A write names a series, it does not match one: an empty value (`tag.k=`), a reserved
+///   `__` key, or any key or value the grammar refuses is `400 invalid_tag`, and
+///   `tag_match` is `400 bad_request`.
+#[derive(Debug)]
+pub struct TaggedQuery<T>(pub T, pub weftdb::TagSet);
+
+impl<T, S> FromRequestParts<S> for TaggedQuery<T>
+where
+	T: DeserializeOwned,
+	S: Send + Sync,
+{
+	type Rejection = ApiError;
+
+	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+		let TagParams { rest, matchers, mode } = split_tag_params(parts.uri.query().unwrap_or_default())?;
+		if mode.is_some() {
+			return Err(ApiError::bad_request(format!("`{TAG_MATCH_PARAM}` is a read option; an ingest names its series exactly with `{TAG_PARAM_PREFIX}<key>=value`")));
+		}
+		// An empty value reaches the builder as `""`, which it refuses as
+		// `TagError::EmptyValue` naming the key.
+		let tags = weftdb::TagSet::from_pairs(matchers.iter().map(|(key, value)| (key.as_str(), value.as_deref().unwrap_or_default()))).map_err(|e| from_tag_error(&e))?;
+		let uri: axum::http::Uri = format!("/?{}", rest.join("&")).parse().map_err(|_| ApiError::bad_request("the query string is not a valid URI query".to_string()))?;
+		let Query(params) = Query::<T>::try_from_uri(&uri).map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+		Ok(Self(params, tags))
+	}
+}
+
+/// Decode one `application/x-www-form-urlencoded` component: `+` is a space and `%XX` a
+/// byte; a malformed escape stays as written, and bytes that are not UTF-8 are replaced
+/// with U+FFFD (which the tag grammar then refuses as a key, and a value keeps).
+fn form_decode(raw: &str) -> String {
+	/// The value of one hex digit, or `None` for any other byte.
+	const fn hex(byte: u8) -> Option<u8> {
+		match byte {
+			b'0'..=b'9' => Some(byte - b'0'),
+			b'a'..=b'f' => Some(byte - b'a' + 10),
+			b'A'..=b'F' => Some(byte - b'A' + 10),
+			_ => None,
+		}
+	}
+	let bytes = raw.as_bytes();
+	let mut out = Vec::with_capacity(bytes.len());
+	let mut i = 0;
+	while let Some(&byte) = bytes.get(i) {
+		match byte {
+			b'+' => out.push(b' '),
+			b'%' => {
+				if let (Some(high), Some(low)) = (bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+					out.push(high << 4 | low);
+					i += 3;
+					continue;
+				}
+				out.push(b'%');
+			}
+			other => out.push(other),
+		}
+		i += 1;
+	}
+	String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Map a [`TagError`](weftdb::TagError) to the §4 envelope (TAG-10).
+///
+/// A variant that only a request can produce — a key or value the grammar refuses, a key
+/// given twice, too many tags — is the caller's `400 invalid_tag`, with `details.tag`
+/// naming the key where the variant has one (the shape `ingest` refusals already use).
+/// [`UnsortedKeys`](weftdb::TagError::UnsortedKeys),
+/// [`MissingSeparator`](weftdb::TagError::MissingSeparator) and
+/// [`ValueNotUtf8`](weftdb::TagError::ValueNotUtf8) can only come from canonical bytes the
+/// store read back, so they are the server's `500 series_binding_mismatch`. A variant a
+/// later version adds is treated as input.
+#[must_use]
+pub fn from_tag_error(error: &weftdb::TagError) -> ApiError {
+	use weftdb::TagError as E;
+	let key = match error {
+		E::UnsortedKeys { .. } | E::MissingSeparator { .. } | E::ValueNotUtf8 { .. } => return ApiError::server(Code::SeriesBindingMismatch, error.to_string()),
+		E::KeyTooLong { key, .. } | E::InvalidKey { key, .. } | E::ReservedKey { key, .. } | E::EmptyValue { key, .. } | E::ValueTooLong { key, .. } | E::ControlCharacter { key, .. } | E::DuplicateKey { key, .. } => Some(key.as_str()),
+		E::EmptyKey => Some(""),
+		_ => None,
+	};
+	let refusal = ApiError::new(Code::InvalidTag, error.to_string());
+	match key {
+		Some(key) => refusal.with_details(serde_json::json!({ "tag": key })),
+		None => refusal,
+	}
+}
+
 // ── classification: a library failure mapped by type, never by its message ────────
 
 /// Map a library failure from a **read or export** route to the envelope its condition has
@@ -733,10 +933,26 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 			weftdb::StoreError::DeclarationConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IdempotencyConflict { .. } => ApiError::new(Code::IdempotencyConflict, e.to_string()),
 			weftdb::StoreError::GroupsUnsupported { .. } => ApiError::new(Code::TagsUnsupported, e.to_string()),
+			weftdb::StoreError::SeriesLimit { .. } => ApiError::new(Code::SeriesLimit, e.to_string()),
+			weftdb::StoreError::AmbiguousSeries { .. } => ApiError::new(Code::AmbiguousSeries, e.to_string()),
+			weftdb::StoreError::ReservedTagKey { .. } => ApiError::new(Code::InvalidTag, e.to_string()),
+			// A tag outside the aspect's declared upsert keys is the caller's tag to fix.
+			weftdb::StoreError::NotAnUpsertKey { key, .. } => ApiError::new(Code::InvalidTag, e.to_string()).with_details(serde_json::json!({ "tag": key, "reason": "not an upsert key" })),
+			weftdb::StoreError::UpsertKeysConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IngestValueOutOfRange { digits, .. } => decimal_out_of_range_refusal(*digits),
+			// The store's own decision 12 read bounds (ROB-13): the same
+			// `422 result_too_large` the read ceilings answer with (ROB-12),
+			// carrying the cap — the store's refusal is the one an unbounded
+			// stored downsample meets, since its grid cannot be counted from
+			// the request alone.
+			weftdb::StoreError::DownsampleTooLarge { limit, .. } | weftdb::StoreError::PointBatchTooLarge { limit, .. } => ApiError::new(Code::ResultTooLarge, e.to_string()).with_limit(u64::try_from(*limit).unwrap_or(u64::MAX)),
 			weftdb::StoreError::EmptyIngestBatch { .. } | weftdb::StoreError::IngestLengthMismatch { .. } => ApiError::bad_request(e.to_string()),
 			_ => ApiError::server(Code::IncompatibleStore, e.to_string()),
 		});
+	}
+	// A tag the request named (400) or a series key read back from the catalog (500).
+	if let Some(e) = err.downcast_ref::<weftdb::TagError>() {
+		return Some(from_tag_error(e));
 	}
 	if let Some(e) = err.downcast_ref::<weft_physical_type::SealError>() {
 		return Some(from_seal_error(e));
@@ -873,6 +1089,41 @@ mod tests {
 		assert_eq!(names.len(), TABLE.len(), "two codes share a wire name");
 	}
 
+	/// The store's series cap (TAG-7) is the plan's `400 series_limit`, read from the type,
+	/// never the sentence.
+	#[test]
+	fn the_store_series_cap_is_series_limit() {
+		let err = anyhow::Error::new(weftdb::StoreError::SeriesLimit { aspect: "price".to_string(), limit: 2 }).context("ingest of aspect \"price\" failed while committing");
+		let refusal = classify_typed(&err).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::SeriesLimit, StatusCode::BAD_REQUEST));
+	}
+
+	/// The store's decision 12 read bounds (ROB-13) are the plan's
+	/// `422 result_too_large`, carrying the cap in the envelope's `limit`,
+	/// read from the type — the same answer the read ceilings give (ROB-12).
+	#[test]
+	fn the_store_read_bounds_are_result_too_large() {
+		let downsample = anyhow::Error::new(weftdb::StoreError::DownsampleTooLarge { aspect: "price".to_string(), buckets: 5, limit: 4 }).context("downsampling \\\"price\\\"");
+		let refusal = classify_typed(&downsample).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::ResultTooLarge, StatusCode::UNPROCESSABLE_ENTITY));
+		let batch = anyhow::Error::new(weftdb::StoreError::PointBatchTooLarge { aspect: "price".to_string(), instants: 10_001, limit: 10_000 });
+		let refusal = classify_typed(&batch).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::ResultTooLarge, StatusCode::UNPROCESSABLE_ENTITY));
+	}
+
+	/// A store read whose selector matched several series (TAG-8) is the plan's
+	/// `400 ambiguous_series`, and an ingest naming a reserved `__` tag key is
+	/// `400 invalid_tag`, both read from the type.
+	#[test]
+	fn store_tag_refusals_map_to_their_codes() {
+		let ambiguous = anyhow::Error::new(weftdb::StoreError::AmbiguousSeries { aspect: "price".to_string(), matched: 2 }).context("resolving a series of \"price\"");
+		let refusal = classify_typed(&ambiguous).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::AmbiguousSeries, StatusCode::BAD_REQUEST));
+		let reserved = anyhow::Error::new(weftdb::StoreError::ReservedTagKey { aspect: "price".to_string(), key: "__dim".to_string() });
+		let refusal = classify_typed(&reserved).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::InvalidTag, StatusCode::BAD_REQUEST));
+	}
+
 	/// The synonyms C6 dropped stay dropped: a client that coded against the old vocabulary
 	/// gets a code it can map, not a second name for a condition the table already has.
 	#[test]
@@ -1001,6 +1252,44 @@ mod tests {
 		let (mut parts, _body) = request.into_parts();
 		let StrictQuery(window) = StrictQuery::<Window>::from_request_parts(&mut parts, &()).await?;
 		Ok(window)
+	}
+
+	/// Bind the query of `uri` as a `Window` plus its series selector (TAG-10).
+	async fn bind_selected_window(uri: &str) -> Result<(Window, weftdb::SeriesSelector), ApiError> {
+		let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+		let (mut parts, _body) = request.into_parts();
+		let SelectorQuery(window, selector) = SelectorQuery::<Window>::from_request_parts(&mut parts, &()).await?;
+		Ok((window, selector))
+	}
+
+	#[tokio::test]
+	async fn the_selector_query_splits_tag_params_from_the_strict_ones() {
+		let (window, selector) = bind_selected_window("/x?start=1&tag.host=a&end=2&tag.rack=").await.expect("binds");
+		assert_eq!((window.start, window.end), (1, 2));
+		assert_eq!(selector, weftdb::SeriesSelector::exact([("host", Some("a")), ("rack", None)]).unwrap());
+		let (_, selector) = bind_selected_window("/x?start=1&end=2").await.expect("binds");
+		assert_eq!(selector, weftdb::SeriesSelector::untagged(), "no tag parameter is series 0");
+		let (_, selector) = bind_selected_window("/x?start=1&end=2&tag_match=subset").await.expect("binds");
+		assert_eq!(selector, weftdb::SeriesSelector::all());
+		let (_, selector) = bind_selected_window("/x?start=1&end=2&tag.host=a+b&tag_match=subset").await.expect("binds");
+		assert_eq!(selector, weftdb::SeriesSelector::new([("host", Some("a b"))]).unwrap(), "`+` decodes to a space");
+		let refusal = bind_selected_window("/x?start=soon&end=2&tag.host=a").await.expect_err("a word is not an integer");
+		assert_eq!(response_json(refusal.into_response()).await["error"], "Failed to deserialize query string: start: invalid digit found in string", "the strict message is unchanged");
+	}
+
+	#[test]
+	fn tag_errors_from_input_are_invalid_tag_and_from_stored_bytes_are_a_server_fault() {
+		let input = weftdb::SeriesSelector::exact([("9", Some("a"))]).expect_err("a key starts with a letter");
+		let refusal = from_tag_error(&input);
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::InvalidTag, StatusCode::BAD_REQUEST));
+		for stored in [&b"b\x1f1\x1ea\x1f1"[..], b"a", b"a\x1f\xff"] {
+			let fault = weftdb::SeriesKey::from_canonical(stored).expect_err("not canonical");
+			let refusal = from_tag_error(&fault);
+			assert_eq!((refusal.code(), refusal.code().status()), (Code::SeriesBindingMismatch, StatusCode::INTERNAL_SERVER_ERROR), "{fault}");
+		}
+		// The read classifier finds a `TagError` anywhere in the chain.
+		let chained = anyhow::Error::new(input).context("resolving a series");
+		assert_eq!(classify_read(&chained).code(), Code::InvalidTag);
 	}
 
 	#[tokio::test]

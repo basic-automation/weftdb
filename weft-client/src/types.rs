@@ -29,7 +29,11 @@ use crate::error::{Error, Result};
 /// # }
 /// ```
 pub trait StoredValue {
-	/// The value as decimal text, `None` for a null; an `Err` for text that is not a decimal.
+	/// The value as decimal text, `None` for a null.
+	///
+	/// # Errors
+	///
+	/// Text that is not a decimal.
 	fn to_decimal_text(&self) -> Result<Option<String>>;
 }
 
@@ -39,9 +43,18 @@ impl StoredValue for BigDecimal {
 	}
 }
 
+/// The widest exponent a decimal string may carry. Plain notation spells every digit an
+/// exponent implies, so `1e999999999` would be a gigabyte of zeros; no value the server can
+/// store needs more than a few dozen digits either side of the point.
+const MAX_EXPONENT: i64 = 4_096;
+
 impl StoredValue for str {
 	fn to_decimal_text(&self) -> Result<Option<String>> {
 		let parsed = BigDecimal::from_str(self.trim()).map_err(|_| Error::invalid(format!("{self:?} is not a decimal")))?;
+		let (_, scale) = parsed.as_bigint_and_exponent();
+		if scale.unsigned_abs() > MAX_EXPONENT.unsigned_abs() {
+			return Err(Error::invalid(format!("{self:?} spans more than {MAX_EXPONENT} decimal places; no stored type holds it")));
+		}
 		Ok(Some(parsed.to_plain_string()))
 	}
 }
@@ -60,10 +73,7 @@ impl<T: StoredValue + ?Sized> StoredValue for &T {
 
 impl<T: StoredValue> StoredValue for Option<T> {
 	fn to_decimal_text(&self) -> Result<Option<String>> {
-		match self {
-			Some(value) => value.to_decimal_text(),
-			None => Ok(None),
-		}
+		self.as_ref().map_or_else(|| Ok(None), |value| value.to_decimal_text())
 	}
 }
 
@@ -104,7 +114,7 @@ pub struct BenchRun {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct BenchRunList {
+pub struct BenchRunList {
 	pub runs: Vec<BenchRun>,
 }
 
@@ -122,7 +132,7 @@ pub struct ComputePoint {
 impl ComputePoint {
 	/// A point from an instant and a sample.
 	#[must_use]
-	pub fn new(timestamp: DateTime<Utc>, value: f64) -> Self {
+	pub const fn new(timestamp: DateTime<Utc>, value: f64) -> Self {
 		Self { timestamp, value }
 	}
 }
@@ -153,7 +163,7 @@ pub enum Spline {
 }
 
 impl Spline {
-	pub(crate) fn query_token(self) -> Option<&'static str> {
+	pub(crate) const fn query_token(self) -> Option<&'static str> {
 		match self {
 			Self::Linear => Some("linear"),
 			Self::Quadratic => Some("quadratic"),
@@ -178,7 +188,7 @@ pub enum Format {
 }
 
 impl Format {
-	pub(crate) fn name(self) -> &'static str {
+	pub(crate) const fn name(self) -> &'static str {
 		match self {
 			Self::Json => "json",
 			Self::Csv => "csv",
@@ -194,7 +204,8 @@ impl Format {
 pub struct Interpolate {
 	/// The reconstruction.
 	pub spline: Spline,
-	/// The grid step: `seconds`, `minutes`, `hours`, `days`, or a width such as `"250ms"`.
+	/// The grid step, a resolution name: `milliseconds`, `seconds`, `minutes`, `hours`, `days`, …
+	/// (the JSON endpoint takes names, not widths such as `"250ms"`).
 	pub resolution: String,
 	/// The grid's first instant (default: the first point's).
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -207,14 +218,14 @@ pub struct Interpolate {
 }
 
 impl Interpolate {
-	/// A request over `points` with the server's defaults (cubic, one-second grid).
+	/// A request over `points`: cubic, on a one-second grid.
 	pub fn new(points: impl IntoIterator<Item = impl Into<ComputePoint>>) -> Self {
 		Self { spline: Spline::Cubic, resolution: "seconds".into(), start: None, end: None, points: points.into_iter().map(Into::into).collect() }
 	}
 
 	/// Use `spline`.
 	#[must_use]
-	pub fn spline(mut self, spline: Spline) -> Self {
+	pub const fn spline(mut self, spline: Spline) -> Self {
 		self.spline = spline;
 		self
 	}
@@ -228,7 +239,7 @@ impl Interpolate {
 
 	/// Bound the grid to `[start, end]`.
 	#[must_use]
-	pub fn window(mut self, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Self {
+	pub const fn window(mut self, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Self {
 		self.start = start;
 		self.end = end;
 		self
@@ -294,7 +305,7 @@ pub struct InterpolatedPoint {
 }
 
 #[derive(Serialize)]
-pub(crate) struct InterpolatePointBody<'a> {
+pub struct InterpolatePointBody<'a> {
 	pub spline: Spline,
 	pub instant: DateTime<Utc>,
 	pub points: &'a [ComputePoint],
@@ -304,7 +315,8 @@ pub(crate) struct InterpolatePointBody<'a> {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct Downsample {
-	/// The bucket width: `seconds`, `minutes`, `hours`, `days`, or a width such as `"15m"`.
+	/// The bucket resolution, a name: `seconds`, `minutes`, `hours`, `days`, … (a count such
+	/// as `"15m"` goes in [`width`](Self::width)).
 	pub resolution: String,
 	/// The reductions per bucket: `avg`, `min`, `max`, `sum`, `count`, `first`, `last`, ….
 	pub aggregations: Vec<String>,
@@ -334,6 +346,13 @@ impl Downsample {
 	#[must_use]
 	pub fn resolution(mut self, resolution: impl Into<String>) -> Self {
 		self.resolution = resolution.into();
+		self
+	}
+
+	/// Buckets `width` wide, e.g. `"15m"` or `"250ms"` (overrides the resolution).
+	#[must_use]
+	pub fn width(mut self, width: impl Into<String>) -> Self {
+		self.width = Some(width.into());
 		self
 	}
 
@@ -388,7 +407,8 @@ pub struct IlpOptions {
 	pub precision: Option<String>,
 	/// The reconstruction (interpolate only).
 	pub spline: Option<Spline>,
-	/// The grid step or bucket width.
+	/// Interpolation: the grid step, a resolution name (`seconds`, …). Downsample: the bucket
+	/// width, a name or a count such as `"15m"`.
 	pub resolution: Option<String>,
 	/// The reductions (downsample only).
 	pub aggregations: Vec<String>,
@@ -411,7 +431,7 @@ impl IlpOptions {
 
 	/// The reconstruction, for interpolation.
 	#[must_use]
-	pub fn spline(mut self, spline: Spline) -> Self {
+	pub const fn spline(mut self, spline: Spline) -> Self {
 		self.spline = Some(spline);
 		self
 	}
@@ -452,7 +472,7 @@ impl AspectDeclaration {
 
 	/// The fixed-point scale.
 	#[must_use]
-	pub fn scale(mut self, scale: u8) -> Self {
+	pub const fn scale(mut self, scale: u8) -> Self {
 		self.scale = Some(scale);
 		self
 	}
@@ -486,12 +506,12 @@ pub struct AspectInfo {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct AspectEnvelope {
+pub struct AspectEnvelope {
 	pub aspect: AspectInfo,
 }
 
 #[derive(Deserialize)]
-pub(crate) struct AspectList {
+pub struct AspectList {
 	pub aspects: Vec<AspectInfo>,
 }
 
@@ -546,6 +566,9 @@ pub struct WriteOptions {
 	pub idempotency_key: Option<String>,
 	/// The Line Protocol body's timestamp precision (`write_ilp` only).
 	pub precision: Option<String>,
+	/// The Line Protocol measurement whose records are sealed (`write_ilp` only). The
+	/// server requires it since TAG-11; the records' own tags name the series.
+	pub measurement: Option<String>,
 }
 
 impl WriteOptions {
@@ -556,7 +579,7 @@ impl WriteOptions {
 
 	/// Refuse an unsorted batch.
 	#[must_use]
-	pub fn require_sorted(mut self) -> Self {
+	pub const fn require_sorted(mut self) -> Self {
 		self.require_sorted = true;
 		self
 	}
@@ -568,22 +591,29 @@ impl WriteOptions {
 		self
 	}
 
+	/// The Line Protocol measurement to seal (`write_ilp` only; required by the server).
+	#[must_use]
+	pub fn measurement(mut self, measurement: impl Into<String>) -> Self {
+		self.measurement = Some(measurement.into());
+		self
+	}
+
 	/// Seal with `rows` rows per page.
 	#[must_use]
-	pub fn rows_per_page(mut self, rows: u32) -> Self {
+	pub const fn rows_per_page(mut self, rows: u32) -> Self {
 		self.rows_per_page = Some(rows);
 		self
 	}
 }
 
 #[derive(Serialize)]
-pub(crate) struct WireStoredPoint {
+pub struct WireStoredPoint {
 	pub timestamp: i64,
 	pub value: Option<String>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct PointsBody {
+pub struct PointsBody {
 	pub points: Vec<WireStoredPoint>,
 	pub require_sorted: bool,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -696,7 +726,7 @@ pub struct PointAt {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct PointsAt {
+pub struct PointsAt {
 	pub points: Vec<PointAt>,
 }
 
@@ -745,6 +775,8 @@ mod tests {
 		assert_eq!(None::<i64>.to_decimal_text().unwrap(), None);
 		assert_eq!(Some("3").to_decimal_text().unwrap(), Some("3".into()));
 		assert_eq!(BigDecimal::from_str("1e-3").unwrap().to_decimal_text().unwrap(), Some("0.001".into()), "plain notation, which every parser on the server takes");
+		assert_eq!("1e999999999".to_decimal_text().unwrap_err().kind(), crate::ErrorKind::InvalidInput, "refused before it is spelled out");
+		assert_eq!("1e-5000".to_decimal_text().unwrap_err().kind(), crate::ErrorKind::InvalidInput);
 		let refused = "1.2.3".to_decimal_text().unwrap_err();
 		assert_eq!(refused.kind(), crate::ErrorKind::InvalidInput);
 	}

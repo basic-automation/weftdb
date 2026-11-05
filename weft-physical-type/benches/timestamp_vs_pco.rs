@@ -22,13 +22,18 @@
 //!   multiple exists.
 //!
 //! `pco` is a bench-only dev-dependency, pinned exactly; the library does not link it.
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{
 	hint::black_box, io::{BufRead, BufReader}
 };
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use weft_physical_type::timestamp::{encode_delta_of_delta, TimeUnit};
+use weft_physical_type::{
+	cast, timestamp::{encode_delta_of_delta, TimeUnit}
+};
 
 const N: usize = 1 << 20;
 const BTC_SKIP_ROWS: usize = 3_000_000;
@@ -79,7 +84,7 @@ fn jittered_micros() -> Vec<i64> {
 }
 
 fn bits_per_value(bytes: usize) -> f64 {
-	bytes as f64 * 8.0 / N as f64
+	cast::usize_to_f64(bytes) * 8.0 / cast::usize_to_f64(N)
 }
 
 fn bench_timestamps(c: &mut Criterion) {

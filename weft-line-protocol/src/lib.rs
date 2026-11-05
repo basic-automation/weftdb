@@ -34,7 +34,9 @@
 //! The timestamp's unit is caller-declared via [`TimestampPrecision`]; ILP's
 //! default is nanoseconds.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use bigdecimal::{BigDecimal, FromPrimitive};
 use chrono::{DateTime, Utc};
@@ -512,7 +514,7 @@ mod tests {
 		let records = parse("weather temp=21.3").expect("parse");
 		let r = &records[0];
 		assert_eq!(r.measurement, "weather");
-		assert!(r.tags.is_empty());
+		assert_eq!(r.tags.len(), 0);
 		assert_eq!(r.field("temp"), Some(&FieldValue::Float(21.3)));
 		assert_eq!(r.timestamp, None);
 	}

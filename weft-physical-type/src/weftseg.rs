@@ -356,8 +356,7 @@ impl ByteWriter {
 	/// Append an `i64` as a zig-zag + LEB128 signed varint — small-magnitude values
 	/// (the common case for deltas) cost a single byte.
 	pub fn put_svarint(&mut self, value: i64) {
-		#[allow(clippy::cast_sign_loss)]
-		let zz = ((value << 1) ^ (value >> 63)) as u64;
+		let zz = ((value << 1) ^ (value >> 63)).cast_unsigned();
 		self.put_uvarint(zz);
 	}
 
@@ -518,8 +517,7 @@ impl<'a> ByteReader<'a> {
 	pub fn read_svarint(&mut self) -> Result<i64, WeftSegError> {
 		let zz = self.read_uvarint()?;
 		// Inverse zig-zag: (zz >> 1) ^ -(zz & 1).
-		#[allow(clippy::cast_possible_wrap)]
-		Ok(((zz >> 1) as i64) ^ -((zz & 1) as i64))
+		Ok((zz >> 1).cast_signed() ^ -((zz & 1).cast_signed()))
 	}
 
 	/// Read a length-prefixed byte block (varint length, then the bytes).
@@ -569,7 +567,7 @@ const LIMITS: DecodeLimits = DecodeLimits::DEFAULT;
 
 /// Refuse a declared count that exceeds its decode limit, before the count
 /// sizes an allocation or a loop (ROB-8).
-fn check_decode_limit(limit: &'static str, found: usize, max: usize) -> Result<(), WeftSegError> {
+const fn check_decode_limit(limit: &'static str, found: usize, max: usize) -> Result<(), WeftSegError> {
 	if found > max {
 		return Err(WeftSegError::DecodeLimit { limit, found, max });
 	}
@@ -580,7 +578,7 @@ fn check_decode_limit(limit: &'static str, found: usize, max: usize) -> Result<(
 /// remaining: every element of such a stream costs at least one byte on
 /// disk, so a count past `remaining` is a claim the frame itself refutes,
 /// and it is refused before the allocation the count would size (ROB-8).
-fn check_count_fits(count: usize, remaining: usize) -> Result<(), WeftSegError> {
+const fn check_count_fits(count: usize, remaining: usize) -> Result<(), WeftSegError> {
 	if count > remaining {
 		return Err(WeftSegError::UnexpectedEof { needed: count, remaining });
 	}
@@ -613,7 +611,7 @@ fn check_page_count(r: &ByteReader, page_count: usize) -> Result<(), WeftSegErro
 /// zero and one row (both store no first delta and no dods — the ambiguity
 /// [`Segment::decode_timestamps`] documents), so `None` means *either* of
 /// those, and the caller accepts a declared count of 0 or 1.
-fn implied_timestamp_rows(column: &DeltaOfDeltaColumn) -> Option<usize> {
+const fn implied_timestamp_rows(column: &DeltaOfDeltaColumn) -> Option<usize> {
 	match column.first_delta {
 		None if column.dods.is_empty() => None,
 		// `decode_delta_of_delta` returns just the anchor when there is no
@@ -628,18 +626,14 @@ fn implied_timestamp_rows(column: &DeltaOfDeltaColumn) -> Option<usize> {
 /// timestamp column must reconstruct to exactly the declared row count. A
 /// frame whose columns disagree with its header was edited or miswritten;
 /// serving it would hand callers columns of different heights.
-fn check_segment_columns(stats: &SegmentStats, values: &ColumnEncoding, timestamps: &DeltaOfDeltaColumn) -> Result<(), WeftSegError> {
+const fn check_segment_columns(stats: &SegmentStats, values: &ColumnEncoding, timestamps: &DeltaOfDeltaColumn) -> Result<(), WeftSegError> {
 	let present = stats.row_count - stats.null_count;
 	if values.values.len() != present {
 		return Err(WeftSegError::ColumnLengthMismatch { column: "value_column", expected: present, found: values.values.len() });
 	}
 	match implied_timestamp_rows(timestamps) {
-		Some(rows) if rows != stats.row_count => {
-			return Err(WeftSegError::ColumnLengthMismatch { column: "timestamp_column", expected: stats.row_count, found: rows });
-		}
-		None if stats.row_count > 1 => {
-			return Err(WeftSegError::ColumnLengthMismatch { column: "timestamp_column", expected: stats.row_count, found: 1 });
-		}
+		Some(rows) if rows != stats.row_count => Err(WeftSegError::ColumnLengthMismatch { column: "timestamp_column", expected: stats.row_count, found: rows }),
+		None if stats.row_count > 1 => Err(WeftSegError::ColumnLengthMismatch { column: "timestamp_column", expected: stats.row_count, found: 1 }),
 		_ => Ok(()),
 	}
 }
@@ -2581,7 +2575,11 @@ pub fn frame_version(bytes: &[u8]) -> Result<u16, WeftSegError> {
 ///
 /// An envelope's answer is the layout of the frame it wraps, so a caller can pick a
 /// layout-specific entry point without knowing whether the envelope is in use.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns a [`WeftSegError`] when the header is too short, carries an unknown magic, or
+/// names a frame version this build cannot route.
 pub fn frame_layout_of(bytes: &[u8]) -> Result<FrameLayout, WeftSegError> {
 	let version = frame_version(bytes)?;
 	if let Some(layout) = layout_of(version) {
@@ -4225,7 +4223,7 @@ mod tests {
 			null_vals[row] = None; // null only tail rows (after the burst's dense range) so its
 			                       // 64-wide block stays aligned and keeps picking a block codec
 		}
-		let mut null_ts = blocked_ts.clone();
+		let mut null_ts = blocked_ts;
 		null_ts[151] = null_ts[150]; // rows 150 (null) & 151 (present) now share a timestamp
 		let nullable = Segment::build_nullable_sorted(&null_ts, &null_vals, TimeUnit::Millis, &BigDecimal::from(0)).expect("builds");
 		// A block codec keeps the fast path exercised through the null/dense-rank mapping.
@@ -4256,7 +4254,7 @@ mod tests {
 		let mut null_vals: Vec<Option<BigDecimal>> = for_vals.iter().cloned().map(Some).collect();
 		null_vals[128] = None;
 		null_vals[200] = None;
-		let mut null_ts = for_ts.clone();
+		let mut null_ts = for_ts;
 		null_ts[129] = null_ts[128]; // rows 128 (null) & 129 (present) share a timestamp at a page edge
 		let nullable = PagedSegment::build_nullable(&null_ts, &null_vals, TimeUnit::Millis, &BigDecimal::from(0), 64).expect("builds");
 
@@ -4346,8 +4344,8 @@ mod tests {
 			assert_eq!(paged_batch[k], read_paged_segment_point(&paged_bytes, t).expect("reads"), "paged batch slot {k} (t={t})");
 		}
 		// An empty query slice is answered with an empty vector, touching nothing.
-		assert!(read_segment_points(&single_bytes, &[]).expect("reads").is_empty());
-		assert!(read_paged_segment_points(&paged_bytes, &[]).expect("reads").is_empty());
+		assert_eq!(read_segment_points(&single_bytes, &[]).expect("reads").len(), 0);
+		assert_eq!(read_paged_segment_points(&paged_bytes, &[]).expect("reads").len(), 0);
 	}
 
 	#[test]
@@ -4381,13 +4379,13 @@ mod tests {
 
 		for seg in [&regular, &regular_null, &irregular, &f64_seg, &unsorted] {
 			let bytes = seg.write_to();
-			let (all_ts, all_vs) = seg.decode_nullable();
-			let (lo, hi) = (all_ts.iter().min().copied().unwrap_or(0), all_ts.iter().max().copied().unwrap_or(0));
+			let (times, present_vals) = seg.decode_nullable();
+			let (low, high) = (times.iter().min().copied().unwrap_or(0), times.iter().max().copied().unwrap_or(0));
 			// Windows: full span, an interior sub-window (on- and off-grid ends), single-point,
 			// empty (gap), and fully out of range on both sides.
-			for (start, end) in [(lo, hi), (lo + 15, hi - 15), (lo - 100, lo - 1), (hi + 1, hi + 100), (lo + 105, lo + 105), (lo + 106, lo + 107)] {
+			for (start, end) in [(low, high), (low + 15, high - 15), (low - 100, low - 1), (high + 1, high + 100), (low + 105, low + 105), (low + 106, low + 107)] {
 				let (rt, rv) = read_segment_range(&bytes, start, end).expect("reads");
-				let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = all_ts.iter().zip(&all_vs).filter(|(t, _)| start <= **t && **t <= end).map(|(&t, v)| (t, v.clone())).unzip();
+				let expected: (Vec<i64>, Vec<Option<BigDecimal>>) = times.iter().zip(&present_vals).filter(|(t, _)| start <= **t && **t <= end).map(|(&t, v)| (t, v.clone())).unzip();
 				assert_eq!((rt.clone(), rv.clone()), expected, "codec {} window [{start},{end}]", seg.values.best_value_codec());
 				// The physical read returns the same rows with each value in its stored encoding.
 				let (pt, pv) = read_segment_range_physical(&bytes, start, end).expect("reads");
@@ -5002,7 +5000,7 @@ mod tests {
 		let seg = paged_segment();
 		// Re-seal a segment whose header stats were tampered with: the
 		// header's row_count is one more than the pages hold.
-		let mut tampered = seg.clone();
+		let mut tampered = seg;
 		tampered.stats.row_count += 1;
 		let frame = write_paged_segment(&tampered);
 		let err = read_paged_segment(&frame).expect_err("refuses");
@@ -5152,7 +5150,7 @@ mod tests {
 		let header = MAGIC.len() + 2 + 2 + 1;
 		// Damage in the body, with the envelope's trailer honestly recomputed over it: the
 		// outer check passes and the inner frame's own CRC still catches the byte.
-		let mut damaged = wrapped.clone();
+		let mut damaged = wrapped;
 		// A byte in the middle of the wrapped frame's column data: not the magic, not the
 		// version, nothing the envelope inspects for itself.
 		damaged[header + inner.len() / 2] ^= 0xFF;

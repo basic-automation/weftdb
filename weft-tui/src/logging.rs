@@ -1,5 +1,5 @@
 use std::{
-	collections::VecDeque, fmt::Write as FmtWrite, sync::{Arc, Mutex}
+	collections::VecDeque, fmt::Write as FmtWrite, sync::{Arc, Mutex, MutexGuard, PoisonError}
 };
 
 use tracing_core::{field::Visit, Subscriber};
@@ -13,24 +13,33 @@ pub struct LogBuffer {
 }
 
 impl LogBuffer {
+	#[must_use]
 	pub fn new(max_lines: usize) -> Self {
 		Self { buffer: Arc::new(Mutex::new(VecDeque::with_capacity(max_lines))), max_lines }
 	}
 
+	/// Locks the buffer. A panic while holding the lock leaves only a partially trimmed list of
+	/// log lines behind, which is still safe to keep using, so poisoning is ignored.
+	fn lock(&self) -> MutexGuard<'_, VecDeque<String>> {
+		self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
 	pub fn add_message(&self, message: String) {
-		let mut buffer = self.buffer.lock().unwrap();
+		let mut buffer = self.lock();
 		buffer.push_back(message);
 		while buffer.len() > self.max_lines {
 			buffer.pop_front();
 		}
+		drop(buffer);
 	}
 
+	#[must_use]
 	pub fn get_messages(&self) -> Vec<String> {
-		self.buffer.lock().unwrap().iter().cloned().collect()
+		self.lock().iter().cloned().collect()
 	}
 
 	pub fn clear(&self) {
-		self.buffer.lock().unwrap().clear();
+		self.lock().clear();
 	}
 }
 
@@ -40,7 +49,8 @@ pub struct LogBufferLayer {
 }
 
 impl LogBufferLayer {
-	pub fn new(buffer: LogBuffer) -> Self {
+	#[must_use]
+	pub const fn new(buffer: LogBuffer) -> Self {
 		Self { buffer }
 	}
 }
@@ -65,7 +75,7 @@ where
 
 struct LogVisitor<'a>(&'a mut String);
 
-impl<'a> Visit for LogVisitor<'a> {
+impl Visit for LogVisitor<'_> {
 	fn record_f64(&mut self, field: &tracing_core::Field, value: f64) {
 		let _ = write!(self.0, "{}={} ", field.name(), value);
 	}
@@ -84,13 +94,13 @@ impl<'a> Visit for LogVisitor<'a> {
 
 	fn record_str(&mut self, field: &tracing_core::Field, value: &str) {
 		if field.name() == "message" {
-			let _ = write!(self.0, "{} ", value);
+			let _ = write!(self.0, "{value} ");
 		} else {
 			let _ = write!(self.0, "{}={} ", field.name(), value);
 		}
 	}
 
 	fn record_debug(&mut self, _field: &tracing_core::Field, value: &dyn std::fmt::Debug) {
-		let _ = write!(self.0, "{:?} ", value);
+		let _ = write!(self.0, "{value:?} ");
 	}
 }

@@ -61,6 +61,11 @@
 //!   buckets of the stored downsample read from the workload model and
 //!   judges a server's observed buckets against them, exactly; recorded
 //!   on the [`soak`] run record (soak schema v5).
+//! - [`soak_backup`] — the backup lane (SOA-11): the online prefix
+//!   check on a backup taken while ingest runs, the final restore
+//!   verification through PAC-13's restore path, and the RPO/RTO the
+//!   lane measures, derived by EVI-19's formulas; recorded on the
+//!   [`soak`] run record (soak schema v6).
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
 //!   distribution + correctness + dataset metadata + end-to-end timing spans).
 //! - [`stats`] — p50/p95/p99 latency summarization + seeded bootstrap
@@ -75,8 +80,9 @@
 //! `DuckDB`), additional workloads, dataset corpora, and report runners land in
 //! subsequent increments per the roadmap.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::module_name_repetitions)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 pub mod accuracy;
 pub mod adapter;
@@ -86,17 +92,21 @@ pub mod combine;
 pub mod compare;
 pub mod compressed_query;
 pub mod compression;
+pub mod conformance;
 pub mod crash_matrix;
 pub mod downsample;
+pub mod e2e_interpolation;
 pub mod engine;
 pub mod export;
 pub mod failure;
 pub mod forward_fill_adapter;
 pub mod gap_fill;
+pub mod gpu_economics;
 pub mod gpu_memory;
 pub mod ingest;
 pub mod line_protocol;
 pub mod manifest;
+pub mod num;
 pub mod parquet_report;
 pub mod point_lookup;
 pub mod profile;
@@ -107,6 +117,7 @@ pub mod report;
 pub mod scale;
 pub mod schema;
 pub mod soak;
+pub mod soak_backup;
 pub mod soak_client;
 pub mod soak_digest;
 pub mod soak_failure;
@@ -130,7 +141,7 @@ use bigdecimal::ToPrimitive;
 
 use crate::adapter::grid_timestamps;
 pub use crate::{
-	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter}, analytics::{run_analytics_pipeline, AnalyticsParams, AnalyticsPoint}, baseline_adapter::BaselineLinearAdapter, compressed_query::{run_compressed_query, CompressedQueryParams, CompressedQueryPoint}, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_growth, run_ingest_on, run_ingest_online, GrowthPoint, IngestProfile, OnlineParams, OnlinePoint, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, query_mix::{run_query_mix, QueryMixParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, ResultDigest, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{PreflightCheck, ResolvedDevice, SoakConfig, SoakHarness, SoakPreflight, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_client::{IngestClient, IngestFlow, IngestTarget, DEFAULT_SOAK_ASPECT, MAX_RESPONSE_BYTES, SOAK_CLIENT_FIELD, SOAK_CLIENT_PHYSICAL_TYPE, SOAK_CLIENT_PRECISION, SOAK_CLIENT_TIMESTAMP_UNIT}, soak_digest::{expected_window_digest, observed_window_digest, WindowDigest}, soak_failure::{DeckAction, FailureCard, FailureDeck, FailureKind, MaintenanceDriver, MaintenanceKind, PhaseRecord, RecoveryRecord, RecoveryWindow, SigtermObservation, SigtermVerdict, SoakPhase}, soak_hdr::HdrHistogram, soak_null::{NullServer, SoakServer}, soak_oracle::{MismatchKind, ObservedPoint, OracleMismatch, OracleSelfTestReport, OracleVerdict, SelfTestCheck, SoakOracle, MAX_REPORTED_MISMATCHES}, soak_read::{DerivedBucket, DerivedMismatch, DerivedMismatchKind, DerivedReadChecker, DerivedReadVerdict, MAX_REPORTED_DERIVED_MISMATCHES}, soak_sched::{IntervalLog, IntervalRecord, OpenLoopScheduler, SchedulerConfig, SchedulerReport, SelfMonitor, TickDecision}, soak_system::{evaluate_flush_check, resolve_store_device, ContaminationFlag, ContaminationLedger, ContaminationPolicy, ContaminationVerdict, DeviceCounters, FlushCheckResult, FlushEvidence, FlushFailureKind, PressureStall, ProcRoot, SamplerShutdown, SamplerThread, StoreDevice, StrictMode, SystemSample, SystemSampler, DEFAULT_PROC_ROOT}, soak_workload::{GridValue, LaneWeights, ValueFormat, ValueGrid, WorkloadLane, WorkloadModel, WorkloadParams, WorkloadStep, SOAK_WORKLOAD_EPOCH_NS, SOAK_WORKLOAD_MEASUREMENT}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, stored_weft_adapter::StoredWeftAdapter, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
+	accuracy::{synthetic_ground_truth, AccuracyError, AccuracyMetrics}, adapter::{AdapterInfo, SystemAdapter}, analytics::{run_analytics_pipeline, AnalyticsParams, AnalyticsPoint}, baseline_adapter::BaselineLinearAdapter, compressed_query::{run_compressed_query, CompressedQueryParams, CompressedQueryPoint}, compression::{load_csv_corpus, run_compression, run_compression_on, CompressionParams, CompressionProfile, CorpusRun, ValueShape}, downsample::{run_downsample, run_downsample_on, Aggregation, DownsampleParams, DownsampleProfile}, engine::{CalibrationStatus, EngineMetadata}, forward_fill_adapter::ForwardFillAdapter, gap_fill::{run_gap_fill, run_gap_fill_on, GapFillCorpus, GapFillParams, GapFillProfile}, ingest::{run_ingest_growth, run_ingest_on, run_ingest_online, GrowthPoint, IngestProfile, OnlineParams, OnlinePoint, DEFAULT_INGEST_BATCH_ROWS}, line_protocol::{parse, parse_points, FieldValue, LineRecord, ParseError, TimestampPrecision}, point_lookup::{run_point_lookup, run_point_lookup_on, LookupMode, PointLookupParams, PointLookupProfile}, profile::{DatasetSource, InterpolationProfile, LineProtocolProfileError, SignalShape, SyntheticParams}, query_mix::{run_query_mix, QueryMixParams}, range_fetch::{run_range_fetch, run_range_fetch_on, RangeFetchParams, RangeFetchProfile}, report::{BenchReport, RunMetadata}, scale::{ScalePreset, DEFAULT_SCALE_PRESET}, schema::{BenchResult, CorrectnessReport, DatasetMeta, ResultDigest, StorageEstimate, TimingBreakdown, SCHEMA_VERSION}, soak::{PreflightCheck, ResolvedDevice, SoakConfig, SoakHarness, SoakPreflight, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_backup::{BackupLaneChecker, BackupLaneVerdict, BackupMismatch, BackupMismatchKind, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict, MAX_REPORTED_BACKUP_MISMATCHES}, soak_client::{IngestClient, IngestFlow, IngestTarget, DEFAULT_SOAK_ASPECT, MAX_RESPONSE_BYTES, SOAK_CLIENT_FIELD, SOAK_CLIENT_PHYSICAL_TYPE, SOAK_CLIENT_PRECISION, SOAK_CLIENT_TIMESTAMP_UNIT}, soak_digest::{expected_window_digest, observed_window_digest, WindowDigest}, soak_failure::{DeckAction, FailureCard, FailureDeck, FailureKind, MaintenanceDriver, MaintenanceKind, PhaseRecord, RecoveryRecord, RecoveryWindow, SigtermObservation, SigtermVerdict, SoakPhase}, soak_hdr::HdrHistogram, soak_null::{NullServer, SoakServer}, soak_oracle::{MismatchKind, ObservedPoint, OracleMismatch, OracleSelfTestReport, OracleVerdict, SelfTestCheck, SoakOracle, MAX_REPORTED_MISMATCHES}, soak_read::{DerivedBucket, DerivedMismatch, DerivedMismatchKind, DerivedReadChecker, DerivedReadVerdict, MAX_REPORTED_DERIVED_MISMATCHES}, soak_sched::{IntervalLog, IntervalRecord, OpenLoopScheduler, SchedulerConfig, SchedulerReport, SelfMonitor, TickDecision}, soak_system::{evaluate_flush_check, resolve_store_device, ContaminationFlag, ContaminationLedger, ContaminationPolicy, ContaminationVerdict, DeviceCounters, FlushCheckResult, FlushEvidence, FlushFailureKind, PressureStall, ProcRoot, SamplerShutdown, SamplerThread, StoreDevice, StrictMode, SystemSample, SystemSampler, DEFAULT_PROC_ROOT}, soak_workload::{GridValue, LaneWeights, ValueFormat, ValueGrid, WorkloadLane, WorkloadModel, WorkloadParams, WorkloadStep, SOAK_WORKLOAD_EPOCH_NS, SOAK_WORKLOAD_MEASUREMENT}, sparse::{run_sparse, SparseParams, SparseProfile, SparseTable}, stats::{BootstrapConfig, ConfidenceInterval, LatencyCis, LatencyStats}, stored_weft_adapter::StoredWeftAdapter, uci::{load_uci_corpus, load_uci_corpus_from_reader, UciCorpus, DEFAULT_UCI_COLUMN, UCI_COLUMNS}, weft_adapter::WeftAdapter
 };
 
 /// Workload class label recorded for the interpolation profile.
@@ -138,9 +149,8 @@ const WORKLOAD_UPSAMPLE_INTERPOLATE: &str = "upsample_interpolate";
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64` so a pathologically
 /// long span can never overflow or wrap the recorded timing.
-#[allow(clippy::cast_possible_truncation)]
 fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 /// Run an interpolation profile against an adapter for `reps` timed repetitions
@@ -220,16 +230,14 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	// reproducible yet decoupled from the dataset-generation RNG stream.
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		#[allow(clippy::cast_precision_loss)]
 		let secs = latency.mean_ns as f64 / 1e9;
-		#[allow(clippy::cast_precision_loss)]
 		let points = actual_output_points as f64;
 		points / secs
 	} else {
 		0.0
 	};
 
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: adapter.name().to_string(), workload: WORKLOAD_UPSAMPLE_INTERPOLATE.to_string(), reps, dataset: DatasetMeta { input_points, output_points: actual_output_points, irregular: true, missingness_fraction: profile.missingness_fraction, seed: profile.seed, signal_shape: profile.ground_truth_shape() }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy, storage, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
 }
 
 /// Measure reconstruction *accuracy*: run `adapter` once over `profile` and score

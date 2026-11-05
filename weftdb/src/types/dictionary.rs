@@ -1046,11 +1046,11 @@ mod tests {
 	#[serial]
 	async fn test_import_new_pattern() {
 		let mut dictionary = create_test_dictionary();
-		let pattern = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
 
-		let result = dictionary.import_pattern(pattern);
+		let result = dictionary.import_pattern(create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]));
 		assert!(result.is_ok());
 		assert_eq!(dictionary.patterns.len(), 1);
+		drop(dictionary);
 	}
 
 	#[tokio::test]
@@ -1059,16 +1059,15 @@ mod tests {
 		let mut dictionary = create_test_dictionary();
 
 		// Import first pattern
-		let pattern1 = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
-		dictionary.import_pattern(pattern1).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0])).unwrap();
 
 		// Import similar pattern (should merge with existing)
-		let pattern2 = create_test_pattern(vec![1.1, 2.1, 3.1, 2.1, 1.1]);
-		dictionary.import_pattern(pattern2).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![1.1, 2.1, 3.1, 2.1, 1.1])).unwrap();
 
 		// Should still have only one pattern, but with two occurrences
 		assert_eq!(dictionary.patterns.len(), 1);
 		assert_eq!(dictionary.patterns[0].occurrences().len(), 2);
+		drop(dictionary);
 	}
 
 	#[tokio::test]
@@ -1077,17 +1076,16 @@ mod tests {
 		let mut dictionary = create_test_dictionary();
 
 		// Import first pattern
-		let pattern1 = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
-		dictionary.import_pattern(pattern1).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0])).unwrap();
 
 		// Import very different pattern
-		let pattern2 = create_test_pattern(vec![10.0, 20.0, 30.0, 20.0, 10.0]);
-		dictionary.import_pattern(pattern2).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![10.0, 20.0, 30.0, 20.0, 10.0])).unwrap();
 
 		// Should have two different patterns
 		assert_eq!(dictionary.patterns.len(), 2);
 		assert_eq!(dictionary.patterns[0].occurrences().len(), 1);
 		assert_eq!(dictionary.patterns[1].occurrences().len(), 1);
+		drop(dictionary);
 	}
 
 	#[tokio::test]
@@ -1096,12 +1094,10 @@ mod tests {
 		let mut dictionary = create_test_dictionary();
 
 		// Import first pattern
-		let pattern1 = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
-		dictionary.import_pattern(pattern1).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0])).unwrap();
 
 		// Import second similar pattern
-		let pattern2 = create_test_pattern(vec![1.05, 2.05, 3.05, 2.05, 1.05]);
-		dictionary.import_pattern(pattern2).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![1.05, 2.05, 3.05, 2.05, 1.05])).unwrap();
 
 		// Both should be merged into one pattern due to similarity
 		assert_eq!(dictionary.patterns.len(), 1);
@@ -1109,12 +1105,12 @@ mod tests {
 
 		// Now import a pattern that could match both existing similar patterns
 		// This pattern should be added to the existing pattern (which already contains both similar occurrences)
-		let pattern3 = create_test_pattern(vec![1.08, 2.08, 3.08, 2.08, 1.08]);
-		dictionary.import_pattern(pattern3).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![1.08, 2.08, 3.08, 2.08, 1.08])).unwrap();
 
 		// Should still have one pattern, now with three occurrences
 		assert_eq!(dictionary.patterns.len(), 1);
 		assert_eq!(dictionary.patterns[0].occurrences().len(), 3);
+		drop(dictionary);
 	}
 
 	#[tokio::test]
@@ -1130,12 +1126,10 @@ mod tests {
 		let mut dictionary = Dictionary::new("Moderate Test Dictionary".to_string(), "A test dictionary with moderate constraints".to_string(), constraints);
 
 		// Import first pattern - interpolated sum ≈ 13.56
-		let pattern1 = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
-		dictionary.import_pattern(pattern1).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0])).unwrap();
 
 		// Import a significantly different pattern - interpolated sum ≈ 22.56
-		let pattern2 = create_test_pattern(vec![3.0, 6.0, 10.0, 6.0, 0.0]);
-		dictionary.import_pattern(pattern2).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![3.0, 6.0, 10.0, 6.0, 0.0])).unwrap();
 
 		// These should be separate patterns due to significant difference
 		// After interpolation: |22.56 - 13.56|/13.56 = 66.4% > 25% threshold
@@ -1144,13 +1138,13 @@ mod tests {
 		// Now import a pattern that matches the first but not the second
 		// Interpolated sum ≈ 16.27: |16.27 - 13.56|/13.56 = 20% < 25% (should match)
 		// But not within 25% of 22.56: |22.56 - 16.27|/16.27 = 38.6% > 25%
-		let pattern3 = create_test_pattern(vec![1.2, 2.4, 3.6, 2.4, 1.2]);
-		dictionary.import_pattern(pattern3).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![1.2, 2.4, 3.6, 2.4, 1.2])).unwrap();
 
 		// Should still have 2 patterns, first should have 2 occurrences, second should have 1
 		assert_eq!(dictionary.patterns.len(), 2);
 		assert_eq!(dictionary.patterns[0].occurrences().len(), 2); // pattern1 + pattern3
 		assert_eq!(dictionary.patterns[1].occurrences().len(), 1); // pattern2 only
+		drop(dictionary);
 	}
 
 	#[tokio::test]
@@ -1166,13 +1160,11 @@ mod tests {
 		let mut dictionary = Dictionary::new("Multi-Match Test Dictionary".to_string(), "Test dictionary for multiple pattern matching".to_string(), constraints);
 
 		// Import first pattern - sum = 6.0
-		let pattern1 = create_test_pattern(vec![2.0, 2.0, 2.0]);
-		dictionary.import_pattern(pattern1).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![2.0, 2.0, 2.0])).unwrap();
 
 		// Import second pattern - sum = 8.0 (should remain separate)
 		// Difference: |8.0 - 6.0|/6.0 = 33.3% > 25%, so these remain separate
-		let pattern2 = create_test_pattern(vec![3.0, 2.0, 3.0]);
-		dictionary.import_pattern(pattern2).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![3.0, 2.0, 3.0])).unwrap();
 
 		// Verify they're separate
 		assert_eq!(dictionary.patterns.len(), 2);
@@ -1181,13 +1173,13 @@ mod tests {
 		// Sum = 7.0
 		// vs pattern1 (sum 6.0): |7.0 - 6.0|/6.0 = 16.7% < 25% ✓
 		// vs pattern2 (sum 8.0): |7.0 - 8.0|/8.0 = 12.5% < 25% ✓
-		let pattern3 = create_test_pattern(vec![2.5, 2.0, 2.5]);
-		dictionary.import_pattern(pattern3).unwrap();
+		dictionary.import_pattern(create_test_pattern(vec![2.5, 2.0, 2.5])).unwrap();
 
 		// Should still have 2 patterns, but BOTH should now have 2 occurrences
 		assert_eq!(dictionary.patterns.len(), 2);
 		assert_eq!(dictionary.patterns[0].occurrences().len(), 2); // pattern1 + pattern3
 		assert_eq!(dictionary.patterns[1].occurrences().len(), 2); // pattern2 + pattern3
+		drop(dictionary);
 	}
 
 	#[test]

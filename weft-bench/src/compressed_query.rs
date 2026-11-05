@@ -100,7 +100,6 @@ pub struct CompressedQueryPoint {
 /// do not strictly rise, if `batch_rows` or `queries` is zero, if `params.rows < 2` or a copy
 /// would leave the timestamp range, if a store operation or a reduction fails, or if
 /// `on_window` fails. Two paths disagreeing is not an error: it fails that size's gate.
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: CompressedQueryParams, mut on_window: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
 	anyhow::ensure!(timestamps.len() >= 2, "a compressed-query corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "compressed-query corpus timestamps and values differ in length");
@@ -148,7 +147,6 @@ struct Pass<'a> {
 }
 
 /// Run every window size once; returns each size's answer digest, in order.
-#[allow(clippy::cast_precision_loss)]
 async fn windows_pass(pass: &Pass<'_>, on_window: &mut impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<Vec<String>> {
 	let Pass { store, profile, tiled, params, stats, irregular, missingness_fraction, generation_ns, suffix, before } = *pass;
 	let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
@@ -197,7 +195,7 @@ async fn windows_pass(pass: &Pass<'_>, on_window: &mut impl FnMut(BenchResult) -
 		let decode = LatencyStats::from_samples(&decode_ns);
 		let measured_ns = in_store_ns.iter().copied().fold(0_u64, u64::saturating_add);
 		let point = CompressedQueryPoint { window: label.to_string(), window_rows, rows_scanned, buckets: in_store_buckets, decode_p50_ns: decode.p50_ns, decode_p99_ns: decode.p99_ns, decode_mean_ns: decode.mean_ns, speedup_p50: if latency.p50_ns > 0 { decode.p50_ns as f64 / latency.p50_ns as f64 } else { 0.0 }, segments: stats.segment_count, bytes_per_point: stats.bytes_per_point };
-		on_window(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{label}{suffix}", profile.name), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSED_QUERY.to_string(), reps: in_store_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: in_store_buckets, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, throughput_points_per_sec: if measured_ns > 0 { rows_scanned as f64 / (measured_ns as f64 / 1e9) } else { 0.0 }, cold_warm: crate::schema::ColdWarm::from_samples(&in_store_ns), latency, latency_ci: None, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) }, correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true, result_sha256: Some(digest) }, accuracy: None, storage: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: Some(point), analytics: None, samples_ns: in_store_ns.clone(), between_run: None })?;
+		on_window(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{label}{suffix}", profile.name), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSED_QUERY.to_string(), reps: in_store_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: in_store_buckets, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, throughput_points_per_sec: if measured_ns > 0 { rows_scanned as f64 / (measured_ns as f64 / 1e9) } else { 0.0 }, cold_warm: crate::schema::ColdWarm::from_samples(&in_store_ns), latency, latency_ci: None, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) }, correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true, result_sha256: Some(digest) }, accuracy: None, storage: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: Some(point), analytics: None, samples_ns: in_store_ns.clone(), between_run: None, gpu_economics: None })?;
 	}
 	Ok(digests)
 }
