@@ -35,15 +35,18 @@
 //! `run` and keep the `BigDecimal`s. `/interpolate/point` still runs `run`: it produces
 //! one value, so there is nothing to save.
 //!
-//! The wire values are bit-identical to the `BigDecimal` path's for every value of
-//! magnitude below `1e22` (a differential test pins it): an interpolated `f64` became
-//! its shortest round-trip decimal and that decimal parsed back to the same `f64`, a
-//! raw sample came back as the `f64` it was sent as, and a negative zero became
-//! `0` (which [`wire_f64`] keeps). Two edges can differ, and in both the old answer
-//! was the artefact: from about `1e23` up, `BigDecimal::to_f64` multiplies by an
-//! inexact power of ten and could land one ulp off the kernel's value, which this path
-//! returns as computed; and a value near `f64::MAX` that the old narrowing could
-//! overflow into a `not_finite` refusal is now returned, since it is finite.
+//! The wire values are bit-identical to the `BigDecimal` path's for values of
+//! magnitude below `2^53` (about `9.0e15`; a differential test over `1e-19..1e15` pins
+//! it): an interpolated `f64` became its shortest round-trip decimal and that decimal
+//! narrowed back to the same `f64`, a raw sample came back as the `f64` it was sent
+//! as, and a negative zero became `0` (which [`wire_f64`] keeps). Above that the old
+//! answer could be the artefact: once a value's shortest decimal has an integer part
+//! wider than `2^53`, `BigDecimal::to_f64` can round twice and land one ulp off the
+//! kernel's value (observed at about `2.0e19`: `...146e19` computed, `...142e19`
+//! served), which this path returns as computed; and a value near `f64::MAX` that the
+//! old narrowing could overflow into a `not_finite` refusal is now returned, since it
+//! is finite. Both are documented wire changes, one ulp at most, only at those
+//! magnitudes.
 
 use std::num::NonZeroUsize;
 
@@ -1545,6 +1548,9 @@ mod tests {
 		let old = legacy_response(request, config).await;
 		match (new, old) {
 			(Ok(new), Ok(old)) => {
+				for (n, o) in new.points.iter().zip(&old.points) {
+					assert_eq!(n.value.to_bits(), o.value.to_bits(), "value at {} ({:?}): f64 path {:e}, BigDecimal path {:e}", n.timestamp, n.kind, n.value, o.value);
+				}
 				assert_eq!(serde_json::to_vec(&new).unwrap(), serde_json::to_vec(&old).unwrap(), "JSON bytes differ");
 				assert_eq!(body_bytes(interpolate_response_to_csv(&new)).await, body_bytes(interpolate_response_to_csv(&old)).await, "CSV bytes differ");
 				assert_eq!(body_bytes(interpolate_response_to_arrow(&new).unwrap()).await, body_bytes(interpolate_response_to_arrow(&old).unwrap()).await, "Arrow bytes differ");
@@ -1582,8 +1588,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn the_f64_path_matches_the_bigdecimal_path_on_random_series() {
-		// A fixed xorshift stream, so a failure reproduces. Magnitudes stay below 1e22,
-		// the bound the module docs give for bit-identical values.
+		// A fixed xorshift stream, so a failure reproduces. Magnitudes stay below 1e16,
+		// inside the `2^53` bound the module docs give for bit-identical values (above
+		// it the old narrowing can be one ulp off; see the module docs).
 		let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
 		let mut next = move || {
 			state ^= state << 13;
@@ -1594,7 +1601,7 @@ mod tests {
 		let splines = [serde_json::json!("linear"), serde_json::json!("quadratic"), serde_json::json!("cubic"), serde_json::json!({ "polynomial": { "degree": 3 } })];
 		for case in 0..64 {
 			let knots = 1 + (next() % 12) as i64;
-			let exponent = (next() % 40) as i32 - 19; // 1e-19 ..= 1e20
+			let exponent = (next() % 35) as i32 - 19; // 1e-19 ..= 1e15
 			let mut t = 0_i64;
 			let mut points = Vec::new();
 			for _ in 0..knots {
