@@ -25,7 +25,8 @@ const ASPECT: &str = "price";
 
 /// The maintenance operations that write once: S8's reconcile and split of one segment,
 /// and S9's overlap merge (a full rewrite of a component, or one whose cold prefix is
-/// split off), squash and size-targeted compaction.
+/// split off), squash and size-targeted compaction; and the overlap merge's
+/// skip-identical swap (Phase 4.6), which writes nothing and only deletes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
 	Reconcile,
@@ -34,10 +35,11 @@ enum Op {
 	OverlapSplit,
 	Squash,
 	Compact,
+	SkipIdentical,
 }
 
 impl Op {
-	const ALL: [Self; 6] = [Self::Reconcile, Self::Split, Self::OverlapFull, Self::OverlapSplit, Self::Squash, Self::Compact];
+	const ALL: [Self; 7] = [Self::Reconcile, Self::Split, Self::OverlapFull, Self::OverlapSplit, Self::Squash, Self::Compact, Self::SkipIdentical];
 }
 
 /// A segment sealed before the maintained ones, which only a squash touches.
@@ -60,6 +62,8 @@ struct Sealed {
 ///   fold into one.
 /// - Compaction toward 3 rows: [`BEFORE`] (3 rows, a group of its own) and two 2-row
 ///   segments sharing timestamp 110, the first paged, which coalesce.
+/// - Skip-identical: [`BEFORE`], a paged segment and a newer one replaying two of its
+///   rows with the same values, so the merge keeps the paged one and deletes the replay.
 ///
 /// In every merge the lowest-id member is paged, so its frame kind differs from the
 /// single-block output's (design window merge-paged-target-format-wedge).
@@ -72,6 +76,7 @@ fn fixture(op: Op) -> Vec<Sealed> {
 		Op::OverlapSplit => vec![before, Sealed { rows: &[(100, "4"), (110, "5"), (120, "6"), (130, "7")], paged: Some(2) }, Sealed { rows: &[(130, "70"), (140, "8")], paged: None }],
 		Op::Squash => vec![Sealed { rows: &BEFORE, paged: Some(2) }, Sealed { rows: &[(100, "4"), (110, "5")], paged: None }, Sealed { rows: &[(110, "50"), (120, "6")], paged: None }],
 		Op::Compact => vec![before, Sealed { rows: &[(100, "4"), (110, "5")], paged: Some(1) }, Sealed { rows: &[(110, "50"), (120, "6")], paged: None }],
+		Op::SkipIdentical => vec![before, Sealed { rows: &[(100, "4"), (110, "5"), (120, "6"), (130, "7")], paged: Some(2) }, Sealed { rows: &[(110, "5"), (120, "6")], paged: None }],
 	}
 }
 
@@ -150,6 +155,13 @@ async fn run(store: &SegmentStore, op: Op, target: u64) -> anyhow::Result<()> {
 			let removed = store.squash_aspect_to_target_rows(ASPECT, COMPACT_TARGET).await?;
 			anyhow::ensure!(removed == 1, "the compaction removed {removed} segments, not 1");
 		}
+		Op::SkipIdentical => {
+			let removed = store.reconcile_overlaps(ASPECT).await?;
+			anyhow::ensure!(removed == 1, "the skip removed {removed} segments, not 1");
+			let fixture_gens = fixture(op).len() as u64;
+			let gens: Vec<u64> = store.index().rows(ASPECT).await?.iter().map(|row| row.gen).collect();
+			anyhow::ensure!(gens.iter().all(|gen| *gen <= fixture_gens), "the skip wrote an output: generations {gens:?}");
+		}
 	}
 	Ok(())
 }
@@ -166,7 +178,7 @@ async fn run_again(store: &SegmentStore, op: Op) -> anyhow::Result<()> {
 				store.split_segment(ASPECT, target, SPLIT_AT).await?;
 			}
 		}
-		Op::OverlapFull => drop(store.reconcile_overlaps(ASPECT).await?),
+		Op::OverlapFull | Op::SkipIdentical => drop(store.reconcile_overlaps(ASPECT).await?),
 		Op::OverlapSplit => drop(store.reconcile_overlaps_with_policy(ASPECT, SplitPolicy::new(1)).await?),
 		Op::Squash => drop(store.squash_aspect(ASPECT).await?),
 		Op::Compact => drop(store.squash_aspect_to_target_rows(ASPECT, COMPACT_TARGET).await?),
@@ -423,6 +435,7 @@ impl Op {
 			Self::OverlapSplit => "overlap-split",
 			Self::Squash => "squash",
 			Self::Compact => "compact",
+			Self::SkipIdentical => "skip-identical",
 		}
 	}
 
@@ -435,7 +448,16 @@ impl Op {
 		match self {
 			Self::Reconcile | Self::OverlapFull | Self::Squash | Self::Compact => 1,
 			Self::Split | Self::OverlapSplit => 2,
+			Self::SkipIdentical => 0,
 		}
+	}
+
+	/// The fault points of [`POINTS`] one run of the operation passes: all of them, but
+	/// for a skip-identical swap, which writes no output and so never journals, writes or
+	/// syncs one.
+	fn points(self) -> Vec<FaultPoint> {
+		let writes = [FaultPoint::MPendingCommitted, FaultPoint::MOutputWritten, FaultPoint::MOutputSynced, FaultPoint::MDirSynced];
+		POINTS.into_iter().filter(|point| self.outputs() > 0 || !writes.contains(point)).collect()
 	}
 }
 
@@ -477,7 +499,8 @@ async fn verify_recovered(root: &Path, op: Op, point: FaultPoint, label: &str) {
 	// 1..=`fixture(op).len()`; only a generation above that can be a swap's
 	// output, so that — not `gen > 0` — is what says the swap committed.
 	let fixture_gens = fixture(op).len() as u64;
-	let swapped = index_rows.iter().any(|row| row.gen > fixture_gens);
+	// A skip-identical swap writes no output: that it committed shows as a segment fewer.
+	let swapped = if op.outputs() == 0 { index_rows.len() < fixture(op).len() } else { index_rows.iter().any(|row| row.gen > fixture_gens) };
 	let rollup = store.aspect_metadata(ASPECT).await.expect("reads the rollup");
 	let derived = crate::AspectMetadata::from_index(&store.index().load_index(ASPECT).await.expect("loads the index"));
 	drop(store);
@@ -545,7 +568,7 @@ async fn matrix_child() {
 	let op = Op::parse(op);
 	match mode {
 		"err" => {
-			for point in POINTS {
+			for point in op.points() {
 				let root = dir.join(point.to_string());
 				let target = seal_fixture(&root, op).await;
 				let store = SegmentStore::open(&root).await.expect("opens");
@@ -564,7 +587,7 @@ async fn matrix_child() {
 			}
 		}
 		"cut" => {
-			for point in POINTS {
+			for point in op.points() {
 				let root = dir.join(point.to_string());
 				let images = dir.join(format!("{point}-images"));
 				let target = seal_fixture(&root, op).await;
@@ -674,7 +697,7 @@ async fn the_crash_matrix_with_aborts_loses_nothing() {
 	let dir = TempDir::new().expect("tempdir");
 	let mut runs = Vec::new();
 	for op in Op::ALL {
-		for point in ABORT_POINTS {
+		for point in ABORT_POINTS.into_iter().filter(|point| op.points().contains(point)) {
 			let dir = dir.path().join(format!("{}-{point}", op.name()));
 			runs.push(async move {
 				std::fs::create_dir_all(&dir).expect("creates the work directory");
@@ -1421,4 +1444,143 @@ async fn a_merge_leaves_a_fresh_sidecar_for_its_output_and_none_for_the_members_
 	assert_eq!(before.len(), 3, "each seal wrote a sidecar");
 	assert!(matched, "the output's sidecar matches its frame");
 	assert_eq!(names, vec![format!("{ASPECT}~g4~p3.weftpart"), format!("{ASPECT}~g4~p3.weftseg")], "only the output and its sidecar are left");
+}
+
+/// Seal the skip-identical fixture's paged member and its replay into a fresh store at
+/// `root`, returning the store.
+async fn sealed_replay(root: &Path) -> SegmentStore {
+	let store = SegmentStore::open(root).await.expect("opens");
+	store.declare(ASPECT, &schema()).await.expect("declares");
+	for sealed in fixture(Op::SkipIdentical) {
+		let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = sealed.rows.iter().map(|(t, v)| (*t, bd(v))).unzip();
+		match sealed.paged {
+			Some(rows_per_page) => store.seal_paged(ASPECT, &schema(), &ts, &vs, rows_per_page).await,
+			None => store.seal(ASPECT, &schema(), &ts, &vs).await,
+		}
+		.expect("seals a fixture segment");
+	}
+	store
+}
+
+/// Phase 4.6 skip-identical (design 9b): an overlap component whose fold is exactly its
+/// lowest-id member's rows (a replay of rows already stored) reconciles without writing a
+/// frame. The kept member's row is unchanged (id, generation, CRC and path), it keeps its
+/// paging, the replay's row and frame are gone, and no frame was added to `segments/`.
+#[tokio::test]
+async fn an_identical_replay_reconciles_without_writing_a_frame() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = sealed_replay(dir.path()).await;
+	let before = store.index().rows(ASPECT).await.expect("reads");
+	let frames_before = frames_in(dir.path());
+	let kept = before.iter().find(|row| row.desc.min_ts == Some(100)).cloned().expect("the paged member");
+	let replay = before.iter().find(|row| row.desc.min_ts == Some(110)).cloned().expect("the replay");
+	let removed = store.reconcile_overlaps(ASPECT).await.expect("reconciles");
+	let after = store.index().rows(ASPECT).await.expect("reads");
+	let rows = rows_of(&store).await.expect("reads");
+	let journal = journal_of(&store).await;
+	let paging = store.read_bound_frame(&kept).await.expect("the kept frame reads").rows_per_page;
+	drop(store);
+	let frames_after = frames_in(dir.path());
+	assert_eq!(removed, 1);
+	assert!(after.iter().any(|row| row.desc.id == kept.desc.id && row.version() == kept.version() && row.desc.path == kept.desc.path), "the kept row is as it was: {after:?}");
+	assert!(after.iter().all(|row| row.desc.id != replay.desc.id), "the replay's row is deleted");
+	assert!(after.iter().all(|row| row.gen <= fixture(Op::SkipIdentical).len() as u64), "no output generation: {after:?}");
+	let replay_frame = replay.desc.path.rsplit(['/', '\\']).next().expect("a file name").to_string();
+	assert_eq!(frames_after, frames_before.into_iter().filter(|name| *name != replay_frame).collect::<Vec<_>>(), "no frame was written, and the replay's was reaped");
+	assert_eq!(paging, Some(2), "the kept frame keeps its paging");
+	assert_eq!(rows, expected_rows(Op::SkipIdentical));
+	assert_eq!(journal, Vec::<(String, String)>::new());
+}
+
+/// Phase 4.6 skip-identical: after a skip, the aspect holds no overlap, and a second pass
+/// finds nothing to do.
+#[tokio::test]
+async fn overlapping_count_reaches_zero_after_a_skip() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = sealed_replay(dir.path()).await;
+	let overlapping = store.aspect_stats(ASPECT).await.expect("stats").overlapping_segments;
+	let removed = store.reconcile_overlaps(ASPECT).await.expect("reconciles");
+	let stats = store.aspect_stats(ASPECT).await.expect("stats");
+	let again = store.reconcile_overlaps(ASPECT).await.expect("reconciles again");
+	drop(store);
+	assert_eq!(overlapping, 2, "the replay overlaps its member");
+	assert_eq!((removed, stats.overlapping_segments, stats.segment_count), (1, 0, 2), "{stats:?}");
+	assert_eq!(again, 0);
+}
+
+/// Phase 4.6 skip-identical, critique F23: a value the replay writes at another scale
+/// (`5.0` beside `5`) is not the same row, since the store keeps the scale it was given and
+/// reads it back, so the component is rewritten, not kept, and the newer text wins.
+#[tokio::test]
+async fn a_replay_at_another_scale_is_rewritten_not_kept() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = SegmentStore::open(dir.path()).await.expect("opens");
+	let text = AspectSchema::new(PhysicalType::BigDecimalText, bd("0"), TimeUnit::Seconds);
+	store.declare(ASPECT, &text).await.expect("declares");
+	store.seal(ASPECT, &text, &[100, 110, 120], &[bd("4"), bd("5"), bd("6")]).await.expect("seals");
+	store.seal(ASPECT, &text, &[110], &[bd("5.0")]).await.expect("seals a replay at another scale");
+	let removed = store.reconcile_overlaps(ASPECT).await.expect("reconciles");
+	let gens: Vec<u64> = store.index().rows(ASPECT).await.expect("reads").iter().map(|row| row.gen).collect();
+	let rows = rows_of(&store).await.expect("reads");
+	drop(store);
+	assert_eq!(removed, 1);
+	assert!(gens.iter().all(|gen| *gen > 2), "the component was rewritten into a new frame: {gens:?}");
+	assert_eq!(rows, vec![(100, "4".to_string()), (110, "5.0".to_string()), (120, "6".to_string())], "the newer text wins");
+}
+
+/// Set only in the child process [`a_racing_change_to_the_kept_row_conflicts`] starts: the
+/// root to open.
+const KEEP_CONFLICT_CHILD_ROOT: &str = "WEFT_TEST_KEEP_CONFLICT_CHILD_ROOT";
+
+/// The body that child runs (in a process of its own because it arms `M-planned`): a
+/// skip-identical reconcile is parked once it has planned; meanwhile the kept row is
+/// changed under it (a new generation, as a racing writer that does not take the
+/// maintenance lock would commit). The swap's precondition on the kept row fails: it
+/// returns `Conflict`, the replay is not deleted, and nothing is left journaled or on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keep_conflict_child() {
+	use crate::types::index_txn::{IndexOp, IndexRow, IndexTxn};
+
+	let Some(root) = std::env::var_os(KEEP_CONFLICT_CHILD_ROOT) else { return };
+	let store = Arc::new(sealed_replay(&std::path::PathBuf::from(root)).await);
+	let kept = store.index().rows(ASPECT).await.expect("reads").into_iter().find(|row| row.desc.min_ts == Some(100)).expect("the paged member");
+
+	let point = FaultPoint::MPlanned;
+	let resume = Arc::new(tokio::sync::Notify::new());
+	let armed = crate::durable::fault::arm(point, crate::durable::fault::FaultAction::Pause(resume.clone()));
+	let hits = crate::durable::fault::hits(point);
+	let reconcile = tokio::spawn({
+		let store = store.clone();
+		async move { store.reconcile_overlaps(ASPECT).await }
+	});
+	tokio::time::timeout(std::time::Duration::from_secs(30), crate::durable::fault::reached(point, hits + 1)).await.expect("the reconcile reaches M-planned");
+	drop(armed);
+	let changed = IndexRow { gen: kept.gen + 100, ..kept.clone() };
+	store.commit_index(&IndexTxn::new(vec![IndexOp::ReplaceExpected { aspect: ASPECT.to_string(), expected: kept.version(), row: changed }])).await.expect("the racing change commits");
+	resume.notify_one();
+	let reconciled = reconcile.await.expect("the reconcile joins");
+
+	let ids: Vec<u64> = store.index().rows(ASPECT).await.expect("reads").iter().map(|row| row.desc.id).collect();
+	let journal = journal_of(&store).await;
+	let referenced = referenced_frames(&store).await;
+	let rows = rows_of(&store).await.expect("reads");
+	let root = store.root().to_path_buf();
+	drop(store);
+	let err = reconciled.expect_err("the swap finds the kept row changed");
+	let kind = err.chain().find_map(|cause| cause.downcast_ref::<crate::types::index_txn::IndexTxnError>()).map(|e| e.kind);
+	assert_eq!(kind, Some(crate::types::index_txn::TxnErrorKind::Conflict), "{err:#}");
+	assert_eq!(ids.len(), 3, "no member was deleted: {ids:?}");
+	assert_eq!(rows, pre_rows(Op::SkipIdentical), "every row still reads, the replay beside its member");
+	assert_eq!(journal, Vec::<(String, String)>::new(), "nothing was retired");
+	assert_eq!(frames_in(&root), referenced, "and every frame is still referenced");
+}
+
+/// Phase 4.6 skip-identical: a racing change to the row the swap keeps fails it with
+/// `Conflict` instead of deleting the other members (see [`keep_conflict_child`]).
+#[tokio::test]
+async fn a_racing_change_to_the_kept_row_conflicts() {
+	let dir = TempDir::new().expect("tempdir");
+	let exe = std::env::current_exe().expect("finds the test binary");
+	let out = tokio::process::Command::new(exe).args(["types::segment_store::swap_tests::keep_conflict_child", "--exact", "--nocapture", "--test-threads=1"]).env(KEEP_CONFLICT_CHILD_ROOT, dir.path()).output().await.expect("runs the child");
+	assert_passed("a racing change to the kept row", &out);
 }

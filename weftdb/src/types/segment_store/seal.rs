@@ -362,15 +362,16 @@ impl SegmentStore {
 		}
 		let mut prepared = Vec::with_capacity(plans.len());
 		let mut rows = Vec::with_capacity(plans.len());
-		for SwapPlan { members, outputs } in plans {
+		for SwapPlan { members, outputs, keep } in plans {
 			let Some(series_id) = members.first().map(|first| first.series_id) else { bail!("a swap plan of aspect {aspect:?} has no members") };
 			// Tags I12: a maintenance output never folds rows of different series.
 			if members.iter().any(|member| member.series_id != series_id) {
 				bail!("a swap plan of aspect {aspect:?} mixes the series of segments {:?}", members.iter().map(|member| (member.desc.id, member.series_id)).collect::<Vec<_>>());
 			}
-			let retired = members.iter().map(|member| self.retired_name(member)).collect::<Result<Vec<String>>>()?;
+			// A keep plan retires only the members it deletes: the kept one stays live.
+			let retired = members.iter().skip(usize::from(keep)).map(|member| self.retired_name(member)).collect::<Result<Vec<String>>>()?;
 			let prec = members.iter().map(|member| member.prec.unwrap_or(0)).max().unwrap_or(0);
-			prepared.push(PreparedPlan { members, retired, series_id, prec, fresh: Vec::new(), outputs: Vec::new() });
+			prepared.push(PreparedPlan { members, keep, retired, series_id, prec, fresh: Vec::new(), outputs: Vec::new() });
 			rows.push(outputs);
 		}
 		// Each tagged plan's outputs carry its series key (TAG-7), looked up once per plan:
@@ -390,16 +391,22 @@ impl SegmentStore {
 		// M2: a run of fresh generations for every output, in plan and time order.
 		let counts: Vec<usize> = rows.iter().map(Vec::len).collect();
 		let count: usize = counts.iter().sum();
-		let mut gen = self.allocate_gens(aspect, u64::try_from(count).unwrap_or(u64::MAX)).await?;
-		let mut planned = Vec::with_capacity(count);
-		for ((outputs, plan), series_key) in rows.into_iter().zip(&prepared).zip(keys) {
-			for PlanOutput { timestamps, values, rows_per_page } in outputs {
-				planned.push(PlannedOutput { gen, prec: plan.prec, timestamps, values, rows_per_page, series_key: series_key.clone() });
-				gen = gen.saturating_add(1);
+		// Only keep plans (skip-identical): nothing to allocate, journal or write, so
+		// M2-M4 are skipped whole and the swap goes straight to its commit.
+		let (written, mut pending) = if count == 0 {
+			(Vec::new(), PendingOutputs { store: self, aspect: aspect.to_string(), names: Vec::new() })
+		} else {
+			let mut gen = self.allocate_gens(aspect, u64::try_from(count).unwrap_or(u64::MAX)).await?;
+			let mut planned = Vec::with_capacity(count);
+			for ((outputs, plan), series_key) in rows.into_iter().zip(&prepared).zip(keys) {
+				for PlanOutput { timestamps, values, rows_per_page } in outputs {
+					planned.push(PlannedOutput { gen, prec: plan.prec, timestamps, values, rows_per_page, series_key: series_key.clone() });
+					gen = gen.saturating_add(1);
+				}
 			}
-		}
-		// M3, M4.
-		let (written, mut pending) = self.write_outputs(aspect, schema, planned).await?;
+			// M3, M4.
+			self.write_outputs(aspect, schema, planned).await?
+		};
 		if written.len() != count {
 			pending.discard_all().await;
 			bail!("a swap of aspect {aspect:?} wrote {} outputs of {count}", written.len());
@@ -628,6 +635,8 @@ impl SegmentStore {
 	/// [`UnknownAspect`](StoreError::UnknownAspect) when `aspect` has no
 	/// declared schema; [`ReservedTagKey`](StoreError::ReservedTagKey) when
 	/// `batch.groups` names a reserved `__` key;
+	/// [`NotAnUpsertKey`](StoreError::NotAnUpsertKey) when the aspect declares upsert keys
+	/// and `batch.groups` names a key outside them;
 	/// [`SeriesLimit`](StoreError::SeriesLimit) for a new series past
 	/// [`SegmentStoreOptions::max_series_per_aspect`];
 	/// [`EmptyIngestBatch`](StoreError::EmptyIngestBatch) for a batch with
@@ -651,6 +660,16 @@ impl SegmentStore {
 		// ingest may write one (critique D17).
 		if let Some((key, _)) = batch.groups.iter().find(|(key, _)| key.starts_with(crate::tags::RESERVED_TAG_KEY_PREFIX)) {
 			return Err(StoreError::ReservedTagKey { aspect: aspect.to_string(), key: key.to_string() }.into());
+		}
+		// Declared upsert keys (Phase 4.6) bound the tags a row may carry: a tag outside
+		// them has no per-row storage once rows differing only in it fold into one. The
+		// untagged path never reads the declaration.
+		if !batch.groups.is_empty() {
+			if let Some(declared) = self.upsert_keys(aspect).await? {
+				if let Some(key) = declared.first_outside(&batch.groups) {
+					return Err(StoreError::NotAnUpsertKey { aspect: aspect.to_string(), key: key.to_string(), declared }.into());
+				}
+			}
 		}
 		if batch.timestamps.len() != batch.values.len() {
 			return Err(StoreError::IngestLengthMismatch { timestamps: batch.timestamps.len(), values: batch.values.len() }.into());

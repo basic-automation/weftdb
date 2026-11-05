@@ -10,6 +10,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Upsert keys** (Phase 4.6). `POST /api/v1/storage/aspects` takes an optional
+  `upsert_keys` list, `"timestamp"` plus tag keys (`SegmentStore::declare_with_upsert_keys`
+  in the library). Every ingested row's tags must then fall inside those keys: a tag outside
+  them is `400 invalid_tag` (`details.reason` `not an upsert key`). The keys are immutable and
+  part of the declaration, so other keys (or none) on a re-declare is `409 schema_conflict`,
+  and the declare response and the schema endpoint echo them. Store migration
+  `0008_upsert_keys` (layout 2) adds the nullable column they live in; an older layout-2
+  build opens the store and ignores the declaration.
+- **Skip-identical overlap merge** (Phase 4.6). When an overlap group's newer-wins fold is
+  exactly its oldest member's own rows (a replayed batch), the merge writes no new frame:
+  it keeps that member and deletes the rest. Values are compared with their scale, so a
+  replay of `5` as `5.0` is still rewritten.
 - **R client** (`clients/r`, package `weftdb`): stored windows, value bands and server-side
   downsamples as Arrow tables, exact JSON rows paged by cursor, interpolation, and ingest of a
   data frame or Arrow table as one Parquet batch with `Idempotency-Key`. Refusals are

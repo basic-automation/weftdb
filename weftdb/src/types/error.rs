@@ -11,6 +11,12 @@ fn describe_schema(schema: &AspectSchema) -> String {
 	format!("{value} (tolerance {}, timestamps in {})", schema.value_tolerance, schema.timestamp_unit.name())
 }
 
+/// Upsert keys as an error message names them: the wire list, or `none (timestamp and
+/// the full tag set)` for an undeclared aspect.
+fn describe_upsert_keys(keys: Option<&crate::UpsertKeys>) -> String {
+	keys.map_or_else(|| "none (timestamp and the full tag set)".to_string(), ToString::to_string)
+}
+
 #[derive(Debug, ThisError)]
 pub enum Error {
 	#[error("Insufficient measurements provided for interpolation")]
@@ -252,6 +258,31 @@ pub enum StoreError {
 		aspect: String,
 		/// The reserved key the batch named.
 		key: String,
+	},
+	/// An ingest batch's `groups` named a tag key outside the aspect's declared
+	/// [`UpsertKeys`](crate::UpsertKeys) (Phase 4.6): with upsert keys declared, every row's
+	/// tags must fall inside them, because a tag outside the key has no per-row storage to
+	/// carry it once rows that differ only in it fold into one. Nothing was written.
+	#[error("aspect {aspect:?}: the tag key {key:?} is not an upsert key (the aspect declares upsert keys {declared}); nothing was written")]
+	NotAnUpsertKey {
+		/// The aspect the batch was offered to.
+		aspect: String,
+		/// The tag key outside the declaration.
+		key: String,
+		/// The declared upsert keys.
+		declared: crate::UpsertKeys,
+	},
+	/// A declaration named upsert keys other than the ones `aspect` is declared with
+	/// (Phase 4.6): like the schema, an upsert-key declaration is immutable once made, and
+	/// no declaration is a declaration too. Nothing was written.
+	#[error("aspect {aspect:?} is declared with upsert keys {} and they are immutable; the offered {} was refused and nothing was written", describe_upsert_keys(declared.as_ref()), describe_upsert_keys(offered.as_ref()))]
+	UpsertKeysConflict {
+		/// The aspect that was re-declared.
+		aspect: String,
+		/// The upsert keys it is declared with ([`None`]: undeclared).
+		declared: Option<crate::UpsertKeys>,
+		/// The upsert keys the refused declaration offered.
+		offered: Option<crate::UpsertKeys>,
 	},
 	/// A [`SeriesSelector`](crate::SeriesSelector) matched more than one series
 	/// of `aspect`, and a store read targets exactly one (TAG-8, tags D4). Narrow

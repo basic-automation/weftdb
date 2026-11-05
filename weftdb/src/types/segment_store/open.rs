@@ -647,6 +647,35 @@ impl SegmentStore {
 		self.catalog.declare(&self.database, &self.subject, aspect, schema).await
 	}
 
+	/// [`declare`](Self::declare) with an upsert-key declaration (roadmap Phase 4.6; see
+	/// [`UpsertKeys`](crate::UpsertKeys)): `upsert_keys` [`None`] declares none, the
+	/// default identity `(timestamp, full tag set)`. With keys declared, an
+	/// [`ingest`](Self::ingest) whose tags name a key outside them is refused. The keys
+	/// are immutable once declared and take part in the declaration's equality (see
+	/// [`AspectCatalog::declare_with_upsert_keys`]); the
+	/// [`AspectSchema`] is untouched by them.
+	///
+	/// # Errors
+	///
+	/// As [`declare`](Self::declare), and a [`StoreError::UpsertKeysConflict`] when the
+	/// aspect is declared with other upsert keys (or none, or some where none are offered).
+	pub async fn declare_with_upsert_keys(&self, aspect: &str, schema: &AspectSchema, upsert_keys: Option<&crate::UpsertKeys>) -> Result<()> {
+		aspect_name::validate(aspect)?;
+		self.writable()?;
+		self.catalog.declare_with_upsert_keys(&self.database, &self.subject, aspect, schema, upsert_keys).await
+	}
+
+	/// The upsert keys `aspect` is declared with (roadmap Phase 4.6), or [`None`] when it
+	/// declares none (or is not declared): its dedup identity is then the timestamp and
+	/// the full tag set.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn upsert_keys(&self, aspect: &str) -> Result<Option<crate::UpsertKeys>> {
+		self.catalog.upsert_keys(&self.database, &self.subject, aspect).await
+	}
+
 	/// The declared [`AspectSchema`] for `aspect`, or [`None`] if it has not been
 	/// [`declare`](SegmentStore::declare)d in this store.
 	///
