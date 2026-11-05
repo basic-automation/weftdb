@@ -107,6 +107,8 @@ name = "stored_interpolate"
 harness = false
 
 [dev-dependencies]
+arrow-array = { workspace = true }  # a RecordBatch with a raw IEEE-754 NaN, for the ingest non-finite test (production code keeps arrow types inside weft-arrow)
+arrow-schema = { workspace = true }  # the schema of that test batch
 criterion = { workspace = true }  # benches/interpolate_wire.rs, benches/json_widening.rs
 async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
 libc = { workspace = true }  # raise(SIGTERM) for the signal-before-serving test in tests/serve_path.rs

@@ -196,6 +196,19 @@ pub enum ConvertError {
 		/// How many digits the value's plain form carries.
 		digits: usize,
 	},
+	/// A value cell held a value with no decimal representation at all — `NaN`
+	/// or an infinity (ROB-7). Raised only by the strict readers
+	/// ([`record_batch_to_columns_strict`], [`record_batches_to_columns_strict`],
+	/// which is what the ingest path uses): a lossy float column or a text cell
+	/// naming a non-finite number becomes `None` in the lenient readers, because
+	/// that is what an export with a hole in it needs, and a silent `None` on the
+	/// way *in* is a row the caller thinks it sent.
+	NonFinite {
+		/// The offending column's name.
+		column: &'static str,
+		/// The row within the batch set the cell sits on (numbered across batches).
+		row: usize,
+	},
 	/// The two columns disagreed on height, or re-sealing the segment failed.
 	Segment(SegmentError),
 	/// Reading or writing the Arrow IPC stream failed (carries the Arrow message).
@@ -233,6 +246,7 @@ impl std::fmt::Display for ConvertError {
 			Self::UnknownTimeUnit(s) => write!(f, "unrecognized time unit `{s}` in schema metadata"),
 			Self::BadValue(s) => write!(f, "value cell `{s}` does not parse as a decimal"),
 			Self::DecimalOutOfRange { digits } => write!(f, "value's plain form has {digits} digits, over the {}-digit decimal domain bound", weft_physical_type::MAX_PLAIN_DIGITS),
+			Self::NonFinite { column, row } => write!(f, "row {row} of column `{column}` is not a finite number (NaN or an infinity has no decimal representation)"),
 			Self::Segment(e) => write!(f, "could not rebuild segment from columns: {e}"),
 			Self::Ipc(e) => write!(f, "arrow IPC stream error: {e}"),
 			Self::EmptyBatchSet => write!(f, "cannot write from zero batches (no schema)"),
@@ -490,6 +504,30 @@ fn build_record_batch(unit: TimeUnit, physical_type_name: &str, version: u16, ti
 /// an Arrow type this crate does not emit, or a text cell does not parse as a
 /// `BigDecimal`.
 pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
+	columns_from_batch(batch, false, 0)
+}
+
+/// Read a batch's two columns with the ingest rules (ROB-7): the same conversion as
+/// [`record_batch_to_columns`], except that a value which cannot exist as a decimal
+/// is a [`ConvertError::NonFinite`] naming its row instead of a `None`.
+///
+/// The lenient reader exists because an export with a hole in it has to come back as
+/// a hole; a request body with a hole in it is a row the caller believes it sent.
+/// Only the strict reader is safe on a write path, which is why the HTTP ingest path
+/// reaches for this one and the re-seal paths keep the lenient one.
+///
+/// # Errors
+///
+/// Every error [`record_batch_to_columns`] returns, plus [`ConvertError::NonFinite`].
+pub fn record_batch_to_columns_strict(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
+	columns_from_batch(batch, true, 0)
+}
+
+/// The one column reader behind both entry points: `strict` decides whether a
+/// non-finite cell is a `None` (the export shape's hole) or a refusal naming the
+/// row, and `row_offset` numbers rows across a batch set so a Parquet file of many
+/// batches reports the row the sender counts, not the row within one batch.
+fn columns_from_batch(batch: &RecordBatch, strict: bool, row_offset: usize) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
 	let ts_col = batch.column_by_name(TIMESTAMP_COLUMN).ok_or(ConvertError::MissingColumn(TIMESTAMP_COLUMN))?;
 	let ts_array = ts_col.as_any().downcast_ref::<Int64Array>().ok_or(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64" })?;
 	// `values()` ignores the validity bitmap: a null timestamp would read as whatever its
@@ -504,9 +542,14 @@ pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Opt
 		DataType::Utf8 => {
 			let val_array = val_col.as_any().downcast_ref::<StringArray>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Utf8" })?;
 			let mut out = Vec::with_capacity(val_array.len());
-			for cell in val_array {
+			for (row, cell) in val_array.iter().enumerate() {
 				match cell {
-					Some(text) => out.push(Some(text.parse::<BigDecimal>().map_err(|_| ConvertError::BadValue(text.to_string()))?)),
+					Some(text) => {
+						if strict && weft_physical_type::is_non_finite_decimal_text(text) {
+							return Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: row_offset + row });
+						}
+						out.push(Some(text.parse::<BigDecimal>().map_err(|_| ConvertError::BadValue(text.to_string()))?));
+					}
 					None => out.push(None),
 				}
 			}
@@ -514,11 +557,25 @@ pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Opt
 		}
 		DataType::Float64 => {
 			let val_array = val_col.as_any().downcast_ref::<Float64Array>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Float64" })?;
-			val_array.iter().map(|cell| cell.and_then(BigDecimal::from_f64)).collect()
+			val_array
+				.iter()
+				.enumerate()
+				.map(|(row, cell)| match cell {
+					Some(v) if strict && !v.is_finite() => Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: row_offset + row }),
+					other => Ok(other.and_then(BigDecimal::from_f64)),
+				})
+				.collect::<Result<Vec<_>, ConvertError>>()?
 		}
 		DataType::Float32 => {
 			let val_array = val_col.as_any().downcast_ref::<Float32Array>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Float32" })?;
-			val_array.iter().map(|cell| cell.and_then(BigDecimal::from_f32)).collect()
+			val_array
+				.iter()
+				.enumerate()
+				.map(|(row, cell)| match cell {
+					Some(v) if strict && !v.is_finite() => Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: row_offset + row }),
+					other => Ok(other.and_then(BigDecimal::from_f32)),
+				})
+				.collect::<Result<Vec<_>, ConvertError>>()?
 		}
 		DataType::Decimal128(_precision, scale) => {
 			let val_array = val_col.as_any().downcast_ref::<Decimal128Array>().ok_or(ConvertError::WrongType { column: VALUE_COLUMN, expected: "Decimal128" })?;
@@ -622,10 +679,26 @@ fn page_to_record_batch(page: &Page, version: u16) -> Result<RecordBatch, Conver
 ///
 /// Propagates any [`ConvertError`] from reading an individual batch.
 pub fn record_batches_to_columns(batches: &[RecordBatch]) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
+	columns_from_batches(batches, false)
+}
+
+/// Concatenate a stream of batches into WeftDB columns under the ingest rules
+/// (ROB-7) — [`record_batches_to_columns`] with [`ConvertError::NonFinite`] turned
+/// on, and row numbers counted across the whole batch set. This is what the Parquet
+/// ingest route decodes with; the re-seal paths keep the lenient form.
+///
+/// # Errors
+///
+/// Every error [`record_batches_to_columns`] returns, plus [`ConvertError::NonFinite`].
+pub fn record_batches_to_columns_strict(batches: &[RecordBatch]) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
+	columns_from_batches(batches, true)
+}
+
+fn columns_from_batches(batches: &[RecordBatch], strict: bool) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>), ConvertError> {
 	let mut timestamps = Vec::new();
 	let mut values = Vec::new();
 	for batch in batches {
-		let (ts, vs) = record_batch_to_columns(batch)?;
+		let (ts, vs) = columns_from_batch(batch, strict, timestamps.len())?;
 		timestamps.extend(ts);
 		values.extend(vs);
 	}
@@ -1751,6 +1824,32 @@ mod tests {
 	#[test]
 	fn reduction_table_rejects_ragged_reduction_column() {
 		assert_eq!(reduction_table_to_record_batch(TimeUnit::Seconds, &[0, 60], &[1, 1], &["min"], &[vec![0.0]]), Err(ConvertError::LengthMismatch { column: VALUE_COLUMN, expected: 2, actual: 1 }));
+	}
+
+	#[test]
+	fn a_non_finite_float_is_a_hole_for_the_lenient_reader_and_a_refusal_for_the_strict_one() {
+		// ROB-7: the export shape needs `NaN` to come back as the null it was written
+		// as, and a request body needs it refused — a `None` on the way in is a row the
+		// caller believes it sent. Same batch, two readers, two answers.
+		let batch = build_record_batch(TimeUnit::Seconds, PhysicalType::F64.name(), LOGICAL_EXPORT_VERSION, &[100, 110, 120], Arc::new(Float64Array::from(vec![Some(1.5), Some(f64::NAN), Some(f64::NEG_INFINITY)])), VALUE_ENCODING_F64).expect("builds the batch");
+		let (timestamps, values) = record_batch_to_columns(&batch).expect("the lenient reader accepts it");
+		assert_eq!(timestamps, vec![100, 110, 120]);
+		assert_eq!(values[0], Some(bd("1.5")));
+		assert_eq!(values[1], None, "a NaN reads back as the hole the writer meant");
+		assert_eq!(values[2], None);
+		assert_eq!(record_batch_to_columns_strict(&batch), Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: 1 }));
+	}
+
+	#[test]
+	fn the_strict_reader_refuses_a_text_non_finite_and_numbers_rows_across_batches() {
+		// The Utf8 export form carries `NaN` as text, so the text arm needs the same
+		// refusal; and a Parquet body is a *set* of batches, so the row a strict
+		// refusal names has to be the row the sender counts, not the row within one
+		// batch of many.
+		let first = build_record_batch(TimeUnit::Seconds, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, &[100, 110], Arc::new(StringArray::from(vec![Some("1.5"), Some("2.5")])), VALUE_ENCODING_TEXT).expect("builds the first batch");
+		let second = build_record_batch(TimeUnit::Seconds, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, &[120, 130], Arc::new(StringArray::from(vec![Some("-Infinity"), Some("4.5")])), VALUE_ENCODING_TEXT).expect("builds the second batch");
+		assert_eq!(record_batches_to_columns(&[first.clone(), second.clone()]), Err(ConvertError::BadValue("-Infinity".to_string())), "the lenient text arm already refused this value, but with the wrong code — see the strict refusal below");
+		assert_eq!(record_batches_to_columns_strict(&[first, second]), Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: 2 }));
 	}
 
 	#[test]

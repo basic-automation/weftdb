@@ -648,8 +648,8 @@ under the declared encoding/tolerance is rejected `422 value_not_representable` 
 |----------|---------|
 | `POST /api/v1/storage/aspects` | **Declare** an aspect's schema — physical encoding, value tolerance, timestamp unit. Declarations are immutable once made: re-declaring the identical schema is a no-op, widening the value encoding to `bigdecimal_text` (tolerance and unit unchanged) is accepted, and any other re-declaration is a `409 schema_conflict`. A `scale` is required for `scaled_i64`/`scaled_i128` and refused for every other encoding. An optional `upsert_keys` list (Phase 4.6) names `"timestamp"` exactly once plus tag keys, for example `["timestamp", "host"]`: every ingested row's tags must then fall inside those keys (a tag outside them is `400 invalid_tag`, `details.tag` naming it, `details.reason` `not an upsert key`), so two writes at one timestamp with the same keyed tags are one row, the newer winning. Omitted, the identity is the timestamp and the full tag set, as before. The keys take part in the declaration's equality: re-declaring with other keys, or without them where they were declared, is a `409 schema_conflict`. A list without `timestamp`, or with a key outside the tag grammar, is a `400`. The declare response and `GET /api/v1/storage/{aspect}/schema` carry `upsert_keys` (`"timestamp"` first) when the aspect declares them; `GET …/aspects` leaves it out. `value` is never an upsert key, and dedup cannot be turned off. The name also names the aspect's files on disk, so it must be at most 160 bytes with no `/`, `\`, control characters, bidirectional controls, line separators or invisible formatting characters (the zero-width joiner and non-joiner are allowed), leading `.`, trailing `.` or space, and must not be a Windows device name (`CON`, `NUL`, `COM1`, …, also with an extension or a `:` suffix, as in `nul:x`); a server running on Windows also refuses `<`, `>`, `:`, `"`, `|`, `?` and `*`. Anything else is a `400`. |
 | `GET /api/v1/storage/aspects` · `…/{aspect}/schema` · `…/catalog` | List declared schemas; read one aspect's schema (the full declaration, the fixed-point `scale` included); report the store's `(database, subject)` scope + registered hierarchy. |
-| `POST /api/v1/storage/{aspect}/points` | Ingest a JSON batch (dense or nullable; single-block or paged via `rows_per_page`). Set `require_sorted` to reject an out-of-order batch (`400`, naming the first backwards row) instead of sealing it. Every ingest response reports `time_sorted` (whether the sealed segment stored in monotonic order). |
-| `POST /api/v1/storage/{aspect}/{ilp,parquet,csv}` | Ingest an ILP payload, a Parquet file, or CSV rows into a declared aspect — all sealing through the same schema-enforced path, and all honouring `require_sorted` (query param) + reporting `time_sorted`. |
+| `POST /api/v1/storage/{aspect}/points` | Ingest a JSON batch (dense or nullable; single-block or paged via `rows_per_page`). Set `require_sorted` to reject an out-of-order batch (`400`, naming the first backwards row) instead of sealing it. Every ingest response reports `time_sorted` (whether the sealed segment stored in monotonic order). A `NaN` or infinite value is a `400 not_finite`, never a null — see [ingest limits](#ingest-limits). |
+| `POST /api/v1/storage/{aspect}/{ilp,parquet,csv}` | Ingest an ILP payload, a Parquet file, or CSV rows into a declared aspect — all sealing through the same schema-enforced path, and all honouring `require_sorted` (query param) + reporting `time_sorted`. All four formats refuse a `NaN` or infinite value the same way (`400 not_finite`) and share the two size ceilings in [ingest limits](#ingest-limits). |
 | Tags on ingest (TAG-11) · `"tags"` (JSON) · `?tag.<key>=<value>` (CSV, Parquet) · `?measurement=` (ILP, **required**) | Each ingest request writes **one series**. JSON: an optional `"tags": {"host": "a"}` object; absent, `null` or `{}` is the untagged series. CSV and Parquet: `tag.<key>=<value>` query parameters (no `tag.*` parameter is the untagged series; `tag_match` is a read option and is `400 bad_request` here). ILP: `measurement=` selects the records sealed (others are skipped) and their own tags name the series; records of that measurement carrying `field` with two different tag sets are `400 ambiguous_series` — split the payload per series. A repeated key (in the JSON object or the query), a reserved `__` key, an empty value, more than 16 tags, or a key or value outside the tag grammar is `400 invalid_tag` (`details.tag` names the key). An ingest that would register a new series beyond `WEFT_MAX_SERIES_PER_ASPECT` is `400 series_limit`; series already registered stay writable and the untagged series never counts. Every ingest response carries `series_id` (`0` untagged; otherwise the id the aspect's catalog assigned when the series was first written) and `tags` (`{}` untagged). Read a tagged series back with the `tag.*` selector below. |
 | `GET /api/v1/storage/{aspect}/range` · `…/value-range` | Stream a stored time window / value band as **Arrow IPC** (`application/vnd.apache.arrow.stream`). A window wider than `WEFT_MAX_READ_ROWS` is `422 result_too_large`. |
 | `GET …/range.parquet` · `…/value-range.parquet` | The same windows as **Parquet** files. |
@@ -684,6 +684,27 @@ Over a row, bucket or instant ceiling the answer is **`422 result_too_large`** c
 `"limit"`; a read whose wait expires is **`504 query_timeout`**. The five are read once at
 startup, and a non-positive or unparsable value stops the server from starting with a message
 naming the variable. `GET /ready` and `GET /health` are never bounded.
+
+#### Ingest limits
+
+A WeftDB value is an exact decimal, so `NaN` and `±Infinity` have no representation to store. Before ROB-7 two of the four formats quietly dropped them anyway: a Parquet body's `Float64` column turned them into nulls on decode, and an ILP line carrying `temp=NaN` was skipped while the response still answered `rows: 1`. Both are refusals now:
+
+| Format | A non-finite value |
+| --- | --- |
+| JSON | `"value": "NaN"` (or `inf`, `+Infinity`, case-insensitive) → `400 not_finite` |
+| CSV | the same text in a value cell → `400 not_finite`; an **empty** cell stays a null, which is legal |
+| ILP | `temp=NaN`, `temp=-inf` → `400 not_finite`, naming the line — the line is no longer skipped |
+| Parquet | a `Float64`/`Float32` column holding `NaN`/`±Inf`, or a text column spelling it → `400 not_finite`, naming the row and column |
+
+Two size ceilings bound what one body can become, both enforced on what the parser produced rather than on the bytes it arrived in — a body cap cannot bound what a compressed Parquet file expands to, and a row count cannot bound what those rows weigh when the decimals are wide:
+
+| Name | Default | Refusal |
+| --- | --- | --- |
+| `WEFT_MAX_INGEST_ROWS` | 10,000,000 rows | `413 too_many_rows`, naming both numbers |
+| `WEFT_MAX_INGEST_DECODED_BYTES` | 1 GiB | `413 payload_too_large`, naming both numbers |
+
+The byte ceiling counts the decoded timestamp and value columns (a 16-byte slot per timestamp and per value, plus the mantissa bytes the non-null decimals actually need), so it moves with the width of the data rather than its encoding. Both are read once at startup; `0` is refused at startup the way the body cap is, because a zero ceiling would refuse every body. A body that trips one of the three existing ingest guards answers as before: `413 payload_too_large` for the per-request body cap (`WEFT_MAX_INGEST_BYTES`), `503 overloaded` for the in-flight byte budget (`WEFT_INGEST_MAX_INFLIGHT_BYTES`).
+
 ### Grafana (experimental)
 
 `weft-server` answers Grafana's community **JSON datasource** (`simpod-json-datasource`)
@@ -992,6 +1013,8 @@ recovery-point and recovery-time objectives these settings produce, see
 | `WEFT_WORKER_THREADS` | `weft-server` | Worker threads in the process runtime the admitted requests run on. | unset (one per available core) |
 | `WEFT_INGEST_MAX_INFLIGHT_BYTES` | `weft-server` | Byte budget across in-flight writes. | 256 MiB |
 | `WEFT_MAX_INGEST_BYTES` | `weft-server` | Per-request ingest body cap (`413`). | 256 MiB |
+| `WEFT_MAX_INGEST_ROWS` | `weft-server` | How many rows one ingest body may decode to, in any format. Past it, `413 too_many_rows` naming the row count, the limit, and the way to shrink the batch. | 10,000,000 rows |
+| `WEFT_MAX_INGEST_DECODED_BYTES` | `weft-server` | The decoded size of one ingest body — its timestamp and value columns counted as they will sit in memory, not the bytes that arrived. Past it, `413 payload_too_large`. This is the ceiling a compressed Parquet body cannot inflate past. | 1 GiB |
 | `WEFT_MAX_CONNECTIONS` | `weft-server` | Connection cap. | half of `RLIMIT_NOFILE`, clamped to 16..65,536 |
 | `WEFT_HEADER_READ_TIMEOUT_SECS` / `WEFT_KEEP_ALIVE_TIMEOUT_SECS` / `WEFT_WRITE_STALL_TIMEOUT_SECS` | `weft-server` | Connection deadlines, enforced before authentication. | 30 / 30 / 10 s |
 | `WEFT_SHUTDOWN_GRACE_SECS` | `weft-server` | How long connections may finish after SIGTERM. | 5 s |

@@ -817,6 +817,32 @@ pub fn classify_read(err: &anyhow::Error) -> ApiError {
 	ApiError::internal(err)
 }
 
+/// A value in an ingest body that has no decimal form (ROB-7).
+///
+/// The same word the read side uses (`downsample`, `interpolate`) for the same
+/// condition, so one client-side fix — drop or replace the sample — serves both
+/// directions. `what` says which value, in the format's own terms.
+#[must_use]
+pub fn non_finite_value(what: impl std::fmt::Display) -> ApiError {
+	ApiError::new(Code::NotFinite, format!("{what} is not a finite number; WeftDB values are exact decimals, so NaN and infinity have no representation to store"))
+}
+
+/// A decoded ingest body over the row cap (`WEFT_MAX_INGEST_ROWS`, ROB-7 / plan C11).
+///
+/// Counted on the decoded columns rather than the body, because the cap bounds the
+/// rows the seal has to write, not the bytes that arrived.
+#[must_use]
+pub fn too_many_ingest_rows(rows: usize, limit: usize) -> ApiError {
+	ApiError::new(Code::TooManyRows, format!("this body decodes to {rows} rows, over the {limit}-row ingest limit; split it into smaller batches or raise `WEFT_MAX_INGEST_ROWS`"))
+}
+
+/// A decoded ingest body over the decoded-byte cap (`WEFT_MAX_INGEST_DECODED_BYTES`,
+/// ROB-7 / plan C11). A body cap cannot bound this: a Parquet body is compressed.
+#[must_use]
+pub fn decoded_too_large(decoded: u64, limit: u64) -> ApiError {
+	ApiError::new(Code::PayloadTooLarge, format!("this body decodes to about {} MiB of columns, over the {} MiB decoded limit; split it into smaller batches or raise `WEFT_MAX_INGEST_DECODED_BYTES`", decoded / (1024 * 1024), limit / (1024 * 1024)))
+}
+
 /// Map a library failure from an **ingest** route: the bytes being refused came from the
 /// caller, so a decode failure is theirs (`4xx`) rather than ours.
 pub fn classify_ingest(err: &anyhow::Error) -> ApiError {
@@ -832,6 +858,9 @@ pub fn classify_ingest(err: &anyhow::Error) -> ApiError {
 			weft_arrow::ConvertError::UnknownTimeUnit(s) => ApiError::bad_request(format!("the batch schema names time unit `{s}`, which WeftDB does not use (the units are s, ms, us, ns)")),
 			weft_arrow::ConvertError::BadValue(_) | weft_arrow::ConvertError::Ipc(_) | weft_arrow::ConvertError::Parquet(_) => ApiError::bad_request(e.to_string()),
 			weft_arrow::ConvertError::DecimalOutOfRange { digits } => decimal_out_of_range_refusal(*digits),
+			// A `NaN` or infinity in a Parquet body: the strict decode (ROB-7) names
+			// the row, and the code says why the row cannot be stored at all.
+			weft_arrow::ConvertError::NonFinite { column, row } => ApiError::new(Code::NotFinite, format!("row {row} of column `{column}` is not a finite number; WeftDB values are exact decimals, so NaN and infinity have no representation to store")),
 			// An empty batch set is a request that carried a schema-less body, and a failed
 			// segment rebuild means the two columns disagreed — both are the batch's doing.
 			_ => ApiError::bad_request(e.to_string()),
@@ -1002,6 +1031,9 @@ pub fn from_reduce_error(e: &weft_reduce::ReduceError) -> ApiError {
 pub fn from_line_protocol_error(e: &weft_line_protocol::ParseError) -> ApiError {
 	match e.kind {
 		weft_line_protocol::ParseErrorKind::AmbiguousSeries => ApiError::new(Code::AmbiguousSeries, e.to_string()),
+		// The read side already answers `not_finite` for this condition (downsample,
+		// interpolate); ROB-7 gives the write side the same word in every format.
+		weft_line_protocol::ParseErrorKind::NonFiniteValue => ApiError::new(Code::NotFinite, e.to_string()),
 		_ => ApiError::bad_request(e.to_string()),
 	}
 }
@@ -1383,5 +1415,25 @@ mod tests {
 		let api = classify_read(&anyhow::anyhow!("aspect `price` has no declared schema in default/default"));
 		assert_eq!(api.code(), Code::AspectNotFound);
 		assert!(api.message().contains("no declared schema"), "a 4xx keeps its detail: {}", api.message());
+	}
+
+	#[test]
+	fn the_ingest_surface_names_non_finite_and_the_two_new_caps() {
+		// ROB-7: a Parquet body's `NaN` reaches this layer as an anyhow-wrapped
+		// `ConvertError`, so the mapping onto the 400 `not_finite` code lives here — and
+		// the two new ceilings have to answer with their own codes rather than the
+		// generic bad-request one every malformed body gets.
+		let api = classify_ingest(&anyhow::Error::new(weft_arrow::ConvertError::NonFinite { column: weft_arrow::VALUE_COLUMN, row: 3 }));
+		assert_eq!(api.code(), Code::NotFinite);
+		assert_eq!(api.code().status(), axum::http::StatusCode::BAD_REQUEST, "a value with no decimal form is the sender's error");
+		assert!(api.wire_message().contains("row 3"), "the refusal names the row: {}", api.wire_message());
+		let api = classify_ingest(&anyhow::Error::new(weft_arrow::ConvertError::BadValue("not a number".to_string())));
+		assert_eq!(api.code(), Code::BadRequest, "an unparseable value keeps the code it always had");
+		assert_eq!(too_many_ingest_rows(20, 10).code(), Code::TooManyRows);
+		assert_eq!(too_many_ingest_rows(20, 10).code().status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+		assert!(too_many_ingest_rows(20, 10).wire_message().contains("WEFT_MAX_INGEST_ROWS"), "an operator ceiling names itself: {}", too_many_ingest_rows(20, 10).wire_message());
+		assert_eq!(decoded_too_large(2048, 1024).code(), Code::PayloadTooLarge);
+		assert!(decoded_too_large(2048, 1024).wire_message().contains("WEFT_MAX_INGEST_DECODED_BYTES"));
+		assert_eq!(non_finite_value("a `value` cell").code(), Code::NotFinite);
 	}
 }
