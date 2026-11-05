@@ -4,6 +4,35 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-04 — ROB-5: Legacy queue-consumer panics converted to errors (#303, PR #565)
+
+**Scope:** The consumer entry points (`build_incremental_unprocessed_queue`,
+`build_processed_batch_queue`, `build_patterns_queue`) and their callees from
+`Pipeline::prepare_data()` and `Pipeline::extract_patterns()`.
+
+**Converted:**
+
+1. **`Pipeline::dictionary()` and `dictionary_mut()` (pipeline.rs:1212, 1222)** — Changed from
+   `.expect("No dictionaries registered")` to returning `Option<&Dictionary>` and
+   `Option<&mut Dictionary>`. Rationale: empty dictionaries are valid (skipped in
+   `extract_patterns`), so panicking was inappropriate. Callers check the `Option`.
+
+2. **`build_patterns_queue` min/max timestamp extraction (lib.rs:819-820)** — Changed from
+   `.expect("active_measurements is non-empty, checked above")` to `.ok_or_else()` returning
+   `anyhow::Error` with the batch ID. Rationale: even though `active_measurements.is_empty()` is
+   checked above, returning an error documents the invariant violation and provides context for
+   debugging. The data model requires active measurements to have timestamps; if they're missing,
+   it's a data corruption issue that should be reported, not hidden.
+
+**Test approach:** Tests use `tokio::spawn` to catch panics as `JoinError` rather than
+`catch_unwind`, because the latter causes "Cannot start a runtime from within a runtime" when
+wrapping `block_on` inside a `#[tokio::test]`. Spawned tasks that panic are caught as
+`JoinError`, while returned `Err` results pass through.
+
+**Other consumer paths checked:** `build_incremental_unprocessed_queue` (already converts
+`database.get_database_info()` failures to `Err` with `.map_err`) and `build_processed_batch_queue`
+(uses only safe operations, no unwrap/expect/panic).
+
 ## 2026-11-04 — ROB-23r: probe-only admin listener
 
 **Context:** `weft-server` binds one listener by default (`WEFT_SERVER_ADDR`, defaulting to
