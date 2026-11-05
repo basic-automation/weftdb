@@ -10,6 +10,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **GPU configuration, compute limits, interpolation provenance and metrics** (ROB-16).
+  `WEFT_GPU_BACKEND` (`auto` / `cpu` / `parallel` / `gpu`) pins the compute backend the
+  interpolation endpoints run on, beside the existing startup calibration; the configured
+  `WEFT_MAX_INTERPOLATE_POINTS` cap now also bounds the downsample gap-fill grids, which
+  previously used the 10,000,000 default constant regardless of the setting. Interpolate
+  responses carry each point's provenance in the open `ValueKind` vocabulary (the wire
+  tokens `raw` / `interpolated` / `extrapolated` are unchanged) and name the backend that
+  actually produced the values (`backend`, plus `gpu_fallback` when `auto` tried the GPU
+  and fell back); `/metrics` gains per-kind output-point counters, per-backend request
+  counters and a GPU-fallback counter, also present in `/debug/profile/current`.
+
 - **Probe-only admin listener** (ROB-23r). With `WEFT_ADMIN_ADDR` set to a loopback address
   (e.g. `127.0.0.1:9095`), `weft-server` binds a second listener serving only `/health`,
   `/ready`, `/healthz` and `/readyz` — with no auth, no host guard, and no other route. An

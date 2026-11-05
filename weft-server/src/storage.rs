@@ -1119,6 +1119,7 @@ pub struct StorageDownsampleParams {
 pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams, selector: &weftdb::SeriesSelector) -> Result<crate::downsample::DownsampleResponse, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let max_fill_buckets = state.interpolate_config().max_output_points();
 	drop(state);
 	let width = crate::downsample::parse_width_token(params.resolution.as_deref())?;
 	let aggregations = crate::downsample::parse_aggregations(params.agg.as_deref())?;
@@ -1159,7 +1160,7 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 	if let (Some(method), Some(_)) = (&method, target.series) {
 		// The fill bounds are the window's, as instants; an omitted bound is the stored data's.
 		let instant = |epoch: Option<i64>| epoch.map(|e| bound_nanos(e).map(chrono::DateTime::from_timestamp_nanos)).transpose();
-		buckets = crate::downsample::apply_fill(&buckets, width, instant(params.start)?, instant(params.end)?, method)?;
+		buckets = crate::downsample::apply_fill(&buckets, width, instant(params.start)?, instant(params.end)?, method, max_fill_buckets)?;
 	}
 	let mut response = crate::downsample::buckets_to_response(buckets, width, &aggregations)?;
 	response.fill = method.is_some().then(|| params.fill.as_deref().unwrap_or_default().trim().to_string());

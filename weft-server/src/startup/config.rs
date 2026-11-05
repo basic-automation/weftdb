@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use weft_server::{
-	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ReadLimits, ServeLimits, TlsConfig, AUTH_KEYS_MODE, DEFAULT_PAGE_ROWS, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_AT_MULTI_INSTANTS_ENV, MAX_CONNECTIONS_ENV, MAX_DOWNSAMPLE_BUCKETS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, MAX_PAGE_ROWS_ENV, MAX_READ_ROWS_ENV, QUERY_MAX_INFLIGHT_ENV, READ_TIMEOUT_SECS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
+	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ReadLimits, ServeLimits, TlsConfig, AUTH_KEYS_MODE, DEFAULT_PAGE_ROWS, GPU_BACKEND_ENV, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_AT_MULTI_INSTANTS_ENV, MAX_CONNECTIONS_ENV, MAX_DOWNSAMPLE_BUCKETS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, MAX_PAGE_ROWS_ENV, MAX_READ_ROWS_ENV, QUERY_MAX_INFLIGHT_ENV, READ_TIMEOUT_SECS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
 };
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
@@ -53,15 +53,17 @@ pub(crate) fn admin_addr() -> anyhow::Result<Option<SocketAddr>> {
 }
 
 /// Read the interpolation settings ([`InterpolateConfig`]) from
-/// `WEFT_MAX_INTERPOLATE_POINTS`, once, and log the output-grid cap in force.
+/// `WEFT_MAX_INTERPOLATE_POINTS` and `WEFT_GPU_BACKEND`, once, and log the
+/// compute limits and the GPU configuration in force.
 ///
 /// # Errors
 ///
-/// A value that is not a positive integer (a malformed operator config should fail
-/// loudly at start rather than silently default).
+/// A points value that is not a positive integer, or a backend value that
+/// names no backend (a malformed operator config should fail loudly at start
+/// rather than silently default).
 pub fn interpolate_config() -> anyhow::Result<InterpolateConfig> {
-	let config = InterpolateConfig::from_env_value(std::env::var(MAX_INTERPOLATE_POINTS_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?;
-	println!("interpolation: at most {} output points per request (set {MAX_INTERPOLATE_POINTS_ENV} to change)", config.max_output_points());
+	let config = InterpolateConfig::from_env_value(std::env::var(MAX_INTERPOLATE_POINTS_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?.with_backend_from_env_value(std::env::var(GPU_BACKEND_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?;
+	println!("interpolation: at most {} output points per request (set {MAX_INTERPOLATE_POINTS_ENV} to change), on the {} compute backend (set {GPU_BACKEND_ENV} to change)", config.max_output_points(), config.backend());
 	Ok(config)
 }
 

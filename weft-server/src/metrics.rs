@@ -188,11 +188,24 @@ impl LatencyHistogramSnapshot {
 }
 
 /// Counters for the interpolation endpoint.
+///
+/// Beyond requests / errors / output points, the provenance counters ROB-16
+/// adds: output points split by the [`ValueKind`](weftdb::ValueKind) they were
+/// served with, requests split by the compute backend that actually ran, and
+/// the count of `auto` requests that tried the GPU and fell back — the three
+/// numbers an operator needs to see what the GPU configuration is doing.
 #[derive(Debug, Default)]
 pub struct InterpolateMetrics {
 	requests: AtomicU64,
 	errors: AtomicU64,
 	output_points: AtomicU64,
+	output_raw_points: AtomicU64,
+	output_interpolated_points: AtomicU64,
+	output_extrapolated_points: AtomicU64,
+	backend_cpu_requests: AtomicU64,
+	backend_parallel_requests: AtomicU64,
+	backend_gpu_requests: AtomicU64,
+	gpu_fallbacks: AtomicU64,
 }
 
 /// Counters for the downsample endpoint.
@@ -270,6 +283,20 @@ pub struct InterpolateSnapshot {
 	pub errors: u64,
 	/// Total interpolated output points served across all successful requests.
 	pub output_points: u64,
+	/// Output points served with provenance `raw`.
+	pub output_raw_points: u64,
+	/// Output points served with provenance `interpolated`.
+	pub output_interpolated_points: u64,
+	/// Output points served with provenance `extrapolated`.
+	pub output_extrapolated_points: u64,
+	/// Successful requests the serial CPU backend produced.
+	pub backend_cpu_requests: u64,
+	/// Successful requests the rayon CPU pool produced.
+	pub backend_parallel_requests: u64,
+	/// Successful requests the GPU produced.
+	pub backend_gpu_requests: u64,
+	/// Successful requests where `auto` tried the GPU and fell back to the CPU pool.
+	pub gpu_fallbacks: u64,
 }
 
 /// A point-in-time read of [`DownsampleMetrics`].
@@ -338,6 +365,36 @@ impl Metrics {
 	/// Add to the running total of interpolated output points served.
 	pub fn add_output_points(&self, count: u64) {
 		self.interpolate.output_points.fetch_add(count, Ordering::Relaxed);
+	}
+
+	/// Record one successful interpolation's provenance (ROB-16): the backend
+	/// token that produced it (`cpu`, `parallel` or `gpu` — anything else is
+	/// not counted, since the engine only ever names those three), whether
+	/// `auto` fell back from the GPU, and the provenance kind of every output
+	/// point. Called alongside [`add_output_points`](Self::add_output_points),
+	/// which stays the kind-agnostic total.
+	pub fn record_interpolate_output<'a>(&self, backend: &str, gpu_fallback: bool, kinds: impl Iterator<Item = &'a weftdb::ValueKind>) {
+		match backend {
+			"cpu" => self.interpolate.backend_cpu_requests.fetch_add(1, Ordering::Relaxed),
+			"parallel" => self.interpolate.backend_parallel_requests.fetch_add(1, Ordering::Relaxed),
+			"gpu" => self.interpolate.backend_gpu_requests.fetch_add(1, Ordering::Relaxed),
+			_ => 0,
+		};
+		if gpu_fallback {
+			self.interpolate.gpu_fallbacks.fetch_add(1, Ordering::Relaxed);
+		}
+		let (mut raw, mut interpolated, mut extrapolated) = (0_u64, 0_u64, 0_u64);
+		for kind in kinds {
+			match kind {
+				weftdb::ValueKind::Raw => raw += 1,
+				weftdb::ValueKind::Interpolated => interpolated += 1,
+				weftdb::ValueKind::Extrapolated => extrapolated += 1,
+				_ => {}
+			}
+		}
+		self.interpolate.output_raw_points.fetch_add(raw, Ordering::Relaxed);
+		self.interpolate.output_interpolated_points.fetch_add(interpolated, Ordering::Relaxed);
+		self.interpolate.output_extrapolated_points.fetch_add(extrapolated, Ordering::Relaxed);
 	}
 
 	/// Count a downsample request (record on entry, before validation).
@@ -457,7 +514,13 @@ impl Metrics {
 	/// Take a consistent-enough snapshot of all counters.
 	#[must_use]
 	pub fn snapshot(&self) -> MetricsSnapshot {
-		MetricsSnapshot { interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed) }, downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) }, ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) }, reconcile: ReconcileSnapshot { passes: self.reconcile.passes.load(Ordering::Relaxed), segments_reconciled: self.reconcile.segments_reconciled.load(Ordering::Relaxed), failed_passes: self.reconcile.failed_passes.load(Ordering::Relaxed) }, backup: BackupSnapshot { snapshots: self.backup.snapshots.load(Ordering::Relaxed), bytes_written: self.backup.bytes_written.load(Ordering::Relaxed), failures: self.backup.failures.load(Ordering::Relaxed), last_success_unix_secs: self.backup.last_success_unix_secs.load(Ordering::Relaxed) } }
+		MetricsSnapshot {
+			interpolate: InterpolateSnapshot { requests: self.interpolate.requests.load(Ordering::Relaxed), errors: self.interpolate.errors.load(Ordering::Relaxed), output_points: self.interpolate.output_points.load(Ordering::Relaxed), output_raw_points: self.interpolate.output_raw_points.load(Ordering::Relaxed), output_interpolated_points: self.interpolate.output_interpolated_points.load(Ordering::Relaxed), output_extrapolated_points: self.interpolate.output_extrapolated_points.load(Ordering::Relaxed), backend_cpu_requests: self.interpolate.backend_cpu_requests.load(Ordering::Relaxed), backend_parallel_requests: self.interpolate.backend_parallel_requests.load(Ordering::Relaxed), backend_gpu_requests: self.interpolate.backend_gpu_requests.load(Ordering::Relaxed), gpu_fallbacks: self.interpolate.gpu_fallbacks.load(Ordering::Relaxed) },
+			downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) },
+			ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) },
+			reconcile: ReconcileSnapshot { passes: self.reconcile.passes.load(Ordering::Relaxed), segments_reconciled: self.reconcile.segments_reconciled.load(Ordering::Relaxed), failed_passes: self.reconcile.failed_passes.load(Ordering::Relaxed) },
+			backup: BackupSnapshot { snapshots: self.backup.snapshots.load(Ordering::Relaxed), bytes_written: self.backup.bytes_written.load(Ordering::Relaxed), failures: self.backup.failures.load(Ordering::Relaxed), last_success_unix_secs: self.backup.last_success_unix_secs.load(Ordering::Relaxed) },
+		}
 	}
 
 	/// Render the counters in the Prometheus text exposition format (v0.0.4).
@@ -473,6 +536,22 @@ impl Metrics {
 			let _ = writeln!(out, "# TYPE {name} counter");
 			let _ = writeln!(out, "{name} {value}");
 		}
+		// Interpolation provenance (ROB-16): output points by the kind they were
+		// served with, and requests by the backend that actually ran — the GPU
+		// configuration made countable.
+		let _ = writeln!(out, "# HELP weft_interpolate_output_points_by_kind_total Total interpolated output points served, by provenance kind.");
+		let _ = writeln!(out, "# TYPE weft_interpolate_output_points_by_kind_total counter");
+		for (kind, value) in [("raw", snap.interpolate.output_raw_points), ("interpolated", snap.interpolate.output_interpolated_points), ("extrapolated", snap.interpolate.output_extrapolated_points)] {
+			let _ = writeln!(out, "weft_interpolate_output_points_by_kind_total{{kind=\"{kind}\"}} {value}");
+		}
+		let _ = writeln!(out, "# HELP weft_interpolate_backend_requests_total Total successful interpolation requests, by the compute backend that produced the values.");
+		let _ = writeln!(out, "# TYPE weft_interpolate_backend_requests_total counter");
+		for (backend, value) in [("cpu", snap.interpolate.backend_cpu_requests), ("parallel", snap.interpolate.backend_parallel_requests), ("gpu", snap.interpolate.backend_gpu_requests)] {
+			let _ = writeln!(out, "weft_interpolate_backend_requests_total{{backend=\"{backend}\"}} {value}");
+		}
+		let _ = writeln!(out, "# HELP weft_interpolate_gpu_fallbacks_total Total successful interpolation requests where the auto backend tried the GPU and fell back to the CPU pool.");
+		let _ = writeln!(out, "# TYPE weft_interpolate_gpu_fallbacks_total counter");
+		let _ = writeln!(out, "weft_interpolate_gpu_fallbacks_total {}", snap.interpolate.gpu_fallbacks);
 		// Health gauges: a scrape alerts on a stale backup from the last-success
 		// time, not from a counter it would have to difference itself.
 		let _ = writeln!(out, "# HELP weft_backup_last_success_seconds Unix seconds of the most recent verified control-plane backup snapshot, or 0 when none has been recorded yet.");
@@ -583,6 +662,20 @@ pub struct InterpolateProfile {
 	pub errors: u64,
 	/// Total interpolated output points served.
 	pub output_points: u64,
+	/// Output points served with provenance `raw`.
+	pub output_raw_points: u64,
+	/// Output points served with provenance `interpolated`.
+	pub output_interpolated_points: u64,
+	/// Output points served with provenance `extrapolated`.
+	pub output_extrapolated_points: u64,
+	/// Successful requests the serial CPU backend produced.
+	pub backend_cpu_requests: u64,
+	/// Successful requests the rayon CPU pool produced.
+	pub backend_parallel_requests: u64,
+	/// Successful requests the GPU produced.
+	pub backend_gpu_requests: u64,
+	/// Successful requests where `auto` tried the GPU and fell back.
+	pub gpu_fallbacks: u64,
 	/// End-to-end latency quantiles for `POST /api/v1/interpolate`.
 	pub latency_seconds: LatencyProfile,
 }
@@ -639,7 +732,7 @@ impl Metrics {
 	#[must_use]
 	pub fn profile(&self) -> ProfileReport {
 		let snap = self.snapshot();
-		ProfileReport { service: crate::SERVICE, version: crate::VERSION, interpolate: InterpolateProfile { requests: snap.interpolate.requests, errors: snap.interpolate.errors, output_points: snap.interpolate.output_points, latency_seconds: LatencyProfile::from_snapshot(&self.interpolate_latency.snapshot()) }, downsample: DownsampleProfile { requests: snap.downsample.requests, errors: snap.downsample.errors, output_buckets: snap.downsample.output_buckets, latency_seconds: LatencyProfile::from_snapshot(&self.downsample_latency.snapshot()) }, ingest: IngestProfile { requests: snap.ingest.requests, errors: snap.ingest.errors, rows_sealed: snap.ingest.rows_sealed, segments_sealed: snap.ingest.segments_sealed, latency_seconds: LatencyProfile::from_snapshot(&self.ingest_latency.snapshot()) } }
+		ProfileReport { service: crate::SERVICE, version: crate::VERSION, interpolate: InterpolateProfile { requests: snap.interpolate.requests, errors: snap.interpolate.errors, output_points: snap.interpolate.output_points, output_raw_points: snap.interpolate.output_raw_points, output_interpolated_points: snap.interpolate.output_interpolated_points, output_extrapolated_points: snap.interpolate.output_extrapolated_points, backend_cpu_requests: snap.interpolate.backend_cpu_requests, backend_parallel_requests: snap.interpolate.backend_parallel_requests, backend_gpu_requests: snap.interpolate.backend_gpu_requests, gpu_fallbacks: snap.interpolate.gpu_fallbacks, latency_seconds: LatencyProfile::from_snapshot(&self.interpolate_latency.snapshot()) }, downsample: DownsampleProfile { requests: snap.downsample.requests, errors: snap.downsample.errors, output_buckets: snap.downsample.output_buckets, latency_seconds: LatencyProfile::from_snapshot(&self.downsample_latency.snapshot()) }, ingest: IngestProfile { requests: snap.ingest.requests, errors: snap.ingest.errors, rows_sealed: snap.ingest.rows_sealed, segments_sealed: snap.ingest.segments_sealed, latency_seconds: LatencyProfile::from_snapshot(&self.ingest_latency.snapshot()) } }
 	}
 }
 
@@ -703,10 +796,10 @@ mod tests {
 		assert!(text.contains("weft_interpolate_output_points_total 5"));
 		// No value line is left dangling without a preceding TYPE line: 16
 		// counters + the backup last-success gauge + the 4 latency histograms
-		// (EVI-25 adds the backup one).
+		// (EVI-25 adds the backup one) + ROB-16's 3 provenance series.
 		// (The GPU device families appear only once a GPU has started, which another test
 		// in this process may do, so they are left out of the count.)
-		assert_eq!(text.lines().filter(|line| line.starts_with("# TYPE ") && !line.starts_with("# TYPE weft_gpu_")).count(), 21);
+		assert_eq!(text.lines().filter(|line| line.starts_with("# TYPE ") && !line.starts_with("# TYPE weft_gpu_")).count(), 24);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE weft_downsample_requests_total counter"));
 		// And the storage-ingest counters.
@@ -732,6 +825,31 @@ mod tests {
 		let stamped: u64 = gauge_line.rsplit(' ').next().unwrap().parse().unwrap();
 		let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 		assert!(stamped > 0 && stamped <= now, "the gauge stamps the successful snapshot: {stamped} vs now {now}");
+	}
+
+	#[test]
+	fn interpolate_provenance_counters_accumulate() {
+		let m = Metrics::default();
+		let kinds = [weftdb::ValueKind::Raw, weftdb::ValueKind::Interpolated, weftdb::ValueKind::Interpolated, weftdb::ValueKind::Extrapolated];
+		m.record_interpolate_output("gpu", false, kinds.iter());
+		m.record_interpolate_output("parallel", true, kinds.iter());
+		m.record_interpolate_output("cpu", false, [].iter());
+		let snap = m.snapshot();
+		assert_eq!(snap.interpolate.output_raw_points, 2);
+		assert_eq!(snap.interpolate.output_interpolated_points, 4);
+		assert_eq!(snap.interpolate.output_extrapolated_points, 2);
+		assert_eq!(snap.interpolate.backend_gpu_requests, 1);
+		assert_eq!(snap.interpolate.backend_parallel_requests, 1);
+		assert_eq!(snap.interpolate.backend_cpu_requests, 1);
+		assert_eq!(snap.interpolate.gpu_fallbacks, 1);
+		let text = m.render_prometheus();
+		assert!(text.contains("weft_interpolate_output_points_by_kind_total{kind=\"interpolated\"} 4"), "{text}");
+		assert!(text.contains("weft_interpolate_backend_requests_total{backend=\"gpu\"} 1"), "{text}");
+		assert!(text.contains("weft_interpolate_gpu_fallbacks_total 1"), "{text}");
+		// The profile carries the same provenance counts.
+		let profile = m.profile();
+		assert_eq!(profile.interpolate.output_interpolated_points, 4);
+		assert_eq!(profile.interpolate.gpu_fallbacks, 1);
 	}
 
 	#[test]
