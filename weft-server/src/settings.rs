@@ -492,7 +492,6 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-<<<<<<< Updated upstream
 		assert_eq!(VARS.len(), 86, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
