@@ -53,7 +53,7 @@ use std::num::NonZeroUsize;
 use axum::{
 	extract::State, http::header, response::{IntoResponse, Response}, Json
 };
-use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
+use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 /// Provenance of a reconstructed value: `raw` (the grid point coincides with an input
@@ -75,7 +75,8 @@ use crate::{
 pub struct InputPoint {
 	/// Sample timestamp (RFC 3339).
 	pub timestamp: DateTime<Utc>,
-	/// Sample value. Widened to `BigDecimal` before the engine sees it.
+	/// Sample value. Widened to `BigDecimal` (the shortest decimal that round-trips to
+	/// it, `crate::downsample::widen_json_value`) before the engine sees it.
 	pub value: f64,
 }
 
@@ -642,7 +643,7 @@ async fn interpolate_point_inner(request: PointRequest, config: InterpolateConfi
 
 	let mut points: Vec<Point> = Vec::with_capacity(input.len());
 	for sample in &input {
-		let value = BigDecimal::from_f64(sample.value).ok_or_else(|| ApiError::bad_request("a point value is not a finite number"))?;
+		let value = crate::downsample::json_point_value(sample.value)?;
 		points.push(Point::new(sample.timestamp, value));
 	}
 
@@ -854,6 +855,7 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
+	use bigdecimal::{BigDecimal, FromPrimitive};
 	use chrono::TimeZone;
 	use tower::ServiceExt;
 
