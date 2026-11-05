@@ -789,11 +789,19 @@ mod tests {
 		}
 		let profile = GpuEconomicsProfile { params: GpuEconomicsParams { lanes: vec![Lane::Cpu, Lane::GpuF64, Lane::GpuF32], contention: vec![Lane::GpuF64], ..smoke().params }, ..smoke() };
 		let mut results = Vec::new();
-		run_in_process_lanes(&profile, true, &[], |r| {
+		let run = run_in_process_lanes(&profile, true, &[], |r| {
 			results.push(r);
 			Ok(())
-		})
-		.expect("runs");
+		});
+		// Some real GPUs (Apple's paravirtual device on macOS CI) have no f64 shaders;
+		// the f64 lane cannot run there, so skip unless a GPU is required.
+		if let Err(e) = &run {
+			if format!("{e:#}").contains("no f64 shader support") && std::env::var_os("WEFT_REQUIRE_GPU").is_none() {
+				eprintln!("skipping: {e:#}");
+				return;
+			}
+		}
+		run.expect("runs");
 		assert_eq!(results.len(), 5);
 		assert!(results.iter().all(|r| r.correctness.passed()));
 		let f64_lane = results[1].gpu_economics.as_ref().expect("point");
