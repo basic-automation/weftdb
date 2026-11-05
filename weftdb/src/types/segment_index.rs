@@ -345,7 +345,7 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// As [`apply`](Self::apply).
-	pub(crate) async fn apply_while(&self, txn: &IndexTxn, may_retry: impl Fn() -> bool + Send) -> std::result::Result<TxnApplied, IndexTxnError> {
+	pub(crate) async fn apply_while(&self, txn: &IndexTxn, may_retry: impl Fn() -> bool + Send + Sync) -> std::result::Result<TxnApplied, IndexTxnError> {
 		self.widen_spans(txn);
 		let applied = txn.run_while(&self.db, may_retry).await;
 		self.forget_catalogs(txn);
@@ -1152,8 +1152,9 @@ impl SegmentIndexStore {
 	}
 }
 
-/// One row of an aspect's change log, `segment_changes` (slice D-S20): a
-/// single commit's footprint — the aspect epoch it committed in, the time
+/// One row of an aspect's change log, `segment_changes` (slice D-S20).
+///
+/// A row is a single commit's footprint — the aspect epoch it committed in, the time
 /// span its rows cover and how many rows it carried. The log replaces the
 /// per-timestamp unbatched queue for seal-backed aspects: a consumer reads
 /// these rows, rebuilds the batch windows their spans touch, and deletes
@@ -1807,6 +1808,7 @@ mod tests {
 		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(TIME_INDEX), "falls back to the time index");
 		store.db.connect().expect("connects").execute(&format!("DROP INDEX {TIME_INDEX}"), ()).await.expect("drops the time index");
 		let scanned = ids(store.prune_series_rows_by_time("price", crate::SeriesId(1), 0, 120).await.expect("prunes"));
+		drop(store);
 		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(""), "falls back to a scan");
 		assert_eq!(with, vec![1, 5, 9]);
 		assert_eq!(without, with);
@@ -1860,6 +1862,8 @@ mod tests {
 		let Err(generation) = store.catalogs.get("fresh") else { panic!("nothing cached") };
 		store.catalogs.invalidate("fresh");
 		store.catalogs.put("fresh", generation, std::sync::Arc::from(Vec::new()));
-		assert!(store.catalogs.get("fresh").is_err(), "a stale load is dropped");
+		let stale = store.catalogs.get("fresh").is_err();
+		drop(store);
+		assert!(stale, "a stale load is dropped");
 	}
 }

@@ -100,7 +100,8 @@ pub struct CompressedQueryPoint {
 /// do not strictly rise, if `batch_rows` or `queries` is zero, if `params.rows < 2` or a copy
 /// would leave the timestamp range, if a store operation or a reduction fails, or if
 /// `on_window` fails. Two paths disagreeing is not an error: it fails that size's gate.
-pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: CompressedQueryParams, mut on_window: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+pub async fn run_compressed_query(profile: &IngestProfile, corpus: crate::ingest::LaneCorpus<'_>, params: CompressedQueryParams, mut on_window: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+	let crate::ingest::LaneCorpus { timestamps, values, value_scale, missingness_fraction, generation_ns } = corpus;
 	anyhow::ensure!(timestamps.len() >= 2, "a compressed-query corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "compressed-query corpus timestamps and values differ in length");
 	anyhow::ensure!(profile.batch_rows > 0, "ingest batch_rows must be > 0");
@@ -194,8 +195,8 @@ async fn windows_pass(pass: &Pass<'_>, on_window: &mut impl FnMut(BenchResult) -
 		let latency = LatencyStats::from_samples(&in_store_ns);
 		let decode = LatencyStats::from_samples(&decode_ns);
 		let measured_ns = in_store_ns.iter().copied().fold(0_u64, u64::saturating_add);
-		let point = CompressedQueryPoint { window: label.to_string(), window_rows, rows_scanned, buckets: in_store_buckets, decode_p50_ns: decode.p50_ns, decode_p99_ns: decode.p99_ns, decode_mean_ns: decode.mean_ns, speedup_p50: if latency.p50_ns > 0 { decode.p50_ns as f64 / latency.p50_ns as f64 } else { 0.0 }, segments: stats.segment_count, bytes_per_point: stats.bytes_per_point };
-		on_window(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{label}{suffix}", profile.name), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSED_QUERY.to_string(), reps: in_store_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: in_store_buckets, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, throughput_points_per_sec: if measured_ns > 0 { rows_scanned as f64 / (measured_ns as f64 / 1e9) } else { 0.0 }, cold_warm: crate::schema::ColdWarm::from_samples(&in_store_ns), latency, latency_ci: None, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) }, correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true, result_sha256: Some(digest) }, accuracy: None, storage: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: Some(point), analytics: None, samples_ns: in_store_ns.clone(), between_run: None, gpu_economics: None })?;
+		let point = CompressedQueryPoint { window: label.to_string(), window_rows, rows_scanned, buckets: in_store_buckets, decode_p50_ns: decode.p50_ns, decode_p99_ns: decode.p99_ns, decode_mean_ns: decode.mean_ns, speedup_p50: if latency.p50_ns > 0 { crate::num::u64_to_f64(decode.p50_ns) / crate::num::u64_to_f64(latency.p50_ns) } else { 0.0 }, segments: stats.segment_count, bytes_per_point: stats.bytes_per_point };
+		on_window(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{label}{suffix}", profile.name), adapter: "weftdb".to_string(), workload: WORKLOAD_COMPRESSED_QUERY.to_string(), reps: in_store_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: in_store_buckets, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, throughput_points_per_sec: if measured_ns > 0 { crate::num::u64_to_f64(rows_scanned) / (crate::num::u64_to_f64(measured_ns) / 1e9) } else { 0.0 }, cold_warm: crate::schema::ColdWarm::from_samples(&in_store_ns), latency, latency_ci: None, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(window_start) }, correctness: CorrectnessReport { output_count_ok: identical, expected_output_points: decode_buckets, actual_output_points: in_store_buckets, values_finite: true, result_sha256: Some(digest) }, accuracy: None, storage: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: Some(point), analytics: None, samples_ns: in_store_ns.clone(), between_run: None, gpu_economics: None })?;
 	}
 	Ok(digests)
 }
@@ -223,7 +224,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("cq", "global_active_power", 7);
 		let mut results = Vec::new();
-		run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, CompressedQueryParams { rows: 200, queries: 5, seed: 3, compact_to: None }, |r| {
+		run_compressed_query(&profile, crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, CompressedQueryParams { rows: 200, queries: 5, seed: 3, compact_to: None }, |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -246,7 +247,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("cq", "global_active_power", 7);
 		let mut results = Vec::new();
-		run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, CompressedQueryParams { rows: 200, queries: 4, seed: 9, compact_to: Some(100) }, |r| {
+		run_compressed_query(&profile, crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, CompressedQueryParams { rows: 200, queries: 4, seed: 9, compact_to: Some(100) }, |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -268,7 +269,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("cq", "global_active_power", 2);
 		for params in [CompressedQueryParams { rows: 8, queries: 0, seed: 0, compact_to: None }, CompressedQueryParams { rows: 1, queries: 1, seed: 0, compact_to: None }] {
-			assert!(run_compressed_query(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, params, |_| Ok(())).await.is_err(), "{params:?}");
+			assert!(run_compressed_query(&profile, crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, params, |_| Ok(())).await.is_err(), "{params:?}");
 		}
 	}
 }

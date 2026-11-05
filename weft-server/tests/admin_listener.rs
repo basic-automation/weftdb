@@ -59,7 +59,7 @@ async fn the_probe_router_answers_the_z_variants() {
 async fn the_probe_router_answers_without_a_host_header() {
 	let router = probe_app_with_state(AppState::new());
 	// No .header() call means no Host header at all.
-	let response = router.oneshot(Request::builder().method("GET").uri("/healthz").body(Body::empty()).expect("builds the request")).await.expect("answers");
+	let response = router.clone().oneshot(Request::builder().method("GET").uri("/healthz").body(Body::empty()).expect("builds the request")).await.expect("answers");
 	let status = response.status();
 	let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("reads the body");
 	let body = String::from_utf8_lossy(&bytes);

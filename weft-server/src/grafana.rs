@@ -58,22 +58,25 @@ impl Reduction {
 	}
 }
 
-/// A bucket width as a token the stored downsample reads: the coarsest unit that divides
+/// A bucket width as a token the stored downsample reads.
+///
+/// This is the coarsest unit that divides
 /// it exactly (so `600000` ms is `10m`, which keeps the reduction on its per-segment fast
 /// path), and otherwise a count small enough for the width's 32-bit count, rounded up so
 /// the panel's point budget still holds.
+///
 #[must_use]
 pub fn width_token(ms: u64) -> String {
 	const UNITS: [(u64, &str); 6] = [(604_800_000, "w"), (86_400_000, "d"), (3_600_000, "h"), (60_000, "m"), (1_000, "s"), (1, "ms")];
 	let ms = ms.max(1);
-	if let Some((per, unit)) = UNITS.iter().find(|(per, _)| ms % per == 0 && ms / per <= u64::from(u32::MAX)) {
+	if let Some((per, unit)) = UNITS.iter().find(|(per, _)| ms.is_multiple_of(*per) && u32::try_from(ms / per).is_ok()) {
 		return format!("{}{unit}", ms / per);
 	}
 	UNITS.iter()
 		.rev()
 		.find_map(|(per, unit)| {
 			let count = ms.div_ceil(*per);
-			(count <= u64::from(u32::MAX)).then(|| format!("{count}{unit}"))
+			u32::try_from(count).is_ok().then(|| format!("{count}{unit}"))
 		})
 		.unwrap_or_else(|| format!("{}w", u32::MAX))
 }
@@ -121,6 +124,7 @@ pub async fn metrics(State(state): State<AppState>, body: Bytes) -> Result<Json<
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let names = store.list_declared_aspects().await.map_err(|error| error::classify_read(&error))?;
+	drop(store);
 	let needle = find.metric.unwrap_or_default().to_lowercase();
 	let payload = json!({"label": "Reduction", "name": "agg", "type": "select", "placeholder": DEFAULT_AGG, "options": OFFERED_AGGS.iter().map(|agg| json!({"label": agg, "value": agg})).collect::<Vec<_>>()});
 	Ok(Json(names.into_iter().filter(|name| name.to_lowercase().contains(&needle)).map(|name| MetricOption { label: name.clone(), value: name, payloads: vec![payload.clone()] }).collect()))
@@ -233,7 +237,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Result<Json<Ve
 			.iter()
 			.filter_map(|bucket| {
 				let value = match reduction {
-					Reduction::Count => Some(bucket.count as f64),
+					Reduction::Count => Some(crate::num::usize_to_f64(bucket.count)),
 					Reduction::Aggregation(_) => bucket.aggregations.get(agg).copied(),
 				};
 				value.map(|value| (value, bucket.timestamp.timestamp_millis()))
@@ -241,6 +245,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Result<Json<Ve
 			.collect();
 		answered.push(Series { target: aspect, ref_id: target.ref_id, datapoints });
 	}
+	drop(store);
 	Ok(Json(answered))
 }
 
@@ -310,7 +315,8 @@ mod tests {
 	async fn grafana_charts_a_stored_aspect() {
 		let dir = tempfile::tempdir().unwrap();
 		let store = Arc::new(weftdb::SegmentStore::open(dir.path()).await.unwrap());
-		let router = crate::app_with_state(AppState::new().with_store(store));
+		let router = crate::app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store)));
+		drop(store);
 		let (status, _) = call(&router, "POST", "/api/v1/storage/aspects", json!({"name": "temp", "physical_type": "f64", "timestamp_unit": "seconds"})).await;
 		assert!(status.is_success(), "{status}");
 		// Two readings a minute for ten minutes: 0, 1, 2, … at 0 s, 30 s, 60 s, ….

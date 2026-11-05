@@ -671,7 +671,7 @@ pub fn build_registry_with_limits(config: IngestConfig, admission_config: Admiss
 /// [`RouteSpec`]s the full registry registers, and nothing else.
 ///
 /// This is not a second routing table to keep in step: it calls the same
-/// [`register_probe_routes`], so a probe that gains a route gains it on both
+/// `register_probe_routes`, so a probe that gains a route gains it on both
 /// listeners. Because the gate layer looks a request up in *this* registry's
 /// table, a data, ingest, declare or maintenance path on the admin listener has
 /// no entry and is refused by the same fallback with `route_not_found` — the
@@ -1005,7 +1005,8 @@ mod tests {
 
 	/// Every registered route is one the pre-SEC-3 router served: the
 	/// registry must not lose (or invent) a route in the move. The count
-	/// is 70 method routes over 64 path templates (66/60 before P5-http added
+	/// is 72 method routes over 66 path templates (70/64 before ROB-23r added
+	/// the `/healthz` and `/readyz` probe aliases, 66/60 before P5-http added
 	/// the four stored-interpolation reads, 63/57 before Phase 2 added
 	/// the three Grafana datasource routes, 62/56 before FRE-12b added
 	/// `GET /api/v1/version`, 60/54 before Phase 3 added the two bench-run
@@ -1013,11 +1014,11 @@ mod tests {
 	#[test]
 	fn registry_covers_the_whole_surface() {
 		let table = build_registry().table();
-		assert_eq!(table.entries().len(), 70, "the registry must carry every route the old lib.rs chain served");
+		assert_eq!(table.entries().len(), 72, "the registry must carry every route the old lib.rs chain served");
 		let mut operations: Vec<&str> = table.entries().iter().map(|entry| entry.spec.operation_id).collect();
 		operations.sort_unstable();
 		operations.dedup();
-		assert_eq!(operations.len(), 70, "operation ids are unique");
+		assert_eq!(operations.len(), 72, "operation ids are unique");
 		// Every scope in the frozen table is used by at least one route:
 		// an unused scope in a frozen table is a scope nobody can hold.
 		for scope in Scope::ALL {
@@ -1044,7 +1045,7 @@ mod tests {
 		let document = table.openapi_document();
 		assert_eq!(document["openapi"], "3.1.0");
 		let paths = document["paths"].as_object().unwrap();
-		assert_eq!(paths.len(), 64, "one path item per template");
+		assert_eq!(paths.len(), 66, "one path item per template");
 		let health = &paths["/health"]["get"];
 		assert_eq!(health["operationId"], "get_health");
 		assert_eq!(health["x-weft-scope"], "probe");

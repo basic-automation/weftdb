@@ -124,7 +124,7 @@ impl FieldValue {
 	/// (a line it must refuse). This is the distinction that makes the second one an
 	/// error instead of a silently missing row.
 	#[must_use]
-	pub fn is_non_finite_float(&self) -> bool {
+	pub const fn is_non_finite_float(&self) -> bool {
 		matches!(self, Self::Float(f) if !f.is_finite())
 	}
 }

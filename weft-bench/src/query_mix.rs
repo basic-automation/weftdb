@@ -15,7 +15,6 @@
 
 use std::time::Instant;
 
-use bigdecimal::BigDecimal;
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -61,7 +60,8 @@ struct Lane {
 /// do not strictly rise, if a knob is zero or the weights sum to zero, if a copy would leave the
 /// timestamp range, if a store operation fails, or if `on_lane` fails. A read that answers wrongly
 /// is not an error: it fails that lane's gate.
-pub async fn run_query_mix(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: QueryMixParams, mut on_lane: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+pub async fn run_query_mix(profile: &IngestProfile, corpus: crate::ingest::LaneCorpus<'_>, params: QueryMixParams, mut on_lane: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+	let crate::ingest::LaneCorpus { timestamps, values, value_scale, missingness_fraction, generation_ns } = corpus;
 	anyhow::ensure!(timestamps.len() >= 2 && timestamps.len() == values.len(), "a query-mix corpus needs at least two rows and as many values as timestamps");
 	anyhow::ensure!(profile.batch_rows > 0 && params.ops > 0 && params.range_rows > 0 && params.rows > 0, "query mix needs rows, ops, range rows and a batch size above zero");
 	let stride = timestamps[1] - timestamps[0];
@@ -119,7 +119,7 @@ pub async fn run_query_mix(profile: &IngestProfile, timestamps: &[i64], values: 
 			continue;
 		}
 		let measured_ns = lane.samples.iter().copied().fold(0_u64, u64::saturating_add);
-		on_lane(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, name.as_str()), adapter: "weftdb".to_string(), workload: WORKLOAD_QUERY_MIX.to_string(), reps: lane.samples.len(), dataset: DatasetMeta { input_points: usize::try_from(stored)?, output_points: usize::try_from(lane.rows)?, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, latency: LatencyStats::from_samples(&lane.samples), latency_ci: None, throughput_points_per_sec: if measured_ns > 0 { lane.rows as f64 / (measured_ns as f64 / 1e9) } else { 0.0 }, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(started) }, correctness: CorrectnessReport { output_count_ok: lane.exact, expected_output_points: usize::try_from(lane.rows)?, actual_output_points: usize::try_from(lane.rows)?, values_finite: true, result_sha256: Some(lane.digest.finish()) }, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&lane.samples), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: lane.samples, between_run: None, gpu_economics: None })?;
+		on_lane(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, name.as_str()), adapter: "weftdb".to_string(), workload: WORKLOAD_QUERY_MIX.to_string(), reps: lane.samples.len(), dataset: DatasetMeta { input_points: usize::try_from(stored)?, output_points: usize::try_from(lane.rows)?, irregular, missingness_fraction, seed: params.seed, signal_shape: None }, latency: LatencyStats::from_samples(&lane.samples), latency_ci: None, throughput_points_per_sec: if measured_ns > 0 { crate::num::u64_to_f64(lane.rows) / (crate::num::u64_to_f64(measured_ns) / 1e9) } else { 0.0 }, timing: TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(started) }, correctness: CorrectnessReport { output_count_ok: lane.exact, expected_output_points: usize::try_from(lane.rows)?, actual_output_points: usize::try_from(lane.rows)?, values_finite: true, result_sha256: Some(lane.digest.finish()) }, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&lane.samples), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: lane.samples, between_run: None, gpu_economics: None })?;
 	}
 	Ok(())
 }
@@ -141,7 +141,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("mix", "global_active_power", 5);
 		let mut results = Vec::new();
-		run_query_mix(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, QueryMixParams { rows: 40, ops: 60, range_rows: 9, weights, seed }, |r| {
+		run_query_mix(&profile, crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, QueryMixParams { rows: 40, ops: 60, range_rows: 9, weights, seed }, |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -177,6 +177,6 @@ mod tests {
 
 	async fn mix_err(weights: LaneWeights) -> bool {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
-		run_query_mix(&IngestProfile::new("mix", "a", 5), &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, QueryMixParams { rows: 4, ops: 1, range_rows: 1, weights, seed: 0 }, |_| Ok(())).await.is_err()
+		run_query_mix(&IngestProfile::new("mix", "a", 5), crate::ingest::LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, QueryMixParams { rows: 4, ops: 1, range_rows: 1, weights, seed: 0 }, |_| Ok(())).await.is_err()
 	}
 }

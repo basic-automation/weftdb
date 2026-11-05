@@ -45,9 +45,11 @@ use crate::{
 	error::{self, ApiError, SelectorQuery}, read_limits, state::AppState
 };
 
-/// The tags of the series a stored read served, as the JSON bodies report them (TAG-10):
+/// The tags of the series a stored read served, as the JSON bodies report them (TAG-10).
+///
 /// `{}` for the untagged series 0, `{key: value}` for a tagged one, and `null` when the
 /// selector matched no series (the body is then empty).
+///
 pub type SeriesTags = Option<std::collections::BTreeMap<String, String>>;
 
 /// The one series a stored read targets, resolved once from the request's selector.
@@ -2153,19 +2155,24 @@ mod tests {
 
 	// ── TAG-10: `tag.<k>=v` selectors on the stored reads ─────────────────────────────
 
+	/// One series' tags and its `(timestamp, value)` rows.
+	type TaggedRows<'a> = (&'a [(&'a str, &'a str)], &'a [(i64, &'a str)]);
+
 	/// `price` with the untagged rows of [`sealed_price_store`] (100..=140) plus three
 	/// tagged series: `{host=a}` at 200 and 210, `{host=a, region=eu}` at 300, and
 	/// `{host=b}` at 400.
 	async fn router_with_tagged_price() -> (TempDir, axum::Router) {
 		let dir = TempDir::new().expect("temp dir");
 		let store = sealed_price_store(&dir).await;
-		let series: [(&[(&str, &str)], &[(i64, &str)]); 3] = [(&[("host", "a")], &[(200, "7"), (210, "8")]), (&[("host", "a"), ("region", "eu")], &[(300, "9")]), (&[("host", "b")], &[(400, "10")])];
+		let series: [TaggedRows<'_>; 3] = [(&[("host", "a")], &[(200, "7"), (210, "8")]), (&[("host", "a"), ("region", "eu")], &[(300, "9")]), (&[("host", "b")], &[(400, "10")])];
 		for (n, (tags, rows)) in series.into_iter().enumerate() {
 			let groups = weftdb::TagSet::from_pairs(tags.iter().copied()).expect("valid tags");
 			let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = rows.iter().map(|(t, v)| (*t, bd(v))).unzip();
 			store.ingest("price", &weftdb::IngestBatch::dense(format!("tagged-{n}"), ts, vs).with_groups(groups)).await.expect("ingests a tagged batch");
 		}
-		(dir, app_with_state(AppState::new().with_store(store)))
+		let result = (dir, app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store))));
+		drop(store);
+		result
 	}
 
 	/// GET `uri` and parse the body as JSON.

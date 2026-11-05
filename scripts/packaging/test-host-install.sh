@@ -45,7 +45,8 @@
 set -euo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly REPO_ROOT=$(cd -- "$(dirname -- "$0")/../.." && pwd)
+REPO_ROOT=$(cd -- "$(dirname -- "$0")/../.." && pwd)
+readonly REPO_ROOT
 
 declare -a PASSES=()
 declare -a SKIPS=()
@@ -177,7 +178,8 @@ $(cat "$WORK/install.out")"
 
 readonly MANIFEST="$WORK/manifest.tsv"
 WEFT_BIN=$BIN "$INSTALLER" --list >"$MANIFEST"
-readonly FILE_COUNT=$(wc -l <"$MANIFEST")
+FILE_COUNT=$(wc -l <"$MANIFEST")
+readonly FILE_COUNT
 ((FILE_COUNT >= 9)) || fail "--list printed $FILE_COUNT entries; a host install is at least 9 files"
 while IFS=$'\t' read -r _src dst mode; do
 	[[ -e "$DEST$dst" ]] || fail "$dst is missing from the installed tree"
@@ -199,7 +201,8 @@ pass "ExecStart names the binary this prefix installed, and no other path"
 # Gate 3: an operator's env file is never overwritten.
 readonly OPERATOR_ENV="$DEST$PREFIX/etc/weftdb/weft-server.env"
 [[ -f $OPERATOR_ENV ]] || fail "the operator's env file was not created at $OPERATOR_ENV"
-readonly ENV_MODE=$(stat -c '%a' "$OPERATOR_ENV")
+ENV_MODE=$(stat -c '%a' "$OPERATOR_ENV")
+readonly ENV_MODE
 [[ $ENV_MODE == 640 ]] || fail "the operator's env file is mode $ENV_MODE, expected 640"
 printf 'WEFT_MAX_CONNECTIONS=64\n' >"$OPERATOR_ENV"
 WEFT_BIN=$BIN "$INSTALLER" --destdir "$DEST" --prefix "$PREFIX" >"$WORK/reinstall.out" 2>&1 ||
@@ -213,9 +216,11 @@ pass "an operator's configuration survives an upgrade; the template stays in sha
 # Gate 4: every name in the shipped env file is a name the real server accepts.
 readonly NAMES="$WORK/names.txt"
 grep -oE '^#[A-Z][A-Z0-9_]*=' "$ENV_TEMPLATE" | cut -d= -f1 | tr -d '#' | sort -u >"$NAMES"
-readonly NAME_COUNT=$(wc -l <"$NAMES")
+NAME_COUNT=$(wc -l <"$NAMES")
+readonly NAME_COUNT
 ((NAME_COUNT >= 30)) || fail "the env file documents only $NAME_COUNT variables; expected 30 or more"
-readonly PROBE_RC=$(probe_server "$NAMES" "$WORK/probe.out")
+PROBE_RC=$(probe_server "$NAMES" "$WORK/probe.out")
+readonly PROBE_RC
 if [[ $PROBE_RC != 78 ]]; then
 	fail "the server exited $PROBE_RC with the shipped env names set; expected 78, a refusal over the unusable address
 $(tail -20 "$WORK/probe.out")"
@@ -231,7 +236,8 @@ pass "all $NAME_COUNT variable names in the env file are ones the real server ac
 
 # Gate 5: gate 4 is capable of failing. An invented name first.
 printf 'WEFT_NOT_A_WEFTDB_VARIABLE\n' >"$WORK/invented.txt"
-readonly INVENTED_RC=$(probe_server "$WORK/invented.txt" "$WORK/invented.out")
+INVENTED_RC=$(probe_server "$WORK/invented.txt" "$WORK/invented.out")
+readonly INVENTED_RC
 [[ $INVENTED_RC == 78 ]] ||
 	fail "an invented variable name was accepted (exit $INVENTED_RC):
 $(tail -20 "$WORK/invented.out")"
@@ -242,13 +248,15 @@ pass "an invented variable name is refused, and recognised as refused"
 
 # A Test-tier name next: taken out of the registry rather than invented, because the whole point of
 # gate 4 is that the env file cannot carry one, and the only way to know that is to try.
-readonly TEST_NAME=$(grep -B3 'tier: Tier::Test' "$SETTINGS" |
-	grep -oE '"(WEFT|OTEL)_[A-Z0-9_]+"' | tr -d '"' | head -1)
+TEST_NAME=$(grep -B3 'tier: Tier::Test' "$SETTINGS" |
+	grep -oE '"(WEFT|OTEL)_[A-Z0-9_]+"' | tr -d '"' | head -1) || true
+readonly TEST_NAME
 if [[ -z $TEST_NAME ]]; then
 	skip "no Tier::Test entry was found in $SETTINGS, so the env file's Test-tier refusal went untested"
 else
 	printf '%s\n' "$TEST_NAME" >"$WORK/tier.txt"
-	readonly TEST_RC=$(probe_server "$WORK/tier.txt" "$WORK/tier.out")
+	TEST_RC=$(probe_server "$WORK/tier.txt" "$WORK/tier.out")
+	readonly TEST_RC
 	[[ $TEST_RC == 78 ]] ||
 		fail "the Test-tier channel $TEST_NAME was accepted on a real server (exit $TEST_RC):
 $(tail -20 "$WORK/tier.out")"
@@ -332,7 +340,7 @@ readonly HARDEN_COUNT=${#PROPS[@]}
 
 SCOPE=weft-host-install-$$
 RUN_LOG="$WORK/run.out"
-if ! systemctl --user is-active --quiet user@$(id -u).service 2>/dev/null &&
+if ! systemctl --user is-active --quiet "user@$(id -u).service" 2>/dev/null &&
 	! systemctl --user show-environment >/dev/null 2>&1; then
 	skip "no reachable user systemd manager, so the unit's hardening has never been loaded by anything"
 elif ! systemd-run --user --quiet --unit "$SCOPE" --collect \

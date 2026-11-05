@@ -598,7 +598,13 @@ fn label_value(raw: &str) -> String {
 	raw.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
-/// Render the per-device GPU series (5.7). Nothing at all for an empty slice, so a server
+/// One per-device metric family: its name, Prometheus type, help text, and the
+/// device row's value for it.
+type DeviceFamily = (&'static str, &'static str, &'static str, fn(&GpuDeviceRow) -> u64);
+
+/// Render the per-device GPU series (5.7).
+///
+/// Nothing at all for an empty slice, so a server
 /// that never started the GPU exposes no GPU families. `device` is the index in
 /// `splimes::gpu_devices()`; device 0 is the one `splimes::gpu_info()` reports.
 pub fn render_gpu_devices(out: &mut String, devices: &[GpuDeviceRow]) {
@@ -611,7 +617,7 @@ pub fn render_gpu_devices(out: &mut String, devices: &[GpuDeviceRow]) {
 	for (index, device) in devices.iter().enumerate() {
 		let _ = writeln!(out, "weft_gpu_device_info{{device=\"{index}\",name=\"{}\",api=\"{}\",type=\"{}\"}} 1", label_value(&device.name), label_value(&device.api), label_value(&device.device_type));
 	}
-	let families: [(&str, &str, &str, fn(&GpuDeviceRow) -> u64); 5] = [("weft_gpu_device_calls_total", "counter", "Interpolation calls, or shares of a split call, the device has run.", |d| d.calls), ("weft_gpu_device_chunks_total", "counter", "Chunks the device has dispatched.", |d| d.chunks), ("weft_gpu_device_in_flight", "gauge", "Calls, or shares of one, running on the device now.", |d| d.in_flight), ("weft_gpu_device_lost", "gauge", "1 when the device was lost and gets no more work, else 0.", |d| u64::from(d.lost)), ("weft_gpu_device_pool_idle_bytes", "gauge", "Bytes the device's buffer pool holds idle for reuse.", |d| d.idle_pool_bytes)];
+	let families: [DeviceFamily; 5] = [("weft_gpu_device_calls_total", "counter", "Interpolation calls, or shares of a split call, the device has run.", |d| d.calls), ("weft_gpu_device_chunks_total", "counter", "Chunks the device has dispatched.", |d| d.chunks), ("weft_gpu_device_in_flight", "gauge", "Calls, or shares of one, running on the device now.", |d| d.in_flight), ("weft_gpu_device_lost", "gauge", "1 when the device was lost and gets no more work, else 0.", |d| u64::from(d.lost)), ("weft_gpu_device_pool_idle_bytes", "gauge", "Bytes the device's buffer pool holds idle for reuse.", |d| d.idle_pool_bytes)];
 	for (name, kind, help, value) in families {
 		let _ = writeln!(out, "# HELP {name} {help}");
 		let _ = writeln!(out, "# TYPE {name} {kind}");
@@ -833,7 +839,7 @@ mod tests {
 		let kinds = [weftdb::ValueKind::Raw, weftdb::ValueKind::Interpolated, weftdb::ValueKind::Interpolated, weftdb::ValueKind::Extrapolated];
 		m.record_interpolate_output("gpu", false, kinds.iter());
 		m.record_interpolate_output("parallel", true, kinds.iter());
-		m.record_interpolate_output("cpu", false, [].iter());
+		m.record_interpolate_output("cpu", false, std::iter::empty());
 		let snap = m.snapshot();
 		assert_eq!(snap.interpolate.output_raw_points, 2);
 		assert_eq!(snap.interpolate.output_interpolated_points, 4);

@@ -49,10 +49,13 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use crate::audit::AuditLog;
 
-/// How long supervision waits before restarting a panicked daemon: long
+/// How long supervision waits before restarting a panicked daemon.
+///
+/// This is long
 /// enough that a daemon panicking in a tight loop cannot spin the CPU,
 /// short enough that a maintenance daemon is back within an operator's
 /// glance at the log.
+///
 pub const RESTART_DELAY: Duration = Duration::from_millis(100);
 
 /// Where a registered daemon is in its supervised life.
@@ -90,14 +93,16 @@ struct Entry {
 
 /// The Daemons registry: spawn background work through it, read it back
 /// with [`snapshot`](Self::snapshot), stop everything with
-/// [`shutdown`](Self::shutdown). Cloneable — every clone is the same
+/// [`shutdown`](Self::shutdown).
+///
+/// Cloneable — every clone is the same
 /// registry, which is what lets startup phases register into one.
 #[derive(Debug, Clone)]
 pub struct Daemons {
 	entries: Arc<Mutex<Vec<Entry>>>,
 	shutdown_tx: watch::Sender<bool>,
 	/// The audit log daemon panics are reported into as `weft_audit`
-	/// events (SEC-9, decision 8: "daemons emit weft_audit events"),
+	/// events (SEC-9, decision 8: "daemons emit `weft_audit` events"),
 	/// when the binary attached one. Absent in the registry's own
 	/// tests, where panics are reported on stderr alone, as before.
 	audit: Arc<Mutex<Option<Arc<AuditLog>>>>,
@@ -315,9 +320,7 @@ mod tests {
 			let attempts = Arc::clone(&factory_attempts);
 			async move {
 				// Panic on the first two runs, then run until shutdown.
-				if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
-					panic!("tick blew up");
-				}
+				assert!(attempts.fetch_add(1, Ordering::SeqCst) >= 2, "tick blew up");
 				std::future::pending::<()>().await;
 			}
 		}));

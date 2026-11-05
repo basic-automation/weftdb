@@ -163,7 +163,7 @@ struct Validated {
 
 /// Validate the request: tokens, window, margin, the aspect's schema, and the grid cap.
 async fn validate(state: AppState, config: InterpolateConfig, aspect: &str, params: &StoredInterpolateParams) -> Result<Validated, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let spline = interpolate::parse_spline_token(params.spline.as_deref())?;
 	let resolution = interpolate::parse_resolution_token(params.resolution.as_deref())?;
@@ -199,7 +199,7 @@ async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, as
 	drop(store);
 	let series: Interpolation<f64> = result.map_err(|err| classify(&err, config))?;
 
-	let points = tracing::info_span!(parent: &span, "interpolate.serialize", output_points = series.len()).in_scope(|| series.iter().map(|(timestamp, value, kind)| if value.is_finite() { Ok(OutputPoint { timestamp, value: *value, kind }) } else { Err(ApiError::new(Code::NotFinite, format!("the interpolated value at {timestamp} has no finite f64 representation; refusing to return a silently narrowed substitute"))) }).collect::<Result<Vec<_>, ApiError>>())?;
+	let points = tracing::info_span!(parent: &span, "interpolate.serialize", output_points = series.len()).in_scope(|| series.iter().map(|(timestamp, value, kind)| if value.is_finite() { Ok(OutputPoint { timestamp, value: *value, kind: kind.into() }) } else { Err(ApiError::new(Code::NotFinite, format!("the interpolated value at {timestamp} has no finite f64 representation; refusing to return a silently narrowed substitute"))) }).collect::<Result<Vec<_>, ApiError>>())?;
 	let backend = format!("{:?}", series.backend());
 	span.record("output_points", points.len());
 	span.record("backend", backend.as_str());
@@ -208,7 +208,9 @@ async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, as
 
 /// Grid points per streamed chunk on the JSON and CSV routes: small enough that one chunk's
 /// text stays a few MB, large enough that a GPU run is a handful of dispatches per million
-/// points. Not tuned by measurement (P5-5.3's measurement stage compares it).
+/// points.
+///
+/// Not tuned by measurement (P5-5.3's measurement stage compares it).
 pub const STREAM_CHUNK_POINTS: usize = 64 * 1024;
 
 /// Chunks computed ahead of the one being serialised (the channel depth of
@@ -224,7 +226,7 @@ enum Format {
 
 /// The instant of grid tick `tick` of `unit` (the stream's tick unit, which is a stored unit or
 /// nanoseconds).
-fn tick_instant(tick: i64, unit: splimes::TickUnit) -> Option<DateTime<Utc>> {
+const fn tick_instant(tick: i64, unit: splimes::TickUnit) -> Option<DateTime<Utc>> {
 	match unit.nanos_per_tick() {
 		1 => Some(DateTime::<Utc>::from_timestamp_nanos(tick)),
 		1_000 => DateTime::<Utc>::from_timestamp_micros(tick),
@@ -250,7 +252,7 @@ fn encode_chunk(chunk: &weftdb::interpolate_range::StoredChunk, unit: splimes::T
 				if chunk.first + i > 0 {
 					out.push(',');
 				}
-				let point = serde_json::to_string(&OutputPoint { timestamp, value, kind }).map_err(|err| ApiError::internal(format!("serialising a point: {err}")))?;
+				let point = serde_json::to_string(&OutputPoint { timestamp, value, kind: kind.into() }).map_err(|err| ApiError::internal(format!("serialising a point: {err}")))?;
 				out.push_str(&point);
 			}
 			Format::Csv => {
@@ -650,7 +652,8 @@ mod tests {
 		let store = line_store(&dir).await;
 		let expected = store.interpolate_range_f64("line", 0, 190, 0, InterpolateConfig::DEFAULT.interpolator(splimes::Spline::Cubic, splimes::Resolution::Milliseconds)).await.unwrap();
 		assert!(expected.len() > 2 * STREAM_CHUNK_POINTS, "several chunks");
-		let router = app_with_state(AppState::new().with_store(store));
+		let router = app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store)));
+		drop(store);
 		let query = "?start=0&end=190&resolution=milliseconds&spline=cubic&margin=0";
 		let (status, body) = get_json(router.clone(), &format!("/api/v1/storage/line/interpolate{query}")).await;
 		assert_eq!(status, StatusCode::OK);

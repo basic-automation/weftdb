@@ -149,8 +149,8 @@ impl DownsampleProfile {
 		let anchor = Self::anchor();
 		let n = self.point_count.max(2);
 		(0..n).map(|i| {
-			let timestamp = anchor + Duration::seconds(i as i64 * self.input_stride_secs);
-			let phase = i as f64 / 500.0;
+			let timestamp = anchor + Duration::seconds(crate::num::usize_to_i64(i) * self.input_stride_secs);
+			let phase = crate::num::usize_to_f64(i) / 500.0;
 			let noise = rng.random_range(-1.0..=1.0);
 			let signal = 20.0_f64.mul_add((phase * TAU).sin(), 50.0) + noise;
 			Point { timestamp, value: self.decimal(signal) }
@@ -164,7 +164,7 @@ impl DownsampleProfile {
 	/// trailing zeros kept, as a price column stores them), or its exact binary expansion.
 	fn decimal(&self, signal: f64) -> BigDecimal {
 		let Some(places) = self.value_decimals else { return BigDecimal::from_f64(signal).unwrap_or_else(|| BigDecimal::from(50)) };
-		let mantissa = (signal * 10_f64.powi(places.cast_signed())).round() as i64;
+		let mantissa = crate::num::f64_to_i64((signal * 10_f64.powi(places.cast_signed())).round());
 		BigDecimal::new(mantissa.into(), i64::from(places))
 	}
 }
@@ -288,8 +288,8 @@ pub fn run_downsample_on(profile: &DownsampleProfile, points: &[Point], generati
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	// Throughput is input points reduced per second.
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		let secs = latency.mean_ns as f64 / 1e9;
-		let points_f = points.len() as f64;
+		let secs = crate::num::u64_to_f64(latency.mean_ns) / 1e9;
+		let points_f = crate::num::usize_to_f64(points.len());
 		points_f / secs
 	} else {
 		0.0

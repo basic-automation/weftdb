@@ -6722,7 +6722,7 @@ Used by:
     https://github.com/rust-lang/pkg-config-rs
   * polling 3.11.0
     https://github.com/smol-rs/polling
-  * pollster 0.4.0
+  * pollster 1.0.1
     https://github.com/zesterer/pollster
   * postcard 1.1.3
     https://github.com/jamesmunns/postcard
@@ -12042,7 +12042,7 @@ MIT License
 --------------------------------------------------------------------------------
 
 Used by:
-  * splimes 1.0.0
+  * splimes 1.3.0
     https://github.com/basic-automation/splimes
 
 MIT License

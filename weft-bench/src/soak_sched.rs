@@ -100,13 +100,13 @@ impl SchedulerConfig {
 	/// still starts and finishes, with zero steps, rather than inventing
 	/// a tick the schedule never asked for.
 	#[must_use]
-	pub fn tick_count(&self, duration_secs: u64) -> u64 {
+	pub const fn tick_count(&self, duration_secs: u64) -> u64 {
 		duration_secs.saturating_mul(1000) / self.interval_ms
 	}
 
 	/// Length of one interval-log window in milliseconds.
 	#[must_use]
-	pub fn interval_log_ms(&self) -> u64 {
+	pub const fn interval_log_ms(&self) -> u64 {
 		self.interval_log_secs.saturating_mul(1000)
 	}
 }
@@ -126,7 +126,7 @@ pub enum TickDecision {
 /// Counts only — no free text, no thresholds. Ratios and warnings are
 /// derived from these counts by the accessors, so the artifact stays a
 /// record of what happened and the interpretation stays beside it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfMonitor {
 	/// Ticks the schedule planned (after any `max_steps` cap).
 	pub scheduled: u64,
@@ -148,7 +148,7 @@ impl SelfMonitor {
 		if self.scheduled == 0 {
 			0.0
 		} else {
-			self.skipped as f64 / self.scheduled as f64
+			crate::num::u64_to_f64(self.skipped) / crate::num::u64_to_f64(self.scheduled)
 		}
 	}
 
@@ -309,7 +309,7 @@ impl OpenLoopScheduler {
 				(started.elapsed(), result)
 			},
 			move |_index, offset_ms| {
-				let elapsed_ms = start.elapsed().as_millis() as u64;
+				let elapsed_ms = crate::num::u128_to_u64(start.elapsed().as_millis());
 				if elapsed_ms > offset_ms {
 					TickDecision::Skip
 				} else {
@@ -363,7 +363,7 @@ impl OpenLoopScheduler {
 		let mut windows: Vec<HdrHistogram> = Vec::new();
 		for index in 0..scheduled {
 			let offset_ms = index.saturating_mul(self.config.interval_ms);
-			if gate(index as usize, offset_ms) == TickDecision::Skip {
+			if gate(crate::num::u64_to_usize(index), offset_ms) == TickDecision::Skip {
 				monitor.skipped = monitor.skipped.saturating_add(1);
 				continue;
 			}
@@ -377,7 +377,7 @@ impl OpenLoopScheduler {
 			let duration_ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
 			monitor.max_step_ns = Some(monitor.max_step_ns.map_or(duration_ns, |max| max.max(duration_ns)));
 			monitor.total_step_ns += u128::from(duration_ns);
-			let window = (offset_ms / window_ms) as usize;
+			let window = crate::num::u64_to_usize(offset_ms / window_ms);
 			if windows.len() <= window {
 				windows.resize_with(window + 1, HdrHistogram::new);
 			}
@@ -389,7 +389,7 @@ impl OpenLoopScheduler {
 		let intervals = if scheduled == 0 {
 			Vec::new()
 		} else {
-			let last_window = ((scheduled - 1).saturating_mul(self.config.interval_ms) / window_ms) as usize;
+			let last_window = crate::num::u64_to_usize((scheduled - 1).saturating_mul(self.config.interval_ms) / window_ms);
 			(0..=last_window)
 				.map(|window| {
 					let start_offset_ms = (window as u64).saturating_mul(window_ms);

@@ -64,15 +64,20 @@ pub const MAX_INGEST_BYTES_ENV: &str = "WEFT_MAX_INGEST_BYTES";
 /// bound behind the ingests already running.
 pub const INGEST_MAX_INFLIGHT_BYTES_ENV: &str = "WEFT_INGEST_MAX_INFLIGHT_BYTES";
 
-/// Environment variable naming the row cap for the four ingest routes (ROB-7, plan
-/// C11's row limit): a positive whole number of rows, counted on the decoded columns
-/// — the rows the seal would write, whichever format carried them. A body over it is
+/// Environment variable naming the row cap for the four ingest routes (ROB-7, plan C11's row limit).
+///
+/// A positive whole number of rows, counted on the decoded columns
+/// — the rows the seal would write, whichever format carried them.
+///
+/// A body over it is
 /// refused `413 too_many_rows` with the limit.
 pub const MAX_INGEST_ROWS_ENV: &str = "WEFT_MAX_INGEST_ROWS";
 
 /// Environment variable naming the decoded-byte cap for the four ingest routes
 /// (ROB-7, plan C11's decoded-byte limit): a positive whole number of bytes of
-/// *decoded* columns, not of body. `WEFT_MAX_INGEST_BYTES` bounds what arrives on the
+/// *decoded* columns, not of body.
+///
+/// `WEFT_MAX_INGEST_BYTES` bounds what arrives on the
 /// socket, which says nothing about what a compressed Parquet body expands to.
 pub const MAX_INGEST_DECODED_BYTES_ENV: &str = "WEFT_MAX_INGEST_DECODED_BYTES";
 
@@ -80,15 +85,20 @@ pub const MAX_INGEST_DECODED_BYTES_ENV: &str = "WEFT_MAX_INGEST_DECODED_BYTES";
 /// 256 MiB (crash-consistency §8).
 pub const DEFAULT_MAX_INGEST_BYTES: usize = 256 * 1024 * 1024;
 
-/// The default row cap when `WEFT_MAX_INGEST_ROWS` is unset: 10 million rows. A batch
+/// The default row cap when `WEFT_MAX_INGEST_ROWS` is unset: 10 million rows.
+///
+/// A batch
 /// that size is a ~240 MB seal — the same order as the 256 MiB body cap, so the row
 /// ceiling sits where the body ceiling already stands, and it bites on a Parquet body
 /// that the body cap lets through.
 pub const DEFAULT_MAX_INGEST_ROWS: usize = 10_000_000;
 
-/// The default decoded-byte cap when `WEFT_MAX_INGEST_DECODED_BYTES` is unset: 1 GiB,
+/// The default decoded-byte cap when `WEFT_MAX_INGEST_DECODED_BYTES` is unset.
+///
+/// 1 GiB,
 /// four times the default body cap, so a compressed body gets room to expand without
 /// the decode being able to grow past what a node's memory is sized for.
+///
 pub const DEFAULT_MAX_INGEST_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The ingest wiring's two limits (D-S14), read once at startup and
@@ -96,44 +106,44 @@ pub const DEFAULT_MAX_INGEST_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
 /// test's registry can carry different caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {
-	max_body_bytes: usize,
-	max_inflight_bytes: u64,
-	max_rows: usize,
-	max_decoded_bytes: u64,
+	body_bytes: usize,
+	inflight_bytes: u64,
+	rows: usize,
+	decoded_bytes: u64,
 }
 
 impl IngestConfig {
 	/// The defaults: a 256 MiB body cap, and an in-flight budget of the
 	/// same 256 MiB — one max-size body in flight by default, or any
 	/// number of smaller ones whose bodies sum under it.
-	pub const DEFAULT: Self = Self { max_body_bytes: DEFAULT_MAX_INGEST_BYTES, max_inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64, max_rows: DEFAULT_MAX_INGEST_ROWS, max_decoded_bytes: DEFAULT_MAX_INGEST_DECODED_BYTES };
+	pub const DEFAULT: Self = Self { body_bytes: DEFAULT_MAX_INGEST_BYTES, inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64, rows: DEFAULT_MAX_INGEST_ROWS, decoded_bytes: DEFAULT_MAX_INGEST_DECODED_BYTES };
 
 	/// A configuration with an explicit body cap and the default
 	/// in-flight budget (tests, embedders).
 	#[must_use]
 	pub const fn with_max_body_bytes(max_body_bytes: usize) -> Self {
-		Self { max_body_bytes, ..Self::DEFAULT }
+		Self { body_bytes: max_body_bytes, ..Self::DEFAULT }
 	}
 
 	/// A configuration with an explicit in-flight byte budget and the
 	/// default body cap (tests, embedders).
 	#[must_use]
 	pub const fn with_max_inflight_bytes(max_inflight_bytes: u64) -> Self {
-		Self { max_inflight_bytes, ..Self::DEFAULT }
+		Self { inflight_bytes: max_inflight_bytes, ..Self::DEFAULT }
 	}
 
 	/// A configuration with an explicit row cap and everything else at its
 	/// default (tests, embedders).
 	#[must_use]
 	pub const fn with_max_rows(max_rows: usize) -> Self {
-		Self { max_rows, ..Self::DEFAULT }
+		Self { rows: max_rows, ..Self::DEFAULT }
 	}
 
 	/// A configuration with an explicit decoded-byte cap and everything else at its
 	/// default (tests, embedders).
 	#[must_use]
 	pub const fn with_max_decoded_bytes(max_decoded_bytes: u64) -> Self {
-		Self { max_decoded_bytes, ..Self::DEFAULT }
+		Self { decoded_bytes: max_decoded_bytes, ..Self::DEFAULT }
 	}
 
 	/// The limits the two `WEFT_*` values describe (`None` for an unset
@@ -147,26 +157,26 @@ impl IngestConfig {
 	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>, max_rows: Option<&str>, max_decoded_bytes: Option<&str>) -> Result<Self, String> {
 		let mut config = Self::DEFAULT;
 		if let Some(raw) = max_body_bytes {
-			config.max_body_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
-			if config.max_body_bytes == 0 {
+			config.body_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.body_bytes == 0 {
 				return Err(format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest body"));
 			}
 		}
 		if let Some(raw) = max_inflight_bytes {
-			config.max_inflight_bytes = raw.parse().map_err(|e| format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
-			if config.max_inflight_bytes == 0 {
+			config.inflight_bytes = raw.parse().map_err(|e| format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.inflight_bytes == 0 {
 				return Err(format!("{INGEST_MAX_INFLIGHT_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest"));
 			}
 		}
 		if let Some(raw) = max_rows {
-			config.max_rows = raw.parse().map_err(|e| format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: {e}"))?;
-			if config.max_rows == 0 {
+			config.rows = raw.parse().map_err(|e| format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: {e}"))?;
+			if config.rows == 0 {
 				return Err(format!("{MAX_INGEST_ROWS_ENV}={raw:?} is not a positive whole number of rows: zero would refuse every ingest body"));
 			}
 		}
 		if let Some(raw) = max_decoded_bytes {
-			config.max_decoded_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
-			if config.max_decoded_bytes == 0 {
+			config.decoded_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
+			if config.decoded_bytes == 0 {
 				return Err(format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest body"));
 			}
 		}
@@ -186,25 +196,25 @@ impl IngestConfig {
 	/// The one body cap for the ingest routes, in bytes.
 	#[must_use]
 	pub const fn max_body_bytes(self) -> usize {
-		self.max_body_bytes
+		self.body_bytes
 	}
 
 	/// The ingest routes' in-flight byte budget, in bytes.
 	#[must_use]
 	pub const fn max_inflight_bytes(self) -> u64 {
-		self.max_inflight_bytes
+		self.inflight_bytes
 	}
 
 	/// The row cap on one decoded ingest body (ROB-7).
 	#[must_use]
 	pub const fn max_rows(self) -> usize {
-		self.max_rows
+		self.rows
 	}
 
 	/// The decoded-byte cap on one ingest body (ROB-7).
 	#[must_use]
 	pub const fn max_decoded_bytes(self) -> u64 {
-		self.max_decoded_bytes
+		self.decoded_bytes
 	}
 }
 
@@ -235,7 +245,7 @@ fn check_decoded_size(timestamps: &[i64], values: &[Option<BigDecimal>], limits:
 /// this and a row count.
 fn decoded_column_bytes(timestamps: &[i64], values: &[Option<BigDecimal>]) -> u64 {
 	let slots = (timestamps.len() + values.len()) as u64;
-	let mantissas: u64 = values.iter().flatten().map(|value| value.as_bigint_and_exponent().0.bits() as u64 / 8 + 1).sum();
+	let mantissas: u64 = values.iter().flatten().map(|value| value.as_bigint_and_exponent().0.bits() / 8 + 1).sum();
 	slots * 16 + mantissas
 }
 
@@ -871,7 +881,12 @@ fn project_ilp_series(body: &str, measurement: &str, field: &str, precision: Tim
 	let records = weft_line_protocol::parse(body).map_err(|err| error::from_line_protocol_error(&err))?;
 	let mut points = Vec::new();
 	let mut series: Option<(weft_line_protocol::SeriesKey, String)> = None;
-	for record in records.iter().filter(|record| record.measurement == measurement) {
+	for (index, record) in records.iter().enumerate().filter(|(_, record)| record.measurement == measurement) {
+		// ROB-7: `to_point` has no decimal for NaN or infinity and would drop the
+		// record, storing a gap the sender never meant; refuse it instead.
+		if record.field_is_non_finite(field) {
+			return Err(error::non_finite_value(format!("record {} field `{field}`", index + 1)));
+		}
 		let Some(point) = record.to_point(field, precision) else {
 			continue;
 		};
@@ -1388,6 +1403,7 @@ mod tests {
 		let store = Arc::new(SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_max_series_per_aspect(1)).await.unwrap());
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.unwrap();
 		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
 		let point = |host: &str| serde_json::json!({ "tags": { "host": host }, "points": [{ "timestamp": 1, "value": "1" }] });
 		let (status, body) = post_json(router.clone(), "/api/v1/storage/price/points", &point("a")).await;
 		assert_eq!(status, StatusCode::CREATED, "the first series fits: {body}");
@@ -1970,7 +1986,7 @@ mod tests {
 		// response counted one row fewer than the sender sent and stored a gap.
 		let dir = TempDir::new().unwrap();
 		let router = router_with_declared_temp(&dir).await;
-		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/temp/ilp?field=temp&precision=s", "weather temp=1 100\nweather temp=NaN 110\n").await;
+		let (status, json) = crate::test_support::post_text(router, "/api/v1/storage/temp/ilp?measurement=weather&field=temp&precision=s", "weather temp=1 100\nweather temp=NaN 110\n").await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
 		assert_eq!(json["code"], "not_finite", "body: {json}");
 	}
@@ -1982,7 +1998,8 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
-		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(super::IngestConfig::with_max_rows(2)));
+		let router = app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store)).with_ingest_config(super::IngestConfig::with_max_rows(2)));
+		drop(store);
 		let body = serde_json::json!({ "points": [
 			{ "timestamp": 100, "value": "1.5" },
 			{ "timestamp": 110, "value": "2.5" },
@@ -2001,7 +2018,8 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
-		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(super::IngestConfig::with_max_decoded_bytes(64)));
+		let router = app_with_state(AppState::new().with_store(std::sync::Arc::clone(&store)).with_ingest_config(super::IngestConfig::with_max_decoded_bytes(64)));
+		drop(store);
 		let body = serde_json::json!({ "points": [
 			{ "timestamp": 100, "value": "1.5" },
 			{ "timestamp": 110, "value": "2.5" },

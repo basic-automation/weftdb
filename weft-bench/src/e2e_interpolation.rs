@@ -1,4 +1,6 @@
-//! End-to-end GPU interpolation benchmark (roadmap Phase 5, P5-e2e): storage read → decode →
+//! End-to-end GPU interpolation benchmark (roadmap Phase 5, P5-e2e).
+//!
+//! Storage read → decode →
 //! upload → kernel → readback → serialization, with p50/p95/p99 per stage, over output sizes
 //! and backends, through the **library path** and the **HTTP route**.
 //!
@@ -58,7 +60,7 @@
 //! claimed by this module: numbers come only from a run.
 
 use std::{
-	io::{BufRead, BufReader, Read, Write}, net::{TcpStream, ToSocketAddrs}, path::{Path, PathBuf}, str::FromStr, sync::mpsc, time::{Duration, Instant}
+	fmt::Write as _, io::{BufRead, BufReader, Read, Write}, net::{TcpStream, ToSocketAddrs}, path::{Path, PathBuf}, str::FromStr, sync::mpsc, time::{Duration, Instant}
 };
 
 use anyhow::{bail, ensure, Context};
@@ -831,8 +833,11 @@ fn runnable_lanes(backends: &[BackendLane], gpu: Option<&GpuDescription>, skippe
 	lanes
 }
 
+/// One probed GPU call: `(upload, readback)` ns, then `(upload, readback)` bytes.
+type TransferProbeCall = ((u64, u64), (u64, u64));
+
 /// Probe the transfers of one GPU call: `(upload, readback)` ns and the bytes moved.
-fn probe_call(probe: &TransferProbe, knots: usize, grid: usize, precision: Precision) -> Result<((u64, u64), (u64, u64)), String> {
+fn probe_call(probe: &TransferProbe, knots: usize, grid: usize, precision: Precision) -> Result<TransferProbeCall, String> {
 	let (up_bytes, down_bytes) = probe_bytes(knots, grid, scalar_bytes(precision) == 4);
 	let upload = probe.upload(up_bytes)?;
 	let readback = probe.readback(down_bytes)?;
@@ -897,15 +902,21 @@ fn library_cell(size: usize, lane: BackendLane, run: CellRun, reference: &Interp
 /// Run the library path for every size and lane.
 async fn run_library(config: &E2eConfig, corpus: &Corpus, gpu: Option<&GpuDescription>, probe: Option<&TransferProbe>, skipped: &mut Vec<SkippedLane>, progress: &mut (dyn FnMut(&str) + Send)) -> anyhow::Result<Vec<LibraryCell>> {
 	let sealed = seal_corpus(corpus, config.mmap_reads).await?;
-	let store = sealed.store.as_ref().context("store")?;
 	let lanes = runnable_lanes(&config.backends, gpu, skipped);
+	let cells = library_cells(config, corpus, sealed.store.as_ref().context("store")?, &lanes, probe, skipped, progress).await?;
+	drop(sealed);
+	Ok(cells)
+}
+
+/// The library-path cells of every size and lane, read from the sealed `store`.
+async fn library_cells(config: &E2eConfig, corpus: &Corpus, store: &SegmentStore, lanes: &[BackendLane], probe: Option<&TransferProbe>, skipped: &mut Vec<SkippedLane>, progress: &mut (dyn FnMut(&str) + Send)) -> anyhow::Result<Vec<LibraryCell>> {
 	let mut cells = Vec::new();
 	for &size in &config.sizes {
 		let w = window(&corpus.info, size, config.resolution, config.margin_knots)?;
 		let base = Interpolator::new(config.spline, config.resolution).max_points(usize::MAX);
 		// The reference values at this size, untimed.
 		let (_, reference, _, _) = library_rep(store, w, base.backend(Backend::Cpu)).await?;
-		for &lane in &lanes {
+		for &lane in lanes {
 			progress(&format!("library size={size} lane={}", lane.as_str()));
 			let interpolator = base.backend(lane.backend()).gpu_precision(lane.precision());
 			let run = run_cell(config, store, w, lane, interpolator, probe).await?;
@@ -915,7 +926,6 @@ async fn run_library(config: &E2eConfig, corpus: &Corpus, gpu: Option<&GpuDescri
 			cells.push(library_cell(size, lane, run, &reference));
 		}
 	}
-	drop(sealed);
 	Ok(cells)
 }
 
@@ -1025,7 +1035,7 @@ fn tail_string(tail: &str, key: &str) -> Option<String> {
 fn ilp_lines(corpus: &Corpus, range: std::ops::Range<usize>) -> String {
 	let mut body = String::with_capacity(range.len() * 40);
 	for i in range {
-		body.push_str(&format!("{ILP_MEASUREMENT} {ILP_FIELD}={} {}\n", corpus.values[i], corpus.timestamps[i]));
+		let _ = writeln!(body, "{ILP_MEASUREMENT} {ILP_FIELD}={} {}", corpus.values[i], corpus.timestamps[i]);
 	}
 	body
 }
@@ -1158,23 +1168,23 @@ fn ms(ns: u64) -> String {
 #[must_use]
 pub fn markdown(report: &E2eReport) -> String {
 	let mut out = String::new();
-	out.push_str(&format!("# End-to-end GPU interpolation ({})\n\n", report.corpus.source));
-	out.push_str(&format!("schema v{}, {} knots, resolution {}, spline {}, {} reps (+{} warm-up), GPU: {}\n\n", report.schema_version, report.corpus.rows, report.resolution, report.spline, report.reps, report.warmup, report.gpu.as_ref().map_or_else(|| format!("none ({})", report.gpu_error.as_deref().unwrap_or("not requested")), |g| format!("{} ({}, {})", g.name, g.api, g.device_type))));
-	out.push_str(&format!("Transfer probe: {}\n\n", report.transfer_probe));
+	let _ = write!(out, "# End-to-end GPU interpolation ({})\n\n", report.corpus.source);
+	let _ = write!(out, "schema v{}, {} knots, resolution {}, spline {}, {} reps (+{} warm-up), GPU: {}\n\n", report.schema_version, report.corpus.rows, report.resolution, report.spline, report.reps, report.warmup, report.gpu.as_ref().map_or_else(|| format!("none ({})", report.gpu_error.as_deref().unwrap_or("not requested")), |g| format!("{} ({}, {})", g.name, g.api, g.device_type)));
+	let _ = write!(out, "Transfer probe: {}\n\n", report.transfer_probe);
 	out.push_str("## Library path (ms, p50 / p95 / p99)\n\n| size | lane | ran | knots | storage read | decode | compute | upload | kernel (derived) | readback | serialize | total | transfer share p50 / p95 | ok |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
 	let tri = |s: &LatencyStats| format!("{} / {} / {}", ms(s.p50_ns), ms(s.p95_ns), ms(s.p99_ns));
 	let opt = |s: Option<&LatencyStats>| s.map_or_else(|| "-".to_string(), tri);
 	for c in &report.library {
 		let share = c.transfer_share.map_or_else(|| "-".to_string(), |t| format!("{:.1}% / {:.1}%", t.p50 * 100.0, t.p95 * 100.0));
-		out.push_str(&format!("| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n", c.size, c.lane.as_str(), c.backend_ran, c.knots, tri(&c.stages.storage_read), tri(&c.stages.decode), tri(&c.stages.compute), opt(c.stages.upload.as_ref()), opt(c.stages.kernel.as_ref()), opt(c.stages.readback.as_ref()), tri(&c.stages.serialize), tri(&c.stages.total), share, if c.correctness.ok { "yes" } else { "NO" }));
+		let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |", c.size, c.lane.as_str(), c.backend_ran, c.knots, tri(&c.stages.storage_read), tri(&c.stages.decode), tri(&c.stages.compute), opt(c.stages.upload.as_ref()), opt(c.stages.kernel.as_ref()), opt(c.stages.readback.as_ref()), tri(&c.stages.serialize), tri(&c.stages.total), share, if c.correctness.ok { "yes" } else { "NO" });
 	}
 	for s in &report.skipped {
-		out.push_str(&format!("\nSkipped `{}`: {}\n", s.lane.as_str(), s.reason));
+		let _ = write!(out, "\nSkipped `{}`: {}\n", s.lane.as_str(), s.reason);
 	}
 	if !report.http.is_empty() {
 		out.push_str("\n## HTTP path (ms, p50 / p95 / p99)\n\n| size | server backend | bytes | ttfb | body | total | ok |\n|---|---|---|---|---|---|---|\n");
 		for c in &report.http {
-			out.push_str(&format!("| {} | {} | {} | {} | {} | {} | {} |\n", c.size, c.server_backend.as_deref().unwrap_or("?"), c.response_bytes, tri(&c.ttfb), tri(&c.body), tri(&c.total), if c.ok { "yes" } else { "NO" }));
+			let _ = writeln!(out, "| {} | {} | {} | {} | {} | {} | {} |", c.size, c.server_backend.as_deref().unwrap_or("?"), c.response_bytes, tri(&c.ttfb), tri(&c.body), tri(&c.total), if c.ok { "yes" } else { "NO" });
 		}
 	}
 	out

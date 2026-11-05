@@ -73,7 +73,7 @@ impl<T: StoredValue + ?Sized> StoredValue for &T {
 
 impl<T: StoredValue> StoredValue for Option<T> {
 	fn to_decimal_text(&self) -> Result<Option<String>> {
-		self.as_ref().map_or_else(|| Ok(None), |value| value.to_decimal_text())
+		self.as_ref().map_or_else(|| Ok(None), StoredValue::to_decimal_text)
 	}
 }
 

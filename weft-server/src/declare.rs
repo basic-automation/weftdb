@@ -124,7 +124,7 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 	let physical_type = parse_physical_type(&request.physical_type, request.scale).map_err(ApiError::bad_request)?;
 	let timestamp_unit = parse_time_unit(&request.timestamp_unit).map_err(ApiError::bad_request)?;
 	let tolerance_text = request.value_tolerance.as_deref().unwrap_or("0");
-	let value_tolerance: BigDecimal = weft_physical_type::parse_decimal(tolerance_text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("`value_tolerance` is not a decimal: {tolerance_text:?}"))))?;
+	let value_tolerance: BigDecimal = weft_physical_type::parse_decimal(tolerance_text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("`value_tolerance` is not a decimal: {tolerance_text:?}"))))?;
 	Ok(AspectSchema::new(physical_type, value_tolerance, timestamp_unit))
 }
 
@@ -152,7 +152,7 @@ fn schema_from_request(request: &DeclareAspectRequest) -> Result<AspectSchema, A
 /// (none and some are different keys), and a `500` on a
 /// control-plane write failure.
 pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): StrictJson<DeclareAspectRequest>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	// The name becomes part of every frame's file name: refuse one that could leave the
 	// store's `segments/` directory before anything is written. This has its own code in the §4
@@ -185,7 +185,6 @@ pub async fn declare_aspect(State(state): State<AppState>, StrictJson(request): 
 }
 
 #[cfg(test)]
-
 mod tests {
 
 	use std::sync::Arc;

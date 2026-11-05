@@ -62,7 +62,7 @@ impl HdrHistogram {
 	/// Bucket index for `value` (see the module docs).
 	fn bucket_index(value: u64) -> usize {
 		if value < SUB_BUCKETS {
-			return value as usize;
+			return crate::num::u64_to_usize(value);
 		}
 		// floor(log2(value)) >= 10 here, so `s >= 0` and the shifts below
 		// cannot overflow: `s + 10 <= 63` for any `u64` value.
@@ -70,7 +70,7 @@ impl HdrHistogram {
 		let s = floor_log2 - 10;
 		let start = 1_u64 << (s + 10);
 		let width = 1_u64 << s;
-		(1024 * (s + 1) + ((value - start) / width) as usize) as usize
+		1024 * (s + 1) + crate::num::u64_to_usize((value - start) / width)
 	}
 
 	/// Upper bound (inclusive) of the bucket at `index`.
@@ -82,7 +82,7 @@ impl HdrHistogram {
 		let sub = index % 1024;
 		let start = 1_u128 << (s + 10);
 		let width = 1_u128 << s;
-		(start + (sub as u128 + 1) * width - 1) as u64
+		crate::num::u128_to_u64(start + (sub as u128 + 1) * width - 1)
 	}
 
 	/// Record one value.
@@ -143,7 +143,7 @@ impl HdrHistogram {
 		if self.total == 0 {
 			None
 		} else {
-			Some(self.sum_ns as f64 / self.total as f64)
+			Some(crate::num::u128_to_f64(self.sum_ns) / crate::num::u64_to_f64(self.total))
 		}
 	}
 
@@ -161,7 +161,7 @@ impl HdrHistogram {
 			return None;
 		}
 		let clamped = if percentile.is_nan() { 0.0 } else { percentile.clamp(0.0, 100.0) };
-		let rank = ((clamped / 100.0) * self.total as f64).ceil() as u64;
+		let rank = crate::num::f64_to_u64(((clamped / 100.0) * crate::num::u64_to_f64(self.total)).ceil());
 		let rank = rank.max(1);
 		let mut cumulative: u64 = 0;
 		for (index, count) in self.counts.iter().enumerate() {
@@ -243,7 +243,7 @@ mod tests {
 		assert!(p50 - value <= value / 500, "percentile must stay within ~0.2% above the value: {p50}");
 		assert_eq!(hist.min_ns(), Some(value));
 		assert_eq!(hist.max_ns(), Some(value));
-		assert_eq!(hist.mean_ns(), Some(value as f64));
+		assert_eq!(hist.mean_ns(), Some(crate::num::u64_to_f64(value)));
 	}
 
 	#[test]

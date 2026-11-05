@@ -185,7 +185,7 @@ impl PointLookupProfile {
 
 		let timestamps: Vec<i64> = if self.regular {
 			// `n` is a row count (never near `i64::MAX`), so the index cast cannot wrap.
-			(0..n as i64).map(|i| EPOCH_ANCHOR_MS + i * REGULAR_STRIDE_MS).collect()
+			(0..crate::num::usize_to_i64(n)).map(|i| EPOCH_ANCHOR_MS + i * REGULAR_STRIDE_MS).collect()
 		} else {
 			// Deterministic jitter: a strictly-increasing series whose gaps are in
 			// `[2, 21]`, so it is genuinely irregular yet a `ts + 1` off-grid query is
@@ -218,7 +218,7 @@ impl PointLookupProfile {
 		assert!(timestamps.len() >= 2, "a point-lookup corpus needs at least two rows");
 		let mut rng = ChaCha8Rng::seed_from_u64(self.seed ^ 0x_C0DE_5EED_A11A_B0BA);
 		let n = timestamps.len();
-		let absent = ((self.query_count as f64) * self.absent_fraction).round() as usize;
+		let absent = crate::num::f64_to_usize((crate::num::usize_to_f64(self.query_count) * self.absent_fraction).round());
 		let present = self.query_count.saturating_sub(absent);
 
 		let mut queries: Vec<i64> = Vec::with_capacity(self.query_count);
@@ -350,8 +350,8 @@ pub fn run_point_lookup_on(profile: &PointLookupProfile, timestamps: &[i64], val
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	// Throughput is resolved instants per second (a "point" here is one lookup).
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		let secs = latency.mean_ns as f64 / 1e9;
-		let points = queries.len() as f64;
+		let secs = crate::num::u64_to_f64(latency.mean_ns) / 1e9;
+		let points = crate::num::usize_to_f64(queries.len());
 		points / secs
 	} else {
 		0.0

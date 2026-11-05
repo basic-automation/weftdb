@@ -165,7 +165,9 @@ use crate::{
 pub const AUTH_KEYS_MODE: &str = "keys";
 
 /// The prefix every key [`generate_api_key`] mints carries, so a key is
-/// recognisable in a log line or a password manager as a WeftDB key. The
+/// recognisable in a log line or a password manager as a WeftDB key.
+///
+/// The
 /// prefix is part of the hashed text: a key authenticates exactly as
 /// printed, prefix included.
 pub const TOKEN_PREFIX: &str = "weft_";
@@ -185,7 +187,9 @@ const WWW_AUTHENTICATE_VALUE: &str = "Bearer realm=\"weftdb\"";
 const CREDENTIAL_QUERY_PARAMS: &[&str] = &["api_key", "apikey", "access_token", "auth_token"];
 
 /// Who a request authenticated as: the key's id and the role the keys
-/// file grants it. Inserted into the request's extensions by
+/// file grants it.
+///
+/// Inserted into the request's extensions by
 /// [`enforce`] once a key checks out, for the layers that follow
 /// (SEC-9's audit). Ids and roles are not secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +210,9 @@ struct KeyEntry {
 }
 
 /// The loaded keys file: the principals this server accepts, and where
-/// they came from. One immutable snapshot of the file; the store in
+/// they came from.
+///
+/// One immutable snapshot of the file; the store in
 /// force is a [`SharedKeyStore`] holding the current snapshot, which a
 /// reload (SEC-7) replaces whole.
 #[derive(Debug, Clone)]
@@ -336,7 +342,9 @@ impl KeyStore {
 /// The keys file in force (SEC-7): the current [`KeyStore`] snapshot
 /// behind a lock, so [`reload`](Self::reload) can swap it while the
 /// server runs and every request authenticates against the snapshot
-/// its moment sees. Cheap to clone — the lock is `Arc`-backed, like
+/// its moment sees.
+///
+/// Cheap to clone — the lock is `Arc`-backed, like
 /// the [`AuthConfig`] that carries it.
 #[derive(Debug, Clone)]
 pub struct SharedKeyStore {
@@ -427,10 +435,11 @@ pub struct GeneratedKey {
 	pub key_hash: String,
 }
 
-/// Mint a new API key: 32 bytes from the ring provider's secure random
-/// (the same provider SEC-5's TLS listener is built on — no new entropy
-/// source, and no process-global provider is installed or consulted),
+/// Mint a new API key: 32 bytes from the ring provider's secure random,
 /// hex-encoded behind [`TOKEN_PREFIX`].
+///
+/// It is the same provider SEC-5's TLS listener is built on — no new entropy
+/// source, and no process-global provider is installed or consulted.
 ///
 /// # Errors
 ///
@@ -624,7 +633,7 @@ impl AuthConfig {
 fn policy_table() -> &'static RouteTable {
 	static TABLE: OnceLock<Arc<RouteTable>> = OnceLock::new();
 	let table: &'static Arc<RouteTable> = TABLE.get_or_init(|| crate::routes::build_registry().table());
-	&**table
+	table
 }
 
 /// What the `Authorization` header carried, before any role check.
@@ -705,7 +714,7 @@ fn request_is_proxied(headers: &axum::http::HeaderMap) -> bool {
 /// mode passes through is a credential in the query string, which is
 /// refused before any of the mode branches run (SEC-10).
 /// Record an authentication refusal in the audit log as a `weft_audit`
-/// event (SEC-9, decision 8: "auth denials … emit weft_audit events").
+/// event (SEC-9, decision 8: "auth denials … emit `weft_audit` events").
 /// The event names the refusal's code, the route and the principal when
 /// one authenticated — never the presented credential, which is not
 /// recorded anywhere. A denial is not an audited *operation* (nothing
@@ -783,11 +792,15 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 	}
 }
 
-/// Spawn the key-reload watcher (SEC-7): a task that waits for
+/// Spawn the key-reload watcher (SEC-7).
+///
+/// This is a task that waits for
 /// `SIGHUP` and, on each one, reloads the keys file `auth` enforces
 /// and logs the outcome — the new key count on success, or the refusal
 /// and its reason (in which case the keys in force stay; see
-/// [`SharedKeyStore::reload`]). The startup sequence registers it with
+/// [`SharedKeyStore::reload`]).
+///
+/// The startup sequence registers it with
 /// the Daemons registry when authentication is on; the registry's
 /// factory may call this again after a panic, and re-registering the
 /// signal stream is all a restart does.
@@ -795,6 +808,7 @@ pub async fn enforce(State(state): State<AppState>, mut request: Request<axum::b
 /// On platforms without `SIGHUP` the task simply never fires: the
 /// reload API ([`AuthConfig::reload_keys`]) is the whole mechanism
 /// there, driven by whoever embeds the library.
+#[must_use]
 pub fn spawn_key_reload_watcher(auth: AuthConfig) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		#[cfg(unix)]
@@ -839,7 +853,7 @@ mod tests {
 	const ADMIN_TOKEN: &str = "weft_admin_token_for_tests";
 
 	fn keys_json() -> String {
-		format!("{{\n  \"version\": 1,\n  \"keys\": [\n    {{ \"id\": \"reader-1\", \"role\": \"reader\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"ingest-1\", \"role\": \"writer\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"operator\", \"role\": \"admin\", \"key_hash\": \"{}\" }}\n  ]\n}}", format_key_hash(READER_TOKEN), format_key_hash(WRITER_TOKEN), format_key_hash(ADMIN_TOKEN),)
+		format!("{{\n  \"version\": 1,\n  \"keys\": [\n    {{ \"id\": \"reader-1\", \"role\": \"reader\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"ingest-1\", \"role\": \"writer\", \"key_hash\": \"{}\" }},\n    {{ \"id\": \"operator\", \"role\": \"admin\", \"key_hash\": \"{}\" }}\n  ]\n}}", format_key_hash(READER_TOKEN), format_key_hash(WRITER_TOKEN), format_key_hash(ADMIN_TOKEN))
 	}
 
 	fn store() -> KeyStore {

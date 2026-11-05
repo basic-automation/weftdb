@@ -16,7 +16,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 /// The environment variable naming the probe-only admin listener's address
 /// (ROB-23r). Unset is the default and means no second listener at all.
-pub(crate) const ADMIN_ADDR_ENV: &str = "WEFT_ADMIN_ADDR";
+pub const ADMIN_ADDR_ENV: &str = "WEFT_ADMIN_ADDR";
 
 /// The address to bind, from `WEFT_SERVER_ADDR` (e.g. `0.0.0.0:9000`) or
 /// [`DEFAULT_ADDR`].
@@ -42,7 +42,7 @@ pub fn bind_addr() -> anyhow::Result<SocketAddr> {
 ///
 /// A value that is not a parseable socket address, or a plaintext exposure the
 /// C8 gate refuses.
-pub(crate) fn admin_addr() -> anyhow::Result<Option<SocketAddr>> {
+pub fn admin_addr() -> anyhow::Result<Option<SocketAddr>> {
 	let Some(raw) = std::env::var(ADMIN_ADDR_ENV).ok().filter(|value| !value.trim().is_empty()) else {
 		return Ok(None);
 	};
@@ -124,7 +124,7 @@ pub fn admission_config() -> anyhow::Result<AdmissionConfig> {
 ///
 /// A value that is not a positive integer (a malformed operator config
 /// should fail loudly at start rather than silently default).
-pub(crate) fn read_limits() -> anyhow::Result<ReadLimits> {
+pub fn read_limits() -> anyhow::Result<ReadLimits> {
 	let limits = ReadLimits::from_env().map_err(anyhow::Error::msg)?;
 	println!("read limits: a {DEFAULT_PAGE_ROWS}-row page by default and at most {} to a page (set {MAX_PAGE_ROWS_ENV}), at most {} rows to a read (set {MAX_READ_ROWS_ENV}), at most {} buckets to a downsample (set {MAX_DOWNSAMPLE_BUCKETS_ENV}), at most {} instants to a multi lookup (set {MAX_AT_MULTI_INSTANTS_ENV}), {} s to a read (set {READ_TIMEOUT_SECS_ENV})", limits.page_max(), limits.read_rows_max(), limits.downsample_buckets_max(), limits.at_multi_instants_max(), limits.read_timeout_secs());
 	Ok(limits)

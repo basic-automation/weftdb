@@ -74,7 +74,9 @@ pub const SOAK_CLIENT_FIELD: &str = "value";
 /// nanoseconds ([`crate::SOAK_WORKLOAD_EPOCH_NS`]).
 pub const SOAK_CLIENT_PRECISION: &str = "ns";
 
-/// The encoding a soak aspect is declared with. The workload emits `f64` values,
+/// The encoding a soak aspect is declared with.
+///
+/// The workload emits `f64` values,
 /// integers and unsigned integers, and every one of them is exact in `f64` at the
 /// magnitudes the generator produces, so the default tolerance of `0` holds.
 pub const SOAK_CLIENT_PHYSICAL_TYPE: &str = "f64";
@@ -87,7 +89,9 @@ pub const SOAK_CLIENT_TIMESTAMP_UNIT: &str = "nanos";
 /// sub-millisecond; this only has to absorb a server that is still starting.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long one socket read or write may block. A soak step that takes longer
+/// How long one socket read or write may block.
+///
+/// A soak step that takes longer
 /// than this overruns its tick anyway, so the scheduler's overrun accounting is
 /// what a large value would show; the timeout exists so a wedged server fails
 /// the run instead of hanging it forever.
@@ -399,9 +403,8 @@ impl IngestClient {
 			return Ok(());
 		}
 		self.flow.connects = self.flow.connects.saturating_add(1);
-		let stream = connect(&self.target).map_err(|err| {
+		let stream = connect(&self.target).inspect_err(|_err| {
 			self.flow.connect_failures = self.flow.connect_failures.saturating_add(1);
-			err
 		})?;
 		self.stream = Some(stream);
 		Ok(())
@@ -414,9 +417,8 @@ impl IngestClient {
 	/// the run's connection.
 	fn exchange(&mut self, method: &str, path: &str, content_type: &str, body: Option<&str>, fresh: bool) -> anyhow::Result<(u16, String)> {
 		if fresh {
-			let mut stream = connect(&self.target).map_err(|err| {
+			let mut stream = connect(&self.target).inspect_err(|_err| {
 				self.flow.connect_failures = self.flow.connect_failures.saturating_add(1);
-				err
 			})?;
 			self.flow.connects = self.flow.connects.saturating_add(1);
 			let written = write_request(&mut stream, method, &self.target.authority(), path, content_type, body)?;
@@ -557,7 +559,7 @@ struct ResponseReader<'a> {
 
 impl<'a> ResponseReader<'a> {
 	/// Wrap a socket that has not been read yet.
-	fn new(stream: &'a mut TcpStream) -> Self {
+	const fn new(stream: &'a mut TcpStream) -> Self {
 		Self { stream, buffered: Vec::new() }
 	}
 
@@ -654,7 +656,7 @@ fn excerpt_of(text: &str) -> String {
 }
 
 impl SoakServer for IngestClient {
-	fn name(&self) -> &str {
+	fn name(&self) -> &'static str {
 		"weftdb-ingest"
 	}
 
@@ -720,7 +722,6 @@ mod tests {
 	/// lifetime: every test binds its own ephemeral port, so an idle loop costs a
 	/// parked thread and nothing else, and stopping it cleanly would need a socket
 	/// the test then has to coordinate with.
-
 	impl TestServer {
 		/// Start a server whose response for a request is `response_for(request)`.
 		fn spawn(response_for: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
@@ -880,7 +881,7 @@ mod tests {
 	#[test]
 	fn a_tick_posts_the_models_body_byte_for_byte() {
 		let server = TestServer::spawn(|_| sealed(4));
-		let model = ingest_model(20261029);
+		let model = ingest_model(20_261_029);
 		let mut client = IngestClient::new(server.target(), model.clone()).expect("an ingest-only model is accepted");
 		client.handle(3).expect("the tick posts");
 

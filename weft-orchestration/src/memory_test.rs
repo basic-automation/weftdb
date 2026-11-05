@@ -16,7 +16,7 @@ mod memory_tests {
 			.into_iter()
 			.enumerate()
 			.map(|(i, amp)| {
-				let location = BigDecimal::from_f64(i as f64 / 10.0).unwrap();
+				let location = BigDecimal::from_usize(i).unwrap() / BigDecimal::from(10);
 				let amplitude = BigDecimal::from_f64(amp).unwrap();
 				let vector = MeasurementVector::new(location, amplitude);
 				Relative::new(vector, BigDecimal::from(1), BigDecimal::from(1))
@@ -37,8 +37,9 @@ mod memory_tests {
 	}
 
 	// Generate varying test pattern amplitudes
-	fn generate_amplitudes(id: usize, length: usize) -> Vec<f64> {
-		(0..length).map(|i| (i as f64 * (id as f64).mul_add(0.01, 1.0)).sin() * (id as f64).mul_add(0.1, 1.0)).collect()
+	fn generate_amplitudes(id: u32, length: u32) -> Vec<f64> {
+		let id = f64::from(id);
+		(0..length).map(|i| (f64::from(i) * id.mul_add(0.01, 1.0)).sin() * id.mul_add(0.1, 1.0)).collect()
 	}
 
 	#[tokio::test]
@@ -55,6 +56,7 @@ mod memory_tests {
 
 		println!("Successfully imported 100 patterns");
 		println!("Dictionary patterns count: {}", dict.len());
+		drop(dict);
 	}
 
 	#[tokio::test]
@@ -71,6 +73,7 @@ mod memory_tests {
 
 		println!("Successfully imported 500 patterns");
 		println!("Dictionary patterns count: {}", dict.len());
+		drop(dict);
 	}
 
 	#[tokio::test]
@@ -90,5 +93,6 @@ mod memory_tests {
 
 		println!("Successfully imported 1000 patterns");
 		println!("Dictionary patterns count: {}", dict.len());
+		drop(dict);
 	}
 }

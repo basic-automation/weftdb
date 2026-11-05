@@ -69,7 +69,7 @@ pub async fn run(listener: tokio::net::TcpListener, state: AppState, otel_provid
 /// It exists only when `WEFT_ADMIN_ADDR` is set
 /// ([`config::admin_addr`](super::config::admin_addr)); an unset variable means
 /// no listener at all, which is how every deployment running today is set up.
-pub(crate) struct AdminListener {
+pub struct AdminListener {
 	/// The serve task, so shutdown waits for its drain rather than leaving a
 	/// listener accepting probes after the store has closed.
 	task: tokio::task::JoinHandle<std::io::Result<()>>,

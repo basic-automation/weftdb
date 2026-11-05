@@ -83,7 +83,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::soak_workload::{GridValue, WorkloadModel};
 
-/// Cap on the mismatches a [`DerivedReadVerdict`] lists. The total is
+/// Cap on the mismatches a [`DerivedReadVerdict`] lists.
+///
+/// The total is
 /// always counted in [`DerivedReadVerdict::mismatch_count`]; the cap
 /// only bounds the artifact a badly broken run produces, on the same
 /// reasoning as the oracle's [`MAX_REPORTED_MISMATCHES`](crate::soak_oracle::MAX_REPORTED_MISMATCHES).
@@ -205,7 +207,7 @@ impl DerivedReadVerdict {
 	/// Whether the mismatch list was capped: the total in
 	/// [`Self::mismatch_count`] is larger than the list kept.
 	#[must_use]
-	pub fn truncated(&self) -> bool {
+	pub const fn truncated(&self) -> bool {
 		let kept = self.mismatches.len() as u64;
 		self.mismatch_count > kept
 	}
@@ -230,8 +232,8 @@ impl DerivedReadVerdict {
 fn sealed_value(value: &GridValue) -> Option<f64> {
 	match value {
 		GridValue::Float(value) => Some(*value),
-		GridValue::Integer(value) => Some(*value as f64),
-		GridValue::Unsigned(value) => Some(*value as f64),
+		GridValue::Integer(value) => Some(crate::num::i64_to_f64(*value)),
+		GridValue::Unsigned(value) => Some(crate::num::u64_to_f64(*value)),
 		GridValue::Boolean(_) | GridValue::Text(_) => None,
 	}
 }
@@ -254,7 +256,7 @@ impl BucketAcc {
 	}
 
 	fn finish(self, timestamp_ns: i64) -> DerivedBucket {
-		let avg = self.sum / self.count as f64;
+		let avg = self.sum / crate::num::u64_to_f64(self.count);
 		DerivedBucket { timestamp_ns, count: self.count, min: self.min, max: self.max, sum: self.sum, avg }
 	}
 }
@@ -340,13 +342,13 @@ impl DerivedReadChecker {
 			};
 			let kind = if bucket.count != expected_bucket.count {
 				Some(DerivedMismatchKind::WrongCount)
-			} else if bucket.min != expected_bucket.min {
+			} else if bucket.min.partial_cmp(&expected_bucket.min) != Some(std::cmp::Ordering::Equal) {
 				Some(DerivedMismatchKind::WrongMin)
-			} else if bucket.max != expected_bucket.max {
+			} else if bucket.max.partial_cmp(&expected_bucket.max) != Some(std::cmp::Ordering::Equal) {
 				Some(DerivedMismatchKind::WrongMax)
-			} else if bucket.sum != expected_bucket.sum {
+			} else if bucket.sum.partial_cmp(&expected_bucket.sum) != Some(std::cmp::Ordering::Equal) {
 				Some(DerivedMismatchKind::WrongSum)
-			} else if bucket.avg != expected_bucket.avg {
+			} else if bucket.avg.partial_cmp(&expected_bucket.avg) != Some(std::cmp::Ordering::Equal) {
 				Some(DerivedMismatchKind::WrongAvg)
 			} else {
 				None
@@ -388,7 +390,7 @@ mod tests {
 			assert!(bucket.min <= bucket.avg && bucket.avg <= bucket.max, "reductions agree: {bucket:?}");
 			assert_eq!(bucket.avg, bucket.sum / 3.0, "avg is sum over count");
 		}
-		let model = checker.model.clone();
+		let model = checker.model;
 		assert_eq!(buckets[0].timestamp_ns, model.timestamp_ns(0, 0), "the bucket is the row's own timestamp");
 	}
 

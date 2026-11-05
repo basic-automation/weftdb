@@ -77,7 +77,9 @@ impl Drop for TempStoreDir {
 }
 
 /// The ingest workload's knobs: which aspect to declare and how large a batch
-/// to seal at once. The corpus itself comes from the caller (today the UCI
+/// to seal at once.
+///
+/// The corpus itself comes from the caller (today the UCI
 /// loader), so there is no seed: a real corpus is its own identity, and the
 /// result records seed `0` exactly as the compression workload's
 /// [`crate::CorpusRun`] does for a real corpus.
@@ -102,7 +104,9 @@ impl IngestProfile {
 }
 
 /// Run the ingest workload over an explicit time-sorted `(timestamps, values)`
-/// corpus: open a fresh [`SegmentStore`] per rep, declare the aspect as an
+/// corpus.
+///
+/// This is open a fresh [`SegmentStore`] per rep, declare the aspect as an
 /// exact scaled-integer column, seal the corpus in [`IngestProfile::batch_rows`]
 /// batches, and gate correctness on reading every row back exactly.
 ///
@@ -162,8 +166,8 @@ pub async fn run_ingest_on(profile: &IngestProfile, timestamps: &[i64], values: 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig::default()));
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		let secs = latency.mean_ns as f64 / 1e9;
-		let points = timestamps.len() as f64;
+		let secs = crate::num::u64_to_f64(latency.mean_ns) / 1e9;
+		let points = crate::num::usize_to_f64(timestamps.len());
 		points / secs
 	} else {
 		0.0
@@ -220,6 +224,21 @@ impl Tiled<'_> {
 	}
 }
 
+/// The corpus a store-backed lane loads, with the provenance its results record.
+#[derive(Debug, Clone, Copy)]
+pub struct LaneCorpus<'a> {
+	/// Timestamps of the corpus rows, in order.
+	pub timestamps: &'a [i64],
+	/// The value of each row.
+	pub values: &'a [BigDecimal],
+	/// Decimal scale of the values, as the ingest schema declares it.
+	pub value_scale: u8,
+	/// Fraction of the corpus grid that is missing, recorded with each result.
+	pub missingness_fraction: f64,
+	/// Nanoseconds spent generating the corpus, recorded with each result.
+	pub generation_ns: u64,
+}
+
 /// Run the ingest growth curve: one store ingests the corpus, laid end to end, up to each checkpoint.
 ///
 /// Every checkpoint becomes one [`BenchResult`] (workload [`WORKLOAD_INGEST_GROWTH`]) for the
@@ -239,7 +258,8 @@ impl Tiled<'_> {
 /// `batch_rows == 0`, if `checkpoints` is empty or not strictly rising, if a copy would leave
 /// the timestamp range, if any store operation fails, or if `on_checkpoint` fails. A failed
 /// check is not an error: it fails that checkpoint's correctness gate.
-pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, checkpoints: &[u64], mut on_checkpoint: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+pub async fn run_ingest_growth(profile: &IngestProfile, corpus: LaneCorpus<'_>, checkpoints: &[u64], mut on_checkpoint: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
+	let LaneCorpus { timestamps, values, value_scale, missingness_fraction, generation_ns } = corpus;
 	anyhow::ensure!(timestamps.len() >= 2, "an ingest corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "ingest corpus timestamps and values differ in length");
 	anyhow::ensure!(profile.batch_rows > 0, "ingest batch_rows must be > 0");
@@ -306,8 +326,8 @@ pub async fn run_ingest_growth(profile: &IngestProfile, timestamps: &[i64], valu
 		let verify_read_ns = span_ns(verify_start);
 
 		let measured_ns = samples_ns.iter().copied().fold(0_u64, u64::saturating_add);
-		let throughput_points_per_sec = if measured_ns > 0 { rows_stage as f64 / (measured_ns as f64 / 1e9) } else { 0.0 };
-		let growth = GrowthPoint { rows_total: checkpoint, rows_stage, corpus_copies: checkpoint as f64 / n as f64, segments: stats.segment_count, segment_bytes: stats.total_bytes, bytes_per_point: stats.bytes_per_point, rows_verified, verify_read_ns };
+		let throughput_points_per_sec = if measured_ns > 0 { crate::num::u64_to_f64(rows_stage) / (crate::num::u64_to_f64(measured_ns) / 1e9) } else { 0.0 };
+		let growth = GrowthPoint { rows_total: checkpoint, rows_stage, corpus_copies: crate::num::u64_to_f64(checkpoint) / crate::num::u64_to_f64(n), segments: stats.segment_count, segment_bytes: stats.total_bytes, bytes_per_point: stats.bytes_per_point, rows_verified, verify_read_ns };
 		let correctness = CorrectnessReport { output_count_ok: accounted && exact, expected_output_points: usize::try_from(checkpoint)?, actual_output_points: usize::try_from(stats.total_rows)?, values_finite: finite, result_sha256: Some(digest.finish()) };
 		let timing = TimingBreakdown { dataset_generation_ns: generation_ns, measured_ns, end_to_end_ns: span_ns(stage_start) };
 		on_checkpoint(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, count_label(checkpoint)), adapter: "weftdb".to_string(), workload: WORKLOAD_INGEST_GROWTH.to_string(), reps: samples_ns.len(), dataset: DatasetMeta { input_points: usize::try_from(checkpoint)?, output_points: usize::try_from(stats.total_rows)?, irregular, missingness_fraction, seed: 0, signal_shape: None }, latency: LatencyStats::from_samples(&samples_ns), latency_ci: None, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: crate::schema::ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: Some(growth), online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })?;
@@ -434,7 +454,7 @@ pub async fn run_ingest_online(profile: &IngestProfile, timestamps: &[i64], valu
 	})?;
 
 	let rows = params.rows;
-	let throughput = |ns: u64| if ns > 0 { rows as f64 / (ns as f64 / 1e9) } else { 0.0 };
+	let throughput = |ns: u64| if ns > 0 { crate::num::u64_to_f64(rows) / (crate::num::u64_to_f64(ns) / 1e9) } else { 0.0 };
 	let idle_latency = LatencyStats::from_samples(&idle.samples_ns);
 	let accounted = stats.0 == rows && stats.1;
 	let mismatched_queries = online.mismatched_queries + idle.mismatched_queries;
@@ -606,6 +626,7 @@ async fn online_phases(profile: &IngestProfile, corpus: Arc<(Vec<i64>, Vec<BigDe
 	let stats = shared.store.aspect_stats(&profile.aspect).await.map_err(|e| anyhow::anyhow!("cannot read the stats of aspect {}: {e:#}", profile.aspect))?;
 	let tiled = Tiled { timestamps: &shared.corpus.0, values: &shared.corpus.1, period };
 	let ordered = stats.time_range == Some((tiled.timestamp(0)?, tiled.timestamp(params.rows - 1)?)) && stats.unsorted_segments == 0 && stats.overlapping_segments == 0;
+	drop(shared);
 	Ok((alone_ns, online_ns, online, merge(idle), (stats.total_rows, ordered)))
 }
 
@@ -669,7 +690,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("growth", "global_active_power", 3);
 		let mut results = Vec::new();
-		run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, &[6, 10], |r| {
+		run_ingest_growth(&profile, LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, &[6, 10], |r| {
 			results.push(r);
 			Ok(())
 		})
@@ -740,7 +761,7 @@ mod tests {
 		let corpus = load_uci_corpus_from_reader(Cursor::new(FIXTURE), DEFAULT_UCI_COLUMN, usize::MAX).expect("loads");
 		let profile = IngestProfile::new("growth", "global_active_power", 2);
 		for bad in [&[][..], &[8, 8][..], &[8, 4][..], &[1][..]] {
-			assert!(run_ingest_growth(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, 0.0, 0, bad, |_| Ok(())).await.is_err(), "{bad:?}");
+			assert!(run_ingest_growth(&profile, LaneCorpus { timestamps: &corpus.timestamps, values: &corpus.values, value_scale: corpus.decimal_scale, missingness_fraction: 0.0, generation_ns: 0 }, bad, |_| Ok(())).await.is_err(), "{bad:?}");
 		}
 	}
 

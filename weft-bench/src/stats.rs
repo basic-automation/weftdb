@@ -58,7 +58,7 @@ impl LatencyStats {
 		let max_ns = sorted[count - 1];
 
 		let sum: u128 = sorted.iter().map(|&v| u128::from(v)).sum();
-		let mean_ns = (sum / count as u128) as u64;
+		let mean_ns = crate::num::u128_to_u64(sum / count as u128);
 
 		let stddev_ns = population_stddev(&sorted, sum);
 
@@ -107,7 +107,7 @@ impl LatencyStats {
 				sum += u128::from(pick);
 			}
 			resample.sort_unstable();
-			mean_dist.push((sum / n as u128) as u64);
+			mean_dist.push(crate::num::u128_to_u64(sum / n as u128));
 			stddev_dist.push(population_stddev(&resample, sum));
 			p50_dist.push(percentile(&resample, 0.50));
 			p95_dist.push(percentile(&resample, 0.95));
@@ -115,7 +115,7 @@ impl LatencyStats {
 		}
 
 		let sum: u128 = original.iter().map(|&v| u128::from(v)).sum();
-		let mean_point = (sum / n as u128) as u64;
+		let mean_point = crate::num::u128_to_u64(sum / n as u128);
 
 		LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: interval_from(&mut mean_dist, mean_point, confidence), stddev: Some(interval_from(&mut stddev_dist, population_stddev(&original, sum), confidence)), p50: interval_from(&mut p50_dist, percentile(&original, 0.50), confidence), p95: interval_from(&mut p95_dist, percentile(&original, 0.95), confidence), p99: interval_from(&mut p99_dist, percentile(&original, 0.99), confidence) }
 	}
@@ -156,14 +156,14 @@ impl LatencyStats {
 			}
 			resample.sort_unstable();
 			let sum: u128 = resample.iter().map(|&v| u128::from(v)).sum();
-			mean_dist.push((sum / resample.len() as u128) as u64);
+			mean_dist.push(crate::num::u128_to_u64(sum / resample.len() as u128));
 			stddev_dist.push(population_stddev(&resample, sum));
 			p50_dist.push(percentile(&resample, 0.50));
 			p95_dist.push(percentile(&resample, 0.95));
 			p99_dist.push(percentile(&resample, 0.99));
 		}
 		let sum: u128 = pooled.iter().map(|&v| u128::from(v)).sum();
-		let mean_point = (sum / pooled.len() as u128) as u64;
+		let mean_point = crate::num::u128_to_u64(sum / pooled.len() as u128);
 		LatencyCis { resamples: config.resamples, confidence, seed: config.seed, mean: interval_from(&mut mean_dist, mean_point, confidence), stddev: Some(interval_from(&mut stddev_dist, population_stddev(&pooled, sum), confidence)), p50: interval_from(&mut p50_dist, percentile(&pooled, 0.50), confidence), p95: interval_from(&mut p95_dist, percentile(&pooled, 0.95), confidence), p99: interval_from(&mut p99_dist, percentile(&pooled, 0.99), confidence) }
 	}
 }
@@ -233,17 +233,17 @@ fn population_stddev(samples: &[u64], sum: u128) -> u64 {
 	if samples.is_empty() {
 		return 0;
 	}
-	let mean = sum as f64 / samples.len() as f64;
+	let mean = crate::num::u128_to_f64(sum) / crate::num::usize_to_f64(samples.len());
 	let variance = samples
 		.iter()
 		.map(|&v| {
-			let d = v as f64 - mean;
+			let d = crate::num::u64_to_f64(v) - mean;
 			d * d
 		})
 		.sum::<f64>()
-		/ samples.len() as f64;
-	let stddev = variance.sqrt().round() as u64;
-	stddev
+		/ crate::num::usize_to_f64(samples.len());
+
+	crate::num::f64_to_u64(variance.sqrt().round())
 }
 
 /// Read a percentile-method confidence interval off a bootstrap distribution.
@@ -275,7 +275,7 @@ fn percentile(sorted: &[u64], q: f64) -> u64 {
 	if q >= 1.0 {
 		return sorted[n - 1];
 	}
-	let rank = (q * n as f64).ceil() as usize;
+	let rank = crate::num::f64_to_usize((q * crate::num::usize_to_f64(n)).ceil());
 	let idx = rank.saturating_sub(1).min(n - 1);
 	sorted[idx]
 }

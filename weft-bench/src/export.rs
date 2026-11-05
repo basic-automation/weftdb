@@ -62,7 +62,7 @@ pub fn render(report: &BenchReport, format: Format) -> String {
 }
 
 fn ms(ns: u64) -> f64 {
-	ns as f64 / 1e6
+	crate::num::u64_to_f64(ns) / 1e6
 }
 
 fn gate(r: &BenchResult) -> &'static str {

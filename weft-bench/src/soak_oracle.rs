@@ -76,7 +76,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::soak_workload::{GridValue, WorkloadModel, WorkloadStep};
 
-/// Cap on the mismatches an [`OracleVerdict`] lists. The total is always
+/// Cap on the mismatches an [`OracleVerdict`] lists.
+///
+/// The total is always
 /// counted in [`OracleVerdict::mismatch_count`]; the cap only bounds the
 /// artifact a badly broken run produces — a 24 h run whose store lost a
 /// segment could otherwise mint a mismatch per point for hours.
@@ -196,7 +198,7 @@ impl OracleVerdict {
 	/// Whether the mismatch list was capped: the total in
 	/// [`Self::mismatch_count`] is larger than the list kept.
 	#[must_use]
-	pub fn truncated(&self) -> bool {
+	pub const fn truncated(&self) -> bool {
 		let listed = self.mismatches.len() as u64;
 		self.mismatch_count > listed
 	}
@@ -245,7 +247,9 @@ impl OracleVerdict {
 
 /// One check in the oracle self-test (SOA-7): a fixed name from the
 /// closed set [`SoakOracle::self_test`] runs, and whether the core
-/// produced the judgement the check's construction requires. The names
+/// produced the judgement the check's construction requires.
+///
+/// The names
 /// are constants of the self-test, never free text from a caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfTestCheck {
@@ -256,7 +260,9 @@ pub struct SelfTestCheck {
 }
 
 /// The oracle self-test's report (SOA-7): every check it ran and
-/// whether each passed. Produced by [`SoakOracle::self_test`]; carries
+/// whether each passed.
+///
+/// Produced by [`SoakOracle::self_test`]; carries
 /// no free text beyond the checks' fixed names, so it needs no
 /// redaction pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,7 +282,7 @@ impl OracleSelfTestReport {
 
 	/// How many checks the self-test ran.
 	#[must_use]
-	pub fn checks_run(&self) -> usize {
+	pub const fn checks_run(&self) -> usize {
 		self.checks.len()
 	}
 
@@ -390,6 +396,10 @@ impl SoakOracle {
 	/// and a publisher can run it before trusting a recorded verdict.
 	/// Pure and deterministic: the same core gives the same report on
 	/// any machine.
+	///
+	/// # Panics
+	///
+	/// If the fixed self-test workload parameters are refused, which they never are.
 	#[must_use]
 	pub fn self_test() -> OracleSelfTestReport {
 		use crate::soak_workload::{LaneWeights, WorkloadParams};
@@ -455,7 +465,7 @@ impl SoakOracle {
 
 		let window: Vec<(u64, Vec<ObservedPoint>)> = (0..4).map(|tick| (tick, faithful_tick(tick))).collect();
 		check("window_digest_agrees_with_a_faithful_read_back", oracle.window_digest(0, 4).matches(&crate::soak_digest::observed_window_digest(0, 4, &window)));
-		let mut short_window = window.clone();
+		let mut short_window = window;
 		short_window[0].1.remove(0);
 		check("window_digest_detects_a_dropped_point", !oracle.window_digest(0, 4).matches(&crate::soak_digest::observed_window_digest(0, 4, &short_window)));
 
@@ -477,7 +487,7 @@ impl SoakOracle {
 		let mut seen: BTreeMap<(usize, usize), &ObservedPoint> = BTreeMap::new();
 		for point in observed {
 			let expected_timestamp_ns = self.model.timestamp_ns(tick, point.row);
-			let in_grid = point.series < grid.series && point.row < grid.rows;
+			let in_grid = grid.contains(point.series, point.row);
 			let expected = if in_grid { grid.cell(point.series, point.row).cloned() } else { None };
 			if seen.insert((point.series, point.row), point).is_some() {
 				verdict.push_capped(OracleMismatch { tick, series: point.series, row: point.row, kind: MismatchKind::Duplicate, expected, observed: Some(point.value.clone()), expected_timestamp_ns, observed_timestamp_ns: Some(point.timestamp_ns) });
@@ -749,7 +759,7 @@ mod tests {
 		let report = SoakOracle::self_test();
 		assert!(report.passed(), "the self-test must pass against the core it ships with; failures: {:?}", report.failed_checks());
 		assert_eq!(report.checks_run(), 9, "nine checks: one faithful pass, six corruption classes, two window digests");
-		assert!(report.failed_checks().is_empty());
+		assert_eq!(report.failed_checks(), [] as [&str; 0]);
 	}
 
 	#[test]

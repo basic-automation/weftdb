@@ -104,8 +104,10 @@ pub struct DownsampleRequest {
 
 /// The default for the most buckets a gap fill may emit: the interpolation
 /// endpoint's default output cap, since a filled grid is an output grid of the
-/// same kind. The handlers pass the operator's configured cap
-/// ([`InterpolateConfig::max_output_points`]) to [`apply_fill`], which is this
+/// same kind.
+///
+/// The handlers pass the operator's configured cap
+/// ([`InterpolateConfig::max_output_points`]) to `apply_fill`, which is this
 /// value unless `WEFT_MAX_INTERPOLATE_POINTS` changed it (ROB-16).
 pub const MAX_FILL_BUCKETS: usize = crate::interpolate::MAX_INTERPOLATE_OUTPUT_POINTS;
 
@@ -1062,7 +1064,7 @@ mod tests {
 		let body = serde_json::json!({
 			"width": "5s",
 			"aggregations": ["min", "max"],
-			"points": (0..12).map(|s| serde_json::json!({ "timestamp": ts(s), "value": s as f64 })).collect::<Vec<_>>(),
+			"points": (0..12_i32).map(|s| serde_json::json!({ "timestamp": ts(i64::from(s)), "value": f64::from(s) })).collect::<Vec<_>>(),
 		});
 		let (status, body) = post_json("/api/v1/downsample", body).await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -1267,8 +1269,10 @@ mod tests {
 	#[test]
 	fn exactly_representable_values_widen_unchanged() {
 		// Values an f64 holds exactly as a short decimal: the shortest decimal and the
-		// exact binary expansion are the same number, so results do not move.
-		for v in [0.0, 1.0, -1.0, 0.5, -0.25, 99.25, 1_048_576.125, 9_007_199_254_740_992.0, 1e300, f64::MAX, -f64::MAX, 2.0_f64.powi(-20)] {
+		// exact binary expansion are the same number, so results do not move. (`1e300`
+		// and `f64::MAX` are not: their exact expansions are long, and bigdecimal's
+		// `from_f64` returns that expansion; the shortest-form test above covers them.)
+		for v in [0.0, 1.0, -1.0, 0.5, -0.25, 99.25, 1_048_576.125, 9_007_199_254_740_992.0, 2.0_f64.powi(-20)] {
 			assert_eq!(widen_json_value(v), BigDecimal::from_f64(v), "{v}");
 		}
 		for i in -100_000_i32..100_000 {
@@ -1288,7 +1292,7 @@ mod tests {
 
 	#[test]
 	fn widening_matches_the_shortest_round_trip_text_for_every_finite_f64() {
-		let mut state = 0x5EED_F64_u64;
+		let mut state = 0x05EE_DF64_u64;
 		let mut checked = 0;
 		while checked < 200_000 {
 			// Alternate random bit patterns (every exponent, subnormals) with short decimals

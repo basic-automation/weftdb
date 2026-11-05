@@ -1,6 +1,7 @@
 //! UCI corpus loader — the UCI Individual household electric power consumption
-//! dataset, the real corpus the 1.0 plan's evidence scope names ("UCI
-//! household-power data at 3 scales", `f085f84:docs/release/1.0-plan.md` §7
+//! dataset, the real corpus the 1.0 plan's evidence scope names.
+//!
+//! The plan names it as "UCI household-power data at 3 scales" (`f085f84:docs/release/1.0-plan.md` §7
 //! decision 18).
 //!
 //! File format (`household_power_consumption.txt`, semicolon-separated, one
@@ -65,11 +66,12 @@ pub struct UciCorpus {
 
 impl UciCorpus {
 	/// Share of examined rows dropped for a missing projected value.
+	#[must_use]
 	pub fn missingness_fraction(&self) -> f64 {
 		if self.rows_seen == 0 {
 			0.0
 		} else {
-			self.rows_missing as f64 / self.rows_seen as f64
+			crate::num::usize_to_f64(self.rows_missing) / crate::num::usize_to_f64(self.rows_seen)
 		}
 	}
 }
@@ -91,6 +93,10 @@ pub fn load_uci_corpus(path: &Path, column: &str, max_rows: usize) -> anyhow::Re
 
 /// The reader half of [`load_uci_corpus`], exposed so tests can load a fixture
 /// from memory and so a caller that already holds the file need not re-open it.
+///
+/// # Errors
+///
+/// As [`load_uci_corpus`], less the failure to open the file.
 pub fn load_uci_corpus_from_reader(reader: impl BufRead, column: &str, max_rows: usize) -> anyhow::Result<UciCorpus> {
 	let mut lines = reader.lines();
 	let header = lines.next().ok_or_else(|| anyhow::anyhow!("empty file: no header row"))?.map_err(|e| anyhow::anyhow!("cannot read header row: {e}"))?;
@@ -122,7 +128,7 @@ pub fn load_uci_corpus_from_reader(reader: impl BufRead, column: &str, max_rows:
 		}
 		let value: BigDecimal = raw.parse().map_err(|e| anyhow::anyhow!("line {}: value {raw:?}: {e}", line_no + 2))?;
 		let scale = value.normalized().as_bigint_and_exponent().1;
-		anyhow::ensure!(scale >= 0 && scale <= 18, "line {}: value {raw:?} needs {scale} fractional digits, over the 18-digit exact-scale cap", line_no + 2);
+		anyhow::ensure!((0..=18).contains(&scale), "line {}: value {raw:?} needs {scale} fractional digits, over the 18-digit exact-scale cap", line_no + 2);
 		decimal_scale = decimal_scale.max(u8::try_from(scale).unwrap_or(u8::MAX));
 		rows.push((timestamp, value));
 	}

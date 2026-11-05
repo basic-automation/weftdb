@@ -150,7 +150,7 @@ mod tests {
 			assert!(params.series >= 1 && params.blocks >= 1);
 			let rows = params.rows_per_block;
 			let total = params.series * params.blocks * rows;
-			assert!(total <= preset.value_budget(), "{} overshoots its budget: {total}", preset);
+			assert!(total <= preset.value_budget(), "{preset} overshoots its budget: {total}");
 			// At most one block's worth of slack per series: the budget is spent, not rounded
 			// away.
 			assert!(preset.value_budget() - total < params.series * rows, "{} wastes a large share of its budget: {total} of {}", preset, preset.value_budget());

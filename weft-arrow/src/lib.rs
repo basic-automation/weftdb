@@ -507,9 +507,11 @@ pub fn record_batch_to_columns(batch: &RecordBatch) -> Result<(Vec<i64>, Vec<Opt
 	columns_from_batch(batch, false, 0)
 }
 
-/// Read a batch's two columns with the ingest rules (ROB-7): the same conversion as
-/// [`record_batch_to_columns`], except that a value which cannot exist as a decimal
-/// is a [`ConvertError::NonFinite`] naming its row instead of a `None`.
+/// Read a batch's two columns with the ingest rules (ROB-7).
+///
+/// The same conversion as [`record_batch_to_columns`], except that a value which
+/// cannot exist as a decimal is a [`ConvertError::NonFinite`] naming its row instead
+/// of a `None`.
 ///
 /// The lenient reader exists because an export with a hole in it has to come back as
 /// a hole; a request body with a hole in it is a row the caller believes it sent.
@@ -682,8 +684,9 @@ pub fn record_batches_to_columns(batches: &[RecordBatch]) -> Result<(Vec<i64>, V
 	columns_from_batches(batches, false)
 }
 
-/// Concatenate a stream of batches into WeftDB columns under the ingest rules
-/// (ROB-7) — [`record_batches_to_columns`] with [`ConvertError::NonFinite`] turned
+/// Concatenate a stream of batches into WeftDB columns under the ingest rules (ROB-7).
+///
+/// This is [`record_batches_to_columns`] with [`ConvertError::NonFinite`] turned
 /// on, and row numbers counted across the whole batch set. This is what the Parquet
 /// ingest route decodes with; the re-seal paths keep the lenient form.
 ///
@@ -1827,29 +1830,31 @@ mod tests {
 	}
 
 	#[test]
-	fn a_non_finite_float_is_a_hole_for_the_lenient_reader_and_a_refusal_for_the_strict_one() {
+	fn a_non_finite_float_is_a_hole_for_the_lenient_reader_and_a_refusal_for_the_strict_one() -> TestResult {
 		// ROB-7: the export shape needs `NaN` to come back as the null it was written
 		// as, and a request body needs it refused — a `None` on the way in is a row the
 		// caller believes it sent. Same batch, two readers, two answers.
-		let batch = build_record_batch(TimeUnit::Seconds, PhysicalType::F64.name(), LOGICAL_EXPORT_VERSION, &[100, 110, 120], Arc::new(Float64Array::from(vec![Some(1.5), Some(f64::NAN), Some(f64::NEG_INFINITY)])), VALUE_ENCODING_F64).expect("builds the batch");
-		let (timestamps, values) = record_batch_to_columns(&batch).expect("the lenient reader accepts it");
-		assert_eq!(timestamps, vec![100, 110, 120]);
-		assert_eq!(values[0], Some(bd("1.5")));
-		assert_eq!(values[1], None, "a NaN reads back as the hole the writer meant");
-		assert_eq!(values[2], None);
-		assert_eq!(record_batch_to_columns_strict(&batch), Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: 1 }));
+		let batch = build_record_batch(TimeUnit::Seconds, PhysicalType::F64.name(), LOGICAL_EXPORT_VERSION, &[100, 110, 120], Arc::new(Float64Array::from(vec![Some(1.5), Some(f64::NAN), Some(f64::NEG_INFINITY)])), VALUE_ENCODING_F64)?;
+		let (timestamps, values) = record_batch_to_columns(&batch)?;
+		check_eq!(timestamps, vec![100, 110, 120]);
+		check_eq!(values[0], Some(bd("1.5")?));
+		check_eq!(values[1], None, "a NaN reads back as the hole the writer meant");
+		check_eq!(values[2], None);
+		check_eq!(record_batch_to_columns_strict(&batch), Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: 1 }));
+		Ok(())
 	}
 
 	#[test]
-	fn the_strict_reader_refuses_a_text_non_finite_and_numbers_rows_across_batches() {
+	fn the_strict_reader_refuses_a_text_non_finite_and_numbers_rows_across_batches() -> TestResult {
 		// The Utf8 export form carries `NaN` as text, so the text arm needs the same
 		// refusal; and a Parquet body is a *set* of batches, so the row a strict
 		// refusal names has to be the row the sender counts, not the row within one
 		// batch of many.
-		let first = build_record_batch(TimeUnit::Seconds, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, &[100, 110], Arc::new(StringArray::from(vec![Some("1.5"), Some("2.5")])), VALUE_ENCODING_TEXT).expect("builds the first batch");
-		let second = build_record_batch(TimeUnit::Seconds, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, &[120, 130], Arc::new(StringArray::from(vec![Some("-Infinity"), Some("4.5")])), VALUE_ENCODING_TEXT).expect("builds the second batch");
-		assert_eq!(record_batches_to_columns(&[first.clone(), second.clone()]), Err(ConvertError::BadValue("-Infinity".to_string())), "the lenient text arm already refused this value, but with the wrong code — see the strict refusal below");
-		assert_eq!(record_batches_to_columns_strict(&[first, second]), Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: 2 }));
+		let first = build_record_batch(TimeUnit::Seconds, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, &[100, 110], Arc::new(StringArray::from(vec![Some("1.5"), Some("2.5")])), VALUE_ENCODING_TEXT)?;
+		let second = build_record_batch(TimeUnit::Seconds, PhysicalType::BigDecimalText.name(), LOGICAL_EXPORT_VERSION, &[120, 130], Arc::new(StringArray::from(vec![Some("-Infinity"), Some("4.5")])), VALUE_ENCODING_TEXT)?;
+		check_eq!(record_batches_to_columns(&[first.clone(), second.clone()]), Err(ConvertError::BadValue("-Infinity".to_string())), "the lenient text arm already refused this value, but with the wrong code — see the strict refusal below");
+		check_eq!(record_batches_to_columns_strict(&[first, second]), Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: 2 }));
+		Ok(())
 	}
 
 	#[test]

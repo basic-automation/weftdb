@@ -45,21 +45,21 @@ fn round2(value: f64) -> f64 {
 /// sinusoid, so a scan does real floating-point work and a wrong block offset shows up.
 fn signal(series: usize, row: usize) -> f64 {
 	use std::f64::consts::TAU;
-	let (series_f, row_f) = (series as f64, row as f64);
-	round2((30.0 + 10.0 * (series_f * 0.7).sin()) * (row_f / 512.0 * TAU).sin() + series_f)
+	let (series_f, row_f) = (crate::num::usize_to_f64(series), crate::num::usize_to_f64(row));
+	round2(f64::mul_add(10.0f64.mul_add((series_f * 0.7).sin(), 30.0), (row_f / 512.0 * TAU).sin(), series_f))
 }
 
 /// The mean of `sum` over `count` values, or 0.0 for an empty count.
 fn mean(sum: f64, count: usize) -> f64 {
 	if count > 0 {
-		sum / count as f64
+		sum / crate::num::usize_to_f64(count)
 	} else {
 		0.0
 	}
 }
 
 /// The tunable knobs of a block-missingness profile.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SparseParams {
 	/// RNG seed; publishing it regenerates the grid and its holes exactly.
 	pub seed: u64,
@@ -82,7 +82,7 @@ impl Default for SparseParams {
 }
 
 /// A reproducible block-missingness profile.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SparseProfile {
 	/// Human-readable profile name, recorded in results.
 	pub name: String,
@@ -110,7 +110,7 @@ impl SparseProfile {
 	/// Build a profile, clamping the knobs: at least one series, block and row, and a density
 	/// between 1% and 100% — an entirely empty table has nothing to scan.
 	#[must_use]
-	pub fn new(name: impl Into<String>, params: SparseParams) -> Self {
+	pub fn new(name: impl Into<String>, params: &SparseParams) -> Self {
 		let params = SparseParams { seed: params.seed, series: params.series.max(1), blocks: params.blocks.max(1), rows_per_block: params.rows_per_block.max(1), density_percent: params.density_percent.clamp(1, 100) };
 		Self { name: name.into(), params }
 	}
@@ -228,8 +228,8 @@ pub fn run_sparse(profile: &SparseProfile, reps: usize) -> anyhow::Result<BenchR
 
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.params.seed ^ 0x50A8_C1EC_7B10, ..BootstrapConfig::default() }));
-	let throughput_points_per_sec = if latency.mean_ns > 0 { table.populated as f64 / (latency.mean_ns as f64 / 1e9) } else { 0.0 };
-	let missingness_fraction = if table.capacity > 0 { 1.0 - table.populated as f64 / table.capacity as f64 } else { 0.0 };
+	let throughput_points_per_sec = if latency.mean_ns > 0 { crate::num::usize_to_f64(table.populated) / (crate::num::u64_to_f64(latency.mean_ns) / 1e9) } else { 0.0 };
+	let missingness_fraction = if table.capacity > 0 { 1.0 - crate::num::usize_to_f64(table.populated) / crate::num::usize_to_f64(table.capacity) } else { 0.0 };
 
 	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_SPARSE.to_string(), reps, dataset: DatasetMeta { input_points: table.populated, output_points: scanned.len(), irregular: false, missingness_fraction, seed: profile.params.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
 }
@@ -244,7 +244,7 @@ mod tests {
 	use super::*;
 
 	fn tiny(density_percent: u32) -> SparseProfile {
-		SparseProfile::new("sp-tiny", SparseParams { seed: 7, series: 3, blocks: 8, rows_per_block: 16, density_percent })
+		SparseProfile::new("sp-tiny", &SparseParams { seed: 7, series: 3, blocks: 8, rows_per_block: 16, density_percent })
 	}
 
 	#[test]
@@ -281,7 +281,7 @@ mod tests {
 	fn a_one_row_block_is_still_a_valid_grid() {
 		// The smallest block the knobs allow: a cell is a single value, so block granularity and
 		// row granularity coincide, and nothing in the scan may divide by a zero row count.
-		let profile = SparseProfile::new("sp-rows1", SparseParams { seed: 3, series: 2, blocks: 6, rows_per_block: 0, density_percent: 50 });
+		let profile = SparseProfile::new("sp-rows1", &SparseParams { seed: 3, series: 2, blocks: 6, rows_per_block: 0, density_percent: 50 });
 		assert_eq!(profile.params.rows_per_block, 1, "the row knob clamps up like the others");
 		let table = profile.generate();
 		assert_eq!(table.capacity, 12, "2 series x 6 blocks of one row");

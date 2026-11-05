@@ -217,7 +217,7 @@ fn knots(rng: &mut ChaCha8Rng, count: usize, points: usize) -> Knots {
 	offsets.extend([0, span]);
 	offsets.sort_unstable();
 	offsets.dedup();
-	let values = offsets.iter().map(|&o| 20.0_f64.mul_add((o as f64 / 600.0).sin(), 50.0) + rng.random_range(-1.0..=1.0)).collect();
+	let values = offsets.iter().map(|&o| 20.0_f64.mul_add((crate::num::i64_to_f64(o) / 600.0).sin(), 50.0) + rng.random_range(-1.0..=1.0)).collect();
 	(offsets.into_iter().map(|o| anchor() + Duration::seconds(o)).collect(), values)
 }
 
@@ -325,7 +325,7 @@ pub fn run_gpu_memory(profile: &GpuMemoryProfile) -> anyhow::Result<BenchResult>
 	let correctness = CorrectnessReport { output_count_ok: complete && stable && !allocated_growth, expected_output_points: p.sizes.iter().sum::<usize>() * rounds, actual_output_points: output_points, values_finite: finite, result_sha256: None };
 	let latency = LatencyStats::from_samples(&samples_ns);
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: p.seed ^ 0x06B0_C0DE_u64, ..BootstrapConfig::default() }));
-	let throughput_points_per_sec = if measured_ns > 0 { output_points as f64 / (measured_ns as f64 / 1e9) } else { 0.0 };
+	let throughput_points_per_sec = if measured_ns > 0 { crate::num::usize_to_f64(output_points) / (crate::num::u64_to_f64(measured_ns) / 1e9) } else { 0.0 };
 	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: profile.name.clone(), adapter: "weftdb".to_string(), workload: WORKLOAD_GPU_MEMORY.to_string(), reps: rounds, dataset: DatasetMeta { input_points: inputs.iter().map(|(_, (t, _))| t.len()).sum(), output_points, irregular: true, missingness_fraction: 0.0, seed: p.seed, signal_shape: None }, latency, latency_ci, throughput_points_per_sec, timing, correctness, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples_ns), gpu_pool: Some(summary), adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples_ns.clone(), between_run: None, gpu_economics: None })
 }
 

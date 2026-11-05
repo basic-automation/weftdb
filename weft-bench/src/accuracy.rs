@@ -117,7 +117,7 @@ impl AccuracyMetrics {
 			}
 		}
 
-		let n = predicted.len() as f64;
+		let n = crate::num::usize_to_f64(predicted.len());
 		Ok(Self { count: predicted.len(), rmse: (sum_sq / n).sqrt(), mae: sum_abs / n, max_abs_error: max_abs, bias: sum_signed / n })
 	}
 }
@@ -228,7 +228,7 @@ mod tests {
 		let truth = synthetic_ground_truth(&profile).expect("generated profile has ground truth");
 		let expected = grid_timestamps(profile.start(), profile.end(), profile.resolution).len();
 		assert_eq!(truth.len(), expected, "ground truth must cover the whole reconstruction grid");
-		assert!(!truth.is_empty());
+		assert_ne!(truth, [] as [f64; 0]);
 		for v in truth {
 			assert!(v.is_finite() && (10.0..=90.0).contains(&v), "every truth value must be finite in [10, 90], got {v}");
 		}

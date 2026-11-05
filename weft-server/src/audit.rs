@@ -278,14 +278,14 @@ impl AuditLog {
 		{
 			use std::io::Read as _;
 			let mut reader = BufReader::new(&file);
-			let mut chunk = [0u8; 64 * 1024];
+			let mut chunk = vec![0u8; 64 * 1024];
 			let mut last_byte: Option<u8> = None;
 			loop {
 				let read = reader.read(&mut chunk).map_err(|err| format!("cannot read back the audit log at {}: {err}", path.display()))?;
 				if read == 0 {
 					break;
 				}
-				next_seq += u64::try_from(chunk[..read].iter().filter(|byte| **byte == b'\n').count()).unwrap_or(u64::MAX);
+				next_seq += chunk[..read].iter().fold(0_u64, |lines, byte| lines + u64::from(*byte == b'\n'));
 				last_byte = chunk[..read].last().copied();
 			}
 			if let Some(byte) = last_byte {
@@ -343,6 +343,7 @@ impl AuditLog {
 			return Err(failure);
 		}
 		writer.next_seq += 1;
+		drop(writer);
 		Ok(seq)
 	}
 
@@ -440,10 +441,10 @@ impl AuditLog {
 		Fut::Output: Send + 'static,
 	{
 		let tracker = Arc::clone(&self.tracker);
-		let tracked = tracker.register();
+		let registered = tracker.register();
 		tokio::spawn(async move {
 			let output = future.await;
-			if tracked {
+			if registered {
 				tracker.complete();
 			}
 			output
@@ -465,7 +466,7 @@ impl AuditLog {
 fn route_table() -> &'static RouteTable {
 	static TABLE: OnceLock<Arc<RouteTable>> = OnceLock::new();
 	let table: &'static Arc<RouteTable> = TABLE.get_or_init(|| crate::routes::build_registry().table());
-	&**table
+	table
 }
 
 /// The `503 audit_unavailable` refusal: the envelope X-ERR's code table
@@ -476,7 +477,9 @@ fn audit_unavailable(detail: String) -> Response {
 }
 
 /// axum middleware: the audit pair around every audited route, as the
-/// module docs describe. Installed by [`crate::app_with_state`] between
+/// module docs describe.
+///
+/// Installed by [`crate::app_with_state`] between
 /// the auth layer (outside it, so a denial is an *event*, never an
 /// attempt, and the attempt can name the authenticated principal) and
 /// the registry's gate (inside it). With no audit log in the state it
@@ -635,9 +638,9 @@ mod tests {
 			let mut saved = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 			unsafe {
 				libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-				assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut saved), 0, "the rlimit is read");
+				assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut saved), 0, "the rlimit is read");
 				let limit = libc::rlimit { rlim_cur: 0, rlim_max: saved.rlim_max };
-				assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0, "the rlimit is set");
+				assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const limit), 0, "the rlimit is set");
 			}
 			let dir = tempfile::tempdir().expect("tempdir");
 			let log = AuditLog::open(&dir.path().join("audit.jsonl")).expect("the file opens; only its writes are capped");
@@ -646,7 +649,7 @@ mod tests {
 			let second = log.event("ingest", json!({})).expect_err("the failure is latched");
 			assert_eq!(first, second, "a poisoned log reports the one latched failure");
 			unsafe {
-				assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &saved), 0, "the rlimit is restored");
+				assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &raw const saved), 0, "the rlimit is restored");
 			}
 			return;
 		}

@@ -34,7 +34,9 @@ async fn debug_batch_processing() -> Result<()> {
 	build_unprocessed_queue(&db, &test_aspect.id(), &Resolution::Minutes, &Spline::Linear, 5).await?;
 
 	// Get unprocessed batches
-	let unprocessed_batches: Vec<weftdb::Batch> = db.get_unprocessed_batches(&test_aspect.id()).await?.try_collect().await?;
+	let mut unprocessed_batches: Vec<weftdb::Batch> = db.get_unprocessed_batches(&test_aspect.id()).await?.try_collect().await?;
+	drop(db);
+	drop(test_aspect);
 	println!("Unprocessed batches: {}", unprocessed_batches.len());
 
 	// Check if batches have proper IDs and hashes
@@ -49,12 +51,14 @@ async fn debug_batch_processing() -> Result<()> {
 	}
 
 	// Try processing one batch
-	let mut first_batch = unprocessed_batches.into_iter().next().unwrap();
+	let mut first_batch = unprocessed_batches.swap_remove(0);
+	drop(unprocessed_batches);
 	println!("Before processing - Hash: {:?}", first_batch.batch_hash().map(|s| &s[..8]));
 
 	// Process the batch (this modifies it)
 	first_batch.process()?;
 	println!("After processing - Hash: {:?}", first_batch.batch_hash().map(|s| &s[..8]));
+	drop(first_batch);
 
 	// Try to mark it as processed
 	// match db.mark_batch_processed(&first_batch).await {

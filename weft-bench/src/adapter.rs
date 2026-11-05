@@ -139,7 +139,7 @@ mod tests {
 		// `end` off the grid: the last point is the last step not after it.
 		assert_eq!(grid_timestamps(ts(5), ts(130), Resolution::Minutes), vec![ts(5), ts(65), ts(125)]);
 		assert_eq!(grid_timestamps(ts(7), ts(7), Resolution::Days), vec![ts(7)]);
-		assert!(grid_timestamps(ts(8), ts(7), Resolution::Seconds).is_empty());
+		assert_eq!(grid_timestamps(ts(8), ts(7), Resolution::Seconds), [] as [chrono::DateTime<chrono::Utc>; 0]);
 	}
 
 	#[test]

@@ -57,7 +57,7 @@
 //! magnitude below `2^53` (about `9.0e15`; a differential test over `1e-19..1e15` pins
 //! it): an interpolated `f64` became its shortest round-trip decimal and that decimal
 //! narrowed back to the same `f64`, a raw sample came back as the `f64` it was sent
-//! as, and a negative zero became `0` (which [`wire_f64`] keeps). Above that the old
+//! as, and a negative zero became `0` (which `wire_f64` keeps). Above that the old
 //! answer could be the artefact: once a value's shortest decimal has an integer part
 //! wider than `2^53`, `BigDecimal::to_f64` can round twice and land one ulp off the
 //! kernel's value (observed at about `2.0e19`: `...146e19` computed, `...142e19`
@@ -71,7 +71,7 @@ use std::num::NonZeroUsize;
 use axum::{
 	extract::State, http::header, response::{IntoResponse, Response}, Json
 };
-use bigdecimal::{BigDecimal, ToPrimitive};
+use bigdecimal::ToPrimitive;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 /// The engine's own provenance type: `raw` (the grid point coincides with an input
@@ -1722,8 +1722,8 @@ mod tests {
 		let spline: Spline = request.spline.into();
 		let resolution: Resolution = request.resolution.into();
 		let output = config.interpolator(spline, resolution).run_async(points, start, end).await.map_err(|err| engine_error(&err, config))?;
-		let points = output.iter().map(|(timestamp, value, kind)| wire_value(value, "the test value").map(|value| OutputPoint { timestamp, value, kind })).collect::<Result<Vec<_>, _>>()?;
-		Ok(InterpolateResponse { spline: output.spline().to_string(), resolution: format!("{resolution:?}"), input_points, output_points: points.len(), points })
+		let points = output.iter().map(|(timestamp, value, kind)| wire_value(value, "the test value").map(|value| OutputPoint { timestamp, value, kind: kind.into() })).collect::<Result<Vec<_>, _>>()?;
+		Ok(InterpolateResponse { spline: output.spline().to_string(), resolution: format!("{resolution:?}"), input_points, output_points: points.len(), backend: output.backend().to_string(), gpu_fallback: output.gpu_fallback().is_some(), points })
 	}
 
 	async fn body_bytes(response: Response) -> Vec<u8> {
@@ -1791,20 +1791,20 @@ mod tests {
 		};
 		let splines = [serde_json::json!("linear"), serde_json::json!("quadratic"), serde_json::json!("cubic"), serde_json::json!({ "polynomial": { "degree": 3 } })];
 		for case in 0..64 {
-			let knots = 1 + (next() % 12) as i64;
+			let knots = 1 + (next() % 12).cast_signed();
 			let exponent = (next() % 35) as i32 - 19; // 1e-19 ..= 1e15
 			let mut t = 0_i64;
 			let mut points = Vec::new();
 			for _ in 0..knots {
-				t += 1 + (next() % 90) as i64;
-				let unit = (next() >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0;
+				t += 1 + (next() % 90).cast_signed();
+				let unit = (crate::num::u64_to_f64(next() >> 11) / crate::num::u64_to_f64(1_u64 << 53)).mul_add(2.0, -1.0);
 				points.push(serde_json::json!({ "timestamp": ts(t), "value": unit * 10_f64.powi(exponent) }));
 			}
 			let body = serde_json::json!({
 				"spline": splines[case % splines.len()],
 				"resolution": "seconds",
-				"start": ts(-((next() % 60) as i64)),
-				"end": ts(t + (next() % 60) as i64),
+				"start": ts(-(next() % 60).cast_signed()),
+				"end": ts(t + (next() % 60).cast_signed()),
 				"points": points,
 			});
 			assert_paths_agree(body).await;

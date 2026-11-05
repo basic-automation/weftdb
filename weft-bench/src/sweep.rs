@@ -97,7 +97,7 @@ impl Sweep {
 		for curve in &self.curves {
 			let _ = write!(out, "\n## {} ({})\n\n| {} | p50 ms | p99 ms | throughput /s | gate |\n|---:|---:|---:|---:|---|\n", curve.profile, curve.workload, self.knob);
 			for p in &curve.points {
-				let ms = |ns: u64| ns as f64 / 1e6;
+				let ms = |ns: u64| crate::num::u64_to_f64(ns) / 1e6;
 				let _ = writeln!(out, "| {} | {:.3} | {:.3} | {:.0} | {} |", p.value, ms(p.p50_ns), ms(p.p99_ns), p.throughput, if p.passed { "PASS" } else { "FAIL" });
 			}
 			let _ = writeln!(out, "\n{}", curve.knee.as_ref().map_or_else(|| format!("No knee: every step gained at least {:.0}% throughput, so the curve has not saturated in this range.", KNEE_GAIN * 100.0), |k| format!("Knee at **{k}**: the next step gained less than {:.0}% throughput.", KNEE_GAIN * 100.0)));

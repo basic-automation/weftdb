@@ -495,7 +495,7 @@ impl MaintenanceDriver {
 
 	/// Whether every card is complete.
 	#[must_use]
-	pub fn is_complete(&self) -> bool {
+	pub const fn is_complete(&self) -> bool {
 		self.card_index >= self.deck.len()
 	}
 

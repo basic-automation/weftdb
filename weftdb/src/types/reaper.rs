@@ -12,13 +12,13 @@
 //!   epoch it started in, and releases it when it is dropped: when the read returns, and
 //!   also when its future is dropped half way (a timed-out or cancelled request);
 //! - right after a swap commits, the store records its retired names under the current
-//!   epoch and advances the epoch ([`ReclaimEpochs::retire`]). A read pinned in that
+//!   epoch and advances the epoch (`ReclaimEpochs::retire`). A read pinned in that
 //!   epoch or an earlier one may have pruned the index before the swap; one pinned later
 //!   pruned it after;
 //! - a backup that links frames holds the reaper off entirely ([`GcHold`]), since its
 //!   snapshot of the index may reference a frame retired after the snapshot.
 //!
-//! The reaper ([`Reaper::sweep`], driven by the store) then works through the journal:
+//! The reaper (`Reaper::sweep`, driven by the store) then works through the journal:
 //!
 //! - **G1.** It takes the retired names no pin or hold protects any more.
 //! - **G2.** It never unlinks a name a live row references. That cannot happen by
@@ -45,7 +45,7 @@
 //! **Abandoned outputs** (release plan D-S9, the robustness track's ROB-21). A swap holds
 //! the outputs it journaled as pending in an RAII guard until its outcome settles them.
 //! One that stops without settling them (it panicked, or its future was dropped, a request
-//! cancelled say) hands them to the reaper on drop ([`Reaper::abandon`]), and the store
+//! cancelled say) hands them to the reaper on drop (`Reaper::abandon`), and the store
 //! runs a pass over the aspect at the start of its next swap: their journal rows are
 //! `'pending'`, so the pass unlinks the ones no row references and drops the rows of the
 //! ones that were swapped in after all. Nothing is unlinked on drop itself, since only a
@@ -253,7 +253,7 @@ pub fn frame_file_name(stored: &str) -> Option<&str> {
 	stored.split(['/', '\\']).rfind(|part| !part.is_empty() && *part != ".")
 }
 
-/// What one [`Reaper::sweep`] did with the journal rows it was given.
+/// What one `Reaper::sweep` did with the journal rows it was given.
 #[derive(Debug, Default)]
 pub struct Swept {
 	/// The rows to delete: their frame is gone, or was kept on purpose (a live row
