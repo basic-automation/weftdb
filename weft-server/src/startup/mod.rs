@@ -105,6 +105,8 @@
 //! with splimes' default thresholds. A CPU/software adapter (llvmpipe, lavapipe, WARP) is
 //! not calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips
 //! calibration altogether. It never stops the server from starting.
+//! `WEFT_GPU_ADAPTER` picks the adapter and `WEFT_GPU_DEVICES` opens several devices
+//! (5.7); both are read before the store opens, and a malformed value refuses the start.
 //! Before the first phase, strict configuration (PAC-5b) checks the environment against
 //! the registry of every variable the workspace reads: a `WEFT_` name no crate reads, a
 //! test harness's own channel set on a real server, or a value outside the shape its
@@ -195,6 +197,11 @@ pub async fn run() -> anyhow::Result<()> {
 	// Phase 2: the opt-in Arrow Flight listener's address, refused here (exit 78) when it
 	// is not loopback, before anything opens.
 	let flight_addr = config::flight_addr().unwrap_or_else(|error| exit_config(&error));
+	// Phase 5 (5.7): the GPU adapter / multi-device choice, refused here (exit 78) when
+	// malformed, and installed before anything can start the GPU.
+	if let Some(gpu_config) = config::gpu_config().unwrap_or_else(|error| exit_config(&error)) {
+		println!("{}", weft_server::gpu::apply_config(gpu_config));
+	}
 	let state = match state::build().await {
 		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth).with_ingest_config(ingest).with_admission_config(admission),
 		Err(error) => match weft_server::store_open::exit_code_for_store_error(&error) {
