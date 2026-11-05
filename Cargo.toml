@@ -99,7 +99,7 @@ weft-orchestration = { path = "./weft-orchestration", version = "0.2.0" }
 # decision: `weft-server` and `weft-bench` enable `splimes/gpu`, and `weft-orchestration`
 # exposes it as its own opt-in `gpu-codecs` feature. `serde` stays on, because
 # `weftdb::BatchedMeasurement`'s derived serde needs splimes' own implementations. PAC-3.
-splimes = { version = "1", default-features = false, features = ["serde"] }
+splimes = { version = "1.3", default-features = false, features = ["serde"] }
 weft-line-protocol = { path = "./weft-line-protocol", version = "0.2.0" }
 weft-physical-type = { path = "./weft-physical-type", version = "0.2.0" }
 weft-reduce = { path = "./weft-reduce", version = "0.2.0" }
