@@ -400,6 +400,21 @@ pub struct SegmentStoreOptions {
 	/// series already registered stay writable. Series 0, the empty tag set, is implicit
 	/// and does not count.
 	pub max_series_per_aspect: usize,
+	/// The most buckets one stored downsample may produce (ROB-13, 1.0 plan
+	/// decision 12): [`DEFAULT_MAX_DOWNSAMPLE_BUCKETS`] unless changed. A
+	/// downsample whose fold reaches one bucket more is refused with
+	/// [`StoreError::DownsampleTooLarge`](crate::StoreError::DownsampleTooLarge),
+	/// so the partial state a caller can make the store hold is bounded here,
+	/// for every caller of the library — the HTTP handlers' own ceilings
+	/// (ROB-12) refuse the request earlier where they can name its grid.
+	pub max_downsample_buckets: usize,
+	/// The most instants one batch point lookup may name (ROB-13, 1.0 plan
+	/// decision 12's `at-multi` number): [`DEFAULT_MAX_POINT_BATCH`] unless
+	/// changed. A wider batch is refused with
+	/// [`StoreError::PointBatchTooLarge`](crate::StoreError::PointBatchTooLarge)
+	/// before the index is pruned. The single point lookup names one instant
+	/// and is bounded by construction.
+	pub max_point_batch: usize,
 }
 
 /// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
@@ -414,9 +429,18 @@ fn max_series_per_aspect_from(value: Option<&str>) -> usize {
 /// 100,000 series.
 pub const DEFAULT_MAX_SERIES_PER_ASPECT: usize = 100_000;
 
+/// The default stored-downsample bucket cap,
+/// [`SegmentStoreOptions::max_downsample_buckets`]: 1,000,000 buckets
+/// (1.0 plan decision 12).
+pub const DEFAULT_MAX_DOWNSAMPLE_BUCKETS: usize = 1_000_000;
+
+/// The default batch point-lookup cap, [`SegmentStoreOptions::max_point_batch`]:
+/// 10,000 instants (1.0 plan decision 12).
+pub const DEFAULT_MAX_POINT_BATCH: usize = 10_000;
+
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH }
 	}
 }
 
@@ -429,7 +453,7 @@ impl SegmentStoreOptions {
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -465,6 +489,22 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_max_series_per_aspect(mut self, limit: usize) -> Self {
 		self.max_series_per_aspect = limit;
+		self
+	}
+
+	/// These options with `limit` as the stored-downsample bucket cap (see
+	/// [`max_downsample_buckets`](Self::max_downsample_buckets)).
+	#[must_use]
+	pub const fn with_max_downsample_buckets(mut self, limit: usize) -> Self {
+		self.max_downsample_buckets = limit;
+		self
+	}
+
+	/// These options with `limit` as the batch point-lookup cap (see
+	/// [`max_point_batch`](Self::max_point_batch)).
+	#[must_use]
+	pub const fn with_max_point_batch(mut self, limit: usize) -> Self {
+		self.max_point_batch = limit;
 		self
 	}
 }
@@ -1544,6 +1584,12 @@ pub struct SegmentStore {
 	/// The most series one aspect may register, from the open options
 	/// ([`SegmentStoreOptions::max_series_per_aspect`]).
 	max_series_per_aspect: usize,
+	/// The most buckets one stored downsample may produce, from the open
+	/// options ([`SegmentStoreOptions::max_downsample_buckets`]) (ROB-13).
+	max_downsample_buckets: usize,
+	/// The most instants one batch point lookup may name, from the open
+	/// options ([`SegmentStoreOptions::max_point_batch`]) (ROB-13).
+	max_point_batch: usize,
 	/// Each aspect's circuit-breaker state (consecutive sweep failures and, once
 	/// tripped, when the cooldown ends), guarded by a plain mutex: it is only
 	/// ever held for a map touch, never across an await.
@@ -8369,3 +8415,8 @@ mod tag_read_tests;
 /// Phase 4.6: declared upsert keys bound the tags an ingest may carry.
 #[cfg(test)]
 mod upsert_keys_tests;
+
+/// ROB-13: the stored downsample and the batch point lookup are bounded in
+/// the store, at decision 12's numbers.
+#[cfg(test)]
+mod read_limits_tests;

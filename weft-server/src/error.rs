@@ -911,6 +911,12 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 			weftdb::StoreError::NotAnUpsertKey { key, .. } => ApiError::new(Code::InvalidTag, e.to_string()).with_details(serde_json::json!({ "tag": key, "reason": "not an upsert key" })),
 			weftdb::StoreError::UpsertKeysConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IngestValueOutOfRange { digits, .. } => decimal_out_of_range_refusal(*digits),
+			// The store's own decision 12 read bounds (ROB-13): the same
+			// `422 result_too_large` the read ceilings answer with (ROB-12),
+			// carrying the cap — the store's refusal is the one an unbounded
+			// stored downsample meets, since its grid cannot be counted from
+			// the request alone.
+			weftdb::StoreError::DownsampleTooLarge { limit, .. } | weftdb::StoreError::PointBatchTooLarge { limit, .. } => ApiError::new(Code::ResultTooLarge, e.to_string()).with_limit(u64::try_from(*limit).unwrap_or(u64::MAX)),
 			weftdb::StoreError::EmptyIngestBatch { .. } | weftdb::StoreError::IngestLengthMismatch { .. } => ApiError::bad_request(e.to_string()),
 			_ => ApiError::server(Code::IncompatibleStore, e.to_string()),
 		});
@@ -1058,6 +1064,19 @@ mod tests {
 		let err = anyhow::Error::new(weftdb::StoreError::SeriesLimit { aspect: "price".to_string(), limit: 2 }).context("ingest of aspect \"price\" failed while committing");
 		let refusal = classify_typed(&err).expect("a typed store error");
 		assert_eq!((refusal.code(), refusal.code().status()), (Code::SeriesLimit, StatusCode::BAD_REQUEST));
+	}
+
+	/// The store's decision 12 read bounds (ROB-13) are the plan's
+	/// `422 result_too_large`, carrying the cap in the envelope's `limit`,
+	/// read from the type — the same answer the read ceilings give (ROB-12).
+	#[test]
+	fn the_store_read_bounds_are_result_too_large() {
+		let downsample = anyhow::Error::new(weftdb::StoreError::DownsampleTooLarge { aspect: "price".to_string(), buckets: 5, limit: 4 }).context("downsampling \\\"price\\\"");
+		let refusal = classify_typed(&downsample).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::ResultTooLarge, StatusCode::UNPROCESSABLE_ENTITY));
+		let batch = anyhow::Error::new(weftdb::StoreError::PointBatchTooLarge { aspect: "price".to_string(), instants: 10_001, limit: 10_000 });
+		let refusal = classify_typed(&batch).expect("a typed store error");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::ResultTooLarge, StatusCode::UNPROCESSABLE_ENTITY));
 	}
 
 	/// A store read whose selector matched several series (TAG-8) is the plan's
