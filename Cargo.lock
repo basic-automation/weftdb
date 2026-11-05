@@ -5729,6 +5729,7 @@ dependencies = [
  "axum",
  "bigdecimal",
  "chrono",
+ "criterion",
  "futures",
  "hyper",
  "hyper-util",

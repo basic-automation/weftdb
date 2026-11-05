@@ -92,6 +92,7 @@ name = "poison_exit"
 required-features = ["fault-injection"]
 
 [dev-dependencies]
+criterion = { workspace = true }  # benches/interpolate_wire.rs
 async-trait = { workspace = true }  # a StoreFs test double whose cleanup fails
 libc = { workspace = true }  # raise(SIGTERM) for the signal-before-serving test in tests/serve_path.rs
 rcgen = "0.14"  # self-signed certificate material for the TLS tests (tls.rs unit tests, tests/tls_serve.rs)
@@ -102,3 +103,7 @@ tonic = { version = "0.14", default-features = false, features = ["channel"] }  
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "interpolate_wire"
+harness = false
