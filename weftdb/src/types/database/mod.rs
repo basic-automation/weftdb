@@ -34,6 +34,24 @@ static SEAL_STORES: LazyLock<Mutex<HashMap<std::path::PathBuf, std::sync::Weak<c
 
 pub use config::{data_dir, default_data_dir};
 
+/// Run a legacy (turso) metadata write inside the control-plane write scope (ROB-2), so a
+/// panic anywhere in it is known to the process's panic hook as a write in flight and takes
+/// the same abort an [`IndexTxn`](crate::types::index_txn::IndexTxn) op takes, instead of
+/// unwinding out of a queue consumer with a half-written metadata file and a live connection.
+///
+/// The scope is applied at the method boundary rather than at `begin_concurrent` or
+/// `commit_concurrent`: a legacy write spans the `BEGIN`/`COMMIT` pair and the statements
+/// between them, so a scope that covered only the connection would end in the middle of the
+/// write (ROB-5, constraint C22: "ROB-5 wraps legacy metadata writes").
+pub(crate) async fn legacy_metadata_write<F: std::future::Future>(fut: F) -> F::Output {
+	crate::types::exec::control_plane_write(async {
+		#[cfg(test)]
+		crate::types::exec::observe_scope();
+		fut.await
+	})
+	.await
+}
+
 /// Clear all cached connections that contain the given name in their path.
 /// This is useful for test cleanup to ensure database connections are released
 /// before deleting the database files.
@@ -200,65 +218,71 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn record_transaction(&self, message: &str) -> Result<TxId> {
-		let tx = Transaction::new(None, message.to_string());
-		let tx_id = tx.id();
+		legacy_metadata_write(async move {
+			let tx = Transaction::new(None, message.to_string());
+			let tx_id = tx.id();
 
-		// Since transaction logging is just for auditing and not critical to the operation,
-		// spawn it as a background task to avoid blocking the main thread
-		let tx_clone = tx.clone();
+			// Since transaction logging is just for auditing and not critical to the operation,
+			// spawn it as a background task to avoid blocking the main thread
+			let tx_clone = tx.clone();
 
-		// Use a more aggressive timeout and fewer retries since this is background logging
-		let id_str = tx_clone.id().as_uuid().to_string();
-		let msg = tx_clone.message().to_string();
-		let created_at = tx_clone.created_at().timestamp_millis();
+			// Use a more aggressive timeout and fewer retries since this is background logging
+			let id_str = tx_clone.id().as_uuid().to_string();
+			let msg = tx_clone.message().to_string();
+			let created_at = tx_clone.created_at().timestamp_millis();
 
-		let conn = Self::begin_concurrent(&self.metadata.clone(), self.metadata_path(), Some(self.cache.clone())).await?;
+			let conn = Self::begin_concurrent(&self.metadata.clone(), self.metadata_path(), Some(self.cache.clone())).await?;
 
-		// Simple INSERT - duplicates are unlikely with UUID ids
-		let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![id_str.clone(), msg.clone(), created_at]).await;
+			// Simple INSERT - duplicates are unlikely with UUID ids
+			let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![id_str.clone(), msg.clone(), created_at]).await;
 
-		match res {
-			Ok(_) => tracing::trace!("Background logged transaction id={id_str}"),
-			Err(e) => {
-				tracing::trace!("Background transaction logging attempt failed: {e}");
-				let _ = Self::rollback_concurrent(&conn).await;
-				return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
+			match res {
+				Ok(_) => tracing::trace!("Background logged transaction id={id_str}"),
+				Err(e) => {
+					tracing::trace!("Background transaction logging attempt failed: {e}");
+					let _ = Self::rollback_concurrent(&conn).await;
+					return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
+				}
 			}
-		}
 
-		Self::commit_concurrent(&conn).await?;
+			Self::commit_concurrent(&conn).await?;
 
-		// Return immediately without waiting for the logging to complete
-		Ok(tx_id)
+			// Return immediately without waiting for the logging to complete
+			Ok(tx_id)
+		})
+		.await
 	}
 
 	async fn log_transaction(&self, transaction: &Transaction) -> Result<()> {
-		// Since transaction logging is just for auditing, make it non-blocking
-		let tx_clone = transaction.clone();
-		let id_str = tx_clone.id().as_uuid().to_string();
-		let msg = tx_clone.message().to_string();
-		let created_at = tx_clone.created_at().timestamp_millis();
+		legacy_metadata_write(async move {
+			// Since transaction logging is just for auditing, make it non-blocking
+			let tx_clone = transaction.clone();
+			let id_str = tx_clone.id().as_uuid().to_string();
+			let msg = tx_clone.message().to_string();
+			let created_at = tx_clone.created_at().timestamp_millis();
 
-		let conn = Self::begin_concurrent(&self.metadata, self.metadata_path(), Some(self.cache.clone())).await?;
+			let conn = Self::begin_concurrent(&self.metadata, self.metadata_path(), Some(self.cache.clone())).await?;
 
-		// Create a fresh connection for each attempt
+			// Create a fresh connection for each attempt
 
-		// Simple INSERT - duplicates are unlikely with UUID ids
-		let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![id_str.clone(), msg.clone(), created_at]).await;
+			// Simple INSERT - duplicates are unlikely with UUID ids
+			let res = conn.as_ref().execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![id_str.clone(), msg.clone(), created_at]).await;
 
-		match res {
-			Ok(_) => tracing::trace!("Logged transaction id={id_str}"),
-			Err(e) => {
-				tracing::trace!("Transaction logging attempt failed: {e}");
-				Self::rollback_after_error(&conn).await;
-				return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
+			match res {
+				Ok(_) => tracing::trace!("Logged transaction id={id_str}"),
+				Err(e) => {
+					tracing::trace!("Transaction logging attempt failed: {e}");
+					Self::rollback_after_error(&conn).await;
+					return Err(anyhow::anyhow!("Failed to log transaction {id_str}: {e}"));
+				}
 			}
-		}
 
-		Self::commit_concurrent(&conn).await?;
+			Self::commit_concurrent(&conn).await?;
 
-		// Return immediately without waiting for the logging to complete
-		Ok(())
+			// Return immediately without waiting for the logging to complete
+			Ok(())
+		})
+		.await
 	}
 
 	async fn metadata_database_create_transactions_table(conn: &cache::Connection) -> Result<Transaction> {
@@ -826,36 +850,39 @@ impl DatabaseStructure for Database {
 	/// # Errors
 	/// Returns an error if the subject does not exist
 	async fn remove_subject(&self, id: &SubjectId) -> Result<()> {
-		// Retrieve subject from metadata database
-		let subject = self.get_subject(id).await?;
-		let metadata_db_path = self.metadata_path.clone();
+		legacy_metadata_write(async move {
+			// Retrieve subject from metadata database
+			let subject = self.get_subject(id).await?;
+			let metadata_db_path = self.metadata_path.clone();
 
-		// Delete the subject folder and all child files and folders
-		let subject_path = format!("{}/{}/{}", Self::get_data_dir(), self.name, subject.name());
-		tokio::fs::remove_dir_all(&subject_path).await?;
+			// Delete the subject folder and all child files and folders
+			let subject_path = format!("{}/{}/{}", Self::get_data_dir(), self.name, subject.name());
+			tokio::fs::remove_dir_all(&subject_path).await?;
 
-		// Remove subject from database metadata
-		let id_str = id.as_uuid().to_string();
+			// Remove subject from database metadata
+			let id_str = id.as_uuid().to_string();
 
-		let conn = Self::begin_concurrent(&self.metadata, &metadata_db_path, Some(self.cache.clone())).await?;
-		let res = conn.as_ref().execute("DELETE FROM subjects WHERE id = ?", turso::params![id_str.clone()]).await;
-		match res {
-			Ok(_) => tracing::debug!("Deleted subject with ID {}", id.as_uuid()),
-			Err(e) => {
-				Self::rollback_after_error(&conn).await;
-				return Err(anyhow::anyhow!("SQL execution failure 13: `{e}`"));
+			let conn = Self::begin_concurrent(&self.metadata, &metadata_db_path, Some(self.cache.clone())).await?;
+			let res = conn.as_ref().execute("DELETE FROM subjects WHERE id = ?", turso::params![id_str.clone()]).await;
+			match res {
+				Ok(_) => tracing::debug!("Deleted subject with ID {}", id.as_uuid()),
+				Err(e) => {
+					Self::rollback_after_error(&conn).await;
+					return Err(anyhow::anyhow!("SQL execution failure 13: `{e}`"));
+				}
 			}
-		}
-		Self::commit_concurrent(&conn).await?;
+			Self::commit_concurrent(&conn).await?;
 
-		// Log the transaction
-		self.record_transaction(&format!("Removed subject '{}'", subject.name())).await?;
-		drop(subject);
+			// Log the transaction
+			self.record_transaction(&format!("Removed subject '{}'", subject.name())).await?;
+			drop(subject);
 
-		// Checkpoint metadata WAL to ensure deletion is persisted
-		Self::checkpoint_wal_passive(&self.metadata).await?;
+			// Checkpoint metadata WAL to ensure deletion is persisted
+			Self::checkpoint_wal_passive(&self.metadata).await?;
 
-		Ok(())
+			Ok(())
+		})
+		.await
 	}
 
 	/// List all subjects in the database
@@ -940,96 +967,99 @@ impl DatabaseStructure for Database {
 	/// # Errors
 	/// Returns an error if the subject does not exist or aspect creation fails or the aspect already exists.
 	async fn track_aspect(&self, subject_id: &SubjectId, name: &str, resolution: &Resolution, compression_config: Option<crate::CompressionConfig>) -> Result<Aspect> {
-		tracing::debug!("Tracking aspect '{}' for subject {}", name, subject_id.as_uuid());
-		// Check if subject exists
-		tracing::debug!("Retrieving subject with ID: {}", subject_id.as_uuid());
-		let subject = self.get_subject(subject_id).await?;
+		legacy_metadata_write(async move {
+			tracing::debug!("Tracking aspect '{}' for subject {}", name, subject_id.as_uuid());
+			// Check if subject exists
+			tracing::debug!("Retrieving subject with ID: {}", subject_id.as_uuid());
+			let subject = self.get_subject(subject_id).await?;
 
-		// Check if aspect already exists for the subject
-		tracing::debug!("Checking existing aspects for subject '{}'", subject.name());
-		let existing_aspects = self.list_aspects(subject_id).await?;
-		if existing_aspects.iter().any(|a| a.name() == name) {
-			return Err(anyhow::anyhow!("Aspect '{}' already exists for subject '{}'", name, subject.name()));
-		}
+			// Check if aspect already exists for the subject
+			tracing::debug!("Checking existing aspects for subject '{}'", subject.name());
+			let existing_aspects = self.list_aspects(subject_id).await?;
+			if existing_aspects.iter().any(|a| a.name() == name) {
+				return Err(anyhow::anyhow!("Aspect '{}' already exists for subject '{}'", name, subject.name()));
+			}
 
-		// Create a new aspect folder
-		let aspect_path = format!("{}/{}/{}/{}", Self::get_data_dir(), self.name, subject.name(), name);
-		tracing::debug!("Creating aspect folder: {aspect_path}");
-		tokio::fs::create_dir_all(&aspect_path).await?;
+			// Create a new aspect folder
+			let aspect_path = format!("{}/{}/{}/{}", Self::get_data_dir(), self.name, subject.name(), name);
+			tracing::debug!("Creating aspect folder: {aspect_path}");
+			tokio::fs::create_dir_all(&aspect_path).await?;
 
-		// Add aspect to database metadata
-		let aspect_id = AspectId::new();
-		tracing::debug!("Generated aspect ID: {}", aspect_id.as_uuid());
+			// Add aspect to database metadata
+			let aspect_id = AspectId::new();
+			tracing::debug!("Generated aspect ID: {}", aspect_id.as_uuid());
 
-		let table_name = format!("aspect_{}_{}", subject_id.as_uuid().to_string().replace('-', "_"), name.replace([' ', '-'], "_"));
-		tracing::debug!("Inserting aspect into database with table_name: {table_name}");
+			let table_name = format!("aspect_{}_{}", subject_id.as_uuid().to_string().replace('-', "_"), name.replace([' ', '-'], "_"));
+			tracing::debug!("Inserting aspect into database with table_name: {table_name}");
 
-		let aspect_id_str = aspect_id.as_uuid().to_string();
-		let name_str = name.to_string();
-		let subj_id_str = subject_id.as_uuid().to_string();
-		let db_id_str = self.id.as_uuid().to_string();
-		let resolution_json = serde_json::to_string(&resolution)?;
-		let compression_config_json = compression_config.as_ref().map(serde_json::to_string).transpose()?;
-		let created_at = chrono::Utc::now().timestamp_millis();
+			let aspect_id_str = aspect_id.as_uuid().to_string();
+			let name_str = name.to_string();
+			let subj_id_str = subject_id.as_uuid().to_string();
+			let db_id_str = self.id.as_uuid().to_string();
+			let resolution_json = serde_json::to_string(&resolution)?;
+			let compression_config_json = compression_config.as_ref().map(serde_json::to_string).transpose()?;
+			let created_at = chrono::Utc::now().timestamp_millis();
 
-		// The aspect's storage mode is chosen here, at creation, and never
-		// switched afterwards (slice D-S19): a compression config forces
-		// rows mode, and WEFT_LEGACY_DEFAULT_STORAGE=segments makes new
-		// aspects seal-backed. A database created before D-S19 gains the
-		// column first, following the compression_config pattern.
-		self.ensure_storage_mode_column().await;
-		let storage_mode = crate::StorageMode::for_new_aspect(compression_config.is_some(), std::env::var(crate::legacy_seal::LEGACY_DEFAULT_STORAGE_ENV).ok().as_deref());
+			// The aspect's storage mode is chosen here, at creation, and never
+			// switched afterwards (slice D-S19): a compression config forces
+			// rows mode, and WEFT_LEGACY_DEFAULT_STORAGE=segments makes new
+			// aspects seal-backed. A database created before D-S19 gains the
+			// column first, following the compression_config pattern.
+			self.ensure_storage_mode_column().await;
+			let storage_mode = crate::StorageMode::for_new_aspect(compression_config.is_some(), std::env::var(crate::legacy_seal::LEGACY_DEFAULT_STORAGE_ENV).ok().as_deref());
 
-		// Establish a fresh connection for this attempt while holding the mutex
-		let metadata_db_conn = self.metadata();
-		let metadata_db_path = self.metadata_path.clone();
+			// Establish a fresh connection for this attempt while holding the mutex
+			let metadata_db_conn = self.metadata();
+			let metadata_db_path = self.metadata_path.clone();
 
-		// Begin transaction on this connection
-		let conn = Self::begin_concurrent(metadata_db_conn, &metadata_db_path, Some(self.cache.clone())).await?;
-		tracing::trace!("About to execute INSERT INTO aspects (aspect_id={aspect_id_str} table_name={table_name})");
+			// Begin transaction on this connection
+			let conn = Self::begin_concurrent(metadata_db_conn, &metadata_db_path, Some(self.cache.clone())).await?;
+			tracing::trace!("About to execute INSERT INTO aspects (aspect_id={aspect_id_str} table_name={table_name})");
 
-		// Execute the INSERT while holding the mutex
-		conn.as_ref().execute("INSERT INTO aspects (id, name, subject_id, database_id, table_name, resolution, created_at, compression_config, storage_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![aspect_id_str.clone(), name_str.clone(), subj_id_str.clone(), db_id_str.clone(), table_name.clone(), resolution_json.clone(), created_at, compression_config_json, storage_mode.as_str()]).await?;
+			// Execute the INSERT while holding the mutex
+			conn.as_ref().execute("INSERT INTO aspects (id, name, subject_id, database_id, table_name, resolution, created_at, compression_config, storage_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", turso::params![aspect_id_str.clone(), name_str.clone(), subj_id_str.clone(), db_id_str.clone(), table_name.clone(), resolution_json.clone(), created_at, compression_config_json, storage_mode.as_str()]).await?;
 
-		tracing::debug!("Aspect inserted successfully");
+			tracing::debug!("Aspect inserted successfully");
 
-		// At this point the metadata INSERT succeeded and we've dropped the metadata connection.
-		// Release the aspect creation mutex (it was locked above) implicitly by letting the
-		// earlier guard drop (we only held it across the insertion). Now perform the
-		// heavier wireframing without holding the metadata lock.
-		let mut aspect = Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?;
+			// At this point the metadata INSERT succeeded and we've dropped the metadata connection.
+			// Release the aspect creation mutex (it was locked above) implicitly by letting the
+			// earlier guard drop (we only held it across the insertion). Now perform the
+			// heavier wireframing without holding the metadata lock.
+			let mut aspect = Aspect::new(Some(aspect_id), name, subject_id, resolution, &conn).await?;
 
-		// Set compression config on the created aspect
-		aspect.set_compression_config_local(compression_config);
-		aspect.set_storage_mode_local(storage_mode);
+			// Set compression config on the created aspect
+			aspect.set_compression_config_local(compression_config);
+			aspect.set_storage_mode_local(storage_mode);
 
-		Self::commit_concurrent(&conn).await?;
+			Self::commit_concurrent(&conn).await?;
 
-		// Update in-memory cache with the newly created aspect to avoid future metadata reads
-		{
-			let mut dbs = DATABASES.lock().await;
-			if let Some(info) = dbs.get_mut(&self.id) {
-				// Ensure subject exists in cache; use the subject we already loaded above
-				if !info.subjects().contains_key(subject_id) {
-					info.add_subject(subject.clone());
-				}
-				if let Some(subj) = info.subjects_mut().get_mut(subject_id) {
-					subj.add_aspect(aspect.clone());
+			// Update in-memory cache with the newly created aspect to avoid future metadata reads
+			{
+				let mut dbs = DATABASES.lock().await;
+				if let Some(info) = dbs.get_mut(&self.id) {
+					// Ensure subject exists in cache; use the subject we already loaded above
+					if !info.subjects().contains_key(subject_id) {
+						info.add_subject(subject.clone());
+					}
+					if let Some(subj) = info.subjects_mut().get_mut(subject_id) {
+						subj.add_aspect(aspect.clone());
+					}
 				}
 			}
-		}
 
-		tracing::debug!("Aspect created and wireframed successfully: {}", aspect.name());
+			tracing::debug!("Aspect created and wireframed successfully: {}", aspect.name());
 
-		// Log the transaction
-		self.record_transaction(&format!("Tracking new aspect '{}' for subject '{}'", name, subject.name())).await?;
+			// Log the transaction
+			self.record_transaction(&format!("Tracking new aspect '{}' for subject '{}'", name, subject.name())).await?;
 
-		// Checkpoint metadata WAL to ensure aspect is persisted
-		Self::checkpoint_wal_passive(&self.metadata).await?;
+			// Checkpoint metadata WAL to ensure aspect is persisted
+			Self::checkpoint_wal_passive(&self.metadata).await?;
 
-		tracing::debug!("Transaction recorded successfully for aspect creation.");
+			tracing::debug!("Transaction recorded successfully for aspect creation.");
 
-		Ok(aspect)
+			Ok(aspect)
+		})
+		.await
 	}
 
 	async fn get_aspect(&self, id: &AspectId) -> Result<Aspect> {
@@ -1185,19 +1215,22 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn update_aspect_timestamps(&self, aspect_id: &AspectId, min_new: DateTime<Utc>, max_new: DateTime<Utc>) -> Result<()> {
-		let metadata_db_path = self.metadata_path.clone();
+		legacy_metadata_write(async move {
+			let metadata_db_path = self.metadata_path.clone();
 
-		let conn = Self::begin_concurrent(&self.metadata, &metadata_db_path, Some(self.cache.clone())).await?;
-		let res = conn.as_ref().execute("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?", turso::params![min_new.to_rfc3339(), max_new.to_rfc3339(), aspect_id.as_uuid().to_string()]).await;
-		match res {
-			Ok(_) => tracing::debug!("Updated aspect timestamps for aspect {aspect_id}"),
-			Err(e) => {
-				let _ = Self::rollback_concurrent(&conn).await;
-				return Err(anyhow::anyhow!("SQL execution failure 20: `{e}`"));
+			let conn = Self::begin_concurrent(&self.metadata, &metadata_db_path, Some(self.cache.clone())).await?;
+			let res = conn.as_ref().execute("UPDATE aspects SET earliest_measurement = ?, latest_measurement = ? WHERE id = ?", turso::params![min_new.to_rfc3339(), max_new.to_rfc3339(), aspect_id.as_uuid().to_string()]).await;
+			match res {
+				Ok(_) => tracing::debug!("Updated aspect timestamps for aspect {aspect_id}"),
+				Err(e) => {
+					let _ = Self::rollback_concurrent(&conn).await;
+					return Err(anyhow::anyhow!("SQL execution failure 20: `{e}`"));
+				}
 			}
-		}
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn get_measurement_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {

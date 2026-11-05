@@ -7,172 +7,199 @@ use crate::{
 	database::traits::{
 		aspect_structure::AspectStructure, connection::Connection as ConnectionTrait, database_structure::DatabaseStructure, pipeline::{PipelineInputs, PipelineOutputs}
 	}, types::{
-		aspect::Aspect, pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState}
+		aspect::Aspect, database::legacy_metadata_write, pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState}
 	}, AspectId, Database, Error
 };
 
 #[async_trait::async_trait]
 impl PipelineInputs for Database {
 	async fn save_pipeline_config(&self, aspect_id: &AspectId, config: &PipelineConfig) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		let now = Utc::now().timestamp_millis();
-		let spline_str = serde_json::to_string(&config.spline_method).map_err(|e| Error::DatabaseError(format!("Failed to serialize spline method: {e}")))?;
-		let batch_size_i64 = i64::try_from(config.batch_size).map_err(|e| Error::DatabaseError(format!("Batch size too large: {e}")))?;
+			let now = Utc::now().timestamp_millis();
+			let spline_str = serde_json::to_string(&config.spline_method).map_err(|e| Error::DatabaseError(format!("Failed to serialize spline method: {e}")))?;
+			let batch_size_i64 = i64::try_from(config.batch_size).map_err(|e| Error::DatabaseError(format!("Batch size too large: {e}")))?;
 
-		// Upsert: try update first, then insert if no rows affected
-		let update_sql = r"
+			// Upsert: try update first, then insert if no rows affected
+			let update_sql = r"
 			UPDATE pipeline_config SET spline_method = ?, batch_size = ?, updated_at = ? WHERE id = 1
 		";
-		let rows = conn.as_ref().execute(update_sql, turso::params![spline_str.clone(), batch_size_i64, now]).await.map_err(|e| Error::DatabaseError(format!("Failed to update pipeline config: {e}")))?;
+			let rows = conn.as_ref().execute(update_sql, turso::params![spline_str.clone(), batch_size_i64, now]).await.map_err(|e| Error::DatabaseError(format!("Failed to update pipeline config: {e}")))?;
 
-		if rows == 0 {
-			let insert_sql = r"
+			if rows == 0 {
+				let insert_sql = r"
 				INSERT INTO pipeline_config (id, spline_method, batch_size, created_at, updated_at) VALUES (1, ?, ?, ?, ?)
 			";
-			conn.as_ref().execute(insert_sql, turso::params![spline_str, batch_size_i64, now, now]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert pipeline config: {e}")))?;
-		}
+				conn.as_ref().execute(insert_sql, turso::params![spline_str, batch_size_i64, now, now]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert pipeline config: {e}")))?;
+			}
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn save_pipeline_state(&self, aspect_id: &AspectId, state: &PipelineState) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		let last_run = state.last_run.map(|dt| dt.timestamp_millis());
-		let run_count_i64 = i64::try_from(state.run_count).map_err(|e| Error::DatabaseError(format!("Run count too large: {e}")))?;
-		let version_i64 = i64::from(state.version);
+			let last_run = state.last_run.map(|dt| dt.timestamp_millis());
+			let run_count_i64 = i64::try_from(state.run_count).map_err(|e| Error::DatabaseError(format!("Run count too large: {e}")))?;
+			let version_i64 = i64::from(state.version);
 
-		// Upsert: try update first, then insert if no rows affected
-		let update_sql = r"
+			// Upsert: try update first, then insert if no rows affected
+			let update_sql = r"
 			UPDATE pipeline_state SET last_run = ?, run_count = ?, version = ? WHERE id = 1
 		";
-		let rows = conn.as_ref().execute(update_sql, turso::params![last_run, run_count_i64, version_i64]).await.map_err(|e| Error::DatabaseError(format!("Failed to update pipeline state: {e}")))?;
+			let rows = conn.as_ref().execute(update_sql, turso::params![last_run, run_count_i64, version_i64]).await.map_err(|e| Error::DatabaseError(format!("Failed to update pipeline state: {e}")))?;
 
-		if rows == 0 {
-			let insert_sql = r"
+			if rows == 0 {
+				let insert_sql = r"
 				INSERT INTO pipeline_state (id, last_run, run_count, version) VALUES (1, ?, ?, ?)
 			";
-			conn.as_ref().execute(insert_sql, turso::params![last_run, run_count_i64, version_i64]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert pipeline state: {e}")))?;
-		}
+				conn.as_ref().execute(insert_sql, turso::params![last_run, run_count_i64, version_i64]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert pipeline state: {e}")))?;
+			}
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn delete_pipeline(&self, aspect_id: &AspectId) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		// Delete all pipeline data
-		conn.as_ref().execute("DELETE FROM pipeline_config WHERE id = 1", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline config: {e}")))?;
-		conn.as_ref().execute("DELETE FROM pipeline_state WHERE id = 1", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline state: {e}")))?;
-		conn.as_ref().execute("DELETE FROM pipeline_dictionaries", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline dictionaries: {e}")))?;
-		conn.as_ref().execute("DELETE FROM pipeline_detectors", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline detectors: {e}")))?;
+			// Delete all pipeline data
+			conn.as_ref().execute("DELETE FROM pipeline_config WHERE id = 1", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline config: {e}")))?;
+			conn.as_ref().execute("DELETE FROM pipeline_state WHERE id = 1", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline state: {e}")))?;
+			conn.as_ref().execute("DELETE FROM pipeline_dictionaries", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline dictionaries: {e}")))?;
+			conn.as_ref().execute("DELETE FROM pipeline_detectors", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete pipeline detectors: {e}")))?;
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn add_pipeline_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		let now = Utc::now().timestamp_millis();
+			let now = Utc::now().timestamp_millis();
 
-		// Check if already exists
-		let check_sql = "SELECT 1 FROM pipeline_dictionaries WHERE dictionary_name = ? LIMIT 1";
-		let mut rows = conn.as_ref().query(check_sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to check dictionary: {e}")))?;
+			// Check if already exists
+			let check_sql = "SELECT 1 FROM pipeline_dictionaries WHERE dictionary_name = ? LIMIT 1";
+			let mut rows = conn.as_ref().query(check_sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to check dictionary: {e}")))?;
 
-		if rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to read row: {e}")))?.is_none() {
-			let insert_sql = "INSERT INTO pipeline_dictionaries (dictionary_name, added_at) VALUES (?, ?)";
-			conn.as_ref().execute(insert_sql, turso::params![dictionary_name, now]).await.map_err(|e| Error::DatabaseError(format!("Failed to add dictionary: {e}")))?;
-		}
+			if rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to read row: {e}")))?.is_none() {
+				let insert_sql = "INSERT INTO pipeline_dictionaries (dictionary_name, added_at) VALUES (?, ?)";
+				conn.as_ref().execute(insert_sql, turso::params![dictionary_name, now]).await.map_err(|e| Error::DatabaseError(format!("Failed to add dictionary: {e}")))?;
+			}
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn remove_pipeline_dictionary(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		let sql = "DELETE FROM pipeline_dictionaries WHERE dictionary_name = ?";
-		conn.as_ref().execute(sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove dictionary: {e}")))?;
+			let sql = "DELETE FROM pipeline_dictionaries WHERE dictionary_name = ?";
+			conn.as_ref().execute(sql, turso::params![dictionary_name]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove dictionary: {e}")))?;
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn clear_pipeline_dictionaries(&self, aspect_id: &AspectId) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		conn.as_ref().execute("DELETE FROM pipeline_dictionaries", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear dictionaries: {e}")))?;
+			conn.as_ref().execute("DELETE FROM pipeline_dictionaries", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear dictionaries: {e}")))?;
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn add_pipeline_detector(&self, aspect_id: &AspectId, metadata: &DetectorMetadata) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		let now = Utc::now().timestamp_millis();
-		let detector_type_str = serde_json::to_string(metadata.detector_type()).map_err(|e| Error::DatabaseError(format!("Failed to serialize detector type: {e}")))?;
+			let now = Utc::now().timestamp_millis();
+			let detector_type_str = serde_json::to_string(metadata.detector_type()).map_err(|e| Error::DatabaseError(format!("Failed to serialize detector type: {e}")))?;
 
-		// Delete existing then insert (simpler than upsert for text primary key in MVCC)
-		conn.as_ref().execute("DELETE FROM pipeline_detectors WHERE detector_id = ?", turso::params![metadata.detector_id()]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete detector: {e}")))?;
+			// Delete existing then insert (simpler than upsert for text primary key in MVCC)
+			conn.as_ref().execute("DELETE FROM pipeline_detectors WHERE detector_id = ?", turso::params![metadata.detector_id()]).await.map_err(|e| Error::DatabaseError(format!("Failed to delete detector: {e}")))?;
 
-		let insert_sql = r"
+			let insert_sql = r"
 			INSERT INTO pipeline_detectors (detector_id, detector_name, description, detector_type, config_json, added_at)
 			VALUES (?, ?, ?, ?, ?, ?)
 		";
-		conn.as_ref().execute(insert_sql, turso::params![metadata.detector_id(), metadata.name(), metadata.description(), detector_type_str, metadata.config_json(), now]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert detector: {e}")))?;
+			conn.as_ref().execute(insert_sql, turso::params![metadata.detector_id(), metadata.name(), metadata.description(), detector_type_str, metadata.config_json(), now]).await.map_err(|e| Error::DatabaseError(format!("Failed to insert detector: {e}")))?;
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn remove_pipeline_detector(&self, aspect_id: &AspectId, detector_id: &str) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		conn.as_ref().execute("DELETE FROM pipeline_detectors WHERE detector_id = ?", turso::params![detector_id]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove detector: {e}")))?;
+			conn.as_ref().execute("DELETE FROM pipeline_detectors WHERE detector_id = ?", turso::params![detector_id]).await.map_err(|e| Error::DatabaseError(format!("Failed to remove detector: {e}")))?;
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 
 	async fn clear_pipeline_detectors(&self, aspect_id: &AspectId) -> Result<()> {
-		let db = self.get_pipeline_db(aspect_id).await?;
-		let db_path = self.get_pipeline_db_path(aspect_id).await?;
-		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-		drop(db);
+		legacy_metadata_write(async move {
+			let db = self.get_pipeline_db(aspect_id).await?;
+			let db_path = self.get_pipeline_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
 
-		conn.as_ref().execute("DELETE FROM pipeline_detectors", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear detectors: {e}")))?;
+			conn.as_ref().execute("DELETE FROM pipeline_detectors", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to clear detectors: {e}")))?;
 
-		Self::commit_concurrent(&conn).await?;
-		Ok(())
+			Self::commit_concurrent(&conn).await?;
+			Ok(())
+		})
+		.await
 	}
 }
 
