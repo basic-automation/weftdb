@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use weft_server::{
-	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ServeLimits, TlsConfig, AUTH_KEYS_MODE, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_CONNECTIONS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, QUERY_MAX_INFLIGHT_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
+	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ReadLimits, ServeLimits, TlsConfig, AUTH_KEYS_MODE, DEFAULT_PAGE_ROWS, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_AT_MULTI_INSTANTS_ENV, MAX_CONNECTIONS_ENV, MAX_DOWNSAMPLE_BUCKETS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, MAX_PAGE_ROWS_ENV, MAX_READ_ROWS_ENV, QUERY_MAX_INFLIGHT_ENV, READ_TIMEOUT_SECS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
 };
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
@@ -80,6 +80,24 @@ pub fn admission_config() -> anyhow::Result<AdmissionConfig> {
 	let config = AdmissionConfig::from_env().map_err(anyhow::Error::msg)?;
 	println!("admission limits: at most {} query-class requests in flight (set {QUERY_MAX_INFLIGHT_ENV} to change); probes are never shed, maintenance is admitted one at a time", config.max_query_inflight());
 	Ok(config)
+}
+
+/// Read the read-path caps ([`ReadLimits`], ROB-12) from the environment,
+/// once, and log the caps in force: the largest page, the largest result,
+/// the largest downsample grid, the largest multi-instant list, and the
+/// deadline one read gets. Every read refuses what cannot fit them — with
+/// `422 result_too_large` for a page or a result over a cap, and `504
+/// query_timeout` when it runs past the deadline — rather than attempting
+/// an answer no client could hold.
+///
+/// # Errors
+///
+/// A value that is not a positive integer (a malformed operator config
+/// should fail loudly at start rather than silently default).
+pub(crate) fn read_limits() -> anyhow::Result<ReadLimits> {
+	let limits = ReadLimits::from_env().map_err(anyhow::Error::msg)?;
+	println!("read limits: a {DEFAULT_PAGE_ROWS}-row page by default and at most {} to a page (set {MAX_PAGE_ROWS_ENV}), at most {} rows to a read (set {MAX_READ_ROWS_ENV}), at most {} buckets to a downsample (set {MAX_DOWNSAMPLE_BUCKETS_ENV}), at most {} instants to a multi lookup (set {MAX_AT_MULTI_INSTANTS_ENV}), {} s to a read (set {READ_TIMEOUT_SECS_ENV})", limits.page_max(), limits.read_rows_max(), limits.downsample_buckets_max(), limits.at_multi_instants_max(), limits.read_timeout_secs());
+	Ok(limits)
 }
 
 /// Resolve the listener's transport for `addr` (SEC-5): TLS when a

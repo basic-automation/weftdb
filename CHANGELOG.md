@@ -83,6 +83,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   scope the store records, and the whole exit-status table — from process state alone, so it
   answers while a store is being refused. It takes a key where keys are mounted: `/health` and
   `/ready` stay the anonymous surface.
+- **Read ceilings (ROB-12, decision 12).** `weft-server` refuses a read whose
+  result shape is too big instead of attempting it: a page over
+  `WEFT_MAX_PAGE_ROWS` (100,000 rows), a window over `WEFT_MAX_READ_ROWS`
+  (5,000,000 rows), a downsample grid over `WEFT_MAX_DOWNSAMPLE_BUCKETS`
+  (1,000,000 buckets) and an `at-multi` batch over `WEFT_MAX_AT_MULTI_INSTANTS`
+  (10,000 instants) are each a `422 result_too_large` carrying the limit it hit,
+  and a read still running when `WEFT_READ_TIMEOUT_SECS` (30) expires is a
+  `504 query_timeout`. The page ceiling is enforced before the store is opened;
+  the row ceiling bounds the window rather than the page, because the store
+  materializes the rows a read names; the bucket ceiling is counted from the
+  request's own bounds when it names both and from the grid produced otherwise.
+  `/ready` and `/health` are never bounded by the read deadline.
 
 - **Audit log (SEC-9).** `weft-server` now keeps an fsynced append-only JSONL audit log
   (decision 8): every admin or mutating operation — ingest, declare, maintenance, backup —
@@ -228,6 +240,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   65,536-row segments an hour reads in 0.25 ms (0.18 ms before the squash, 0.50 ms with
   single-block output) and the year window in 11.3 ms (13.8 ms before). The squashed store is
   1.357 B/pt rather than 1.341, still below the 1.414 of the 1,024-row seals it replaced.
+- A stored read that names no page size is a paged read (ROB-12). It returns this
+  server's default page of 10,000 rows — or `WEFT_MAX_PAGE_ROWS`, when an operator
+  set it lower — plus `next_cursor`, instead of every row in the window. A client
+  that wanted the whole window already had to page through it; a client that named
+  nothing asked for unbounded work. `limit` in the response now reports the page
+  actually served.
+
 - `weft-server` builds its tokio runtime explicitly (ROB-11, Admission II's runtime-builder
   side): workers are named `weft-worker`, the new `WEFT_WORKER_THREADS` setting sizes the
   pool (unset keeps one worker per available core), and the runtime is shut down with plan

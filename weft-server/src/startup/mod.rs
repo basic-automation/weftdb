@@ -96,6 +96,20 @@
 //! another positive limit. It is read once at startup, and a value that is not a
 //! positive integer stops the server from starting.
 //!
+//! ## Read caps
+//!
+//! Every read answers in full, so it is bounded before it starts
+//! (`weft_server::ReadLimits`, ROB-12): a page defaults to 10,000 rows and
+//! `WEFT_MAX_PAGE_ROWS` sets the largest one a client may ask for (100,000),
+//! `WEFT_MAX_READ_ROWS` the most rows one read may return (5,000,000),
+//! `WEFT_MAX_DOWNSAMPLE_BUCKETS` the most buckets one downsample may return
+//! (1,000,000), `WEFT_MAX_AT_MULTI_INSTANTS` the most instants one
+//! `POST /api/v1/at` may name (10,000), and `WEFT_READ_TIMEOUT_SECS` how long
+//! one read may take (30 s). A page or a result over a cap is refused with
+//! `422 result_too_large` and a read past the deadline with `504
+//! query_timeout`; a value that is not a positive integer stops the server
+//! from starting.
+//!
 //! ## GPU calibration
 //!
 //! Once the listener is bound, the server calibrates the interpolation engine's backend
@@ -186,6 +200,9 @@ pub async fn run() -> anyhow::Result<()> {
 	// wiring's, so the gate the registry builds carries the operator's
 	// query-class cap rather than the default.
 	let admission = config::admission_config().unwrap_or_else(|error| exit_config(&error));
+	// ROB-12: the read caps, read once beside the other limits, so every
+	// read handler refuses what it cannot answer instead of attempting it.
+	let read_limits = config::read_limits().unwrap_or_else(|error| exit_config(&error));
 	// SEC-5: resolve the transport (TLS when configured) and run the C8
 	// plaintext gate against the address about to be bound, before the
 	// store opens — a refused exposure starts nothing at all.
@@ -203,7 +220,7 @@ pub async fn run() -> anyhow::Result<()> {
 		println!("{}", weft_server::gpu::apply_config(gpu_config));
 	}
 	let state = match state::build().await {
-		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth).with_ingest_config(ingest).with_admission_config(admission),
+		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth).with_ingest_config(ingest).with_admission_config(admission).with_read_limits(read_limits),
 		Err(error) => match weft_server::store_open::exit_code_for_store_error(&error) {
 			// A store that needs operator action (65) or a locked root (75):
 			// the plan C7 class, not a generic failure.
