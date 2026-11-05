@@ -152,8 +152,40 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `422 result_too_large` carrying the cap. The single point lookup names one instant
   and needs no cap. The HTTP read ceilings themselves are ROB-12's.
 
+- **Stored-range interpolation route** (Phase 5): `GET /api/v1/storage/{aspect}/interpolate`
+  and its `.csv`, `.arrow` and `.parquet` forms interpolate a stored window server side. The grid
+  is capped by `WEFT_MAX_INTERPOLATE_POINTS` and the knots by `MAX_KNOTS` (`422
+  result_too_large`); the route takes the `read` scope and query admission like the other
+  storage reads. JSON and CSV stream their body in chunks as the points are computed; Arrow and
+  Parquet are buffered. This ships before 1.0 by an owner amendment to decision 18 (DECISIONS.md).
+- **GPU adapter selection and multi-device mode** (experimental, Phase 5.7): `WEFT_GPU_ADAPTER`
+  picks the one adapter splimes opens (index, `api:<api>` or a name match) and
+  `WEFT_GPU_DEVICES` (`one`, `all` or a list) spreads interpolation over several. `/metrics`
+  reports each open device (`weft_gpu_device_info`, `weft_gpu_device_calls_total`,
+  `weft_gpu_device_chunks_total`, `weft_gpu_device_in_flight`, `weft_gpu_device_lost`,
+  `weft_gpu_device_pool_idle_bytes`). Unset keeps the single-device default; several devices
+  measured slower than one in splimes, so it is opt-in.
+- **Memory-mapped range reads** (experimental, Phase 5): with the `mmap-reads` cargo feature,
+  `WEFT_SEGMENT_MMAP_READS=on` (`SegmentStoreOptions::mmap_reads` in the library) maps sealed
+  `.weftseg` frames instead of copying each into a heap buffer. A frame truncated by another
+  process while mapped can stop the server with `SIGBUS`, which is why it is off by default.
+- **Phase 5 benchmarks**: `weft-bench --gpu-economics` (report schema v29), a device-memory
+  soak in `weft-bench --gpu-memory` (`gpu_pool.device_memory`, schema v30), the end-to-end
+  interpolation benchmark `weft-e2e-interp` (schema v31) and the GPU conformance matrix
+  `weft-gpu-conformance` with tolerances published in `docs/gpu-conformance.md`. Their
+  results are not recorded yet.
+
 ### Changed
 
+- **splimes 1.3** (Phase 5): WeftDB depends on `splimes = "1.3"` (was 1.0; `pollster` moves to
+  1.0.1 with it). Stored interpolation now feeds splimes epoch ticks (`run_epoch`,
+  `stream_epoch`) instead of building a `DateTime` per knot.
+- **`POST /api/v1/interpolate` range outputs compute in `f64`** (splimes `run_f64`) instead of
+  a `BigDecimal` per output point; `/interpolate/point` is unchanged. Results are bit-identical
+  below 2^53; above it the kernel's value replaces a narrowing that could be 1 ulp off.
+- **The compute endpoints widen JSON `f64` through the shortest round-trip decimal** instead of
+  `BigDecimal::from_f64`, so an input of `99.92` is computed as `99.92`, not its binary
+  expansion. Non-finite inputs are still rejected.
 - **Breaking (HTTP): the storage ILP ingest requires `measurement=` (TAG-11).**
   `POST /api/v1/storage/{aspect}/ilp` now seals only the records of the named measurement,
   and a request without the parameter is `400 bad_request`. This fixes a silent tag drop:
