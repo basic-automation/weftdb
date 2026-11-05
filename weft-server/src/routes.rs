@@ -73,7 +73,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, grafana, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, version::version, HealthResponse, ReadyResponse
+	admission::{Admission, AdmissionConfig}, backup_routes, bench_runs, declare, downsample, error::{ApiError, Code}, grafana, ingest::{self, IngestConfig}, interpolate, maintain, metrics, settings::Tier, state::AppState, storage, stored_interpolate, version::version, HealthResponse, ReadyResponse
 };
 
 /// What a request to a route must hold, from the frozen table above. See the
@@ -877,6 +877,10 @@ fn register_storage_read_routes(routes: &mut Routes) {
 	routes.route(Method::POST, "/api/v1/storage/{aspect}/downsample.arrow", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_downsample_arrow_post"), post(storage::storage_downsample_arrow));
 	routes.route(Method::GET, "/api/v1/storage/{aspect}/downsample.parquet", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_downsample_parquet_get"), get(storage::storage_downsample_parquet));
 	routes.route(Method::POST, "/api/v1/storage/{aspect}/downsample.parquet", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_downsample_parquet_post"), post(storage::storage_downsample_parquet));
+	routes.route(Method::GET, "/api/v1/storage/{aspect}/interpolate", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_interpolate_get"), get(stored_interpolate::storage_interpolate));
+	routes.route(Method::GET, "/api/v1/storage/{aspect}/interpolate.csv", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_interpolate_csv_get"), get(stored_interpolate::storage_interpolate_csv));
+	routes.route(Method::GET, "/api/v1/storage/{aspect}/interpolate.arrow", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_interpolate_arrow_get"), get(stored_interpolate::storage_interpolate_arrow));
+	routes.route(Method::GET, "/api/v1/storage/{aspect}/interpolate.parquet", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_interpolate_parquet_get"), get(stored_interpolate::storage_interpolate_parquet));
 	routes.route(Method::GET, "/api/v1/storage/{aspect}/at", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_point_at"), get(storage::storage_point));
 	routes.route(Method::GET, "/api/v1/storage/{aspect}/at-multi", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_points_at_multi"), get(storage::storage_points));
 	routes.route(Method::GET, "/api/v1/storage/{aspect}/value-range", RouteSpec::stable(Scope::Read, Audit::None, false, AdmissionClass::Query, "storage_value_range"), get(storage::storage_value_range));
@@ -966,18 +970,19 @@ mod tests {
 
 	/// Every registered route is one the pre-SEC-3 router served: the
 	/// registry must not lose (or invent) a route in the move. The count
-	/// is 66 method routes over 60 path templates (63/57 before Phase 2 added
+	/// is 70 method routes over 64 path templates (66/60 before P5-http added
+	/// the four stored-interpolation reads, 63/57 before Phase 2 added
 	/// the three Grafana datasource routes, 62/56 before FRE-12b added
 	/// `GET /api/v1/version`, 60/54 before Phase 3 added the two bench-run
 	/// routes, 55/49 before D-S12 added the fsck and quarantine routes).
 	#[test]
 	fn registry_covers_the_whole_surface() {
 		let table = build_registry().table();
-		assert_eq!(table.entries().len(), 66, "the registry must carry every route the old lib.rs chain served");
+		assert_eq!(table.entries().len(), 70, "the registry must carry every route the old lib.rs chain served");
 		let mut operations: Vec<&str> = table.entries().iter().map(|entry| entry.spec.operation_id).collect();
 		operations.sort_unstable();
 		operations.dedup();
-		assert_eq!(operations.len(), 66, "operation ids are unique");
+		assert_eq!(operations.len(), 70, "operation ids are unique");
 		// Every scope in the frozen table is used by at least one route:
 		// an unused scope in a frozen table is a scope nobody can hold.
 		for scope in Scope::ALL {
@@ -1004,7 +1009,7 @@ mod tests {
 		let document = table.openapi_document();
 		assert_eq!(document["openapi"], "3.1.0");
 		let paths = document["paths"].as_object().unwrap();
-		assert_eq!(paths.len(), 60, "one path item per template");
+		assert_eq!(paths.len(), 64, "one path item per template");
 		let health = &paths["/health"]["get"];
 		assert_eq!(health["operationId"], "get_health");
 		assert_eq!(health["x-weft-scope"], "probe");

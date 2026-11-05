@@ -148,7 +148,7 @@ impl InterpolateConfig {
 	/// The interpolator every endpoint here runs: `spline` onto a `resolution` grid on
 	/// the default `Backend::Auto`, refusing grids above
 	/// [`max_output_points`](Self::max_output_points).
-	const fn interpolator(self, spline: Spline, resolution: Resolution) -> Interpolator {
+	pub(crate) const fn interpolator(self, spline: Spline, resolution: Resolution) -> Interpolator {
 		Interpolator::new(spline, resolution).max_points(self.max_output_points())
 	}
 }
@@ -283,7 +283,7 @@ pub struct InterpolateResponse {
 /// else is a `500`. `config` supplies the cap that an oversized grid's message names, and the
 /// `limit` the envelope carries with it so a client can size its next request without parsing
 /// the sentence.
-fn engine_error(err: &splimes::Error, config: InterpolateConfig) -> ApiError {
+pub(crate) fn engine_error(err: &splimes::Error, config: InterpolateConfig) -> ApiError {
 	use splimes::Error as E;
 	match err {
 		E::OutputTooLarge { points } => ApiError::new(Code::ResultTooLarge, format!("the output grid would have {points} points, more than the {} one request may produce; narrow `start`..`end` or use a coarser `resolution`", config.max_output_points())).with_limit(config.max_output_points() as u64),
@@ -431,9 +431,15 @@ fn wire_f64(value: f64) -> f64 {
 /// the raw/interpolated/extrapolated provenance token. None of the three columns
 /// can contain a comma, so no field escaping is required.
 fn interpolate_response_to_csv(response: &InterpolateResponse) -> Response {
+	points_to_csv(&response.points)
+}
+
+/// The `timestamp,value,kind` CSV document for a reconstructed series, shared by the compute
+/// endpoints and the stored-range interpolation (`stored_interpolate`).
+pub(crate) fn points_to_csv(points: &[OutputPoint]) -> Response {
 	use std::fmt::Write as _;
 	let mut out = String::from("timestamp,value,kind\n");
-	for point in &response.points {
+	for point in points {
 		let _ = writeln!(out, "{},{},{}", point.timestamp.to_rfc3339(), point.value, point.kind.as_str());
 	}
 	([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response()
@@ -452,11 +458,11 @@ const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 ///
 /// Kept private and primitive-typed so no `arrow-*` type appears in this module's
 /// signatures — all Arrow knowledge stays inside `weft-arrow`.
-fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<&'static str>) {
-	let mut timestamps = Vec::with_capacity(response.points.len());
-	let mut values = Vec::with_capacity(response.points.len());
-	let mut kinds = Vec::with_capacity(response.points.len());
-	for point in &response.points {
+fn points_columns(points: &[OutputPoint]) -> (Vec<i64>, Vec<f64>, Vec<&'static str>) {
+	let mut timestamps = Vec::with_capacity(points.len());
+	let mut values = Vec::with_capacity(points.len());
+	let mut kinds = Vec::with_capacity(points.len());
+	for point in points {
 		timestamps.push(point.timestamp.timestamp_nanos_opt().unwrap_or_default());
 		values.push(point.value);
 		kinds.push(point.kind.as_str());
@@ -475,7 +481,17 @@ fn response_columns(response: &InterpolateResponse) -> (Vec<i64>, Vec<f64>, Vec<
 ///
 /// Returns `internal` (`500`) if the Arrow encoding fails.
 fn interpolate_response_to_arrow(response: &InterpolateResponse) -> Result<Response, ApiError> {
-	let (timestamps, values, kinds) = response_columns(response);
+	points_to_arrow(&response.points)
+}
+
+/// The Arrow IPC stream for a reconstructed series (see [`interpolate_response_to_arrow`]),
+/// shared with the stored-range interpolation.
+///
+/// # Errors
+///
+/// Returns `internal` (`500`) if the Arrow encoding fails.
+pub(crate) fn points_to_arrow(points: &[OutputPoint]) -> Result<Response, ApiError> {
+	let (timestamps, values, kinds) = points_columns(points);
 	let bytes = weft_arrow::reconstructed_series_to_ipc_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
 	Ok(([(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)], bytes).into_response())
 }
@@ -488,7 +504,17 @@ fn interpolate_response_to_arrow(response: &InterpolateResponse) -> Result<Respo
 ///
 /// Returns `internal` (`500`) if the Parquet encoding fails.
 fn interpolate_response_to_parquet(response: &InterpolateResponse) -> Result<Response, ApiError> {
-	let (timestamps, values, kinds) = response_columns(response);
+	points_to_parquet(&response.points)
+}
+
+/// The Parquet file for a reconstructed series (see [`interpolate_response_to_parquet`]),
+/// shared with the stored-range interpolation.
+///
+/// # Errors
+///
+/// Returns `internal` (`500`) if the Parquet encoding fails.
+pub(crate) fn points_to_parquet(points: &[OutputPoint]) -> Result<Response, ApiError> {
+	let (timestamps, values, kinds) = points_columns(points);
 	let bytes = weft_arrow::reconstructed_series_to_parquet_bytes(weft_physical_type::TimeUnit::Nanos, &timestamps, &values, &kinds).map_err(|err| ApiError::internal(err.to_string()))?;
 	Ok(([(header::CONTENT_TYPE, PARQUET_CONTENT_TYPE)], bytes).into_response())
 }
@@ -797,7 +823,7 @@ pub(crate) fn parse_precision_token(token: Option<&str>) -> Result<TimestampPrec
 }
 
 /// Map an optional spline token to [`Spline`] (default cubic).
-fn parse_spline_token(token: Option<&str>) -> Result<Spline, ApiError> {
+pub(crate) fn parse_spline_token(token: Option<&str>) -> Result<Spline, ApiError> {
 	match token.map(str::to_ascii_lowercase).as_deref() {
 		Some("linear") => Ok(Spline::Linear),
 		Some("quadratic") => Ok(Spline::Quadratic),

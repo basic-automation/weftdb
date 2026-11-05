@@ -23,6 +23,11 @@
 //! window: refusing before decoding needs the index's per-segment row counts, which are private
 //! to `segment_store.rs` (the store lane's file), so that tightening belongs to that lane.
 //!
+//! The two refusals a caller may want to answer differently from a failure (the cap, and a
+//! window with no stored sample) are a typed [`StoredWindowError`] inside the `anyhow` chain,
+//! so a caller can `downcast_ref` them; the HTTP route answers the cap with
+//! `422 result_too_large`.
+//!
 //! [`SegmentStore::interpolate_range_f64`] is the same reconstruction with `f64` values out.
 //! splimes computes every method in `f64` and its `BigDecimal` result is the shortest decimal
 //! that round-trips each computed `f64`, so for interpolated and extrapolated points the
@@ -68,6 +73,47 @@ struct StoredWindow {
 /// `margin`, or interpolate in pieces.
 pub const MAX_KNOTS: usize = 4 << 20;
 
+/// A stored window that cannot be reconstructed as asked: carried inside the `anyhow` error
+/// the reconstruction calls return, for a caller that answers these apart from a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoredWindowError {
+	/// `[lo, hi]` (the window widened by the margin) holds more stored rows than one
+	/// reconstruction reads.
+	TooManyRows {
+		/// The aspect read.
+		aspect: String,
+		/// The read window's first instant (`start − margin`, saturating).
+		lo: i64,
+		/// The read window's last instant (`end + margin`, saturating).
+		hi: i64,
+		/// The stored rows (null rows included) in `[lo, hi]`.
+		rows: usize,
+		/// The cap, [`MAX_KNOTS`] outside tests.
+		limit: usize,
+	},
+	/// `[lo, hi]` holds no stored sample with a value, so there is nothing to interpolate.
+	NoSample {
+		/// The aspect read.
+		aspect: String,
+		/// The read window's first instant.
+		lo: i64,
+		/// The read window's last instant.
+		hi: i64,
+	},
+}
+
+impl std::fmt::Display for StoredWindowError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::TooManyRows { aspect, lo, hi, rows, limit } => write!(f, "interpolate_range: [{lo}, {hi}] holds {rows} stored rows of aspect {aspect:?}, more than the {limit} one reconstruction reads; narrow the window or the margin"),
+			Self::NoSample { aspect, lo, hi } => write!(f, "aspect {aspect:?} has no stored sample in [{lo}, {hi}]"),
+		}
+	}
+}
+
+impl std::error::Error for StoredWindowError {}
+
 impl SegmentStore {
 	/// Validate a reconstruction request and read its rows.
 	async fn stored_window(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, margin: i64) -> Result<StoredWindow> {
@@ -83,8 +129,12 @@ impl SegmentStore {
 		let (from, to) = (instant(start, unit).with_context(|| format!("start {start} is outside the representable range"))?, instant(end, unit).with_context(|| format!("end {end} is outside the representable range"))?);
 		let (lo, hi) = (start.saturating_sub(margin), end.saturating_add(margin));
 		let (timestamps, values) = self.read_time_range_of(aspect, series, lo, hi).await?;
-		anyhow::ensure!(timestamps.len() <= max_rows, "interpolate_range: [{lo}, {hi}] holds {} stored rows of aspect {aspect:?}, more than the {max_rows} one reconstruction reads; narrow the window or the margin", timestamps.len());
-		anyhow::ensure!(values.iter().any(Option::is_some), "aspect {aspect:?} has no stored sample in [{lo}, {hi}]");
+		if timestamps.len() > max_rows {
+			return Err(StoredWindowError::TooManyRows { aspect: aspect.to_string(), lo, hi, rows: timestamps.len(), limit: max_rows }.into());
+		}
+		if !values.iter().any(Option::is_some) {
+			return Err(StoredWindowError::NoSample { aspect: aspect.to_string(), lo, hi }.into());
+		}
 		Ok(StoredWindow { from, to, unit, timestamps, values })
 	}
 
@@ -238,6 +288,9 @@ mod tests {
 		let padded = store.stored_window_capped("line", crate::SeriesId::UNTAGGED, 95, 105, 50, 5).await.err().expect("the margin counts toward the cap").to_string();
 		assert!(padded.contains("holds 11 stored rows"), "{padded}");
 		assert!(store.stored_window_capped("line", crate::SeriesId::UNTAGGED, 95, 105, 50, 11).await.is_ok());
+		// The refusal is typed, so a caller can tell it from a failure.
+		let typed = store.stored_window_capped("line", crate::SeriesId::UNTAGGED, 0, 190, 0, 19).await.err().expect("over the cap");
+		assert_eq!(typed.downcast_ref::<StoredWindowError>(), Some(&StoredWindowError::TooManyRows { aspect: "line".to_string(), lo: 0, hi: 190, rows: 20, limit: 19 }));
 		// The default cap is far above anything these tests read.
 		assert!(MAX_KNOTS >= 4_000_000);
 		drop(store);
@@ -251,7 +304,9 @@ mod tests {
 		assert!(store.interpolate_range("nope", 0, 10, 0, linear).await.unwrap_err().to_string().contains("not declared"));
 		assert!(store.interpolate_range("line", 10, 0, 0, linear).await.is_err(), "start after end");
 		assert!(store.interpolate_range("line", 0, 10, -1, linear).await.is_err(), "negative margin");
-		assert!(store.interpolate_range("line", 1_000, 2_000, 0, linear).await.unwrap_err().to_string().contains("no stored sample"));
+		let empty = store.interpolate_range("line", 1_000, 2_000, 0, linear).await.unwrap_err();
+		assert!(empty.to_string().contains("no stored sample"));
+		assert!(matches!(empty.downcast_ref::<StoredWindowError>(), Some(StoredWindowError::NoSample { .. })));
 		assert!(store.interpolate_range("line", 0, 190, 0, linear.max_points(10)).await.is_err(), "splimes' grid limit applies");
 		drop(store);
 	}
