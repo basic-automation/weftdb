@@ -93,10 +93,11 @@ use crate::{
 /// `analytics`, an `analytics_pipeline` run's stages ([`crate::analytics::AnalyticsPoint`]). v28
 /// added `samples_ns`, the raw samples behind every latency summary, and
 /// `correctness.result_sha256`, a digest of the output, and `between_run`, the spread of the
-/// separate runs `weft-bench combine` pooled. All
+/// separate runs `weft-bench combine` pooled. v29 added `gpu_economics`, one lane of a
+/// `gpu_economics` run ([`crate::gpu_economics::GpuEconomicsPoint`]). All
 /// optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 29;
 
 /// Metadata describing the dataset a result was measured against.
 ///
@@ -582,6 +583,10 @@ pub struct BenchResult {
 	/// v28); `None` for a single run.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub between_run: Option<BetweenRun>,
+	/// One lane of a `gpu_economics` run (schema v29): cold start, no adapter, a fallback
+	/// backend or a contention step; `None` for every other workload and for older artifacts.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub gpu_economics: Option<crate::gpu_economics::GpuEconomicsPoint>,
 }
 
 /// The first timed repetition apart from the remaining ones.
@@ -697,6 +702,7 @@ mod tests {
 			analytics: None,
 			samples_ns: samples.to_vec(),
 			between_run: None,
+			gpu_economics: None,
 		}
 	}
 

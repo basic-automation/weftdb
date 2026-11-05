@@ -742,6 +742,12 @@ pub struct AspectInfo {
 	pub value_tolerance: String,
 	/// The declared timestamp unit token (e.g. `"seconds"`, `"millis"`).
 	pub timestamp_unit: &'static str,
+	/// The declared upsert keys (roadmap Phase 4.6): `"timestamp"` first, then the tag
+	/// keys every row's tags must fall inside. Absent when the aspect declares none, whose
+	/// identity is the timestamp and the full tag set. Carried by the schema endpoint and
+	/// the declare response; the aspect list leaves it out.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub upsert_keys: Option<Vec<String>>,
 }
 
 impl AspectInfo {
@@ -749,7 +755,14 @@ impl AspectInfo {
 	/// declaration fixed, scale included (FRE-7b schema read-back).
 	#[must_use]
 	pub fn declared(name: String, schema: &weft_physical_type::AspectSchema) -> Self {
-		Self { name, physical_type: schema.value.name(), scale: schema.value.scale(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name() }
+		Self { name, physical_type: schema.value.name(), scale: schema.value.scale(), value_tolerance: schema.value_tolerance.to_string(), timestamp_unit: schema.timestamp_unit.name(), upsert_keys: None }
+	}
+
+	/// This read-back with the aspect's declared upsert keys, in their wire form.
+	#[must_use]
+	pub fn with_upsert_keys(mut self, upsert_keys: Option<&weftdb::UpsertKeys>) -> Self {
+		self.upsert_keys = upsert_keys.map(weftdb::UpsertKeys::to_wire);
+		self
 	}
 }
 
@@ -927,12 +940,14 @@ pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): 
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
 	let result = store.schema_for(&aspect).await;
+	let keys = store.upsert_keys(&aspect).await;
 	drop(store);
 	let schema = result.map_err(|err| ApiError::internal(err.to_string()))?;
 	let Some(schema) = schema else {
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
-	let aspect = AspectInfo::declared(aspect, &schema);
+	let keys = keys.map_err(|err| ApiError::internal(err.to_string()))?;
+	let aspect = AspectInfo::declared(aspect, &schema).with_upsert_keys(keys.as_ref());
 	Ok(Json(AspectSchemaResponse { aspect }))
 }
 

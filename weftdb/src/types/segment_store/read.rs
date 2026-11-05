@@ -43,6 +43,28 @@ impl SegmentStore {
 		tokio::task::spawn_blocking(move || fold_newest_wins(frames)).await.context("merging maintenance inputs")
 	}
 
+	/// [`merge_members`](Self::merge_members), and whether the fold is exactly the
+	/// lowest-id member's own rows (Phase 4.6 skip-identical, design 9b): the member is
+	/// `time_sorted`, and its decoded rows equal the folded ones row for row, each value
+	/// compared in its plain form, scale included ([`same_rows`]), so `-3` and `-3.0` are
+	/// different rows here even though `BigDecimal` calls them equal (critique F23).
+	/// When it is, a reconcile can keep that member as it is instead of writing the fold.
+	pub(crate) async fn merge_members_against_first(&self, members: &[IndexRow]) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>, bool)> {
+		let mut frames = Vec::with_capacity(members.len());
+		for member in members {
+			frames.push(self.read_bound_frame(member).await?);
+		}
+		let sorted_first = members.first().is_some_and(|first| first.desc.time_sorted);
+		tokio::task::spawn_blocking(move || {
+			let first = frames.first().filter(|_| sorted_first).map(|frame| (frame.timestamps.clone(), frame.values.clone()));
+			let (timestamps, values) = fold_newest_wins(frames);
+			let identical = first.is_some_and(|(first_ts, first_vs)| same_rows(&first_ts, &first_vs, &timestamps, &values));
+			(timestamps, values, identical)
+		})
+		.await
+		.context("merging maintenance inputs")
+	}
+
 	/// The file holding `descriptor`'s frame: its recorded path, resolved against this
 	/// store's root (see [`resolve_frame_path`]), so that a root that was moved or
 	/// restored elsewhere still reads its own frames.
@@ -150,6 +172,14 @@ impl SegmentStore {
 	/// for every reduction), which is what the test asserts. Timestamps are the aspect's
 	/// declared [`TimeUnit`] epochs, lifted to absolute instants for bucketing.
 	///
+	/// The grid itself is bounded (ROB-13, 1.0 plan decision 12): a fold that
+	/// reaches more than
+	/// [`max_downsample_buckets`](crate::SegmentStoreOptions::max_downsample_buckets)
+	/// buckets is refused with
+	/// [`StoreError::DownsampleTooLarge`](crate::StoreError::DownsampleTooLarge)
+	/// while it runs, so no caller of the store — HTTP handler or embedder —
+	/// can make it hold an unbounded partial.
+	///
 	/// # Errors
 	///
 	/// If `aspect` has no declared schema, if a segment cannot be read or decoded, if a
@@ -165,7 +195,9 @@ impl SegmentStore {
 	///
 	/// As [`downsample_range`](Self::downsample_range).
 	pub async fn downsample_range_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
-		let partial = self.downsample_partial(aspect, series, start, end, resolution, aggregations).await?;
+		// At a plain resolution the finished grid is the partial's own buckets,
+		// so the decision 12 cap is the fold's cap unchanged (ROB-13).
+		let partial = self.downsample_partial(aspect, series, start, end, resolution, aggregations, self.max_downsample_buckets).await?;
 		partial.map_or_else(|| Ok(Vec::new()), |p| p.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")))
 	}
 
@@ -174,6 +206,10 @@ impl SegmentStore {
 	/// the width's unit, each run of `count` unit buckets merged into one before finishing.
 	/// Exact for every reduction, as merging is; a stored sidecar partial serves the unit as
 	/// it serves [`downsample_range`](Self::downsample_range).
+	///
+	/// The decision 12 bound is on the grid this returns (ROB-13): the fold at
+	/// the unit is capped at `count` times the bucket cap, and the coarsened
+	/// grid is refused over the cap itself.
 	///
 	/// # Errors
 	///
@@ -188,16 +224,32 @@ impl SegmentStore {
 	///
 	/// As [`downsample_range`](Self::downsample_range).
 	pub async fn downsample_range_width_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, width: weft_reduce::BucketWidth, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
-		let partial = self.downsample_partial(aspect, series, start, end, width.unit(), aggregations).await?;
+		// The fold runs at the width's unit, where one output bucket is `count`
+		// unit buckets, so the fold's cap is the decision 12 cap scaled by the
+		// count; the cap itself is then enforced exactly on the coarsened
+		// grid, which is the grid the caller gets (ROB-13).
+		let unit_cap = self.max_downsample_buckets.saturating_mul(width.count() as usize);
+		let partial = self.downsample_partial(aspect, series, start, end, width.unit(), aggregations, unit_cap).await?;
 		let Some(partial) = partial else { return Ok(Vec::new()) };
-		partial.coarsen(width.count()).and_then(|p| p.finish_width(width, aggregations)).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"))
+		let coarsened = partial.coarsen(width.count()).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"))?;
+		if coarsened.len() > self.max_downsample_buckets {
+			return Err(StoreError::DownsampleTooLarge { aspect: aspect.to_string(), buckets: coarsened.len(), limit: self.max_downsample_buckets }.into());
+		}
+		coarsened.finish_width(width, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}"))
 	}
 
 	/// The merged [`PartialReduction`] of `aspect`'s `[start, end]` rows at `resolution`, or
 	/// `None` when no row falls there: the fold behind
 	/// [`downsample_range`](Self::downsample_range) and
 	/// [`downsample_range_width`](Self::downsample_range_width).
-	pub(crate) async fn downsample_partial(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
+	///
+	/// `max_buckets` bounds the fold in `resolution` buckets (ROB-13): a
+	/// partial that reaches one bucket more — a single segment's own, or the
+	/// merged accumulator as each segment folds in — is refused with
+	/// [`StoreError::DownsampleTooLarge`](crate::StoreError::DownsampleTooLarge)
+	/// and the state is dropped, rather than the grid being counted for the
+	/// first time once it has been built.
+	pub(crate) async fn downsample_partial(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation], max_buckets: usize) -> Result<Option<PartialReduction>> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		let schema = self.require_schema(aspect).await?;
@@ -234,12 +286,15 @@ impl SegmentStore {
 			if sidecar_eligible && window_covers_segment(descriptor, start, end) {
 				if let Some(sidecar) = self.load_partial_sidecar(aspect, descriptor, frame_crc).await? {
 					if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
-						return Ok(Some(partial));
+						return check_partial_len(aspect, partial, max_buckets).map(Some);
 					}
 				}
 			}
 			let bytes = self.read_frame(descriptor).await?;
-			return segment_partial(descriptor, &bytes, start, end, schema.timestamp_unit, resolution, aggregations);
+			return match segment_partial(descriptor, &bytes, start, end, schema.timestamp_unit, resolution, aggregations)? {
+				Some(partial) => check_partial_len(aspect, partial, max_buckets).map(Some),
+				None => Ok(None),
+			};
 		}
 
 		// Each pruned segment folds into its own `PartialReduction` **concurrently**: the
@@ -275,6 +330,15 @@ impl SegmentStore {
 			match merged.as_mut() {
 				Some(m) => m.merge(partial).map_err(|e| anyhow::anyhow!("merging a segment partial of {aspect:?}: {e}"))?,
 				None => merged = Some(partial),
+			}
+			// The accumulator is the state the fold holds, so the bound is
+			// checked as each segment folds in (ROB-13): the first count over
+			// the cap refuses, and the partials still queued are dropped with
+			// it instead of being merged into a grid nobody may return.
+			if let Some(m) = &merged {
+				if m.len() > max_buckets {
+					return Err(StoreError::DownsampleTooLarge { aspect: aspect.to_string(), buckets: m.len(), limit: max_buckets }.into());
+				}
 			}
 		}
 		Ok(merged)
@@ -350,6 +414,14 @@ impl SegmentStore {
 	/// [`read_point`](SegmentStore::read_point) applies at both levels: fully null segments are
 	/// dropped by the index prune, fully null pages by the frame's page index.
 	///
+	/// The batch itself is bounded (ROB-13, 1.0 plan decision 12): more than
+	/// [`max_point_batch`](crate::SegmentStoreOptions::max_point_batch) instants
+	/// is refused with
+	/// [`StoreError::PointBatchTooLarge`](crate::StoreError::PointBatchTooLarge)
+	/// before the index is pruned. The single lookup,
+	/// [`read_point`](SegmentStore::read_point), names one instant and needs
+	/// no cap.
+	///
 	/// # Errors
 	///
 	/// Propagates a libSQL prune failure, a filesystem read error, or a frame-decode
@@ -369,6 +441,12 @@ impl SegmentStore {
 		let _pin = self.pin_reads();
 		if ts.is_empty() {
 			return Ok(Vec::new());
+		}
+		// The batch is the read (ROB-13): over the cap it is refused before a
+		// single segment is pruned or opened, the same place the HTTP
+		// `at-multi` handler's own ceiling refuses it (ROB-12).
+		if ts.len() > self.max_point_batch {
+			return Err(StoreError::PointBatchTooLarge { aspect: aspect.to_string(), instants: ts.len(), limit: self.max_point_batch }.into());
 		}
 		// Prune the index once by the batch's whole span (safe: every instant lies within it).
 		let (lo, hi) = ts.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &t| (lo.min(t), hi.max(t)));
@@ -512,4 +590,14 @@ impl SegmentStore {
 	pub async fn aspect_metadata(&self, aspect: &str) -> Result<AspectMetadata> {
 		Ok(self.index.rollup(aspect).await?.unwrap_or_default())
 	}
+}
+
+/// A single segment's partial against the fold's bucket bound (ROB-13): the
+/// partial passes unchanged at or under `max_buckets`, and is refused —
+/// dropped, with the count it reached — over it.
+fn check_partial_len(aspect: &str, partial: PartialReduction, max_buckets: usize) -> Result<PartialReduction> {
+	if partial.len() > max_buckets {
+		return Err(StoreError::DownsampleTooLarge { aspect: aspect.to_string(), buckets: partial.len(), limit: max_buckets }.into());
+	}
+	Ok(partial)
 }

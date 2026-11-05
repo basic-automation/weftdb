@@ -62,6 +62,12 @@
 //!   `0001_baseline`: a store that cannot build it still opens, and its series prunes
 //!   fall back to the time index. An older layout-2 build never names it, so it reads
 //!   and writes the store exactly as before.
+//! - **`0008_upsert_keys`** (layout 2): the nullable `aspect_schema.upsert_keys` column in
+//!   `aspect_catalog.db` (Phase 4.6), where an aspect's optional upsert-key declaration
+//!   lives. NULL, every existing aspect's value, is today's `(timestamp, full tag set)`.
+//!   Pure DDL. It stays at layout 2 like every pre-1.0 migration, so an older layout-2
+//!   build still opens and writes the store and **ignores** a declaration (it accepts a
+//!   tag outside the declared keys); see DECISIONS.md for why that is accepted pre-1.0.
 
 use std::collections::BTreeSet;
 
@@ -134,7 +140,7 @@ pub(crate) struct Floors {
 /// Every registered migration, in id order. An id is four digits, an underscore, and a
 /// lower snake_case name: the digits are the ordinal that `pending` and `after` select on,
 /// so the numbering rule is part of the registry's contract and the test below asserts it.
-pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }, Migration { id: "0005_d_s13", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s13, rederive: None }, Migration { id: "0006_tag5_series", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: tag5_series, rederive: None }, Migration { id: "0007_series_time_index", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: series_time_index, rederive: None }];
+pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }, Migration { id: "0005_d_s13", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s13, rederive: None }, Migration { id: "0006_tag5_series", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: tag5_series, rederive: None }, Migration { id: "0007_series_time_index", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: series_time_index, rederive: None }, Migration { id: "0008_upsert_keys", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: upsert_keys, rederive: None }];
 
 /// The ordinal of a migration id: its leading digits (`0002_s6_s7` → 2). An id without
 /// them sorts first.
@@ -503,6 +509,16 @@ fn series_time_index<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> 
 	})
 }
 
+/// `0008_upsert_keys`: the nullable `aspect_schema.upsert_keys` column in
+/// `aspect_catalog.db`. NULL is the undeclared default.
+fn upsert_keys<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
+	Box::pin(async move {
+		let Some(catalog) = cp.aspect_catalog else { return Ok(()) };
+		let conn = connect(catalog.db).await.with_context(|| format!("{}: connecting", catalog.name))?;
+		add_column(&conn, catalog.name, "aspect_schema", "upsert_keys", "TEXT").await
+	})
+}
+
 /// `0004_d_s12`: the C5 quarantine columns in `segment_index.db`.
 fn d_s12<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>> {
 	Box::pin(async move {
@@ -641,16 +657,17 @@ mod tests {
 	#[test]
 	fn pending_and_after_select_by_applied_set_and_by_ordinal() {
 		let applied: BTreeSet<String> = ["0001_baseline".to_string()].into();
-		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
+		assert_eq!(pending(REGISTRY, &applied).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index", "0008_upsert_keys"]);
 		assert_eq!(pending(REGISTRY, &BTreeSet::new()).len(), REGISTRY.len());
 		assert_eq!(after(REGISTRY, None).len(), REGISTRY.len());
-		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
-		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
-		assert_eq!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
-		assert_eq!(after(REGISTRY, Some("0004_d_s12")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
-		assert_eq!(after(REGISTRY, Some("0005_d_s13")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0006_tag5_series", "0007_series_time_index"]);
-		assert_eq!(after(REGISTRY, Some("0006_tag5_series")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0007_series_time_index"]);
-		assert!(after(REGISTRY, Some("0007_series_time_index")).is_empty());
+		assert_eq!(after(REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index", "0008_upsert_keys"]);
+		assert_eq!(after(REGISTRY, Some("0002_s6_s7")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index", "0008_upsert_keys"]);
+		assert_eq!(after(REGISTRY, Some("0003_fre14_legacy_catalog")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index", "0008_upsert_keys"]);
+		assert_eq!(after(REGISTRY, Some("0004_d_s12")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0005_d_s13", "0006_tag5_series", "0007_series_time_index", "0008_upsert_keys"]);
+		assert_eq!(after(REGISTRY, Some("0005_d_s13")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0006_tag5_series", "0007_series_time_index", "0008_upsert_keys"]);
+		assert_eq!(after(REGISTRY, Some("0006_tag5_series")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0007_series_time_index", "0008_upsert_keys"]);
+		assert_eq!(after(REGISTRY, Some("0007_series_time_index")).iter().map(|m| m.id).collect::<Vec<_>>(), vec!["0008_upsert_keys"]);
+		assert!(after(REGISTRY, Some("0008_upsert_keys")).is_empty());
 		assert!(after(REGISTRY, Some("0009_future")).is_empty(), "a newer marker's ordinal is past everything here");
 		assert_eq!(floors(pending(REGISTRY, &applied)), Some(Floors { layout: 2, min_read: 2, min_write: 2 }));
 		assert_eq!(floors(Vec::<&Migration>::new()), None);

@@ -4,6 +4,60 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-04 — Phase 4.6: upsert keys in the narrowed form, and skip-identical's crash semantics (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** ROADMAP 4.6 asks for "configurable upsert keys + skip-identical" and names
+neither shape. QuestDB's `DEDUP UPSERT KEYS` picks columns, but a WeftDB row has one value
+column and a series is a full tag set, and tags invariant I12 ("one output frame, one
+series") forbids folding two series into one. The tags design (9a) and its critique (F21,
+F22, F23) disagree on whether the keys should exist at all and at which layout.
+
+**Chosen:**
+
+- **Upsert keys are `timestamp` plus a tag-key set K, and they bound the tags an ingest may
+  carry.** Declared through `SegmentStore::declare_with_upsert_keys` (HTTP: `upsert_keys` on
+  declare) and read with `SegmentStore::upsert_keys`; `AspectSchema` is untouched (it is frozen
+  and not `#[non_exhaustive]`). With K declared, a `TagSet` naming a key outside K is
+  `StoreError::NotAnUpsertKey` (`400 invalid_tag`, "not an upsert key"), because a tag outside
+  the key has no per-row storage to carry once two rows differing only in it fold into one.
+  So the dedup identity is `(timestamp, tags restricted to K)`, which under that rule is the
+  full tag set; undeclared stays `(timestamp, full tag set)`. Newer-wins per series (reads and
+  `merge_newer_wins`) does the dedup in both cases. Critique F22 is right that this changes
+  which writes are accepted rather than how they fold; the owner's spec asked for the honest
+  narrowed form anyway, and it is what lets a caller pin the identity and have stray tags
+  refused rather than silently minting a series.
+- **The keys are immutable and take part in declare equality.** Other keys, keys where none
+  were declared, or none where some were, is `StoreError::UpsertKeysConflict` (`409
+  schema_conflict`); a schema conflict is still reported as itself first. Plain `declare`
+  leaves the keys out of the comparison, so every existing library caller (widening
+  included) behaves as before.
+- **Storage: migration `0008_upsert_keys` at layout 2**, a nullable
+  `aspect_schema.upsert_keys TEXT` (JSON wire list) in `aspect_catalog.db`. This follows D1
+  and the `store_format.rs` rule rather than design 9a's "layout 3, floors 3". Critique F21
+  holds either way: floors at 3 would not stop a layout-3 build that predates 0008 either,
+  only layout 4 would. The cost is stated in the migration doc: an older layout-2 build opens
+  and writes the store and **ignores** the declaration, accepting a tag outside K. Accepted
+  pre-1.0; a floor raise is the 1.0 freeze's call, not this slice's.
+- **`value` is not an upsert key.** Keying on value means "keep both rows when the values
+  differ" at one timestamp of one series, which no fold, read or index supports: every read
+  path answers one value per `(series, timestamp)`.
+- **Dedup-off is deferred.** Keeping duplicates needs a second fold beside
+  `merge_newer_wins`, and an X-READ (C16) that does not dedup either; neither exists, and a
+  flag that only some paths honoured would be worse than none.
+- **Skip-identical is a delete-only swap** (design 9b with F23). In `reconcile_overlaps_held`,
+  when the fold equals the lowest-id member's decoded rows and that member is
+  `time_sorted`, the component swaps `SwapPlan::keep`: no generation is allocated and no
+  output is journaled, written or synced (M2-M4 are skipped, so `M-pending-committed` through
+  `M-dir-synced` are never reached), the kept row gets an unchanged `ReplaceExpected` as its
+  version precondition, `DeleteEveryExpected` and `JournalRetire` cover only the other
+  members, and only their sidecars are removed. A racing change to the kept row is a
+  `Conflict` and nothing is deleted. Values compare by plain form with scale (`5` vs `5.0`
+  differ), not `BigDecimal ==`, which ignores scale. The kept frame keeps its paging even
+  where a rewrite would have chosen another (#507's merge page height waived, as 9b says).
+  Squash and compaction do not skip yet; only the overlap merge was specified.
+- **The crash matrix's `Op::SkipIdentical`** runs only the fault points the swap passes, and
+  reads "committed" as "one segment fewer" since no output generation appears.
+
 ## 2026-11-04 — Phase 2 integrations: what was built, and the two items left with a reason (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** Phase 2's two remaining roadmap lines chain six items with arrows —
@@ -4431,3 +4485,145 @@ Issue #158; design PR 8, with critique A4 (the composite index was deferred from
    `a_tagged_read_among_a_thousand_series_opens_only_its_own_frames` (1,000 series over one
    window; every other series' frame is overwritten with garbage, so opening one would fail
    the read; about 40 s locally, from 1,000 durable seals). No micro-benchmark was run.
+## 2026-11-04 — D-S20 change log replaces the per-timestamp queue for seal-backed aspects — FOR MERGE REVIEW
+
+**Ambiguous:** the 1.0 plan (§5 D-S19/D-S20 amendment, §6 W7 seal lane) and
+issue #210 name the deliverable — "change log replaces the per-timestamp
+unbatched queue for seal-backed aspects" — and D-S19's decision notes name
+the mechanism's table (`segment_changes`, created by migration `0002` with
+columns `(aspect, epoch, min_ts, max_ts, row_count)`), but no source fixes:
+which commits write a row, how a consumer acknowledges work, or how a
+span-based consumer decides coverage.
+
+**Chosen:**
+1. **One row per data commit, in the commit's own transaction.** A new
+   `IndexOp::RecordChange` rides the seal (`publish_seal`) and ingest
+   (`publish_ingest`) index transactions, keyed by the commit's aspect
+   epoch with that commit's span and row count. Because the row commits
+   with the segments, there is no write-ahead entry for a commit that
+   never landed and no landed commit without its row — the S18
+   write-ahead/requeue shape the queue needed has no counterpart.
+   Maintenance swaps write no row: they move no new data, and the
+   ingest that fed them already recorded its change (a swap row would
+   only rebuild the same windows). A replayed ingest records nothing,
+   because it commits nothing.
+2. **Legacy ingest drops the queue.** The seal-backed branches of
+   `capture_measurement` and `batch_capture_measurements` no longer
+   enqueue or requeue timestamps; `count_unbatched_measurements` for a
+   seal-backed aspect is always 0. Rows mode is untouched. The capture
+   variants D-S19 already left in rows mode (`capture_new_measurement`
+   and the chunk helpers, which the design does not name) are unchanged.
+3. **Acknowledgement is deletion by epoch.** `SegmentStore::ack_changes`
+   (`IndexOp::DeleteChanges`) deletes an aspect's rows at or below an
+   epoch, as a queue consumer dequeues what it batched. No watermark
+   table: a crash before the acknowledgement leaves the rows, the next
+   run rebuilds the same windows, and the batch dedupe skips them. A
+   commit landing after a consumer's read takes a higher epoch and is
+   never deleted by that consumer's acknowledgement.
+4. **Coverage is per change, over spans.** The orchestration consumer
+   (`build_incremental_from_change_log`, dispatched from
+   `build_incremental_unprocessed_queue` for seal-backed aspects) unions
+   each change span's windows via `calculate_affected_windows_for_range`
+   — a superset of the span's rows' windows, so a gap inside a span
+   costs extra rebuilds that dedupe skips, never a missed row — and
+   acknowledges only the longest prefix of changes whose windows were
+   all built, since acknowledgement is through an epoch. A change
+   touching a window past the stored data, or short of points, stays
+   logged for the next run, as a queued timestamp stays queued. A first
+   run (no batches yet) is the full rebuild plus acknowledgement of the
+   rows read, which also covers aspects sealed before D-S20 whose rows
+   have no change rows.
+
+5. **One seal-store open per process, shared across handles.** The
+   consumer reaches the rows through `analyze_range`, which reopens the
+   database by name for every chunk — a fresh `Database` handle whose
+   per-handle seal-store cache is empty, so its first seal read refused
+   the root as locked by the ingest handle's open (a root can be open
+   only once in a process). Seal-backed aspects could therefore never
+   be batched at all. `Database::seal_store` now shares its open
+   through a process-wide weak registry keyed by the root path
+   (`SEAL_STORES`): every handle of a database gets the one open, and
+   when the last reference drops the next open goes back to disk.
+
+**Not in this slice:** change rows for maintenance swaps (see 1), the
+rows-mode queue (unchanged, S18 semantics intact), and the plan's `:780`
+gate tick as a separate line — the current ROADMAP carries no distinct
+`:780` line; this slice ticks the Phase 7 **S20** mirror line, the same
+line the queue records for D-S20.
+
+**Salvage amendment (parent, 2026-11-04):** the verification bar caught an
+interaction the slice's own tests missed. FRE-12a's newer-layout store
+opens without running a migration and deliberately has no
+`segment_changes` table — its test drops the table and asserts it stays
+gone — so the unconditional change-log insert failed that store's seals
+outright. `RecordChange` and `DeleteChanges` now probe for the table on
+the transaction's connection and record/delete nothing when it is
+absent, the agreement the change-log reader already kept: a store with
+no change log has no consumer to notify, and this build must not create
+the table outside a migration.
+## 2026-11-04 — ROB-13: the decision 12 bounds live in the store too — the ROB-12/ROB-13 split (FLAGGED FOR MERGE REVIEW)
+
+**Context:** 1.0-plan §3 gives ROB-12 / ROB-13 / ROB-15 "one set of read limits
+(decision 12)" and does not itemize the split; the queue notes for both slices
+carry that as an open question, with only ROB-13's part named (ROADMAP line
+359: "Bounded stored downsample and point lookups"). ROB-12 (peer PR #546)
+took the HTTP layer: one `ReadLimits` in weft-server caps every read a client
+can size — page, rows, the stored downsample's grid, the `at-multi` batch —
+with `422 result_too_large` and a `504` deadline, and its DECISIONS entry
+records the two things it deliberately did not do: its deadline "bounds the
+wait, not the work", and counting or bounding inside `SegmentStore` was "a
+store change outside this slice". §3 likewise puts ROB-13 in the store lane
+(it carries the `segment_store.rs` rustdoc item removed from EVI-1, which
+"stays out of the store lane"). What was left unbuilt is the work bound
+itself: a caller that is not an HTTP handler (an embedder, the bench, a
+future Flight/Grafana surface) could still make the store fold an unbounded
+grid, and the one HTTP shape whose grid cannot be counted from the request —
+an unbounded stored downsample — could only be refused by ROB-12 *after* its
+buckets were produced.
+
+**Chosen:**
+
+1. **The bounds are the store's, at decision 12's numbers.**
+   `SegmentStoreOptions` gains `max_downsample_buckets` (default
+   1,000,000) and `max_point_batch` (default 10,000), with
+   `DEFAULT_MAX_DOWNSAMPLE_BUCKETS` / `DEFAULT_MAX_POINT_BATCH` constants
+   and `with_*` builders — the exact shape TAG-7's `max_series_per_aspect`
+   set for a store limit. No new `WEFT_*` variables: the library reads none
+   on its own (decision 1(d)); the server's `WEFT_MAX_DOWNSAMPLE_BUCKETS` /
+   `WEFT_MAX_AT_MULTI_INSTANTS` stay ROB-12's HTTP ceilings, at the same
+   defaults.
+2. **Refusals are typed.** `StoreError::DownsampleTooLarge { aspect,
+   buckets, limit }` and `StoreError::PointBatchTooLarge { aspect, instants,
+   limit }` land beside `SeriesLimit` in the store's one typed error, and
+   `classify_typed` maps both to `422 result_too_large` with the cap in the
+   envelope's `limit` — over HTTP the store's refusal is the same answer
+   ROB-12's ceilings give, never the match's wildcard `503
+   incompatible_store`.
+3. **The downsample bound bites during the fold, not after it.**
+   `downsample_partial` takes the cap and checks a single segment's partial
+   and the merged accumulator as each segment folds in; the first count over
+   the cap refuses and the remaining partials drop with it. For
+   `BucketWidth` requests the fold runs at the width's unit, so its cap is
+   the bucket cap × `count`, and the coarsened grid is checked against the
+   cap itself: the bound is the grid the caller gets (ten one-second buckets
+   coarsened by 3 answer under a cap of 4; coarsened by 2 the same rows are
+   refused from the fold, whose scaled cap they necessarily cross). A fold
+   refusal therefore reports the unit count against the scaled cap; a
+   plain-resolution refusal reports decision 12's numbers unchanged.
+4. **Point lookups:** `read_points_of` refuses an over-cap batch before the
+   index prune — the batch is the read. `read_point` names one instant and
+   is bounded by construction; nothing is added there.
+5. **The §3 rustdoc item is not applicable at pick time.** The cited lines
+   (`segment_store.rs:772-773`) were in the pre-split file; the reads have
+   since moved to `segment_store/read.rs`, and the crate's rustdoc builds
+   clean under `-D warnings` on this branch, so no doc defect remains at
+   the cited place to fix.
+
+**Alternatives considered:** duplicating ROB-12's two named ceilings in
+`weft-server/src/storage.rs` (double-builds the peer's open PR in the same
+functions, and still leaves every non-HTTP caller unbounded); counting the
+grid from the requested window before the fold (an unbounded window counts
+as the whole `i64` span and would refuse the common shape — the reason
+ROB-12 pre-checks only named bounds); a cancellation token threaded into
+the store so ROB-12's deadline stops the work (real, but ROB-15's plumbing
+per ROB-12's own DECISIONS entry, not this slice's).

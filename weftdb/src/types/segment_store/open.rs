@@ -253,7 +253,7 @@ impl SegmentStore {
 		// The previous process's clean-shutdown flag, as this open finds it, before
 		// this open resets it: a later crash must not inherit a clean verdict.
 		let previous_clean_shutdown = index.meta("clean_shutdown").await.with_context(|| format!("{}: reading the previous clean-shutdown flag", names[0]))?.as_deref() == Some("1");
-		let store = Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, recovery: RwLock::new(RecoveryReport::default()), suspect_present: AtomicBool::new(false), previous_clean_shutdown, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), frame_gens: tokio::sync::OnceCell::new(), reaper, maintenance_wait: DEFAULT_MAINTENANCE_WAIT, maintenance_breaker: options.breaker, max_series_per_aspect: options.max_series_per_aspect, breaker_state: Mutex::new(HashMap::new()), index_conflicts: AtomicU64::new(0), _root_lock: root_lock };
+		let store = Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, recovery: RwLock::new(RecoveryReport::default()), suspect_present: AtomicBool::new(false), previous_clean_shutdown, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), frame_gens: tokio::sync::OnceCell::new(), reaper, maintenance_wait: DEFAULT_MAINTENANCE_WAIT, maintenance_breaker: options.breaker, max_series_per_aspect: options.max_series_per_aspect, max_downsample_buckets: options.max_downsample_buckets, max_point_batch: options.max_point_batch, breaker_state: Mutex::new(HashMap::new()), index_conflicts: AtomicU64::new(0), _root_lock: root_lock };
 		// 12. The frame journal's replay (R6), before anything is served: unless recovery
 		// must only report what it finds, a newer WeftDB's store.
 		// 13. Backfill the rollup rows the journal replay did not write: a pre-S11
@@ -645,6 +645,35 @@ impl SegmentStore {
 		aspect_name::validate(aspect)?;
 		self.writable()?;
 		self.catalog.declare(&self.database, &self.subject, aspect, schema).await
+	}
+
+	/// [`declare`](Self::declare) with an upsert-key declaration (roadmap Phase 4.6; see
+	/// [`UpsertKeys`](crate::UpsertKeys)): `upsert_keys` [`None`] declares none, the
+	/// default identity `(timestamp, full tag set)`. With keys declared, an
+	/// [`ingest`](Self::ingest) whose tags name a key outside them is refused. The keys
+	/// are immutable once declared and take part in the declaration's equality (see
+	/// [`AspectCatalog::declare_with_upsert_keys`]); the
+	/// [`AspectSchema`] is untouched by them.
+	///
+	/// # Errors
+	///
+	/// As [`declare`](Self::declare), and a [`StoreError::UpsertKeysConflict`] when the
+	/// aspect is declared with other upsert keys (or none, or some where none are offered).
+	pub async fn declare_with_upsert_keys(&self, aspect: &str, schema: &AspectSchema, upsert_keys: Option<&crate::UpsertKeys>) -> Result<()> {
+		aspect_name::validate(aspect)?;
+		self.writable()?;
+		self.catalog.declare_with_upsert_keys(&self.database, &self.subject, aspect, schema, upsert_keys).await
+	}
+
+	/// The upsert keys `aspect` is declared with (roadmap Phase 4.6), or [`None`] when it
+	/// declares none (or is not declared): its dedup identity is then the timestamp and
+	/// the full tag set.
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn upsert_keys(&self, aspect: &str) -> Result<Option<crate::UpsertKeys>> {
+		self.catalog.upsert_keys(&self.database, &self.subject, aspect).await
 	}
 
 	/// The declared [`AspectSchema`] for `aspect`, or [`None`] if it has not been

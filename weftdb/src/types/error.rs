@@ -11,6 +11,12 @@ fn describe_schema(schema: &AspectSchema) -> String {
 	format!("{value} (tolerance {}, timestamps in {})", schema.value_tolerance, schema.timestamp_unit.name())
 }
 
+/// Upsert keys as an error message names them: the wire list, or `none (timestamp and
+/// the full tag set)` for an undeclared aspect.
+fn describe_upsert_keys(keys: Option<&crate::UpsertKeys>) -> String {
+	keys.map_or_else(|| "none (timestamp and the full tag set)".to_string(), ToString::to_string)
+}
+
 #[derive(Debug, ThisError)]
 pub enum Error {
 	#[error("Insufficient measurements provided for interpolation")]
@@ -107,7 +113,8 @@ mod tests {
 
 /// Why a [`SegmentStore`](crate::SegmentStore) refused an operation: an open it
 /// would not perform (freeze design §4.3, FRE-12a), or — since D-S13 — an ingest
-/// it would not commit. The ingest variants are the typed errors the 1.0 plan
+/// it would not commit, or — since ROB-13 — a stored read over its decision 12
+/// bound. The ingest variants are the typed errors the 1.0 plan
 /// (§3 X-ERR, §5 D-S13) assigns to this lane: they land here, in the store's one
 /// typed error, rather than in sentences a caller must re-recognise.
 ///
@@ -253,6 +260,31 @@ pub enum StoreError {
 		/// The reserved key the batch named.
 		key: String,
 	},
+	/// An ingest batch's `groups` named a tag key outside the aspect's declared
+	/// [`UpsertKeys`](crate::UpsertKeys) (Phase 4.6): with upsert keys declared, every row's
+	/// tags must fall inside them, because a tag outside the key has no per-row storage to
+	/// carry it once rows that differ only in it fold into one. Nothing was written.
+	#[error("aspect {aspect:?}: the tag key {key:?} is not an upsert key (the aspect declares upsert keys {declared}); nothing was written")]
+	NotAnUpsertKey {
+		/// The aspect the batch was offered to.
+		aspect: String,
+		/// The tag key outside the declaration.
+		key: String,
+		/// The declared upsert keys.
+		declared: crate::UpsertKeys,
+	},
+	/// A declaration named upsert keys other than the ones `aspect` is declared with
+	/// (Phase 4.6): like the schema, an upsert-key declaration is immutable once made, and
+	/// no declaration is a declaration too. Nothing was written.
+	#[error("aspect {aspect:?} is declared with upsert keys {} and they are immutable; the offered {} was refused and nothing was written", describe_upsert_keys(declared.as_ref()), describe_upsert_keys(offered.as_ref()))]
+	UpsertKeysConflict {
+		/// The aspect that was re-declared.
+		aspect: String,
+		/// The upsert keys it is declared with ([`None`]: undeclared).
+		declared: Option<crate::UpsertKeys>,
+		/// The upsert keys the refused declaration offered.
+		offered: Option<crate::UpsertKeys>,
+	},
 	/// A [`SeriesSelector`](crate::SeriesSelector) matched more than one series
 	/// of `aspect`, and a store read targets exactly one (TAG-8, tags D4). Narrow
 	/// the selector, or select exactly. Nothing was read.
@@ -289,5 +321,34 @@ pub enum StoreError {
 		digits: usize,
 		/// The bound it exceeded.
 		max: usize,
+	},
+	/// A stored downsample of `aspect` produced more than `limit` buckets —
+	/// the decision 12 grid cap in force
+	/// ([`SegmentStoreOptions::max_downsample_buckets`](crate::SegmentStoreOptions::max_downsample_buckets))
+	/// — and was refused while the fold was running (ROB-13). The partial
+	/// state is dropped; nothing was written. A coarser resolution or a
+	/// narrower window fits under the cap.
+	#[error("the stored downsample of aspect {aspect:?} produced {buckets} buckets, over the limit of {limit}; narrow the window or use a coarser resolution (nothing was written)")]
+	DownsampleTooLarge {
+		/// The aspect the downsample named.
+		aspect: String,
+		/// The bucket count the fold had produced when it was refused (the
+		/// first count over the limit, not the grid's full width).
+		buckets: usize,
+		/// The cap in force.
+		limit: usize,
+	},
+	/// A batch point lookup named more instants than the decision 12 cap in
+	/// force ([`SegmentStoreOptions::max_point_batch`](crate::SegmentStoreOptions::max_point_batch))
+	/// allows (ROB-13). It was refused before the index was pruned; nothing
+	/// was read. Split the batch across lookups.
+	#[error("the point lookup of aspect {aspect:?} names {instants} instants, over the limit of {limit} per batch; split the batch (nothing was read)")]
+	PointBatchTooLarge {
+		/// The aspect the lookup named.
+		aspect: String,
+		/// How many instants the batch named.
+		instants: usize,
+		/// The cap in force.
+		limit: usize,
 	},
 }

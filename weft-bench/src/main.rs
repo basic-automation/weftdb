@@ -52,6 +52,16 @@ fn main() -> ExitCode {
 			}
 		};
 	}
+	if args.first().map(String::as_str) == Some(weft_bench::gpu_economics::CHILD_COMMAND) {
+		// A GPU-economics child: one cold start or the no-adapter check, one result line.
+		return match weft_bench::gpu_economics::child(&args[1..]) {
+			Ok(()) => ExitCode::SUCCESS,
+			Err(e) => {
+				eprintln!("{PROG} {}: {e:#}", weft_bench::gpu_economics::CHILD_COMMAND);
+				ExitCode::FAILURE
+			}
+		};
+	}
 	let command = match Cli::from_args(std::env::args().skip(1)) {
 		Ok(c) => c,
 		Err(e) => {
@@ -137,6 +147,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.mode == InputMode::GpuMemory {
 		return run_gpu_memory_workload(&cli);
+	}
+	if cli.mode == InputMode::GpuEconomics {
+		return run_gpu_economics_workload(&cli);
 	}
 	if cli.mode == InputMode::Ingest {
 		return run_ingest_workload(&cli).await;
@@ -370,6 +383,40 @@ fn run_gpu_memory_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(Some(engine));
 	let report = BenchReport::with_results(metadata, vec![result]);
 	finish(cli, &report)
+}
+
+/// Run the GPU economics workload (roadmap 5.5): the cold-start and no-adapter children first,
+/// then start the GPU here and run the fallback and contention lanes, one report per lane.
+fn run_gpu_economics_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	use weft_bench::gpu_economics as ge;
+	let profile_name = cli.name.clone().unwrap_or_else(|| "gpu-economics".to_string());
+	let profile = ge::GpuEconomicsProfile::new(profile_name, ge::GpuEconomicsParams { seed: cli.seed, ..cli.gpu_economics.clone() });
+	let ms = |ns: u64| std::time::Duration::from_nanos(ns).as_secs_f64() * 1e3;
+	let mut code = ExitCode::SUCCESS;
+	let mut write = |metadata: &RunMetadata, result: BenchResult| -> anyhow::Result<()> {
+		println!("economics {:<36}: {:>5} samples  p50 {:>10.3} ms p95 {:>10.3} ms p99 {:>10.3} ms  {:>14.0} pts/s  {}", result.profile, result.reps, ms(result.latency.p50_ns), ms(result.latency.p95_ns), ms(result.latency.p99_ns), result.throughput_points_per_sec, if result.correctness.passed() { "PASS" } else { "FAIL" });
+		if finish(cli, &BenchReport::with_results(metadata.clone(), vec![result]))? != ExitCode::SUCCESS {
+			code = ExitCode::FAILURE;
+		}
+		Ok(())
+	};
+	let baseline = ge::sample_baseline(&profile.params);
+	let exe = std::env::current_exe().map_err(|e| anyhow::anyhow!("cannot find this executable for the child processes: {e}"))?;
+	let child_metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	ge::run_child_lanes(&profile, &exe, |r| write(&child_metadata, r))?;
+	let engine = match ge::start_gpu() {
+		Ok(engine) => {
+			println!("engine: GPU {}", engine.describe_gpu().unwrap_or_default());
+			Some(engine)
+		}
+		Err(e) => {
+			eprintln!("gpu-economics: GPU lanes skipped: {e}");
+			None
+		}
+	};
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(engine.clone());
+	ge::run_in_process_lanes(&profile, engine.is_some(), &baseline, |r| write(&metadata, r)).map_err(|e| anyhow::anyhow!("gpu-economics run failed: {e}"))?;
+	Ok(code)
 }
 
 /// Run the ingest workload: load one column of a UCI household-power file,
@@ -1007,6 +1054,8 @@ struct Cli {
 	scale: Option<ScalePreset>,
 	/// GPU-memory mode: the workload knobs (the seed comes from `--seed`).
 	gpu_memory: weft_bench::gpu_memory::GpuMemoryParams,
+	/// GPU-economics mode: the workload knobs (the seed comes from `--seed`).
+	gpu_economics: weft_bench::gpu_economics::GpuEconomicsParams,
 	/// Ingest mode: UCI household-power file to load (`--uci`, required).
 	uci: Option<PathBuf>,
 	/// Ingest mode: UCI column to project (`--uci-column`).
@@ -1151,6 +1200,8 @@ enum InputMode {
 	Sparse,
 	/// The GPU memory-stability workload (repeated mixed-size GPU interpolations).
 	GpuMemory,
+	/// The GPU economics workload (cold start, CPU fallback, contention, utilization).
+	GpuEconomics,
 	/// The ingest workload (EVI-6): load a UCI household-power column and seal
 	/// it into a fresh SegmentStore in batches, gated on an exact read-back.
 	Ingest,
@@ -1289,6 +1340,7 @@ impl Cli {
 		let (mut query_mix, mut query_mix_rows, mut query_mix_range, mut query_mix_weights): (usize, Option<u64>, u64, weft_bench::LaneWeights) = (0, None, 1_440, weft_bench::LaneWeights::default());
 		let (mut analytics_rows, mut analytics_tail, mut analytics_batch): (Option<u64>, Option<u64>, usize) = (None, None, 1_440);
 		let (mut gap_fill, mut gpu_memory) = (GapFillParams::default(), weft_bench::gpu_memory::GpuMemoryParams::default());
+		let (mut gpu_economics_mode, mut gpu_economics) = (false, weft_bench::gpu_economics::GpuEconomicsParams::default());
 		let (mut comp_rows, mut comp_shape, mut csv) = (comp_defaults.point_count, comp_defaults.value_shape, CsvKnobs::default());
 		let (mut ds_points, mut ds_stride, mut ds_bucket) = (ds_defaults.point_count, ds_defaults.input_stride_secs, ds_defaults.bucket_resolution);
 		let (mut ds_aggs, mut ds_parallel, mut ds_decimals) = (ds_defaults.aggregations, ds_defaults.parallel_chunks.max(1), ds_defaults.value_decimals);
@@ -1348,6 +1400,8 @@ impl Cli {
 				flag if SPARSE_FLAGS.contains(&flag) => set_sparse_knob(&mut sparse, flag, &take_value(&key)?)?,
 				"--scale" => scale = Some(ScalePreset::parse(&take_value(&key)?).ok_or_else(|| format!("--scale must name a preset ({})", ScalePreset::names()))?),
 				"--gpu-memory" => gpu_memory_mode = true,
+				"--gpu-economics" => gpu_economics_mode = true,
+				flag if GPU_ECONOMICS_FLAGS.contains(&flag) => set_gpu_economics_knob(&mut gpu_economics, flag, &take_value(&key)?)?,
 				"--ingest" => ingest_mode = true,
 				"--uci" => uci = Some(PathBuf::from(take_value(&key)?)),
 				"--uci-column" => uci_column = take_value(&key)?,
@@ -1431,7 +1485,7 @@ impl Cli {
 		}
 
 		// Exactly one workload mode may be selected; the rest default to line protocol.
-		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (sparse_mode, InputMode::Sparse), (gpu_memory_mode, InputMode::GpuMemory), (ingest_mode, InputMode::Ingest)])?;
+		let mode = select_workload_mode(&[(synthetic, InputMode::Synthetic), (point_lookup, InputMode::PointLookup), (range_fetch, InputMode::RangeFetch), (compression, InputMode::Compression), (downsample, InputMode::Downsample), (gap_fill_mode, InputMode::GapFill), (sparse_mode, InputMode::Sparse), (gpu_memory_mode, InputMode::GpuMemory), (gpu_economics_mode, InputMode::GpuEconomics), (ingest_mode, InputMode::Ingest)])?;
 		if let Some(preset) = scale {
 			apply_scale_preset(preset, &mut ds_points, &mut gap_fill, &mut sparse);
 		}
@@ -1493,7 +1547,7 @@ impl Cli {
 			return Err("`--compressed-query` is a run of its own, apart from `--ingest-online` and `--ingest-growth`".to_string());
 		}
 
-		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, failure, failure_rows, failure_reps, failure_compact_to, failure_kill_within_ms, crash_matrix, crash_matrix_seeds, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, exports, gpu_calibrate, manifest, claim, labels })))
+		Ok(Command::Run(Box::new(Self { input, field, mode, comp_rows, comp_shape, csv, ds_points, ds_stride, ds_bucket, ds_aggs, ds_parallel, ds_decimals, ds_scaled, gap_fill, sparse, scale, gpu_memory, gpu_economics, uci, uci_column, ingest_rows, ingest_batch, ingest_growth, ingest_online, ingest_online_rows, ingest_online_window, compressed_query, compressed_query_rows, compressed_query_compact, failure, failure_rows, failure_reps, failure_compact_to, failure_kill_within_ms, crash_matrix, crash_matrix_seeds, query_mix, query_mix_rows, query_mix_range, query_mix_weights, analytics_rows, analytics_tail, analytics_batch, irregular, pl_rows, pl_queries, pl_absent, pl_mode, pl_rows_per_page, rf_rows, rf_window, rf_windows, rf_rows_per_page, seed, points, missingness, jitter, noise, decimals, shape, precision, spline, resolution, reps, out_dir, name, compare, stored, html, parquet, exports, gpu_calibrate, manifest, claim, labels })))
 	}
 }
 
@@ -1639,7 +1693,7 @@ fn parse_label(token: &str) -> Result<(String, String), String> {
 fn select_workload_mode(candidates: &[(bool, InputMode)]) -> Result<InputMode, String> {
 	let selected: Vec<InputMode> = candidates.iter().filter(|(set, _)| *set).map(|(_, m)| *m).collect();
 	if selected.len() > 1 {
-		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --sparse / --gpu-memory / --ingest)".to_string());
+		return Err("only one workload mode may be given (--synthetic / --point-lookup / --range-fetch / --compression / --downsample / --gap-fill / --sparse / --gpu-memory / --gpu-economics / --ingest)".to_string());
 	}
 	Ok(selected.first().copied().unwrap_or(InputMode::LineProtocol))
 }
@@ -1656,6 +1710,7 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 		InputMode::GapFill => Some("--gap-fill"),
 		InputMode::Sparse => Some("--sparse"),
 		InputMode::GpuMemory => Some("--gpu-memory"),
+		InputMode::GpuEconomics => Some("--gpu-economics"),
 		InputMode::Ingest => Some("--ingest"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
@@ -1704,7 +1759,7 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory | InputMode::Ingest => unreachable!("handled by self_generating_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory | InputMode::GpuEconomics | InputMode::Ingest => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -1937,6 +1992,36 @@ fn set_gpu_memory_knob(params: &mut weft_bench::gpu_memory::GpuMemoryParams, fla
 	Ok(())
 }
 
+/// The GPU-economics workload's knob flags, each taking one value ([`set_gpu_economics_knob`]).
+const GPU_ECONOMICS_FLAGS: [&str; 10] = ["--ge-points", "--ge-knots", "--ge-calls", "--ge-lanes", "--ge-concurrency", "--ge-calls-per-caller", "--ge-contention", "--ge-cold-spawns", "--ge-no-adapter", "--ge-smi-ms"];
+
+/// Apply one GPU-economics knob (`flag` from [`GPU_ECONOMICS_FLAGS`]) to `params`.
+fn set_gpu_economics_knob(params: &mut weft_bench::gpu_economics::GpuEconomicsParams, flag: &str, value: &str) -> Result<(), String> {
+	use weft_bench::gpu_economics::Lane;
+	let positive = |v: &str| v.trim().parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| format!("{flag} must be a positive whole number"));
+	let lanes = |v: &str| v.split(',').map(|l| Lane::parse(l.trim()).ok_or_else(|| format!("{flag}: {:?} is not cpu, parallel, gpu-f64, gpu-f32 or auto", l.trim()))).collect::<Result<Vec<_>, _>>();
+	match flag {
+		"--ge-points" => params.points = positive(value)?.max(2),
+		"--ge-knots" => params.knots = positive(value)?.max(2),
+		"--ge-calls" => params.calls = positive(value)?,
+		"--ge-lanes" => params.lanes = lanes(value)?,
+		"--ge-concurrency" => params.concurrency = value.split(',').map(positive).collect::<Result<_, _>>()?,
+		"--ge-calls-per-caller" => params.calls_per_caller = positive(value)?,
+		"--ge-contention" => params.contention = lanes(value)?,
+		"--ge-cold-spawns" => params.cold_spawns = value.parse().map_err(|_| "--ge-cold-spawns must be a whole number (0 skips the cold-start lanes)".to_string())?,
+		"--ge-no-adapter" => {
+			params.no_adapter = match value {
+				"on" => true,
+				"off" => false,
+				_ => return Err("--ge-no-adapter must be on or off".to_string()),
+			};
+		}
+		"--ge-smi-ms" => params.smi_interval_ms = value.parse().map_err(|_| "--ge-smi-ms must be a whole number of milliseconds (0 turns sampling off)".to_string())?,
+		_ => unreachable!("only GPU_ECONOMICS_FLAGS are dispatched here"),
+	}
+	Ok(())
+}
+
 /// Parse a `--ds-decimals` value: a place count in `0..=MAX_VALUE_DECIMALS`, or `full`.
 fn parse_value_decimals(s: &str) -> Result<Option<u32>, String> {
 	if s.eq_ignore_ascii_case("full") {
@@ -2014,6 +2099,7 @@ USAGE:
     weft-bench --gap-fill [GAP-FILL OPTIONS]
     weft-bench --sparse [BLOCK-MISSINGNESS OPTIONS]
     weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
+    weft-bench --gpu-economics [GPU-ECONOMICS OPTIONS]
     weft-bench --ingest --uci <FILE.txt> [INGEST OPTIONS]
     weft-bench verify <RUN.manifest.json> [--accept-advisories]
     weft-bench combine --out <FILE.json> [--no-manifest] <RUN.json> <RUN.json>...
@@ -2230,6 +2316,23 @@ GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
                                                [default: 16384,1048576,4194304]
         --gm-knots <N>       Input knots per call                    [default: 1000]
         --gm-pool-mib <N>    Start the GPU with this pool cap  [default: splimes' 512]
+
+GPU-ECONOMICS OPTIONS (with --gpu-economics; GPU lanes skip without a GPU; seeded by --seed):
+        --ge-points <N>      Output points per call                [default: 1048576]
+        --ge-knots <N>       Input knots per call                    [default: 10000]
+        --ge-calls <N>       Timed calls per fallback lane             [default: 30]
+        --ge-lanes <LIST>    Fallback lanes: cpu,parallel,gpu-f64,gpu-f32,auto
+                                                                   [default: all five]
+        --ge-concurrency <LIST>
+                             Concurrent callers per step        [default: 1,2,4,8,16]
+        --ge-calls-per-caller <N>
+                             Calls per contention caller               [default: 10]
+        --ge-contention <LIST>
+                             Contention lanes                   [default: gpu-f64,cpu]
+        --ge-cold-spawns <N> Child processes per cold-start mode; 0 skips [default: 5]
+        --ge-no-adapter <on|off>
+                             Run the hidden-driver child            [default: on]
+        --ge-smi-ms <N>      nvidia-smi sampling interval; 0 is off   [default: 100]
 
 SYNTHETIC OPTIONS (with --synthetic):
         --seed <N>           Generator seed, decimal or 0x-hex     [default: flagship]
@@ -2620,6 +2723,22 @@ mod tests {
 		assert!(run_cli(&["--range-fetch", "--synthetic"]).unwrap_err().contains("only one workload mode"));
 		assert!(run_cli(&["--range-fetch", "--input", "x.lp"]).unwrap_err().contains("cannot be combined with an input file"));
 		assert!(run_cli(&["--range-fetch", "--compare"]).unwrap_err().contains("`--compare` has no meaning"));
+	}
+
+	#[test]
+	fn gpu_economics_mode_parses_its_knobs() {
+		use weft_bench::gpu_economics::Lane;
+		let cli = expect_run(&["--gpu-economics"]);
+		assert_eq!(cli.mode, InputMode::GpuEconomics);
+		assert_eq!(cli.gpu_economics, weft_bench::gpu_economics::GpuEconomicsParams::default());
+		let cli = expect_run(&["--gpu-economics", "--ge-points", "65536", "--ge-knots", "50", "--ge-calls", "3", "--ge-lanes", "cpu, gpu-f32", "--ge-concurrency", "1,4", "--ge-calls-per-caller", "2", "--ge-contention", "parallel", "--ge-cold-spawns", "0", "--ge-no-adapter", "off", "--ge-smi-ms", "0"]);
+		let p = &cli.gpu_economics;
+		assert_eq!((p.points, p.knots, p.calls, p.calls_per_caller, p.cold_spawns, p.no_adapter, p.smi_interval_ms), (65_536, 50, 3, 2, 0, false, 0));
+		assert_eq!((p.lanes.clone(), p.contention.clone(), p.concurrency.clone()), (vec![Lane::Cpu, Lane::GpuF32], vec![Lane::Parallel], vec![1, 4]));
+		assert!(run_cli(&["--gpu-economics", "--ge-lanes", "tpu"]).unwrap_err().contains("--ge-lanes"));
+		assert!(run_cli(&["--gpu-economics", "--ge-concurrency", "0"]).unwrap_err().contains("--ge-concurrency"));
+		assert!(run_cli(&["--gpu-economics", "--ge-no-adapter", "yes"]).unwrap_err().contains("--ge-no-adapter"));
+		assert!(run_cli(&["--gpu-economics", "--gpu-memory"]).unwrap_err().contains("only one workload mode"));
 	}
 
 	#[test]

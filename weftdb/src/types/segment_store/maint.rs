@@ -927,6 +927,13 @@ impl SegmentStore {
 	/// meanwhile fails the swap with a `Conflict`, which writes nothing back. The
 	/// materialized rollup is rebuilt after each component's swap.
 	///
+	/// **Skip-identical** (Phase 4.6). When the fold is exactly the lowest-id member's own
+	/// rows (a replay of rows it already holds, say) and that member is time-sorted, no
+	/// frame is written: the swap keeps the member's row as it is, under the same
+	/// version precondition a rewrite takes (a racing change to it is a `Conflict`), and
+	/// only deletes and retires the others. Values are compared in their plain form,
+	/// scale included, so `-3` never stands in for `-3.0`.
+	///
 	/// Returns the net reduction in segment count across all components — `members − 1`
 	/// per fully-rewritten component and `members − 2` per split one (a split keeps two
 	/// segments); zero when no two segments overlap (a no-op).
@@ -1010,7 +1017,16 @@ impl SegmentStore {
 			let mut starts: Vec<i64> = members.iter().filter_map(|member| member.desc.min_ts).collect();
 			starts.sort_unstable();
 			let cold_boundary = starts.get(1).copied().unwrap_or(i64::MIN);
-			let (all_ts, all_vs) = self.merge_members(&members).await?;
+			let (all_ts, all_vs, identical) = self.merge_members_against_first(&members).await?;
+			// Skip-identical (Phase 4.6, design 9b): the lowest-id member already holds
+			// every row the fold gives, so it is kept as it is and only the others are
+			// deleted. No frame is written, and the kept frame keeps its paging.
+			if identical {
+				let plan = SwapPlan::keep(members);
+				removed += plan.removes();
+				self.swap_plan(held, &schema, plan).await?;
+				continue;
+			}
 			// The cold prefix: merged rows strictly before the second member's start.
 			let prefix_len = all_ts.partition_point(|&t| t < cold_boundary);
 			// Estimate prefix/suffix bytes from the component's uniform per-row size.
