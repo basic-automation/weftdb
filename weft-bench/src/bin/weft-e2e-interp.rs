@@ -6,7 +6,7 @@
 //!                 [--resolution milliseconds] [--spline linear|quadratic|cubic]
 //!                 [--uci FILE [--uci-column NAME] [--uci-rows N]]
 //!                 [--http HOST:PORT [--http-aspect NAME] [--http-skip-ingest] [--http-timeout-s S]]
-//!                 [--no-library] [--smoke]
+//!                 [--no-library] [--mmap-reads] [--smoke]
 //! ```
 //!
 //! Writes `DIR/e2e.json` (the `E2eReport`) and `DIR/e2e.md`, and exits 1 if any correctness
@@ -18,7 +18,7 @@ use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use weft_bench::e2e_interpolation::{self, parse_count, parse_resolution, BackendLane, CorpusSource, E2eConfig, HttpTarget, DEFAULT_E2E_SEED, E2E_ASPECT};
 
-const USAGE: &str = "usage: weft-e2e-interp [--out DIR] [--sizes 10k,100k,1M] [--backends cpu,parallel,gpu,gpu-f32,auto] [--reps N] [--warmup N] [--seed S] [--knot-step-ms MS] [--margin-knots K] [--resolution milliseconds] [--spline linear|quadratic|cubic] [--uci FILE [--uci-column NAME] [--uci-rows N]] [--http HOST:PORT [--http-aspect NAME] [--http-skip-ingest] [--http-timeout-s S]] [--no-library] [--smoke]";
+const USAGE: &str = "usage: weft-e2e-interp [--out DIR] [--sizes 10k,100k,1M] [--backends cpu,parallel,gpu,gpu-f32,auto] [--reps N] [--warmup N] [--seed S] [--knot-step-ms MS] [--margin-knots K] [--resolution milliseconds] [--spline linear|quadratic|cubic] [--uci FILE [--uci-column NAME] [--uci-rows N]] [--http HOST:PORT [--http-aspect NAME] [--http-skip-ingest] [--http-timeout-s S]] [--no-library] [--mmap-reads] [--smoke]";
 
 fn parse(args: &[String]) -> Result<(E2eConfig, PathBuf), String> {
 	let mut config = E2eConfig { sizes: vec![10_000, 100_000, 1_000_000, 10_000_000], reps: 30, warmup: 3, ..E2eConfig::smoke() };
@@ -66,6 +66,7 @@ fn parse(args: &[String]) -> Result<(E2eConfig, PathBuf), String> {
 			"--http-skip-ingest" => skip_ingest = true,
 			"--http-timeout-s" => timeout_s = value()?.parse().ok().filter(|v| *v > 0).ok_or_else(|| "--http-timeout-s needs a positive integer".to_string())?,
 			"--no-library" => no_library = true,
+			"--mmap-reads" => config.mmap_reads = true,
 			other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
 		}
 	}
@@ -143,5 +144,8 @@ mod tests {
 		assert!(parse(&args("--bogus")).is_err());
 		let (uci, _) = parse(&args("--uci f.txt --no-library --http h:1")).expect("parses");
 		assert!(uci.backends.is_empty() && uci.resolution == splimes::Resolution::Seconds);
+		assert!(!uci.mmap_reads, "buffered reads unless asked");
+		let (mapped, _) = parse(&args("--smoke --mmap-reads")).expect("parses");
+		assert!(mapped.mmap_reads);
 	}
 }

@@ -245,13 +245,19 @@ pub struct E2eConfig {
 	pub margin_knots: i64,
 	/// The HTTP path, if any.
 	pub http: Option<HttpTarget>,
+	/// Open the library path's store with memory-mapped range reads
+	/// ([`weftdb::SegmentStoreOptions::mmap_reads`], roadmap Phase 5 memory-mapped GPU I/O), so
+	/// `storage_read` decodes from mapped frames. Needs this crate's `mmap-reads` feature. The
+	/// HTTP path's server decides for itself (`WEFT_SEGMENT_MMAP_READS` on a server built with
+	/// its own `mmap-reads` feature).
+	pub mmap_reads: bool,
 }
 
 impl E2eConfig {
 	/// A smoke-size configuration (tiny sizes, two reps), for a quick check that every stage runs.
 	#[must_use]
 	pub fn smoke() -> Self {
-		Self { corpus: CorpusSource::Synthetic { seed: DEFAULT_E2E_SEED, knot_step_ns: 100_000_000 }, sizes: vec![1_000, 10_000], backends: BackendLane::ALL.to_vec(), resolution: Resolution::Milliseconds, spline: Spline::Cubic, reps: 2, warmup: 1, margin_knots: 4, http: None }
+		Self { corpus: CorpusSource::Synthetic { seed: DEFAULT_E2E_SEED, knot_step_ns: 100_000_000 }, sizes: vec![1_000, 10_000], backends: BackendLane::ALL.to_vec(), resolution: Resolution::Milliseconds, spline: Spline::Cubic, reps: 2, warmup: 1, margin_knots: 4, http: None, mmap_reads: false }
 	}
 
 	fn validate(&self) -> anyhow::Result<()> {
@@ -260,6 +266,7 @@ impl E2eConfig {
 		ensure!(self.reps > 0, "reps must be positive");
 		ensure!(self.margin_knots >= 1, "margin must be at least one knot spacing");
 		ensure!(!self.backends.is_empty() || self.http.is_some(), "nothing to run: no library backends and no --http");
+		ensure!(!self.mmap_reads || cfg!(feature = "mmap-reads"), "--mmap-reads needs weft-bench built with `--features mmap-reads`; without it the store would silently read buffered");
 		Ok(())
 	}
 }
@@ -600,6 +607,10 @@ pub struct E2eReport {
 	pub http: Vec<HttpCell>,
 	/// Every gate passed.
 	pub all_ok: bool,
+	/// The library path read its frames memory-mapped (`--mmap-reads`, roadmap Phase 5). Absent
+	/// in reports written before it existed, which read buffered.
+	#[serde(default)]
+	pub mmap_reads: bool,
 }
 
 /// What the probe description says.
@@ -749,11 +760,12 @@ impl Drop for TempStore {
 }
 
 /// Seal the corpus into a fresh store in a temporary directory.
-async fn seal_corpus(corpus: &Corpus) -> anyhow::Result<TempStore> {
+async fn seal_corpus(corpus: &Corpus, mmap_reads: bool) -> anyhow::Result<TempStore> {
 	let dir = std::env::temp_dir().join(format!("weft-bench-e2e-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap_or_default()));
 	std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 	let mut guard = TempStore { store: None, dir: dir.clone() };
-	let store = SegmentStore::open(&dir).await.with_context(|| format!("opening a store in {}", dir.display()))?;
+	let options = weftdb::SegmentStoreOptions::default().with_mmap_reads(mmap_reads);
+	let store = SegmentStore::open_with_options(&dir, options).await.with_context(|| format!("opening a store in {}", dir.display()))?;
 	store.declare(E2E_ASPECT, &AspectSchema::new(PhysicalType::ScaledI64 { scale: corpus.info.decimal_scale }, BigDecimal::from(0), TimeUnit::Nanos)).await.context("declaring the e2e aspect")?;
 	for (ts, vs) in corpus.timestamps.chunks(SEAL_BATCH_ROWS).zip(corpus.values.chunks(SEAL_BATCH_ROWS)) {
 		store.seal_declared(E2E_ASPECT, ts, vs).await.context("sealing the corpus")?;
@@ -884,7 +896,7 @@ fn library_cell(size: usize, lane: BackendLane, run: CellRun, reference: &Interp
 
 /// Run the library path for every size and lane.
 async fn run_library(config: &E2eConfig, corpus: &Corpus, gpu: Option<&GpuDescription>, probe: Option<&TransferProbe>, skipped: &mut Vec<SkippedLane>, progress: &mut (dyn FnMut(&str) + Send)) -> anyhow::Result<Vec<LibraryCell>> {
-	let sealed = seal_corpus(corpus).await?;
+	let sealed = seal_corpus(corpus, config.mmap_reads).await?;
 	let store = sealed.store.as_ref().context("store")?;
 	let lanes = runnable_lanes(&config.backends, gpu, skipped);
 	let mut cells = Vec::new();
@@ -1135,7 +1147,7 @@ pub async fn run(config: &E2eConfig, progress: &mut (dyn FnMut(&str) + Send)) ->
 		http = run_http(config, target, &corpus, progress)?;
 	}
 	let all_ok = library.iter().all(|c| c.correctness.ok) && http.iter().all(|c| c.ok);
-	Ok(E2eReport { schema_version: SCHEMA_VERSION, kind: E2E_REPORT_KIND.to_string(), corpus: corpus.info, resolution: config.resolution.as_str().to_string(), spline: spline_token(config.spline).to_string(), margin_knots: config.margin_knots, reps: config.reps, warmup: config.warmup, gpu, gpu_error, transfer_probe: probe_state, library, skipped, http_ingest: http_ingested, http, all_ok })
+	Ok(E2eReport { schema_version: SCHEMA_VERSION, kind: E2E_REPORT_KIND.to_string(), corpus: corpus.info, resolution: config.resolution.as_str().to_string(), spline: spline_token(config.spline).to_string(), margin_knots: config.margin_knots, reps: config.reps, warmup: config.warmup, gpu, gpu_error, transfer_probe: probe_state, library, skipped, http_ingest: http_ingested, http, all_ok, mmap_reads: config.mmap_reads })
 }
 
 fn ms(ns: u64) -> String {

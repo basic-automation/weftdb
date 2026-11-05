@@ -14,6 +14,11 @@ categories = ["development-tools::profiling", "database"]
 publish = false
 
 
+[features]
+# Lets `weft-e2e-interp --mmap-reads` open its store with weftdb's memory-mapped range reads
+# (roadmap Phase 5, memory-mapped GPU I/O), for the before/after transfer comparison.
+mmap-reads = ["weftdb/mmap-reads"]
+
 [dependencies]
 anyhow = { workspace = true }
 # The Parquet results table (`--parquet`): arrow builders + weft-arrow's uncompressed writer.

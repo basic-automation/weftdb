@@ -22,6 +22,11 @@ fault-injection = []
 # `WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD` is ignored with a warning, and reading a segment that
 # uses the codec fails with an error naming this feature.
 bitsliced-codec = ["weft-physical-type/bitsliced-codec"]
+# Off by default (roadmap Phase 5, memory-mapped GPU I/O). Lets `SegmentStoreOptions::mmap_reads`
+# (`WEFT_SEGMENT_MMAP_READS`) map sealed frames for range reads instead of reading them into the
+# heap; without it the option is accepted and ignored. The one `unsafe` it adds, and why it is
+# opt-in, is documented in `segment_store/mapped.rs`.
+mmap-reads = ["dep:memmap2"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -51,6 +56,7 @@ serde_json = { workspace = true }
 md5 = { workspace = true }
 sysinfo = { workspace = true }
 tracing = { workspace = true }
+memmap2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 csv = { workspace = true }
