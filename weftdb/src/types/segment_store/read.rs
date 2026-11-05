@@ -43,6 +43,28 @@ impl SegmentStore {
 		tokio::task::spawn_blocking(move || fold_newest_wins(frames)).await.context("merging maintenance inputs")
 	}
 
+	/// [`merge_members`](Self::merge_members), and whether the fold is exactly the
+	/// lowest-id member's own rows (Phase 4.6 skip-identical, design 9b): the member is
+	/// `time_sorted`, and its decoded rows equal the folded ones row for row, each value
+	/// compared in its plain form, scale included ([`same_rows`]), so `-3` and `-3.0` are
+	/// different rows here even though `BigDecimal` calls them equal (critique F23).
+	/// When it is, a reconcile can keep that member as it is instead of writing the fold.
+	pub(crate) async fn merge_members_against_first(&self, members: &[IndexRow]) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>, bool)> {
+		let mut frames = Vec::with_capacity(members.len());
+		for member in members {
+			frames.push(self.read_bound_frame(member).await?);
+		}
+		let sorted_first = members.first().is_some_and(|first| first.desc.time_sorted);
+		tokio::task::spawn_blocking(move || {
+			let first = frames.first().filter(|_| sorted_first).map(|frame| (frame.timestamps.clone(), frame.values.clone()));
+			let (timestamps, values) = fold_newest_wins(frames);
+			let identical = first.is_some_and(|(first_ts, first_vs)| same_rows(&first_ts, &first_vs, &timestamps, &values));
+			(timestamps, values, identical)
+		})
+		.await
+		.context("merging maintenance inputs")
+	}
+
 	/// The file holding `descriptor`'s frame: its recorded path, resolved against this
 	/// store's root (see [`resolve_frame_path`]), so that a root that was moved or
 	/// restored elsewhere still reads its own frames.

@@ -93,7 +93,7 @@ use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, write_new_durable, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, store_format::{self, StoreFormat, StoreScope}
+		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, segment_index::SegmentChange, store_format::{self, StoreFormat, StoreScope}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
@@ -1000,6 +1000,23 @@ fn fold_newest_wins(frames: Vec<DecodedFrame>) -> (Vec<i64>, Vec<Option<BigDecim
 	merged.into_iter().unzip()
 }
 
+/// Whether two runs of rows are the same, row for row: equal timestamps, and values equal
+/// in their **plain form**, scale included (`-3` and `-3.0` differ), nulls equal to nulls.
+/// `BigDecimal`'s own `==` ignores scale, and the store keeps the scale a value was
+/// written with, so a numeric comparison could keep a frame that reads back different
+/// text from the fold (Phase 4.6 skip-identical, critique F23).
+fn same_rows(left_ts: &[i64], left_vs: &[Option<BigDecimal>], right_ts: &[i64], right_vs: &[Option<BigDecimal>]) -> bool {
+	left_ts == right_ts
+		&& left_vs.len() == right_vs.len()
+		&& left_vs.iter().zip(right_vs).all(|(left, right)| match (left, right) {
+			(None, None) => true,
+			// Same digits at the same scale is the same plain form; otherwise the plain forms
+			// decide (`1E+2` and `100` read back alike).
+			(Some(left), Some(right)) => left.as_bigint_and_scale() == right.as_bigint_and_scale() || left.to_plain_string() == right.to_plain_string(),
+			_ => false,
+		})
+}
+
 /// Rows per page of a maintenance merge's output once it holds more than one page.
 ///
 /// A merge writes outputs far larger than the seals it folds (a squash to 65,536-row
@@ -1049,9 +1066,15 @@ struct PlanOutput {
 /// or a run of consecutive ids, and a row committed after the snapshot has a higher id
 /// (see the module documentation for the seals of the S7-S10 interim), so outputs under
 /// member ids outrank exactly what their members did.
+///
+/// A **keep** plan (Phase 4.6 skip-identical, design 9b) writes no output at all: its
+/// lowest-id member already holds exactly the rows the fold would write, so it stays as
+/// it is, under an expected-version precondition, and only the other members are deleted
+/// and retired.
 pub(crate) struct SwapPlan {
 	members: Vec<IndexRow>,
 	outputs: Vec<PlanOutput>,
+	keep: bool,
 }
 
 impl SwapPlan {
@@ -1081,12 +1104,21 @@ impl SwapPlan {
 			outputs.push(PlanOutput { timestamps, values, rows_per_page });
 		}
 		outputs.reverse();
-		Self { members, outputs }
+		Self { members, outputs, keep: false }
 	}
 
-	/// How many segments the swap removes from the aspect: its members less its outputs.
+	/// A delete-only plan over `members` (Phase 4.6 skip-identical): the lowest-id member
+	/// is kept as it is, since its rows are already what a fold of every member gives, and
+	/// the others are deleted. No frame is written.
+	fn keep(mut members: Vec<IndexRow>) -> Self {
+		members.sort_by_key(|member| member.desc.id);
+		Self { members, outputs: Vec::new(), keep: true }
+	}
+
+	/// How many segments the swap removes from the aspect: its members less its outputs
+	/// (the kept member counting as one).
 	const fn removes(&self) -> usize {
-		self.members.len().saturating_sub(self.outputs.len())
+		self.members.len().saturating_sub(self.outputs.len() + self.keep as usize)
 	}
 
 	/// The spans of the outputs that take fresh ids (P2), in time order.
@@ -1105,6 +1137,8 @@ pub(crate) struct Swapped {
 /// outputs once written.
 pub(crate) struct PreparedPlan {
 	members: Vec<IndexRow>,
+	/// Whether this is a keep plan ([`SwapPlan::keep`]): no outputs, its first member kept.
+	keep: bool,
 	retired: Vec<String>,
 	series_id: u64,
 	prec: u64,
@@ -1118,6 +1152,16 @@ impl PreparedPlan {
 		self.outputs.iter().map(|output| output.name.clone()).collect()
 	}
 
+	/// How many members keep their row: one per output, or the kept member of a keep
+	/// plan. The rest are deleted.
+	const fn taken(&self) -> usize {
+		if self.keep {
+			1
+		} else {
+			self.outputs.len()
+		}
+	}
+
 	/// How many of the plan's outputs take fresh ids.
 	const fn extra(&self) -> usize {
 		self.outputs.len().saturating_sub(self.members.len())
@@ -1126,21 +1170,33 @@ impl PreparedPlan {
 	/// The id each output takes, in time order: the members' ids in ascending order (P1),
 	/// then the fresh ones (P2).
 	fn output_ids(&self) -> Vec<u64> {
+		if self.keep {
+			return self.members.iter().take(1).map(|member| member.desc.id).collect();
+		}
 		self.members.iter().map(|member| member.desc.id).chain(self.fresh.iter().copied()).take(self.outputs.len()).collect()
 	}
 
 	/// The members no output takes the id of, which the swap deletes: their frame
 	/// paths, whose sidecars a merge removes by frame name.
 	fn deleted_frames(&self) -> Vec<String> {
-		self.members.iter().skip(self.outputs.len()).map(|member| member.desc.path.clone()).collect()
+		self.members.iter().skip(self.taken()).map(|member| member.desc.path.clone()).collect()
 	}
 
 	/// Step M5's ops for this plan, committing in aspect epoch `epoch` (design section 5.3):
 	/// `ReplaceExpected` on the member whose id each output takes (against the version M1
 	/// read) or `InsertNew` under a fresh id, one `DeleteEveryExpected` for the members left over,
-	/// `JournalRetire` for every member's frame, and `ClearJournal` for every output's
-	/// pending row.
+	/// `JournalRetire` for every retired member's frame, and `ClearJournal` for every output's
+	/// pending row. A keep plan has no outputs: its kept member gets an unchanged
+	/// `ReplaceExpected` instead, a pure precondition, and is not retired.
 	fn ops(&self, aspect: &str, epoch: u64, created_ms: i64, ops: &mut Vec<IndexOp>) {
+		if self.keep {
+			// The kept member is rewritten as itself: the op changes nothing, but it is a
+			// precondition on the version M1 read, so a racing change to it is a `Conflict`
+			// and the other members are not deleted under a row that no longer folds them.
+			if let Some(kept) = self.members.first() {
+				ops.push(IndexOp::ReplaceExpected { aspect: aspect.to_string(), expected: kept.version(), row: kept.clone() });
+			}
+		}
 		for (j, (output, id)) in self.outputs.iter().zip(self.output_ids()).enumerate() {
 			let row = output.row(id, epoch, self.series_id);
 			match self.members.get(j) {
@@ -1148,7 +1204,7 @@ impl PreparedPlan {
 				None => ops.push(IndexOp::InsertNew { aspect: aspect.to_string(), row }),
 			}
 		}
-		let deleted: Vec<RowVersion> = self.members.iter().skip(self.outputs.len()).map(IndexRow::version).collect();
+		let deleted: Vec<RowVersion> = self.members.iter().skip(self.taken()).map(IndexRow::version).collect();
 		if !deleted.is_empty() {
 			ops.push(IndexOp::DeleteEveryExpected { aspect: aspect.to_string(), expected: deleted });
 		}
@@ -6692,11 +6748,11 @@ mod tests {
 		assert_eq!(schemas[1], schemas[0], "the second open changes nothing the first did not");
 		assert_eq!(schemas[2], schemas[0], "nor does the third");
 
-		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false };
+		let migrated = OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false };
 		let settled = OpenReport { created_new: false, migrated_from: None, applied: Vec::new(), recovery_report_only: false };
 		assert_eq!(reports, vec![migrated, settled.clone(), settled], "the first open migrates from layout 1 through the registry, and the later ones find nothing pending");
 		let (format, uuid) = formats[0].clone();
-		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0007_series_time_index".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
+		assert_eq!(format, StoreFormat { kind: crate::types::store_format::STORE_KIND.into(), layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0008_upsert_keys".into()), store_uuid: uuid.clone(), scope: StoreScope { database: "default".into(), subject: "default".into() } });
 		assert!(formats.iter().all(|seen| seen == &formats[0]), "the marker and the store's identity stay put: {formats:?}");
 		assert_eq!(crate::types::store_format::read_marker(&root).await.expect("reads the marker"), Some(format));
 
@@ -6712,13 +6768,13 @@ mod tests {
 			assert!(row.contains("/var/tmp/weft-pre-v2-fixture/root/segments/"), "the stored path is left as the pre-v2 build wrote it: {row}");
 			assert!(row.ends_with(" Integer(0) Null Null Null Integer(0)"), "a legacy row is generation 0 and series 0, with no prec, frame_crc or commit_epoch: {row}");
 		}
-		for (key, value) in [("applied_through", "0007_series_time_index"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
+		for (key, value) in [("applied_through", "0008_upsert_keys"), ("last_written_layout", "2"), ("layout_version", "2"), ("min_read_layout", "2"), ("min_write_layout", "2"), ("store_uuid", uuid.as_str())] {
 			assert!(schema.contains(&format!("meta Text(\"{key}\") Text(\"{value}\")\n")), "store_meta mirrors the marker's {key}:\n{schema}");
 		}
 		assert!(uuid::Uuid::parse_str(&uuid).is_ok(), "the store_uuid is a UUID: {uuid}");
 		let migrations: Vec<&str> = schema.lines().filter_map(|line| line.strip_prefix("migration ")).collect();
-		assert_eq!(migrations.len(), 7, "{schema}");
-		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) ") && migrations[5].starts_with("Text(\"0006_tag5_series\") Integer(2) ") && migrations[6].starts_with("Text(\"0007_series_time_index\") Integer(2) "), "{migrations:?}");
+		assert_eq!(migrations.len(), 8, "{schema}");
+		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) ") && migrations[5].starts_with("Text(\"0006_tag5_series\") Integer(2) ") && migrations[6].starts_with("Text(\"0007_series_time_index\") Integer(2) ") && migrations[7].starts_with("Text(\"0008_upsert_keys\") Integer(2) "), "{migrations:?}");
 	}
 
 	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
@@ -6792,9 +6848,9 @@ mod tests {
 		let (last, databases) = &markers[1];
 		assert_eq!(databases, &CONTROL_PLANE_FILES.to_vec(), "the final marker follows the databases");
 		assert_eq!(last, &format);
-		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0007_series_time_index".into()), ..first.clone() }, "the final marker is the first, settled");
+		assert_eq!(format, StoreFormat { migrating_to: None, applied_through: Some("0008_upsert_keys".into()), ..first.clone() }, "the final marker is the first, settled");
 		assert_eq!((format.store_uuid.as_str(), &format.scope), (uuid.as_str(), &StoreScope { database: "market".into(), subject: "BTCUSD".into() }));
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
 		let reopened = SegmentStore::open_scoped(&root, "market", "BTCUSD").await.expect("reopens");
 		let again = (reopened.open_report().created_new, reopened.store_uuid().to_string());
 		drop(reopened);
@@ -6856,7 +6912,7 @@ mod tests {
 		let applied = store.open_report().applied.clone();
 		let reads = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
-		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index"]);
+		assert_eq!(ran, vec!["0001_baseline", "0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index", "0008_upsert_keys"]);
 		assert!(before.contains("store_migrations") && before.contains("0002_s6_s7"), "{before}");
 		assert_eq!(after, before, "a second run of every migration changed nothing");
 		assert!(applied.is_empty(), "nothing is pending: {applied:?}");
@@ -7035,7 +7091,7 @@ mod tests {
 				let settled = store.store_format();
 				let reads = if legacy { Some(fixture_reads(&store).await) } else { None };
 				drop(store);
-				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0007_series_time_index")), "{}", image.display());
+				assert_eq!((settled.layout_version, settled.min_write_layout, settled.migrating_to, settled.applied_through.as_deref()), (SUPPORTED_LAYOUT, SUPPORTED_LAYOUT, None, Some("0008_upsert_keys")), "{}", image.display());
 				if let Some(reads) = reads {
 					assert_eq!(reads, expected_reads, "{}: the image reads what the fixture holds", image.display());
 				}
@@ -7197,7 +7253,7 @@ mod tests {
 		let (ts, _) = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		drop(store);
 		let schema = index_schema(&root).await;
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
 		assert_eq!(kept, uuid, "the S6 store_uuid is kept");
 		assert!(schema.contains("| Text(\"series_id\") Text(\"INTEGER\") Integer(1) Text(\"0\") Integer(0)\n"), "segment_index gains series_id (NOT NULL DEFAULT 0):\n{schema}");
 		assert!(schema.contains("| Text(\"next_series_id\") Text(\"INTEGER\") Integer(1) Text(\"1\") Integer(0)\n"), "aspect_seq gains next_series_id (NOT NULL DEFAULT 1):\n{schema}");
@@ -7220,7 +7276,7 @@ mod tests {
 		let (format, before) = (store.store_format(), store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads"));
 		drop(store);
 		put_marker(&root, &StoreFormat { applied_through: Some("0005_d_s13".into()), ..format.clone() });
-		on_raw_index(&root, &["DROP TABLE series", "DROP INDEX idx_segment_index_series_time", "DELETE FROM store_migrations WHERE id IN ('0006_tag5_series', '0007_series_time_index')", "UPDATE store_meta SET value = '0005_d_s13' WHERE key = 'applied_through'"]).await;
+		on_raw_index(&root, &["DROP TABLE series", "DROP INDEX idx_segment_index_series_time", "DELETE FROM store_migrations WHERE id IN ('0006_tag5_series', '0007_series_time_index', '0008_upsert_keys')", "UPDATE store_meta SET value = '0005_d_s13' WHERE key = 'applied_through'"]).await;
 		assert!(!index_tables(&root).await.contains(&"series".to_string()), "the pre-TAG-5 shape");
 		let rows_before: Vec<String> = index_schema(&root).await.lines().filter(|line| line.starts_with("row ")).map(str::to_string).collect();
 
@@ -7229,8 +7285,8 @@ mod tests {
 		let after = store.read_time_range("price", i64::MIN, i64::MAX).await.expect("reads");
 		let catalog = store.index().series_of("price").await.expect("the catalog reads");
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: vec!["0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
-		assert_eq!(settled, StoreFormat { applied_through: Some("0007_series_time_index".into()), ..format.clone() }, "layout, floors and identity unchanged");
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: None, applied: vec!["0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
+		assert_eq!(settled, StoreFormat { applied_through: Some("0008_upsert_keys".into()), ..format.clone() }, "layout, floors and identity unchanged");
 		assert_eq!((settled.layout_version, settled.min_read_layout, settled.min_write_layout), (2, 2, 2), "the catalog is a layout-2 migration (DECISIONS: TAG-5)");
 		assert_eq!(uuid, format.store_uuid, "the store keeps its identity");
 		assert_eq!(after, before, "reads are unchanged");
@@ -7239,7 +7295,7 @@ mod tests {
 		assert!(schema.contains("table series: Text(\"aspect\") Text(\"TEXT\") Integer(1) Null Integer(1) | Text(\"series_key\") Text(\"TEXT\") Integer(1) Null Integer(2) | Text(\"series_id\") Text(\"INTEGER\") Integer(1) Null Integer(0)\n"), "series(aspect, series_key, series_id), keyed on (aspect, series_key):\n{schema}");
 		let rows_after: Vec<String> = schema.lines().filter(|line| line.starts_with("row ")).map(str::to_string).collect();
 		assert_eq!(rows_after, rows_before, "no segment_index row is rewritten");
-		assert!(schema.contains("meta Text(\"applied_through\") Text(\"0007_series_time_index\")\n"), "{schema}");
+		assert!(schema.contains("meta Text(\"applied_through\") Text(\"0008_upsert_keys\")\n"), "{schema}");
 	}
 
 	/// TAG-5, R10: the repair pass seeds each aspect's series allocator past the ids its
@@ -7291,7 +7347,7 @@ mod tests {
 		let store = SegmentStore::open(&root).await.expect("finishes the creation");
 		let (report, uuid) = (store.open_report().clone(), store.store_uuid().to_string());
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: true, migrated_from: None, applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
 		assert_eq!(uuid, format.store_uuid);
 
 		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
@@ -7302,7 +7358,7 @@ mod tests {
 		let store = SegmentStore::open(&legacy).await.expect("finishes the upgrade");
 		let report = store.open_report().clone();
 		drop(store);
-		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into()], recovery_report_only: false });
+		assert_eq!(report, OpenReport { created_new: false, migrated_from: Some(1), applied: vec!["0001_baseline".into(), "0002_s6_s7".into(), "0003_fre14_legacy_catalog".into(), "0004_d_s12".into(), "0005_d_s13".into(), "0006_tag5_series".into(), "0007_series_time_index".into(), "0008_upsert_keys".into()], recovery_report_only: false });
 	}
 
 	/// FRE-12a's `ensure_floor`: raising a floor writes the marker first, fsynced, and
@@ -8309,3 +8365,7 @@ mod tag_maint_tests;
 /// TAG-8: every store read targets one series; selectors resolve to one.
 #[cfg(test)]
 mod tag_read_tests;
+
+/// Phase 4.6: declared upsert keys bound the tags an ingest may carry.
+#[cfg(test)]
+mod upsert_keys_tests;
