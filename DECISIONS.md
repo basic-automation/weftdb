@@ -57,6 +57,60 @@ F22, F23) disagree on whether the keys should exist at all and at which layout.
   Squash and compaction do not skip yet; only the overlap merge was specified.
 - **The crash matrix's `Op::SkipIdentical`** runs only the fault points the swap passes, and
   reads "committed" as "one segment fewer" since no output generation appears.
+## 2026-11-04 — SOA-11: the backup lane is a checker over the caller's backup/restore/read-backs, judging the online backup as an exact prefix and recording RPO/RTO by EVI-19's formulas (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6, W7) lists SOA-11 by name only — "Soak backup
+lane, online prefix check, final restore verification, RPO/RTO" — and the
+queue's acceptance fixes the outcomes (the lane runs with an online prefix
+check; final restore verification passes through PAC-13's restore CLI;
+RPO/RTO recorded) without naming shapes. What the sources do fix: plan C19
+makes PAC-13's `weft-server restore` the one restore entry point (§3 absorbs
+SOA-11's own restore command into PAC-13), so the lane verifies restores
+*through* that path rather than growing a second one; EVI-19's page
+(docs/RPO-RTO.md) names SOA-11 as the slice that "times the soak backup lane
+and the final restore verification" and pins the definitions this lane
+records — RPO = max(I, d_max) + d_max (plan decision D-S21's corrected
+formula), and RTO as the time to a restored store serving again *including*
+taking the backup it restores from; and SOA's standing rules govern the
+shape (SOA-6/SOA-10 precedent: a library checker that performs no I/O
+itself, exact judgement with no invented tolerance or threshold, a field on
+`SoakRun` bumping `SOAK_SCHEMA_VERSION` on SOA's own line, no free text in
+records).
+
+**Chosen (grounded as above, under the owner's best-guess authorization of
+2026-10-26; if merge review disagrees, this decision is revisited there):**
+
+1. **Library module, no backup/restore client, no CLI flag**:
+   `weft-bench/src/soak_backup.rs`, exported from the crate, on the SOA-6 /
+   SOA-10 precedent. The caller takes the backup against its live server,
+   restores through PAC-13's path (`restore_store` /
+   `restore_control_plane` — the library calls the CLI itself runs), reads
+   points back, times the passes, and hands all of it to
+   `BackupLaneChecker`. The slices that own how a soak is launched are
+   later ones.
+2. **The online prefix check.** A backup taken while ingest runs must be an
+   exact *prefix* of the acknowledged tick sequence: complete and exact up
+   to a cut, nothing from any later acknowledged tick, nothing
+   unacknowledged. A later tick present while an earlier acknowledged tick
+   is incomplete is a torn image, classified once as `BeyondPrefix` at the
+   furthest observed tick, on top of the incomplete tick's own cell
+   mismatches. Points are judged per cell exactly as SOA-6's oracle judges
+   a raw read-back (same `ObservedPoint` form).
+3. **Final restore verification** judges the restored store against the
+   *whole* acknowledged history — every acknowledged tick complete and
+   exact, nothing else — not against the backup's prefix: a restore that
+   loses a point the run acknowledged fails even when the backup itself
+   was a clean prefix.
+4. **RPO/RTO are recorded, never gated.** `RecoveryTiming` carries the
+   caller's three measured durations (backup interval `I`, one backup
+   pass `d_max`, the final restore's duration) and derives RPO/RTO by
+   EVI-19's formulas; no threshold is invented for either — SOA-13 owns
+   the SLO evaluator that will judge them.
+5. **Recorded on the run record** as `SoakRun::backup` via
+   `SoakHarness::record_backup_verdict` (recorded exactly once, while
+   `Running`, like the oracle and derived verdicts); `SOAK_SCHEMA_VERSION`
+   moves to v6 on SOA's own line, the field `#[serde(default)]` and
+   skipped when absent so v1–v5 artifacts still deserialize.
 
 ## 2026-11-04 — Phase 2 integrations: what was built, and the two items left with a reason (FLAGGED FOR MERGE REVIEW)
 
