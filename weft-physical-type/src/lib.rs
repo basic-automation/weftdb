@@ -103,14 +103,19 @@
 //! the store (`database`), the server (`weft-server`), the harness (`weft-bench`),
 //! and the forthcoming Storage v2 columnar segments alike.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
+pub mod cast;
 pub mod catalog;
 pub mod column;
 #[cfg(feature = "experimental-codecs")]
 pub mod floatcodec;
-/// The `.weftseg` frame version registry, and the two classes of frame-fault a read
-/// can fail with (1.0 plan X-FRAME, resolution C5). Also the
+/// The `.weftseg` frame version registry.
+///
+/// Also the two classes of frame-fault a read
+/// can fail with (1.0 plan X-FRAME, resolution C5), and the
 /// [`DecodeLimits`] a frame decode enforces (ROB-8).
 pub mod frame_registry;
 pub mod nulls;
@@ -301,7 +306,9 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
-/// The one decimal domain every WeftDB value lives in (1.0 plan **decision 10**,
+/// The one decimal domain every WeftDB value lives in.
+///
+/// (1.0 plan **decision 10**,
 /// slice **ROB-6**, resolving conflict **C13**): a value's **plain**
 /// (non-exponent) form — the form every sink writes, see
 /// [`PhysicalType::BigDecimalText`]'s `to_plain_string` — carries at most

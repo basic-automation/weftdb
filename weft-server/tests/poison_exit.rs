@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! `WEFT_ON_AMBIGUOUS_COMMIT=exit` (release plan C-1): the `weftdb` library never exits
 //! the process, so the server does. Once its store is write-poisoned it logs why and exits
 //! with status 70, for a supervisor to restart it and the restart's recovery to settle the
@@ -32,6 +35,8 @@ async fn poison_exit_child() {
 	let wait = if OnPoison::from_env() == OnPoison::Exit { Duration::from_secs(30) } else { Duration::from_millis(500) };
 	tokio::time::sleep(wait).await;
 	println!("{STILL_RUNNING}");
+	// Held open to here: the poisoned store is what the server would still be serving.
+	drop(store);
 }
 
 /// Run [`poison_exit_child`] in a child process over `root`, with

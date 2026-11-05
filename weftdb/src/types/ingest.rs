@@ -7,10 +7,9 @@
 //!
 //! - [`IngestBatch`]: an idempotency `key`, a `groups` tag set, and the
 //!   `(timestamp, value)` rows (nullable, like the quality-column seal).
-//!   Before the tags gate flips, `groups` accepts only the empty
-//!   [`TagSet`] — series 0 — exactly as the plan's D-S13 amendment and C1/A4
-//!   prescribe; a non-empty set is refused with the typed
-//!   [`StoreError::GroupsUnsupported`](crate::StoreError).
+//!   An empty `groups` is series 0; a non-empty set seals as its own series
+//!   (the library gate opened in TAG-8), and a reserved `__` key is refused
+//!   with the typed [`StoreError::ReservedTagKey`](crate::StoreError).
 //! - The **fingerprint**: a deterministic 64-bit hash over the batch's rows,
 //!   each present value hashed as its **bounded plain form** (ROB-6's one
 //!   decimal domain: the form every sink writes, at most
@@ -91,7 +90,7 @@ impl fmt::Display for IngestPhase {
 
 /// One batch offered to [`SegmentStore::ingest`](crate::SegmentStore::ingest):
 /// an idempotency key, a groups tag set, and its rows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestBatch {
 	/// The idempotency key, scoped to the aspect: the same key offered again
 	/// with the same batch replays the first commit's receipt; with a
@@ -100,9 +99,10 @@ pub struct IngestBatch {
 	/// the caller's, from whatever namespace its own retries use (the HTTP
 	/// layer's `Idempotency-Key` header lands on this field in D-S14).
 	pub key: String,
-	/// The batch's tag groups (plan §4 C1, shape A4). Before the tags gate
-	/// flips only the empty set is accepted — series 0 — and a non-empty set
-	/// is refused with [`GroupsUnsupported`](StoreError::GroupsUnsupported).
+	/// The batch's tag groups (plan §4 C1, shape A4): the empty set is series
+	/// 0, and a non-empty set names the series the batch seals into (TAG-8).
+	/// A key with the reserved `__` prefix is refused with
+	/// [`ReservedTagKey`](StoreError::ReservedTagKey).
 	pub groups: TagSet,
 	/// The page height the batch's segments seal with, when the caller asked
 	/// for paged frames (crash-consistency §8: the HTTP layer's
@@ -147,15 +147,6 @@ impl IngestBatch {
 	pub const fn with_rows_per_page(mut self, rows_per_page: Option<usize>) -> Self {
 		self.rows_per_page = rows_per_page;
 		self
-	}
-
-	/// The series ids this batch's rows belong to: the empty group is
-	/// series 0, the only series an ingest can name before the tags gate
-	/// flips. Recorded on every segment row the batch commits and in the
-	/// ledger's `series_ids` column (plan §4 C1).
-	#[must_use]
-	pub fn series_ids(&self) -> Vec<u64> {
-		vec![0]
 	}
 
 	/// This batch's fingerprint: the deterministic hash the ledger records
@@ -220,8 +211,11 @@ pub struct IngestReceipt {
 	pub max_ts: Option<i64>,
 	/// The segment ids the batch's commit assigned, in time order.
 	pub segment_ids: Vec<u64>,
-	/// The series ids the batch's rows belong to (`[0]`, the empty group,
-	/// until the tags gate flips).
+	/// The series ids the batch's rows belong to: `[0]` for the empty group,
+	/// otherwise the one id the aspect's catalog holds for the batch's series
+	/// key, resolved (and, for a new key, registered) by the commit itself
+	/// (TAG-7). A batch never names its id: ids are per store and only known
+	/// at commit.
 	pub series_ids: Vec<u64>,
 	/// The aspect epoch the batch committed in.
 	pub commit_epoch: u64,
@@ -289,7 +283,7 @@ pub struct LedgerEntry {
 struct Fnv1a(u64);
 
 impl Fnv1a {
-	fn new() -> Self {
+	const fn new() -> Self {
 		Self(0xcbf2_9ce4_8422_2325)
 	}
 
@@ -315,7 +309,7 @@ impl Fnv1a {
 		self.u64(value.cast_unsigned());
 	}
 
-	fn finish(&self) -> i64 {
+	const fn finish(&self) -> i64 {
 		self.0.cast_signed()
 	}
 }

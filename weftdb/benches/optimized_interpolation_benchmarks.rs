@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::{hint::black_box, str::FromStr};
 
 use ::weftdb::{
@@ -50,7 +53,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 			let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 			let mut measurements = Vec::with_capacity(measurement_count);
 			for i in 0..measurement_count {
-				measurements.push(InputMeasurement::new(start_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
+				measurements.push(InputMeasurement::new(start_time + Duration::minutes(i64::try_from(i).expect("fits an i64")), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
 			}
 			shared_db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
@@ -72,7 +75,7 @@ fn benchmark_optimization_strategies(c: &mut Criterion) {
 			});
 		});
 	}
-	group.finish();
+	drop(group);
 
 	// Single cleanup at the end
 	rt.block_on(async {
@@ -117,7 +120,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 			let start_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 			let mut measurements = Vec::with_capacity(measurement_count);
 			for i in 0..measurement_count {
-				measurements.push(InputMeasurement::new(start_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
+				measurements.push(InputMeasurement::new(start_time + Duration::minutes(i64::try_from(i).expect("fits an i64")), BigDecimal::from_str(&format!("{}.0", i * 10)).unwrap()));
 			}
 			db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
@@ -138,7 +141,7 @@ fn benchmark_memory_efficiency(c: &mut Criterion) {
 			});
 		});
 	}
-	mem_group.finish();
+	drop(mem_group);
 
 	// Cleanup after all benchmarks
 	rt.block_on(async {

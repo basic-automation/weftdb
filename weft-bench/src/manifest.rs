@@ -694,7 +694,6 @@ fn push_result_measures(result: &BenchResult, measures: &mut Vec<Measure>) {
 	let adapter = result.adapter.as_str();
 	// Latency is a whole number of nanoseconds; f64 carries it exactly, so the cast is a
 	// representation change and not a rounding choice.
-	#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 	let as_f64 = |value: u64| value as f64;
 	measures.push(Measure { name: "latency.p50_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.p50_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
 	measures.push(Measure { name: "latency.mean_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.mean_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
@@ -757,7 +756,7 @@ mod tests {
 	/// A result with the shape a real interpolation run produces: latency, storage, and an
 	/// accuracy block (which only a synthetic profile carries).
 	fn sample_result(adapter: &str, publishable: bool) -> BenchResult {
-		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: 1000, values_finite: publishable, result_sha256: None }, accuracy: Some(crate::accuracy::AccuracyMetrics { count: 1000, rmse: 0.5, mae: 0.4, max_abs_error: 1.5, bias: 0.0 }), storage: Some(sample_storage()), cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: Vec::new(), between_run: None }
+		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "interpolation-heavy-irregular".to_string(), adapter: adapter.to_string(), workload: "upsample_interpolate".to_string(), reps: 3, dataset: DatasetMeta { input_points: 200, output_points: 1000, irregular: true, missingness_fraction: 0.2, seed: 7, signal_shape: None }, latency: LatencyStats::from_samples(&[100, 200, 300]), latency_ci: None, throughput_points_per_sec: 5_000_000.0, timing: TimingBreakdown { dataset_generation_ns: 5_000, measured_ns: 600, end_to_end_ns: 6_200 }, correctness: CorrectnessReport { output_count_ok: publishable, expected_output_points: 1000, actual_output_points: 1000, values_finite: publishable, result_sha256: None }, accuracy: Some(crate::accuracy::AccuracyMetrics { count: 1000, rmse: 0.5, mae: 0.4, max_abs_error: 1.5, bias: 0.0 }), storage: Some(sample_storage()), cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: Vec::new(), between_run: None, gpu_economics: None }
 	}
 
 	/// A storage estimate shaped like a real f64 compression result: the value column realized

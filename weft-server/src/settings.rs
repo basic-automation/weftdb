@@ -110,7 +110,10 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_EXTRACTED_BATCH_RETENTION_SECS", tier: Tier::Tuning, summary: "How long the queue remembers that a pattern extraction already consumed a batch, which is how long a re-ingested batch is recognised as a duplicate.", accepts: "a positive whole number of seconds", default: "48 h (172800 s); anything else warns and keeps the default", read_by: "weftdb/types/database/inputs.rs" },
 	VarSpec { name: "WEFT_FAULT", tier: Tier::Test, summary: "Arms durable fault points so a test can make a commit, an fsync or a swap fail at a chosen step. Not configuration: it exists to make crashes testable.", accepts: "a comma-separated list of `<point>:abort` or `<point>:err`, e.g. `S-frame-synced:abort`", default: "unset: no fault armed (the points are not even compiled without the `fault-injection` feature)", read_by: "weftdb/types/durable/fault.rs" },
 	VarSpec { name: "WEFT_FAULT_TEST_CHILD", tier: Tier::Test, summary: "Marks the child process a fault-injection test spawns, so its parent can tell a deliberate abort from a real crash.", accepts: "any value", default: "unset", read_by: "weftdb/types/durable/fault.rs" },
+	VarSpec { name: "WEFT_FLIGHT_ADDR", tier: Tier::Experimental, summary: "Turns on the read-only Arrow Flight listener (gRPC, HTTP/2) beside the HTTP serve path: `DoGet`, `GetFlightInfo`, `GetSchema` and `ListFlights` over the stored range and value-band reads, with the same keys and `read` scope as the HTTP range routes.", accepts: "a loopback socket address, e.g. `127.0.0.1:8815`; a non-loopback address stops the server from starting (the listener is plaintext)", default: "unset: no Flight listener", read_by: "weft-server/flight.rs (the name itself is `weft_server::flight::FLIGHT_ADDR_ENV`), read in startup/config.rs" },
+	VarSpec { name: "WEFT_GPU_ADAPTER", tier: Tier::Experimental, summary: "The one GPU adapter splimes opens (Phase 5, 5.7), from the adapters `splimes::gpu_adapters()` lists.", accepts: "a whole number (the adapter's index), `api:<api>` (first adapter on that graphics API), or `name:<text>`/any other text (first adapter whose name contains it, ignoring case); a blank `api:`/`name:`, or an adapter together with `WEFT_GPU_DEVICES=all` or a list, stops the server from starting", default: "unset: splimes' own choice (`WGPU_ADAPTER_NAME`, else the high-performance adapter)", read_by: "weft-server/gpu.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_GPU_CALIBRATE", tier: Tier::Experimental, summary: "Whether the server times the interpolation backends at startup — GPU, rayon pool, single core — to find where each overtakes the others.", accepts: "`0`/`false`/`no`/`off` skips; `force` also calibrates a software adapter (llvmpipe, lavapipe, WARP); anything else calibrates a real GPU", default: "auto: calibrate when a real GPU is present", read_by: "weft-server/gpu.rs, read in startup/daemons.rs" },
+	VarSpec { name: "WEFT_GPU_DEVICES", tier: Tier::Experimental, summary: "How many GPU devices splimes opens and spreads interpolation over (Phase 5, 5.7); `/metrics` reports each one. splimes measured several devices slower than one on a discrete-plus-integrated machine, so it is opt-in.", accepts: "`one`, `all` (every hardware adapter), or a comma-separated list of `WEFT_GPU_ADAPTER`-style selectors opened in that order; anything else stops the server from starting", default: "unset: one device, as before", read_by: "weft-server/gpu.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_HEADER_READ_TIMEOUT_SECS", tier: Tier::Tuning, summary: "How long a peer may take to deliver a complete request header block before the connection is closed (SEC-4's header deadline, pre-auth).", accepts: "a positive whole number of seconds", default: "30 s (`DEFAULT_HEADER_READ_TIMEOUT` in serve.rs)", read_by: "weft-server/serve.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_INGEST_MAX_INFLIGHT_BYTES", tier: Tier::Tuning, summary: "The ingest routes' in-flight byte budget (D-S14): the registry's gate charges each ingest request's `Content-Length` against it, and a request that would push the total past the budget is refused `503 overloaded` with `Retry-After` instead of queueing behind the ingests already running.", accepts: "a positive whole number of bytes", default: "256 MiB — one maximum-size body in flight", read_by: "weft-server/ingest.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_KEEP_ALIVE_TIMEOUT_SECS", tier: Tier::Tuning, summary: "How long a connection may make no read progress before it is closed: the keep-alive idle bound between requests (SEC-4, pre-auth).", accepts: "a positive whole number of seconds", default: "30 s (`DEFAULT_KEEP_ALIVE_TIMEOUT` in serve.rs)", read_by: "weft-server/serve.rs, read in startup/config.rs" },
@@ -127,6 +130,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_MAX_INTERPOLATE_POINTS", tier: Tier::Tuning, summary: "The cap on how many output points one `/api/v1/interpolate*` request may produce.", accepts: "a positive whole number of points", default: "10,000,000 (`MAX_INTERPOLATE_OUTPUT_POINTS`); anything else stops the server from starting", read_by: "weft-server/interpolate.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_MAX_PAGE_ROWS", tier: Tier::Tuning, summary: "The ceiling on a page of the paginated `/points` and `/value-points` reads — a named `limit`/`take` over it is refused `422 result_too_large`, and a read that names no page size gets 10,000 rows and pages with `next_cursor` (ROB-12).", accepts: "a positive whole number of rows", default: "100,000 (`MAX_PAGE_ROWS` in read_limits.rs); anything else stops the server from starting", read_by: "weft-server/read_limits.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_MAX_READ_ROWS", tier: Tier::Tuning, summary: "The most rows one stored read or export may return — the whole window a `/points`, `/value-points`, `/range*` or `/value-range*` request asks the server to materialize; over it `422 result_too_large` with the limit (ROB-12).", accepts: "a positive whole number of rows", default: "5,000,000 (`MAX_READ_ROWS` in read_limits.rs); anything else stops the server from starting", read_by: "weft-server/read_limits.rs, read in startup/config.rs" },
+	VarSpec { name: "WEFT_MAX_SERIES_PER_ASPECT", tier: Tier::Tuning, summary: "The most tagged series one aspect may register (TAG-7, TAG-11): an ingest that would register one more is refused `400 series_limit`; series already registered stay writable, and the untagged series 0 does not count.", accepts: "a positive whole number of series", default: "100,000 (`DEFAULT_MAX_SERIES_PER_ASPECT` in weftdb); a malformed value stops the server from starting", read_by: "weftdb/types/segment_store.rs (`SegmentStoreOptions::from_env`), read in store_open.rs" },
 	VarSpec { name: "WEFT_ON_AMBIGUOUS_COMMIT", tier: Tier::Stable, summary: "What the server does once its store is write-poisoned by an ambiguous COMMIT: keep serving, or exit and let a supervisor restart into the recovery that settles the commit.", accepts: "`poison` (or unset) keeps serving; `exit` exits with status 70", default: "serve; an unknown value stops the server from starting (PAC-5b strict configuration)", read_by: "weft-server/store_open.rs (the name itself is `weftdb::AMBIGUOUS_COMMIT_ENV`)" },
 	VarSpec { name: "WEFT_QUERY_MAX_INFLIGHT", tier: Tier::Tuning, summary: "The query admission class's in-flight cap (ROB-10, Admission I): at most this many read and stateless-compute requests run at once through the registry's gate, and one beyond the cap is refused `503 overloaded` with `Retry-After` instead of queueing behind them. Probes are never shed, writes are charged against `WEFT_INGEST_MAX_INFLIGHT_BYTES`, and maintenance is admitted one at a time.", accepts: "a positive whole number of requests", default: "128 (`DEFAULT_QUERY_MAX_INFLIGHT` in admission.rs); anything else stops the server from starting", read_by: "weft-server/admission.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_READ_TIMEOUT_SECS", tier: Tier::Tuning, summary: "How long the server will keep waiting for one stored read — a range, a point lookup, a multi-instant lookup or a downsample — before it answers `504 query_timeout` (ROB-12). The ceiling bounds the wait, not the work: the read already handed to a blocking thread runs to completion, which is what keeps the memory ceiling true.", accepts: "a positive whole number of seconds", default: "30 (`DEFAULT_READ_TIMEOUT_SECS` in read_limits.rs); anything else stops the server from starting", read_by: "weft-server/read_limits.rs, read in startup/config.rs" },
@@ -140,6 +144,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD", tier: Tier::Tuning, summary: "The ceiling on the timestamp-codec override a checkpointed frame may pay, as blocked bytes over best-codec bytes — the gate that stops a column whose shape does not benefit from checkpoints being bloated for a lookup win.", accepts: "a finite number at or above 1.0 (`1.0` = only when free)", default: "1.25 (`DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD`)", read_by: "weftdb/types/segment_store.rs (`CheckpointPolicy::from_env`)" },
 	VarSpec { name: "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", tier: Tier::Tuning, summary: "The segment row floor below which no checkpoint index is written: a small segment decodes trivially, so indexing it is pure cost.", accepts: "a positive whole number of rows", default: "8,192 (`DEFAULT_CHECKPOINT_MIN_ROWS`)", read_by: "weftdb/types/segment_store.rs (`CheckpointPolicy::from_env`)" },
 	VarSpec { name: "WEFT_SEGMENT_CHECKPOINT_STRIDE", tier: Tier::Tuning, summary: "Turns on the checkpoint index inside a frame — one entry every this many rows — trading about 0.4% more bytes for a bounded timestamp scan.", accepts: "a positive whole number of rows (~1024 measured the sweet spot)", default: "unset or `0`: no checkpoint index; the frames WeftDB has always written", read_by: "weftdb/types/segment_store.rs (`CheckpointPolicy::from_env`)" },
+	VarSpec { name: "WEFT_SEGMENT_MMAP_READS", tier: Tier::Experimental, summary: "Range reads (and so the interpolation routes and the GPU path) memory-map their sealed `.weftseg` frames instead of reading each into a heap buffer (roadmap Phase 5, memory-mapped GPU I/O). The rows are the same; whether it is faster is what the end-to-end interpolation bench measures. A frame truncated by another process while mapped can stop the server with `SIGBUS`, which is why it is opt-in, and it needs a build with the `mmap-reads` cargo feature.", accepts: "on (`on`/`1`/`true`/`yes`) or off (`off`/`0`/`false`/`no`), any case; any other value stops the server from starting", default: "unset: off, the buffered read; a build without the feature warns once and ignores it", read_by: "weftdb/types/segment_store.rs (`SegmentStoreOptions::from_env`), read in store_open.rs" },
 	VarSpec { name: "WEFT_SEGMENT_PARTIAL_BASE", tier: Tier::Tuning, summary: "Materializes a partial rollup sidecar per segment at this resolution, so a coarse read of a fine segment skips the fine rows.", accepts: "one resolution token — `seconds`, `minutes`, `hours`, …", default: "unset or unparseable: no sidecar", read_by: "weftdb/types/partial_sidecar.rs (`PartialSidecarPolicy::from_env`)" },
 	VarSpec { name: "WEFT_SEGMENT_PARTIAL_MIN_ROWS", tier: Tier::Tuning, summary: "The segment row floor below which no partial sidecar is written.", accepts: "a positive whole number of rows", default: "4,096 (`DEFAULT_PARTIAL_SIDECAR_MIN_ROWS`)", read_by: "weftdb/types/partial_sidecar.rs (`PartialSidecarPolicy::from_env`)" },
 	VarSpec { name: "WEFT_SEGMENT_PARTIAL_TIERS", tier: Tier::Tuning, summary: "The coarser rollup tiers to materialize beside the base, fine to coarse, so an unbounded read pays one level each instead of re-materializing.", accepts: "a comma-separated list of resolution tokens, e.g. `hours,days`; unparseable entries are dropped", default: "unset: base only", read_by: "weftdb/types/partial_sidecar.rs (`PartialSidecarPolicy::from_env`)" },
@@ -155,6 +160,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_TEST_AUDIT_FULL_CHILD", tier: Tier::Test, summary: "Marks the child process the audit write-failure test spawns, in which a file-size rlimit of zero makes the audit log's writes fail so its poisoned-failure latching is exercised. No shipped binary reads it.", accepts: "any value", default: "unset: the parent test spawns the child instead of running the scenario", read_by: "weft-server/audit.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_AUDIT_REFUSAL_CHILD", tier: Tier::Test, summary: "Marks the child process the audit fail-closed test spawns, in which a file-size rlimit of zero makes the audit log's writes fail so the `503 audit_unavailable` refusal is exercised over HTTP. No shipped binary reads it.", accepts: "any value", default: "unset: the parent test spawns the child instead of running the scenario", read_by: "weft-server/tests/audit_log.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process the process-wide-poison test spawns: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store.rs (test child)" },
+	VarSpec { name: "WEFT_TEST_KEEP_CONFLICT_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process whose skip-identical reconcile has its kept row changed under it: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_OPEN_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process the open-recovery test spawns: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_ORPHAN_CHILD_ROOT", tier: Tier::Test, summary: "Set only in the child process that seals a frame and crashes before its commit: the store root it opens.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_PANIC_CHILD_MODE", tier: Tier::Test, summary: "Names which half of the control-plane panic test the child process is exercising, so its parent can tell a deliberate abort from a real crash. No shipped binary reads it.", accepts: "`inside` panics while the control-plane write scope is held; `outside` panics in an ordinary task", default: "unset: the child returns and the test binary exits 0", read_by: "weft-server/tests/control_plane_panic.rs (test child)" },
@@ -167,6 +173,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_TEST_S9_SUFFIX_RACE_DIR", tier: Tier::Test, summary: "Set only in the child process racing an overlap split's suffix against a later seal: the directory it works in.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_SWAP_MATRIX", tier: Tier::Test, summary: "Names which cell of the swap/crash matrix a child process runs, so each cell arms its faults in its own process.", accepts: "a `<mode>:<op>` spec", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_SWAP_MATRIX_DIR", tier: Tier::Test, summary: "The work directory handed to the swap-matrix child named by `WEFT_TEST_SWAP_MATRIX`.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/swap_tests.rs (test child)" },
+	VarSpec { name: "WEFT_TEST_TAG_SEAL_CRASH_ROOT", tier: Tier::Test, summary: "The store root handed to the tagged-seal crash child that `a_power_cut_between_tagged_frames_leaves_no_catalog_row_without_rows` starts.", accepts: "a directory path", default: "unset", read_by: "weftdb/types/segment_store/tag_seal_tests.rs (test child)" },
 	VarSpec { name: "WEFT_TEST_TXN_CHILD_INDEX", tier: Tier::Test, summary: "Set only in the child process that dies inside an `IndexTxn`: the index database it opens.", accepts: "a file path", default: "unset", read_by: "weftdb/types/index_txn.rs (test child)" },
 	VarSpec { name: "WEFT_TLS_CERT_FILE", tier: Tier::Stable, summary: "The PEM certificate chain the TLS listener presents (SEC-5). Set with `WEFT_TLS_KEY_FILE`; naming one without the other stops the server from starting.", accepts: "a path to a PEM file holding the certificate chain", default: "unset: no TLS — the listener is plaintext and the C8 gate applies", read_by: "weft-server/tls.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_TLS_KEY_FILE", tier: Tier::Stable, summary: "The PEM private key matching `WEFT_TLS_CERT_FILE` (SEC-5). Never logged, never served; read once at startup.", accepts: "a path to a PEM file holding the private key", default: "unset: no TLS — the listener is plaintext and the C8 gate applies", read_by: "weft-server/tls.rs, read in startup/config.rs" },
@@ -219,7 +226,9 @@ pub fn vars() -> impl Iterator<Item = &'static VarSpec> {
 }
 
 /// The registered name closest to `name`, when one is close enough to be the spelling the
-/// operator meant: case-insensitive, at most `MAX_SUGGEST_DISTANCE` edits apart, the nearest
+/// operator meant.
+///
+/// Case-insensitive, at most `MAX_SUGGEST_DISTANCE` edits apart, the nearest
 /// one if several are equally close.
 #[must_use]
 pub fn suggest(name: &str) -> Option<&'static str> {
@@ -284,9 +293,10 @@ pub fn report() {
 /// deployment, including filesystem refusals.
 pub const CONFIG_EXIT_CODE: i32 = 78;
 
-/// The `EX_DATAERR`-class exit status (plan C7): the store needs operator action —
-/// a layout or `min_write_layout` newer than this binary, an unreadable
-/// `STORE_FORMAT`, a scope mismatch, an incomplete restore, or frames without a
+/// The `EX_DATAERR`-class exit status (plan C7).
+///
+/// The store needs operator action — a layout or `min_write_layout` newer than this binary,
+/// an unreadable `STORE_FORMAT`, a scope mismatch, an incomplete restore, or frames without a
 /// control plane.
 pub const STORE_EXIT_CODE: i32 = 65;
 
@@ -295,13 +305,17 @@ pub const ROOT_LOCKED_EXIT_CODE: i32 = 75;
 
 /// The `EX_USAGE` exit status (plan C7): the command line itself is wrong —
 /// an unknown command, an unknown option, or a missing value — so nothing
-/// was attempted. The operator CLI ([`crate::cli`]) owns this class: a
+/// was attempted.
+///
+/// The operator CLI ([`crate::cli`]) owns this class: a
 /// subcommand's own parse errors exit with it, and so does a first word
 /// that names no command at all.
 pub const USAGE_EXIT_CODE: i32 = 2;
 
 /// The exit status (plan C7) for an unexpected error: the failure no other
-/// row of the table names. It is what the runtime's own error report (the
+/// row of the table names.
+///
+/// It is what the runtime's own error report (the
 /// `fn main() -> anyhow::Result<()>` return) exits with, so a caller only
 /// sees it when no phase classified the failure first.
 pub const UNEXPECTED_EXIT_CODE: i32 = 1;
@@ -312,12 +326,16 @@ pub const UNEXPECTED_EXIT_CODE: i32 = 1;
 const NON_NEGATIVE_INTS: &[&str] = &["WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS", "WEFT_MAINTENANCE_BREAKER_FAILURES", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_RECONCILE_THRESHOLD", "WEFT_RECONCILE_SPLIT_MIN_BYTES", "WEFT_SEGMENT_CHECKPOINT_STRIDE"];
 
 /// Variables whose registry `accepts` shape is a positive whole number.
-const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_INGEST_MAX_INFLIGHT_BYTES", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INGEST_BYTES", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_QUERY_MAX_INFLIGHT", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_SHUTDOWN_GRACE_SECS", "WEFT_WORKER_THREADS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
+const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_INGEST_MAX_INFLIGHT_BYTES", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INGEST_BYTES", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_MAX_SERIES_PER_ASPECT", "WEFT_QUERY_MAX_INFLIGHT", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_SHUTDOWN_GRACE_SECS", "WEFT_WORKER_THREADS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
 
 /// One line per *value* the operator should hear about, in the order the environment
-/// lists them: a registered numeric variable holding a value outside the shape its
+/// lists them.
+///
+/// A registered numeric variable holding a value outside the shape its
 /// registry entry accepts, or a closed enum whose reader used to warn and keep serving
-/// (`WEFT_ON_AMBIGUOUS_COMMIT`: `poison` or `exit`; `WEFT_STORE_SCOPE_PIN`: on or off).
+/// (`WEFT_ON_AMBIGUOUS_COMMIT`:
+///
+/// `poison` or `exit`; `WEFT_STORE_SCOPE_PIN`: on or off).
 /// Variables whose readers define open shapes (paths, endpoints, truthy flags where
 /// anything else is simply "off") are not judged here — their own startup phase refuses
 /// what it cannot use.
@@ -331,34 +349,39 @@ pub fn value_errors_for(entries: impl IntoIterator<Item = (String, String)>) -> 
 				errors.push(format!("{name}={value:?} is not a non-negative whole number, which is the only shape it accepts"));
 			}
 		} else if POSITIVE_INTS.contains(&name.as_str()) {
-			if trimmed.parse::<u64>().ok().filter(|n| *n > 0).is_none() {
+			if trimmed.parse::<u64>().ok().as_ref().is_none_or(|n| *n == 0) {
 				errors.push(format!("{name}={value:?} is not a positive whole number, which is the only shape it accepts"));
 			}
 		} else if name == "WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD" {
-			if trimmed.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 1.0).is_none() {
+			if trimmed.parse::<f64>().ok().as_ref().is_none_or(|n| !(n.is_finite() && *n >= 1.0)) {
 				errors.push(format!("{name}={value:?} is not a finite number at or above 1.0, which is the only shape it accepts"));
 			}
 		} else if name == "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD" {
-			if trimmed.parse::<f64>().ok().filter(|n| n.is_finite() && *n > 0.0).is_none() {
+			if trimmed.parse::<f64>().ok().as_ref().is_none_or(|n| !(n.is_finite() && *n > 0.0)) {
 				errors.push(format!("{name}={value:?} is not a finite number above 0, which is the only shape it accepts"));
+			}
+		} else if name == "WEFT_SEGMENT_MMAP_READS" {
+			if crate::store_open::ScopePin::parse_strict(trimmed).is_none() {
+				errors.push(format!("{name}={value:?} is neither on (`on`/`1`/`true`/`yes`) nor off (`off`/`0`/`false`/`no`), the only values it accepts"));
 			}
 		} else if name == "WEFT_STORE_SCOPE_PIN" {
 			if crate::store_open::ScopePin::parse_strict(trimmed).is_none() {
 				errors.push(format!("{name}={value:?} is neither on (`on`/`1`/`true`/`yes`) nor off (`off`/`0`/`false`/`no`), the only values it accepts"));
 			}
-		} else if name == "WEFT_ON_AMBIGUOUS_COMMIT" {
-			if !(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("poison") || trimmed.eq_ignore_ascii_case("exit")) {
-				errors.push(format!("{name}={value:?} is neither `poison` nor `exit`, the only values it accepts"));
-			}
+		} else if name == "WEFT_ON_AMBIGUOUS_COMMIT" && !(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("poison") || trimmed.eq_ignore_ascii_case("exit")) {
+			errors.push(format!("{name}={value:?} is neither `poison` nor `exit`, the only values it accepts"));
 		}
 	}
 	errors
 }
 
-/// Every reason strict server configuration (PAC-5b) refuses this environment: the
-/// name problems [`warnings_for`] reports (an unknown `WEFT_` name, a `Test`-tier
-/// channel set on a real server) plus the value problems [`value_errors_for`]
-/// reports. An empty result is a configuration the server will start with; anything
+/// Every reason strict server configuration (PAC-5b).
+///
+/// Refuses this environment: the name problems [`warnings_for`] reports (an unknown `WEFT_`
+/// name, a `Test`-tier channel set on a real server) plus the value problems
+/// [`value_errors_for`] reports.
+///
+/// An empty result is a configuration the server will start with; anything
 /// else is refused before any phase reads a setting, with exit [`CONFIG_EXIT_CODE`].
 #[must_use]
 pub fn strict_errors_for(entries: Vec<(String, String)>) -> Vec<String> {
@@ -494,7 +517,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 88, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 94, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
@@ -529,9 +552,9 @@ mod tests {
 		let stable: Vec<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Stable).map(|spec| spec.name).collect();
 		assert_eq!(stable, ["OTEL_EXPORTER_OTLP_ENDPOINT", "WEFT_ALLOW_ANY_HOST", "WEFT_ALLOW_PLAINTEXT", "WEFT_AUDIT_FILE", "WEFT_AUTH", "WEFT_BACKUP_DIR", "WEFT_DATA_DIR", "WEFT_KEYS_FILE", "WEFT_ON_AMBIGUOUS_COMMIT", "WEFT_SEGMENT_STORE_ROOT", "WEFT_SERVER_ADDR", "WEFT_TLS_CERT_FILE", "WEFT_TLS_KEY_FILE"], "the stable surface is what 1.0 promises; adding to it costs a deprecation cycle later");
 		let experimental: Vec<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Experimental).map(|spec| spec.name).collect();
-		assert_eq!(experimental, ["WEFT_BENCH_RUNS_DIR", "WEFT_GPU_CALIBRATE", "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD"], "a surface outside the 1.0 freeze (the bench-run routes), and two knobs whose value is unproven (GPU calibration's thresholds, and a codec the measurements retired)");
+		assert_eq!(experimental, ["WEFT_BENCH_RUNS_DIR", "WEFT_FLIGHT_ADDR", "WEFT_GPU_ADAPTER", "WEFT_GPU_CALIBRATE", "WEFT_GPU_DEVICES", "WEFT_SEGMENT_MMAP_READS", "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD"], "two surfaces outside the 1.0 freeze (the bench-run routes and the Flight listener), and five knobs whose value is unproven (GPU adapter and multi-device selection, GPU calibration's thresholds, memory-mapped range reads, and a codec the measurements retired)");
 		let harness: BTreeSet<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Test).map(|spec| spec.name).collect();
-		let allowlist: BTreeSet<&str> = ["SKIP_SLOW_TESTS", "TEST_DATA_DIR", "WEFT_FAULT", "WEFT_FAULT_TEST_CHILD", "WEFT_REQUIRE_GPU", "WEFT_SERVER_BIN", "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", "WEFT_TEST_AUDIT_FULL_CHILD", "WEFT_TEST_AUDIT_REFUSAL_CHILD", "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", "WEFT_TEST_OPEN_CHILD_ROOT", "WEFT_TEST_ORPHAN_CHILD_ROOT", "WEFT_TEST_PANIC_CHILD_MODE", "WEFT_TEST_POISON_EXIT_CHILD_ROOT", "WEFT_TEST_RACE_CHILD_ROOT", "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", "WEFT_TEST_S8_SPLIT_RACE_ROOT", "WEFT_TEST_S9_DROPPED_SWAP_DIR", "WEFT_TEST_S9_SQUASH_RACE_DIR", "WEFT_TEST_S9_SUFFIX_RACE_DIR", "WEFT_TEST_SWAP_MATRIX", "WEFT_TEST_SWAP_MATRIX_DIR", "WEFT_TEST_TXN_CHILD_INDEX", "WEFT_BENCH_BACKUP_DIR", "WEFT_BTC_CSV", "WEFT_DB_NEW_CRASH_CHILD", "WEFT_LEGACY_CONSUMER_CRASH_CHILD", "WEFT_LEGACY_INGEST_CRASH_CHILD", "WEFT_UPDATE_GOLDENS", "WEFT_VERBOSE", "WEFT_XBENCH_CLICKHOUSE", "WEFT_XBENCH_INFLUXDB3", "WEFT_XBENCH_IOTDB", "WEFT_XBENCH_QUESTDB", "WEFT_XBENCH_TIMESCALE"].into_iter().collect();
+		let allowlist: BTreeSet<&str> = ["SKIP_SLOW_TESTS", "TEST_DATA_DIR", "WEFT_FAULT", "WEFT_FAULT_TEST_CHILD", "WEFT_REQUIRE_GPU", "WEFT_SERVER_BIN", "WEFT_TEST_AMBIGUOUS_CHILD_ROOT", "WEFT_TEST_AUDIT_FULL_CHILD", "WEFT_TEST_AUDIT_REFUSAL_CHILD", "WEFT_TEST_GLOBAL_POISON_CHILD_ROOT", "WEFT_TEST_KEEP_CONFLICT_CHILD_ROOT", "WEFT_TEST_OPEN_CHILD_ROOT", "WEFT_TEST_ORPHAN_CHILD_ROOT", "WEFT_TEST_PANIC_CHILD_MODE", "WEFT_TEST_POISON_EXIT_CHILD_ROOT", "WEFT_TEST_RACE_CHILD_ROOT", "WEFT_TEST_S8_CONFLICT_CHILD_ROOT", "WEFT_TEST_S8_SPLIT_RACE_ROOT", "WEFT_TEST_S9_DROPPED_SWAP_DIR", "WEFT_TEST_S9_SQUASH_RACE_DIR", "WEFT_TEST_S9_SUFFIX_RACE_DIR", "WEFT_TEST_SWAP_MATRIX", "WEFT_TEST_SWAP_MATRIX_DIR", "WEFT_TEST_TAG_SEAL_CRASH_ROOT", "WEFT_TEST_TXN_CHILD_INDEX", "WEFT_BENCH_BACKUP_DIR", "WEFT_BTC_CSV", "WEFT_DB_NEW_CRASH_CHILD", "WEFT_LEGACY_CONSUMER_CRASH_CHILD", "WEFT_LEGACY_INGEST_CRASH_CHILD", "WEFT_UPDATE_GOLDENS", "WEFT_VERBOSE", "WEFT_XBENCH_CLICKHOUSE", "WEFT_XBENCH_INFLUXDB3", "WEFT_XBENCH_IOTDB", "WEFT_XBENCH_QUESTDB", "WEFT_XBENCH_TIMESCALE"].into_iter().collect();
 		assert_eq!(harness, allowlist, "the Test tier is the plan's allowlist: a channel a test harness sets for the child it spawns, and nothing else may sit in it");
 		assert_eq!(VARS.iter().filter(|spec| spec.tier == Tier::Tuning).count(), VARS.len() - stable.len() - experimental.len() - allowlist.len(), "every remaining name is Tuning: a knob whose value is deployment-specific and whose number is still moving");
 	}
@@ -569,7 +592,7 @@ mod tests {
 	/// and a correctly shaped value is not one.
 	#[test]
 	fn strict_errors_cover_bad_names_and_bad_values() {
-		assert!(strict_errors_for(vec![("WEFT_BACKUP_KEEP".into(), "3".into()), ("WEFT_ON_AMBIGUOUS_COMMIT".into(), " EXIT ".into()), ("WEFT_STORE_SCOPE_PIN".into(), " OFF ".into()), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD".into(), "1.25".into())]).is_empty());
+		assert_eq!(strict_errors_for(vec![("WEFT_BACKUP_KEEP".into(), "3".into()), ("WEFT_ON_AMBIGUOUS_COMMIT".into(), " EXIT ".into()), ("WEFT_STORE_SCOPE_PIN".into(), " OFF ".into()), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD".into(), "1.25".into())]), [] as [std::string::String; 0]);
 		for (name, value) in [("WEFT_BACKUP_KEEP", "-1"), ("WEFT_BACKUP_KEEP", "three"), ("WEFT_MAX_INTERPOLATE_POINTS", "0"), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD", "0.5"), ("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD", "0"), ("WEFT_ON_AMBIGUOUS_COMMIT", "nonsense"), ("WEFT_STORE_SCOPE_PIN", "maybe")] {
 			let errors = strict_errors_for(vec![(name.into(), value.into())]);
 			assert_eq!(errors.len(), 1, "{name}={value}: {errors:?}");

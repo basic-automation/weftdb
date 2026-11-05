@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! What a client gets when a frame on disk cannot be decoded.
 //!
 //! It cannot be a unit test: `weftdb::FrameFaultError` has no public

@@ -106,7 +106,6 @@ pub struct FailureParams {
 /// A knob of zero, a corpus too small, a child that cannot start or exits before it is killed, or
 /// a store operation the harness itself makes failing. What the reopened store holds is not an
 /// error: a wrong answer fails the result's gate.
-#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub async fn run_failure(failure: Failure, profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, params: &FailureParams) -> anyhow::Result<BenchResult> {
 	anyhow::ensure!(params.reps > 0 && params.rows >= 2 && profile.batch_rows > 0 && params.compact_to > 0, "failure tests need reps, rows, a batch size and a compaction target above zero");
 	anyhow::ensure!(timestamps.len() >= 2 && timestamps.len() == values.len(), "a failure-test corpus needs at least two rows and as many values as timestamps");
@@ -207,7 +206,7 @@ pub async fn run_failure(failure: Failure, profile: &IngestProfile, timestamps: 
 		eprintln!("failure {} rep {rep}: {note}", failure.as_str());
 	}
 	let measured_ns = samples.iter().copied().fold(0_u64, u64::saturating_add);
-	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, failure.as_str()), adapter: "weftdb".to_string(), workload: WORKLOAD_FAILURE.to_string(), reps: samples.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: samples.len(), irregular: false, missingness_fraction: 0.0, seed: params.seed, signal_shape: None }, latency: LatencyStats::from_samples(&samples), latency_ci: None, throughput_points_per_sec: 0.0, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns, end_to_end_ns: span_ns(started) }, correctness: CorrectnessReport { output_count_ok: passed, expected_output_points: samples.len(), actual_output_points: samples.len(), values_finite: true, result_sha256: Some(digest.finish()) }, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples, between_run: None })
+	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, failure.as_str()), adapter: "weftdb".to_string(), workload: WORKLOAD_FAILURE.to_string(), reps: samples.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: samples.len(), irregular: false, missingness_fraction: 0.0, seed: params.seed, signal_shape: None }, latency: LatencyStats::from_samples(&samples), latency_ci: None, throughput_points_per_sec: 0.0, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns, end_to_end_ns: span_ns(started) }, correctness: CorrectnessReport { output_count_ok: passed, expected_output_points: samples.len(), actual_output_points: samples.len(), values_finite: true, result_sha256: Some(digest.finish()) }, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples, between_run: None, gpu_economics: None })
 }
 
 /// The child process: `ingest ROOT ASPECT SCALE UCI COLUMN CORPUS_ROWS ROWS BATCH` or

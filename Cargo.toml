@@ -81,6 +81,9 @@ wide = "1"
 bytemuck = { version = "1", features = ["derive"] }
 fastrand = "2"
 libc = "0.2"
+# Read-only mapping of sealed `.weftseg` frames, behind weftdb's opt-in `mmap-reads` feature
+# (roadmap Phase 5, memory-mapped GPU I/O). MIT OR Apache-2.0.
+memmap2 = "0.9"
 num_cpus = "1"
 ratatui = "0.30"
 crossterm = "0.29"
@@ -99,7 +102,7 @@ weft-orchestration = { path = "./weft-orchestration", version = "0.2.0" }
 # decision: `weft-server` and `weft-bench` enable `splimes/gpu`, and `weft-orchestration`
 # exposes it as its own opt-in `gpu-codecs` feature. `serde` stays on, because
 # `weftdb::BatchedMeasurement`'s derived serde needs splimes' own implementations. PAC-3.
-splimes = { version = "1", default-features = false, features = ["serde"] }
+splimes = { version = "1.3", default-features = false, features = ["serde"] }
 weft-line-protocol = { path = "./weft-line-protocol", version = "0.2.0" }
 weft-physical-type = { path = "./weft-physical-type", version = "0.2.0" }
 weft-reduce = { path = "./weft-reduce", version = "0.2.0" }
@@ -108,7 +111,9 @@ weft-arrow-store = { path = "./weft-arrow-store", version = "0.2.0" }
 arrow-array = "60"
 arrow-schema = "60"
 arrow-ipc = "60"
-parquet = { version = "60", default-features = false, features = ["arrow"] }
+# `snap`: Snappy is the default codec of pyarrow, R's arrow, pandas and Spark, so a reader
+# without it refuses the Parquet most clients send (pure Rust, BSD-3-Clause).
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
 bytes = "1"
 csv = "1"
 indexmap = "2"

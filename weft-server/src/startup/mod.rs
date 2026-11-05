@@ -119,6 +119,8 @@
 //! with splimes' default thresholds. A CPU/software adapter (llvmpipe, lavapipe, WARP) is
 //! not calibrated unless `WEFT_GPU_CALIBRATE=force`; `WEFT_GPU_CALIBRATE=0` skips
 //! calibration altogether. It never stops the server from starting.
+//! `WEFT_GPU_ADAPTER` picks the adapter and `WEFT_GPU_DEVICES` opens several devices
+//! (5.7); both are read before the store opens, and a malformed value refuses the start.
 //! Before the first phase, strict configuration (PAC-5b) checks the environment against
 //! the registry of every variable the workspace reads: a `WEFT_` name no crate reads, a
 //! test harness's own channel set on a real server, or a value outside the shape its
@@ -128,17 +130,17 @@
 //! filesystem before opening it, and a store-open refusal that needs operator action
 //! exits 65 (75 for a locked root).
 
-pub(crate) mod config;
-pub(crate) mod daemons;
-pub(crate) mod hooks;
-pub(crate) mod serve;
-pub(crate) mod state;
+pub mod config;
+pub mod daemons;
+pub mod hooks;
+pub mod serve;
+pub mod state;
 
 /// The startup phases in the order [`run`] executes them (SEC-8). The
 /// module docs above describe each one; the test below pins this list
 /// against `run`'s actual call order, so reordering a phase means
 /// editing this list and the docs in the same change — never silently.
-pub(crate) const PHASES: [&str; 7] = ["strict-config", "hooks", "signals", "config", "state", "daemons", "serve"];
+pub const PHASES: [&str; 7] = ["strict-config", "hooks", "signals", "config", "state", "daemons", "serve"];
 
 /// Run every startup phase, in order, until the server stops serving.
 ///
@@ -157,7 +159,7 @@ fn exit_config(error: &anyhow::Error) -> ! {
 	std::process::exit(weft_server::settings::CONFIG_EXIT_CODE);
 }
 
-pub(crate) async fn run() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
 	// First, before any phase reads a setting or opens a store: strict
 	// configuration (PAC-5b). What PAC-5a's registry only warned about — an
 	// unknown `WEFT_` name, a test-harness channel set on a real server, a
@@ -209,6 +211,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// opens — a keys file that cannot be loaded stops startup, and the
 	// server never comes up unauthenticated by accident.
 	let auth = config::auth().unwrap_or_else(|error| exit_config(&error));
+	// Phase 2: the opt-in Arrow Flight listener's address, refused here (exit 78) when it
+	// is not loopback, before anything opens.
+	let flight_addr = config::flight_addr().unwrap_or_else(|error| exit_config(&error));
+	// Phase 5 (5.7): the GPU adapter / multi-device choice, refused here (exit 78) when
+	// malformed, and installed before anything can start the GPU.
+	if let Some(gpu_config) = config::gpu_config().unwrap_or_else(|error| exit_config(&error)) {
+		println!("{}", weft_server::gpu::apply_config(gpu_config));
+	}
 	let state = match state::build().await {
 		Ok(state) => state.with_interpolate_config(interpolate).with_auth(auth).with_ingest_config(ingest).with_admission_config(admission).with_read_limits(read_limits),
 		Err(error) => match weft_server::store_open::exit_code_for_store_error(&error) {
@@ -232,31 +242,47 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 	// SEC-7: the key-reload watcher, so a SIGHUP after a keys-file edit
 	// reloads the keys in force instead of needing a restart.
 	daemons::spawn_key_reload_if_configured(&state, &daemons);
+	let flight = match flight_addr {
+		Some(addr) => Some(daemons::spawn_flight(addr, &state, &daemons).await?),
+		None => None,
+	};
 
 	let listener = serve::bind(addr, tls.is_some()).await?;
-	let state = state.with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
+	// The served state is the built one plus the guard the bound address calls for; the
+	// built one is done with once the guard is on.
+	let serving = state.clone().with_host_guard(config::host_guard_for(serve::local_addr(&listener)?));
+	drop(state);
 
 	// After the bind and in the background, so serving never waits for it.
 	daemons::spawn_gpu_calibration_if_enabled(&daemons);
 
-	serve::run(listener, state.clone(), otel_provider, limits, tls, &mut shutdown).await?;
+	serve::run(listener, serving.clone(), otel_provider, limits, tls, &mut shutdown).await?;
 	// Serving is over: raise the registry's shutdown watch so no daemon
 	// outlives the server it maintains, and none restarts from here.
 	daemons.shutdown();
-	// C9's drain order: serve → SEC-9 TaskTracker → store.shutdown().
-	// The audit tracker drains next, so an audited handler still in
-	// flight when serving ended writes its outcome record before the
-	// store closes under it.
+	// The Flight listener stops on that watch and gives its open streams their grace
+	// before the store below shuts down; a stream still open after it is abandoned and
+	// ends in an error rather than holding the shutdown.
+	if let Some(flight) = flight {
+		let _ = flight.await;
+	}
+	drain_after_serving(serving).await
+}
+
+/// The last steps of C9's drain order, once serving and the daemons have stopped:
+/// serve → SEC-9 `TaskTracker` → `store.shutdown()`.
+///
+/// The audit tracker drains first, so an audited handler still in flight when serving
+/// ended writes its outcome record before the store closes under it. Then the store
+/// shuts down — the closing reaper pass, then the clean-shutdown commit (D-S14's
+/// `SegmentStore::shutdown`, crash-consistency §5.5) — so the next open's `/ready` can
+/// report `previous_clean_shutdown: true` (D-S12). Only a clean stop (including a signal
+/// before serving, which exits 0 without accepting a connection) gets here: a serve
+/// failure is not a clean shutdown, and leaves the flag at the `0` the open wrote.
+async fn drain_after_serving(state: weft_server::AppState) -> anyhow::Result<()> {
 	if let Some(log) = state.audit_log() {
 		log.close_and_drain().await;
 	}
-	// Serving stopped cleanly (including a signal before serving, which exits 0
-	// without accepting a connection): shut the store down — the closing
-	// reaper pass, then the clean-shutdown commit (D-S14's
-	// `SegmentStore::shutdown`, crash-consistency §5.5) — so the next
-	// open's `/ready` can report `previous_clean_shutdown: true` (D-S12). A
-	// serve failure is not a clean shutdown, and leaves the flag at the `0`
-	// the open wrote.
 	if let Some(store) = state.store() {
 		store.shutdown().await?;
 	}

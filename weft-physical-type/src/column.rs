@@ -255,12 +255,7 @@ impl ColumnEncoding {
 		if best == 0 {
 			return None;
 		}
-		// Byte counts far below 2^53, so the ratio is exact in practice — the same
-		// statement-scoped exemption `Segment::checkpoint_codec_overhead` takes for its
-		// identical codec-size ratio.
-		#[allow(clippy::cast_precision_loss)]
-		let ratio = transposed as f64 / best as f64;
-		Some(ratio)
+		Some(crate::cast::usize_to_f64(transposed) / crate::cast::usize_to_f64(best))
 	}
 
 	/// The value codec to write when the **bit-sliced layout is permitted** up to a size
@@ -987,7 +982,7 @@ mod tests {
 		// bits, so the XOR codec undercuts the flat 8 B/value the varint payload writes. (A
 		// zero-crossing signal would sweep exponents and Gorilla could not help — an honest
 		// regime boundary, so the fixture stays in the regime where the win is real.)
-		let lits: Vec<String> = (0..256).map(|i| format!("{:.9}", 1000.0 + f64::from(i) * 0.001)).collect();
+		let lits: Vec<String> = (0..256).map(|i| format!("{:.9}", f64::from(i).mul_add(0.001, 1000.0))).collect();
 		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
 		let enc = encode_column(PhysicalType::F64, &col(&refs)).expect("encodes");
 		let raw = enc.serialized_bytes();
@@ -1004,7 +999,7 @@ mod tests {
 	fn best_f64_advisory_selects_a_codec_no_worse_than_raw() {
 		// The best-of advisory over an F64 column never exceeds the raw payload and names the
 		// winning codec.
-		let lits: Vec<String> = (0..256).map(|i| format!("{:.9}", 1000.0 + f64::from(i) * 0.001)).collect();
+		let lits: Vec<String> = (0..256).map(|i| format!("{:.9}", f64::from(i).mul_add(0.001, 1000.0))).collect();
 		let refs: Vec<&str> = lits.iter().map(String::as_str).collect();
 		let enc = encode_column(PhysicalType::F64, &col(&refs)).expect("encodes");
 		let best = enc.best_f64_bytes().expect("f64 column has a best codec");

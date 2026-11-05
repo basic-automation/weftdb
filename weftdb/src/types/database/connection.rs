@@ -174,7 +174,6 @@ impl Connection for Database {
 				// Consume the result set
 				while let Ok(Some(_)) = rows.next().await {}
 				tracing::debug!("[checkpoint_wal_passive] PASSIVE checkpoint completed in {:?}", start.elapsed());
-				Ok(())
 			}
 			Err(e) => {
 				// Expected under MVCC: Turso rejects PASSIVE unless
@@ -184,8 +183,8 @@ impl Connection for Database {
 				// once Turso's own TRUNCATE checkpoint has run past ~4 MB of log
 				// (mvcc/database/mod.rs:3706-3715), in the main file.
 				tracing::warn!("[checkpoint_wal_passive] PASSIVE checkpoint not run ({e}): Turso rejects PASSIVE under MVCC; committed data stays durable in the -log (or the main file after Turso's own checkpoint)");
-				Ok(())
 			}
 		}
+		Ok(())
 	}
 }

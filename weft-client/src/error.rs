@@ -77,7 +77,7 @@ struct Inner {
 
 /// The server's error envelope, as it arrives.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct Envelope {
+pub struct Envelope {
 	#[serde(default)]
 	pub error: Option<String>,
 	#[serde(default)]

@@ -1,5 +1,8 @@
 //! The failure tests (#147) end to end: the harness kills a real child process (this crate's
 //! binary) and checks the store it leaves behind.
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::io::Write as _;
 

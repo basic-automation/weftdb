@@ -1,6 +1,9 @@
 //! The client's own behaviour against a fake server: what it sends, how it follows cursors,
 //! when it retries, and what it refuses to believe. The wire contract against the real
 //! server is `tests/live.rs`.
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::sync::{
 	atomic::{AtomicUsize, Ordering}, Arc, Mutex
@@ -64,6 +67,11 @@ async fn an_overloaded_read_is_retried_and_a_write_is_not() {
 	assert_eq!(error.retry_after(), Some(std::time::Duration::ZERO), "a Retry-After of 0 is a value, not an absence");
 	assert_eq!(error.request_id(), Some("req-busy"));
 	assert_eq!(seen.hits.load(Ordering::SeqCst), 1, "a write is never retried by the client");
+
+	// A Retry-After too large for a Duration is no wait at all rather than a panic.
+	let router = Router::new().route("/health", get(|| async { (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1e300")], Json(json!({"error": "busy", "code": "overloaded"}))).into_response() }));
+	let huge = Client::builder(serve(router).await).max_retries(0).build().unwrap().health().await.unwrap_err();
+	assert_eq!((huge.kind(), huge.retry_after()), (ErrorKind::Overloaded, None));
 
 	let no_retries = Client::builder(&base).max_retries(0).build().unwrap();
 	seen.hits.store(0, Ordering::SeqCst);

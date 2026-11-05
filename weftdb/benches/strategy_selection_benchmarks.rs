@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::{hint::black_box, str::FromStr};
 
 use ::weftdb::{
@@ -45,18 +48,20 @@ fn benchmark_strategy_selection(c: &mut Criterion) {
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 					let mut measurements = Vec::with_capacity(size);
 					for i in 0..size {
-						measurements.push(InputMeasurement::new(base_time + Duration::minutes(i as i64), BigDecimal::from_str(&format!("{}.5", i + 10)).unwrap()));
+						measurements.push(InputMeasurement::new(base_time + Duration::minutes(i64::try_from(i).expect("fits an i64")), BigDecimal::from_str(&format!("{}.5", i + 10)).unwrap()));
 					}
 
 					// Use batch insertion instead of individual insertions
 					db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 					// Perform interpolation analysis
-					let analyze_time = base_time + Duration::minutes((size / 2) as i64);
+					let analyze_time = base_time + Duration::minutes(i64::try_from(size / 2).expect("fits an i64"));
 					let result = db.analyze_point(&aspect.id(), analyze_time, &resolution, &Spline::Linear).await.unwrap();
+					drop(aspect);
 
 					// Cleanup
 					db.close().await.unwrap();
+					drop(db);
 
 					// Add small delay before cleanup
 					tokio::time::sleep(std::time::Duration::from_millis(100)).await;

@@ -628,7 +628,7 @@ fn policy_table() -> &'static RouteTable {
 }
 
 /// What the `Authorization` header carried, before any role check.
-enum Presented {
+pub(crate) enum Presented {
 	/// No header at all: the anonymous principal.
 	Absent,
 	/// A header that is malformed, or a key the file does not hold:
@@ -641,7 +641,7 @@ enum Presented {
 /// Read the `Authorization` header of a request against the store in
 /// force (the [`SharedKeyStore`]'s current snapshot, so a reload
 /// SEC-7 landed is the table this request is checked against).
-fn presented(headers: &axum::http::HeaderMap, store: &SharedKeyStore) -> Presented {
+pub(crate) fn presented(headers: &axum::http::HeaderMap, store: &SharedKeyStore) -> Presented {
 	let mut values = headers.get_all(header::AUTHORIZATION).iter();
 	let Some(value) = values.next() else {
 		return Presented::Absent;

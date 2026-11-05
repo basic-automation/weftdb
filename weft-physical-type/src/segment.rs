@@ -169,6 +169,7 @@ impl SegmentStats {
 	/// [`SegmentDescriptor::is_all_null`](crate::SegmentDescriptor::is_all_null), and the
 	/// on-disk page/segment skips in [`crate::weftseg`]'s point readers — which reach it
 	/// from the persisted stats alone, without decoding a column.
+	#[must_use]
 	pub const fn is_all_null(&self) -> bool {
 		self.row_count > 0 && self.null_count == self.row_count
 	}
@@ -467,10 +468,8 @@ impl Segment {
 		if self.stats.row_count == 0 {
 			return 0.0;
 		}
-		#[allow(clippy::cast_precision_loss)]
-		let n = self.stats.row_count as f64;
-		#[allow(clippy::cast_precision_loss)]
-		let total = self.total_bytes() as f64;
+		let n = crate::cast::usize_to_f64(self.stats.row_count);
+		let total = crate::cast::usize_to_f64(self.total_bytes());
 		total / n
 	}
 
@@ -605,9 +604,7 @@ impl Segment {
 		if best == 0 {
 			return 1.0;
 		}
-		#[allow(clippy::cast_precision_loss)]
-		let ratio = self.timestamps.blocked_estimated_bytes() as f64 / best as f64;
-		ratio
+		crate::cast::usize_to_f64(self.timestamps.blocked_estimated_bytes()) / crate::cast::usize_to_f64(best)
 	}
 
 	/// Read a segment back from a `.weftseg` byte frame, verifying its checksum.
@@ -937,7 +934,7 @@ mod tests {
 		assert_eq!(seg.stats.max_value, None);
 		let (ts, vs) = seg.decode();
 		assert!(ts.is_empty(), "empty segment must decode to no timestamps, not a lone anchor");
-		assert!(vs.is_empty());
+		assert_eq!(vs.len(), 0);
 		assert!((seg.bytes_per_point() - 0.0).abs() < f64::EPSILON);
 	}
 
@@ -1059,10 +1056,10 @@ mod tests {
 
 	#[test]
 	fn prune_by_time_handles_empty_inputs() {
-		assert!(prune_by_time(&[], 0, 100).is_empty());
+		assert_eq!(prune_by_time(&[], 0, 100).len(), 0);
 		let empty_seg = Segment::build(&[], &[], TimeUnit::Seconds, &BigDecimal::from(0)).expect("builds");
 		// An empty segment is always skipped.
-		assert!(prune_by_time(std::slice::from_ref(&empty_seg), i64::MIN, i64::MAX).is_empty());
+		assert_eq!(prune_by_time(std::slice::from_ref(&empty_seg), i64::MIN, i64::MAX).len(), 0);
 	}
 
 	fn ncol(lits: &[Option<&str>]) -> Vec<Option<BigDecimal>> {
