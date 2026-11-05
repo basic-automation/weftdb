@@ -4,6 +4,60 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-04 — Phase 4.6: upsert keys in the narrowed form, and skip-identical's crash semantics (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** ROADMAP 4.6 asks for "configurable upsert keys + skip-identical" and names
+neither shape. QuestDB's `DEDUP UPSERT KEYS` picks columns, but a WeftDB row has one value
+column and a series is a full tag set, and tags invariant I12 ("one output frame, one
+series") forbids folding two series into one. The tags design (9a) and its critique (F21,
+F22, F23) disagree on whether the keys should exist at all and at which layout.
+
+**Chosen:**
+
+- **Upsert keys are `timestamp` plus a tag-key set K, and they bound the tags an ingest may
+  carry.** Declared through `SegmentStore::declare_with_upsert_keys` (HTTP: `upsert_keys` on
+  declare) and read with `SegmentStore::upsert_keys`; `AspectSchema` is untouched (it is frozen
+  and not `#[non_exhaustive]`). With K declared, a `TagSet` naming a key outside K is
+  `StoreError::NotAnUpsertKey` (`400 invalid_tag`, "not an upsert key"), because a tag outside
+  the key has no per-row storage to carry once two rows differing only in it fold into one.
+  So the dedup identity is `(timestamp, tags restricted to K)`, which under that rule is the
+  full tag set; undeclared stays `(timestamp, full tag set)`. Newer-wins per series (reads and
+  `merge_newer_wins`) does the dedup in both cases. Critique F22 is right that this changes
+  which writes are accepted rather than how they fold; the owner's spec asked for the honest
+  narrowed form anyway, and it is what lets a caller pin the identity and have stray tags
+  refused rather than silently minting a series.
+- **The keys are immutable and take part in declare equality.** Other keys, keys where none
+  were declared, or none where some were, is `StoreError::UpsertKeysConflict` (`409
+  schema_conflict`); a schema conflict is still reported as itself first. Plain `declare`
+  leaves the keys out of the comparison, so every existing library caller (widening
+  included) behaves as before.
+- **Storage: migration `0008_upsert_keys` at layout 2**, a nullable
+  `aspect_schema.upsert_keys TEXT` (JSON wire list) in `aspect_catalog.db`. This follows D1
+  and the `store_format.rs` rule rather than design 9a's "layout 3, floors 3". Critique F21
+  holds either way: floors at 3 would not stop a layout-3 build that predates 0008 either,
+  only layout 4 would. The cost is stated in the migration doc: an older layout-2 build opens
+  and writes the store and **ignores** the declaration, accepting a tag outside K. Accepted
+  pre-1.0; a floor raise is the 1.0 freeze's call, not this slice's.
+- **`value` is not an upsert key.** Keying on value means "keep both rows when the values
+  differ" at one timestamp of one series, which no fold, read or index supports: every read
+  path answers one value per `(series, timestamp)`.
+- **Dedup-off is deferred.** Keeping duplicates needs a second fold beside
+  `merge_newer_wins`, and an X-READ (C16) that does not dedup either; neither exists, and a
+  flag that only some paths honoured would be worse than none.
+- **Skip-identical is a delete-only swap** (design 9b with F23). In `reconcile_overlaps_held`,
+  when the fold equals the lowest-id member's decoded rows and that member is
+  `time_sorted`, the component swaps `SwapPlan::keep`: no generation is allocated and no
+  output is journaled, written or synced (M2-M4 are skipped, so `M-pending-committed` through
+  `M-dir-synced` are never reached), the kept row gets an unchanged `ReplaceExpected` as its
+  version precondition, `DeleteEveryExpected` and `JournalRetire` cover only the other
+  members, and only their sidecars are removed. A racing change to the kept row is a
+  `Conflict` and nothing is deleted. Values compare by plain form with scale (`5` vs `5.0`
+  differ), not `BigDecimal ==`, which ignores scale. The kept frame keeps its paging even
+  where a rewrite would have chosen another (#507's merge page height waived, as 9b says).
+  Squash and compaction do not skip yet; only the overlap merge was specified.
+- **The crash matrix's `Op::SkipIdentical`** runs only the fault points the swap passes, and
+  reads "committed" as "one segment fewer" since no output generation appears.
+
 ## 2026-11-04 — Phase 2 integrations: what was built, and the two items left with a reason (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** Phase 2's two remaining roadmap lines chain six items with arrows —
@@ -4282,3 +4336,228 @@ check on every call, and a cursor wants a stable id); `all()` as the meaning of 
 methods (it would break pinned untagged reads on tagged stores); reusing `GroupsUnsupported`
 or `TagError` for reserved keys (the first now means "gate shut", the second carries no
 aspect).
+
+## 2026-11-04 — TAG-10: stored reads take `tag.<k>=v` selectors, exact by default; a JSON body reports the series' `tags` (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Issue #447; design PR 6 without 6b (the `DownsampleResponse.series → buckets` rename), with
+tags D6 and critique G.
+
+1. **Route count (critique G).** The design said 21 data-read routes; `routes.rs` registers
+   **18**: `range`/`range.parquet`/`range.csv`, `points`, `downsample{,.csv,.arrow,.parquet}`
+   over GET and POST (8), `at`, `at-multi`, `value-range`/`value-range.parquet`/
+   `value-range.csv`, `value-points`. All 18 (11 handlers) take the selector. No route,
+   operation id, error code or setting was added, so the 62/56, 43 and 81 pins are unchanged.
+2. **Spelling (tags D6).** `SelectorQuery<T>` in `error.rs` splits the raw query before
+   binding: `tag.<key>` parameters and one `tag_match` build the selector; everything else
+   binds `T` through axum's `Query` exactly as `StrictQuery` does, so `deny_unknown_fields`
+   still refuses a typo with the same message. Names and values are form-decoded
+   (`tag%2Ehost` is `tag.host`). No `tag.*` and no `tag_match` is `SeriesSelector::untagged()`
+   (series 0, no catalog read), so every untagged client reads what it read before.
+   **Exact by default**; `tag_match=subset` is `SeriesSelector::new`; `tag_match=exact` is
+   accepted explicitly; any other value, or a repeated `tag_match`, is `400 bad_request`
+   (it is not a tag, so not `invalid_tag`). `tag.<key>=` (empty value) is the absent matcher.
+   Owner call carried from the design: with loose-by-default, `{a=1}` could never be read
+   while `{a=1,b=2}` exists.
+3. **Refusals.** A repeated `tag.<key>` (including `tag.k=a&tag.k=`) is left to the selector
+   builder's `TagError::DuplicateKey` (the variant is `#[non_exhaustive]`, so the server
+   cannot construct it, and need not). More than `MAX_TAGS` (16) matchers is refused in the
+   extractor (there is no cap in `tags.rs`) as `400 invalid_tag` with
+   `details: {count, limit}`. `from_tag_error`: every input variant is `400 invalid_tag`
+   with `details: {tag: key}` where the variant has a key (`EmptyKey` reports `""`);
+   `UnsortedKeys`, `MissingSeparator`, `ValueNotUtf8` (stored bytes only) are
+   `500 series_binding_mismatch`; a future variant is treated as input. `classify_typed`
+   also downcasts `TagError` through the same mapping, so a key the catalog cannot decode
+   surfaces as the 500.
+4. **Resolution and empty matches.** Each handler checks the aspect's schema first (an
+   undeclared aspect stays `404` whatever the selector; the Arrow/Parquet handlers now call
+   `require_schema` themselves, one extra catalog read), then `resolve_series` once, then the
+   `_of` read. No match is an empty body (`200`): zero rows, `found:false` per instant, zero
+   buckets; Arrow/Parquet build an empty batch of the declared schema directly. Two or more
+   matches are `400 ambiguous_series` (TAG-8's mapping).
+5. **`tags` in JSON bodies.** `StoredRangeResponse` (`points`, `value-points`),
+   `StoredPointResponse` (`at`), `StoredPointsResponse` (`at-multi`) gain an always-present
+   `tags`: `{}` for series 0, the series' tags for a tagged one, `null` when nothing
+   matched. This is an additive field on untagged responses too (the store read itself is
+   byte-identical). `DownsampleResponse` gains an optional `tags` set only by the stored
+   downsample, so the compute endpoint's body is unchanged. The tags come from a new public
+   `SegmentStore::series_tags(aspect, SeriesId) -> Result<Option<TagSet>>`
+   (`series_key_of` is crate-private). CSV/Arrow/Parquet carry no tags.
+6. **Auth.** `tag.api_key` is not a credential parameter: `query_carries_a_credential`
+   compares whole names, so only a bare `api_key`/`apikey`/`access_token`/`auth_token` is
+   refused; pinned by `tag_api_key_is_not_a_credential_param`.
+7. **Not done here:** the cursor is not bound to the selector (ROB-15, C15); OpenAPI does
+   not describe the dynamic `tag.*` family (FRE-9a); the SDKs gain no selector arguments;
+   HTTP ingest of tags stays shut until TAG-11.
+
+## 2026-11-04 — TAG-11: HTTP ingest writes one tagged series; storage ILP requires `measurement=` (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Issue #329; design PR 7 without 7b (the SDKs), tags D5/D6.
+
+1. **One series per request.** JSON takes `tags` in the body, CSV and Parquet take
+   `tag.<key>=value` query parameters, ILP takes the payload's own tags. The batch's
+   `IngestBatch.groups` carries the `TagSet`; the library resolves (and for a new key
+   registers) the id in the same commit (TAG-7). Multi-series ILP through a multi-group
+   batch stays rejected (design: needs an atomic multi-series commit; TSBS can post per
+   series), so two tag sets in one ILP request are still `400 ambiguous_series`.
+2. **ILP `measurement=` is required (breaking, decision 15).** The records of that
+   measurement carrying `field` with a timestamp are sealed; other measurements are skipped.
+   This replaces `weft_line_protocol::parse_points` on the storage route with a server-side
+   projection over `parse` (the public `SeriesKey` alias is untouched): the old projection
+   checked that the tags agreed and then dropped them, writing a tagged payload to series 0.
+   No `drop_tags` escape hatch: the gate flip lands here, so decision 15's pre-flip
+   parameter is moot. The compute ILP routes are unchanged. A missing `measurement` is
+   serde's `400 bad_request` ("missing field"), like any other required query parameter.
+3. **JSON `tags` refuses a repeated key.** `JsonTags` deserializes the object as its
+   written pairs (a map would keep the last value silently) and `TagSet::from_pairs`
+   refuses the repeat as `TagError::DuplicateKey`, so it is `400 invalid_tag` with
+   `details.tag`, not `400 invalid_json`. Absent, `null` and `{}` are all series 0.
+4. **CSV/Parquet share TAG-10's query splitter.** `split_tag_params` is factored out of
+   `split_selector`; the new `TaggedQuery<T>` extractor builds a `TagSet` instead of a
+   selector. On a write an empty value (`tag.k=`) is `invalid_tag` (it names no tag; the
+   read side's "absent" meaning has no write analogue) and `tag_match` is `400 bad_request`.
+5. **Response and audit.** `IngestResponse` gains `series_id` (the receipt's one id, `0`
+   untagged) and `tags` (always present, `{}` untagged), so untagged ingest response bodies
+   gain two fields (additive, as TAG-10's `"tags":{}` on reads). The `ingest` audit event and
+   its tracing line gain `series_id`. `format_version` keeps reporting the body's layout
+   (5/6), per TAG-7's documentation.
+6. **`WEFT_MAX_SERIES_PER_ASPECT`** (Tuning) is read by `SegmentStoreOptions::from_env`
+   (the server's `store_options_from_env` path), lenient there (unset/zero/garbage → the
+   100,000 default) and strict at server startup (`POSITIVE_INTS`). Settings count pin
+   85 → 86 (the design's 81 → 82 was stale; other loops had moved it).
+7. **`Code::TagsUnsupported`** is kept in the table as reserved (nothing raises it once
+   every ingest route accepts tags; `StoreError::GroupsUnsupported` is already never
+   produced, TAG-8). Error-code and route count pins are unchanged.
+8. **B-tags closed.** `tagged_write_then_tagged_read_round_trips` writes each of JSON, ILP,
+   CSV and Parquet into its own series plus an untagged batch over HTTP and reads each back
+   over HTTP by its exact selector (and the subset selector), so the ROADMAP B-tags lines
+   (1.0 criteria and backlog) are ticked and #233 is closed with this slice.
+9. **Deviation: one additive `weft-client` option.** CI runs `weft-client`'s live contract
+   against this server, and its `write_ilp` call would fail without `measurement`. So
+   `WriteOptions::measurement` (an additive field on a `#[non_exhaustive]` struct plus a
+   builder; no signature changes) is sent by `write_ilp`, and the live test writes an
+   untagged `cpu` payload with it. The rest of PR 7b stays out: the `Cow` `Call.query`
+   change, tag arguments in the SDKs, and the Python client's `write_ilp` (its live test
+   does not call it; it fails against this server until 7b).
+10. **Not in this slice.** `scripts/compat/make-v010-fixtures.sh` runs a v0.1.0 binary and
+    is left as is. The soak client now sends `measurement=soak`.
+
+## 2026-11-04 — PHASE4-TAGPRUNE: a series-time composite index, per-series span bounds, a cached series catalog (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Issue #158; design PR 8, with critique A4 (the composite index was deferred from TAG-5 to here).
+
+1. **Migration `0007_series_time_index`, layout 2, best effort.** It creates
+   `idx_segment_index_series_time ON segment_index(aspect, series_id, min_ts, max_ts)` in
+   `segment_index.db`. Layout 2 by the standing pre-1.0 rule in `store_format` (tags D1), no
+   floor raise: an older layout-2 build never names the index and writes the table as before
+   (SQLite maintains the index for it). A failure to create it is logged, not fatal, exactly
+   like `idx_segment_index_time` in `0001_baseline`. Cost accepted: one more index entry per
+   `InsertNew`/`DeleteEveryExpected` on every workload, untagged included (critique A4's
+   concern); the time index is kept, since aspect-wide prunes (maintenance, recovery,
+   `prune_by_time`) still need it.
+2. **Fallback chain.** A series-bound prune names the composite index; on "no such index" it
+   retries with the time index, then with a scan. Aspect-wide prunes are unchanged.
+3. **`SpanBounds` keyed by `(aspect, Option<SeriesId>)`.** Every written row widens both its
+   series' bound and the aspect-wide (`None`) bound, so the aspect-wide prune keeps its old
+   behaviour and a series prune seeks `start - widest span of that series`. A series' bound
+   loads with `MAX(max_ts - min_ts) ... AND series_id = ?` on first use. The design said
+   "keyed by (aspect, series_id)"; the `None` key is how the aspect-wide prune keeps its bound.
+4. **The catalog cache lives on `SegmentIndexStore`, not `AspectState`.** Deviation from the
+   design's `aspect_locks.rs:48`: the index handle is where every transaction commits
+   (`apply`/`apply_while`; nothing else runs an `IndexTxn` against `segment_index.db` outside
+   migrations, which register no series), so invalidation cannot be bypassed, and a reader
+   needs no aspect lock. Each `apply` of a transaction holding `RegisterSeries` forgets that
+   aspect's copy after it runs, whether it committed, was refused or is ambiguous, and bumps
+   a per-aspect generation; a load keeps its result only if the generation did not move
+   while it queried, so a load that raced a registration never installs the older catalog.
+   `series_of` stays an uncached SQL read for tests that write the table directly.
+5. **"`resolve_series` needs no SQL" holds for the catalog only.** The series-0 existence
+   test (`series_has_rows`) still queries, but only for a loose selector that matches the
+   empty tag set; `untagged()` returns before it and an exact non-empty selector never
+   reaches it. Caching it would need invalidation on every row write and delete, which is
+   not worth it for that one case.
+6. **`SeriesSelector::matches_key(&SeriesKey)`** walks the canonical pairs and the sorted
+   matchers together, allocating nothing; it agrees with `matches(&TagSet::from(key))` on the
+   existing truth table, the 3,000-case randomized model test and a reserved-key case.
+7. **Tests.** `a_series_seek_uses_the_composite_index` (schema DDL and `EXPLAIN QUERY PLAN`
+   name the index), `a_series_prune_without_the_composite_index_still_answers`,
+   `span_bound_is_per_series`, `catalog_cache_sees_a_series_registered_after_it_loaded`,
+   `matches_key_treats_a_reserved_key_as_an_unnamed_tag`, and
+   `a_tagged_read_among_a_thousand_series_opens_only_its_own_frames` (1,000 series over one
+   window; every other series' frame is overwritten with garbage, so opening one would fail
+   the read; about 40 s locally, from 1,000 durable seals). No micro-benchmark was run.
+## 2026-11-04 — D-S20 change log replaces the per-timestamp queue for seal-backed aspects — FOR MERGE REVIEW
+
+**Ambiguous:** the 1.0 plan (§5 D-S19/D-S20 amendment, §6 W7 seal lane) and
+issue #210 name the deliverable — "change log replaces the per-timestamp
+unbatched queue for seal-backed aspects" — and D-S19's decision notes name
+the mechanism's table (`segment_changes`, created by migration `0002` with
+columns `(aspect, epoch, min_ts, max_ts, row_count)`), but no source fixes:
+which commits write a row, how a consumer acknowledges work, or how a
+span-based consumer decides coverage.
+
+**Chosen:**
+1. **One row per data commit, in the commit's own transaction.** A new
+   `IndexOp::RecordChange` rides the seal (`publish_seal`) and ingest
+   (`publish_ingest`) index transactions, keyed by the commit's aspect
+   epoch with that commit's span and row count. Because the row commits
+   with the segments, there is no write-ahead entry for a commit that
+   never landed and no landed commit without its row — the S18
+   write-ahead/requeue shape the queue needed has no counterpart.
+   Maintenance swaps write no row: they move no new data, and the
+   ingest that fed them already recorded its change (a swap row would
+   only rebuild the same windows). A replayed ingest records nothing,
+   because it commits nothing.
+2. **Legacy ingest drops the queue.** The seal-backed branches of
+   `capture_measurement` and `batch_capture_measurements` no longer
+   enqueue or requeue timestamps; `count_unbatched_measurements` for a
+   seal-backed aspect is always 0. Rows mode is untouched. The capture
+   variants D-S19 already left in rows mode (`capture_new_measurement`
+   and the chunk helpers, which the design does not name) are unchanged.
+3. **Acknowledgement is deletion by epoch.** `SegmentStore::ack_changes`
+   (`IndexOp::DeleteChanges`) deletes an aspect's rows at or below an
+   epoch, as a queue consumer dequeues what it batched. No watermark
+   table: a crash before the acknowledgement leaves the rows, the next
+   run rebuilds the same windows, and the batch dedupe skips them. A
+   commit landing after a consumer's read takes a higher epoch and is
+   never deleted by that consumer's acknowledgement.
+4. **Coverage is per change, over spans.** The orchestration consumer
+   (`build_incremental_from_change_log`, dispatched from
+   `build_incremental_unprocessed_queue` for seal-backed aspects) unions
+   each change span's windows via `calculate_affected_windows_for_range`
+   — a superset of the span's rows' windows, so a gap inside a span
+   costs extra rebuilds that dedupe skips, never a missed row — and
+   acknowledges only the longest prefix of changes whose windows were
+   all built, since acknowledgement is through an epoch. A change
+   touching a window past the stored data, or short of points, stays
+   logged for the next run, as a queued timestamp stays queued. A first
+   run (no batches yet) is the full rebuild plus acknowledgement of the
+   rows read, which also covers aspects sealed before D-S20 whose rows
+   have no change rows.
+
+5. **One seal-store open per process, shared across handles.** The
+   consumer reaches the rows through `analyze_range`, which reopens the
+   database by name for every chunk — a fresh `Database` handle whose
+   per-handle seal-store cache is empty, so its first seal read refused
+   the root as locked by the ingest handle's open (a root can be open
+   only once in a process). Seal-backed aspects could therefore never
+   be batched at all. `Database::seal_store` now shares its open
+   through a process-wide weak registry keyed by the root path
+   (`SEAL_STORES`): every handle of a database gets the one open, and
+   when the last reference drops the next open goes back to disk.
+
+**Not in this slice:** change rows for maintenance swaps (see 1), the
+rows-mode queue (unchanged, S18 semantics intact), and the plan's `:780`
+gate tick as a separate line — the current ROADMAP carries no distinct
+`:780` line; this slice ticks the Phase 7 **S20** mirror line, the same
+line the queue records for D-S20.
+
+**Salvage amendment (parent, 2026-11-04):** the verification bar caught an
+interaction the slice's own tests missed. FRE-12a's newer-layout store
+opens without running a migration and deliberately has no
+`segment_changes` table — its test drops the table and asserts it stays
+gone — so the unconditional change-log insert failed that store's seals
+outright. `RecordChange` and `DeleteChanges` now probe for the table on
+the transaction's connection and record/delete nothing when it is
+absent, the agreement the change-log reader already kept: a store with
+no change log has no consumer to notify, and this build must not create
+the table outside a migration.

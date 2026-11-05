@@ -43,6 +43,28 @@ impl SegmentStore {
 		tokio::task::spawn_blocking(move || fold_newest_wins(frames)).await.context("merging maintenance inputs")
 	}
 
+	/// [`merge_members`](Self::merge_members), and whether the fold is exactly the
+	/// lowest-id member's own rows (Phase 4.6 skip-identical, design 9b): the member is
+	/// `time_sorted`, and its decoded rows equal the folded ones row for row, each value
+	/// compared in its plain form, scale included ([`same_rows`]), so `-3` and `-3.0` are
+	/// different rows here even though `BigDecimal` calls them equal (critique F23).
+	/// When it is, a reconcile can keep that member as it is instead of writing the fold.
+	pub(crate) async fn merge_members_against_first(&self, members: &[IndexRow]) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>, bool)> {
+		let mut frames = Vec::with_capacity(members.len());
+		for member in members {
+			frames.push(self.read_bound_frame(member).await?);
+		}
+		let sorted_first = members.first().is_some_and(|first| first.desc.time_sorted);
+		tokio::task::spawn_blocking(move || {
+			let first = frames.first().filter(|_| sorted_first).map(|frame| (frame.timestamps.clone(), frame.values.clone()));
+			let (timestamps, values) = fold_newest_wins(frames);
+			let identical = first.is_some_and(|(first_ts, first_vs)| same_rows(&first_ts, &first_vs, &timestamps, &values));
+			(timestamps, values, identical)
+		})
+		.await
+		.context("merging maintenance inputs")
+	}
+
 	/// The file holding `descriptor`'s frame: its recorded path, resolved against this
 	/// store's root (see [`resolve_frame_path`]), so that a root that was moved or
 	/// restored elsewhere still reads its own frames.
@@ -445,7 +467,8 @@ impl SegmentStore {
 	/// - [`SeriesSelector::untagged`](crate::SeriesSelector::untagged) is
 	///   [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED) without touching the catalog.
 	/// - Otherwise every registered series whose [`TagSet`](crate::TagSet) the selector
-	///   [matches](crate::SeriesSelector::matches) is a candidate, and series 0 is one
+	///   [matches](crate::SeriesSelector::matches_key) is a candidate, read from the
+	///   index's per-aspect catalog cache (no SQL once loaded), and series 0 is one
 	///   only when the selector matches the empty tag set **and** series 0 holds rows
 	///   (series 0 has no catalog row; without the existence test a loose selector would
 	///   always be ambiguous on a tagged aspect).
@@ -464,9 +487,9 @@ impl SegmentStore {
 		if selector.matches(&crate::TagSet::new()) && self.index.series_has_rows(aspect, crate::SeriesId::UNTAGGED).await? {
 			matched.push(crate::SeriesId::UNTAGGED);
 		}
-		for (id, key) in self.index.series_of(aspect).await? {
-			if selector.matches(&crate::TagSet::from(key)) {
-				matched.push(id);
+		for (id, key) in self.index.cached_series_of(aspect).await?.iter() {
+			if selector.matches_key(key) {
+				matched.push(*id);
 			}
 		}
 		match matched.as_slice() {
@@ -474,6 +497,21 @@ impl SegmentStore {
 			[one] => Ok(Some(*one)),
 			_ => Err(StoreError::AmbiguousSeries { aspect: aspect.to_string(), matched: matched.len() }.into()),
 		}
+	}
+
+	/// The tags of one series of `aspect` (TAG-10): the empty set for
+	/// [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED), the decoded catalog key for a
+	/// registered series, and `None` for an id the catalog does not hold. A read route
+	/// reports this beside the rows of the series [`resolve_series`](Self::resolve_series)
+	/// picked.
+	///
+	/// # Errors
+	///
+	/// An invalid `aspect` name, a libSQL read failure, or a stored key that is not
+	/// canonical.
+	pub async fn series_tags(&self, aspect: &str, series: crate::SeriesId) -> Result<Option<crate::TagSet>> {
+		aspect_name::validate(aspect)?;
+		Ok(self.index.series_key_of(aspect, series).await?.map(crate::TagSet::from))
 	}
 
 	/// Read and fully decode one segment file (frame-version aware), returning all

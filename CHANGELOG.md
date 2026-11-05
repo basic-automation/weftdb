@@ -10,6 +10,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Upsert keys** (Phase 4.6). `POST /api/v1/storage/aspects` takes an optional
+  `upsert_keys` list, `"timestamp"` plus tag keys (`SegmentStore::declare_with_upsert_keys`
+  in the library). Every ingested row's tags must then fall inside those keys: a tag outside
+  them is `400 invalid_tag` (`details.reason` `not an upsert key`). The keys are immutable and
+  part of the declaration, so other keys (or none) on a re-declare is `409 schema_conflict`,
+  and the declare response and the schema endpoint echo them. Store migration
+  `0008_upsert_keys` (layout 2) adds the nullable column they live in; an older layout-2
+  build opens the store and ignores the declaration.
+- **Skip-identical overlap merge** (Phase 4.6). When an overlap group's newer-wins fold is
+  exactly its oldest member's own rows (a replayed batch), the merge writes no new frame:
+  it keeps that member and deletes the rest. Values are compared with their scale, so a
+  replay of `5` as `5.0` is still rewritten.
 - **R client** (`clients/r`, package `weftdb`): stored windows, value bands and server-side
   downsamples as Arrow tables, exact JSON rows paged by cursor, interpolation, and ingest of a
   data frame or Arrow table as one Parquet batch with `Idempotency-Key`. Refusals are
@@ -104,8 +116,43 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `SeriesSelector` into the one series it names, or refuses with the typed
   `StoreError::AmbiguousSeries` (`400 ambiguous_series`) when it matches several. HTTP
   ingest still refuses tags until TAG-11.
+- **Stored reads take a series selector (TAG-10).** Every storage data read (`range`,
+  `points`, `value-range`, `value-points`, `at`, `at-multi`, `downsample`; 18 routes over
+  their formats and verbs) accepts `tag.<key>=<value>` query parameters, matched exactly
+  by default and loosely with `tag_match=subset`; `tag.<key>=` requires the tag to be
+  absent. No `tag.*` parameter reads the untagged series as before. No match reads empty,
+  two or more matches are `400 ambiguous_series`, and a bad, repeated or reserved key or
+  more than 16 matchers is `400 invalid_tag`. The JSON read bodies gain a `tags` field; untagged `points`, `value-points`, `at`, `at-multi` and stored `downsample` responses now include `"tags":{}` too, so their bodies are not byte-identical to before (an additive field).
+  `SegmentStore::series_tags` reads one series' tags.
+- **Tagged ingest over HTTP (TAG-11).** Each ingest request writes one series. The JSON
+  body takes `"tags": {"host": "a"}`, CSV and Parquet take `tag.<key>=<value>` query
+  parameters, and an ILP payload's own tags name the series. A repeated key (in a JSON
+  object or the query), a reserved `__` key, an empty value or anything else outside the
+  tag grammar is `400 invalid_tag`; a new series beyond the per-aspect cap is
+  `400 series_limit`. Every ingest response gains `series_id` (`0` for the untagged series)
+  and `tags` (`{}` untagged), and the `ingest` audit event gains `series_id`.
+- **Tag pruning (Phase 4).** Migration `0007_series_time_index` adds
+  `idx_segment_index_series_time` on `segment_index(aspect, series_id, min_ts, max_ts)`
+  (layout 2, best effort: a store that cannot build it still opens and its series reads use
+  the time index). A read of one tagged series seeks that index, bounds its seek by that
+  series' own widest segment rather than the whole aspect's, and resolves its selector from
+  an in-memory copy of the aspect's series catalog, so it opens only its own series'
+  segments however many series share the window. `SeriesSelector::matches_key` tests a
+  canonical `SeriesKey` without building a `TagSet`.
+- **`WEFT_MAX_SERIES_PER_ASPECT`** (Tuning): the most tagged series one aspect may register,
+  default 100,000; a malformed value stops the server from starting.
 
 ### Changed
+
+- **Breaking (HTTP): the storage ILP ingest requires `measurement=` (TAG-11).**
+  `POST /api/v1/storage/{aspect}/ilp` now seals only the records of the named measurement,
+  and a request without the parameter is `400 bad_request`. This fixes a silent tag drop:
+  before, a tagged single-series payload was checked for one tag set and then written to the
+  untagged series, its tags discarded. Now those tags name the series the rows land in, and
+  two tag sets in one request are still `400 ambiguous_series`. The Rust SDK's `write_ilp`
+  sends it from the new `WriteOptions::measurement`; the Python client's `write_ilp` does
+  not yet (design PR 7b). The compute routes
+  (`/api/v1/{interpolate,downsample}/ilp`) are unchanged.
 
 - **Reads without a series mean the untagged series (TAG-8).** The existing read methods
   answer series 0 only. A store with no tagged writes answers exactly as before; on an aspect
@@ -122,6 +169,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   aspect's catalog; read the id from `IngestReceipt::series_ids` instead. The method shipped
   in `weftdb` 0.2.0 on crates.io, so this is a breaking change, allowed in the next minor
   release by the pre-1.0 policy above.
+- **Seal-backed legacy aspects feed a change log, not the per-timestamp queue (S20).**
+  Each seal-store commit records one `segment_changes` row (epoch, time span, row count)
+  in its own index transaction, and the batch consumer rebuilds the windows a change's
+  span touches and acknowledges the row by epoch. Seal-backed ingest no longer writes
+  `unbatched_measurements` entries; rows-mode aspects keep the queue unchanged. This
+  closes the S20 half of the 0.2.0 "crash consistency is not finished" limitation.
 - The `503 unconfigured` sentence no longer names the segment store, since the bench-run
   routes answer it too: it reads "a subsystem this route needs is not configured on this
   server", and `details.subsystem` / `details.enabled_by` say which one and the variable that

@@ -30,7 +30,7 @@ pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState
 pub use quarantine::{QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS};
 pub use relative::Relative;
 pub use rows_mode::{discover, import_into, read_import_record, record_key, ImportRecord, ImportedAspect, LegacyAspect, LegacyCatalogAspect, LegacyTree, NotCarried, RowsModeError, DEFAULT_ROWS_PER_SEGMENT, IMPORT_RECORD_KEY, MEASUREMENTS_FILE, TIMESTAMP_COLUMN, TIMESTAMP_TIME_UNIT, TIMESTAMP_UNIT};
-pub use segment_index::SegmentIndexStore;
+pub use segment_index::{SegmentChange, SegmentIndexStore};
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;
@@ -40,6 +40,7 @@ pub use store_format::{StoreFormat, StoreScope, LEGACY_LAYOUT, STORE_FORMAT_FILE
 pub use subject::{Subject, SubjectId};
 pub use transaction::{Transaction, TxId};
 pub use trend::Trend;
+pub use upsert_keys::{UpsertKeys, TIMESTAMP_UPSERT_KEY};
 pub use value_kind::{UnknownValueKind, ValueKind, RESERVED_VALUE_KIND_TOKENS};
 
 pub mod aspect;
@@ -86,6 +87,7 @@ pub mod store_format;
 pub mod subject;
 pub mod transaction;
 pub mod trend;
+pub mod upsert_keys;
 pub mod value_kind;
 
 pub use error::*;

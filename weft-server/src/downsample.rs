@@ -171,6 +171,11 @@ pub struct DownsampleResponse {
 	/// The fill method, when the request named one.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub fill: Option<String>,
+	/// The tags of the stored series reduced (TAG-10), on the stored downsample only:
+	/// `{}` for the untagged series 0, `null` when the `tag.*` selector matched no series.
+	/// Absent from the compute endpoint, which reduces a series the caller sent.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tags: Option<crate::storage::SeriesTags>,
 }
 
 /// Handle `POST /api/v1/downsample`: reduce a series into grid-aligned buckets.
@@ -376,7 +381,7 @@ pub(crate) fn buckets_to_response(buckets: Vec<weft_reduce::Bucket>, width: Buck
 		}
 		series.push(DownsampleBucket { timestamp: b.timestamp, count: b.count, aggregations: values });
 	}
-	Ok(DownsampleResponse { resolution: width.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series, fill: None })
+	Ok(DownsampleResponse { resolution: width.to_string(), aggregations: aggregations.iter().map(|a| a.as_str().to_string()).collect(), input_points, buckets: series.len(), series, fill: None, tags: None })
 }
 
 /// Render a [`DownsampleResponse`] as a `timestamp,count,<agg>…` CSV document.
