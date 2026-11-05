@@ -96,10 +96,12 @@ use crate::{
 /// separate runs `weft-bench combine` pooled. v29 added `gpu_economics`, one lane of a
 /// `gpu_economics` run ([`crate::gpu_economics::GpuEconomicsPoint`]). v30 added
 /// `gpu_pool.device_memory`, the device allocator's and `nvidia-smi`'s memory over a
-/// `gpu_memory` run ([`crate::gpu_memory::DeviceMemorySoak`]). All
+/// `gpu_memory` run ([`crate::gpu_memory::DeviceMemorySoak`]). v31 added the end-to-end GPU
+/// interpolation report ([`crate::e2e_interpolation::E2eReport`], written by
+/// `weft-e2e-interp`), which carries this version beside, not inside, `BenchResult`. All
 /// optional fields are
 /// `#[serde(default)]`, so older artifacts still deserialize.
-pub const SCHEMA_VERSION: u32 = 30;
+pub const SCHEMA_VERSION: u32 = 31;
 
 /// Metadata describing the dataset a result was measured against.
 ///

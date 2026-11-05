@@ -90,6 +90,7 @@ pub mod compression;
 pub mod conformance;
 pub mod crash_matrix;
 pub mod downsample;
+pub mod e2e_interpolation;
 pub mod engine;
 pub mod export;
 pub mod failure;
