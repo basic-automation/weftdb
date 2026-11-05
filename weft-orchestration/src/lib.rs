@@ -777,10 +777,7 @@ pub async fn build_processed_batch_queue(database: &Database, aspect_id: &weftdb
 /// - Pattern creation fails due to invalid batch data
 /// - Dictionary import fails during pattern merging
 ///
-/// # Panics
-///
-/// This function will panic if active measurements exist in a batch but have no timestamps,
-/// which should not happen under normal circumstances.
+/// Returns an error if a batch has active measurements but extracting min/max timestamps fails.
 pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::AspectId, dictionary: &mut Dictionary) -> Result<()> {
 	let mut stream = database.get_processed_batches(aspect_id).await?;
 
@@ -816,19 +813,19 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 				continue; // Skip batches with no active measurements
 			}
 
-			// Safe to unwrap: active_measurements.is_empty() is checked above
+			// Get min/max timestamps from active measurements
 			let beginning = active_measurements
 				.iter()
 				.map(|m| m.get_measurement_timestamp())
 				.min()
 				.copied()
-				.expect("active_measurements is non-empty, checked above");
+				.ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no minimum timestamp", batch.batch_id()))?;
 			let end = active_measurements
 				.iter()
 				.map(|m| m.get_measurement_timestamp())
 				.max()
 				.copied()
-				.expect("active_measurements is non-empty, checked above");
+				.ok_or_else(|| anyhow::anyhow!("Batch {} has active measurements but no maximum timestamp", batch.batch_id()))?
 
 			// Create an occurrence for this pattern
 			let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
