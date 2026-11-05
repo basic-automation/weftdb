@@ -64,14 +64,83 @@ const SELECT_COLUMNS: &str = "id, path, format_version, physical_type, time_unit
 pub struct SegmentIndexStore {
 	db: turso::Database,
 	spans: SpanBounds,
+	catalogs: SeriesCatalogs,
+}
+
+/// The composite index a series-bound prune names (Phase 4 tag pruning,
+/// `0007_series_time_index`): it seeks `(aspect, series_id)` and then the span, so the
+/// rows of the aspect's other series are never visited. Best effort, like
+/// [`TIME_INDEX`]: without it the prune falls back to the time index.
+const SERIES_TIME_INDEX: &str = "idx_segment_index_series_time";
+
+#[cfg(test)]
+thread_local! {
+	/// The index the last prune on this thread queried through (`""` for a scan).
+	static LAST_PRUNE_INDEX: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// The key a [`SpanBounds`] entry is held under: an aspect and, for a series-bound
+/// prune, one series of it. `None` is the aspect-wide bound, which every series widens.
+type SpanKey = (String, Option<crate::SeriesId>);
+
+/// A per-aspect copy of the series catalog (`series` table), so that resolving a
+/// selector reads no SQL once the aspect's catalog has been loaded.
+///
+/// Every [`SegmentIndexStore::apply`] of a transaction that registers a series forgets
+/// the aspect's copy once the transaction has run, committed or not, and bumps the
+/// aspect's generation. A load records the generation before it queries and keeps its
+/// result only if the generation is unchanged after, so a load that raced a
+/// registration never installs the catalog from before it. Like [`SpanBounds`], it
+/// holds because this handle is the only writer of the database.
+#[derive(Debug, Default)]
+struct SeriesCatalogs(std::sync::Mutex<HashMap<String, CachedCatalog>>);
+
+#[derive(Debug, Default)]
+struct CachedCatalog {
+	generation: u64,
+	series: Option<std::sync::Arc<[(crate::SeriesId, crate::SeriesKey)]>>,
+}
+
+impl SeriesCatalogs {
+	fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedCatalog>> {
+		self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	/// `aspect`'s cached catalog, or the generation a load must still see to keep its own.
+	fn get(&self, aspect: &str) -> Result<std::sync::Arc<[(crate::SeriesId, crate::SeriesKey)]>, u64> {
+		let catalogs = self.lock();
+		match catalogs.get(aspect) {
+			Some(CachedCatalog { series: Some(series), .. }) => Ok(series.clone()),
+			Some(cached) => Err(cached.generation),
+			None => Err(0),
+		}
+	}
+
+	/// Keep `series` as `aspect`'s catalog if no registration ran since `generation`.
+	fn put(&self, aspect: &str, generation: u64, series: std::sync::Arc<[(crate::SeriesId, crate::SeriesKey)]>) {
+		let mut catalogs = self.lock();
+		let cached = catalogs.entry(aspect.to_string()).or_default();
+		if cached.generation == generation {
+			cached.series = Some(series);
+		}
+	}
+
+	/// Forget `aspect`'s catalog: a series was (or may have been) registered in it.
+	fn invalidate(&self, aspect: &str) {
+		let mut catalogs = self.lock();
+		let cached = catalogs.entry(aspect.to_string()).or_default();
+		cached.generation += 1;
+		cached.series = None;
+	}
 }
 
 /// The time index a prune names (`INDEXED BY`): left to itself, the planner walks the
 /// `(aspect, id)` key through every segment of the aspect instead.
 const TIME_INDEX: &str = "idx_segment_index_time";
 
-/// The widest time span (`max_ts - min_ts`) of any segment recorded under each aspect, so
-/// that a prune can bound `min_ts` from below as well as above and seek only the segments
+/// The widest time span (`max_ts - min_ts`) of any segment recorded under each aspect, and
+/// under each series of it (Phase 4 tag pruning: one wide series no longer widens the seek
+/// of every other), so that a prune can bound `min_ts` from below as well as above and seek only the segments
 /// near its window, not every segment that starts before the window ends.
 ///
 /// An aspect's bound is loaded from the index the first time a prune needs it, and every
@@ -81,7 +150,7 @@ const TIME_INDEX: &str = "idx_segment_index_time";
 /// seek. It holds because this handle is the only writer: Turso locks the database file
 /// exclusively, and the store root's `LOCK` keeps a second process out.
 #[derive(Debug, Default)]
-struct SpanBounds(std::sync::Mutex<HashMap<String, SpanBound>>);
+struct SpanBounds(std::sync::Mutex<HashMap<SpanKey, SpanBound>>);
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SpanBound {
@@ -91,23 +160,26 @@ struct SpanBound {
 }
 
 impl SpanBounds {
-	fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, SpanBound>> {
+	fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SpanKey, SpanBound>> {
 		self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 	}
 
-	/// Widen `aspect`'s bound to `span`.
-	fn widen(&self, aspect: &str, span: i64) {
-		self.lock().entry(aspect.to_string()).or_default().widen(span);
+	/// Widen the bound of `aspect`, and of its series `series`, to `span`.
+	fn widen(&self, aspect: &str, series: crate::SeriesId, span: i64) {
+		let mut bounds = self.lock();
+		bounds.entry((aspect.to_string(), None)).or_default().widen(span);
+		bounds.entry((aspect.to_string(), Some(series))).or_default().widen(span);
 	}
 
-	/// `aspect`'s bound, if the index's own has been folded in.
-	fn get(&self, aspect: &str) -> Option<i64> {
-		self.lock().get(aspect).filter(|bound| bound.loaded).map(|bound| bound.widest)
+	/// The bound of `aspect` (`series` [`None`]) or of one series of it, if the index's
+	/// own has been folded in.
+	fn get(&self, aspect: &str, series: Option<crate::SeriesId>) -> Option<i64> {
+		self.lock().get(&(aspect.to_string(), series)).filter(|bound| bound.loaded).map(|bound| bound.widest)
 	}
 
-	/// Fold the index's widest span into `aspect`'s bound and return the bound.
-	fn load(&self, aspect: &str, indexed: i64) -> i64 {
-		self.lock().entry(aspect.to_string()).or_default().load(indexed)
+	/// Fold the index's widest span into that bound and return the bound.
+	fn load(&self, aspect: &str, series: Option<crate::SeriesId>, indexed: i64) -> i64 {
+		self.lock().entry((aspect.to_string(), series)).or_default().load(indexed)
 	}
 }
 
@@ -168,7 +240,7 @@ impl SegmentIndexStore {
 	async fn open_with(builder: Builder, path: &str) -> Result<Self> {
 		let db = builder.build().await?;
 		Self::configure(&db, path).await?;
-		Ok(Self { db, spans: SpanBounds::default() })
+		Ok(Self { db, spans: SpanBounds::default(), catalogs: SeriesCatalogs::default() })
 	}
 
 	/// Snapshot this `segment_index.db` to `dest` (a fresh file) via Turso's
@@ -257,7 +329,9 @@ impl SegmentIndexStore {
 	/// committed anyway.
 	pub(crate) async fn apply(&self, txn: &IndexTxn) -> std::result::Result<TxnApplied, IndexTxnError> {
 		self.widen_spans(txn);
-		txn.run(&self.db).await
+		let applied = txn.run(&self.db).await;
+		self.forget_catalogs(txn);
+		applied
 	}
 
 	/// [`apply`](Self::apply), asking `may_retry` before each retry
@@ -268,28 +342,43 @@ impl SegmentIndexStore {
 	/// As [`apply`](Self::apply).
 	pub(crate) async fn apply_while(&self, txn: &IndexTxn, may_retry: impl Fn() -> bool) -> std::result::Result<TxnApplied, IndexTxnError> {
 		self.widen_spans(txn);
-		txn.run_while(&self.db, may_retry).await
+		let applied = txn.run_while(&self.db, may_retry).await;
+		self.forget_catalogs(txn);
+		applied
+	}
+
+	/// Forget the cached series catalog of every aspect `txn` registers a series in,
+	/// once it has run: committed, refused or ambiguous alike, the next resolve reads
+	/// the catalog again.
+	fn forget_catalogs(&self, txn: &IndexTxn) {
+		for aspect in txn.registered_aspects() {
+			self.catalogs.invalidate(aspect);
+		}
 	}
 
 	/// Widen the prune's span bounds to every row `txn` writes, before it can commit: a
 	/// prune that sees the row then also sees a bound that reaches it.
 	fn widen_spans(&self, txn: &IndexTxn) {
-		for (aspect, span) in txn.row_spans() {
-			self.spans.widen(aspect, span);
+		for (aspect, series, span) in txn.row_spans() {
+			self.spans.widen(aspect, series, span);
 		}
 	}
 
-	/// The widest span recorded under `aspect`, loading it from the index on first use.
-	async fn span_bound(&self, conn: &turso::Connection, aspect: &str) -> Result<i64> {
-		if let Some(widest) = self.spans.get(aspect) {
+	/// The widest span recorded under `aspect`, or under its series `series`, loading it
+	/// from the index on first use.
+	async fn span_bound(&self, conn: &turso::Connection, aspect: &str, series: Option<crate::SeriesId>) -> Result<i64> {
+		if let Some(widest) = self.spans.get(aspect, series) {
 			return Ok(widest);
 		}
-		let mut rows = conn.query("SELECT MAX(max_ts - min_ts) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?;
+		let mut rows = match series {
+			None => conn.query("SELECT MAX(max_ts - min_ts) FROM segment_index WHERE aspect = ?", turso::params![aspect.to_string()]).await?,
+			Some(id) => conn.query("SELECT MAX(max_ts - min_ts) FROM segment_index WHERE aspect = ? AND series_id = ?", turso::params![aspect.to_string(), integer_param(id.0)?]).await?,
+		};
 		let indexed = match rows.next().await?.map(|row| row.get_value(0)).transpose()? {
 			Some(Value::Integer(widest)) => widest,
 			_ => 0,
 		};
-		Ok(self.spans.load(aspect, indexed))
+		Ok(self.spans.load(aspect, series, indexed))
 	}
 
 	/// The rows of `aspect` whose span overlaps `[start, end]` and that pass `filter` (an
@@ -306,7 +395,7 @@ impl SegmentIndexStore {
 	/// aspect-wide prune the public [`prune_by_time`](Self::prune_by_time) keeps.
 	async fn prune_rows(&self, aspect: &str, series: Option<crate::SeriesId>, start: i64, end: i64, filter: &str) -> Result<Vec<IndexRow>> {
 		let conn = connect_reader(&self.db).await?;
-		let mut widest = self.span_bound(&conn, aspect).await?;
+		let mut widest = self.span_bound(&conn, aspect, series).await?;
 		loop {
 			let floor = start.saturating_sub(widest);
 			// A NULL-spanned (empty) segment can never overlap, and the inequalities reject it.
@@ -323,18 +412,44 @@ impl SegmentIndexStore {
 				params.extend(series_param.clone());
 				turso::params_from_iter(params)
 			};
-			let rows = match conn.query(sql(&format!("INDEXED BY {TIME_INDEX}")), params()).await {
-				Ok(rows) => rows,
-				Err(e) if e.to_string().contains("no such index") => conn.query(sql(""), params()).await?,
-				Err(e) => return Err(e.into()),
-			};
+			let rows = Self::query_indexed(&conn, series.is_some(), &sql, &params).await?;
 			let rows = Self::collect(rows).await?;
-			let now = self.span_bound(&conn, aspect).await?;
+			let now = self.span_bound(&conn, aspect, series).await?;
 			if now == widest {
 				return Ok(rows);
 			}
 			widest = now;
 		}
+	}
+
+	/// Run a prune's query naming the index that fits it: the series-time index for a
+	/// series-bound prune, the time index otherwise. A store without the named index
+	/// (both are best effort) falls back: the series-time index to the time index, the
+	/// time index to a scan.
+	async fn query_indexed<P: turso::IntoParams>(conn: &turso::Connection, series_bound: bool, sql: &impl Fn(&str) -> String, params: &impl Fn() -> P) -> Result<turso::Rows> {
+		let missing = |e: &turso::Error| e.to_string().contains("no such index");
+		if series_bound {
+			match conn.query(sql(&format!("INDEXED BY {SERIES_TIME_INDEX}")), params()).await {
+				Ok(rows) => return Ok(Self::used(rows, SERIES_TIME_INDEX)),
+				Err(e) if missing(&e) => {}
+				Err(e) => return Err(e.into()),
+			}
+		}
+		match conn.query(sql(&format!("INDEXED BY {TIME_INDEX}")), params()).await {
+			Ok(rows) => Ok(Self::used(rows, TIME_INDEX)),
+			Err(e) if missing(&e) => Ok(Self::used(conn.query(sql(""), params()).await?, "")),
+			Err(e) => Err(e.into()),
+		}
+	}
+
+	/// Note which index the last prune on this thread ran through (`""` for a scan), so
+	/// tests can assert the production query reached the index it names.
+	fn used(rows: turso::Rows, index: &'static str) -> turso::Rows {
+		#[cfg(test)]
+		LAST_PRUNE_INDEX.with(|cell| cell.set(Some(index)));
+		#[cfg(not(test))]
+		let _ = index;
+		rows
 	}
 
 	/// The database behind this index: what the migration registry runs against, and what
@@ -719,7 +834,33 @@ impl SegmentIndexStore {
 	/// # Errors
 	///
 	/// Propagates any libSQL read failure, or a row this build cannot decode.
+	///
+	/// It reads the `series` table every time, bypassing the catalog cache, so a test
+	/// that wrote the table behind the handle's back sees what it wrote. Reads use
+	/// [`cached_series_of`](Self::cached_series_of).
+	#[cfg_attr(not(test), expect(dead_code, reason = "reads resolve through the catalog cache since Phase 4 tag pruning; the uncached form is the tests' oracle"))]
 	pub(crate) async fn series_of(&self, aspect: &str) -> Result<Vec<(crate::SeriesId, crate::SeriesKey)>> {
+		self.load_series_of(aspect).await
+	}
+
+	/// [`series_of`](Self::series_of) from the per-aspect catalog cache: no SQL once the
+	/// aspect's catalog is loaded, until a transaction registers a series in it.
+	///
+	/// # Errors
+	///
+	/// As [`series_of`](Self::series_of), on a load.
+	pub(crate) async fn cached_series_of(&self, aspect: &str) -> Result<std::sync::Arc<[(crate::SeriesId, crate::SeriesKey)]>> {
+		let generation = match self.catalogs.get(aspect) {
+			Ok(series) => return Ok(series),
+			Err(generation) => generation,
+		};
+		let series: std::sync::Arc<[_]> = self.load_series_of(aspect).await?.into();
+		self.catalogs.put(aspect, generation, series.clone());
+		Ok(series)
+	}
+
+	/// The catalog rows of `aspect`, read from the `series` table.
+	async fn load_series_of(&self, aspect: &str) -> Result<Vec<(crate::SeriesId, crate::SeriesKey)>> {
 		let conn = connect_reader(&self.db).await?;
 		let mut rows = conn.query("SELECT series_id, series_key FROM series WHERE aspect = ? ORDER BY series_id", turso::params![aspect.to_string()]).await?;
 		let mut out = Vec::new();
@@ -1546,5 +1687,113 @@ mod tests {
 		assert_eq!(store.series_aspects().await.expect("reads"), vec!["price".to_string()]);
 		assert_eq!(store.max_registered_series_id("price").await.expect("reads"), 2);
 		assert_eq!(store.max_registered_series_id("volume").await.expect("reads"), 0);
+	}
+
+	/// A row of `aspect`'s series `series` over exactly `[lo, hi]`, id `id`.
+	fn series_row(id: u64, series: u64, lo: i64, hi: i64) -> IndexRow {
+		let (seg, len) = spanning(lo, hi);
+		IndexRow { series_id: series, ..IndexRow::legacy(SegmentDescriptor::of_segment(id, format!("s{id}.weftseg"), len, &seg)) }
+	}
+
+	async fn upsert(store: &SegmentIndexStore, aspect: &str, rows: impl IntoIterator<Item = IndexRow>) {
+		store.apply(&IndexTxn::new(rows.into_iter().map(|row| IndexOp::Upsert { aspect: aspect.to_string(), row }).collect())).await.expect("upserts");
+	}
+
+	/// Phase 4 tag pruning: `0007_series_time_index` builds the composite index, and the
+	/// planner seeks it for a series-bound prune's query, by `(aspect, series_id)` and the
+	/// span, rather than the time index or a scan.
+	#[tokio::test]
+	async fn a_series_seek_uses_the_composite_index() {
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		upsert(&store, "price", (0..20).map(|i| series_row(i, i % 4, i64::try_from(i).expect("small") * 10, i64::try_from(i).expect("small") * 10 + 5))).await;
+		let conn = store.db.connect().expect("connects");
+		let mut rows = conn.query("SELECT sql FROM sqlite_schema WHERE name = 'idx_segment_index_series_time'", ()).await.expect("reads the schema");
+		let ddl = format!("{:?}", rows.next().await.expect("reads").expect("the index exists").get_value(0).expect("its sql"));
+		drop(rows);
+		assert!(ddl.contains("aspect, series_id, min_ts, max_ts"), "{ddl}");
+		let sql = format!("EXPLAIN QUERY PLAN SELECT {SELECT_COLUMNS} FROM segment_index INDEXED BY {SERIES_TIME_INDEX} WHERE aspect = ? AND min_ts IS NOT NULL AND max_ts IS NOT NULL AND ? <= min_ts AND min_ts <= ? AND ? <= max_ts AND series_id = ? ORDER BY id");
+		let mut plan = conn.query(&sql, turso::params!["price", 0_i64, 100_i64, 0_i64, 2_i64]).await.expect("explains");
+		let mut detail = String::new();
+		while let Some(row) = plan.next().await.expect("reads the plan") {
+			for i in 0..row.column_count() {
+				detail.push_str(&format!("{:?} ", row.get_value(i).expect("a column")));
+			}
+			detail.push('\n');
+		}
+		assert!(detail.contains(SERIES_TIME_INDEX), "the plan seeks the composite index:\n{detail}");
+		let ids = |rows: Vec<IndexRow>| rows.into_iter().map(|row| row.desc.id).collect::<Vec<_>>();
+		LAST_PRUNE_INDEX.with(|cell| cell.set(None));
+		assert_eq!(ids(store.prune_series_rows_by_time("price", crate::SeriesId(2), 0, 100).await.expect("prunes")), vec![2, 6, 10]);
+		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(SERIES_TIME_INDEX), "the production prune ran through the composite index");
+	}
+
+	/// Without the composite index (it is best effort), a series prune falls back to the
+	/// time index and answers the same.
+	#[tokio::test]
+	async fn a_series_prune_without_the_composite_index_still_answers() {
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		upsert(&store, "price", (0..20).map(|i| series_row(i, i % 4, i64::try_from(i).expect("small") * 10, i64::try_from(i).expect("small") * 10 + 5))).await;
+		let ids = |rows: Vec<IndexRow>| rows.into_iter().map(|row| row.desc.id).collect::<Vec<_>>();
+		let with = ids(store.prune_series_rows_by_time("price", crate::SeriesId(1), 0, 120).await.expect("prunes"));
+		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(SERIES_TIME_INDEX));
+		store.db.connect().expect("connects").execute(&format!("DROP INDEX {SERIES_TIME_INDEX}"), ()).await.expect("drops the composite index");
+		let without = ids(store.prune_series_rows_by_time("price", crate::SeriesId(1), 0, 120).await.expect("prunes"));
+		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(TIME_INDEX), "falls back to the time index");
+		store.db.connect().expect("connects").execute(&format!("DROP INDEX {TIME_INDEX}"), ()).await.expect("drops the time index");
+		let scanned = ids(store.prune_series_rows_by_time("price", crate::SeriesId(1), 0, 120).await.expect("prunes"));
+		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(""), "falls back to a scan");
+		assert_eq!(with, vec![1, 5, 9]);
+		assert_eq!(without, with);
+		assert_eq!(scanned, with);
+	}
+
+	/// The span bound is per series: one very wide segment of series 1 widens series 1's
+	/// bound and the aspect-wide one, never series 2's, and every prune still finds it.
+	#[tokio::test]
+	async fn span_bound_is_per_series() {
+		use crate::SeriesId;
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		upsert(&store, "price", [series_row(0, 2, 0, 10), series_row(1, 2, 100, 120), series_row(2, 1, 0, 50_000)]).await;
+		let conn = connect_reader(&store.db).await.expect("connects");
+		assert_eq!(store.span_bound(&conn, "price", Some(SeriesId(2))).await.expect("loads"), 20);
+		assert_eq!(store.span_bound(&conn, "price", Some(SeriesId(1))).await.expect("loads"), 50_000);
+		assert_eq!(store.span_bound(&conn, "price", None).await.expect("loads"), 50_000);
+		assert_eq!(store.span_bound(&conn, "price", Some(SeriesId(7))).await.expect("loads"), 0, "a series with no rows");
+		// A later wide write of series 2 widens series 2 and the aspect, not series 1.
+		upsert(&store, "price", [series_row(3, 2, 0, 90_000)]).await;
+		assert_eq!(store.span_bound(&conn, "price", Some(SeriesId(2))).await.expect("reads"), 90_000);
+		assert_eq!(store.span_bound(&conn, "price", Some(SeriesId(1))).await.expect("reads"), 50_000);
+		assert_eq!(store.span_bound(&conn, "price", None).await.expect("reads"), 90_000);
+		let ids = |rows: Vec<IndexRow>| rows.into_iter().map(|row| row.desc.id).collect::<Vec<_>>();
+		assert_eq!(ids(store.prune_series_rows_by_time("price", SeriesId(1), 49_990, 50_000).await.expect("prunes")), vec![2]);
+		assert_eq!(ids(store.prune_series_rows_by_time("price", SeriesId(2), 110, 115).await.expect("prunes")), vec![1, 3]);
+		assert_eq!(ids(store.prune_rows_by_time("price", 89_000, 89_000).await.expect("prunes")), vec![3]);
+	}
+
+	/// The catalog cache, once loaded, sees a series registered afterwards: the
+	/// registering transaction forgets the aspect's copy, and only that aspect's.
+	#[tokio::test]
+	async fn catalog_cache_sees_a_series_registered_after_it_loaded() {
+		use crate::{SeriesId, TagSet};
+		let store = SegmentIndexStore::open_migrated(":memory:").await.expect("opens");
+		let key = |host: &str| TagSet::from_pairs([("host", host)]).expect("valid").series_key().clone();
+		let register = |aspect: &str, id: u64, host: &str| IndexTxn::new(vec![IndexOp::RegisterSeries { aspect: aspect.into(), series_id: SeriesId(id), series_key: key(host) }, IndexOp::SeedSeries { aspect: aspect.into(), next_series_id: id + 1 }]);
+		store.apply(&register("price", 1, "a")).await.expect("registers");
+		assert_eq!(store.cached_series_of("price").await.expect("loads").to_vec(), vec![(SeriesId(1), key("a"))]);
+		assert_eq!(store.cached_series_of("volume").await.expect("loads").len(), 0);
+		assert!(store.catalogs.get("price").is_ok() && store.catalogs.get("volume").is_ok(), "both are cached");
+		store.apply(&register("price", 2, "b")).await.expect("registers");
+		assert!(store.catalogs.get("price").is_err(), "the registration forgot price's copy");
+		assert!(store.catalogs.get("volume").is_ok(), "and kept volume's");
+		assert_eq!(store.cached_series_of("price").await.expect("reloads").to_vec(), vec![(SeriesId(1), key("a")), (SeriesId(2), key("b"))]);
+		// A refused registration (a taken key) forgets too, and the reload is unchanged.
+		assert!(store.apply(&register("price", 3, "a")).await.is_err(), "the key is taken");
+		assert!(store.catalogs.get("price").is_err());
+		assert_eq!(store.cached_series_of("price").await.expect("reloads").len(), 2);
+		// A load that raced a registration does not install the catalog from before it.
+		let Err(generation) = store.catalogs.get("fresh") else { panic!("nothing cached") };
+		store.catalogs.invalidate("fresh");
+		store.catalogs.put("fresh", generation, std::sync::Arc::from(Vec::new()));
+		assert!(store.catalogs.get("fresh").is_err(), "a stale load is dropped");
 	}
 }

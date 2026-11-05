@@ -168,3 +168,37 @@ async fn series_tags_reads_back_the_catalog_key() {
 	assert_eq!(store.series_tags(ASPECT, SeriesId(a.0 + 1)).await.expect("reads"), None);
 	assert!(store.series_tags("../x", a).await.is_err(), "an invalid aspect name");
 }
+
+/// Phase 4 tag pruning: a tagged read of an aspect with 1,000 series, every one over the
+/// same window, opens only its own series' frames. Every other series' frame is
+/// overwritten with garbage first, so a read that opened one would fail its checksum.
+/// The selector resolves through the catalog cache, which a registration keeps current.
+#[tokio::test]
+async fn a_tagged_read_among_a_thousand_series_opens_only_its_own_frames() {
+	const SERIES: usize = 1_000;
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+	for i in 0..SERIES {
+		let host = format!("h{i:04}");
+		let ts: Vec<i64> = (0..4).map(|k| k * 10).collect();
+		let vs: Vec<BigDecimal> = ts.iter().map(|t| BigDecimal::from(t + i64::try_from(i).expect("small"))).collect();
+		store.ingest(ASPECT, &IngestBatch::dense(format!("k{i}"), ts, vs).with_groups(tags(&[("host", &host)]))).await.expect("ingests");
+	}
+	let wanted = store.resolve_series(ASPECT, &SeriesSelector::exact([("host", Some("h0421"))]).expect("valid")).await.expect("resolves").expect("one series");
+	let rows = store.index.prune_rows_by_time(ASPECT, i64::MIN, i64::MAX).await.expect("prunes");
+	assert_eq!(rows.iter().map(|row| row.series_id).collect::<std::collections::BTreeSet<_>>().len(), SERIES, "one series per ingest");
+	let mut corrupted = 0;
+	for row in rows.iter().filter(|row| row.series_id != wanted.0) {
+		std::fs::write(store.frame_path(&row.desc).expect("a frame path"), b"not a frame").expect("overwrites");
+		corrupted += 1;
+	}
+	assert!(corrupted >= SERIES - 1);
+	let (ts, vs) = store.read_time_range_of(ASPECT, wanted, 0, 30).await.expect("reads only its own frames");
+	assert_eq!(ts, vec![0, 10, 20, 30]);
+	assert_eq!(vs, [421, 431, 441, 451].iter().map(|v| Some(BigDecimal::from(*v))).collect::<Vec<_>>());
+	assert_eq!(store.read_point_of(ASPECT, wanted, 20).await.expect("reads"), Some(bd("441")));
+	// A series registered after the catalog was cached resolves too.
+	store.ingest(ASPECT, &IngestBatch::dense("late", vec![0], vec![bd("7")]).with_groups(tags(&[("host", "late")]))).await.expect("ingests");
+	let late = store.resolve_series(ASPECT, &SeriesSelector::exact([("host", Some("late"))]).expect("valid")).await.expect("resolves").expect("the new series");
+	assert_eq!(store.read_point_of(ASPECT, late, 0).await.expect("reads"), Some(bd("7")));
+}

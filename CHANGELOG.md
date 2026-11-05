@@ -119,6 +119,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   tag grammar is `400 invalid_tag`; a new series beyond the per-aspect cap is
   `400 series_limit`. Every ingest response gains `series_id` (`0` for the untagged series)
   and `tags` (`{}` untagged), and the `ingest` audit event gains `series_id`.
+- **Tag pruning (Phase 4).** Migration `0007_series_time_index` adds
+  `idx_segment_index_series_time` on `segment_index(aspect, series_id, min_ts, max_ts)`
+  (layout 2, best effort: a store that cannot build it still opens and its series reads use
+  the time index). A read of one tagged series seeks that index, bounds its seek by that
+  series' own widest segment rather than the whole aspect's, and resolves its selector from
+  an in-memory copy of the aspect's series catalog, so it opens only its own series'
+  segments however many series share the window. `SeriesSelector::matches_key` tests a
+  canonical `SeriesKey` without building a `TagSet`.
 - **`WEFT_MAX_SERIES_PER_ASPECT`** (Tuning): the most tagged series one aspect may register,
   default 100,000; a malformed value stops the server from starting.
 

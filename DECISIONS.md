@@ -4387,6 +4387,51 @@ Issue #329; design PR 7 without 7b (the SDKs), tags D5/D6.
 10. **Not in this slice.** `scripts/compat/make-v010-fixtures.sh` runs a v0.1.0 binary and
     is left as is. The soak client now sends `measurement=soak`.
 
+## 2026-11-04 — PHASE4-TAGPRUNE: a series-time composite index, per-series span bounds, a cached series catalog (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Issue #158; design PR 8, with critique A4 (the composite index was deferred from TAG-5 to here).
+
+1. **Migration `0007_series_time_index`, layout 2, best effort.** It creates
+   `idx_segment_index_series_time ON segment_index(aspect, series_id, min_ts, max_ts)` in
+   `segment_index.db`. Layout 2 by the standing pre-1.0 rule in `store_format` (tags D1), no
+   floor raise: an older layout-2 build never names the index and writes the table as before
+   (SQLite maintains the index for it). A failure to create it is logged, not fatal, exactly
+   like `idx_segment_index_time` in `0001_baseline`. Cost accepted: one more index entry per
+   `InsertNew`/`DeleteEveryExpected` on every workload, untagged included (critique A4's
+   concern); the time index is kept, since aspect-wide prunes (maintenance, recovery,
+   `prune_by_time`) still need it.
+2. **Fallback chain.** A series-bound prune names the composite index; on "no such index" it
+   retries with the time index, then with a scan. Aspect-wide prunes are unchanged.
+3. **`SpanBounds` keyed by `(aspect, Option<SeriesId>)`.** Every written row widens both its
+   series' bound and the aspect-wide (`None`) bound, so the aspect-wide prune keeps its old
+   behaviour and a series prune seeks `start - widest span of that series`. A series' bound
+   loads with `MAX(max_ts - min_ts) ... AND series_id = ?` on first use. The design said
+   "keyed by (aspect, series_id)"; the `None` key is how the aspect-wide prune keeps its bound.
+4. **The catalog cache lives on `SegmentIndexStore`, not `AspectState`.** Deviation from the
+   design's `aspect_locks.rs:48`: the index handle is where every transaction commits
+   (`apply`/`apply_while`; nothing else runs an `IndexTxn` against `segment_index.db` outside
+   migrations, which register no series), so invalidation cannot be bypassed, and a reader
+   needs no aspect lock. Each `apply` of a transaction holding `RegisterSeries` forgets that
+   aspect's copy after it runs, whether it committed, was refused or is ambiguous, and bumps
+   a per-aspect generation; a load keeps its result only if the generation did not move
+   while it queried, so a load that raced a registration never installs the older catalog.
+   `series_of` stays an uncached SQL read for tests that write the table directly.
+5. **"`resolve_series` needs no SQL" holds for the catalog only.** The series-0 existence
+   test (`series_has_rows`) still queries, but only for a loose selector that matches the
+   empty tag set; `untagged()` returns before it and an exact non-empty selector never
+   reaches it. Caching it would need invalidation on every row write and delete, which is
+   not worth it for that one case.
+6. **`SeriesSelector::matches_key(&SeriesKey)`** walks the canonical pairs and the sorted
+   matchers together, allocating nothing; it agrees with `matches(&TagSet::from(key))` on the
+   existing truth table, the 3,000-case randomized model test and a reserved-key case.
+7. **Tests.** `a_series_seek_uses_the_composite_index` (schema DDL and `EXPLAIN QUERY PLAN`
+   name the index), `a_series_prune_without_the_composite_index_still_answers`,
+   `span_bound_is_per_series`, `catalog_cache_sees_a_series_registered_after_it_loaded`,
+   `matches_key_treats_a_reserved_key_as_an_unnamed_tag`, and
+   `a_tagged_read_among_a_thousand_series_opens_only_its_own_frames` (1,000 series over one
+   window; every other series' frame is overwritten with garbage, so opening one would fail
+   the read; about 40 s locally, from 1,000 durable seals). No micro-benchmark was run.
+
 ## 2026-11-04 — Decision 18 amended: the stored-interpolation HTTP route ships now (P5-http, FOR MERGE REVIEW)
 
 **Amends:** the 1.0 plan's decision 18 (`f085f84:docs/release/1.0-plan.md:540`), which shipped
