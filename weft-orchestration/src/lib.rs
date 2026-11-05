@@ -816,8 +816,19 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 				continue; // Skip batches with no active measurements
 			}
 
-			let beginning = active_measurements.iter().map(|m| m.get_measurement_timestamp()).min().copied().unwrap();
-			let end = active_measurements.iter().map(|m| m.get_measurement_timestamp()).max().copied().unwrap();
+			// Safe to unwrap: active_measurements.is_empty() is checked above
+			let beginning = active_measurements
+				.iter()
+				.map(|m| m.get_measurement_timestamp())
+				.min()
+				.copied()
+				.expect("active_measurements is non-empty, checked above");
+			let end = active_measurements
+				.iter()
+				.map(|m| m.get_measurement_timestamp())
+				.max()
+				.copied()
+				.expect("active_measurements is non-empty, checked above");
 
 			// Create an occurrence for this pattern
 			let occurrence = Occurrence::new(batch.metadata.aspect, batch.metadata.resolution, batch.metadata.size, batch.metadata.database_info.clone(), pattern_id, beginning, end);
