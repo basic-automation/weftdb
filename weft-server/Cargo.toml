@@ -27,6 +27,9 @@ bitsliced-codec = ["weftdb/bitsliced-codec"]
 # `cargo test --workspace`, and weftdb's check that production builds keep them inert
 # (tests/durable_fault_disabled.rs) would compile to nothing.
 fault-injection = ["weftdb/fault-injection"]
+# Forwards weftdb's opt-in memory-mapped range reads so `WEFT_SEGMENT_MMAP_READS` takes effect
+# (roadmap Phase 5); without it the variable is ignored with a warning.
+mmap-reads = ["weftdb/mmap-reads"]
 
 [lib]
 name = "weft_server"

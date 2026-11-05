@@ -140,7 +140,15 @@ impl SegmentStore {
 		let mut timestamps = Vec::new();
 		let mut values = Vec::new();
 		for descriptor in &descriptors {
-			let bytes = self.read_frame(descriptor).await?;
+			// Phase 5 memory-mapped reads: with `mmap_reads` on (and the feature compiled in),
+			// the window decodes straight from a read-only mapping of the frame instead of a
+			// heap copy of the whole file. Same bytes, same decoder, same rows.
+			let bytes = if self.mmap_reads && super::mapped::MMAP_COMPILED {
+				let path = self.frame_path(descriptor)?;
+				super::mapped::map_frame(&path).with_context(|| format!("mapping segment {}", path.display()))?
+			} else {
+				super::mapped::FrameBytes::Owned(self.read_frame(descriptor).await?)
+			};
 			// A paged frame (v3) decodes through PagedSegment::read_time_range, which
 			// skips pages *within* the file; a single-block frame decodes whole.
 			// Windowed read: a regular block-coded frame decodes only the row window (closed-form
