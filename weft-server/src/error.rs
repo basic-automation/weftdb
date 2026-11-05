@@ -907,6 +907,9 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 			weftdb::StoreError::SeriesLimit { .. } => ApiError::new(Code::SeriesLimit, e.to_string()),
 			weftdb::StoreError::AmbiguousSeries { .. } => ApiError::new(Code::AmbiguousSeries, e.to_string()),
 			weftdb::StoreError::ReservedTagKey { .. } => ApiError::new(Code::InvalidTag, e.to_string()),
+			// A tag outside the aspect's declared upsert keys is the caller's tag to fix.
+			weftdb::StoreError::NotAnUpsertKey { key, .. } => ApiError::new(Code::InvalidTag, e.to_string()).with_details(serde_json::json!({ "tag": key, "reason": "not an upsert key" })),
+			weftdb::StoreError::UpsertKeysConflict { .. } => ApiError::new(Code::SchemaConflict, e.to_string()),
 			weftdb::StoreError::IngestValueOutOfRange { digits, .. } => decimal_out_of_range_refusal(*digits),
 			weftdb::StoreError::EmptyIngestBatch { .. } | weftdb::StoreError::IngestLengthMismatch { .. } => ApiError::bad_request(e.to_string()),
 			_ => ApiError::server(Code::IncompatibleStore, e.to_string()),

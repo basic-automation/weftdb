@@ -4,6 +4,60 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-04 — Phase 4.6: upsert keys in the narrowed form, and skip-identical's crash semantics (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** ROADMAP 4.6 asks for "configurable upsert keys + skip-identical" and names
+neither shape. QuestDB's `DEDUP UPSERT KEYS` picks columns, but a WeftDB row has one value
+column and a series is a full tag set, and tags invariant I12 ("one output frame, one
+series") forbids folding two series into one. The tags design (9a) and its critique (F21,
+F22, F23) disagree on whether the keys should exist at all and at which layout.
+
+**Chosen:**
+
+- **Upsert keys are `timestamp` plus a tag-key set K, and they bound the tags an ingest may
+  carry.** Declared through `SegmentStore::declare_with_upsert_keys` (HTTP: `upsert_keys` on
+  declare) and read with `SegmentStore::upsert_keys`; `AspectSchema` is untouched (it is frozen
+  and not `#[non_exhaustive]`). With K declared, a `TagSet` naming a key outside K is
+  `StoreError::NotAnUpsertKey` (`400 invalid_tag`, "not an upsert key"), because a tag outside
+  the key has no per-row storage to carry once two rows differing only in it fold into one.
+  So the dedup identity is `(timestamp, tags restricted to K)`, which under that rule is the
+  full tag set; undeclared stays `(timestamp, full tag set)`. Newer-wins per series (reads and
+  `merge_newer_wins`) does the dedup in both cases. Critique F22 is right that this changes
+  which writes are accepted rather than how they fold; the owner's spec asked for the honest
+  narrowed form anyway, and it is what lets a caller pin the identity and have stray tags
+  refused rather than silently minting a series.
+- **The keys are immutable and take part in declare equality.** Other keys, keys where none
+  were declared, or none where some were, is `StoreError::UpsertKeysConflict` (`409
+  schema_conflict`); a schema conflict is still reported as itself first. Plain `declare`
+  leaves the keys out of the comparison, so every existing library caller (widening
+  included) behaves as before.
+- **Storage: migration `0008_upsert_keys` at layout 2**, a nullable
+  `aspect_schema.upsert_keys TEXT` (JSON wire list) in `aspect_catalog.db`. This follows D1
+  and the `store_format.rs` rule rather than design 9a's "layout 3, floors 3". Critique F21
+  holds either way: floors at 3 would not stop a layout-3 build that predates 0008 either,
+  only layout 4 would. The cost is stated in the migration doc: an older layout-2 build opens
+  and writes the store and **ignores** the declaration, accepting a tag outside K. Accepted
+  pre-1.0; a floor raise is the 1.0 freeze's call, not this slice's.
+- **`value` is not an upsert key.** Keying on value means "keep both rows when the values
+  differ" at one timestamp of one series, which no fold, read or index supports: every read
+  path answers one value per `(series, timestamp)`.
+- **Dedup-off is deferred.** Keeping duplicates needs a second fold beside
+  `merge_newer_wins`, and an X-READ (C16) that does not dedup either; neither exists, and a
+  flag that only some paths honoured would be worse than none.
+- **Skip-identical is a delete-only swap** (design 9b with F23). In `reconcile_overlaps_held`,
+  when the fold equals the lowest-id member's decoded rows and that member is
+  `time_sorted`, the component swaps `SwapPlan::keep`: no generation is allocated and no
+  output is journaled, written or synced (M2-M4 are skipped, so `M-pending-committed` through
+  `M-dir-synced` are never reached), the kept row gets an unchanged `ReplaceExpected` as its
+  version precondition, `DeleteEveryExpected` and `JournalRetire` cover only the other
+  members, and only their sidecars are removed. A racing change to the kept row is a
+  `Conflict` and nothing is deleted. Values compare by plain form with scale (`5` vs `5.0`
+  differ), not `BigDecimal ==`, which ignores scale. The kept frame keeps its paging even
+  where a rewrite would have chosen another (#507's merge page height waived, as 9b says).
+  Squash and compaction do not skip yet; only the overlap merge was specified.
+- **The crash matrix's `Op::SkipIdentical`** runs only the fault points the swap passes, and
+  reads "committed" as "one segment fewer" since no output generation appears.
+
 ## 2026-11-04 — Phase 2 integrations: what was built, and the two items left with a reason (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** Phase 2's two remaining roadmap lines chain six items with arrows —
