@@ -381,6 +381,12 @@ fn run_gpu_memory_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let result = weft_bench::gpu_memory::run_gpu_memory(&profile).map_err(|e| anyhow::anyhow!("gpu-memory benchmark run failed: {e}"))?;
 	if let Some(pool) = &result.gpu_pool {
 		println!("gpu pool: cap {} MiB; created {} ({} after round 1), reused {}, evicted {}; idle peak {} MiB (round 1) / {} MiB (later), final {} MiB; stable: {}", pool.max_pool_bytes >> 20, pool.created, pool.created_after_first_round, pool.reused, pool.evicted, pool.peak_idle_bytes_first_round >> 20, pool.peak_idle_bytes_later >> 20, pool.final_idle_bytes >> 20, pool.stable);
+		if let Some(d) = &pool.device_memory {
+			println!("device memory: {} rounds in {} s, {} samples; allocated peak {} MiB (round 1) / {} MiB (later), final {} MiB allocated / {} MiB reserved; growth (leak): {}", pool.rounds, d.elapsed_secs, d.samples, d.peak_allocated_bytes_first_round >> 20, d.peak_allocated_bytes_later >> 20, d.final_allocated_bytes >> 20, d.final_reserved_bytes >> 20, d.allocated_growth);
+			for t in &d.smi {
+				println!("nvidia-smi gpu {}: {} samples, memory.used trend {:?} MiB; growth: {}", t.gpu_index, t.samples, t.memory_used_trend_mib, t.growth);
+			}
+		}
 	}
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339()).with_engine(Some(engine));
 	let report = BenchReport::with_results(metadata, vec![result]);
@@ -1976,7 +1982,7 @@ fn set_gap_fill_knob(params: &mut GapFillParams, flag: &str, value: &str) -> Res
 }
 
 /// The GPU-memory workload's knob flags, each taking one value ([`set_gpu_memory_knob`]).
-const GPU_MEMORY_FLAGS: [&str; 4] = ["--gm-rounds", "--gm-sizes", "--gm-knots", "--gm-pool-mib"];
+const GPU_MEMORY_FLAGS: [&str; 6] = ["--gm-rounds", "--gm-sizes", "--gm-knots", "--gm-pool-mib", "--gm-soak-secs", "--gm-smi-ms"];
 
 /// Apply one GPU-memory knob (`flag` from [`GPU_MEMORY_FLAGS`]) to `params`.
 fn set_gpu_memory_knob(params: &mut weft_bench::gpu_memory::GpuMemoryParams, flag: &str, value: &str) -> Result<(), String> {
@@ -1986,6 +1992,8 @@ fn set_gpu_memory_knob(params: &mut weft_bench::gpu_memory::GpuMemoryParams, fla
 		"--gm-knots" => params.knots = positive("--gm-knots", value)?.max(2),
 		"--gm-sizes" => params.sizes = value.split(',').map(|v| positive("--gm-sizes", v.trim()).map(|n| n.max(2))).collect::<Result<_, _>>()?,
 		"--gm-pool-mib" => params.pool_mib = Some(value.parse::<u64>().map_err(|_| "--gm-pool-mib must be a whole number of MiB".to_string())?),
+		"--gm-soak-secs" => params.soak_secs = Some(u64::try_from(positive("--gm-soak-secs", value)?).unwrap_or(u64::MAX)),
+		"--gm-smi-ms" => params.smi_interval_ms = value.parse::<u64>().map_err(|_| "--gm-smi-ms must be a whole number of milliseconds".to_string())?,
 		_ => unreachable!("only GPU_MEMORY_FLAGS are dispatched here"),
 	}
 	Ok(())
@@ -2315,6 +2323,11 @@ GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
                                                [default: 16384,1048576,4194304]
         --gm-knots <N>       Input knots per call                    [default: 1000]
         --gm-pool-mib <N>    Start the GPU with this pool cap  [default: splimes' 512]
+        --gm-soak-secs <N>   Keep running rounds (at least --gm-rounds) for N seconds;
+                             device memory is sampled after every call, and steady
+                             growth after round 1 fails the run as a leak
+        --gm-smi-ms <N>      nvidia-smi memory.used cross-check interval; 0 = off
+                                                                    [default: 1000]
 
 GPU-ECONOMICS OPTIONS (with --gpu-economics; GPU lanes skip without a GPU; seeded by --seed):
         --ge-points <N>      Output points per call                [default: 1048576]
@@ -2749,6 +2762,10 @@ mod tests {
 		assert_eq!((cli.gpu_memory.rounds, cli.gpu_memory.sizes.clone(), cli.gpu_memory.knots, cli.gpu_memory.pool_mib), (5, vec![1_024, 65_536], 50, Some(32)));
 		assert!(run_cli(&["--gpu-memory", "--gm-sizes", "10,x"]).unwrap_err().contains("--gm-sizes"));
 		assert!(run_cli(&["--gpu-memory", "--gm-rounds", "0"]).unwrap_err().contains("--gm-rounds"));
+		let cli = expect_run(&["--gpu-memory", "--gm-soak-secs", "1800", "--gm-smi-ms", "0"]);
+		assert_eq!((cli.gpu_memory.soak_secs, cli.gpu_memory.smi_interval_ms), (Some(1_800), 0));
+		assert!(run_cli(&["--gpu-memory", "--gm-soak-secs", "0"]).unwrap_err().contains("--gm-soak-secs"));
+		assert!(run_cli(&["--gpu-memory", "--gm-smi-ms", "x"]).unwrap_err().contains("--gm-smi-ms"));
 		assert!(run_cli(&["--gpu-memory", "-g"]).unwrap_err().contains("only one workload mode"));
 	}
 
