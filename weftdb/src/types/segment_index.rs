@@ -73,6 +73,12 @@ pub struct SegmentIndexStore {
 /// [`TIME_INDEX`]: without it the prune falls back to the time index.
 const SERIES_TIME_INDEX: &str = "idx_segment_index_series_time";
 
+#[cfg(test)]
+thread_local! {
+	/// The index the last prune on this thread queried through (`""` for a scan).
+	static LAST_PRUNE_INDEX: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
 /// The key a [`SpanBounds`] entry is held under: an aspect and, for a series-bound
 /// prune, one series of it. `None` is the aspect-wide bound, which every series widens.
 type SpanKey = (String, Option<crate::SeriesId>);
@@ -424,16 +430,26 @@ impl SegmentIndexStore {
 		let missing = |e: &turso::Error| e.to_string().contains("no such index");
 		if series_bound {
 			match conn.query(sql(&format!("INDEXED BY {SERIES_TIME_INDEX}")), params()).await {
-				Ok(rows) => return Ok(rows),
+				Ok(rows) => return Ok(Self::used(rows, SERIES_TIME_INDEX)),
 				Err(e) if missing(&e) => {}
 				Err(e) => return Err(e.into()),
 			}
 		}
 		match conn.query(sql(&format!("INDEXED BY {TIME_INDEX}")), params()).await {
-			Ok(rows) => Ok(rows),
-			Err(e) if missing(&e) => Ok(conn.query(sql(""), params()).await?),
+			Ok(rows) => Ok(Self::used(rows, TIME_INDEX)),
+			Err(e) if missing(&e) => Ok(Self::used(conn.query(sql(""), params()).await?, "")),
 			Err(e) => Err(e.into()),
 		}
+	}
+
+	/// Note which index the last prune on this thread ran through (`""` for a scan), so
+	/// tests can assert the production query reached the index it names.
+	fn used(rows: turso::Rows, index: &'static str) -> turso::Rows {
+		#[cfg(test)]
+		LAST_PRUNE_INDEX.with(|cell| cell.set(Some(index)));
+		#[cfg(not(test))]
+		let _ = index;
+		rows
 	}
 
 	/// The database behind this index: what the migration registry runs against, and what
@@ -1706,7 +1722,9 @@ mod tests {
 		}
 		assert!(detail.contains(SERIES_TIME_INDEX), "the plan seeks the composite index:\n{detail}");
 		let ids = |rows: Vec<IndexRow>| rows.into_iter().map(|row| row.desc.id).collect::<Vec<_>>();
+		LAST_PRUNE_INDEX.with(|cell| cell.set(None));
 		assert_eq!(ids(store.prune_series_rows_by_time("price", crate::SeriesId(2), 0, 100).await.expect("prunes")), vec![2, 6, 10]);
+		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(SERIES_TIME_INDEX), "the production prune ran through the composite index");
 	}
 
 	/// Without the composite index (it is best effort), a series prune falls back to the
@@ -1717,10 +1735,13 @@ mod tests {
 		upsert(&store, "price", (0..20).map(|i| series_row(i, i % 4, i64::try_from(i).expect("small") * 10, i64::try_from(i).expect("small") * 10 + 5))).await;
 		let ids = |rows: Vec<IndexRow>| rows.into_iter().map(|row| row.desc.id).collect::<Vec<_>>();
 		let with = ids(store.prune_series_rows_by_time("price", crate::SeriesId(1), 0, 120).await.expect("prunes"));
+		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(SERIES_TIME_INDEX));
 		store.db.connect().expect("connects").execute(&format!("DROP INDEX {SERIES_TIME_INDEX}"), ()).await.expect("drops the composite index");
 		let without = ids(store.prune_series_rows_by_time("price", crate::SeriesId(1), 0, 120).await.expect("prunes"));
+		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(TIME_INDEX), "falls back to the time index");
 		store.db.connect().expect("connects").execute(&format!("DROP INDEX {TIME_INDEX}"), ()).await.expect("drops the time index");
 		let scanned = ids(store.prune_series_rows_by_time("price", crate::SeriesId(1), 0, 120).await.expect("prunes"));
+		assert_eq!(LAST_PRUNE_INDEX.with(std::cell::Cell::get), Some(""), "falls back to a scan");
 		assert_eq!(with, vec![1, 5, 9]);
 		assert_eq!(without, with);
 		assert_eq!(scanned, with);
