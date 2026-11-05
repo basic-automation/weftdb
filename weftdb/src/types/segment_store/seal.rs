@@ -99,7 +99,7 @@ impl SegmentStore {
 		// The seal's index write, spanned like `SegmentIndexStore::insert` (roadmap Phase 3). Its
 		// `rows_changed` is the affected-row count of the first op, the `InsertNew`.
 		let span = tracing::debug_span!("control_plane.index.insert", aspect, id = descriptor.id, rows_changed = tracing::field::Empty);
-		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row }, seq_bump(aspect, &commit, gen.saturating_add(1), epoch), IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup }])).instrument(span.clone()).await?;
+		let applied = self.commit_index(&IndexTxn::new(vec![IndexOp::InsertNew { aspect: aspect.to_string(), row }, seq_bump(aspect, &commit, gen.saturating_add(1), epoch), IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup }, IndexOp::RecordChange { aspect: aspect.to_string(), epoch, min_ts: descriptor.min_ts, max_ts: descriptor.max_ts, row_count: u64::try_from(descriptor.row_count).unwrap_or(u64::MAX) }])).instrument(span.clone()).await?;
 		span.record("rows_changed", applied.changes.first().copied().unwrap_or(0));
 		commit.set_epoch(epoch);
 		drop(commit);
@@ -819,6 +819,7 @@ impl SegmentStore {
 		ops.push(seq_bump(aspect, &commit, max_gen.saturating_add(1), epoch));
 		ops.push(IndexOp::PutRollup { aspect: aspect.to_string(), meta: rollup });
 		ops.push(IndexOp::RecordIngest { entry });
+		ops.push(IndexOp::RecordChange { aspect: aspect.to_string(), epoch, min_ts, max_ts, row_count: u64::try_from(batch.timestamps.len()).unwrap_or(u64::MAX) });
 		self.commit_index(&IndexTxn::new(ops)).await?;
 		commit.set_epoch(epoch);
 		drop(commit);
@@ -880,6 +881,40 @@ impl SegmentStore {
 		if held >= self.max_series_per_aspect {
 			return Err(StoreError::SeriesLimit { aspect: aspect.to_string(), limit: self.max_series_per_aspect }.into());
 		}
+		Ok(())
+	}
+
+	/// The change-log rows of `aspect` at epochs after `after_epoch`, in
+	/// epoch order (slice D-S20): one row per seal or ingest commit, each
+	/// carrying that commit's time span and row count. This is the log
+	/// that replaces the per-timestamp unbatched queue for seal-backed
+	/// aspects: a consumer reads the rows since the last epoch it
+	/// acknowledged, rebuilds the batch windows their spans touch, and
+	/// acknowledges them with [`ack_changes`](Self::ack_changes).
+	///
+	/// # Errors
+	///
+	/// Propagates any libSQL read failure.
+	pub async fn changes_since(&self, aspect: &str, after_epoch: u64) -> Result<Vec<SegmentChange>> {
+		self.index.changes_after(aspect, after_epoch).await
+	}
+
+	/// Acknowledge `aspect`'s change-log rows at or below `through_epoch`
+	/// (slice D-S20): delete them, as a queue consumer dequeues what it
+	/// has batched. A commit that lands after the consumer's read takes a
+	/// higher epoch, so it is never deleted here; a crash before the
+	/// acknowledgement leaves the rows, and the next run rebuilds the
+	/// same windows, whose batches the store's dedupe skips.
+	///
+	/// # Errors
+	///
+	/// A control-plane write failure (an ambiguous COMMIT poisons the
+	/// store, as for every write).
+	pub async fn ack_changes(&self, aspect: &str, through_epoch: u64) -> Result<()> {
+		if through_epoch == 0 {
+			return Ok(());
+		}
+		self.commit_index(&IndexTxn::new(vec![IndexOp::DeleteChanges { aspect: aspect.to_string(), through_epoch }])).await?;
 		Ok(())
 	}
 

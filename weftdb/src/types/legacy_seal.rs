@@ -22,9 +22,20 @@
 //! returned TxIds are synthetic: UUIDv5 over the idempotency key and the row
 //! index (the only production caller ignores them). `capture_measurement`
 //! is a one-row ingest under the same derivation, followed by the store's
-//! O(1) fragmentation gate. Until D-S20 lands, seal-backed ingest still
-//! enqueues its timestamps in the per-timestamp queue exactly as rows mode
-//! does; D-S20 is the slice that replaces the queue with `segment_changes`.
+//! O(1) fragmentation gate.
+//!
+//! **Change log (D-S20).** Seal-backed ingest never touches the
+//! per-timestamp unbatched queue rows mode feeds. Each seal-store commit
+//! records one `segment_changes` row in its own index transaction — the
+//! commit's epoch, time span and row count — so the batch consumer learns
+//! about a commit from the change log
+//! ([`SegmentStore::changes_since`](crate::SegmentStore::changes_since))
+//! and acknowledges the rows it has batched
+//! ([`SegmentStore::ack_changes`](crate::SegmentStore::ack_changes)).
+//! Because the row commits with the segments, there is no write-ahead
+//! entry for a commit that never landed and no landed commit without its
+//! row: the S18 write-ahead/requeue dance the queue needed has no
+//! counterpart here. Rows-mode aspects keep the queue unchanged.
 //!
 //! **Encoding.** On first use the adapter declares the aspect
 //! [`PhysicalType::Decimal128`] at zero tolerance, in milliseconds (the
