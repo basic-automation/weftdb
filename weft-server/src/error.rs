@@ -81,7 +81,9 @@ pub enum Code {
 	InvalidTag,
 	/// A selector matched more than one series where exactly one was required.
 	AmbiguousSeries,
-	/// The request asked for tags on a store whose layout predates them.
+	/// Reserved: the request asked for tags where they cannot be stored. Since TAG-11
+	/// every ingest route accepts tags, so nothing answers with it today; the code stays
+	/// in the table so a later refusal of this kind keeps its documented name.
 	TagsUnsupported,
 	/// The request would create or touch more series than the configured cap allows.
 	SeriesLimit,
@@ -637,32 +639,52 @@ where
 	}
 }
 
-/// Split a raw query into the pieces that are not selector parameters (rejoined, still
-/// encoded) and the selector the `tag.*` / `tag_match` parameters build.
-fn split_selector(query: &str) -> Result<(String, weftdb::SeriesSelector), ApiError> {
-	let mut rest: Vec<&str> = Vec::new();
-	let mut matchers: Vec<(String, Option<String>)> = Vec::new();
-	let mut mode: Option<String> = None;
+/// The `tag.*` / `tag_match` parameters of a raw query, taken apart from the rest.
+struct TagParams<'q> {
+	/// The pieces that are not tag parameters, still encoded.
+	rest: Vec<&'q str>,
+	/// Every `tag.<key>` parameter in request order: an empty value is `None`.
+	matchers: Vec<(String, Option<String>)>,
+	/// The one `tag_match` value, if given.
+	mode: Option<String>,
+}
+
+/// Split a raw query into its tag parameters and the rest (TAG-10, shared by the
+/// read-side [`SelectorQuery`] and the ingest-side [`TaggedQuery`]).
+///
+/// # Errors
+///
+/// `400 bad_request` for a repeated `tag_match`, and `400 invalid_tag` with
+/// `details: {count, limit}` for more than [`MAX_TAGS`](weftdb::tags::MAX_TAGS) tag
+/// parameters. A repeated key is left to the tag builder, which refuses it as
+/// `TagError::DuplicateKey` (the empty-value spelling included).
+fn split_tag_params(query: &str) -> Result<TagParams<'_>, ApiError> {
+	let mut params = TagParams { rest: Vec::new(), matchers: Vec::new(), mode: None };
 	for piece in query.split('&') {
 		let (raw_name, raw_value) = piece.split_once('=').unwrap_or((piece, ""));
 		let name = form_decode(raw_name);
 		if name == TAG_MATCH_PARAM {
-			if mode.is_some() {
+			if params.mode.is_some() {
 				return Err(ApiError::bad_request(format!("`{TAG_MATCH_PARAM}` is given more than once")));
 			}
-			mode = Some(form_decode(raw_value));
+			params.mode = Some(form_decode(raw_value));
 		} else if let Some(key) = name.strip_prefix(TAG_PARAM_PREFIX) {
 			let value = form_decode(raw_value);
-			// A repeated key is left to the selector builder, which refuses it as
-			// `TagError::DuplicateKey` (the empty-value spelling included).
-			matchers.push((key.to_string(), (!value.is_empty()).then_some(value)));
+			params.matchers.push((key.to_string(), (!value.is_empty()).then_some(value)));
 		} else {
-			rest.push(piece);
+			params.rest.push(piece);
 		}
 	}
-	if matchers.len() > weftdb::tags::MAX_TAGS {
-		return Err(ApiError::new(Code::InvalidTag, format!("{} tag matchers given; a selector holds at most {}", matchers.len(), weftdb::tags::MAX_TAGS)).with_details(serde_json::json!({ "count": matchers.len(), "limit": weftdb::tags::MAX_TAGS })));
+	if params.matchers.len() > weftdb::tags::MAX_TAGS {
+		return Err(ApiError::new(Code::InvalidTag, format!("{} tag matchers given; a selector holds at most {}", params.matchers.len(), weftdb::tags::MAX_TAGS)).with_details(serde_json::json!({ "count": params.matchers.len(), "limit": weftdb::tags::MAX_TAGS })));
 	}
+	Ok(params)
+}
+
+/// Split a raw query into the pieces that are not selector parameters (rejoined, still
+/// encoded) and the selector the `tag.*` / `tag_match` parameters build.
+fn split_selector(query: &str) -> Result<(String, weftdb::SeriesSelector), ApiError> {
+	let TagParams { rest, matchers, mode } = split_tag_params(query)?;
 	let selector = match mode.as_deref() {
 		None | Some("exact") if matchers.is_empty() => weftdb::SeriesSelector::untagged(),
 		None | Some("exact") => weftdb::SeriesSelector::exact(matchers).map_err(|e| from_tag_error(&e))?,
@@ -670,6 +692,42 @@ fn split_selector(query: &str) -> Result<(String, weftdb::SeriesSelector), ApiEr
 		Some(other) => return Err(ApiError::bad_request(format!("`{TAG_MATCH_PARAM}` must be `exact` or `subset`, not {other:?}"))),
 	};
 	Ok((rest.join("&"), selector))
+}
+
+/// [`StrictQuery`] for an ingest route whose body carries no tags of its own (CSV,
+/// Parquet): the `tag.<key>=value` parameters name the one series the batch writes
+/// (TAG-11), and the rest bind `T` exactly as [`StrictQuery`] binds it.
+///
+/// - No `tag.*` parameter is the empty [`TagSet`](weftdb::TagSet): series 0, the write
+///   every untagged client already makes.
+/// - The parameters are split by the same code as [`SelectorQuery`]'s, so the encoding,
+///   the repeated-key refusal and the [`MAX_TAGS`](weftdb::tags::MAX_TAGS) cap read
+///   the same on both sides.
+/// - A write names a series, it does not match one: an empty value (`tag.k=`), a reserved
+///   `__` key, or any key or value the grammar refuses is `400 invalid_tag`, and
+///   `tag_match` is `400 bad_request`.
+#[derive(Debug)]
+pub struct TaggedQuery<T>(pub T, pub weftdb::TagSet);
+
+impl<T, S> FromRequestParts<S> for TaggedQuery<T>
+where
+	T: DeserializeOwned,
+	S: Send + Sync,
+{
+	type Rejection = ApiError;
+
+	async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+		let TagParams { rest, matchers, mode } = split_tag_params(parts.uri.query().unwrap_or_default())?;
+		if mode.is_some() {
+			return Err(ApiError::bad_request(format!("`{TAG_MATCH_PARAM}` is a read option; an ingest names its series exactly with `{TAG_PARAM_PREFIX}<key>=value`")));
+		}
+		// An empty value reaches the builder as `""`, which it refuses as
+		// `TagError::EmptyValue` naming the key.
+		let tags = weftdb::TagSet::from_pairs(matchers.iter().map(|(key, value)| (key.as_str(), value.as_deref().unwrap_or_default()))).map_err(|e| from_tag_error(&e))?;
+		let uri: axum::http::Uri = format!("/?{}", rest.join("&")).parse().map_err(|_| ApiError::bad_request("the query string is not a valid URI query".to_string()))?;
+		let Query(params) = Query::<T>::try_from_uri(&uri).map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+		Ok(Self(params, tags))
+	}
 }
 
 /// Decode one `application/x-www-form-urlencoded` component: `+` is a space and `%XX` a

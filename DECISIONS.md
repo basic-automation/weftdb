@@ -4334,3 +4334,55 @@ tags D6 and critique G.
 7. **Not done here:** the cursor is not bound to the selector (ROB-15, C15); OpenAPI does
    not describe the dynamic `tag.*` family (FRE-9a); the SDKs gain no selector arguments;
    HTTP ingest of tags stays shut until TAG-11.
+
+## 2026-11-04 — TAG-11: HTTP ingest writes one tagged series; storage ILP requires `measurement=` (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+Issue #329; design PR 7 without 7b (the SDKs), tags D5/D6.
+
+1. **One series per request.** JSON takes `tags` in the body, CSV and Parquet take
+   `tag.<key>=value` query parameters, ILP takes the payload's own tags. The batch's
+   `IngestBatch.groups` carries the `TagSet`; the library resolves (and for a new key
+   registers) the id in the same commit (TAG-7). Multi-series ILP through a multi-group
+   batch stays rejected (design: needs an atomic multi-series commit; TSBS can post per
+   series), so two tag sets in one ILP request are still `400 ambiguous_series`.
+2. **ILP `measurement=` is required (breaking, decision 15).** The records of that
+   measurement carrying `field` with a timestamp are sealed; other measurements are skipped.
+   This replaces `weft_line_protocol::parse_points` on the storage route with a server-side
+   projection over `parse` (the public `SeriesKey` alias is untouched): the old projection
+   checked that the tags agreed and then dropped them, writing a tagged payload to series 0.
+   No `drop_tags` escape hatch: the gate flip lands here, so decision 15's pre-flip
+   parameter is moot. The compute ILP routes are unchanged. A missing `measurement` is
+   serde's `400 bad_request` ("missing field"), like any other required query parameter.
+3. **JSON `tags` refuses a repeated key.** `JsonTags` deserializes the object as its
+   written pairs (a map would keep the last value silently) and `TagSet::from_pairs`
+   refuses the repeat as `TagError::DuplicateKey`, so it is `400 invalid_tag` with
+   `details.tag`, not `400 invalid_json`. Absent, `null` and `{}` are all series 0.
+4. **CSV/Parquet share TAG-10's query splitter.** `split_tag_params` is factored out of
+   `split_selector`; the new `TaggedQuery<T>` extractor builds a `TagSet` instead of a
+   selector. On a write an empty value (`tag.k=`) is `invalid_tag` (it names no tag; the
+   read side's "absent" meaning has no write analogue) and `tag_match` is `400 bad_request`.
+5. **Response and audit.** `IngestResponse` gains `series_id` (the receipt's one id, `0`
+   untagged) and `tags` (always present, `{}` untagged), so untagged ingest response bodies
+   gain two fields (additive, as TAG-10's `"tags":{}` on reads). The `ingest` audit event and
+   its tracing line gain `series_id`. `format_version` keeps reporting the body's layout
+   (5/6), per TAG-7's documentation.
+6. **`WEFT_MAX_SERIES_PER_ASPECT`** (Tuning) is read by `SegmentStoreOptions::from_env`
+   (the server's `store_options_from_env` path), lenient there (unset/zero/garbage → the
+   100,000 default) and strict at server startup (`POSITIVE_INTS`). Settings count pin
+   85 → 86 (the design's 81 → 82 was stale; other loops had moved it).
+7. **`Code::TagsUnsupported`** is kept in the table as reserved (nothing raises it once
+   every ingest route accepts tags; `StoreError::GroupsUnsupported` is already never
+   produced, TAG-8). Error-code and route count pins are unchanged.
+8. **B-tags closed.** `tagged_write_then_tagged_read_round_trips` writes each of JSON, ILP,
+   CSV and Parquet into its own series plus an untagged batch over HTTP and reads each back
+   over HTTP by its exact selector (and the subset selector), so the ROADMAP B-tags lines
+   (1.0 criteria and backlog) are ticked and #233 is closed with this slice.
+9. **Deviation: one additive `weft-client` option.** CI runs `weft-client`'s live contract
+   against this server, and its `write_ilp` call would fail without `measurement`. So
+   `WriteOptions::measurement` (an additive field on a `#[non_exhaustive]` struct plus a
+   builder; no signature changes) is sent by `write_ilp`, and the live test writes an
+   untagged `cpu` payload with it. The rest of PR 7b stays out: the `Cow` `Call.query`
+   change, tag arguments in the SDKs, and the Python client's `write_ilp` (its live test
+   does not call it; it fails against this server until 7b).
+10. **Not in this slice.** `scripts/compat/make-v010-fixtures.sh` runs a v0.1.0 binary and
+    is left as is. The soak client now sends `measurement=soak`.

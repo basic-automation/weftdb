@@ -112,8 +112,27 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   two or more matches are `400 ambiguous_series`, and a bad, repeated or reserved key or
   more than 16 matchers is `400 invalid_tag`. The JSON read bodies gain a `tags` field; untagged `points`, `value-points`, `at`, `at-multi` and stored `downsample` responses now include `"tags":{}` too, so their bodies are not byte-identical to before (an additive field).
   `SegmentStore::series_tags` reads one series' tags.
+- **Tagged ingest over HTTP (TAG-11).** Each ingest request writes one series. The JSON
+  body takes `"tags": {"host": "a"}`, CSV and Parquet take `tag.<key>=<value>` query
+  parameters, and an ILP payload's own tags name the series. A repeated key (in a JSON
+  object or the query), a reserved `__` key, an empty value or anything else outside the
+  tag grammar is `400 invalid_tag`; a new series beyond the per-aspect cap is
+  `400 series_limit`. Every ingest response gains `series_id` (`0` for the untagged series)
+  and `tags` (`{}` untagged), and the `ingest` audit event gains `series_id`.
+- **`WEFT_MAX_SERIES_PER_ASPECT`** (Tuning): the most tagged series one aspect may register,
+  default 100,000; a malformed value stops the server from starting.
 
 ### Changed
+
+- **Breaking (HTTP): the storage ILP ingest requires `measurement=` (TAG-11).**
+  `POST /api/v1/storage/{aspect}/ilp` now seals only the records of the named measurement,
+  and a request without the parameter is `400 bad_request`. This fixes a silent tag drop:
+  before, a tagged single-series payload was checked for one tag set and then written to the
+  untagged series, its tags discarded. Now those tags name the series the rows land in, and
+  two tag sets in one request are still `400 ambiguous_series`. The Rust SDK's `write_ilp`
+  sends it from the new `WriteOptions::measurement`; the Python client's `write_ilp` does
+  not yet (design PR 7b). The compute routes
+  (`/api/v1/{interpolate,downsample}/ilp`) are unchanged.
 
 - **Reads without a series mean the untagged series (TAG-8).** The existing read methods
   answer series 0 only. A store with no tagged writes answers exactly as before; on an aspect
