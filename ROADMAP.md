@@ -238,8 +238,10 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 
 ### Security & packaging *(Phase 8 minimum)*
 
-- [ ] TLS on `weft-server`
-- [ ] API-key/token auth + basic RBAC + audit log
+- [x] TLS on `weft-server`
+  - *Audit 2026-11-04 (SEC-13): checked — the acceptance suite (`weft-server/tests/security_acceptance.rs`) boots the real binary with a TLS certificate and a mounted keys file and serves the whole secured surface over HTTPS, with plaintext to the same port unserved.*
+- [x] API-key/token auth + basic RBAC + audit log
+  - *Audit 2026-11-04 (SEC-13): checked — the same suite pins the full role × scope matrix (SEC-3's six roles × eight scopes, enforced by SEC-6's keys), live key reload, and SEC-9's audit trail for a mixed run of denials and mutations, in-process and over the wire.*
 - [ ] Packaging
 - [ ] Upgrade/rollback procedure, exercised against the previous release
 
@@ -376,7 +378,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **ROB-23r** Probe-only admin listener
   - [x] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
   - [x] **ROB-5** Legacy queue-consumer panics
-  - [ ] **SEC-13** Security acceptance
+  - [x] **SEC-13** Security acceptance
   - [x] **PAC-9** Docker image and container smoke test (with a mounted keys file)
   - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
   - [x] **EVI-15** First cross-engine report
