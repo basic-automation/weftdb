@@ -370,7 +370,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-15** First cross-engine report
   - [x] Write or approve the cross-engine report narrative *(owner)*
   - [x] **EVI-19** Documented RPO/RTO
-  - [ ] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
+  - [x] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
 - [ ] **W8 · Tags core, memory budget**
   - [ ] open lane
   - [ ] → **TAG-9** Frame error classes in recovery
