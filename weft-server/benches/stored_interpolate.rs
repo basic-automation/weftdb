@@ -22,6 +22,14 @@
 //! - `WEFT_GPU_CALIBRATE` — as on the server: unset calibrates `Backend::Auto` first (so `Auto`
 //!   may pick the GPU), `0` skips it (CPU-only defaults), `force` calibrates a software adapter.
 //!
+//! **Streaming (P5-5.3).** The JSON and CSV routes stream their body chunk by chunk as splimes
+//! computes it; Arrow and Parquet are still built whole. Every format's row therefore also
+//! reports `ttfb`, the time from the request to the first body frame (p50/p95), next to the
+//! total: on a buffered format the two are nearly equal, on a streamed one `ttfb` is the first
+//! chunk. The `lib-stream` row times the library's `interpolate_range_stream` (first chunk and
+//! last chunk) against the `lib` row's buffered `interpolate_range_f64`, with the route's chunk
+//! size and depth.
+//!
 //! Run: `cargo bench -p weft-server --bench stored_interpolate`.
 
 use std::{
@@ -30,6 +38,7 @@ use std::{
 
 use axum::{body::Body, http::Request};
 use bigdecimal::BigDecimal;
+use futures::StreamExt as _;
 use splimes::{Interpolator, Resolution, Spline};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -87,9 +96,11 @@ fn ms(d: Duration) -> f64 {
 	d.as_secs_f64() * 1e3
 }
 
-fn report(case: &str, knots: i64, points: usize, bytes: usize, backend: &str, mut samples: Vec<Duration>) {
+fn report(case: &str, knots: i64, points: usize, bytes: usize, backend: &str, mut samples: Vec<Duration>, mut first: Vec<Duration>) {
 	samples.sort_unstable();
-	println!("{case:<8} knots={knots:<8} points={points:<9} bytes={bytes:<10} backend={backend:<9} reps={:<3} p50={:>9.3}ms p95={:>9.3}ms max={:>9.3}ms", samples.len(), ms(quantile(&samples, 0.5)), ms(quantile(&samples, 0.95)), ms(*samples.last().expect("reps > 0")));
+	first.sort_unstable();
+	let ttfb = if first.is_empty() { String::new() } else { format!(" ttfb_p50={:>9.3}ms ttfb_p95={:>9.3}ms", ms(quantile(&first, 0.5)), ms(quantile(&first, 0.95))) };
+	println!("{case:<10} knots={knots:<8} points={points:<9} bytes={bytes:<10} backend={backend:<9} reps={:<3} p50={:>9.3}ms p95={:>9.3}ms max={:>9.3}ms{ttfb}", samples.len(), ms(quantile(&samples, 0.5)), ms(quantile(&samples, 0.95)), ms(*samples.last().expect("reps > 0")));
 }
 
 fn main() {
@@ -131,27 +142,60 @@ fn main() {
 				samples.push(took);
 			}
 		}
-		report("lib", knots, points, 0, &backend, samples);
+		report("lib", knots, points, 0, &backend, samples, Vec::new());
+
+		// The streamed library call the JSON and CSV routes make.
+		let streamed = interpolator.stream_chunk_points(weft_server::stored_interpolate::STREAM_CHUNK_POINTS);
+		let (mut samples, mut firsts) = (Vec::with_capacity(reps), Vec::with_capacity(reps));
+		for rep in 0..=reps {
+			let began = Instant::now();
+			let (first, summary) = rt.block_on(async {
+				let mut stream = store.interpolate_range_stream("sensor", start, end, margin, streamed, weft_server::stored_interpolate::STREAM_DEPTH).await.expect("streams");
+				let mut first = None;
+				while let Some(chunk) = stream.next().await {
+					first.get_or_insert_with(|| began.elapsed());
+					std::hint::black_box(&chunk);
+				}
+				(first.expect("a chunk"), stream.finish().await.expect("completes"))
+			});
+			let took = began.elapsed();
+			assert_eq!(summary.len(), points, "the stream's grid is the buffered call's");
+			backend = format!("{:?}", summary.backend());
+			if rep > 0 {
+				samples.push(took);
+				firsts.push(first);
+			}
+		}
+		report("lib-stream", knots, points, 0, &backend, samples, firsts);
 
 		for suffix in ["", ".csv", ".arrow", ".parquet"] {
 			let uri = format!("/api/v1/storage/sensor/interpolate{suffix}?start={start}&end={end}&resolution=seconds&spline=cubic&margin={margin}");
-			let mut samples = Vec::with_capacity(reps);
+			let (mut samples, mut firsts) = (Vec::with_capacity(reps), Vec::with_capacity(reps));
 			let mut bytes = 0;
 			for rep in 0..=reps {
 				let began = Instant::now();
-				let body = rt.block_on(async {
+				let (first, length) = rt.block_on(async {
 					let response = router.clone().oneshot(Request::builder().uri(&uri).body(Body::empty()).expect("request")).await.expect("infallible");
 					assert!(response.status().is_success(), "{uri}: {}", response.status());
-					axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body")
+					// Frame by frame, so the first frame's arrival is timed (a streamed body sends
+					// one per chunk; a buffered one, one in all).
+					let mut frames = response.into_body().into_data_stream();
+					let (mut first, mut length) = (None, 0);
+					while let Some(frame) = frames.next().await {
+						first.get_or_insert_with(|| began.elapsed());
+						length += frame.expect("body").len();
+					}
+					(first.unwrap_or_else(|| began.elapsed()), length)
 				});
 				let took = began.elapsed();
-				bytes = body.len();
+				bytes = length;
 				if rep > 0 {
 					samples.push(took);
+					firsts.push(first);
 				}
 			}
 			let case = if suffix.is_empty() { "json" } else { &suffix[1..] };
-			report(case, knots, points, bytes, "auto", samples);
+			report(case, knots, points, bytes, "auto", samples, firsts);
 		}
 	}
 	drop(router);

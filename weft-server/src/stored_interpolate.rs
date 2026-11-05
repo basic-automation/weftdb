@@ -40,11 +40,21 @@
 //! - the **knots**: at most [`weftdb::interpolate_range::MAX_KNOTS`] stored rows in the read
 //!   window, checked by the library on the rows it read.
 //!
+//! ## Streaming
+//!
+//! The JSON and CSV routes stream (P5-5.3): the knots go to splimes as epoch ticks, the grid
+//! comes back in chunks of [`STREAM_CHUNK_POINTS`], and each chunk is serialised and sent as
+//! soon as it is computed, with at most [`STREAM_DEPTH`] chunks computed ahead, so a large grid
+//! is never held whole. The response is committed after the first chunk, so request refusals and
+//! engine errors before it keep their status codes; a failure after it cuts the body short. The
+//! JSON object carries the same fields as before, with `spline`, `backend` and `output_points`
+//! after `points`. Arrow and Parquet are still built whole.
+//!
 //! The scope is `read` (the route reads stored data, as the range reads do) and the admission
 //! class is `query`, as on every stored read.
 
 use axum::{
-	extract::{Path, State}, response::{IntoResponse, Response}, Json
+	extract::{Path, State}, response::{IntoResponse, Response}
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -139,7 +149,20 @@ fn classify(err: &anyhow::Error, config: InterpolateConfig) -> ApiError {
 ///
 /// Traced as `interpolate.range` (the stored counterpart of the compute endpoints'
 /// `interpolate.engine`), recording the grid size and the backend splimes picked.
-async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, aspect: &str, params: &StoredInterpolateParams) -> Result<StoredInterpolateResponse, ApiError> {
+/// A validated request: everything [`stored_interpolate_inner`] and [`stored_interpolate_stream`]
+/// need before they read.
+struct Validated {
+	store: std::sync::Arc<weftdb::SegmentStore>,
+	unit: TimeUnit,
+	start: i64,
+	end: i64,
+	margin: i64,
+	resolution: splimes::Resolution,
+	interpolator: splimes::Interpolator,
+}
+
+/// Validate the request: tokens, window, margin, the aspect's schema, and the grid cap.
+async fn validate(state: AppState, config: InterpolateConfig, aspect: &str, params: &StoredInterpolateParams) -> Result<Validated, ApiError> {
 	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
 	drop(state);
 	let spline = interpolate::parse_spline_token(params.spline.as_deref())?;
@@ -166,7 +189,11 @@ async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, as
 		Err(splimes::Error::NoPoints) | Ok(_) => {}
 		Err(err) => return Err(interpolate::engine_error(&err, config)),
 	}
+	Ok(Validated { store, unit, start, end, margin, resolution, interpolator })
+}
 
+async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, aspect: &str, params: &StoredInterpolateParams) -> Result<StoredInterpolateResponse, ApiError> {
+	let Validated { store, unit, start, end, margin, resolution, interpolator } = validate(state, config, aspect, params).await?;
 	let span = tracing::info_span!("interpolate.range", %aspect, start, end, margin, resolution = ?resolution, output_points = tracing::field::Empty, backend = tracing::field::Empty);
 	let result = store.interpolate_range_f64(aspect, start, end, margin, interpolator).instrument(span.clone()).await;
 	drop(store);
@@ -177,6 +204,153 @@ async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, as
 	span.record("output_points", points.len());
 	span.record("backend", backend.as_str());
 	Ok(StoredInterpolateResponse { aspect: aspect.to_string(), time_unit: unit.name(), start, end, margin, spline: series.spline().to_string(), resolution: format!("{resolution:?}"), backend, output_points: points.len(), points })
+}
+
+/// Grid points per streamed chunk on the JSON and CSV routes: small enough that one chunk's
+/// text stays a few MB, large enough that a GPU run is a handful of dispatches per million
+/// points. Not tuned by measurement (P5-5.3's measurement stage compares it).
+pub const STREAM_CHUNK_POINTS: usize = 64 * 1024;
+
+/// Chunks computed ahead of the one being serialised (the channel depth of
+/// [`weftdb::interpolate_range::StoredStream`]).
+pub const STREAM_DEPTH: usize = 4;
+
+/// The two text formats the route streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+	Json,
+	Csv,
+}
+
+/// The instant of grid tick `tick` of `unit` (the stream's tick unit, which is a stored unit or
+/// nanoseconds).
+fn tick_instant(tick: i64, unit: splimes::TickUnit) -> Option<DateTime<Utc>> {
+	match unit.nanos_per_tick() {
+		1 => Some(DateTime::<Utc>::from_timestamp_nanos(tick)),
+		1_000 => DateTime::<Utc>::from_timestamp_micros(tick),
+		1_000_000 => DateTime::<Utc>::from_timestamp_millis(tick),
+		1_000_000_000 => DateTime::<Utc>::from_timestamp(tick, 0),
+		_ => None,
+	}
+}
+
+/// Serialise one chunk in `format` (JSON: comma-separated `OutputPoint` objects, with a
+/// leading comma unless it is the grid's first chunk; CSV: one `timestamp,value,kind` row per
+/// point, the buffered writer's layout). Refuses a non-finite value, as the buffered route did.
+fn encode_chunk(chunk: &weftdb::interpolate_range::StoredChunk, unit: splimes::TickUnit, format: Format) -> Result<String, ApiError> {
+	use std::fmt::Write as _;
+	let mut out = String::with_capacity(chunk.len() * 64);
+	for (i, ((&tick, &value), &kind)) in chunk.ticks.iter().zip(&chunk.values).zip(&chunk.kinds).enumerate() {
+		let timestamp = tick_instant(tick, unit).ok_or_else(|| ApiError::internal(format!("grid tick {tick} ({unit}) has no instant")))?;
+		if !value.is_finite() {
+			return Err(ApiError::new(Code::NotFinite, format!("the interpolated value at {timestamp} has no finite f64 representation; refusing to return a silently narrowed substitute")));
+		}
+		match format {
+			Format::Json => {
+				if chunk.first + i > 0 {
+					out.push(',');
+				}
+				let point = serde_json::to_string(&OutputPoint { timestamp, value, kind }).map_err(|err| ApiError::internal(format!("serialising a point: {err}")))?;
+				out.push_str(&point);
+			}
+			Format::Csv => {
+				let _ = writeln!(out, "{},{},{}", timestamp.to_rfc3339(), value, kind.as_str());
+			}
+		}
+	}
+	Ok(out)
+}
+
+/// The state of a streamed body.
+struct StreamBody {
+	/// Text to send before the next chunk (the header and the first chunk, already encoded).
+	pending: Option<String>,
+	/// The run; `None` once it has finished.
+	stream: Option<weftdb::interpolate_range::StoredStream>,
+	unit: splimes::TickUnit,
+	format: Format,
+	span: tracing::Span,
+}
+
+/// An I/O error for the body: hyper ends the response without its terminator, so a client sees
+/// a truncated body rather than a complete one.
+fn abort(message: impl std::fmt::Display) -> std::io::Error {
+	std::io::Error::other(message.to_string())
+}
+
+impl StreamBody {
+	/// The next piece of the body, or `None` at its end.
+	async fn step(mut self) -> Option<(Result<axum::body::Bytes, std::io::Error>, Self)> {
+		if let Some(text) = self.pending.take() {
+			return Some((Ok(text.into()), self));
+		}
+		let stream = self.stream.as_mut()?;
+		if let Some(chunk) = stream.next().await {
+			return match encode_chunk(&chunk, self.unit, self.format) {
+				Ok(text) => Some((Ok(text.into()), self)),
+				Err(err) => {
+					// Stop the run: the response cannot change status any more.
+					drop(self.stream.take());
+					Some((Err(abort(err.message())), self))
+				}
+			};
+		}
+		let summary = match self.stream.take()?.finish().await {
+			Ok(summary) => summary,
+			Err(err) => return Some((Err(abort(format!("{err:#}"))), self)),
+		};
+		if !summary.is_complete() {
+			return Some((Err(abort(format!("the run stopped after {} of {} points", summary.delivered(), summary.len()))), self));
+		}
+		let backend = format!("{:?}", summary.backend());
+		self.span.record("output_points", summary.len());
+		self.span.record("backend", backend.as_str());
+		match self.format {
+			Format::Csv => None,
+			Format::Json => {
+				let tail = format!("],\"spline\":{},\"backend\":{},\"output_points\":{}}}", serde_json::Value::from(summary.spline().to_string()), serde_json::Value::from(backend), summary.len());
+				Some((Ok(tail.into()), self))
+			}
+		}
+	}
+}
+
+/// The JSON and CSV routes, streamed (P5-5.3): the knots are read and validated, the first
+/// chunk is computed, and only then is the response committed, so every request refusal and
+/// every engine error splimes raises before its first point keep their status codes. The rest
+/// of the grid is serialised chunk by chunk as splimes computes it, with at most
+/// [`STREAM_DEPTH`] chunks in flight, so the server never holds the whole grid. An error after
+/// the first chunk (a non-finite value further in) can no longer change the status: the body
+/// is cut short instead, which a client sees as an incomplete response.
+///
+/// The JSON body is the buffered route's object with the same fields; `spline`, `backend` and
+/// `output_points`, known only once the run ends, come after `points`.
+async fn stored_interpolate_stream(state: AppState, config: InterpolateConfig, aspect: String, params: &StoredInterpolateParams, format: Format) -> Result<Response, ApiError> {
+	let Validated { store, unit, start, end, margin, resolution, interpolator } = validate(state, config, &aspect, params).await?;
+	let span = tracing::info_span!("interpolate.range", %aspect, start, end, margin, resolution = ?resolution, output_points = tracing::field::Empty, backend = tracing::field::Empty);
+	let result = store.interpolate_range_stream(&aspect, start, end, margin, interpolator.stream_chunk_points(STREAM_CHUNK_POINTS), STREAM_DEPTH).instrument(span.clone()).await;
+	drop(store);
+	let mut stream = result.map_err(|err| classify(&err, config))?;
+	let ticks = stream.tick_unit();
+	let Some(first) = stream.next().await else {
+		// No chunk: the run failed before its first point (a grid is never empty).
+		return Err(match stream.finish().await {
+			Err(err) => classify(&err, config),
+			Ok(summary) => ApiError::internal(format!("the interpolation delivered nothing of {} points", summary.len())),
+		});
+	};
+	let first = encode_chunk(&first, ticks, format)?;
+	let (content_type, head) = match format {
+		Format::Csv => ("text/csv; charset=utf-8", String::from("timestamp,value,kind\n")),
+		Format::Json => {
+			let head = serde_json::json!({ "aspect": aspect, "time_unit": unit.name(), "start": start, "end": end, "margin": margin, "resolution": format!("{resolution:?}") }).to_string();
+			// `{…}` without its closing brace, then the points array.
+			("application/json", format!("{},\"points\":[", &head[..head.len() - 1]))
+		}
+	};
+	let body = StreamBody { pending: Some(head + &first), stream: Some(stream), unit: ticks, format, span };
+	let body = axum::body::Body::from_stream(futures::stream::unfold(body, StreamBody::step));
+	Ok(([(axum::http::header::CONTENT_TYPE, content_type)], body).into_response())
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/interpolate?start&end&resolution&spline&margin`:
@@ -190,8 +364,8 @@ async fn stored_interpolate_inner(state: AppState, config: InterpolateConfig, as
 /// range; `422 result_too_large` (with `limit`) for a grid over the output cap or a read window
 /// over [`MAX_KNOTS`](weftdb::interpolate_range::MAX_KNOTS) stored rows; `400 not_finite` for a computed value with no finite `f64`;
 /// and `500 internal` on a read or engine failure.
-pub async fn storage_interpolate(State(state): State<AppState>, State(config): State<InterpolateConfig>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<StoredInterpolateParams>) -> Result<Json<StoredInterpolateResponse>, ApiError> {
-	Ok(Json(stored_interpolate_inner(state, config, &aspect, &params).await?))
+pub async fn storage_interpolate(State(state): State<AppState>, State(config): State<InterpolateConfig>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<StoredInterpolateParams>) -> Result<Response, ApiError> {
+	stored_interpolate_stream(state, config, aspect, &params, Format::Json).await
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/interpolate.csv`: [`storage_interpolate`] as a
@@ -201,8 +375,7 @@ pub async fn storage_interpolate(State(state): State<AppState>, State(config): S
 ///
 /// As [`storage_interpolate`].
 pub async fn storage_interpolate_csv(State(state): State<AppState>, State(config): State<InterpolateConfig>, Path(aspect): Path<String>, StrictQuery(params): StrictQuery<StoredInterpolateParams>) -> Result<Response, ApiError> {
-	let response = stored_interpolate_inner(state, config, &aspect, &params).await?;
-	Ok(interpolate::points_to_csv(&response.points).into_response())
+	stored_interpolate_stream(state, config, aspect, &params, Format::Csv).await
 }
 
 /// Handle `GET /api/v1/storage/{aspect}/interpolate.arrow`: [`storage_interpolate`] as an
@@ -467,5 +640,39 @@ mod tests {
 			assert_eq!(entry.spec.audit, range.spec.audit, "{operation}: audited as a stored read");
 			assert_eq!(entry.spec.tier, range.spec.tier, "{operation}: the stored reads' tier");
 		}
+	}
+
+	/// A grid of several streamed chunks (190,001 millisecond points over a seconds aspect, so
+	/// nanosecond ticks) serves, on JSON and CSV, exactly the library's `f64` result.
+	#[tokio::test]
+	async fn a_multi_chunk_stream_is_the_library_result() {
+		let dir = TempDir::new().unwrap();
+		let store = line_store(&dir).await;
+		let expected = store.interpolate_range_f64("line", 0, 190, 0, InterpolateConfig::DEFAULT.interpolator(splimes::Spline::Cubic, splimes::Resolution::Milliseconds)).await.unwrap();
+		assert!(expected.len() > 2 * STREAM_CHUNK_POINTS, "several chunks");
+		let router = app_with_state(AppState::new().with_store(store));
+		let query = "?start=0&end=190&resolution=milliseconds&spline=cubic&margin=0";
+		let (status, body) = get_json(router.clone(), &format!("/api/v1/storage/line/interpolate{query}")).await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body["output_points"].as_u64(), Some(expected.len() as u64));
+		assert_eq!(body["spline"], expected.spline().to_string());
+		let points = body["points"].as_array().unwrap();
+		assert_eq!(points.len(), expected.len());
+		for (point, (timestamp, value, kind)) in points.iter().zip(expected.iter()) {
+			assert_eq!(point["timestamp"].as_str().unwrap().parse::<DateTime<Utc>>().unwrap(), timestamp);
+			assert_eq!(point["value"].as_f64().unwrap().to_bits(), value.to_bits());
+			assert_eq!(point["kind"], kind.as_str());
+		}
+		let (status, content_type, bytes) = get_bytes(router, &format!("/api/v1/storage/line/interpolate.csv{query}")).await;
+		assert_eq!((status, content_type.as_str()), (StatusCode::OK, "text/csv; charset=utf-8"));
+		let text = String::from_utf8(bytes).unwrap();
+		let mut lines = text.lines();
+		assert_eq!(lines.next(), Some("timestamp,value,kind"));
+		let mut rows = 0;
+		for (line, (timestamp, value, kind)) in lines.zip(expected.iter()) {
+			assert_eq!(line, format!("{},{},{}", timestamp.to_rfc3339(), value, kind.as_str()));
+			rows += 1;
+		}
+		assert_eq!(rows, expected.len());
 	}
 }

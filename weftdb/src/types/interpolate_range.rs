@@ -37,10 +37,12 @@
 //! bench, ~1M points: 38.0 ms against 7.7 ms for the `f64` call on rayon), so a caller whose
 //! own boundary is `f64` (a JSON body, Arrow `Float64`, a plot) should take this one.
 
+use std::ops::ControlFlow;
+
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use splimes::{Interpolation, Interpolator, Point};
+use splimes::{Interpolation, Interpolator, Point, PointKind, StreamSummary, TickUnit};
 use weft_physical_type::TimeUnit;
 
 use crate::types::segment_store::SegmentStore;
@@ -54,6 +56,113 @@ const fn instant(epoch: i64, unit: TimeUnit) -> Option<DateTime<Utc>> {
 		TimeUnit::Micros => DateTime::<Utc>::from_timestamp_micros(epoch),
 		TimeUnit::Nanos => Some(DateTime::<Utc>::from_timestamp_nanos(epoch)),
 	}
+}
+
+/// splimes' tick length for a stored time unit.
+const fn tick_unit(unit: TimeUnit) -> TickUnit {
+	match unit {
+		TimeUnit::Seconds => TickUnit::SECONDS,
+		TimeUnit::Millis => TickUnit::MILLISECONDS,
+		TimeUnit::Micros => TickUnit::MICROSECONDS,
+		TimeUnit::Nanos => TickUnit::NANOSECONDS,
+	}
+}
+
+/// The present rows as `f64` columns, ticks kept as stored (no `DateTime` per row).
+fn f64_columns(timestamps: Vec<i64>, values: Vec<Option<BigDecimal>>) -> Result<(Vec<i64>, Vec<f64>)> {
+	let (mut ticks, mut floats) = (Vec::with_capacity(timestamps.len()), Vec::with_capacity(timestamps.len()));
+	for (t, v) in timestamps.into_iter().zip(values) {
+		if let Some(value) = v {
+			ticks.push(t);
+			// The same `f64` as `to_f64`, without formatting and parsing a short decimal.
+			floats.push(weft_reduce::decimal_to_f64(&value).filter(|f| f.is_finite()).with_context(|| format!("stored value {value} has no finite f64 image"))?);
+		}
+	}
+	Ok((ticks, floats))
+}
+
+/// One streamed chunk of a stored reconstruction: grid points `first..first + len()`, owned
+/// (copied out of splimes' reused buffers), times as ticks of [`StoredStream::tick_unit`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredChunk {
+	/// The grid index of the chunk's first point.
+	pub first: usize,
+	/// The grid times, ascending, in ticks of the stream's [`tick_unit`](StoredStream::tick_unit).
+	pub ticks: Vec<i64>,
+	/// The values, one per time.
+	pub values: Vec<f64>,
+	/// Provenance, one per time.
+	pub kinds: Vec<PointKind>,
+}
+
+impl StoredChunk {
+	/// The number of points in the chunk.
+	#[must_use]
+	pub const fn len(&self) -> usize {
+		self.values.len()
+	}
+
+	/// Whether the chunk holds no point (a streamed chunk never is empty).
+	#[must_use]
+	pub const fn is_empty(&self) -> bool {
+		self.values.is_empty()
+	}
+}
+
+/// A stored reconstruction delivered in chunks as splimes computes them (P5-5.3).
+///
+/// The interpolation runs on the blocking pool and hands each chunk to a bounded channel of
+/// `depth` chunks, so at most `depth + 1` chunks (plus the one being serialised) are alive at a
+/// time, however large the grid: a caller serialises chunk `k` while the kernel computes chunk
+/// `k + 1` (on the GPU, splimes overlaps the read-back of one chunk with the next's compute).
+/// Dropping the stream stops the run at the next chunk boundary.
+#[derive(Debug)]
+pub struct StoredStream {
+	unit: TickUnit,
+	chunks: tokio::sync::mpsc::Receiver<StoredChunk>,
+	run: tokio::task::JoinHandle<std::result::Result<StreamSummary, splimes::Error>>,
+}
+
+impl StoredStream {
+	/// The tick length of every chunk's [`ticks`](StoredChunk::ticks): the aspect's declared
+	/// unit, or nanoseconds when the grid step is not a whole number of the aspect's ticks
+	/// (a millisecond grid over a seconds aspect).
+	#[must_use]
+	pub const fn tick_unit(&self) -> TickUnit {
+		self.unit
+	}
+
+	/// The next chunk, in grid order; `None` once the run has delivered everything it will
+	/// (call [`finish`](Self::finish) to learn whether that was all of it).
+	pub async fn next(&mut self) -> Option<StoredChunk> {
+		self.chunks.recv().await
+	}
+
+	/// Wait for the run and return its summary (spline, backend, points delivered).
+	///
+	/// # Errors
+	///
+	/// splimes' error if the run failed (chunks before the failing point may already have been
+	/// delivered, as [`Interpolator::stream_epoch`] documents), or if the task panicked.
+	pub async fn finish(self) -> Result<StreamSummary> {
+		let Self { chunks, run, .. } = self;
+		// Closing the receiver lets a run still blocked on a full channel stop at once.
+		drop(chunks);
+		Ok(run.await.context("the interpolation task panicked")??)
+	}
+}
+
+/// The tick unit a stream runs in and the knots, start and end in it: the aspect's own unit
+/// when the grid step is a whole number of its ticks, else nanoseconds.
+fn stream_ticks(unit: TimeUnit, step_nanos: i64, ticks: Vec<i64>, start: i64, end: i64) -> Result<(TickUnit, Vec<i64>, i64, i64)> {
+	let native = tick_unit(unit);
+	let per_tick = i64::try_from(native.nanos_per_tick()).unwrap_or(i64::MAX);
+	if step_nanos % per_tick == 0 {
+		return Ok((native, ticks, start, end));
+	}
+	let scale = |t: i64| t.checked_mul(per_tick).with_context(|| format!("epoch {t} in {} has no nanosecond tick; a grid finer than the aspect's unit needs nanosecond instants", unit.name()));
+	let scaled = ticks.into_iter().map(scale).collect::<Result<Vec<i64>>>()?;
+	Ok((TickUnit::NANOSECONDS, scaled, scale(start)?, scale(end)?))
 }
 
 /// The stored rows a reconstruction of `[start, end]` reads, with the grid bounds as instants.
@@ -185,16 +294,55 @@ impl SegmentStore {
 	///
 	/// As [`interpolate_range_f64`](Self::interpolate_range_f64).
 	pub async fn interpolate_range_f64_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, margin: i64, interpolator: Interpolator) -> Result<Interpolation<f64>> {
-		let StoredWindow { from, to, unit, timestamps, values } = self.stored_window(aspect, series, start, end, margin).await?;
-		let (mut instants, mut floats) = (Vec::with_capacity(timestamps.len()), Vec::with_capacity(timestamps.len()));
-		for (t, v) in timestamps.into_iter().zip(values) {
-			if let Some(value) = v {
-				instants.push(instant(t, unit).with_context(|| format!("stored epoch {t} is outside the representable range"))?);
-				// The same `f64` as `to_f64`, without formatting and parsing a short decimal.
-				floats.push(weft_reduce::decimal_to_f64(&value).filter(|f| f.is_finite()).with_context(|| format!("stored value {value} has no finite f64 image"))?);
-			}
-		}
-		tokio::task::spawn_blocking(move || interpolator.run_f64(&instants, &floats, from, to)).await.context("the interpolation task panicked")?.with_context(|| format!("interpolating aspect {aspect:?}"))
+		let StoredWindow { unit, timestamps, values, .. } = self.stored_window(aspect, series, start, end, margin).await?;
+		let (ticks, floats) = f64_columns(timestamps, values)?;
+		// Epoch-native input (splimes 1.3, `run_epoch`): no `DateTime` is built per knot, and
+		// the result is bit-identical to `run_f64` on the same instants.
+		tokio::task::spawn_blocking(move || interpolator.run_epoch(&ticks, tick_unit(unit), &floats, start, end)).await.context("the interpolation task panicked")?.with_context(|| format!("interpolating aspect {aspect:?}"))
+	}
+
+	/// [`interpolate_range_f64`](Self::interpolate_range_f64), streamed: the grid comes back
+	/// in chunks as it is computed, so a caller can serialise the first points while later
+	/// ones are still computing, holding at most `depth` chunks in flight (see
+	/// [`StoredStream`]). Chunk size is the interpolator's
+	/// [`stream_chunk_points`](Interpolator::stream_chunk_points).
+	///
+	/// The knots go to splimes as epoch ticks ([`Interpolator::stream_epoch`]), with no
+	/// `DateTime` per knot or per output point. Every time, value and kind is the one
+	/// [`interpolate_range_f64`](Self::interpolate_range_f64) returns, bit for bit.
+	///
+	/// # Errors
+	///
+	/// The request and read errors of [`interpolate_range_f64`](Self::interpolate_range_f64)
+	/// are returned here, before any chunk; an interpolation error comes from
+	/// [`StoredStream::finish`].
+	pub async fn interpolate_range_stream(&self, aspect: &str, start: i64, end: i64, margin: i64, interpolator: Interpolator, depth: usize) -> Result<StoredStream> {
+		self.interpolate_range_stream_of(aspect, crate::SeriesId::UNTAGGED, start, end, margin, interpolator, depth).await
+	}
+
+	/// [`interpolate_range_stream`](Self::interpolate_range_stream) of one series (TAG-8).
+	///
+	/// # Errors
+	///
+	/// As [`interpolate_range_stream`](Self::interpolate_range_stream).
+	#[allow(clippy::too_many_arguments)]
+	pub async fn interpolate_range_stream_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, margin: i64, interpolator: Interpolator, depth: usize) -> Result<StoredStream> {
+		let StoredWindow { unit, timestamps, values, .. } = self.stored_window(aspect, series, start, end, margin).await?;
+		let (ticks, floats) = f64_columns(timestamps, values)?;
+		let (tick, ticks, start, end) = stream_ticks(unit, interpolator.resolution().step_nanos(), ticks, start, end)?;
+		let (tx, chunks) = tokio::sync::mpsc::channel(depth.max(1));
+		let run = tokio::task::spawn_blocking(move || {
+			interpolator.stream_epoch(&ticks, tick, &floats, start, end, |chunk| {
+				let owned = StoredChunk { first: chunk.first(), ticks: chunk.times().to_vec(), values: chunk.values().to_vec(), kinds: chunk.kinds().to_vec() };
+				// A closed receiver (the caller went away) stops the run.
+				if tx.blocking_send(owned).is_ok() {
+					ControlFlow::Continue(())
+				} else {
+					ControlFlow::Break(())
+				}
+			})
+		});
+		Ok(StoredStream { unit: tick, chunks, run })
 	}
 }
 
@@ -309,6 +457,77 @@ mod tests {
 		assert!(empty.to_string().contains("no stored sample"));
 		assert!(matches!(empty.downcast_ref::<StoredWindowError>(), Some(StoredWindowError::NoSample { .. })));
 		assert!(store.interpolate_range("line", 0, 190, 0, linear.max_points(10)).await.is_err(), "splimes' grid limit applies");
+		drop(store);
+	}
+
+	/// Drain a stream into columns, checking chunk order on the way.
+	async fn drain(mut stream: StoredStream) -> (TickUnit, Vec<i64>, Vec<f64>, Vec<PointKind>, StreamSummary) {
+		let unit = stream.tick_unit();
+		let (mut ticks, mut values, mut kinds) = (Vec::new(), Vec::new(), Vec::new());
+		while let Some(chunk) = stream.next().await {
+			assert_eq!(chunk.first, values.len(), "chunks arrive in grid order");
+			assert!(!chunk.is_empty());
+			ticks.extend(chunk.ticks);
+			values.extend(chunk.values);
+			kinds.extend(chunk.kinds);
+		}
+		let summary = stream.finish().await.expect("the run succeeds");
+		(unit, ticks, values, kinds, summary)
+	}
+
+	#[tokio::test]
+	async fn the_stream_is_the_f64_call_bit_for_bit() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = line_store(&dir).await;
+		for spline in [Spline::Linear, Spline::Cubic] {
+			// Chunks of 7 points over a 185-point grid: many chunks, the last one short.
+			let interpolator = Interpolator::new(spline, Resolution::Seconds).stream_chunk_points(7);
+			let whole = store.interpolate_range_f64("line", 3, 187, 20, interpolator).await.expect("interpolates");
+			let (unit, ticks, values, kinds, summary) = drain(store.interpolate_range_stream("line", 3, 187, 20, interpolator, 2).await.expect("streams")).await;
+			assert_eq!(unit, TickUnit::SECONDS, "a seconds grid over a seconds aspect stays in seconds");
+			assert!(summary.is_complete() && summary.len() == whole.len() && summary.chunks() > 1, "{summary:?}");
+			assert_eq!(ticks, (3..=187).collect::<Vec<i64>>());
+			let instants: Vec<DateTime<Utc>> = ticks.iter().map(|&t| DateTime::from_timestamp(t, 0).unwrap()).collect();
+			assert_eq!(instants.as_slice(), whole.timestamps());
+			assert_eq!(kinds.as_slice(), whole.kinds());
+			assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), whole.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "{spline:?}");
+		}
+		drop(store);
+	}
+
+	#[tokio::test]
+	async fn a_grid_finer_than_the_aspect_unit_streams_in_nanoseconds() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = line_store(&dir).await;
+		let interpolator = Interpolator::new(Spline::Linear, Resolution::Milliseconds).stream_chunk_points(100);
+		let whole = store.interpolate_range_f64("line", 99, 100, 10, interpolator).await.expect("interpolates");
+		let (unit, ticks, values, kinds, _) = drain(store.interpolate_range_stream("line", 99, 100, 10, interpolator, 1).await.expect("streams")).await;
+		assert_eq!(unit, TickUnit::NANOSECONDS);
+		assert_eq!(ticks.len(), 1_001);
+		assert_eq!((ticks[0], ticks[1_000]), (99_000_000_000, 100_000_000_000));
+		let instants: Vec<DateTime<Utc>> = ticks.iter().map(|&t| DateTime::from_timestamp_nanos(t)).collect();
+		assert_eq!(instants.as_slice(), whole.timestamps());
+		assert_eq!(kinds.as_slice(), whole.kinds());
+		assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), whole.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+		drop(store);
+	}
+
+	#[tokio::test]
+	async fn dropping_the_receiver_stops_the_run_and_request_errors_come_first() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = line_store(&dir).await;
+		let interpolator = Interpolator::new(Spline::Linear, Resolution::Seconds).stream_chunk_points(1);
+		let mut stream = store.interpolate_range_stream("line", 0, 190, 0, interpolator, 1).await.expect("streams");
+		assert_eq!(stream.next().await.expect("a first chunk").first, 0);
+		let summary = stream.finish().await.expect("a stopped run is not an error");
+		assert!(!summary.is_complete() && summary.delivered() < 191, "{summary:?}");
+		// Request and read refusals are errors of the call itself, before any chunk.
+		assert!(store.interpolate_range_stream("nope", 0, 10, 0, interpolator, 1).await.is_err());
+		let empty = store.interpolate_range_stream("line", 1_000, 2_000, 0, interpolator, 1).await.unwrap_err();
+		assert!(matches!(empty.downcast_ref::<StoredWindowError>(), Some(StoredWindowError::NoSample { .. })));
+		// splimes' own refusals come from `finish`.
+		let capped = store.interpolate_range_stream("line", 0, 190, 0, interpolator.max_points(10), 1).await.expect("starts");
+		assert!(capped.finish().await.is_err(), "splimes' grid limit applies");
 		drop(store);
 	}
 }
