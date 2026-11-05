@@ -890,7 +890,7 @@ mod tests {
 		assert_eq!(body["input_points"], 2);
 		assert!(body["output_points"].as_u64().unwrap() >= 2);
 		let pts = body["points"].as_array().unwrap();
-		assert!(!pts.is_empty());
+		assert_ne!(pts.as_slice(), [] as [serde_json::Value; 0]);
 		// Monotonic, in-range values for a linear fill between 0 and 60.
 		for p in pts {
 			let v = p["value"].as_f64().unwrap();
@@ -1437,7 +1437,7 @@ mod tests {
 		assert_eq!(batches.len(), 1);
 		let (unit, timestamps, values, kinds) = weft_arrow::reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
 		assert_eq!(unit, weft_physical_type::TimeUnit::Nanos);
-		assert!(!timestamps.is_empty());
+		assert_ne!(timestamps, [] as [i64; 0]);
 		assert_eq!(timestamps.len(), values.len());
 		assert_eq!(timestamps.len(), kinds.len());
 		// First and last grid points coincide with input observations.
@@ -1515,7 +1515,7 @@ mod tests {
 		assert_eq!(&bytes[..4], b"PAR1");
 		let batches = weft_arrow::read_parquet(&bytes).expect("valid parquet");
 		let (_unit, timestamps, _values, kinds) = weft_arrow::reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
-		assert!(!timestamps.is_empty());
+		assert_ne!(timestamps, [] as [i64; 0]);
 		assert_eq!(kinds.first().map(String::as_str), Some("raw"));
 	}
 

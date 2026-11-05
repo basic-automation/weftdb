@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 use std::{hint::black_box, str::FromStr};
 
 use ::weftdb::{
@@ -44,17 +47,19 @@ fn benchmark_interpolation_sizes(c: &mut Criterion) {
 					let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 					let mut measurements = Vec::with_capacity(size);
 					for i in 0..size {
-						measurements.push(InputMeasurement::new(base_time + Duration::seconds(i as i64), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
+						measurements.push(InputMeasurement::new(base_time + Duration::seconds(i64::try_from(i).expect("fits an i64")), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
 					}
 					db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
 					// Perform interpolation
 					let start = base_time;
-					let end = base_time + Duration::seconds((size - 1) as i64);
+					let end = base_time + Duration::seconds(i64::try_from(size - 1).expect("fits an i64"));
 					let result = db.analyze_range(&aspect.id(), start, end, Resolution::Seconds, Spline::Linear).await.unwrap();
+					drop(aspect);
 
 					// Cleanup
 					db.close().await.unwrap();
+					drop(db);
 					tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 					common::discard_database(&db_name).await;
 
@@ -81,7 +86,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 		let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
 		let mut measurements = Vec::with_capacity(size);
 		for i in 0..size {
-			measurements.push(InputMeasurement::new(base_time + Duration::seconds(i as i64), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
+			measurements.push(InputMeasurement::new(base_time + Duration::seconds(i64::try_from(i).expect("fits an i64")), BigDecimal::from_str(&format!("{i}.0")).unwrap()));
 		}
 		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await.unwrap();
 
@@ -110,7 +115,7 @@ fn benchmark_interpolation_resolutions(c: &mut Criterion) {
 			});
 		});
 	}
-	group.finish();
+	drop(group);
 
 	// Cleanup after all benchmarks
 	rt.block_on(async {
@@ -168,7 +173,7 @@ fn benchmark_spline_types(c: &mut Criterion) {
 			});
 		});
 	}
-	group.finish();
+	drop(group);
 
 	// Cleanup after all benchmarks
 	rt.block_on(async {

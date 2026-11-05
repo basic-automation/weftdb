@@ -11,6 +11,9 @@ use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType, SplitP
 use super::{SegmentStore, SegmentStoreOptions, DEFAULT_DATABASE, DEFAULT_SUBJECT};
 use crate::durable::{FaultPoint, SimFs, StoreFs};
 
+/// A segment's id, time span and adoption order, as a test compares them.
+type SegmentShape = (u64, Option<i64>, Option<i64>, Option<u64>);
+
 fn bd(s: &str) -> BigDecimal {
 	BigDecimal::from_str(s).expect("parses")
 }
@@ -306,7 +309,7 @@ async fn a_reader_looping_during_reconciles_and_splits_never_errors() {
 					return Err(format!("read {reads} saw {} rows at {} timestamps", rows.len(), distinct.len()));
 				}
 				let batch_rows = usize::try_from(ROWS).expect("small");
-				if (rows.len() - BEFORE.len()) % batch_rows != 0 {
+				if !(rows.len() - BEFORE.len()).is_multiple_of(batch_rows) {
 					return Err(format!("read {reads} saw {} rows, not whole batches", rows.len()));
 				}
 				reads += 1;
@@ -619,6 +622,7 @@ async fn matrix_child() {
 			let target = seal_fixture(&root, op).await;
 			let store = SegmentStore::open(&root).await.expect("opens");
 			let result = run(&store, op, target).await;
+			drop(store);
 			panic!("{op:?}: the operation was to abort at the armed point, and returned {result:?}");
 		}
 		other => panic!("unknown matrix mode {other:?}"),
@@ -788,7 +792,7 @@ async fn a_backup_hold_keeps_retired_frames_until_it_drops() {
 	assert_eq!((reaped_while_held.frames_unlinked, reaped_while_held.frames_waiting), (0, 1));
 	assert!(kept, "the held frame stays");
 	assert_eq!(reaped.frames_unlinked, 1);
-	assert!(journal.is_empty());
+	assert_eq!(journal, [] as [(String, String); 0]);
 	assert_eq!(frames_in(&root), referenced, "only the split's halves are left");
 }
 
@@ -1195,7 +1199,7 @@ async fn merge_outputs_take_the_lowest_member_ids_in_time_order_and_the_largest_
 	let (read, expected) = newest_values(&store, &[(90, "0"), (100, "1"), (110, "2"), (120, "3"), (130, "40"), (135, "6"), (140, "50")]).await;
 	let next = seal_rows(&store, &[(1000, "9")]).await.expect("seals afterwards").id;
 	drop(store);
-	let shape: Vec<(u64, Option<i64>, Option<i64>, Option<u64>)> = rows.iter().map(|row| (row.desc.id, row.desc.min_ts, row.desc.max_ts, row.prec)).collect();
+	let shape: Vec<SegmentShape> = rows.iter().map(|row| (row.desc.id, row.desc.min_ts, row.desc.max_ts, row.prec)).collect();
 	assert_eq!(removed, 1, "three members, two outputs");
 	assert_eq!(shape, vec![(0, Some(90), Some(120), Some(7)), (1, Some(130), Some(140), Some(7))], "the prefix took id 0 and the suffix id 1, both of adoption order 7");
 	assert!(rows.iter().all(|row| row.gen > 0 && row.desc.path.ends_with("~p7.weftseg")), "both are write-once frames named for adoption order 7: {rows:?}");

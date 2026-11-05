@@ -490,7 +490,6 @@ fn per_point(bytes: usize, count: usize) -> f64 {
 	if count == 0 {
 		return 0.0;
 	}
-	#[allow(clippy::cast_precision_loss)]
 	let (bytes, count) = (bytes as f64, count as f64);
 	bytes / count
 }
@@ -619,7 +618,6 @@ impl ColdWarm {
 	/// warm-up cost); `None` when the warm median is zero.
 	#[must_use]
 	pub fn first_rep_ratio(&self) -> Option<f64> {
-		#[allow(clippy::cast_precision_loss)]
 		(self.warm.p50_ns > 0).then(|| self.first_rep_ns as f64 / self.warm.p50_ns as f64)
 	}
 }
@@ -886,7 +884,6 @@ mod tests {
 		// realized codec (v10), which packs these tiny mantissas well below 8 B each.
 		assert_eq!(est.estimated_value_bytes, 4 * 8);
 		assert!(est.realized_value_bytes < est.estimated_value_bytes);
-		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = est.realized_value_bytes as f64 / 4.0;
 		assert!((est.bytes_per_point - expected_bpp).abs() < f64::EPSILON, "headline {} must be the realized rate {expected_bpp}", est.bytes_per_point);
 		assert!(est.bytes_per_point < 8.0, "realized bytes/point must undercut the naive 8 B/pt");
@@ -1046,7 +1043,6 @@ mod tests {
 		assert_eq!(est.realized_value_bytes, seg.serialized_value_bytes(), "bench realized bytes must match the sealed segment");
 		// The headline derives from the realized figure and sits far below the naive
 		// fixed-width baseline (mantissas near 1e8 pack to a few residual bits each).
-		#[allow(clippy::cast_precision_loss)]
 		let expected_bpp = est.realized_value_bytes as f64 / est.value_count as f64;
 		assert!((est.bytes_per_point - expected_bpp).abs() < f64::EPSILON, "headline {} must be the realized rate {expected_bpp}", est.bytes_per_point);
 		assert!(est.realized_value_bytes * 4 < est.estimated_value_bytes, "realized {} must be well below the naive {} baseline", est.realized_value_bytes, est.estimated_value_bytes);

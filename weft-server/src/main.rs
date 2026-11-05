@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! `weft-server` binary entry point: the process runtime and one call into
 //! the operator CLI ([`weft_server::cli`], PAC-7).
 //!

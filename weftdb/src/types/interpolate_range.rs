@@ -68,9 +68,10 @@ struct StoredWindow {
 	values: Vec<Option<BigDecimal>>,
 }
 
-/// The most stored rows one reconstruction reads (null rows count): 4 Mi, about 40 times the
-/// 100k-knot window the bench measures. A wider window is refused: narrow `[start, end]` or
-/// `margin`, or interpolate in pieces.
+/// The most stored rows one reconstruction reads (null rows count).
+///
+/// 4 Mi, about 40 times the 100k-knot window the bench measures. A wider window is refused: narrow
+/// `[start, end]` or `margin`, or interpolate in pieces.
 pub const MAX_KNOTS: usize = 4 << 20;
 
 /// A stored window that cannot be reconstructed as asked: carried inside the `anyhow` error
@@ -292,7 +293,7 @@ mod tests {
 		let typed = store.stored_window_capped("line", crate::SeriesId::UNTAGGED, 0, 190, 0, 19).await.err().expect("over the cap");
 		assert_eq!(typed.downcast_ref::<StoredWindowError>(), Some(&StoredWindowError::TooManyRows { aspect: "line".to_string(), lo: 0, hi: 190, rows: 20, limit: 19 }));
 		// The default cap is far above anything these tests read.
-		assert!(MAX_KNOTS >= 4_000_000);
+		const { assert!(MAX_KNOTS >= 4_000_000) };
 		drop(store);
 	}
 

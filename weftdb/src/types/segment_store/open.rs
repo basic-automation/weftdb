@@ -116,12 +116,10 @@ impl SegmentStore {
 		Self::open_on(Arc::new(RealFs), root.as_ref(), database, subject, options).await
 	}
 
-	/// [`open_scoped_with_options`](SegmentStore::open_scoped_with_options), with its
-	/// marker writes and directory fsyncs going through `fs`, so a test can see what the
-	/// open writes and syncs, fail a step, or cut the power there.
-	pub(crate) async fn open_on(fs: Arc<dyn StoreFs>, root: &Path, database: &str, subject: &str, options: SegmentStoreOptions) -> Result<Self> {
-		let root = root.to_path_buf();
-		let segments_dir = root.join("segments");
+	/// Steps 0 to 4a of [`open_on`](Self::open_on), before any database opens: the
+	/// process poison, the root and LOCK, the marker and its gate, and the refusal of a
+	/// 0.1.x data directory.
+	async fn open_preflight(root: &Path, segments_dir: &Path, database: &str, subject: &str) -> Result<Preflight> {
 		let opening = || format!("opening segment store {}", root.display());
 		// 0. A write-poisoned process opens no store: the open writes (the marker, the
 		// migrations, store_meta, the scope), through the engine the poison distrusts.
@@ -129,13 +127,13 @@ impl SegmentStore {
 			return Err(anyhow::Error::new(poisoned).context(opening()));
 		}
 		// 1. The root, and any missing ancestor, for a new store.
-		let created = missing_dirs(&segments_dir).await;
-		tokio::fs::create_dir_all(&root).await.with_context(|| format!("creating store root {}", root.display()))?;
+		let created = missing_dirs(segments_dir).await;
+		tokio::fs::create_dir_all(root).await.with_context(|| format!("creating store root {}", root.display()))?;
 		// 2. LOCK.
-		let root_lock = lock_root(&root).await?;
+		let root_lock = lock_root(root).await?;
 		// 3. The marker.
-		let found = store_format::read_marker(&root).await.map_err(anyhow::Error::new).with_context(opening)?;
-		let had_databases = control_plane_present(&root).await;
+		let found = store_format::read_marker(root).await.map_err(anyhow::Error::new).with_context(opening)?;
+		let had_databases = control_plane_present(root).await;
 		let scope = StoreScope { database: database.to_string(), subject: subject.to_string() };
 		let names = CONTROL_PLANE_FILES.map(|file| root.join(file).to_string_lossy().into_owned());
 		// 4. The marker's gate, before any database is opened: nothing but LOCK and
@@ -149,11 +147,61 @@ impl SegmentStore {
 		// store beside that data and report it empty with no error, so it is refused here,
 		// before any database opens and before any file of ours exists in the directory.
 		if found.is_none() {
-			let aspects = store_format::rows_mode_aspects(&root).await;
+			let aspects = store_format::rows_mode_aspects(root).await;
 			if !aspects.is_empty() {
 				return Err(anyhow::Error::new(StoreError::RowsModeDataDirectory { aspects }).context(opening()));
 			}
 		}
+		Ok(Preflight { created, root_lock, found, had_databases, scope, names })
+	}
+
+	/// Steps 12 to 14 of [`open_on`](Self::open_on), before anything is served: the
+	/// journal replay and rollup backfill (skipped for a newer layout), then startup
+	/// recovery, in restore mode when the root carries a restore intent marker.
+	async fn open_recover(&self, newer: bool, replaying: String) -> Result<()> {
+		// 12. The frame journal's replay (R6), before anything is served: unless recovery
+		// must only report what it finds, a newer WeftDB's store.
+		// 13. Backfill the rollup rows the journal replay did not write: a pre-S11
+		// store has none, and the replay only re-derives the aspects its journal
+		// names, so without this a clean pre-S11 store would read default zeros.
+		if !newer {
+			self.replay_journal().await.context(replaying)?;
+			self.backfill_missing_rollups().await.context("backfilling the rollup rows the journal replay did not write")?;
+			// This open has not shut down cleanly yet: say so now, so a crash
+			// before any clean shutdown is never mistaken for one.
+			self.commit_index(&IndexTxn::new(vec![IndexOp::MetaSet { key: "clean_shutdown".to_string(), value: "0".to_string() }])).await.context("recording that this open has not shut down cleanly yet")?;
+		}
+		// 14. Startup recovery, report-only exactly when the layout is newer.
+		// A root carrying a restore intent marker (D-S16, C-7) is opened in
+		// restore mode instead: its orphans are adopted via describe_frame,
+		// and the marker is removed once that recovery completes, so the
+		// restore is a one-open event. A newer layout still only reports.
+		let intent = if newer { None } else { crate::read_restore_intent(&self.root).await.context("reading the restore intent marker")? };
+		match intent {
+			Some(_) => {
+				self.fsck_restore().await.context("running restore-mode recovery")?;
+				let marker = self.root.join(crate::RESTORE_INTENT_FILE);
+				if let Err(e) = self.fs.remove_file(&marker).await {
+					tracing::warn!(root = %self.root.display(), error = %e, "could not remove the restore intent marker after restore-mode recovery; the next open runs it again (adoption is idempotent: adopted frames have rows then)");
+				} else {
+					self.fs.sync_dir(&self.root).await.context("syncing the restore intent marker's removal")?;
+				}
+			}
+			None => {
+				self.fsck(newer).await.context("running startup recovery")?;
+			}
+		}
+		Ok(())
+	}
+
+	/// [`open_scoped_with_options`](SegmentStore::open_scoped_with_options), with its
+	/// marker writes and directory fsyncs going through `fs`, so a test can see what the
+	/// open writes and syncs, fail a step, or cut the power there.
+	pub(crate) async fn open_on(fs: Arc<dyn StoreFs>, root: &Path, database: &str, subject: &str, options: SegmentStoreOptions) -> Result<Self> {
+		let root = root.to_path_buf();
+		let segments_dir = root.join("segments");
+		let opening = || format!("opening segment store {}", root.display());
+		let Preflight { created, root_lock, found, had_databases, scope, names } = Self::open_preflight(&root, &segments_dir, database, subject).await?;
 		// 7, for a root that has databases: they open now, before anything is written to the
 		// root. segment_index.db opens first and refuses a write floor its store_meta records
 		// newer than this build (the gate of a root without a marker, 4) before anything is
@@ -254,38 +302,7 @@ impl SegmentStore {
 		// this open resets it: a later crash must not inherit a clean verdict.
 		let previous_clean_shutdown = index.meta("clean_shutdown").await.with_context(|| format!("{}: reading the previous clean-shutdown flag", names[0]))?.as_deref() == Some("1");
 		let store = Self { root, index, metadata, catalog, registry, database: database.to_string(), subject: subject.to_string(), checkpoints: options.checkpoints, partials: options.partials, transposed: options.transposed, poison: StorePoison::default(), fs, format: RwLock::new(settled), marker_writer: tokio::sync::Mutex::new(()), floor_ensured, store_uuid, report, recovery: RwLock::new(RecoveryReport::default()), suspect_present: AtomicBool::new(false), previous_clean_shutdown, locks: AspectLocks::default(), legacy_ids: tokio::sync::OnceCell::new(), frame_gens: tokio::sync::OnceCell::new(), reaper, maintenance_wait: DEFAULT_MAINTENANCE_WAIT, maintenance_breaker: options.breaker, max_series_per_aspect: options.max_series_per_aspect, max_downsample_buckets: options.max_downsample_buckets, max_point_batch: options.max_point_batch, breaker_state: Mutex::new(HashMap::new()), index_conflicts: AtomicU64::new(0), _root_lock: root_lock };
-		// 12. The frame journal's replay (R6), before anything is served: unless recovery
-		// must only report what it finds, a newer WeftDB's store.
-		// 13. Backfill the rollup rows the journal replay did not write: a pre-S11
-		// store has none, and the replay only re-derives the aspects its journal
-		// names, so without this a clean pre-S11 store would read default zeros.
-		if !newer {
-			store.replay_journal().await.context(replaying)?;
-			store.backfill_missing_rollups().await.context("backfilling the rollup rows the journal replay did not write")?;
-			// This open has not shut down cleanly yet: say so now, so a crash
-			// before any clean shutdown is never mistaken for one.
-			store.commit_index(&IndexTxn::new(vec![IndexOp::MetaSet { key: "clean_shutdown".to_string(), value: "0".to_string() }])).await.context("recording that this open has not shut down cleanly yet")?;
-		}
-		// 14. Startup recovery, report-only exactly when the layout is newer.
-		// A root carrying a restore intent marker (D-S16, C-7) is opened in
-		// restore mode instead: its orphans are adopted via describe_frame,
-		// and the marker is removed once that recovery completes, so the
-		// restore is a one-open event. A newer layout still only reports.
-		let intent = if newer { None } else { crate::read_restore_intent(&store.root).await.context("reading the restore intent marker")? };
-		match intent {
-			Some(_) => {
-				store.fsck_restore().await.context("running restore-mode recovery")?;
-				let marker = store.root.join(crate::RESTORE_INTENT_FILE);
-				if let Err(e) = store.fs.remove_file(&marker).await {
-					tracing::warn!(root = %store.root.display(), error = %e, "could not remove the restore intent marker after restore-mode recovery; the next open runs it again (adoption is idempotent: adopted frames have rows then)");
-				} else {
-					store.fs.sync_dir(&store.root).await.context("syncing the restore intent marker's removal")?;
-				}
-			}
-			None => {
-				store.fsck(newer).await.context("running startup recovery")?;
-			}
-		}
+		store.open_recover(newer, replaying).await?;
 		Ok(store)
 	}
 
@@ -398,10 +415,7 @@ impl SegmentStore {
 	/// Refuse a write while the store, or the process, is poisoned. Every write entry
 	/// point calls this first, before it reads or writes anything.
 	pub(crate) fn writable(&self) -> Result<()> {
-		match self.poisoned() {
-			Some(poisoned) => Err(poisoned.into()),
-			None => Ok(()),
-		}
+		self.poisoned().map_or_else(|| Ok(()), |poisoned| Err(poisoned.into()))
 	}
 
 	/// How long a per-aspect maintenance entry point waits for an aspect another
@@ -734,4 +748,15 @@ impl SegmentStore {
 	pub(crate) async fn require_schema(&self, aspect: &str) -> Result<AspectSchema> {
 		self.schema_for(aspect).await?.ok_or_else(|| anyhow::Error::new(StoreError::UnknownAspect { aspect: aspect.to_string() }).context(format!("aspect {aspect:?} has no declared schema in {}/{}", self.database, self.subject)))
 	}
+}
+
+/// What [`SegmentStore::open_preflight`] found and holds for the rest of the open.
+struct Preflight {
+	/// The directories the open created, for the layout sync.
+	created: Vec<PathBuf>,
+	root_lock: RootLock,
+	found: Option<StoreFormat>,
+	had_databases: bool,
+	scope: StoreScope,
+	names: [String; 4],
 }

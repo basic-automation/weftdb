@@ -20,7 +20,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 /// # Errors
 ///
 /// A value that is not a parseable socket address.
-pub(crate) fn bind_addr() -> anyhow::Result<SocketAddr> {
+pub fn bind_addr() -> anyhow::Result<SocketAddr> {
 	Ok(std::env::var("WEFT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?)
 }
 
@@ -31,7 +31,7 @@ pub(crate) fn bind_addr() -> anyhow::Result<SocketAddr> {
 ///
 /// A value that is not a positive integer (a malformed operator config should fail
 /// loudly at start rather than silently default).
-pub(crate) fn interpolate_config() -> anyhow::Result<InterpolateConfig> {
+pub fn interpolate_config() -> anyhow::Result<InterpolateConfig> {
 	let config = InterpolateConfig::from_env_value(std::env::var(MAX_INTERPOLATE_POINTS_ENV).ok().as_deref()).map_err(anyhow::Error::msg)?;
 	println!("interpolation: at most {} output points per request (set {MAX_INTERPOLATE_POINTS_ENV} to change)", config.max_output_points());
 	Ok(config)
@@ -46,7 +46,7 @@ pub(crate) fn interpolate_config() -> anyhow::Result<InterpolateConfig> {
 ///
 /// A value that is not a positive integer (a malformed operator config should
 /// fail loudly at start rather than silently default).
-pub(crate) fn serve_limits() -> anyhow::Result<ServeLimits> {
+pub fn serve_limits() -> anyhow::Result<ServeLimits> {
 	let limits = ServeLimits::from_env().map_err(anyhow::Error::msg)?;
 	println!("listener limits: at most {} connections (set {MAX_CONNECTIONS_ENV} to change; the default is half the RLIMIT_NOFILE soft limit), header deadline {}s (set {HEADER_READ_TIMEOUT_ENV}), keep-alive deadline {}s (set {KEEP_ALIVE_TIMEOUT_ENV}), write-stall timeout {}s (set {WRITE_STALL_TIMEOUT_ENV}), shutdown grace {}s (set {SHUTDOWN_GRACE_SECS_ENV})", limits.max_connections(), limits.header_read_timeout().as_secs(), limits.keep_alive_timeout().as_secs(), limits.write_stall_timeout().as_secs(), limits.shutdown_grace().as_secs());
 	Ok(limits)
@@ -60,7 +60,7 @@ pub(crate) fn serve_limits() -> anyhow::Result<ServeLimits> {
 ///
 /// A value that is not a positive integer (a malformed operator config
 /// should fail loudly at start rather than silently default).
-pub(crate) fn ingest_config() -> anyhow::Result<IngestConfig> {
+pub fn ingest_config() -> anyhow::Result<IngestConfig> {
 	let config = IngestConfig::from_env().map_err(anyhow::Error::msg)?;
 	println!("ingest limits: body cap {} bytes (set {MAX_INGEST_BYTES_ENV} to change), in-flight budget {} bytes (set {INGEST_MAX_INFLIGHT_BYTES_ENV})", config.max_body_bytes(), config.max_inflight_bytes());
 	Ok(config)
@@ -76,7 +76,7 @@ pub(crate) fn ingest_config() -> anyhow::Result<IngestConfig> {
 ///
 /// A value that is not a positive integer (a malformed operator config
 /// should fail loudly at start rather than silently default).
-pub(crate) fn admission_config() -> anyhow::Result<AdmissionConfig> {
+pub fn admission_config() -> anyhow::Result<AdmissionConfig> {
 	let config = AdmissionConfig::from_env().map_err(anyhow::Error::msg)?;
 	println!("admission limits: at most {} query-class requests in flight (set {QUERY_MAX_INFLIGHT_ENV} to change); probes are never shed, maintenance is admitted one at a time", config.max_query_inflight());
 	Ok(config)
@@ -93,7 +93,7 @@ pub(crate) fn admission_config() -> anyhow::Result<AdmissionConfig> {
 ///
 /// A half-configured TLS pair, TLS files that cannot be loaded, or the
 /// gate's refusal of an unopted plaintext exposure.
-pub(crate) fn transport(addr: SocketAddr) -> anyhow::Result<Option<TlsConfig>> {
+pub fn transport(addr: SocketAddr) -> anyhow::Result<Option<TlsConfig>> {
 	let tls = TlsConfig::from_env().map_err(anyhow::Error::msg)?;
 	let gate = PlaintextGate::from_env();
 	gate.check(addr, tls.as_ref()).map_err(anyhow::Error::msg)?;
@@ -117,7 +117,7 @@ pub(crate) fn transport(addr: SocketAddr) -> anyhow::Result<Option<TlsConfig>> {
 ///
 /// An unrecognised `WEFT_AUTH` value, `WEFT_AUTH=keys` with no keys
 /// file mounted, or a keys file that cannot be loaded.
-pub(crate) fn auth() -> anyhow::Result<AuthConfig> {
+pub fn auth() -> anyhow::Result<AuthConfig> {
 	let auth = AuthConfig::from_env().map_err(anyhow::Error::msg)?;
 	match &auth {
 		AuthConfig::Keys(store) => {
@@ -132,7 +132,7 @@ pub(crate) fn auth() -> anyhow::Result<AuthConfig> {
 
 /// Pick the request guard for the bound address `local` ([`HostGuard::for_bind`],
 /// honouring `WEFT_ALLOW_ANY_HOST`) and log which one is in force.
-pub(crate) fn host_guard_for(local: SocketAddr) -> HostGuard {
+pub fn host_guard_for(local: SocketAddr) -> HostGuard {
 	let allow_any_host = host_guard::allow_any_host_from_env(std::env::var(ALLOW_ANY_HOST_ENV).ok().as_deref());
 	let guard = HostGuard::for_bind(local, allow_any_host);
 	match guard {
@@ -150,6 +150,6 @@ pub(crate) fn host_guard_for(local: SocketAddr) -> HostGuard {
 ///
 /// A value that is not a socket address, or one that is not loopback (the listener is
 /// plaintext; [`weft_server::flight::flight_addr`] says why).
-pub(crate) fn flight_addr() -> anyhow::Result<Option<SocketAddr>> {
+pub fn flight_addr() -> anyhow::Result<Option<SocketAddr>> {
 	weft_server::flight::flight_addr(std::env::var(weft_server::flight::FLIGHT_ADDR_ENV).ok().as_deref()).map_err(anyhow::Error::msg)
 }

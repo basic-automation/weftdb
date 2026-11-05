@@ -61,7 +61,6 @@ pub fn render(report: &BenchReport, format: Format) -> String {
 	}
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn ms(ns: u64) -> f64 {
 	ns as f64 / 1e6
 }

@@ -228,7 +228,6 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Result<Json<Ve
 		let per = schema.timestamp_unit.nanos_per_unit();
 		let params = StorageDownsampleParams { start: Some(to_unit(query.range.from, per)), end: Some(to_unit(query.range.to, per)), resolution: Some(width.clone()), agg: Some(agg.to_owned()), fill: None };
 		let response = crate::storage::storage_downsample_inner(state.clone(), &aspect, &params, &weftdb::SeriesSelector::untagged()).await?;
-		#[allow(clippy::cast_precision_loss)]
 		let datapoints = response
 			.series
 			.iter()

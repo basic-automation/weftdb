@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Benchmark **interpolate-on-read over stored segments** (`SegmentStore::interpolate_range`)
 //! end to end below the HTTP layer: index prune → `.weftseg` read and decode → knots →
 //! splimes on the blocking pool → a `BigDecimal` series with provenance.
@@ -47,8 +50,7 @@ async fn sealed_store(dir: &TempDir) -> SegmentStore {
 		for i in 0..per_segment {
 			let n = seg * per_segment + i;
 			ts.push(n * STRIDE_SECS + i64::try_from(next() % 7).unwrap_or(0) - 3);
-			#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-			let cents = ((20.0_f64.mul_add((n as f64 / 360.0).sin(), 50.0) + (next() % 200) as f64 / 100.0) * 100.0).round() as i64;
+			let cents = bigdecimal::ToPrimitive::to_i64(&((20.0_f64.mul_add((bigdecimal::ToPrimitive::to_f64(&n).expect("a number") / 360.0).sin(), 50.0) + f64::from(u32::try_from(next() % 200).expect("below 200")) / 100.0) * 100.0).round()).expect("a price in cents");
 			vs.push(BigDecimal::new(cents.into(), 2));
 		}
 		store.seal_declared("sensor", &ts, &vs).await.expect("seals");
@@ -84,7 +86,7 @@ fn bench_interpolate_range(c: &mut Criterion) {
 			group.bench_with_input(BenchmarkId::new(format!("{label}_f64"), knots), &knots, |b, _| b.iter(|| black_box(rt.block_on(store.interpolate_range_f64("sensor", start, end, 60, interpolator)).expect("interpolates"))));
 		}
 	}
-	group.finish();
+	drop(group);
 
 	// Where the time goes, on the 100k-knot window: the storage read and decode alone, then
 	// the same interpolation on already-lifted knots with an `f64` result (`run_f64`, no
@@ -106,7 +108,7 @@ fn bench_interpolate_range(c: &mut Criterion) {
 		group.bench_function(format!("run_f64/{label}"), |b| b.iter(|| black_box(interpolator.run_f64(&instants, &floats, from, to).expect("interpolates"))));
 		group.bench_function(format!("run_bigdecimal/{label}"), |b| b.iter(|| black_box(interpolator.run(&points, from, to).expect("interpolates"))));
 	}
-	group.finish();
+	drop(group);
 	drop(store);
 	drop(dir);
 }

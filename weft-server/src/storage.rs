@@ -78,7 +78,7 @@ async fn resolve_target(store: &weftdb::SegmentStore, aspect: &str, selector: &w
 /// not-a-decimal is the caller's `400 bad_request` as before, and a decimal
 /// whose plain form is over the bound is `400 decimal_out_of_range`.
 fn parse_value_bound(name: &str, text: &str) -> Result<BigDecimal, ApiError> {
-	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
+	weft_physical_type::parse_decimal(text).map_err(|e| error::decimal_error(&e, ApiError::bad_request(format!("`{name}` is not a decimal: {text:?}"))))
 }
 
 /// The Arrow IPC stream content type, per the Apache Arrow conventions.
@@ -183,7 +183,7 @@ async fn require_schema(store: &weftdb::SegmentStore, aspect: &str) -> Result<we
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared, and
 /// [`ApiError::internal`] on a read failure.
 pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	require_schema(&store, &aspect).await?;
 	let target = resolve_target(&store, &aspect, &selector).await?;
@@ -209,7 +209,7 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 /// As [`storage_time_range_csv`], plus [`ApiError::bad_request`] when a value
 /// bound does not parse as a decimal.
 pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -237,7 +237,7 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared, and
 /// [`ApiError::internal`] on a read/serialization failure.
 pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	let target = resolve_target(&store, &aspect, &selector).await?;
@@ -261,7 +261,7 @@ pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Pat
 /// As [`storage_time_range`], plus [`ApiError::bad_request`] when a value bound
 /// does not parse as a decimal.
 pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -289,7 +289,7 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 /// As [`storage_time_range`] (unconfigured store, undeclared aspect, or a
 /// read/serialization failure).
 pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	let target = resolve_target(&store, &aspect, &selector).await?;
@@ -314,7 +314,7 @@ pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspe
 /// As [`storage_value_range`], including [`ApiError::bad_request`] when a value
 /// bound does not parse as a decimal.
 pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -438,7 +438,7 @@ pub struct StoredRangeResponse {
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared (its timestamp unit is
 /// unknown), and [`ApiError::internal`] on a read failure.
 pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<PointsRangeParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let schema = store.schema_for(&aspect).await.map_err(|err| ApiError::internal(err.to_string()))?;
 	let Some(schema) = schema else {
@@ -562,7 +562,7 @@ pub struct ValuePointsParams {
 /// undeclared), [`ApiError::bad_request`] when a value bound does not parse as a
 /// decimal, and [`ApiError::internal`] on a read failure.
 pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValuePointsParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -639,7 +639,7 @@ pub struct StoredPointResponse {
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared (its timestamp unit is
 /// unknown), and [`ApiError::internal`] on a read failure.
 pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<PointParams>) -> Result<Json<StoredPointResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	let target = resolve_target(&store, &aspect, &selector).await?;
@@ -705,7 +705,7 @@ pub struct StoredPointsResponse {
 /// the aspect is undeclared, [`ApiError::bad_request`] when the `t` list has a non-integer
 /// entry, and [`ApiError::internal`] on a read failure.
 pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<MultiPointParams>) -> Result<Json<StoredPointsResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	// Parse the comma-separated instants; a non-integer (or otherwise malformed) entry is a 400.
@@ -879,7 +879,7 @@ async fn collect_catalog(store: &weftdb::SegmentStore) -> anyhow::Result<Vec<Cat
 /// [`ApiError::unconfigured`] when no store is attached, or
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_catalog(State(state): State<AppState>) -> Result<Json<CatalogResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let scope_database = store.database().to_string();
 	let scope_subject = store.subject().to_string();
@@ -911,7 +911,7 @@ async fn collect_aspects(store: &weftdb::SegmentStore) -> anyhow::Result<Vec<Asp
 /// [`ApiError::unconfigured`] when no store is attached, or
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_aspects(State(state): State<AppState>) -> Result<Json<AspectListResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let result = collect_aspects(&store).await;
 	drop(store);
@@ -937,7 +937,7 @@ pub struct AspectSchemaResponse {
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared, and
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Json<AspectSchemaResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let result = store.schema_for(&aspect).await;
 	let keys = store.upsert_keys(&aspect).await;
@@ -962,7 +962,7 @@ pub async fn storage_aspect_schema(State(state): State<AppState>, Path(aspect): 
 /// [`ApiError::unconfigured`] when no store is attached, or
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): Path<String>) -> Result<Json<AspectStatsResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	// The O(1) rollup carries every field except the cross-segment overlap count,
 	// which has no incremental fold — a second, index-scanning `aspect_stats` supplies
@@ -987,7 +987,7 @@ pub async fn storage_aspect_stats(State(state): State<AppState>, Path(aspect): P
 /// [`ApiError::unconfigured`] when no store is attached, or
 /// [`ApiError::internal`] on a control-plane read failure.
 pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreStatsResponse>, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	// The O(1) rollup carries every field except the cross-segment overlap total,
 	// which has no incremental fold — a separate index-scanning aggregate supplies it.
@@ -1043,7 +1043,7 @@ pub struct StorageDownsampleParams {
 /// Traced as `downsample.range` so a `RUST_LOG`/OTLP run attributes the stored
 /// reduction apart from the compute endpoints' `downsample.reduce`.
 pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams, selector: &weftdb::SeriesSelector) -> Result<crate::downsample::DownsampleResponse, ApiError> {
-	let store = state.store().cloned().ok_or(ApiError::unconfigured())?;
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	drop(state);
 	let width = crate::downsample::parse_width_token(params.resolution.as_deref())?;
 	let aggregations = crate::downsample::parse_aggregations(params.agg.as_deref())?;
@@ -1121,7 +1121,7 @@ pub async fn storage_downsample_csv(State(state): State<AppState>, Path(aspect):
 /// failure.
 pub async fn storage_downsample_arrow(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<StorageDownsampleParams>) -> Result<Response, ApiError> {
 	let response = storage_downsample_inner(state, &aspect, &params, &selector).await?;
-	Ok(crate::downsample::downsample_response_to_arrow(&response)?)
+	crate::downsample::downsample_response_to_arrow(&response)
 }
 
 /// Handle `GET|POST /api/v1/storage/{aspect}/downsample.parquet`: the Parquet-output
@@ -1133,7 +1133,7 @@ pub async fn storage_downsample_arrow(State(state): State<AppState>, Path(aspect
 /// failure.
 pub async fn storage_downsample_parquet(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<StorageDownsampleParams>) -> Result<Response, ApiError> {
 	let response = storage_downsample_inner(state, &aspect, &params, &selector).await?;
-	Ok(crate::downsample::downsample_response_to_parquet(&response)?)
+	crate::downsample::downsample_response_to_parquet(&response)
 }
 
 #[cfg(test)]
@@ -1372,12 +1372,13 @@ mod tests {
 	#[tokio::test]
 	async fn aspect_stats_reports_unsorted_segments_after_an_out_of_order_seal() {
 		let dir = TempDir::new().expect("temp dir");
-		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
 		// One ordered segment, then one whose timestamps step backwards.
 		store.seal_declared("price", &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("ordered");
 		store.seal_declared("price", &[100_i64, 130, 110], &[bd("4"), bd("5"), bd("6")]).await.expect("out of order");
-		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
 		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["segment_count"], 2);
@@ -1390,12 +1391,13 @@ mod tests {
 	#[tokio::test]
 	async fn aspect_stats_reports_cross_segment_overlap() {
 		let dir = TempDir::new().expect("temp dir");
-		let store = SegmentStore::open(dir.path()).await.expect("opens store");
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens store"));
 		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.expect("declares");
 		// Two internally-sorted segments whose time windows overlap ([0,20] and [10,30]).
 		store.seal_declared("price", &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.expect("first");
 		store.seal_declared("price", &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.expect("overlapping");
-		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
 		let (status, body) = get_json(router, "/api/v1/storage/price/stats").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		// Both segments are internally sorted, but their windows overlap.
@@ -1454,7 +1456,7 @@ mod tests {
 		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=1000&end=2000").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["count"], 0);
-		assert!(body["points"].as_array().unwrap().is_empty());
+		assert_eq!(body["points"].as_array().unwrap().as_slice(), [] as [serde_json::Value; 0]);
 	}
 
 	#[tokio::test]
@@ -1567,7 +1569,7 @@ mod tests {
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["total"], 5);
 		assert_eq!(body["count"], 0);
-		assert!(body["points"].as_array().unwrap().is_empty());
+		assert_eq!(body["points"].as_array().unwrap().as_slice(), [] as [serde_json::Value; 0]);
 	}
 
 	#[tokio::test]

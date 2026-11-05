@@ -82,21 +82,22 @@ use crate::{
 };
 
 /// A migration step over the databases it is given; see [`ControlPlane`].
-pub(crate) type MigrationFn = for<'a> fn(&'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>>;
+pub type MigrationFn = for<'a> fn(&'a ControlPlane<'a>) -> BoxFuture<'a, Result<()>>;
 
 /// One control-plane database a migration runs against: the database and the name its
 /// errors use (its path).
 #[derive(Clone, Copy)]
-pub(crate) struct Db<'a> {
+pub struct Db<'a> {
 	pub db: &'a turso::Database,
 	pub name: &'a str,
 }
 
-/// The control-plane databases a migration runs against. A store passes all four; a
-/// database opened on its own passes just itself, and each migration runs the part of
-/// itself that belongs to the databases present.
+/// The control-plane databases a migration runs against.
+///
+/// A store passes all four; a database opened on its own passes just itself, and each migration runs
+/// the part of itself that belongs to the databases present.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct ControlPlane<'a> {
+pub struct ControlPlane<'a> {
 	/// `segment_index.db`, which also holds `store_meta` and `store_migrations`.
 	pub index: Option<Db<'a>>,
 	/// `metadata.db`.
@@ -108,7 +109,7 @@ pub(crate) struct ControlPlane<'a> {
 }
 
 /// One registered migration; see the module documentation.
-pub(crate) struct Migration {
+pub struct Migration {
 	/// The ordinal id, `NNNN_name`; the registry is in id order.
 	pub id: &'static str,
 	/// The release layout the migration belongs to.
@@ -131,16 +132,18 @@ pub(crate) struct Migration {
 /// What a set of migrations needs of the store's marker: the newest layout among them,
 /// and the floors once they have all applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Floors {
+pub struct Floors {
 	pub layout: u32,
 	pub min_read: u32,
 	pub min_write: u32,
 }
 
-/// Every registered migration, in id order. An id is four digits, an underscore, and a
-/// lower snake_case name: the digits are the ordinal that `pending` and `after` select on,
-/// so the numbering rule is part of the registry's contract and the test below asserts it.
-pub(crate) static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }, Migration { id: "0005_d_s13", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s13, rederive: None }, Migration { id: "0006_tag5_series", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: tag5_series, rederive: None }, Migration { id: "0007_series_time_index", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: series_time_index, rederive: None }, Migration { id: "0008_upsert_keys", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: upsert_keys, rederive: None }];
+/// Every registered migration, in id order.
+///
+/// An id is four digits, an underscore, and a lower `snake_case` name: the digits are the ordinal that
+/// `pending` and `after` select on, so the numbering rule is part of the registry's contract and the
+/// test below asserts it.
+pub static REGISTRY: &[Migration] = &[Migration { id: "0001_baseline", layout: 1, min_read_after: 1, min_write_after: 1, older_writers_safe: false, precheck: None, apply: baseline, rederive: None }, Migration { id: "0002_s6_s7", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: Some(refuse_unsafe_legacy_paths), apply: s6_s7, rederive: None }, Migration { id: "0003_fre14_legacy_catalog", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: fre14_legacy_catalog, rederive: None }, Migration { id: "0004_d_s12", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s12, rederive: None }, Migration { id: "0005_d_s13", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: d_s13, rederive: None }, Migration { id: "0006_tag5_series", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: tag5_series, rederive: None }, Migration { id: "0007_series_time_index", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: series_time_index, rederive: None }, Migration { id: "0008_upsert_keys", layout: 2, min_read_after: 2, min_write_after: 2, older_writers_safe: false, precheck: None, apply: upsert_keys, rederive: None }];
 
 /// The ordinal of a migration id: its leading digits (`0002_s6_s7` → 2). An id without
 /// them sorts first.
@@ -149,19 +152,20 @@ fn ordinal(id: &str) -> u64 {
 }
 
 /// The migrations of `registry` that `applied` does not list, in order.
-pub(crate) fn pending<'r>(registry: &'r [Migration], applied: &BTreeSet<String>) -> Vec<&'r Migration> {
+#[must_use]
+pub fn pending<'r>(registry: &'r [Migration], applied: &BTreeSet<String>) -> Vec<&'r Migration> {
 	registry.iter().filter(|migration| !applied.contains(migration.id)).collect()
 }
 
 /// The migrations of `registry` after `applied_through` (all of them for `None`): what a
 /// store's marker says is still to run, before its databases are open to say exactly.
-pub(crate) fn after<'r>(registry: &'r [Migration], applied_through: Option<&str>) -> Vec<&'r Migration> {
+pub fn after<'r>(registry: &'r [Migration], applied_through: Option<&str>) -> Vec<&'r Migration> {
 	let through = applied_through.map_or(0, ordinal);
 	registry.iter().filter(|migration| ordinal(migration.id) > through).collect()
 }
 
 /// What `migrations` need of the marker, or `None` for no migration.
-pub(crate) fn floors<'r>(migrations: impl IntoIterator<Item = &'r Migration>) -> Option<Floors> {
+pub fn floors<'r>(migrations: impl IntoIterator<Item = &'r Migration>) -> Option<Floors> {
 	migrations.into_iter().fold(None, |acc: Option<Floors>, migration| {
 		let own = Floors { layout: migration.layout, min_read: migration.min_read_after, min_write: migration.min_write_after };
 		Some(acc.map_or(own, |acc| Floors { layout: acc.layout.max(own.layout), min_read: acc.min_read.max(own.min_read), min_write: acc.min_write.max(own.min_write) }))
@@ -174,7 +178,7 @@ pub(crate) fn floors<'r>(migrations: impl IntoIterator<Item = &'r Migration>) ->
 /// # Errors
 ///
 /// A failed read.
-pub(crate) async fn applied(index: Db<'_>) -> Result<BTreeSet<String>> {
+pub async fn applied(index: Db<'_>) -> Result<BTreeSet<String>> {
 	let conn = connect(index.db).await.with_context(|| format!("{}: connecting", index.name))?;
 	if !table_exists(&conn, "store_migrations").await.with_context(|| format!("{}: looking for store_migrations", index.name))? {
 		return Ok(BTreeSet::new());
@@ -196,20 +200,21 @@ pub(crate) async fn applied(index: Db<'_>) -> Result<BTreeSet<String>> {
 ///
 /// As [`precheck`] (then nothing applied) and [`apply`].
 #[cfg(test)]
-pub(crate) async fn run(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<Vec<&'static str>> {
+pub async fn run(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<Vec<&'static str>> {
 	precheck(cp, migrations).await?;
 	apply(cp, migrations).await
 }
 
-/// Run the precheck of each of `migrations`, in order, against `cp`: reads only, so a
-/// refusal leaves the store as it was. The open runs them all before it applies the first
-/// migration and, for an existing store, before it raises the marker's floors, so a store
-/// one of them refuses is not left with some migrations applied and others not.
+/// Run the precheck of each of `migrations`, in order, against `cp`.
+///
+/// Reads only, so a refusal leaves the store as it was. The open runs them all before it applies the
+/// first migration and, for an existing store, before it raises the marker's floors, so a store one of
+/// them refuses is not left with some migrations applied and others not.
 ///
 /// # Errors
 ///
 /// The first refusal, or a failed read.
-pub(crate) async fn precheck(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<()> {
+pub async fn precheck(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<()> {
 	for migration in migrations {
 		if let Some(precheck) = migration.precheck {
 			precheck(cp).await.with_context(|| format!("checking the store before migration {}", migration.id))?;
@@ -225,7 +230,7 @@ pub(crate) async fn precheck(cp: &ControlPlane<'_>, migrations: &[&Migration]) -
 /// # Errors
 ///
 /// A failed DDL statement or record (the migration re-runs at the next open).
-pub(crate) async fn apply(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<Vec<&'static str>> {
+pub async fn apply(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> Result<Vec<&'static str>> {
 	let index = cp.index.context("running the store migrations needs segment_index.db")?;
 	let mut ran = Vec::with_capacity(migrations.len());
 	for migration in migrations {
@@ -237,14 +242,15 @@ pub(crate) async fn apply(cp: &ControlPlane<'_>, migrations: &[&Migration]) -> R
 	Ok(ran)
 }
 
-/// Run the re-derive hook of every migration in `registry` that declared older writers
-/// safe and belongs to a layout newer than `last_written`, the layout of the WeftDB that
-/// last wrote the store. Returns the ids re-derived.
+/// Run the re-derive hook of every migration in `registry` that declared older writers safe and belongs
+/// to a layout newer than `last_written`, the layout of the WeftDB that last wrote the store.
+///
+/// Returns the ids re-derived.
 ///
 /// # Errors
 ///
 /// A failed hook.
-pub(crate) async fn rederive(cp: &ControlPlane<'_>, registry: &[Migration], applied: &BTreeSet<String>, last_written: u32) -> Result<Vec<&'static str>> {
+pub async fn rederive(cp: &ControlPlane<'_>, registry: &[Migration], applied: &BTreeSet<String>, last_written: u32) -> Result<Vec<&'static str>> {
 	let mut ran = Vec::new();
 	for migration in registry.iter().filter(|migration| migration.older_writers_safe && migration.layout > last_written && applied.contains(migration.id)) {
 		if let Some(hook) = migration.rederive {
@@ -255,17 +261,17 @@ pub(crate) async fn rederive(cp: &ControlPlane<'_>, registry: &[Migration], appl
 	Ok(ran)
 }
 
-/// Apply every registered migration's DDL to the databases `cp` holds, recording
-/// nothing: what the unit tests of one control-plane database, opened on its own (so
-/// with no marker and no floors), need to use it. Only tests have it: outside one, the
-/// databases open only inside a store, which runs the registry behind its gate.
-/// Idempotent.
+/// Apply every registered migration's DDL to the databases `cp` holds, recording nothing.
+///
+/// What the unit tests of one control-plane database, opened on its own (so with no marker and no
+/// floors), need to use it. Only tests have it: outside one, the databases open only inside a store,
+/// which runs the registry behind its gate. Idempotent.
 ///
 /// # Errors
 ///
 /// A failed DDL statement.
 #[cfg(test)]
-pub(crate) async fn apply_standalone(cp: &ControlPlane<'_>) -> Result<()> {
+pub async fn apply_standalone(cp: &ControlPlane<'_>) -> Result<()> {
 	for migration in REGISTRY {
 		(migration.apply)(cp).await.with_context(|| format!("applying migration {}", migration.id))?;
 	}
@@ -563,15 +569,17 @@ fn refuse_unsafe_legacy_paths<'a>(cp: &'a ControlPlane<'a>) -> BoxFuture<'a, Res
 	})
 }
 
-/// Whether the path a layout-1 store recorded for `aspect`'s segment `id` names the frame
-/// directly inside a `segments/` directory: its last two components, split on both `/`
-/// and `\` (a store written on Windows records `\`), are `segments` and
-/// `{aspect}-{id}.weftseg`.
+/// Whether the path a layout-1 store recorded for `aspect`'s segment `id` names the frame directly
+/// inside a `segments/` directory.
+///
+/// Its last two components, split on both `/` and `\` (a store written on Windows records `\`), are
+/// `segments` and `{aspect}-{id}.weftseg`.
 ///
 /// Anything else escaped `segments/`: the aspect name held a separator or a `..`, which
 /// the pre-1.0 store joined into the path unchecked. Such a frame cannot be resolved
 /// against a moved root, and reading it as recorded could read outside the store.
-pub(crate) fn legacy_path_is_contained(aspect: &str, id: u64, stored: &str) -> bool {
+#[must_use]
+pub fn legacy_path_is_contained(aspect: &str, id: u64, stored: &str) -> bool {
 	let parts: Vec<&str> = stored.split(['/', '\\']).filter(|part| !part.is_empty() && *part != ".").collect();
 	match parts.as_slice() {
 		[.., parent, name] => *parent == "segments" && *name == format!("{aspect}-{id}.weftseg"),
@@ -603,7 +611,8 @@ async fn add_column(conn: &turso::Connection, name: &str, table: &str, column: &
 
 /// Whether `e` is exactly Turso's refusal to add `column` because the table has it
 /// already, and not some other error that happens to mention a duplicate.
-pub(crate) fn is_duplicate_column(e: &turso::Error, column: &str) -> bool {
+#[must_use]
+pub fn is_duplicate_column(e: &turso::Error, column: &str) -> bool {
 	let expected = format!("duplicate column name: {column}");
 	match e {
 		turso::Error::Error(message) => message == &expected || message.strip_prefix("Parse error: ") == Some(expected.as_str()),
@@ -612,13 +621,21 @@ pub(crate) fn is_duplicate_column(e: &turso::Error, column: &str) -> bool {
 }
 
 /// Whether the database behind `conn` has a table named `table`.
-pub(crate) async fn table_exists(conn: &turso::Connection, table: &str) -> Result<bool> {
+///
+/// # Errors
+///
+/// A failed query.
+pub async fn table_exists(conn: &turso::Connection, table: &str) -> Result<bool> {
 	let mut rows = conn.query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", [Value::Text(table.to_string())]).await?;
 	Ok(rows.next().await?.is_some())
 }
 
 /// The column names of `table`, from `PRAGMA table_info`.
-pub(crate) async fn column_names(conn: &turso::Connection, table: &str) -> Result<Vec<String>> {
+///
+/// # Errors
+///
+/// A failed query.
+pub async fn column_names(conn: &turso::Connection, table: &str) -> Result<Vec<String>> {
 	let mut rows = conn.query(format!("PRAGMA table_info({table})"), ()).await?;
 	let mut names = Vec::new();
 	while let Some(row) = rows.next().await? {
@@ -691,6 +708,7 @@ mod tests {
 	async fn a_duplicate_column_is_recognised_exactly() {
 		let db = turso::Builder::new_local(":memory:").build().await.unwrap();
 		let conn = db.connect().unwrap();
+		drop(db);
 		conn.execute("CREATE TABLE t (a INTEGER)", ()).await.unwrap();
 		let err = conn.execute("ALTER TABLE t ADD COLUMN a INTEGER", ()).await.expect_err("a duplicate column");
 		assert!(is_duplicate_column(&err, "a"), "{err:?}");

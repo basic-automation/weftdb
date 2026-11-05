@@ -97,7 +97,6 @@ impl Sweep {
 		for curve in &self.curves {
 			let _ = write!(out, "\n## {} ({})\n\n| {} | p50 ms | p99 ms | throughput /s | gate |\n|---:|---:|---:|---:|---|\n", curve.profile, curve.workload, self.knob);
 			for p in &curve.points {
-				#[allow(clippy::cast_precision_loss)]
 				let ms = |ns: u64| ns as f64 / 1e6;
 				let _ = writeln!(out, "| {} | {:.3} | {:.3} | {:.0} | {} |", p.value, ms(p.p50_ns), ms(p.p99_ns), p.throughput, if p.passed { "PASS" } else { "FAIL" });
 			}

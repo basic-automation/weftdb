@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! PAC-13's offline restore, end to end: a backup this server wrote, put back on disk as a
 //! store root nothing is serving, and then read the way a server reads a store.
 //!

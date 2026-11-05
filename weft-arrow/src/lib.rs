@@ -62,7 +62,9 @@
 //! crate denies the panic-family clippy lints below, and a source-scan test
 //! covers the assertion macros, which clippy has no lint for.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 // ROB-4: the no-panic lint, enforced. Production code in this crate must not
 // panic, unwrap, expect, or fall through an unreachable arm; test code is
 // exempted at the test module, where an assertion failure is the point. The
@@ -264,7 +266,7 @@ fn time_unit_from_name(name: &str) -> Option<TimeUnit> {
 /// Refuse a column whose length disagrees with the row count it must share.
 ///
 /// The batch builders' former assertion, as a returned error (ROB-4).
-fn check_len(column: &'static str, expected: usize, actual: usize) -> Result<(), ConvertError> {
+const fn check_len(column: &'static str, expected: usize, actual: usize) -> Result<(), ConvertError> {
 	if actual == expected {
 		Ok(())
 	} else {
@@ -892,7 +894,9 @@ pub fn reduction_table_to_record_batch(unit: TimeUnit, timestamps: &[i64], count
 }
 
 /// [`reduction_table_to_record_batch`] for a table whose reductions may be missing in some
-/// buckets: a gap-filled downsample (`?fill=null`, or a linear fill past the last measured
+/// buckets.
+///
+/// A gap-filled downsample (`?fill=null`, or a linear fill past the last measured
 /// bucket) emits buckets without a value. A reduction column holding a `None` is a nullable
 /// `Float64` with a null there; a column with none stays non-null, so a dense table's schema
 /// is unchanged.
@@ -1000,7 +1004,6 @@ pub fn reduction_table_from_record_batch(batch: &RecordBatch) -> Result<Reductio
 }
 
 #[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::unreachable)]
 mod tests {
 	use std::str::FromStr;
 
@@ -1008,433 +1011,510 @@ mod tests {
 
 	use super::*;
 
-	fn bd(s: &str) -> BigDecimal {
-		BigDecimal::from_str(s).expect("test literal parses")
+	type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+	// Assertion macros for the `Result`-returning tests: `clippy::panic_in_result_fn`
+	// forbids `assert!` in a function returning `Result`, so a failed check is
+	// returned as an error instead, which the test harness reports as a failure.
+	macro_rules! check {
+		($cond:expr $(,)?) => {
+			if !$cond {
+				return Err(concat!("check failed: ", stringify!($cond)).into());
+			}
+		};
+		($cond:expr, $($arg:tt)+) => {
+			if !$cond {
+				return Err(format!($($arg)+).into());
+			}
+		};
 	}
 
-	fn col(lits: &[&str]) -> Vec<BigDecimal> {
+	macro_rules! check_eq {
+		($left:expr, $right:expr $(,)?) => {
+			match (&$left, &$right) {
+				(left, right) => {
+					if *left != *right {
+						return Err(format!("check failed: `{:?}` != `{:?}`", left, right).into());
+					}
+				}
+			}
+		};
+		($left:expr, $right:expr, $($arg:tt)+) => {
+			match (&$left, &$right) {
+				(left, right) => {
+					if *left != *right {
+						return Err(format!("{}: `{:?}` != `{:?}`", format_args!($($arg)+), left, right).into());
+					}
+				}
+			}
+		};
+	}
+
+	fn value_column(batch: &RecordBatch) -> Result<&ArrayRef, &'static str> {
+		batch.column_by_name(VALUE_COLUMN).ok_or("value column present")
+	}
+
+	fn value_array<T: Array + 'static>(batch: &RecordBatch) -> Result<&T, &'static str> {
+		value_column(batch)?.as_any().downcast_ref::<T>().ok_or("value column has the expected Arrow type")
+	}
+
+	fn bd(s: &str) -> Result<BigDecimal, bigdecimal::ParseBigDecimalError> {
+		BigDecimal::from_str(s)
+	}
+
+	fn col(lits: &[&str]) -> Result<Vec<BigDecimal>, bigdecimal::ParseBigDecimalError> {
 		lits.iter().map(|s| bd(s)).collect()
 	}
 
-	fn ncol(lits: &[Option<&str>]) -> Vec<Option<BigDecimal>> {
-		lits.iter().map(|o| o.map(bd)).collect()
+	fn ncol(lits: &[Option<&str>]) -> Result<Vec<Option<BigDecimal>>, bigdecimal::ParseBigDecimalError> {
+		lits.iter().map(|o| o.map(bd).transpose()).collect()
 	}
 
 	#[test]
-	fn dense_segment_round_trips_through_arrow() {
+	fn dense_segment_round_trips_through_arrow() -> TestResult {
 		let timestamps: Vec<i64> = (0..5).map(|i| 1_000 + i * 10).collect();
-		let values = col(&["1.25", "2.50", "3.75", "5.00", "6.25"]);
-		let seg = Segment::build(&timestamps, &values, TimeUnit::Micros, &bd("0")).expect("builds");
+		let values = col(&["1.25", "2.50", "3.75", "5.00", "6.25"])?;
+		let seg = Segment::build(&timestamps, &values, TimeUnit::Micros, &bd("0")?)?;
 
-		let batch = segment_to_record_batch(&seg).expect("builds the batch");
-		assert_eq!(batch.num_columns(), 2);
-		assert_eq!(batch.num_rows(), 5);
+		let batch = segment_to_record_batch(&seg)?;
+		check_eq!(batch.num_columns(), 2);
+		check_eq!(batch.num_rows(), 5);
 
-		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
-		assert_eq!(back.decode(), (timestamps, values));
-		assert_eq!(back.time_unit(), TimeUnit::Micros);
+		let back = segment_from_record_batch(&batch, &bd("0")?)?;
+		check_eq!(back.decode(), (timestamps, values));
+		check_eq!(back.time_unit(), TimeUnit::Micros);
+		Ok(())
 	}
 
 	#[test]
-	fn record_batch_value_outside_the_decimal_domain_is_refused() {
+	fn record_batch_value_outside_the_decimal_domain_is_refused() -> TestResult {
 		// ROB-6: the batch lift is an ingest parse site — a text value whose
 		// plain form is over 1,024 digits is refused, not lifted.
 		let over = format!("1{}", "0".repeat(1024));
-		let values: Vec<Option<BigDecimal>> = vec![Some(bd(&over))];
-		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1], &values).expect("builds the batch");
-		assert_eq!(record_batch_to_columns(&batch), Err(ConvertError::DecimalOutOfRange { digits: 1025 }));
+		let values: Vec<Option<BigDecimal>> = vec![Some(bd(&over)?)];
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[1], &values)?;
+		check_eq!(record_batch_to_columns(&batch), Err(ConvertError::DecimalOutOfRange { digits: 1025 }));
+		Ok(())
 	}
 
 	#[test]
-	fn nullable_segment_preserves_gaps_as_arrow_nulls() {
+	fn nullable_segment_preserves_gaps_as_arrow_nulls() -> TestResult {
 		let timestamps = vec![10_i64, 20, 30, 40, 50];
-		let values = ncol(&[Some("1.5"), None, Some("3.5"), None, Some("5.5")]);
-		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &bd("0")).expect("builds");
+		let values = ncol(&[Some("1.5"), None, Some("3.5"), None, Some("5.5")])?;
+		let seg = Segment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &bd("0")?)?;
 
-		let batch = segment_to_record_batch(&seg).expect("builds the batch");
+		let batch = segment_to_record_batch(&seg)?;
 		// The Arrow value column carries the two nulls as real validity bits.
-		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-		assert_eq!(val_array.null_count(), 2);
-		assert!(val_array.is_null(1) && val_array.is_null(3));
+		let val_array = value_array::<StringArray>(&batch)?;
+		check_eq!(val_array.null_count(), 2);
+		check!(val_array.is_null(1) && val_array.is_null(3));
 
-		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values);
+		let (ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn high_precision_values_survive_losslessly() {
+	fn high_precision_values_survive_losslessly() -> TestResult {
 		// Far more digits than f64 or i128 could hold — text keeps every one.
 		let timestamps = vec![1_i64, 2];
-		let values = col(&["123456789012345678901234567890.123456789012345678901234567890", "-0.000000000000000000000000000001"]);
-		let seg = Segment::build(&timestamps, &values, TimeUnit::Nanos, &bd("0")).expect("builds");
-		assert!(seg.is_exact());
+		let values = col(&["123456789012345678901234567890.123456789012345678901234567890", "-0.000000000000000000000000000001"])?;
+		let seg = Segment::build(&timestamps, &values, TimeUnit::Nanos, &bd("0")?)?;
+		check!(seg.is_exact());
 
-		let batch = segment_to_record_batch(&seg).expect("builds the batch");
-		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
-		assert!(back.is_exact(), "decimal text crossing into Arrow loses nothing");
-		assert_eq!(back.decode_values(), values);
+		let batch = segment_to_record_batch(&seg)?;
+		let back = segment_from_record_batch(&batch, &bd("0")?)?;
+		check!(back.is_exact(), "decimal text crossing into Arrow loses nothing");
+		check_eq!(back.decode_values(), values);
+		Ok(())
 	}
 
 	#[test]
-	fn schema_metadata_is_self_describing() {
-		let seg = Segment::build(&[5_i64], &col(&["7.5"]), TimeUnit::Millis, &bd("0")).expect("builds");
-		let batch = segment_to_record_batch(&seg).expect("builds the batch");
+	fn schema_metadata_is_self_describing() -> TestResult {
+		let seg = Segment::build(&[5_i64], &col(&["7.5"])?, TimeUnit::Millis, &bd("0")?)?;
+		let batch = segment_to_record_batch(&seg)?;
 		let md = batch.schema_ref().metadata();
-		assert_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("millis"));
-		assert_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
-		assert_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&seg.version.to_string()[..]));
-		assert!(md.contains_key(META_PHYSICAL_TYPE));
+		check_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("millis"));
+		check_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		check_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&seg.version.to_string()[..]));
+		check!(md.contains_key(META_PHYSICAL_TYPE));
+		Ok(())
 	}
 
 	#[test]
-	fn empty_segment_round_trips() {
-		let seg = Segment::build(&[], &[], TimeUnit::Seconds, &bd("0")).expect("builds");
-		let batch = segment_to_record_batch(&seg).expect("builds the batch");
-		assert_eq!(batch.num_rows(), 0);
-		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
-		assert!(back.is_empty());
+	fn empty_segment_round_trips() -> TestResult {
+		let seg = Segment::build(&[], &[], TimeUnit::Seconds, &bd("0")?)?;
+		let batch = segment_to_record_batch(&seg)?;
+		check_eq!(batch.num_rows(), 0);
+		let back = segment_from_record_batch(&batch, &bd("0")?)?;
+		check!(back.is_empty());
+		Ok(())
 	}
 
 	#[test]
-	fn missing_time_unit_metadata_is_reported() {
+	fn missing_time_unit_metadata_is_reported() -> TestResult {
 		// A batch with the right columns but no metadata cannot become a segment.
 		let ts = Int64Array::from(vec![1_i64, 2]);
 		let vals = StringArray::from(vec![Some("1.0"), Some("2.0")]);
 		let schema = Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, DataType::Utf8, true)]);
-		let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts), Arc::new(vals)]).expect("constructs");
-		assert_eq!(segment_from_record_batch(&batch, &bd("0")), Err(ConvertError::MissingMetadata(META_TIME_UNIT)));
+		let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts), Arc::new(vals)])?;
+		check_eq!(segment_from_record_batch(&batch, &bd("0")?), Err(ConvertError::MissingMetadata(META_TIME_UNIT)));
+		Ok(())
 	}
 
 	#[test]
-	fn missing_column_is_reported() {
+	fn missing_column_is_reported() -> TestResult {
 		let schema = Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false)]);
-		let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![1_i64]))]).expect("constructs");
-		assert_eq!(record_batch_to_columns(&batch), Err(ConvertError::MissingColumn(VALUE_COLUMN)));
+		let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![1_i64]))])?;
+		check_eq!(record_batch_to_columns(&batch), Err(ConvertError::MissingColumn(VALUE_COLUMN)));
+		Ok(())
 	}
 
 	#[test]
-	fn unparseable_value_cell_is_reported() {
+	fn unparseable_value_cell_is_reported() -> TestResult {
 		let ts = Int64Array::from(vec![1_i64]);
 		let vals = StringArray::from(vec![Some("not-a-number")]);
 		let schema = Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, DataType::Utf8, true)]);
-		let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts), Arc::new(vals)]).expect("constructs");
-		assert_eq!(record_batch_to_columns(&batch), Err(ConvertError::BadValue("not-a-number".to_string())));
+		let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(ts), Arc::new(vals)])?;
+		check_eq!(record_batch_to_columns(&batch), Err(ConvertError::BadValue("not-a-number".to_string())));
+		Ok(())
 	}
 
 	#[test]
-	fn f64_segment_uses_arrow_float64_and_round_trips() {
+	fn f64_segment_uses_arrow_float64_and_round_trips() -> TestResult {
 		// Values exact in binary64, sealed under a declared F64 encoding.
 		let timestamps = vec![1_i64, 2, 3, 4];
-		let values = col(&["0.5", "2.25", "-0.25", "128"]);
-		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
-		assert_eq!(seg.physical_type(), PhysicalType::F64);
+		let values = col(&["0.5", "2.25", "-0.25", "128"])?;
+		let seg = AspectSchema::new(PhysicalType::F64, bd("0")?, TimeUnit::Seconds).seal(&timestamps, &values)?;
+		check_eq!(seg.physical_type(), PhysicalType::F64);
 
-		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
+		let batch = segment_to_record_batch_typed(&seg)?;
 		// The value column is a real Arrow Float64, not text.
-		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float64);
-		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
+		check_eq!(value_column(&batch)?.data_type(), &DataType::Float64);
+		check_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
 
-		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+		let (ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+		Ok(())
 	}
 
 	#[test]
-	fn f32_segment_uses_arrow_float32_and_round_trips() {
+	fn f32_segment_uses_arrow_float32_and_round_trips() -> TestResult {
 		let timestamps = vec![10_i64, 20, 30];
-		let values = col(&["0.5", "0.25", "-4"]);
-		let seg = AspectSchema::new(PhysicalType::F32, bd("0"), TimeUnit::Millis).seal(&timestamps, &values).expect("seals");
-		assert_eq!(seg.physical_type(), PhysicalType::F32);
+		let values = col(&["0.5", "0.25", "-4"])?;
+		let seg = AspectSchema::new(PhysicalType::F32, bd("0")?, TimeUnit::Millis).seal(&timestamps, &values)?;
+		check_eq!(seg.physical_type(), PhysicalType::F32);
 
-		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
-		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float32);
-		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F32));
+		let batch = segment_to_record_batch_typed(&seg)?;
+		check_eq!(value_column(&batch)?.data_type(), &DataType::Float32);
+		check_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F32));
 
-		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
-		assert_eq!(back.decode(), (timestamps, values));
+		let back = segment_from_record_batch(&batch, &bd("0")?)?;
+		check_eq!(back.decode(), (timestamps, values));
+		Ok(())
 	}
 
 	#[test]
-	fn typed_export_preserves_nulls_in_the_float_column() {
+	fn typed_export_preserves_nulls_in_the_float_column() -> TestResult {
 		let timestamps = vec![1_i64, 2, 3, 4, 5];
-		let values = ncol(&[Some("0.5"), None, Some("2.25"), None, Some("-8")]);
-		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal_nullable(&timestamps, &values).expect("seals");
+		let values = ncol(&[Some("0.5"), None, Some("2.25"), None, Some("-8")])?;
+		let seg = AspectSchema::new(PhysicalType::F64, bd("0")?, TimeUnit::Seconds).seal_nullable(&timestamps, &values)?;
 
-		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
-		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<Float64Array>().unwrap();
-		assert_eq!(val_array.null_count(), 2);
-		assert!(val_array.is_null(1) && val_array.is_null(3));
+		let batch = segment_to_record_batch_typed(&seg)?;
+		let val_array = value_array::<Float64Array>(&batch)?;
+		check_eq!(val_array.null_count(), 2);
+		check!(val_array.is_null(1) && val_array.is_null(3));
 
-		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values);
+		let (ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn typed_export_falls_back_to_text_for_non_float_encodings() {
+	fn typed_export_falls_back_to_text_for_non_float_encodings() -> TestResult {
 		// A 60-digit value can only be held losslessly by the text encoding, so the
 		// typed path must fall back to Utf8 rather than downcast it to a float.
 		let timestamps = vec![1_i64, 2];
-		let values = col(&["123456789012345678901234567890.123456789012345678901234567890", "1"]);
-		let seg = Segment::build(&timestamps, &values, TimeUnit::Nanos, &bd("0")).expect("builds");
-		assert_eq!(seg.physical_type(), PhysicalType::BigDecimalText);
+		let values = col(&["123456789012345678901234567890.123456789012345678901234567890", "1"])?;
+		let seg = Segment::build(&timestamps, &values, TimeUnit::Nanos, &bd("0")?)?;
+		check_eq!(seg.physical_type(), PhysicalType::BigDecimalText);
 
-		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
-		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
-		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
-		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
-		assert!(back.is_exact());
-		assert_eq!(back.decode_values(), values);
+		let batch = segment_to_record_batch_typed(&seg)?;
+		check_eq!(value_column(&batch)?.data_type(), &DataType::Utf8);
+		check_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		let back = segment_from_record_batch(&batch, &bd("0")?)?;
+		check!(back.is_exact());
+		check_eq!(back.decode_values(), values);
+		Ok(())
 	}
 
 	#[test]
-	fn scaled_i64_segment_uses_arrow_decimal128_exactly() {
+	fn scaled_i64_segment_uses_arrow_decimal128_exactly() -> TestResult {
 		// Two-decimal-place values, sealed under a declared ScaledI64{scale:2}.
 		let timestamps = vec![1_i64, 2, 3, 4];
-		let values = col(&["12.34", "0.05", "-7.50", "1000.00"]);
-		let seg = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
-		assert_eq!(seg.physical_type(), PhysicalType::ScaledI64 { scale: 2 });
+		let values = col(&["12.34", "0.05", "-7.50", "1000.00"])?;
+		let seg = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0")?, TimeUnit::Seconds).seal(&timestamps, &values)?;
+		check_eq!(seg.physical_type(), PhysicalType::ScaledI64 { scale: 2 });
 
-		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
+		let batch = segment_to_record_batch_typed(&seg)?;
 		// The value column is an exact Arrow Decimal128 at scale 2.
-		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
-		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_DECIMAL128));
+		check_eq!(value_column(&batch)?.data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
+		check_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_DECIMAL128));
 
-		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(ts, timestamps);
+		let (ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(ts, timestamps);
 		// Values reconstruct exactly — no float rounding.
-		let got: Vec<BigDecimal> = vs.into_iter().map(|o| o.expect("present")).collect();
+		let got: Vec<BigDecimal> = vs.into_iter().collect::<Option<_>>().ok_or("every value present")?;
 		for (g, e) in got.iter().zip(values.iter()) {
-			assert_eq!(g, e, "decimal128 round trip is exact");
+			check_eq!(g, e, "decimal128 round trip is exact");
 		}
+		Ok(())
 	}
 
 	#[test]
-	fn scaled_i128_segment_round_trips_through_decimal128() {
+	fn scaled_i128_segment_round_trips_through_decimal128() -> TestResult {
 		// A value beyond i64 once shifted, exact at scale 2 → ScaledI128.
 		let big = "92233720368547758080.00"; // ~ (i64::MAX) * 10, two decimals
 		let timestamps = vec![1_i64, 2];
-		let values = col(&[big, "0.25"]);
-		let seg = AspectSchema::new(PhysicalType::ScaledI128 { scale: 2 }, bd("0"), TimeUnit::Micros).seal(&timestamps, &values).expect("seals");
-		assert_eq!(seg.physical_type(), PhysicalType::ScaledI128 { scale: 2 });
+		let values = col(&[big, "0.25"])?;
+		let seg = AspectSchema::new(PhysicalType::ScaledI128 { scale: 2 }, bd("0")?, TimeUnit::Micros).seal(&timestamps, &values)?;
+		check_eq!(seg.physical_type(), PhysicalType::ScaledI128 { scale: 2 });
 
-		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
-		assert!(matches!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), DataType::Decimal128(_, 2)));
-		let back = segment_from_record_batch(&batch, &bd("0")).expect("rebuilds");
-		assert!(back.is_exact());
-		assert_eq!(back.decode_values(), values);
+		let batch = segment_to_record_batch_typed(&seg)?;
+		check!(matches!(value_column(&batch)?.data_type(), DataType::Decimal128(_, 2)));
+		let back = segment_from_record_batch(&batch, &bd("0")?)?;
+		check!(back.is_exact());
+		check_eq!(back.decode_values(), values);
+		Ok(())
 	}
 
 	#[test]
-	fn decimal128_path_preserves_nulls() {
+	fn decimal128_path_preserves_nulls() -> TestResult {
 		let timestamps = vec![1_i64, 2, 3];
-		let values = ncol(&[Some("1.25"), None, Some("9.99")]);
-		let seg = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0"), TimeUnit::Seconds).seal_nullable(&timestamps, &values).expect("seals");
+		let values = ncol(&[Some("1.25"), None, Some("9.99")])?;
+		let seg = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0")?, TimeUnit::Seconds).seal_nullable(&timestamps, &values)?;
 
-		let batch = segment_to_record_batch_typed(&seg).expect("builds the batch");
-		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<Decimal128Array>().unwrap();
-		assert_eq!(val_array.null_count(), 1);
-		assert!(val_array.is_null(1));
-		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(vs, values);
+		let batch = segment_to_record_batch_typed(&seg)?;
+		let val_array = value_array::<Decimal128Array>(&batch)?;
+		check_eq!(val_array.null_count(), 1);
+		check!(val_array.is_null(1));
+		let (_ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn paged_segment_exports_one_batch_per_page_and_round_trips() {
+	fn paged_segment_exports_one_batch_per_page_and_round_trips() -> TestResult {
 		// 10 rows in pages of 4 ⇒ 3 pages (4 + 4 + 2).
 		let timestamps: Vec<i64> = (0..10).map(|i| 1_000 + i * 10).collect();
 		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
-		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Micros, &bd("0"), 4).expect("builds");
-		assert_eq!(paged.page_count(), 3);
+		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Micros, &bd("0")?, 4)?;
+		check_eq!(paged.page_count(), 3);
 
-		let batches = paged_segment_to_record_batches(&paged).expect("builds the batch");
-		assert_eq!(batches.len(), 3);
-		assert_eq!(batches[0].num_rows(), 4);
-		assert_eq!(batches[2].num_rows(), 2);
+		let batches = paged_segment_to_record_batches(&paged)?;
+		check_eq!(batches.len(), 3);
+		check_eq!(batches[0].num_rows(), 4);
+		check_eq!(batches[2].num_rows(), 2);
 		// Each batch carries the shared time unit in its metadata.
-		assert_eq!(batches[1].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("micros"));
+		check_eq!(batches[1].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("micros"));
 
 		// Concatenating the page batches recovers the full columns in order.
-		let (ts, vs) = record_batches_to_columns(&batches).expect("reads back");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values.iter().cloned().map(Some).collect::<Vec<_>>());
+		let (ts, vs) = record_batches_to_columns(&batches)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values.iter().cloned().map(Some).collect::<Vec<_>>());
 
 		// Rebuilding with the original page height reproduces the paged segment.
-		let rebuilt = paged_segment_from_record_batches(&batches, &bd("0"), 4).expect("rebuilds");
-		assert_eq!(rebuilt.page_count(), 3);
-		assert_eq!(rebuilt.decode_nullable(), paged.decode_nullable());
+		let rebuilt = paged_segment_from_record_batches(&batches, &bd("0")?, 4)?;
+		check_eq!(rebuilt.page_count(), 3);
+		check_eq!(rebuilt.decode_nullable(), paged.decode_nullable());
+		Ok(())
 	}
 
 	#[test]
-	fn paged_segment_collapses_to_a_single_batch() {
+	fn paged_segment_collapses_to_a_single_batch() -> TestResult {
 		let timestamps: Vec<i64> = (0..7).collect();
-		let values = ncol(&[Some("1.0"), None, Some("3.0"), Some("4.0"), None, Some("6.0"), Some("7.0")]);
-		let paged = PagedSegment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 3).expect("builds");
-		assert_eq!(paged.page_count(), 3);
+		let values = ncol(&[Some("1.0"), None, Some("3.0"), Some("4.0"), None, Some("6.0"), Some("7.0")])?;
+		let paged = PagedSegment::build_nullable(&timestamps, &values, TimeUnit::Seconds, &bd("0")?, 3)?;
+		check_eq!(paged.page_count(), 3);
 
-		let batch = paged_segment_to_record_batch(&paged).expect("builds the batch");
-		assert_eq!(batch.num_rows(), 7);
-		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values);
+		let batch = paged_segment_to_record_batch(&paged)?;
+		check_eq!(batch.num_rows(), 7);
+		let (ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn empty_paged_segment_yields_no_batches() {
-		let paged = PagedSegment::build(&[], &[], TimeUnit::Seconds, &bd("0"), 4).expect("builds");
-		assert_eq!(paged.page_count(), 0);
-		assert!(paged_segment_to_record_batches(&paged).expect("builds the batches").is_empty());
+	fn empty_paged_segment_yields_no_batches() -> TestResult {
+		let paged = PagedSegment::build(&[], &[], TimeUnit::Seconds, &bd("0")?, 4)?;
+		check_eq!(paged.page_count(), 0);
+		check!(paged_segment_to_record_batches(&paged)?.is_empty());
 		// Rebuilding from no batches cannot recover the unit, so it is an error.
-		assert_eq!(paged_segment_from_record_batches(&[], &bd("0"), 4), Err(ConvertError::MissingMetadata(META_TIME_UNIT)));
+		check_eq!(paged_segment_from_record_batches(&[], &bd("0")?, 4), Err(ConvertError::MissingMetadata(META_TIME_UNIT)));
+		Ok(())
 	}
 
 	#[test]
-	fn logical_columns_round_trip_through_arrow() {
+	fn logical_columns_round_trip_through_arrow() -> TestResult {
 		// The shape a segment-store time-range read returns: a dense timestamp
 		// column and a nullable value column that may have crossed several segments.
 		let timestamps = vec![100_i64, 110, 120, 130, 140];
-		let values = ncol(&[Some("1.5"), None, Some("3.5"), Some("4.0"), None]);
-		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values).expect("builds the batch");
+		let values = ncol(&[Some("1.5"), None, Some("3.5"), Some("4.0"), None])?;
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values)?;
 
-		assert_eq!(batch.num_columns(), 2);
-		assert_eq!(batch.num_rows(), 5);
+		check_eq!(batch.num_columns(), 2);
+		check_eq!(batch.num_rows(), 5);
 		// Lossless text form, with the two gaps as Arrow validity bits.
-		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
-		let val_array = batch.column_by_name(VALUE_COLUMN).unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-		assert_eq!(val_array.null_count(), 2);
+		check_eq!(value_column(&batch)?.data_type(), &DataType::Utf8);
+		let val_array = value_array::<StringArray>(&batch)?;
+		check_eq!(val_array.null_count(), 2);
 
-		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values);
+		let (ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn logical_columns_metadata_marks_the_logical_export() {
-		let batch = columns_to_record_batch(TimeUnit::Nanos, &[1_i64], &[Some(bd("2.5"))]).expect("builds the batch");
+	fn logical_columns_metadata_marks_the_logical_export() -> TestResult {
+		let batch = columns_to_record_batch(TimeUnit::Nanos, &[1_i64], &[Some(bd("2.5")?)])?;
 		let md = batch.schema_ref().metadata();
-		assert_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("nanos"));
-		assert_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		check_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("nanos"));
+		check_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
 		// Physical type is the lossless logical text form, version is the sentinel.
-		assert_eq!(md.get(META_PHYSICAL_TYPE).map(String::as_str), Some(PhysicalType::BigDecimalText.name()));
-		assert_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+		check_eq!(md.get(META_PHYSICAL_TYPE).map(String::as_str), Some(PhysicalType::BigDecimalText.name()));
+		check_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+		Ok(())
 	}
 
 	#[test]
-	fn logical_columns_high_precision_is_lossless() {
+	fn logical_columns_high_precision_is_lossless() -> TestResult {
 		// Crossing into Arrow as text keeps every digit, even past f64/i128 range.
 		let huge = "123456789012345678901234567890.123456789012345678901234567890";
 		let timestamps = vec![1_i64, 2];
-		let values = vec![Some(bd(huge)), Some(bd("-0.000000000000000000000000000001"))];
-		let batch = columns_to_record_batch(TimeUnit::Nanos, &timestamps, &values).expect("builds the batch");
-		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(vs, values);
+		let values = vec![Some(bd(huge)?), Some(bd("-0.000000000000000000000000000001")?)];
+		let batch = columns_to_record_batch(TimeUnit::Nanos, &timestamps, &values)?;
+		let (_ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn logical_columns_empty_is_a_zero_row_batch() {
-		let batch = columns_to_record_batch(TimeUnit::Seconds, &[], &[]).expect("builds the batch");
-		assert_eq!(batch.num_rows(), 0);
-		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert!(ts.is_empty() && vs.is_empty());
+	fn logical_columns_empty_is_a_zero_row_batch() -> TestResult {
+		let batch = columns_to_record_batch(TimeUnit::Seconds, &[], &[])?;
+		check_eq!(batch.num_rows(), 0);
+		let (ts, vs) = record_batch_to_columns(&batch)?;
+		check!(ts.is_empty() && vs.is_empty());
+		Ok(())
 	}
 
 	#[test]
-	fn logical_columns_reject_mismatched_lengths() {
-		assert_eq!(columns_to_record_batch(TimeUnit::Seconds, &[1_i64, 2], &[Some(bd("1.0"))]), Err(ConvertError::LengthMismatch { column: VALUE_COLUMN, expected: 2, actual: 1 }));
+	fn logical_columns_reject_mismatched_lengths() -> TestResult {
+		check_eq!(columns_to_record_batch(TimeUnit::Seconds, &[1_i64, 2], &[Some(bd("1.0")?)]), Err(ConvertError::LengthMismatch { column: VALUE_COLUMN, expected: 2, actual: 1 }));
+		Ok(())
 	}
 
 	#[test]
-	fn typed_logical_columns_emit_float64_and_round_trip() {
+	fn typed_logical_columns_emit_float64_and_round_trip() -> TestResult {
 		let timestamps = vec![1_i64, 2, 3, 4];
-		let values = ncol(&[Some("0.5"), None, Some("2.25"), Some("-8")]);
-		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values).expect("builds the batch");
+		let values = ncol(&[Some("0.5"), None, Some("2.25"), Some("-8")])?;
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values)?;
 
-		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Float64);
-		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
+		check_eq!(value_column(&batch)?.data_type(), &DataType::Float64);
+		check_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
 		// Physical type recorded is the declared one, version is the logical sentinel.
-		assert_eq!(batch.schema_ref().metadata().get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+		check_eq!(batch.schema_ref().metadata().get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
 
-		let (ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values);
+		let (ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn typed_logical_columns_emit_exact_decimal128() {
+	fn typed_logical_columns_emit_exact_decimal128() -> TestResult {
 		let timestamps = vec![1_i64, 2, 3];
-		let values = ncol(&[Some("12.34"), None, Some("-7.50")]);
-		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values).expect("builds the batch");
+		let values = ncol(&[Some("12.34"), None, Some("-7.50")])?;
+		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values)?;
 
-		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
-		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
+		check_eq!(value_column(&batch)?.data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
+		let (_ts, vs) = record_batch_to_columns(&batch)?;
 		// Exact reconstruction — no float rounding.
-		assert_eq!(vs, values);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn typed_logical_columns_fall_back_to_text_for_variable_encoding() {
+	fn typed_logical_columns_fall_back_to_text_for_variable_encoding() -> TestResult {
 		// BigDecimalText has no fixed-width Arrow array → the typed path stays text.
 		let timestamps = vec![1_i64, 2];
-		let values = vec![Some(bd("123456789012345678901234567890.123")), Some(bd("1"))];
-		let batch = columns_to_record_batch_typed(TimeUnit::Nanos, PhysicalType::BigDecimalText, &timestamps, &values).expect("builds the batch");
+		let values = vec![Some(bd("123456789012345678901234567890.123")?), Some(bd("1")?)];
+		let batch = columns_to_record_batch_typed(TimeUnit::Nanos, PhysicalType::BigDecimalText, &timestamps, &values)?;
 
-		assert_eq!(batch.column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Utf8);
-		assert_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
-		let (_ts, vs) = record_batch_to_columns(&batch).expect("reads back");
-		assert_eq!(vs, values);
+		check_eq!(value_column(&batch)?.data_type(), &DataType::Utf8);
+		check_eq!(batch.schema_ref().metadata().get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_TEXT));
+		let (_ts, vs) = record_batch_to_columns(&batch)?;
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn typed_logical_columns_match_segment_typed_export() {
+	fn typed_logical_columns_match_segment_typed_export() -> TestResult {
 		// The column-level typed path and the segment-level typed path must agree.
 		let timestamps = vec![1_i64, 2, 3, 4];
-		let values = col(&["0.5", "2.25", "-0.25", "128"]);
-		let seg = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds).seal(&timestamps, &values).expect("seals");
+		let values = col(&["0.5", "2.25", "-0.25", "128"])?;
+		let seg = AspectSchema::new(PhysicalType::F64, bd("0")?, TimeUnit::Seconds).seal(&timestamps, &values)?;
 
-		let from_segment = segment_to_record_batch_typed(&seg).expect("builds the batch");
+		let from_segment = segment_to_record_batch_typed(&seg)?;
 		let nullable: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
-		let from_columns = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &nullable).expect("builds the batch");
+		let from_columns = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &nullable)?;
 
 		// Same value column type and same decoded contents (metadata version differs:
 		// a real segment version vs the logical sentinel).
-		assert_eq!(from_segment.column_by_name(VALUE_COLUMN).unwrap().data_type(), from_columns.column_by_name(VALUE_COLUMN).unwrap().data_type());
-		assert_eq!(record_batch_to_columns(&from_segment).unwrap(), record_batch_to_columns(&from_columns).unwrap());
+		check_eq!(value_column(&from_segment)?.data_type(), value_column(&from_columns)?.data_type());
+		check_eq!(record_batch_to_columns(&from_segment)?, record_batch_to_columns(&from_columns)?);
+		Ok(())
 	}
 
 	#[test]
-	fn ipc_stream_round_trips_a_single_batch() {
+	fn ipc_stream_round_trips_a_single_batch() -> TestResult {
 		let timestamps = vec![1_i64, 2, 3];
-		let values = ncol(&[Some("1.5"), None, Some("3.5")]);
-		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values).expect("builds the batch");
+		let values = ncol(&[Some("1.5"), None, Some("3.5")])?;
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values)?;
 
-		let bytes = write_ipc_stream(std::slice::from_ref(&batch)).expect("writes");
-		assert!(!bytes.is_empty());
-		let back = read_ipc_stream(&bytes).expect("reads");
-		assert_eq!(back.len(), 1);
+		let bytes = write_ipc_stream(std::slice::from_ref(&batch))?;
+		check!(!bytes.is_empty());
+		let back = read_ipc_stream(&bytes)?;
+		check_eq!(back.len(), 1);
 
 		// The self-describing metadata survives the stream.
-		assert_eq!(back[0].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("millis"));
-		let (ts, vs) = record_batch_to_columns(&back[0]).expect("reads back columns");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values);
+		check_eq!(back[0].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("millis"));
+		let (ts, vs) = record_batch_to_columns(&back[0])?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn ipc_stream_round_trips_typed_and_paged_batches() {
+	fn ipc_stream_round_trips_typed_and_paged_batches() -> TestResult {
 		// A multi-page export: each page batch shares one schema, so they stream together.
 		let timestamps: Vec<i64> = (0..10).map(|i| 100 + i).collect();
 		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
-		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 4).expect("builds");
-		let batches = paged_segment_to_record_batches(&paged).expect("builds the batch");
-		assert_eq!(batches.len(), 3);
+		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0")?, 4)?;
+		let batches = paged_segment_to_record_batches(&paged)?;
+		check_eq!(batches.len(), 3);
 
-		let bytes = write_ipc_stream(&batches).expect("writes");
-		let back = read_ipc_stream(&bytes).expect("reads");
-		assert_eq!(back.len(), 3);
-		let (ts, vs) = record_batches_to_columns(&back).expect("reads back columns");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+		let bytes = write_ipc_stream(&batches)?;
+		let back = read_ipc_stream(&bytes)?;
+		check_eq!(back.len(), 3);
+		let (ts, vs) = record_batches_to_columns(&back)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+		Ok(())
 	}
 
 	#[test]
@@ -1444,58 +1524,61 @@ mod tests {
 
 	#[test]
 	fn ipc_read_rejects_garbage_bytes() {
-		let err = read_ipc_stream(b"not an arrow stream").expect_err("must error");
-		assert!(matches!(err, ConvertError::Ipc(_)), "got: {err}");
+		let result = read_ipc_stream(b"not an arrow stream");
+		assert!(matches!(result, Err(ConvertError::Ipc(_))), "got: {result:?}");
 	}
 
 	#[test]
-	fn parquet_round_trips_a_single_batch() {
+	fn parquet_round_trips_a_single_batch() -> TestResult {
 		let timestamps = vec![1_i64, 2, 3];
-		let values = ncol(&[Some("1.5"), None, Some("3.5")]);
-		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values).expect("builds the batch");
+		let values = ncol(&[Some("1.5"), None, Some("3.5")])?;
+		let batch = columns_to_record_batch(TimeUnit::Millis, &timestamps, &values)?;
 
-		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
+		let bytes = write_parquet(std::slice::from_ref(&batch))?;
 		// Parquet files start with the "PAR1" magic.
-		assert_eq!(&bytes[..4], b"PAR1");
-		let back = read_parquet(&bytes).expect("reads");
-		assert_eq!(back.len(), 1);
+		check_eq!(&bytes[..4], b"PAR1");
+		let back = read_parquet(&bytes)?;
+		check_eq!(back.len(), 1);
 
 		// The self-describing Arrow metadata survives the Parquet file.
-		assert_eq!(back[0].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("millis"));
-		let (ts, vs) = record_batch_to_columns(&back[0]).expect("reads back columns");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values);
+		check_eq!(back[0].schema_ref().metadata().get(META_TIME_UNIT).map(String::as_str), Some("millis"));
+		let (ts, vs) = record_batch_to_columns(&back[0])?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn parquet_preserves_exact_decimal128_values() {
+	fn parquet_preserves_exact_decimal128_values() -> TestResult {
 		// The typed exact-Decimal128 path must stay byte-faithful through Parquet.
 		let timestamps = vec![1_i64, 2, 3];
-		let values = ncol(&[Some("12.34"), None, Some("-7.50")]);
-		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values).expect("builds the batch");
+		let values = ncol(&[Some("12.34"), None, Some("-7.50")])?;
+		let batch = columns_to_record_batch_typed(TimeUnit::Millis, PhysicalType::ScaledI64 { scale: 2 }, &timestamps, &values)?;
 
-		let bytes = write_parquet(std::slice::from_ref(&batch)).expect("writes");
-		let back = read_parquet(&bytes).expect("reads");
-		assert_eq!(back[0].column_by_name(VALUE_COLUMN).unwrap().data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
-		let (_ts, vs) = record_batch_to_columns(&back[0]).expect("reads back");
+		let bytes = write_parquet(std::slice::from_ref(&batch))?;
+		let back = read_parquet(&bytes)?;
+		check_eq!(value_column(&back[0])?.data_type(), &DataType::Decimal128(DECIMAL128_MAX_PRECISION, 2));
+		let (_ts, vs) = record_batch_to_columns(&back[0])?;
 		// Exact reconstruction — no float rounding.
-		assert_eq!(vs, values);
+		check_eq!(vs, values);
+		Ok(())
 	}
 
 	#[test]
-	fn parquet_round_trips_paged_batches_into_columns() {
+	fn parquet_round_trips_paged_batches_into_columns() -> TestResult {
 		// A multi-page export writes several row groups into one Parquet file.
 		let timestamps: Vec<i64> = (0..10).map(|i| 100 + i).collect();
 		let values: Vec<BigDecimal> = (0..10).map(BigDecimal::from).collect();
-		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0"), 4).expect("builds");
-		let batches = paged_segment_to_record_batches(&paged).expect("builds the batch");
-		assert_eq!(batches.len(), 3);
+		let paged = PagedSegment::build(&timestamps, &values, TimeUnit::Seconds, &bd("0")?, 4)?;
+		let batches = paged_segment_to_record_batches(&paged)?;
+		check_eq!(batches.len(), 3);
 
-		let bytes = write_parquet(&batches).expect("writes");
-		let back = read_parquet(&bytes).expect("reads");
-		let (ts, vs) = record_batches_to_columns(&back).expect("reads back columns");
-		assert_eq!(ts, timestamps);
-		assert_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+		let bytes = write_parquet(&batches)?;
+		let back = read_parquet(&bytes)?;
+		let (ts, vs) = record_batches_to_columns(&back)?;
+		check_eq!(ts, timestamps);
+		check_eq!(vs, values.into_iter().map(Some).collect::<Vec<_>>());
+		Ok(())
 	}
 
 	#[test]
@@ -1506,84 +1589,89 @@ mod tests {
 	/// Snappy is the default codec of the writers clients ingest from (pyarrow, R's arrow,
 	/// pandas, Spark): a reader built without it refuses their files outright.
 	#[test]
-	fn parquet_reads_a_snappy_compressed_file() {
+	fn parquet_reads_a_snappy_compressed_file() -> TestResult {
 		use parquet::{basic::Compression, file::properties::WriterProperties};
 		let schema = Arc::new(Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, false), Field::new(VALUE_COLUMN, DataType::Utf8, true)]));
-		let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1_i64, 2])), Arc::new(StringArray::from(vec![Some("1.25"), None]))]).expect("constructs");
+		let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1_i64, 2])), Arc::new(StringArray::from(vec![Some("1.25"), None]))])?;
 		let mut bytes = Vec::new();
 		let properties = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
-		let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties)).expect("a snappy writer");
-		writer.write(&batch).expect("writes");
-		writer.close().expect("closes");
-		let read = read_parquet(&bytes).expect("snappy reads");
-		assert_eq!(read[0].column(1).as_ref(), batch.column(1).as_ref());
+		let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties))?;
+		writer.write(&batch)?;
+		writer.close()?;
+		let read = read_parquet(&bytes)?;
+		check_eq!(read[0].column(1).as_ref(), batch.column(1).as_ref());
+		Ok(())
 	}
 
 	#[test]
-	fn a_null_timestamp_is_refused_not_read_as_the_epoch() {
+	fn a_null_timestamp_is_refused_not_read_as_the_epoch() -> TestResult {
 		let schema = Arc::new(Schema::new(vec![Field::new(TIMESTAMP_COLUMN, DataType::Int64, true), Field::new(VALUE_COLUMN, DataType::Utf8, true)]));
-		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(5_i64), None])), Arc::new(StringArray::from(vec![Some("1"), Some("2")]))]).expect("constructs");
-		assert_eq!(record_batch_to_columns(&batch), Err(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64 with no nulls" }));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(5_i64), None])), Arc::new(StringArray::from(vec![Some("1"), Some("2")]))])?;
+		check_eq!(record_batch_to_columns(&batch), Err(ConvertError::WrongType { column: TIMESTAMP_COLUMN, expected: "Int64 with no nulls" }));
+		Ok(())
 	}
 
 	#[test]
 	fn parquet_read_rejects_garbage_bytes() {
-		let err = read_parquet(b"not a parquet file").expect_err("must error");
-		assert!(matches!(err, ConvertError::Parquet(_)), "got: {err}");
+		let result = read_parquet(b"not a parquet file");
+		assert!(matches!(result, Err(ConvertError::Parquet(_))), "got: {result:?}");
 	}
 
 	#[test]
-	fn reconstructed_series_batch_has_three_typed_columns() {
+	fn reconstructed_series_batch_has_three_typed_columns() -> TestResult {
 		let timestamps = [0_i64, 60, 120];
 		let values = [0.0_f64, 30.0, 60.0];
 		let kinds = ["raw", "interpolated", "raw"];
-		let batch = reconstructed_series_to_record_batch(TimeUnit::Seconds, &timestamps, &values, &kinds).expect("builds the batch");
+		let batch = reconstructed_series_to_record_batch(TimeUnit::Seconds, &timestamps, &values, &kinds)?;
 
-		assert_eq!(batch.num_columns(), 3);
-		assert_eq!(batch.num_rows(), 3);
-		assert_eq!(batch.schema_ref().field(0).name(), TIMESTAMP_COLUMN);
-		assert_eq!(batch.schema_ref().field(0).data_type(), &DataType::Int64);
-		assert_eq!(batch.schema_ref().field(1).name(), VALUE_COLUMN);
-		assert_eq!(batch.schema_ref().field(1).data_type(), &DataType::Float64);
-		assert_eq!(batch.schema_ref().field(2).name(), SERIES_KIND_COLUMN);
-		assert_eq!(batch.schema_ref().field(2).data_type(), &DataType::Utf8);
+		check_eq!(batch.num_columns(), 3);
+		check_eq!(batch.num_rows(), 3);
+		check_eq!(batch.schema_ref().field(0).name(), TIMESTAMP_COLUMN);
+		check_eq!(batch.schema_ref().field(0).data_type(), &DataType::Int64);
+		check_eq!(batch.schema_ref().field(1).name(), VALUE_COLUMN);
+		check_eq!(batch.schema_ref().field(1).data_type(), &DataType::Float64);
+		check_eq!(batch.schema_ref().field(2).name(), SERIES_KIND_COLUMN);
+		check_eq!(batch.schema_ref().field(2).data_type(), &DataType::Utf8);
 
 		let md = batch.schema_ref().metadata();
-		assert_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("seconds"));
-		assert_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
-		assert_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+		check_eq!(md.get(META_TIME_UNIT).map(String::as_str), Some("seconds"));
+		check_eq!(md.get(META_VALUE_ENCODING).map(String::as_str), Some(VALUE_ENCODING_F64));
+		check_eq!(md.get(META_FORMAT_VERSION).map(String::as_str), Some(&LOGICAL_EXPORT_VERSION.to_string()[..]));
+		Ok(())
 	}
 
 	#[test]
-	fn reconstructed_series_round_trips_through_ipc() {
+	fn reconstructed_series_round_trips_through_ipc() -> TestResult {
 		let timestamps = [1_000_i64, 1_010, 1_020];
 		let values = [1.5_f64, 2.25, 3.0];
 		let kinds = ["raw", "interpolated", "extrapolated"];
-		let bytes = reconstructed_series_to_ipc_bytes(TimeUnit::Millis, &timestamps, &values, &kinds).expect("writes ipc");
+		let bytes = reconstructed_series_to_ipc_bytes(TimeUnit::Millis, &timestamps, &values, &kinds)?;
 
-		let batches = read_ipc_stream(&bytes).expect("reads ipc");
-		assert_eq!(batches.len(), 1);
-		let (unit, ts, vs, ks) = reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
-		assert_eq!(unit, TimeUnit::Millis);
-		assert_eq!(ts, timestamps.to_vec());
-		assert_eq!(vs, values.to_vec());
-		assert_eq!(ks, vec!["raw", "interpolated", "extrapolated"]);
+		let batches = read_ipc_stream(&bytes)?;
+		check_eq!(batches.len(), 1);
+		let (unit, ts, vs, ks) = reconstructed_series_from_record_batch(&batches[0])?;
+		check_eq!(unit, TimeUnit::Millis);
+		check_eq!(ts, timestamps.to_vec());
+		check_eq!(vs, values.to_vec());
+		check_eq!(ks, vec!["raw", "interpolated", "extrapolated"]);
+		Ok(())
 	}
 
 	#[test]
-	fn reconstructed_series_round_trips_through_parquet() {
+	fn reconstructed_series_round_trips_through_parquet() -> TestResult {
 		let timestamps = [0_i64, 1, 2, 3];
 		let values = [10.0_f64, 20.0, 30.0, 40.0];
 		let kinds = ["raw", "interpolated", "interpolated", "raw"];
-		let bytes = reconstructed_series_to_parquet_bytes(TimeUnit::Nanos, &timestamps, &values, &kinds).expect("writes parquet");
-		assert_eq!(&bytes[..4], b"PAR1");
+		let bytes = reconstructed_series_to_parquet_bytes(TimeUnit::Nanos, &timestamps, &values, &kinds)?;
+		check_eq!(&bytes[..4], b"PAR1");
 
-		let batches = read_parquet(&bytes).expect("reads parquet");
-		let (unit, ts, vs, ks) = reconstructed_series_from_record_batch(&batches[0]).expect("reads back");
-		assert_eq!(unit, TimeUnit::Nanos);
-		assert_eq!(ts, timestamps.to_vec());
-		assert_eq!(vs, values.to_vec());
-		assert_eq!(ks, vec!["raw", "interpolated", "interpolated", "raw"]);
+		let batches = read_parquet(&bytes)?;
+		let (unit, ts, vs, ks) = reconstructed_series_from_record_batch(&batches[0])?;
+		check_eq!(unit, TimeUnit::Nanos);
+		check_eq!(ts, timestamps.to_vec());
+		check_eq!(vs, values.to_vec());
+		check_eq!(ks, vec!["raw", "interpolated", "interpolated", "raw"]);
+		Ok(())
 	}
 
 	#[test]
@@ -1592,68 +1680,72 @@ mod tests {
 	}
 
 	#[test]
-	fn reduction_table_batch_lays_out_timestamp_count_and_reductions() {
+	fn reduction_table_batch_lays_out_timestamp_count_and_reductions() -> TestResult {
 		let timestamps = [0_i64, 60];
 		let counts = [3_i64, 2];
 		let names = ["min", "max", "avg"];
 		let columns = vec![vec![0.0_f64, 30.0], vec![20.0, 50.0], vec![10.0, 40.0]];
-		let batch = reduction_table_to_record_batch(TimeUnit::Seconds, &timestamps, &counts, &names, &columns).expect("builds the batch");
+		let batch = reduction_table_to_record_batch(TimeUnit::Seconds, &timestamps, &counts, &names, &columns)?;
 
-		assert_eq!(batch.num_columns(), 5);
-		assert_eq!(batch.num_rows(), 2);
-		assert_eq!(batch.schema_ref().field(0).name(), TIMESTAMP_COLUMN);
-		assert_eq!(batch.schema_ref().field(1).name(), REDUCTION_COUNT_COLUMN);
-		assert_eq!(batch.schema_ref().field(1).data_type(), &DataType::Int64);
-		assert_eq!(batch.schema_ref().field(2).name(), "min");
-		assert_eq!(batch.schema_ref().field(2).data_type(), &DataType::Float64);
-		assert_eq!(batch.schema_ref().field(4).name(), "avg");
+		check_eq!(batch.num_columns(), 5);
+		check_eq!(batch.num_rows(), 2);
+		check_eq!(batch.schema_ref().field(0).name(), TIMESTAMP_COLUMN);
+		check_eq!(batch.schema_ref().field(1).name(), REDUCTION_COUNT_COLUMN);
+		check_eq!(batch.schema_ref().field(1).data_type(), &DataType::Int64);
+		check_eq!(batch.schema_ref().field(2).name(), "min");
+		check_eq!(batch.schema_ref().field(2).data_type(), &DataType::Float64);
+		check_eq!(batch.schema_ref().field(4).name(), "avg");
+		Ok(())
 	}
 
 	#[test]
-	fn reduction_table_round_trips_through_ipc() {
+	fn reduction_table_round_trips_through_ipc() -> TestResult {
 		let timestamps = [0_i64, 60];
 		let counts = [3_i64, 2];
 		let names = ["min", "sum"];
 		let columns = vec![vec![0.0_f64, 30.0], vec![30.0, 80.0]];
-		let bytes = reduction_table_to_ipc_bytes(TimeUnit::Seconds, &timestamps, &counts, &names, &columns).expect("writes ipc");
+		let bytes = reduction_table_to_ipc_bytes(TimeUnit::Seconds, &timestamps, &counts, &names, &columns)?;
 
-		let batches = read_ipc_stream(&bytes).expect("reads ipc");
-		let (unit, ts, cs, aggs) = reduction_table_from_record_batch(&batches[0]).expect("reads back");
-		assert_eq!(unit, TimeUnit::Seconds);
-		assert_eq!(ts, timestamps.to_vec());
-		assert_eq!(cs, counts.to_vec());
-		assert_eq!(aggs.len(), 2);
-		assert_eq!(aggs[0], ("min".to_string(), vec![0.0, 30.0]));
-		assert_eq!(aggs[1], ("sum".to_string(), vec![30.0, 80.0]));
+		let batches = read_ipc_stream(&bytes)?;
+		let (unit, ts, cs, aggs) = reduction_table_from_record_batch(&batches[0])?;
+		check_eq!(unit, TimeUnit::Seconds);
+		check_eq!(ts, timestamps.to_vec());
+		check_eq!(cs, counts.to_vec());
+		check_eq!(aggs.len(), 2);
+		check_eq!(aggs[0], ("min".to_string(), vec![0.0, 30.0]));
+		check_eq!(aggs[1], ("sum".to_string(), vec![30.0, 80.0]));
+		Ok(())
 	}
 
 	#[test]
-	fn reduction_table_round_trips_through_parquet() {
+	fn reduction_table_round_trips_through_parquet() -> TestResult {
 		let timestamps = [0_i64, 60];
 		let counts = [1_i64, 1];
 		let names = ["avg"];
 		let columns = vec![vec![5.0_f64, 7.5]];
-		let bytes = reduction_table_to_parquet_bytes(TimeUnit::Millis, &timestamps, &counts, &names, &columns).expect("writes parquet");
-		assert_eq!(&bytes[..4], b"PAR1");
+		let bytes = reduction_table_to_parquet_bytes(TimeUnit::Millis, &timestamps, &counts, &names, &columns)?;
+		check_eq!(&bytes[..4], b"PAR1");
 
-		let batches = read_parquet(&bytes).expect("reads parquet");
-		let (unit, ts, cs, aggs) = reduction_table_from_record_batch(&batches[0]).expect("reads back");
-		assert_eq!(unit, TimeUnit::Millis);
-		assert_eq!(ts, timestamps.to_vec());
-		assert_eq!(cs, counts.to_vec());
-		assert_eq!(aggs, vec![("avg".to_string(), vec![5.0, 7.5])]);
+		let batches = read_parquet(&bytes)?;
+		let (unit, ts, cs, aggs) = reduction_table_from_record_batch(&batches[0])?;
+		check_eq!(unit, TimeUnit::Millis);
+		check_eq!(ts, timestamps.to_vec());
+		check_eq!(cs, counts.to_vec());
+		check_eq!(aggs, vec![("avg".to_string(), vec![5.0, 7.5])]);
+		Ok(())
 	}
 
 	#[test]
-	fn a_reduction_with_gaps_is_a_nullable_column_and_a_dense_one_is_not() {
-		let batch = reduction_table_with_gaps_to_record_batch(TimeUnit::Seconds, &[0, 60, 120], &[2, 0, 1], &["min", "max"], &[vec![Some(1.0), None, Some(3.0)], vec![Some(2.0), Some(2.5), Some(4.0)]]).expect("builds the batch");
+	fn a_reduction_with_gaps_is_a_nullable_column_and_a_dense_one_is_not() -> TestResult {
+		let batch = reduction_table_with_gaps_to_record_batch(TimeUnit::Seconds, &[0, 60, 120], &[2, 0, 1], &["min", "max"], &[vec![Some(1.0), None, Some(3.0)], vec![Some(2.0), Some(2.5), Some(4.0)]])?;
 		let schema = batch.schema();
-		assert!(schema.field_with_name("min").expect("min").is_nullable());
-		assert!(!schema.field_with_name("max").expect("max").is_nullable(), "a column with every value keeps the dense schema");
-		let min = batch.column_by_name("min").and_then(|c| c.as_any().downcast_ref::<Float64Array>()).expect("f64");
-		assert!(min.is_null(1) && min.value(2) == 3.0);
-		assert!(!reduction_table_with_gaps_to_ipc_bytes(TimeUnit::Seconds, &[0], &[0], &["min"], &[vec![None]]).expect("writes ipc").is_empty());
-		assert!(!reduction_table_with_gaps_to_parquet_bytes(TimeUnit::Seconds, &[0], &[0], &["min"], &[vec![None]]).expect("writes parquet").is_empty());
+		check!(schema.field_with_name("min")?.is_nullable());
+		check!(!schema.field_with_name("max")?.is_nullable(), "a column with every value keeps the dense schema");
+		let min = batch.column_by_name("min").and_then(|c| c.as_any().downcast_ref::<Float64Array>()).ok_or("min column is f64")?;
+		check!(min.is_null(1) && (min.value(2) - 3.0).abs() < f64::EPSILON);
+		check!(!reduction_table_with_gaps_to_ipc_bytes(TimeUnit::Seconds, &[0], &[0], &["min"], &[vec![None]])?.is_empty());
+		check!(!reduction_table_with_gaps_to_parquet_bytes(TimeUnit::Seconds, &[0], &[0], &["min"], &[vec![None]])?.is_empty());
+		Ok(())
 	}
 
 	#[test]

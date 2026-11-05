@@ -21,6 +21,9 @@
 //! "restarts": every handle is released and the database is reopened cold, so no cache
 //! of the crashed run survives, as after a real process crash. The consumer crash is also
 //! run as one: a re-executed child aborts at the point (`WEFT_FAULT=<point>:abort`).
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{
 	collections::{BTreeMap, BTreeSet, HashSet}, sync::Arc

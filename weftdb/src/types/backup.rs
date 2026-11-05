@@ -405,10 +405,10 @@ pub const BACKUP_MANIFEST: &str = "MANIFEST.json";
 /// if it were control plane only.
 pub const MANIFEST_FORMAT: &str = "weftdb-control-plane-backup/1";
 
-/// The [`BackupManifest::format`] of a whole-store backup (D-S16): the control
-/// plane plus every `.weftseg` frame it references, the store's allocators and
-/// its embedded `STORE_FORMAT`. A control-plane restore refuses it, and a
-/// whole-store restore refuses anything else.
+/// The [`BackupManifest::format`] of a whole-store backup (D-S16).
+///
+/// The control plane plus every `.weftseg` frame it references, the store's allocators and its embedded
+/// `STORE_FORMAT`. A control-plane restore refuses it, and a whole-store restore refuses anything else.
 pub const WHOLE_STORE_MANIFEST_FORMAT: &str = "weftdb-whole-store-backup/1";
 
 /// How a whole-store backup carries its frames (D-S16).
@@ -426,9 +426,10 @@ pub enum BackupMode {
 	Copy,
 }
 
-/// The bytes a backup in `mode` needs free at its destination: the control
-/// plane always copies (it is `VACUUM INTO` output); frames cost their bytes
-/// only when they are copied, since a hard link is a directory entry.
+/// The bytes a backup in `mode` needs free at its destination.
+///
+/// The control plane always copies (it is `VACUUM INTO` output); frames cost their bytes only when they
+/// are copied, since a hard link is a directory entry.
 ///
 /// # Errors
 ///
@@ -1012,6 +1013,11 @@ pub struct WholeStoreRestoreReport {
 ///
 /// As above, or any copy, verify, sync or rename failure. An error before the
 /// rename removes the staging directory; `new_root` is never half-published.
+///
+/// # Panics
+///
+/// Never in practice: [`BackupManifest::read`] refuses a whole-store manifest that
+/// does not embed its `STORE_FORMAT`.
 pub async fn restore_store_with(fs: &dyn StoreFs, backup_dir: &Path, new_root: &Path) -> Result<WholeStoreRestoreReport> {
 	if is_staging_dir(backup_dir) {
 		bail!("{} is an unfinished backup, prune or drill (its name starts with one of {STAGING_PREFIXES:?}), not a backup", backup_dir.display());
@@ -1105,8 +1111,44 @@ async fn restore_store_into(fs: &dyn StoreFs, backup_dir: &Path, manifest: &Back
 }
 
 /// [`restore_store_with`] through the real filesystem.
+///
+/// # Errors
+///
+/// As [`restore_store_with`].
 pub async fn restore_store(backup_dir: &Path, new_root: &Path) -> Result<WholeStoreRestoreReport> {
 	restore_store_with(&RealFs, backup_dir, new_root).await
+}
+
+/// The free bytes on the filesystem holding `path` (or its nearest existing ancestor), where the
+/// platform can say.
+///
+/// Unix `statvfs`. `None` where it cannot, in which case a headroom check has nothing to check against
+/// and the backup itself is the test.
+#[must_use]
+pub fn free_bytes_at(path: &Path) -> Option<u64> {
+	#[cfg(unix)]
+	{
+		let mut probe = path.to_path_buf();
+		loop {
+			if probe.exists() {
+				break;
+			}
+			if !probe.pop() {
+				return None;
+			}
+		}
+		let c_path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).ok()?;
+		let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+		if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
+			return None;
+		}
+		Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = path;
+		None
+	}
 }
 
 #[cfg(test)]
@@ -1116,8 +1158,7 @@ mod tests {
 	use super::*;
 
 	async fn seed_db(path: &Path) -> turso::Connection {
-		let db = Builder::new_local(path.to_str().unwrap()).build().await.unwrap();
-		let conn = db.connect().unwrap();
+		let conn = Builder::new_local(path.to_str().unwrap()).build().await.unwrap().connect().unwrap();
 		conn.execute("PRAGMA journal_mode=experimental_mvcc", turso::params![]).await.ok();
 		conn.execute("CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", turso::params![]).await.unwrap();
 		conn.execute("CREATE TABLE gadget (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL)", turso::params![]).await.unwrap();
@@ -1165,6 +1206,7 @@ mod tests {
 		// The copy is independently openable and holds the same rows.
 		let copy_db = Builder::new_local(dest.to_str().unwrap()).build().await.unwrap();
 		let copy_conn = copy_db.connect().unwrap();
+		drop(copy_db);
 		assert_eq!(count_rows(&copy_conn, "widget").await.unwrap(), 7);
 		assert_eq!(count_rows(&copy_conn, "gadget").await.unwrap(), 3);
 	}
@@ -1367,7 +1409,7 @@ mod tests {
 	}
 
 	/// D-S16: a whole-store manifest round-trips with its frames, allocators
-	/// and embedded STORE_FORMAT; a control-plane manifest carrying
+	/// and embedded `STORE_FORMAT`; a control-plane manifest carrying
 	/// whole-store fields is refused.
 	#[tokio::test]
 	async fn a_whole_store_manifest_round_trips_and_validates() {
@@ -1622,36 +1664,5 @@ mod tests {
 			let report = snapshot_with_verify(&conn, &dir.path().join(name), mode, &["gadget", "widget"]).await.unwrap();
 			assert_eq!((report.tables, report.rows), (2, 10), "{mode:?} must count the real tables/rows, not a pragma");
 		}
-	}
-}
-
-/// The free bytes on the filesystem holding `path` (or its nearest existing
-/// ancestor), where the platform can say: Unix `statvfs`. `None` where it
-/// cannot, in which case a headroom check has nothing to check against and
-/// the backup itself is the test.
-#[must_use]
-pub fn free_bytes_at(path: &Path) -> Option<u64> {
-	#[cfg(unix)]
-	{
-		let mut probe = path.to_path_buf();
-		loop {
-			if probe.exists() {
-				break;
-			}
-			if !probe.pop() {
-				return None;
-			}
-		}
-		let c_path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).ok()?;
-		let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-		if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
-			return None;
-		}
-		Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
-	}
-	#[cfg(not(unix))]
-	{
-		let _ = path;
-		None
 	}
 }

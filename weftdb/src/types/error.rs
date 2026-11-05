@@ -4,10 +4,7 @@ use weft_physical_type::AspectSchema;
 /// One declaration in the shape a refusal names it: the encoding (with its
 /// scale, where it carries one), the tolerance and the timestamp unit.
 fn describe_schema(schema: &AspectSchema) -> String {
-	let value = match schema.value.scale() {
-		Some(scale) => format!("{}:{scale}", schema.value.name()),
-		None => schema.value.name().to_string(),
-	};
+	let value = schema.value.scale().map_or_else(|| schema.value.name().to_string(), |scale| format!("{}:{scale}", schema.value.name()));
 	format!("{value} (tolerance {}, timestamps in {})", schema.value_tolerance, schema.timestamp_unit.name())
 }
 
@@ -72,6 +69,7 @@ const WRITE_WRITE_CONFLICT: &str = "Write-write conflict";
 /// under a `context`), one of Turso's: `Busy` (lock contention), `BusySnapshot` (a stale
 /// snapshot or an aborted commit dependency), or a write-write conflict, after which
 /// Turso has already rolled the transaction back.
+#[must_use]
 pub fn is_transient_mvcc_error(err: &anyhow::Error) -> bool {
 	err.chain().any(|cause| cause.downcast_ref::<Error>().is_some_and(Error::is_transient_mvcc) || cause.downcast_ref::<turso::Error>().is_some_and(is_transient_turso_error))
 }
@@ -111,12 +109,12 @@ mod tests {
 	}
 }
 
-/// Why a [`SegmentStore`](crate::SegmentStore) refused an operation: an open it
-/// would not perform (freeze design §4.3, FRE-12a), or — since D-S13 — an ingest
-/// it would not commit, or — since ROB-13 — a stored read over its decision 12
-/// bound. The ingest variants are the typed errors the 1.0 plan
-/// (§3 X-ERR, §5 D-S13) assigns to this lane: they land here, in the store's one
-/// typed error, rather than in sentences a caller must re-recognise.
+/// Why a [`SegmentStore`](crate::SegmentStore) refused an operation.
+///
+/// An open it would not perform (freeze design §4.3, FRE-12a), or — since D-S13 — an ingest it
+/// would not commit, or — since ROB-13 — a stored read over its decision 12 bound. The ingest
+/// variants are the typed errors the 1.0 plan (§3 X-ERR, §5 D-S13) assigns to this lane: they
+/// land here, in the store's one typed error, rather than in sentences a caller must re-recognise.
 ///
 /// It arrives inside an [`anyhow::Error`]; `downcast_ref::<StoreError>()` recovers it,
 /// whatever context the operation added.
@@ -351,4 +349,30 @@ pub enum StoreError {
 		/// The cap in force.
 		limit: usize,
 	},
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn turso_conflicts_are_transient_anywhere_in_the_chain() {
+		let conflict = || anyhow::Error::new(turso::Error::Error(WRITE_WRITE_CONFLICT.to_string()));
+		assert!(is_transient_mvcc_error(&conflict()));
+		assert!(is_transient_mvcc_error(&conflict().context("Failed to set dictionary metadata: Write-write conflict")));
+		assert!(is_transient_mvcc_error(&anyhow::Error::new(turso::Error::Busy("database is locked".to_string()))));
+		assert!(is_transient_mvcc_error(&anyhow::Error::new(turso::Error::BusySnapshot("database snapshot is stale".to_string()))));
+		assert!(is_transient_mvcc_error(&anyhow::Error::new(Error::TransientMvccError("type mismatch".to_string())).context("read")));
+	}
+
+	#[test]
+	fn other_errors_are_not_transient() {
+		assert!(!is_transient_mvcc_error(&anyhow::Error::new(turso::Error::Error("no such table: patterns".to_string()))));
+		assert!(!is_transient_mvcc_error(&anyhow::Error::new(turso::Error::Constraint("UNIQUE constraint failed".to_string()))));
+		assert!(!is_transient_mvcc_error(&anyhow::Error::new(Error::DatabaseError("Write-write conflict".to_string()))));
+		// Only the error itself counts, not a message that quotes one: this is how a
+		// conflict looked once the failed `ROLLBACK` after it had replaced it.
+		assert!(!is_transient_mvcc_error(&anyhow::anyhow!("Rollback failed: cannot rollback - no transaction is active")));
+		assert!(!is_transient_mvcc_error(&anyhow::anyhow!("Failed to set dictionary metadata: Write-write conflict")));
+	}
 }

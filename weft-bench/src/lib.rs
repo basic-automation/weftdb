@@ -75,8 +75,9 @@
 //! `DuckDB`), additional workloads, dataset corpora, and report runners land in
 //! subsequent increments per the roadmap.
 
-#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
-#![allow(clippy::module_name_repetitions)]
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 pub mod accuracy;
 pub mod adapter;
@@ -99,6 +100,7 @@ pub mod gpu_memory;
 pub mod ingest;
 pub mod line_protocol;
 pub mod manifest;
+pub mod num;
 pub mod parquet_report;
 pub mod point_lookup;
 pub mod profile;
@@ -140,9 +142,8 @@ const WORKLOAD_UPSAMPLE_INTERPOLATE: &str = "upsample_interpolate";
 
 /// Elapsed nanoseconds since `since`, saturated into a `u64` so a pathologically
 /// long span can never overflow or wrap the recorded timing.
-#[allow(clippy::cast_possible_truncation)]
 fn span_ns(since: Instant) -> u64 {
-	since.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+	crate::num::u128_to_u64(since.elapsed().as_nanos())
 }
 
 /// Run an interpolation profile against an adapter for `reps` timed repetitions
@@ -222,9 +223,7 @@ pub async fn run_profile<A: SystemAdapter + ?Sized>(adapter: &A, profile: &Inter
 	// reproducible yet decoupled from the dataset-generation RNG stream.
 	let latency_ci = Some(LatencyStats::bootstrap_cis(&samples_ns, &BootstrapConfig { seed: profile.seed ^ 0x_C0FF_EE15_C0DE_u64, ..BootstrapConfig::default() }));
 	let throughput_points_per_sec = if latency.mean_ns > 0 {
-		#[allow(clippy::cast_precision_loss)]
 		let secs = latency.mean_ns as f64 / 1e9;
-		#[allow(clippy::cast_precision_loss)]
 		let points = actual_output_points as f64;
 		points / secs
 	} else {

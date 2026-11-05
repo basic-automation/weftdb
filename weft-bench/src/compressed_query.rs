@@ -100,7 +100,6 @@ pub struct CompressedQueryPoint {
 /// do not strictly rise, if `batch_rows` or `queries` is zero, if `params.rows < 2` or a copy
 /// would leave the timestamp range, if a store operation or a reduction fails, or if
 /// `on_window` fails. Two paths disagreeing is not an error: it fails that size's gate.
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 pub async fn run_compressed_query(profile: &IngestProfile, timestamps: &[i64], values: &[BigDecimal], value_scale: u8, missingness_fraction: f64, generation_ns: u64, params: CompressedQueryParams, mut on_window: impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<()> {
 	anyhow::ensure!(timestamps.len() >= 2, "a compressed-query corpus needs at least two rows");
 	anyhow::ensure!(timestamps.len() == values.len(), "compressed-query corpus timestamps and values differ in length");
@@ -148,7 +147,6 @@ struct Pass<'a> {
 }
 
 /// Run every window size once; returns each size's answer digest, in order.
-#[allow(clippy::cast_precision_loss)]
 async fn windows_pass(pass: &Pass<'_>, on_window: &mut impl FnMut(BenchResult) -> anyhow::Result<()>) -> anyhow::Result<Vec<String>> {
 	let Pass { store, profile, tiled, params, stats, irregular, missingness_fraction, generation_ns, suffix, before } = *pass;
 	let mut rng = ChaCha8Rng::seed_from_u64(params.seed);

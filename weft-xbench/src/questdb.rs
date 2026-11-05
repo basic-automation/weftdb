@@ -422,23 +422,23 @@ impl Arm for QuestDb {
 		match self.class {
 			ArmClass::Native => {
 				let iso = |ns: i64| chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-				let sql = NATIVE_SQL.replace("{interval}", &sample_interval(step)).replace("{from}", &iso(start)).replace("{end}", &iso(end)).replace("{to}", &iso(end + step));
-				let rows = self.on_db(move |db| pairs(&mut db.reader, &sql.replace("{table}", &db.table))).await?;
+				let sql = crate::fill(NATIVE_SQL, &[("interval", &sample_interval(step)), ("from", &iso(start)), ("end", &iso(end)), ("to", &iso(end + step))]);
+				let rows = self.on_db(move |db| pairs(&mut db.reader, &crate::fill(&sql, &[("table", &db.table)]))).await?;
 				return Ok(Output::Float(place(&rows, start, step, grid_len)));
 			}
 			ArmClass::ClientSide => {
-				let (t, v): (Vec<i64>, Vec<f64>) = self.on_db(move |db| pairs(&mut db.reader, &FETCH_SQL.replace("{table}", &db.table))).await?.into_iter().unzip();
+				let (t, v): (Vec<i64>, Vec<f64>) = self.on_db(move |db| pairs(&mut db.reader, &crate::fill(FETCH_SQL, &[("table", &db.table)]))).await?.into_iter().unzip();
 				return Ok(Output::Float(client_linear(&t, &v, start, step, grid_len)));
 			}
 			ArmClass::PortableSql => {}
 		}
 		let hint = if self.linear_asof { "/*+ asof_linear(g seg) */" } else { "" };
-		Ok(Output::Float(self.on_db(move |db| doubles(&mut db.reader, &INTERPOLATE_SQL.replace("{hint}", hint).replace("{table}", &db.table).replace("{start}", &start.to_string()).replace("{step}", &step.to_string()).replace("{n}", &n.to_string()))).await?))
+		Ok(Output::Float(self.on_db(move |db| doubles(&mut db.reader, &crate::fill(INTERPOLATE_SQL, &[("hint", &hint), ("table", &db.table), ("start", &start), ("step", &step), ("n", &n)]))).await?))
 	}
 
 	async fn downsample(&mut self, ds: &Dataset, _knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {
 		let width = ds.bucket.step().num_nanoseconds().ok_or_else(|| anyhow::anyhow!("bucket width out of range"))?;
-		self.on_db(move |db| buckets(&mut db.reader, &DOWNSAMPLE_SQL.replace("{table}", &db.table).replace("{width}", &sample_interval(width)))).await
+		self.on_db(move |db| buckets(&mut db.reader, &crate::fill(DOWNSAMPLE_SQL, &[("table", &db.table), ("width", &sample_interval(width))]))).await
 	}
 }
 

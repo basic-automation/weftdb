@@ -5,6 +5,9 @@
 //! running (the unit and fake-server tests still run). Each test starts its own server
 //! on a free loopback port over a throwaway store and run directory, with a clean
 //! environment, and stops it on drop.
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 
 use std::{
 	path::PathBuf, process::{Child, Command, Stdio}, str::FromStr as _, time::{Duration, Instant}

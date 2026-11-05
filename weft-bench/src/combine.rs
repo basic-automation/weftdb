@@ -77,7 +77,6 @@ fn combine_result(runs: &[&BenchResult]) -> anyhow::Result<BenchResult> {
 	}
 	let run_p50_ns: Vec<u64> = runs.iter().map(|run| run.latency.p50_ns).collect();
 	let (fastest, slowest) = (run_p50_ns.iter().copied().min().unwrap_or(0), run_p50_ns.iter().copied().max().unwrap_or(0));
-	#[allow(clippy::cast_precision_loss, reason = "a ratio of two latencies")]
 	let p50_spread = if fastest > 0 { slowest as f64 / fastest as f64 - 1.0 } else { 0.0 };
 	combined.between_run = Some(BetweenRun { runs: runs.len(), run_p50_ns, run_mean_ns: runs.iter().map(|run| run.latency.mean_ns).collect(), p50_spread, digests_agree });
 	Ok(combined)

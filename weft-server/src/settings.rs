@@ -218,7 +218,9 @@ pub fn vars() -> impl Iterator<Item = &'static VarSpec> {
 }
 
 /// The registered name closest to `name`, when one is close enough to be the spelling the
-/// operator meant: case-insensitive, at most `MAX_SUGGEST_DISTANCE` edits apart, the nearest
+/// operator meant.
+///
+/// Case-insensitive, at most `MAX_SUGGEST_DISTANCE` edits apart, the nearest
 /// one if several are equally close.
 #[must_use]
 pub fn suggest(name: &str) -> Option<&'static str> {
@@ -283,9 +285,10 @@ pub fn report() {
 /// deployment, including filesystem refusals.
 pub const CONFIG_EXIT_CODE: i32 = 78;
 
-/// The `EX_DATAERR`-class exit status (plan C7): the store needs operator action —
-/// a layout or `min_write_layout` newer than this binary, an unreadable
-/// `STORE_FORMAT`, a scope mismatch, an incomplete restore, or frames without a
+/// The `EX_DATAERR`-class exit status (plan C7).
+///
+/// The store needs operator action — a layout or `min_write_layout` newer than this binary,
+/// an unreadable `STORE_FORMAT`, a scope mismatch, an incomplete restore, or frames without a
 /// control plane.
 pub const STORE_EXIT_CODE: i32 = 65;
 
@@ -294,13 +297,17 @@ pub const ROOT_LOCKED_EXIT_CODE: i32 = 75;
 
 /// The `EX_USAGE` exit status (plan C7): the command line itself is wrong —
 /// an unknown command, an unknown option, or a missing value — so nothing
-/// was attempted. The operator CLI ([`crate::cli`]) owns this class: a
+/// was attempted.
+///
+/// The operator CLI ([`crate::cli`]) owns this class: a
 /// subcommand's own parse errors exit with it, and so does a first word
 /// that names no command at all.
 pub const USAGE_EXIT_CODE: i32 = 2;
 
 /// The exit status (plan C7) for an unexpected error: the failure no other
-/// row of the table names. It is what the runtime's own error report (the
+/// row of the table names.
+///
+/// It is what the runtime's own error report (the
 /// `fn main() -> anyhow::Result<()>` return) exits with, so a caller only
 /// sees it when no phase classified the failure first.
 pub const UNEXPECTED_EXIT_CODE: i32 = 1;
@@ -314,9 +321,13 @@ const NON_NEGATIVE_INTS: &[&str] = &["WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_K
 const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_INGEST_MAX_INFLIGHT_BYTES", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INGEST_BYTES", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_MAX_SERIES_PER_ASPECT", "WEFT_QUERY_MAX_INFLIGHT", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_SHUTDOWN_GRACE_SECS", "WEFT_WORKER_THREADS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
 
 /// One line per *value* the operator should hear about, in the order the environment
-/// lists them: a registered numeric variable holding a value outside the shape its
+/// lists them.
+///
+/// A registered numeric variable holding a value outside the shape its
 /// registry entry accepts, or a closed enum whose reader used to warn and keep serving
-/// (`WEFT_ON_AMBIGUOUS_COMMIT`: `poison` or `exit`; `WEFT_STORE_SCOPE_PIN`: on or off).
+/// (`WEFT_ON_AMBIGUOUS_COMMIT`:
+///
+/// `poison` or `exit`; `WEFT_STORE_SCOPE_PIN`: on or off).
 /// Variables whose readers define open shapes (paths, endpoints, truthy flags where
 /// anything else is simply "off") are not judged here — their own startup phase refuses
 /// what it cannot use.
@@ -330,34 +341,35 @@ pub fn value_errors_for(entries: impl IntoIterator<Item = (String, String)>) -> 
 				errors.push(format!("{name}={value:?} is not a non-negative whole number, which is the only shape it accepts"));
 			}
 		} else if POSITIVE_INTS.contains(&name.as_str()) {
-			if trimmed.parse::<u64>().ok().filter(|n| *n > 0).is_none() {
+			if trimmed.parse::<u64>().ok().as_ref().is_none_or(|n| *n == 0) {
 				errors.push(format!("{name}={value:?} is not a positive whole number, which is the only shape it accepts"));
 			}
 		} else if name == "WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD" {
-			if trimmed.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 1.0).is_none() {
+			if trimmed.parse::<f64>().ok().as_ref().is_none_or(|n| !(n.is_finite() && *n >= 1.0)) {
 				errors.push(format!("{name}={value:?} is not a finite number at or above 1.0, which is the only shape it accepts"));
 			}
 		} else if name == "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD" {
-			if trimmed.parse::<f64>().ok().filter(|n| n.is_finite() && *n > 0.0).is_none() {
+			if trimmed.parse::<f64>().ok().as_ref().is_none_or(|n| !(n.is_finite() && *n > 0.0)) {
 				errors.push(format!("{name}={value:?} is not a finite number above 0, which is the only shape it accepts"));
 			}
 		} else if name == "WEFT_STORE_SCOPE_PIN" {
 			if crate::store_open::ScopePin::parse_strict(trimmed).is_none() {
 				errors.push(format!("{name}={value:?} is neither on (`on`/`1`/`true`/`yes`) nor off (`off`/`0`/`false`/`no`), the only values it accepts"));
 			}
-		} else if name == "WEFT_ON_AMBIGUOUS_COMMIT" {
-			if !(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("poison") || trimmed.eq_ignore_ascii_case("exit")) {
-				errors.push(format!("{name}={value:?} is neither `poison` nor `exit`, the only values it accepts"));
-			}
+		} else if name == "WEFT_ON_AMBIGUOUS_COMMIT" && !(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("poison") || trimmed.eq_ignore_ascii_case("exit")) {
+			errors.push(format!("{name}={value:?} is neither `poison` nor `exit`, the only values it accepts"));
 		}
 	}
 	errors
 }
 
-/// Every reason strict server configuration (PAC-5b) refuses this environment: the
-/// name problems [`warnings_for`] reports (an unknown `WEFT_` name, a `Test`-tier
-/// channel set on a real server) plus the value problems [`value_errors_for`]
-/// reports. An empty result is a configuration the server will start with; anything
+/// Every reason strict server configuration (PAC-5b).
+///
+/// Refuses this environment: the name problems [`warnings_for`] reports (an unknown `WEFT_`
+/// name, a `Test`-tier channel set on a real server) plus the value problems
+/// [`value_errors_for`] reports.
+///
+/// An empty result is a configuration the server will start with; anything
 /// else is refused before any phase reads a setting, with exit [`CONFIG_EXIT_CODE`].
 #[must_use]
 pub fn strict_errors_for(entries: Vec<(String, String)>) -> Vec<String> {
@@ -568,7 +580,7 @@ mod tests {
 	/// and a correctly shaped value is not one.
 	#[test]
 	fn strict_errors_cover_bad_names_and_bad_values() {
-		assert!(strict_errors_for(vec![("WEFT_BACKUP_KEEP".into(), "3".into()), ("WEFT_ON_AMBIGUOUS_COMMIT".into(), " EXIT ".into()), ("WEFT_STORE_SCOPE_PIN".into(), " OFF ".into()), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD".into(), "1.25".into())]).is_empty());
+		assert_eq!(strict_errors_for(vec![("WEFT_BACKUP_KEEP".into(), "3".into()), ("WEFT_ON_AMBIGUOUS_COMMIT".into(), " EXIT ".into()), ("WEFT_STORE_SCOPE_PIN".into(), " OFF ".into()), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD".into(), "1.25".into())]), [] as [std::string::String; 0]);
 		for (name, value) in [("WEFT_BACKUP_KEEP", "-1"), ("WEFT_BACKUP_KEEP", "three"), ("WEFT_MAX_INTERPOLATE_POINTS", "0"), ("WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD", "0.5"), ("WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD", "0"), ("WEFT_ON_AMBIGUOUS_COMMIT", "nonsense"), ("WEFT_STORE_SCOPE_PIN", "maybe")] {
 			let errors = strict_errors_for(vec![(name.into(), value.into())]);
 			assert_eq!(errors.len(), 1, "{name}={value}: {errors:?}");

@@ -22,7 +22,7 @@ use weft_server::{AppState, ServeLimits, ShutdownSignals, TlsConfig, SERVICE, VE
 /// # Errors
 ///
 /// The address is in use or cannot be bound.
-pub(crate) async fn bind(addr: SocketAddr, tls: bool) -> anyhow::Result<tokio::net::TcpListener> {
+pub async fn bind(addr: SocketAddr, tls: bool) -> anyhow::Result<tokio::net::TcpListener> {
 	let listener = tokio::net::TcpListener::bind(addr).await?;
 	let local = listener.local_addr()?;
 	let scheme = if tls { "https" } else { "http" };
@@ -31,7 +31,7 @@ pub(crate) async fn bind(addr: SocketAddr, tls: bool) -> anyhow::Result<tokio::n
 }
 
 /// The address the bound listener is actually serving on.
-pub(crate) fn local_addr(listener: &tokio::net::TcpListener) -> anyhow::Result<SocketAddr> {
+pub fn local_addr(listener: &tokio::net::TcpListener) -> anyhow::Result<SocketAddr> {
 	Ok(listener.local_addr()?)
 }
 
@@ -49,7 +49,7 @@ pub(crate) fn local_addr(listener: &tokio::net::TcpListener) -> anyhow::Result<S
 ///
 /// Whatever the serve path reports: a listener that stopped accepting, or an
 /// io error on accept.
-pub(crate) async fn run(listener: tokio::net::TcpListener, state: AppState, otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>, limits: ServeLimits, tls: Option<TlsConfig>, shutdown: &mut ShutdownSignals) -> anyhow::Result<()> {
+pub async fn run(listener: tokio::net::TcpListener, state: AppState, otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>, limits: ServeLimits, tls: Option<TlsConfig>, shutdown: &mut ShutdownSignals) -> anyhow::Result<()> {
 	let router = weft_server::app_with_state(state);
 	let serve_result = match &tls {
 		Some(tls) => weft_server::serve::run_tls(listener, router, limits, tls, shutdown.wait()).await,

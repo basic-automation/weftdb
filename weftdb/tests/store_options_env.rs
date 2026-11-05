@@ -1,3 +1,6 @@
+#![recursion_limit = "1024"]
+#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![allow(clippy::multiple_crate_versions)]
 //! Release plan C-1: the library reads no `WEFT_*` variable on its own. A `SegmentStore`
 //! opened with `open` or `open_scoped` is configured by `SegmentStoreOptions::default()`,
 //! whatever the environment says; an embedder that wants the environment's settings asks

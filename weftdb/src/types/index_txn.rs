@@ -117,11 +117,13 @@ pub struct IndexRow {
 impl IndexRow {
 	/// A legacy row: generation 0, nothing bound. What every seal and in-place rewrite
 	/// writes until the write-once protocols take over (S7-S10).
+	#[must_use]
 	pub const fn legacy(desc: SegmentDescriptor) -> Self {
 		Self { desc, gen: 0, prec: None, frame_crc: None, commit_epoch: None, series_id: 0 }
 	}
 
 	/// The identity a precondition on this row names.
+	#[must_use]
 	pub const fn version(&self) -> RowVersion {
 		RowVersion { id: self.desc.id, gen: self.gen, frame_crc: self.frame_crc }
 	}
@@ -288,20 +290,19 @@ impl IndexOp {
 			// `QuarantineInsert` replaces a record of the same key and
 			// `QuarantineDelete` deletes one if it exists, so neither re-checks
 			// what its caller decided from, like `Upsert` and `Delete`.
-			Self::QuarantineInsert { .. } | Self::QuarantineDelete { .. } => false,
+			Self::QuarantineInsert { .. } | Self::QuarantineDelete { .. } | Self::Upsert { .. } | Self::Delete { .. } | Self::MetaSet { .. } => false,
 			// `MetaSet` replaces the value, so a retry would overwrite what another writer
 			// committed in between. (Its one writer today is the open, under the root's
 			// LOCK, which nothing races.)
-			Self::Upsert { .. } | Self::Delete { .. } | Self::MetaSet { .. } => false,
 		}
 	}
 }
 
-/// The fault points one [`IndexTxn`] hits, so the crash tests can stop it between its
-/// steps. The protocol that builds a transaction passes its own (a seal's `S-*`, a
-/// swap's `M-*`, from S8 and S10 on). Every transaction S6 commits passes
-/// [`NONE`](Self::NONE): a point that every seal hit could not be armed in-process
-/// while other tests seal alongside.
+/// The fault points one [`IndexTxn`] hits, so the crash tests can stop it between its steps.
+///
+/// The protocol that builds a transaction passes its own (a seal's `S-*`, a swap's `M-*`, from S8 and
+/// S10 on). Every transaction S6 commits passes [`NONE`](Self::NONE): a point that every seal hit could
+/// not be armed in-process while other tests seal alongside.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TxnPoints {
 	/// Hit right after `BEGIN CONCURRENT`: `S-txn-begun`, `M-swap-begun`.
@@ -382,6 +383,7 @@ impl IndexTxnError {
 	}
 
 	/// Whether the transaction may have committed although it reported an error.
+	#[must_use]
 	pub fn is_ambiguous(&self) -> bool {
 		self.kind == TxnErrorKind::Ambiguous
 	}
@@ -424,6 +426,7 @@ impl std::error::Error for IndexTxnError {}
 
 impl IndexTxn {
 	/// A transaction of `ops`, hitting no fault points.
+	#[must_use]
 	pub const fn new(ops: Vec<IndexOp>) -> Self {
 		Self { ops, points: TxnPoints::NONE }
 	}
@@ -473,7 +476,7 @@ impl IndexTxn {
 	/// # Errors
 	///
 	/// As [`run`](Self::run).
-	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool) -> Result<TxnApplied, IndexTxnError> {
+	pub async fn run_while(&self, db: &turso::Database, may_retry: impl Fn() -> bool + Send) -> Result<TxnApplied, IndexTxnError> {
 		crate::exec::control_plane_write(async {
 			let mut attempts = 1;
 			loop {
@@ -1060,8 +1063,8 @@ mod tests {
 		for (next_id, next_gen, epoch) in [(5, 0, 2), (3, 4, 1), (9, 2, 0), (9, 7, 4)] {
 			let applied = index.apply(&bump(ASPECT, next_id, next_gen, epoch)).await.expect("bumps");
 			assert_eq!(applied.changes, vec![1], "bump to ({next_id}, {next_gen}, {epoch})");
-			let seed = index.allocator_seed(ASPECT).await.expect("reads");
-			seen.push((seed.next_id, seed.next_gen, seed.epoch));
+			let allocator_seed = index.allocator_seed(ASPECT).await.expect("reads");
+			seen.push((allocator_seed.next_id, allocator_seed.next_gen, allocator_seed.epoch));
 		}
 		index.apply(&bump("other", 1, 0, 0)).await.expect("bumps another aspect");
 		let other = index.allocator_seed("other").await.expect("reads");
@@ -1114,7 +1117,7 @@ mod tests {
 		let shown: Vec<_> = journal.iter().map(|e| (e.name.as_str(), e.aspect.as_str(), e.state, e.retire_epoch)).collect();
 		assert_eq!(shown, vec![("a-0.weftseg", ASPECT, crate::types::reaper::JournalState::Retired, Some(3)), ("a~g1~p0.weftseg", ASPECT, crate::types::reaper::JournalState::Pending, None)]);
 		assert_eq!(cleared.changes, vec![1, 1, 0]);
-		assert!(after.is_empty());
+		assert_eq!(after, [] as [crate::types::reaper::JournalEntry; 0]);
 		assert!([pending("x"), retire("x"), clear("x")].iter().all(IndexOp::is_guarded), "a swap of guarded ops is retried");
 	}
 
