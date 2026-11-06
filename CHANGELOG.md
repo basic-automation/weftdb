@@ -8,6 +8,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
 ### Added
 
 - **GPU configuration, compute limits, interpolation provenance and metrics** (ROB-16).
@@ -283,6 +285,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- CI on `main` is green again after the Phase 5 / W7 merges: test, lint and
+  feature-gate fallout fixed (#592, #593).
 - A panic inside a legacy queue-consumer write took the worker task with it and
   left the write's transaction open. Every write of the `Inputs` and `Pipeline`
   traits now runs inside `weftdb::exec`'s control-plane write scope (C22,
@@ -2383,7 +2387,8 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/basic-automation/weftdb/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/basic-automation/weftdb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/basic-automation/weftdb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/basic-automation/weftdb/releases/tag/v0.1.0
