@@ -58,10 +58,12 @@
 //! A report is produced by calling [`SoakReport::evaluate`] on a finished run
 //! and is not a new lifecycle state of the harness.
 
+use std::fmt::Write;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	soak::SoakRun, soak_backup::BackupLaneVerdict, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_system::{ContaminationFlag, ContaminationVerdict, FlushCheckResult, FlushFailureKind, WorstValues}
+	soak::SoakRun, soak_backup::BackupLaneVerdict, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_system::{ContaminationVerdict, FlushCheckResult}
 };
 
 // ---------------------------------------------------------------------------
@@ -460,14 +462,14 @@ fn check_coverage(oracle_ticks: Option<u64>, derived_ticks: Option<u64>, backup_
 	let mut first_required: u64 = 0;
 	let mut first_set = false;
 
-	fn push_failure(msg: String, observed: u64, required: u64) {
+	let push_failure = |msg: String, observed: u64, required: u64| {
 		if !first_set {
 			first_observed = observed;
 			first_required = required;
 			first_set = true;
 		}
 		failures.push(msg);
-	}
+	};
 
 	if min_evaluated_ticks > 0 {
 		let observed = oracle_ticks.unwrap_or(0);
@@ -576,7 +578,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, coverage: &CoverageRepo
 
 	// --- Wins ---
 	out.push_str("### Wins (rules passed)\n\n");
-	let wins = slo.rules.iter().filter(|r| r.outcome == Outcome::Pass).collect();
+	let wins: Vec<&RuleResult> = slo.rules.iter().filter(|r| r.outcome == Outcome::Pass).collect();
 	if wins.is_empty() {
 		out.push_str("None.\n\n");
 	} else {
