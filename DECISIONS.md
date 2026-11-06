@@ -4,6 +4,58 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-06 — W7 close-out, W8 start, the SOA-13 rule set, and one infra blocker
+
+**W7 was one item, not six.** The wave-7 briefing listed ROB-12, ROB-7, ROB-16, ROB-23r and ROB-5
+as in flight; git said all five had merged (#546, #551, #563, #589 and the ROB-23r slice) before
+this loop started, and the two lane-header lines ("maint lane", "read lane") plus the W7
+open/close narrative boxes in `ROADMAP.md` are prose markers, not ticks — a lane is closed when its
+slices tick, not the header. The one open non-owner item was PAC-11's remaining half: the packaging
+scripts had merged (PR #512) but nothing ran `test-host-install.sh` in CI. PR #596 adds
+`host-install.yml` for that, and fixing what the run then found is this entry's technical half:
+`test-host-install.sh` needed `install-host.sh` and itself to be mode 0755 in git (both were 0644,
+so every invocation `bash …`d around it — the unit's own `ExecStart` semantics were never proven),
+`--list` must be asked with the same `--prefix` the gates installed (without it the manifest names
+`/usr/local` and the tree-under-test check fails on paths nobody installed), and gate 4's contract
+— export every shipped env name with no value, expect the address refusal — is dead under PAC-5b
+strict validation, which refuses an empty value on any integer name before the address is ever
+parsed. The probe now exports the defaults the shipped template itself declares, with the
+machine-pointing and auth-enabling ones redirected into the scratch tree, and pins
+`WEFT_SERVER_ADDR` last so the probe address always wins. This strengthens gate 4: it now proves
+the template's documented defaults are a configuration the real server walks past toward the
+address, not merely that the names exist.
+
+**W8's gate.** "When the release goes out then start wave 8" was interpreted literally: v0.3.0
+became visible on crates.io and the GitHub release left draft on 2026-11-06, so W8 started the same
+night — no additional human gate was invented.
+
+**SOA-13's SLO rules are this loop's definition.** Neither `ROADMAP.md:372`, issue #322, nor any
+doc names R1–R8, and the oracle agent this protocol normally escalates architecture calls to is
+currently broken (`Required child extension failed to load … Cannot find module 'typebox'`), so the
+rule set was defined here rather than stalled: R1 correctness — zero oracle mismatches over
+ticks; R2 contamination — every flag inside a declared window, else fail; R3 flush discipline —
+zero strict-mode violations; R4 derived reads — zero divergence from the model; R5 recovery — every
+backup window records finite RPO/RTO by the EVI-19 formulas in `docs/RPO-RTO.md` (a *recorded*
+number: inventing a numeric target the project never fixed was rejected); R6 hook contract —
+exact callback counts; R7 liveness — at least `MIN_TICK_PROGRESS` ticks per window; R8 report
+integrity — serde round-trip at `SOAK_REPORT_SCHEMA_VERSION` plus the coverage floors. Below a
+floor a rule reports `InsufficientCoverage`, never `Pass` — the failure mode this slice exists to
+catch is a quiet green. If the oracle comes back and re-litigates, it amends, not rewrites.
+
+**The crash matrix is broken on `main`, and says so as issue #604.** Since 2026-11-05 ~16:35 UTC
+every `crash matrix` job — including one dispatched on plain `main` (run 42199040596) — is SIGTERM'd
+at ~nine minutes inside `bench-stage` (`Terminated`, exit 143) with the job timeout at 120 minutes,
+no concurrency block, and no internal timeout in the script. Any PR touching the paths filter can
+therefore never go all-green; #599 (FRE-13) and #603 (SOA-13) are blocked on that, not on their
+diffs. Neither was merged red, and neither script was weakened to dodge it.
+
+**Float parsing waits for #598.** FRE-8b (JSON float parse) touches the same parser the other
+loop's #598 is inside of (its 1-ULP parse fix spans `weftdb`/`weft-server`/`clients`), so it stays
+unclaimed here until #598 lands; one writer per crate beats two clever ones.
+
+**Needs human (owner items, unchanged):** make the ghcr.io container package public (#318) and the
+human honesty narrative (#320). Neither is clickable by an agent loop.
+
 ## 2026-11-04 — W7 start: the two reds that gated the wave, and what was chosen about each (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** W7's in-flight PRs (#559 D-S20, #546 ROB-12, #551 ROB-7) were red on checks that had
