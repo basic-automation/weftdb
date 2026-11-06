@@ -210,7 +210,7 @@ readonly ENV_MODE
 printf 'WEFT_MAX_CONNECTIONS=64\n' >"$OPERATOR_ENV"
 WEFT_BIN=$BIN "$INSTALLER" --destdir "$DEST" --prefix "$PREFIX" >"$WORK/reinstall.out" 2>&1 ||
 	fail "reinstalling over an existing configuration exited non-zero"
-grep -qF "left $PREFIX/etc/weftdb/weft-server.env alone" "$WORK/reinstall.out" ||
+grep -qF "left $OPERATOR_ENV alone" "$WORK/reinstall.out" ||
 	fail "the reinstall did not say it left the operator's env file alone"
 grep -qxF 'WEFT_MAX_CONNECTIONS=64' "$OPERATOR_ENV" ||
 	fail "the reinstall changed the operator's env file"
