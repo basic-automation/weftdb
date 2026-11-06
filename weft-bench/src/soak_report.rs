@@ -1063,7 +1063,7 @@ mod tests {
 		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(&[])), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
 		assert!(verdicts.honesty.contains("Wins (rules passed)"), "honesty must have a wins section");
 		assert!(verdicts.honesty.contains("Losses (rules failed)"), "honesty must have a losses section");
-		assert!(verdicts.honesty.contains("Contamination"), "honesty must have a contamination section");
+		assert!(verdicts.honesty.contains("contamination"), "honesty must have a contamination section");
 		assert!(verdicts.honesty.contains("Surfaces not tested"), "honesty must list untested surfaces");
 		assert!(verdicts.honesty.contains("Overrides"), "honesty must have an overrides section");
 		assert!(verdicts.honesty.contains("Limitations"), "honesty must list limitations");
