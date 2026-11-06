@@ -4,15 +4,19 @@ What WeftDB is not for, how its numbers are produced and checked, and what "exac
 not mean. Each claim below links to the code, benchmark or measurement it rests on. If a link and a
 sentence disagree, the link wins and this page is wrong; please open an issue.
 
-These are the first four of the six honesty pages in the commercial thesis (evidence track
-EVI-16). *When WeftDB beats general TSDBs* and *GPU tuning and economics* follow in EVI-17, built
-on the first cross-engine report ([`bench/reports/evi-15/`](bench/reports/evi-15/README.md)). The narrative is the project owner's to
-approve before it is published anywhere else.
+These are the six honesty pages in the commercial thesis (evidence tracks EVI-16 and EVI-17).
+*When WeftDB beats general TSDBs* is built on the first cross-engine report
+([`bench/reports/phase1-pooled/`](bench/reports/phase1-pooled/report.md), a six-engine matrix pooled
+from two runs). *GPU tuning and economics* is built on the GPU-economics measurement suite
+([`bench/reports/gpu-economics/`](bench/reports/gpu-economics/README.md)).
+The narrative is the project owner's to approve before it is published anywhere else.
 
 - [When WeftDB is not the right tool](#when-weftdb-is-not-the-right-tool)
 - [Benchmark methodology](#benchmark-methodology)
 - [Interpolation-accuracy methodology](#interpolation-accuracy-methodology)
 - [Precision and physical value types](#precision-and-physical-value-types)
+- [When WeftDB beats general TSDBs](#when-weftdb-beats-general-tsdbs)
+- [GPU tuning and economics](#gpu-tuning-and-economics)
 
 ---
 
@@ -261,3 +265,119 @@ cost: 38.0 ms against 7.7 ms for the `f64` call on about 1M points.
 - `ScaledI64` and `ScaledI128` are exact within their scale and are the fast integer path.
 - `Decimal128` carries a per-value scale up to 38 digits.
 - `BigDecimalText` is the lossless escape hatch.
+
+---
+
+## When WeftDB beats general TSDBs
+
+WeftDB wins against general-purpose time-series databases only in interpolation and only at
+`small` scale (and `medium` on TSBS), and mostly against DuckDB's hand-written SQL, not against a
+client-side fetch into a Rust loop. The numbers are from the first comprehensive cross-engine
+report ([`bench/reports/phase1-pooled/`](bench/reports/phase1-pooled/report.md)): a six-engine
+matrix covering DuckDB, ClickHouse, TimescaleDB, QuestDB, InfluxDB 3 and IoTDB on load, linear
+interpolation, and bucketed downsampling, at two scales, pooled from two independent runs.
+
+**17 victories.** Every win is in interpolation against class B (portable SQL), and all but five
+are at `small` scale (about 30k input points into a 14,401-point grid):
+
+- `mcar-small` interpolate: `weftdb-memory` 1.2× faster than `duckdb-double`, `weftdb-stored-f64`
+  2.7× faster.
+- `block-small` interpolate: `weftdb-memory` 1.2× faster than `duckdb-double`,
+  `weftdb-stored-f64` 2.8× faster.
+- `uci-small` interpolate: `weftdb-memory` 1.3× faster than `duckdb-double`,
+  `weftdb-stored-f64` 2.7× faster, `weftdb-stored` 1.1× faster, `weftdb-stored-bulk` 1.1× faster.
+- `uci-medium` interpolate: `weftdb-stored-f64` 1.5× faster than `duckdb-double` — the only
+  medium-scale win that held in both runs.
+- `tsbs-small` interpolate: `weftdb-memory` 3.5× faster than `duckdb-double`, `weftdb-stored`
+  3.0×, `weftdb-stored-f64` 8.2×, `weftdb-stored-bulk` 3.2×.
+- `tsbs-medium` interpolate: `weftdb-memory` 2.7× faster than `duckdb-double`, `weftdb-stored`
+  2.2×, `weftdb-stored-f64` 6.1×, `weftdb-stored-bulk` 2.3×.
+
+**85 losses.** Loads lose by 7.8×–47.4× against every engine on every dataset. Class C (client-side
+fetch into Rust) beats WeftDB across the board: ClickHouse, QuestDB and InfluxDB 3 fetched into
+Rust are 1.6×–11.6× faster than WeftDB on the same grid. Stored downsampling loses 1.5×–5.8× on
+every `medium` dataset.
+
+**3 within noise.** `weftdb-stored-f64` on `block-medium` interpolation vs DuckDB (intervals
+overlap); `weftdb-stored-f64` on `tsbs-small` vs QuestDB client-side (intervals overlap);
+`weftdb-stored-f64` on `tsbs-medium` vs ClickHouse client-side (intervals overlap).
+
+**What this means.** WeftDB's interpolation is faster than a SQL expression when the grid is
+small and the SQL must scan every input knot. At medium scale (86k output points), only the `f64`
+path keeps a measurable edge, and only on the TSBS data (where the input is a 10 s staircase
+between 1 s grid points, so every reading is cheap geometry). Client-side interpolation — fetching
+knots into a Rust loop over the network — is always faster than fetching knots and asking WeftDB
+to run the same arithmetic, because the fetch is the same and the client skips WeftDB's decoding,
+grid wiring and provenance marking. The `f64` output path closes most of that gap (1.6× on MCAR,
+2.7× on UCI, within noise on TSBS), but does not eliminate it.
+
+**What does not beat WeftDB at anything.** At these scales and on these workloads, QuestDB,
+InfluxDB 3 and IoTDB either lose to or are within noise of DuckDB, and they never beat WeftDB's
+two fastest paths on interpolation. Their advantage is in their native operations (streaming
+aggregation, many-series queries, high-cardinality ingest, production durability), none of which
+this benchmark covers.
+
+**Where to read the detail.** Every win and every loss above is linked by name to the report's
+corresponding section. The report's *Configuration caveats* and *Known limitations* record the
+engine versions, the exact commands, what data sizes were and were not tested, and how each
+engine's arm was written and verified.
+
+---
+
+## GPU tuning and economics
+
+GPU interpolation costs next to running the same interpolation on the CPU alone: cold-start
+latency, CPU-only fallback, GPU utilisation, contention, and dollars per billion interpolated
+points. The report is at [`bench/reports/gpu-economics/`](bench/reports/gpu-economics/README.md).
+
+> **Status: measurement pending.** The tables in the report are filled with `⟦MEASURE⟧` placeholders
+> and the verdict is not yet written. The raw numbers need a measurement run
+> (`weft-bench --gpu-economics`) on the reference workstation. The section below records what the
+> measurement will show; it restates the structural findings that are final without a run.
+> Awaiting owner narrative (#320) for the prose presentation of these results.
+
+**Cold start.** Opening a GPU device compiles splimes kernels and allocates Vulkan resources. The
+`prewarm_gpu` call exists to do this once at server start rather than on the first query. A lazy
+first call must do the same work inside the user's request latency. In the EVI-10 stored-range
+benchmark, the GPU was never the fastest backend for a single request at any size
+(`weftdb/benches/interpolate_range.rs`). The GPU-economics report will confirm how much of the
+cold-start cost is in the driver (shader cache) versus in kernel compilation.
+
+**CPU-only fallback.** With no GPU adapter available (no Vulkan driver, no EGL vendor), `Auto`
+falls back to the CPU backend without error. A CPU-only deployment loses throughput, never
+answers: `Auto` ran on `Cpu` with the full grid returned. A `Backend::Gpu` call must fail, not fall
+back, and the test confirms that.
+
+**GPU is not the fastest backend at any concurrency tested.** In the single-caller stored-range
+benchmark, CPU threads (rayon, 16 cores) reconstructed about 1M points from 100k stored knots in
+14.1–16.3 ms, against 17.0–29.8 ms on an RTX 4070 Ti SUPER. The contention table in the report
+will show whether GPU throughput catches up or pulls ahead at 8–16 concurrent callers, and at what
+cost in per-request latency.
+
+**Cost per billion points.** The report computes a formula:
+
+    $ per 10⁹ points = P / (T × 3600) × 10⁹
+
+where `P` is the instance's on-demand hourly price (AWS EC2, US East, shared, on demand) and `T`
+is sustained output points per second. The price ratios and break-even multiples are final without
+a measurement: for example, a `g6.xlarge` (NVIDIA L4, $0.80/h) is cheaper per point only if its
+throughput exceeds 0.98× the `c7a.4xlarge` (16 vCPU, $0.82/h). The measured rows will say whether
+that holds at any concurrency and for which GPU precision.
+
+**GPU precision `f64` vs `f32`.** The RTX 4070 Ti SUPER, like the L4, A10G and L40S, runs `f64` at
+1/64 of its `f32` rate. So the `f64` row is a fair stand-in for those cloud GPUs at best, and the
+`f32` row is within splimes' published tolerance (1e-5 · range · Λ, not `f64`'s). The cost table
+will price both paths.
+
+**Caveats that hold.** The cloud rows are arithmetic on local throughput — none of the priced
+instances was run. An RTX 4070 Ti SUPER is not an L4, A10G, L40S or H100. CPU work on a 4-vCPU
+GPU instance (the `.xlarge` tiers) is slower than on the 16-core measurement host for the CPU
+portion of a GPU interpolation. Prices are on-demand, one region, compute only — no reserved,
+savings-plan or spot, no storage or egress, and no idle-time cost (a GPU instance that
+interpolates a few percent of the time costs its full hourly price). The measurement host's GPU
+is shared with other work; baseline utilisation is recorded in each report.
+
+**What is not in this page.** AMD, Intel and Apple GPUs: the workstation has only NVIDIA. No
+multi-GPU configuration was tested. No power or thermal cost is priced. The GPU-economics
+benchmark measures per-call interpolation throughput; it does not measure concurrent machine
+learning workloads sharing the same GPU.
