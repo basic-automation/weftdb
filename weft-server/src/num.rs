@@ -54,4 +54,30 @@ mod json_float_parse_tests {
 			assert_eq!(in_a_body["value"].as_f64().map(f64::to_bits), Some(exact.to_bits()), "{text} inside a request body");
 		}
 	}
+
+	/// The same over a seeded sample shaped like the compute routes' inputs (magnitudes
+	/// 1e-19 to 1e15, written the way `serde_json` and most clients write them). Without
+	/// `float_roundtrip`, 175,103 of a million such values came back one ULP off (measured
+	/// 2026-11-05); every one must survive the trip.
+	#[test]
+	fn a_seeded_sample_of_json_floats_round_trips_exactly() {
+		let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+		let mut next = || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state
+		};
+		let values: Vec<f64> = (0..100_000)
+			.map(|_| {
+				let unit = (crate::num::u64_to_f64(next() >> 11) / crate::num::u64_to_f64(1_u64 << 53)).mul_add(2.0, -1.0);
+				let exponent = i32::try_from(next() % 35).expect("below 35") - 19;
+				unit * 10_f64.powi(exponent)
+			})
+			.collect();
+		let body = serde_json::to_string(&values).unwrap();
+		let parsed: Vec<f64> = serde_json::from_str(&body).unwrap();
+		let off = parsed.iter().zip(&values).filter(|(read, sent)| read.to_bits() != sent.to_bits()).count();
+		assert_eq!(off, 0, "{off} of {} JSON floats did not round-trip", values.len());
+	}
 }

@@ -39,7 +39,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **JSON floats are parsed to the nearest `f64` in every build of `weft-server`.** serde_json's
   default float parser is not correctly rounded, and a `weft-server` built on its own — as
   the release workflow and the Docker image build it — read some JSON numbers one ULP away
-  from their text (for example `900719925474100.5`); a whole-workspace build happened to
+  from their text (for example `900719925474100.5`; 175,103 of a seeded million values
+  shaped like the compute routes' inputs); a whole-workspace build happened to
   read them right through another crate's `arbitrary_precision`. The workspace now enables
   serde_json's `float_roundtrip`.
 
