@@ -266,32 +266,9 @@ impl SoakReport {
 	/// The report is deterministic from these inputs and carries no free
 	/// text from the caller.
 	#[must_use]
-	pub fn evaluate(
-		run: &SoakRun,
-		oracle: Option<&OracleVerdict>,
-		derived: Option<&DerivedReadVerdict>,
-		backup: Option<&BackupLaneVerdict>,
-		contamination: Option<&ContaminationVerdict>,
-		flush_check: Option<&FlushCheckResult>,
-		hook_windows: Vec<(String, u64)>,
-		progress_total_ticks: u64,
-		progress_new_sealed: u64,
-		min_evaluated_ticks: u64,
-		min_backup_windows: u64,
-		min_derived_read_ticks: u64,
-		min_hook_windows: u64,
-	) -> Self {
+	pub fn evaluate(run: &SoakRun, oracle: Option<&OracleVerdict>, derived: Option<&DerivedReadVerdict>, backup: Option<&BackupLaneVerdict>, contamination: Option<&ContaminationVerdict>, flush_check: Option<&FlushCheckResult>, hook_windows: Vec<(String, u64)>, progress_total_ticks: u64, progress_new_sealed: u64, min_evaluated_ticks: u64, min_backup_windows: u64, min_derived_read_ticks: u64, min_hook_windows: u64) -> Self {
 		let r8_source = String::from("exact");
-		let rules: Vec<RuleResult> = Vec::from([
-			evaluate_r1(oracle),
-			evaluate_r2(contamination),
-			evaluate_r3(flush_check),
-			evaluate_r4(derived),
-			evaluate_r5(backup),
-			evaluate_r6(&hook_windows, min_hook_windows),
-			evaluate_r7(progress_total_ticks, progress_new_sealed),
-			RuleResult::not_evaluated("R8", "report-integrity", String::from("checked at serialisation time"), r8_source),
-		]);
+		let rules: Vec<RuleResult> = Vec::from([evaluate_r1(oracle), evaluate_r2(contamination), evaluate_r3(flush_check), evaluate_r4(derived), evaluate_r5(backup), evaluate_r6(&hook_windows, min_hook_windows), evaluate_r7(progress_total_ticks, progress_new_sealed), RuleResult::not_evaluated("R8", "report-integrity", String::from("checked at serialisation time"), r8_source)]);
 
 		let oracle_ticks_val = oracle.map(|o| o.ticks_judged);
 		let derived_ticks_val = derived.map(|d| d.ticks_judged);
@@ -303,23 +280,11 @@ impl SoakReport {
 
 		let (outcome, summary) = compute_overall_outcome(&rules, &coverage);
 
-		let slo = SloReport {
-			schema_version: SOAK_REPORT_SCHEMA_VERSION,
-			rules,
-			outcome,
-			summary,
-		};
+		let slo = SloReport { schema_version: SOAK_REPORT_SCHEMA_VERSION, rules, outcome, summary };
 
 		let honesty = build_honesty_section(run, &slo, &coverage, &overrides, contamination, flush_check);
 
-		SoakReport {
-			schema_version: SOAK_REPORT_SCHEMA_VERSION,
-			run: run.redacted_copy(),
-			slo,
-			coverage,
-			overrides,
-			honesty,
-		}
+		SoakReport { schema_version: SOAK_REPORT_SCHEMA_VERSION, run: run.redacted_copy(), slo, coverage, overrides, honesty }
 	}
 
 	/// Serialize this report as pretty JSON.
@@ -353,7 +318,7 @@ fn evaluate_r1(oracle: Option<&OracleVerdict>) -> RuleResult {
 			} else {
 				RuleResult::failed(tid, name, format!("{} mismatches over {} ticks", o.mismatch_count, o.ticks_judged), source)
 			}
-		},
+		}
 	}
 }
 
@@ -368,14 +333,12 @@ fn evaluate_r2(contamination: Option<&ContaminationVerdict>) -> RuleResult {
 		Some(c) => {
 			if c.flags.is_empty() {
 				RuleResult::passed(tid, name, String::from("no flags, no explanation needed"), source)
-			} else if c.worst.clock_step_ms != 0 || c.worst.cpu_psi_some_avg10 > 0.0 || c.worst.dirty_kib > 0
-				|| c.worst.io_psi_some_avg10 > 0.0 || c.worst.load_per_core > 0.0
-				|| c.worst.memory_psi_some_avg10 > 0.0 || c.worst.sample_gap_ms > 0 {
+			} else if c.worst.clock_step_ms != 0 || c.worst.cpu_psi_some_avg10 > 0.0 || c.worst.dirty_kib > 0 || c.worst.io_psi_some_avg10 > 0.0 || c.worst.load_per_core > 0.0 || c.worst.memory_psi_some_avg10 > 0.0 || c.worst.sample_gap_ms > 0 {
 				RuleResult::passed(tid, name, format!("{} flag(s) with WorstValues", c.flags.len()), source)
 			} else {
 				RuleResult::failed(tid, name, format!("{} flag(s) with no WorstValues — flags outside any window", c.flags.len()), source)
 			}
-		},
+		}
 	}
 }
 
@@ -388,13 +351,12 @@ fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 		None => RuleResult::not_evaluated(tid, name, String::from("flush check never ran"), source),
 		Some(f) => {
 			if f.passed {
-				RuleResult::passed(tid, name, format!("flush check passed (device={}, written={}, ackd={})",
-					f.device.clone().unwrap_or(String::from("?")), f.device_written_bytes.unwrap_or(0), f.acknowledged_bytes), source)
+				RuleResult::passed(tid, name, format!("flush check passed (device={}, written={}, ackd={})", f.device.clone().unwrap_or(String::from("?")), f.device_written_bytes.unwrap_or(0), f.acknowledged_bytes), source)
 			} else {
 				let failure = f.failure.map(|k| k.as_str()).unwrap_or("unknown");
 				RuleResult::failed(tid, name, format!("flush check failed: {} (device={})", failure, f.device.clone().unwrap_or(String::from("?"))), source)
 			}
-		},
+		}
 	}
 }
 
@@ -415,7 +377,7 @@ fn evaluate_r4(derived: Option<&DerivedReadVerdict>) -> RuleResult {
 			} else {
 				RuleResult::failed(tid, name, format!("{} mismatches over {} ticks", d.mismatch_count, d.ticks_judged), source)
 			}
-		},
+		}
 	}
 }
 
@@ -434,14 +396,13 @@ fn evaluate_r5(backup: Option<&BackupLaneVerdict>) -> RuleResult {
 			let rpo = b.timing.rpo_ms();
 			let rto = b.timing.rto_ms();
 			if rpo > 0 && rto > 0 {
-				RuleResult::passed(tid, name, format!("RPO={}ms RTO={}ms (I={}ms d_max={}ms restore={}ms)",
-					rpo, rto, b.timing.backup_interval_ms, b.timing.backup_duration_ms, b.timing.restore_duration_ms), source)
+				RuleResult::passed(tid, name, format!("RPO={}ms RTO={}ms (I={}ms d_max={}ms restore={}ms)", rpo, rto, b.timing.backup_interval_ms, b.timing.backup_duration_ms, b.timing.restore_duration_ms), source)
 			} else if rpo == 0 && rto == 0 {
 				RuleResult::failed(tid, name, String::from("backup lane recorded but RecoveryTiming is all zeroes — no objective can be derived"), source)
 			} else {
 				RuleResult::failed(tid, name, format!("RPO={}ms RTO={}ms — at least one is zero, recovery not fully recorded", rpo, rto), source)
 			}
-		},
+		}
 	}
 }
 
@@ -493,24 +454,18 @@ fn evaluate_r7(total_ticks: u64, new_sealed_points: u64) -> RuleResult {
 // ---------------------------------------------------------------------------
 
 /// Check coverage floors and produce a `CoverageReport`.
-fn check_coverage(
-	oracle_ticks: Option<u64>,
-	derived_ticks: Option<u64>,
-	backup_windows: Option<u64>,
-	steps: u64,
-	hook_windows: &Vec<(String, u64)>,
-	min_evaluated_ticks: u64,
-	min_backup_windows: u64,
-	min_derived_read_ticks: u64,
-	min_hook_windows: u64,
-) -> CoverageReport {
+fn check_coverage(oracle_ticks: Option<u64>, derived_ticks: Option<u64>, backup_windows: Option<u64>, steps: u64, hook_windows: &Vec<(String, u64)>, min_evaluated_ticks: u64, min_backup_windows: u64, min_derived_read_ticks: u64, min_hook_windows: u64) -> CoverageReport {
 	let mut failures: Vec<String> = Vec::new();
 	let mut first_observed: u64 = 0;
 	let mut first_required: u64 = 0;
 	let mut first_set = false;
 
 	fn push_failure(msg: String, observed: u64, required: u64) {
-		if !first_set { first_observed = observed; first_required = required; first_set = true; }
+		if !first_set {
+			first_observed = observed;
+			first_required = required;
+			first_set = true;
+		}
 		failures.push(msg);
 	}
 
@@ -551,21 +506,10 @@ fn check_coverage(
 	if failures.is_empty() {
 		status = CoverageStatus::Met;
 	} else {
-		status = CoverageStatus::InsufficientCoverage(InsufficientCoverage {
-			reason: failures.join("; "),
-			observed: first_observed,
-			required: first_required,
-		});
+		status = CoverageStatus::InsufficientCoverage(InsufficientCoverage { reason: failures.join("; "), observed: first_observed, required: first_required });
 	}
 
-	CoverageReport {
-		status,
-		oracle_ticks,
-		derived_ticks,
-		backup_windows,
-		steps,
-		hook_windows: hook_windows.clone(),
-	}
+	CoverageReport { status, oracle_ticks, derived_ticks, backup_windows, steps, hook_windows: hook_windows.clone() }
 }
 
 // ---------------------------------------------------------------------------
@@ -627,14 +571,7 @@ fn compute_overall_outcome(rules: &Vec<RuleResult>, coverage: &CoverageReport) -
 // ---------------------------------------------------------------------------
 
 /// Build the generated honesty section as Markdown.
-fn build_honesty_section(
-	run: &SoakRun,
-	slo: &SloReport,
-	coverage: &CoverageReport,
-	overrides: &Vec<OverrideDiff>,
-	contamination: Option<&ContaminationVerdict>,
-	flush_check: Option<&FlushCheckResult>,
-) -> String {
+fn build_honesty_section(run: &SoakRun, slo: &SloReport, coverage: &CoverageReport, overrides: &Vec<OverrideDiff>, contamination: Option<&ContaminationVerdict>, flush_check: Option<&FlushCheckResult>) -> String {
 	let mut out = String::with_capacity(2048);
 
 	// --- Wins ---
@@ -683,12 +620,11 @@ fn build_honesty_section(
 			} else {
 				let _ = writeln!(out, "{} contamination flag(s) fired:", c.flags.len());
 				for flag in &c.flags {
-					let _ = writeln!(out, "- {} (worst: cpu={:.1}%, load={:.1}, dirty={}KiB, clock_step={}ms, gap={}ms)",
-						flag.as_str(), c.worst.cpu_psi_some_avg10, c.worst.load_per_core, c.worst.dirty_kib, c.worst.clock_step_ms, c.worst.sample_gap_ms);
+					let _ = writeln!(out, "- {} (worst: cpu={:.1}%, load={:.1}, dirty={}KiB, clock_step={}ms, gap={}ms)", flag.as_str(), c.worst.cpu_psi_some_avg10, c.worst.load_per_core, c.worst.dirty_kib, c.worst.clock_step_ms, c.worst.sample_gap_ms);
 				}
 				out.push_str("\n");
 			}
-		},
+		}
 	}
 
 	// --- Surfaces not tested ---
@@ -777,87 +713,23 @@ mod tests {
 	}
 
 	fn oracle_verdict(ticks_judged: u64, mismatches: u64) -> OracleVerdict {
-		OracleVerdict {
-			ticks_judged,
-			cells_checked: ticks_judged * 4,
-			cells_present: ticks_judged * 4,
-			points_observed: ticks_judged * 4,
-			mismatch_count: mismatches,
-			mismatches: Vec::new(),
-		}
+		OracleVerdict { ticks_judged, cells_checked: ticks_judged * 4, cells_present: ticks_judged * 4, points_observed: ticks_judged * 4, mismatch_count: mismatches, mismatches: Vec::new() }
 	}
 
 	fn derived_verdict(ticks_judged: u64, mismatches: u64) -> DerivedReadVerdict {
-		DerivedReadVerdict {
-			ticks_judged,
-			buckets_checked: ticks_judged,
-			buckets_present: ticks_judged,
-			points_counted: ticks_judged * 4,
-			mismatch_count: mismatches,
-			mismatches: Vec::new(),
-		}
+		DerivedReadVerdict { ticks_judged, buckets_checked: ticks_judged, buckets_present: ticks_judged, points_counted: ticks_judged * 4, mismatch_count: mismatches, mismatches: Vec::new() }
 	}
 
 	fn backup_verdict(rpo_param: u64, rto_param: u64) -> BackupLaneVerdict {
-		BackupLaneVerdict {
-			prefix: BackupPrefixVerdict {
-				acknowledged_ticks: 6,
-				ticks_in_backup: 3,
-				cut_tick: Some(2),
-				points_expected: 24,
-				points_in_backup: 24,
-				mismatch_count: 0,
-				mismatches: Vec::new(),
-			},
-			restore: RestoreVerdict {
-				ticks_judged: 6,
-				points_expected: 48,
-				points_restored: 48,
-				mismatch_count: 0,
-				mismatches: Vec::new(),
-			},
-			timing: RecoveryTiming {
-				backup_interval_ms: 1000,
-				backup_duration_ms: rpo_param,
-				restore_duration_ms: if rto_param > rpo_param { rto_param - rpo_param } else { rpo_param },
-			},
-		}
+		BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1000, backup_duration_ms: rpo_param, restore_duration_ms: if rto_param > rpo_param { rto_param - rpo_param } else { rpo_param } } }
 	}
 
 	fn contamination_verdict(flags: Vec<ContaminationFlag>) -> ContaminationVerdict {
-		ContaminationVerdict {
-			flags,
-			sample_count: 60,
-			window_ms: 60_000,
-			worst: WorstValues {
-				io_psi_some_avg10: if flags.is_empty() { 0.0 } else { 5.0 },
-				cpu_psi_some_avg10: if flags.is_empty() { 0.0 } else { 10.0 },
-				memory_psi_some_avg10: 0.0,
-				dirty_kib: 0,
-				load_per_core: if flags.is_empty() { 0.0 } else { 2.0 },
-				clock_step_ms: 0,
-				sample_gap_ms: 0,
-			},
-			device_written_bytes: Some(500_000),
-			acknowledged_bytes: Some(500_000),
-			foreign_write_bytes: Some(0),
-			psi_capable: true,
-			device: Some(String::from("nvme0n1")),
-		}
+		ContaminationVerdict { flags, sample_count: 60, window_ms: 60_000, worst: WorstValues { io_psi_some_avg10: if flags.is_empty() { 0.0 } else { 5.0 }, cpu_psi_some_avg10: if flags.is_empty() { 0.0 } else { 10.0 }, memory_psi_some_avg10: 0.0, dirty_kib: 0, load_per_core: if flags.is_empty() { 0.0 } else { 2.0 }, clock_step_ms: 0, sample_gap_ms: 0 }, device_written_bytes: Some(500_000), acknowledged_bytes: Some(500_000), foreign_write_bytes: Some(0), psi_capable: true, device: Some(String::from("nvme0n1")) }
 	}
 
 	fn flush_check() -> FlushCheckResult {
-		FlushCheckResult {
-			name: "flush_observed",
-			device: Some(String::from("nvme0n1")),
-			passed: true,
-			failure: None,
-			skipped: None,
-			device_written_bytes: Some(1_000_000),
-			acknowledged_bytes: 1_000_000,
-			dirty_kib_at_close: 0,
-			slack_bytes: 0,
-		}
+		FlushCheckResult { name: "flush_observed", device: Some(String::from("nvme0n1")), passed: true, failure: None, skipped: None, device_written_bytes: Some(1_000_000), acknowledged_bytes: 1_000_000, dirty_kib_at_close: 0, slack_bytes: 0 }
 	}
 
 	fn run_harness(steps: u64) -> SoakRun {
@@ -953,17 +825,7 @@ mod tests {
 	#[test]
 	fn r3_fails_when_flush_check_fails() {
 		let run = run_harness(60);
-		let failed_check = FlushCheckResult {
-			name: "flush_observed",
-			device: Some(String::from("nvme0n1")),
-			passed: false,
-			failure: Some(FlushFailureKind::WritesNotObserved),
-			skipped: None,
-			device_written_bytes: Some(500_000),
-			acknowledged_bytes: 1_000_000,
-			dirty_kib_at_close: 0,
-			slack_bytes: 0,
-		};
+		let failed_check = FlushCheckResult { name: "flush_observed", device: Some(String::from("nvme0n1")), passed: false, failure: Some(FlushFailureKind::WritesNotObserved), skipped: None, device_written_bytes: Some(500_000), acknowledged_bytes: 1_000_000, dirty_kib_at_close: 0, slack_bytes: 0 };
 		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&failed_check), Vec::new(), 60, 240, 1, 1, 1, 1);
 		let r3 = &verdicts.slo.rules[2];
 		assert_eq!(r3.outcome, Outcome::Fail, "R3 must fail when flush check fails");
@@ -1023,29 +885,7 @@ mod tests {
 	#[test]
 	fn r5_fails_when_backup_has_zero_timing() {
 		let run = run_harness(60);
-		let zero_timing = BackupLaneVerdict {
-			prefix: BackupPrefixVerdict {
-				acknowledged_ticks: 6,
-				ticks_in_backup: 3,
-				cut_tick: Some(2),
-				points_expected: 24,
-				points_in_backup: 24,
-				mismatch_count: 0,
-				mismatches: Vec::new(),
-			},
-			restore: RestoreVerdict {
-				ticks_judged: 6,
-				points_expected: 48,
-				points_restored: 48,
-				mismatch_count: 0,
-				mismatches: Vec::new(),
-			},
-			timing: RecoveryTiming {
-				backup_interval_ms: 0,
-				backup_duration_ms: 0,
-				restore_duration_ms: 0,
-			},
-		};
+		let zero_timing = BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 0, backup_duration_ms: 0, restore_duration_ms: 0 } };
 		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&zero_timing), None, Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
 		let r5 = &verdicts.slo.rules[4];
 		assert_eq!(r5.outcome, Outcome::Fail, "R5 must fail when backup RecoveryTiming is all zeroes");
@@ -1142,10 +982,10 @@ mod tests {
 		let run = run_harness(60);
 		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&flush_check()), Vec::new(), 60, 240, 50, 3, 30, 1);
 		match verdicts.coverage.status {
-			CoverageStatus::Met => {}, // expected
+			CoverageStatus::Met => {} // expected
 			CoverageStatus::InsufficientCoverage(ins) => {
 				panic!("expected Met, got InsufficientCoverage: {ins.reason}");
-			},
+			}
 		}
 	}
 
@@ -1156,7 +996,7 @@ mod tests {
 		match verdicts.coverage.status {
 			CoverageStatus::InsufficientCoverage(ins) => {
 				assert!(ins.reason.contains("oracle"), "reason must mention oracle: {ins.reason}");
-			},
+			}
 			_ => panic!("expected InsufficientCoverage"),
 		}
 	}
@@ -1168,7 +1008,7 @@ mod tests {
 		match verdicts.coverage.status {
 			CoverageStatus::InsufficientCoverage(ins) => {
 				assert!(ins.reason.contains("derived"), "reason must mention derived: {ins.reason}");
-			},
+			}
 			_ => panic!("expected InsufficientCoverage"),
 		}
 	}
@@ -1180,7 +1020,7 @@ mod tests {
 		match verdicts.coverage.status {
 			CoverageStatus::InsufficientCoverage(ins) => {
 				assert!(ins.reason.contains("backup"), "reason must mention backup: {ins.reason}");
-			},
+			}
 			_ => panic!("expected InsufficientCoverage"),
 		}
 	}
@@ -1192,7 +1032,7 @@ mod tests {
 		match verdicts.coverage.status {
 			CoverageStatus::InsufficientCoverage(ins) => {
 				assert!(ins.reason.contains("steps"), "reason must mention steps: {ins.reason}");
-			},
+			}
 			_ => panic!("expected InsufficientCoverage"),
 		}
 	}
