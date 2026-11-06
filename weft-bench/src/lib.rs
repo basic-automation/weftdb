@@ -66,6 +66,11 @@
 //!   verification through PAC-13's restore path, and the RPO/RTO the
 //!   lane measures, derived by EVI-19's formulas; recorded on the
 //!   [`soak`] run record (soak schema v6).
+//! - [`soak_report`] — the soak report and SLO evaluator (SOA-13): the
+//!   [`SoakReport`] wrapping a finished run with the SLO evaluator
+//!   verdict (R1–R8), coverage floors, and a generated honesty section;
+//!   no new schema version — the report is a new artifact beside the
+//!   run record, not a field on it.
 //! - [`schema`] — the serializable [`BenchResult`] record (Phase 1.1 latency
 //!   distribution + correctness + dataset metadata + end-to-end timing spans).
 //! - [`stats`] — p50/p95/p99 latency summarization + seeded bootstrap
@@ -125,6 +130,7 @@ pub mod soak_hdr;
 pub mod soak_null;
 pub mod soak_oracle;
 pub mod soak_read;
+pub mod soak_report;
 pub mod soak_sched;
 pub mod soak_system;
 pub mod soak_workload;
