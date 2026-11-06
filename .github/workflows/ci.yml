@@ -201,9 +201,9 @@ jobs:
           WEFT_SERVER_BIN: target/debug/weft-server
       # The Rust SDK's contract tests against the same server. The workspace run above
       # skips them (no WEFT_SERVER_BIN); `arrow` adds the columnar decode checks.
-      - name: Rust SDK contract (weft-client)
+      - name: Rust SDK contract (weftdb-client)
         if: runner.os == 'Linux'
-        run: cargo test -p weft-client --features arrow --locked --test live -- --test-threads=4
+        run: cargo test -p weftdb-client --features arrow --locked --test live -- --test-threads=4
         env:
           # Absolute: cargo runs an integration test from its package directory.
           WEFT_SERVER_BIN: ${{ github.workspace }}/target/debug/weft-server
