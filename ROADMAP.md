@@ -364,7 +364,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
   - [ ] **FRE-8b** Stored-value text and one float-input rule across every ingest format
   - [ ] **FRE-9a** OpenAPI generated from code
-  - [ ] **ROB-9** Mutation harness for frames, sidecars and Parquet
+  - [x] **ROB-9** Mutation harness for frames, sidecars and Parquet
+    - [ ] Report the three `parquet` 60.0.0 decoder panics upstream to apache/arrow-rs (`offset + len out of bounds`, `column start and length should not be negative`, `Decoder for dict should have been set`; reproducers are one-byte edits found by `weft-arrow-store/tests/parquet_mutation.rs`) *(owner: outward-facing)*. WeftDB contains them in `weft_arrow::read_parquet` meanwhile (DECISIONS 2026-11-05).
   - [ ] **SEC-14** Security documentation, config schema and upgrade notes
   - [ ] **PAC-10** Publish the multi-arch image (only after API auth)
   - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
@@ -480,6 +481,8 @@ The decimal-versus-f64 gap was measured at about 43x rather than 2x, which set t
 
 Around that, the read-path arc is done: streaming and batch point lookup (also at the API), closed-form and block-random-access timestamp search, and windowed range reads. The `weft-reduce` crate has mergeable DDSketch quantiles, cross-segment downsample at the store layer and the API (4.7x with concurrent segments), per-segment `.weftpart` partials with a hierarchy of materialised tiers, and size-targeted compaction with a fragmentation gate in the reconcile daemon. Test infrastructure is healthy: the flaky GPU tests, the rustc ICE and the link OOM were root-caused and fixed, `cargo test --workspace` completes (969 passed), and the BTC bulk-load test is runnable. The codec and reconciliation items from Phases 2 to 6 that were tracked here are summarised in those phases.
 
+- [ ] **START HERE (filed 2026-11-05 for the next run).** W8 after ROB-17 and ROB-9 (#311, #315): the unclaimed non-owner slices left are ROB-14 (cgroup-aware memory budget), FRE-8b (stored-value text and one float-input rule), FRE-9a (OpenAPI from code), FRE-13 (layout-1 → layout-2 upgrade test), SEC-14 and SOA-13. Check #125 and open PRs for claims first. Builds: the shared `Cargo Target` lock was held for 30+ min by other projects' tests on 2026-11-05; the warm `/mnt/weftbench/target-ci` worked, and clippy needs `RUSTC_WRAPPER=` because the global nightly-threads wrapper breaks `clippy-driver`.
+- [ ] **Two `weft-server` bit-exactness tests fail on this host on clean `origin/main` (found 2026-11-05):** `interpolate::tests::ilp_values_feed_the_f64_path_unchanged` and `stored_interpolate::tests::a_multi_chunk_stream_is_the_library_result` each differ from the library result by 1 ULP (e.g. `…594019` vs `…594020` in the bits). Both compare the server's `auto` backend against a CPU-run library result, and `auto`'s choice depends on the startup calibration, so on a loaded GPU the two sides can run different kernels. Pin the test's backend (or compare against the same backend) rather than loosen the assertion. Also flaky under GPU contention: `weft-bench` `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` (failed in the full suite, passed alone).
 - [ ] **START HERE (filed 2026-10-11 for the next run).**
 - [ ] **Research (2026-10-11) — the exact TWA is now a measurable differentiator.**
 - [ ] **START HERE (filed 2026-10-09 for the next run).**

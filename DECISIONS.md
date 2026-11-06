@@ -5267,3 +5267,36 @@ looks like are not specified.
 recovery writes too, and a frame refused half-way through a batch is litter); a
 percentage reserve (a percentage of a 15 TB volume is hundreds of GB nobody asked to keep,
 and of a small volume too little for the control plane).
+
+## 2026-11-05 — ROB-9: the `parquet` decoder's panics are contained at `weft_arrow::read_parquet` (FLAGGED FOR MERGE REVIEW)
+
+**What the harness found.** ROB-9's mutation harness feeds every one-byte substitution,
+every truncation and 2,048 seeded multi-byte mutants of a real WeftDB-written Parquet file
+to the ingest decoder (`weft_arrow_store::decode_parquet_columns_strict`). 15 of 14,161
+mutants panicked inside `parquet` 60.0.0 instead of returning its error: `offset + len out
+of bounds`, `column start and length should not be negative`, and `Decoder for dict should
+have been set`. Before this change such a body reached ROB-3's panic layer and was answered
+`500 commit_failed` — a client's malformed file reported as a server failure, with an
+error-level panic log per request.
+
+**Chosen:** `weft_arrow::read_parquet` runs the decode under `catch_unwind` and answers a
+panic as `ConvertError::Parquet("the Parquet decoder could not read this file (…)")`, which
+the ingest classifier already maps to `400 bad_request`. This amends plan C12 ("ROB-3's
+layer is the only layer that catches panics") for exactly one place, and the argument is
+that C12's reasons do not apply there: C12 exists so a panic in *WeftDB's* request handling
+is reported once, as the envelope, and so a control-plane panic stays a fail-stop. The
+Parquet decode is a third-party pure function of an owned copy of the caller's bytes, run
+before the seal, outside any control-plane write (so ROB-2's abort can never be what it
+would swallow), holding no lock or shared state that an unwind could leave inconsistent.
+
+**The frame and sidecar halves found one bug and fixed it at its source rather than
+containing it:** the windowed range read's closed form sized its window from the header's
+`row_count` without the ROB-8 cross-check the full decode applies, so a resealed frame
+whose header claimed 0 rows underflowed `row_count - 1` (a panic in debug, a wrapped
+`usize::MAX` bound in release). It now refuses a header that disagrees with its timestamp
+column (`ColumnLengthMismatch`, Integrity). No sidecar mutant panicked.
+
+**Rejected:** leaving the panics to ROB-3 (wrong status, and an error log an attacker can
+generate at will); a `catch_unwind` in `weft-server`'s handler (C12's "no handler catches its
+own panics" is about exactly that); waiting for upstream (the fix belongs upstream too, and
+is filed as a to-do for the owner, but the boundary has to hold whatever version is pinned).

@@ -19,6 +19,22 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   the `weft_disk_{total,available,reserve,writable}_bytes` gauges plus a 0/1
   `weft_disk_guard_refusing`. The library default
   (`SegmentStoreOptions::default`) leaves the guard off.
+- **Mutation harness for frames, sidecars and Parquet** (ROB-9). Every committed golden
+  `.weftseg` frame, a tiered `.weftpart` sidecar and a WeftDB-written Parquet file are
+  mutated — every byte substitution, every truncation, and a seeded multi-byte corpus —
+  and **resealed** (CRC recomputed, so the mutation reaches the decoders) before going
+  through every reader; none may panic.
+
+### Fixed
+
+- **A resealed frame whose header claims 0 rows no longer panics the windowed range read**
+  (ROB-9). The closed-form range window now cross-checks the header's row count against
+  the timestamp column, as the full decode already did, and refuses a disagreement as
+  `ColumnLengthMismatch`.
+- **A Parquet body that panics the `parquet` decoder is `400 bad_request`, not
+  `500 commit_failed`** (ROB-9). `weft_arrow::read_parquet` contains the decoder's own
+  panics (three found in `parquet` 60.0.0 within single-byte edits of a valid file) as
+  `ConvertError::Parquet`.
 
 ## [0.3.0] - 2026-11-05
 

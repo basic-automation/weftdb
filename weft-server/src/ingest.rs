@@ -1727,6 +1727,34 @@ mod tests {
 		assert_eq!(status, StatusCode::BAD_REQUEST);
 	}
 
+	/// ROB-9: a file that panics the `parquet` decoder (the mutation harness found such
+	/// files within one byte of a valid one) is the caller's malformed file — `400`,
+	/// never the panic layer's `500 commit_failed`. The panicking mutant is found by
+	/// scanning a real file's one-byte edits, so the test follows the dependency: once
+	/// upstream refuses every such edit with its own error, there is nothing to post.
+	#[tokio::test]
+	async fn parquet_ingest_answers_a_decoder_panic_as_a_bad_request() {
+		use weft_arrow::{columns_to_record_batch_typed, write_parquet};
+
+		let timestamps: Vec<i64> = (0..64).map(|i| 1_700_000_000 + i * 60).collect();
+		let values: Vec<Option<bigdecimal::BigDecimal>> = (0..64).map(|i| (i % 7 != 3).then(|| bd(&format!("{}.25", i * 3)))).collect();
+		let batch = columns_to_record_batch_typed(TimeUnit::Seconds, PhysicalType::F64, &timestamps, &values).expect("builds the batch");
+		let golden = write_parquet(std::slice::from_ref(&batch)).expect("writes parquet");
+		let mut contained = (0..golden.len()).flat_map(|offset| [0x01_u8, 0x80].map(|mask| (offset, mask))).map(|(offset, mask)| {
+			let mut mutant = golden.clone();
+			mutant[offset] ^= mask;
+			mutant
+		});
+		let Some(mutant) = contained.find(|mutant| matches!(weft_arrow::read_parquet(mutant), Err(weft_arrow::ConvertError::Parquet(message)) if message.contains("could not read this file"))) else {
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		let router = router_with_declared_empty_price(&dir).await;
+		let (status, json) = post_parquet(router, "/api/v1/storage/price/parquet", mutant).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+		assert_eq!(json["code"], "bad_request", "{json}");
+	}
+
 	#[tokio::test]
 
 	async fn parquet_ingest_into_undeclared_aspect_is_not_found() {

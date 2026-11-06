@@ -580,4 +580,74 @@ mod tests {
 		assert!(PartialSidecar::from_bytes_with_limits(&honest, tight).is_err(), "a two-row sidecar is over a one-row limit");
 		assert!(PartialSidecar::from_bytes_with_limits(&honest, DecodeLimits::DEFAULT).is_ok(), "the honest frame passes the default limits");
 	}
+
+	/// One named byte substitution of the mutation harness below.
+	type Substitution = (&'static str, fn(u8) -> u8);
+
+	/// ROB-9: the sidecar half of the mutation harness. A CRC is not a signature, so a
+	/// damaged-then-resealed `.weftpart` reaches the postcard decoder and, if accepted,
+	/// the downsample path that consumes it. Every byte substitution and every
+	/// truncation of a tiered sidecar, each resealed, must be refused or read — and a
+	/// sidecar the reader accepts must serve every resolution and finish without a panic.
+	#[test]
+	fn resealed_mutants_are_refused_or_served_without_a_panic() {
+		use std::panic::{catch_unwind, AssertUnwindSafe};
+
+		// Small enough that every mutant is cheap in a debug build, and still two tiers
+		// deep: 48 samples, 20 minutes apart, span 16 hours (a Minutes base, Hours and
+		// Days rollups).
+		let points: Vec<Point> = (0..48).map(|i| pt(i64::from(i) * 1_200, &format!("{}.25", (i * 13) % 71))).collect();
+		let base = reduce_partial(&points, Resolution::Minutes, None, None, &SIDECAR_AGGREGATIONS).expect("base partial");
+		let sidecar = PartialSidecar::materialize(Resolution::Minutes, &descriptor(48, 1), FRAME_CRC, base, &[Resolution::Hours, Resolution::Days]).expect("materializes tiers");
+		let golden = sidecar.to_bytes().expect("serializes");
+		let reseal = |frame: &mut Vec<u8>| {
+			if frame.len() >= 4 {
+				let body = frame.len() - 4;
+				let crc = crc32(&frame[..body]);
+				frame[body..].copy_from_slice(&crc.to_le_bytes());
+			}
+		};
+		let consume = |bytes: &[u8]| {
+			catch_unwind(AssertUnwindSafe(|| {
+				if let Ok(read) = PartialSidecar::from_bytes(bytes) {
+					for resolution in [Resolution::Minutes, Resolution::Hours, Resolution::Days, Resolution::Months] {
+						if let Ok(Some(partial)) = read.partial_for(resolution) {
+							let _ = partial.finish(resolution, &SIDECAR_AGGREGATIONS);
+						}
+					}
+				}
+			}))
+			.is_ok()
+		};
+		let previous = std::panic::take_hook();
+		std::panic::set_hook(Box::new(|_| {}));
+		let mut failures = Vec::new();
+		let mut mutants = 0usize;
+		let substitutions: [Substitution; 5] = [("xor 0x01", |b| b ^ 0x01), ("xor 0x80", |b| b ^ 0x80), ("set 0x00", |_| 0x00), ("set 0x7f", |_| 0x7f), ("set 0xff", |_| 0xff)];
+		for offset in 0..golden.len() - 4 {
+			for (label, substitute) in substitutions {
+				let mut mutant = golden.clone();
+				if substitute(mutant[offset]) == mutant[offset] {
+					continue;
+				}
+				mutant[offset] = substitute(mutant[offset]);
+				reseal(&mut mutant);
+				mutants += 1;
+				if !consume(&mutant) {
+					failures.push(format!("offset {offset} {label}"));
+				}
+			}
+		}
+		for len in 0..golden.len() {
+			let mut cut = golden[..len].to_vec();
+			reseal(&mut cut);
+			mutants += 1;
+			if !consume(&cut) {
+				failures.push(format!("truncated to {len}"));
+			}
+		}
+		std::panic::set_hook(previous);
+		assert!(consume(&golden), "the unmutated sidecar is served");
+		assert!(failures.is_empty(), "{} of {mutants} resealed sidecar mutants panicked; first: {:?}", failures.len(), &failures[..failures.len().min(20)]);
+	}
 }
