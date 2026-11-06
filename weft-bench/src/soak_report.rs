@@ -337,6 +337,7 @@ fn evaluate_r2(contamination: Option<&ContaminationVerdict>) -> RuleResult {
 }
 
 /// R3: flush-discipline — strict-mode flush check violations == 0.
+#[allow(clippy::redundant_closure)]
 fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 	let tid = "R3";
 	let name = "flush-discipline";
@@ -347,7 +348,7 @@ fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 			if f.passed {
 				RuleResult::passed(tid, name, format!("flush check passed (device={}, written={}, ackd={})", f.device.clone().unwrap_or_else(|| String::from("?")), f.device_written_bytes.unwrap_or(0), f.acknowledged_bytes), source)
 			} else {
-				let failure = f.failure.as_deref().unwrap_or("unknown");
+				let failure = f.failure.map(|k| k.as_str()).unwrap_or_else(|| "unknown");
 				RuleResult::failed(tid, name, format!("flush check failed: {} (device={})", failure, f.device.clone().unwrap_or_else(|| String::from("?"))), source)
 			}
 		}
