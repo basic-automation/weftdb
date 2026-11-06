@@ -67,7 +67,7 @@
 //!   lane measures, derived by EVI-19's formulas; recorded on the
 //!   [`soak`] run record (soak schema v6).
 //! - [`soak_report`] — the soak report and SLO evaluator (SOA-13): the
-//!   [`SoakReport`] wrapping a finished run with the SLO evaluator
+//!   [`SoakReport`](soak_report::SoakReport) wrapping a finished run with the SLO evaluator
 //!   verdict (R1–R8), coverage floors, and a generated honesty section;
 //!   no new schema version — the report is a new artifact beside the
 //!   run record, not a field on it.

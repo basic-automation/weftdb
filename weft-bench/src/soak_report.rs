@@ -1,4 +1,4 @@
-//! SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
+//! `SoakReport`, SLO evaluator R1–R8, coverage floors, honesty section
 //! (1.0 plan SOA-13, W8).
 //!
 //! Every soak run ends with individual verdicts — the oracle judged the
@@ -72,7 +72,7 @@ use crate::{
 
 /// Version of the soak report artifact.
 ///
-/// v1 is defined by SOA-13: the SoakReport struct with SLO evaluator, coverage
+/// v1 is defined by SOA-13: the `SoakReport` struct with SLO evaluator, coverage
 /// floors and honesty section. It is independent of
 /// [`SOAK_SCHEMA_VERSION`](crate::soak::SOAK_SCHEMA_VERSION) (the soak run
 /// record's version line) and of the bench result schema
@@ -219,7 +219,7 @@ pub struct SloReport {
 	/// The 8 rule results in R1–R8 order.
 	pub rules: Vec<RuleResult>,
 	/// Overall outcome: Pass when all pass, Fail when any fails,
-	/// NotEvaluated when all are not-evaluated.
+	/// `NotEvaluated` when all are not-evaluated.
 	pub outcome: Outcome,
 	/// Short human-readable summary of the overall outcome.
 	pub summary: String,
@@ -325,7 +325,7 @@ fn evaluate_r1(oracle: Option<&OracleVerdict>) -> RuleResult {
 }
 
 /// R2: contamination-explained — every set flag maps to a reported window
-/// with WorstValues.
+/// with `WorstValues`.
 fn evaluate_r2(contamination: Option<&ContaminationVerdict>) -> RuleResult {
 	let tid = "R2";
 	let name = "contamination-explained";
@@ -362,7 +362,7 @@ fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 	}
 }
 
-/// R4: derived-read agreement — zero DerivedReadVerdict mismatches.
+/// R4: derived-read agreement — zero `DerivedReadVerdict` mismatches.
 fn evaluate_r4(derived: Option<&DerivedReadVerdict>) -> RuleResult {
 	let tid = "R4";
 	let name = "derived-read-agreement";
@@ -383,8 +383,8 @@ fn evaluate_r4(derived: Option<&DerivedReadVerdict>) -> RuleResult {
 	}
 }
 
-/// R5: recovery-recorded — backup lane completed and RecoveryTiming
-/// produced finite rpo_ms()/rto_ms().
+/// R5: recovery-recorded — backup lane completed and `RecoveryTiming`
+/// produced finite `rpo_ms()`/`rto_ms()`.
 ///
 /// This is an existence rule only: the recovery objectives are recorded,
 /// not asserted against a numeric target (none exists in the repo).
@@ -431,7 +431,7 @@ fn evaluate_r6(hook_windows: &Vec<(String, u64)>, min_hook_windows: u64) -> Rule
 	}
 }
 
-/// R7: progress-liveness — each evaluated tick shows >= MIN_TICK_PROGRESS
+/// R7: progress-liveness — each evaluated tick shows >= `MIN_TICK_PROGRESS`
 /// new sealed points, non-decreasing counters.
 fn evaluate_r7(total_ticks: u64, new_sealed_points: u64) -> RuleResult {
 	let tid = "R7";
