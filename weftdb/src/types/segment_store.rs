@@ -6946,12 +6946,14 @@ mod tests {
 		assert_eq!(format.applied_through, Some("0008_upsert_keys".into()));
 		let uuid = store.store_uuid().to_string();
 
-		// Write new data into the now-layout-2 store
+		// Write new data into the now-layout-2 store. The timestamps sit outside the
+		// fixture's range on purpose: the series keeps every row it is given, so a
+		// re-used timestamp would read back as two points, not one replaced point.
 		let sch = schema();
-		let new_ts: Vec<i64> = vec![300, 310, 320];
+		let new_ts: Vec<i64> = vec![500, 510, 520];
 		let new_vals: Vec<BigDecimal> = vec![bd("55"), bd("66"), bd("77")];
 		store.seal("price", &sch, &new_ts, &new_vals).await.expect("seals new data after migration");
-		let (ts, vs) = store.read_time_range("price", 300, 400).await.expect("reads the just-written range");
+		let (ts, vs) = store.read_time_range("price", 500, 600).await.expect("reads the just-written range");
 		let expected_new_read: Vec<Option<BigDecimal>> = vec![Some(bd("55")), Some(bd("66")), Some(bd("77"))];
 		assert_eq!(ts, new_ts, "new timestamps readable");
 		assert_eq!(vs, expected_new_read, "new values readable");
@@ -6972,7 +6974,7 @@ mod tests {
 		assert_eq!(store2.read_point("temp", 180).await.expect("reads point 180"), Some(bd("22")));
 
 		// New data persisted through reopen
-		let (ts2, vs2) = store2.read_time_range("price", 300, 400).await.expect("reads new data after reopen");
+		let (ts2, vs2) = store2.read_time_range("price", 500, 600).await.expect("reads new data after reopen");
 		assert_eq!(ts2, new_ts, "new timestamps persisted");
 		assert_eq!(vs2, expected_new_read, "new values persisted");
 
