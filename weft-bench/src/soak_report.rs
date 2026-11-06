@@ -103,17 +103,12 @@ pub const MIN_HOOK_WINDOWS: u64 = 1;
 // RuleResult outcome
 // ---------------------------------------------------------------------------
 
-/// The outcome of one SLO rule's evaluation.
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Outcome {
-	/// The rule's condition was met.
 	Pass,
-	/// The rule's condition was not met.
 	Fail,
-	/// The rule could not be evaluated — the surface it depends on was not
-	/// tested (the oracle never ran, the backup lane was not enabled,
-	/// the hooks were not configured, etc).
 	NotEvaluated,
 }
 
@@ -212,16 +207,12 @@ pub enum CoverageStatus {
 
 /// The SLO evaluator's report on one run: the 8 rule results (R1–R8) and
 /// the overall outcome.
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SloReport {
-	/// Schema version of this report.
 	pub schema_version: u32,
-	/// The 8 rule results in R1–R8 order.
 	pub rules: Vec<RuleResult>,
-	/// Overall outcome: Pass when all pass, Fail when any fails,
-	/// `NotEvaluated` when all are not-evaluated.
 	pub outcome: Outcome,
-	/// Short human-readable summary of the overall outcome.
 	pub summary: String,
 }
 
