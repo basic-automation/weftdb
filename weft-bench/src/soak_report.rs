@@ -306,7 +306,7 @@ fn evaluate_r1(oracle: Option<&OracleVerdict>) -> RuleResult {
 				if o.ticks_judged > 0 {
 					RuleResult::passed(tid, name, format!("zero mismatches over {} ticks", o.ticks_judged), source)
 				} else {
-					RuleResult::failed(tid, name, format!("oracle judged 0 ticks — vacuous pass"), source)
+					RuleResult::failed(tid, name, String::from("oracle judged 0 ticks — vacuous pass"), source)
 				}
 			} else {
 				RuleResult::failed(tid, name, format!("{} mismatches over {} ticks", o.mismatch_count, o.ticks_judged), source)
@@ -344,10 +344,10 @@ fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 		None => RuleResult::not_evaluated(tid, name, String::from("flush check never ran"), source),
 		Some(f) => {
 			if f.passed {
-				RuleResult::passed(tid, name, format!("flush check passed (device={}, written={}, ackd={})", f.device.clone().unwrap_or(String::from("?")), f.device_written_bytes.unwrap_or(0), f.acknowledged_bytes), source)
+				RuleResult::passed(tid, name, format!("flush check passed (device={}, written={}, ackd={})", f.device.clone().unwrap_or_else(|| String::from("?")), f.device_written_bytes.unwrap_or(0), f.acknowledged_bytes), source)
 			} else {
-				let failure = f.failure.map(|k| k.as_str()).unwrap_or("unknown");
-				RuleResult::failed(tid, name, format!("flush check failed: {} (device={})", failure, f.device.clone().unwrap_or(String::from("?"))), source)
+				let failure = f.failure.map(|k| k.as_str()).unwrap_or_else(|| "unknown");
+				RuleResult::failed(tid, name, format!("flush check failed: {} (device={})", failure, f.device.clone().unwrap_or_else(|| String::from("?"))), source)
 			}
 		}
 	}
@@ -495,12 +495,11 @@ fn check_coverage(oracle_ticks: Option<u64>, derived_ticks: Option<u64>, backup_
 		}
 	}
 
-	let status: CoverageStatus;
-	if failures.is_empty() {
-		status = CoverageStatus::Met;
+	let status = if failures.is_empty() {
+		CoverageStatus::Met
 	} else {
-		status = CoverageStatus::InsufficientCoverage(InsufficientCoverage { reason: failures.join("; "), observed: first_observed, required: first_required });
-	}
+		CoverageStatus::InsufficientCoverage(InsufficientCoverage { reason: failures.join("; "), observed: first_observed, required: first_required })
+	};
 
 	CoverageReport { status, oracle_ticks, derived_ticks, backup_windows, steps, hook_windows: hook_windows.clone() }
 }
