@@ -144,21 +144,23 @@ readonly DEAD_ADDR=127.0.0.1:0
 readonly STATE="$WORK/state"
 mkdir -p "$STATE"
 
-# Run the real server with a set of names exported and no values, and report what it said.
+# Run the real server with a set of NAME=value settings exported, and report what it said.
 #
 # `env -i` keeps the developer's own WEFT_* out of the picture: a machine with WEFT_KEYS_FILE in
 # the shell would otherwise pass or fail a gate for reasons the script cannot see.
 #
-# $1: file of variable names, one per line. $2: file to write the server's output to.
+# $1: file of NAME=value lines, one per line. $2: file to write the server's output to.
 # Prints the exit status; leaves the refusal text in $2.
 probe_server() {
 	local names=$1 out=$2 rc=0
 	local -a assignments=()
-	while read -r name; do
-		assignments+=("$name=")
+	while read -r line; do
+		assignments+=("$line")
 	done <"$names"
-	env -i PATH="$PATH" HOME="$WORK" WEFT_SERVER_ADDR="$DEAD_ADDR" \
-		"${assignments[@]}" "$BIN" serve >"$out" 2>&1 || rc=$?
+	# WEFT_SERVER_ADDR is assigned last so nothing in the file can undo it: the probe must run
+	# against an address that binds nothing, so the refusal left standing is the one this gate looks for.
+	env -i PATH="$PATH" HOME="$WORK" \
+		"${assignments[@]}" WEFT_SERVER_ADDR="$DEAD_ADDR" "$BIN" serve >"$out" 2>&1 || rc=$?
 	printf '%s' "$rc"
 }
 
@@ -217,8 +219,25 @@ grep -qxF 'WEFT_MAX_CONNECTIONS=64' "$OPERATOR_ENV" ||
 pass "an operator's configuration survives an upgrade; the template stays in share/doc"
 
 # Gate 4: every name in the shipped env file is a name the real server accepts.
+# Since PAC-5b the server refuses values outside the shape its registry says a name accepts —
+# an empty value on a positive-integer name is a refusal, not a default — so the probe exports
+# the defaults the template actually ships rather than bare names. Defaults that point at the
+# machine or turn authentication on are redirected into the scratch tree, so the one refusal
+# left standing is the probe's own unusable address.
 readonly NAMES="$WORK/names.txt"
-grep -oE '^#[A-Z][A-Z0-9_]*=' "$ENV_TEMPLATE" | cut -d= -f1 | tr -d '#' | sort -u >"$NAMES"
+mkdir -p "$WORK/data/store" "$WORK/data/backups"
+: >"$WORK/api.keys"
+grep -oE '^#[A-Z][A-Z0-9_]*=.*' "$ENV_TEMPLATE" | sed 's/^#//' | sort -u |
+	while IFS='=' read -r gname gvalue; do
+		case $gname in
+			WEFT_AUTH) gvalue='' ;;
+			WEFT_DATA_DIR) gvalue="$WORK/data" ;;
+			WEFT_SEGMENT_STORE_ROOT) gvalue="$WORK/data/store" ;;
+			WEFT_BACKUP_DIR) gvalue="$WORK/data/backups" ;;
+			WEFT_KEYS_FILE) gvalue="$WORK/api.keys" ;;
+		esac
+		printf '%s=%s\n' "$gname" "$gvalue"
+	done >"$NAMES"
 NAME_COUNT=$(wc -l <"$NAMES")
 readonly NAME_COUNT
 ((NAME_COUNT >= 30)) || fail "the env file documents only $NAME_COUNT variables; expected 30 or more"
@@ -238,7 +257,7 @@ $(tail -20 "$WORK/probe.out")"
 pass "all $NAME_COUNT variable names in the env file are ones the real server accepts, none of them Test-tier"
 
 # Gate 5: gate 4 is capable of failing. An invented name first.
-printf 'WEFT_NOT_A_WEFTDB_VARIABLE\n' >"$WORK/invented.txt"
+printf 'WEFT_NOT_A_WEFTDB_VARIABLE=1\n' >"$WORK/invented.txt"
 INVENTED_RC=$(probe_server "$WORK/invented.txt" "$WORK/invented.out")
 readonly INVENTED_RC
 [[ $INVENTED_RC == 78 ]] ||
@@ -257,7 +276,7 @@ readonly TEST_NAME
 if [[ -z $TEST_NAME ]]; then
 	skip "no Tier::Test entry was found in $SETTINGS, so the env file's Test-tier refusal went untested"
 else
-	printf '%s\n' "$TEST_NAME" >"$WORK/tier.txt"
+	printf '%s=1\n' "$TEST_NAME" >"$WORK/tier.txt"
 	TEST_RC=$(probe_server "$WORK/tier.txt" "$WORK/tier.out")
 	readonly TEST_RC
 	[[ $TEST_RC == 78 ]] ||
