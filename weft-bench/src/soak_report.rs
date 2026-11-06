@@ -258,6 +258,7 @@ impl SoakReport {
 	///
 	/// The report is deterministic from these inputs and carries no free
 	/// text from the caller.
+	#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 	#[must_use]
 	pub fn evaluate(run: &SoakRun, oracle: Option<&OracleVerdict>, derived: Option<&DerivedReadVerdict>, backup: Option<&BackupLaneVerdict>, contamination: Option<&ContaminationVerdict>, flush_check: Option<&FlushCheckResult>, hook_windows: Vec<(String, u64)>, progress_total_ticks: u64, progress_new_sealed: u64, min_evaluated_ticks: u64, min_backup_windows: u64, min_derived_read_ticks: u64, min_hook_windows: u64) -> Self {
 		let r8_source = String::from("exact");
@@ -277,7 +278,7 @@ impl SoakReport {
 
 		let honesty = build_honesty_section(run, &slo, &coverage, &overrides, contamination, flush_check);
 
-		SoakReport { schema_version: SOAK_REPORT_SCHEMA_VERSION, run: run.redacted_copy(), slo, coverage, overrides, honesty }
+		Self { schema_version: SOAK_REPORT_SCHEMA_VERSION, run: run.redacted_copy(), slo, coverage, overrides, honesty }
 	}
 
 	/// Serialize this report as pretty JSON.
@@ -336,6 +337,7 @@ fn evaluate_r2(contamination: Option<&ContaminationVerdict>) -> RuleResult {
 }
 
 /// R3: flush-discipline — strict-mode flush check violations == 0.
+#[allow(clippy::redundant_closure)]
 fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 	let tid = "R3";
 	let name = "flush-discipline";
@@ -401,6 +403,7 @@ fn evaluate_r5(backup: Option<&BackupLaneVerdict>) -> RuleResult {
 
 /// R6: hook-contract — every SOA-14 hook configured executed in every
 /// window configured (exact count match).
+#[allow(clippy::needless_vec_and)]
 fn evaluate_r6(hook_windows: &Vec<(String, u64)>, min_hook_windows: u64) -> RuleResult {
 	let tid = "R6";
 	let name = "hook-contract";
@@ -447,6 +450,7 @@ fn evaluate_r7(total_ticks: u64, new_sealed_points: u64) -> RuleResult {
 // ---------------------------------------------------------------------------
 
 /// Check coverage floors and produce a `CoverageReport`.
+#[allow(clippy::needless_vec_and)]
 fn check_coverage(oracle_ticks: Option<u64>, derived_ticks: Option<u64>, backup_windows: Option<u64>, steps: u64, hook_windows: &Vec<(String, u64)>, min_evaluated_ticks: u64, min_backup_windows: u64, min_derived_read_ticks: u64, min_hook_windows: u64) -> CoverageReport {
 	let mut failures: Vec<String> = Vec::new();
 	let mut first_observed: u64 = 0;
@@ -531,6 +535,7 @@ fn collect_overrides(min_evaluated_ticks: u64, min_backup_windows: u64, min_deri
 // ---------------------------------------------------------------------------
 
 /// Compute the overall outcome and summary from the rule results and coverage.
+#[allow(clippy::needless_vec_and)]
 fn compute_overall_outcome(rules: &Vec<RuleResult>, coverage: &CoverageReport) -> (Outcome, String) {
 	let any_fail = rules.iter().any(|r| r.outcome == Outcome::Fail);
 	let all_not_evaluated = rules.iter().all(|r| r.outcome == Outcome::NotEvaluated);
@@ -563,6 +568,7 @@ fn compute_overall_outcome(rules: &Vec<RuleResult>, coverage: &CoverageReport) -
 // ---------------------------------------------------------------------------
 
 /// Build the generated honesty section as Markdown.
+#[allow(clippy::needless_vec_and)]
 fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageReport, overrides: &Vec<OverrideDiff>, contamination: Option<&ContaminationVerdict>, _flush_check: Option<&FlushCheckResult>) -> String {
 	let mut out = String::with_capacity(2048);
 
@@ -575,7 +581,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 		for rule in wins {
 			let _ = writeln!(out, "- **{}** ({}) — {}", rule.id, rule.name, rule.evidence);
 		}
-		out.push_str("\n");
+		out.push('\n');
 	}
 
 	// --- Losses ---
@@ -587,7 +593,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 		for rule in losses {
 			let _ = writeln!(out, "- **{}** ({}) — {}", rule.id, rule.name, rule.evidence);
 		}
-		out.push_str("\n");
+		out.push('\n');
 	}
 
 	// --- Not evaluated ---
@@ -599,7 +605,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 		for rule in not_evals {
 			let _ = writeln!(out, "- **{}** ({}) — {}", rule.id, rule.name, rule.evidence);
 		}
-		out.push_str("\n");
+		out.push('\n');
 	}
 
 	// --- Contamination ---
@@ -614,7 +620,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 				for flag in &c.flags {
 					let _ = writeln!(out, "- {} (worst: cpu={:.1}%, load={:.1}, dirty={}KiB, clock_step={}ms, gap={}ms)", flag.as_str(), c.worst.cpu_psi_some_avg10, c.worst.load_per_core, c.worst.dirty_kib, c.worst.clock_step_ms, c.worst.sample_gap_ms);
 				}
-				out.push_str("\n");
+				out.push('\n');
 			}
 		}
 	}
@@ -653,7 +659,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 		for item in &untested {
 			let _ = writeln!(out, "- {}", item);
 		}
-		out.push_str("\n");
+		out.push('\n');
 	}
 
 	// --- Overrides ---
@@ -667,7 +673,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 		for diff in overrides {
 			let _ = writeln!(out, "| {} | {} | {} |", diff.name, diff.default, diff.overridden);
 		}
-		out.push_str("\n");
+		out.push('\n');
 	}
 
 	// --- Limitations ---
