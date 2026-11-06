@@ -337,7 +337,6 @@ fn evaluate_r2(contamination: Option<&ContaminationVerdict>) -> RuleResult {
 }
 
 /// R3: flush-discipline — strict-mode flush check violations == 0.
-#[allow(clippy::redundant_closure)]
 fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 	let tid = "R3";
 	let name = "flush-discipline";
@@ -348,7 +347,7 @@ fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 			if f.passed {
 				RuleResult::passed(tid, name, format!("flush check passed (device={}, written={}, ackd={})", f.device.clone().unwrap_or_else(|| String::from("?")), f.device_written_bytes.unwrap_or(0), f.acknowledged_bytes), source)
 			} else {
-				let failure = f.failure.map(|k| k.as_str()).unwrap_or_else(|| "unknown");
+				let failure = f.failure.map_or("unknown", FlushFailureKind::as_str);
 				RuleResult::failed(tid, name, format!("flush check failed: {} (device={})", failure, f.device.clone().unwrap_or_else(|| String::from("?"))), source)
 			}
 		}
@@ -716,8 +715,8 @@ mod tests {
 		DerivedReadVerdict { ticks_judged, buckets_checked: ticks_judged, buckets_present: ticks_judged, points_counted: ticks_judged * 4, mismatch_count: mismatches, mismatches: Vec::new() }
 	}
 
-	fn backup_verdict(rpo_param: u64, rto_param: u64) -> BackupLaneVerdict {
-		BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1000, backup_duration_ms: rpo_param, restore_duration_ms: if rto_param > rpo_param { rto_param - rpo_param } else { rpo_param } } }
+	fn backup_verdict(rpo_ms: u64, rto_ms: u64) -> BackupLaneVerdict {
+		BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1000, backup_duration_ms: rpo_ms, restore_duration_ms: if rto_ms > rpo_ms { rto_ms - rpo_ms } else { rpo_ms } } }
 	}
 
 	fn contamination_verdict(flags: Vec<ContaminationFlag>) -> ContaminationVerdict {
@@ -993,7 +992,7 @@ mod tests {
 			CoverageStatus::InsufficientCoverage(ins) => {
 				assert!(ins.reason.contains("oracle"), "reason must mention oracle: {0}", ins.reason);
 			}
-			_ => panic!("expected InsufficientCoverage"),
+			CoverageStatus::Met => panic!("expected InsufficientCoverage"),
 		}
 	}
 
@@ -1005,7 +1004,7 @@ mod tests {
 			CoverageStatus::InsufficientCoverage(ins) => {
 				assert!(ins.reason.contains("derived"), "reason must mention derived: {0}", ins.reason);
 			}
-			_ => panic!("expected InsufficientCoverage"),
+			CoverageStatus::Met => panic!("expected InsufficientCoverage"),
 		}
 	}
 
@@ -1017,7 +1016,7 @@ mod tests {
 			CoverageStatus::InsufficientCoverage(ins) => {
 				assert!(ins.reason.contains("backup"), "reason must mention backup: {0}", ins.reason);
 			}
-			_ => panic!("expected InsufficientCoverage"),
+			CoverageStatus::Met => panic!("expected InsufficientCoverage"),
 		}
 	}
 
@@ -1029,7 +1028,7 @@ mod tests {
 			CoverageStatus::InsufficientCoverage(ins) => {
 				assert!(ins.reason.contains("steps"), "reason must mention steps: {0}", ins.reason);
 			}
-			_ => panic!("expected InsufficientCoverage"),
+			CoverageStatus::Met => panic!("expected InsufficientCoverage"),
 		}
 	}
 

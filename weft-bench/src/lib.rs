@@ -86,7 +86,7 @@
 //! subsequent increments per the roadmap.
 
 #![recursion_limit = "1024"]
-#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
+#![deny(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod accuracy;
