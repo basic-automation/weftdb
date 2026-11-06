@@ -703,7 +703,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 mod tests {
 	use super::*;
 	use crate::{
-		report::RunMetadata, soak::{SoakConfig, SoakHarness, SoakRun}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::{OracleVerdict}, soak_read::{DerivedReadVerdict}, soak_system::{ContaminationFlag, FlushCheckResult, FlushFailureKind, WorstValues}
+		report::RunMetadata, soak::{SoakConfig, SoakHarness, SoakRun}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_system::{ContaminationFlag, FlushCheckResult, FlushFailureKind, WorstValues}
 	};
 
 	fn config() -> SoakConfig {
