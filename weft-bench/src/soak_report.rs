@@ -499,11 +499,7 @@ fn check_coverage(oracle_ticks: Option<u64>, derived_ticks: Option<u64>, backup_
 		}
 	}
 
-	let status = if failures.is_empty() {
-		CoverageStatus::Met
-	} else {
-		CoverageStatus::InsufficientCoverage(InsufficientCoverage { reason: failures.join("; "), observed: first_observed, required: first_required })
-	};
+	let status = if failures.is_empty() { CoverageStatus::Met } else { CoverageStatus::InsufficientCoverage(InsufficientCoverage { reason: failures.join("; "), observed: first_observed, required: first_required }) };
 
 	CoverageReport { status, oracle_ticks, derived_ticks, backup_windows, steps, hook_windows: hook_windows.clone() }
 }
