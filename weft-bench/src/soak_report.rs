@@ -63,7 +63,7 @@ use std::fmt::Write;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	soak::SoakRun, soak_backup::BackupLaneVerdict, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_system::{ContaminationVerdict, FlushCheckResult}
+	soak::SoakRun, soak_backup::BackupLaneVerdict, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_system::{ContaminationVerdict, FlushCheckResult, FlushFailureKind}
 };
 
 // ---------------------------------------------------------------------------
