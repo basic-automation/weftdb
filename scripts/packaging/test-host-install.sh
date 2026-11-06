@@ -138,9 +138,10 @@ readonly SETTINGS="$REPO_ROOT/weft-server/src/settings.rs"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/weft-host-install-XXXXXX")
 readonly WORK
 readonly DEST="$WORK/root"
-# An address that is an address — loopback, port 0, which binds nothing and connects to nothing —
-# so the only refusal a gate can be reacting to is the one it claims to be reacting to.
-readonly DEAD_ADDR=127.0.0.1:0
+# An address the socket-address parser itself rejects — a host with no port — refused as
+# invalid configuration before anything binds, so the server cannot serve even by accident
+# and the only refusal a gate can be reacting to names this variable.
+readonly DEAD_ADDR=127.0.0.1
 readonly STATE="$WORK/state"
 mkdir -p "$STATE"
 
