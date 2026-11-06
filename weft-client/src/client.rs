@@ -100,7 +100,7 @@ impl ClientBuilder {
 		let builder = builder.tls_backend_preconfigured(tls_config(self.root_pem.as_deref())?);
 		#[cfg(not(feature = "rustls"))]
 		if base.scheme() == "https" {
-			return Err(Error::invalid("an https server needs weft-client's `rustls` feature"));
+			return Err(Error::invalid("an https server needs weftdb-client's `rustls` feature"));
 		}
 		let http = builder.build().map_err(|error| Error::new(ErrorKind::InvalidInput, format!("cannot build the HTTP client: {error}")).with_source(error))?;
 		Ok(Client { http, base, api_key: self.api_key, max_retries: self.max_retries })

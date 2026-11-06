@@ -233,7 +233,7 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 | Library crates on crates.io | Not published yet |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
 | Packaging — Helm | Not started |
-| Client SDKs | Rust: [`weft-client`](../weft-client) (not on crates.io yet). R: [`clients/r`](../clients/r) (not on CRAN). Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
+| Client SDKs | Rust: [`weftdb-client`](../weft-client) (on crates.io; the `weft-client` name belongs to an unrelated crate). R: [`clients/r`](../clients/r) (not on CRAN). Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
 | Per-measurement tags | Not started |
 
 The full work queue lives in [`ROADMAP.md`](../ROADMAP.md). It is the single source of
@@ -295,7 +295,7 @@ truth for status and priorities, and it records negative results alongside wins.
   with each panel's buckets reduced in the store.
 - **Arrow Flight** (experimental, read-only) — stream a stored window or value band as
   Arrow record batches to `pyarrow.flight` or any Flight client.
-- **Rust client** ([`weft-client`](../weft-client)) — every HTTP route from async Rust,
+- **Rust client** ([`weftdb-client`](../weft-client)) — every HTTP route from async Rust,
   lossless `BigDecimal` values on the storage paths, cursor-following streams, and
   optional Arrow `RecordBatch` decoding.
 - **Rust libraries** — use the engine, the storage layer or the reductions directly,

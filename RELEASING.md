@@ -269,7 +269,7 @@ somewhere else is how a crate joins the workspace and then never joins the regis
 As of writing that is:
 
 Published: `weft-physical-type`, `weft-reduce`, `weft-line-protocol`,
-`weft-arrow`, `weftdb`, `weft-arrow-store`, `weft-orchestration`, `weft-client`.
+`weft-arrow`, `weftdb`, `weft-arrow-store`, `weft-orchestration`, `weftdb-client`.
 
 `splimes` is released from its own repository
 ([basic-automation/splimes](https://github.com/basic-automation/splimes)) and consumed

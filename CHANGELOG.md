@@ -8,6 +8,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- The Rust SDK is published as **`weftdb-client`** (library `weftdb_client`). The
+  `weft-client` name on crates.io belongs to an unrelated crate, so v0.3.0 shipped
+  without the SDK on the registry. The source stays in `weft-client/`.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added

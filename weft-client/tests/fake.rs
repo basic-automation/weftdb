@@ -14,7 +14,7 @@ use axum::{
 };
 use futures::TryStreamExt as _;
 use serde_json::{json, Value};
-use weft_client::{Client, ErrorKind, Page, WriteOptions};
+use weftdb_client::{Client, ErrorKind, Page, WriteOptions};
 
 #[derive(Clone, Default)]
 struct Seen {

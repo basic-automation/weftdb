@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 /// stored as something nobody wrote.
 ///
 /// ```compile_fail
-/// # async fn f(client: &weft_client::Client) {
+/// # async fn f(client: &weftdb_client::Client) {
 /// client.write_points("price", [(1_i64, 1.25_f64)], &Default::default()).await;
 /// # }
 /// ```

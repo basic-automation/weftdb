@@ -905,7 +905,7 @@ Used by:
     https://github.com/basic-automation/weftdb
   * weft-bench 0.3.0
     https://github.com/basic-automation/weftdb
-  * weft-client 0.1.0
+  * weftdb-client 0.1.0
     https://github.com/basic-automation/weftdb
   * weft-line-protocol 0.3.0
     https://github.com/basic-automation/weftdb

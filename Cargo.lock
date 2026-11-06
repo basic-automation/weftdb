@@ -5642,29 +5642,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "weft-client"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "axum",
- "bigdecimal",
- "bytes",
- "chrono",
- "futures",
- "parquet",
- "reqwest",
- "rustls",
- "rustls-platform-verifier",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "weft-line-protocol"
 version = "0.3.0"
 dependencies = [
@@ -5830,6 +5807,29 @@ dependencies = [
  "weft-physical-type",
  "weft-reduce",
  "wide",
+]
+
+[[package]]
+name = "weftdb-client"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "axum",
+ "bigdecimal",
+ "bytes",
+ "chrono",
+ "futures",
+ "parquet",
+ "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
