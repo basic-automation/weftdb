@@ -35,3 +35,23 @@ mod tests {
 		assert_eq!(usize_to_f64(3).to_bits(), 3.0_f64.to_bits());
 	}
 }
+
+#[cfg(test)]
+mod json_float_parse_tests {
+	/// Every JSON float the server reads is the nearest `f64` to its text, whichever way the
+	/// binary was built. `serde_json`'s default float parser is not correctly rounded: before
+	/// the workspace turned on its `float_roundtrip` feature, a `weft-server` built on its
+	/// own (`cargo build -p weft-server`, which is how the release workflow and the Docker
+	/// image build it) read both values below one ULP low, and only a whole-workspace build —
+	/// where another member switches on `arbitrary_precision` — read them right.
+	#[test]
+	fn json_floats_parse_to_the_nearest_f64() {
+		for text in ["900719925474100.5", "0.009999999999990905", "9007199254740993", "1e-19", "2.2250738585072014e-308", "0.30000000000000004"] {
+			let from_json: f64 = serde_json::from_str(text).unwrap();
+			let exact: f64 = text.parse().unwrap();
+			assert_eq!(from_json.to_bits(), exact.to_bits(), "{text}: serde_json read {from_json:e}, the nearest f64 is {exact:e}");
+			let in_a_body: serde_json::Value = serde_json::from_str(&format!("{{\"value\": {text}}}")).unwrap();
+			assert_eq!(in_a_body["value"].as_f64().map(f64::to_bits), Some(exact.to_bits()), "{text} inside a request body");
+		}
+	}
+}

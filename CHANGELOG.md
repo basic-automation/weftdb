@@ -36,6 +36,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `500 commit_failed`** (ROB-9). `weft_arrow::read_parquet` contains the decoder's own
   panics (three found in `parquet` 60.0.0 within single-byte edits of a valid file) as
   `ConvertError::Parquet`.
+- **JSON floats are parsed to the nearest `f64` in every build of `weft-server`.** serde_json's
+  default float parser is not correctly rounded, and a `weft-server` built on its own — as
+  the release workflow and the Docker image build it — read some JSON numbers one ULP away
+  from their text (for example `900719925474100.5`); a whole-workspace build happened to
+  read them right through another crate's `arbitrary_precision`. The workspace now enables
+  serde_json's `float_roundtrip`.
 
 ## [0.3.0] - 2026-11-05
 
