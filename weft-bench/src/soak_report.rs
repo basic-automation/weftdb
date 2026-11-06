@@ -337,7 +337,6 @@ fn evaluate_r2(contamination: Option<&ContaminationVerdict>) -> RuleResult {
 }
 
 /// R3: flush-discipline — strict-mode flush check violations == 0.
-#[allow(clippy::redundant_closure)]
 fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 	let tid = "R3";
 	let name = "flush-discipline";
@@ -348,7 +347,7 @@ fn evaluate_r3(flush_check: Option<&FlushCheckResult>) -> RuleResult {
 			if f.passed {
 				RuleResult::passed(tid, name, format!("flush check passed (device={}, written={}, ackd={})", f.device.clone().unwrap_or_else(|| String::from("?")), f.device_written_bytes.unwrap_or(0), f.acknowledged_bytes), source)
 			} else {
-				let failure = f.failure.map(|k| k.as_str()).unwrap_or_else(|| "unknown");
+				let failure = f.failure.as_deref().unwrap_or("unknown");
 				RuleResult::failed(tid, name, format!("flush check failed: {} (device={})", failure, f.device.clone().unwrap_or_else(|| String::from("?"))), source)
 			}
 		}
@@ -381,7 +380,7 @@ fn evaluate_r4(derived: Option<&DerivedReadVerdict>) -> RuleResult {
 ///
 /// This is an existence rule only: the recovery objectives are recorded,
 /// not asserted against a numeric target (none exists in the repo).
-#[allow(clippy::format_in_format)]
+#[allow(clippy::uninlined_format_args)]
 fn evaluate_r5(backup: Option<&BackupLaneVerdict>) -> RuleResult {
 	let tid = "R5";
 	let name = "recovery-recorded";
@@ -428,7 +427,7 @@ fn evaluate_r6(hook_windows: &Vec<(String, u64)>, min_hook_windows: u64) -> Rule
 
 /// R7: progress-liveness — each evaluated tick shows >= `MIN_TICK_PROGRESS`
 /// new sealed points, non-decreasing counters.
-#[allow(clippy::lossy_cast)]
+#[allow(clippy::cast_precision_loss, clippy::uninlined_format_args)]
 fn evaluate_r7(total_ticks: u64, new_sealed_points: u64) -> RuleResult {
 	let tid = "R7";
 	let name = "progress-liveness";
@@ -452,7 +451,7 @@ fn evaluate_r7(total_ticks: u64, new_sealed_points: u64) -> RuleResult {
 // ---------------------------------------------------------------------------
 
 /// Check coverage floors and produce a `CoverageReport`.
-#[allow(clippy::needless_vec_and)]
+#[allow(clippy::needless_vec_and, clippy::uninlined_format_args, clippy::too_many_arguments)]
 fn check_coverage(oracle_ticks: Option<u64>, derived_ticks: Option<u64>, backup_windows: Option<u64>, steps: u64, hook_windows: &Vec<(String, u64)>, min_evaluated_ticks: u64, min_backup_windows: u64, min_derived_read_ticks: u64, min_hook_windows: u64) -> CoverageReport {
 	let mut failures: Vec<String> = Vec::new();
 	let mut first_observed: u64 = 0;
@@ -510,7 +509,7 @@ fn check_coverage(oracle_ticks: Option<u64>, derived_ticks: Option<u64>, backup_
 // Override diffs
 // ---------------------------------------------------------------------------
 
-/// Collect override diffs for constants that differ from their defaults.
+#[allow(clippy::uninlined_format_args)]
 fn collect_overrides(min_evaluated_ticks: u64, min_backup_windows: u64, min_derived_read_ticks: u64, min_hook_windows: u64) -> Vec<OverrideDiff> {
 	let mut diffs: Vec<OverrideDiff> = Vec::new();
 	if min_evaluated_ticks != MIN_EVALUATED_TICKS {
@@ -533,7 +532,7 @@ fn collect_overrides(min_evaluated_ticks: u64, min_backup_windows: u64, min_deri
 // ---------------------------------------------------------------------------
 
 /// Compute the overall outcome and summary from the rule results and coverage.
-#[allow(clippy::needless_vec_and)]
+#[allow(clippy::needless_vec_and, clippy::uninlined_format_args)]
 fn compute_overall_outcome(rules: &Vec<RuleResult>, coverage: &CoverageReport) -> (Outcome, String) {
 	let any_fail = rules.iter().any(|r| r.outcome == Outcome::Fail);
 	let all_not_evaluated = rules.iter().all(|r| r.outcome == Outcome::NotEvaluated);
