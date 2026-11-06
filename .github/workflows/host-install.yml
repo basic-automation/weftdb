@@ -76,10 +76,7 @@ jobs:
       - name: Enable user systemd manager for gate 7
         run: |
           sudo loginctl enable-linger "$(id -u)"
-          for i in $(seq 1 20); do
-            systemctl --user show-environment >/dev/null 2>&1 && break
-            sleep 0.5
-          done
+          timeout 15 bash -c 'until systemctl --user show-environment >/dev/null 2>&1; do sleep 0.5; done' || true
 
       # Run the full test suite. Gates 6–7 use systemd-analyze, systemd-sysusers,
       # systemd-tmpfiles, and a transient user-scope with the unit's hardening
@@ -89,7 +86,7 @@ jobs:
         run: |
           out=$(mktemp)
           scripts/packaging/test-host-install.sh --bin target/release/weft-server 2>&1 | tee "$out"; rc=${PIPESTATUS[0]}
-          if [ $rc -ne 0 ]; then echo "exit $rc" >&2; exit $rc; fi
+          if [ "$rc" -ne 0 ]; then echo "exit $rc" >&2; exit "$rc"; fi
           # Gates 6-7 should not skip on ubuntu-latest (gate 7 after loginctl).
           for pattern in \
             'systemd-analyze is not installed here' \
