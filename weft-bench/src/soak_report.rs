@@ -533,7 +533,7 @@ fn collect_overrides(min_evaluated_ticks: u64, min_backup_windows: u64, min_deri
 
 /// Compute the overall outcome and summary from the rule results and coverage.
 #[allow(clippy::needless_vec_and, clippy::uninlined_format_args)]
-fn compute_overall_outcome(rules: &Vec<RuleResult>, coverage: &CoverageReport) -> (Outcome, String) {
+fn compute_overall_outcome(rules: &[RuleResult], coverage: &CoverageReport) -> (Outcome, String) {
 	let any_fail = rules.iter().any(|r| r.outcome == Outcome::Fail);
 	let all_not_evaluated = rules.iter().all(|r| r.outcome == Outcome::NotEvaluated);
 	let coverage_sufficient = match coverage.status {
@@ -566,6 +566,7 @@ fn compute_overall_outcome(rules: &Vec<RuleResult>, coverage: &CoverageReport) -
 
 /// Build the generated honesty section as Markdown.
 #[allow(clippy::needless_vec_and)]
+#[allow(clippy::uninlined_format_args)]
 fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageReport, overrides: &Vec<OverrideDiff>, contamination: Option<&ContaminationVerdict>, _flush_check: Option<&FlushCheckResult>) -> String {
 	let mut out = String::with_capacity(2048);
 
@@ -715,12 +716,12 @@ mod tests {
 		DerivedReadVerdict { ticks_judged, buckets_checked: ticks_judged, buckets_present: ticks_judged, points_counted: ticks_judged * 4, mismatch_count: mismatches, mismatches: Vec::new() }
 	}
 
-	fn backup_verdict(rpo_ms: u64, rto_ms: u64) -> BackupLaneVerdict {
-		BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1000, backup_duration_ms: rpo_ms, restore_duration_ms: if rto_ms > rpo_ms { rto_ms - rpo_ms } else { rpo_ms } } }
+	fn backup_verdict(backup_dur: u64, restore_dur: u64) -> BackupLaneVerdict {
+		BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1000, backup_duration_ms: backup_dur, restore_duration_ms: if restore_dur > backup_dur { restore_dur - backup_dur } else { backup_dur } } }
 	}
 
-	fn contamination_verdict(flags: Vec<ContaminationFlag>) -> ContaminationVerdict {
-		ContaminationVerdict { flags: flags.clone(), sample_count: 60, window_ms: 60_000, worst: WorstValues { io_psi_some_avg10: if flags.is_empty() { 0.0 } else { 5.0 }, cpu_psi_some_avg10: if flags.is_empty() { 0.0 } else { 10.0 }, memory_psi_some_avg10: 0.0, dirty_kib: 0, load_per_core: if flags.is_empty() { 0.0 } else { 2.0 }, clock_step_ms: 0, sample_gap_ms: 0 }, device_written_bytes: Some(500_000), acknowledged_bytes: Some(500_000), foreign_write_bytes: Some(0), psi_capable: true, device: Some(String::from("nvme0n1")) }
+	fn contamination_verdict(flags: &[ContaminationFlag]) -> ContaminationVerdict {
+		ContaminationVerdict { flags: flags.to_vec(), sample_count: 60, window_ms: 60_000, worst: WorstValues { io_psi_some_avg10: if flags.is_empty() { 0.0 } else { 5.0 }, cpu_psi_some_avg10: if flags.is_empty() { 0.0 } else { 10.0 }, memory_psi_some_avg10: 0.0, dirty_kib: 0, load_per_core: if flags.is_empty() { 0.0 } else { 2.0 }, clock_step_ms: 0, sample_gap_ms: 0 }, device_written_bytes: Some(500_000), acknowledged_bytes: Some(500_000), foreign_write_bytes: Some(0), psi_capable: true, device: Some(String::from("nvme0n1")) }
 	}
 
 	fn flush_check() -> FlushCheckResult {
@@ -783,7 +784,7 @@ mod tests {
 	#[test]
 	fn r2_passes_when_no_flags_fired() {
 		let run = run_harness(60);
-		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(Vec::new())), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(&[])), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
 		let r2 = &verdicts.slo.rules[1];
 		assert_eq!(r2.outcome, Outcome::Pass, "R2 must pass with no flags");
 	}
@@ -791,7 +792,7 @@ mod tests {
 	#[test]
 	fn r2_passes_when_flags_have_worst_values() {
 		let run = run_harness(60);
-		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(Vec::from([ContaminationFlag::CpuPressure, ContaminationFlag::LoadAverage]))), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(&[ContaminationFlag::CpuPressure, ContaminationFlag::LoadAverage])), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
 		let r2 = &verdicts.slo.rules[1];
 		assert_eq!(r2.outcome, Outcome::Pass, "R2 must pass when flags have WorstValues");
 		assert!(r2.evidence.contains("2 flag(s)"), "evidence must mention 2 flags");
@@ -959,7 +960,7 @@ mod tests {
 	#[test]
 	fn r8_round_trips_through_json() {
 		let run = run_harness(60);
-		let report = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(Vec::new())), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let report = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(&[])), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
 		let json = report.to_json().expect("serialize report");
 		let back: SoakReport = serde_json::from_str(&json).expect("deserialize report");
 		assert_eq!(back.schema_version, SOAK_REPORT_SCHEMA_VERSION, "schema version must survive round-trip");
@@ -1059,7 +1060,7 @@ mod tests {
 	#[test]
 	fn honesty_mentions_wins_and_losses() {
 		let run = run_harness(60);
-		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(Vec::new())), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(&[])), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
 		assert!(verdicts.honesty.contains("Wins (rules passed)"), "honesty must have a wins section");
 		assert!(verdicts.honesty.contains("Losses (rules failed)"), "honesty must have a losses section");
 		assert!(verdicts.honesty.contains("Contamination"), "honesty must have a contamination section");
@@ -1085,14 +1086,14 @@ mod tests {
 	#[test]
 	fn overall_outcome_pass_when_all_rules_pass_and_coverage_met() {
 		let run = run_harness(60);
-		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(Vec::new())), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(&[])), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
 		assert_eq!(verdicts.slo.outcome, Outcome::Pass, "overall outcome must be Pass when all rules pass and coverage is met");
 	}
 
 	#[test]
 	fn overall_outcome_fail_when_any_rule_fails() {
 		let run = run_harness(60);
-		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 1)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(Vec::new())), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 1)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(&[])), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
 		assert_eq!(verdicts.slo.outcome, Outcome::Fail, "overall outcome must be Fail when R1 fails");
 	}
 
