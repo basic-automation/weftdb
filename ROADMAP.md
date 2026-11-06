@@ -356,7 +356,9 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] → **TAG-9** Frame error classes in recovery
     *Closed 2026-11-05 (audit): #556 (2026-11-04). Recovery and fsck adopt series-key frames into their series, class a malformed/empty/duplicate SERIES_KEY after a passing CRC as suspect (C5), rebind mismatched keys (`series_rebound`), and settle every held row (`held_cleared`).*
   - [ ] seal lane
-  - [ ] → **ROB-17** Disk guard, headroom API and space gauges
+  - [x] → **ROB-17** Disk guard, headroom API and space gauges
+    - [ ] Log the `507 insufficient_storage` refusal once per transition into and out of refusing, not once per request: today every refused ingest logs at ERROR, so a client retrying against a full disk floods the log (the `weft_disk_guard_refusing` gauge already carries the state).
+    - [ ] ROB-18 phase 1: call `weftdb::DiskGuard::admit` with the reserved body size, so a request is refused `507` before its body is read (plan C11; the guard is public for it).
   - [ ] maint lane
   - [ ] read lane
   - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations

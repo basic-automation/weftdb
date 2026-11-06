@@ -852,6 +852,9 @@ fn register_version_route(routes: &mut Routes) {
 fn register_metrics_routes(routes: &mut Routes) {
 	routes.route(Method::GET, "/metrics", RouteSpec::stable(Scope::Metrics, Audit::None, false, AdmissionClass::Query, "get_metrics"), get(metrics::metrics));
 	routes.route(Method::GET, "/debug/profile/current", RouteSpec::stable(Scope::Metrics, Audit::None, true, AdmissionClass::Query, "get_debug_profile_current"), get(metrics::profile_current));
+	// ROB-17: the store's free-space margin. Host numbers, so the operator's scope;
+	// experimental, because the surface postdates the 1.0 freeze.
+	routes.route(Method::GET, "/api/v1/storage/headroom", RouteSpec::experimental(Scope::Metrics, Audit::None, true, AdmissionClass::Query, "storage_headroom"), get(storage::storage_headroom));
 }
 
 /// Benchmark runs (Phase 3): the EVI-3 run manifests, addressed by content
@@ -1005,7 +1008,8 @@ mod tests {
 
 	/// Every registered route is one the pre-SEC-3 router served: the
 	/// registry must not lose (or invent) a route in the move. The count
-	/// is 72 method routes over 66 path templates (70/64 before ROB-23r added
+	/// is 73 method routes over 67 path templates (72/66 before ROB-17 added
+	/// `GET /api/v1/storage/headroom`, 70/64 before ROB-23r added
 	/// the `/healthz` and `/readyz` probe aliases, 66/60 before P5-http added
 	/// the four stored-interpolation reads, 63/57 before Phase 2 added
 	/// the three Grafana datasource routes, 62/56 before FRE-12b added
@@ -1014,11 +1018,11 @@ mod tests {
 	#[test]
 	fn registry_covers_the_whole_surface() {
 		let table = build_registry().table();
-		assert_eq!(table.entries().len(), 72, "the registry must carry every route the old lib.rs chain served");
+		assert_eq!(table.entries().len(), 73, "the registry must carry every route the old lib.rs chain served");
 		let mut operations: Vec<&str> = table.entries().iter().map(|entry| entry.spec.operation_id).collect();
 		operations.sort_unstable();
 		operations.dedup();
-		assert_eq!(operations.len(), 72, "operation ids are unique");
+		assert_eq!(operations.len(), 73, "operation ids are unique");
 		// Every scope in the frozen table is used by at least one route:
 		// an unused scope in a frozen table is a scope nobody can hold.
 		for scope in Scope::ALL {
@@ -1045,7 +1049,7 @@ mod tests {
 		let document = table.openapi_document();
 		assert_eq!(document["openapi"], "3.1.0");
 		let paths = document["paths"].as_object().unwrap();
-		assert_eq!(paths.len(), 66, "one path item per template");
+		assert_eq!(paths.len(), 67, "one path item per template");
 		let health = &paths["/health"]["get"];
 		assert_eq!(health["operationId"], "get_health");
 		assert_eq!(health["x-weft-scope"], "probe");

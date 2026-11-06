@@ -1071,6 +1071,44 @@ pub async fn storage_stats(State(state): State<AppState>) -> Result<Json<StoreSt
 	Ok(Json(StoreStatsResponse { aspect_count: summary.aspect_count, segment_count: summary.segment_count, total_rows: summary.total_rows, total_nulls: summary.total_nulls, total_bytes: summary.total_bytes, bytes_per_point, unsorted_segments: summary.unsorted_segments, overlapping_segments, time_range }))
 }
 
+/// Response body for `GET /api/v1/storage/headroom` (ROB-17): the filesystem holding
+/// the store and the margin the disk guard leaves on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HeadroomResponse {
+	/// The filesystem's size in bytes.
+	pub total_bytes: u64,
+	/// The bytes an unprivileged writer can still use.
+	pub available_bytes: u64,
+	/// The reserve every ingest or seal must leave (`WEFT_DISK_RESERVE_BYTES`; `0`: the
+	/// guard is off).
+	pub reserve_bytes: u64,
+	/// What a write may still take before the guard refuses it.
+	pub writable_bytes: u64,
+	/// Whether the guard refuses every write now (`507 insufficient_storage`).
+	pub refusing: bool,
+}
+
+impl From<weftdb::Headroom> for HeadroomResponse {
+	fn from(headroom: weftdb::Headroom) -> Self {
+		Self { total_bytes: headroom.total_bytes, available_bytes: headroom.available_bytes, reserve_bytes: headroom.reserve_bytes, writable_bytes: headroom.writable_bytes, refusing: headroom.refusing() }
+	}
+}
+
+/// Handle `GET /api/v1/storage/headroom` (ROB-17): the store's free-space margin.
+///
+/// These are the numbers the disk guard decides on. `503 unconfigured` without a store;
+/// a `500` on a platform that cannot describe the filesystem.
+///
+/// # Errors
+///
+/// As above.
+pub async fn storage_headroom(State(state): State<AppState>) -> Result<Json<HeadroomResponse>, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+	drop(state);
+	let headroom = tokio::task::spawn_blocking(move || store.headroom()).await.map_err(|err| ApiError::internal(err.to_string()))?;
+	headroom.map(|headroom| Json(headroom.into())).ok_or_else(|| ApiError::internal("this platform cannot describe the store's filesystem"))
+}
+
 /// Query parameters for the stored-range downsample.
 ///
 /// The `[start, end]` window is inclusive and expressed as integer epochs **in the

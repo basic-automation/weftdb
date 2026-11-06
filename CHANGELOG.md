@@ -8,6 +8,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Disk guard, headroom API and space gauges** (ROB-17). An ingest or seal that would
+  leave the store's filesystem with less than `WEFT_DISK_RESERVE_BYTES` available (default
+  256 MiB; `0` turns it off) is refused `507 insufficient_storage` before any frame is
+  written (`weftdb::DiskGuard`, `StoreError::InsufficientStorage`). The experimental
+  `GET /api/v1/storage/headroom` (`metrics` scope) reports the filesystem's size, available
+  bytes, the reserve and what is still writable, and `/metrics` carries the same numbers as
+  the `weft_disk_{total,available,reserve,writable}_bytes` gauges plus a 0/1
+  `weft_disk_guard_refusing`. The library default
+  (`SegmentStoreOptions::default`) leaves the guard off.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added

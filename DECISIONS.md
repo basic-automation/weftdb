@@ -5223,3 +5223,47 @@ the connection's acquisition, not the transaction: a panic after
 outside the scope. It also marks reads, which take the same call, and it would
 have made this slice a change to every caller in the crate instead of a change
 to the three impls that own the legacy writes.
+
+## 2026-11-05 — ROB-17: the disk guard's shape, and what it does not guard (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan names ROB-17 only as "Disk guard, headroom API and space gauges"
+(seal lane, after TAG-7) and fixes one boundary in C11: the request-level `507` belongs to
+ROB-18's two-phase body extractor, "via ROB-17's `DiskGuard`, so ROB-17 never edits
+ingest.rs". The reserve, its default, where the guard sits and what the headroom route
+looks like are not specified.
+
+**Chosen:**
+
+1. **`weftdb::DiskGuard` is a reserve, checked before the first frame.** A write of `need`
+   bytes is admitted while `available - need >= reserve` (`statvfs`'s `f_bavail`, the
+   unprivileged figure). `SegmentStore::ingest` decides once per batch, on the whole
+   batch's plain encoding, before any frame is written — a refusal half-way would leave
+   frames for recovery to sweep. The direct seals (`seal*`, through `persist` /
+   `persist_paged`) check their one frame. The refusal is
+   `StoreError::InsufficientStorage`, `507 insufficient_storage` at the API (a `5xx` whose
+   numbers stay in the operator-only cause), and it is not recorded in the idempotency
+   ledger, so the same request succeeds once there is room. `weft-server`'s `ingest.rs` is
+   untouched, as C11 requires; ROB-18's request-level check is left to call the same
+   `DiskGuard::admit` (it is public for that).
+2. **`WEFT_DISK_RESERVE_BYTES`, Tuning tier, default 256 MiB, `0` turns it off.** Enough for
+   the control plane to commit, checkpoint and back itself up after frames stop. The
+   library default (`SegmentStoreOptions::default`) is `0`, so an embedder's open refuses
+   nothing it did not refuse before; the server reads the variable through
+   `SegmentStoreOptions::from_env`, like every other store option.
+3. **Maintenance is not guarded.** A squash or reconciliation writes before it deletes, but
+   it is how a store gets space back; refusing it near the reserve would pin the store
+   full.
+4. **The headroom is a read of the filesystem, not a counter.** `GET
+   /api/v1/storage/headroom` (experimental, `metrics` scope — host numbers are the
+   operator's) answers `total_bytes`, `available_bytes`, `reserve_bytes`, `writable_bytes`
+   and `refusing`; `/metrics` carries the same as `weft_disk_*` gauges plus a 0/1
+   `weft_disk_guard_refusing` (the analogue of VictoriaMetrics' `vm_storage_is_read_only`,
+   which `vmstorage` sets while free space is under `-storage.minFreeDiskSpaceBytes`:
+   https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/docs/victoriametrics/Cluster-VictoriaMetrics.md#readonly-mode).
+   Without a store, or on a platform that cannot describe the filesystem, the gauges are
+   absent rather than zero, so a scrape never reads a made-up full disk.
+
+**Rejected:** guarding every `create_new_write` in `StoreFs` (it would refuse maintenance and
+recovery writes too, and a frame refused half-way through a batch is litter); a
+percentage reserve (a percentage of a 15 TB volume is hundreds of GB nobody asked to keep,
+and of a small volume too little for the control plane).

@@ -640,7 +640,10 @@ impl SegmentStore {
 	/// [`IngestValueOutOfRange`](StoreError::IngestValueOutOfRange) for a
 	/// value outside the decimal domain;
 	/// [`IdempotencyConflict`](StoreError::IdempotencyConflict) for a
-	/// different batch under a recorded key. Otherwise a
+	/// different batch under a recorded key;
+	/// [`InsufficientStorage`](StoreError::InsufficientStorage) when the batch
+	/// would leave the store's filesystem below the disk guard's reserve
+	/// (ROB-17), checked before any frame is written. Otherwise a
 	/// [`SealError`](weft_physical_type::SealError) from encoding, a
 	/// filesystem write error, or a libSQL index failure (an ambiguous
 	/// COMMIT poisons the store, as for every write).
@@ -697,7 +700,8 @@ impl SegmentStore {
 		// over rows, and each chunk re-seals from its own rows, so a chunk
 		// boundary is a segment boundary and nothing else.
 		let whole = encode_ingest_chunk(&schema, &batch.timestamps, &batch.values, batch.rows_per_page).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
-		let chunks = if whole.write_to_with(&self.frame_options(whole.row_count(), false, 0.0)).len() as u64 <= target {
+		let whole_len = whole.write_to_with(&self.frame_options(whole.row_count(), false, 0.0)).len() as u64;
+		let chunks = if whole_len <= target {
 			vec![(batch.timestamps.clone(), batch.values.clone())]
 		} else {
 			let mut chunks: Vec<(Vec<i64>, Vec<Option<BigDecimal>>)> = Vec::new();
@@ -714,6 +718,11 @@ impl SegmentStore {
 			}
 			chunks
 		};
+		// The disk guard (ROB-17) decides once, for the whole batch, before the first
+		// frame: a refusal half-way would leave written frames for recovery to sweep.
+		// The whole batch's plain encoding is the estimate; the frames actually written
+		// differ from it only by their per-frame headers and optional indexes.
+		self.admit_write(whole_len).map_err(|e| e.context(format!("ingest of aspect {aspect:?} failed while {phase}")))?;
 		phase = IngestPhase::WritingFrames;
 		crate::exec::set_ingest_phase(phase);
 		let mut written: Vec<WrittenSegment> = Vec::with_capacity(chunks.len());
@@ -1036,6 +1045,7 @@ impl SegmentStore {
 		// every combination reads identically.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
 		let byte_len = bytes.len() as u64;
+		self.admit_write(byte_len)?;
 		let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await?;
 		let descriptor = SegmentDescriptor::of_segment(0, path.to_string_lossy().into_owned(), byte_len, segment);
 		let descriptor = self.publish_seal(aspect, &descriptor, gen, frame_crc).await?;
@@ -1059,6 +1069,7 @@ impl SegmentStore {
 		// bounds a probe's decode to `rows_per_page`.
 		let bytes = segment.write_to_with(&self.frame_options(segment.stats.row_count, segment.benefits_from_checkpoints(), segment.checkpoint_codec_overhead()));
 		let byte_len = bytes.len() as u64;
+		self.admit_write(byte_len)?;
 		let (gen, frame_crc, path) = self.write_seal_frame(aspect, bytes).await?;
 		let descriptor = SegmentDescriptor::of_paged_segment(0, path.to_string_lossy().into_owned(), byte_len, segment);
 		let descriptor = self.publish_seal(aspect, &descriptor, gen, frame_crc).await?;
@@ -1070,6 +1081,33 @@ impl SegmentStore {
 			}
 		}
 		Ok(descriptor)
+	}
+
+	/// Ask the disk guard (ROB-17) whether a seal of `need` bytes may be written.
+	///
+	/// # Errors
+	///
+	/// [`StoreError::InsufficientStorage`] when the write would leave the store's
+	/// filesystem below the reserve; nothing has been written.
+	pub(crate) fn admit_write(&self, need: u64) -> Result<()> {
+		if !self.disk_guard.is_enabled() {
+			return Ok(());
+		}
+		self.disk_guard.admit(crate::disk_space_at(&self.root), need).map_err(Into::into)
+	}
+
+	/// The disk guard this store's seals run under (ROB-17).
+	#[must_use]
+	pub const fn disk_guard(&self) -> crate::DiskGuard {
+		self.disk_guard
+	}
+
+	/// The store's free-space margin (ROB-17): the size and available bytes of the
+	/// filesystem holding the store root, and what the disk guard leaves of them.
+	/// `None` where the platform cannot describe the filesystem.
+	#[must_use]
+	pub fn headroom(&self) -> Option<crate::Headroom> {
+		crate::disk_space_at(&self.root).map(|space| self.disk_guard.headroom(space))
 	}
 
 	/// Write `bytes` as `aspect`'s next write-once seal frame and make it durable,

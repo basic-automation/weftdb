@@ -1126,29 +1126,7 @@ pub async fn restore_store(backup_dir: &Path, new_root: &Path) -> Result<WholeSt
 /// and the backup itself is the test.
 #[must_use]
 pub fn free_bytes_at(path: &Path) -> Option<u64> {
-	#[cfg(unix)]
-	{
-		let mut probe = path.to_path_buf();
-		loop {
-			if probe.exists() {
-				break;
-			}
-			if !probe.pop() {
-				return None;
-			}
-		}
-		let c_path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).ok()?;
-		let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-		if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
-			return None;
-		}
-		Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
-	}
-	#[cfg(not(unix))]
-	{
-		let _ = path;
-		None
-	}
+	crate::disk_space_at(path).map(|space| space.available_bytes)
 }
 
 #[cfg(test)]

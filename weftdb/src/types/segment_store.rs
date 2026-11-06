@@ -422,6 +422,13 @@ pub struct SegmentStoreOptions {
 	/// The rows returned are the same either way. See the `mapped` module for the safety
 	/// argument and its one residual risk (a file truncated by another process while mapped).
 	pub mmap_reads: bool,
+	/// The bytes every seal must leave available on the store's filesystem (ROB-17,
+	/// [`DiskGuard`](crate::DiskGuard)): an ingest or seal that would leave less is
+	/// refused with [`StoreError::InsufficientStorage`](crate::StoreError::InsufficientStorage)
+	/// before any frame is written. `0`, the library default, turns the guard off;
+	/// [`from_env`](Self::from_env) reads `WEFT_DISK_RESERVE_BYTES` and falls back to
+	/// [`DEFAULT_DISK_RESERVE_BYTES`](crate::DEFAULT_DISK_RESERVE_BYTES).
+	pub disk_reserve_bytes: u64,
 }
 
 /// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
@@ -447,7 +454,7 @@ pub const DEFAULT_MAX_POINT_BATCH: usize = 10_000;
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0 }
 	}
 }
 
@@ -458,11 +465,14 @@ impl SegmentStoreOptions {
 	/// ([`max_series_per_aspect`](Self::max_series_per_aspect); absent or not a
 	/// positive whole number → [`DEFAULT_MAX_SERIES_PER_ASPECT`]) and
 	/// `WEFT_SEGMENT_MMAP_READS` ([`mmap_reads`](Self::mmap_reads); on for
-	/// `1`/`true`/`on`/`yes`, any case, off otherwise), each as lenient
+	/// `1`/`true`/`on`/`yes`, any case, off otherwise) and
+	/// `WEFT_DISK_RESERVE_BYTES` ([`disk_reserve_bytes`](Self::disk_reserve_bytes);
+	/// a non-negative whole number, else
+	/// [`DEFAULT_DISK_RESERVE_BYTES`](crate::DEFAULT_DISK_RESERVE_BYTES)), each as lenient
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()) }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -522,6 +532,14 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_mmap_reads(mut self, on: bool) -> Self {
 		self.mmap_reads = on;
+		self
+	}
+
+	/// These options with `bytes` as the disk guard's reserve (see
+	/// [`disk_reserve_bytes`](Self::disk_reserve_bytes); `0` turns the guard off).
+	#[must_use]
+	pub const fn with_disk_reserve_bytes(mut self, bytes: u64) -> Self {
+		self.disk_reserve_bytes = bytes;
 		self
 	}
 }
@@ -1620,6 +1638,9 @@ pub struct SegmentStore {
 	/// Whether range reads memory-map their frames, from the open options
 	/// ([`SegmentStoreOptions::mmap_reads`]); always buffered without the `mmap-reads` feature.
 	mmap_reads: bool,
+	/// The disk guard every seal consults (ROB-17), from the open options
+	/// ([`SegmentStoreOptions::disk_reserve_bytes`]).
+	disk_guard: crate::DiskGuard,
 	/// Each aspect's circuit-breaker state (consecutive sweep failures and, once
 	/// tripped, when the cooldown ends), guarded by a plain mutex: it is only
 	/// ever held for a map touch, never across an await.
@@ -8517,6 +8538,10 @@ mod upsert_keys_tests;
 /// the store, at decision 12's numbers.
 #[cfg(test)]
 mod read_limits_tests;
+
+/// ROB-17: a seal below the disk guard's reserve writes nothing.
+#[cfg(test)]
+mod disk_guard_tests;
 
 /// Phase 5 memory-mapped GPU I/O: a mapped range read returns exactly the buffered read's rows.
 #[cfg(test)]

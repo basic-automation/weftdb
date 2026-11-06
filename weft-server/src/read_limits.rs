@@ -381,7 +381,7 @@ mod tests {
 				MAX_AT_MULTI_INSTANTS_ENV => ReadLimits::from_env_values(None, None, None, Some(raw), None),
 				_ => ReadLimits::from_env_values(None, None, None, None, Some(raw)),
 			};
-			let message = error.expect_err(&format!("{name}={raw:?} must be refused")).clone();
+			let message = error.expect_err(&format!("{name}={raw:?} must be refused"));
 			assert!(message.contains(name), "{message} must name {name}");
 		}
 	}
