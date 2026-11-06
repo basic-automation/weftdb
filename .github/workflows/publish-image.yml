@@ -89,7 +89,7 @@ jobs:
             platform: linux/arm64
             rust-target: aarch64-unknown-linux-gnu
             builder-image: quay.io/pypa/manylinux_2_28_aarch64:2026.10.25-1@sha256:743e05864cdd8dc63dbf568898abd7ff616d121440770fda36263294c6f711c6
-            runtime-image: docker.io/library/debian:12-slim
+            runtime-image: ""
             smoke: false
 
     runs-on: ${{ matrix.runner }}
@@ -113,6 +113,8 @@ jobs:
             --builder-image "${{ matrix.builder-image }}"
           )
           if [[ -n "${{ matrix.runtime-image }}" ]]; then
+            # Overrides exist for baseline experiments only; the Dockerfile's own runtime default
+            # is digest-pinned and multi-arch, so no leg should replace it with a floating tag.
             args+=(--runtime-image "${{ matrix.runtime-image }}")
           fi
           # RUST_TARGET is a build arg the Dockerfile now exposes to
