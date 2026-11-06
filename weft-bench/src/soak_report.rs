@@ -52,7 +52,7 @@
 //!    hooks none configured), and overrides (any constant changed from
 //!    default, showing old→new).
 //!
-//! **Recorded beside the run, not on it.** [`SoakReport`] is a new artifact
+//! **Recorded beside the run, not on it.** `SoakReport` is a new artifact
 //! type with its own [`SOAK_REPORT_SCHEMA_VERSION`] (currently 1). It adds no
 //! field to [`SoakRun`], so [`crate::soak::SOAK_SCHEMA_VERSION`] stays at v6.
 //! A report is produced by calling `SoakReport::evaluate` on a finished run
@@ -986,7 +986,7 @@ mod tests {
 		match verdicts.coverage.status {
 			CoverageStatus::Met => {} // expected
 			CoverageStatus::InsufficientCoverage(ins) => {
-				panic!("expected Met, got InsufficientCoverage: {ins.reason}");
+				panic!("expected Met, got InsufficientCoverage: {0}", ins.reason);
 			}
 		}
 	}
