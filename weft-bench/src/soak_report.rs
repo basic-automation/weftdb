@@ -462,7 +462,7 @@ fn check_coverage(oracle_ticks: Option<u64>, derived_ticks: Option<u64>, backup_
 	let mut first_required: u64 = 0;
 	let mut first_set = false;
 
-	let push_failure = |msg: String, observed: u64, required: u64| {
+	let mut push_failure = |msg: String, observed: u64, required: u64| {
 		if !first_set {
 			first_observed = observed;
 			first_required = required;
@@ -573,7 +573,7 @@ fn compute_overall_outcome(rules: &Vec<RuleResult>, coverage: &CoverageReport) -
 // ---------------------------------------------------------------------------
 
 /// Build the generated honesty section as Markdown.
-fn build_honesty_section(run: &SoakRun, slo: &SloReport, coverage: &CoverageReport, overrides: &Vec<OverrideDiff>, contamination: Option<&ContaminationVerdict>, flush_check: Option<&FlushCheckResult>) -> String {
+fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageReport, overrides: &Vec<OverrideDiff>, contamination: Option<&ContaminationVerdict>, _flush_check: Option<&FlushCheckResult>) -> String {
 	let mut out = String::with_capacity(2048);
 
 	// --- Wins ---
@@ -590,7 +590,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, coverage: &CoverageRepo
 
 	// --- Losses ---
 	out.push_str("### Losses (rules failed)\n\n");
-	let losses = slo.rules.iter().filter(|r| r.outcome == Outcome::Fail).collect();
+	let losses: Vec<&RuleResult> = slo.rules.iter().filter(|r| r.outcome == Outcome::Fail).collect();
 	if losses.is_empty() {
 		out.push_str("None.\n\n");
 	} else {
@@ -602,7 +602,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, coverage: &CoverageRepo
 
 	// --- Not evaluated ---
 	out.push_str("### Rules not evaluated\n\n");
-	let not_evals = slo.rules.iter().filter(|r| r.outcome == Outcome::NotEvaluated).collect();
+	let not_evals: Vec<&RuleResult> = slo.rules.iter().filter(|r| r.outcome == Outcome::NotEvaluated).collect();
 	if not_evals.is_empty() {
 		out.push_str("None.\n\n");
 	} else {
