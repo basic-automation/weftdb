@@ -22,16 +22,16 @@
 //! | Rule | Name | Evaluator | Threshold source |
 //! |------|------|-----------|-----------------|
 //! | R1 | correctness-exact | zero [`OracleVerdict::mismatch_count`] over uncontaminated ticks | exact |
-//! | R2 | contamination-explained | every [`ContaminationFlag`] set maps to a reported window with [`WorstValues`]; a flag outside any declared window fails | exact |
+//! | R2 | contamination-explained | every `ContaminationFlag` set maps to a reported window with `WorstValues`; a flag outside any declared window fails | exact |
 //! | R3 | flush-discipline | strict-mode flush check (SOA-12) [`FlushCheckResult`] violations == 0 | exact |
 //! | R4 | derived-read agreement | zero [`DerivedReadVerdict::mismatch_count`] over evaluated ticks | exact |
-//! | R5 | recovery-recorded | backup lane completed and [`RecoveryTiming::rpo_ms`]/[`RecoveryTiming::rto_ms`] finite | const `recovery_exists=true` |
+//! | R5 | recovery-recorded | backup lane completed and `RecoveryTiming::rpo_ms`/`RecoveryTiming::rto_ms` finite | const `recovery_exists=true` |
 //! | R6 | hook-contract | every SOA-14 hook configured executed in every window configured | exact |
-//! | R7 | progress-liveness | each evaluated tick >= [`MIN_TICK_PROGRESS`] new sealed points (default 1), non-decreasing counters | const `MIN_TICK_PROGRESS=1` |
-//! | R8 | report-integrity | [`SoakReport`] round-trips serde JSON at [`SOAK_REPORT_SCHEMA_VERSION`]=1, all coverage floors met | exact |
+//! | R7 | progress-liveness | each evaluated tick >= `MIN_TICK_PROGRESS` new sealed points (default 1), non-decreasing counters | const `MIN_TICK_PROGRESS=1` |
+//! | R8 | report-integrity | `SoakReport` round-trips serde JSON at `SOAK_REPORT_SCHEMA_VERSION`=1, all coverage floors met | exact |
 //!
-//! **Three parts, one report.** [`SoakReport`] wraps the run record
-//! ([`crate::soak::SoakRun`]) with the three layers:
+//! **Three parts, one report.** `SoakReport` wraps the run record
+//! (\[`crate::soak::SoakRun`]) with the three layers:
 //!
 //! 1. **SLO evaluator** — the 8 [`RuleResult`]s (R1–R8) carrying evidence
 //!    counts, pass/fail/not-evaluated outcome, and the threshold source that
@@ -55,7 +55,7 @@
 //! **Recorded beside the run, not on it.** [`SoakReport`] is a new artifact
 //! type with its own [`SOAK_REPORT_SCHEMA_VERSION`] (currently 1). It adds no
 //! field to [`SoakRun`], so [`crate::soak::SOAK_SCHEMA_VERSION`] stays at v6.
-//! A report is produced by calling [`SoakReport::evaluate`] on a finished run
+//! A report is produced by calling `SoakReport::evaluate` on a finished run
 //! and is not a new lifecycle state of the harness.
 
 use std::fmt::Write;
@@ -703,7 +703,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 mod tests {
 	use super::*;
 	use crate::{
-		report::RunMetadata, soak::{SoakConfig, SoakHarness, SoakRun, SoakState}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::{MismatchKind, OracleMismatch, OracleVerdict}, soak_read::{DerivedMismatch, DerivedReadVerdict}, soak_system::{ContaminationFlag, FlushCheckResult, FlushFailureKind, WorstValues}
+		report::RunMetadata, soak::{SoakConfig, SoakHarness, SoakRun}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::{OracleVerdict}, soak_read::{DerivedReadVerdict}, soak_system::{ContaminationFlag, FlushCheckResult, FlushFailureKind, WorstValues}
 	};
 
 	fn config() -> SoakConfig {
@@ -727,7 +727,7 @@ mod tests {
 	}
 
 	fn contamination_verdict(flags: Vec<ContaminationFlag>) -> ContaminationVerdict {
-		ContaminationVerdict { flags, sample_count: 60, window_ms: 60_000, worst: WorstValues { io_psi_some_avg10: if flags.is_empty() { 0.0 } else { 5.0 }, cpu_psi_some_avg10: if flags.is_empty() { 0.0 } else { 10.0 }, memory_psi_some_avg10: 0.0, dirty_kib: 0, load_per_core: if flags.is_empty() { 0.0 } else { 2.0 }, clock_step_ms: 0, sample_gap_ms: 0 }, device_written_bytes: Some(500_000), acknowledged_bytes: Some(500_000), foreign_write_bytes: Some(0), psi_capable: true, device: Some(String::from("nvme0n1")) }
+		ContaminationVerdict { flags: flags.clone(), sample_count: 60, window_ms: 60_000, worst: WorstValues { io_psi_some_avg10: if flags.is_empty() { 0.0 } else { 5.0 }, cpu_psi_some_avg10: if flags.is_empty() { 0.0 } else { 10.0 }, memory_psi_some_avg10: 0.0, dirty_kib: 0, load_per_core: if flags.is_empty() { 0.0 } else { 2.0 }, clock_step_ms: 0, sample_gap_ms: 0 }, device_written_bytes: Some(500_000), acknowledged_bytes: Some(500_000), foreign_write_bytes: Some(0), psi_capable: true, device: Some(String::from("nvme0n1")) }
 	}
 
 	fn flush_check() -> FlushCheckResult {
@@ -741,7 +741,7 @@ mod tests {
 			harness.record_step().expect("step");
 		}
 		harness.finish().expect("finish");
-		*harness.run_record()
+		harness.run_record().clone()
 	}
 
 	// -----------------------------------------------------------------------
@@ -997,7 +997,7 @@ mod tests {
 		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(5, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&flush_check()), Vec::new(), 60, 240, 10, 1, 1, 1);
 		match verdicts.coverage.status {
 			CoverageStatus::InsufficientCoverage(ins) => {
-				assert!(ins.reason.contains("oracle"), "reason must mention oracle: {ins.reason}");
+				assert!(ins.reason.contains("oracle"), "reason must mention oracle: {0}", ins.reason);
 			}
 			_ => panic!("expected InsufficientCoverage"),
 		}
@@ -1009,7 +1009,7 @@ mod tests {
 		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(3, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 10, 1);
 		match verdicts.coverage.status {
 			CoverageStatus::InsufficientCoverage(ins) => {
-				assert!(ins.reason.contains("derived"), "reason must mention derived: {ins.reason}");
+				assert!(ins.reason.contains("derived"), "reason must mention derived: {0}", ins.reason);
 			}
 			_ => panic!("expected InsufficientCoverage"),
 		}
@@ -1021,7 +1021,7 @@ mod tests {
 		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&flush_check()), Vec::new(), 60, 240, 1, 10, 1, 1);
 		match verdicts.coverage.status {
 			CoverageStatus::InsufficientCoverage(ins) => {
-				assert!(ins.reason.contains("backup"), "reason must mention backup: {ins.reason}");
+				assert!(ins.reason.contains("backup"), "reason must mention backup: {0}", ins.reason);
 			}
 			_ => panic!("expected InsufficientCoverage"),
 		}
@@ -1033,7 +1033,7 @@ mod tests {
 		let verdicts = SoakReport::evaluate(&run, None, None, None, None, None, Vec::new(), 0, 0, 1, 1, 1, 1);
 		match verdicts.coverage.status {
 			CoverageStatus::InsufficientCoverage(ins) => {
-				assert!(ins.reason.contains("steps"), "reason must mention steps: {ins.reason}");
+				assert!(ins.reason.contains("steps"), "reason must mention steps: {0}", ins.reason);
 			}
 			_ => panic!("expected InsufficientCoverage"),
 		}
