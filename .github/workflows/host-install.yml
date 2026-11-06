@@ -1,0 +1,103 @@
+name: Host install
+
+# PAC-11's gate: install-host.sh places the server binary, systemd unit, sysusers,
+# tmpfiles, and env template into a --prefix tree; test-host-install.sh proves every
+# claim about that tree — the manifest matches the disk, ExecStart is rewritten for
+# the prefix, an operator's env file survives reinstall, every env‑template variable
+# is one the real binary accepts, and systemd's own readers (gates 6–7) accept the
+# result on a machine where they are installed.
+#
+# It is a separate workflow rather than a job of ci.yml because the per‑workflow
+# path filter is the only way to scope it to packaging‑relevant changes without
+# affecting CI's broader pull‑request gate, and because it only needs the
+# weft‑server crate, not a workspace build. CI lints the packaging scripts on
+# every pull request; this workflow runs the artifact.
+#
+# The push and schedule triggers exist because a path filter cannot see an upstream
+# change: a systemd version bump or a unit syntax change that makes the service
+# unloadable is caught on the first main‑branch run after it lands, not when it
+# has rotted.
+
+on:
+  pull_request:
+    paths:
+      - packaging/**
+      - scripts/packaging/**
+      - weft-server/**
+      - Cargo.lock
+      - Cargo.toml
+      - .github/release-toolchain
+      - .github/workflows/host-install.yml
+  push:
+    branches: [main]
+  schedule:
+    # 10:00 UTC, one hour after container.yml (09:00) and three hours after CI
+    # (07:00), so the three do not compete for the same runners.
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-install-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: host-install
+    runs-on: ubuntu-latest
+    # A cold release build of weft‑server takes ~30 min; the test runs in seconds.
+    # The ceiling is generous for the initial cache‑less run on main.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build weft-server (release)
+        run: cargo build --release -p weft-server --locked -j 4
+
+      # Gate 7 (transient systemd scope with the unit's hardening) needs the user
+      # systemd manager to be reachable. ubuntu-latest runs systemd as pid 1, but
+      # the user manager does not start without a session; loginctl enable-linger
+      # makes it start now and keep running for the job.
+      - name: Enable user systemd manager for gate 7
+        run: |
+          sudo loginctl enable-linger "$(id -u)"
+          for i in $(seq 1 20); do
+            systemctl --user show-environment >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+
+      # Run the full test suite. Gates 6–7 use systemd-analyze, systemd-sysusers,
+      # systemd-tmpfiles, and a transient user-scope with the unit's hardening
+      # properties — all available on ubuntu-latest after the step above. The
+      # post-check fails the job if any of those gates still skipped.
+      - name: Run test-host-install.sh
+        run: |
+          out=$(mktemp)
+          scripts/packaging/test-host-install.sh --bin target/release/weft-server 2>&1 | tee "$out"; rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then echo "exit $rc" >&2; exit $rc; fi
+          # Gates 6-7 should not skip on ubuntu-latest (gate 7 after loginctl).
+          for pattern in \
+            'systemd-analyze is not installed here' \
+            'systemd-sysusers is not installed here' \
+            'systemd-tmpfiles is not installed here' \
+            'no reachable user systemd manager'; do
+            if grep -qF "$pattern" "$out"; then
+              echo "FAIL: systemd gate 6/7 skipped on ubuntu-latest: $pattern" >&2
+              exit 1
+            fi
+          done
