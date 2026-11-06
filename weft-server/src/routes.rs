@@ -831,7 +831,13 @@ async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> (
 	let ready = !report.incompatible_store;
 	let status = if ready { axum::http::StatusCode::OK } else { axum::http::StatusCode::SERVICE_UNAVAILABLE };
 	let body = ReadyResponse { ready, segment_store: true, store_uuid: Some(store.store_uuid().to_string()), durability_class: Some(weftdb::SegmentStore::durability_class()), previous_clean_shutdown: Some(store.previous_clean_shutdown()), quarantined: report.quarantined, suspect: report.suspected, incompatible_store: report.incompatible_store, ..ReadyResponse::default() }.with_poison(poison);
-	(status, axum::Json(body))
+	// ROB-17: whether the disk guard refuses writes now. `statvfs` is a blocking call, so
+	// it runs off the async runtime; a failed or undescribable read reports `false`, the
+	// same as a guard that is off.
+	let store = std::sync::Arc::clone(store);
+	drop(state);
+	let disk_refusing = tokio::task::spawn_blocking(move || store.headroom().is_some_and(|headroom| headroom.refusing())).await.unwrap_or(false);
+	(status, axum::Json(ReadyResponse { disk: crate::DiskGuardState { disk_refusing }, ..body }))
 }
 
 /// The process and store identity route (FRE-12b).

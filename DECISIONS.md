@@ -5268,6 +5268,11 @@ looks like are not specified.
    server answers the refusal with `ApiError::server_logged_elsewhere`, the `5xx`
    constructor without the per-request error line. A client retrying against a full disk
    would otherwise write one error line per attempt into the logs on the disk that is full.
+6. **`/ready` carries `disk_refusing`, a boolean, and stays `200 ready`.** Reads keep
+   working, so the server is still ready; the flag is what lets a balancer or ingest router
+   steer writes elsewhere, as `vminsert` re-routes around a read-only `vmstorage`. The probe
+   answers without a key, so it carries the state only; the byte counts stay on the
+   `metrics`-scoped headroom route.
 
 **Rejected:** guarding every `create_new_write` in `StoreFs` (it would refuse maintenance and
 recovery writes too, and a frame refused half-way through a batch is litter); a

@@ -358,7 +358,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] seal lane
   - [x] → **ROB-17** Disk guard, headroom API and space gauges
     - [x] Log the `507 insufficient_storage` refusal once per transition into and out of refusing, not once per request: today every refused ingest logs at ERROR, so a client retrying against a full disk floods the log (the `weft_disk_guard_refusing` gauge already carries the state).
-    - [ ] Report the guard's state on `/ready` (a `disk_refusing` field, still `200`) so a balancer or ingest router can steer writes elsewhere while reads keep being served — VictoriaMetrics' `vmstorage` does exactly this: it switches to read-only below `-storage.minFreeDiskSpaceBytes` and `vminsert` re-routes data to the remaining nodes (https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/docs/victoriametrics/Cluster-VictoriaMetrics.md#readonly-mode).
+    - [x] Report the guard's state on `/ready` (a `disk_refusing` field, still `200`) so a balancer or ingest router can steer writes elsewhere while reads keep being served — VictoriaMetrics' `vmstorage` does exactly this: it switches to read-only below `-storage.minFreeDiskSpaceBytes` and `vminsert` re-routes data to the remaining nodes (https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/docs/victoriametrics/Cluster-VictoriaMetrics.md#readonly-mode).
     - [ ] ROB-18 phase 1: call `weftdb::DiskGuard::admit` with the reserved body size, so a request is refused `507` before its body is read (plan C11; the guard is public for it).
   - [ ] maint lane
   - [ ] read lane

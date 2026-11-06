@@ -88,3 +88,21 @@ async fn ready_without_a_store_carries_build_info_and_no_identity() {
 	assert_eq!(body["durability_class"], serde_json::Value::Null, "{body}");
 	assert_eq!(body["previous_clean_shutdown"], serde_json::Value::Null, "{body}");
 }
+
+/// ROB-17: `/ready` says whether the disk guard refuses writes, as a boolean, and stays
+/// `200 ready` while it does — reads keep working. An impossible reserve refuses on any
+/// filesystem; a guard that is off never does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_reports_a_refusing_disk_guard_and_stays_ready() {
+	for (reserve, refusing) in [(u64::MAX / 2, true), (0, false)] {
+		let dir = tempfile::tempdir().expect("temp dir");
+		let store = SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(reserve)).await.expect("opens");
+		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let (status, body) = get_ready(&router).await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+		assert_eq!(body["ready"], true, "{body}");
+		assert_eq!(body["disk_refusing"], refusing, "reserve {reserve}: {body}");
+	}
+	let (_, body) = get_ready(&app()).await;
+	assert_eq!(body["disk_refusing"], false, "no store, nothing to refuse: {body}");
+}

@@ -19,7 +19,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   the `weft_disk_{total,available,reserve,writable}_bytes` gauges plus a 0/1
   `weft_disk_guard_refusing`. The library default
   (`SegmentStoreOptions::default`) leaves the guard off. The refusal is logged once when
-  the guard starts refusing (WARN) and once when it admits again (INFO), not per request.
+  the guard starts refusing (WARN) and once when it admits again (INFO), not per request. `GET /ready`
+  gains `disk_refusing` (a boolean; `ready` stays `true`, since reads keep working).
 - **Mutation harness for frames, sidecars and Parquet** (ROB-9). Every committed golden
   `.weftseg` frame, a tiered `.weftpart` sidecar and a WeftDB-written Parquet file are
   mutated — every byte substitution, every truncation, and a seeded multi-byte corpus —

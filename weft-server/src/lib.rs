@@ -201,6 +201,20 @@ pub struct ReadyResponse {
 	/// Whether any suspect record's cause is a frame version this build predates:
 	/// the store holds data written by a newer server, and `ready` is `false`. D-S12.
 	pub incompatible_store: bool,
+	/// The store's disk guard (flattened: `disk_refusing` is a top-level field). ROB-17.
+	#[serde(flatten)]
+	pub disk: DiskGuardState,
+}
+
+/// The disk-guard part of [`ReadyResponse`] (ROB-17).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DiskGuardState {
+	/// Whether the store's disk guard is refusing every ingest and seal now: the
+	/// filesystem holding the store has no more than the `WEFT_DISK_RESERVE_BYTES` reserve
+	/// available. Reads keep working, so `ready` stays `true`; a balancer or ingest router
+	/// can steer writes elsewhere meanwhile. A boolean only — the probe answers without a
+	/// key, so the byte counts stay on the `metrics`-scoped headroom route.
+	pub disk_refusing: bool,
 }
 
 /// The write-poison part of [`ReadyResponse`].
@@ -220,7 +234,7 @@ pub struct WritePoison {
 
 impl Default for ReadyResponse {
 	fn default() -> Self {
-		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false, write: WritePoison::default(), store_uuid: None, durability_class: None, previous_clean_shutdown: None, quarantined: 0, suspect: 0, incompatible_store: false }
+		Self { ready: true, service: SERVICE, version: VERSION, segment_store: false, write: WritePoison::default(), store_uuid: None, durability_class: None, previous_clean_shutdown: None, quarantined: 0, suspect: 0, incompatible_store: false, disk: DiskGuardState { disk_refusing: false } }
 	}
 }
 
