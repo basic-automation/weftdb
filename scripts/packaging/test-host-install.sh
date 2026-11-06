@@ -233,7 +233,11 @@ pass "an operator's configuration survives an upgrade; the template stays in sha
 readonly NAMES="$WORK/names.txt"          # literal defaults, probe one
 readonly ALL_NAMES="$WORK/all-names.txt"  # every documented name, probe two
 mkdir -p "$WORK/data/store" "$WORK/data/backups"
-: >"$WORK/api.keys"
+# The config stage parses the keys file before it ever reaches the address, so
+# the scratch keys file must be a well-formed keys document holding one key —
+# the shape auth.rs accepts. Nothing is served or connected anywhere; the probe
+# still ends in the refusal over the dead address.
+printf '%s\n' '{"version":1,"keys":[{"id":"gate-probe","role":"admin","key_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}' >"$WORK/api.keys"
 grep -oE '^#[[:space:]]*WEFT_[A-Z0-9_]+' "$ENV_TEMPLATE" | sed -E 's/^#[[:space:]]*//' |
 	sort -u >"$ALL_NAMES"
 NAME_COUNT=$(wc -l <"$ALL_NAMES")
