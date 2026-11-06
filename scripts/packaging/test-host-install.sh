@@ -177,7 +177,10 @@ WEFT_BIN=$BIN "$INSTALLER" --destdir "$DEST" --prefix "$PREFIX" >"$WORK/install.
 $(cat "$WORK/install.out")"
 
 readonly MANIFEST="$WORK/manifest.tsv"
-WEFT_BIN=$BIN "$INSTALLER" --list >"$MANIFEST"
+# The manifest must describe the tree the gates just installed, so it is listed with the same
+# --prefix the install used; `--list` without it prints the machine's default prefix instead,
+# which is not the tree under test.
+WEFT_BIN=$BIN "$INSTALLER" --prefix "$PREFIX" --list >"$MANIFEST"
 FILE_COUNT=$(wc -l <"$MANIFEST")
 readonly FILE_COUNT
 ((FILE_COUNT >= 9)) || fail "--list printed $FILE_COUNT entries; a host install is at least 9 files"
