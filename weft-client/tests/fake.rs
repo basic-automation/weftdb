@@ -166,3 +166,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 	use sha2::Digest as _;
 	format!("{:x}", sha2::Sha256::digest(bytes))
 }
+
+#[tokio::test]
+async fn the_headroom_is_read_as_typed_numbers() {
+	let router = Router::new().route("/api/v1/storage/headroom", get(|| async { Json(json!({ "total_bytes": 10_000, "available_bytes": 1_000, "reserve_bytes": 400, "writable_bytes": 600, "refusing": false })) }));
+	let headroom = Client::new(serve(router).await).unwrap().headroom().await.unwrap();
+	assert_eq!((headroom.total_bytes, headroom.available_bytes, headroom.reserve_bytes, headroom.writable_bytes, headroom.refusing), (10_000, 1_000, 400, 600, false));
+}

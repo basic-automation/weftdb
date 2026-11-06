@@ -369,6 +369,14 @@ class Client:
             return self._get("/api/v1/storage/stats").json()
         return self._get(f"/api/v1/storage/{self._aspect(aspect)}/stats").json()
 
+    def headroom(self) -> Dict[str, Any]:
+        """``GET /api/v1/storage/headroom``: the store's free-space margin (``metrics`` scope).
+
+        ``total_bytes``, ``available_bytes``, the ``reserve_bytes`` every write must leave,
+        ``writable_bytes`` and ``refusing`` (the disk guard answers ``507`` to every write).
+        """
+        return self._get("/api/v1/storage/headroom").json()
+
     # ── ingest ───────────────────────────────────────────────────────────────
 
     @staticmethod

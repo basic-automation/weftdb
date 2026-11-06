@@ -38,7 +38,7 @@ pub use bigdecimal::BigDecimal;
 pub use client::{Answer, Client, ClientBuilder};
 pub use error::{Error, ErrorKind, Result};
 pub use reqwest::Method;
-pub use types::{parse_decimal, AspectDeclaration, AspectInfo, AspectStats, BenchRun, Bucket, ComputePoint, Downsample, Downsampled, Format, IlpOptions, Interpolate, Interpolated, InterpolatedPoint, OutputPoint, Page, PointAt, PointKind, PointsPage, Spline, StoreStats, StoredDownsample, StoredPoint, StoredValue, WriteOptions, WriteSummary};
+pub use types::{parse_decimal, AspectDeclaration, AspectInfo, AspectStats, BenchRun, Bucket, ComputePoint, Downsample, Downsampled, Format, Headroom, IlpOptions, Interpolate, Interpolated, InterpolatedPoint, OutputPoint, Page, PointAt, PointKind, PointsPage, Spline, StoreStats, StoredDownsample, StoredPoint, StoredValue, WriteOptions, WriteSummary};
 
 /// The record batches of an Arrow IPC stream answer.
 ///
