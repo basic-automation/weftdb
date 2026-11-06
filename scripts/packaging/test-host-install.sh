@@ -218,19 +218,30 @@ grep -qxF 'WEFT_MAX_CONNECTIONS=64' "$OPERATOR_ENV" ||
 	fail "the reinstall changed the operator's env file"
 pass "an operator's configuration survives an upgrade; the template stays in share/doc"
 
-# Gate 4: every name in the shipped env file is a name the real server accepts.
-# Since PAC-5b the server refuses values outside the shape its registry says a name accepts —
-# an empty value on a positive-integer name is a refusal, not a default — so the probe exports
-# the defaults the template actually ships rather than bare names. Defaults that point at the
-# machine or turn authentication on are redirected into the scratch tree, so the one refusal
-# left standing is the probe's own unusable address.
-readonly NAMES="$WORK/names.txt"
+# Gate 4: every name in the shipped env file is a name the real server accepts, and the
+# defaults the file literally ships start cleanly. Since PAC-5b an empty value on an integer
+# name is a refusal, not a default, and the template uses two shapes: `#WEFT_X=value` ships a
+# literal default, `#WEFT_X=` documents a name whose default the server keeps internally and
+# describes in prose. The two shapes get two probes.
+#
+# Probe one exports the literal defaults, with the ones that point at the machine redirected
+# into the scratch tree, and expects the only refusal left standing to be the probe's own
+# unusable address: a shipped default that does not start cleanly fails here, naming itself.
+# Probe two gives every documented name — both shapes — a value no shape can accept. PAC-5b
+# then refuses those values, but a name the registry does not know is refused as unknown,
+# which is precisely what this probe forbids; that is the registry-coverage check.
+readonly NAMES="$WORK/names.txt"          # literal defaults, probe one
+readonly ALL_NAMES="$WORK/all-names.txt"  # every documented name, probe two
 mkdir -p "$WORK/data/store" "$WORK/data/backups"
 : >"$WORK/api.keys"
-grep -oE '^#[A-Z][A-Z0-9_]*=.*' "$ENV_TEMPLATE" | sed 's/^#//' | sort -u |
+grep -oE '^#[[:space:]]*WEFT_[A-Z0-9_]+' "$ENV_TEMPLATE" | sed -E 's/^#[[:space:]]*//' |
+	sort -u >"$ALL_NAMES"
+NAME_COUNT=$(wc -l <"$ALL_NAMES")
+readonly NAME_COUNT
+((NAME_COUNT >= 30)) || fail "the env file documents only $NAME_COUNT variables; expected 30 or more"
+grep -E '^#WEFT_[A-Z0-9_]+=.+' "$ENV_TEMPLATE" | sed 's/^#//' | sort -u |
 	while IFS='=' read -r gname gvalue; do
 		case $gname in
-			WEFT_AUTH) gvalue='' ;;
 			WEFT_DATA_DIR) gvalue="$WORK/data" ;;
 			WEFT_SEGMENT_STORE_ROOT) gvalue="$WORK/data/store" ;;
 			WEFT_BACKUP_DIR) gvalue="$WORK/data/backups" ;;
@@ -238,13 +249,10 @@ grep -oE '^#[A-Z][A-Z0-9_]*=.*' "$ENV_TEMPLATE" | sed 's/^#//' | sort -u |
 		esac
 		printf '%s=%s\n' "$gname" "$gvalue"
 	done >"$NAMES"
-NAME_COUNT=$(wc -l <"$NAMES")
-readonly NAME_COUNT
-((NAME_COUNT >= 30)) || fail "the env file documents only $NAME_COUNT variables; expected 30 or more"
 PROBE_RC=$(probe_server "$NAMES" "$WORK/probe.out")
 readonly PROBE_RC
 if [[ $PROBE_RC != 78 ]]; then
-	fail "the server exited $PROBE_RC with the shipped env names set; expected 78, a refusal over the unusable address
+	fail "the server exited $PROBE_RC with the shipped defaults set; expected 78, a refusal over the unusable address
 $(tail -20 "$WORK/probe.out")"
 fi
 if grep -q "$REFUSAL_UNKNOWN" "$WORK/probe.out" || grep -q "$REFUSAL_TEST" "$WORK/probe.out"; then
@@ -254,7 +262,25 @@ fi
 grep -qi "WEFT_SERVER_ADDR" "$WORK/probe.out" ||
 	fail "the refusal did not name WEFT_SERVER_ADDR, so it is not the refusal this gate expects:
 $(tail -20 "$WORK/probe.out")"
-pass "all $NAME_COUNT variable names in the env file are ones the real server accepts, none of them Test-tier"
+OTHER_NAMED=$(grep -oE 'WEFT_[A-Z0-9_]+' "$WORK/probe.out" | sort -u | grep -cv '^WEFT_SERVER_ADDR$') || true
+readonly OTHER_NAMED
+((OTHER_NAMED == 0)) ||
+	fail "a shipped default was refused besides the probe's own address ($OTHER_NAMED other name(s)):
+$(grep -oE 'WEFT_[A-Z0-9_]+' "$WORK/probe.out" | sort -u)"
+while read -r gname; do
+	printf '%s=__weft_gate_probe__\n' "$gname"
+done <"$ALL_NAMES" >"$WORK/sentinel.txt"
+COVER_RC=$(probe_server "$WORK/sentinel.txt" "$WORK/cover.out")
+readonly COVER_RC
+if [[ $COVER_RC != 78 ]]; then
+	fail "the server exited $COVER_RC with every documented name set to an impossible value; expected 78
+$(tail -20 "$WORK/cover.out")"
+fi
+if grep -q "$REFUSAL_UNKNOWN" "$WORK/cover.out" || grep -q "$REFUSAL_TEST" "$WORK/cover.out"; then
+	fail "a name in the shipped env file is not the real server's name:
+$(grep -e "$REFUSAL_UNKNOWN" -e "$REFUSAL_TEST" "$WORK/cover.out")"
+fi
+pass "all $NAME_COUNT variable names in the env file are ones the real server accepts, and its literal defaults start cleanly"
 
 # Gate 5: gate 4 is capable of failing. An invented name first.
 printf 'WEFT_NOT_A_WEFTDB_VARIABLE=1\n' >"$WORK/invented.txt"
