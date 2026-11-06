@@ -381,6 +381,7 @@ fn evaluate_r4(derived: Option<&DerivedReadVerdict>) -> RuleResult {
 ///
 /// This is an existence rule only: the recovery objectives are recorded,
 /// not asserted against a numeric target (none exists in the repo).
+#[allow(clippy::format_in_format)]
 fn evaluate_r5(backup: Option<&BackupLaneVerdict>) -> RuleResult {
 	let tid = "R5";
 	let name = "recovery-recorded";
@@ -427,6 +428,7 @@ fn evaluate_r6(hook_windows: &Vec<(String, u64)>, min_hook_windows: u64) -> Rule
 
 /// R7: progress-liveness — each evaluated tick shows >= `MIN_TICK_PROGRESS`
 /// new sealed points, non-decreasing counters.
+#[allow(clippy::lossy_cast)]
 fn evaluate_r7(total_ticks: u64, new_sealed_points: u64) -> RuleResult {
 	let tid = "R7";
 	let name = "progress-liveness";
