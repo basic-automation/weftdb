@@ -263,11 +263,12 @@ jobs:
       # are not the workspace's: serde_json's `arbitrary_precision` (switched on by another
       # member) once hid a one-ULP JSON float misread that only the per-package build had
       # (2026-11-05). Test the server the way it ships.
-      - name: Test weft-server as the release builds it (no workspace feature unification)
+      - name: Test weft-server and weftdb as the release builds them (no workspace feature unification)
         shell: bash
         run: |
           if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
           cargo test -p weft-server --lib --locked -- --test-threads=4
+          cargo test -p weftdb --lib --locked -- --test-threads=4
 
   docs:
     name: rustdoc
