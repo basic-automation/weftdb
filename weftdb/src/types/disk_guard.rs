@@ -153,6 +153,38 @@ impl Headroom {
 	}
 }
 
+/// Which way a store's disk guard just changed state ([`RefusalLatch::record`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalTransition {
+	/// The guard refused a write after admitting (or before any write).
+	Started,
+	/// The guard admitted a write after refusing.
+	Ended,
+}
+
+/// Whether the guard is currently refusing.
+///
+/// Kept so a refusal is reported once per transition rather than once per refused
+/// request: a client retrying against a full disk
+/// would otherwise write one error line per attempt, and the `weft_disk_guard_refusing`
+/// gauge already carries the state between transitions.
+#[derive(Debug, Default)]
+pub struct RefusalLatch {
+	refusing: std::sync::atomic::AtomicBool,
+}
+
+impl RefusalLatch {
+	/// Record one decision of the guard; `Some` only when it differs from the last one.
+	pub fn record(&self, refused: bool) -> Option<RefusalTransition> {
+		let was = self.refusing.swap(refused, std::sync::atomic::Ordering::AcqRel);
+		match (was, refused) {
+			(false, true) => Some(RefusalTransition::Started),
+			(true, false) => Some(RefusalTransition::Ended),
+			_ => None,
+		}
+	}
+}
+
 /// The reserve `WEFT_DISK_RESERVE_BYTES`'s value names: a non-negative whole number of
 /// bytes (`0` turns the guard off), or [`DEFAULT_DISK_RESERVE_BYTES`] when it is unset or
 /// anything else (the server's strict configuration check refuses a malformed value at
@@ -194,6 +226,18 @@ mod tests {
 		assert!(!headroom.refusing());
 		assert!(DiskGuard::new(5_000).headroom(SPACE).refusing(), "a reserve above what is available refuses every write");
 		assert!(!DiskGuard::DISABLED.headroom(DiskSpace { total_bytes: 1, available_bytes: 0 }).refusing(), "a disabled guard never refuses");
+	}
+
+	#[test]
+	fn the_latch_reports_only_transitions() {
+		let latch = RefusalLatch::default();
+		assert_eq!(latch.record(false), None, "admitting from the start is not a transition");
+		assert_eq!(latch.record(true), Some(RefusalTransition::Started));
+		assert_eq!(latch.record(true), None, "a second refusal is the same state");
+		assert_eq!(latch.record(true), None);
+		assert_eq!(latch.record(false), Some(RefusalTransition::Ended));
+		assert_eq!(latch.record(false), None);
+		assert_eq!(latch.record(true), Some(RefusalTransition::Started), "a later refusal is a new transition");
 	}
 
 	#[test]

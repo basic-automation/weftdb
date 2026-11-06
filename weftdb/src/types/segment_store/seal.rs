@@ -1093,7 +1093,17 @@ impl SegmentStore {
 		if !self.disk_guard.is_enabled() {
 			return Ok(());
 		}
-		self.disk_guard.admit(crate::disk_space_at(&self.root), need).map_err(Into::into)
+		let decision = self.disk_guard.admit(crate::disk_space_at(&self.root), need);
+		// One line per change of state, not per refused write: a client retrying against a
+		// full disk would otherwise write one line per attempt.
+		match (self.disk_refusals.record(decision.is_err()), &decision) {
+			(Some(crate::RefusalTransition::Started), Err(StoreError::InsufficientStorage { available_bytes, reserve_bytes, need_bytes })) => {
+				tracing::warn!(root = %self.root.display(), available_bytes, reserve_bytes, need_bytes, "disk guard: refusing ingests and seals until the store's filesystem has more than the reserve available");
+			}
+			(Some(crate::RefusalTransition::Ended), _) => tracing::info!(root = %self.root.display(), reserve_bytes = self.disk_guard.reserve_bytes(), "disk guard: admitting ingests and seals again"),
+			_ => {}
+		}
+		decision.map_err(Into::into)
 	}
 
 	/// The disk guard this store's seals run under (ROB-17).

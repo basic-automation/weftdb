@@ -5263,6 +5263,12 @@ looks like are not specified.
    Without a store, or on a platform that cannot describe the filesystem, the gauges are
    absent rather than zero, so a scrape never reads a made-up full disk.
 
+5. **Logged per transition, not per request.** The store records each guard decision in a
+   `RefusalLatch` and logs WARN when it starts refusing and INFO when it admits again; the
+   server answers the refusal with `ApiError::server_logged_elsewhere`, the `5xx`
+   constructor without the per-request error line. A client retrying against a full disk
+   would otherwise write one error line per attempt into the logs on the disk that is full.
+
 **Rejected:** guarding every `create_new_write` in `StoreFs` (it would refuse maintenance and
 recovery writes too, and a frame refused half-way through a batch is litter); a
 percentage reserve (a percentage of a 15 TB volume is hundreds of GB nobody asked to keep,

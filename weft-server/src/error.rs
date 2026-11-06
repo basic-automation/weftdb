@@ -353,6 +353,16 @@ impl ApiError {
 	}
 
 	/// A caller-side problem the table has no more specific name for.
+	/// [`server`](Self::server) without its per-request error line, for a `5xx` whose
+	/// condition is logged where it changes state rather than per request — the disk
+	/// guard's refusal, which a retrying client would otherwise turn into one error line
+	/// per attempt. The cause still reaches an operator-detail route.
+	#[must_use]
+	pub fn server_logged_elsewhere(code: Code, detail: impl std::fmt::Display) -> Self {
+		debug_assert!(code.status().is_server_error(), "ApiError::server_logged_elsewhere is for the 5xx codes; {code:?} answers {}", code.status().as_u16());
+		Self { code, message: String::new(), details: None, limit: None, committed: None, retry_after: None, cause: Some(detail.to_string()) }
+	}
+
 	pub fn bad_request(message: impl Into<String>) -> Self {
 		Self::new(Code::BadRequest, message)
 	}
@@ -968,7 +978,9 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 			// The disk guard (ROB-17): the write would have left the store's filesystem
 			// below its reserve, and nothing was written. A `5xx` with the cause kept for
 			// the operator, since the numbers describe the host, not the request.
-			weftdb::StoreError::InsufficientStorage { .. } => ApiError::server(Code::InsufficientStorage, e.to_string()),
+			// The store logs the refusal once per change of state, so this answer does not
+			// log again per request (ROB-17).
+			weftdb::StoreError::InsufficientStorage { .. } => ApiError::server_logged_elsewhere(Code::InsufficientStorage, e.to_string()),
 			_ => ApiError::server(Code::IncompatibleStore, e.to_string()),
 		});
 	}

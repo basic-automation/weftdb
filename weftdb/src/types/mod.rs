@@ -92,5 +92,5 @@ pub mod trend;
 pub mod upsert_keys;
 pub mod value_kind;
 
-pub use disk_guard::{disk_space_at, DiskGuard, DiskSpace, Headroom, DEFAULT_DISK_RESERVE_BYTES};
+pub use disk_guard::{disk_space_at, DiskGuard, DiskSpace, Headroom, RefusalLatch, RefusalTransition, DEFAULT_DISK_RESERVE_BYTES};
 pub use error::*;

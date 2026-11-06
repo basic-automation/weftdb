@@ -357,7 +357,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     *Closed 2026-11-05 (audit): #556 (2026-11-04). Recovery and fsck adopt series-key frames into their series, class a malformed/empty/duplicate SERIES_KEY after a passing CRC as suspect (C5), rebind mismatched keys (`series_rebound`), and settle every held row (`held_cleared`).*
   - [ ] seal lane
   - [x] → **ROB-17** Disk guard, headroom API and space gauges
-    - [ ] Log the `507 insufficient_storage` refusal once per transition into and out of refusing, not once per request: today every refused ingest logs at ERROR, so a client retrying against a full disk floods the log (the `weft_disk_guard_refusing` gauge already carries the state).
+    - [x] Log the `507 insufficient_storage` refusal once per transition into and out of refusing, not once per request: today every refused ingest logs at ERROR, so a client retrying against a full disk floods the log (the `weft_disk_guard_refusing` gauge already carries the state).
     - [ ] ROB-18 phase 1: call `weftdb::DiskGuard::admit` with the reserved body size, so a request is refused `507` before its body is read (plan C11; the guard is public for it).
   - [ ] maint lane
   - [ ] read lane
@@ -365,7 +365,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **FRE-8b** Stored-value text and one float-input rule across every ingest format
   - [ ] **FRE-9a** OpenAPI generated from code
   - [x] **ROB-9** Mutation harness for frames, sidecars and Parquet
-    - [ ] Report the three `parquet` 60.0.0 decoder panics upstream to apache/arrow-rs (`offset + len out of bounds`, `column start and length should not be negative`, `Decoder for dict should have been set`; reproducers are one-byte edits found by `weft-arrow-store/tests/parquet_mutation.rs`) *(owner: outward-facing)*. WeftDB contains them in `weft_arrow::read_parquet` meanwhile (DECISIONS 2026-11-05).
+    - [ ] Report the three `parquet` 60.0.0 decoder panics upstream to apache/arrow-rs (`offset + len out of bounds`, `column start and length should not be negative`, `Decoder for dict should have been set`; reproducers are one-byte edits found by `weft-arrow-store/tests/parquet_mutation.rs`), plus an `arrow-buffer` 60.0.0 panic at `util/bit_chunk_iterator.rs:235` seen when 4,070 one-bit mutants were posted to a running server *(owner: outward-facing)*. WeftDB contains them in `weft_arrow::read_parquet` meanwhile (DECISIONS 2026-11-05).
   - [ ] **SEC-14** Security documentation, config schema and upgrade notes
   - [ ] **PAC-10** Publish the multi-arch image (only after API auth)
   - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*

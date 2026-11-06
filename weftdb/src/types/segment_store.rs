@@ -1641,6 +1641,9 @@ pub struct SegmentStore {
 	/// The disk guard every seal consults (ROB-17), from the open options
 	/// ([`SegmentStoreOptions::disk_reserve_bytes`]).
 	disk_guard: crate::DiskGuard,
+	/// Whether the disk guard is refusing, so the store logs the change of state once
+	/// rather than every refused write (ROB-17).
+	disk_refusals: crate::RefusalLatch,
 	/// Each aspect's circuit-breaker state (consecutive sweep failures and, once
 	/// tripped, when the cooldown ends), guarded by a plain mutex: it is only
 	/// ever held for a map touch, never across an await.
