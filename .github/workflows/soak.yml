@@ -1,3 +1,4 @@
+# yamllint disable rule:line-length
 name: soak nightly
 
 # The nightly soak gate (1.0 plan SOA-15). It builds and runs a time-boxed
@@ -45,6 +46,10 @@ on:
 permissions:
   contents: read
   actions: read
+
+concurrency:
+  group: soak-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

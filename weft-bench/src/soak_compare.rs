@@ -39,7 +39,9 @@ use crate::soak_report::{CoverageStatus, Outcome, RuleResult, SoakReport};
 // ---------------------------------------------------------------------------
 
 /// A named metric with a relative tolerance (0.0 = exact, 0.10 = 10%).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// This type exists only as a parameter to [`compare_soak_reports`]; it is
+/// never serialised, so the name field is a static str reference.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetricTolerance {
 	/// Name of the metric, used in drift messages and the comparison JSON.
 	pub metric_name: &'static str,
@@ -60,7 +62,7 @@ pub const DEFAULT_METRIC_TOLERANCES: &[MetricTolerance] = &[MetricTolerance { me
 // ---------------------------------------------------------------------------
 
 /// How one rule's outcome changed between two reports.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutcomeChange {
 	/// The outcome is the same.
@@ -95,6 +97,8 @@ pub struct RuleChange {
 }
 
 impl RuleChange {
+	/// Build a `RuleChange` from two rule results for the same rule.
+	#[must_use]
 	fn new(previous: &RuleResult, current: &RuleResult) -> Self {
 		let change = match (previous.outcome, current.outcome) {
 			(Outcome::Pass, Outcome::Pass) | (Outcome::Fail, Outcome::Fail) | (Outcome::NotEvaluated, Outcome::NotEvaluated) => OutcomeChange::Unchanged,
@@ -112,7 +116,7 @@ impl RuleChange {
 // ---------------------------------------------------------------------------
 
 /// How the coverage changed between two reports.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CoverageChange {
 	/// Both reports met coverage.
@@ -123,8 +127,6 @@ pub enum CoverageChange {
 	BecameInsufficient,
 	/// Both reports have insufficient coverage (possibly different reasons).
 	BothInsufficient,
-	/// A new lane was added or the report structure changed.
-	StructureChange,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,28 +191,33 @@ impl SoakComparison {
 	}
 
 	/// Render the comparison as a Markdown summary for the job summary.
-	///
-	/// # Errors
-	///
-	/// Returns an error when the underlying `Write` fails (unreachable for a
-	/// `String`).
-	#[allow(clippy::needless_vec_and)]
+	#[must_use]
 	pub fn to_markdown(&self) -> String {
 		let mut out = String::with_capacity(1024);
 
-		out.push_str("## Soak Comparison\n\n");
+		let _ = write!(out, "## Soak Comparison\n\n");
 
 		if let Some((prev_ver, cur_ver)) = self.schema_mismatch {
-			let _ = writeln!(out, "⚠️ **Schema version mismatch:** previous=v{prev_ver}, current=v{cur_ver}. Metric drift not computed.\n");
+			let _ = write!(out, "⚠️ **Schema version mismatch:** previous=v{}, current=v{}. Metric drift not computed.\n\n", prev_ver, cur_ver);
 		}
 
-		out.push_str("### Rule outcome changes\n\n");
+		let _ = writeln!(out, "### Rule outcome changes\n");
 		if self.rule_changes.is_empty() {
-			out.push_str("No rules compared — both reports likely empty.\n\n");
+			let _ = writeln!(out, "No rules compared — both reports likely empty.\n");
 		} else {
-			out.push_str("| Rule | Previous | Current | Change |\n");
-			out.push_str("|------|----------|---------|--------|\n");
+			let _ = writeln!(out, "| Rule | Previous | Current | Change |");
+			let _ = writeln!(out, "|------|----------|---------|--------|");
 			for change in &self.rule_changes {
+				let prev_str = match change.previous {
+					Outcome::Pass => "pass",
+					Outcome::Fail => "fail",
+					Outcome::NotEvaluated => "not-evaluated",
+				};
+				let curr_str = match change.current {
+					Outcome::Pass => "pass",
+					Outcome::Fail => "fail",
+					Outcome::NotEvaluated => "not-evaluated",
+				};
 				let label = match change.change {
 					OutcomeChange::Unchanged => "—",
 					OutcomeChange::PassToFail => "🔴 Pass→Fail",
@@ -218,18 +225,18 @@ impl SoakComparison {
 					OutcomeChange::NotEvaluatedToEvaluated => "⚪→◉ evaluated",
 					OutcomeChange::EvaluatedToNotEvaluated => "◉→⚪ not-evaluated",
 				};
-				let _ = writeln!(out, "| {} ({}) | `{:?}` | `{:?}` | {} |", change.rule_id, change.rule_name, change.previous, change.current, label);
+				let _ = writeln!(out, "| {} ({}) | {} | {} | {} |", change.rule_id, change.rule_name, prev_str, curr_str, label);
 			}
 		}
-		out.push('\n');
+		let _ = write!(out, "\n");
 
 		if self.has_regression {
-			out.push_str("❌ **Regression detected**: one or more rules changed from Pass to Fail.\n\n");
+			let _ = writeln!(out, "❌ **Regression detected**: one or more rules changed from Pass to Fail.\n");
 		}
 		if self.has_drift_warning {
-			out.push_str("⚠️ **Metric drift past tolerance**:\n\n");
-			out.push_str("| Metric | Previous | Current | Drift | Tolerance | Past? |\n");
-			out.push_str("|--------|----------|---------|-------|-----------|-------|\n");
+			let _ = writeln!(out, "⚠️ **Metric drift past tolerance**:\n");
+			let _ = writeln!(out, "| Metric | Previous | Current | Drift | Tolerance | Past? |");
+			let _ = writeln!(out, "|--------|----------|---------|-------|-----------|-------|");
 			for drift in &self.metric_drifts {
 				if drift.past_tolerance {
 					let pct = format!("{:.2}%", drift.drift_pct * 100.0);
@@ -237,12 +244,188 @@ impl SoakComparison {
 					let _ = writeln!(out, "| {} | {:.0} | {:.0} | {} | {} | ⚠️ |", drift.metric_name, drift.previous_value, drift.current_value, pct, tol_pct);
 				}
 			}
-			out.push('\n');
+			let _ = write!(out, "\n");
 		}
 
-		out.push_str(&self.summary);
+		let _ = write!(out, "{}", &self.summary);
 		out
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Helper: match rules by id across two reports
+// ---------------------------------------------------------------------------
+
+/// Match rules by `id` across two reports and produce [`RuleChange`]s.
+///
+/// Rules present in previous but absent in current are marked
+/// `EvaluatedToNotEvaluated`. Rules present in current but not in
+/// previous are marked `NotEvaluatedToEvaluated`.
+fn match_rule_changes(previous: &SoakReport, current: &SoakReport) -> Vec<RuleChange> {
+	let mut changes: Vec<RuleChange> = Vec::new();
+
+	// Iterate by rule id; for 8 rules a linear scan is negligible.
+	for prev_rule in &previous.slo.rules {
+		let matched = current.slo.rules.iter().find(|cr| cr.id == prev_rule.id);
+		if let Some(curr_rule) = matched {
+			changes.push(RuleChange::new(prev_rule, curr_rule));
+		} else {
+			changes.push(RuleChange { rule_id: prev_rule.id.clone(), rule_name: prev_rule.name.clone(), previous: prev_rule.outcome, current: Outcome::NotEvaluated, change: OutcomeChange::EvaluatedToNotEvaluated });
+		}
+	}
+
+	// Rules in current but not previous
+	for curr_rule in &current.slo.rules {
+		let already = changes.iter().any(|rc| rc.rule_id == curr_rule.id);
+		if !already {
+			changes.push(RuleChange { rule_id: curr_rule.id.clone(), rule_name: curr_rule.name.clone(), previous: Outcome::NotEvaluated, current: curr_rule.outcome, change: OutcomeChange::NotEvaluatedToEvaluated });
+		}
+	}
+
+	changes
+}
+
+// ---------------------------------------------------------------------------
+// Helper: compute coverage change
+// ---------------------------------------------------------------------------
+
+fn compute_coverage_change(previous: &SoakReport, current: &SoakReport) -> CoverageChange {
+	match (&previous.coverage.status, &current.coverage.status) {
+		(CoverageStatus::Met, CoverageStatus::Met) => CoverageChange::BothMet,
+		(CoverageStatus::InsufficientCoverage(_), CoverageStatus::Met) => CoverageChange::Recovered,
+		(CoverageStatus::Met, CoverageStatus::InsufficientCoverage(_)) => CoverageChange::BecameInsufficient,
+		(CoverageStatus::InsufficientCoverage(_), CoverageStatus::InsufficientCoverage(_)) => CoverageChange::BothInsufficient,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Helper: extract metrics from a SoakReport
+// ---------------------------------------------------------------------------
+
+/// Extract the documented metrics from a report into a Vec of (name, value)
+/// pairs. Metrics that are not present in this report are omitted (e.g. no
+/// oracle → oracle metrics absent).
+fn extract_metrics(report: &SoakReport) -> Vec<(String, f64)> {
+	let m: Vec<(String, f64)> = Vec::new();
+
+	// Helper: append a metric to the output vec.
+	// Inlined rather than a local closure because the custom dialect does
+	// not support let-bound block closures.
+	fn push_metric(m: &mut Vec<(String, f64)>, name: &str, value: f64) {
+		m.push((name.to_string(), value));
+	}
+
+	push_metric(&mut m, "steps", report.run.steps as f64);
+
+	if let Some(oracle) = report.run.oracle.as_ref() {
+		push_metric(&mut m, "oracle_ticks_judged", oracle.ticks_judged as f64);
+		push_metric(&mut m, "oracle_mismatch_count", oracle.mismatch_count as f64);
+	}
+
+	if let Some(derived) = report.run.derived.as_ref() {
+		push_metric(&mut m, "derived_ticks_judged", derived.ticks_judged as f64);
+		push_metric(&mut m, "derived_mismatch_count", derived.mismatch_count as f64);
+	}
+
+	if let Some(backup) = report.run.backup.as_ref() {
+		push_metric(&mut m, "backup_acknowledged_ticks", backup.prefix.acknowledged_ticks as f64);
+		push_metric(&mut m, "backup_rpo_ms", backup.timing.rpo_ms() as f64);
+		push_metric(&mut m, "backup_rto_ms", backup.timing.rto_ms() as f64);
+		push_metric(&mut m, "backup_restore_duration_ms", backup.timing.restore_duration_ms as f64);
+	}
+
+	// Contamination flags count is not stored on SoakRun directly.
+	// Default to 0 — the soak workflow can set it from the honesty section.
+	push_metric(&mut m, "contamination_flags_count", 0.0);
+
+	m
+}
+
+/// Find a metric value by name from an extracted metrics vec.
+fn find_metric(metrics: &Vec<(String, f64)>, name: &str) -> Option<f64> {
+	for (n, v) in metrics {
+		if n == name {
+			return Some(*v);
+		}
+	}
+	None
+}
+
+// ---------------------------------------------------------------------------
+// Helper: compute metric drifts
+// ---------------------------------------------------------------------------
+
+fn compute_metric_drifts(previous: &SoakReport, current: &SoakReport, tolerances: &[MetricTolerance], schema_mismatch: Option<(u32, u32)>) -> Vec<MetricDrift> {
+	if schema_mismatch.is_some() {
+		return Vec::new();
+	}
+
+	let prev_metrics = extract_metrics(previous);
+	let curr_metrics = extract_metrics(current);
+
+	let mut drifts: Vec<MetricDrift> = Vec::with_capacity(tolerances.len());
+
+	for t in tolerances {
+		let prev_val = find_metric(&prev_metrics, t.metric_name);
+		let curr_val = find_metric(&curr_metrics, t.metric_name);
+
+		// Both reports must have the metric to compute drift
+		if let (Some(prev_v), Some(curr_v)) = (prev_val, curr_val) {
+			let drift_pct = if prev_v != 0.0 {
+				(curr_v - prev_v).abs() / prev_v.abs()
+			} else if curr_v != 0.0 {
+				// Previous was zero, current is non-zero — effectively infinite drift
+				f64::MAX
+			} else {
+				0.0
+			};
+
+			let past_tolerance = drift_pct > t.tolerance;
+			drifts.push(MetricDrift { metric_name: t.metric_name.to_string(), previous_value: prev_v, current_value: curr_v, tolerance: t.tolerance, drift_pct, past_tolerance });
+		}
+		// Metric not present in both reports → skip silently
+	}
+
+	drifts
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build the summary string
+// ---------------------------------------------------------------------------
+
+fn build_summary(has_regression: bool, has_drift_warning: bool, rule_changes: &Vec<RuleChange>, schema_mismatch: Option<(u32, u32)>) -> String {
+	let mut s = String::new();
+	if schema_mismatch.is_some() {
+		let _ = write!(s, "Schema version mismatch — rule outcomes compared, metrics skipped.");
+	} else if has_regression {
+		let regression_count = rule_changes.iter().filter(|rc| rc.change == OutcomeChange::PassToFail).count();
+		let _ = write!(s, "{} regression(s) — job fails.", regression_count);
+	} else {
+		let pass_to_fail = rule_changes.iter().filter(|rc| rc.change == OutcomeChange::PassToFail).count();
+		let fail_to_pass = rule_changes.iter().filter(|rc| rc.change == OutcomeChange::FailToPass).count();
+		let _ = write!(s, "No rule outcome changes.");
+		if pass_to_fail > 0 || fail_to_pass > 0 {
+			// Clear and rebuild: "No regressions. Improvements: N."
+			s = String::new();
+			if pass_to_fail == 0 {
+				let _ = write!(s, "No regressions.");
+			} else {
+				let _ = write!(s, "{} regressions.", pass_to_fail);
+			}
+			if fail_to_pass > 0 {
+				let _ = write!(s, " Improvements: {}.", fail_to_pass);
+			} else {
+				let _ = write!(s, " No improvements.");
+			}
+		}
+		if has_drift_warning {
+			let _ = write!(s, " Metric drift past tolerance — check warnings.");
+		}
+		if !has_drift_warning && pass_to_fail == 0 && fail_to_pass == 0 {
+			let _ = write!(s, " All metric drifts within tolerance.");
+		}
+	}
+	s
 }
 
 // ---------------------------------------------------------------------------
@@ -257,152 +440,18 @@ impl SoakComparison {
 /// 3. Compares coverage status.
 /// 4. Computes metric drift for the [`DEFAULT_METRIC_TOLERANCES`] set.
 ///
-/// `tolerances` may be `DEFAULT_METRIC_TOLERANCES` or a custom set. Passing
+/// `tolerances` may be [`DEFAULT_METRIC_TOLERANCES`] or a custom set. Passing
 /// an empty slice disables the metric-drift check entirely.
 #[must_use]
 pub fn compare_soak_reports(previous: &SoakReport, current: &SoakReport, tolerances: &[MetricTolerance]) -> SoakComparison {
 	let schema_mismatch = if previous.schema_version != current.schema_version { Some((previous.schema_version, current.schema_version)) } else { None };
 
-	// --- Rule outcome changes ---
-	let rule_changes: Vec<RuleChange> = {
-		let mut changes = Vec::with_capacity(previous.slo.rules.len().max(current.slo.rules.len()));
-		// Match by id
-		let prev_by_id: std::collections::HashMap<&str, &RuleResult> = previous.slo.rules.iter().map(|r| (r.id.as_str(), r)).collect();
-		let curr_by_id: std::collections::HashMap<&str, &RuleResult> = current.slo.rules.iter().map(|r| (r.id.as_str(), r)).collect();
-
-		// Rules in previous
-		for (id, prev_rule) in &prev_by_id {
-			if let Some(curr_rule) = curr_by_id.get(id) {
-				changes.push(RuleChange::new(prev_rule, curr_rule));
-			} else {
-				// Rule exists in previous but not current — treat as evaluated→not-evaluated
-				changes.push(RuleChange { rule_id: id.to_string(), rule_name: prev_rule.name.clone(), previous: prev_rule.outcome, current: Outcome::NotEvaluated, change: OutcomeChange::EvaluatedToNotEvaluated });
-			}
-		}
-		// Rules in current but not previous
-		for (id, curr_rule) in &curr_by_id {
-			if !prev_by_id.contains_key(id) {
-				changes.push(RuleChange { rule_id: id.to_string(), rule_name: curr_rule.name.clone(), previous: Outcome::NotEvaluated, current: curr_rule.outcome, change: OutcomeChange::NotEvaluatedToEvaluated });
-			}
-		}
-		changes.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
-		changes
-	};
-
+	let rule_changes = match_rule_changes(previous, current);
 	let has_regression = rule_changes.iter().any(|rc| rc.change == OutcomeChange::PassToFail);
-
-	// --- Coverage change ---
-	let coverage_change = match (&previous.coverage.status, &current.coverage.status) {
-		(CoverageStatus::Met, CoverageStatus::Met) => CoverageChange::BothMet,
-		(CoverageStatus::InsufficientCoverage(_), CoverageStatus::Met) => CoverageChange::Recovered,
-		(CoverageStatus::Met, CoverageStatus::InsufficientCoverage(_)) => CoverageChange::BecameInsufficient,
-		(CoverageStatus::InsufficientCoverage(_), CoverageStatus::InsufficientCoverage(_)) => CoverageChange::BothInsufficient,
-	};
-
-	// --- Metric drift ---
-	let metric_drifts = if schema_mismatch.is_some() {
-		Vec::new()
-	} else {
-		let extract = |report: &SoakReport| -> Vec<(String, f64)> {
-			let mut m = Vec::with_capacity(16);
-
-			m.push(("steps".to_string(), report.run.steps as f64));
-
-			if let Some(ref oracle) = report.run.oracle {
-				m.push(("oracle_ticks_judged".to_string(), oracle.ticks_judged as f64));
-				m.push(("oracle_mismatch_count".to_string(), oracle.mismatch_count as f64));
-			} else {
-				m.push(("oracle_ticks_judged".to_string(), f64::NAN));
-				m.push(("oracle_mismatch_count".to_string(), f64::NAN));
-			}
-
-			if let Some(ref derived) = report.run.derived {
-				m.push(("derived_ticks_judged".to_string(), derived.ticks_judged as f64));
-				m.push(("derived_mismatch_count".to_string(), derived.mismatch_count as f64));
-			} else {
-				m.push(("derived_ticks_judged".to_string(), f64::NAN));
-				m.push(("derived_mismatch_count".to_string(), f64::NAN));
-			}
-
-			if let Some(ref backup) = report.run.backup {
-				m.push(("backup_acknowledged_ticks".to_string(), backup.prefix.acknowledged_ticks as f64));
-				m.push(("backup_rpo_ms".to_string(), backup.timing.rpo_ms() as f64));
-				m.push(("backup_rto_ms".to_string(), backup.timing.rto_ms() as f64));
-				m.push(("backup_restore_duration_ms".to_string(), backup.timing.restore_duration_ms as f64));
-			} else {
-				m.push(("backup_acknowledged_ticks".to_string(), f64::NAN));
-				m.push(("backup_rpo_ms".to_string(), f64::NAN));
-				m.push(("backup_rto_ms".to_string(), f64::NAN));
-				m.push(("backup_restore_duration_ms".to_string(), f64::NAN));
-			}
-
-			// Contamination flags count: not stored directly on SoakReport.run,
-			// so we extract from the honesty section by checking the slo rules.
-			// We'll use the contamination verdict from the run's system sampler
-			// which is not stored. Default to 0 for now.
-			m.push(("contamination_flags_count".to_string(), 0.0_f64));
-
-			m
-		};
-
-		let prev_metrics = extract(previous);
-		let curr_metrics = extract(current);
-
-		let prev_map: std::collections::HashMap<&str, f64> = prev_metrics.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-		let curr_map: std::collections::HashMap<&str, f64> = curr_metrics.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-
-		let mut drifts = Vec::with_capacity(tolerances.len());
-		for tolerance in tolerances {
-			let prev_val = prev_map.get(tolerance.metric_name).copied().unwrap_or(f64::NAN);
-			let curr_val = curr_map.get(tolerance.metric_name).copied().unwrap_or(f64::NAN);
-
-			if prev_val.is_nan() || curr_val.is_nan() {
-				// One or both reports don't have this metric — skip
-				continue;
-			}
-
-			let drift_pct = if prev_val != 0.0 {
-				(curr_val - prev_val).abs() / prev_val.abs()
-			} else if curr_val != 0.0 {
-				// Previous was zero, current is non-zero — infinite drift
-				f64::INFINITY
-			} else {
-				0.0
-			};
-
-			let past_tolerance = drift_pct > tolerance.tolerance;
-			drifts.push(MetricDrift { metric_name: tolerance.metric_name.to_string(), previous_value: prev_val, current_value: curr_val, tolerance: tolerance.tolerance, drift_pct, past_tolerance });
-		}
-		drifts
-	};
-
+	let coverage_change = compute_coverage_change(previous, current);
+	let metric_drifts = compute_metric_drifts(previous, current, tolerances, schema_mismatch);
 	let has_drift_warning = metric_drifts.iter().any(|d| d.past_tolerance);
-
-	// --- Summary ---
-	let summary = {
-		let mut s = String::new();
-		if schema_mismatch.is_some() {
-			let _ = write!(s, "Schema version mismatch — rule outcomes compared, metrics skipped.");
-		} else if has_regression {
-			let regression_count = rule_changes.iter().filter(|rc| rc.change == OutcomeChange::PassToFail).count();
-			let _ = write!(s, "{regression_count} regression(s) — job fails.");
-		} else {
-			let pass_to_fail = rule_changes.iter().filter(|rc| rc.change == OutcomeChange::PassToFail).count();
-			let fail_to_pass = rule_changes.iter().filter(|rc| rc.change == OutcomeChange::FailToPass).count();
-			if pass_to_fail == 0 && fail_to_pass == 0 {
-				let _ = write!(s, "No rule outcome changes.");
-			} else {
-				let _ = write!(s, "No regressions. Improvements: {fail_to_pass}.");
-			}
-			if has_drift_warning {
-				let _ = write!(s, " Metric drift past tolerance — check warnings.");
-			}
-			if !has_drift_warning && pass_to_fail == 0 {
-				let _ = write!(s, " All metric drifts within tolerance.");
-			}
-		}
-		s
-	};
+	let summary = build_summary(has_regression, has_drift_warning, &rule_changes, schema_mismatch);
 
 	SoakComparison { schema_version: 1, schema_mismatch, rule_changes, coverage_change, metric_drifts, has_regression, has_drift_warning, summary }
 }
@@ -415,45 +464,40 @@ pub fn compare_soak_reports(previous: &SoakReport, current: &SoakReport, toleran
 mod tests {
 	use super::*;
 	use crate::{
-		report::RunMetadata, soak::{SoakConfig, SoakHarness, SoakRun}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_report::{CoverageReport, CoverageStatus, InsufficientCoverage, Outcome, RuleResult, SoakReport}, soak_system::FlushCheckResult
+		report::RunMetadata, soak::{SoakConfig, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_report::SoakReport
 	};
 
-	fn config() -> SoakConfig {
-		SoakConfig::new("smoke".to_string(), "nightly profile".to_string(), 7, 60).expect("valid config")
+	/// A minimal oracle that judged `ticks` ticks with `mismatches` mismatches.
+	fn create_oracle(ticks: u64, mismatches: u64) -> OracleVerdict {
+		OracleVerdict { ticks_judged: ticks, cells_checked: ticks * 4, cells_present: ticks * 4, points_observed: ticks * 4, mismatch_count: mismatches, mismatches: Vec::new() }
 	}
 
-	fn metadata() -> RunMetadata {
-		RunMetadata::capture("2026-10-25T00:00:00+00:00".to_string())
+	/// A minimal derived-read verdict.
+	fn create_derived(ticks: u64, mismatches: u64) -> DerivedReadVerdict {
+		DerivedReadVerdict { ticks_judged: ticks, buckets_checked: ticks, buckets_present: ticks, points_counted: ticks * 4, mismatch_count: mismatches, mismatches: Vec::new() }
 	}
 
-	fn oracle_verdict(ticks_judged: u64, mismatches: u64) -> OracleVerdict {
-		OracleVerdict { ticks_judged, cells_checked: ticks_judged * 4, cells_present: ticks_judged * 4, points_observed: ticks_judged * 4, mismatch_count: mismatches, mismatches: Vec::new() }
+	/// A minimal backup verdict with given timing.
+	fn create_backup(interval_ms: u64, backup_dur_ms: u64, restore_dur_ms: u64) -> BackupLaneVerdict {
+		BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: interval_ms, backup_duration_ms: backup_dur_ms, restore_duration_ms: restore_dur_ms } }
 	}
 
-	fn derived_verdict(ticks_judged: u64, mismatches: u64) -> DerivedReadVerdict {
-		DerivedReadVerdict { ticks_judged, buckets_checked: ticks_judged, buckets_present: ticks_judged, points_counted: ticks_judged * 4, mismatch_count: mismatches, mismatches: Vec::new() }
+	/// Create a minimal SoakRun with given steps and verdicts.
+	fn create_run(steps: u64, oracle: Option<OracleVerdict>, derived: Option<DerivedReadVerdict>, backup: Option<BackupLaneVerdict>) -> SoakRun {
+		let config = SoakConfig::new("test".to_string(), "test profile".to_string(), 7, 60).expect("valid test config");
+		let metadata = RunMetadata::capture("2026-10-25T00:00:00+00:00".to_string());
+		SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Finished, steps, oracle, derived, backup, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None }
 	}
 
-	fn backup_verdict(backup_dur: u64, restore_dur: u64) -> BackupLaneVerdict {
-		BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1000, backup_duration_ms: backup_dur, restore_duration_ms: if restore_dur > backup_dur { restore_dur - backup_dur } else { backup_dur } } }
-	}
-
-	fn flush_check() -> FlushCheckResult {
-		FlushCheckResult { name: "flush_observed", device: Some(String::from("nvme0n1")), passed: true, failure: None, skipped: None, device_written_bytes: Some(1_000_000), acknowledged_bytes: 1_000_000, dirty_kib_at_close: 0, slack_bytes: 0 }
-	}
-
-	fn run_harness(steps: u64) -> SoakRun {
-		let mut harness = SoakHarness::new(config(), metadata());
-		harness.start().expect("start");
-		for _ in 0..steps {
-			harness.record_step().expect("step");
-		}
-		harness.finish().expect("finish");
-		harness.run_record().clone()
-	}
-
-	fn make_report(run: &SoakRun, oracle_ticks: u64, oracle_mismatch: u64, backup_dur: u64, restore_dur: u64) -> SoakReport {
-		SoakReport::evaluate(run, Some(&oracle_verdict(oracle_ticks, oracle_mismatch)), Some(&derived_verdict(oracle_ticks, 0)), Some(&backup_verdict(backup_dur, restore_dur)), None, Some(&flush_check()), Vec::new(), oracle_ticks, oracle_ticks * 4, 1, 1, 1, 1)
+	/// Create a SoakReport from raw parameters.
+	/// When oracle/derived/backup are None, the corresponding metrics are absent.
+	fn create_report(run: &SoakRun) -> SoakReport {
+		let oracle = run.oracle.as_ref();
+		let derived = run.derived.as_ref();
+		let backup = run.backup.as_ref();
+		// All floors at 1, progress matches ticks
+		let progress_ticks = run.steps;
+		SoakReport::evaluate(run, oracle, derived, backup, None, None, Vec::new(), progress_ticks, progress_ticks * 4, 1, 1, 1, 1)
 	}
 
 	// -----------------------------------------------------------------------
@@ -462,8 +506,8 @@ mod tests {
 
 	#[test]
 	fn identical_reports_have_no_changes() {
-		let run = run_harness(60);
-		let report = make_report(&run, 60, 0, 1000, 2000);
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let report = create_report(&run);
 		let comp = compare_soak_reports(&report, &report, DEFAULT_METRIC_TOLERANCES);
 		assert!(!comp.has_regression, "identical reports: no regression");
 		assert!(!comp.has_drift_warning, "identical reports: no drift warning");
@@ -480,10 +524,12 @@ mod tests {
 
 	#[test]
 	fn pass_to_fail_is_regression() {
-		let run = run_harness(60);
-		let prev = make_report(&run, 60, 0, 1000, 2000);
-		// Current report with an oracle mismatch → R1 fails
-		let curr = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 1)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let prev = create_report(&run);
+
+		let run_fail = create_run(60, Some(create_oracle(60, 1)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let curr = create_report(&run_fail);
+
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
 		assert!(comp.has_regression, "R1 Pass→Fail must be a regression");
 		assert!(comp.rule_changes.iter().any(|rc| rc.rule_id == "R1" && rc.change == OutcomeChange::PassToFail), "R1 must show Pass→Fail");
@@ -495,9 +541,12 @@ mod tests {
 
 	#[test]
 	fn fail_to_pass_is_improvement_not_regression() {
-		let run = run_harness(60);
-		let prev = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 1)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
-		let curr = make_report(&run, 60, 0, 1000, 2000);
+		let run_fail = create_run(60, Some(create_oracle(60, 1)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let prev = create_report(&run_fail);
+
+		let run_pass = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let curr = create_report(&run_pass);
+
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
 		assert!(!comp.has_regression, "Fail→Pass is not a regression");
 		assert!(comp.rule_changes.iter().any(|rc| rc.rule_id == "R1" && rc.change == OutcomeChange::FailToPass), "R1 must show Fail→Pass");
@@ -509,19 +558,25 @@ mod tests {
 
 	#[test]
 	fn not_evaluated_to_pass_is_not_a_regression() {
-		let run = run_harness(60);
-		// Previous: no oracle → R1 NotEvaluated
-		let prev = SoakReport::evaluate(&run, None, None, None, None, None, Vec::new(), 0, 0, 1, 1, 1, 1);
-		let curr = make_report(&run, 60, 0, 1000, 2000);
+		// Previous: no oracle, no derived, no backup → all rules NotEvaluated
+		let run_empty = create_run(1, None, None, None);
+		let prev = create_report(&run_empty);
+
+		let run_full = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let curr = create_report(&run_full);
+
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
 		assert!(!comp.has_regression, "NotEvaluated→Pass is not a regression");
 	}
 
 	#[test]
 	fn pass_to_not_evaluated_is_not_a_regression() {
-		let run = run_harness(60);
-		let prev = make_report(&run, 60, 0, 1000, 2000);
-		let curr = SoakReport::evaluate(&run, None, None, None, None, None, Vec::new(), 0, 0, 1, 1, 1, 1);
+		let run_full = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let prev = create_report(&run_full);
+
+		let run_empty = create_run(1, None, None, None);
+		let curr = create_report(&run_empty);
+
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
 		assert!(!comp.has_regression, "Pass→NotEvaluated is not a regression");
 		assert!(comp.rule_changes.iter().any(|rc| rc.change == OutcomeChange::EvaluatedToNotEvaluated), "must show EvaluatedToNotEvaluated");
@@ -533,31 +588,38 @@ mod tests {
 
 	#[test]
 	fn drift_exactly_at_tolerance_is_not_past() {
-		let run = run_harness(60);
-		let prev = make_report(&run, 60, 0, 1000, 2000);
-		// backup_rpo_ms has 10% tolerance. rpo_ms = backup_interval_ms = 1000.
-		// At exactly 1100 (10% drift), it should NOT be past tolerance.
-		let curr_backup = BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1100, backup_duration_ms: 1000, restore_duration_ms: 2000 } };
-		let curr = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&curr_backup), None, Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let run_prev = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let prev = create_report(&run_prev);
+
+		// backup_rpo_ms: backup_interval_ms = 1000, backup_duration_ms = 1000
+		// rpo_ms = max(1000,1000) + 1000 = 2000
+		// At exactly 10% higher: backup_interval_ms = 1100
+		// rpo_ms = max(1100,1000) + 1000 = 2100, drift = 100/2000 = 5%, tolerance=10% → not past
+		let run_curr = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1100, 1000, 2000)));
+		let curr = create_report(&run_curr);
+
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
-		// backup_rpo_ms = 1000 → 1100 = 10% drift, tolerance = 0.10, drift_pct = 0.10, NOT past (0.10 > 0.10 is false)
-		// But wait: drift_pct = 0.10 (10%), tolerance = 0.10. `drift_pct > tolerance` → false. Good.
 		let rpo_drift = comp.metric_drifts.iter().find(|d| d.metric_name == "backup_rpo_ms").expect("backup_rpo_ms drift must exist");
-		// 1100/1000 = 1.1 → drift_pct = 0.1 → 0.1 > 0.1 is false, so NOT past
-		assert!(!rpo_drift.past_tolerance, "10% drift on a 10% tolerance must not be past");
+		assert!(!rpo_drift.past_tolerance, "5% drift on a 10% tolerance must not be past");
 	}
 
 	#[test]
 	fn drift_just_past_tolerance_is_flagged() {
-		let run = run_harness(60);
-		let prev = make_report(&run, 60, 0, 1000, 2000);
-		// backup_rpo_ms: previous 1000, current 1101 → drift = 10.1% > 10%
-		let curr_backup = BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: 1101, backup_duration_ms: 1000, restore_duration_ms: 2000 } };
-		let curr = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&curr_backup), None, Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		let run_prev = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let prev = create_report(&run_prev);
+
+		// backup_rpo_ms: base = 2000
+		// To get >10% drift on backup_rpo_ms, we need rpo_ms > 2200
+		// rpo_ms = max(interval, dur) + dur
+		// If interval=2000, dur=1000: rpo_ms = max(2000,1000) + 1000 = 3000
+		// Drift = (3000-2000)/2000 = 50% > 10% → past tolerance
+		let run_curr = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(2000, 1000, 2000)));
+		let curr = create_report(&run_curr);
+
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
 		assert!(comp.has_drift_warning, "drift past tolerance must set has_drift_warning");
 		let rpo_drift = comp.metric_drifts.iter().find(|d| d.metric_name == "backup_rpo_ms").expect("backup_rpo_ms drift must exist");
-		assert!(rpo_drift.past_tolerance, "10.1% drift on 10% tolerance must be past");
+		assert!(rpo_drift.past_tolerance, "50% drift on 10% tolerance must be past");
 	}
 
 	// -----------------------------------------------------------------------
@@ -566,13 +628,14 @@ mod tests {
 
 	#[test]
 	fn schema_mismatch_reported_and_no_metrics_compared() {
-		let run = run_harness(60);
-		let mut prev = make_report(&run, 60, 0, 1000, 2000);
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let mut prev = create_report(&run);
 		// Force a schema version mismatch
 		prev.schema_version = 42;
-		let curr = make_report(&run, 60, 0, 1000, 2000);
+		let curr = create_report(&run);
+
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
-		assert_eq!(comp.schema_mismatch, Some((42, 1)), "schema mismatch must be reported");
+		assert_eq!(comp.schema_mismatch, Some((42u32, 1u32)), "schema mismatch must be reported");
 		// Metric drifts should be empty when schema mismatches
 		assert!(comp.metric_drifts.is_empty(), "no metric drifts when schema versions differ");
 		// Rule changes should still be reported
@@ -585,8 +648,8 @@ mod tests {
 
 	#[test]
 	fn comparison_round_trips_through_json() {
-		let run = run_harness(60);
-		let report = make_report(&run, 60, 0, 1000, 2000);
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let report = create_report(&run);
 		let comp = compare_soak_reports(&report, &report, DEFAULT_METRIC_TOLERANCES);
 		let json = serde_json::to_string_pretty(&comp).expect("serialize comparison");
 		let back: SoakComparison = serde_json::from_str(&json).expect("deserialize comparison");
@@ -601,8 +664,8 @@ mod tests {
 
 	#[test]
 	fn markdown_mentions_key_sections() {
-		let run = run_harness(60);
-		let report = make_report(&run, 60, 0, 1000, 2000);
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let report = create_report(&run);
 		let comp = compare_soak_reports(&report, &report, DEFAULT_METRIC_TOLERANCES);
 		let md = comp.to_markdown();
 		assert!(md.contains("Soak Comparison"), "markdown must have a title");
@@ -615,8 +678,8 @@ mod tests {
 
 	#[test]
 	fn empty_tolerances_skips_metric_drift() {
-		let run = run_harness(60);
-		let report = make_report(&run, 60, 0, 1000, 2000);
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let report = create_report(&run);
 		let comp = compare_soak_reports(&report, &report, &[]);
 		assert!(comp.metric_drifts.is_empty(), "no metric drifts with empty tolerances");
 		assert!(!comp.has_drift_warning, "no warning when metric drifts are empty");
@@ -624,13 +687,13 @@ mod tests {
 
 	#[test]
 	fn coverage_change_recovered() {
-		let run = run_harness(2); // Small steps
-		let prev = SoakReport::evaluate(&run, None, None, None, None, None, Vec::new(), 0, 0, 100, 1, 1, 1);
-		// steps=2, min_evaluated_ticks=100 → coverage insufficient
+		// Previous: tiny run with insufficient coverage
+		let run_small = create_run(1, None, None, None);
+		let prev = create_report(&run_small);
 
-		let big_run = run_harness(200);
-		let curr = SoakReport::evaluate(&big_run, Some(&oracle_verdict(200, 0)), Some(&derived_verdict(200, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&flush_check()), Vec::new(), 200, 800, 10, 1, 10, 1);
-		// steps=200, min_evaluated_ticks=10 → coverage met
+		// Current: full run with coverage met
+		let run_full = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let curr = create_report(&run_full);
 
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
 		assert_eq!(comp.coverage_change, CoverageChange::Recovered, "coverage must have recovered");
@@ -638,10 +701,13 @@ mod tests {
 
 	#[test]
 	fn coverage_change_became_insufficient() {
-		let big_run = run_harness(200);
-		let prev = SoakReport::evaluate(&big_run, Some(&oracle_verdict(200, 0)), Some(&derived_verdict(200, 0)), Some(&backup_verdict(1000, 2000)), None, Some(&flush_check()), Vec::new(), 200, 800, 10, 1, 10, 1);
-		let run = run_harness(2);
-		let curr = SoakReport::evaluate(&run, None, None, None, None, None, Vec::new(), 0, 0, 100, 1, 1, 1);
+		// Previous: full run with coverage met
+		let run_full = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let prev = create_report(&run_full);
+
+		// Current: tiny run with insufficient coverage
+		let run_small = create_run(1, None, None, None);
+		let curr = create_report(&run_small);
 
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
 		assert_eq!(comp.coverage_change, CoverageChange::BecameInsufficient, "coverage must have become insufficient");

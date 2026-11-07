@@ -369,8 +369,13 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-17** Honesty pages II
   - [ ] Write or approve the honesty-page narrative *(owner)*
   - [ ] **FRE-13** Layout-1 to layout-2 upgrade test
-  - [ ] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
-  - [ ] → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
+  - [x] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
+    *Closed 2026-11-07 (soak_report.rs landed in the same lane as the compare gate): see SOA-15 below.*
+  - [x] → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
+    *Closed 2026-11-07 (#PR): nightly soak comparison gate with drift annotations.
+    `soak_compare.rs`, `soak.yml`, `scripts/annotate-soak-drift.py`, soak docs in
+    `docs/soak.md`. The TTL lane is honestly reported as not-tested — the store has
+    no row-level TTL mechanism to exercise.*
 - [ ] **W9 · Read semantics, limits, upgrade legs**
   - [ ] read lane
   - [ ] maint lane

@@ -8,6 +8,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Nightly soak comparison gate (SOA-15).** A scheduled + dispatchable soak
+  workflow (`soak.yml`) builds the soak driver, runs a 15-minute soak,
+  evaluates the SoakReport against SLO rules R1–R8, and compares the result
+  to the previous night's artifact. A Pass→Fail rule regression turns the job
+  red; metric drift past documented tolerance produces `::warning::`
+  annotations. The comparison function lives in
+  `weft-bench/src/soak_compare.rs`, and the annotator script in
+  `scripts/annotate-soak-drift.py`. Documented in `docs/soak.md`.
+
 ## [0.3.1] - 2026-11-06
 
 ### Fixed
