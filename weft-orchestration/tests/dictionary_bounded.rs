@@ -31,13 +31,12 @@ fn base() -> DateTime<Utc> {
 
 /// A temperature-like minute series: a slow drift plus deterministic noise.
 fn minutes(range: std::ops::Range<i64>) -> Vec<InputMeasurement> {
-	range
-		.map(|i| {
-			let noise = ((i * 7919) % 101) as f64 / 25.0;
-			let value = 45.0 + 10.0 * ((i as f64) / 40.0).sin() + noise;
-			InputMeasurement::new(base() + Duration::minutes(i), BigDecimal::from_f64(value).unwrap())
-		})
-		.collect()
+	range.map(|i| {
+		let noise = ((i * 7919) % 101) as f64 / 25.0;
+		let value = 45.0 + 10.0 * ((i as f64) / 40.0).sin() + noise;
+		InputMeasurement::new(base() + Duration::minutes(i), BigDecimal::from_f64(value).unwrap())
+	})
+	.collect()
 }
 
 async fn count(db: &Database, aspect: &AspectId, name: &str, sql: &str) -> Result<i64> {

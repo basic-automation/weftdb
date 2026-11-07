@@ -8,6 +8,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-07
+
 ### Added
 
 - **Generated OpenAPI document from the route registry (FRE-9a).** The
