@@ -8,6 +8,29 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **A refused bind address names the variable.** `WEFT_SERVER_ADDR` and `WEFT_ADMIN_ADDR`
+  now refuse to start the server with `WEFT_SERVER_ADDR="127.0.0.1" is not a socket address
+  (invalid socket address syntax); e.g. 127.0.0.1:8080` instead of the parser's bare
+  `invalid socket address syntax`, in the same shape as `WEFT_FLIGHT_ADDR` and the
+  strict-config warnings already use. Exit status is unchanged (78). This is what lets
+  `scripts/packaging/test-host-install.sh` gate 4 prove that the systemd env file it
+  installed is the configuration the running binary read.
+
+### Fixed
+
+- **The host-install gate that proves gate 4 can fail was pointing at a Stable variable.** Its
+  Test-tier probe name came from `grep -B3 'tier: Tier::Test' weft-server/src/settings.rs`, and
+  every `VarSpec` is one line, so the three context lines above each match returned the *entry
+  above* the Test entry as well. The first name it therefore picked was
+  `OTEL_EXPORTER_OTLP_ENDPOINT` — `Tier::Stable`, meant to be accepted — and the gate reported
+  that a valid variable "was refused for some reason other than its tier". The name is now read
+  off the matched line itself, so the probe carries a real harness channel
+  (`WEFT_BENCH_BACKUP_DIR` today) and the refusal the gate greps for is the one the server
+  actually produces. No server behaviour changed: strict configuration had been refusing
+  Test-tier channels correctly all along.
+
 ## [0.3.1] - 2026-11-06
 
 ### Fixed

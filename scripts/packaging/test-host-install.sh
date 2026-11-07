@@ -32,7 +32,9 @@
 #   6.  systemd's own readers accept the installed files: `systemd-analyze verify` on the unit,
 #       `systemd-sysusers` and `systemd-tmpfiles` on the conf files, with their stderr inspected
 #       because all three are happy to skip a line they do not understand and exit 0 anyway.
-#       Skipped, loudly, where systemd is not installed.
+#       Verify resolves the unit by name and builds a real transaction, so the two essential
+#       targets an install prefix cannot carry are the only complaint not counted against the
+#       unit. Skipped, loudly, where systemd is not installed.
 #   7.  the hardening in the unit actually runs the server: the properties are read out of the
 #       installed unit — not copied into this script, so the test cannot drift from the file it
 #       tests — and applied to the real binary under a transient systemd scope. The server must
@@ -138,27 +140,33 @@ readonly SETTINGS="$REPO_ROOT/weft-server/src/settings.rs"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/weft-host-install-XXXXXX")
 readonly WORK
 readonly DEST="$WORK/root"
-# An address that is an address — loopback, port 0, which binds nothing and connects to nothing —
-# so the only refusal a gate can be reacting to is the one it claims to be reacting to.
-readonly DEAD_ADDR=127.0.0.1:0
+# An address the socket-address parser itself rejects — a host with no port — refused as
+# invalid configuration before anything binds, so the server cannot serve even by accident.
+# The refusal is recognisable because `weft-server/src/startup/config.rs::bind_addr` formats
+# it as `WEFT_SERVER_ADDR="<value>" is not a socket address`: the gate below greps for that
+# name, and `weft-server/tests/operator_cli.rs` pins the same text on the binary. Keep the
+# three in step, as with the two refusal fragments further down.
+readonly DEAD_ADDR=127.0.0.1
 readonly STATE="$WORK/state"
 mkdir -p "$STATE"
 
-# Run the real server with a set of names exported and no values, and report what it said.
+# Run the real server with a set of NAME=value settings exported, and report what it said.
 #
 # `env -i` keeps the developer's own WEFT_* out of the picture: a machine with WEFT_KEYS_FILE in
 # the shell would otherwise pass or fail a gate for reasons the script cannot see.
 #
-# $1: file of variable names, one per line. $2: file to write the server's output to.
+# $1: file of NAME=value lines, one per line. $2: file to write the server's output to.
 # Prints the exit status; leaves the refusal text in $2.
 probe_server() {
 	local names=$1 out=$2 rc=0
 	local -a assignments=()
-	while read -r name; do
-		assignments+=("$name=")
+	while read -r line; do
+		assignments+=("$line")
 	done <"$names"
-	env -i PATH="$PATH" HOME="$WORK" WEFT_SERVER_ADDR="$DEAD_ADDR" \
-		"${assignments[@]}" "$BIN" serve >"$out" 2>&1 || rc=$?
+	# WEFT_SERVER_ADDR is assigned last so nothing in the file can undo it: the probe must run
+	# against an address that binds nothing, so the refusal left standing is the one this gate looks for.
+	env -i PATH="$PATH" HOME="$WORK" \
+		"${assignments[@]}" WEFT_SERVER_ADDR="$DEAD_ADDR" "$BIN" serve >"$out" 2>&1 || rc=$?
 	printf '%s' "$rc"
 }
 
@@ -177,7 +185,10 @@ WEFT_BIN=$BIN "$INSTALLER" --destdir "$DEST" --prefix "$PREFIX" >"$WORK/install.
 $(cat "$WORK/install.out")"
 
 readonly MANIFEST="$WORK/manifest.tsv"
-WEFT_BIN=$BIN "$INSTALLER" --list >"$MANIFEST"
+# The manifest must describe the tree the gates just installed, so it is listed with the same
+# --prefix the install used; `--list` without it prints the machine's default prefix instead,
+# which is not the tree under test.
+WEFT_BIN=$BIN "$INSTALLER" --prefix "$PREFIX" --list >"$MANIFEST"
 FILE_COUNT=$(wc -l <"$MANIFEST")
 readonly FILE_COUNT
 ((FILE_COUNT >= 9)) || fail "--list printed $FILE_COUNT entries; a host install is at least 9 files"
@@ -207,22 +218,51 @@ readonly ENV_MODE
 printf 'WEFT_MAX_CONNECTIONS=64\n' >"$OPERATOR_ENV"
 WEFT_BIN=$BIN "$INSTALLER" --destdir "$DEST" --prefix "$PREFIX" >"$WORK/reinstall.out" 2>&1 ||
 	fail "reinstalling over an existing configuration exited non-zero"
-grep -qF "left $PREFIX/etc/weftdb/weft-server.env alone" "$WORK/reinstall.out" ||
+grep -qF "left $OPERATOR_ENV alone" "$WORK/reinstall.out" ||
 	fail "the reinstall did not say it left the operator's env file alone"
 grep -qxF 'WEFT_MAX_CONNECTIONS=64' "$OPERATOR_ENV" ||
 	fail "the reinstall changed the operator's env file"
 pass "an operator's configuration survives an upgrade; the template stays in share/doc"
 
-# Gate 4: every name in the shipped env file is a name the real server accepts.
-readonly NAMES="$WORK/names.txt"
-grep -oE '^#[A-Z][A-Z0-9_]*=' "$ENV_TEMPLATE" | cut -d= -f1 | tr -d '#' | sort -u >"$NAMES"
-NAME_COUNT=$(wc -l <"$NAMES")
+# Gate 4: every name in the shipped env file is a name the real server accepts, and the
+# defaults the file literally ships start cleanly. Since PAC-5b an empty value on an integer
+# name is a refusal, not a default, and the template uses two shapes: `#WEFT_X=value` ships a
+# literal default, `#WEFT_X=` documents a name whose default the server keeps internally and
+# describes in prose. The two shapes get two probes.
+#
+# Probe one exports the literal defaults, with the ones that point at the machine redirected
+# into the scratch tree, and expects the only refusal left standing to be the probe's own
+# unusable address: a shipped default that does not start cleanly fails here, naming itself.
+# Probe two gives every documented name — both shapes — a value no shape can accept. PAC-5b
+# then refuses those values, but a name the registry does not know is refused as unknown,
+# which is precisely what this probe forbids; that is the registry-coverage check.
+readonly NAMES="$WORK/names.txt"          # literal defaults, probe one
+readonly ALL_NAMES="$WORK/all-names.txt"  # every documented name, probe two
+mkdir -p "$WORK/data/store" "$WORK/data/backups"
+# The config stage parses the keys file before it ever reaches the address, so
+# the scratch keys file must be a well-formed keys document holding one key —
+# the shape auth.rs accepts. Nothing is served or connected anywhere; the probe
+# still ends in the refusal over the dead address.
+printf '%s\n' '{"version":1,"keys":[{"id":"gate-probe","role":"admin","key_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}' >"$WORK/api.keys"
+grep -oE '^#[[:space:]]*WEFT_[A-Z0-9_]+' "$ENV_TEMPLATE" | sed -E 's/^#[[:space:]]*//' |
+	sort -u >"$ALL_NAMES"
+NAME_COUNT=$(wc -l <"$ALL_NAMES")
 readonly NAME_COUNT
 ((NAME_COUNT >= 30)) || fail "the env file documents only $NAME_COUNT variables; expected 30 or more"
+grep -E '^#WEFT_[A-Z0-9_]+=.+' "$ENV_TEMPLATE" | sed 's/^#//' | sort -u |
+	while IFS='=' read -r gname gvalue; do
+		case $gname in
+			WEFT_DATA_DIR) gvalue="$WORK/data" ;;
+			WEFT_SEGMENT_STORE_ROOT) gvalue="$WORK/data/store" ;;
+			WEFT_BACKUP_DIR) gvalue="$WORK/data/backups" ;;
+			WEFT_KEYS_FILE) gvalue="$WORK/api.keys" ;;
+		esac
+		printf '%s=%s\n' "$gname" "$gvalue"
+	done >"$NAMES"
 PROBE_RC=$(probe_server "$NAMES" "$WORK/probe.out")
 readonly PROBE_RC
 if [[ $PROBE_RC != 78 ]]; then
-	fail "the server exited $PROBE_RC with the shipped env names set; expected 78, a refusal over the unusable address
+	fail "the server exited $PROBE_RC with the shipped defaults set; expected 78, a refusal over the unusable address
 $(tail -20 "$WORK/probe.out")"
 fi
 if grep -q "$REFUSAL_UNKNOWN" "$WORK/probe.out" || grep -q "$REFUSAL_TEST" "$WORK/probe.out"; then
@@ -232,10 +272,28 @@ fi
 grep -qi "WEFT_SERVER_ADDR" "$WORK/probe.out" ||
 	fail "the refusal did not name WEFT_SERVER_ADDR, so it is not the refusal this gate expects:
 $(tail -20 "$WORK/probe.out")"
-pass "all $NAME_COUNT variable names in the env file are ones the real server accepts, none of them Test-tier"
+OTHER_NAMED=$(grep -oE 'WEFT_[A-Z0-9_]+' "$WORK/probe.out" | sort -u | grep -cv '^WEFT_SERVER_ADDR$') || true
+readonly OTHER_NAMED
+((OTHER_NAMED == 0)) ||
+	fail "a shipped default was refused besides the probe's own address ($OTHER_NAMED other name(s)):
+$(grep -oE 'WEFT_[A-Z0-9_]+' "$WORK/probe.out" | sort -u)"
+while read -r gname; do
+	printf '%s=__weft_gate_probe__\n' "$gname"
+done <"$ALL_NAMES" >"$WORK/sentinel.txt"
+COVER_RC=$(probe_server "$WORK/sentinel.txt" "$WORK/cover.out")
+readonly COVER_RC
+if [[ $COVER_RC != 78 ]]; then
+	fail "the server exited $COVER_RC with every documented name set to an impossible value; expected 78
+$(tail -20 "$WORK/cover.out")"
+fi
+if grep -q "$REFUSAL_UNKNOWN" "$WORK/cover.out" || grep -q "$REFUSAL_TEST" "$WORK/cover.out"; then
+	fail "a name in the shipped env file is not the real server's name:
+$(grep -e "$REFUSAL_UNKNOWN" -e "$REFUSAL_TEST" "$WORK/cover.out")"
+fi
+pass "all $NAME_COUNT variable names in the env file are ones the real server accepts, and its literal defaults start cleanly"
 
 # Gate 5: gate 4 is capable of failing. An invented name first.
-printf 'WEFT_NOT_A_WEFTDB_VARIABLE\n' >"$WORK/invented.txt"
+printf 'WEFT_NOT_A_WEFTDB_VARIABLE=1\n' >"$WORK/invented.txt"
 INVENTED_RC=$(probe_server "$WORK/invented.txt" "$WORK/invented.out")
 readonly INVENTED_RC
 [[ $INVENTED_RC == 78 ]] ||
@@ -247,14 +305,19 @@ $(tail -20 "$WORK/invented.out")"
 pass "an invented variable name is refused, and recognised as refused"
 
 # A Test-tier name next: taken out of the registry rather than invented, because the whole point of
-# gate 4 is that the env file cannot carry one, and the only way to know that is to try.
-TEST_NAME=$(grep -B3 'tier: Tier::Test' "$SETTINGS" |
-	grep -oE '"(WEFT|OTEL)_[A-Z0-9_]+"' | tr -d '"' | head -1) || true
+# gate 4 is that the env file cannot carry one, and the only way to know that is to try. The name is
+# read off the same line as the tier, never from context lines: every VarSpec is one line, so `-B3`
+# also returns the entry sitting above each match, and the probe then points a Stable name — one the
+# server is meant to accept — at the Test-tier refusal. On ubuntu-latest that read as "OTEL_EXPORTER
+# OTLP_ENDPOINT was refused for some reason other than its tier" while the server was in fact
+# correct to accept it.
+TEST_NAME=$(grep -oE 'name: "(WEFT|OTEL)[A-Z0-9_]+", tier: Tier::Test' "$SETTINGS" |
+	sed -E 's/^name: "([A-Z0-9_]+)".*/\1/' | head -1) || true
 readonly TEST_NAME
 if [[ -z $TEST_NAME ]]; then
 	skip "no Tier::Test entry was found in $SETTINGS, so the env file's Test-tier refusal went untested"
 else
-	printf '%s\n' "$TEST_NAME" >"$WORK/tier.txt"
+	printf '%s=1\n' "$TEST_NAME" >"$WORK/tier.txt"
 	TEST_RC=$(probe_server "$WORK/tier.txt" "$WORK/tier.out")
 	readonly TEST_RC
 	[[ $TEST_RC == 78 ]] ||
@@ -268,12 +331,51 @@ fi
 
 # Gate 6: systemd's own readers accept the installed files.
 if command -v systemd-analyze >/dev/null 2>&1; then
-	verify_out=$(systemd-analyze verify --root "$DEST" \
-		"${PREFIX#/}/lib/systemd/system/weft-server.service" 2>&1) && verify_rc=0 || verify_rc=$?
-	[[ $verify_rc -eq 0 ]] ||
-		fail "systemd-analyze verify rejected the installed unit (exit $verify_rc):
+	# The unit is looked up by name, so first assert the installed bytes exist: that keeps "nothing
+	# was installed" apart from "systemd dislikes what was installed", which the first version of
+	# this gate conflated when it answered "Unit weft-server.service not found" for a unit gate 1
+	# had just confirmed on disk.
+	UNIT_IN_ROOT="$PREFIX/lib/systemd/system/weft-server.service"
+	[[ -f "$DEST$UNIT_IN_ROOT" ]] ||
+		fail "the installed tree carries no unit at $DEST$UNIT_IN_ROOT, so systemd has nothing to read:
+$(find "$DEST" -name '*.service' -printf '  %p\n' 2>/dev/null || true)"
+	# `systemd-analyze verify --root R` does not read a unit from a path: it looks the name up in
+	# R's own search paths (R/usr/lib/systemd/system, R/etc/systemd/system), and a prefix install
+	# lives in neither. ubuntu-latest said "Unit weft-server.service not found." for
+	# $DEST/opt/weftdb/lib/systemd/system/weft-server.service with the file plainly present.
+	# So stage the installed bytes where systemd looks, verify the name, and prove the staged copy
+	# is the installed file rather than some sibling that happens to parse.
+	UNIT_SEARCH_DIR="$DEST/usr/lib/systemd/system"
+	mkdir -p "$UNIT_SEARCH_DIR"
+	cp "$DEST$UNIT_IN_ROOT" "$UNIT_SEARCH_DIR/weft-server.service"
+	cmp -s "$DEST$UNIT_IN_ROOT" "$UNIT_SEARCH_DIR/weft-server.service" ||
+		fail "staging the unit for verification altered it: $DEST$UNIT_IN_ROOT and its copy in $UNIT_SEARCH_DIR differ"
+	# What remains is that an installed tree carries no essential targets. systemd injects
+	# `Requires=sysinit.target` into every service, and `verify --root` builds the real transaction,
+	# so on the runner's systemd (255) it answers
+	# "weft-server.service: Failed to create weft-server.service/start: Unit sysinit.target not
+	# found." An install prefix is not a bootable system and must not carry sysinit.target, so that
+	# line is a property of verifying a partial tree, not of the unit. The host running this gate
+	# (systemd 262) returns 0 for the same bytes, so the gate cannot simply require exit 0: it would
+	# pass here and fail there for reasons nothing to do with WeftDB controls.
+	#
+	# So tolerate precisely those two lines and fail on anything else. The allowance names the
+	# essential targets by name rather than matching "not found" generally, because a unit that
+	# `Wants=`s or `Requires=`s some other missing unit is a real defect this gate must keep
+	# catching, and `SYSTEMD_RELAX_ESSENTIALS` is not an option: no such string exists in this
+	# host's systemd-analyze, libsystemd-shared, or libsystemd-core, and adding an environment
+	# variable on the assumption a different version honours it would change the gate's meaning on
+	# some runners without proving anything on any of them.
+	verify_out=$(systemd-analyze verify --root "$DEST" weft-server.service 2>&1) && verify_rc=0 || verify_rc=$?
+	verify_blame=$(grep -vE 'Unit (sysinit|basic)\.target not found' <<<"$verify_out" | sed 's/^[[:space:]]*//')
+	if [[ $verify_rc -ne 0 && -z $verify_blame ]]; then
+		pass "systemd-analyze verify finds no fault in the installed unit beyond the essential targets an install prefix cannot carry"
+	elif [[ -n $verify_blame ]]; then
+		fail "systemd-analyze verify rejected the installed unit (verified as weft-server.service under --root $DEST, staged from $DEST$UNIT_IN_ROOT into $UNIT_SEARCH_DIR; exit $verify_rc; a missing sysinit.target or basic.target alone is not counted against the unit):
 $verify_out"
-	pass "systemd-analyze verify is silent about the installed unit"
+	else
+		pass "systemd-analyze verify is silent about the installed unit"
+	fi
 else
 	skip "systemd-analyze is not installed here, so nothing has ever parsed the unit file"
 fi
