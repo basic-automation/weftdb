@@ -18,6 +18,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   file matches the generated output; regenerate with `weft-server openapi
   --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
   no `--out`, or writes to a named file.
+
 ### Changed
 
 - **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
@@ -43,7 +44,6 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `Database::replace_dictionary_patterns`, `Dictionary::import_pattern` ignores a
   pattern id it already holds, and the dictionary-list cache key now includes the aspect
   (two aspects with a dictionary of the same name were served each other's patterns).
->>>>>>> 248f343 (fix(weftdb): stop pipeline dictionaries doubling on every run; release 0.3.2)
 
 ## [0.3.1] - 2026-11-06
 
