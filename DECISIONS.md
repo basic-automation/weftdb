@@ -5276,7 +5276,6 @@ outside the scope. It also marks reads, which take the same call, and it would
 have made this slice a change to every caller in the crate instead of a change
 to the three impls that own the legacy writes.
 
-<<<<<<< HEAD
 ## 2026-11-07 — W8 recovery: what a red gate, a vanished worker lane, and a silent CI each taught
 
 Three failures this wave looked like different problems and each turned out to be a missing fact
@@ -5370,7 +5369,7 @@ before invoking it, so a missing file and an unresolvable argument cannot produc
 generalisation is the point: PAC-11 was ticked on `main` (8c5fea9, #611) while gates 4, 5 and 6
 were each in turn the wall, and it should be closed again, if at all, on the evidence of a roll
 that printed all seven `ok:` lines — not on the evidence that a packaging branch exists.
-=======
+
 ## 2026-11-06 — PAC-11 gate 4: a refused bind address names its variable (#309)
 
 **Context:** `scripts/packaging/test-host-install.sh` gate 4 installs the tree, writes an env
@@ -5403,4 +5402,3 @@ holds the port on a shared runner, which turns a packaging gate on a determinist
 **Recorded, not decided here:** ROADMAP tick #611 marks PAC-11 closed while this PR was still
 open with the gate red. The tick is only true once this PR lands; it is left in place rather
 than reverted, so this PR is the thing that makes the roadmap honest.
->>>>>>> 110d2a9 ([PAC-11] Record why gate 4's fix went into the server rather than the gate)
