@@ -327,16 +327,16 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-14** DuckDB adapter II
   - [x] **EVI-18** Backup health metrics and catch-up-free ticking
   - [x] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
-- [ ] **W7 · Post-split lanes open; security and packaging close**
-  - [ ] open lane
+- [x] **W7 · Post-split lanes open; security and packaging close**
+  - [x] open lane
   - [x] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code
     - The pin refuses a start whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` differ from the
       scope the store root's own `STORE_FORMAT` records (exit 65, the class the exit table has
       always named for a scope mismatch; `WEFT_STORE_SCOPE_PIN=off` serves the root anyway).
       `GET /api/v1/version` answers build, layout, scope-pin and exit-code state from process
       state alone, so it answers while a store is being refused. DECISIONS 2026-11-03
-  - [ ] seal lane
-  - [ ] read lane
+  - [x] seal lane
+  - [x] read lane
   - [x] → **ROB-13** Bounded stored downsample and point lookups
   - [x] **ROB-7** Ingest decode bounds
     *Closed 2026-11-05 (#551): non-finite input is `400 not_finite` in every ingest format (Parquet NaN no longer sealed as a null), plus decoded ceilings `WEFT_MAX_INGEST_ROWS` (413 too_many_rows) and `WEFT_MAX_INGEST_DECODED_BYTES` (413 payload_too_large), checked after parse and before the seal (`weft-server/src/ingest.rs:218`).*
@@ -346,7 +346,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **ROB-5** Legacy queue-consumer panics
   - [x] **SEC-13** Security acceptance
   - [x] **PAC-9** Docker image and container smoke test (with a mounted keys file)
-  - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
+  - [x] **PAC-11** systemd unit, user and env files, and host-install CI
   - [x] **EVI-15** First cross-engine report
   - [x] Write or approve the cross-engine report narrative *(owner)*
   - [x] **EVI-19** Documented RPO/RTO
