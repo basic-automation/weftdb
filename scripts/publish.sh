@@ -56,8 +56,26 @@ if [[ $EXECUTE -eq 0 ]]; then
 	exit 0
 fi
 
+# Each crate carries its own version (RELEASING.md), so a patch release leaves most of them
+# at a version crates.io already has. Skip those instead of letting `cargo publish` fail
+# on the first one and abort the run.
+crate_version() {
+	cargo metadata --format-version 1 --no-deps |
+		python3 -c 'import json,sys; n=sys.argv[1]; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]==n))' "$1"
+}
+on_registry() {
+	local code
+	code=$(curl -s -o /dev/null -w '%{http_code}' -A "weftdb-publish-script" "https://crates.io/api/v1/crates/$1/$2")
+	[[ "$code" == "200" ]]
+}
+
 for crate in "${CRATES[@]}"; do
-	echo "==> publishing $crate"
+	version=$(crate_version "$crate")
+	if on_registry "$crate" "$version"; then
+		echo "==> skipping $crate $version: already on crates.io"
+		continue
+	fi
+	echo "==> publishing $crate $version"
 	cargo publish -p "$crate"
 	# The registry index needs a moment before the next crate can resolve this one.
 	echo "    waiting for the index to catch up..."
