@@ -20,7 +20,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 /// Variables the surrounding test harness may itself set, removed from
 /// every child so the assertions are about the test's own settings.
-const NEUTRALIZED: &[&str] = &["WEFT_SEGMENT_STORE_ROOT", "WEFT_STORE_DATABASE", "WEFT_STORE_SUBJECT", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_BACKUP_DIR", "OTEL_EXPORTER_OTLP_ENDPOINT", "WEFT_GPU_CALIBRATE", "TEST_DATA_DIR", "WEFT_DATA_DIR", "SKIP_SLOW_TESTS", "WEFT_VERBOSE", "WEFT_REQUIRE_GPU", "WEFT_FAULT"];
+const NEUTRALIZED: &[&str] = &["WEFT_SEGMENT_STORE_ROOT", "WEFT_STORE_DATABASE", "WEFT_STORE_SUBJECT", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_BACKUP_DIR", "OTEL_EXPORTER_OTLP_ENDPOINT", "WEFT_GPU_CALIBRATE", "WEFT_DATA_DIR", "SKIP_SLOW_TESTS", "WEFT_VERBOSE", "WEFT_REQUIRE_GPU", "WEFT_FAULT"];
 
 /// A `weft-server` invocation with the harness's environment neutralized.
 fn invocation(args: &[&str]) -> Command {

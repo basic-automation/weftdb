@@ -973,7 +973,6 @@ recovery-point and recovery-time objectives these settings produce, see
 | Variable | Used by | Purpose | Default |
 |----------|---------|---------|---------|
 | `WEFT_DATA_DIR` | `weftdb`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
-| `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
 | `WEFT_EXTRACTED_BATCH_RETENTION_SECS` | `weftdb` | How long (seconds) a legacy aspect remembers the batches pattern extraction consumed, so the incremental build does not queue them again. Each extraction deletes older records, keeping about one row per resolution step of this period. Set it above the longest interval between pipeline runs of an aspect plus the longest ingest call; a non-positive or unparsable value keeps the default. | `172800` (48 hours) |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
 | `WEFT_ALLOW_ANY_HOST` | `weft-server` | Truthy (`1`/`true`/`yes`/`on`) → turn off the loopback request guard. On a loopback bind the server otherwise answers only requests whose `Host` is `localhost`, `127.0.0.0/8` or `[::1]` (`421` otherwise) and refuses state-changing requests from non-loopback web origins (`403`). Set it behind a local reverse proxy that forwards a different `Host`, or one that forwards the non-loopback `Origin` of a browser UI it fronts. A non-loopback bind is never guarded. | unset (guarded on a loopback bind) |
@@ -1045,9 +1044,9 @@ reads them as the server does.
 
 The database root directory is resolved in this order:
 
-1. `TEST_DATA_DIR`, if set (explicit override for the test suite);
-2. otherwise `WEFT_DATA_DIR`, if set;
-3. otherwise a **portable, per-user default** — `~/.weftdb/data` (falling back to the
+1. `WEFT_DATA_DIR`, if set — the test suites are handed their fixture directory
+   through this variable too (PAC-6 removed the test-only `TEST_DATA_DIR` override);
+2. otherwise a **portable, per-user default** — `~/.weftdb/data` (falling back to the
    platform data directory + `weftdb`, e.g. `%APPDATA%\weftdb` on Windows, if the home
    directory cannot be determined).
 
@@ -2172,7 +2171,7 @@ cargo bench -p weftdb --bench cache_performance_benchmarks
 
 These benches create their databases in a temporary data dir of their own, which they
 remove when they finish, never in `~/.weftdb/data`. That dir is under the system temp
-dir, often a tmpfs; to bench another filesystem, set `TEST_DATA_DIR` to a directory on
+dir, often a tmpfs; to bench another filesystem, set `WEFT_DATA_DIR` to a directory on
 it (the benches remove the databases they create there, not the directory).
 
 HTML reports are generated under `target/criterion/`. The interpolation engine's own

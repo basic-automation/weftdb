@@ -8,6 +8,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Removed
+
+- **`TEST_DATA_DIR` is gone** (PAC-6, completing the PAC-5a configuration
+  registry). The test-only variable no longer overrides the database root in
+  `weftdb::data_dir`; the test suites are handed their fixture directory
+  through the Stable `WEFT_DATA_DIR` variable instead. Operators were never
+  meant to set it — it was a Test-tier registry entry — but a deployment that
+  did will now find it ignored, with `WEFT_DATA_DIR` as the migration.
 ### Added
 
 - **Generated OpenAPI document from the route registry (FRE-9a).** The
@@ -51,6 +59,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `Database::replace_dictionary_patterns`, `Dictionary::import_pattern` ignores a
   pattern id it already holds, and the dictionary-list cache key now includes the aspect
   (two aspects with a dictionary of the same name were served each other's patterns).
+
 
 ## [0.3.1] - 2026-11-06
 

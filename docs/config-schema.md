@@ -117,7 +117,7 @@ or code path behind a cargo feature.
 
 ## Test
 
-Forty-two variables. Not configuration. A test harness's private channel to the child
+Forty-one variables. Not configuration. A test harness's private channel to the child
 process it spawns, or a switch a test suite reads. Setting one on a real server does
 nothing useful — `weft-server` warns at startup. They are registered precisely so that
 this doc **cannot** carry one by accident; the env file explicitly excludes Test-tier
@@ -125,10 +125,14 @@ variables for the same reason.
 
 Listed here for completeness; see `weft-server/src/settings.rs` for the full spec of each.
 
+PAC-6 completed the registry by removing `TEST_DATA_DIR`, the one Test-tier name that
+configured a shipped library path (`weftdb::data_dir`): the test suites are handed their
+fixture directory through `WEFT_DATA_DIR` (Stable) instead, so no test-only override of
+the database root remains.
+
 | Variable |
 |----------|
 | `SKIP_SLOW_TESTS` |
-| `TEST_DATA_DIR` |
 | `WEFT_BENCH_BACKUP_DIR` |
 | `WEFT_BENCH_INTERPOLATE_POINTS` |
 | `WEFT_BTC_CSV` |
@@ -182,7 +186,7 @@ Listed here for completeness; see `weft-server/src/settings.rs` for the full spe
 - A store it cannot open exits `65` (operator action).
 - An unknown write-ambiguous commit mode or an unrecognised `WEFT_STORE_SCOPE_PIN` or
   `WEFT_GPU_*` value stops the server, again with `78`.
-- All 104 names in the registry are tested (by `cargo test`) against every crate's `src/`
+- All 103 names in the registry are tested (by `cargo test`) against every crate's `src/`
   to catch any `env::var("WEFT_…")` that is read without being registered, or registered
   without being read.
 - The env file `packaging/env/weft-server.env` covers the Tuning and Experimental tiers
