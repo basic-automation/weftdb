@@ -183,7 +183,7 @@ pub fn parse(argv: &[String]) -> Result<Command, UsageError> {
 }
 
 /// A usage refusal: the reason, then the help it points at.
-fn usage(reason: &str) -> UsageError {
+pub(crate) fn usage(reason: &str) -> UsageError {
 	UsageError { message: format!("{reason}\n\n{USAGE}") }
 }
 

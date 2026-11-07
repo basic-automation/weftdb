@@ -54,16 +54,19 @@ const fn error_status_description(status: u16) -> &'static str {
 /// Derive a human-readable summary from a snake_case `operation_id`:
 /// split on `_`, capitalise the first word, and join with spaces.
 fn operation_summary(id: &str) -> String {
-	let words: Vec<&str> = id.split('_').filter(|w| !w.is_empty()).collect::<Vec<_>>();
-	if words.is_empty() {
+	let mut words = id.split('_').filter(|word| !word.is_empty());
+	let Some(first) = words.next() else {
 		return id.to_string();
-	}
+	};
 	let mut buf = String::new();
-	buf.write_char(words[0][0].to_upper());
-	buf.write(words[0][1..]);
-	for word in words[1..] {
-		buf.write_char(' ');
-		buf.write(word);
+	let mut chars = first.chars();
+	if let Some(head) = chars.next() {
+		buf.extend(head.to_uppercase());
+	}
+	buf.extend(chars);
+	for word in words {
+		buf.push(' ');
+		buf.push_str(word);
 	}
 	buf
 }
@@ -150,21 +153,21 @@ fn build_operation(spec: &RouteSpec) -> Value {
 
 	let mut responses: Map<String, Value> = Map::new();
 	responses.insert("200".to_string(), json!({"description": "the operation completed successfully"}));
-	for status in ERROR_STATUSES {
+	for &status in ERROR_STATUSES {
 		responses.insert(status.to_string(), error_response_entry(status));
 	}
 
 	let mut result = Map::new();
-	result.insert("operationId".to_string(), Value::from_str(spec.operation_id));
-	result.insert("summary".to_string(), Value::from_str(summary));
-	result.insert("tags".to_string(), Value::from_array(Vec::from([Value::from_str(tag)])));
-	result.insert("responses".to_string(), Value::from_object(responses));
-	result.insert("x-weft-scope".to_string(), Value::from_str(spec.scope.as_str()));
-	result.insert("x-weft-audit".to_string(), Value::from_str(spec.audit.as_str()));
+	result.insert("operationId".to_string(), Value::String(spec.operation_id.to_string()));
+	result.insert("summary".to_string(), Value::String(summary));
+	result.insert("tags".to_string(), Value::Array(vec![Value::String(tag.to_string())]));
+	result.insert("responses".to_string(), Value::Object(responses));
+	result.insert("x-weft-scope".to_string(), Value::String(spec.scope.as_str().to_string()));
+	result.insert("x-weft-audit".to_string(), Value::String(spec.audit.as_str().to_string()));
 	result.insert("x-weft-operator-detail".to_string(), json!(spec.operator_detail));
-	result.insert("x-weft-tier".to_string(), Value::from_str(spec.tier.label()));
-	result.insert("x-weft-admission-class".to_string(), Value::from_str(spec.admission_class.as_str()));
-	Value::from_object(result)
+	result.insert("x-weft-tier".to_string(), Value::String(spec.tier.label().to_string()));
+	result.insert("x-weft-admission-class".to_string(), Value::String(spec.admission_class.as_str().to_string()));
+	Value::Object(result)
 }
 
 /// Extract path parameters from a path template: segments wrapped in
@@ -173,7 +176,7 @@ fn extract_path_parameters(template: &str) -> Vec<Value> {
 	let mut params: Vec<Value> = Vec::new();
 	for segment in template.split('/') {
 		if segment.starts_with('{') && segment.ends_with('}') {
-			let name = segment[1..segment.len() - 1];
+			let name: &str = &segment[1..segment.len() - 1];
 			params.push(json!({
 				"name": name,
 				"in": "path",
@@ -191,7 +194,7 @@ fn build_components() -> Value {
 	schemas.insert("ErrorEnvelope".to_string(), error_envelope_schema());
 
 	let mut responses: Map<String, Value> = Map::new();
-	for status in ERROR_STATUSES {
+	for &status in ERROR_STATUSES {
 		let key = format!("Error{status}");
 		responses.insert(key, error_response_entry(status));
 	}
@@ -215,22 +218,20 @@ pub fn from_table(table: &RouteTable) -> Value {
 		methods.insert(method_key(&entry.method).to_string(), operation);
 	}
 
-	// Add path parameters to each path item, sorted by path for deterministic output.
-	let mut path_keys: Vec<&str> = path_groups.keys().collect::<Vec<_>>();
-	path_keys.sort();
+	// A BTreeMap iterates in key order, so the document is deterministic
+	// without sorting the paths a second time.
 	let mut path_items: Map<String, Value> = Map::new();
-	for path in path_keys {
-		let methods = path_groups.get(path).unwrap();
+	for (path, methods) in &path_groups {
 		let mut item: Map<String, Value> = Map::new();
-		for &(method, operation) in methods {
-			item.insert(method.to_string(), operation);
+		for (method, operation) in methods {
+			item.insert(method.clone(), operation.clone());
 		}
 		// Inject path parameters from the template.
-		let params = extract_path_parameters(path);
+		let params = extract_path_parameters(*path);
 		if !params.is_empty() {
-			item.insert("parameters".to_string(), Value::from_array(params));
+			item.insert("parameters".to_string(), Value::Array(params));
 		}
-		path_items.insert(path.to_string(), Value::from_object(item));
+		path_items.insert((*path).to_string(), Value::Object(item));
 	}
 
 	json!({
@@ -253,6 +254,9 @@ pub fn from_table(table: &RouteTable) -> Value {
 #[must_use]
 pub fn validate(document: &Value) -> Vec<String> {
 	let mut issues: Vec<String> = Vec::new();
+	// A missing section is something to report, not something to panic on, so
+	// every `as_object` below borrows this map instead of a temporary.
+	let empty = Map::new();
 
 	// 1. OpenAPI version is 3.1.x
 	let version = document["openapi"].as_str().unwrap_or("");
@@ -260,16 +264,19 @@ pub fn validate(document: &Value) -> Vec<String> {
 		issues.push(format!("`openapi` version must start with `3.1`, got {version:?}"));
 	}
 
-	let components = document["components"].as_object().unwrap_or(&Map::new());
-	let schemas = components["schemas"].as_object().unwrap_or(&Map::new());
-	let comp_responses = components["responses"].as_object().unwrap_or(&Map::new());
+	let components = document["components"].as_object().unwrap_or(&empty);
+	let schemas = components["schemas"].as_object().unwrap_or(&empty);
+	let comp_responses = components["responses"].as_object().unwrap_or(&empty);
 
-	let paths = document["paths"].as_object().unwrap_or(&Map::new());
+	let paths = document["paths"].as_object().unwrap_or(&empty);
 	let mut operation_ids: Vec<String> = Vec::new();
 
-	for &(ppath, item) in paths {
-		let methods = item.as_object().unwrap_or(&Map::new());
-		let method_keys: Vec<&str> = methods.keys().filter(|k| *k != "parameters").collect::<Vec<_>>();
+	for (ppath, item) in paths {
+		let Some(methods) = item.as_object() else {
+			issues.push(format!("path `{ppath}` is not an object"));
+			continue;
+		};
+		let method_keys: Vec<&str> = methods.keys().map(String::as_str).filter(|key| *key != "parameters").collect();
 
 		if method_keys.is_empty() {
 			issues.push(format!("path `{ppath}` has no operations"));
@@ -277,7 +284,10 @@ pub fn validate(document: &Value) -> Vec<String> {
 		}
 
 		for method in method_keys {
-			let operation = methods[*method].as_object().unwrap_or(&Map::new());
+			let Some(operation) = methods[method].as_object() else {
+				issues.push(format!("`{ppath}`/{method} is not an object"));
+				continue;
+		};
 
 			// 3a. Has operationId.
 			let op_id = operation["operationId"].as_str().unwrap_or("");
@@ -293,7 +303,7 @@ pub fn validate(document: &Value) -> Vec<String> {
 			}
 
 			// 3c. Has a 2xx response.
-			let responses = operation["responses"].as_object().unwrap_or(&Map::new());
+			let responses = operation["responses"].as_object().unwrap_or(&empty);
 			let has_2xx = responses.keys().any(|k| k.starts_with('2'));
 			if !has_2xx {
 				issues.push(format!("`{ppath}`/{method} has no `2xx` response"));
@@ -325,13 +335,13 @@ pub fn validate(document: &Value) -> Vec<String> {
 fn collect_refs(value: &Value, issues: &mut Vec<String>, schemas: &Map<String, Value>, responses: &Map<String, Value>) {
 	match value {
 		Value::Object(obj) => {
-			for &(key, val) in obj {
+			for (key, val) in obj {
 				if key == "$ref" {
 					if let Some(ref_str) = val.as_str() {
 						check_ref(ref_str, issues, schemas, responses);
 					}
 				} else {
-					collect_refs(&val, issues, schemas, responses);
+					collect_refs(val, issues, schemas, responses);
 				}
 			}
 		}
@@ -352,13 +362,14 @@ fn check_ref(target: &str, issues: &mut Vec<String>, schemas: &Map<String, Value
 	}
 	let tail = target.strip_prefix("#/components/").unwrap_or("");
 	// tail is "schemas/Foo" or "responses/Error400"
-	let slash = tail.find('/');
-	if slash == None || slash < 1 || slash + 1 >= tail.len() {
+	let Some((category, name)) = tail.split_once('/') else {
+		issues.push(format!("`{target}` has an unrecognised component path"));
+		return;
+	};
+	if category.is_empty() || name.is_empty() {
 		issues.push(format!("`{target}` has an unrecognised component path"));
 		return;
 	}
-	let category = tail[..slash];
-	let name = tail[slash + 1..];
 	match category {
 		"schemas" => {
 			if !schemas.contains_key(name) {
@@ -384,19 +395,23 @@ fn check_ref(target: &str, issues: &mut Vec<String>, schemas: &Map<String, Value
 /// `openapi`. Returns a usage error on a parse refusal, or propagates an
 /// I/O error.
 pub fn run(arguments: Vec<String>) -> anyhow::Result<()> {
+	use std::io::Write as _;
 	let out_path = parse_args(arguments)?;
 
 	let table = crate::routes::build_registry().table();
 	let document = from_table(&table);
 
-	let json_bytes = serde_json::to_vec(&document).map_err(|e| anyhow::Error::new(e))?;
+	// Pretty-printed with a trailing newline: the committed document is diffed
+	// by hand as well as by the drift gate.
+	let mut json_bytes = serde_json::to_vec_pretty(&document)?;
+	json_bytes.push(b'\n');
 
-	match out_path {
+	match out_path.as_deref() {
 		None | Some("-") => {
-			std::io::stdout().write(json_bytes).map_err(|e| anyhow::Error::new(e))?;
+			std::io::stdout().write_all(&json_bytes).map_err(|error| anyhow::anyhow!("openapi: writing the document to stdout failed: {error}"))?;
 		}
 		Some(path) => {
-			std::fs::write(path, &json_bytes).map_err(|e| anyhow::Error::new(e))?;
+			std::fs::write(path, &json_bytes).map_err(|error| anyhow::anyhow!("openapi: writing the document to {path} failed: {error}"))?;
 		}
 	}
 	Ok(())
@@ -408,18 +423,21 @@ pub fn run(arguments: Vec<String>) -> anyhow::Result<()> {
 /// - `openapi` → stdout
 /// - `openapi --out -` → stdout
 /// - `openapi --out <path>` → write to file
-fn parse_args(arguments: Vec<String>) -> std::result::Result<Option<String>, crate::cli::UsageError> {
-	// arguments: ["openapi", ...] or ["openapi"]
+fn parse_args(mut arguments: Vec<String>) -> Result<Option<String>, crate::cli::UsageError> {
+	// `arguments[0]` is the `openapi` word the parser already matched.
 	if arguments.len() <= 1 {
 		return Ok(None);
 	}
-	let first = arguments[1];
-	match first {
+	let first = arguments[1].clone();
+	match first.as_str() {
 		"--out" => {
 			if arguments.len() <= 2 {
-				return Err(crate::cli::usage(&format!("openapi: `--out` needs a path argument; use `-` for stdout")));
+				return Err(crate::cli::usage("openapi: `--out` needs a path argument; use `-` for stdout"));
 			}
-			let path = arguments[2];
+			if arguments.len() > 3 {
+				return Err(crate::cli::usage(&format!("openapi: `{}` is not an argument of `--out`; usage: weft-server openapi [--out PATH]", arguments[3])));
+			}
+			let path = arguments.remove(2);
 			if std::path::Path::new(&path).is_dir() {
 				return Err(crate::cli::usage(&format!("openapi: `{path}` is a directory; `--out` expects a file path or `-` for stdout")));
 			}
@@ -433,142 +451,128 @@ fn parse_args(arguments: Vec<String>) -> std::result::Result<Option<String>, cra
 
 #[cfg(test)]
 mod tests {
-	use serde_json::Value;
-
 	use super::*;
 	use crate::routes::build_registry;
 
-	/// The drift gate: the committed spec matches the generated document.
+	/// The document generated from the registry the server actually serves.
+	fn generated() -> Value {
+		from_table(&build_registry().table())
+	}
+
+	/// The drift gate: the committed spec is the document the routes generate.
+	/// A generated file nothing compares against is a second source of truth,
+	/// which is what this slice exists to prevent.
 	#[test]
 	fn generated_spec_matches_committed_file() {
-		let generated = from_table(build_registry().table());
-		let committed_file = "../compat/openapi/weftdb.json";
-		let p = std::path::Path::new(committed_file);
-		if !p.exists() {
+		let committed_path = "../compat/openapi/weftdb.json";
+		if !std::path::Path::new(committed_path).exists() {
 			panic!(
-				"`{committed_file}` could not be found; "
-				"the drift gate needs a committed spec file. Generate it with:\n\n"
-				"    weft-server openapi --out ../compat/openapi/weftdb.json\n\n"
-				"(Run from the `weft-server/` crate directory.)"
+				"`{committed_path}` is missing; the drift gate needs a committed spec file.\n\t\
+			 Generate it from the `weft-server/` crate directory with:\n\t\
+			 \t cargo run -p weft-server -- openapi --out ../compat/openapi/weftdb.json"
 			);
 		}
-		let text = std::fs::read_to_string(committed_file).unwrap();
-		let committed = serde_json::from_slice(text.as_bytes());
-		if committed.is_err() {
-			panic!("`{committed_file}` must be valid JSON; parse error: {committed.unwrap_err()}");
-		}
-		if generated != committed.unwrap() {
+		let text = std::fs::read_to_string(committed_path).unwrap_or_else(|error| panic!("`{committed_path}` could not be read: {error}"));
+		let committed: Value = serde_json::from_str(&text).unwrap_or_else(|error| panic!("`{committed_path}` is not valid JSON: {error}"));
+		let generated = generated();
+		if generated != committed {
+			let generated_paths = generated["paths"].as_object().map_or(0, |items| items.len());
+			let committed_paths = committed["paths"].as_object().map_or(0, |items| items.len());
 			panic!(
-				"the generated OpenAPI document differs from the committed spec at `{committed_file}`;\n"
-				"regenerate with: weft-server openapi --out ../compat/openapi/weftdb.json"
+				"the committed spec at `{committed_path}` is not what the routes generate \n\t\
+			 ({generated_paths} paths generated, {committed_paths} committed).\n\t\
+			 Regenerate it with: cargo run -p weft-server -- openapi --out ../compat/openapi/weftdb.json"
 			);
 		}
 	}
 
-	/// Structural validation: every path item has at least one operation,
-	/// every operation has a 2xx and an error response, every `$ref`
-	/// target exists, every operation has an `operationId` and a
-	/// `summary`, and no two operations share an `operationId`.
+	/// Structural validation of the generated document: every path item carries
+	/// an operation, every operation a 2xx and an error response, every `$ref`
+	/// an existing target, and no two operations a shared `operationId`.
 	#[test]
 	fn generated_spec_passes_structural_validation() {
-		let document = from_table(build_registry().table());
-		let issues = validate(&document);
+		let issues = validate(&generated());
 		if !issues.is_empty() {
-			let report = issues.join("\n  ");
-			panic!("the generated OpenAPI document has structural issues:\n  {report}");
+			panic!("the generated OpenAPI document has structural issues:\n  {}", issues.join("\n  "));
 		}
 	}
 
-	/// Every error status the code table can produce has a corresponding
-	/// component response entry.
+	/// Every status the error table can produce has a documented component
+	/// response, so a client is never handed a status with no shape.
 	#[test]
 	fn every_error_status_has_a_component_response() {
-		let document = from_table(build_registry().table());
-		let components = document["components"].as_object().unwrap();
-		let responses = components["responses"].as_object().unwrap();
+		let document = generated();
+		let components = document["components"].as_object().expect("the document has a components section");
+		let responses = components.get("responses").and_then(Value::as_object).expect("components has a responses section");
 		for status in ERROR_STATUSES {
 			let key = format!("Error{status}");
-			assert!(responses.contains_key(&key), "missing component response `{key}` for status {status}");
-			let entry = responses[&key].as_object().unwrap();
-			assert!(entry.contains_key("description"), "response `{key}` has no description");
+			let entry = responses.get(&key).unwrap_or_else(|| panic!("`{key}` is missing from `components.responses`"));
+			assert!(entry["description"].as_str().is_some_and(|text| !text.is_empty()), "`{key}` has no description");
 		}
 	}
 
-	/// The committed spec file exists and is valid JSON.
+	/// The committed file is a documented API, not a placeholder: an empty
+	/// `paths` object would satisfy a byte-comparison drift gate the day the
+	/// routes regenerate onto it, and would ship a spec that documents nothing.
 	#[test]
-	fn committed_spec_is_valid_json() {
+	fn committed_spec_is_a_documented_api() {
 		let path = "../compat/openapi/weftdb.json";
-		let p = std::path::Path::new(path);
-		if !p.exists() {
-			// This test is informational: the drift gate is the real guard.
-			return;
-		}
-		let text = std::fs::read_to_string(path).unwrap();
-		let parsed = serde_json::from_slice(text.as_bytes());
-		assert!(parsed.is_ok(), "`{path}` must be valid JSON, but parsing failed");
+		let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("`{path}` must exist: generate it with `cargo run -p weft-server -- openapi --out ../compat/openapi/weftdb.json`: {error}"));
+		let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|error| panic!("`{path}` is not valid JSON: {error}"));
+		let paths = parsed["paths"].as_object().unwrap_or_else(|| panic!("`{path}` has no `paths` object"));
+		assert!(!paths.is_empty(), "`{path}` documents no paths: the committed spec is a placeholder");
 	}
 
-	/// The generated document has the right OpenAPI version.
+	/// The version is the one the document claims to be, not a bare "3.1".
 	#[test]
 	fn openapi_version_is_3_1() {
-		let document = from_table(build_registry().table());
+		let document = generated();
 		assert_eq!(document["openapi"], "3.1.0");
 	}
 
-	/// The generated document has the correct info block.
+	/// The document names the service and the version that produced it.
 	#[test]
 	fn info_block_has_service_name_and_version() {
-		let document = from_table(build_registry().table());
-		let info = document["info"].as_object().unwrap();
+		let document = generated();
+		let info = document["info"].as_object().expect("the document has an info block");
 		assert_eq!(info["title"], crate::SERVICE);
-		assert!(info["version"].as_str().unwrap_or("").len() > 0, "version must not be empty");
+		assert!(!info["version"].as_str().unwrap_or_default().is_empty(), "the version must not be empty");
 	}
 
-	/// The path count matches the existing openapi_document test in routes.
+	/// One path item per registered template, counted from the registry rather
+	/// than hardcoded, so adding a route cannot pass against a stale number.
 	#[test]
-	fn path_count_is_consistent() {
-		let document = from_table(build_registry().table());
-		let paths = document["paths"].as_object().unwrap();
-		assert_eq!(paths.len(), 66, "one path item per template");
+	fn one_path_item_per_registered_template() {
+		let table = build_registry().table();
+		let mut templates: Vec<&str> = table.entries().iter().map(|entry| entry.path).collect();
+		templates.sort_unstable();
+		templates.dedup();
+		assert!(!templates.is_empty(), "the registry registered no routes at all");
+		let document = generated();
+		let paths = document["paths"].as_object().expect("the document has a paths section");
+		assert_eq!(paths.len(), templates.len(), "one path item per registered template");
 	}
 
-	/// Every operation has a unique operationId.
+	/// No two operations share an `operationId`: it is the client's method name.
 	#[test]
 	fn no_duplicate_operation_ids() {
-		let document = from_table(build_registry().table());
-		let issues = validate(&document);
-		let dups = issues.filter(|i| i.contains("duplicate `operationId`"));
-		assert!(dups.is_empty(), "no duplicate operationIds, but found: {dups:?}");
+		let duplicates: Vec<String> = validate(&generated()).into_iter().filter(|issue| issue.contains("duplicate `operationId`")).collect();
+		assert!(duplicates.is_empty(), "duplicate operationIds: {duplicates:?}");
 	}
 
-	/// Every operation has a summary that is not empty.
+	/// Every operation carries the summary and id a generated client needs.
 	#[test]
-	fn every_operation_has_summary() {
-		let document = from_table(build_registry().table());
-		let paths = document["paths"].as_object().unwrap();
-		for &(path, item) in paths {
-			for &(method, operation) in item.as_object().unwrap() {
+	fn every_operation_has_a_summary_and_an_id() {
+		let document = generated();
+		let paths = document["paths"].as_object().expect("the document has a paths section");
+		for (path, item) in paths {
+			let methods = item.as_object().unwrap_or_else(|| panic!("`{path}` is not an object"));
+			for (method, operation) in methods {
 				if method == "parameters" {
 					continue;
 				}
-				let summary = operation["summary"].as_str().unwrap_or("");
-				assert!(!summary.is_empty(), "operation `{path}`/{method} has no summary");
-			}
-		}
-	}
-
-	/// Every operation has an operationId that is not empty.
-	#[test]
-	fn every_operation_has_operation_id() {
-		let document = from_table(build_registry().table());
-		let paths = document["paths"].as_object().unwrap();
-		for &(path, item) in paths {
-			for &(method, operation) in item.as_object().unwrap() {
-				if method == "parameters" {
-					continue;
-				}
-				let id = operation["operationId"].as_str().unwrap_or("");
-				assert!(!id.is_empty(), "operation `{path}`/{method} has no operationId");
+				assert!(!operation["summary"].as_str().unwrap_or_default().is_empty(), "operation `{path}`/{method} has no summary");
+				assert!(!operation["operationId"].as_str().unwrap_or_default().is_empty(), "operation `{path}`/{method} has no operationId");
 			}
 		}
 	}

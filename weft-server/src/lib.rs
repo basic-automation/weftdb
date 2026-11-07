@@ -76,11 +76,6 @@ pub mod keygen;
 pub mod maintain;
 pub mod metrics;
 mod num;
-/// PAC-13's operator command: `weft-server restore`.
-///
-/// It puts a backup back on disk as a store root while nothing serves it. A library module for the same reason as
-/// [`import_rows_mode`]: its parsing, its report and the exit code it refuses with are
-/// testable.
 /// FRE-9a: OpenAPI 3.1 document generated from the route registry.
 ///
 /// The document is built from the same route table the router serves. Adding a
@@ -98,6 +93,11 @@ pub mod reconcile_daemon;
 /// Values that can carry a credential (a URL's userinfo above all) are only ever printed
 /// redacted (see [`redact`]).
 pub mod redact;
+/// PAC-13's operator command: `weft-server restore`.
+///
+/// It puts a backup back on disk as a store root while nothing serves it. A library module for the same reason as
+/// [`import_rows_mode`]: its parsing, its report and the exit code it refuses with are
+/// testable.
 pub mod restore;
 pub mod routes;
 /// ROB-11's runtime builder: the explicit tokio runtime the binary

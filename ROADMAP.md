@@ -362,7 +362,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
   - [ ] **FRE-8b** Stored-value text and one float-input rule across every ingest format
   - [x] **FRE-9a** OpenAPI generated from the route table, committed, drift-checked in CI
-    *Closed 2026-11-07 (#PR): generated from the real [`RouteTable`] via
+    *Closed 2026-11-07 (#615): generated from the real `RouteTable` via
     `openapi::from_table`, wired as the `weft-server openapi` subcommand
     (PAC-7 exit-code contract), committed at `compat/openapi/weftdb.json`,
     drift-gated by `generated_spec_matches_committed_file`, and structurally

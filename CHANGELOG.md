@@ -12,7 +12,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 - **Generated OpenAPI document from the route registry (FRE-9a).** The
   document at `compat/openapi/weftdb.json` is built from the same
-  [`RouteTable`] the HTTP router serves, so every path, method, scope,
+  `RouteTable` the HTTP router serves, so every path, method, scope,
   admission class and tier is the one the code registered. The drift
   gate (`generated_spec_matches_committed_file`) checks the committed
   file matches the generated output; regenerate with `weft-server openapi
