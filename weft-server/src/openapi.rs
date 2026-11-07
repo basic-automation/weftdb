@@ -51,7 +51,7 @@ const fn error_status_description(status: u16) -> &'static str {
 	}
 }
 
-/// Derive a human-readable summary from a snake_case `operation_id`:
+/// Derive a human-readable summary from a `snake_case` `operation_id`:
 /// split on `_`, capitalise the first word, and join with spaces.
 fn operation_summary(id: &str) -> String {
 	let mut words = id.split('_').filter(|word| !word.is_empty());
@@ -102,7 +102,7 @@ fn operation_tag(id: &str) -> &'static str {
 	}
 }
 
-/// The OpenAPI method key (lowercase) for an HTTP method.
+/// The `OpenAPI` method key (lowercase) for an HTTP method.
 const fn method_key(method: &Method) -> &'static str {
 	match *method {
 		Method::GET => "get",
@@ -171,7 +171,7 @@ fn build_operation(spec: &RouteSpec) -> Value {
 }
 
 /// Extract path parameters from a path template: segments wrapped in
-/// `{` `}` become OpenAPI path-parameter entries.
+/// `{` `}` become `OpenAPI` path-parameter entries.
 fn extract_path_parameters(template: &str) -> Vec<Value> {
 	let mut params: Vec<Value> = Vec::new();
 	for segment in template.split('/') {
@@ -205,7 +205,7 @@ fn build_components() -> Value {
 	})
 }
 
-/// Generate the full OpenAPI 3.1 document from a sealed route table.
+/// Generate the full `OpenAPI` 3.1 document from a sealed route table.
 ///
 /// Every path item, operation, path parameter, scope and admission class
 /// comes from the same registrations the running server uses.
@@ -227,7 +227,7 @@ pub fn from_table(table: &RouteTable) -> Value {
 			item.insert(method.clone(), operation.clone());
 		}
 		// Inject path parameters from the template.
-		let params = extract_path_parameters(*path);
+		let params = extract_path_parameters(path);
 		if !params.is_empty() {
 			item.insert("parameters".to_string(), Value::Array(params));
 		}
@@ -247,7 +247,7 @@ pub fn from_table(table: &RouteTable) -> Value {
 
 // ── structural validation ──────────────────────────────────────────────────
 
-/// Validate the structural integrity of an OpenAPI document.
+/// Validate the structural integrity of an `OpenAPI` document.
 ///
 /// Returns a list of issues found: an empty list means the document
 /// passes all checks.
@@ -287,7 +287,7 @@ pub fn validate(document: &Value) -> Vec<String> {
 			let Some(operation) = methods[method].as_object() else {
 				issues.push(format!("`{ppath}`/{method} is not an object"));
 				continue;
-		};
+			};
 
 			// 3a. Has operationId.
 			let op_id = operation["operationId"].as_str().unwrap_or("");
@@ -347,7 +347,7 @@ fn collect_refs(value: &Value, issues: &mut Vec<String>, schemas: &Map<String, V
 		}
 		Value::Array(arr) => {
 			for val in arr {
-				collect_refs(&val, issues, schemas, responses);
+				collect_refs(val, issues, schemas, responses);
 			}
 		}
 		_ => {}
@@ -394,6 +394,12 @@ fn check_ref(target: &str, issues: &mut Vec<String>, schemas: &Map<String, Value
 /// `arguments` follows the program name, starting with the subcommand word
 /// `openapi`. Returns a usage error on a parse refusal, or propagates an
 /// I/O error.
+///
+/// # Errors
+///
+/// Returns a usage error when the arguments name an unknown flag, repeat a
+/// flag, or give `--out` no path. Returns an I/O error when the document
+/// cannot be serialised, or the target path or stdout cannot be written.
 pub fn run(arguments: Vec<String>) -> anyhow::Result<()> {
 	use std::io::Write as _;
 	let out_path = parse_args(arguments)?;
@@ -459,31 +465,48 @@ mod tests {
 		from_table(&build_registry().table())
 	}
 
+	/// Where the committed document lives, resolved from the crate directory. A path relative to
+	/// the working directory only lines up when the test binary happens to be run from one place;
+	/// `cargo test -p weft-server` runs it from the workspace root, and the file is above there.
+	fn committed_spec_path() -> std::path::PathBuf {
+		std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("weft-server is a crate inside the workspace, so it has a parent directory").join("compat/openapi/weftdb.json")
+	}
+
+	/// Setting this rewrites the committed document instead of comparing against it. The name is
+	/// the one `weft-physical-type`'s golden harness uses, because this is the same arrangement:
+	/// bytes produced by the code, committed, and compared on every run.
+	const UPDATE_VAR: &str = "WEFT_UPDATE_GOLDENS";
+
 	/// The drift gate: the committed spec is the document the routes generate.
 	/// A generated file nothing compares against is a second source of truth,
 	/// which is what this slice exists to prevent.
 	#[test]
 	fn generated_spec_matches_committed_file() {
-		let committed_path = "../compat/openapi/weftdb.json";
-		if !std::path::Path::new(committed_path).exists() {
-			panic!(
-				"`{committed_path}` is missing; the drift gate needs a committed spec file.\n\t\
-			 Generate it from the `weft-server/` crate directory with:\n\t\
-			 \t cargo run -p weft-server -- openapi --out ../compat/openapi/weftdb.json"
-			);
+		let path = committed_spec_path();
+		let document = generated();
+		// The same serialiser the `openapi` subcommand uses, so the file the test compares against
+		// and the file an operator writes out with the CLI cannot differ by formatting alone.
+		let fresh = serde_json::to_vec_pretty(&document).expect("the generated document is serialisable");
+		if std::env::var_os(UPDATE_VAR).is_some() {
+			std::fs::write(&path, fresh).unwrap_or_else(|error| panic!("{}: could not rewrite the committed spec: {error}", path.display()));
+			return;
 		}
-		let text = std::fs::read_to_string(committed_path).unwrap_or_else(|error| panic!("`{committed_path}` could not be read: {error}"));
-		let committed: Value = serde_json::from_str(&text).unwrap_or_else(|error| panic!("`{committed_path}` is not valid JSON: {error}"));
-		let generated = generated();
-		if generated != committed {
-			let generated_paths = generated["paths"].as_object().map_or(0, |items| items.len());
-			let committed_paths = committed["paths"].as_object().map_or(0, |items| items.len());
+		let committed = std::fs::read(&path).unwrap_or_else(|error| {
 			panic!(
-				"the committed spec at `{committed_path}` is not what the routes generate \n\t\
-			 ({generated_paths} paths generated, {committed_paths} committed).\n\t\
-			 Regenerate it with: cargo run -p weft-server -- openapi --out ../compat/openapi/weftdb.json"
-			);
-		}
+				"no committed spec at {} ({error}).\n\tCreate it with `{UPDATE_VAR}=1 cargo test -p weft-server --lib openapi`, \
+				 then review the file as a fixture before committing it.",
+				path.display()
+			)
+		});
+		let committed_value: Value = serde_json::from_slice(&committed).unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", path.display()));
+		let generated_paths = document["paths"].as_object().map_or(0, Map::len);
+		let committed_paths = committed_value["paths"].as_object().map_or(0, Map::len);
+		assert!(
+			document == committed_value,
+			"the committed spec at {} is not what the routes generate: {generated_paths} paths generated, {committed_paths} committed.\n\t\
+			 If a route changed on purpose, regenerate it with `{UPDATE_VAR}=1 cargo test -p weft-server --lib openapi` and review the diff.",
+			path.display()
+		);
 	}
 
 	/// Structural validation of the generated document: every path item carries
@@ -516,11 +539,16 @@ mod tests {
 	/// routes regenerate onto it, and would ship a spec that documents nothing.
 	#[test]
 	fn committed_spec_is_a_documented_api() {
-		let path = "../compat/openapi/weftdb.json";
-		let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("`{path}` must exist: generate it with `cargo run -p weft-server -- openapi --out ../compat/openapi/weftdb.json`: {error}"));
-		let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|error| panic!("`{path}` is not valid JSON: {error}"));
-		let paths = parsed["paths"].as_object().unwrap_or_else(|| panic!("`{path}` has no `paths` object"));
-		assert!(!paths.is_empty(), "`{path}` documents no paths: the committed spec is a placeholder");
+		// A regeneration run is precisely the moment the file on disk is the stale one, so this
+		// check has nothing to say until the writer has run.
+		if std::env::var_os(UPDATE_VAR).is_some() {
+			return;
+		}
+		let path = committed_spec_path();
+		let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{} must exist: create it with `{UPDATE_VAR}=1 cargo test -p weft-server --lib openapi`: {error}", path.display()));
+		let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", path.display()));
+		let paths = parsed["paths"].as_object().unwrap_or_else(|| panic!("{} has no `paths` object", path.display()));
+		assert!(!paths.is_empty(), "{} documents no paths: the committed spec is a placeholder", path.display());
 	}
 
 	/// The version is the one the document claims to be, not a bare "3.1".
