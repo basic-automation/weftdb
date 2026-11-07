@@ -2110,6 +2110,83 @@ impl Inputs for Database {
 	}
 }
 
+/// Dictionary persistence that is not part of the `Inputs` trait.
+impl Database {
+	/// Replace every pattern stored in `dictionary_name` for `aspect_id` with `patterns`,
+	/// in one transaction.
+	///
+	/// This is how a pipeline writes a dictionary back after an extraction run. The
+	/// in-memory dictionary is the whole truth (it was loaded from this store, then new
+	/// batches were merged into it), so its patterns replace what is stored rather than
+	/// being appended. Appending them, as
+	/// [`batch_insert_patterns_into_dictionary`](Inputs::batch_insert_patterns_into_dictionary)
+	/// does, stores every existing pattern a second time on each run: the `patterns` table
+	/// has no unique id, so each run duplicated the dictionary and every duplicate row of
+	/// a pattern then loaded all of that pattern's occurrence and relative rows.
+	///
+	/// # Errors
+	///
+	/// When the dictionary name cannot name a file, its database cannot be opened, or a
+	/// statement fails (the transaction is rolled back and the stored dictionary kept).
+	pub async fn replace_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str, patterns: &[Pattern]) -> Result<TxId> {
+		let tx_id = legacy_metadata_write(async move {
+			let tx_id = TxId::new();
+			let aspect = self.get_aspect(aspect_id).await?;
+			let db_name = &self.name;
+			let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
+			drop(aspect);
+			let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
+			let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
+
+			let result: Result<()> = async {
+				for sql in ["DELETE FROM pattern_relatives", "DELETE FROM pattern_occurrences", "DELETE FROM patterns"] {
+					conn.as_ref().execute(sql, turso::params![]).await.map_err(|e| anyhow::anyhow!("Failed to clear dictionary '{dictionary_name}': {e}"))?;
+				}
+				for pattern in patterns {
+					let id = pattern.id().to_string();
+					conn.as_ref().execute(r"INSERT INTO patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()]).await.map_err(|e| anyhow::anyhow!("Failed to insert pattern '{id}': {e}"))?;
+					for (index, occurrence) in pattern.occurrences().iter().enumerate() {
+						let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
+						let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
+						conn.as_ref().execute(r"INSERT INTO pattern_occurrences (pattern_id, occurrence_index, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), occurrence_index, aspect_id.to_string(), occurrence.resolution().to_string(), size, serde_json::to_string(occurrence.database_info())?, occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()]).await.map_err(|e| anyhow::anyhow!("Failed to insert occurrence for pattern '{id}': {e}"))?;
+					}
+					for (index, relative) in pattern.relatives().iter().enumerate() {
+						let relative_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Relative index too large for i64"))?;
+						conn.as_ref().execute(r"INSERT INTO pattern_relatives (pattern_id, relative_index, relative_value) VALUES (?, ?, ?)", turso::params![id.clone(), relative_index, serde_json::to_string(relative)?]).await.map_err(|e| anyhow::anyhow!("Failed to insert relative {index} for pattern '{id}': {e}"))?;
+					}
+				}
+				Ok(())
+			}
+			.await;
+			if let Err(e) = result {
+				tracing::warn!("Failed to replace dictionary '{dictionary_name}' for aspect {aspect_id}: {e}");
+				Self::rollback_after_error(&conn).await;
+				return Err(e);
+			}
+			Self::commit_concurrent(&conn).await?;
+			let log = format!("Replaced dictionary '{dictionary_name}' for aspect {aspect_id} with {} patterns", patterns.len());
+			let _ = self.record_transaction(&log).await?;
+			Ok(tx_id)
+		})
+		.await?;
+
+		// Readers cache the dictionary and each pattern; what they hold is now stale.
+		let cache = self.cache.lock().await;
+		cache.invalidate(&Self::dictionary_patterns_cache_key(aspect_id, dictionary_name)).await;
+		for pattern in patterns {
+			cache.invalidate(&format!("pattern_{}", pattern.id().as_uuid())).await;
+		}
+		drop(cache);
+		Ok(tx_id)
+	}
+
+	/// The cache key of an aspect's dictionary's pattern list. Every aspect can have a
+	/// dictionary of the same name, so the key carries the aspect.
+	pub(crate) fn dictionary_patterns_cache_key(aspect_id: &AspectId, dictionary_name: &str) -> String {
+		format!("patterns_{aspect_id}_{dictionary_name}")
+	}
+}
+
 /// Helper methods for dirty region tracking (not part of trait)
 impl Database {
 	/// A batch's identity for the queue dedupe: its measurements as stored (JSON) and

@@ -8,6 +8,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-06
+
+### Fixed
+
+- **A pipeline's pattern dictionary no longer grows without bound.** Each
+  `Pipeline::run` loaded the stored dictionary on top of the patterns it already held
+  and then appended the whole dictionary to the store again (`patterns.id` is not
+  unique), so every run roughly doubled it, and each duplicated row then loaded all of
+  its pattern's occurrence and relative rows. A Fan Control daemon reached 3.5 GB of
+  `preamble.db` and 112 GB of RSS within minutes. `load_dictionary` now starts from the
+  store, extraction writes back with the new atomic
+  `Database::replace_dictionary_patterns`, `Dictionary::import_pattern` ignores a
+  pattern id it already holds, and the dictionary-list cache key now includes the aspect
+  (two aspects with a dictionary of the same name were served each other's patterns).
+
 ## [0.3.1] - 2026-11-06
 
 ### Fixed
