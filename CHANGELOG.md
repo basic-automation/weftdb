@@ -29,6 +29,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **CI now pins every GitHub Action to a commit SHA.** A floating `uses:` (e.g.
+  `Swatinem/rust-cache@v2`) fails the static-check job. A new guard,
+  `scripts/ci/check-action-pinning.py`, scans every workflow on every push and
+  pull request. (#626)
+
 - **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
   each measure by metric name alone, so two results in one report — a crash matrix, a query mix, any
   cross-adapter run — looked like a duplicated measure and `finish --manifest` refused the
