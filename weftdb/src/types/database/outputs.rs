@@ -954,7 +954,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	async fn get_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Pin<Box<dyn Stream<Item = Result<Pattern>> + Send + 'static>>> {
 		// Check cache first
-		let cache_key = format!("patterns_{dictionary_name}");
+		let cache_key = Self::dictionary_patterns_cache_key(aspect_id, dictionary_name);
 		if let Some(cached_patterns) = self.cache.lock().await.get::<Vec<Pattern>>(&cache_key).await {
 			// Convert cached patterns to stream
 			let pattern_stream = futures::stream::iter(cached_patterns.into_iter().map(Ok));
@@ -966,7 +966,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
 		drop(db);
 		let query_sql = r"
-                        SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value
+                        SELECT DISTINCT id
                         FROM patterns 
                 ";
 		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query patterns: {e}")))?;

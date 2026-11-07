@@ -884,10 +884,13 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 	tracing::info!(processed_count = processed_count, "Batch processing into patterns completed");
 
 	// Get all patterns from dictionary after merging
-	let merged_patterns: Vec<Pattern> = dictionary.patterns().to_vec();
+	// The in-memory dictionary was loaded from the store and then grew by this run's
+	// batches, so it replaces what is stored (appending it stored every pattern again on
+	// each run).
+	let merged_patterns: &[Pattern] = dictionary.patterns();
 	if !merged_patterns.is_empty() {
 		// Store patterns in the specified dictionary - handle case where dictionary schema doesn't exist
-		match database.batch_insert_patterns_into_dictionary(aspect_id, dictionary.name(), merged_patterns.clone()).await {
+		match database.replace_dictionary_patterns(aspect_id, dictionary.name(), merged_patterns).await {
 			Ok(_tx_ids) => {
 				tracing::info!(pattern_count = merged_patterns.len(), dictionary = dictionary.name(), batch_count = processed_count, "Stored patterns in database dictionary");
 			}
@@ -960,6 +963,10 @@ pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, 
 		}
 	};
 	let pattern_count = patterns.len();
+
+	// The store is the whole dictionary: start from it rather than adding it on top of
+	// what this dictionary already holds, which doubled it on every load.
+	dictionary.patterns_mut().clear();
 
 	let start_time = std::time::Instant::now();
 	tracing::info!(pattern_count = pattern_count, "Loading patterns into dictionary with memory-aware batching");
