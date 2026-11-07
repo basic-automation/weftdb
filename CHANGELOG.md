@@ -19,6 +19,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
   no `--out`, or writes to a named file.
 
+## [0.3.2] - 2026-11-06
+
 ### Fixed
 
 - **A pipeline's pattern dictionary no longer grows without bound.** Each
