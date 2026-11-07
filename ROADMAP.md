@@ -355,6 +355,15 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] open lane
   - [x] → **TAG-9** Frame error classes in recovery
     *Closed 2026-11-05 (audit): #556 (2026-11-04). Recovery and fsck adopt series-key frames into their series, class a malformed/empty/duplicate SERIES_KEY after a passing CRC as suspect (C5), rebind mismatched keys (`series_rebound`), and settle every held row (`held_cleared`).*
+  - [x] → **TAG-5** Tags core: series table, catalog, and the layout marker
+    *Closed 2026-11-07 by audit (#619): the series catalog and its time index are registered
+    migrations `0006_tag5_series` and `0007_series_time_index`, and the rest of the C1 columns
+    landed earlier in the same registry (`0002_s6_s7`, `0004_d_s12`, `0005_d_s13`). No
+    `0009_*` and no bump: `SUPPORTED_LAYOUT` stays 2 and layout 3 stays unassigned, because every
+    shape of a marker-only migration either makes 0.3.x binaries refuse a store that differs only
+    by a re-run of `CREATE TABLE IF NOT EXISTS series` or teaches that a layout number can move
+    without meaning anything. DECISIONS 2026-11-07; the owner still owes the ruling on whether the
+    literal `layout_version = 3` is a hard 1.0 gate.*
   - [ ] seal lane
   - [ ] → **ROB-17** Disk guard, headroom API and space gauges
   - [ ] maint lane
@@ -374,8 +383,15 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-17** Honesty pages II
   - [ ] Write or approve the honesty-page narrative *(owner)*
   - [ ] **FRE-13** Layout-1 to layout-2 upgrade test
-  - [ ] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
+  - [x] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
+    *Closed 2026-11-07 (#603): `SoakReport`, the R1–R8 evaluator, the coverage floors and the
+    honesty section are on main; the report is what #616's nightly comparison reads.*
   - [ ] → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
+    *Partial 2026-11-07 (#616): `compare_soak_reports` reports metric drift past tolerance and
+    every rule outcome change (a Pass→Fail turns the job red), and `soak.yml` runs the driver and
+    the comparison on `workflow_dispatch`. The schedule stays commented out and the TTL lane is
+    reported as not-tested, because the in-process `soak-run` driver cannot yet produce honest
+    R1–R8 evidence — that needs the SOA-4/6/12 fleet lanes.*
 - [ ] **W9 · Read semantics, limits, upgrade legs**
   - [ ] read lane
   - [ ] maint lane
@@ -510,7 +526,7 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.**
 - [ ] **`weft-orchestration`: per-pipeline signal state, not the global `SIGNALS_QUEUE` (filed 2026-11-06, from the fan-controller build).** `SIGNALS_QUEUE` is a process-wide static (`lib.rs:662`); `Pipeline::generate_signals` and `filter_signals_at` clone the whole queue into each pipeline (`pipeline.rs:964`, `:982`). With several sensor pipelines in one process, one sensor's signals reach another's probability queries. Fix: key the queue by aspect (or move it onto `Pipeline`), and add a two-pipeline isolation test. Check whether `create_signals` clears the queue; if not, even running the pipelines one at a time leaks.
 - [ ] **`weft-orchestration`: bounded-window threshold detectors (filed 2026-11-06, from the fan-controller build).** `detect_threshold_crossing_up` (`detectors.rs:504`), and probably its sibling detectors, analyse the aspect from its earliest to its latest measurement on every call, then collect and sort every point. For a 1 Hz daemon that runs for weeks, each tick costs O(history). Fix: an optional `since` start time (or an incremental cursor from the last evaluated point), so a live caller only scans new data. Add a test that the windowed and full-history runs find the same crossings in the window.
-- [ ] **`weftdb` dictionaries: shrink the occurrence footprint without dropping any occurrence (filed 2026-11-06, after the Fan Control 112 GB incident).** Every occurrence must be kept, because the statistics need them all. No `max_patterns` or `max_occurrences` caps: if the dictionary needs a cap, it is under-constrained. The duplicate-on-every-run bug is fixed separately (`replace_dictionary_patterns`). What remains:
+- [ ] **`weftdb` dictionaries: shrink the occurrence footprint without dropping any occurrence (filed 2026-11-06, after the Fan Control 112 GB incident).** Every occurrence must be kept, because the statistics need them all. No `max_patterns` or `max_occurrences` caps: if the dictionary needs a cap, it is under-constrained. The duplicate-on-every-run bug is **fixed 2026-11-07 (#612, 0.3.2)**: `Pipeline::import_windows` rewrites every id, so the old `if exists { continue }` test could not fire and each run re-inserted every occurrence. What remains:
   - **Lossless compact encoding.** Each `pattern_occurrences` row now repeats `pattern_id`, `aspect_id`, `resolution`, `size`, a JSON `database_info` and two timestamps. Store the per-dictionary constants once. Derive `end` from `start + size·resolution` and store it only when it differs. Store `start` as delta-of-delta varints, reusing the `weft-physical-type` timestamp codecs. Keep each pattern's occurrences in an append-only log on disk.
   - **Lean patterns in memory.** A pattern in RAM holds its shape, `count` and `first_seen`/`last_seen`. Occurrences are never loaded for matching; statistics and correlation read them as a stream. First check what `correlation.rs` needs from them.
   - **Restore on reload.** `load_dictionary` restores the stored patterns verbatim, with no re-matching through `import_pattern` and no occurrence load.
