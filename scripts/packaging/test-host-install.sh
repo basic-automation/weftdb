@@ -303,9 +303,14 @@ $(tail -20 "$WORK/invented.out")"
 pass "an invented variable name is refused, and recognised as refused"
 
 # A Test-tier name next: taken out of the registry rather than invented, because the whole point of
-# gate 4 is that the env file cannot carry one, and the only way to know that is to try.
-TEST_NAME=$(grep -B3 'tier: Tier::Test' "$SETTINGS" |
-	grep -oE '"(WEFT|OTEL)_[A-Z0-9_]+"' | tr -d '"' | head -1) || true
+# gate 4 is that the env file cannot carry one, and the only way to know that is to try. The name is
+# read off the same line as the tier, never from context lines: every VarSpec is one line, so `-B3`
+# also returns the entry sitting above each match, and the probe then points a Stable name — one the
+# server is meant to accept — at the Test-tier refusal. On ubuntu-latest that read as "OTEL_EXPORTER
+# OTLP_ENDPOINT was refused for some reason other than its tier" while the server was in fact
+# correct to accept it.
+TEST_NAME=$(grep -oE 'name: "(WEFT|OTEL)[A-Z0-9_]+", tier: Tier::Test' "$SETTINGS" |
+	sed -E 's/^name: "([A-Z0-9_]+)".*/\1/' | head -1) || true
 readonly TEST_NAME
 if [[ -z $TEST_NAME ]]; then
 	skip "no Tier::Test entry was found in $SETTINGS, so the env file's Test-tier refusal went untested"
