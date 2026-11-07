@@ -5308,3 +5308,47 @@ holds the port on a shared runner, which turns a packaging gate on a determinist
 **Recorded, not decided here:** ROADMAP tick #611 marks PAC-11 closed while this PR was still
 open with the gate red. The tick is only true once this PR lands; it is left in place rather
 than reverted, so this PR is the thing that makes the roadmap honest.
+## 2026-11-07 — W8 recovery: what a red gate, a vanished worker lane, and a silent CI each taught
+
+Three failures this wave looked like different problems and each turned out to be a missing fact
+about the tooling rather than about the code. Recorded because the next session will meet all
+three again.
+
+**1. A PR whose merge state is CONFLICTING runs almost no checks, and it looks like Actions is
+broken.** `w7/pac-11-ci` (PR #596) took three pushes in which only `Contribution terms` ran —
+the one workflow triggered by `pull_request_target`. `CI`, `Host install`, `Container` and
+`crash matrix` (all `pull_request`) produced no run at all: not queued, not pending approval,
+nothing under `status=action_required`. `gh pr view --json mergeable` said `CONFLICTING` /
+`DIRTY` — `#611` had ticked PAC-11 in `ROADMAP.md` and `#603` had rewritten the `## [Unreleased]`
+head of `CHANGELOG.md`, the two places that branch also edits. After merging `origin/main` and
+resolving the CHANGELOG by hand, all four workflows started within seconds of the push. So the
+check order for "CI did not run" is: `mergeable` first, then the trigger's event type, then
+runner availability — not the other way round. Cost of getting it wrong: two rounds of poking at
+GitHub instead of fixing the conflict.
+
+**2. A timed-out worker keeps its work only in the run's worktree diff, and that diff is against
+the harness base commit, not against `origin/main`.** Both W8 lanes (`FRE-9a`, `SOA-15`) hit the
+30-minute wall while waiting on each other's cargo builds; both had written nearly everything
+(593 lines of `weft-server/src/openapi.rs`; 649 lines of `weft-bench/src/soak_compare.rs` plus
+`.github/workflows/soak.yml`) and neither had pushed. The harness then removed the worktree *and*
+the branch, leaving `worktree-diffs/step-0/task-0-parallel-worker.patch` as the only survivor.
+That patch's base was `4ee2629` — the main tree's HEAD, an unpublished local commit — so a whole-
+patch apply onto `main` would "add" files `main` already has and "delete" the ones that commit
+touched. Chosen: `git apply --3way --include=<each authored file>` onto a fresh branch from
+`origin/main`, one recovery commit per lane saying plainly that it is recovered and unverified,
+pushed, then a **fresh** worker per lane with `cwd` pinned to the pushed worktree and
+`worktree: false`, given the file-and-line state of the scaffold and a 90-minute timeout.
+Rejected: `action: "resume"`. The sessions were 400k+ tokens of a lane that had already spent
+half an hour rediscovering its own build environment, and resume would have restored that
+context into a worktree that no longer existed. The brief is cheaper and truer than the memory.
+
+**3. `[skip ci]` in a commit message suppresses `pull_request` workflows too, not just pushes.**
+The only commit that ever existed solely on this machine — `4ee2629`, the pipeline-dictionary
+doubling fix that made Fan Control reach 112 GB RSS — ended its subject with `[skip ci]`. Had it
+been pushed as-is, PR #612 would have carried a memory-bug fix and a four-crate version bump
+through to a merge candidate with zero checks, and its regression test would never have run
+anywhere. The rebase dropped the tag, added the `Signed-off-by` the DCO gate needs (the commit
+had none), and the PR was opened as a draft with "no local build: two lanes have the RAM" written
+into its body, so the absence of verification is visible rather than implied. Tagging 0.3.2 stays
+a human action: `release.yml` accepts only a CI run on `main`, and crates.io is unreachable from
+this machine, so publication state cannot be confirmed from here at all.
