@@ -309,7 +309,7 @@ truth for status and priorities, and it records negative results alongside wins.
 
 Every number below was measured by a benchmark in this repo. Where a row names a **Source:**
 path, that is the bench the figure came from and you can re-run it; the run artifacts themselves
-(the manifest and result JSON of schema v23) are not committed, so a figure with no source line is
+(the manifest and result JSON of schema v24) are not committed, so a figure with no source line is
 a *dated local measurement*, not a claim you can reproduce from a clone. Which proof each figure carries is machine-checked, not asserted in prose:
 [`bench/claims.json`](../bench/claims.json) is the per-figure registry and
 [`tools/check_claims.py`](../tools/check_claims.py) runs it in CI, so a figure with no entry, or an

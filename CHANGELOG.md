@@ -18,6 +18,32 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   file matches the generated output; regenerate with `weft-server openapi
   --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
   no `--out`, or writes to a named file.
+### Changed
+
+- **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
+  each measure by metric name alone, so two results in one report — a crash matrix, a query mix, any
+  cross-adapter run — looked like a duplicated measure and `finish --manifest` refused the
+  evidence (#517). Measures now carry the result they were quoted from (`profile`, `adapter`,
+  `workload`) and uniqueness is checked within a result, so the same metric may appear once per
+  result; a repeat inside one result is still a defect, and the message names both the metric and the
+  result. Manifest schema v23 → v24: a manifest written by an older build is refused with an
+  instruction to re-run the benchmark, since the fields that identify a measure did not exist then.
+
+## [0.3.2] - 2026-11-06
+
+### Fixed
+
+- **A pipeline's pattern dictionary no longer grows without bound.** Each
+  `Pipeline::run` loaded the stored dictionary on top of the patterns it already held
+  and then appended the whole dictionary to the store again (`patterns.id` is not
+  unique), so every run roughly doubled it, and each duplicated row then loaded all of
+  its pattern's occurrence and relative rows. A Fan Control daemon reached 3.5 GB of
+  `preamble.db` and 112 GB of RSS within minutes. `load_dictionary` now starts from the
+  store, extraction writes back with the new atomic
+  `Database::replace_dictionary_patterns`, `Dictionary::import_pattern` ignores a
+  pattern id it already holds, and the dictionary-list cache key now includes the aspect
+  (two aspects with a dictionary of the same name were served each other's patterns).
+>>>>>>> 248f343 (fix(weftdb): stop pipeline dictionaries doubling on every run; release 0.3.2)
 
 ### Fixed
 

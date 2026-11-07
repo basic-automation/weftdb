@@ -4,6 +4,45 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
+
+**The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every
+result's measures to their metric name and refused any repeat, so a report carrying two results —
+which is what `--crash-matrix`, `--query-mix` and a multi-adapter run produce — could not be
+verified at all, and `finish --manifest` exited non-zero on honest evidence (`#517`, the reason
+`crash-matrix.yml` had to be narrowed to one report per cell after `#511`). `Measure` carried only
+`name` and `adapter`, so `adapter` was the only candidate disambiguator, and it is the wrong one: a
+query-mix report runs one adapter across many profiles, and a cross-adapter report runs one profile
+across many adapters. A measure's identity is the result it was quoted from, which `BenchResult`
+already states as `(profile, adapter, workload)` and `compare.rs` already uses as its `WorkloadKey`.
+
+**Chosen:** add `profile` and `workload` to `Measure` beside `adapter`, fill them where the measures
+are built (`push_result_measures`, which quotes them from the same result it quotes the numbers
+from), and check uniqueness per `(profile, adapter, workload)`. `Problem::DuplicateMeasure` became a
+struct variant carrying the name *and* the result identity, because the message a runner reads has to
+say which measure to go and look at — the file's own convention elsewhere is
+``measure `{name}` appears more than once``, and the old check broke it with a static
+"a measure name is repeated across adapters" string that named nothing.
+
+**Rejected: dropping the check.** Names are how a comparison selects a number, so a genuine
+repeat inside one result must stay a defect. The new test pair pins both halves: cross-result reuse
+of `latency.p50_ns` verifies clean, a second `latency.p50_ns` inside one result is still refused at
+`write_to`, which is where a manifest that cannot verify is turned into an error.
+
+**Rejected: making the recovery "regenerate the manifest from the report."** A manifest records
+provenance facts that are only available while the run happens — the source revision, the working
+tree's dirtiness, the environment — so an old manifest cannot be converted without inventing them.
+The refusal wording now says what is true instead: re-run the benchmark with a build that writes the
+current version. Bumping `MANIFEST_SCHEMA_VERSION` to 24 was unavoidable, since `Measure` gained two
+fields that every verifier depends on, and the version check stays an exact match: accepting a list
+of versions would make a v23 reader's silence about `profile`/`workload` invisible.
+
+**Not done here, deliberately:** the splitting that `#513` and `#147` added (`--crash-matrix`,
+`--query-mix`, `--failure` each writing one report per cell) is left in place. It was a workaround
+for this bug, but it is also what keeps a crash cell's artifact attributable to that cell, and
+removing it changes what the nightly publishes. Flagged as a follow-up rather than folded into a fix
+whose whole claim is that a multi-result report verifies.
+
 ## 2026-11-06 — W7 close-out, W8 start, the SOA-13 rule set, and one infra blocker
 
 **W7 was one item, not six.** The wave-7 briefing listed ROB-12, ROB-7, ROB-16, ROB-23r and ROB-5
@@ -5402,3 +5441,94 @@ holds the port on a shared runner, which turns a packaging gate on a determinist
 **Recorded, not decided here:** ROADMAP tick #611 marks PAC-11 closed while this PR was still
 open with the gate red. The tick is only true once this PR lands; it is left in place rather
 than reverted, so this PR is the thing that makes the roadmap honest.
+## 2026-11-07 — TAG-5: the tags schema is closed by an audit, and layout 3 stays unassigned (#437)
+
+**What was ambiguous.** Issue #437 gives two acceptance lines: "the series table and
+catalog exist, created by a registered migration", and "layout_version=3 marker written by
+that migration (C1)". The first is simply true of `main`. The second collides with the rule
+that the code itself states above the constant it would change: "It goes up for a
+control-plane DDL layout, a new frame decode capability, or a Turso on-disk format change
+(expressed as a migration that raises both floors). Layout numbers are assigned at a
+release: **every migration written before 1.0 belongs to layout 2**"
+(`weftdb/src/types/store_format.rs:60-65`, `SUPPORTED_LAYOUT = 2` at `:67`). So the literal
+reading of the issue asks for a layout bump that the shipped format policy forbids, and this
+loop does not get to decide which of the two is authoritative.
+
+**The audit part, which is settled.** `0006_tag5_series` (`weftdb/src/types/migrations.rs:146`,
+applied by `tag5_series`, DDL `SERIES_TABLE` at `:484`) creates the per-aspect series catalog
+in `segment_index.db`, and `0007_series_time_index` (`SEGMENT_INDEX_SERIES_TIME_INDEX` at
+`:503`) adds `idx_segment_index_series_time ON segment_index(aspect, series_id, min_ts,
+max_ts)`. The rest of the tags schema named by the plan's C1 note had already landed under
+layout 2 earlier in the registry: `segment_index.series_id` and `aspect_seq.next_series_id`
+in `0002_s6_s7`, `segment_quarantine.series_id` in `0004_d_s12`, `ingest_ledger.series_ids`
+in `0005_d_s13`. Every registry entry is `layout: 2`
+(`REGISTRY` at `migrations.rs:146`), which is what the registry's own contract test enforces
+(`floors(REGISTRY).layout == SUPPORTED_LAYOUT`, `migrations.rs:660-671`). Acceptance line one
+is therefore satisfied by migrations that are already recorded by id on every store.
+
+**Why the marker cannot be written the way the issue phrases it.** Migrations are recorded by
+id (`IndexOp::RecordMigration`), and a store that already recorded `0006_tag5_series` will
+never re-run it, so re-stamping `0006` to `layout: 3` would leave such a store permanently
+unable to reach floor 3 while the registry test still demanded a `layout: 3` entry. The only
+mechanically valid way to introduce 3 is a *new* migration after `0008_upsert_keys`. And that
+migration would have no schema change to carry — the substance is already there — so it would
+be a marker wearing a migration's clothes. Both shapes of it are bad in different directions:
+
+- floors 3 with `older_writers_safe: false` makes every 0.3.x binary refuse a store whose only
+  difference is a re-run of `CREATE TABLE IF NOT EXISTS series`: the refusal sites are
+  `refuse_newer_floor` (`weftdb/src/types/segment_index.rs:1268-1275`) and the restore check
+  (`weftdb/src/types/backup.rs:1030`), and both key off `min_write_layout`, which is exactly
+  the field future tags slices will need for real incompatibilities.
+- floors 2 with `older_writers_safe: true` and a `rederive` would be honest about safety but
+  would imply a repair that does not exist — `rederive` (`migrations.rs:253-263`) repairs what
+  an older writer left stale, and a writer that never populated `series` has no DDL-only fix —
+  while teaching everyone that a layout number can move without meaning anything.
+
+**Chosen.** No `0009_*` migration, no bump: `SUPPORTED_LAYOUT` stays 2. TAG-5 is closed on the
+audit above, and "layout_version=3" is read for what C1 was doing — a *name* for "the store
+carries the full tags schema", which arrived as `0006` and `0007` under layout 2. Layout 3 is
+left unassigned for the first change that actually needs it (the next tags-schema step that
+breaks an older reader, or the 1.0 freeze itself, whichever comes first). When a real bump
+happens, the newer-store fixtures should be written as `SUPPORTED_LAYOUT + 1` rather than a
+literal number, so the "a newer floor is refused" assertions
+(`segment_index.rs:1615`, `segment_store.rs:7336`, `:7412`, `:7444`, `store_format.rs:259`)
+survive it.
+
+**Needs human.** Whether the literal `layout_version = 3` is a hard 1.0 gate is the owner's
+call, not this loop's: it is an intent-versus-letter conflict between issue #437's acceptance
+line and the format policy in `store_format.rs:60-65`, and the letter is the one with
+compatibility consequences. If the owner rules that the number must move anyway, the only
+defensible form is floors 2 with `older_writers_safe: true` and a documented no-op `0009`,
+labelled a name-only rollover; a floors-3 store that 0.3.x binaries refuse to open is not
+worth the ticket. TAG-6 (#440) and TAG-7 (#441) are plan-only and were gated on TAG-5; they
+can be scoped against the schema as it exists at layout 2 without waiting on that ruling,
+because neither of them changes what an older reader can parse.
+
+## 2026-11-07 — Needs human: this loop cannot compile any more, and the OpenAPI gate punishes version bumps (#620)
+
+**The machine, first, because it explains the last day of misses.** `strata` — this agent's
+own process — is holding 84 GiB of RSS after twelve hours, against 124 GiB of RAM
+(`ps -eo pid,rss,etime,comm --sort=-rss` shows 84,271,372 KiB; `free -g` reports 3 GiB free
+and 5 GiB available). Nothing local compiles any more: `cargo check` is out of the question,
+so CI is the only compiler this loop has, and every judgement about code has to be written so
+that a reviewer can check it against a roll rather than against a local run. It also explains
+the worker lane: three `parallel-worker` runs on #516 each died at the 30-minute cap, and a
+cargo build next to an 84 GiB process plus a pi-lens workspace sweep is not a build, it is
+swapping. **The fix is a human action:** restart this pi session (or the harness's memory
+growth is a bug worth filing) before any further build-heavy delegation. Nothing in this
+buildout is blocked on it, but every slice that needs compiling is slower and less verifiable
+than it should be, and that is the difference between this session's merge rate and the last
+one's.
+
+**The second thing is small and will bite every release.** `compat/openapi/weftdb.json`
+publishes the server's own version as `info.version`, and the FRE-9a drift gate
+(`generated_spec_matches_committed_file`, `weft-server/src/openapi.rs:504`) compares the whole
+document against the committed file. So the 0.3.2 bump on #612 made three platform test jobs
+fail with "66 paths generated, 66 committed" — a message about route counts for a one-field
+version difference. Patched on that branch by hand (`2dfc7b9`), because a dictionary fix should
+not also change what a gate means. Filed as #620 with the two real options: exclude
+`info.version` from the drift comparison and assert it separately against
+`env!("CARGO_PKG_VERSION")`, or keep the gate strict and put "regenerate the spec" in the
+release checklist and accept that every version bump edits a 417 KB fixture that two
+version-bumping PRs will then conflict in. Whoever owns FRE-9a should pick; this loop
+deliberately did neither.

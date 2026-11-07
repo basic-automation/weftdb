@@ -19,7 +19,7 @@
 //! claim can point at it.
 
 use std::{
-	collections::BTreeMap, fmt, path::{Path, PathBuf}
+	collections::{BTreeMap, BTreeSet}, fmt, path::{Path, PathBuf}
 };
 
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,7 @@ use crate::{redaction, report::BenchReport, schema::BenchResult};
 /// to. The two lines are bumped independently — EVI-3's 23 landed here while the report was still
 /// v22, and EVI-8A's 23 landed on the report line — so equal numbers are a coincidence, not a
 /// lockstep rule.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 23;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 24;
 
 /// The environment variables a manifest records.
 ///
@@ -74,8 +74,10 @@ impl fmt::Display for Better {
 pub struct Measure {
 	/// Dotted metric name, e.g. `latency.p50_ns`.
 	pub name: String,
-	/// The adapter the number belongs to, so a multi-adapter run stays attributable.
+	/// The result identity: profile, adapter and workload together attribute the measure.
+	pub profile: String,
 	pub adapter: String,
+	pub workload: String,
 	/// The value. Booleans become `1.0` (pass) and `0.0` (fail).
 	pub value: f64,
 	/// Unit of [`Self::value`]: `ns`, `points_per_sec`, `bytes_per_point`, `value_units`, `flag`.
@@ -308,7 +310,7 @@ impl fmt::Display for ManifestError {
 		match self {
 			Self::Io { path, source } => write!(f, "cannot read manifest {}: {source}", path.display()),
 			Self::Parse { path, source } => write!(f, "{} is not a run manifest: {source}", path.display()),
-			Self::UnsupportedSchema { found, expected } => write!(f, "manifest schema v{found} cannot be verified by a build that writes v{expected}"),
+			Self::UnsupportedSchema { found, expected } => write!(f, "manifest schema v{found} was written by an older build; re-run the benchmark with a build that writes v{expected}"),
 		}
 	}
 }
@@ -340,8 +342,13 @@ pub enum Problem {
 	ReportMismatch(String),
 	/// A provenance field still holds something shaped like a credential.
 	CredentialInProvenance(&'static str),
-	/// A measure name is duplicated, so a comparison could not select one.
-	DuplicateMeasure(String),
+	/// A measure name is duplicated within one result, so a comparison could not select one.
+	DuplicateMeasure {
+		/// The measure name that appears more than once.
+		name: String,
+		/// The result identity: `{profile} / {adapter} / {workload}`.
+		result: String,
+	},
 	/// The binary records no source revision, so nothing here can be re-produced.
 	SourceUnrecorded,
 	/// The binary was compiled from a modified tree.
@@ -385,7 +392,7 @@ impl fmt::Display for Problem {
 			Self::ChecksumMismatch { path, expected, actual } => write!(f, "report {path} no longer matches the manifest: recorded sha256 {expected}, file is {actual}"),
 			Self::ReportMismatch(why) => write!(f, "report does not match the manifest: {why}"),
 			Self::CredentialInProvenance(field) => write!(f, "provenance field `{field}` still carries a credential shape"),
-			Self::DuplicateMeasure(name) => write!(f, "measure `{name}` appears more than once"),
+			Self::DuplicateMeasure { name, result } => write!(f, "measure `{name}` appears more than once within result `{result}`; each result must grade each metric name exactly once"),
 			Self::SourceUnrecorded => f.write_str("the measured binary records no source revision"),
 			Self::DirtySource => f.write_str("the measured binary was compiled from a modified working tree"),
 			Self::FewSamples { result, samples } => write!(f, "{result} rests on {samples} timed sample(s); a short test needs at least {MIN_REFERENCE_SAMPLES}"),
@@ -575,12 +582,22 @@ impl RunManifest {
 			problems.push(Problem::SourceUnreadable { path: self.sources.report.clone(), reason: "the recorded path is not usable on this host".to_string() });
 		}
 
-		let mut names: Vec<&str> = self.grade.measures.iter().map(|m| m.name.as_str()).collect();
-		let before = names.len();
-		names.sort_unstable();
-		names.dedup();
-		if names.len() != before {
-			problems.push(Problem::DuplicateMeasure("a measure name is repeated across adapters".to_string()));
+		// Group measures by result identity; a name may repeat across results but never within one.
+		let mut by_result: BTreeMap<(&str, &str, &str), Vec<&str>> = BTreeMap::new();
+		for measure in &self.grade.measures {
+			by_result.entry((measure.profile.as_str(), measure.adapter.as_str(), measure.workload.as_str())).or_default().push(measure.name.as_str());
+		}
+		for ((profile, adapter, workload), names) in by_result {
+			let mut seen: BTreeSet<&str> = BTreeSet::new();
+			let mut reported: BTreeSet<&str> = BTreeSet::new();
+			for name in names {
+				// The duplicated name is the thing an operator has to read to repair the report, so
+				// the problem carries it. Indexing the deduplicated list for a guess would panic
+				// whenever a name was actually dropped.
+				if !seen.insert(name) && reported.insert(name) {
+					problems.push(Problem::DuplicateMeasure { name: name.to_string(), result: format!("{profile} / {adapter} / {workload}") });
+				}
+			}
 		}
 
 		Verdict { problems }
@@ -692,24 +709,26 @@ pub fn result_measures(result: &BenchResult) -> Vec<Measure> {
 /// Append the measures of one result.
 fn push_result_measures(result: &BenchResult, measures: &mut Vec<Measure>) {
 	let adapter = result.adapter.as_str();
+	let profile = result.profile.as_str();
+	let workload = result.workload.as_str();
 	// Latency is a whole number of nanoseconds; f64 carries it exactly, so the cast is a
 	// representation change and not a rounding choice.
 	let as_f64 = |value: u64| crate::num::u64_to_f64(value);
-	measures.push(Measure { name: "latency.p50_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.p50_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
-	measures.push(Measure { name: "latency.mean_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.mean_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
-	measures.push(Measure { name: "latency.p95_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.p95_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
-	measures.push(Measure { name: "latency.p99_ns".to_string(), adapter: adapter.to_string(), value: as_f64(result.latency.p99_ns), unit: "ns".to_string(), better: Better::Lower, headline: false });
-	measures.push(Measure { name: "throughput.points_per_sec".to_string(), adapter: adapter.to_string(), value: result.throughput_points_per_sec, unit: "points_per_sec".to_string(), better: Better::Higher, headline: true });
+	measures.push(Measure { name: "latency.p50_ns".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: as_f64(result.latency.p50_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
+	measures.push(Measure { name: "latency.mean_ns".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: as_f64(result.latency.mean_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
+	measures.push(Measure { name: "latency.p95_ns".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: as_f64(result.latency.p95_ns), unit: "ns".to_string(), better: Better::Lower, headline: true });
+	measures.push(Measure { name: "latency.p99_ns".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: as_f64(result.latency.p99_ns), unit: "ns".to_string(), better: Better::Lower, headline: false });
+	measures.push(Measure { name: "throughput.points_per_sec".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: result.throughput_points_per_sec, unit: "points_per_sec".to_string(), better: Better::Higher, headline: true });
 	if let Some(storage) = &result.storage {
-		measures.push(Measure { name: "storage.bytes_per_point".to_string(), adapter: adapter.to_string(), value: storage.bytes_per_point, unit: "bytes_per_point".to_string(), better: Better::Lower, headline: true });
-		measures.push(Measure { name: "storage.total_bytes_per_point".to_string(), adapter: adapter.to_string(), value: storage.total_bytes_per_point, unit: "bytes_per_point".to_string(), better: Better::Lower, headline: false });
+		measures.push(Measure { name: "storage.bytes_per_point".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: storage.bytes_per_point, unit: "bytes_per_point".to_string(), better: Better::Lower, headline: true });
+		measures.push(Measure { name: "storage.total_bytes_per_point".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: storage.total_bytes_per_point, unit: "bytes_per_point".to_string(), better: Better::Lower, headline: false });
 	}
 	if let Some(accuracy) = &result.accuracy {
-		measures.push(Measure { name: "accuracy.rmse".to_string(), adapter: adapter.to_string(), value: accuracy.rmse, unit: "value_units".to_string(), better: Better::Lower, headline: true });
-		measures.push(Measure { name: "accuracy.mae".to_string(), adapter: adapter.to_string(), value: accuracy.mae, unit: "value_units".to_string(), better: Better::Lower, headline: false });
-		measures.push(Measure { name: "accuracy.max_abs_error".to_string(), adapter: adapter.to_string(), value: accuracy.max_abs_error, unit: "value_units".to_string(), better: Better::Lower, headline: false });
+		measures.push(Measure { name: "accuracy.rmse".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: accuracy.rmse, unit: "value_units".to_string(), better: Better::Lower, headline: true });
+		measures.push(Measure { name: "accuracy.mae".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: accuracy.mae, unit: "value_units".to_string(), better: Better::Lower, headline: false });
+		measures.push(Measure { name: "accuracy.max_abs_error".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: accuracy.max_abs_error, unit: "value_units".to_string(), better: Better::Lower, headline: false });
 	}
-	measures.push(Measure { name: "correctness.passed".to_string(), adapter: adapter.to_string(), value: if result.correctness.passed() { 1.0 } else { 0.0 }, unit: "flag".to_string(), better: Better::Pass, headline: false });
+	measures.push(Measure { name: "correctness.passed".to_string(), profile: profile.to_string(), adapter: adapter.to_string(), workload: workload.to_string(), value: if result.correctness.passed() { 1.0 } else { 0.0 }, unit: "flag".to_string(), better: Better::Pass, headline: false });
 }
 
 /// The run id of the manifest file at `path`: the SHA-256 of its exact bytes, lower-case hex.
@@ -876,12 +895,17 @@ mod tests {
 	fn a_manifest_of_another_schema_version_is_refused_not_guessed() {
 		let (_report, _report_path, manifest_path) = captured("schema", &[], None);
 		let text = std::fs::read_to_string(&manifest_path).expect("reads");
-		let downgraded = text.replacen(&format!("\"schema_version\": {MANIFEST_SCHEMA_VERSION}"), "\"schema_version\": 22", 1);
-		assert_ne!(downgraded, text, "the fixture must actually carry the current version");
-		std::fs::write(&manifest_path, downgraded).expect("writes");
-		match RunManifest::read(&manifest_path) {
-			Err(ManifestError::UnsupportedSchema { found: 22, expected }) => assert_eq!(expected, MANIFEST_SCHEMA_VERSION),
-			other => panic!("expected an unsupported-schema refusal, got {other:?}"),
+		for old_version in [22u32, 23u32] {
+			let downgraded = text.replacen(&format!("\"schema_version\": {MANIFEST_SCHEMA_VERSION}"), &format!("\"schema_version\": {old_version}"), 1);
+			assert_ne!(downgraded, text, "the fixture must actually carry the current version");
+			std::fs::write(&manifest_path, downgraded).expect("writes");
+			match RunManifest::read(&manifest_path) {
+				Err(ManifestError::UnsupportedSchema { found, expected }) => {
+					assert_eq!(found, old_version);
+					assert_eq!(expected, MANIFEST_SCHEMA_VERSION);
+				}
+				other => panic!("expected an unsupported-schema refusal for v{old_version}, got {other:?}"),
+			}
 		}
 	}
 
@@ -976,5 +1000,39 @@ mod tests {
 		let resolved = manifest.report_path(Path::new("/nowhere/run.manifest.json")).expect("resolves");
 		let home = std::env::var_os("HOME").map(|home| PathBuf::from(home.to_string_lossy().into_owned()).join("reports/run.json"));
 		assert_eq!(resolved, home.unwrap_or_else(|| PathBuf::from("reports/run.json")), "the `~` prefix must expand to the home directory");
+	}
+
+	#[test]
+	fn a_multi_result_report_verifies_with_cross_result_name_reuse() {
+		let dir = temp_dir("multi");
+		let result1 = sample_result("weftdb", true);
+		let mut result2 = sample_result("weftdb", true);
+		result2.profile = "mcar-medium".to_string();
+		result2.workload = "downsample".to_string();
+		let metadata = sample_report().metadata;
+		let report = BenchReport::with_results(metadata, vec![result1, result2]);
+		let report_path = dir.join("multi.json");
+		report.write_json(&report_path).expect("report writes");
+		let manifest = RunManifest::capture(&report, &report_path, &["weft-bench".to_string()], &[], None).expect("capture");
+		let manifest_path = dir.join("multi.manifest.json");
+		manifest.write_to(&manifest_path).expect("a multi-result manifest with cross-result name reuse must verify");
+		let verdict = RunManifest::read(&manifest_path).expect("reads").verify(&manifest_path);
+		assert!(verdict.defects().is_empty(), "a multi-result manifest with cross-result name reuse must have no defects: {:?}", verdict.problems);
+	}
+
+	#[test]
+	fn a_name_repeated_within_one_result_is_still_a_defect() {
+		let dir = temp_dir("intra-dup");
+		let report = sample_report();
+		let report_path = dir.join("run.json");
+		report.write_json(&report_path).expect("report writes");
+		let mut manifest = RunManifest::capture(&report, &report_path, &["weft-bench".to_string()], &[], None).expect("capture");
+		let duplicate = manifest.grade.measures[0].clone();
+		manifest.grade.measures.push(duplicate);
+		let manifest_path = dir.join("run.manifest.json");
+		let error = manifest.write_to(&manifest_path).expect_err("a duplicate within one result must be refused");
+		let msg = error.to_string();
+		assert!(msg.contains("latency.p50_ns"), "error must name the duplicated metric: {msg}");
+		assert!(msg.contains("interpolation-heavy-irregular / weftdb / upsample_interpolate"), "error must name the result identity: {msg}");
 	}
 }
