@@ -501,61 +501,150 @@ RUN_LOG="$WORK/run.out"
 # /var/lib — and what the gate asks, whether the sandbox leaves the server somewhere to work, is
 # unchanged by the plumbing.
 STATE_BIND="BindPaths=$STATE $STATE"
+# Which manager hosts the transient unit is not a detail the unit can control. The identical
+# property list that starts cleanly under this host's systemd 262 user manager ends
+# `Failed to drop capabilities: Operation not permitted`, `status=218/CAPABILITIES`, with an empty
+# child log under the ubuntu-24.04 runner's user manager: an unprivileged manager has to build the
+# unit's sandbox with fewer privileges than the unit assumes, and the first thing it cannot do is the
+# capability drop that the rest of the restrictions sit on top of. That is a fact about the machine,
+# not about `weft-server.service`, so the gate uses the stronger manager when one is reachable and
+# names in its verdict which one ran the server: a pass from a user manager and a pass from the
+# system manager are different claims, and the message must not let a reader trade them.
+SUDO_ON=0
+if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then SUDO_ON=1; fi
+# `systemctl` against the manager named first: the caller's own manager, or PID 1's, which is where an
+# operator actually installs this unit.
+ctl() {
+	local mgr=$1
+	shift
+	if [[ $mgr == system ]]; then
+		sudo -n systemctl "$@"
+	else
+		systemctl --user "$@"
+	fi
+}
 # Reads back everything the transient unit's process wrote, which is the only account of a run that
 # failed before or during exec.
-unit_log() { journalctl --user --no-pager -u "$SCOPE" 2>/dev/null; }
-if ! systemctl --user is-active --quiet "user@$(id -u).service" 2>/dev/null &&
-	! systemctl --user show-environment >/dev/null 2>&1; then
+unit_log() {
+	local mgr=$1
+	if [[ $mgr == system ]]; then
+		sudo -n journalctl --no-pager -u "$SCOPE" 2>/dev/null
+	else
+		journalctl --user --no-pager -u "$SCOPE" 2>/dev/null
+	fi
+}
+# Submits the transient unit with the property list read off the installed unit, under one manager.
+submit() {
+	local mgr=$1
+	local -a run=()
+	if [[ $mgr == system ]]; then
+		run=(sudo -n systemd-run --quiet)
+	else
+		run=(systemd-run --user --quiet)
+	fi
+	"${run[@]}" --unit "$SCOPE" --collect \
+		"${ENV_ARGS[@]}" "${PROPS[@]}" --property="$STATE_BIND" \
+		--setenv=WEFT_SERVER_ADDR="127.0.0.1:0" \
+		--setenv=WEFT_GPU_CALIBRATE=0 \
+		--setenv=TMPDIR="$STATE/tmp" \
+		--working-directory="$STATE" \
+		"$BIN" serve >"$RUN_LOG" 2>&1
+}
+# A start that died in one of systemd's own setup steps — 200 CHDIR, 203 EXEC, 218 CAPABILITIES,
+# 226 NAMESPACE, the 2xx band — never reached the server, so the failure belongs to the manager and
+# trying a manager with more privileges is legitimate. Any other failure is the server's own
+# behaviour, and retrying that somewhere privileged is precisely how a real defect gets buried.
+preexec_step() {
+	local mgr=$1 code status
+	code=$(ctl "$mgr" show "$SCOPE" -p ExecMainCode --value 2>/dev/null)
+	status=$(ctl "$mgr" show "$SCOPE" -p ExecMainStatus --value 2>/dev/null)
+	if [[ $code == exited && $status =~ ^2[0-4][0-9]$ ]]; then printf 'status=%s' "$status"; fi
+}
+wait_up() {
+	local mgr=$1 _
+	for _ in $(seq 1 160); do
+		unit_log "$mgr" | grep -q "listening on http://" && return 0
+		ctl "$mgr" is-active --quiet "$SCOPE" || return 1
+		sleep 0.25
+	done
+	return 1
+}
+MANAGER=
+if systemctl --user is-active --quiet "user@$(id -u).service" 2>/dev/null ||
+	systemctl --user show-environment >/dev/null 2>&1; then
+	MANAGER=user
+elif ((SUDO_ON)) && sudo -n systemctl is-system-running >/dev/null 2>&1; then
+	MANAGER=system
+else
 	skip "no reachable user systemd manager, so the unit's hardening has never been loaded by anything"
-elif ! systemd-run --user --quiet --unit "$SCOPE" --collect \
-	"${ENV_ARGS[@]}" "${PROPS[@]}" --property="$STATE_BIND" \
-	--setenv=WEFT_SERVER_ADDR="127.0.0.1:0" \
-	--setenv=WEFT_GPU_CALIBRATE=0 \
-	--setenv=TMPDIR="$STATE/tmp" \
-	--working-directory="$STATE" \
-	"$BIN" serve >"$RUN_LOG" 2>&1; then
-	# Quote systemd's own account, not just the child's. A start that fails before the exec step —
-	# sandbox or namespace setup — writes nothing to the run log and puts the reason in the journal,
-	# which is how this gate first failed on a runner: an empty log and no clue. `226/NAMESPACE` and
-	# `status=1/FAILURE` need different fixes, so the failure text has to say which one happened.
-	blame=$(unit_log | tail -12)
-	[[ -n $blame ]] || blame=$(systemctl --user --no-pager show "$SCOPE" \
-		-p Result -p ExecMainCode -p ExecMainStatus -p ActiveState -p SubState 2>&1)
-	systemctl --user stop "$SCOPE" >/dev/null 2>&1 || true
-	fail "the server would not start under the unit's own hardening.
+fi
+
+if [[ -n $MANAGER ]]; then
+	verdict=
+	step=
+	if submit "$MANAGER"; then
+		if wait_up "$MANAGER"; then verdict=ok; else verdict=not-listening; fi
+	else
+		verdict=submit-failed
+		step=$(preexec_step "$MANAGER")
+	fi
+	if [[ $verdict == submit-failed && -n $step ]] && ((SUDO_ON)) && [[ $MANAGER == user ]] &&
+		sudo -n systemctl is-system-running >/dev/null 2>&1; then
+		ctl user stop "$SCOPE" >/dev/null 2>&1 || true
+		MANAGER=system
+		step=
+		if submit system; then
+			if wait_up system; then verdict=ok; else verdict=not-listening; fi
+		else
+			verdict=submit-failed
+			step=$(preexec_step system)
+		fi
+	fi
+	case $verdict in
+	ok) ;;
+	submit-failed)
+		# Quote systemd's own account, not just the child's. A start that fails before the exec step —
+		# sandbox or namespace setup — writes nothing to the run log and puts the reason in the journal,
+		# which is how this gate first failed on a runner: an empty log and no clue. `226/NAMESPACE` and
+		# `status=1/FAILURE` need different fixes, so the failure text has to say which one happened.
+		blame=$(unit_log "$MANAGER" | tail -12)
+		[[ -n $blame ]] || blame="the $MANAGER journal holds nothing for $SCOPE; systemd-run said:
+$(tail -25 "$RUN_LOG")"
+		ctl "$MANAGER" stop "$SCOPE" >/dev/null 2>&1 || true
+		extra=
+		if [[ -n $step ]]; then
+			extra="
+It failed inside systemd's own setup ($step), before the server was exec'd: that is usually the
+$MANAGER manager missing a privilege rather than the unit being wrong. Rerun this script where the
+system manager is reachable (sudo -n $SCRIPT_NAME --bin …), or on the deployment host, for the
+stronger test."
+		fi
+		fail "the server would not start under the unit's own hardening (systemd manager: $MANAGER).$extra
 systemd-run's own output (empty when systemd fails before it execs the binary):
 $(tail -25 "$RUN_LOG")
 systemd's account of the start:
 $blame"
-else
-	up=0
-	for _ in $(seq 1 160); do
-		unit_log | grep -q "listening on http://" && {
-			up=1
-			break
-		}
-		systemctl --user is-active --quiet "$SCOPE" || break
-		sleep 0.25
-	done
-	if ((up == 0)); then
-		blame=$(unit_log | tail -25)
-		[[ -n $blame ]] || blame="the user journal holds nothing for $SCOPE; systemd-run said:
+		;;
+	not-listening)
+		blame=$(unit_log "$MANAGER" | tail -25)
+		[[ -n $blame ]] || blame="the $MANAGER journal holds nothing for $SCOPE; systemd-run said:
 $(tail -5 "$RUN_LOG")"
-		systemctl --user stop "$SCOPE" >/dev/null 2>&1 || true
-		fail "the server never reached its listening line under the unit's hardening:
+		ctl "$MANAGER" stop "$SCOPE" >/dev/null 2>&1 || true
+		fail "the server never reached its listening line under the unit's hardening (systemd manager: $MANAGER):
 $blame"
-	fi
+		;;
+	esac
 	# `systemctl stop` sends the unit's KillSignal — SIGTERM here — and waits. A clean stop is the
 	# whole claim of `TimeoutStopSec=90` and the graceful-shutdown path behind it.
 	stop_rc=0
-	systemctl --user stop "$SCOPE" || stop_rc=$?
+	ctl "$MANAGER" stop "$SCOPE" || stop_rc=$?
 	if ((stop_rc != 0)); then
 		fail "stopping the scope exited $stop_rc: SIGTERM did not take the server down inside the unit's own timeout"
 	fi
-	unit_log | grep -qE "shutdown|stopped|listening on" ||
+	unit_log "$MANAGER" | grep -qE "shutdown|stopped|listening on" ||
 		fail "the journal holds nothing about the run:
-$(unit_log | tail -25)"
-	pass "$HARDEN_COUNT hardening properties from the unit ran the real server and stopped it with SIGTERM"
+$(unit_log "$MANAGER" | tail -25)"
+	pass "$HARDEN_COUNT hardening properties from the unit ran the real server under the $MANAGER systemd manager and stopped it with SIGTERM"
 fi
 
 echo
