@@ -486,7 +486,7 @@ mod tests {
 	fn create_run(steps: u64, oracle: Option<OracleVerdict>, derived: Option<DerivedReadVerdict>, backup: Option<BackupLaneVerdict>) -> SoakRun {
 		let config = SoakConfig::new("test".to_string(), "test profile".to_string(), 7, 60).expect("valid test config");
 		let metadata = RunMetadata::capture("2026-10-25T00:00:00+00:00".to_string());
-		SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Finished, steps, oracle, derived, backup, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None }
+		SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Finished, steps, oracle, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None, derived, backup }
 	}
 
 	/// Create a SoakReport from raw parameters.
@@ -635,7 +635,7 @@ mod tests {
 		let curr = create_report(&run);
 
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
-		assert_eq!(comp.schema_mismatch, Some((42u32, 1u32)), "schema mismatch must be reported");
+		assert_eq!(comp.schema_mismatch, Some((42 as u32, 1 as u32)), "schema mismatch must be reported");
 		// Metric drifts should be empty when schema mismatches
 		assert!(comp.metric_drifts.is_empty(), "no metric drifts when schema versions differ");
 		// Rule changes should still be reported
