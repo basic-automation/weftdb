@@ -5369,3 +5369,34 @@ before invoking it, so a missing file and an unresolvable argument cannot produc
 generalisation is the point: PAC-11 was ticked on `main` (8c5fea9, #611) while gates 4, 5 and 6
 were each in turn the wall, and it should be closed again, if at all, on the evidence of a roll
 that printed all seven `ok:` lines — not on the evidence that a packaging branch exists.
+
+## 2026-11-07 — SOA-15: the nightly soak gate waits for a soak that produces evidence (#323)
+
+**Context:** SOA-15 ("nightly soak comparison gate with drift annotations", #323) was built
+as a scheduled workflow plus a comparison function over `SoakReport`. Reviewing the lane
+(PR #616) showed the driver it schedules cannot yet produce the document it grades.
+`weft-bench/src/main.rs`'s `run_soak` steps an in-process harness with no pacing, ignores
+`--window-ticks`, and calls `SoakReport::evaluate(..., Vec::new() /* hook_windows */, ticks,
+ticks * 4 /* progress_new_sealed */, 1,1,1,1)`: zero hook windows make `check_coverage`
+report `InsufficientCoverage`, which `compute_overall_outcome` turns into `Outcome::Fail`, so
+the first nightly is red; and `ticks * 4` is not a measurement, so R7 passes on a figure the
+driver invented. The gap is upstream of the workflow — `SoakHarness::record_step` counts
+steps, and nothing in the tree produces an `OracleVerdict`, a `DerivedReadVerdict`, a
+`BackupLaneVerdict` or hook windows from a live run, because SOA-4's workload, SOA-6's oracle
+and SOA-12's backup lane are still open. `SoakReport::evaluate` has exactly one non-test
+caller: this new driver.
+
+**Chosen:** land the comparison half and schedule nothing. `soak_compare.rs`, its unit tests
+and the `soak-compare <PREVIOUS> <CURRENT>` subcommand are real, testable and independent of
+whether a soak driver exists; they are also the part that is expensive to rewrite later, and
+`compare_soak` already annotates `PassToFail` and exits non-zero. The nightly schedule is
+deferred to the slice that lands a driver emitting the evidence R1–R8 consume, and #323 stays
+open with that reason stated on it. The ROADMAP line for SOA-15 is left unticked rather than
+half-ticked.
+
+**Rejected:** scheduling the nightly as written, which buys a job that is either red on a real
+gap or green on an invented number — both teach people to ignore the nightly, and the second
+is the failure mode this project keeps hitting ("soak runs are honest before they are long",
+B10). Also rejected: filling `hook_windows`/`progress_new_sealed` with plausible values to get
+a green first run, and narrowing R6/R7's coverage floors so the skeleton passes them; either
+would move the dishonesty from the driver into the rubric.
