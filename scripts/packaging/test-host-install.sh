@@ -32,7 +32,9 @@
 #   6.  systemd's own readers accept the installed files: `systemd-analyze verify` on the unit,
 #       `systemd-sysusers` and `systemd-tmpfiles` on the conf files, with their stderr inspected
 #       because all three are happy to skip a line they do not understand and exit 0 anyway.
-#       Skipped, loudly, where systemd is not installed.
+#       Verify resolves the unit by name and builds a real transaction, so the two essential
+#       targets an install prefix cannot carry are the only complaint not counted against the
+#       unit. Skipped, loudly, where systemd is not installed.
 #   7.  the hardening in the unit actually runs the server: the properties are read out of the
 #       installed unit — not copied into this script, so the test cannot drift from the file it
 #       tests — and applied to the real binary under a transient systemd scope. The server must
@@ -329,12 +331,10 @@ fi
 
 # Gate 6: systemd's own readers accept the installed files.
 if command -v systemd-analyze >/dev/null 2>&1; then
-	# The unit is named by its path *inside* the destination root, with the leading slash kept:
-	# `--root` resolves an absolute path against the root, while a slash-bearing relative path is
-	# resolved against the current directory and never found there. On ubuntu-latest the relative
-	# form made verify answer "Unit weft-server.service not found" for a unit gate 1 had just
-	# confirmed on disk, which is a gate that cannot tell an installed unit from a missing one.
-	# Asserting the file first keeps the two failure modes apart.
+	# The unit is looked up by name, so first assert the installed bytes exist: that keeps "nothing
+	# was installed" apart from "systemd dislikes what was installed", which the first version of
+	# this gate conflated when it answered "Unit weft-server.service not found" for a unit gate 1
+	# had just confirmed on disk.
 	UNIT_IN_ROOT="$PREFIX/lib/systemd/system/weft-server.service"
 	[[ -f "$DEST$UNIT_IN_ROOT" ]] ||
 		fail "the installed tree carries no unit at $DEST$UNIT_IN_ROOT, so systemd has nothing to read:
@@ -350,11 +350,32 @@ $(find "$DEST" -name '*.service' -printf '  %p\n' 2>/dev/null || true)"
 	cp "$DEST$UNIT_IN_ROOT" "$UNIT_SEARCH_DIR/weft-server.service"
 	cmp -s "$DEST$UNIT_IN_ROOT" "$UNIT_SEARCH_DIR/weft-server.service" ||
 		fail "staging the unit for verification altered it: $DEST$UNIT_IN_ROOT and its copy in $UNIT_SEARCH_DIR differ"
+	# What remains is that an installed tree carries no essential targets. systemd injects
+	# `Requires=sysinit.target` into every service, and `verify --root` builds the real transaction,
+	# so on the runner's systemd (255) it answers
+	# "weft-server.service: Failed to create weft-server.service/start: Unit sysinit.target not
+	# found." An install prefix is not a bootable system and must not carry sysinit.target, so that
+	# line is a property of verifying a partial tree, not of the unit. The host running this gate
+	# (systemd 262) returns 0 for the same bytes, so the gate cannot simply require exit 0: it would
+	# pass here and fail there for reasons nothing to do with WeftDB controls.
+	#
+	# So tolerate precisely those two lines and fail on anything else. The allowance names the
+	# essential targets by name rather than matching "not found" generally, because a unit that
+	# `Wants=`s or `Requires=`s some other missing unit is a real defect this gate must keep
+	# catching, and `SYSTEMD_RELAX_ESSENTIALS` is not an option: no such string exists in this
+	# host's systemd-analyze, libsystemd-shared, or libsystemd-core, and adding an environment
+	# variable on the assumption a different version honours it would change the gate's meaning on
+	# some runners without proving anything on any of them.
 	verify_out=$(systemd-analyze verify --root "$DEST" weft-server.service 2>&1) && verify_rc=0 || verify_rc=$?
-	[[ $verify_rc -eq 0 ]] ||
-		fail "systemd-analyze verify rejected the installed unit (verified as weft-server.service under --root $DEST, staged from $DEST$UNIT_IN_ROOT into $UNIT_SEARCH_DIR; exit $verify_rc):
+	verify_blame=$(grep -vE 'Unit (sysinit|basic)\.target not found' <<<"$verify_out" | sed 's/^[[:space:]]*//')
+	if [[ $verify_rc -ne 0 && -z $verify_blame ]]; then
+		pass "systemd-analyze verify finds no fault in the installed unit beyond the essential targets an install prefix cannot carry"
+	elif [[ -n $verify_blame ]]; then
+		fail "systemd-analyze verify rejected the installed unit (verified as weft-server.service under --root $DEST, staged from $DEST$UNIT_IN_ROOT into $UNIT_SEARCH_DIR; exit $verify_rc; a missing sysinit.target or basic.target alone is not counted against the unit):
 $verify_out"
-	pass "systemd-analyze verify is silent about the installed unit"
+	else
+		pass "systemd-analyze verify is silent about the installed unit"
+	fi
 else
 	skip "systemd-analyze is not installed here, so nothing has ever parsed the unit file"
 fi
