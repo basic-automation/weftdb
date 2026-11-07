@@ -329,10 +329,19 @@ fi
 
 # Gate 6: systemd's own readers accept the installed files.
 if command -v systemd-analyze >/dev/null 2>&1; then
-	verify_out=$(systemd-analyze verify --root "$DEST" \
-		"${PREFIX#/}/lib/systemd/system/weft-server.service" 2>&1) && verify_rc=0 || verify_rc=$?
+	# The unit is named by its path *inside* the destination root, with the leading slash kept:
+	# `--root` resolves an absolute path against the root, while a slash-bearing relative path is
+	# resolved against the current directory and never found there. On ubuntu-latest the relative
+	# form made verify answer "Unit weft-server.service not found" for a unit gate 1 had just
+	# confirmed on disk, which is a gate that cannot tell an installed unit from a missing one.
+	# Asserting the file first keeps the two failure modes apart.
+	UNIT_IN_ROOT="$PREFIX/lib/systemd/system/weft-server.service"
+	[[ -f "$DEST$UNIT_IN_ROOT" ]] ||
+		fail "the installed tree carries no unit at $DEST$UNIT_IN_ROOT, so systemd has nothing to read:
+$(find "$DEST" -name '*.service' -printf '  %p\n' 2>/dev/null || true)"
+	verify_out=$(systemd-analyze verify --root "$DEST" "$UNIT_IN_ROOT" 2>&1) && verify_rc=0 || verify_rc=$?
 	[[ $verify_rc -eq 0 ]] ||
-		fail "systemd-analyze verify rejected the installed unit (exit $verify_rc):
+		fail "systemd-analyze verify rejected the installed unit $UNIT_IN_ROOT under --root $DEST (exit $verify_rc):
 $verify_out"
 	pass "systemd-analyze verify is silent about the installed unit"
 else
