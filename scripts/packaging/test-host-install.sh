@@ -339,9 +339,20 @@ if command -v systemd-analyze >/dev/null 2>&1; then
 	[[ -f "$DEST$UNIT_IN_ROOT" ]] ||
 		fail "the installed tree carries no unit at $DEST$UNIT_IN_ROOT, so systemd has nothing to read:
 $(find "$DEST" -name '*.service' -printf '  %p\n' 2>/dev/null || true)"
-	verify_out=$(systemd-analyze verify --root "$DEST" "$UNIT_IN_ROOT" 2>&1) && verify_rc=0 || verify_rc=$?
+	# `systemd-analyze verify --root R` does not read a unit from a path: it looks the name up in
+	# R's own search paths (R/usr/lib/systemd/system, R/etc/systemd/system), and a prefix install
+	# lives in neither. ubuntu-latest said "Unit weft-server.service not found." for
+	# $DEST/opt/weftdb/lib/systemd/system/weft-server.service with the file plainly present.
+	# So stage the installed bytes where systemd looks, verify the name, and prove the staged copy
+	# is the installed file rather than some sibling that happens to parse.
+	UNIT_SEARCH_DIR="$DEST/usr/lib/systemd/system"
+	mkdir -p "$UNIT_SEARCH_DIR"
+	cp "$DEST$UNIT_IN_ROOT" "$UNIT_SEARCH_DIR/weft-server.service"
+	cmp -s "$DEST$UNIT_IN_ROOT" "$UNIT_SEARCH_DIR/weft-server.service" ||
+		fail "staging the unit for verification altered it: $DEST$UNIT_IN_ROOT and its copy in $UNIT_SEARCH_DIR differ"
+	verify_out=$(systemd-analyze verify --root "$DEST" weft-server.service 2>&1) && verify_rc=0 || verify_rc=$?
 	[[ $verify_rc -eq 0 ]] ||
-		fail "systemd-analyze verify rejected the installed unit $UNIT_IN_ROOT under --root $DEST (exit $verify_rc):
+		fail "systemd-analyze verify rejected the installed unit (verified as weft-server.service under --root $DEST, staged from $DEST$UNIT_IN_ROOT into $UNIT_SEARCH_DIR; exit $verify_rc):
 $verify_out"
 	pass "systemd-analyze verify is silent about the installed unit"
 else
