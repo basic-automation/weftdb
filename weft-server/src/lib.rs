@@ -91,6 +91,13 @@ pub mod redact;
 /// It puts a backup back on disk as a store root while nothing serves it. A library module for the same reason as
 /// [`import_rows_mode`]: its parsing, its report and the exit code it refuses with are
 /// testable.
+/// FRE-9a: OpenAPI 3.1 document generated from the route registry.
+///
+/// The document is built from the same route table the router serves. Adding a
+/// route changes the generated document; a test asserts the committed spec matches
+/// it (the drift gate). The CLI subcommand `weft-server openapi` emits it.
+/// FRE-9b (W11) publishes and extends the document.
+pub mod openapi;
 pub mod restore;
 pub mod routes;
 /// ROB-11's runtime builder: the explicit tokio runtime the binary
