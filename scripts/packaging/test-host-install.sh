@@ -412,6 +412,15 @@ fi
 # The properties come out of the installed unit file rather than being repeated here, because a
 # test carrying its own copy of the hardening list passes when the unit loses an entry — which is
 # the drift this script exists to prevent.
+# `journalctl` is required, not optional, and for a reason that broke this gate once already: the
+# child of `systemd-run` is a *service*, so its standard output goes to the journal and the file this
+# script redirects only ever holds systemd-run's own words. A gate that polls that redirected file for
+# the listening line can never see it, however healthy the server is. The journal is what an operator
+# reads, so it is what the gate reads.
+if ! command -v journalctl >/dev/null 2>&1; then
+	skip "no journalctl, so nothing can read back what a transient unit's server printed"
+fi
+mkdir -p "$STATE/store" "$STATE/tmp"
 declare -a ENV_ARGS=()
 while read -r line; do
 	name=${line%%=*}
@@ -425,13 +434,37 @@ while read -r line; do
 	ENV_ARGS+=("--setenv=$name=$value")
 done < <(sed -n 's|^Environment=||p' "$INSTALLED_UNIT")
 
+# The state directory the unit asks systemd to create, read off the unit itself: `StateDirectory=w`
+# means /var/lib/w, and that is the root `ReadWritePaths=` then names. A leading `-` (ignore
+# failures) or `+` (persistent) is a flag on the directory, not part of its name.
+unit_state=/var/lib/$(sed -n 's|^StateDirectory=||p' "$INSTALLED_UNIT" | head -1 | sed -E 's/^[-+]//; s/[[:space:]].*$//')
 declare -a PROPS=()
 while read -r line; do
 	key=${line%%=*}
+	value=${line#*=}
 	case $key in
-	# A transient scope has no restart policy to honour, and `Environment=`/`ExecStart` are handled
+	# A transient service has no restart policy to honour, and `Environment=`/`ExecStart` are handled
 	# above; everything else in [Service] is a security or lifetime property and is copied as-is.
 	Restart | RestartSec | Environment | EnvironmentFile | ExecStart | WorkingDirectory) continue ;;
+	# `ReadWritePaths=` names the deployment's state directory, which this gate neither owns nor
+	# creates — `User=`, `Group=` and `StateDirectory=` are dropped below for the same reason. It
+	# cannot simply be dropped though: with `ProtectSystem=strict` in force systemd builds the mount
+	# namespace *before* it execs anything, and a read-write path that does not exist fails the start
+	# outright. Measured on this host with the unit's own list: `(true)[…]: Failed to set up mount
+	# namespacing: /var/lib/weftdb: No such file or directory`, `Failed at step NAMESPACE spawning`,
+	# `status=226/NAMESPACE`. The path is where a deployment keeps its state, not a hardening choice,
+	# so it is redirected into the scratch tree — the property, and what strict then means for
+	# everything else in the hierarchy, stay under test.
+	ReadWritePaths)
+		redirected=
+		for path in $value; do
+			case $path in
+			"$unit_state"*) path=$STATE ;;
+			esac
+			redirected+="$path "
+		done
+		line="ReadWritePaths=${redirected% }"
+		;;
 	esac
 	PROPS+=("--property=$line")
 done < <(awk '/^\[Service\]/{inside=1;next} /^\[/{inside=0} inside && /^[A-Z][A-Za-z]+=/' "$INSTALLED_UNIT")
@@ -451,22 +484,53 @@ readonly HARDEN_COUNT=${#PROPS[@]}
 
 SCOPE=weft-host-install-$$
 RUN_LOG="$WORK/run.out"
+# `PrivateTmp=yes` under `ProtectSystem=strict` leaves the process no writable temporary directory
+# of its own, and the store wants one: the unit's own comment records the rootless measurement where
+# opening a store failed at migration 0001_baseline with `segment_index transaction failed with an
+# error before COMMIT: BEGIN CONCURRENT: I/O error (tempdir): read-only filesystem or storage
+# medium`, and names `Environment=TMPDIR=` inside `ReadWritePaths=` as the operator's answer. This
+# gate takes that answer instead of switching the hardening off, so the property list under test is
+# the one an operator ships.
+# The scratch tree lives under $TMPDIR, which the sandbox hides: `PrivateTmp=yes` replaces /tmp and
+# /var/tmp with a fresh tmpfs before `WorkingDirectory=` and `ReadWritePaths=` are resolved, and
+# `ProtectHome=yes` masks /home, /root and /run/user — measured here, a scratch directory in either
+# place fails with `Failed at step CHDIR … No such file or directory` and `status=200/CHDIR`, again
+# with an empty child log. Neither property is negotiable (they are the point of the gate) and no
+# portable machine has a /var/lib/weftdb this user owns, so the scratch directory is bound into the
+# namespace instead. A deployment needs no such line — its state directory is a real one under
+# /var/lib — and what the gate asks, whether the sandbox leaves the server somewhere to work, is
+# unchanged by the plumbing.
+STATE_BIND="BindPaths=$STATE $STATE"
+# Reads back everything the transient unit's process wrote, which is the only account of a run that
+# failed before or during exec.
+unit_log() { journalctl --user --no-pager -u "$SCOPE" 2>/dev/null; }
 if ! systemctl --user is-active --quiet "user@$(id -u).service" 2>/dev/null &&
 	! systemctl --user show-environment >/dev/null 2>&1; then
 	skip "no reachable user systemd manager, so the unit's hardening has never been loaded by anything"
 elif ! systemd-run --user --quiet --unit "$SCOPE" --collect \
-	"${ENV_ARGS[@]}" "${PROPS[@]}" \
+	"${ENV_ARGS[@]}" "${PROPS[@]}" --property="$STATE_BIND" \
 	--setenv=WEFT_SERVER_ADDR="127.0.0.1:0" \
 	--setenv=WEFT_GPU_CALIBRATE=0 \
+	--setenv=TMPDIR="$STATE/tmp" \
 	--working-directory="$STATE" \
 	"$BIN" serve >"$RUN_LOG" 2>&1; then
+	# Quote systemd's own account, not just the child's. A start that fails before the exec step —
+	# sandbox or namespace setup — writes nothing to the run log and puts the reason in the journal,
+	# which is how this gate first failed on a runner: an empty log and no clue. `226/NAMESPACE` and
+	# `status=1/FAILURE` need different fixes, so the failure text has to say which one happened.
+	blame=$(unit_log | tail -12)
+	[[ -n $blame ]] || blame=$(systemctl --user --no-pager show "$SCOPE" \
+		-p Result -p ExecMainCode -p ExecMainStatus -p ActiveState -p SubState 2>&1)
 	systemctl --user stop "$SCOPE" >/dev/null 2>&1 || true
-	fail "the server would not start under the unit's own hardening:
-$(tail -25 "$RUN_LOG")"
+	fail "the server would not start under the unit's own hardening.
+systemd-run's own output (empty when systemd fails before it execs the binary):
+$(tail -25 "$RUN_LOG")
+systemd's account of the start:
+$blame"
 else
 	up=0
-	for _ in $(seq 1 40); do
-		grep -q "listening on http://" "$RUN_LOG" && {
+	for _ in $(seq 1 160); do
+		unit_log | grep -q "listening on http://" && {
 			up=1
 			break
 		}
@@ -474,9 +538,12 @@ else
 		sleep 0.25
 	done
 	if ((up == 0)); then
+		blame=$(unit_log | tail -25)
+		[[ -n $blame ]] || blame="the user journal holds nothing for $SCOPE; systemd-run said:
+$(tail -5 "$RUN_LOG")"
 		systemctl --user stop "$SCOPE" >/dev/null 2>&1 || true
 		fail "the server never reached its listening line under the unit's hardening:
-$(tail -25 "$RUN_LOG")"
+$blame"
 	fi
 	# `systemctl stop` sends the unit's KillSignal — SIGTERM here — and waits. A clean stop is the
 	# whole claim of `TimeoutStopSec=90` and the graceful-shutdown path behind it.
@@ -485,9 +552,9 @@ $(tail -25 "$RUN_LOG")"
 	if ((stop_rc != 0)); then
 		fail "stopping the scope exited $stop_rc: SIGTERM did not take the server down inside the unit's own timeout"
 	fi
-	grep -qE "shutdown|stopped|listening on" "$RUN_LOG" ||
-		fail "the run log holds nothing about the shutdown:
-$(tail -25 "$RUN_LOG")"
+	unit_log | grep -qE "shutdown|stopped|listening on" ||
+		fail "the journal holds nothing about the run:
+$(unit_log | tail -25)"
 	pass "$HARDEN_COUNT hardening properties from the unit ran the real server and stopped it with SIGTERM"
 fi
 
