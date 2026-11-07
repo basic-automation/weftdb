@@ -5276,6 +5276,7 @@ outside the scope. It also marks reads, which take the same call, and it would
 have made this slice a change to every caller in the crate instead of a change
 to the three impls that own the legacy writes.
 
+<<<<<<< HEAD
 ## 2026-11-07 — W8 recovery: what a red gate, a vanished worker lane, and a silent CI each taught
 
 Three failures this wave looked like different problems and each turned out to be a missing fact
@@ -5369,3 +5370,37 @@ before invoking it, so a missing file and an unresolvable argument cannot produc
 generalisation is the point: PAC-11 was ticked on `main` (8c5fea9, #611) while gates 4, 5 and 6
 were each in turn the wall, and it should be closed again, if at all, on the evidence of a roll
 that printed all seven `ok:` lines — not on the evidence that a packaging branch exists.
+=======
+## 2026-11-06 — PAC-11 gate 4: a refused bind address names its variable (#309)
+
+**Context:** `scripts/packaging/test-host-install.sh` gate 4 installs the tree, writes an env
+file whose `WEFT_SERVER_ADDR` is a host with no port (`127.0.0.1`), runs the real binary, and
+treats one refusal as the proof that the *installed env file* is the configuration the process
+read: the run must exit 78 and its output must name `WEFT_SERVER_ADDR`. On the first CI run the
+gate failed (host-install run 42237464718: `weft-server: invalid configuration: invalid socket
+address syntax`) although the exit status was right. `startup::config::bind_addr` returned
+`std`'s bare `AddrParseError`, so the refusal named nothing, and a gate that greps for a name
+the server never prints can only ever fail.
+
+**Chosen:** change the server's message, not the gate. `bind_addr` and `admin_addr` now format
+the refusal as `WEFT_SERVER_ADDR="127.0.0.1" is not a socket address (invalid socket address
+syntax); e.g. 127.0.0.1:8080` — the variable, the value it rejected, the reason, a shape to
+copy. That is the convention the codebase already uses twice: `flight::flight_addr` names
+`WEFT_FLIGHT_ADDR` the same way, and the strict-config warnings in `settings.rs` name every
+variable they refuse. Exit status is unchanged (78, plan C7). Parsing moved into a private
+`parse_bind_addr(raw: &str)` so the text is unit-testable without mutating the environment
+(`set_var` from a parallel test thread would have been flaky), and the same contract is pinned
+end-to-end in `weft-server/tests/operator_cli.rs` against the binary, because gate 4 asserts on
+the process. The gate's comment now names all three places to keep in step.
+
+**Rejected:** grepping the gate for `invalid socket address syntax`, the parser's own text.
+It would have gone green immediately and proved nothing: that string appears whether or not
+the address came from the unit's env file, so it cannot distinguish "read my file" from
+"refused to start for a reason unrelated to the packaging". Also rejected: pointing the probe
+at a live port and asserting a bind error naming the value — a real bind depends on what else
+holds the port on a shared runner, which turns a packaging gate on a deterministic property.
+
+**Recorded, not decided here:** ROADMAP tick #611 marks PAC-11 closed while this PR was still
+open with the gate red. The tick is only true once this PR lands; it is left in place rather
+than reverted, so this PR is the thing that makes the roadmap honest.
+>>>>>>> 110d2a9 ([PAC-11] Record why gate 4's fix went into the server rather than the gate)
