@@ -2144,30 +2144,15 @@ impl Database {
 				}
 				for pattern in patterns {
 					let id = pattern.id().to_string();
-					conn.as_ref()
-						.execute(
-							r"INSERT INTO patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-							turso::params![id.clone(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()],
-						)
-						.await
-						.map_err(|e| anyhow::anyhow!("Failed to insert pattern '{id}': {e}"))?;
+					conn.as_ref().execute(r"INSERT INTO patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()]).await.map_err(|e| anyhow::anyhow!("Failed to insert pattern '{id}': {e}"))?;
 					for (index, occurrence) in pattern.occurrences().iter().enumerate() {
 						let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
 						let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
-						conn.as_ref()
-							.execute(
-								r"INSERT INTO pattern_occurrences (pattern_id, occurrence_index, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-								turso::params![id.clone(), occurrence_index, aspect_id.to_string(), occurrence.resolution().to_string(), size, serde_json::to_string(occurrence.database_info())?, occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()],
-							)
-							.await
-							.map_err(|e| anyhow::anyhow!("Failed to insert occurrence for pattern '{id}': {e}"))?;
+						conn.as_ref().execute(r"INSERT INTO pattern_occurrences (pattern_id, occurrence_index, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), occurrence_index, aspect_id.to_string(), occurrence.resolution().to_string(), size, serde_json::to_string(occurrence.database_info())?, occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()]).await.map_err(|e| anyhow::anyhow!("Failed to insert occurrence for pattern '{id}': {e}"))?;
 					}
 					for (index, relative) in pattern.relatives().iter().enumerate() {
 						let relative_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Relative index too large for i64"))?;
-						conn.as_ref()
-							.execute(r"INSERT INTO pattern_relatives (pattern_id, relative_index, relative_value) VALUES (?, ?, ?)", turso::params![id.clone(), relative_index, serde_json::to_string(relative)?])
-							.await
-							.map_err(|e| anyhow::anyhow!("Failed to insert relative {index} for pattern '{id}': {e}"))?;
+						conn.as_ref().execute(r"INSERT INTO pattern_relatives (pattern_id, relative_index, relative_value) VALUES (?, ?, ?)", turso::params![id.clone(), relative_index, serde_json::to_string(relative)?]).await.map_err(|e| anyhow::anyhow!("Failed to insert relative {index} for pattern '{id}': {e}"))?;
 					}
 				}
 				Ok(())
