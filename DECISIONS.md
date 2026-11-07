@@ -5432,3 +5432,32 @@ labelled a name-only rollover; a floors-3 store that 0.3.x binaries refuse to op
 worth the ticket. TAG-6 (#440) and TAG-7 (#441) are plan-only and were gated on TAG-5; they
 can be scoped against the schema as it exists at layout 2 without waiting on that ruling,
 because neither of them changes what an older reader can parse.
+
+## 2026-11-07 — Needs human: this loop cannot compile any more, and the OpenAPI gate punishes version bumps (#620)
+
+**The machine, first, because it explains the last day of misses.** `strata` — this agent's
+own process — is holding 84 GiB of RSS after twelve hours, against 124 GiB of RAM
+(`ps -eo pid,rss,etime,comm --sort=-rss` shows 84,271,372 KiB; `free -g` reports 3 GiB free
+and 5 GiB available). Nothing local compiles any more: `cargo check` is out of the question,
+so CI is the only compiler this loop has, and every judgement about code has to be written so
+that a reviewer can check it against a roll rather than against a local run. It also explains
+the worker lane: three `parallel-worker` runs on #516 each died at the 30-minute cap, and a
+cargo build next to an 84 GiB process plus a pi-lens workspace sweep is not a build, it is
+swapping. **The fix is a human action:** restart this pi session (or the harness's memory
+growth is a bug worth filing) before any further build-heavy delegation. Nothing in this
+buildout is blocked on it, but every slice that needs compiling is slower and less verifiable
+than it should be, and that is the difference between this session's merge rate and the last
+one's.
+
+**The second thing is small and will bite every release.** `compat/openapi/weftdb.json`
+publishes the server's own version as `info.version`, and the FRE-9a drift gate
+(`generated_spec_matches_committed_file`, `weft-server/src/openapi.rs:504`) compares the whole
+document against the committed file. So the 0.3.2 bump on #612 made three platform test jobs
+fail with "66 paths generated, 66 committed" — a message about route counts for a one-field
+version difference. Patched on that branch by hand (`2dfc7b9`), because a dictionary fix should
+not also change what a gate means. Filed as #620 with the two real options: exclude
+`info.version` from the drift comparison and assert it separately against
+`env!("CARGO_PKG_VERSION")`, or keep the gate strict and put "regenerate the spec" in the
+release checklist and accept that every version bump edits a 417 KB fixture that two
+version-bumping PRs will then conflict in. Whoever owns FRE-9a should pick; this loop
+deliberately did neither.
