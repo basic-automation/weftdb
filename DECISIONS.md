@@ -5408,3 +5408,95 @@ before invoking it, so a missing file and an unresolvable argument cannot produc
 generalisation is the point: PAC-11 was ticked on `main` (8c5fea9, #611) while gates 4, 5 and 6
 were each in turn the wall, and it should be closed again, if at all, on the evidence of a roll
 that printed all seven `ok:` lines — not on the evidence that a packaging branch exists.
+
+## 2026-11-07 — TAG-5: the tags schema is closed by an audit, and layout 3 stays unassigned (#437)
+
+**What was ambiguous.** Issue #437 gives two acceptance lines: "the series table and
+catalog exist, created by a registered migration", and "layout_version=3 marker written by
+that migration (C1)". The first is simply true of `main`. The second collides with the rule
+that the code itself states above the constant it would change: "It goes up for a
+control-plane DDL layout, a new frame decode capability, or a Turso on-disk format change
+(expressed as a migration that raises both floors). Layout numbers are assigned at a
+release: **every migration written before 1.0 belongs to layout 2**"
+(`weftdb/src/types/store_format.rs:60-65`, `SUPPORTED_LAYOUT = 2` at `:67`). So the literal
+reading of the issue asks for a layout bump that the shipped format policy forbids, and this
+loop does not get to decide which of the two is authoritative.
+
+**The audit part, which is settled.** `0006_tag5_series` (`weftdb/src/types/migrations.rs:146`,
+applied by `tag5_series`, DDL `SERIES_TABLE` at `:484`) creates the per-aspect series catalog
+in `segment_index.db`, and `0007_series_time_index` (`SEGMENT_INDEX_SERIES_TIME_INDEX` at
+`:503`) adds `idx_segment_index_series_time ON segment_index(aspect, series_id, min_ts,
+max_ts)`. The rest of the tags schema named by the plan's C1 note had already landed under
+layout 2 earlier in the registry: `segment_index.series_id` and `aspect_seq.next_series_id`
+in `0002_s6_s7`, `segment_quarantine.series_id` in `0004_d_s12`, `ingest_ledger.series_ids`
+in `0005_d_s13`. Every registry entry is `layout: 2`
+(`REGISTRY` at `migrations.rs:146`), which is what the registry's own contract test enforces
+(`floors(REGISTRY).layout == SUPPORTED_LAYOUT`, `migrations.rs:660-671`). Acceptance line one
+is therefore satisfied by migrations that are already recorded by id on every store.
+
+**Why the marker cannot be written the way the issue phrases it.** Migrations are recorded by
+id (`IndexOp::RecordMigration`), and a store that already recorded `0006_tag5_series` will
+never re-run it, so re-stamping `0006` to `layout: 3` would leave such a store permanently
+unable to reach floor 3 while the registry test still demanded a `layout: 3` entry. The only
+mechanically valid way to introduce 3 is a *new* migration after `0008_upsert_keys`. And that
+migration would have no schema change to carry — the substance is already there — so it would
+be a marker wearing a migration's clothes. Both shapes of it are bad in different directions:
+
+- floors 3 with `older_writers_safe: false` makes every 0.3.x binary refuse a store whose only
+  difference is a re-run of `CREATE TABLE IF NOT EXISTS series`: the refusal sites are
+  `refuse_newer_floor` (`weftdb/src/types/segment_index.rs:1268-1275`) and the restore check
+  (`weftdb/src/types/backup.rs:1030`), and both key off `min_write_layout`, which is exactly
+  the field future tags slices will need for real incompatibilities.
+- floors 2 with `older_writers_safe: true` and a `rederive` would be honest about safety but
+  would imply a repair that does not exist — `rederive` (`migrations.rs:253-263`) repairs what
+  an older writer left stale, and a writer that never populated `series` has no DDL-only fix —
+  while teaching everyone that a layout number can move without meaning anything.
+
+**Chosen.** No `0009_*` migration, no bump: `SUPPORTED_LAYOUT` stays 2. TAG-5 is closed on the
+audit above, and "layout_version=3" is read for what C1 was doing — a *name* for "the store
+carries the full tags schema", which arrived as `0006` and `0007` under layout 2. Layout 3 is
+left unassigned for the first change that actually needs it (the next tags-schema step that
+breaks an older reader, or the 1.0 freeze itself, whichever comes first). When a real bump
+happens, the newer-store fixtures should be written as `SUPPORTED_LAYOUT + 1` rather than a
+literal number, so the "a newer floor is refused" assertions
+(`segment_index.rs:1615`, `segment_store.rs:7336`, `:7412`, `:7444`, `store_format.rs:259`)
+survive it.
+
+**Needs human.** Whether the literal `layout_version = 3` is a hard 1.0 gate is the owner's
+call, not this loop's: it is an intent-versus-letter conflict between issue #437's acceptance
+line and the format policy in `store_format.rs:60-65`, and the letter is the one with
+compatibility consequences. If the owner rules that the number must move anyway, the only
+defensible form is floors 2 with `older_writers_safe: true` and a documented no-op `0009`,
+labelled a name-only rollover; a floors-3 store that 0.3.x binaries refuse to open is not
+worth the ticket. TAG-6 (#440) and TAG-7 (#441) are plan-only and were gated on TAG-5; they
+can be scoped against the schema as it exists at layout 2 without waiting on that ruling,
+because neither of them changes what an older reader can parse.
+
+## 2026-11-07 — Needs human: this loop cannot compile any more, and the OpenAPI gate punishes version bumps (#620)
+
+**The machine, first, because it explains the last day of misses.** `strata` — this agent's
+own process — is holding 84 GiB of RSS after twelve hours, against 124 GiB of RAM
+(`ps -eo pid,rss,etime,comm --sort=-rss` shows 84,271,372 KiB; `free -g` reports 3 GiB free
+and 5 GiB available). Nothing local compiles any more: `cargo check` is out of the question,
+so CI is the only compiler this loop has, and every judgement about code has to be written so
+that a reviewer can check it against a roll rather than against a local run. It also explains
+the worker lane: three `parallel-worker` runs on #516 each died at the 30-minute cap, and a
+cargo build next to an 84 GiB process plus a pi-lens workspace sweep is not a build, it is
+swapping. **The fix is a human action:** restart this pi session (or the harness's memory
+growth is a bug worth filing) before any further build-heavy delegation. Nothing in this
+buildout is blocked on it, but every slice that needs compiling is slower and less verifiable
+than it should be, and that is the difference between this session's merge rate and the last
+one's.
+
+**The second thing is small and will bite every release.** `compat/openapi/weftdb.json`
+publishes the server's own version as `info.version`, and the FRE-9a drift gate
+(`generated_spec_matches_committed_file`, `weft-server/src/openapi.rs:504`) compares the whole
+document against the committed file. So the 0.3.2 bump on #612 made three platform test jobs
+fail with "66 paths generated, 66 committed" — a message about route counts for a one-field
+version difference. Patched on that branch by hand (`2dfc7b9`), because a dictionary fix should
+not also change what a gate means. Filed as #620 with the two real options: exclude
+`info.version` from the drift comparison and assert it separately against
+`env!("CARGO_PKG_VERSION")`, or keep the gate strict and put "regenerate the spec" in the
+release checklist and accept that every version bump edits a 417 KB fixture that two
+version-bumping PRs will then conflict in. Whoever owns FRE-9a should pick; this loop
+deliberately did neither.
