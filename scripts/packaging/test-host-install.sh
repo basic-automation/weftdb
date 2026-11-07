@@ -512,6 +512,17 @@ STATE_BIND="BindPaths=$STATE $STATE"
 # system manager are different claims, and the message must not let a reader trade them.
 SUDO_ON=0
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then SUDO_ON=1; fi
+# Whether PID 1's manager will take a transient unit. `systemctl is-system-running` exits non-zero
+# unless the machine is pristine, and a hosted runner is not: it answers `degraded` because some unit
+# nobody here cares about failed. `running` and `degraded` both mean the manager is up and will accept
+# the unit, so usability is read from the word rather than the exit status; anything else (offline, or
+# no answer because there is no passwordless sudo) is a manager this gate cannot use.
+system_manager_usable() {
+	((SUDO_ON)) || return 1
+	local state
+	state=$(sudo -n systemctl is-system-running 2>/dev/null)
+	[[ $state == running || $state == degraded ]]
+}
 # `systemctl` against the manager named first: the caller's own manager, or PID 1's, which is where an
 # operator actually installs this unit.
 ctl() {
@@ -573,7 +584,7 @@ MANAGER=
 if systemctl --user is-active --quiet "user@$(id -u).service" 2>/dev/null ||
 	systemctl --user show-environment >/dev/null 2>&1; then
 	MANAGER=user
-elif ((SUDO_ON)) && sudo -n systemctl is-system-running >/dev/null 2>&1; then
+elif system_manager_usable; then
 	MANAGER=system
 else
 	skip "no reachable user systemd manager, so the unit's hardening has never been loaded by anything"
@@ -588,8 +599,14 @@ if [[ -n $MANAGER ]]; then
 		verdict=submit-failed
 		step=$(preexec_step "$MANAGER")
 	fi
-	if [[ $verdict == submit-failed && -n $step ]] && ((SUDO_ON)) && [[ $MANAGER == user ]] &&
-		sudo -n systemctl is-system-running >/dev/null 2>&1; then
+	# A start killed inside systemd's own setup surfaces two ways: `systemd-run` returns non-zero, or it
+	# succeeds and the unit dies before the server is exec'd — which leaves the child log empty and the
+	# verdict merely "not listening", and is how 218/CAPABILITIES actually appeared on a runner. Both
+	# carry the same ExecMainCode, so the escalation asks the manager what it did instead of trusting how
+	# the submission reported it. It still fires only on a 2xx setup step: a server that started and then
+	# failed is the server's problem, and retrying that somewhere privileged buries the defect.
+	if [[ $verdict != ok && -z $step ]]; then step=$(preexec_step user); fi
+	if [[ $verdict != ok && -n $step && $MANAGER == user ]] && system_manager_usable; then
 		ctl user stop "$SCOPE" >/dev/null 2>&1 || true
 		MANAGER=system
 		step=
