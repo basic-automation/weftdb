@@ -367,7 +367,12 @@ $(find "$DEST" -name '*.service' -printf '  %p\n' 2>/dev/null || true)"
 	# variable on the assumption a different version honours it would change the gate's meaning on
 	# some runners without proving anything on any of them.
 	verify_out=$(systemd-analyze verify --root "$DEST" weft-server.service 2>&1) && verify_rc=0 || verify_rc=$?
-	verify_blame=$(grep -vE 'Unit (sysinit|basic)\.target not found' <<<"$verify_out" | sed 's/^[[:space:]]*//')
+	# Delete the two lines rather than grep -v for them: grep exits 1 when it filters out every
+	# line, which is the passing case here, and the script runs under `set -euo pipefail`. The
+	# first version of this filter therefore aborted the run between gate 5's "ok" and any
+	# message at all — CI printed "exit 1" and nothing else, which is a failure that cannot be
+	# read. sed's status does not depend on whether it deleted anything.
+	verify_blame=$(sed -E '/Unit (sysinit|basic)\.target not found/d; s/^[[:space:]]+//' <<<"$verify_out")
 	if [[ $verify_rc -ne 0 && -z $verify_blame ]]; then
 		pass "systemd-analyze verify finds no fault in the installed unit beyond the essential targets an install prefix cannot carry"
 	elif [[ -n $verify_blame ]]; then
