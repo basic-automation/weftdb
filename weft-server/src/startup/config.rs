@@ -21,11 +21,27 @@ pub const ADMIN_ADDR_ENV: &str = "WEFT_ADMIN_ADDR";
 /// The address to bind, from `WEFT_SERVER_ADDR` (e.g. `0.0.0.0:9000`) or
 /// [`DEFAULT_ADDR`].
 ///
+/// A refusal names the variable and quotes the value it rejected, in the same
+/// shape as [`weft_server::flight::flight_addr`] and the strict-config warnings in
+/// [`crate::settings`]: an operator staring at an env file needs to be told which
+/// line is wrong, and `scripts/packaging/test-host-install.sh` gate 4 relies on that
+/// name to prove the installed unit's env file is what the server read.
+///
 /// # Errors
 ///
 /// A value that is not a parseable socket address.
 pub fn bind_addr() -> anyhow::Result<SocketAddr> {
-	Ok(std::env::var("WEFT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()).parse()?)
+	let raw = std::env::var("WEFT_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+	parse_bind_addr(&raw)
+}
+
+/// [`bind_addr`] with the environment read by the caller, so the refusal text is testable.
+///
+/// # Errors
+///
+/// `raw` is not a parseable socket address.
+fn parse_bind_addr(raw: &str) -> anyhow::Result<SocketAddr> {
+	raw.parse::<SocketAddr>().map_err(|error| anyhow::anyhow!("WEFT_SERVER_ADDR={raw:?} is not a socket address ({error}); e.g. {DEFAULT_ADDR}"))
 }
 
 /// The address the probe-only admin listener binds (ROB-23r), from
@@ -46,7 +62,7 @@ pub fn admin_addr() -> anyhow::Result<Option<SocketAddr>> {
 	let Some(raw) = std::env::var(ADMIN_ADDR_ENV).ok().filter(|value| !value.trim().is_empty()) else {
 		return Ok(None);
 	};
-	let addr: SocketAddr = raw.parse()?;
+	let addr: SocketAddr = raw.parse().map_err(|error| anyhow::anyhow!("{ADMIN_ADDR_ENV}={raw:?} is not a socket address ({error}); e.g. 127.0.0.1:9090"))?;
 	PlaintextGate::from_env().check(addr, None).map_err(anyhow::Error::msg)?;
 	println!("admin listener: probe-only surface (/health, /ready) on http://{addr}");
 	Ok(Some(addr))
@@ -208,4 +224,28 @@ pub fn gpu_config() -> anyhow::Result<Option<splimes::GpuConfig>> {
 
 pub fn flight_addr() -> anyhow::Result<Option<SocketAddr>> {
 	weft_server::flight::flight_addr(std::env::var(weft_server::flight::FLIGHT_ADDR_ENV).ok().as_deref()).map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::parse_bind_addr;
+
+	#[test]
+	fn the_default_address_parses() {
+		let addr = parse_bind_addr("127.0.0.1:8080").expect("the documented default parses");
+		assert_eq!(addr.port(), 8080, "the default is the port the docs name");
+		assert!(addr.ip().is_loopback(), "the default binds loopback, not the world");
+	}
+
+	#[test]
+	fn a_refused_bind_address_names_the_variable_and_quotes_the_value() {
+		// PAC-11's host-install gate 4 proves the installed unit's env file reached the
+		// server by recognising this refusal, so the name and the value are contract.
+		let error = parse_bind_addr("127.0.0.1").expect_err("a host with no port is not a socket address");
+		let text = error.to_string();
+		assert!(text.contains("WEFT_SERVER_ADDR"), "the refusal names the variable to fix: {text}");
+		assert!(text.contains("\"127.0.0.1\""), "the refusal quotes the value it rejected: {text}");
+		assert!(text.contains("8080"), "the refusal shows a good shape to copy: {text}");
+		assert_eq!(error.chain().count(), 1, "the reason is stated once, not repeated down a cause chain: {text}");
+	}
 }
