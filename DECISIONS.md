@@ -4,6 +4,45 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
+
+**The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every
+result's measures to their metric name and refused any repeat, so a report carrying two results —
+which is what `--crash-matrix`, `--query-mix` and a multi-adapter run produce — could not be
+verified at all, and `finish --manifest` exited non-zero on honest evidence (`#517`, the reason
+`crash-matrix.yml` had to be narrowed to one report per cell after `#511`). `Measure` carried only
+`name` and `adapter`, so `adapter` was the only candidate disambiguator, and it is the wrong one: a
+query-mix report runs one adapter across many profiles, and a cross-adapter report runs one profile
+across many adapters. A measure's identity is the result it was quoted from, which `BenchResult`
+already states as `(profile, adapter, workload)` and `compare.rs` already uses as its `WorkloadKey`.
+
+**Chosen:** add `profile` and `workload` to `Measure` beside `adapter`, fill them where the measures
+are built (`push_result_measures`, which quotes them from the same result it quotes the numbers
+from), and check uniqueness per `(profile, adapter, workload)`. `Problem::DuplicateMeasure` became a
+struct variant carrying the name *and* the result identity, because the message a runner reads has to
+say which measure to go and look at — the file's own convention elsewhere is
+``measure `{name}` appears more than once``, and the old check broke it with a static
+"a measure name is repeated across adapters" string that named nothing.
+
+**Rejected: dropping the check.** Names are how a comparison selects a number, so a genuine
+repeat inside one result must stay a defect. The new test pair pins both halves: cross-result reuse
+of `latency.p50_ns` verifies clean, a second `latency.p50_ns` inside one result is still refused at
+`write_to`, which is where a manifest that cannot verify is turned into an error.
+
+**Rejected: making the recovery "regenerate the manifest from the report."** A manifest records
+provenance facts that are only available while the run happens — the source revision, the working
+tree's dirtiness, the environment — so an old manifest cannot be converted without inventing them.
+The refusal wording now says what is true instead: re-run the benchmark with a build that writes the
+current version. Bumping `MANIFEST_SCHEMA_VERSION` to 24 was unavoidable, since `Measure` gained two
+fields that every verifier depends on, and the version check stays an exact match: accepting a list
+of versions would make a v23 reader's silence about `profile`/`workload` invisible.
+
+**Not done here, deliberately:** the splitting that `#513` and `#147` added (`--crash-matrix`,
+`--query-mix`, `--failure` each writing one report per cell) is left in place. It was a workaround
+for this bug, but it is also what keeps a crash cell's artifact attributable to that cell, and
+removing it changes what the nightly publishes. Flagged as a follow-up rather than folded into a fix
+whose whole claim is that a multi-result report verifies.
+
 ## 2026-11-06 — W7 close-out, W8 start, the SOA-13 rule set, and one infra blocker
 
 **W7 was one item, not six.** The wave-7 briefing listed ROB-12, ROB-7, ROB-16, ROB-23r and ROB-5
