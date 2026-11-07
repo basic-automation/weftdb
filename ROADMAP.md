@@ -361,7 +361,12 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] read lane
   - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
   - [ ] **FRE-8b** Stored-value text and one float-input rule across every ingest format
-  - [ ] **FRE-9a** OpenAPI generated from code
+  - [x] **FRE-9a** OpenAPI generated from the route table, committed, drift-checked in CI
+    *Closed 2026-11-07 (#PR): generated from the real [`RouteTable`] via
+    `openapi::from_table`, wired as the `weft-server openapi` subcommand
+    (PAC-7 exit-code contract), committed at `compat/openapi/weftdb.json`,
+    drift-gated by `generated_spec_matches_committed_file`, and structurally
+    validated by `generated_spec_passes_structural_validation`.*
   - [ ] **ROB-9** Mutation harness for frames, sidecars and Parquet
   - [ ] **SEC-14** Security documentation, config schema and upgrade notes
   - [ ] **PAC-10** Publish the multi-arch image (only after API auth)

@@ -427,6 +427,16 @@ Three more results from 2026-10-09 where the obvious answer was wrong:
 `weft-server` is the `axum` HTTP surface — Weft-Bench, TSBS-style harnesses, Grafana
 and SDKs all drive the engine through it. It carries no vendor-specific dependencies.
 
+**The OpenAPI document is generated from the code.** Every path, method, scope,
+admission class and tier comes from the real [`RouteTable`] the router serves. The
+committed spec lives at [`compat/openapi/weftdb.json`](../compat/openapi/weftdb.json)
+and is checked by the drift gate (`generated_spec_matches_committed_file`) in CI.
+Regenerate it at any time:
+
+```bash
+weft-server openapi --out compat/openapi/weftdb.json
+```
+
 See the [Quickstart](#quickstart) to start it.
 
 Bind address defaults to `127.0.0.1:8080` (`WEFT_SERVER_ADDR` overrides). Setting

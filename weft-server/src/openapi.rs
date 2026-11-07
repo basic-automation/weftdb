@@ -16,20 +16,19 @@
 //! `--out <path>`, it is written to that file. The command refuses a directory
 //! or an unwritable path with exit 78.
 
-use crate::routes::{RouteSpec, RouteTable};
-use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
+
+use axum::http::Method;
+use serde_json::{json, Map, Value};
+
+use crate::routes::{RouteSpec, RouteTable};
 
 /// The first argv word that selects this command instead of serving.
 pub const SUBCOMMAND: &str = "openapi";
 
 /// The HTTP status codes the server's error table can produce, derived from
 /// `Code::status` in `error.rs`.
-pub const ERROR_STATUSES: &[u16] = &[
-	400, 401, 403, 404, 405, 408, 409, 410,
-	413, 415, 422,
-	500, 503, 504, 507,
-];
+pub const ERROR_STATUSES: &[u16] = &[400, 401, 403, 404, 405, 408, 409, 410, 413, 415, 422, 500, 503, 504, 507];
 
 const fn error_status_description(status: u16) -> &'static str {
 	match status {
@@ -101,15 +100,15 @@ fn operation_tag(id: &str) -> &'static str {
 }
 
 /// The OpenAPI method key (lowercase) for an HTTP method.
-const fn method_key(method: &crate::http::Method) -> &'static str {
+const fn method_key(method: &Method) -> &'static str {
 	match *method {
-		crate::http::Method::GET => "get",
-		crate::http::Method::POST => "post",
-		crate::http::Method::PUT => "put",
-		crate::http::Method::PATCH => "patch",
-		crate::http::Method::DELETE => "delete",
-		crate::http::Method::HEAD => "head",
-		crate::http::Method::OPTIONS => "options",
+		Method::GET => "get",
+		Method::POST => "post",
+		Method::PUT => "put",
+		Method::PATCH => "patch",
+		Method::DELETE => "delete",
+		Method::HEAD => "head",
+		Method::OPTIONS => "options",
 		_ => "other",
 	}
 }
@@ -346,16 +345,16 @@ fn collect_refs(value: &Value, issues: &mut Vec<String>, schemas: &Map<String, V
 }
 
 /// Check that a single `$ref` string targets an existing component.
-fn check_ref(ref: &str, issues: &mut Vec<String>, schemas: &Map<String, Value>, responses: &Map<String, Value>) {
-	if !ref.starts_with("#/components/") {
-		issues.push(format!("`{ref}` is not a valid `$ref` (must start with `#/components/`)"));
+fn check_ref(target: &str, issues: &mut Vec<String>, schemas: &Map<String, Value>, responses: &Map<String, Value>) {
+	if !target.starts_with("#/components/") {
+		issues.push(format!("`{target}` is not a valid `$ref` (must start with `#/components/`)"));
 		return;
 	}
-	let tail = ref.strip_prefix("#/components/").unwrap_or("");
+	let tail = target.strip_prefix("#/components/").unwrap_or("");
 	// tail is "schemas/Foo" or "responses/Error400"
 	let slash = tail.find('/');
 	if slash == None || slash < 1 || slash + 1 >= tail.len() {
-		issues.push(format!("`{ref}` has an unrecognised component path"));
+		issues.push(format!("`{target}` has an unrecognised component path"));
 		return;
 	}
 	let category = tail[..slash];
@@ -435,7 +434,6 @@ fn parse_args(arguments: Vec<String>) -> std::result::Result<Option<String>, cra
 #[cfg(test)]
 mod tests {
 	use serde_json::Value;
-	use std::fs;
 
 	use super::*;
 	use crate::routes::build_registry;
@@ -445,7 +443,8 @@ mod tests {
 	fn generated_spec_matches_committed_file() {
 		let generated = from_table(build_registry().table());
 		let committed_file = "../compat/openapi/weftdb.json";
-		if !fs::exists(committed_file) {
+		let p = std::path::Path::new(committed_file);
+		if !p.exists() {
 			panic!(
 				"`{committed_file}` could not be found; "
 				"the drift gate needs a committed spec file. Generate it with:\n\n"
@@ -453,8 +452,8 @@ mod tests {
 				"(Run from the `weft-server/` crate directory.)"
 			);
 		}
-		let bytes = fs::read(committed_file).unwrap();
-		let committed = serde_json::from_slice(bytes.as_bytes());
+		let text = std::fs::read_to_string(committed_file).unwrap();
+		let committed = serde_json::from_slice(text.as_bytes());
 		if committed.is_err() {
 			panic!("`{committed_file}` must be valid JSON; parse error: {committed.unwrap_err()}");
 		}
@@ -489,15 +488,9 @@ mod tests {
 		let responses = components["responses"].as_object().unwrap();
 		for status in ERROR_STATUSES {
 			let key = format!("Error{status}");
-			assert!(
-				responses.contains_key(&key),
-				"missing component response `{key}` for status {status}"
-			);
+			assert!(responses.contains_key(&key), "missing component response `{key}` for status {status}");
 			let entry = responses[&key].as_object().unwrap();
-			assert!(
-				entry.contains_key("description"),
-				"response `{key}` has no description"
-			);
+			assert!(entry.contains_key("description"), "response `{key}` has no description");
 		}
 	}
 
@@ -505,12 +498,13 @@ mod tests {
 	#[test]
 	fn committed_spec_is_valid_json() {
 		let path = "../compat/openapi/weftdb.json";
-		if !fs::exists(path) {
+		let p = std::path::Path::new(path);
+		if !p.exists() {
 			// This test is informational: the drift gate is the real guard.
 			return;
 		}
-		let bytes = fs::read(path).unwrap();
-		let parsed = serde_json::from_slice(bytes.as_bytes());
+		let text = std::fs::read_to_string(path).unwrap();
+		let parsed = serde_json::from_slice(text.as_bytes());
 		assert!(parsed.is_ok(), "`{path}` must be valid JSON, but parsing failed");
 	}
 
@@ -527,10 +521,7 @@ mod tests {
 		let document = from_table(build_registry().table());
 		let info = document["info"].as_object().unwrap();
 		assert_eq!(info["title"], crate::SERVICE);
-		assert!(
-			info["version"].as_str().unwrap_or("").len() > 0,
-			"version must not be empty"
-		);
+		assert!(info["version"].as_str().unwrap_or("").len() > 0, "version must not be empty");
 	}
 
 	/// The path count matches the existing openapi_document test in routes.
@@ -547,10 +538,7 @@ mod tests {
 		let document = from_table(build_registry().table());
 		let issues = validate(&document);
 		let dups = issues.filter(|i| i.contains("duplicate `operationId`"));
-		assert!(
-			dups.is_empty(),
-			"no duplicate operationIds, but found: {dups:?}"
-		);
+		assert!(dups.is_empty(), "no duplicate operationIds, but found: {dups:?}");
 	}
 
 	/// Every operation has a summary that is not empty.
@@ -564,10 +552,7 @@ mod tests {
 					continue;
 				}
 				let summary = operation["summary"].as_str().unwrap_or("");
-				assert!(
-					!summary.is_empty(),
-					"operation `{path}`/{method} has no summary"
-				);
+				assert!(!summary.is_empty(), "operation `{path}`/{method} has no summary");
 			}
 		}
 	}
@@ -583,10 +568,7 @@ mod tests {
 					continue;
 				}
 				let id = operation["operationId"].as_str().unwrap_or("");
-				assert!(
-					!id.is_empty(),
-					"operation `{path}`/{method} has no operationId"
-				);
+				assert!(!id.is_empty(), "operation `{path}`/{method} has no operationId");
 			}
 		}
 	}

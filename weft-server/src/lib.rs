@@ -76,16 +76,6 @@ pub mod keygen;
 pub mod maintain;
 pub mod metrics;
 mod num;
-/// ROB-3's single panic-catch layer (see [`panic_catch`]).
-pub mod panic_catch;
-pub mod panic_hook;
-pub mod read_limits;
-pub mod reconcile_daemon;
-/// SEC-10's secret hygiene for the server's own output.
-///
-/// Values that can carry a credential (a URL's userinfo above all) are only ever printed
-/// redacted (see [`redact`]).
-pub mod redact;
 /// PAC-13's operator command: `weft-server restore`.
 ///
 /// It puts a backup back on disk as a store root while nothing serves it. A library module for the same reason as
@@ -98,6 +88,16 @@ pub mod redact;
 /// it (the drift gate). The CLI subcommand `weft-server openapi` emits it.
 /// FRE-9b (W11) publishes and extends the document.
 pub mod openapi;
+/// ROB-3's single panic-catch layer (see [`panic_catch`]).
+pub mod panic_catch;
+pub mod panic_hook;
+pub mod read_limits;
+pub mod reconcile_daemon;
+/// SEC-10's secret hygiene for the server's own output.
+///
+/// Values that can carry a credential (a URL's userinfo above all) are only ever printed
+/// redacted (see [`redact`]).
+pub mod redact;
 pub mod restore;
 pub mod routes;
 /// ROB-11's runtime builder: the explicit tokio runtime the binary
