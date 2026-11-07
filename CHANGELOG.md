@@ -18,6 +18,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   file matches the generated output; regenerate with `weft-server openapi
   --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
   no `--out`, or writes to a named file.
+### Changed
+
+- **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
+  each measure by metric name alone, so two results in one report — a crash matrix, a query mix, any
+  cross-adapter run — looked like a duplicated measure and `finish --manifest` refused the
+  evidence (#517). Measures now carry the result they were quoted from (`profile`, `adapter`,
+  `workload`) and uniqueness is checked within a result, so the same metric may appear once per
+  result; a repeat inside one result is still a defect, and the message names both the metric and the
+  result. Manifest schema v23 → v24: a manifest written by an older build is refused with an
+  instruction to re-run the benchmark, since the fields that identify a measure did not exist then.
 
 ## [0.3.1] - 2026-11-06
 
