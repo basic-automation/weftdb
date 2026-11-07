@@ -61,6 +61,22 @@ fn a_command_line_that_names_nothing_exits_with_usage_status_2() {
 }
 
 #[test]
+fn an_unparseable_bind_address_is_refused_by_name_and_exits_78() {
+	// PAC-11's host-install gate 4 proves the installed unit's env file reached the process by
+	// recognising this one refusal, so the variable name and the rejected value are asserted on
+	// the binary, not on the parser: a server that refused for some other reason, or refused
+	// without saying which line to fix, would make that gate mean nothing.
+	let dir = tempfile::TempDir::new().expect("tempdir");
+	let mut cmd = invocation(&["serve"]);
+	cmd.env("WEFT_SERVER_ADDR", "127.0.0.1").env("WEFT_SEGMENT_STORE_ROOT", dir.path());
+	let output = cmd.stdin(Stdio::null()).output().expect("runs weft-server");
+	let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+	assert_eq!(output.status.code(), Some(78), "an unusable address is an invalid-configuration refusal (plan C7): {stderr}");
+	assert!(stderr.contains("WEFT_SERVER_ADDR"), "the refusal names the variable the operator must fix: {stderr}");
+	assert!(stderr.contains("\"127.0.0.1\""), "the refusal quotes the value it rejected: {stderr}");
+}
+
+#[test]
 fn startup_reports_the_store_identity_before_the_banner() {
 	let dir = tempfile::TempDir::new().expect("tempdir");
 	let root = dir.path().join("store");

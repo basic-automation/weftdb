@@ -139,8 +139,11 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/weft-host-install-XXXXXX")
 readonly WORK
 readonly DEST="$WORK/root"
 # An address the socket-address parser itself rejects — a host with no port — refused as
-# invalid configuration before anything binds, so the server cannot serve even by accident
-# and the only refusal a gate can be reacting to names this variable.
+# invalid configuration before anything binds, so the server cannot serve even by accident.
+# The refusal is recognisable because `weft-server/src/startup/config.rs::bind_addr` formats
+# it as `WEFT_SERVER_ADDR="<value>" is not a socket address`: the gate below greps for that
+# name, and `weft-server/tests/operator_cli.rs` pins the same text on the binary. Keep the
+# three in step, as with the two refusal fragments further down.
 readonly DEAD_ADDR=127.0.0.1
 readonly STATE="$WORK/state"
 mkdir -p "$STATE"
