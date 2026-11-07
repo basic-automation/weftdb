@@ -66,6 +66,9 @@
 //!   verification through PAC-13's restore path, and the RPO/RTO the
 //!   lane measures, derived by EVI-19's formulas; recorded on the
 //!   [`soak`] run record (soak schema v6).
+//! - [`soak_compare`] — nightly-to-nightly comparison of soak reports
+//!   (SOA-15): per-rule outcome changes, metric drift with documented
+//!   tolerances, and the regression gate that fails the workflow.
 //! - [`soak_report`] — the soak report and SLO evaluator (SOA-13): the
 //!   [`SoakReport`](soak_report::SoakReport) wrapping a finished run with the SLO evaluator
 //!   verdict (R1–R8), coverage floors, and a generated honesty section;
@@ -124,6 +127,7 @@ pub mod schema;
 pub mod soak;
 pub mod soak_backup;
 pub mod soak_client;
+pub mod soak_compare;
 pub mod soak_digest;
 pub mod soak_failure;
 pub mod soak_hdr;
