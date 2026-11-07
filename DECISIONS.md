@@ -5320,3 +5320,52 @@ had none), and the PR was opened as a draft with "no local build: two lanes have
 into its body, so the absence of verification is visible rather than implied. Tagging 0.3.2 stays
 a human action: `release.yml` accepts only a CI run on `main`, and crates.io is unreachable from
 this machine, so publication state cannot be confirmed from here at all.
+
+## 2026-11-07 — Needs human: the crates.io token; and the gates that sat behind a red gate (PAC-11, #596)
+
+**Confirmed, not inferred: publication to crates.io has never happened, and it is a missing secret.**
+`publish.yml` has been dispatched twice and both runs failed — 42301816146 (2026-11-06T22:04Z) and
+42346611064 (2026-11-07T06:21Z) — in job `execute`, step `Publish`:
+
+```
+error: failed to publish weftdb v0.3.1 to registry at https://crates.io
+
+Caused by:
+  please provide a non-empty token
+```
+
+`publish.yml:123` wires `CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}`, so the
+repository secret is unset or empty. Everything before that step succeeded: the crate packaged,
+`weftdb v0.3.1` compiled out of `target/package/weftdb-0.3.1`, and cargo printed `Uploading weftdb
+v0.3.1` before the token check. The GitHub release for `v0.3.1` is drafted with its five archives
+and their `.sha256` files (run 42342265711, success), so the tag and the artifacts exist and only
+the registry side is missing. Nothing on this machine can close it: crates.io is also unreachable
+from here, so `cargo login` / `cargo publish` by hand is not available as a workaround either.
+
+**Chosen:** leave the publish lane exactly as it is and record the blocker under Needs human.
+**Rejected:** making `Publish` tolerate an empty token so the lane reads green — the step exists to
+say either "it reached the registry" or "it did not, loudly", and #610 already taught it the one
+case that is benign (a version already published).
+
+**The owner's decision once a token exists:** publish `v0.3.1` (re-dispatch `publish.yml` for that
+tag) or accept a gap and make 0.3.2 the first published release. #612 bumps `weftdb`,
+`weft-server`, `weft-arrow-store` and `weft-orchestration` to 0.3.2, so silence now *is* the gap. A
+gap is survivable — nothing pins a published 0.3.1, because there is none — but `docs/reference.md`
+tells people to install from the registry, so whichever version goes out first should be followed
+by re-reading that page against what `cargo install` really resolves.
+
+**The second thing here is a habit, not a task: any gate behind a red gate is an untested gate.**
+`scripts/packaging/test-host-install.sh` has seven gates, and the `ubuntu-latest` roll had never
+got past gate 5 — gate 4 stopped it on the bind-address message, then gate 5 stopped it on its own
+name selection (both fixed on `w7/pac11-ci`). Gates 6 and 7 (`systemd-analyze verify`,
+`systemd-sysusers`, `systemd-tmpfiles`, a live user manager) had therefore never executed on any
+host: the machine this script was developed on skips all four, while the workflow asserts they must
+not skip on `ubuntu-latest`. Gate 6's first execution ever failed in 32 seconds — `systemd-analyze
+verify --root "$DEST" "usr/lib/systemd/system/weft-server.service"` answered `Unit
+weft-server.service not found.` about a unit gate 1 had just confirmed on disk, because `--root`
+resolves an absolute path against the root and a slash-bearing relative path against the current
+directory. Fixed by keeping the leading slash and by asserting `[[ -f "$DEST$UNIT_IN_ROOT" ]]`
+before invoking it, so a missing file and an unresolvable argument cannot produce one message. The
+generalisation is the point: PAC-11 was ticked on `main` (8c5fea9, #611) while gates 4, 5 and 6
+were each in turn the wall, and it should be closed again, if at all, on the evidence of a roll
+that printed all seven `ok:` lines — not on the evidence that a packaging branch exists.
