@@ -333,6 +333,12 @@ impl Dictionary {
 			}
 		}
 
+		// A pattern already in the dictionary (by id) is not added again: loading a store
+		// into a dictionary that already holds it must not duplicate it.
+		if self.patterns.iter().any(|p| p.id() == new_pattern.id()) {
+			return Ok(());
+		}
+
 		// Step 2: Check similarity against ALL existing patterns using configured variability constraints
 		// This is the specification-compliant approach - no shortcuts or optimizations that change behavior
 		let mut matching_indices = Vec::new();
