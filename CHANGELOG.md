@@ -29,6 +29,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   result. Manifest schema v23 → v24: a manifest written by an older build is refused with an
   instruction to re-run the benchmark, since the fields that identify a measure did not exist then.
 
+- **`weft-xbench combine` no longer calls an unreproducible-but-in-tolerance answer a failure (#516).**
+  Two runs that each pass their own tolerance but produce different answer digests are
+  non-deterministic, not wrong. The combined gate is reported as `non-deterministic` and kept out of
+  win/loss verdicts and failure lists; a new `Non-deterministic within tolerance` section in the
+  rendered report explains the row. Report schema v7 → v8: `Correctness` gains an `indeterminate`
+  field.
+
 ## [0.3.2] - 2026-11-06
 
 ### Fixed

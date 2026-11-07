@@ -5500,3 +5500,36 @@ not also change what a gate means. Filed as #620 with the two real options: excl
 release checklist and accept that every version bump edits a 417 KB fixture that two
 version-bumping PRs will then conflict in. Whoever owns FRE-9a should pick; this loop
 deliberately did neither.
+
+## 2026-11-07 — #516: a digest disagreement inside tolerance is non-determinism, not a wrong answer
+
+	**The finding.** The pooled Phase 1 report (`bench/reports/phase1-pooled/`) contains two runs of
+	the `timescaledb-double` downsample gate at `mcar-medium`. Both passed their individual tolerance
+	(test-to-reference differences of 7.1e-14 and 1.4e-13 against a 9.2e-8 relative tolerance). But
+	their `answer_sha256` values differed — `DIGEST_DIGITS` (12) significant digits of each bucket's
+	`avg`, computed by TimescaleDB's `avg(double precision)`, which sums in whatever order the
+	parallel scan delivers rows and then divides. The two runs' rows landed in different order, so
+	the 12-significant-digit string of a float that the hash feeds on was different, so the hash
+	differed, so `combine.rs:81` recorded a FAILED gate.
+
+	**Why a hash is the wrong test for a `double precision` `avg` that does not add in a fixed order.**
+	`AVG(double precision)` in PostgreSQL and its derivatives computes a parallel sum whose rounding
+	depends on row arrival order. Two runs that return the same set of rows within tolerance can
+	therefore produce a different floating-point result at the 14th or 15th decimal digit — well
+	short of the 1e-9 tolerance but enough to change a SHA-256 over 12-significant-digit
+	representations. The answer digest was designed to detect a run that answers a *completely
+	different grid*, not the last 1e-14 of a sum, and using it as a pass/fail criterion for a
+	combined report conflates the two.
+
+	**What the third state does.** `Correctness.indeterminate` (report schema v7 → v8) records that
+	the runs' digests disagreed while every run stayed inside its own tolerance. The combined gate's
+	`passed` field is kept `false` — the row stays out of `all_correct()` and out of win/loss
+	verdicts exactly as before — because the answer is not reproducible bit for bit. The rendered
+	report shows `non-deterministic` in the gate cell and lists the row in a new `Non-deterministic
+	within tolerance` section.
+
+	**What it does NOT do.** It does NOT weaken the digest check for out-of-tolerance answers: a run
+	supplying a completely different grid still produces a different hash, and a run that also fails
+	its own tolerance produces `indeterminate = false`. It does NOT let the row into a verdict: a
+	row whose `passed` is false is excluded by the existing `passed(r)` filter — `all_correct()` and
+	the verdict loop never see it.
