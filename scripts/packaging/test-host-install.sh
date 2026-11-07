@@ -434,7 +434,11 @@ while read -r line; do
 	Restart | RestartSec | Environment | EnvironmentFile | ExecStart | WorkingDirectory) continue ;;
 	esac
 	PROPS+=("--property=$line")
-done < <(awk '/^\[Service\]/{in=1;next} /^\[/{in=0} in && /^[A-Z][A-Za-z]+=/' "$INSTALLED_UNIT")
+done < <(awk '/^\[Service\]/{inside=1;next} /^\[/{inside=0} inside && /^[A-Z][A-Za-z]+=/' "$INSTALLED_UNIT")
+# The counter is called `inside`, not `in`: `in` is a reserved word in awk grammar, which gawk
+# tolerates as a variable name and Ubuntu's mawk refuses outright with a syntax error on the
+# runner. A failed awk here yields zero properties and the gate below reports that, but the real
+# fault was the program not parsing at all.
 # The account and the state directory the unit names do not exist on the machine running this, and
 # creating them is gate 6's business, not this one: the scope runs as the user who ran the test.
 for drop in User Group StateDirectory; do
