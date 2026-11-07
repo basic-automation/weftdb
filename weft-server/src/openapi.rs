@@ -515,9 +515,7 @@ mod tests {
 	#[test]
 	fn generated_spec_passes_structural_validation() {
 		let issues = validate(&generated());
-		if !issues.is_empty() {
-			panic!("the generated OpenAPI document has structural issues:\n  {}", issues.join("\n  "));
-		}
+		assert!(issues.is_empty(), "the generated OpenAPI document has structural issues:\n  {}", issues.join("\n  "));
 	}
 
 	/// Every status the error table can produce has a documented component
