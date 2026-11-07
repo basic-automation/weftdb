@@ -76,6 +76,13 @@ pub mod keygen;
 pub mod maintain;
 pub mod metrics;
 mod num;
+/// FRE-9a: OpenAPI 3.1 document generated from the route registry.
+///
+/// The document is built from the same route table the router serves. Adding a
+/// route changes the generated document; a test asserts the committed spec matches
+/// it (the drift gate). The CLI subcommand `weft-server openapi` emits it.
+/// FRE-9b (W11) publishes and extends the document.
+pub mod openapi;
 /// ROB-3's single panic-catch layer (see [`panic_catch`]).
 pub mod panic_catch;
 pub mod panic_hook;

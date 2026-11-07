@@ -75,6 +75,8 @@ SIGINT or SIGTERM stops it cleanly.
 
 Commands:
   serve                 serve (the default; takes no arguments)
+  openapi               generate the OpenAPI 3.1 document from the route
+                        registry and write it to stdout or a file
   keygen                mint an API key and record its hash in a keys file
   restore               restore a backup into a fresh store root, offline
   import-rows-mode      read a 0.1.x rows-mode data directory into a store
@@ -116,6 +118,10 @@ pub enum Command {
 	/// name, starting with the subcommand word, as
 	/// [`crate::import_rows_mode::parse`] expects them.
 	ImportRowsMode(Vec<String>),
+	/// `weft-server openapi …`: the arguments after the program name,
+	/// starting with the subcommand word, as [`crate::openapi::run`]
+	/// expects them.
+	Openapi(Vec<String>),
 }
 
 /// A command line that names nothing the CLI can run: the message names
@@ -167,6 +173,7 @@ pub fn parse(argv: &[String]) -> Result<Command, UsageError> {
 				Ok(Command::Serve)
 			}
 		}
+		word if word == crate::openapi::SUBCOMMAND => Ok(Command::Openapi(with_word())),
 		word if word == crate::keygen::SUBCOMMAND => Ok(Command::Keygen(with_word())),
 		word if word == crate::restore::SUBCOMMAND => Ok(Command::Restore(rest())),
 		word if word == crate::import_rows_mode::SUBCOMMAND => Ok(Command::ImportRowsMode(with_word())),
@@ -176,7 +183,7 @@ pub fn parse(argv: &[String]) -> Result<Command, UsageError> {
 }
 
 /// A usage refusal: the reason, then the help it points at.
-fn usage(reason: &str) -> UsageError {
+pub(crate) fn usage(reason: &str) -> UsageError {
 	UsageError { message: format!("{reason}\n\n{USAGE}") }
 }
 

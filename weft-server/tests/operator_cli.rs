@@ -43,7 +43,7 @@ fn help_and_version_exit_zero_and_name_the_contract() {
 	for args in [&["--help"][..], &["-h"][..], &["help"][..]] {
 		let (code, stdout, _) = run(args);
 		assert_eq!(code, Some(0), "{args:?} exits 0");
-		assert!(stdout.contains("keygen") && stdout.contains("restore") && stdout.contains("import-rows-mode"), "the help names every command: {stdout}");
+		assert!(stdout.contains("keygen") && stdout.contains("restore") && stdout.contains("import-rows-mode") && stdout.contains("openapi"), "the help names every command: {stdout}");
 		assert!(stdout.contains("65") && stdout.contains("store needs operator action"), "the help prints the C7 table: {stdout}");
 	}
 	let (code, stdout, _) = run(&["--version"]);
