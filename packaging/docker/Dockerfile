@@ -62,11 +62,15 @@ ARG RUNTIME_IMAGE=docker.io/library/debian:12-slim@sha256:99c0b25c46d0214d5a2091
 # users on Debian, so a bind mount created by the container's own uid cannot collide with a
 # host user's files the way uid 1000 so often does.
 ARG WEFT_UID=10001
+# The Rust target triple for cross-compilation. Defaults to x86_64; override for arm64 builds.
+ARG RUST_TARGET=x86_64-unknown-linux-gnu
 
 # ---------------------------------------------------------------------------
 # builder: the release toolchain, in the release baseline
 # ---------------------------------------------------------------------------
 FROM ${BUILDER_IMAGE} AS builder
+
+ARG RUST_TARGET=x86_64-unknown-linux-gnu
 
 # The dependency tree needs cmake and nasm beyond the baseline's cc — the same two packages the
 # release leg installs, for the same reason (see release.yml, "Install the build tools the
@@ -81,7 +85,7 @@ ENV CARGO_HOME=/usr/local/cargo \
 	PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
 		--profile minimal --default-toolchain "$(tr -d '[:space:]' < /tmp/release-toolchain)" \
-		--target x86_64-unknown-linux-gnu \
+		--target "${RUST_TARGET}" \
 	&& rustc --version && cargo --version
 
 WORKDIR /src

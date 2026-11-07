@@ -18,6 +18,22 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `scripts/packaging/test-host-install.sh` gate 4 prove that the systemd env file it
   installed is the configuration the running binary read.
 
+## [0.3.1] - 2026-11-06
+
+### Fixed
+
+- **docs.rs builds for `weftdb`, `weft-arrow-store` and `weft-orchestration`.** 0.3.0's
+  documentation failed to build: `turso_core` pulls in `branches` 0.4.x with its `std`
+  feature off, and that path calls `core::intrinsics::abort`, which nightly removed on
+  2026-10-15. The workspace `[patch]` only covers local builds, so `weftdb` now depends on
+  `branches` with `std` enabled, which carries into the published crate.
+
+### Changed
+
+- The Rust SDK is published as **`weftdb-client`** (library `weftdb_client`). The
+  `weft-client` name on crates.io belongs to an unrelated crate, so v0.3.0 shipped
+  without the SDK on the registry. The source stays in `weft-client/`.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added
@@ -2397,7 +2413,8 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/basic-automation/weftdb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/basic-automation/weftdb/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/basic-automation/weftdb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/basic-automation/weftdb/compare/v0.1.0...v0.2.0

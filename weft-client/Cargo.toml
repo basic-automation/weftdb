@@ -1,19 +1,19 @@
 [package]
-name = "weft-client"
+name = "weftdb-client"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-documentation = "https://docs.rs/weft-client"
+documentation = "https://docs.rs/weftdb-client"
 readme = "README.md"
 description = "Async Rust client for weft-server's HTTP API: compute, catalog, lossless ingest and stored reads, maintenance and backup."
 keywords = ["weftdb", "timeseries", "client", "database", "http"]
 categories = ["database", "api-bindings", "web-programming::http-client"]
 
 [lib]
-name = "weft_client"
+name = "weftdb_client"
 path = "src/lib.rs"
 
 [features]

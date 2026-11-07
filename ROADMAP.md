@@ -327,16 +327,16 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-14** DuckDB adapter II
   - [x] **EVI-18** Backup health metrics and catch-up-free ticking
   - [x] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
-- [ ] **W7 · Post-split lanes open; security and packaging close**
-  - [ ] open lane
+- [x] **W7 · Post-split lanes open; security and packaging close**
+  - [x] open lane
   - [x] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code
     - The pin refuses a start whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` differ from the
       scope the store root's own `STORE_FORMAT` records (exit 65, the class the exit table has
       always named for a scope mismatch; `WEFT_STORE_SCOPE_PIN=off` serves the root anyway).
       `GET /api/v1/version` answers build, layout, scope-pin and exit-code state from process
       state alone, so it answers while a store is being refused. DECISIONS 2026-11-03
-  - [ ] seal lane
-  - [ ] read lane
+  - [x] seal lane
+  - [x] read lane
   - [x] → **ROB-13** Bounded stored downsample and point lookups
   - [x] **ROB-7** Ingest decode bounds
     *Closed 2026-11-05 (#551): non-finite input is `400 not_finite` in every ingest format (Parquet NaN no longer sealed as a null), plus decoded ceilings `WEFT_MAX_INGEST_ROWS` (413 too_many_rows) and `WEFT_MAX_INGEST_DECODED_BYTES` (413 payload_too_large), checked after parse and before the seal (`weft-server/src/ingest.rs:218`).*
@@ -346,7 +346,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **ROB-5** Legacy queue-consumer panics
   - [x] **SEC-13** Security acceptance
   - [x] **PAC-9** Docker image and container smoke test (with a mounted keys file)
-  - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
+  - [x] **PAC-11** systemd unit, user and env files, and host-install CI
   - [x] **EVI-15** First cross-engine report
   - [x] Write or approve the cross-engine report narrative *(owner)*
   - [x] **EVI-19** Documented RPO/RTO
@@ -366,7 +366,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **SEC-14** Security documentation, config schema and upgrade notes
   - [ ] **PAC-10** Publish the multi-arch image (only after API auth)
   - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
-  - [ ] **EVI-17** Honesty pages II
+  - [x] **EVI-17** Honesty pages II
   - [ ] Write or approve the honesty-page narrative *(owner)*
   - [ ] **FRE-13** Layout-1 to layout-2 upgrade test
   - [ ] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
@@ -503,6 +503,9 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **The three unguarded `weft-orchestration` failures are latent bugs, not flakes — fix them
 - [ ] **Re-measured 2026-10-09 — still unbounded.**
 - [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.**
+- [ ] **`weft-orchestration`: per-pipeline signal state, not the global `SIGNALS_QUEUE` (filed 2026-11-06, from the fan-controller build).** `SIGNALS_QUEUE` is a process-wide static (`lib.rs:662`); `Pipeline::generate_signals` and `filter_signals_at` clone the whole queue into each pipeline (`pipeline.rs:964`, `:982`). With several sensor pipelines in one process, one sensor's signals reach another's probability queries. Fix: key the queue by aspect (or move it onto `Pipeline`), and add a two-pipeline isolation test. Check whether `create_signals` clears the queue; if not, even running the pipelines one at a time leaks.
+- [ ] **`weft-orchestration`: bounded-window threshold detectors (filed 2026-11-06, from the fan-controller build).** `detect_threshold_crossing_up` (`detectors.rs:504`), and probably its sibling detectors, analyse the aspect from its earliest to its latest measurement on every call, then collect and sort every point. For a 1 Hz daemon that runs for weeks, each tick costs O(history). Fix: an optional `since` start time (or an incremental cursor from the last evaluated point), so a live caller only scans new data. Add a test that the windowed and full-history runs find the same crossings in the window.
+- [ ] **Publish `weft-orchestration` to crates.io, or mark it `publish = false` and document path-dependency use (filed 2026-11-06).** Downstream users who mix a crates.io `weftdb` with a path `weft-orchestration` get two copies of `weftdb` and type mismatches. Confirm the crate's crates.io status first.
 - [x] **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:**
   - *Audit 2026-10-27: checked — this is a historical note and its fix shipped: `[profile.test] debug = 1` is at Cargo.toml:128.*
 - [ ] **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):**

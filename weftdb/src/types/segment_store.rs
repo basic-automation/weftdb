@@ -6918,6 +6918,87 @@ mod tests {
 		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) ") && migrations[5].starts_with("Text(\"0006_tag5_series\") Integer(2) ") && migrations[6].starts_with("Text(\"0007_series_time_index\") Integer(2) ") && migrations[7].starts_with("Text(\"0008_upsert_keys\") Integer(2) "), "{migrations:?}");
 	}
 
+	/// FRE-13: a pre-v2 (layout-1) store upgrades to layout-2, serves existing data
+	/// correctly, accepts new writes after the migration, and the upgrade is idempotent
+	/// on subsequent opens.
+	#[tokio::test]
+	async fn a_layout_1_store_upgrades_to_layout_2_and_accepts_new_writes() {
+		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
+		let expected_reads = std::fs::read_to_string(fixture.join("expected_reads.txt")).expect("reads the expected reads");
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		copy_tree(&fixture.join("root"), &root);
+		assert!(!root.join(STORE_FORMAT_FILE).exists(), "the fixture predates the marker");
+
+		// First open: migrates layout-1 → layout-2
+		let store = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("first open: {e:#}"));
+		let fresh_reads = fixture_reads(&store).await;
+		assert_eq!(fresh_reads, expected_reads, "migrated store reads exactly what the pre-v2 build read");
+		let report = store.open_report();
+		assert_eq!(report.migrated_from, Some(1), "first open migrates from layout 1");
+		assert_eq!(report.applied.len(), 8, "all migrations applied");
+		assert!(!report.created_new, "not a new store");
+		let format = store.store_format();
+		assert_eq!(format.layout_version, 2, "upgraded to layout 2");
+		assert_eq!(format.min_read_layout, 2);
+		assert_eq!(format.min_write_layout, 2);
+		assert_eq!(format.last_written_layout, 2);
+		assert_eq!(format.applied_through, Some("0008_upsert_keys".into()));
+		let uuid = store.store_uuid().to_string();
+
+		// Write new data into the now-layout-2 store. The timestamps sit outside the
+		// fixture's range on purpose: the series keeps every row it is given, so a
+		// re-used timestamp would read back as two points, not one replaced point.
+		let sch = schema();
+		let new_ts: Vec<i64> = vec![500, 510, 520];
+		let new_vals: Vec<BigDecimal> = vec![bd("55"), bd("66"), bd("77")];
+		store.seal("price", &sch, &new_ts, &new_vals).await.expect("seals new data after migration");
+		let (ts, vs) = store.read_time_range("price", 500, 600).await.expect("reads the just-written range");
+		let expected_new_read: Vec<Option<BigDecimal>> = vec![Some(bd("55")), Some(bd("66")), Some(bd("77"))];
+		assert_eq!(ts, new_ts, "new timestamps readable");
+		assert_eq!(vs, expected_new_read, "new values readable");
+		drop(store);
+
+		// Second open: settled — the marker says layout 2, no migration runs
+		let store2 = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("second open: {e:#}"));
+		let report2 = store2.open_report();
+		assert_eq!(report2.migrated_from, None, "second open finds no pending migration");
+		assert_eq!(report2.applied.len(), 0, "no new migrations");
+		assert!(!report2.created_new);
+
+		// Existing fixture data is still correct (spot-check)
+		assert_eq!(store2.read_point("price", 0).await.expect("reads point 0"), Some(bd("0.5")));
+		assert_eq!(store2.read_point("price", 50).await.expect("reads point 50"), Some(bd("5.5")));
+		assert_eq!(store2.read_point("price", 150).await.expect("reads point 150"), Some(bd("0.125")));
+		assert_eq!(store2.read_point("temp", 0).await.expect("reads point 0"), Some(bd("20.5")));
+		assert_eq!(store2.read_point("temp", 180).await.expect("reads point 180"), Some(bd("22")));
+
+		// New data persisted through reopen
+		let (ts2, vs2) = store2.read_time_range("price", 500, 600).await.expect("reads new data after reopen");
+		assert_eq!(ts2, new_ts, "new timestamps persisted");
+		assert_eq!(vs2, expected_new_read, "new values persisted");
+
+		let format2 = store2.store_format();
+		assert_eq!(format2.layout_version, 2, "still layout 2");
+		assert_eq!(format2.applied_through, Some("0008_upsert_keys".into()));
+		assert_eq!(store2.store_uuid().to_string(), uuid, "store uuid unchanged");
+		drop(store2);
+
+		// Third open: also settled (idempotent on re-reopen)
+		let store3 = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("third open: {e:#}"));
+		let report3 = store3.open_report();
+		assert_eq!(report3.migrated_from, None);
+		assert_eq!(report3.applied.len(), 0);
+		let format3 = store3.store_format();
+		assert_eq!(format3.layout_version, 2, "layout 2 persists");
+		assert_eq!(store3.store_uuid().to_string(), uuid, "uuid stable");
+		drop(store3);
+
+		// On-disk marker matches
+		let marker = crate::types::store_format::read_marker(&root).await.expect("reads the marker");
+		assert_eq!(marker.map(|f| f.layout_version), Some(2), "on-disk marker is layout 2");
+	}
+
 	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
 	/// which every open, even a refused one, takes and rewrites.
 	fn files_but_the_lock(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {

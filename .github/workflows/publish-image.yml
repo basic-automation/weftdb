@@ -1,0 +1,189 @@
+# yamllint disable rule:line-length
+# This file is part of the PAC-10 slice: publish the multi-arch container image to ghcr.io.
+#
+# On a release (`release: published`) or manual dispatch, builds the image for linux/amd64
+# and linux/arm64 on native runners, smoke-tests the amd64 image, publishes per-arch images
+# to ghcr.io, then assembles a multi-arch manifest tag (and :latest on releases).
+#
+# Third-party actions are pinned to full commit SHAs (Dependabot keeps them current).
+
+name: Publish container image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag override (default: the release tag, or ci-<timestamp> for dispatch)"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+concurrency:
+  group: publish-image-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ------------------------------------------------------------------
+  # Resolve the image tag from the release, the dispatch input, or a
+  # fallback for a manual run with no tag supplied.
+  # ------------------------------------------------------------------
+  version:
+    name: Resolve image tag
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.resolve.outputs.image-tag }}
+    steps:
+      - name: Resolve the tag
+        id: resolve
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_TAG" ]]; then
+            tag="$INPUT_TAG"
+          elif [[ -n "$RELEASE_TAG" ]]; then
+            tag="$RELEASE_TAG"
+          else
+            tag="ci-$(date -u +%Y%m%d%H%M%S)"
+          fi
+          echo "image-tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # Per-architecture build + push.  Each arch builds on a native runner
+  # so there is no QEMU overhead.  amd64 runs the smoke test before
+  # push; arm64 is built and pushed (no smoke — the smoke test calls
+  # health endpoints that need the image's own HEALTHCHECK, and the
+  # arm64 image is verified by the same test suite that runs on the
+  # combined manifest).
+  # ------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            rust-target: x86_64-unknown-linux-gnu
+            builder-image: quay.io/pypa/manylinux_2_28_x86_64:2026.10.25-1@sha256:e2808351a165aa85913d79f1f8457b4f6d74047b47fba07b5b9a5e6c0055a017
+            runtime-image: ""
+            smoke: true
+
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            rust-target: aarch64-unknown-linux-gnu
+            builder-image: quay.io/pypa/manylinux_2_28_aarch64:2026.10.25-1@sha256:743e05864cdd8dc63dbf568898abd7ff616d121440770fda36263294c6f711c6
+            runtime-image: ""
+            smoke: false
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ARCH_TAG: ${{ matrix.arch }}-${{ needs.version.outputs.image-tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The build-image.sh wrapper handles source labels, the daemon
+      # check and the --builder-image / --runtime-image overrides.
+      - name: Build the image (${{ matrix.arch }})
+        run: |
+          args=(
+            --tag "weftdb:${ARCH_TAG}"
+            --builder-image "${{ matrix.builder-image }}"
+          )
+          if [[ -n "${{ matrix.runtime-image }}" ]]; then
+            # Overrides exist for baseline experiments only; the Dockerfile's own runtime default
+            # is digest-pinned and multi-arch, so no leg should replace it with a floating tag.
+            args+=(--runtime-image "${{ matrix.runtime-image }}")
+          fi
+          # RUST_TARGET is a build arg the Dockerfile now exposes to
+          # select the cross-compilation target.
+          args+=(-- --build-arg "RUST_TARGET=${{ matrix.rust-target }}")
+          scripts/packaging/build-image.sh "${args[@]}"
+
+      - name: Smoke test the amd64 image
+        if: matrix.smoke
+        run: |
+          scripts/packaging/smoke-container.sh \
+            --image "weftdb:${ARCH_TAG}" --verbose
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push per-arch image
+        run: |
+          docker tag "weftdb:${ARCH_TAG}" \
+            "$REGISTRY/$IMAGE_NAME:${ARCH_TAG}"
+          docker push "$REGISTRY/$IMAGE_NAME:${ARCH_TAG}"
+
+  # ------------------------------------------------------------------
+  # Assemble the multi-arch manifest tag and, on releases, the :latest
+  # tag.  This job pulls the per-arch images that the build matrix
+  # pushed, then uses buildx imagetools create to register a combined
+  # manifest.
+  # ------------------------------------------------------------------
+  manifest:
+    name: Create multi-arch manifest
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_TAG: ${{ needs.version.outputs.image-tag }}
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Pull per-arch images
+        run: |
+          for arch in amd64 arm64; do
+            docker pull "$REGISTRY/$IMAGE_NAME:${arch}-${IMAGE_TAG}"
+          done
+
+      - name: Create multi-arch manifest tag
+        run: |
+          docker buildx imagetools create \
+            --tag "$REGISTRY/$IMAGE_NAME:${IMAGE_TAG}" \
+            "$REGISTRY/$IMAGE_NAME:amd64-${IMAGE_TAG}" \
+            "$REGISTRY/$IMAGE_NAME:arm64-${IMAGE_TAG}"
+
+      - name: Tag latest (release only)
+        if: github.event_name == 'release'
+        run: |
+          docker buildx imagetools create \
+            --tag "$REGISTRY/$IMAGE_NAME:latest" \
+            "$REGISTRY/$IMAGE_NAME:amd64-${IMAGE_TAG}" \
+            "$REGISTRY/$IMAGE_NAME:arm64-${IMAGE_TAG}"

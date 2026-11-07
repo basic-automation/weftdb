@@ -6,9 +6,9 @@
 //! and the `request_id` an operator needs to find the request in a log.
 //!
 //! ```no_run
-//! use weft_client::{AspectDeclaration, Client, WriteOptions};
+//! use weftdb_client::{AspectDeclaration, Client, WriteOptions};
 //!
-//! # async fn demo() -> weft_client::Result<()> {
+//! # async fn demo() -> weftdb_client::Result<()> {
 //! let client = Client::builder("http://127.0.0.1:8080").api_key("weft_…").build()?;
 //! client.declare_aspect(&AspectDeclaration::new("price", "scaled_i64", "millis").scale(2)).await?;
 //! client.write_points("price", [(1_000, "1.25"), (2_000, "2.50")], &WriteOptions::idempotent("batch-1")).await?;

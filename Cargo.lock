@@ -5599,7 +5599,7 @@ dependencies = [
 
 [[package]]
 name = "weft-arrow-store"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5642,29 +5642,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "weft-client"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "axum",
- "bigdecimal",
- "bytes",
- "chrono",
- "futures",
- "parquet",
- "reqwest",
- "rustls",
- "rustls-platform-verifier",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "weft-line-protocol"
 version = "0.3.0"
 dependencies = [
@@ -5675,7 +5652,7 @@ dependencies = [
 
 [[package]]
 name = "weft-orchestration"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -5729,7 +5706,7 @@ dependencies = [
 
 [[package]]
 name = "weft-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5794,11 +5771,12 @@ dependencies = [
 
 [[package]]
 name = "weftdb"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "bigdecimal",
+ "branches",
  "bytemuck",
  "chrono",
  "criterion",
@@ -5830,6 +5808,29 @@ dependencies = [
  "weft-physical-type",
  "weft-reduce",
  "wide",
+]
+
+[[package]]
+name = "weftdb-client"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "axum",
+ "bigdecimal",
+ "bytes",
+ "chrono",
+ "futures",
+ "parquet",
+ "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
