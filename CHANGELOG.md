@@ -50,6 +50,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **The OpenAPI drift gate no longer fails on a version bump (#620).**
+  `generated_spec_matches_committed_file` now normalises `info.version` on
+  both sides before comparing, so every path, method, scope, tier and schema
+  is still checked but a release version change does not trip the gate.
+  A separate assertion in `info_block_has_service_name_and_version` verifies
+  that `info.version` equals the crate version directly.
+
 - **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
   each measure by metric name alone, so two results in one report — a crash matrix, a query mix, any
   cross-adapter run — looked like a duplicated measure and `finish --manifest` refused the
