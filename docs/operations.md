@@ -35,8 +35,10 @@ label, and the parent fsynced. A crash before the rename leaves only the
 ```bash
 # Take an online snapshot (source verification — quiescent store recommended)
 curl -X POST http://127.0.0.1:8080/api/v1/storage/backup
+
 # Take a snapshot with snapshot-only verification (safe under concurrent writes)
 curl -X POST 'http://127.0.0.1:8080/api/v1/storage/backup?verify=snapshot'
+
 # Take a snapshot with a label
 curl -X POST 'http://127.0.0.1:8080/api/v1/storage/backup?label=nightly-01'
 ```
@@ -53,7 +55,7 @@ ls -1 /var/lib/weftdb/backups/
 Set two environment variables to enable it:
 
 | Variable | Default | Effect |
-|----------|---------|--------|
+|---|---|---|
 | `WEFT_BACKUP_INTERVAL_SECS` | Unset (daemon off) | Seconds between daemon ticks |
 | `WEFT_BACKUP_KEEP` | 0 (no pruning) | Newest N daemon backups to retain |
 
@@ -70,10 +72,12 @@ cannot serve:
 
 ```bash
 # Restore a control-plane backup into a fresh root
-weft-server restore /var/lib/weftdb/backups/backup-1744246800000 --into /var/lib/weftdb/store
+weft-server restore /var/lib/weftdb/backups/backup-1744246800000 \
+  --into /var/lib/weftdb/store
 
 # Restore and adopt (open the root once to adopt frames)
-weft-server restore /path/to/backup --into /mnt/restored --adopt --database mydb --subject host-1
+weft-server restore /path/to/backup --into /mnt/restored \
+  --adopt --database mydb --subject host-1
 ```
 
 The command reads the backup's manifest and picks the correct restore function:
@@ -85,7 +89,8 @@ or `65` (the backup needs an operator).
 ### Verify restorability without interrupting service
 
 ```bash
-curl -X POST 'http://127.0.0.1:8080/api/v1/storage/restore/drill?label=backup-1744246800000'
+curl -X POST \
+  'http://127.0.0.1:8080/api/v1/storage/restore/drill?label=backup-1744246800000'
 ```
 
 This rehearses a restore into a throwaway directory, reports `restorable`, and
@@ -100,11 +105,11 @@ The server can be run as a systemd service using the unit file at
 
 ### What the unit enforces
 
-- **`Type=exec`** — the binary must start successfully; a missing interpreter or
-  a glibc mismatch produces a start failure, not a silent success.
-- **`ProtectHome=yes`** — `/home` is absent from the service's view (the binary
-  cannot fall back to `~/.weftdb/data`). The environment file must supply
-  `WEFT_DATA_DIR` explicitly.
+- **`Type=exec`** — the binary must start successfully; a missing interpreter
+  or a glibc mismatch produces a start failure, not a silent success.
+- **`ProtectHome=yes`** — `/home` is absent from the service's view (the
+  binary cannot fall back to `~/.weftdb/data`). The environment file must
+  supply `WEFT_DATA_DIR` explicitly.
 - **`ProtectSystem=strict`** — `/usr`, `/etc`, `/boot` are read-only. Only
   `/var/lib/weftdb` is writable (via `ReadWritePaths`), and only because
   `StateDirectory=weftdb` is declared. When `PrivateTmp=yes` is set alongside
@@ -117,17 +122,17 @@ The server can be run as a systemd service using the unit file at
 - **`PrivateDevices` deliberately off** — the GPU needs `/dev/dri` visible.
 - **`LimitNOFILE=65536`** — systemd's default soft limit of 1024 would cap
   connections at ~512.
-- **`TimeoutStopSec=90`** — the graceful shutdown drain (SIGTERM + `WEFT_SHUTDOWN_GRACE_SECS`,
-  default 5 s) must finish within this budget.
-- **Maintenance budget** is the 90‑second `TimeoutStopSec`: after SIGTERM,
-  active connections get their grace window, the task drain runs, and the store
-  closes. If `WEFT_SHUTDOWN_GRACE_SECS` is raised above ~60 s, `TimeoutStopSec`
-  must be raised with it.
+- **`TimeoutStopSec=90`** — the graceful shutdown drain (SIGTERM +
+  `WEFT_SHUTDOWN_GRACE_SECS`, default 5 s) must finish within this budget.
+- **Maintenance budget** is the 90-second `TimeoutStopSec`: after SIGTERM,
+  active connections get their grace window, the task drain runs, and the
+  store closes. If `WEFT_SHUTDOWN_GRACE_SECS` is raised above ~60 s,
+  `TimeoutStopSec` must be raised with it.
 
 ### Required paths
 
 | Path | Created by | Purpose |
-|------|-----------|---------|
+|---|---|---|
 | `/var/lib/weftdb` | `StateDirectory=weftdb` (systemd) | Data directory, store root (`/var/lib/weftdb/store`), backups (`/var/lib/weftdb/backups`) |
 | `/run/weftdb` | [`weftdb.tmpfiles`](../packaging/systemd/weftdb.tmpfiles) + `systemd-tmpfiles --create` | Runtime directory for API key files, survives service restart |
 | `/etc/weftdb/weft-server.env` | Install script (created once, never overwritten) | Operator configuration (all `WEFT_*` variables) |
@@ -136,17 +141,20 @@ The server can be run as a systemd service using the unit file at
 ### Installation
 
 The support files are at `packaging/systemd/`:
+
 - `weft-server.service` — the unit
 - `weftdb.sysusers` — creates the `weftdb` user and group
 - `weftdb.tmpfiles` — creates `/run/weftdb`
 
-The install script at [`scripts/packaging/install-host.sh`](../scripts/packaging/install-host.sh)
+The install script at
+[`scripts/packaging/install-host.sh`](../scripts/packaging/install-host.sh)
 places everything in the right locations and prints the four post-install
 commands. It never overwrites an existing environment file.
 
 ```bash
 # Install from a release archive or a build tree
 sudo scripts/packaging/install-host.sh
+
 # After the script finishes, run its printed commands:
 sudo systemd-sysusers
 sudo systemd-tmpfiles --create
@@ -180,8 +188,9 @@ This section adds what an operator needs beyond that.
 ### Image publishing
 
 The repository publishes multi-arch container images to
-`ghcr.io/basic-automation/weftdb` on every [release](https://github.com/basic-automation/weftdb/releases)
-(see [`.github/workflows/publish-image.yml`](../.github/workflows/publish-image.yml)).
+`ghcr.io/basic-automation/weftdb` on every
+[release](https://github.com/basic-automation/weftdb/releases) (see
+[`.github/workflows/publish-image.yml`](../.github/workflows/publish-image.yml)).
 Each release tag becomes the image tag; the `:latest` tag is updated on
 releases. The image is built for `linux/amd64` and `linux/arm64` on native
 runners — no QEMU overhead. The amd64 leg runs a smoke test against the built
@@ -243,9 +252,11 @@ Upgrading a WeftDB host installation follows this pattern:
 1. **Read the upgrade notes and the per-release `UPGRADING.md`** for any
    breaking changes, new configuration variables, or migration instructions.
 2. **Stop the service.**
+
    ```bash
    sudo systemctl stop weft-server
    ```
+
 3. **Take a backup of the data directory.** On a host install the data lives at
    `/var/lib/weftdb` by default. A full directory copy (or an online snapshot
    taken before stopping) covers the control plane. For a container deployment,
@@ -256,9 +267,11 @@ Upgrading a WeftDB host installation follows this pattern:
    new env template at `/usr/share/doc/weftdb/weft-server.env` for new or
    changed variables.
 6. **Start the service.**
+
    ```bash
    sudo systemctl start weft-server
    ```
+
 7. **Verify.** Check the journal for a clean start, confirm `GET /ready`
    returns `200`, and run a drill restore or an ingest-read round-trip.
 
@@ -295,9 +308,10 @@ operator action: free space and restart.
 
 The server runs as `weftdb` (uid/gid from
 [`weftdb.sysusers`](../packaging/systemd/weftdb.sysusers)). The data directory
-(`/var/lib/weftdb`, created by `StateDirectory`) is owned by `weftdb:weftdb`.
-A common initial failure is a bind-mounted directory with the wrong owner: the
-store's first act is to probe the root for write access. Check the journal:
+(`/var/lib/weftdb`, created by `StateDirectory`) is owned by
+`weftdb:weftdb`. A common initial failure is a bind-mounted directory with the
+wrong owner: the store's first act is to probe the root for write access.
+Check the journal:
 
 ```bash
 journalctl -u weft-server --since "5 min ago"
@@ -317,52 +331,54 @@ include:
 
 - A layout or `min_write_layout` newer than the binary
 - An unreadable `STORE_FORMAT`
-- A scope mismatch (the environment names a database/subject the store does not
-  contain)
+- A scope mismatch (the environment names a database/subject the store does
+  not contain)
 - An incomplete restore
 - Frames without a control-plane trailer
 
 ### Backup failure
 
-The daemon's backup failures are recorded in metrics (`weft_backup_failures_total`).
-A transient failure (network filesystem glitch, short disk stall) causes the
-daemon to skip the tick and retry on the next period. A repeated failure is
-visible in the metric and the journal.
+The daemon's backup failures are recorded in metrics
+(`weft_backup_failures_total`). A transient failure (network filesystem glitch,
+short disk stall) causes the daemon to skip the tick and retry on the next
+period. A repeated failure is visible in the metric and the journal.
 
 ### Logs and metrics
 
 **Logs.** The server uses the [`tracing`](https://docs.rs/tracing) framework.
 Set `RUST_LOG` to control verbosity (defaults to `error` or the distribution's
-default). Every request gets a root span (`request{method,path,request_id}`)
-with nested per-stage spans. Journal:
+default). Every request gets a root span
+(`request{method,path,request_id}`) with nested per-stage spans.
 
 ```bash
 journalctl -u weft-server -f
 ```
 
 For a container:
+
 ```bash
 docker logs -f <container>
 ```
 
-OpenTelemetry export is available by setting `OTEL_EXPORTER_OTLP_ENDPOINT`
-(to an OTLP/gRPC collector), in addition to the journal output.
+OpenTelemetry export is available by setting
+`OTEL_EXPORTER_OTLP_ENDPOINT` (to an OTLP/gRPC collector), in addition to
+the journal output.
 
 **Metrics (`GET /metrics`).** The following backup-related metrics are
 exposed at `/metrics` in the Prometheus text exposition format:
 
 | Metric | Type | Meaning |
-|--------|------|---------|
+|---|---|---|
 | `weft_backup_snapshots_total` | counter | Successful control-plane snapshots |
 | `weft_backup_bytes_written_total` | counter | Total bytes written by snapshots |
 | `weft_backup_failures_total` | counter | Daemon ticks that failed to snapshot |
-| `weft_backup_last_success_seconds` | gauge | Unix seconds of the most recent verified snapshot (0 when none) |
+| `weft_backup_last_success_seconds` | gauge | Unix seconds of most recent verified snapshot (0 when none) |
 | `weft_backup_duration_seconds` | histogram | Wall-clock duration of each completed snapshot |
 
 Other notable metrics:
 
 | Metric | Type | Meaning |
-|--------|------|---------|
+|---|---|---|
 | `weft_interpolate_requests_total` | counter | Interpolation requests received |
 | `weft_interpolate_errors_total` | counter | Interpolation errors |
 | `weft_ingest_requests_total` | counter | Ingest requests received |
