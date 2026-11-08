@@ -2,6 +2,7 @@
 //! Pure move of the former `segment_store.rs` `impl` block; no behaviour change.
 
 use super::*;
+use weft_physical_type::merge_newer_wins;
 
 impl SegmentStore {
 	/// Pin the reclaim epoch for a read about to prune the index, so that no frame a swap
@@ -136,9 +137,19 @@ impl SegmentStore {
 	pub async fn read_time_range_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
-		let descriptors: Vec<SegmentDescriptor> = self.index.prune_series_rows_by_time(aspect, series, start, end).await?.into_iter().map(|row| row.desc).collect();
-		let mut timestamps = Vec::new();
-		let mut values = Vec::new();
+		// Same quality prune as point reads — present-prune (`null_count < row_count`) so
+		// that nulls behave identically in both paths: an all-null segment is dropped before
+		// its file is opened, so the older value at that instant survives.  A newer segment
+		// that carries a non-null row at one timestamp and a null at another still overrides
+		// the older value with null at the null timestamp (issue #443).
+		let descriptors: Vec<SegmentDescriptor> = self.index.prune_series_present_rows(aspect, series, start, end).await?.into_iter().map(|row| row.desc).collect();
+		// Fold overlapping segments with **newer-wins** (upsert).  Descriptors are in seal
+		// (id) order, oldest first, matching the contract of `merge_newer_wins` where the
+		// second argument supersedes the first at any shared instant.  This makes a range
+		// read give the same answer as `read_point` / `read_points` across overlapping
+		// segments (last-writer-wins) — and the same answer a later `reconcile_overlaps`
+		// merge would fold them to.
+		let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
 		for descriptor in &descriptors {
 			// Phase 5 memory-mapped reads: with `mmap_reads` on (and the feature compiled in),
 			// the window decodes straight from a read-only mapping of the frame instead of a
@@ -156,14 +167,21 @@ impl SegmentStore {
 			// pages disjoint from the window — instead of the whole segment; any other shape falls
 			// back to a full decode. Already filtered to `[start, end]`.
 			let (ts, vs) = frame_read::read_range(descriptor.path.as_str(), &bytes, start, end)?;
+			let mut rows: Vec<(i64, Option<BigDecimal>)> = Vec::with_capacity(ts.len());
 			for (t, v) in ts.into_iter().zip(vs) {
 				if start <= t && t <= end {
-					timestamps.push(t);
-					values.push(v);
+					rows.push((t, v));
 				}
 			}
+			if merged.is_empty() {
+				merged = rows;
+			} else {
+				// Each segment's rows are already in file order; `merge_newer_wins` requires
+				// both sides to be **non-decreasing** by timestamp, which sealed segments satisfy.
+				merged = merge_newer_wins(&merged, &rows);
+			}
 		}
-		Ok((timestamps, values))
+		Ok(merged.into_iter().unzip())
 	}
 
 	/// **Cross-segment downsample** — reduce `aspect`'s `[start, end]` rows into

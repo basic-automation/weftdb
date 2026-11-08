@@ -8691,3 +8691,7 @@ mod read_limits_tests;
 /// Phase 5 memory-mapped GPU I/O: a mapped range read returns exactly the buffered read's rows.
 #[cfg(test)]
 mod mapped_read_tests;
+
+/// Issue #443: overlapping reads across pruned segments — a range read merges with newer-wins.
+#[cfg(test)]
+mod overlap_read_tests;
