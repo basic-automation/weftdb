@@ -24,6 +24,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   clients** that send mixed-case `?fill=Linear` or `--gf-fill=CUBIC`: send `null`,
   `prev`, `linear`, `quadratic`, `cubic` or the lowercase spellings. The value arm
   (a decimal constant) is unchanged.
+- **`/v1` range responses may omit `total` or send it `null` (cursor pages).**
+  The `points`, `range`, `value-points` and `value-range` JSON endpoints no longer
+  promise `total` on every page: it is `null` on cursor-following pages or absent
+  from the response body. The Rust client now models it as `Option<usize>` with
+  `#[serde(default)]`; a strict client of any language must treat it as optional.
 
 ### Removed
 
