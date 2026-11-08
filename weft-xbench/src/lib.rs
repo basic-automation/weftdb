@@ -88,7 +88,11 @@ use weft_bench::{
 /// v8 (#516) adds each gate's `indeterminate`: a digest disagreement where every run stayed inside
 /// its tolerance is non-determinism, not a wrong answer and not a failure. The combined gate's
 /// `passed` stays false to keep the row out of verdicts.
-pub const XBENCH_SCHEMA_VERSION: u32 = 8;
+///
+/// v9 (#452) adds `ArmInfo::adapter_workload: Option<bool>` and `ArmInfo::is_self_measured()`.
+/// A result marked `adapter_workload: false` (imported from a non-adapter weft-bench workload) must
+/// not be presented as a cross-engine comparison.
+pub const XBENCH_SCHEMA_VERSION: u32 = 9;
 
 /// The reductions the downsample phase computes per bucket.
 pub const DOWNSAMPLE_AGGREGATIONS: [weft_reduce::Aggregation; 3] = [weft_reduce::Aggregation::Min, weft_reduce::Aggregation::Max, weft_reduce::Aggregation::Avg];
@@ -303,6 +307,12 @@ pub struct ArmInfo {
 	/// arms that answer the question asked.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub own_answer: Option<String>,
+	/// Whether this arm was produced through a proper adapter workload — `None` (the default)
+	/// means it was (v9). `Some(false)` marks a result from a non-adapter workload (e.g. ingest,
+	/// compression), which measures only WeftDB's own storage paths and must not appear in a
+	/// cross-engine comparison (#452).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub adapter_workload: Option<bool>,
 }
 
 /// The fair protocol's three ways to interpolate with an engine (roadmap 1.2).
@@ -392,6 +402,16 @@ impl ArmInfo {
 	#[must_use]
 	pub fn engine_key(&self) -> &str {
 		self.arm.split('-').next().unwrap_or(&self.arm)
+	}
+
+	/// Whether this arm result came from a non-adapter workload — a result that measures
+	/// WeftDB's own storage paths with no competitor adapter provenance.
+	///
+	/// True when `adapter_workload` is explicitly `Some(false)`. A self-measured result
+	/// must not be presented as a cross-engine comparison (#452).
+	#[must_use]
+	pub fn is_self_measured(&self) -> bool {
+		matches!(self.adapter_workload, Some(false))
 	}
 }
 

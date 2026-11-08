@@ -356,10 +356,10 @@ impl Arm for QuestDb {
 		match self.class {
 			ArmClass::PortableSql => {
 				let (arm, strategy) = if self.linear_asof { ("questdb-double-linear", "ASOF JOIN forced linear by the asof_linear hint (EXPLAIN: AsOf Join)") } else { (arm, "ASOF JOIN strategy left to the optimizer (EXPLAIN: AsOf Join Fast)") };
-				ArmInfo { arm: arm.into(), engine, value_type: value_type.into(), method: format!("linear interpolation in SQL: long_sequence() grid, native LT JOIN into segments, then ASOF JOIN from the grid, first/last segment extended; {strategy}; downsample via SAMPLE BY … ALIGN TO CALENDAR; {storage}{note}"), class: Some(self.class), own_answer: None }
+				ArmInfo { arm: arm.into(), engine, value_type: value_type.into(), method: format!("linear interpolation in SQL: long_sequence() grid, native LT JOIN into segments, then ASOF JOIN from the grid, first/last segment extended; {strategy}; downsample via SAMPLE BY … ALIGN TO CALENDAR; {storage}{note}"), class: Some(self.class), own_answer: None, adapter_workload: None }
 			}
-			ArmClass::Native => ArmInfo { arm: "questdb-native".into(), engine, value_type: value_type.into(), method: format!("native fill: SAMPLE BY the grid step FROM … TO … FILL(LINEAR) over avg(v); {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones".into()) },
-			ArmClass::ClientSide => ArmInfo { arm: "questdb-client".into(), engine, value_type: value_type.into(), method: format!("client-side: every knot fetched in instant order over QWP, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None },
+			ArmClass::Native => ArmInfo { arm: "questdb-native".into(), engine, value_type: value_type.into(), method: format!("native fill: SAMPLE BY the grid step FROM … TO … FILL(LINEAR) over avg(v); {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones".into()), adapter_workload: None },
+			ArmClass::ClientSide => ArmInfo { arm: "questdb-client".into(), engine, value_type: value_type.into(), method: format!("client-side: every knot fetched in instant order over QWP, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None, adapter_workload: None },
 		}
 	}
 

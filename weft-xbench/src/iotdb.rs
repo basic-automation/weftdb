@@ -234,9 +234,9 @@ impl Arm for IoTdb {
 		let storage = format!("table model, one device; insertTablet of {ROWS_PER_INSERT} rows in time order, answered once the WAL entry is synced (wal_mode=SYNC); table REST API (JSON) on loopback");
 		let (engine, value_type) = (format!("iotdb {version}"), "DOUBLE field".to_string());
 		match self.class {
-			ArmClass::PortableSql => ArmInfo { arm: "iotdb-double".into(), engine, value_type, method: format!("linear interpolation in SQL: lead() into segments, date_bin_gapfill() grid, ASOF LEFT JOIN from the grid, first/last segment extended; downsample via date_bin; {storage}"), class: Some(self.class), own_answer: None },
-			ArmClass::Native => ArmInfo { arm: "iotdb-native".into(), engine, value_type, method: format!("native fill: date_bin_gapfill(step) over avg(v), FILL METHOD LINEAR; {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones; nothing before the first knot's bucket or after the last's".into()) },
-			ArmClass::ClientSide => ArmInfo { arm: "iotdb-client".into(), engine, value_type, method: format!("client-side: every knot fetched in instant order as JSON, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None },
+			ArmClass::PortableSql => ArmInfo { arm: "iotdb-double".into(), engine, value_type, method: format!("linear interpolation in SQL: lead() into segments, date_bin_gapfill() grid, ASOF LEFT JOIN from the grid, first/last segment extended; downsample via date_bin; {storage}"), class: Some(self.class), own_answer: None, adapter_workload: None },
+			ArmClass::Native => ArmInfo { arm: "iotdb-native".into(), engine, value_type, method: format!("native fill: date_bin_gapfill(step) over avg(v), FILL METHOD LINEAR; {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, labelled with the bucket's start, and the line between the averages of the nearest filled buckets across empty ones; nothing before the first knot's bucket or after the last's".into()), adapter_workload: None },
+			ArmClass::ClientSide => ArmInfo { arm: "iotdb-client".into(), engine, value_type, method: format!("client-side: every knot fetched in instant order as JSON, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None, adapter_workload: None },
 		}
 	}
 

@@ -80,6 +80,13 @@ fn is_weft(r: &ArmResult) -> bool {
 	r.arm.arm.starts_with("weftdb")
 }
 
+/// Whether this result records WeftDB alone, with no competitor adapter.
+/// Per the performance methodology (#452), such results must not be presented as
+/// a cross-engine comparison.
+fn is_self_measured(r: &ArmResult) -> bool {
+	r.arm.is_self_measured()
+}
+
 /// The arm's class; a pre-v7 result, which recorded none, ran the portable SQL.
 fn class_of(r: &ArmResult) -> ArmClass {
 	r.arm.class.unwrap_or_else(|| if is_weft(r) { ArmClass::Native } else { ArmClass::PortableSql })
@@ -452,15 +459,41 @@ fn reproduction_section(report: &XbenchReport, b: &mut Vec<Block>) {
 /// The report as blocks: header, results, honesty section.
 #[must_use]
 pub fn blocks(report: &XbenchReport) -> Vec<Block> {
-	let mut b = vec![Block::Heading(1, "WeftDB cross-engine benchmark".into())];
+	// Detect self-measured results (non-adapter workload, set explicitly) and whether the report
+	// spans multiple engines. A self-measured arm must not appear in a cross-engine comparison (#452).
+	use std::collections::BTreeSet;
+	let self_measured_arms: Vec<&str> = report.results.iter().filter(|r| r.arm.is_self_measured()).map(|r| r.arm.arm.as_str()).collect();
+	let has_adapter = report.results.iter().any(|r| !r.arm.is_self_measured());
+	let distinct_engines: Vec<&str> = {
+		let mut s: BTreeSet<&str> = report.results.iter().map(|r| r.arm.engine_key()).collect();
+		s.into_iter().collect()
+	};
+	let cross_engine_self_measured = !self_measured_arms.is_empty() && distinct_engines.len() >= 2;
+	let title = if cross_engine_self_measured {
+		"WeftDB benchmark (invalid cross-engine comparison — see note)"
+	} else if !self_measured_arms.is_empty() && distinct_engines.len() == 1 {
+		"WeftDB benchmark (self-measured — not a cross-engine comparison)"
+	} else if self_measured_arms.is_empty() && has_adapter {
+		"WeftDB cross-engine benchmark"
+	} else {
+		"WeftDB benchmark"
+	};
+	let mut b = vec![Block::Heading(1, title.into())];
 	header_section(report, &mut b);
 	results_section(report, &mut b);
-	classes_section(report, &mut b);
+	if !cross_engine_self_measured && !(distinct_engines.len() == 1 && !self_measured_arms.is_empty()) {
+		classes_section(report, &mut b);
+	}
 	honesty_section(report, &mut b);
 	not_tested_section(report, &mut b);
 	limitations_section(report, &mut b);
 	caveats_section(report, &mut b);
 	reproduction_section(report, &mut b);
+	if cross_engine_self_measured {
+		let arm_list = self_measured_arms.join(", ");
+		b.push(Block::Heading(3, "Invalid cross-engine comparison".into()));
+		b.push(Block::Para(format!("The following arm(s) are self-measured (no adapter workload): {arm_list}. Per the performance methodology, a self-measured result must not be presented as a head-to-head comparison against a genuine adapter result. To compare these arms against another engine, run them through an adapter workload first.")));
+	}
 	b
 }
 
@@ -568,12 +601,12 @@ mod tests {
 	use weft_bench::report::RunMetadata;
 
 	use super::*;
-	use crate::{latency, ArmInfo, Correctness, XBENCH_SCHEMA_VERSION};
+	use crate::{latency, ArmInfo, Correctness, DatasetKind, Phase, Warmth, XBENCH_SCHEMA_VERSION};
 
 	fn result(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
 		let (latency, latency_ci) = latency(samples, 1);
 		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed, unfilled_points: 0, answer_sha256: None, indeterminate: false });
-		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec(), between_run: None }
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None, adapter_workload: Some(true) }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec(), between_run: None }
 	}
 
 	fn report(results: Vec<ArmResult>) -> XbenchReport {
@@ -772,5 +805,27 @@ mod tests {
 	fn markdown_tables_escape_pipes() {
 		let md = to_markdown(&[Block::Table(vec!["a|b".into()], vec![vec!["c|d".into()]])]);
 		assert!(md.contains("| a\\|b |") && md.contains("| c\\|d |"));
+	}
+
+	/// A self-measured result: records WeftDB's own storage paths with no adapter workload.
+	fn self_measured(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
+		let (latency, latency_ci) = latency(samples, 1);
+		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed, unfilled_points: 0, answer_sha256: None, indeterminate: false });
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "weftdb".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None, adapter_workload: Some(false) }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec(), between_run: None }
+	}
+
+	#[test]
+	fn self_measured_results_render_as_weftdb_only() {
+		let r = report(vec![self_measured("a", "weftdb-ingest", Phase::Load, &SLOW, true)]);
+		let md = to_markdown(&blocks(&r));
+		assert!(md.contains("self-measured"), "heading says self-measured\n{md}");
+		assert!(!md.contains("Where WeftDB loses"), "no comparison section\n{md}");
+		assert!(!md.contains("Where WeftDB wins"), "no win section\n{md}");
+	}
+
+	#[test]
+	fn self_measured_results_verdicts_are_empty() {
+		let r = report(vec![self_measured("a", "weftdb-ingest", Phase::Interpolate, &FAST, true)]);
+		assert!(verdicts(&r).is_empty(), "no genuine adapter results to compare against");
 	}
 }

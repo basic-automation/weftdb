@@ -219,9 +219,9 @@ impl Arm for Duck {
 			DuckValue::Decimal => ("duckdb-decimal", "DECIMAL(18, s)", "; stored exactly, the interpolation line computed in DOUBLE (DECIMAL × DOUBLE is DOUBLE)"),
 		};
 		if self.class == ArmClass::ClientSide {
-			return ArmInfo { arm: "duckdb-client".into(), engine: format!("duckdb {version}"), value_type: value_type.into(), method: "client-side: every knot fetched in instant order, the line computed in this Rust client in f64, first/last segment extended; on-disk database".into(), class: Some(self.class), own_answer: None };
+			return ArmInfo { arm: "duckdb-client".into(), engine: format!("duckdb {version}"), value_type: value_type.into(), method: "client-side: every knot fetched in instant order, the line computed in this Rust client in f64, first/last segment extended; on-disk database".into(), class: Some(self.class), own_answer: None, adapter_workload: None };
 		}
-		ArmInfo { arm: arm.into(), engine: format!("duckdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: range() grid, two ASOF JOINs, first/last segment extended; downsample via GROUP BY on the epoch bucket; on-disk database{note}"), class: Some(self.class), own_answer: None }
+		ArmInfo { arm: arm.into(), engine: format!("duckdb {version}"), value_type: value_type.into(), method: format!("linear interpolation in SQL: range() grid, two ASOF JOINs, first/last segment extended; downsample via GROUP BY on the epoch bucket; on-disk database{note}"), class: Some(self.class), own_answer: None, adapter_workload: None }
 	}
 
 	fn reports_load(&self) -> bool {

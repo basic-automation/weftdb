@@ -307,10 +307,10 @@ impl Arm for ClickHouse {
 		match self.class {
 			ArmClass::PortableSql => {
 				let arm = if self.join == "hash" { arm } else { "clickhouse-double-merge" };
-				ArmInfo { arm: arm.into(), engine, value_type: value_type.into(), method: format!("linear interpolation in SQL: numbers() grid, two ASOF LEFT JOINs (join_algorithm = '{}'), first/last segment extended; downsample via GROUP BY on the epoch bucket; {storage}{note}", self.join), class: Some(self.class), own_answer: None }
+				ArmInfo { arm: arm.into(), engine, value_type: value_type.into(), method: format!("linear interpolation in SQL: numbers() grid, two ASOF LEFT JOINs (join_algorithm = '{}'), first/last segment extended; downsample via GROUP BY on the epoch bucket; {storage}{note}", self.join), class: Some(self.class), own_answer: None, adapter_workload: None }
 			}
-			ArmClass::Native => ArmInfo { arm: "clickhouse-native".into(), engine, value_type: value_type.into(), method: format!("native fill: GROUP BY the grid-step bucket, ORDER BY … WITH FILL over the grid, INTERPOLATE (v); {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, carried forward unchanged across empty buckets (last observation carried forward, not a line), and 0 (the column's default) before the first knot".into()) },
-			ArmClass::ClientSide => ArmInfo { arm: "clickhouse-client".into(), engine, value_type: value_type.into(), method: format!("client-side: every knot fetched in instant order, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None },
+			ArmClass::Native => ArmInfo { arm: "clickhouse-native".into(), engine, value_type: value_type.into(), method: format!("native fill: GROUP BY the grid-step bucket, ORDER BY … WITH FILL over the grid, INTERPOLATE (v); {storage}"), class: Some(self.class), own_answer: Some("the average of the knots in each grid-step bucket, carried forward unchanged across empty buckets (last observation carried forward, not a line), and 0 (the column's default) before the first knot".into()), adapter_workload: None },
+			ArmClass::ClientSide => ArmInfo { arm: "clickhouse-client".into(), engine, value_type: value_type.into(), method: format!("client-side: every knot fetched in instant order, the line computed in this Rust client in f64, first/last segment extended; {storage}"), class: Some(self.class), own_answer: None, adapter_workload: None },
 		}
 	}
 

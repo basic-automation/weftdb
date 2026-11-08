@@ -48,6 +48,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   satisfy it, which is the audit the section on Rust doc comments points to.
   (#430)
 
+- **A non-adapter result cannot carry a cross-engine claim (#452).**
+  `weft-xbench` now distinguishes self-measured results (WeftDB's own
+  storage paths, no competitor adapter) from genuine adapter results
+  through `ArmInfo::adapter_workload` and `ArmInfo::is_self_measured()`.
+  A report that contains only self-measured results renders as
+  WeftDB-only. Combining self-measured results with adapter results
+  exits early with a message naming the workload and the remedy. Report
+  schema v8 → v9.
+
 ### Changed
 
 - **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded

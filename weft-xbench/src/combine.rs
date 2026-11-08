@@ -35,6 +35,21 @@ const fn bootstrap_seed(seed: u64) -> u64 {
 /// Fewer than two runs, runs that are not the same benchmark, or a result without raw samples.
 pub fn combine(runs: &[XbenchReport], sources: Vec<InputFile>) -> anyhow::Result<XbenchReport> {
 	ensure!(runs.len() >= 2, "combining needs at least two runs, got {}", runs.len());
+	// A self-measured result records only WeftDB's own storage paths and must not appear in a
+	// cross-engine comparison (#452). Reject the whole combine rather than silently dropping.
+	// The guard fires only when the combined set spans ≥2 distinct engines, since a single-engine
+	// report has nothing to compare. The weftdb reference arm is deliberately excluded — it
+	// legitimately has no adapter provenance because there is no second party.
+	let engines: std::collections::BTreeSet<&str> = runs.iter().flat_map(|run| run.results.iter().map(|r| r.arm.engine_key())).collect();
+	if engines.len() >= 2 {
+		for (n, run) in runs.iter().enumerate() {
+			for r in &run.results {
+				if r.arm.is_self_measured() {
+					bail!("run {} result `{}` ({}, {:?}, {}) is self-measured (no adapter workload). To compare {} against another engine, run it through an adapter workload first.", n + 1, r.arm.arm, r.dataset, r.phase, r.warmth.as_str(), r.arm.engine_key());
+				}
+			}
+		}
+	}
 	let first = &runs[0];
 	for (n, run) in runs.iter().enumerate().skip(1) {
 		let (a, b) = (&first.metadata, &run.metadata);
@@ -115,11 +130,23 @@ mod tests {
 	use super::*;
 	use crate::{latency, ArmInfo, Correctness, DatasetKind, Phase, Warmth};
 
+	/// A self-measured result: records WeftDB's own storage paths with no adapter workload.
+	fn self_measured_result(dataset: &str, arm: &str, level: u64, digest: &str) -> ArmResult {
+		let samples: Vec<u64> = (0..12).map(|i| level + i % 4).collect();
+		let (latency, latency_ci) = latency(&samples, 7);
+		let correctness = Some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: 0.0, tolerance: 1e-9, passed: true, unfilled_points: 0, answer_sha256: Some(digest.into()), indeterminate: false });
+		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "weftdb".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None, adapter_workload: Some(false) }, phase: Phase::Interpolate, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples, between_run: None }
+	}
+
+	fn self_measured_run(dataset: &str, arm: &str, level: u64, digest: &str) -> XbenchReport {
+		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-11-02T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: None, invocation: vec![], scratch_dir: None, optimized: Some(true), cold_hook: None, results: vec![self_measured_result(dataset, arm, level, digest)], inputs: vec![], binary_sha256: None, containers: vec![], combined_from: vec![] }
+	}
+
 	fn result(level: u64, digest: &str) -> ArmResult {
 		let samples: Vec<u64> = (0..12).map(|i| level + i % 4).collect();
 		let (latency, latency_ci) = latency(&samples, 7);
 		let correctness = Some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: 0.0, tolerance: 1e-9, passed: true, unfilled_points: 0, answer_sha256: Some(digest.into()), indeterminate: false });
-		ArmResult { dataset: "mcar-tiny".into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: "duckdb-double".into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None }, phase: Phase::Interpolate, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples, between_run: None }
+		ArmResult { dataset: "mcar-tiny".into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: "duckdb-double".into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None, adapter_workload: Some(true) }, phase: Phase::Interpolate, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples, between_run: None }
 	}
 
 	fn run(level: u64, digest: &str) -> XbenchReport {
@@ -177,6 +204,23 @@ mod tests {
 		let gate = combined.results[0].correctness.as_ref().expect("gate");
 		assert!(!gate.passed);
 		assert!(!gate.indeterminate, "a real failure is not indeterminate");
+	}
+
+	#[test]
+	fn a_self_measured_result_with_a_genuine_adapter_is_refused() {
+		let err = combine(&[self_measured_run("mcar-tiny", "weftdb-ingest", 1_000, "a"), run(1_000, "a")], vec![]).unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains("weftdb-ingest"), "names the workload: {msg}");
+		assert!(msg.contains("self-measured"), "says self-measured: {msg}");
+		assert!(msg.contains("adapter workload"), "mentions the remedy: {msg}");
+	}
+
+	#[test]
+	fn two_genuine_adapter_results_still_combine() {
+		let combined = combine(&[run(1_000, "a"), run(1_000, "a")], vec![]).expect("two duckdb adapter runs combine");
+		assert_eq!(combined.results.len(), 1);
+		let gate = combined.results[0].correctness.as_ref().expect("gate");
+		assert!(gate.passed);
 	}
 
 	#[test]
