@@ -5632,3 +5632,22 @@ cache instead was rejected: the `weftdb` test job is already 13 to 16 minutes wa
 would detect a false pass, and it is kept out of this change because the first run will fail on
 whatever the poisoned cache has been hiding, and that needs its own fix commit rather than a red
 gate nobody triages.
+
+## 2026-11-08 — Needs human: the box lost its uplink mid-wave (network, not code)
+At about 00:45 the machine stopped routing: `getent hosts github.com` fails,
+`resolvectl` still reports quad9 as current, and `bash -c 'echo > /dev/tcp/1.1.1.1/53'`
+returns `Network is unreachable` with no default route in `ip route show default`. That is
+an uplink or default-route failure, not a resolver failure — a resolver problem would still
+reach 1.1.1.1 over TCP.
+
+**What it cost.** A freshly dispatched `parallel-worker` for #625 died at its first turn with
+`502 cannot resolve tunnel destination openrouter.ai`, and the local `git push` of the clippy
+fixes for #636 could not reach the remote (the commit exists locally as `4882ef1`, so nothing
+is lost). Every CI-dependent claim in this session's open PRs (#636, #637, #638, #639) is
+therefore pending rather than verified, and no PR was merged on the strength of a guess.
+
+**Chosen response.** Keep working on what a machine without a network can still do — local
+`cargo clippy`/`cargo test` verification of the branches already committed — and re-attempt
+the pushes when the route returns, rather than inventing an offline workaround or claiming
+green. Recorded here because if the wave appears to stall again with no explanation, this is
+the reason, and because restarting the interface or the VPN is a human action on this host.
