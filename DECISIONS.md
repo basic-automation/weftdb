@@ -5724,6 +5724,21 @@ the pushes when the route returns, rather than inventing an offline workaround o
 green. Recorded here because if the wave appears to stall again with no explanation, this is
 the reason, and because restarting the interface or the VPN is a human action on this host.
 
+## 2026-11-08 — FRE-15: the stability policy lives in `docs/`, not at the root (#331)
+
+`docs/release/1.0-plan.md` calls the slice "STABILITY.md", which reads like a root-level
+file next to `HONESTY.md` and `SECURITY.md`. **Chosen:** `docs/stability.md`, linked from
+`README.md` and `docs/reference.md`. The root pair exists at the root because GitHub gives
+those two filenames special meaning (a security policy is surfaced in the repository's
+security tab); a versioning policy gets no such treatment, and every other explanatory
+document in this repository lives in `docs/`. A 225-line policy document with an internal
+link graph is also easier to read rendered than as a root landing page.
+
+**Rejected: `STABILITY.md` at the root** — it would be the only long-form policy document
+there, and `SECURITY.md`'s reason for being at the root does not transfer. **Rejected:
+putting it inside `docs/release/`** — that directory holds release *procedures* (the
+checklist, the 1.0 plan), which are internal; this document is addressed to users.
+
 ## 2026-11-08 — #430: the methodology pointer is enforced, not offered
 
 **What was ambiguous.** #430 asks for "a methodology document published before any performance
@@ -5779,3 +5794,28 @@ on a pre-1.0 crate whose CHANGELOG is the deprecation notice.
 name the token. No test sends a mixed-case fill, so this is a documentation-level break, recorded
 under `### Changed` in CHANGELOG.md with the same "This breaks v0.3.x clients…" call-out the
 reduction change used.
+
+## 2026-11-07 — a note this session inherited describes an `audit` CI job that does not exist here
+
+**Ambiguity.** Context carried forward from an earlier lane claimed `audit.yml` ran a job named
+`audit (latest)`, that it had been red on main since 2026-10-23 because the container image
+`ghcr.io/rustsec/audit:latest` could not be pulled, that `cargo audit` is yanked upstream so the
+replacement tool is an owner decision, and that the resulting issue should be filed with that
+evidence. Before filing anything, checked it.
+
+**Finding.** None of that is true of this repository. `git grep` over `.github/workflows` at
+`origin/main` finds no `audit` job and no reference to `rustsec/audit`; `git log --all -S
+'rustsec/audit' -- .github` finds nothing in reachable history; and the check list on current
+heads contains no check by that name — the supply-chain checks that do run are `cargo-deny` and
+`third-party licenses`, and both are green on every open PR today.
+
+**Choice.** Record the correction here rather than file the issue. An issue about a workflow that
+does not exist would send a future reader after a phantom, which is the exact failure mode this
+file exists to prevent.
+
+**What is actually true about advisory coverage.** `deny.toml` carries an `[advisories]` section
+whose comment states the policy — "Every RustSec advisory (vulnerability, unmaintained, unsound,
+yanked) fails the check" — with `ignore = []`, so the acceptance list is empty and the check is as
+strict as the tool gets. If advisory coverage is ever judged thin, the change to make is to that
+file (the ignore list and its revisit dates, the advisory database, the yanked/unsound categories),
+not a new tool replacing one that was never here.

@@ -212,6 +212,8 @@ The [changelog](CHANGELOG.md) lists every change and this release's known limita
   format, the terminal UI, the Rust API and how it all works.
 - [Migrating a 0.1.x data directory](docs/reference.md#migrating-a-01x-data-directory)
 - [Configuration](docs/reference.md#configuration) and [backup and restore](docs/reference.md#backup--restore)
+- [Stability and versioning policy](docs/stability.md): what you may rely on, what is
+  experimental, and what a wire-format change counts as.
 - [SECURITY.md](SECURITY.md), [HONESTY.md](HONESTY.md), [ROADMAP.md](ROADMAP.md),
   [CONTRIBUTING.md](CONTRIBUTING.md)
 

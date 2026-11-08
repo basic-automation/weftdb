@@ -339,7 +339,10 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
   - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
   - [ ] read lane
-  - [ ] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
+  - [x] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
+    *Closed 2026-11-08: [`docs/stability.md`](docs/stability.md) documents the semver
+    policy, surface stability table, compat-suite coverage and named gaps; linked from
+    README.md and docs/reference.md.*
   - [ ] **PAC-15** Operator documentation
 - [ ] **W11 · Contract candidate, beta tag, calibration**
   - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*

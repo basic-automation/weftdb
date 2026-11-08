@@ -48,6 +48,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   whose selector, high-water mark or data fingerprint no longer matches the
   server's current view returns `410 cursor_stale`. `total` is present on the first page and `null` on
   cursor-following pages.
+- **Stability and versioning policy (FRE-15).** [`docs/stability.md`](docs/stability.md)
+  documents the semver policy, the surface stability table (query/ingest wire API,
+  `weftdb-client` Rust SDK, storage format, CLI, configuration, metrics), what the compat
+  suite actually tests, and the promises the repo does not yet support. Linked from
+  `README.md` and `docs/reference.md`. (#331)
 
 - **The measurement rules are wired to the figures they govern (EVI-6, #430).**
   `tools/check_claims.py` now fails when the claims document never links
