@@ -15,6 +15,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `scripts/ci/check-action-pinning.py`, so `main` went red on the pinning gate the
   moment it landed — the gate works, the merge queue just did not re-run it.
 
+### Changed
+
+- **Fill tokens are exact-case** (PAC-3, #453). `Fill::from_token` now matches the
+  lowercase wire tokens exactly, so `?fill=`, the downsample JSON body's `fill`,
+  the stored-range `fill=` and `weft-bench --gf-fill` refuse `Linear`, `CUBIC` and
+  `NULL` with a `400` (or a CLI error) that names the token. **This breaks v0.3.x
+  clients** that send mixed-case `?fill=Linear` or `--gf-fill=CUBIC`: send `null`,
+  `prev`, `linear`, `quadratic`, `cubic` or the lowercase spellings. The value arm
+  (a decimal constant) is unchanged.
+
 ### Removed
 
 - **`TEST_DATA_DIR` is gone** (PAC-6, completing the PAC-5a configuration
