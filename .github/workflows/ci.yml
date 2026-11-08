@@ -61,9 +61,19 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.version }}
           components: clippy
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
-      # Gated on the categories that catch defects. `style`/`pedantic`/`nursery`
-      # have a large pre-existing backlog in this workspace; they are reported by
-      # running clippy locally, not enforced here, so the gate stays honest.
+      # Gated, on the command line, on the categories that catch defects: correctness,
+      # suspicious, perf. `style`/`pedantic`/`nursery` have a large pre-existing backlog
+      # in this workspace, so this job does not raise them.
+      #
+      # That is not the whole gate, and reading only the flags below is how people get
+      # surprised. Most crates in this workspace set their own levels at the crate root
+      # — `#![deny(clippy::pedantic, clippy::nursery, clippy::all)]` in
+      # `weft-bench/src/lib.rs`, `#![forbid(...)]` of the same three in `weft-arrow`,
+      # `weft-client`, `weft-line-protocol`, `weft-arrow-store` and the `weft-bench`
+      # binaries and integration tests — and a crate-level `deny`/`forbid` is not
+      # overridden by the `-D` list. So a new module in `weft-bench` or `weftdb` fails on
+      # a `pedantic` lint that a new module in `weft-reduce` only warns about, and the
+      # gate is not uniform across the workspace. #635 tracks making it uniform.
       #
       # RUSTFLAGS is cleared for this job on purpose: the workflow-level `-D warnings`
       # reaches clippy-driver as a rustc flag and would deny *every* clippy lint,

@@ -76,7 +76,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
 
       - name: Build the soak driver
         run: cargo build --locked --release -p weft-bench

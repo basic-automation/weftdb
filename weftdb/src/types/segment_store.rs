@@ -8453,13 +8453,16 @@ mod tests {
 	#[tokio::test]
 	async fn mixed_good_and_suspect_frames_survive_recovery_with_good_data_readable() {
 		let dir = TempDir::new().expect("tempdir");
-		let store = SegmentStore::open(dir.path()).await.expect("opens");
-		// A good segment at [0, 10].
-		let _good = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals good");
-		// A second segment at [20, 30] that recovery will suspect.
-		let desc = store.seal("price", &schema(), &[20, 30], &[bd("3"), bd("4")]).await.expect("seals second");
-		let frame = PathBuf::from(&desc.path);
-		drop(store);
+		let frame = {
+			let store = SegmentStore::open(dir.path()).await.expect("opens");
+			// A good segment at [0, 10].
+			let _good = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals good");
+			// A second segment at [20, 30] that recovery will suspect.
+			let desc = store.seal("price", &schema(), &[20, 30], &[bd("3"), bd("4")]).await.expect("seals second");
+			let frame = PathBuf::from(&desc.path);
+			drop(store);
+			frame
+		};
 		let mut bytes = std::fs::read(&frame).expect("reads frame");
 		bytes[7..9].copy_from_slice(&99u16.to_le_bytes());
 		let body = bytes.len() - 4;
@@ -8487,6 +8490,7 @@ mod tests {
 		let (ts, vs) = store.read_time_range("price", 0, 40).await.expect("reads range after purge attempt");
 		assert_eq!(ts, vec![0, 10], "the good data is still there after the purge attempt");
 		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2"))]);
+		drop(store);
 	}
 
 	/// D-S12: a missing indexed file quarantines as corrupt and reads as gone, and

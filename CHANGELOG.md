@@ -24,6 +24,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   frame is quarantined and then TTL-purged. The first was previously asserted
   only through the recovery report, and the third not at all. (#446)
 
+- **Six-field claims audit of `docs/reference.md` (EVI-6/#430).**
+  `docs/claims-audit.md` audits every published performance number against the
+  six-field provenance rule (source, command, dataset, measured-date,
+  reproducible-from-clone, artifact). 11 registered and 19 unregistered figures
+  are assessed for conformance; three non-recoverable claims carry a
+  pre-six-field note in the reference doc; the single fully-conforming claim
+  (pointread bench) carries its fields inline. Non-conforming figures must be
+  re-measured before they are repeated — they are not deleted.
+ ([EVI-6] audit the reference documentation against the six-field rule (#430))
+
 - **Generated OpenAPI document from the route registry (FRE-9a).** The
   document at `compat/openapi/weftdb.json` is built from the same
   `RouteTable` the HTTP router serves, so every path, method, scope,
@@ -77,6 +87,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   rendered report explains the row. Report schema v7 → v8: `Correctness` gains an `indeterminate`
   field.
 
+### Fixed
+
+- **A competitor result with no adapter report refuses to take part in a
+  comparison (EVI-8B, #452).** `weft-bench compare` compared a `duckdb` arm whose
+  `adapter_info` was `null` with a WeftDB arm and footnoted the missing attribution
+  instead of stopping, so a ratio claim could be published about numbers nobody could
+  attribute to an engine. `provenance` now emits a `hard:` note per such result, which
+  reuses the existing `Incomparable` refusal and the existing `--ignore-provenance`
+  override; the predicate is `adapter_info.is_none() &&
+  !adapter.starts_with("weftdb")`, because `weftdb`, `weftdb-stored` and
+  `weftdb-ingest` measure their own paths and honestly report no adapter, and because
+  `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
+  tested.
 ## [0.3.2] - 2026-11-06
 
 ### Fixed
