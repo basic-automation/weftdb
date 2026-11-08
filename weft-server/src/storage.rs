@@ -2476,7 +2476,7 @@ mod tests {
 		// A different selector must fail with CursorStale (410 GONE).
 		let wrong_sel = weftdb::SeriesSelector::new([("host", Some("other"))]).expect("valid");
 		let err = decode_cursor_v1(&token, &wrong_sel, &timestamps, &values).expect_err("wrong selector rejects");
-		assert_eq!(err.status(), StatusCode::GONE, "wrong selector → 410 GONE");
+		assert_eq!(err.code().status(), StatusCode::GONE, "wrong selector → 410 GONE");
 	}
 
 	#[test]
@@ -2489,7 +2489,7 @@ mod tests {
 		// Different data (different values at first timestamp) must fail with CursorStale.
 		let changed_values: Vec<Option<bigdecimal::BigDecimal>> = vec![Some(bd("9.0")), Some(bd("2.0")), Some(bd("3.0")), Some(bd("4.0"))];
 		let err = decode_cursor_v1(&token, &sel, &timestamps, &changed_values).expect_err("changed data rejects");
-		assert_eq!(err.status(), StatusCode::GONE, "changed data → 410 GONE");
+		assert_eq!(err.code().status(), StatusCode::GONE, "changed data → 410 GONE");
 	}
 
 	#[test]
@@ -2500,14 +2500,14 @@ mod tests {
 
 		// Wrong version prefix.
 		let err = decode_cursor_v1("02deadbeef", &sel, &timestamps, &values).expect_err("wrong version rejects");
-		assert_eq!(err.status(), StatusCode::BAD_REQUEST, "wrong version → 400");
+		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST, "wrong version → 400");
 
 		// Too short.
 		let err = decode_cursor_v1("01", &sel, &timestamps, &values).expect_err("too short rejects");
-		assert_eq!(err.status(), StatusCode::BAD_REQUEST, "too short → 400");
+		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST, "too short → 400");
 
 		// Non-hex content in selector hash field.
 		let err = decode_cursor_v1("01zzzzzzzzzzzzzzzz000000000000000000000000000000000000000000000000000000000000000000", &sel, &timestamps, &values).expect_err("non-hex rejects");
-		assert_eq!(err.status(), StatusCode::BAD_REQUEST, "non-hex → 400");
+		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST, "non-hex → 400");
 	}
 }
