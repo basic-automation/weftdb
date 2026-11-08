@@ -84,8 +84,10 @@ fn main() -> ExitCode {
 		Command::Sweep { knob, values, out_dir, args } => return sweep_runs(&knob, &values, &out_dir, &args),
 		Command::Export { report, format, out } => return export_report(&report, format, out.as_deref()),
 		Command::Compare { baseline, candidate, threshold_pct, ignore_provenance, strict, json, markdown } => return compare_runs(&baseline, &candidate, threshold_pct, ignore_provenance, strict, json.as_deref(), markdown.as_deref()),
-		Command::SoakRun { name, seed, duration_secs, ticks, window_ticks, out_dir, report, honesty } => return run_soak(name, seed, duration_secs, ticks, window_ticks, out_dir, report, honesty),
-		Command::SoakCompare { previous, current, markdown, json } => return compare_soak(previous, current, markdown, json),
+		Command::SoakRun { name, seed, duration_secs, ticks, window_ticks, out_dir, report, honesty } => {
+			return run_soak(&name, seed, duration_secs, ticks, window_ticks, &SoakOutput { out_dir, report, honesty });
+		}
+		Command::SoakCompare { previous, current, markdown, json } => return compare_soak(&previous, &current, markdown.as_deref(), json.as_deref()),
 	};
 
 	// A multi-threaded runtime is unnecessary for a single sequential run; a
@@ -958,9 +960,23 @@ fn parse_soak_compare_args(args: impl IntoIterator<Item = String>) -> Result<Com
 	Ok(Command::SoakCompare { previous, current, markdown, json })
 }
 
+/// Where a soak run writes its three artefacts.
+///
+/// Grouped into a single argument rather than kept as three parameters: the eight-parameter form of
+/// [`run_soak`] tripped `clippy::too_many_arguments`, and the three paths are never meaningful apart
+/// — a run that writes a report but no honesty section is not a run this tool recognises.
+struct SoakOutput {
+	/// Directory created if absent, and the location the two files are written under.
+	out_dir: PathBuf,
+	/// The machine-readable [`SoakReport`](weft_bench::soak_report::SoakReport).
+	report: PathBuf,
+	/// The honesty section, written beside the report.
+	honesty: PathBuf,
+}
+
 /// Run a time-boxed soak and produce a `SoakReport`.
-fn run_soak(name: String, seed: u64, duration_secs: u64, ticks: u64, _window_ticks: u64, out_dir: PathBuf, report: PathBuf, honesty: PathBuf) -> ExitCode {
-	let config = match weft_bench::soak::SoakConfig::new(name.clone(), "nightly profile".to_string(), seed, duration_secs) {
+fn run_soak(name: &str, seed: u64, duration_secs: u64, ticks: u64, _window_ticks: u64, output: &SoakOutput) -> ExitCode {
+	let config = match weft_bench::soak::SoakConfig::new(name.to_string(), "nightly profile".to_string(), seed, duration_secs) {
 		Ok(c) => c,
 		Err(e) => {
 			eprintln!("{PROG}: soak-run: failed to create config: {e:#}");
@@ -1010,22 +1026,22 @@ fn run_soak(name: String, seed: u64, duration_secs: u64, ticks: u64, _window_tic
 			return ExitCode::FAILURE;
 		}
 	};
-	if let Err(e) = std::fs::create_dir_all(&out_dir) {
+	if let Err(e) = std::fs::create_dir_all(&output.out_dir) {
 		eprintln!("{PROG}: soak-run: failed to create output directory: {e:#}");
 		return ExitCode::FAILURE;
 	}
-	if let Err(e) = std::fs::write(&report, &json) {
+	if let Err(e) = std::fs::write(&output.report, &json) {
 		eprintln!("{PROG}: soak-run: failed to write report: {e:#}");
 		return ExitCode::FAILURE;
 	}
-	println!("{}: soak report written to {}", PROG, report.display());
+	println!("{}: soak report written to {}", PROG, output.report.display());
 
 	// Write honesty section
-	if let Err(e) = std::fs::write(&honesty, &report_data.honesty) {
+	if let Err(e) = std::fs::write(&output.honesty, &report_data.honesty) {
 		eprintln!("{PROG}: soak-run: failed to write honesty section: {e:#}");
 		return ExitCode::FAILURE;
 	}
-	println!("{}: honesty section written to {}", PROG, honesty.display());
+	println!("{}: honesty section written to {}", PROG, output.honesty.display());
 
 	println!("{}: soak-run complete: {} ticks, overall outcome: {:?}", PROG, ticks, report_data.slo.outcome);
 
@@ -1033,7 +1049,7 @@ fn run_soak(name: String, seed: u64, duration_secs: u64, ticks: u64, _window_tic
 }
 
 /// Compare two soak reports and produce a `SoakComparison`.
-fn compare_soak(previous: PathBuf, current: PathBuf, markdown: Option<PathBuf>, json: Option<PathBuf>) -> ExitCode {
+fn compare_soak(previous: &Path, current: &Path, markdown: Option<&Path>, json: Option<&Path>) -> ExitCode {
 	fn read_soak_report(path: &Path) -> Option<weft_bench::soak_report::SoakReport> {
 		let data = match std::fs::read_to_string(path) {
 			Ok(d) => d,
@@ -1051,7 +1067,7 @@ fn compare_soak(previous: PathBuf, current: PathBuf, markdown: Option<PathBuf>, 
 		}
 	}
 
-	let (Some(prev_report), Some(curr_report)) = (read_soak_report(&previous), read_soak_report(&current)) else {
+	let (Some(prev_report), Some(curr_report)) = (read_soak_report(previous), read_soak_report(current)) else {
 		return ExitCode::FAILURE;
 	};
 
@@ -1072,14 +1088,14 @@ fn compare_soak(previous: PathBuf, current: PathBuf, markdown: Option<PathBuf>, 
 		}
 	}
 
-	if let Some(path) = &json {
+	if let Some(path) = json {
 		if let Err(e) = std::fs::write(path, serde_json::to_string_pretty(&comparison).expect("a comparison always serialises")) {
 			eprintln!("{PROG}: cannot write the verdict to {}: {e}", path.display());
 			return ExitCode::FAILURE;
 		}
 		println!("verdict    : {}", path.display());
 	}
-	if let Some(path) = &markdown {
+	if let Some(path) = markdown {
 		if let Err(e) = std::fs::write(path, comparison.to_markdown()) {
 			eprintln!("{PROG}: cannot write the verdict to {}: {e}", path.display());
 			return ExitCode::FAILURE;
@@ -1088,10 +1104,10 @@ fn compare_soak(previous: PathBuf, current: PathBuf, markdown: Option<PathBuf>, 
 	}
 
 	if comparison.has_regression {
-		eprintln!("{}: SOAK COMPARISON: regression detected — a rule that previously passed now fails", PROG);
+		eprintln!("{PROG}: SOAK COMPARISON: regression detected — a rule that previously passed now fails");
 		return ExitCode::FAILURE;
 	}
-	println!("{}: soak-compare: OK", PROG);
+	println!("{PROG}: soak-compare: OK");
 	ExitCode::SUCCESS
 }
 
@@ -1449,9 +1465,9 @@ enum Command {
 	/// Run a benchmark with the given configuration. Boxed because [`Cli`] is large
 	/// relative to the unit `Help` variant.
 	Run(Box<Cli>),
-	/// Run a time-boxed soak exercise and produce a SoakReport.
+	/// Run a time-boxed soak exercise and produce a `SoakReport`.
 	SoakRun { name: String, seed: u64, duration_secs: u64, ticks: u64, window_ticks: u64, out_dir: PathBuf, report: PathBuf, honesty: PathBuf },
-	/// Compare two soak reports and produce a SoakComparison.
+	/// Compare two soak reports and produce a `SoakComparison`.
 	SoakCompare { previous: PathBuf, current: PathBuf, markdown: Option<PathBuf>, json: Option<PathBuf> },
 	/// Verify a run manifest against the report it points at.
 	Verify {
