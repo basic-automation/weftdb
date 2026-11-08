@@ -683,9 +683,7 @@ async fn open_store_retry(root: &Path) -> anyhow::Result<SegmentStore> {
 /// Windows means a Turso database handle still held by a process that was aborted on this
 /// path (issue #625).
 fn is_open_permission_denied(e: &anyhow::Error) -> bool {
-	e.root_cause()
-		.downcast_ref::<std::io::Error>()
-		.is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+	e.root_cause().downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 /// The frame file name of `id`'s row in `store`'s index: since S10 a seal's frame
