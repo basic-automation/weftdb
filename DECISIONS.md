@@ -18,6 +18,8 @@ The selector is hashed by SHA-256 of its canonical matcher sequence (each `(key,
 **`read_value_range_of` returns `Vec<BigDecimal>` not `Vec<Option<BigDecimal>>`.**
 Value-range reads return only present rows, so every value is populated. The cursor fingerprinting functions take `&[Option<BigDecimal>]` (shared with the time-range read which includes nulls), so values are wrapped to `Some(v)` at the call site.
 
+**Backwards compatibility: `total` stays populated on every non-cursor page.** An existing client that sends no `cursor` gets the same `total` as before — `Option<usize>` is `Some(total)` on the first page and `None` only on cursor-following pages. The acceptance criterion says "total nullable after the first page": the first page (and every page requested without a cursor) carries the count; cursor pages omit it because the window total was already reported.
+
 ## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
 
 **The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every

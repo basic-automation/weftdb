@@ -1321,6 +1321,7 @@ mod tests {
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use weftdb::SegmentStore;
 
+	use super::{decode_cursor_v1, encode_cursor_v1, hash_selector};
 	use crate::{app_with_state, test_support::*, AppState};
 
 	/// Open a store under `dir`, declare `price` (F64, seconds), seal one batch, and
@@ -2428,5 +2429,85 @@ mod tests {
 		assert_eq!((status, &body["tags"]), (StatusCode::OK, &serde_json::Value::Null), "a tag named `api_key` is a matcher, not a credential: {body}");
 		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=0&end=1000&api_key=a").await;
 		assert_eq!((status, &body["code"]), (StatusCode::BAD_REQUEST, &serde_json::json!("credentials_in_query")), "{body}");
+	}
+
+	// ── cursor v1 pure-function tests ──────────────────────────────────────
+
+	#[test]
+	fn hash_selector_is_deterministic() {
+		let sel = weftdb::SeriesSelector::new([("host", Some("a"))]).expect("valid");
+		let h1 = hash_selector(&sel);
+		let h2 = hash_selector(&sel);
+		assert_eq!(h1, h2, "same selector → same hash");
+		let sel_diff = weftdb::SeriesSelector::new([("host", Some("b"))]).expect("valid");
+		assert_ne!(h1, hash_selector(&sel_diff), "different value → different hash");
+		let sel_exact = weftdb::SeriesSelector::exact([("host", Some("a"))]).expect("valid");
+		assert_ne!(h1, hash_selector(&sel_exact), "exact flag changes the hash");
+		let sel_empty = weftdb::SeriesSelector::all();
+		let sel_empty_exact = weftdb::SeriesSelector::untagged();
+		assert_eq!(hash_selector(&sel_empty), hash_selector(&sel_empty_exact), "all and untagged both have no matchers — same hash");
+	}
+
+	#[test]
+	fn cursor_v1_round_trip() {
+		let sel = weftdb::SeriesSelector::new([("host", Some("price1"))]).expect("valid");
+		let timestamps = vec![100i64, 110, 120, 130];
+		let values: Vec<Option<bigdecimal::BigDecimal>> = vec![Some(bd("1.0")), Some(bd("2.0")), Some(bd("3.0")), Some(bd("4.0"))];
+
+		// Encode at offset 2 (rows 0,1 consumed), total 4.
+		let token = encode_cursor_v1(&sel, &timestamps, &values, 2, 4).expect("non-last page encodes");
+		// Decode must succeed with the same data.
+		let decoded = decode_cursor_v1(&token, &sel, &timestamps, &values).expect("round-trip decodes");
+		assert_eq!(decoded, 2, "decoded offset matches what was encoded");
+
+		// Encoding at offset 4 (past the end = last page) must return None.
+		assert!(encode_cursor_v1(&sel, &timestamps, &values, 4, 4).is_none(), "past-end offset returns None");
+		// Encoding with empty timestamps returns None.
+		assert!(encode_cursor_v1(&sel, &[], &[], 0, 0).is_none(), "empty window returns None");
+	}
+
+	#[test]
+	fn cursor_v1_wrong_selector_returns_cursor_stale() {
+		let sel = weftdb::SeriesSelector::new([("host", Some("price1"))]).expect("valid");
+		let timestamps = vec![100i64, 110, 120, 130];
+		let values: Vec<Option<bigdecimal::BigDecimal>> = vec![Some(bd("1.0")), Some(bd("2.0")), Some(bd("3.0")), Some(bd("4.0"))];
+		let token = encode_cursor_v1(&sel, &timestamps, &values, 2, 4).expect("non-last page encodes");
+
+		// A different selector must fail with CursorStale (410 GONE).
+		let wrong_sel = weftdb::SeriesSelector::new([("host", Some("other"))]).expect("valid");
+		let err = decode_cursor_v1(&token, &wrong_sel, &timestamps, &values).expect_err("wrong selector rejects");
+		assert_eq!(err.status(), StatusCode::GONE, "wrong selector → 410 GONE");
+	}
+
+	#[test]
+	fn cursor_v1_changed_data_returns_cursor_stale() {
+		let sel = weftdb::SeriesSelector::new([("host", Some("price1"))]).expect("valid");
+		let timestamps = vec![100i64, 110, 120, 130];
+		let values: Vec<Option<bigdecimal::BigDecimal>> = vec![Some(bd("1.0")), Some(bd("2.0")), Some(bd("3.0")), Some(bd("4.0"))];
+		let token = encode_cursor_v1(&sel, &timestamps, &values, 2, 4).expect("non-last page encodes");
+
+		// Different data (different values at first timestamp) must fail with CursorStale.
+		let changed_values: Vec<Option<bigdecimal::BigDecimal>> = vec![Some(bd("9.0")), Some(bd("2.0")), Some(bd("3.0")), Some(bd("4.0"))];
+		let err = decode_cursor_v1(&token, &sel, &timestamps, &changed_values).expect_err("changed data rejects");
+		assert_eq!(err.status(), StatusCode::GONE, "changed data → 410 GONE");
+	}
+
+	#[test]
+	fn cursor_v1_malformed_token_is_bad_request() {
+		let sel = weftdb::SeriesSelector::new([("host", Some("price1"))]).expect("valid");
+		let timestamps = vec![100i64];
+		let values: Vec<Option<bigdecimal::BigDecimal>> = vec![Some(bd("1.0"))];
+
+		// Wrong version prefix.
+		let err = decode_cursor_v1("02deadbeef", &sel, &timestamps, &values).expect_err("wrong version rejects");
+		assert_eq!(err.status(), StatusCode::BAD_REQUEST, "wrong version → 400");
+
+		// Too short.
+		let err = decode_cursor_v1("01", &sel, &timestamps, &values).expect_err("too short rejects");
+		assert_eq!(err.status(), StatusCode::BAD_REQUEST, "too short → 400");
+
+		// Non-hex content in selector hash field.
+		let err = decode_cursor_v1("01zzzzzzzzzzzzzzzz000000000000000000000000000000000000000000000000000000000000000000", &sel, &timestamps, &values).expect_err("non-hex rejects");
+		assert_eq!(err.status(), StatusCode::BAD_REQUEST, "non-hex → 400");
 	}
 }
