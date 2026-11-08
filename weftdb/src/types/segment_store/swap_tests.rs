@@ -658,30 +658,37 @@ fn assert_passed(what: &str, out: &std::process::Output) {
 /// the retry catches every `io::ErrorKind::PermissionDenied` at the `SegmentStore::open`
 /// level.  Up to 6 attempts, 500 ms apart; a non-permission error, or the last attempt's
 /// error, propagates.
+///
+/// On non-Windows platforms this compiles to a single pass-through call.
 async fn open_store_retry(root: &Path) -> anyhow::Result<SegmentStore> {
-	let mut last = None;
-	for i in 0..6u32 {
-		#[cfg(not(windows))]
-		let _ = i;
-		match SegmentStore::open(root).await {
-			Ok(store) => return Ok(store),
-			Err(e) => {
-				#[cfg(windows)]
-				if i < 5 && is_open_permission_denied(&e) {
-					last = Some(e);
-					tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-					continue;
+	#[cfg(not(windows))]
+	{
+		return SegmentStore::open(root).await;
+	}
+	#[cfg(windows)]
+	{
+		let mut last = None;
+		for i in 0..6u32 {
+			match SegmentStore::open(root).await {
+				Ok(store) => return Ok(store),
+				Err(e) => {
+					if i < 5 && is_open_permission_denied(&e) {
+						last = Some(e);
+						tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+						continue;
+					}
+					return Err(e);
 				}
-				return Err(e);
 			}
 		}
+		Err(last.expect("loop exhausted without storing an error"))
 	}
-	Err(last.expect("loop exhausted without storing an error"))
 }
 
 /// Whether `e` is an I/O permission-denied error at the open-or-begin level, which on
 /// Windows means a Turso database handle still held by a process that was aborted on this
 /// path (issue #625).
+#[cfg(windows)]
 fn is_open_permission_denied(e: &anyhow::Error) -> bool {
 	e.root_cause().downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
 }
