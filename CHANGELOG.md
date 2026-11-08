@@ -24,6 +24,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   frame is quarantined and then TTL-purged. The first was previously asserted
   only through the recovery report, and the third not at all. (#446)
 
+- **Six-field claims audit of `docs/reference.md` (EVI-6/#430).**
+  `docs/claims-audit.md` audits every published performance number against the
+  six-field provenance rule (source, command, dataset, measured-date,
+  reproducible-from-clone, artifact). 11 registered and 19 unregistered figures
+  are assessed for conformance; three non-recoverable claims carry a
+  pre-six-field note in the reference doc; the single fully-conforming claim
+  (pointread bench) carries its fields inline. Non-conforming figures must be
+  re-measured before they are repeated — they are not deleted.
+ ([EVI-6] audit the reference documentation against the six-field rule (#430))
+
 - **Generated OpenAPI document from the route registry (FRE-9a).** The
   document at `compat/openapi/weftdb.json` is built from the same
   `RouteTable` the HTTP router serves, so every path, method, scope,
@@ -49,6 +59,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   (#430)
 
 ### Changed
+
+- **The OpenAPI drift gate no longer fails on a version bump (#620).**
+  `generated_spec_matches_committed_file` now normalises `info.version` on
+  both sides before comparing, so every path, method, scope, tier and schema
+  is still checked but a release version change does not trip the gate.
+  A separate assertion in `info_block_has_service_name_and_version` verifies
+  that `info.version` equals the crate version directly.
 
 - **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
   each measure by metric name alone, so two results in one report — a crash matrix, a query mix, any
