@@ -5444,6 +5444,38 @@ generalisation is the point: PAC-11 was ticked on `main` (8c5fea9, #611) while g
 were each in turn the wall, and it should be closed again, if at all, on the evidence of a roll
 that printed all seven `ok:` lines — not on the evidence that a packaging branch exists.
 
+## 2026-11-06 — PAC-11 gate 4: a refused bind address names its variable (#309)
+
+**Context:** `scripts/packaging/test-host-install.sh` gate 4 installs the tree, writes an env
+file whose `WEFT_SERVER_ADDR` is a host with no port (`127.0.0.1`), runs the real binary, and
+treats one refusal as the proof that the *installed env file* is the configuration the process
+read: the run must exit 78 and its output must name `WEFT_SERVER_ADDR`. On the first CI run the
+gate failed (host-install run 42237464718: `weft-server: invalid configuration: invalid socket
+address syntax`) although the exit status was right. `startup::config::bind_addr` returned
+`std`'s bare `AddrParseError`, so the refusal named nothing, and a gate that greps for a name
+the server never prints can only ever fail.
+
+**Chosen:** change the server's message, not the gate. `bind_addr` and `admin_addr` now format
+the refusal as `WEFT_SERVER_ADDR="127.0.0.1" is not a socket address (invalid socket address
+syntax); e.g. 127.0.0.1:8080` — the variable, the value it rejected, the reason, a shape to
+copy. That is the convention the codebase already uses twice: `flight::flight_addr` names
+`WEFT_FLIGHT_ADDR` the same way, and the strict-config warnings in `settings.rs` name every
+variable they refuse. Exit status is unchanged (78, plan C7). Parsing moved into a private
+`parse_bind_addr(raw: &str)` so the text is unit-testable without mutating the environment
+(`set_var` from a parallel test thread would have been flaky), and the same contract is pinned
+end-to-end in `weft-server/tests/operator_cli.rs` against the binary, because gate 4 asserts on
+the process. The gate's comment now names all three places to keep in step.
+
+**Rejected:** grepping the gate for `invalid socket address syntax`, the parser's own text.
+It would have gone green immediately and proved nothing: that string appears whether or not
+the address came from the unit's env file, so it cannot distinguish "read my file" from
+"refused to start for a reason unrelated to the packaging". Also rejected: pointing the probe
+at a live port and asserting a bind error naming the value — a real bind depends on what else
+holds the port on a shared runner, which turns a packaging gate on a deterministic property.
+
+**Recorded, not decided here:** ROADMAP tick #611 marks PAC-11 closed while this PR was still
+open with the gate red. The tick is only true once this PR lands; it is left in place rather
+than reverted, so this PR is the thing that makes the roadmap honest.
 ## 2026-11-07 — TAG-5: the tags schema is closed by an audit, and layout 3 stays unassigned (#437)
 
 **What was ambiguous.** Issue #437 gives two acceptance lines: "the series table and
@@ -5536,6 +5568,30 @@ release checklist and accept that every version bump edits a 417 KB fixture that
 version-bumping PRs will then conflict in. Whoever owns FRE-9a should pick; this loop
 deliberately did neither.
 
+## 2026-11-07 — gate 7 reads a setup-step death from the journal, not from the unit
+
+	**The finding.** The escalation added earlier today (use the system manager when the user
+	manager cannot apply the unit's capability drop) never fired on the runner, so gate 7 still
+	failed with `Failed to drop capabilities: Operation not permitted` and
+	`status=218/CAPABILITIES`. `preexec_step` asked the unit for `ExecMainCode`/`ExecMainStatus`,
+	but the transient unit is submitted with `--collect`: systemd unloads it the moment it exits,
+	so both properties read back as the empty string, `step` stayed empty, and the escalation's
+	`-n $step` test never held. The failure text then named the *user* manager, which is what a
+	reader would need to tell the two environments apart.
+
+	**The decision.** Read the same fact from PID 1's journal when the properties are gone:
+	`unit_log | grep -oE 'status=2[0-4][0-9]/[A-Z]+'`. The journal line survives unloading and
+	carries the identical status code, so the escalation now sees `status=218` and retries under
+	the system manager, which is privileged enough to apply the hardening and is where an operator
+	actually installs this unit.
+
+	**Why not the alternatives.** Dropping `--collect` would leak a unit per run on a shared
+	machine and still leave a race between exit and the query. Querying before exit would mean
+	waiting on the unit, which changes what the gate measures (`systemd-run` returns after the
+	start, and the gate's claim is about the start path). Narrowing the ladder to "trust the
+	verdict string" is what produced the wrong verdict in the first place. The 2xx band check is
+	kept exactly as before, so a server that started and then failed is still the server's problem
+	and is never retried somewhere privileged.
 ## 2026-11-07 — #516: a digest disagreement inside tolerance is non-determinism, not a wrong answer
 
 	**The finding.** The pooled Phase 1 report (`bench/reports/phase1-pooled/`) contains two runs of
