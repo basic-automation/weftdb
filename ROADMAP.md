@@ -566,4 +566,4 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **Cascade adopt-or-drop into the DEFAULT selector — owner-gated (headline change, as FOR/ALP):**
 - [ ] **NEXT — checkpoint index adopt-or-drop into the DEFAULT policy — owner-gated (bytes/point
 - [ ] **NEXT — a random-access-capable Gorilla/RLE would widen the checkpoint index's reach:**
-- [ ] Publish a methodology document **before** any performance claim
+- [x] Publish a methodology document **before** any performance claim
