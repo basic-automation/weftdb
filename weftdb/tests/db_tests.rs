@@ -22,7 +22,7 @@ async fn setup_test_database() -> Result<(TempDir, Database, Subject, Aspect)> {
 	let db_name = format!("test_db_{}", Uuid::new_v4());
 
 	// Override the data directory for testing
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().unwrap());
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().unwrap());
 
 	let db = Database::new(&db_name).await?;
 	let subject = db.observe_subject("test_subject").await?;
@@ -199,7 +199,7 @@ async fn test_analyze_point_no_measurements_error() -> Result<()> {
 async fn test_analyze_point_invalid_aspect_error() -> Result<()> {
 	let temp_dir = tempfile::tempdir()?;
 	// Override the data directory for this test
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().unwrap());
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().unwrap());
 
 	let db_name = format!("test_invalid_aspect_{}", Uuid::new_v4());
 	let db = Database::new(&db_name).await?;
@@ -492,7 +492,7 @@ async fn test_create_btc_1min_database() -> Result<()> {
 		None
 	} else {
 		let temp = tempfile::tempdir()?;
-		std::env::set_var("TEST_DATA_DIR", temp.path().to_str().context("temp data dir is not valid UTF-8")?);
+		std::env::set_var("WEFT_DATA_DIR", temp.path().to_str().context("temp data dir is not valid UTF-8")?);
 		debug!("Bounded BTC load: {max_rows} rows into a temp data dir at {}", temp.path().display());
 		Some(temp)
 	};
@@ -707,7 +707,7 @@ async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 	assert!(n > 0, "the corpus yielded no rows");
 
 	let temp = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp.path().to_str().unwrap());
+	std::env::set_var("WEFT_DATA_DIR", temp.path().to_str().unwrap());
 
 	// --- Legacy Turso row-store path (measurements + unbatched shadow queue) ---
 	// Skippable: the legacy path is super-linear, so a large real corpus through it does
@@ -921,7 +921,7 @@ async fn restart_with_uncheckpointed_log(id: weftdb::DatabaseId, db_name: &str) 
 #[serial]
 async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	let temp_dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 	let db_name = format!("reopen_{}", Uuid::new_v4());
 
 	let db = Database::new(&db_name).await?;
@@ -992,7 +992,7 @@ async fn zero_length_metadata_log_is_removed_on_cold_open() -> Result<()> {
 	use std::os::unix::fs::MetadataExt as _;
 
 	let temp_dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 	let db_name = format!("emptylog_{}", Uuid::new_v4());
 
 	let db = Database::new(&db_name).await?;
@@ -1042,7 +1042,7 @@ async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
 	const ROUNDS: u64 = 20;
 
 	let temp_dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 	let db_name = format!("coldrace_{}", Uuid::new_v4());
 	let db = Database::new(&db_name).await?;
 	let metadata_path = format!("{}/{}/metadata.db", Database::get_data_dir(), db_name);
@@ -1379,7 +1379,7 @@ async fn the_batch_tables_index_their_hashes() -> Result<()> {
 #[serial]
 async fn database_new_refuses_a_build_directory_name() -> Result<()> {
 	let temp_dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 	let name = format!(".sensors.creating-{}", Uuid::new_v4().simple());
 	let err = Database::new(&name).await.expect_err("a build directory's name is reserved");
 	assert!(err.to_string().contains("reserved"), "{err:#}");
@@ -1464,7 +1464,7 @@ mod database_new_crash {
 	#[serial]
 	async fn a_failure_at_each_point_is_recoverable() -> Result<()> {
 		let temp_dir = tempfile::tempdir()?;
-		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+		std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 
 		for point in [FaultPoint::LNewCreated, FaultPoint::LNewRenamed] {
 			let name = format!("newfail_{}", Uuid::new_v4().simple());
@@ -1500,7 +1500,7 @@ mod database_new_crash {
 	#[serial]
 	async fn the_listing_sweeps_stale_builds_but_never_a_live_one() -> Result<()> {
 		let temp_dir = tempfile::tempdir()?;
-		std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+		std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 		let listed = format!("listed_{}", Uuid::new_v4().simple());
 		release_database(Database::new(&listed).await?.id(), &listed).await;
 
@@ -1587,11 +1587,11 @@ mod database_new_crash {
 	async fn a_process_crash_at_each_point_is_recoverable() -> Result<()> {
 		let temp_dir = tempfile::tempdir()?;
 		let data_dir = temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?;
-		std::env::set_var("TEST_DATA_DIR", data_dir);
+		std::env::set_var("WEFT_DATA_DIR", data_dir);
 
 		for point in [FaultPoint::LNewCreated, FaultPoint::LNewRenamed] {
 			let name = format!("newcrash_{}", Uuid::new_v4().simple());
-			let output = std::process::Command::new(std::env::current_exe()?).args(["database_new_crash::child", "--exact", "--nocapture", "--test-threads=1"]).env(CHILD_ENV, &name).env("TEST_DATA_DIR", data_dir).env(FAULT_ENV, format!("{point}:abort")).output()?;
+			let output = std::process::Command::new(std::env::current_exe()?).args(["database_new_crash::child", "--exact", "--nocapture", "--test-threads=1"]).env(CHILD_ENV, &name).env("WEFT_DATA_DIR", data_dir).env(FAULT_ENV, format!("{point}:abort")).output()?;
 			assert!(!output.status.success(), "{point}: the child aborted: {output:?}");
 			#[cfg(unix)]
 			{

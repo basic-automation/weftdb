@@ -15,7 +15,7 @@ use weftdb::{
 	database::traits::{AspectStructure, DatabaseStructure, Inputs}, AspectId, Database, DatasetId, Dictionary, InputMeasurement
 };
 
-/// Points `TEST_DATA_DIR` at one temp dir for this test binary, so no test writes
+/// Points `WEFT_DATA_DIR` at one temp dir for this test binary, so no test writes
 /// to `~/.weftdb` (CI's "Tests wrote nothing to ~/.weftdb" guard).
 fn isolate_data_dir() -> Result<()> {
 	static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
@@ -27,7 +27,7 @@ fn isolate_data_dir() -> Result<()> {
 		}
 	};
 	let path = dir.path().to_str().ok_or_else(|| anyhow::anyhow!("temp data dir is not valid UTF-8"))?;
-	std::env::set_var("TEST_DATA_DIR", path);
+	std::env::set_var("WEFT_DATA_DIR", path);
 	Ok(())
 }
 

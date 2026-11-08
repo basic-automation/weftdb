@@ -8,7 +8,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Removed
+
+- **`TEST_DATA_DIR` is gone** (PAC-6, completing the PAC-5a configuration
+  registry). The test-only variable no longer overrides the database root in
+  `weftdb::data_dir`; the test suites are handed their fixture directory
+  through the Stable `WEFT_DATA_DIR` variable instead. Operators were never
+  meant to set it — it was a Test-tier registry entry — but a deployment that
+  did will now find it ignored, with `WEFT_DATA_DIR` as the migration.
 ### Added
+
+- **The frame-fault policy is verified (ROB-22/C5).** The three behaviours of
+  the C5 policy are now pinned by tests: a suspect frame is excluded from
+  reads, a suspect frame is never auto-purged by maintenance, and a corrupt
+  frame is quarantined and then TTL-purged. The first was previously asserted
+  only through the recovery report, and the third not at all. (#446)
 
 - **Generated OpenAPI document from the route registry (FRE-9a).** The
   document at `compat/openapi/weftdb.json` is built from the same
@@ -18,6 +32,22 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   file matches the generated output; regenerate with `weft-server openapi
   --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
   no `--out`, or writes to a named file.
+- **Nightly soak comparison gate (SOA-15).** A scheduled + dispatchable soak
+  workflow (`soak.yml`) builds the soak driver, runs a 15-minute soak,
+  evaluates the SoakReport against SLO rules R1–R8, and compares the result
+  to the previous night's artifact. A Pass→Fail rule regression turns the job
+  red; metric drift past documented tolerance produces `::warning::`
+  annotations. The comparison function lives in
+  `weft-bench/src/soak_compare.rs`, and the annotator script in
+  `scripts/annotate-soak-drift.py`. Documented in `docs/soak.md`.
+
+- **Performance methodology document.** `docs/methodology.md` defines what
+  counts as a performance claim, what evidence a claim must carry, what
+  disqualifies a claim, and where numbers may be stated. It makes a published
+  number checkable; it does not yet certify that the numbers published before it
+  satisfy it, which is the audit the section on Rust doc comments points to.
+  (#430)
+
 ### Changed
 
 - **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
@@ -28,6 +58,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   result; a repeat inside one result is still a defect, and the message names both the metric and the
   result. Manifest schema v23 → v24: a manifest written by an older build is refused with an
   instruction to re-run the benchmark, since the fields that identify a measure did not exist then.
+
+- **`weft-xbench combine` no longer calls an unreproducible-but-in-tolerance answer a failure (#516).**
+  Two runs that each pass their own tolerance but produce different answer digests are
+  non-deterministic, not wrong. The combined gate is reported as `non-deterministic` and kept out of
+  win/loss verdicts and failure lists; a new `Non-deterministic within tolerance` section in the
+  rendered report explains the row. Report schema v7 → v8: `Correctness` gains an `indeterminate`
+  field.
 
 ## [0.3.2] - 2026-11-06
 
@@ -43,7 +80,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `Database::replace_dictionary_patterns`, `Dictionary::import_pattern` ignores a
   pattern id it already holds, and the dictionary-list cache key now includes the aspect
   (two aspects with a dictionary of the same name were served each other's patterns).
->>>>>>> 248f343 (fix(weftdb): stop pipeline dictionaries doubling on every run; release 0.3.2)
+
 
 ### Fixed
 

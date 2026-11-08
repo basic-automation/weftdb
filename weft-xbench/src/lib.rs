@@ -84,7 +84,11 @@ use weft_bench::{
 ///
 /// v7 (#148) adds each arm's interpolation `class` (native, portable SQL, client-side) and, for a
 /// native fill that computes another answer, its `own_answer`, and each gate's `unfilled_points`.
-pub const XBENCH_SCHEMA_VERSION: u32 = 7;
+///
+/// v8 (#516) adds each gate's `indeterminate`: a digest disagreement where every run stayed inside
+/// its tolerance is non-determinism, not a wrong answer and not a failure. The combined gate's
+/// `passed` stays false to keep the row out of verdicts.
+pub const XBENCH_SCHEMA_VERSION: u32 = 8;
 
 /// The reductions the downsample phase computes per bucket.
 pub const DOWNSAMPLE_AGGREGATIONS: [weft_reduce::Aggregation; 3] = [weft_reduce::Aggregation::Min, weft_reduce::Aggregation::Max, weft_reduce::Aggregation::Avg];
@@ -551,6 +555,11 @@ pub struct Correctness {
 	/// first and last knots. Always zero for an arm held to the reference.
 	#[serde(default)]
 	pub unfilled_points: usize,
+	/// Set only by `combine` (#516): the runs' answer digests differed while every run stayed
+	/// inside its tolerance, so the answer is not reproducible bit for bit but no run was wrong.
+	/// Such a row is neither a pass nor a failure, and stays out of win/loss verdicts.
+	#[serde(default)]
+	pub indeterminate: bool,
 	/// SHA-256 of this arm's answer ([`grid_digest`], [`bucket_digest`]), so separate runs of one arm
 	/// can be shown to answer alike (v6). Engines differ in the last bits of a float, so arms are
 	/// compared with each other by [`Self::max_abs_diff_vs_reference`], not by this.
@@ -607,7 +616,7 @@ impl Correctness {
 		let magnitude = reference.iter().map(|v| v.abs()).fold(1.0, f64::max);
 		let tolerance = RELATIVE_TOLERANCE * magnitude;
 		let passed = values.len() == expected && values_finite && max_abs_diff_vs_reference <= tolerance;
-		Self { expected_points: expected, actual_points: values.len(), values_finite, max_abs_diff_vs_reference, tolerance, passed, unfilled_points: 0, answer_sha256: Some(grid_digest(values)) }
+		Self { expected_points: expected, actual_points: values.len(), values_finite, max_abs_diff_vs_reference, tolerance, passed, unfilled_points: 0, answer_sha256: Some(grid_digest(values)), indeterminate: false }
 	}
 
 	/// The gate of a native fill that answers a different question ([`ArmInfo::own_answer`]): the
@@ -621,7 +630,7 @@ impl Correctness {
 		let max_abs_diff_vs_reference = filled.iter().map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
 		let magnitude = reference.iter().map(|v| v.abs()).fold(1.0, f64::max);
 		let unfilled_points = values.len() - filled.len();
-		Self { expected_points: expected, actual_points: values.len(), values_finite, max_abs_diff_vs_reference, tolerance: RELATIVE_TOLERANCE * magnitude, passed: values.len() == expected && values_finite && !filled.is_empty(), unfilled_points, answer_sha256: Some(grid_digest(values)) }
+		Self { expected_points: expected, actual_points: values.len(), values_finite, max_abs_diff_vs_reference, tolerance: RELATIVE_TOLERANCE * magnitude, passed: values.len() == expected && values_finite && !filled.is_empty(), unfilled_points, answer_sha256: Some(grid_digest(values)), indeterminate: false }
 	}
 }
 

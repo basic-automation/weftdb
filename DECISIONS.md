@@ -5360,6 +5360,41 @@ into its body, so the absence of verification is visible rather than implied. Ta
 a human action: `release.yml` accepts only a CI run on `main`, and crates.io is unreachable from
 this machine, so publication state cannot be confirmed from here at all.
 
+## 2026-11-06 — PAC-6: TEST_DATA_DIR is removed; the suites are handed WEFT_DATA_DIR (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan (§3 PAC-5a/PAC-6 row) fixes the outcome — one VarSpec
+registry with tiers stable/tuning/experimental plus a test allowlist, and
+"`TEST_DATA_DIR` is removed (PAC-6)" — and PAC-5a's registry entry for the name
+says it is removed "once the suites are handed a fixture path instead", but no
+source names the replacement channel the suites are handed.
+
+**Chosen:** the fixture path is `WEFT_DATA_DIR`, the Stable variable
+`weftdb::data_dir` already honoured as its first (and now only) override:
+
+- `weftdb::data_dir` drops the `TEST_DATA_DIR` leg; resolution is
+  `WEFT_DATA_DIR`, else the portable per-user default.
+- Every suite that set `TEST_DATA_DIR` now sets `WEFT_DATA_DIR` instead: the
+  per-test `#[serial]` sites in `weftdb` and `weft-orchestration`, the crash-test
+  child processes (handed the path through the child's environment, as before),
+  and the two `data_dir()` helpers, whose explicit-fixture branch now keys on
+  `WEFT_DATA_DIR` — which is also how `test_api`/`test_pipeline_api` still reach
+  a real `Crypto` corpus (`WEFT_DATA_DIR=~/.weftdb/data`). The helpers' comments
+  say plainly that a shell exporting `WEFT_DATA_DIR` for `weft-tui` now also
+  points the suites at that directory; CI does not set it.
+- The registry entry and the test allowlist entry are deleted (104 → 103
+  names; Test tier 42 → 41), and the configuration docs (SEC-14's
+  `docs/config-schema.md`, plus the `docs/reference.md` configuration table and
+  resolution list) are updated in the same commit, so the PAC-5b/6
+  configuration documentation (§8 :788, wording per decision 21) describes the
+  completed registry. The historical mention in `compat/v010/README.md` stays:
+  it records the v0.1.0 binary's behaviour, which did read the name.
+
+**Rejected:** a new in-process override API on `weftdb` (a settable global the
+library would carry for tests alone — the plan's direction is the library
+taking *fewer* environment-shaped inputs, and the child-process crash tests
+still need an environment channel to be handed their directory), and keeping a
+differently-named test-only variable (that is `TEST_DATA_DIR` under a new
+spelling, not its removal).
 ## 2026-11-07 — Needs human: the crates.io token; and the gates that sat behind a red gate (PAC-11, #596)
 
 **Confirmed, not inferred: publication to crates.io has never happened, and it is a missing secret.**
@@ -5557,3 +5592,36 @@ deliberately did neither.
 	verdict string" is what produced the wrong verdict in the first place. The 2xx band check is
 	kept exactly as before, so a server that started and then failed is still the server's problem
 	and is never retried somewhere privileged.
+## 2026-11-07 — #516: a digest disagreement inside tolerance is non-determinism, not a wrong answer
+
+	**The finding.** The pooled Phase 1 report (`bench/reports/phase1-pooled/`) contains two runs of
+	the `timescaledb-double` downsample gate at `mcar-medium`. Both passed their individual tolerance
+	(test-to-reference differences of 7.1e-14 and 1.4e-13 against a 9.2e-8 relative tolerance). But
+	their `answer_sha256` values differed — `DIGEST_DIGITS` (12) significant digits of each bucket's
+	`avg`, computed by TimescaleDB's `avg(double precision)`, which sums in whatever order the
+	parallel scan delivers rows and then divides. The two runs' rows landed in different order, so
+	the 12-significant-digit string of a float that the hash feeds on was different, so the hash
+	differed, so `combine.rs:81` recorded a FAILED gate.
+
+	**Why a hash is the wrong test for a `double precision` `avg` that does not add in a fixed order.**
+	`AVG(double precision)` in PostgreSQL and its derivatives computes a parallel sum whose rounding
+	depends on row arrival order. Two runs that return the same set of rows within tolerance can
+	therefore produce a different floating-point result at the 14th or 15th decimal digit — well
+	short of the 1e-9 tolerance but enough to change a SHA-256 over 12-significant-digit
+	representations. The answer digest was designed to detect a run that answers a *completely
+	different grid*, not the last 1e-14 of a sum, and using it as a pass/fail criterion for a
+	combined report conflates the two.
+
+	**What the third state does.** `Correctness.indeterminate` (report schema v7 → v8) records that
+	the runs' digests disagreed while every run stayed inside its own tolerance. The combined gate's
+	`passed` field is kept `false` — the row stays out of `all_correct()` and out of win/loss
+	verdicts exactly as before — because the answer is not reproducible bit for bit. The rendered
+	report shows `non-deterministic` in the gate cell and lists the row in a new `Non-deterministic
+	within tolerance` section.
+
+	**What it does NOT do.** It does NOT weaken the digest check for out-of-tolerance answers: a run
+	supplying a completely different grid still produces a different hash, and a run that also fails
+	its own tolerance produces `indeterminate = false`. It does NOT let the row into a verdict: a
+	row whose `passed` is false is excluded by the existing `passed(r)` filter — `all_correct()` and
+	the verdict loop never see it.
+
