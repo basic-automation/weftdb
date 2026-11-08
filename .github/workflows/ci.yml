@@ -128,9 +128,15 @@ jobs:
       - run: python3 tools/check_claims.py --registry bench/claims.json --readme docs/reference.md --root .
       # Every workflow action must be pinned to a commit SHA (#626).
       - run: python3 scripts/ci/check-action-pinning.py
+      # Every #[serial] must sit immediately above #[test] or #[tokio::test] (#405).
+      - run: python3 scripts/ci/check-serial-order.py
       # The artifact-reference checks in check_claims.py are part of the gate, so
       # their tests run here too (EVI-4).
       - run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Unit tests for the serial-order guard.
+      - run: python3 -m unittest discover -s scripts/ci -p 'test_check_serial_order.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
 

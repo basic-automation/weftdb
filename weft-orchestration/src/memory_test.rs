@@ -42,8 +42,8 @@ mod memory_tests {
 		(0..length).map(|i| (f64::from(i) * id.mul_add(0.01, 1.0)).sin() * id.mul_add(0.1, 1.0)).collect()
 	}
 
-	#[tokio::test]
 	#[serial] // Run serially to prevent memory contention
+	#[tokio::test]
 	async fn test_memory_usage_small() {
 		println!("Testing memory usage with 100 patterns...");
 		let mut dict = create_test_dict();
@@ -59,8 +59,8 @@ mod memory_tests {
 		drop(dict);
 	}
 
-	#[tokio::test]
 	#[serial] // Run serially to prevent memory contention
+	#[tokio::test]
 	async fn test_memory_usage_medium() {
 		println!("Testing memory usage with 500 patterns...");
 		let mut dict = create_test_dict();
@@ -76,8 +76,8 @@ mod memory_tests {
 		drop(dict);
 	}
 
-	#[tokio::test]
 	#[serial] // Run serially to prevent memory contention
+	#[tokio::test]
 	async fn test_memory_usage_large() {
 		println!("Testing memory usage with 1000 patterns...");
 		let mut dict = create_test_dict();

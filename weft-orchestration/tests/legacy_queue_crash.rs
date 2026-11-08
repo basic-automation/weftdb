@@ -225,8 +225,9 @@ async fn crash_the_consumer(store: &Store) -> Result<Vec<BatchRow>> {
 /// **Regression (legacy-queue-consumer-batch-before-dequeue).** A consumer crash before
 /// the dequeue, then a re-run, creates no duplicate batches or pattern occurrences. On
 /// main the re-run inserted every batch a second time.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_consumer_rerun_after_a_crash_before_the_dequeue_adds_no_duplicates() -> Result<()> {
 	let mut store = Store::new("consumer_unprocessed").await?;
 	let crashed = crash_the_consumer(&store).await?;
@@ -247,8 +248,9 @@ async fn a_consumer_rerun_after_a_crash_before_the_dequeue_adds_no_duplicates() 
 /// processed DB before the consumer re-runs. The dedupe also checks the processed
 /// batches, so the re-run still adds nothing. On main the re-run queued every batch
 /// again and each one was processed, and turned into an occurrence, twice.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_consumer_rerun_after_its_batches_were_processed_adds_no_duplicates() -> Result<()> {
 	let mut store = Store::new("consumer_processed").await?;
 	let crashed = crash_the_consumer(&store).await?;
@@ -270,8 +272,9 @@ async fn a_consumer_rerun_after_its_batches_were_processed_adds_no_duplicates() 
 /// hashes of the batches it consumed, and the dedupe checks them too, so the re-run
 /// queues nothing again. Before, the dedupe saw only the two batch tables, and the
 /// re-run queued every extracted batch again: a second occurrence of each span.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_consumer_rerun_after_its_batches_were_extracted_adds_no_duplicates() -> Result<()> {
 	let mut store = Store::new("consumer_extracted").await?;
 	let crashed = crash_the_consumer(&store).await?;
@@ -298,8 +301,9 @@ async fn a_consumer_rerun_after_its_batches_were_extracted_adds_no_duplicates() 
 /// dedupe recognises them by the hashes extraction recorded, so no span becomes a second
 /// occurrence. Before, it saw only the batches still in a table, so every one of those
 /// windows was extracted twice.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_pipeline_run_during_an_ingest_extracts_each_window_once() -> Result<()> {
 	let mut store = Store::new("concurrent_extract").await?;
 	let mut dictionary = dictionary();
@@ -380,8 +384,9 @@ fn suppress_core_dump() {
 /// The consumer crash as a real process crash: a child process runs the consumer and
 /// aborts at `L-consumer-batches`, after its batches committed and before the dequeue.
 /// The re-run in this process then adds no duplicate batches or pattern occurrences.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_consumer_killed_before_the_dequeue_reruns_without_duplicates() -> Result<()> {
 	let rows = minutes(0..CONSUMER_ROWS);
 	let closed = {
@@ -422,8 +427,9 @@ async fn a_consumer_killed_before_the_dequeue_reruns_without_duplicates() -> Res
 /// so the incremental build covers them. On main the enqueue ran after the chunk loop,
 /// so it never ran, and the landed rows were never batched (the aspect already had
 /// batches, so the consumer did not fall back to a full rebuild).
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_failure_after_a_chunk_leaves_the_landed_rows_queued_and_batched() -> Result<()> {
 	let mut store = Store::new("chunk_crash").await?;
 	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(0..8)).await?;
@@ -492,8 +498,9 @@ async fn assert_a_partial_prefix_is_batched_and_the_rest_waits(store: &Store) ->
 /// timestamps, queued ahead of rows that never landed, wait in the queue without failing
 /// the build. On main the enqueue ran after the chunk loop, so the landed chunk was never
 /// queued.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_failure_after_the_first_of_two_chunks_leaves_a_batched_prefix() -> Result<()> {
 	let mut store = Store::new("two_chunk_crash").await?;
 	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(0..8)).await?;
@@ -537,8 +544,9 @@ async fn ingest_child() -> Result<()> {
 /// ingest and aborts at `L-chunk(0)`, after its first chunk committed. The write-ahead
 /// entries and the chunk survive the crash, and the build in this process batches the
 /// landed rows and leaves the rest queued.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn an_ingest_killed_after_its_first_chunk_leaves_a_batched_prefix() -> Result<()> {
 	let closed = {
 		let store = Store::new("two_chunk_abort").await?;
@@ -570,8 +578,9 @@ async fn an_ingest_killed_after_its_first_chunk_leaves_a_batched_prefix() -> Res
 /// incremental build neither fails nor invents batches for rows that do not exist. The
 /// client's retry then lands the rows, and the build covers them. `capture_measurement`
 /// follows the same order.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_failure_after_the_enqueue_leaves_a_superset_queue_the_build_tolerates() -> Result<()> {
 	let mut store = Store::new("enqueue_crash").await?;
 	let rows = minutes(0..10);
@@ -664,8 +673,9 @@ async fn assert_a_consumer_during_the_ingest_misses_nothing(store: &Store, inges
 /// the timestamp. Without the queue entry written again after the commit (and a dequeue
 /// that only removes the entries the consumer read), the row that then lands is never
 /// batched.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_consumer_during_an_ingest_inside_the_range_misses_nothing() -> Result<()> {
 	let (store, landed) = a_store_with_a_gap("concurrent_inside").await?;
 	assert_a_consumer_during_the_ingest_misses_nothing(&store, Ingest::Capture(landed)).await
@@ -691,8 +701,9 @@ async fn a_store_with_a_gap(tag: &str) -> Result<(Store, InputMeasurement)> {
 /// It dequeues the entry only under the `queued_at` it read, so the entry stays queued and
 /// the next run batches the landed row. A dequeue by bare timestamp removed it, and the
 /// row was never batched.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn an_entry_queued_again_before_the_consumers_dequeue_stays_queued() -> Result<()> {
 	let (store, landed) = a_store_with_a_gap("requeue_before_dequeue").await?;
 	let (resume_ingest, resume_consumer, ingested) = (Arc::new(Notify::new()), Arc::new(Notify::new()), Notify::new());
@@ -734,8 +745,9 @@ async fn an_entry_queued_again_before_the_consumers_dequeue_stays_queued() -> Re
 /// the base, so the consumer finds no affected window and clears what it read from the
 /// queue. Without the entries written again after the commit, the backfilled rows are
 /// never batched.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_consumer_during_a_backfill_misses_nothing() -> Result<()> {
 	let store = Store::new("concurrent_backfill").await?;
 	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(10..20)).await?;
@@ -758,8 +770,9 @@ async fn a_consumer_during_a_backfill_misses_nothing() -> Result<()> {
 /// behind. Aligned on it, a backfill lies before the consumer's base, where it has no
 /// window, and the consumer cleared it from the queue: the backfilled rows were never
 /// batched.
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn the_consumer_aligns_on_the_stored_earliest_measurement_not_a_cached_one() -> Result<()> {
 	let store = Store::new("stale_earliest").await?;
 	store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(10..20)).await?;

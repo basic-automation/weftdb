@@ -46,8 +46,9 @@ async fn count(db: &Database, aspect: &AspectId, name: &str, sql: &str) -> Resul
 	Ok(row.get(0)?)
 }
 
-#[tokio::test(flavor = "multi_thread")]
 #[serial]
+#[tokio::test(flavor = "multi_thread")]
+
 async fn repeated_runs_store_each_pattern_once() -> Result<()> {
 	let dir = tempfile::tempdir()?;
 	std::env::set_var("WEFT_DATA_DIR", dir.path().to_str().context("temp dir not UTF-8")?);

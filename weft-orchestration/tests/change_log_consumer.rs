@@ -28,8 +28,9 @@ fn minutes(range: std::ops::Range<i64>) -> Vec<InputMeasurement> {
 	range.map(|m| InputMeasurement::new(base + Duration::minutes(m), bd(&format!("{m}.5")))).collect()
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn a_seal_backed_aspect_is_batched_from_its_change_log() -> Result<()> {
 	let dir = tempfile::tempdir()?;
 	std::env::set_var("WEFT_DATA_DIR", dir.path().to_str().unwrap());

@@ -33,8 +33,9 @@ async fn setup() -> Result<(TempDir, Database)> {
 	Ok((temp_dir, db))
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 	let (_dir, db) = setup().await?;
@@ -99,8 +100,9 @@ async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
+
 async fn rows_mode_is_the_default_and_compression_forces_it() -> Result<()> {
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	let (_dir, db) = setup().await?;

@@ -33,6 +33,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `docs/reference.md` carry the link; the note in `docs/claims-audit.md` that the
   methodology "does not yet exist" was stale — it landed in #630 — and now says where the
   rules live.
+- **Guard the `#[serial]`-above-`#[test]` ordering (#405).**
+  `scripts/ci/check-serial-order.py` scans every tracked `*.rs` file and
+  fails, with `file:line`, on any `#[serial]` that is not immediately above
+  a test attribute (`#[test]` or `#[tokio::test]`). Wired into the `claims`
+  job in `ci.yml` after the action-pinning check.
+
 - **The frame-fault policy is verified (ROB-22/C5).** The three behaviours of
   the C5 policy are now pinned by tests: a suspect frame is excluded from
   reads, a suspect frame is never auto-purged by maintenance, and a corrupt
