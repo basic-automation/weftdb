@@ -54,14 +54,14 @@ pub enum Fill {
 }
 
 impl Fill {
-	/// Parse a wire token: `null`, `prev`/`previous`/`locf`, `linear`, `quadratic`, `cubic`,
-	/// or a decimal constant (case-insensitive, surrounding whitespace ignored). `None` for
-	/// anything else. `quadratic` and `cubic` are [`Fill::Spline`]s; `linear` is the exact
-	/// [`Fill::Linear`], not a linear spline.
+	/// Parse a wire token: exact lowercase `null`, `prev`/`previous`/`locf`, `linear`,
+	/// `quadratic`, `cubic`, or a decimal constant (surrounding whitespace ignored).
+	/// `None` for anything else. `quadratic` and `cubic` are [`Fill::Spline`]s; `linear` is
+	/// the exact [`Fill::Linear`], not a linear spline.
 	#[must_use]
 	pub fn from_token(token: &str) -> Option<Self> {
 		let token = token.trim();
-		match token.to_ascii_lowercase().as_str() {
+		match token {
 			"null" => Some(Self::Null),
 			"prev" | "previous" | "locf" => Some(Self::Previous),
 			"linear" => Some(Self::Linear),
@@ -399,13 +399,20 @@ mod tests {
 
 	#[test]
 	fn tokens_parse() {
-		assert_eq!(Fill::from_token(" NULL "), Some(Fill::Null));
+		// Trimming is preserved; case is not.
+		assert_eq!(Fill::from_token(" null "), Some(Fill::Null));
+		assert_eq!(Fill::from_token("null"), Some(Fill::Null));
+		assert_eq!(Fill::from_token("NULL"), None);
 		assert_eq!(Fill::from_token("prev"), Some(Fill::Previous));
+		assert_eq!(Fill::from_token("previous"), Some(Fill::Previous));
 		assert_eq!(Fill::from_token("locf"), Some(Fill::Previous));
-		assert_eq!(Fill::from_token("Linear"), Some(Fill::Linear));
-		assert_eq!(Fill::from_token("-2.50"), Some(Fill::Value(dec("-2.50"))));
-		assert_eq!(Fill::from_token("CUBIC"), Some(Fill::Spline(Spline::Cubic)));
+		assert_eq!(Fill::from_token("Prev"), None);
+		assert_eq!(Fill::from_token("linear"), Some(Fill::Linear));
+		assert_eq!(Fill::from_token("Linear"), None);
+		assert_eq!(Fill::from_token("CUBIC"), None);
+		assert_eq!(Fill::from_token("cubic"), Some(Fill::Spline(Spline::Cubic)));
 		assert_eq!(Fill::from_token("quadratic"), Some(Fill::Spline(Spline::Quadratic)));
+		assert_eq!(Fill::from_token("-2.50"), Some(Fill::Value(dec("-2.50"))));
 		assert_eq!(Fill::from_token("nearest"), None);
 	}
 }

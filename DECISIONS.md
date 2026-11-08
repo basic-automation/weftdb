@@ -5740,3 +5740,26 @@ breaking the build, and `docs/claims-audit.md` now says where the rules live ins
 they do not exist. Closing #430 also removes the last "documentation not yet written" caveat from
 the claims story: from here, an unprovenanced figure fails CI, and a provenanced-but-unjudgeable one
 now has nowhere to hide either.
+## 2026-11-07 — #453: Fill tokens are exact-case like the reduction tokens
+
+**Context.** FRE-5 (2026-10-29, DECISIONS.md:3352) made `Aggregation::from_token` exact-case and
+noted that `Fill::from_token` (`weft-reduce/src/fill.rs:62`) still folded case, left for its own
+decision (#453). `Fill` reaches the same wire surface — `?fill=` on the ILP endpoint
+(`weft-server/src/downsample.rs:134`), the stored-range routes (`weft-server/src/storage.rs`), the
+downsample JSON body, and `weft-bench --gf-fill` (`weft-bench/src/main.rs:2059`) — so the two
+vocabularies cannot be expected to resolve `agg=` one way and `fill=` the other on the same query.
+
+**Chosen:** exact-case word tokens, value arm unchanged. `from_token` trims, matches exactly
+`null | prev | previous | locf | linear | quadratic | cubic`, then falls through to the
+`BigDecimal` parse for the constant arm. The value arm takes no letters, so case rules never touch
+it. Tests at `fill.rs:401-409` now pin `"Linear" -> None` and `"CUBIC" -> None`.
+
+**Rejected:** keeping case folded so the two vocabularies agree in-kind (they would agree only in
+being wrong together); and a deprecation-warning path — the tokens return `Option` and the server
+already 400s unknowns with the accepted spellings, so a separate warning surface would be new API
+on a pre-1.0 crate whose CHANGELOG is the deprecation notice.
+
+**Breaking:** mixed-case `fill` tokens on the HTTP endpoints and `--gf-fill` now 400/CLI-error and
+name the token. No test sends a mixed-case fill, so this is a documentation-level break, recorded
+under `### Changed` in CHANGELOG.md with the same "This breaks v0.3.x clients…" call-out the
+reduction change used.
