@@ -5569,3 +5569,85 @@ deliberately did neither.
 	row whose `passed` is false is excluded by the existing `passed(r)` filter — `all_correct()` and
 	the verdict loop never see it.
 
+
+## 2026-11-07 — #452: the adapter string is the predicate; no new field
+**Ambiguity.** The issue says a non-adapter result "cannot carry a cross-engine claim", but a result
+whose `adapter_info` is `None` is precisely the result that cannot say which engine produced it, so
+the enforcement predicate cannot be the obvious "this arm is a competitor and has no report". Two
+candidate readings: a mixture rule (a report that contains both a null-report result and a result
+with `adapter_info` where `native_engine` is true) and a workload rule (the null-report workloads are
+WeftDB-only by construction).
+
+**Choice.** Neither, as written. The predicate is `result.adapter_info.is_none() &&
+!result.adapter.starts_with("weftdb")`, enforced in `weft-bench/src/compare.rs` by a helper called
+from `provenance` (`compare.rs:459`) that pushes `hard:`-prefixed notes, so it reuses the existing
+`CompareError::Incomparable` refusal (`compare.rs:346-351`) and the existing `--ignore-provenance`
+downgrade to `ignored:` with no new machinery.
+
+**Why.** `native_engine`, `engine` and `method` all live *inside* `AdapterInfo`, which is the very
+structure whose absence is under test — a predicate over them can never observe the offending shape.
+`BenchResult::adapter` is the only party field populated on every result. `starts_with` rather than
+equality because the self-measured paths are not all spelled `weftdb`: `stored_weft_adapter.rs:136`
+writes `weftdb-stored` and `soak_client.rs:660` writes `weftdb-ingest`, and an exact-match allow list
+would silently exempt those. Every real adapter implements `adapter_info` because
+`SystemAdapter::adapter_info` (`weft-bench/src/adapter.rs:54`) deliberately has no default, so the
+crate's other names (`baseline-linear`, `baseline-forward-fill`, `null`) cannot reach the branch and
+get no entry in any list. The honest shape the issue concedes — `adapter: "weftdb"` with
+`adapter_info: None` from the seven in-process workloads — keeps comparing.
+
+**Consequence accepted.** The `compare.rs` test helper at `compare.rs:566` builds fixtures with
+`adapter: "weft"` and `adapter_info: None`; under this rule that is a second party without
+provenance, so the fixture becomes `"weftdb"` rather than the rule being widened to cover a name that
+exists only in tests.
+
+**What this does NOT do.** It does not add a field, an `Option<bool>`, or a report-schema bump; a
+new optional boolean is the opposite of the trait's "no default implementation" rule, because the
+caller may simply not set it — which is exactly how the first attempt (#634, in `weft-xbench::ArmInfo`)
+produced a guard that could only fire in tests. It also does not check a lone report at publication
+time: only the compare boundary is guarded, because that is where this repository forms a ratio claim.
+
+## 2026-11-07 — CI-12: a clippy verdict that depends on cache state is not a gate (#635, #636, #637)
+**Ambiguity.** `Run clippy` is green on PRs and red on the commits they merge into. Two mechanisms
+fit the evidence — a restored `target/` whose fingerprints came from `cargo test` rather than clippy,
+and a deny set on the command line that is narrower than the one the crates declare — and a CI log
+does not separate them.
+
+**Choice.** Fix the code first, then the cache, then the blind spot, as three separate changes; and
+in the meantime correct the workflow comment so the next reader is not told something false.
+
+**Why.** `main` at `c04f055` ran clippy on a tree where `weft-bench` was not checked at all (job
+`42432269724`, `Checked 7 crates`) and the same tree failed on a cache-miss runner with 23 errors in
+`weft-bench/src/soak_compare.rs`; #616 was merged on a run that printed `Reusing CI artifacts from a
+previous job`. So #636 makes the code satisfy the lint level the crates themselves declare —
+`weft-bench/src/lib.rs:92` is `#![deny(clippy::pedantic, clippy::nursery, clippy::all)]` and
+`weft-bench/src/main.rs:28` is the `forbid` form, which an inline `allow` cannot downgrade — and that
+is a superset of whatever the CLI flags ask for. Only then does namespacing the clippy job's build
+(`CARGO_TARGET_DIR: target/clippy`, or a distinct rust-cache `key:`) mean anything, and the proof is
+that a warm run on `main` prints `Checking weft-bench` instead of `Reusing CI artifacts`. Deleting the
+cache instead was rejected: the `weftdb` test job is already 13 to 16 minutes warm, and a cold
+`--all-features` clippy pass is the expensive case.
+
+**Deferred deliberately.** A check that the job enumerated every workspace crate — comparing
+`cargo metadata --no-deps` package count against the `Checked N crates` line — is the only thing that
+would detect a false pass, and it is kept out of this change because the first run will fail on
+whatever the poisoned cache has been hiding, and that needs its own fix commit rather than a red
+gate nobody triages.
+
+## 2026-11-08 — Needs human: the box lost its uplink mid-wave (network, not code)
+At about 00:45 the machine stopped routing: `getent hosts github.com` fails,
+`resolvectl` still reports quad9 as current, and `bash -c 'echo > /dev/tcp/1.1.1.1/53'`
+returns `Network is unreachable` with no default route in `ip route show default`. That is
+an uplink or default-route failure, not a resolver failure — a resolver problem would still
+reach 1.1.1.1 over TCP.
+
+**What it cost.** A freshly dispatched `parallel-worker` for #625 died at its first turn with
+`502 cannot resolve tunnel destination openrouter.ai`, and the local `git push` of the clippy
+fixes for #636 could not reach the remote (the commit exists locally as `4882ef1`, so nothing
+is lost). Every CI-dependent claim in this session's open PRs (#636, #637, #638, #639) is
+therefore pending rather than verified, and no PR was merged on the strength of a guess.
+
+**Chosen response.** Keep working on what a machine without a network can still do — local
+`cargo clippy`/`cargo test` verification of the branches already committed — and re-attempt
+the pushes when the route returns, rather than inventing an offline workaround or claiming
+green. Recorded here because if the wave appears to stall again with no explanation, this is
+the reason, and because restarting the interface or the VPN is a human action on this host.
