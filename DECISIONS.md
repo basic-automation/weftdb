@@ -5708,6 +5708,21 @@ the pushes when the route returns, rather than inventing an offline workaround o
 green. Recorded here because if the wave appears to stall again with no explanation, this is
 the reason, and because restarting the interface or the VPN is a human action on this host.
 
+## 2026-11-08 — FRE-15: the stability policy lives in `docs/`, not at the root (#331)
+
+`docs/release/1.0-plan.md` calls the slice "STABILITY.md", which reads like a root-level
+file next to `HONESTY.md` and `SECURITY.md`. **Chosen:** `docs/stability.md`, linked from
+`README.md` and `docs/reference.md`. The root pair exists at the root because GitHub gives
+those two filenames special meaning (a security policy is surfaced in the repository's
+security tab); a versioning policy gets no such treatment, and every other explanatory
+document in this repository lives in `docs/`. A 225-line policy document with an internal
+link graph is also easier to read rendered than as a root landing page.
+
+**Rejected: `STABILITY.md` at the root** — it would be the only long-form policy document
+there, and `SECURITY.md`'s reason for being at the root does not transfer. **Rejected:
+putting it inside `docs/release/`** — that directory holds release *procedures* (the
+checklist, the 1.0 plan), which are internal; this document is addressed to users.
+
 ## 2026-11-08 — #430: the methodology pointer is enforced, not offered
 
 **What was ambiguous.** #430 asks for "a methodology document published before any performance

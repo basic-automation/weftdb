@@ -239,6 +239,9 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 The full work queue lives in [`ROADMAP.md`](../ROADMAP.md). It is the single source of
 truth for status and priorities, and it records negative results alongside wins.
 
+See [`docs/stability.md`](stability.md) for the stability and versioning policy — what
+is stable, what is experimental, and what is not yet guaranteed for code and data.
+
 ---
 
 ## What you get
