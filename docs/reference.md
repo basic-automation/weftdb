@@ -2145,6 +2145,13 @@ every comparison with client-side interpolation. Treat a margin under about 1.5Ã
 
 ---
 
+### Nightly soak comparison gate
+
+See [`docs/soak.md`](soak.md) â€” the SOA-15 nightly soak comparison schedule,
+metrics, tolerances, and how to regenerate a baseline.
+
+---
+
 ## Development
 
 ```bash
