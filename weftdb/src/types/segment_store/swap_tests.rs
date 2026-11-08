@@ -479,9 +479,9 @@ impl Op {
 /// On Windows the open is retried with a bounded backoff because a process that aborted on
 /// the same path holds Turso database handles the OS does not release instantly, so the
 /// first open attempts return `PermissionDenied` (`I/O error (tempdir): permission denied`
-/// from `CreateFile` on the Turso database or its `-log` or `-wal` file).  The retry is
-/// bounded by `(2 * backoff_base).as_millis()` across at most 6 attempts; after that the
-/// error is propagated unchanged.
+/// from `CreateFile` on the Turso database or its `-log` or `-wal` file).  The retry is at
+/// most 6 attempts 500 ms apart, so it waits no longer than 2.5 s; any other error, or the
+/// sixth attempt's, is propagated unchanged.
 async fn verify_recovered(root: &Path, op: Op, point: FaultPoint, label: &str) {
 	let store = open_store_retry(root).await.unwrap_or_else(|e| panic!("{label}: the store opens: {e:#}"));
 	let expected = expected_rows(op);

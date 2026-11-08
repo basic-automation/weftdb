@@ -100,6 +100,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **The abort arm of the crash matrix no longer flakes on Windows.** The test aborts a
+  child process mid-operation and then re-opens the same store in the parent, and Windows
+  keeps an aborted process's Turso database handles live for a short window, so those first
+  opens returned `I/O error (tempdir): permission denied` while Linux tolerated them.
+  `verify_recovered` now retries the open on Windows (6 attempts, 500 ms apart) and
+  propagates any other error unchanged; no production path opens a path an aborted process
+  just vacated, so the race was test-only (#625).
 - **A pipeline's pattern dictionary no longer grows without bound.** Each
   `Pipeline::run` loaded the stored dictionary on top of the patterns it already held
   and then appended the whole dictionary to the store again (`patterns.id` is not
