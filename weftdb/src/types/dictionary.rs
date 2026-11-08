@@ -1050,7 +1050,6 @@ mod tests {
 
 	#[serial]
 	#[tokio::test]
-
 	async fn test_import_new_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -1062,7 +1061,6 @@ mod tests {
 
 	#[serial]
 	#[tokio::test]
-
 	async fn test_import_similar_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -1080,7 +1078,6 @@ mod tests {
 
 	#[serial]
 	#[tokio::test]
-
 	async fn test_import_different_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -1099,7 +1096,6 @@ mod tests {
 
 	#[serial]
 	#[tokio::test]
-
 	async fn test_import_pattern_matches_multiple() {
 		let mut dictionary = create_test_dictionary();
 
@@ -1125,7 +1121,6 @@ mod tests {
 
 	#[serial]
 	#[tokio::test]
-
 	async fn test_import_pattern_matches_multiple_distinct_patterns() {
 		// Create a dictionary with moderately loose constraints to allow some matches
 		let constraints = DictionaryConstraints {
@@ -1160,7 +1155,6 @@ mod tests {
 
 	#[serial]
 	#[tokio::test]
-
 	async fn test_import_pattern_matches_multiple_existing_patterns() {
 		// Create a dictionary with loose constraints to enable multiple matches
 		let constraints = DictionaryConstraints {

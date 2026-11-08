@@ -146,7 +146,13 @@ def check_file(path: Path) -> list[tuple[str, int, str]]:
             next_stripped = next_raw.lstrip()
 
             if not next_stripped:
-                continue
+                # Blank line between #[serial] and the test attribute is
+                # rejected — no blank line is allowed in the attribute block.
+                errors.append(
+                    (str(path), serial_line,
+                     "#[serial] has a blank line in the attribute block before the test attribute")
+                )
+                break
             if _COMMENT_LINE_RE.match(next_raw):
                 continue
             if next_stripped.startswith(("//", "#![")):

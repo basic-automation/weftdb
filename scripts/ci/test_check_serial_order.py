@@ -120,6 +120,13 @@ class SerialOrderTest(unittest.TestCase):
         src = "#[serial]\n#[serial]\n#[tokio::test]\nasync fn it_works() {}"
         self.assertEqual(check(src), [])
 
+    def test_blank_line_between_serial_and_test_attr_rejects(self):
+        """A blank line between #[serial] and the test attribute is rejected."""
+        src = "#[serial]\n\n#[tokio::test]\nasync fn it_works() {}"
+        errs = check(src)
+        self.assertEqual(len(errs), 1)
+        self.assertIn("blank line", errs[0][2].lower())
+
     def test_empty_file(self):
         self.assertEqual(check(""), [])
 
