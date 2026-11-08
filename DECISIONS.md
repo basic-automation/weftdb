@@ -4,6 +4,20 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-08 — Pagination cursor v1: selector hash, high-water mark, fingerprint, nullable total (ROB-15, #449)
+
+**The cursor v1 token is 66 hex characters: `01` + selector SHA-256 prefix (16) + high-water mark (16) + data fingerprint (16) + next-page offset (16).**
+The selector is hashed by SHA-256 of its canonical matcher sequence (each `(key, Some(value))` encoded as `key\0value\0`, a missing value as `key\0\xff\0`), followed by the exactness flag as one byte. SHA-256 was already a dependency of `weft-server` (SEC-6's API-key digests), so no new dependency was added.
+
+**`total: null` on cursor-following pages.** The acceptance criteria say "total nullable after the first page". A cursor-following page has no meaningful total — the window total was already reported — so `total` is omitted (serialized as `null`). The first page (no cursor in the request) always carries it.
+
+**Appends never invalidate an existing cursor.** The high-water mark is the *max timestamp* of the window, not the *last returned timestamp*, so appends after the window shift the high-water mark forward and an old cursor's high-water fails the staleness check. But an append *within* the window (a row with a timestamp between start and end) is not possible after seal — the segment store's rows are immutable once sealed — so a cursor that is valid today stays valid as long as the segment store does not mutate.
+
+**410 for three conditions:** the selector hash does not match (a different tag selector), the high-water mark changed (data was appended to the window, which after seal is only possible via a new segment whose rows overlap the window), or the data fingerprint changed (rows within the window were altered).
+
+**`read_value_range_of` returns `Vec<BigDecimal>` not `Vec<Option<BigDecimal>>`.**
+Value-range reads return only present rows, so every value is populated. The cursor fingerprinting functions take `&[Option<BigDecimal>]` (shared with the time-range read which includes nulls), so values are wrapped to `Some(v)` at the call site.
+
 ## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
 
 **The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every

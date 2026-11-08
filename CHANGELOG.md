@@ -36,6 +36,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Pagination cursor v1 for stored-range reads (ROB-15).** The JSON
+  `{/value-}points` endpoints now emit a selector-hashed cursor (`next_cursor`)
+  on every page until the end of the window. A client follows it by re-issuing
+  the request with `?cursor=…`; the cursor supersedes `offset`/`page`. A cursor
+  whose selector, high-water mark or data fingerprint no longer matches the
+  server's current view returns `410 cursor_stale`. `total` is `null` on
+  cursor-following pages (omitted on the first page).
+
 - **The measurement rules are wired to the figures they govern (EVI-6, #430).**
   `tools/check_claims.py` now fails when the claims document never links
   `docs/methodology.md`, or when that file is missing under the repository root, so a

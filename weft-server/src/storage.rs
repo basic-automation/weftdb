@@ -39,6 +39,7 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 
 use crate::{
@@ -440,8 +441,9 @@ pub struct StoredRangeResponse {
 	/// can interpret the integer timestamps.
 	pub time_unit: &'static str,
 	/// Total rows in the window **before** pagination — the count a client pages
-	/// through (so it knows whether more pages remain).
-	pub total: usize,
+	/// through (so it knows whether more pages remain). `None` on cursor-following
+	/// pages (the first page always carries it, cursor-based pages omit it).
+	pub total: Option<usize>,
 	/// Number of rows returned in this page (after `offset`/`limit`).
 	pub count: usize,
 	/// The number of leading rows skipped (the applied `offset`, 0 if none).
@@ -463,6 +465,84 @@ pub struct StoredRangeResponse {
 	pub points: Vec<StoredPoint>,
 }
 
+/// Hash a [`SeriesSelector`](weftdb::SeriesSelector) into a u64 for cursor binding.
+/// Uses SHA-256 of the canonical matcher sequence and exactness flag.
+fn hash_selector(selector: &weftdb::SeriesSelector) -> u64 {
+	let mut hasher = Sha256::new();
+	for (key, value) in selector.matchers() {
+		hasher.update(key.as_bytes());
+		hasher.update(b"\0");
+		match value {
+			Some(v) => hasher.update(v.as_bytes()),
+			None => hasher.update(b"\xff"),
+		}
+		hasher.update(b"\0");
+	}
+	hasher.update([if selector.is_exact() { 1u8 } else { 0u8 }]);
+	let hash = hasher.finalize();
+	u64::from_le_bytes(hash[..8].try_into().unwrap())
+}
+
+/// Fingerprint the rows of a read window as a u64 for cursor staleness detection.
+/// SHA-256 of the binary-encoded timestamps and decimal-text values.
+fn fingerprint_rows(timestamps: &[i64], values: &[Option<BigDecimal>]) -> u64 {
+	let mut hasher = Sha256::new();
+	for (&ts, val) in timestamps.iter().zip(values.iter()) {
+		hasher.update(ts.to_le_bytes());
+		match val {
+			Some(v) => hasher.update(v.to_string().as_bytes()),
+			None => hasher.update(b"\xff"),
+		}
+	}
+	let hash = hasher.finalize();
+	u64::from_le_bytes(hash[..8].try_into().unwrap())
+}
+
+/// Encode a cursor v1 token: `01{selector_hash:016x}{high_water:016x}{fingerprint:016x}{offset:016x}`.
+///
+/// The token binds the selector, records the high-water mark (max timestamp) and a data
+/// fingerprint, and encodes the next page offset. Returns `None` when there are no rows
+/// to cursor over, or when `next_offset` is past the end.
+fn encode_cursor_v1(selector: &weftdb::SeriesSelector, timestamps: &[i64], values: &[Option<BigDecimal>], next_offset: usize, total: usize) -> Option<String> {
+	if timestamps.is_empty() || next_offset >= total {
+		return None;
+	}
+	let high_water = *timestamps.iter().max().unwrap() as u64;
+	let s_hash = hash_selector(selector);
+	let fp = fingerprint_rows(timestamps, values);
+	Some(format!("01{s_hash:016x}{high_water:016x}{fp:016x}{:016x}", next_offset as u64))
+}
+
+/// Decode and verify a cursor v1 token against the current selector and data.
+///
+/// Returns the start offset to resume from, or [`ApiError::bad_request`] for a malformed
+/// token, or [`ApiError::server`] with [`Code::CursorStale`](crate::error::Code::CursorStale)
+/// when the selector, high-water mark or data fingerprint no longer match.
+fn decode_cursor_v1(cursor: &str, selector: &weftdb::SeriesSelector, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<usize, ApiError> {
+	let trimmed = cursor.trim();
+	if trimmed.len() != 66 || !trimmed.starts_with("01") {
+		return Err(ApiError::bad_request(format!("`cursor` is not a valid v1 cursor: {cursor:?}")));
+	}
+	let parse_hex = |start: usize| u64::from_str_radix(&trimmed[start..start + 16], 16).map_err(|_| ApiError::bad_request(format!("`cursor` is not a valid v1 cursor: {cursor:?}")));
+	let s_hash = parse_hex(2)?;
+	let high_water = parse_hex(18)?;
+	let fp = parse_hex(34)?;
+	let offset = parse_hex(50)? as usize;
+
+	if s_hash != hash_selector(selector) {
+		return Err(ApiError::server(crate::error::Code::CursorStale, "the cursor's tag selector hash does not match the request's selector — the cursor is bound to a different selector"));
+	}
+	let current_high_water = timestamps.iter().max().copied().unwrap_or(0) as u64;
+	if high_water != current_high_water {
+		return Err(ApiError::server(crate::error::Code::CursorStale, format!("the data in this window has changed since the cursor was issued (high-water mark {:?} vs {:?})", high_water, current_high_water)));
+	}
+	let current_fp = fingerprint_rows(timestamps, values);
+	if fp != current_fp {
+		return Err(ApiError::server(crate::error::Code::CursorStale, "the data in this window has changed since the cursor was issued (fingerprint mismatch)"));
+	}
+	Ok(offset)
+}
+
 /// Handle `GET /api/v1/storage/{aspect}/points?start&end&offset&limit&take&page`.
 ///
 /// The JSON counterpart of the Arrow [`storage_time_range`] read, for clients that
@@ -471,15 +551,17 @@ pub struct StoredRangeResponse {
 /// aspect's declared timestamp unit. Optional `offset`/`limit` paginate the window
 /// (backlog B-rest), with the declarative `take` (alias for `limit`) and `page`
 /// (1-based, derives the offset) aliases also accepted; `total` reports the
-/// pre-pagination row count. For stable forward iteration a client follows the
-/// opaque `next_cursor` (re-issuing with `?cursor=…` until it is absent) instead of
-/// managing offsets; a cursor supersedes `offset`/`page`.
+/// pre-pagination row count (first page only). For stable forward iteration a client
+/// follows the opaque `next_cursor` (v1: selector-hashed, high-water + fingerprint,
+/// re-issuing with `?cursor=…` until it is absent) instead of managing offsets; a
+/// cursor supersedes `offset`/`page`. A cursor bound to stale data, a different tag
+/// selector, or whose high-water mark does not match returns `410 cursor_stale`.
 ///
 /// # Errors
 ///
 /// [`ApiError::unconfigured`] when no store is attached,
 /// [`ApiError::aspect_not_found`] when the aspect is undeclared (its timestamp unit is
-/// unknown), and [`ApiError::internal`] on a read failure.
+/// unknown), and [`ApiError::internal`] (or `410 cursor_stale`) on a read failure.
 pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<PointsRangeParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
@@ -500,12 +582,19 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	drop(store);
 	let total = timestamps.len();
 	limits.check_rows(total, "this range read", Some("limit"))?;
-	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref(), &limits)?;
+	// Cursor v1: decode and verify staleness when present; resolve offset/limit/page.
+	let cursor_offset: Option<usize> = match params.cursor.as_deref() {
+		Some(c) => Some(decode_cursor_v1(c, &selector, &timestamps, &values)?),
+		None => None,
+	};
+	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, cursor_offset, &limits)?;
 	// Paginate + stringify under a serialize span: skip `offset` rows of the window,
-	// take at most `page_size`.
-	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| timestamps.into_iter().zip(values).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp, value: value.map(|v| v.to_string()) }).collect());
-	let next_cursor = next_cursor(offset, points.len(), total);
-	Ok(Json(StoredRangeResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
+	// take at most `page_size`.  Borrow timestamps/values so they remain available
+	// for the cursor functions below.
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| timestamps.iter().zip(values.iter()).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp: *timestamp, value: value.as_ref().map(|v| v.to_string()) }).collect());
+	let total_response = cursor_offset.is_none().then_some(total);
+	let next_cursor = encode_cursor_v1(&selector, &timestamps, &values, offset + points.len(), total);
+	Ok(Json(StoredRangeResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), total: total_response, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
 }
 
 /// Resolve the declarative B-rest pagination params shared by the JSON range reads
@@ -536,44 +625,18 @@ fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<
 	Ok((offset, page_size, page.map(|page| page.max(1))))
 }
 
-/// Encode a forward-iteration position — a row offset in the deterministic read order
-/// — as an opaque **cursor** token (roadmap B-rest): the fixed-width hex of the
-/// offset. Paired with [`decode_cursor`]. A client following `next_cursor` never
-/// computes offsets itself; the token is stable while the window's rows are unchanged.
-fn encode_cursor(offset: usize) -> String {
-	format!("{offset:016x}")
-}
-
-/// Decode a [`encode_cursor`] token back to a row offset, or `None` when it is
-/// malformed (a handler surfaces that as a `400`).
-fn decode_cursor(token: &str) -> Option<usize> {
-	usize::from_str_radix(token.trim(), 16).ok()
-}
-
 /// Resolve the effective start offset and the `page`/`next_cursor` echoes from the
 /// declarative pagination params plus an optional forward-iteration `cursor`.
 ///
 /// A present `cursor` supersedes `offset`/`page` (it *is* the resolved start position,
 /// so the `page` echo is cleared); a malformed `cursor` is a `400`. Returns the
 /// `(offset, page_size, page_echo)` triple that drives the slice.
-fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, cursor: Option<&str>, limits: &read_limits::ReadLimits) -> Result<(usize, usize, Option<usize>), ApiError> {
-	let (offset, page_size, page) = resolve_pagination(offset, limit, take, page, limits)?;
+fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, cursor: Option<usize>, limits: &read_limits::ReadLimits) -> Result<(usize, usize, Option<usize>), ApiError> {
+	let (pagination_offset, page_size, page) = resolve_pagination(offset, limit, take, page, limits)?;
 	match cursor {
-		Some(token) => {
-			let cursor_offset = decode_cursor(token).ok_or_else(|| ApiError::bad_request(format!("`cursor` is not a valid token: {token:?}")))?;
-			Ok((cursor_offset, page_size, None))
-		}
-		None => Ok((offset, page_size, page)),
+		Some(cursor_offset) => Ok((cursor_offset, page_size, None)),
+		None => Ok((pagination_offset, page_size, page)),
 	}
-}
-
-/// The forward-iteration cursor for the *next* page: `Some(token)` when rows remain
-/// past the one just served (`start + count < total`), `None` at the end of the
-/// window (so a client stops when `next_cursor` is absent).
-fn next_cursor(start: usize, count: usize, total: usize) -> Option<String> {
-	// An empty page (`limit=0`) is a count probe, not a step: a cursor that pointed back at
-	// `start` would hand a cursor-following client the same empty page forever.
-	(count > 0 && start + count < total).then(|| encode_cursor(start + count))
 }
 
 /// Query parameters for the JSON value-range read: the inclusive `[lo, hi]` value
@@ -630,7 +693,10 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 		return Err(ApiError::aspect_not_found(format!("aspect `{aspect}` has no declared schema in the segment store")));
 	};
 	let target = resolve_target(&store, &aspect, &selector).await?;
-	let (timestamps, values) = read_limits::within_deadline(&limits, async {
+	// read_value_range_of returns non-optional BigDecimal values; wrap them into
+	// Option for the cursor functions (which share the same fingerprinting logic
+	// as the time-range read that uses Option<BigDecimal>).
+	let (raw_timestamps, raw_values) = read_limits::within_deadline(&limits, async {
 		match target.series {
 			Some(series) => store.read_value_range_of(&aspect, series, &lo, &hi).instrument(tracing::info_span!("storage.value_range.read", %aspect, %lo, %hi, format = "json")).await,
 			None => Ok((Vec::new(), Vec::new())),
@@ -639,12 +705,22 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 	})
 	.await?;
 	drop(store);
+	// Convert the raw non-optional values to Option<BigDecimal> so cursor functions
+	// share the same type as the time-range read.
+	let timestamps = raw_timestamps;
+	let values: Vec<Option<BigDecimal>> = raw_values.into_iter().map(Some).collect();
 	let total = timestamps.len();
 	limits.check_rows(total, "this value-range read", Some("limit"))?;
-	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, params.cursor.as_deref(), &limits)?;
-	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| timestamps.into_iter().zip(values).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp, value: Some(value.to_string()) }).collect());
-	let next_cursor = next_cursor(offset, points.len(), total);
-	Ok(Json(StoredRangeResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), total, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
+	// Cursor v1: decode and verify staleness when present; resolve offset/limit/page.
+	let cursor_offset: Option<usize> = match params.cursor.as_deref() {
+		Some(c) => Some(decode_cursor_v1(c, &selector, &timestamps, &values)?),
+		None => None,
+	};
+	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, cursor_offset, &limits)?;
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| timestamps.iter().zip(values.iter()).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp: *timestamp, value: value.as_ref().map(|v| v.to_string()) }).collect());
+	let total_response = cursor_offset.is_none().then_some(total);
+	let next_cursor = encode_cursor_v1(&selector, &timestamps, &values, offset + points.len(), total);
+	Ok(Json(StoredRangeResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), total: total_response, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
 }
 
 /// Query parameters for the single-instant point lookup: the instant `t` to read
@@ -1638,8 +1714,9 @@ mod tests {
 	#[tokio::test]
 	async fn points_cursor_supersedes_offset_and_clears_page_echo() {
 		let (_dir, router) = router_with_sealed_price().await;
-		// cursor=0000000000000003 (offset 3) with an explicit offset=1 that it overrides.
-		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&limit=2&offset=1&cursor=0000000000000003").await;
+		// Cursor v1 token for offset=3 (rows 130..=140). Computed from the sealed data:
+		// empty selector (hash 0x987ab3ff9c0b346e), high-water=140, fingerprint from all 5 rows.
+		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&limit=2&offset=1&cursor=01987ab3ff9c0b346e000000000000008cb3a19015125cf38d0000000000000003").await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
 		assert_eq!(body["offset"], 3, "the cursor position supersedes the explicit offset");
 		assert!(body.get("page").is_none(), "a cursor read clears the page echo");
