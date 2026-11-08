@@ -82,6 +82,38 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D clippy::correctness -D clippy::suspicious -D clippy::perf
         env:
           RUSTFLAGS: ""
+      # The gate above is honest about *categories* but silent about *coverage*. A warm
+      # rust-cache hit leaves a crate's fingerprint fresh, cargo never re-runs
+      # clippy-driver for it, and the job passes having linted a subset of the workspace:
+      # `main` sat red because the merge commit that broke it passed a run that restored
+      # a cache and printed `Checked 7 crates`, with `weft-bench` never linted at all, and
+      # the same tree then failed clippy on a cold runner (#635). This step makes every
+      # workspace crate dirty and lints the lot, so the lints the cached gate cannot see
+      # are at least named. Report-only on purpose: the first runs are expected to list
+      # real defects, and a gate that goes red for pre-existing ones stops being a signal.
+      # When this step reports zero errors and full coverage, delete `continue-on-error`
+      # and promote it to the gate, which is the actual fix for #635.
+      - name: Cold re-lint (report only, #635)
+        continue-on-error: true
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+        run: |
+          set -uo pipefail
+          expected=$(cargo metadata --no-deps --format-version 1 | jq '[.packages[] | select(.source == null)] | length')
+          git ls-files -z '*.rs' | xargs -0 --no-run-if-empty touch
+          cargo clippy --workspace --all-targets --all-features --locked > /tmp/relint.log 2>&1
+          status=$?
+          checked=$(grep -c '^ *Checking ' /tmp/relint.log || true)
+          errors=$(grep -c '^error' /tmp/relint.log || true)
+          echo "cold re-lint: $checked of $expected workspace crates compiled, clippy exit $status, $errors error lines"
+          if [ "$checked" -lt "$expected" ]; then
+            echo "::warning::cold re-lint compiled $checked of $expected workspace crates; something is still skipping the lint pass"
+          fi
+          if [ "$errors" -gt 0 ]; then
+            echo "::warning::cold re-lint found $errors error lines that the cached gate above did not see"
+            grep '^error' /tmp/relint.log | head -n 40
+          fi
 
   # Every performance figure in the README is vouched for by an entry in
   # bench/claims.json, which names the bench or the local corpus behind it and says
