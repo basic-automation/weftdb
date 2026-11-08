@@ -41,7 +41,7 @@ observed endpoints marked `raw`, the 59 between them `interpolated`.
 
 **Start here** · [Why WeftDB](#why-weftdb) · [Quickstart](#quickstart) · [Is WeftDB right for you?](#is-weftdb-right-for-you) · [Project status](#project-status)
 
-**Use it** · [What you get](#what-you-get) · [HTTP API](#http-api) · [Migrate a 0.1.x tree](#migrating-a-01x-data-directory) · [Configuration](#configuration) · [Rust library](#rust-library) · [Terminal UI](#terminal-ui)
+**Use it** · [What you get](#what-you-get) · [HTTP API](#http-api) · [Migrate a 0.1.x tree](#migrating-a-01x-data-directory) · [Configuration](#configuration) · [Operations](operations.md) · [Rust library](#rust-library) · [Terminal UI](#terminal-ui)
 
 **Understand it** · [Performance](#performance) · [How it works](#how-it-works) · [Benchmarking](#benchmarking) · [Development](#development)
 
