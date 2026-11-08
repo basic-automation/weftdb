@@ -90,9 +90,7 @@ async fn newer_null_over_older_value_point_read() {
 
 	// Point read: the newer segment is fully null (null_count == row_count == 1),
 	// so the present-value prune drops it. The older segment's value 10 survives.
-	assert_eq!(store.read_point(ASPECT, 10).await.expect("point read"),
-		Some(bd("10")),
-		"point read: the all-null segment is quality-pruned, so the older value survives");
+	assert_eq!(store.read_point(ASPECT, 10).await.expect("point read"), Some(bd("10")), "point read: the all-null segment is quality-pruned, so the older value survives");
 
 	drop(store);
 }
@@ -118,13 +116,11 @@ async fn newer_null_over_older_value_range_read() {
 	// At timestamp 10: newer segment has null. The newer-wins merge gives None.
 	// At timestamp 20: newer segment has value 200 — supersedes older 20.
 	assert_eq!(ts, vec![10, 20], "timestamps deduplicated");
-	assert_eq!(vs, vec![None, Some(bd("200"))],
-		"newer null supersedes older value at 10; newer value 200 supersedes older 20 at 20");
+	assert_eq!(vs, vec![None, Some(bd("200"))], "newer null supersedes older value at 10; newer value 200 supersedes older 20 at 20");
 
 	// Point read at the null timestamp: the segment has 1 null + 1 present = 2 rows,
 	// null_count=1 < row_count=2, so it IS kept. The newer null beats the older 10.
-	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), None,
-		"point read at 10: the newer segment carries a null at 10, so the answer is None");
+	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), None, "point read at 10: the newer segment carries a null at 10, so the answer is None");
 
 	// Point read at the non-null timestamp: newer value 200 wins.
 	assert_eq!(store.read_point(ASPECT, 20).await.expect("point at 20"), Some(bd("200")));

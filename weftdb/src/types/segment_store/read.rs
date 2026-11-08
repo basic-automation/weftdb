@@ -1,8 +1,9 @@
 //! Segment-store implementation: this submodule holds the `read` portion of [`SegmentStore`](super::SegmentStore).
 //! Pure move of the former `segment_store.rs` `impl` block; no behaviour change.
 
-use super::*;
 use weft_physical_type::merge_newer_wins;
+
+use super::*;
 
 impl SegmentStore {
 	/// Pin the reclaim epoch for a read about to prune the index, so that no frame a swap

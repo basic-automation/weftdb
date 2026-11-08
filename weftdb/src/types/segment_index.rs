@@ -534,6 +534,11 @@ impl SegmentIndexStore {
 
 	/// [`prune_rows_by_time`](Self::prune_rows_by_time) scoped to one series (TAG-8): only
 	/// the rows whose `series_id` is `series`.
+	///
+	/// `#[cfg(test)]`, following [`prune_present_rows`](Self::prune_present_rows): a range
+	/// read now prunes by presence rather than by time alone, so the only callers left are
+	/// the tests below.
+	#[cfg(test)]
 	pub(crate) async fn prune_series_rows_by_time(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<Vec<IndexRow>> {
 		self.prune_rows(aspect, Some(series), start, end, "").await
 	}
