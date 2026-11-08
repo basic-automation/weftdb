@@ -47,7 +47,9 @@ the 59 between them `interpolated`.
   as JSON (downsamples as Arrow too), and the endpoints accept InfluxDB Line Protocol, so data
   goes straight into pandas, Polars or DuckDB.
 - **Honest numbers.** Every performance claim comes from a benchmark in this repository that
-  you can re-run, and the results show where WeftDB loses as well as where it wins.
+  you can re-run, and the results show where WeftDB loses as well as where it wins. The
+  [rules behind every published number](docs/methodology.md) — the harness, the hardware class,
+  the repetitions, and what disqualifies a measurement — are written down alongside them.
 
 ## Install
 

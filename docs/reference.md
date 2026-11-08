@@ -313,7 +313,10 @@ path, that is the bench the figure came from and you can re-run it; the run arti
 a *dated local measurement*, not a claim you can reproduce from a clone. Which proof each figure carries is machine-checked, not asserted in prose:
 [`bench/claims.json`](../bench/claims.json) is the per-figure registry and
 [`tools/check_claims.py`](../tools/check_claims.py) runs it in CI, so a figure with no entry, or an
-entry whose text or source path has drifted, fails the build. The exception is any figure measured on
+entry whose text or source path has drifted, fails the build. The rules those numbers were produced
+under — harness, hardware class, repetitions, rounding, and what disqualifies a measurement — are
+in [the performance methodology](methodology.md), and the same lint fails the build if this document
+stops linking it: a figure you can re-run but cannot judge is only half auditable. The exception is any figure measured on
 the real BTC corpus: that input is a local file the repository does not ship (see
 [Ingest](#ingest)), so those figures cannot be reproduced from a clone at all. All were measured on
 one developer workstation — treat them as *shape*, not as a specification for your hardware.

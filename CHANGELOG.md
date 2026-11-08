@@ -16,8 +16,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   through the Stable `WEFT_DATA_DIR` variable instead. Operators were never
   meant to set it — it was a Test-tier registry entry — but a deployment that
   did will now find it ignored, with `WEFT_DATA_DIR` as the migration.
+
 ### Added
 
+- **The measurement rules are wired to the figures they govern (EVI-6, #430).**
+  `tools/check_claims.py` now fails when the claims document never links
+  `docs/methodology.md`, or when that file is missing under the repository root, so a
+  published number cannot outlive the rules that made it. `README.md` and
+  `docs/reference.md` carry the link; the note in `docs/claims-audit.md` that the
+  methodology "does not yet exist" was stale — it landed in #630 — and now says where the
+  rules live.
 - **The frame-fault policy is verified (ROB-22/C5).** The three behaviours of
   the C5 policy are now pinned by tests: a suspect frame is excluded from
   reads, a suspect frame is never auto-purged by maintenance, and a corrupt
