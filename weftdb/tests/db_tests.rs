@@ -43,8 +43,8 @@ async fn add_test_measurements(db: &Database, aspect: &Aspect, base_time: DateTi
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_basic_interpolation() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?; // Changed variable name
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -63,8 +63,8 @@ async fn test_analyze_point_basic_interpolation() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_extrapolation_forward() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -81,8 +81,8 @@ async fn test_analyze_point_extrapolation_forward() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_extrapolation_backward() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -99,8 +99,8 @@ async fn test_analyze_point_extrapolation_backward() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_exact_match() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -138,8 +138,8 @@ async fn test_analyze_point_exact_match() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_cache_hit() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -160,8 +160,8 @@ async fn test_analyze_point_cache_hit() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_different_resolutions() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -181,8 +181,8 @@ async fn test_analyze_point_different_resolutions() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_no_measurements_error() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let query_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -194,8 +194,8 @@ async fn test_analyze_point_no_measurements_error() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_invalid_aspect_error() -> Result<()> {
 	let temp_dir = tempfile::tempdir()?;
 	// Override the data directory for this test
@@ -219,8 +219,8 @@ async fn test_analyze_point_invalid_aspect_error() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_single_measurement() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -258,8 +258,8 @@ async fn test_analyze_point_single_measurement() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_large_time_gap() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -293,8 +293,8 @@ async fn test_analyze_point_large_time_gap() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_time_boundary_conditions() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -321,8 +321,8 @@ async fn test_analyze_point_time_boundary_conditions() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_cache_invalidation() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -355,8 +355,8 @@ async fn test_analyze_point_cache_invalidation() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_concurrent_access() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -395,8 +395,8 @@ async fn test_analyze_point_concurrent_access() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_analyze_point_precision_boundaries() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let base_time = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
@@ -449,8 +449,8 @@ fn convert_unix_timestamp_to_datetime_utc(timestamp_seconds: f64) -> Option<Date
 }
 
 /// load BTC 1-minute data into a test database for use in other tests
-#[tokio::test(flavor = "multi_thread")]
 #[serial]
+#[tokio::test(flavor = "multi_thread")]
 #[instrument]
 async fn test_create_btc_1min_database() -> Result<()> {
 	// Initialize tracing subscriber for this test
@@ -681,8 +681,8 @@ async fn test_create_btc_1min_database() -> Result<()> {
 /// `INGEST_PROFILE_SKIP_ROWS=N` discards the first N data rows of a real corpus. Use it:
 /// the BTC file's head is degenerate (see [`read_close_series`]) and measuring
 /// bytes/point there overstates WeftDB's compression by ~10×.
-#[tokio::test(flavor = "multi_thread")]
 #[serial]
+#[tokio::test(flavor = "multi_thread")]
 async fn ingest_path_profile_legacy_vs_columnar() -> Result<()> {
 	if std::env::var("RUN_INGEST_PROFILE").is_err() {
 		return Ok(());
@@ -917,8 +917,8 @@ async fn restart_with_uncheckpointed_log(id: weftdb::DatabaseId, db_name: &str) 
 /// [`restart_with_uncheckpointed_log`] checks it). The cold-open path used to delete that log
 /// unconditionally, which threw away the subject, the aspect and the unbatched queue; on
 /// main the reopen does not even find the `database` table.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	let temp_dir = tempfile::tempdir()?;
 	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
@@ -986,8 +986,8 @@ async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 /// its only remaining name (`nlink == 1`); had it been kept, `-log` would still be a
 /// second name for it.
 #[cfg(unix)]
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn zero_length_metadata_log_is_removed_on_cold_open() -> Result<()> {
 	use std::os::unix::fs::MetadataExt as _;
 
@@ -1036,8 +1036,8 @@ async fn zero_length_metadata_log_is_removed_on_cold_open() -> Result<()> {
 /// races two opens with the second one staggered across the first one's cold path,
 /// commits through the first, and checks the commit reached the `-log` on disk; after a
 /// crash-like release (no checkpoint) the next round's cold open must replay it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
 	const ROUNDS: u64 = 20;
 
@@ -1092,8 +1092,8 @@ async fn concurrent_cold_opens_keep_the_live_metadata_log() -> Result<()> {
 /// stores nothing, through either insert API; a new batch is still queued. The processed
 /// case holds although processing rewrites a batch's measurements: the processed row keeps
 /// the hash the batch was queued under. On main every call inserted another copy.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn queuing_a_queued_or_processed_batch_again_stores_nothing() -> Result<()> {
 	use futures::TryStreamExt;
 	use weftdb::{Batch, BatchedMeasurement, Point};
@@ -1143,8 +1143,8 @@ async fn queuing_a_queued_or_processed_batch_again_stores_nothing() -> Result<()
 /// recorded, and `clear_processed_batches` clears the record, so a full rebuild queues
 /// every window again. Before, a batch extraction had deleted was queued again, and
 /// extracted as a second occurrence of its window.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn queuing_an_extracted_batch_again_stores_nothing() -> Result<()> {
 	use futures::TryStreamExt;
 	use weftdb::{Batch, BatchId, BatchedMeasurement, Point};
@@ -1191,8 +1191,8 @@ async fn queuing_an_extracted_batch_again_stores_nothing() -> Result<()> {
 /// record expired is queued again; one still recorded is not. Before, only
 /// `clear_processed_batches` removed a record, and the table grew by about one row per
 /// resolution step of every aspect, forever.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn the_extracted_batch_record_expires_after_its_retention() -> Result<()> {
 	use futures::TryStreamExt;
 	use weftdb::{Batch, BatchId, BatchedMeasurement, Point};
@@ -1245,8 +1245,8 @@ async fn the_extracted_batch_record_expires_after_its_retention() -> Result<()> 
 ///   the dequeue commits, instead of failing the call (one attempt fails);
 /// - a dequeue that meets an enqueue of an entry it read retries until the enqueue
 ///   commits, and then leaves that entry queued, since it moved past what was read.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn queue_writes_retry_a_conflict_over_the_same_entry() -> Result<()> {
 	/// Commit the held transaction after a while, so that the other side meets it first.
 	async fn release_later(holder: &turso::Connection) -> Result<()> {
@@ -1290,8 +1290,8 @@ async fn queue_writes_retry_a_conflict_over_the_same_entry() -> Result<()> {
 /// `dequeue_unbatched_entries` removes an entry only while it has the `queued_at` it was
 /// read with. Ingest relies on this to keep a row it committed after a consumer read the
 /// row's write-ahead entry. Dequeuing bare timestamps removed it.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn an_entry_queued_again_after_it_was_read_survives_the_dequeue() -> Result<()> {
 	let (_temp_dir, db, _subject, aspect) = setup_test_database().await?;
 	let aspect_id = aspect.id();
@@ -1320,8 +1320,8 @@ async fn an_entry_queued_again_after_it_was_read_survives_the_dequeue() -> Resul
 /// (whose DB belongs to one aspect). So each check is a point lookup instead of a scan of
 /// every stored batch; and a DB created before the index (or the record) gets it the next
 /// time a process opens it.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn the_batch_tables_index_their_hashes() -> Result<()> {
 	/// Turso's plan for the duplicate check's lookup in `table`.
 	async fn lookup_plan(conn: &turso::Connection, table: &str) -> Result<String> {
@@ -1375,8 +1375,8 @@ async fn the_batch_tables_index_their_hashes() -> Result<()> {
 
 /// `Database::new` refuses a name of the form of its own build directories
 /// (`.{name}.creating-{nonce}`), which a stale-build sweep would take for crash litter.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn database_new_refuses_a_build_directory_name() -> Result<()> {
 	let temp_dir = tempfile::tempdir()?;
 	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
@@ -1460,8 +1460,8 @@ mod database_new_crash {
 	///   error says it was created and to open it with `existing`, and `new(name)` reports
 	///   that it exists. It used to be renamed back and removed, which deleted the files
 	///   under any handle a concurrent `existing(name)` had opened meanwhile.
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn a_failure_at_each_point_is_recoverable() -> Result<()> {
 		let temp_dir = tempfile::tempdir()?;
 		std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
@@ -1496,8 +1496,8 @@ mod database_new_crash {
 
 	/// The on-disk listing never lists a build directory, never sweeps the one a running
 	/// `new` owns, and sweeps a stale one (left by a crashed `new`) once no `new` is running.
-	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	#[serial]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn the_listing_sweeps_stale_builds_but_never_a_live_one() -> Result<()> {
 		let temp_dir = tempfile::tempdir()?;
 		std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?);
@@ -1582,8 +1582,8 @@ mod database_new_crash {
 	/// - At `L-new-renamed` the rename, which is the commit point, has happened: the
 	///   database is complete under `{name}`, so `existing(name)` works and `new(name)`
 	///   reports that it already exists, as for any existing database.
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn a_process_crash_at_each_point_is_recoverable() -> Result<()> {
 		let temp_dir = tempfile::tempdir()?;
 		let data_dir = temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?;

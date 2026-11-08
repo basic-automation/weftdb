@@ -1449,8 +1449,8 @@ mod tests {
 	use super::*;
 	use crate::test_support::{data_dir, remove_database};
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_api() -> Result<()> {
 		// Initialize tracing subscriber for test output
 		// Filter to reduce noise: INFO for external crates, DEBUG for our code
@@ -1712,8 +1712,8 @@ mod tests {
 	}
 
 	/// Test using the new Pipeline API - mirrors `test_api` but uses the fluent builder pattern
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_pipeline_api() -> Result<()> {
 		// Initialize tracing subscriber for test output
 		let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,dataset_management=debug,database=debug,splimes=info,turso_core=warn"))).with_test_writer().try_init();
@@ -1918,8 +1918,8 @@ mod tests {
 		Ok(())
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_api_precise() -> Result<()> {
 		// Initialize tracing subscriber for test output
 		// Filter to reduce noise: INFO for external crates, DEBUG for our code
@@ -2097,8 +2097,8 @@ mod tests {
 	}
 
 	/// Test using the Pipeline API with `fake_database` - mirrors `test_api_precise`
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_pipeline_api_precise() -> Result<()> {
 		// Initialize tracing subscriber for test output
 		let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,dataset_management=debug,database=debug,splimes=info,turso_core=warn"))).with_test_writer().try_init();
@@ -2323,8 +2323,8 @@ mod tests {
 		db
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_batch_processing() -> Result<()> {
 		// Skip this test if running in CI or if we want fast feedback
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
@@ -2389,8 +2389,8 @@ mod tests {
 		Ok(())
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_specific_process_batch() -> Result<()> {
 		// Skip this test if running in CI or if we want fast feedback
 		if std::env::var("SKIP_SLOW_TESTS").is_ok() {
@@ -2544,8 +2544,8 @@ mod tests {
 	}
 
 	/// Test for the new Pipeline API using fake database
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_pipeline_api_with_fake_db() -> Result<()> {
 		// Initialize tracing
 		let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,dataset_management=debug,database=debug"))).with_test_writer().try_init();
@@ -2646,8 +2646,8 @@ mod tests {
 		Ok(())
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_load_or_create_pipeline() -> Result<()> {
 		tracing::info!("=== Testing Pipeline::load_or_create ===");
 
@@ -2698,8 +2698,8 @@ mod tests {
 		Ok(())
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_run_subject_pipelines() -> Result<()> {
 		tracing::info!("=== Testing run_subject_pipelines ===");
 

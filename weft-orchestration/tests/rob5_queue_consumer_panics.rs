@@ -42,8 +42,8 @@ async fn setup_test_db(name: &str) -> Result<(Database, AspectId)> {
 
 /// Test that build_patterns_queue handles empty active measurements without panicking
 /// (fixes lib.rs:819-820 unwrap on min/max)
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_build_patterns_queue_no_panic_on_empty_batch() -> Result<()> {
 	let uuid_suffix = uuid::Uuid::new_v4().simple().to_string();
 	let db_name = format!("test_patterns_empty_{uuid_suffix}");
@@ -82,8 +82,8 @@ async fn test_build_patterns_queue_no_panic_on_empty_batch() -> Result<()> {
 
 /// Test that Pipeline::dictionary() returns None instead of panicking
 /// when no dictionaries are registered (fixes pipeline.rs:1212)
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_pipeline_dictionary_no_panic() -> Result<()> {
 	let uuid_suffix = uuid::Uuid::new_v4().simple().to_string();
 	let db_name = format!("test_pipeline_dict_{uuid_suffix}");
@@ -105,8 +105,8 @@ async fn test_pipeline_dictionary_no_panic() -> Result<()> {
 
 /// Test that Pipeline::dictionary_mut() returns None instead of panicking
 /// when no dictionaries are registered (fixes pipeline.rs:1222)
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_pipeline_dictionary_mut_no_panic() -> Result<()> {
 	let uuid_suffix = uuid::Uuid::new_v4().simple().to_string();
 	let db_name = format!("test_pipeline_dict_mut_{uuid_suffix}");
@@ -131,8 +131,8 @@ async fn test_pipeline_dictionary_mut_no_panic() -> Result<()> {
 
 /// Test that the consumer handles batches with measurements correctly and doesn't panic
 /// on min/max operations (regression test for lib.rs:819-820)
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn test_patterns_queue_with_valid_measurements() -> Result<()> {
 	let uuid_suffix = uuid::Uuid::new_v4().simple().to_string();
 	let db_name = format!("test_patterns_valid_{uuid_suffix}");
