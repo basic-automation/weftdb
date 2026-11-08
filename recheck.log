@@ -1,0 +1,9 @@
+    Checking weft-physical-type v0.3.0 (/work/weft-physical-type)
+    Checking weft-reduce v0.3.0 (/work/weft-reduce)
+   Compiling weft-server v0.3.2 (/work/weft-server)
+    Checking weftdb v0.3.2 (/work/weftdb)
+    Checking weft-arrow v0.3.0 (/work/weft-arrow)
+    Checking weft-line-protocol v0.3.0 (/work/weft-line-protocol)
+    Checking weft-arrow-store v0.3.2 (/work/weft-arrow-store)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 02s
+exit=0

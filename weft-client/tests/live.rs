@@ -95,7 +95,7 @@ async fn a_series_round_trips_losslessly() {
 	let got: Vec<(i64, String)> = streamed.iter().map(|p| (p.timestamp, p.value.as_ref().unwrap().to_string())).collect();
 	assert_eq!(got, [(1_000, "1.25".into()), (2_000, "2.50".into()), (3_000, "3.00".into())], "the aspect's scale, every digit");
 	let first = client.points("price", 0, 9_999, &Page::first(2)).await.unwrap();
-	assert_eq!((first.total, first.count, first.next_cursor.is_some()), (3, 2, true));
+	assert_eq!((first.total, first.count, first.next_cursor.is_some()), (Some(3), 2, true));
 
 	assert_eq!(client.at("price", 2_000).await.unwrap().value, Some(decimal("2.50")));
 	assert!(!client.at("price", 2_500).await.unwrap().found);

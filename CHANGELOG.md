@@ -24,6 +24,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   clients** that send mixed-case `?fill=Linear` or `--gf-fill=CUBIC`: send `null`,
   `prev`, `linear`, `quadratic`, `cubic` or the lowercase spellings. The value arm
   (a decimal constant) is unchanged.
+- **`/v1` range responses may omit `total` or send it `null` (cursor pages).**
+  The `points`, `range`, `value-points` and `value-range` JSON endpoints no longer
+  promise `total` on every page: it is `null` on cursor-following pages or absent
+  from the response body. The Rust client now models it as `Option<usize>` with
+  `#[serde(default)]`; a strict client of any language must treat it as optional.
 
 ### Removed
 
@@ -36,6 +41,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Pagination cursor v1 for stored-range reads (ROB-15).** The JSON
+  `{/value-}points` endpoints now emit a selector-hashed cursor (`next_cursor`)
+  on every page until the end of the window. A client follows it by re-issuing
+  the request with `?cursor=…`; the cursor supersedes `offset`/`page`. A cursor
+  whose selector, high-water mark or data fingerprint no longer matches the
+  server's current view returns `410 cursor_stale`. `total` is present on the first page and `null` on
+  cursor-following pages.
 - **Stability and versioning policy (FRE-15).** [`docs/stability.md`](docs/stability.md)
   documents the semver policy, the surface stability table (query/ingest wire API,
   `weftdb-client` Rust SDK, storage format, CLI, configuration, metrics), what the compat
