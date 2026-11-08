@@ -45,9 +45,10 @@ PIN_FILE = "compat/releases.toml"
 
 # A release archive as scripts/release/stage.sh names it: weftdb-<tag>-<target>.(tar.gz|zip).
 TARGET_RE = r"[a-z0-9_]+(?:-[a-z0-9_]+){2,3}"
-ASSET_RE = re.compile(rf"^weftdb-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.[0-9]+)?)-({TARGET_RE})\.(tar\.gz|zip)$")
-TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$")
-VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?$")
+ASSET_RE = re.compile(rf"^weftdb-(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:beta|rc)\.[0-9]+)?)-({TARGET_RE})\.(tar\.gz|zip)$")
+# Pre-release ordering (semver 2.0): -beta.N < -rc.N < release
+TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.[1-9][0-9]*)?$")
+VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.[1-9][0-9]*)?$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 MANIFEST_NAME = "MANIFEST.sha256"
 LEGS = {"upgrade", "rollback", "binary"}
@@ -114,9 +115,9 @@ def check_block(block: dict, position: int) -> list[str]:
 			problems.append(f"release #{position}: missing required field {field!r}")
 	version, tag = block.get("version"), block.get("tag")
 	if isinstance(version, str) and not VERSION_RE.match(version):
-		problems.append(f"release #{position}: version {version!r} is not X.Y.Z or X.Y.Z-rc.N")
+		problems.append(f"release #{position}: version {version!r} is not X.Y.Z, X.Y.Z-rc.N or X.Y.Z-beta.N")
 	if isinstance(tag, str) and not TAG_RE.match(tag):
-		problems.append(f"release #{position}: tag {tag!r} is not vX.Y.Z or vX.Y.Z-rc.N")
+		problems.append(f"release #{position}: tag {tag!r} is not vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N")
 	if isinstance(version, str) and isinstance(tag, str) and tag != f"v{version}":
 		problems.append(f"release #{position}: tag {tag!r} must be v{version}")
 	if isinstance(block.get("commit"), str) and not re.fullmatch(r"[0-9a-f]{40}", block["commit"]):
@@ -291,7 +292,7 @@ def pin_block(tag: str) -> str:
 	It writes no `fixtures` line: the fixture set a release wrote lands in a later PR, which
 	adds the line when it commits `compat/fixtures/<tag>/`."""
 	if not TAG_RE.match(tag):
-		raise PinError(f"{tag} is not a release tag (vX.Y.Z or vX.Y.Z-rc.N)")
+		raise PinError(f"{tag} is not a release tag (vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N)")
 	version = tag[1:]
 	commit = subprocess.run(["git", "-C", str(REPO), "rev-list", "-n1", tag], capture_output=True, text=True).stdout.strip()
 	if not re.fullmatch(r"[0-9a-f]{40}", commit):

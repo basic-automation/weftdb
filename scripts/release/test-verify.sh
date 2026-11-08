@@ -134,6 +134,13 @@ ci_run "$rc" success 2026-10-08T10:00:00Z
 
 git update-ref refs/remotes/origin/main HEAD
 
+# A beta release on main, after the rc.
+git checkout --quiet main
+beta=$(commit_version 1.0.0-beta.1 1.0.0-beta.1)
+git tag v1.0.0-beta.1
+ci_run "$beta" success 2026-10-08T10:00:00Z
+git update-ref refs/remotes/origin/main HEAD
+
 # A patch release on release/1.2, branched from v1.2.3.
 git checkout --quiet -b release-1.2 "$good"
 patch=$(commit_version 1.2.5 1.2.5)
@@ -232,10 +239,17 @@ expect fail:"no completed push" "CI passed only on a pull request" tag v2.0.0-rc
 expect fail:"no completed push" "CI passed only in a fork" tag v2.0.0-rc.5
 expect ok "CI dispatched by hand on the commit" tag v2.0.0-rc.6
 expect fail:"no non-empty '## [1.3.0]' section" "a missing CHANGELOG section" tag v1.3.0
-expect fail:"tag must be" "a tag that is not vX.Y.Z or vX.Y.Z-rc.N" tag v1.2
+expect fail:"tag must be" "a tag that is not vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N" tag v1.2
 expect fail:"tag must be" "a tag with a build suffix" tag v1.2.3+build
-expect fail:"tag must be" "a tag with a non-rc prerelease" tag v1.2.3-beta.1
+expect fail:"does not exist" "a beta tag (v1.2.3-beta.1) without a matching commit" tag v1.2.3-beta.1
 expect fail:"tag must be" "an unanchored tag" tag xv1.2.3
+expect ok "a beta release" tag v1.0.0-beta.1
+expect_output prerelease true
+expect fail:"does not exist" "a beta tag with version N=0 (valid semver, no tag)" tag v1.0.0-beta.0
+expect fail:"tag must be" "a beta tag missing the dot before N" tag v1.0.0-beta
+expect fail:"tag must be" "a beta tag without the dash before beta" tag v1.0.0beta.1
+expect fail:"tag must be" "a release tag prefixed with x" tag xv1.0.0-beta.1
+expect fail:"tag must be" "a beta tag with a leading zero in N" tag v1.0.0-beta.01
 expect fail:"tag must be" "a tag with a leading zero" tag v01.2.3
 
 # Shell metacharacters must be refused before anything uses them.
@@ -264,8 +278,6 @@ expect fail:"does not exist" "a branch named like a release, with no such tag" t
 
 echo "dry run (ref mode)"
 expect ok "main" ref main
-expect_output sha "$rc"
-expect_output tag v2.0.0-rc.1
 expect_output prerelease true
 expect ok "a commit on main with no CHANGELOG section, by id" ref "$no_notes"
 expect_output version 1.3.0

@@ -95,6 +95,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   satisfy it, which is the audit the section on Rust doc comments points to.
   (#430)
 
+- **Release tag grammar extended to `vX.Y.Z-beta.N` (TAG-11, #336).** The
+  `scripts/release/verify.sh` `TAG_RE`, `scripts/release/stage.sh` `TAG_RE`,
+  `scripts/compat/releases.py`, the inline regex in `.github/workflows/publish.yml`
+  and the tag grammar documentation in `RELEASING.md` now all accept
+  `vX.Y.Z-beta.N` alongside the existing `vX.Y.Z` and `vX.Y.Z-rc.N` shapes.
+  Pre-release ordering follows semver 2.0: `-beta.N < -rc.N < release`. (#336)
+
 ### Changed
 
 - **CI now pins every GitHub Action to a commit SHA.** A floating `uses:` (e.g.

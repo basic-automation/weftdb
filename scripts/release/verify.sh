@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Decide whether the release workflow may build a commit, and which commit that is.
 #
-#   scripts/release/verify.sh tag <vX.Y.Z | vX.Y.Z-rc.N>   # a release
+#   scripts/release/verify.sh tag <vX.Y.Z | vX.Y.Z-rc.N | vX.Y.Z-beta.N>   # a release
 #   scripts/release/verify.sh ref <branch | tag | commit>   # a dry run
 #
 # A release fails unless every one of these holds:
-#   1. the tag is exactly vX.Y.Z or vX.Y.Z-rc.N (it is checked before any other use);
+#   1. the tag is exactly vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N (it is checked before any other use);
 #   2. refs/tags/<tag> already exists, so the release can never create it;
 #   3. <tag> is "v" followed by weft-server's version at that commit (cargo metadata);
 #   4. the commit is an ancestor of origin/main, or of a maintenance branch
@@ -38,7 +38,8 @@ set -euo pipefail
 # scripts' digits (v１.2.3 passes), so every pattern below is matched in the C locale.
 export LC_ALL=C
 
-TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+# Pre-release ordering (semver 2.0): -beta.N < -rc.N < release
+TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.(0|[1-9][0-9]*))?$'
 # Branch and tag names as this repository uses them, or an abbreviated or full commit id.
 REF_RE='^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$'
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
@@ -61,7 +62,7 @@ emit() {
 	fi
 }
 
-usage() { fail "usage: verify.sh tag <vX.Y.Z|vX.Y.Z-rc.N> | verify.sh ref <ref>"; }
+usage() { fail "usage: verify.sh tag <vX.Y.Z|vX.Y.Z-rc.N|vX.Y.Z-beta.N> | verify.sh ref <ref>"; }
 
 # Sets $version to weft-server's version at a commit. cargo metadata reads it from a
 # scratch worktree, so the caller's checkout is never touched.
@@ -177,7 +178,7 @@ trap cleanup EXIT
 case $mode in
 tag)
 	tag=$arg
-	[[ $tag =~ $TAG_RE ]] || fail "tag must be vX.Y.Z or vX.Y.Z-rc.N; got $(printf '%q' "$tag")"
+	[[ $tag =~ $TAG_RE ]] || fail "tag must be vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N; got $(printf '%q' "$tag")"
 	sha=$(git rev-parse --verify --quiet "refs/tags/$tag^{commit}") ||
 		fail "tag $tag does not exist; push it first (a release never creates its tag)"
 	note "tag: $tag is $sha"
