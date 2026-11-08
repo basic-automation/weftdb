@@ -421,6 +421,22 @@ if ! command -v journalctl >/dev/null 2>&1; then
 	skip "no journalctl, so nothing can read back what a transient unit's server printed"
 fi
 mkdir -p "$STATE/store" "$STATE/tmp"
+# The binary has to be started from inside the scratch tree rather than from where it was built.
+# `ProtectHome=yes` masks /home, and a CI checkout lives there: with the unit's own property list,
+# exec'ing a binary staged under `$HOME` measures here as
+# `Failed at step EXEC spawning /home/…/weft-server: No such file or directory` and
+# `status=203/EXEC` with an empty child log — the path the unit names simply is not in the
+# namespace the sandbox built. A deployment names `<prefix>/bin`, which `ProtectSystem=strict`
+# makes read-only but does not hide, so the absent path is this harness's, not the unit's, and the
+# gate would be reporting a defect that no operator can hit. The scratch tree is already bound into
+# the namespace by `BindPaths` below — measured: a copy staged inside a bound directory starts
+# cleanly under all three properties — so the gate runs the binary through that tree. A hard link
+# where the filesystem allows it (same bytes, no 460 MB copy), a plain copy where it does not.
+mkdir -p "$STATE/bin"
+ln "$BIN" "$STATE/bin/weft-server" 2>/dev/null ||
+	cp -p "$BIN" "$STATE/bin/weft-server" ||
+	fail "could not stage a copy of $BIN at $STATE/bin/weft-server"
+readonly GATE_BIN="$STATE/bin/weft-server"
 declare -a ENV_ARGS=()
 while read -r line; do
 	name=${line%%=*}
@@ -559,7 +575,7 @@ submit() {
 		--setenv=WEFT_GPU_CALIBRATE=0 \
 		--setenv=TMPDIR="$STATE/tmp" \
 		--working-directory="$STATE" \
-		"$BIN" serve >"$RUN_LOG" 2>&1
+		"$GATE_BIN" serve >"$RUN_LOG" 2>&1
 }
 # A start that died in one of systemd's own setup steps — 200 CHDIR, 203 EXEC, 218 CAPABILITIES,
 # 226 NAMESPACE, the 2xx band — never reached the server, so the failure belongs to the manager and
