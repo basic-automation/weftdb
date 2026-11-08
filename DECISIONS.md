@@ -5763,3 +5763,36 @@ on a pre-1.0 crate whose CHANGELOG is the deprecation notice.
 name the token. No test sends a mixed-case fill, so this is a documentation-level break, recorded
 under `### Changed` in CHANGELOG.md with the same "This breaks v0.3.x clients…" call-out the
 reduction change used.
+
+## 2026-11-08 — FRE-10a: the a/b split is recovered from the pre-slimming ROADMAP, and the gate test enumerates the registry
+
+**The ambiguity.** The 1.0 plan (§6 W9, §7) names FRE-10a and FRE-10b only as
+"Contract tests" in a chain "finished by W11", and the current ROADMAP lines
+and issues #325/#339 carry no qualifier either — so which contract each half
+pins was, on the face of the surviving documents, unrecorded. It is recorded
+in git history: the ROADMAP text at 7bfe28c, before the #99 slimming to a
+phased checklist dropped the qualifiers, read "FRE-10a Contract tests:
+probes, compute endpoints, metrics and roles" and "FRE-10b Contract tests:
+storage and operator endpoints, plus coverage". FRE-9b's surviving line
+("OpenAPI: storage and operator endpoints") mirrors the same split.
+FRE-10a therefore pins probes, the stateless compute endpoints, metrics
+(including the bench-run surface, which registers under the metrics scope),
+and the roles gating those families; storage and operator endpoints stay
+FRE-10b's, in W11. Flagged for merge review: if the owner intended a
+different split, this entry is the place to reverse it — the test file's
+families are enumerated from the registry by scope, so re-scoping is a
+small edit.
+
+**The shape of the suite.** `weft-server/tests/fre10a_contract.rs` pins the
+composed client contract, not handler internals (the per-slice suites own
+those, and SEC-13 already pins the role matrix on one representative route
+per scope): exact JSON key sets for /health(z), /ready(z) with and without
+a store, interpolate, interpolate/point, downsample, the profile report and
+the bench-run list; both probe spellings answering identically; the media
+types and file magics of the CSV/Arrow/Parquet compute formats and the
+Prometheus media type of /metrics, with the counters reflecting compute
+calls made through the same registry; bench manifests served byte-for-byte
+under their hash; and the role gate on *every* route in the three families,
+enumerated from `build_registry()`'s table — the family sizes (4 probes,
+4 metrics, 17 compute) are pinned so a route joining one of these scopes
+without contract coverage fails the suite instead of shipping unexamined.

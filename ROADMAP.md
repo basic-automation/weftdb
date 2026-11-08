@@ -332,7 +332,15 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] open lane
   - [ ] L-INGEST
   - [x] storage read handlers lane (TAG-10)
-  - [ ] **FRE-10a** Contract tests
+  - [x] **FRE-10a** Contract tests
+    *Closed 2026-11-08: `weft-server/tests/fre10a_contract.rs` pins the first half of the
+    FRE-10 surface — probes, compute endpoints, metrics and roles (the a/b split recovered
+    from the pre-#99 ROADMAP text at 7bfe28c; DECISIONS 2026-11-08). Exact JSON key sets for
+    both probe spellings with and without a store, interpolate, interpolate/point and
+    downsample, the profile report and the bench-run list; CSV/Arrow/Parquet media types and
+    magics; `/metrics` in Prometheus text counting the compute calls; bench manifests served
+    byte-for-byte under their hash; and the role gate on every route in the three families,
+    enumerated from the sealed registry (family sizes pinned at 4/4/17).*
   - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [ ] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
