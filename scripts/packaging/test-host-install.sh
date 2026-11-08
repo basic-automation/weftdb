@@ -566,10 +566,18 @@ submit() {
 # trying a manager with more privileges is legitimate. Any other failure is the server's own
 # behaviour, and retrying that somewhere privileged is precisely how a real defect gets buried.
 preexec_step() {
-	local mgr=$1 code status
+	local mgr=$1 code status note
 	code=$(ctl "$mgr" show "$SCOPE" -p ExecMainCode --value 2>/dev/null)
 	status=$(ctl "$mgr" show "$SCOPE" -p ExecMainStatus --value 2>/dev/null)
-	if [[ $code == exited && $status =~ ^2[0-4][0-9]$ ]]; then printf 'status=%s' "$status"; fi
+	if [[ $code == exited && $status =~ ^2[0-4][0-9]$ ]]; then printf 'status=%s' "$status"; return; fi
+	# The properties above are usually already gone. `--collect` unloads a transient unit the instant it
+	# exits, so by the time this gate asks, `systemctl show` answers with an empty string and the setup
+	# step looks like an ordinary "would not start". The manager's own journal line survives unloading —
+	# `Main process exited, code=exited, status=218/CAPABILITIES` — and it is the same fact, so read it
+	# from there rather than concluding the server itself failed.
+	note=$(unit_log "$mgr" | grep -oE 'status=2[0-4][0-9]/[A-Z]+' | tail -1)
+	[[ -n $note ]] && printf '%s' "${note%%/*}"
+	return 0
 }
 wait_up() {
 	local mgr=$1 _
