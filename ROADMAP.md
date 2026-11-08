@@ -343,7 +343,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     *Closed 2026-11-08: [`docs/stability.md`](docs/stability.md) documents the semver
     policy, surface stability table, compat-suite coverage and named gaps; linked from
     README.md and docs/reference.md.*
-  - [ ] **PAC-15** Operator documentation
+  - [x] **PAC-15** Operator documentation
 - [ ] **W11 · Contract candidate, beta tag, calibration**
   - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
   - [ ] **FRE-9b** OpenAPI

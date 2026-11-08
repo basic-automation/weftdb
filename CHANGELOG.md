@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Added
+- **Operator documentation** ([docs/operations.md](docs/operations.md)) — backup and
+  restore, systemd, container, upgrade, and failure modes with what to do.
+
 ### Fixed
 - **`host-install.yml` carried the one unpinned action on `main` (#626).**
   `.github/workflows/host-install.yml:67` still asked for `Swatinem/rust-cache@v2`
