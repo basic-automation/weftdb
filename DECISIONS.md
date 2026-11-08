@@ -5532,3 +5532,28 @@ not also change what a gate means. Filed as #620 with the two real options: excl
 release checklist and accept that every version bump edits a 417 KB fixture that two
 version-bumping PRs will then conflict in. Whoever owns FRE-9a should pick; this loop
 deliberately did neither.
+
+## 2026-11-07 — gate 7 reads a setup-step death from the journal, not from the unit
+
+	**The finding.** The escalation added earlier today (use the system manager when the user
+	manager cannot apply the unit's capability drop) never fired on the runner, so gate 7 still
+	failed with `Failed to drop capabilities: Operation not permitted` and
+	`status=218/CAPABILITIES`. `preexec_step` asked the unit for `ExecMainCode`/`ExecMainStatus`,
+	but the transient unit is submitted with `--collect`: systemd unloads it the moment it exits,
+	so both properties read back as the empty string, `step` stayed empty, and the escalation's
+	`-n $step` test never held. The failure text then named the *user* manager, which is what a
+	reader would need to tell the two environments apart.
+
+	**The decision.** Read the same fact from PID 1's journal when the properties are gone:
+	`unit_log | grep -oE 'status=2[0-4][0-9]/[A-Z]+'`. The journal line survives unloading and
+	carries the identical status code, so the escalation now sees `status=218` and retries under
+	the system manager, which is privileged enough to apply the hardening and is where an operator
+	actually installs this unit.
+
+	**Why not the alternatives.** Dropping `--collect` would leak a unit per run on a shared
+	machine and still leave a race between exit and the query. Querying before exit would mean
+	waiting on the unit, which changes what the gate measures (`systemd-run` returns after the
+	start, and the gate's claim is about the start path). Narrowing the ladder to "trust the
+	verdict string" is what produced the wrong verdict in the first place. The 2xx band check is
+	kept exactly as before, so a server that started and then failed is still the server's problem
+	and is never retried somewhere privileged.
