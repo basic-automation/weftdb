@@ -220,7 +220,7 @@ seven library crates on crates.io at 0.2.0. It closes roadmap Phase 1, the bench
 [known limitations](https://github.com/basic-automation/weftdb/blob/v0.2.0/CHANGELOG.md#known-limitations)
 include a security layer that is new and not yet reviewed, unfinished crash consistency, and a one-way store
 upgrade from v0.1.0. [v0.1.0](https://github.com/basic-automation/weftdb/releases/tag/v0.1.0)
-stays the baseline that upgrade, rollback and compatibility checks run against.
+stays the baseline that upgrade, rollback and compatibility checks run against (see [`UPGRADING.md`](../UPGRADING.md)).
 
 | Area | State |
 |---|---|

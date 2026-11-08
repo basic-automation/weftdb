@@ -333,7 +333,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] L-INGEST
   - [x] storage read handlers lane (TAG-10)
   - [ ] **FRE-10a** Contract tests
-  - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
+  - [x] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [ ] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
   - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
