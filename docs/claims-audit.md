@@ -1,10 +1,12 @@
 # Claims audit: reference documentation against the six-field rule
 
-> **Methodology status.** `docs/methodology.md` does not yet exist in this repository (issue
-> [#430](https://github.com/basic-automation/weftdb/issues/430)). The six-field rule referenced
-> here is the methodology's provisional specification as described in that issue and in
-> [`bench/claims.json`](../bench/claims.json)'s schema comment: every published performance number
-> must carry **source, command, dataset, measured-date, reproducible-from-clone, and artifact**.
+> **Methodology status.** The rules applied here are published in
+> [`methodology.md`](methodology.md) (issue
+> [#430](https://github.com/basic-automation/weftdb/issues/430)). This audit was written against
+> its six-field rule before that document landed, and applies it unchanged: every published
+> performance number must carry **source, command, dataset, measured-date, reproducible-from-clone,
+> and artifact**. `tools/check_claims.py` now fails the build when a document that carries figures
+> stops linking the rules, so this paragraph cannot go stale a second time.
 >
 > A number whose provenance cannot be reconstructed is **non-conforming** and must be re-measured
 > before it is repeated; it must not be deleted to make the audit pass.

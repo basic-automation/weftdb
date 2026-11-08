@@ -5651,3 +5651,36 @@ therefore pending rather than verified, and no PR was merged on the strength of 
 the pushes when the route returns, rather than inventing an offline workaround or claiming
 green. Recorded here because if the wave appears to stall again with no explanation, this is
 the reason, and because restarting the interface or the VPN is a human action on this host.
+
+## 2026-11-08 — #430: the methodology pointer is enforced, not offered
+
+**What was ambiguous.** #430 asks for "a methodology document published before any performance
+claim", and `ROADMAP.md:571` had already ticked it: `docs/methodology.md` exists, 318 lines, landed
+in #630. So the deliverable looked finished, and the only literal reading left was "link it from
+somewhere". The gap that actually matters is narrower: the two documents that carry figures —
+`README.md` and `docs/reference.md` — never mentioned the rules at all, and nothing checked that
+they did. Every other claims guarantee in `tools/check_claims.py` (marker pairing, source
+existence, artifact publication, figure-in-window) is machine-enforced; the rules the figures were
+measured under were the one guarantee carried by convention. `docs/claims-audit.md`, merged the same
+day, even asserted in its opening note that the methodology "does not yet exist" — a sentence that
+was already false when it merged, which is what an unchecked pointer costs.
+
+**Chosen enforcement.** Fail the lint when the claims document never links the methodology file, or
+when the file is absent under the repository root. This is unconditional: there is no flag to opt a
+document out, and no "warn if missing" tier. The reasoning is the one #635 just recorded about the
+clippy gate — a guarantee that holds only when someone remembers to ask for it is not a gate, it is
+a suggestion with a nicer error message. `--methodology` exists so a test fixture can point at a
+scratch file, and resolves against `--root` exactly as a registry source path does; links still
+resolve beside the document, which is the distinction `RootTests` exists to hold.
+
+**Rejected.** Making the check opt-in so the four existing test fixtures would keep passing without
+edits — rejected for the reason above, and the fixture edits were four lines. Also rejected: adding
+a new workflow step or a new lint script. The claims lint already runs in CI with the reference
+document as its argument, so the rule belongs inside it, and a second gate would have to be kept
+honest the same way this one is.
+
+**Consequence.** A claims document can no longer lose its pointer to the measurement rules without
+breaking the build, and `docs/claims-audit.md` now says where the rules live instead of claiming
+they do not exist. Closing #430 also removes the last "documentation not yet written" caveat from
+the claims story: from here, an unprovenanced figure fails CI, and a provenanced-but-unjudgeable one
+now has nowhere to hide either.

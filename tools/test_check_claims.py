@@ -52,12 +52,15 @@ def registry(artifact_present=True, artifact=None):
 
 class ArtifactCheckTests(unittest.TestCase):
     def run_lint(self, reg, workflows):
-        """Build a temp tree (README + registry + workflows) and run the lint."""
+        """Build a temp tree (README + registry + workflows + methodology) and run the lint."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "README.md").write_text(
-                "<!-- claim:test-1 -->\n\nThe run took **42 ms**.\n", encoding="utf-8"
+                "<!-- claim:test-1 -->\n\nThe run took **42 ms**. Measured under the "
+                "[methodology](docs/methodology.md).\n", encoding="utf-8"
             )
+            (root / "docs").mkdir()
+            (root / "docs" / "methodology.md").write_text("# Rules\n", encoding="utf-8")
             reg_path = root / "claims.json"
             reg_path.write_text(json.dumps(reg), encoding="utf-8")
             for filename, text in workflows.items():
@@ -136,7 +139,12 @@ class RootTests(unittest.TestCase):
             (root / "benches" / "b.rs").write_text("", encoding="utf-8")
             (root / "docs").mkdir()
             doc = root / "docs" / "reference.md"
-            doc.write_text(f"<!-- claim:test-1 -->\n\nThe run took **42 ms** ([bench]({link})).\n", encoding="utf-8")
+            doc.write_text(
+                f"<!-- claim:test-1 -->\n\nThe run took **42 ms** ([bench]({link})), under the "
+                "[rules](methodology.md).\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "methodology.md").write_text("# Rules\n", encoding="utf-8")
             reg = registry(artifact=None)
             reg["claims"][0]["source"] = "benches/b.rs"
             reg_path = root / "claims.json"
@@ -160,3 +168,80 @@ class RootTests(unittest.TestCase):
         code, out = self.run_lint("benches/b.rs")
         self.assertNotEqual(code, 0, out)
         self.assertIn("links to 'benches/b.rs'", out)
+
+
+class MethodologyTests(unittest.TestCase):
+    """The EVI-6 pointer: a claims document must reach the rules its figures were measured under."""
+
+    def run_lint(self, doc_text, with_methodology=True, methodology="docs/methodology.md"):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            doc = root / "README.md"
+            doc.write_text(doc_text, encoding="utf-8")
+            if with_methodology:
+                (root / "docs").mkdir()
+                (root / "docs" / "methodology.md").write_text("# Rules\n", encoding="utf-8")
+            reg_path = root / "claims.json"
+            reg_path.write_text(json.dumps(registry(artifact=None)), encoding="utf-8")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(LINT),
+                    "--registry",
+                    str(reg_path),
+                    "--readme",
+                    str(doc),
+                    "--methodology",
+                    methodology,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return proc.returncode, proc.stdout
+
+    FIGURE = "<!-- claim:test-1 -->\n\nThe run took **42 ms**.\n"
+
+    def test_a_document_without_the_rules_file_fails(self):
+        code, out = self.run_lint(self.FIGURE + "[methodology](docs/methodology.md).\n", with_methodology=False)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("is not under", out)
+
+    def test_unlinked_rules_file_fails(self):
+        code, out = self.run_lint(self.FIGURE)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("never links docs/methodology.md", out)
+
+    def test_a_linked_rules_file_passes(self):
+        code, out = self.run_lint(self.FIGURE + "Measured under the [rules](docs/methodology.md).\n")
+        self.assertEqual(code, 0, out)
+
+    def test_an_explicit_methodology_resolves_against_the_root(self):
+        """`--methodology` is repository-relative like a registry source path, while the
+        document's own links still resolve beside the document."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "rules.md").write_text("# Rules\n", encoding="utf-8")
+            doc = root / "docs" / "reference.md"
+            doc.write_text(self.FIGURE + "Measured under the [rules](../rules.md).\n", encoding="utf-8")
+            reg_path = root / "claims.json"
+            reg_path.write_text(json.dumps(registry(artifact=None)), encoding="utf-8")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(LINT),
+                    "--registry",
+                    str(reg_path),
+                    "--readme",
+                    str(doc),
+                    "--root",
+                    str(root),
+                    "--methodology",
+                    "rules.md",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout)
