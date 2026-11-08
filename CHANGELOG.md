@@ -83,6 +83,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   rendered report explains the row. Report schema v7 → v8: `Correctness` gains an `indeterminate`
   field.
 
+### Fixed
+
+- **A competitor result with no adapter report refuses to take part in a
+  comparison (EVI-8B, #452).** `weft-bench compare` compared a `duckdb` arm whose
+  `adapter_info` was `null` with a WeftDB arm and footnoted the missing attribution
+  instead of stopping, so a ratio claim could be published about numbers nobody could
+  attribute to an engine. `provenance` now emits a `hard:` note per such result, which
+  reuses the existing `Incomparable` refusal and the existing `--ignore-provenance`
+  override; the predicate is `adapter_info.is_none() &&
+  !adapter.starts_with("weftdb")`, because `weftdb`, `weftdb-stored` and
+  `weftdb-ingest` measure their own paths and honestly report no adapter, and because
+  `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
+  tested.
 ## [0.3.2] - 2026-11-06
 
 ### Fixed
