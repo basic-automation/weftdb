@@ -479,6 +479,16 @@ fn provenance(baseline: &BenchReport, candidate: &BenchReport) -> Vec<String> {
 		// same column, so this is a refusal and not a caveat -- `--ignore-provenance` is the override.
 		notes.push(format!("hard: report schema v{} vs v{}", baseline.schema_version, candidate.schema_version));
 	}
+	// A result that names a party other than WeftDB but carries no adapter report must
+	// refuse to compare, because the numbers are not attributed. These are `hard:` notes so
+	// they flow through the existing refusal gate and the `--ignore-provenance` downgrade.
+	// This check runs on both reports so a mismatch on either side stops the comparison.
+	for report in [baseline, candidate] {
+		for unprov in unprovenanced_second_parties(report) {
+			notes.push(format!("hard: {unprov}"));
+		}
+	}
+
 	// Which adapters produced the numbers is provenance too, and now that every
 	// adapter reports itself it is recorded rather than assumed. It is a caveat and
 	// never a refusal: pairing WeftDB with another engine is the point of a
@@ -503,6 +513,17 @@ fn adapters_of(report: &BenchReport) -> Vec<String> {
 	adapters.sort_unstable();
 	adapters.dedup();
 	adapters
+}
+
+/// Results whose adapter says they are not one of WeftDB's own named paths but
+/// carry no `adapter_info` — a competitor that does not say what engine produced its
+/// numbers cannot take part in a comparison. The predicate uses `starts_with("weftdb")`
+/// rather than exact match because the self-measured paths are `weftdb`, `weftdb-stored`
+/// and `weftdb-ingest` (and stop at the first non-"weftdb" prefix). It cannot read
+/// `native_engine`, `engine` or `method` here — those live inside `AdapterInfo` whose
+/// absence is what the function is testing.
+fn unprovenanced_second_parties(report: &BenchReport) -> Vec<String> {
+	report.results.iter().filter_map(|result| if result.adapter_info.is_none() && !result.adapter.starts_with("weftdb") { Some(format!("the `{}` results in `{}` record no adapter report; a run that is not WeftDB measuring its own paths must carry adapter_info before its numbers can be compared", result.adapter, result.profile)) } else { None }).collect::<Vec<String>>()
 }
 
 const fn engine_kind(native_engine: bool) -> &'static str {
@@ -564,7 +585,7 @@ mod tests {
 	}
 
 	fn result(workload: &str, p50: u64, p95: u64, p99: u64, throughput: f64, intervals: Option<LatencyCis>) -> BenchResult {
-		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "standard".into(), adapter: "weft".into(), workload: workload.into(), reps: 3, dataset: dataset(), latency: latency(p50, p95, p99), latency_ci: intervals, throughput_points_per_sec: throughput, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns: 0, end_to_end_ns: 0 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1, actual_output_points: 1, values_finite: true, result_sha256: None }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: Vec::new(), between_run: None, gpu_economics: None }
+		BenchResult { schema_version: crate::schema::SCHEMA_VERSION, profile: "standard".into(), adapter: "weftdb".into(), workload: workload.into(), reps: 3, dataset: dataset(), latency: latency(p50, p95, p99), latency_ci: intervals, throughput_points_per_sec: throughput, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns: 0, end_to_end_ns: 0 }, correctness: CorrectnessReport { output_count_ok: true, expected_output_points: 1, actual_output_points: 1, values_finite: true, result_sha256: None }, accuracy: None, storage: None, cold_warm: None, gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: Vec::new(), between_run: None, gpu_economics: None }
 	}
 
 	fn report(os: &str, arch: &str, results: Vec<BenchResult>) -> BenchReport {
@@ -697,7 +718,7 @@ mod tests {
 		competitor.results[0].adapter_info = Some(crate::adapter::AdapterInfo { interface_version: 2, engine: "duckdb".into(), method: "native interpolation".into(), native_engine: true, honours_requested_spline: false });
 		let comparison = compare_reports(&baseline, &competitor, DEFAULT_THRESHOLD_PCT, false).expect("a cross-engine comparison is allowed");
 		let note = comparison.notes.iter().find(|n| n.starts_with("adapter:")).expect("the adapters differ").clone();
-		assert!(note.contains("weft [engine splimes") && note.contains("honours the requested spline"), "weftdb side of: {note}");
+		assert!(note.contains("weftdb [engine splimes") && note.contains("honours the requested spline"), "weftdb side of: {note}");
 		assert!(note.contains("duckdb [engine duckdb") && note.contains("ignores the requested spline"), "competitor side of: {note}");
 
 		// An artifact written before adapters reported themselves is distinguishable
@@ -706,6 +727,33 @@ mod tests {
 		let comparison = compare_reports(&baseline, &legacy, DEFAULT_THRESHOLD_PCT, false).expect("comparable");
 		let note = comparison.notes.iter().find(|n| n.starts_with("adapter:")).expect("one side reports, the other cannot").clone();
 		assert!(note.contains("[no adapter report]"), "{note}");
+	}
+
+	#[test]
+	fn a_competitor_without_adapter_report_is_refused() {
+		let baseline = report("linux", "x86_64", vec![result("query", 1_000, 2_000, 3_000, 1e6, Some(ci(1_000, 2_000, 3_000)))]);
+
+		// A candidate result from duckdb with no adapter_info must refuse.
+		let mut candidate = report("linux", "x86_64", vec![result("query", 1_000, 2_000, 3_000, 1e6, Some(ci(1_000, 2_000, 3_000)))]);
+		candidate.results[0].adapter = "duckdb".into();
+		candidate.results[0].adapter_info = None;
+		let err = compare_reports(&baseline, &candidate, DEFAULT_THRESHOLD_PCT, false).expect_err("must refuse unprovenanced competitor");
+		assert!(matches!(&err, CompareError::Incomparable(notes) if notes.iter().any(|n| n.contains("duckdb"))), "{err:?}");
+
+		// With --ignore-provenance the same pair compares, and the note is prefixed ignored:.
+		let forced = compare_reports(&baseline, &candidate, DEFAULT_THRESHOLD_PCT, true).expect("--ignore-provenance compares");
+		assert!(forced.notes.iter().any(|n| n.starts_with("ignored:") && n.contains("duckdb")), "{:?}", forced.notes);
+		assert!(forced.notes.iter().all(|n| !n.starts_with("hard:")));
+	}
+
+	#[test]
+	fn an_honest_weftdb_result_without_adapter_info_still_compares() {
+		// weftdb (and weftdb-stored, weftdb-ingest) measuring their own paths
+		// carry no adapter_info, and that must not trigger a refusal.
+		let baseline = report("linux", "x86_64", vec![result("query", 1_000, 2_000, 3_000, 1e6, Some(ci(1_000, 2_000, 3_000)))]);
+		let candidate = report("linux", "x86_64", vec![result("query", 1_100, 2_100, 3_100, 1e6, Some(ci(1_100, 2_100, 3_100)))]);
+		let comparison = compare_reports(&baseline, &candidate, DEFAULT_THRESHOLD_PCT, false).expect("honest weftdb result must compare");
+		assert!(comparison.notes.iter().all(|n| !n.starts_with("hard:")), "{:?}", comparison.notes);
 	}
 
 	/// The same result as [`result`], with the report WeftDB's own adapter gives.

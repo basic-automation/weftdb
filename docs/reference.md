@@ -328,7 +328,8 @@ one developer workstation — treat them as *shape*, not as a specification for 
 | 100-row window over 100k rows | **58 µs** | 2.73 ms | ~47× |
 
 *Source: [`weft-physical-type/benches/pointread.rs`](../weft-physical-type/benches/pointread.rs), <!-- claim:pointread-2026-10-08 -->
-re-measured 2026-10-08 after the word-wise bit reads and the slicing-by-16 frame CRC.*
+re-measured 2026-10-08 after the word-wise bit reads and the slicing-by-16 frame CRC.
+`source: weft-physical-type/benches/pointread.rs; command: cargo bench -p weft-physical-type --bench pointread; dataset: generated; measured: 2026-10-08; reproducible_from_clone: yes`*
 The wins come from skipping the value column entirely until a specific row is needed,
 and from resolving regular timestamp columns in closed form.
 
@@ -336,6 +337,11 @@ and from resolving regular timestamp columns in closed form.
 
 Sealing **1M rows** of a real 1-minute financial series into a columnar segment:
 **4.57 s — 218,963 rows/sec at 4.22 bytes/point.**
+
+> *This figure predates the six-field provenance rule: its source and command are
+> not recoverable from the repository (no bench file or reproduction command is
+> recorded). It must be re-measured before being repeated (see
+> [`docs/claims-audit.md`](claims-audit.md)).*
 
 That corpus (`database/datasets/btc_1min.csv`, a BTC/USD one-minute series) is a local,
 gitignored file, **not distributed with this repository** and not required to build or test —
@@ -845,6 +851,11 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   takes at most one snapshot per interval however far behind it fell. **Set `WEFT_BACKUP_INTERVAL_SECS` from what your storage
   can sustain, not from how much data you have**; point `WEFT_BENCH_BACKUP_DIR`
   at your own volume to measure it.
+
+  > *The tmpfs figures above predate the six-field provenance rule: their measured
+  > date and reproduction command are not recoverable from the repository. They
+  > must be re-measured before being repeated
+  > (see [`docs/claims-audit.md`](claims-audit.md)).*
 - **Unattended backups with retention.** Set `WEFT_BACKUP_INTERVAL_SECS` to run a
   background daemon that snapshots into a fresh `backup-<unix_millis>` directory
   each tick (verifying `snapshot`-only, since it backs up a live store), and
