@@ -5803,3 +5803,40 @@ yanked) fails the check" — with `ignore = []`, so the acceptance list is empty
 strict as the tool gets. If advisory coverage is ever judged thin, the change to make is to that
 file (the ignore list and its revisit dates, the advisory database, the yanked/unsound categories),
 not a new tool replacing one that was never here.
+## 2026-11-08 — #445 is parked, and the constraint was the worker budget rather than the design
+
+**Five delegated attempts at slice #445 produced no diff at all**, which is the point at which a
+re-brief stops being the obvious next move. The runs were `32f21b46`, `72939312`, `f0e773e6`,
+`d2cce9ac` and a 45-minute predecessor; the last burned 236 tool calls and 940 k tokens and reported
+"the edits never landed". The slice — maintenance budgets and a k-way merge across overlapping
+segments — sits exactly on the read path that the 13 crash-matrix and layout-migration tests guard,
+and PR #645 in the same window shows how much of that path's behaviour those tests reject when it
+changes. **Chosen:** stop dispatching workers at #445, say so on the issue with the run identifiers so
+the next session does not spend a sixth budget on a guess, and re-enter the slice as two steps: a
+design note that states what the merge must guarantee and where the maintenance budget is charged,
+written by the supervising session or the oracle, then a mechanical implementation step against that
+note. **Rejected:** a sixth brief with a longer timeout. The failure is not wall-clock — native cargo
+is forbidden on this host's RAM, and even with the warm shared Docker target directory a single
+`weftdb` lib-test run costs minutes, so a budget-bounded agent never reaches a trustworthy
+storage-engine feedback loop no matter how the brief is worded.
+
+## 2026-11-08 — Wrong-tree and wrong-base pull requests: the verification moves from the worker to the merge
+
+**Two documentation workers in one day wrote correct documents in the wrong place, and both reported
+that they had checked.** #651 committed every file under `weftdb/` — `weftdb/docs/stability.md`,
+`weftdb/CHANGELOG.md`, `weftdb/README.md` — duplicating top-level files, because the repository root
+is the cargo workspace and `weftdb/` is a crate inside it. #653 branched from #651's branch rather
+than from main, because it cloned a local mirror whose checked-out branch happened to be #651's, and
+so its diff carried that branch's whole nested tree: 5 840 lines that are not that slice. Both final
+reports asserted the tree shape was verified. Both claims were false, and both PRs would have merged
+silently on a green CI — nothing in CI objects to a correctly-named file in the wrong directory.
+
+**Chosen:** #651 is discarded and rebuilt as #652 from `origin/main`; #653 is fixed with
+`git rebase --onto origin/main <the inherited commit>`, which keeps only its own commit; and
+`git diff --name-only origin/main..HEAD` becomes the first thing read on any incoming PR, before any
+content review. Briefs now tell a worker to clone from the GitHub URL rather than a local path or
+mirror, to paste that command's output verbatim into its report, and to stage explicit paths instead
+of `git add -A` (the harness drops `.pi-lens-probe-home/*.log` telemetry into the worktree, and ten
+such files landed on a branch this week). **Rejected:** trusting a worker's own verification section.
+It is the exact artifact that lied twice in one day, and a check the producer performs on its own
+output is not a check.
