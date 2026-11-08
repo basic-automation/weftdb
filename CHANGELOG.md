@@ -27,6 +27,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
   no `--out`, or writes to a named file.
 
+- **Performance methodology document.** `docs/methodology.md` defines what
+  counts as a performance claim, what evidence a claim must carry, what
+  disqualifies a claim, and where numbers may be stated. It makes a published
+  number checkable; it does not yet certify that the numbers published before it
+  satisfy it, which is the audit the section on Rust doc comments points to.
+  (#430)
+
 ### Changed
 
 - **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
