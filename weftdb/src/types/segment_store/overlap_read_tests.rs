@@ -76,7 +76,7 @@ async fn same_series_overlap_newer_wins() {
 ///
 /// A newer segment with a null at a timestamp the older segment carried a value
 /// for must return None (null). The present-value quality prune drops segments whose
-/// every row is null (null_count == row_count), so a single-null segment is dropped
+/// every row is null (`null_count == row_count`), so a single-null segment is dropped
 /// and the older value survives — matching how point reads already work.
 #[tokio::test]
 async fn newer_null_over_older_value_point_read() {
