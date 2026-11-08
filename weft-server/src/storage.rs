@@ -516,8 +516,11 @@ fn encode_cursor_v1(selector: &weftdb::SeriesSelector, timestamps: &[i64], value
 /// Decode and verify a cursor v1 token against the current selector and data.
 ///
 /// Returns the start offset to resume from, or [`ApiError::bad_request`] for a malformed
-/// token, or [`ApiError::server`] with [`Code::CursorStale`](crate::error::Code::CursorStale)
-/// when the selector, high-water mark or data fingerprint no longer match.
+/// token, or [`Code::CursorStale`](crate::error::Code::CursorStale) (410) when the selector,
+/// high-water mark or data fingerprint no longer match. Staleness is built with
+/// [`ApiError::new`], not [`ApiError::server`]: `server` is reserved for `5xx` codes and
+/// swallows the sentence into the log, while a stale cursor has to reach the caller, who is
+/// the only one that can restart the walk.
 fn decode_cursor_v1(cursor: &str, selector: &weftdb::SeriesSelector, timestamps: &[i64], values: &[Option<BigDecimal>]) -> Result<usize, ApiError> {
 	let trimmed = cursor.trim();
 	if trimmed.len() != 66 || !trimmed.starts_with("01") {
@@ -533,15 +536,15 @@ fn decode_cursor_v1(cursor: &str, selector: &weftdb::SeriesSelector, timestamps:
 	let offset = parse_hex(50)? as usize;
 
 	if s_hash != hash_selector(selector) {
-		return Err(ApiError::server(crate::error::Code::CursorStale, "the cursor's tag selector hash does not match the request's selector — the cursor is bound to a different selector"));
+		return Err(ApiError::new(crate::error::Code::CursorStale, "`cursor` was issued for a different selector than this request — start the walk again from the first page"));
 	}
 	let current_high_water = timestamps.iter().max().copied().unwrap_or(0).cast_unsigned();
 	if high_water != current_high_water {
-		return Err(ApiError::server(crate::error::Code::CursorStale, format!("the data in this window has changed since the cursor was issued (high-water mark {high_water:?} vs {current_high_water:?})")));
+		return Err(ApiError::new(crate::error::Code::CursorStale, "this window has been written to since the cursor was issued — start the walk again from the first page"));
 	}
 	let current_fp = fingerprint_rows(timestamps, values);
 	if fp != current_fp {
-		return Err(ApiError::server(crate::error::Code::CursorStale, "the data in this window has changed since the cursor was issued (fingerprint mismatch)"));
+		return Err(ApiError::new(crate::error::Code::CursorStale, "the rows in this window changed since the cursor was issued — start the walk again from the first page"));
 	}
 	Ok(offset)
 }
@@ -1715,17 +1718,23 @@ mod tests {
 	#[tokio::test]
 	async fn points_cursor_supersedes_offset_and_clears_page_echo() {
 		let (_dir, router) = router_with_sealed_price().await;
-		// Cursor v1 token for offset=3 (rows 130..=140). Computed from the sealed data:
-		// empty selector (hash 0x987ab3ff9c0b346e), high-water=140, fingerprint from all 5 rows.
-		let (status, body) = get_json(router, "/api/v1/storage/price/points?start=100&end=140&limit=2&offset=1&cursor=01987ab3ff9c0b346e000000000000008cb3a19015125cf38d0000000000000003").await;
+		// Take the token from the server rather than hand-writing one: a cursor is only
+		// meaningful against the selector and the data that produced it, and a literal here
+		// silently rots the moment either changes.
+		let (status, first) = get_json(router.clone(), "/api/v1/storage/price/points?start=100&end=140&limit=2").await;
+		assert_eq!(status, StatusCode::OK, "body: {first}");
+		let cursor = first["next_cursor"].as_str().expect("a non-final page hands back a cursor").to_owned();
+		// Ask for the same page again, but lie about the offset: the cursor wins.
+		let (status, body) = get_json(router, &format!("/api/v1/storage/price/points?start=100&end=140&limit=2&offset=0&cursor={cursor}")).await;
 		assert_eq!(status, StatusCode::OK, "body: {body}");
-		assert_eq!(body["offset"], 3, "the cursor position supersedes the explicit offset");
+		assert_eq!(body["offset"], 2, "the cursor position supersedes the explicit offset");
 		assert!(body.get("page").is_none(), "a cursor read clears the page echo");
+		assert!(body["total"].is_null(), "a cursor read does not echo a total the caller is not paginating by");
 		let points = body["points"].as_array().unwrap();
-		assert_eq!(points.len(), 2, "rows 130 and 140 remain from offset 3");
-		assert_eq!(points[0]["timestamp"], 130);
-		assert_eq!(points[1]["timestamp"], 140);
-		assert!(body.get("next_cursor").is_none(), "offset 3 + 2 rows = 5 = total → end of window");
+		assert_eq!(points.len(), 2, "rows 120 and 130 remain from offset 2");
+		assert_eq!(points[0]["timestamp"], 120);
+		assert_eq!(points[1]["timestamp"], 130);
+		assert!(body.get("next_cursor").is_some(), "one row is left, so the walk continues");
 	}
 
 	#[tokio::test]
@@ -2443,9 +2452,12 @@ mod tests {
 		assert_ne!(h1, hash_selector(&sel_diff), "different value → different hash");
 		let sel_exact = weftdb::SeriesSelector::exact([("host", Some("a"))]).expect("valid");
 		assert_ne!(h1, hash_selector(&sel_exact), "exact flag changes the hash");
+		// `all()` and `untagged()` carry no matchers either, but they are different queries, so
+		// a cursor issued for one must not resume the other. The exactness byte is what makes
+		// them differ here — the same byte the assertion above proves is hashed.
 		let sel_empty = weftdb::SeriesSelector::all();
 		let sel_empty_exact = weftdb::SeriesSelector::untagged();
-		assert_eq!(hash_selector(&sel_empty), hash_selector(&sel_empty_exact), "all and untagged both have no matchers — same hash");
+		assert_ne!(hash_selector(&sel_empty), hash_selector(&sel_empty_exact), "no matchers does not mean the same query — the exactness byte separates them");
 	}
 
 	#[test]
