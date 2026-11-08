@@ -516,7 +516,7 @@ fn adapters_of(report: &BenchReport) -> Vec<String> {
 }
 
 /// Results whose adapter says they are not one of WeftDB's own named paths but
-/// carry no adapter_info — a competitor that does not say what engine produced its
+/// carry no `adapter_info` — a competitor that does not say what engine produced its
 /// numbers cannot take part in a comparison. The predicate uses `starts_with("weftdb")`
 /// rather than exact match because the self-measured paths are `weftdb`, `weftdb-stored`
 /// and `weftdb-ingest` (and stop at the first non-"weftdb" prefix). It cannot read
