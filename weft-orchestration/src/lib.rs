@@ -1728,7 +1728,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_secs(1800), async {
+		tokio::time::timeout(std::time::Duration::from_mins(25), async {
 			// Point this binary at its test data dir before opening anything, as a plain statement
 			// (see `test_api`).
 			let crypto = data_dir().join("Crypto");
@@ -1923,7 +1923,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_pipeline_api timed out after 1800s"))?
+		.map_err(|_| anyhow::anyhow!("test_pipeline_api timed out after 1500s"))?
 	}
 
 	#[tokio::test]
@@ -1939,7 +1939,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_secs(3600), async {
+		tokio::time::timeout(std::time::Duration::from_mins(15), async {
 			let db = fake_database().await;
 			let subjects = db.list_subjects().await?;
 			let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
@@ -2106,7 +2106,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_api_precise timed out after 3600s"))?
+		.map_err(|_| anyhow::anyhow!("test_api_precise timed out after 900s"))?
 	}
 
 	/// Test using the Pipeline API with `fake_database` - mirrors `test_api_precise`
@@ -2122,7 +2122,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_secs(1800), async {
+		tokio::time::timeout(std::time::Duration::from_mins(10), async {
 			let db = fake_database().await;
 			let subjects = db.list_subjects().await?;
 			let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
@@ -2288,7 +2288,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_pipeline_api_precise timed out after 1800s"))?
+		.map_err(|_| anyhow::anyhow!("test_pipeline_api_precise timed out after 600s"))?
 	}
 
 	/// Generate test data points with peaks every 4 hours
