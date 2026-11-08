@@ -388,10 +388,12 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     honesty section are on main; the report is what #616's nightly comparison reads.*
   - [ ] → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
     *Partial 2026-11-07 (#616): `compare_soak_reports` reports metric drift past tolerance and
-    every rule outcome change (a Pass→Fail turns the job red), and `soak.yml` runs the driver and
-    the comparison on `workflow_dispatch`. The schedule stays commented out and the TTL lane is
-    reported as not-tested, because the in-process `soak-run` driver cannot yet produce honest
-    R1–R8 evidence — that needs the SOA-4/6/12 fleet lanes.*
+    every rule outcome change (a Pass→Fail turns the job red), `scripts/annotate-soak-drift.py`
+    puts the offending pair on the run summary, and `soak.yml` runs the driver and the comparison
+    on `workflow_dispatch` (`docs/soak.md`). Two pieces of this item are deliberately not claimed:
+    the schedule stays commented out, and the TTL lane is reported as not-tested, because the
+    in-process `soak-run` driver cannot yet produce honest R1–R8 evidence — that needs the
+    SOA-4/6/12 fleet lanes.*
 - [ ] **W9 · Read semantics, limits, upgrade legs**
   - [ ] read lane
   - [ ] maint lane
@@ -566,4 +568,4 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **Cascade adopt-or-drop into the DEFAULT selector — owner-gated (headline change, as FOR/ALP):**
 - [ ] **NEXT — checkpoint index adopt-or-drop into the DEFAULT policy — owner-gated (bytes/point
 - [ ] **NEXT — a random-access-capable Gorilla/RLE would widen the checkpoint index's reach:**
-- [ ] Publish a methodology document **before** any performance claim
+- [x] Publish a methodology document **before** any performance claim

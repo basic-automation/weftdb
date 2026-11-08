@@ -18,6 +18,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   did will now find it ignored, with `WEFT_DATA_DIR` as the migration.
 ### Added
 
+- **The frame-fault policy is verified (ROB-22/C5).** The three behaviours of
+  the C5 policy are now pinned by tests: a suspect frame is excluded from
+  reads, a suspect frame is never auto-purged by maintenance, and a corrupt
+  frame is quarantined and then TTL-purged. The first was previously asserted
+  only through the recovery report, and the third not at all. (#446)
+
 - **Generated OpenAPI document from the route registry (FRE-9a).** The
   document at `compat/openapi/weftdb.json` is built from the same
   `RouteTable` the HTTP router serves, so every path, method, scope,
@@ -26,6 +32,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   file matches the generated output; regenerate with `weft-server openapi
   --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
   no `--out`, or writes to a named file.
+- **Nightly soak comparison gate (SOA-15).** A scheduled + dispatchable soak
+  workflow (`soak.yml`) builds the soak driver, runs a 15-minute soak,
+  evaluates the SoakReport against SLO rules R1–R8, and compares the result
+  to the previous night's artifact. A Pass→Fail rule regression turns the job
+  red; metric drift past documented tolerance produces `::warning::`
+  annotations. The comparison function lives in
+  `weft-bench/src/soak_compare.rs`, and the annotator script in
+  `scripts/annotate-soak-drift.py`. Documented in `docs/soak.md`.
+
+- **Performance methodology document.** `docs/methodology.md` defines what
+  counts as a performance claim, what evidence a claim must carry, what
+  disqualifies a claim, and where numbers may be stated. It makes a published
+  number checkable; it does not yet certify that the numbers published before it
+  satisfy it, which is the audit the section on Rust doc comments points to.
+  (#430)
 
 ### Changed
 
@@ -33,6 +54,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `Swatinem/rust-cache@v2`) fails the static-check job. A new guard,
   `scripts/ci/check-action-pinning.py`, scans every workflow on every push and
   pull request. (#626)
+- **The OpenAPI drift gate no longer fails on a version bump (#620).**
+  `generated_spec_matches_committed_file` now normalises `info.version` on
+  both sides before comparing, so every path, method, scope, tier and schema
+  is still checked but a release version change does not trip the gate.
+  A separate assertion in `info_block_has_service_name_and_version` verifies
+  that `info.version` equals the crate version directly.
 
 - **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
   each measure by metric name alone, so two results in one report — a crash matrix, a query mix, any

@@ -480,6 +480,11 @@ mod tests {
 	/// The drift gate: the committed spec is the document the routes generate.
 	/// A generated file nothing compares against is a second source of truth,
 	/// which is what this slice exists to prevent.
+	///
+	/// `info.version` is normalised on both sides before comparison — every path,
+	/// method, scope, tier and schema is still compared. The version is asserted
+	/// separately against the crate version in `info_block_has_service_name_and_version`.
+	/// This avoids the gate tripping on every release bump; see weftdb#620.
 	#[test]
 	fn generated_spec_matches_committed_file() {
 		let path = committed_spec_path();
@@ -499,11 +504,30 @@ mod tests {
 			)
 		});
 		let committed_value: Value = serde_json::from_slice(&committed).unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", path.display()));
+
+		// Normalise `info.version` on both sides so a crate version bump does not
+		// break the gate — route shape is what matters, not the version string. See #620.
+		let mut compare_gen = document.clone();
+		let mut compare_com = committed_value.clone();
+		let version_sentinel = Value::String("version::excluded-from-drift-comparison".to_string());
+		if let Some(info) = compare_gen.get_mut("info") {
+			if let Some(obj) = info.as_object_mut() {
+				obj.insert("version".to_string(), version_sentinel.clone());
+			}
+		}
+		if let Some(info) = compare_com.get_mut("info") {
+			if let Some(obj) = info.as_object_mut() {
+				obj.insert("version".to_string(), version_sentinel);
+			}
+		}
+
 		let generated_paths = document["paths"].as_object().map_or(0, Map::len);
 		let committed_paths = committed_value["paths"].as_object().map_or(0, Map::len);
 		assert!(
-			document == committed_value,
+			compare_gen == compare_com,
 			"the committed spec at {} is not what the routes generate: {generated_paths} paths generated, {committed_paths} committed.\n\t\
+			 (`info.version` is excluded from this comparison — it is asserted against the crate version in \
+			 `info_block_has_service_name_and_version`.)\n\t\
 			 If a route changed on purpose, regenerate it with `{UPDATE_VAR}=1 cargo test -p weft-server --lib openapi` and review the diff.",
 			path.display()
 		);
@@ -562,7 +586,7 @@ mod tests {
 		let document = generated();
 		let info = document["info"].as_object().expect("the document has an info block");
 		assert_eq!(info["title"], crate::SERVICE);
-		assert!(!info["version"].as_str().unwrap_or_default().is_empty(), "the version must not be empty");
+		assert_eq!(info["version"], crate::VERSION, "the version in the OpenAPI document must match the crate version");
 	}
 
 	/// One path item per registered template, counted from the registry rather
