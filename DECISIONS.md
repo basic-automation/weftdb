@@ -5763,3 +5763,28 @@ on a pre-1.0 crate whose CHANGELOG is the deprecation notice.
 name the token. No test sends a mixed-case fill, so this is a documentation-level break, recorded
 under `### Changed` in CHANGELOG.md with the same "This breaks v0.3.x clients…" call-out the
 reduction change used.
+
+## 2026-11-07 — a note this session inherited describes an `audit` CI job that does not exist here
+
+**Ambiguity.** Context carried forward from an earlier lane claimed `audit.yml` ran a job named
+`audit (latest)`, that it had been red on main since 2026-10-23 because the container image
+`ghcr.io/rustsec/audit:latest` could not be pulled, that `cargo audit` is yanked upstream so the
+replacement tool is an owner decision, and that the resulting issue should be filed with that
+evidence. Before filing anything, checked it.
+
+**Finding.** None of that is true of this repository. `git grep` over `.github/workflows` at
+`origin/main` finds no `audit` job and no reference to `rustsec/audit`; `git log --all -S
+'rustsec/audit' -- .github` finds nothing in reachable history; and the check list on current
+heads contains no check by that name — the supply-chain checks that do run are `cargo-deny` and
+`third-party licenses`, and both are green on every open PR today.
+
+**Choice.** Record the correction here rather than file the issue. An issue about a workflow that
+does not exist would send a future reader after a phantom, which is the exact failure mode this
+file exists to prevent.
+
+**What is actually true about advisory coverage.** `deny.toml` carries an `[advisories]` section
+whose comment states the policy — "Every RustSec advisory (vulnerability, unmaintained, unsound,
+yanked) fails the check" — with `ignore = []`, so the acceptance list is empty and the check is as
+strict as the tool gets. If advisory coverage is ever judged thin, the change to make is to that
+file (the ignore list and its revisit dates, the advisory database, the yanked/unsound categories),
+not a new tool replacing one that was never here.
