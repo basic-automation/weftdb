@@ -5360,6 +5360,41 @@ into its body, so the absence of verification is visible rather than implied. Ta
 a human action: `release.yml` accepts only a CI run on `main`, and crates.io is unreachable from
 this machine, so publication state cannot be confirmed from here at all.
 
+## 2026-11-06 — PAC-6: TEST_DATA_DIR is removed; the suites are handed WEFT_DATA_DIR (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan (§3 PAC-5a/PAC-6 row) fixes the outcome — one VarSpec
+registry with tiers stable/tuning/experimental plus a test allowlist, and
+"`TEST_DATA_DIR` is removed (PAC-6)" — and PAC-5a's registry entry for the name
+says it is removed "once the suites are handed a fixture path instead", but no
+source names the replacement channel the suites are handed.
+
+**Chosen:** the fixture path is `WEFT_DATA_DIR`, the Stable variable
+`weftdb::data_dir` already honoured as its first (and now only) override:
+
+- `weftdb::data_dir` drops the `TEST_DATA_DIR` leg; resolution is
+  `WEFT_DATA_DIR`, else the portable per-user default.
+- Every suite that set `TEST_DATA_DIR` now sets `WEFT_DATA_DIR` instead: the
+  per-test `#[serial]` sites in `weftdb` and `weft-orchestration`, the crash-test
+  child processes (handed the path through the child's environment, as before),
+  and the two `data_dir()` helpers, whose explicit-fixture branch now keys on
+  `WEFT_DATA_DIR` — which is also how `test_api`/`test_pipeline_api` still reach
+  a real `Crypto` corpus (`WEFT_DATA_DIR=~/.weftdb/data`). The helpers' comments
+  say plainly that a shell exporting `WEFT_DATA_DIR` for `weft-tui` now also
+  points the suites at that directory; CI does not set it.
+- The registry entry and the test allowlist entry are deleted (104 → 103
+  names; Test tier 42 → 41), and the configuration docs (SEC-14's
+  `docs/config-schema.md`, plus the `docs/reference.md` configuration table and
+  resolution list) are updated in the same commit, so the PAC-5b/6
+  configuration documentation (§8 :788, wording per decision 21) describes the
+  completed registry. The historical mention in `compat/v010/README.md` stays:
+  it records the v0.1.0 binary's behaviour, which did read the name.
+
+**Rejected:** a new in-process override API on `weftdb` (a settable global the
+library would carry for tests alone — the plan's direction is the library
+taking *fewer* environment-shaped inputs, and the child-process crash tests
+still need an environment channel to be handed their directory), and keeping a
+differently-named test-only variable (that is `TEST_DATA_DIR` under a new
+spelling, not its removal).
 ## 2026-11-07 — Needs human: the crates.io token; and the gates that sat behind a red gate (PAC-11, #596)
 
 **Confirmed, not inferred: publication to crates.io has never happened, and it is a missing secret.**
@@ -5533,3 +5568,4 @@ deliberately did neither.
 	its own tolerance produces `indeterminate = false`. It does NOT let the row into a verdict: a
 	row whose `passed` is false is excluded by the existing `passed(r)` filter — `all_correct()` and
 	the verdict loop never see it.
+

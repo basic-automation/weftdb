@@ -32,7 +32,7 @@ fn minutes(range: std::ops::Range<i64>) -> Vec<InputMeasurement> {
 #[serial]
 async fn a_seal_backed_aspect_is_batched_from_its_change_log() -> Result<()> {
 	let dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", dir.path().to_str().unwrap());
+	std::env::set_var("WEFT_DATA_DIR", dir.path().to_str().unwrap());
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 	let name = format!("change_log_{}", Uuid::new_v4().simple());
 	let db = Database::new(&name).await?;

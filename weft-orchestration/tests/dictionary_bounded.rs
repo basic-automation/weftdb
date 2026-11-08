@@ -50,7 +50,7 @@ async fn count(db: &Database, aspect: &AspectId, name: &str, sql: &str) -> Resul
 #[serial]
 async fn repeated_runs_store_each_pattern_once() -> Result<()> {
 	let dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", dir.path().to_str().context("temp dir not UTF-8")?);
+	std::env::set_var("WEFT_DATA_DIR", dir.path().to_str().context("temp dir not UTF-8")?);
 	let db = Database::new(&format!("bounded_{}", Uuid::new_v4().simple())).await?;
 	let subject = db.observe_subject("subject").await?;
 	let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Minutes, None).await?.id();

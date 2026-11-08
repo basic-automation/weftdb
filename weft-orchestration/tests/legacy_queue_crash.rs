@@ -79,7 +79,7 @@ impl Store {
 	/// A fresh legacy database with one minute-resolution aspect, in its own data dir.
 	async fn new(tag: &str) -> Result<Self> {
 		let dir = tempfile::tempdir()?;
-		std::env::set_var("TEST_DATA_DIR", dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+		std::env::set_var("WEFT_DATA_DIR", dir.path().to_str().context("temp data dir is not valid UTF-8")?);
 		let name = format!("{tag}_{}", Uuid::new_v4().simple());
 		let db = Database::new(&name).await?;
 		let subject = db.observe_subject("subject").await?;
@@ -392,7 +392,7 @@ async fn a_consumer_killed_before_the_dequeue_reruns_without_duplicates() -> Res
 
 	let data_dir = closed.dir.path().to_str().context("temp data dir is not valid UTF-8")?;
 	let point = FaultPoint::LConsumerBatches;
-	let output = std::process::Command::new(std::env::current_exe()?).args(["consumer_child", "--exact", "--nocapture", "--test-threads=1"]).env("TEST_DATA_DIR", data_dir).env(CHILD_ENV, format!("{} {}", closed.name, closed.aspect.as_uuid())).env(fault::FAULT_ENV, format!("{point}:abort")).output()?;
+	let output = std::process::Command::new(std::env::current_exe()?).args(["consumer_child", "--exact", "--nocapture", "--test-threads=1"]).env("WEFT_DATA_DIR", data_dir).env(CHILD_ENV, format!("{} {}", closed.name, closed.aspect.as_uuid())).env(fault::FAULT_ENV, format!("{point}:abort")).output()?;
 	assert!(!output.status.success(), "the child aborted: {output:?}");
 	#[cfg(unix)]
 	{
@@ -550,7 +550,7 @@ async fn an_ingest_killed_after_its_first_chunk_leaves_a_batched_prefix() -> Res
 
 	let data_dir = closed.dir.path().to_str().context("temp data dir is not valid UTF-8")?;
 	let point = FaultPoint::LChunk(0);
-	let output = std::process::Command::new(std::env::current_exe()?).args(["ingest_child", "--exact", "--nocapture", "--test-threads=1"]).env("TEST_DATA_DIR", data_dir).env(INGEST_CHILD_ENV, format!("{} {}", closed.name, closed.aspect.as_uuid())).env(fault::FAULT_ENV, format!("{point}:abort")).output()?;
+	let output = std::process::Command::new(std::env::current_exe()?).args(["ingest_child", "--exact", "--nocapture", "--test-threads=1"]).env("WEFT_DATA_DIR", data_dir).env(INGEST_CHILD_ENV, format!("{} {}", closed.name, closed.aspect.as_uuid())).env(fault::FAULT_ENV, format!("{point}:abort")).output()?;
 	assert!(!output.status.success(), "the child aborted: {output:?}");
 	#[cfg(unix)]
 	{

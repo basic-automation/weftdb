@@ -69,7 +69,7 @@ async fn seal_and_ingest_each_record_one_change_and_ack_deletes_by_epoch() -> Re
 
 async fn setup() -> Result<(TempDir, Database)> {
 	let temp_dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().unwrap());
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().unwrap());
 	let db_name = format!("change_db_{}", Uuid::new_v4());
 	let db = Database::new(&db_name).await?;
 	Ok((temp_dir, db))

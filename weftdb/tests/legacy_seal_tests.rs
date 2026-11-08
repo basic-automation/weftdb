@@ -27,7 +27,7 @@ fn bd(s: &str) -> BigDecimal {
 
 async fn setup() -> Result<(TempDir, Database)> {
 	let temp_dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().unwrap());
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().unwrap());
 	let db_name = format!("seal_db_{}", Uuid::new_v4());
 	let db = Database::new(&db_name).await?;
 	Ok((temp_dir, db))
