@@ -478,7 +478,7 @@ fn hash_selector(selector: &weftdb::SeriesSelector) -> u64 {
 		}
 		hasher.update(b"\0");
 	}
-	hasher.update([if selector.is_exact() { 1u8 } else { 0u8 }]);
+	hasher.update([u8::from(selector.is_exact())]);
 	let hash = hasher.finalize();
 	u64::from_le_bytes(hash[..8].try_into().unwrap())
 }
@@ -507,7 +507,7 @@ fn encode_cursor_v1(selector: &weftdb::SeriesSelector, timestamps: &[i64], value
 	if timestamps.is_empty() || next_offset >= total {
 		return None;
 	}
-	let high_water = *timestamps.iter().max().unwrap() as u64;
+	let high_water = timestamps.iter().max().copied().unwrap_or(0).cast_unsigned();
 	let s_hash = hash_selector(selector);
 	let fp = fingerprint_rows(timestamps, values);
 	Some(format!("01{s_hash:016x}{high_water:016x}{fp:016x}{:016x}", next_offset as u64))
@@ -527,14 +527,17 @@ fn decode_cursor_v1(cursor: &str, selector: &weftdb::SeriesSelector, timestamps:
 	let s_hash = parse_hex(2)?;
 	let high_water = parse_hex(18)?;
 	let fp = parse_hex(34)?;
+	// A cursor offset too large for `usize` cannot address a row on a 32-bit host,
+	// which is the truncation this cast admits to.
+	#[allow(clippy::cast_possible_truncation)]
 	let offset = parse_hex(50)? as usize;
 
 	if s_hash != hash_selector(selector) {
 		return Err(ApiError::server(crate::error::Code::CursorStale, "the cursor's tag selector hash does not match the request's selector — the cursor is bound to a different selector"));
 	}
-	let current_high_water = timestamps.iter().max().copied().unwrap_or(0) as u64;
+	let current_high_water = timestamps.iter().max().copied().unwrap_or(0).cast_unsigned();
 	if high_water != current_high_water {
-		return Err(ApiError::server(crate::error::Code::CursorStale, format!("the data in this window has changed since the cursor was issued (high-water mark {:?} vs {:?})", high_water, current_high_water)));
+		return Err(ApiError::server(crate::error::Code::CursorStale, format!("the data in this window has changed since the cursor was issued (high-water mark {high_water:?} vs {current_high_water:?})")));
 	}
 	let current_fp = fingerprint_rows(timestamps, values);
 	if fp != current_fp {
@@ -591,7 +594,7 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 	// Paginate + stringify under a serialize span: skip `offset` rows of the window,
 	// take at most `page_size`.  Borrow timestamps/values so they remain available
 	// for the cursor functions below.
-	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| timestamps.iter().zip(values.iter()).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp: *timestamp, value: value.as_ref().map(|v| v.to_string()) }).collect());
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.range.serialize", total, offset).in_scope(|| timestamps.iter().zip(values.iter()).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp: *timestamp, value: value.as_ref().map(std::string::ToString::to_string) }).collect());
 	let total_response = cursor_offset.is_none().then_some(total);
 	let next_cursor = encode_cursor_v1(&selector, &timestamps, &values, offset + points.len(), total);
 	Ok(Json(StoredRangeResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), total: total_response, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
@@ -633,10 +636,7 @@ fn resolve_pagination(offset: Option<usize>, limit: Option<usize>, take: Option<
 /// `(offset, page_size, page_echo)` triple that drives the slice.
 fn resolve_pagination_with_cursor(offset: Option<usize>, limit: Option<usize>, take: Option<usize>, page: Option<usize>, cursor: Option<usize>, limits: &read_limits::ReadLimits) -> Result<(usize, usize, Option<usize>), ApiError> {
 	let (pagination_offset, page_size, page) = resolve_pagination(offset, limit, take, page, limits)?;
-	match cursor {
-		Some(cursor_offset) => Ok((cursor_offset, page_size, None)),
-		None => Ok((pagination_offset, page_size, page)),
-	}
+	Ok(cursor.map_or((pagination_offset, page_size, page), |cursor_offset| (cursor_offset, page_size, None)))
 }
 
 /// Query parameters for the JSON value-range read: the inclusive `[lo, hi]` value
@@ -717,7 +717,7 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 		None => None,
 	};
 	let (offset, page_size, page) = resolve_pagination_with_cursor(params.offset, params.limit, params.take, params.page, cursor_offset, &limits)?;
-	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| timestamps.iter().zip(values.iter()).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp: *timestamp, value: value.as_ref().map(|v| v.to_string()) }).collect());
+	let points: Vec<StoredPoint> = tracing::info_span!("storage.value_range.serialize", total, offset).in_scope(|| timestamps.iter().zip(values.iter()).skip(offset).take(page_size).map(|(timestamp, value)| StoredPoint { timestamp: *timestamp, value: value.as_ref().map(std::string::ToString::to_string) }).collect());
 	let total_response = cursor_offset.is_none().then_some(total);
 	let next_cursor = encode_cursor_v1(&selector, &timestamps, &values, offset + points.len(), total);
 	Ok(Json(StoredRangeResponse { aspect, tags: target.tags, time_unit: schema.timestamp_unit.name(), total: total_response, count: points.len(), offset, limit: Some(page_size), page, next_cursor, points }))
