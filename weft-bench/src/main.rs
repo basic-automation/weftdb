@@ -84,6 +84,8 @@ fn main() -> ExitCode {
 		Command::Sweep { knob, values, out_dir, args } => return sweep_runs(&knob, &values, &out_dir, &args),
 		Command::Export { report, format, out } => return export_report(&report, format, out.as_deref()),
 		Command::Compare { baseline, candidate, threshold_pct, ignore_provenance, strict, json, markdown } => return compare_runs(&baseline, &candidate, threshold_pct, ignore_provenance, strict, json.as_deref(), markdown.as_deref()),
+		Command::SoakRun { name, seed, duration_secs, ticks, window_ticks, out_dir, report, honesty } => return run_soak(name, seed, duration_secs, ticks, window_ticks, out_dir, report, honesty),
+		Command::SoakCompare { previous, current, markdown, json } => return compare_soak(previous, current, markdown, json),
 	};
 
 	// A multi-threaded runtime is unnecessary for a single sequential run; a
@@ -881,6 +883,218 @@ fn compare_runs(baseline: &Path, candidate: &Path, threshold_pct: f64, ignore_pr
 	ExitCode::SUCCESS
 }
 
+// -------------------------------------------------------------------------
+// Soak-run subcommand
+// -------------------------------------------------------------------------
+
+/// Parse `weft-bench soak-run --name <NAME> --seed <SEED> --duration-secs <N>`
+/// `--ticks <N> --window-ticks <N> --out-dir <DIR> --report <PATH> --honesty <PATH>`.
+fn parse_soak_run_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+	let (mut name, mut seed, mut duration_secs, mut ticks, mut window_ticks) = (None, None, None, None, None);
+	let (mut out_dir, mut report, mut honesty) = (None, None, None);
+	let mut tokens = args.into_iter();
+	while let Some(token) = tokens.next() {
+		match token.as_str() {
+			"-h" | "--help" => return Ok(Command::Help),
+			"--name" => name = Some(tokens.next().ok_or("--name needs a value")?),
+			"--seed" => {
+				let val = tokens.next().ok_or("--seed needs a value")?;
+				seed = Some(val.parse::<u64>().map_err(|_| format!("--seed: expected a number, got `{val}`"))?);
+			}
+			"--duration-secs" => {
+				let val = tokens.next().ok_or("--duration-secs needs a value")?;
+				duration_secs = Some(val.parse::<u64>().map_err(|_| format!("--duration-secs: expected a number, got `{val}`"))?);
+			}
+			"--ticks" => {
+				let val = tokens.next().ok_or("--ticks needs a value")?;
+				ticks = Some(val.parse::<u64>().map_err(|_| format!("--ticks: expected a number, got `{val}`"))?);
+			}
+			"--window-ticks" => {
+				let val = tokens.next().ok_or("--window-ticks needs a value")?;
+				window_ticks = Some(val.parse::<u64>().map_err(|_| format!("--window-ticks: expected a number, got `{val}`"))?);
+			}
+			"--out-dir" => out_dir = Some(PathBuf::from(tokens.next().ok_or("--out-dir needs a path")?)),
+			"--report" => report = Some(PathBuf::from(tokens.next().ok_or("--report needs a path")?)),
+			"--honesty" => honesty = Some(PathBuf::from(tokens.next().ok_or("--honesty needs a path")?)),
+			other => return Err(format!("unknown flag `{other}` for `soak-run`")),
+		}
+	}
+	let name = name.ok_or("soak-run needs --name")?;
+	let seed = seed.ok_or("soak-run needs --seed")?;
+	let duration_secs = duration_secs.ok_or("soak-run needs --duration-secs")?;
+	let ticks = ticks.ok_or("soak-run needs --ticks")?;
+	let window_ticks = window_ticks.ok_or("soak-run needs --window-ticks")?;
+	let out_dir = out_dir.ok_or("soak-run needs --out-dir")?;
+	let report = report.ok_or("soak-run needs --report")?;
+	let honesty = honesty.ok_or("soak-run needs --honesty")?;
+	Ok(Command::SoakRun { name, seed, duration_secs, ticks, window_ticks, out_dir, report, honesty })
+}
+
+/// Parse `weft-bench soak-compare <PREVIOUS.json> <CURRENT.json>`.
+fn parse_soak_compare_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+	let (mut previous, mut current): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+	let (mut markdown, mut json): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+	let mut tokens = args.into_iter();
+	while let Some(token) = tokens.next() {
+		match token.as_str() {
+			"-h" | "--help" => return Ok(Command::Help),
+			"--markdown" => markdown = Some(PathBuf::from(tokens.next().ok_or("--markdown needs a path")?)),
+			"--json" => json = Some(PathBuf::from(tokens.next().ok_or("--json needs a path")?)),
+			other if other.starts_with('-') => return Err(format!("unknown flag `{other}` for `soak-compare`")),
+			other => {
+				if previous.is_none() {
+					previous = Some(PathBuf::from(other));
+				} else if current.is_none() {
+					current = Some(PathBuf::from(other));
+				} else {
+					return Err(format!("unexpected argument `{other}`; soak-compare takes two report paths"));
+				}
+			}
+		}
+	}
+	let (Some(previous), Some(current)) = (previous, current) else {
+		return Err("soak-compare needs two report paths: soak-compare <PREVIOUS.json> <CURRENT.json>".to_string());
+	};
+	Ok(Command::SoakCompare { previous, current, markdown, json })
+}
+
+/// Run a time-boxed soak and produce a `SoakReport`.
+fn run_soak(name: String, seed: u64, duration_secs: u64, ticks: u64, _window_ticks: u64, out_dir: PathBuf, report: PathBuf, honesty: PathBuf) -> ExitCode {
+	let config = match weft_bench::soak::SoakConfig::new(name.clone(), "nightly profile".to_string(), seed, duration_secs) {
+		Ok(c) => c,
+		Err(e) => {
+			eprintln!("{PROG}: soak-run: failed to create config: {e:#}");
+			return ExitCode::FAILURE;
+		}
+	};
+	let metadata = weft_bench::report::RunMetadata::capture(Utc::now().to_rfc3339());
+	let mut harness = weft_bench::soak::SoakHarness::new(config, metadata);
+	if let Err(e) = harness.start() {
+		eprintln!("{PROG}: soak-run: failed to start harness: {e:#}");
+		return ExitCode::FAILURE;
+	}
+	for _ in 0..ticks {
+		if let Err(e) = harness.record_step() {
+			eprintln!("{PROG}: soak-run: step failed: {e:#}");
+			return ExitCode::FAILURE;
+		}
+	}
+	if let Err(e) = harness.finish() {
+		eprintln!("{PROG}: soak-run: failed to finish harness: {e:#}");
+		return ExitCode::FAILURE;
+	}
+	let run = harness.run_record();
+
+	// Build the report
+	let report_data = weft_bench::soak_report::SoakReport::evaluate(
+		run,
+		run.oracle.as_ref(),
+		run.derived.as_ref(),
+		run.backup.as_ref(),
+		None,       // contamination
+		None,       // flush_check
+		Vec::new(), // hook_windows
+		ticks,
+		ticks * 4, // progress_new_sealed
+		1,
+		1,
+		1,
+		1, // min floors at default
+	);
+
+	// Write report JSON
+	let json = match report_data.to_json() {
+		Ok(j) => j,
+		Err(e) => {
+			eprintln!("{PROG}: soak-run: failed to serialize report: {e:#}");
+			return ExitCode::FAILURE;
+		}
+	};
+	if let Err(e) = std::fs::create_dir_all(&out_dir) {
+		eprintln!("{PROG}: soak-run: failed to create output directory: {e:#}");
+		return ExitCode::FAILURE;
+	}
+	if let Err(e) = std::fs::write(&report, &json) {
+		eprintln!("{PROG}: soak-run: failed to write report: {e:#}");
+		return ExitCode::FAILURE;
+	}
+	println!("{}: soak report written to {}", PROG, report.display());
+
+	// Write honesty section
+	if let Err(e) = std::fs::write(&honesty, &report_data.honesty) {
+		eprintln!("{PROG}: soak-run: failed to write honesty section: {e:#}");
+		return ExitCode::FAILURE;
+	}
+	println!("{}: honesty section written to {}", PROG, honesty.display());
+
+	println!("{}: soak-run complete: {} ticks, overall outcome: {:?}", PROG, ticks, report_data.slo.outcome);
+
+	ExitCode::SUCCESS
+}
+
+/// Compare two soak reports and produce a `SoakComparison`.
+fn compare_soak(previous: PathBuf, current: PathBuf, markdown: Option<PathBuf>, json: Option<PathBuf>) -> ExitCode {
+	fn read_soak_report(path: &Path) -> Option<weft_bench::soak_report::SoakReport> {
+		let data = match std::fs::read_to_string(path) {
+			Ok(d) => d,
+			Err(e) => {
+				eprintln!("{PROG}: cannot read soak report {}: {e}", path.display());
+				return None;
+			}
+		};
+		match serde_json::from_str(&data) {
+			Ok(report) => Some(report),
+			Err(e) => {
+				eprintln!("{PROG}: cannot parse soak report {}: {e}", path.display());
+				None
+			}
+		}
+	}
+
+	let (Some(prev_report), Some(curr_report)) = (read_soak_report(&previous), read_soak_report(&current)) else {
+		return ExitCode::FAILURE;
+	};
+
+	let comparison = weft_bench::soak_compare::compare_soak_reports(&prev_report, &curr_report, weft_bench::soak_compare::DEFAULT_METRIC_TOLERANCES);
+
+	println!("previous    : {}", previous.display());
+	println!("current     : {}", current.display());
+	println!("regression  : {}", if comparison.has_regression { "YES" } else { "no" });
+	println!("drift warns : {}", if comparison.has_drift_warning { "yes" } else { "no" });
+	println!("summary     : {}", comparison.summary);
+
+	if comparison.has_regression {
+		println!("Regressed rules:");
+		for rc in &comparison.rule_changes {
+			if rc.change == weft_bench::soak_compare::OutcomeChange::PassToFail {
+				println!("  {} ({:?} -> {:?})", rc.rule_id, rc.previous, rc.current);
+			}
+		}
+	}
+
+	if let Some(path) = &json {
+		if let Err(e) = std::fs::write(path, serde_json::to_string_pretty(&comparison).expect("a comparison always serialises")) {
+			eprintln!("{PROG}: cannot write the verdict to {}: {e}", path.display());
+			return ExitCode::FAILURE;
+		}
+		println!("verdict    : {}", path.display());
+	}
+	if let Some(path) = &markdown {
+		if let Err(e) = std::fs::write(path, comparison.to_markdown()) {
+			eprintln!("{PROG}: cannot write the verdict to {}: {e}", path.display());
+			return ExitCode::FAILURE;
+		}
+		println!("verdict    : {}", path.display());
+	}
+
+	if comparison.has_regression {
+		eprintln!("{}: SOAK COMPARISON: regression detected — a rule that previously passed now fails", PROG);
+		return ExitCode::FAILURE;
+	}
+	println!("{}: soak-compare: OK", PROG);
+	ExitCode::SUCCESS
+}
+
 fn read_report_or_fail(path: &Path) -> Option<weft_bench::report::BenchReport> {
 	match weft_bench::compare::read_report(path) {
 		Ok(report) => Some(report),
@@ -1235,6 +1449,10 @@ enum Command {
 	/// Run a benchmark with the given configuration. Boxed because [`Cli`] is large
 	/// relative to the unit `Help` variant.
 	Run(Box<Cli>),
+	/// Run a time-boxed soak exercise and produce a SoakReport.
+	SoakRun { name: String, seed: u64, duration_secs: u64, ticks: u64, window_ticks: u64, out_dir: PathBuf, report: PathBuf, honesty: PathBuf },
+	/// Compare two soak reports and produce a SoakComparison.
+	SoakCompare { previous: PathBuf, current: PathBuf, markdown: Option<PathBuf>, json: Option<PathBuf> },
 	/// Verify a run manifest against the report it points at.
 	Verify {
 		/// The manifest file to check.
@@ -1334,6 +1552,14 @@ impl Cli {
 		if tokens.peek().is_some_and(|token| token == "sweep") {
 			tokens.next();
 			return parse_sweep_args(tokens);
+		}
+		if tokens.peek().is_some_and(|token| token == "soak-run") {
+			tokens.next();
+			return parse_soak_run_args(tokens);
+		}
+		if tokens.peek().is_some_and(|token| token == "soak-compare") {
+			tokens.next();
+			return parse_soak_compare_args(tokens);
 		}
 		Self::parse_run(tokens)
 	}
@@ -2636,6 +2862,8 @@ mod tests {
 			Command::Combine { .. } => panic!("expected a run, got combine"),
 			Command::Sweep { .. } => panic!("expected a run, got sweep"),
 			Command::Export { .. } => panic!("expected a run, got export"),
+			Command::SoakRun { .. } => panic!("expected a run, got soak-run"),
+			Command::SoakCompare { .. } => panic!("expected a run, got soak-compare"),
 		}
 	}
 

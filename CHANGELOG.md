@@ -26,6 +26,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   file matches the generated output; regenerate with `weft-server openapi
   --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
   no `--out`, or writes to a named file.
+- **Nightly soak comparison gate (SOA-15).** A scheduled + dispatchable soak
+  workflow (`soak.yml`) builds the soak driver, runs a 15-minute soak,
+  evaluates the SoakReport against SLO rules R1–R8, and compares the result
+  to the previous night's artifact. A Pass→Fail rule regression turns the job
+  red; metric drift past documented tolerance produces `::warning::`
+  annotations. The comparison function lives in
+  `weft-bench/src/soak_compare.rs`, and the annotator script in
+  `scripts/annotate-soak-drift.py`. Documented in `docs/soak.md`.
 
 - **Performance methodology document.** `docs/methodology.md` defines what
   counts as a performance claim, what evidence a claim must carry, what
