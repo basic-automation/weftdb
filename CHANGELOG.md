@@ -110,6 +110,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- `weft-orchestration`'s seven slow tests are bounded by a 1200-second `tokio::time::timeout` each, so a hang names the test and fails the run instead of disappearing at the job's 60-minute cap (#404, #646). The bound is 3x the window in which all seven finished for real on a runner (357 s in the run where the seeded `Crypto` database was present); a push or pull-request run skips them, so the nightly schedule is what exercises them.
+
 - **A competitor result with no adapter report refuses to take part in a
   comparison (EVI-8B, #452).** `weft-bench compare` compared a `duckdb` arm whose
   `adapter_info` was `null` with a WeftDB arm and footnoted the missing attribution
@@ -121,6 +123,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weftdb-ingest` measure their own paths and honestly report no adapter, and because
   `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
   tested.
+
+- **Slow orchestration tests bounded by timeout (issue #404).** Seven
+  `weft-orchestration` tests that self-skip locally (Crypto-database guard)
+  now wrap their bodies in `tokio::time::timeout` within the CI job budget
+  (3600 s job timeout): `test_api` (60 s), `test_api_precise` (900 s),
+  `test_pipeline_api` (1500 s), `test_pipeline_api_precise` (600 s),
+  `test_batch_processing` (10 s), `test_specific_process_batch` (10 s) and
+  `test_pipeline_api_with_fake_db` (10 s). The predecessor's 3600 s bound
+  for `test_api_precise` could never fire before the job was killed; the
+  two 1800 s bounds triggered `clippy::duration_suboptimal_units`. All
+  corrected. Sum of worst-case sequential bounds: 3090 s, leaving ≈510 s
+  for compilation, teardown and crash verification. Durations measured
+  from run 40886128666.
 ## [0.3.2] - 2026-11-06
 
 ### Fixed
