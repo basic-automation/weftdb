@@ -68,6 +68,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **CI now pins every GitHub Action to a commit SHA.** A floating `uses:` (e.g.
+  `Swatinem/rust-cache@v2`) fails the static-check job. A new guard,
+  `scripts/ci/check-action-pinning.py`, scans every workflow on every push and
+  pull request. (#626)
 - **The OpenAPI drift gate no longer fails on a version bump (#620).**
   `generated_spec_matches_committed_file` now normalises `info.version` on
   both sides before comparing, so every path, method, scope, tier and schema
