@@ -138,12 +138,13 @@ impl SegmentStore {
 	pub async fn read_time_range_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
-		// Same quality prune as point reads — present-prune (`null_count < row_count`) so
-		// that nulls behave identically in both paths: an all-null segment is dropped before
-		// its file is opened, so the older value at that instant survives.  A newer segment
-		// that carries a non-null row at one timestamp and a null at another still overrides
-		// the older value with null at the null timestamp (issue #443).
-		let descriptors: Vec<SegmentDescriptor> = self.index.prune_series_present_rows(aspect, series, start, end).await?.into_iter().map(|row| row.desc).collect();
+		// Time-only prune (not present-prune): a segment whose every row is null still
+		// contributes its null rows to the answer, because a newer null must be able to
+		// override an older value at the same instant.  Point reads call
+		// `series_present_descriptors` instead (which uses present-prune), so all-null
+		// segments are skipped there — a null row is not a value — making point and
+		// range reads deliberately asymmetric for the all-null-newer case (issue #443).
+		let descriptors: Vec<SegmentDescriptor> = self.index.prune_series_rows_by_time(aspect, series, start, end).await?.into_iter().map(|row| row.desc).collect();
 		// Fold overlapping segments with **newer-wins** (upsert).  Descriptors are in seal
 		// (id) order, oldest first, matching the contract of `merge_newer_wins` where the
 		// second argument supersedes the first at any shared instant.  This makes a range

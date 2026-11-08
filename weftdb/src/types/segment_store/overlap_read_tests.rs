@@ -1,16 +1,20 @@
 //! Issue #443 [X-READ] — overlapping reads across pruned segments.
 //!
 //! When two sealed segments cover overlapping positions for the same series, a range read
-//! must return the **newer-wins** merge (last-writer-wins by seal id), matching the answer
-//! [`read_point`](SegmentStore::read_point) and
-//! [`read_points`](SegmentStore::read_points) already give across overlapping segments
-//! — and the answer [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) would fold
-//! them to.
+//! returns the **newer-wins** merge (last-writer-wins by seal id), including a newer null
+//! that overrides an older non-null value at the same instant.
 //!
-//! Three cases:
-//! 1. Same series, same positions, two segments.
-//! 2. A newer null over an older value, read back as a point read and as a range-read merge.
+//! Point reads keep their existing behaviour: the index is pruned by presence (all-null
+//! segments are dropped) and the loop skips `None` from the frame reader, so a newer null
+//! does **not** mask an older value.  The resulting asymmetry between range and point is
+//! deliberate (issue #443) and pinned by
+//! [`asymmetry_newer_all_null_over_older_value`].
+//!
+//! Cases:
+//! 1. Same series, same positions, two segments — newer value wins.
+//! 2. Newer null over an older value — range uses newer-wins, point keeps older.
 //! 3. Two different series split across overlapping segments (not merged together).
+//! 4. Asymmetry pinned: range returns `None` where point returns the older value.
 
 use std::{path::Path, str::FromStr};
 
@@ -72,12 +76,17 @@ async fn same_series_overlap_newer_wins() {
 }
 
 /// ------------------------------------------------------------------
-/// Case 2a: newer null over an older value — point read.
+/// Case 2a: newer null over an older value — point read (all-null newer).
 ///
-/// A newer segment with a null at a timestamp the older segment carried a value
-/// for must return None (null). The present-value quality prune drops segments whose
-/// every row is null (`null_count == row_count`), so a single-null segment is dropped
-/// and the older value survives — matching how point reads already work.
+/// The newer segment is entirely null (null_count == row_count).  The present-value
+/// quality prune drops it, so the older segment's value survives.  The deliberate
+/// asymmetry with the range read (where the same data returns `None`) is pinned
+/// by [`asymmetry_newer_all_null_over_older_value`].
+///
+/// The all-null segment's nulls cannot mask an older value here because the segment
+/// is never opened — present-prune (`null_count < row_count`) drops it from the
+/// point-read index query.  This is safe because a null row is not a value: the
+/// point-read loop (`if hit.is_some()`) skips `None` anyway.
 #[tokio::test]
 async fn newer_null_over_older_value_point_read() {
 	let dir = TempDir::new().expect("tempdir");
@@ -96,11 +105,12 @@ async fn newer_null_over_older_value_point_read() {
 }
 
 /// ------------------------------------------------------------------
-/// Case 2b: newer null over an older value — range read.
+/// Case 2b: newer null over an older value — range read (partially-null newer).
 ///
-/// A newer segment that has a null at one timestamp and a non-null at another is NOT
-/// fully null, so the present-value prune keeps it. At the null timestamp, the newer
-/// value (null) replaces the older value. At the non-null timestamp, the newer value wins.
+/// A newer segment that has a null at one timestamp and a non-null at another keeps
+/// the range read *time* prune (it is not fully null), so the newer segment's rows
+/// are opened and merged.  At the null timestamp the newer-wins merge gives `None`;
+/// at the non-null timestamp the newer value wins.
 #[tokio::test]
 async fn newer_null_over_older_value_range_read() {
 	let dir = TempDir::new().expect("tempdir");
@@ -119,11 +129,69 @@ async fn newer_null_over_older_value_range_read() {
 	assert_eq!(vs, vec![None, Some(bd("200"))], "newer null supersedes older value at 10; newer value 200 supersedes older 20 at 20");
 
 	// Point read at the null timestamp: the segment has 1 null + 1 present = 2 rows,
-	// null_count=1 < row_count=2, so it IS kept. The newer null beats the older 10.
-	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), None, "point read at 10: the newer segment carries a null at 10, so the answer is None");
+	// null_count=1 < row_count=2, so it IS kept. But the point-read loop skips `None`
+	// from the frame reader, so the older segment's value 10 survives (deliberate
+	// asymmetry, pinned by [`asymmetry_newer_all_null_over_older_value`]).
+	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), Some(bd("10")), "point read at 10: the loop skips None from the frame reader, so the older value survives — asymmetry with the range read");
 
 	// Point read at the non-null timestamp: newer value 200 wins.
 	assert_eq!(store.read_point(ASPECT, 20).await.expect("point at 20"), Some(bd("200")));
+
+	drop(store);
+}
+
+/// ------------------------------------------------------------------
+/// Case 2c: asymmetry — all-null newer segment vs range read (deliberate).
+///
+/// A newer segment whose every row is null (null_count == row_count) over an older
+/// value at the same instant.  The range read uses *time* prune so it opens the
+/// all-null segment and the newer-wins merge returns `None`.  The point read uses
+/// *present* prune so it drops the all-null segment and returns the older value.
+/// This asymmetry is intentional (issue #443).
+#[tokio::test]
+async fn asymmetry_newer_all_null_over_older_value() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+
+	// Older segment: timestamp 10 -> value 10, timestamp 20 -> value 20
+	ingest(&store, "a", &[10, 20], &[bd("10"), bd("20")]).await;
+	// Newer segment: timestamp 10 -> null, timestamp 20 -> null (all-null)
+	store.seal_nullable(ASPECT, &schema(), &[10, 20], &[None, None]).await.expect("seals all-null");
+
+	// Range read: *time* prune opens the all-null segment, newer-wins gives `None` at both.
+	let (ts, vs) = store.read_time_range(ASPECT, 10, 20).await.expect("range read");
+	assert_eq!(ts, vec![10, 20], "timestamps deduplicated");
+	assert_eq!(vs, vec![None, None], "range: newer all-null segment's nulls mask older values");
+
+	// Point read: *present* prune drops the all-null segment, older value at 10 survives.
+	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), Some(bd("10")), "point: all-null segment dropped, older value survives — deliberate asymmetry");
+
+	drop(store);
+}
+
+/// ------------------------------------------------------------------
+/// Case 2d: older segment's row survives when newer segment has NO row at that instant.
+///
+/// The newer segment has a row at timestamp 20 but no row at 10.  The older segment's
+/// row at 10 must survive in both range and point reads.
+#[tokio::test]
+async fn older_row_survives_when_newer_has_no_row() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+
+	// Older segment: timestamp 10 -> value 10
+	ingest(&store, "a", &[10], &[bd("10")]).await;
+	// Newer segment: timestamp 20 -> value 20 (no row at 10)
+	ingest(&store, "b", &[20], &[bd("20")]).await;
+
+	// Range read: [10, 20] — both rows survive, no overlap.
+	let (ts, vs) = store.read_time_range(ASPECT, 10, 20).await.expect("range read");
+	assert_eq!(ts, vec![10, 20], "both timestamps");
+	assert_eq!(vs, vec![Some(bd("10")), Some(bd("20"))], "both values survive");
+
+	// Point reads agree.
+	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), Some(bd("10")));
+	assert_eq!(store.read_point(ASPECT, 20).await.expect("point at 20"), Some(bd("20")));
 
 	drop(store);
 }

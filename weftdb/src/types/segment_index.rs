@@ -535,10 +535,11 @@ impl SegmentIndexStore {
 	/// [`prune_rows_by_time`](Self::prune_rows_by_time) scoped to one series (TAG-8): only
 	/// the rows whose `series_id` is `series`.
 	///
-	/// `#[cfg(test)]`, following [`prune_present_rows`](Self::prune_present_rows): a range
-	/// read now prunes by presence rather than by time alone, so the only callers left are
-	/// the tests below.
-	#[cfg(test)]
+	/// Used by range reads, which must see **all** overlapping segments (including
+	/// all-null ones) so a newer null can override an older value at the same instant
+	/// (issue #443).  Point reads and downsampling call
+	/// [`prune_series_present_rows`](Self::prune_series_present_rows) instead, which drops
+	/// all-null segments via `PRESENT_FILTER`.
 	pub(crate) async fn prune_series_rows_by_time(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<Vec<IndexRow>> {
 		self.prune_rows(aspect, Some(series), start, end, "").await
 	}
@@ -551,15 +552,14 @@ impl SegmentIndexStore {
 	/// [`prune_present_by_time`](weft_physical_type::prune_present_by_time): the quality
 	/// test rides the same SQL `WHERE` as the time test (`null_count < row_count`, both
 	/// columns written at seal from the frame's own stats), so a fully null segment is
-	/// dropped by libSQL and its `.weftseg` is never read, checksummed or decoded. A
-	/// point lookup returns the same answer with it or without it — a null row is not a
-	/// value — which is what makes the skip safe for
-	/// [`read_point`](crate::SegmentStore::read_point) and
-	/// [`read_points`](crate::SegmentStore::read_points).
+	/// dropped by libSQL and its `.weftseg` is never read, checksummed or decoded.
 	///
-	/// It is deliberately **not** a drop-in for [`prune_by_time`](Self::prune_by_time):
-	/// a row whose value is null is still a row, so a range read — which returns
-	/// `None`s — must keep the segments this one drops.
+	/// Used by point reads ([`read_point`](crate::SegmentStore::read_point) and
+	/// [`read_points`](crate::SegmentStore::read_points)), which skip `None` from the
+	/// frame reader anyway, so dropping an all-null segment is still correct: the older
+	/// segment's present value survives.  Range reads must **not** use this prune — they
+	/// call [`prune_series_rows_by_time`](Self::prune_series_rows_by_time) instead, so a
+	/// newer null can override an older value at the same instant (issue #443).
 	///
 	/// # Errors
 	///
@@ -590,8 +590,14 @@ impl SegmentIndexStore {
 		self.prune_rows(aspect, None, start, end, PRESENT_FILTER).await
 	}
 
-	/// The aspect-wide present prune above, scoped to one series (TAG-8). This is what
-	/// every store read uses; the aspect-wide form survives only under `#[cfg(test)]`.
+	/// The present-values prune scoped to one series (TAG-8).
+	///
+	/// Used by point reads (`series_present_descriptors`), which need only segments that
+	/// carry at least one non-null row — an all-null segment that overlaps an older one is
+	/// dropped here, and the point loop's `if hit.is_some()` skips the `None` the frame
+	/// reader would have returned, so the older segment's value survives.  Range reads
+	/// must **not** call this; they call
+	/// [`prune_series_rows_by_time`](Self::prune_series_rows_by_time) instead.
 	pub(crate) async fn prune_series_present_rows(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<Vec<IndexRow>> {
 		self.prune_rows(aspect, Some(series), start, end, PRESENT_FILTER).await
 	}
