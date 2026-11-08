@@ -115,6 +115,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weftdb-ingest` measure their own paths and honestly report no adapter, and because
   `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
   tested.
+
+- **Slow orchestration tests bounded by timeout (issue #404).** Seven
+  `weft-orchestration` tests that self-skip locally (Crypto-database guard)
+  now wrap their bodies in `tokio::time::timeout` at ten times their CI wall
+  time: `test_api` (60 s), `test_api_precise` (3600 s),
+  `test_pipeline_api` (1800 s), `test_pipeline_api_precise` (1800 s),
+  `test_batch_processing` (10 s), `test_specific_process_batch` (10 s) and
+  `test_pipeline_api_with_fake_db` (10 s). Durations measured from run
+  40886128666.
 ## [0.3.2] - 2026-11-06
 
 ### Fixed
