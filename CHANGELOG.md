@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Fixed
+- **`host-install.yml` carried the one unpinned action on `main` (#626).**
+  `.github/workflows/host-install.yml:67` still asked for `Swatinem/rust-cache@v2`
+  while every other workflow was pinned to `e9d7b9f1` by #628, because the workflow
+  arrived in #596 after that branch was cut. It merged into a tree that already had
+  `scripts/ci/check-action-pinning.py`, so `main` went red on the pinning gate the
+  moment it landed — the gate works, the merge queue just did not re-run it.
 
 ### Removed
 
