@@ -18,6 +18,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   did will now find it ignored, with `WEFT_DATA_DIR` as the migration.
 ### Added
 
+- **The frame-fault policy is verified (ROB-22/C5).** The three behaviours of
+  the C5 policy are now pinned by tests: a suspect frame is excluded from
+  reads, a suspect frame is never auto-purged by maintenance, and a corrupt
+  frame is quarantined and then TTL-purged. The first was previously asserted
+  only through the recovery report, and the third not at all. (#446)
+
 - **Generated OpenAPI document from the route registry (FRE-9a).** The
   document at `compat/openapi/weftdb.json` is built from the same
   `RouteTable` the HTTP router serves, so every path, method, scope,
