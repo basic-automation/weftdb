@@ -53,6 +53,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weftdb-client` Rust SDK, storage format, CLI, configuration, metrics), what the compat
   suite actually tests, and the promises the repo does not yet support. Linked from
   `README.md` and `docs/reference.md`. (#331)
+- **UPGRADING.md and the upgrade/rollback compat legs (PAC-14a).**
+  [`UPGRADING.md`](UPGRADING.md) documents the layout 1→2 upgrade, rollback
+  procedures and version support window. The v0.1.0 release pin in
+  `compat/releases.toml` carries `legs = ["upgrade", "rollback"]`; the upgrade
+  leg is tested by `weftdb/tests/compat_v010.rs`, and the rollback-after-writes
+  leg is documented as aspirational.
 
 - **The measurement rules are wired to the figures they govern (EVI-6, #430).**
   `tools/check_claims.py` now fails when the claims document never links
