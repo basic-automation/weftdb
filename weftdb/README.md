@@ -73,6 +73,9 @@ library crates of this workspace are released together, on crates.io since 0.2.0
 [RELEASING.md](https://github.com/basic-automation/weftdb/blob/main/RELEASING.md) says what
 a release publishes.
 
+See [**`docs/stability.md`**](docs/stability.md) for the full stability and versioning
+policy — what is stable, what is experimental, and what is not yet guaranteed.
+
 Part of [WeftDB](https://github.com/basic-automation/weftdb) — the roadmap for what is
 finished and what is planned is
 [ROADMAP.md](https://github.com/basic-automation/weftdb/blob/main/ROADMAP.md).
