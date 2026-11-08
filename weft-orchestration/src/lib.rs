@@ -1462,7 +1462,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_secs(60), async {
+		tokio::time::timeout(std::time::Duration::from_mins(20), async {
 			// Point this binary at its test data dir before opening anything. A plain statement,
 			// never a log field: tracing evaluates fields only for enabled events, so under a
 			// filter without info `Database::existing` would resolve the real ~/.weftdb/data.
@@ -1712,7 +1712,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_api timed out after 60s"))?
+		.map_err(|_| anyhow::anyhow!("test_api timed out after 1200s (#404)"))?
 	}
 
 	/// Test using the new Pipeline API - mirrors `test_api` but uses the fluent builder pattern
@@ -1728,7 +1728,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_mins(25), async {
+		tokio::time::timeout(std::time::Duration::from_mins(20), async {
 			// Point this binary at its test data dir before opening anything, as a plain statement
 			// (see `test_api`).
 			let crypto = data_dir().join("Crypto");
@@ -1923,7 +1923,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_pipeline_api timed out after 1500s"))?
+		.map_err(|_| anyhow::anyhow!("test_pipeline_api timed out after 1200s (#404)"))?
 	}
 
 	#[tokio::test]
@@ -1939,7 +1939,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_mins(15), async {
+		tokio::time::timeout(std::time::Duration::from_mins(20), async {
 			let db = fake_database().await;
 			let subjects = db.list_subjects().await?;
 			let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
@@ -2106,7 +2106,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_api_precise timed out after 900s"))?
+		.map_err(|_| anyhow::anyhow!("test_api_precise timed out after 1200s (#404)"))?
 	}
 
 	/// Test using the Pipeline API with `fake_database` - mirrors `test_api_precise`
@@ -2122,7 +2122,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_mins(10), async {
+		tokio::time::timeout(std::time::Duration::from_mins(20), async {
 			let db = fake_database().await;
 			let subjects = db.list_subjects().await?;
 			let subject = subjects.iter().find(|(_, name)| name.as_str() == "TestSubject").map(|(id, _)| *id).ok_or_else(|| anyhow::anyhow!("Subject 'TestSubject' not found"))?;
@@ -2288,7 +2288,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_pipeline_api_precise timed out after 600s"))?
+		.map_err(|_| anyhow::anyhow!("test_pipeline_api_precise timed out after 1200s (#404)"))?
 	}
 
 	/// Generate test data points with peaks every 4 hours
@@ -2349,7 +2349,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_secs(10), async {
+		tokio::time::timeout(std::time::Duration::from_mins(20), async {
 			remove_database("test_bath_processing");
 
 			let db = Database::new("test_bath_processing").await.unwrap();
@@ -2407,7 +2407,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_batch_processing timed out after 10s"))?
+		.map_err(|_| anyhow::anyhow!("test_batch_processing timed out after 1200s (#404)"))?
 	}
 
 	#[tokio::test]
@@ -2419,7 +2419,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_secs(10), async {
+		tokio::time::timeout(std::time::Duration::from_mins(20), async {
 			remove_database("test_specific_process_batch");
 
 			let db = Database::new("test_specific_process_batch").await.unwrap();
@@ -2477,7 +2477,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_specific_process_batch timed out after 10s"))?
+		.map_err(|_| anyhow::anyhow!("test_specific_process_batch timed out after 1200s (#404)"))?
 	}
 
 	async fn create_peak_detection_events(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<()> {
@@ -2581,7 +2581,7 @@ mod tests {
 			return Ok(());
 		}
 
-		tokio::time::timeout(std::time::Duration::from_secs(10), async {
+		tokio::time::timeout(std::time::Duration::from_mins(20), async {
 			// Use the fake database for testing
 			let db = fake_database().await;
 			let subjects = db.list_subjects().await?;
@@ -2672,7 +2672,7 @@ mod tests {
 			Ok(())
 		})
 		.await
-		.map_err(|_| anyhow::anyhow!("test_pipeline_api_with_fake_db timed out after 10s"))?
+		.map_err(|_| anyhow::anyhow!("test_pipeline_api_with_fake_db timed out after 1200s (#404)"))?
 	}
 
 	#[tokio::test]

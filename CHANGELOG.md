@@ -104,6 +104,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- `weft-orchestration`'s seven slow tests are bounded by a 1200-second `tokio::time::timeout` each, so a hang names the test and fails the run instead of disappearing at the job's 60-minute cap (#404, #646). The bound is 3x the window in which all seven finished for real on a runner (357 s in the run where the seeded `Crypto` database was present); a push or pull-request run skips them, so the nightly schedule is what exercises them.
+
 - **A competitor result with no adapter report refuses to take part in a
   comparison (EVI-8B, #452).** `weft-bench compare` compared a `duckdb` arm whose
   `adapter_info` was `null` with a WeftDB arm and footnoted the missing attribution
