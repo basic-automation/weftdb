@@ -14,6 +14,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   variable is documented, the version markers agree, and the checker runs in the `claims`
   CI job. (#pending)
 
+- **Security documentation updated (SEC-14).** `docs/security.md` rewritten with source
+  citations to `weft-server/src/auth.rs`, `tls.rs`, `host_guard.rs`, `audit.rs`,
+  `settings.rs`, `routes.rs`, `main.rs`, and `cli.rs`. Adds the full six-role table,
+  credential-in-query guard, proxy guard, exit statuses, startup enforcement section,
+  and a section on security-relevant absences. See the branch diff for the full delta
+  from the previous version of the document.
+
 - **Operator documentation** ([docs/operations.md](docs/operations.md)) — backup and
   restore, systemd, container, upgrade, and failure modes with what to do.
 - **SOA-15 honest bookkeeping for TTL lane.** `docs/soak.md` and `ROADMAP.md` now
