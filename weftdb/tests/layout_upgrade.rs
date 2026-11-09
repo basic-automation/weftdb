@@ -13,7 +13,29 @@
 //! column-by-column DDL, store_meta mirroring, frame paths, etc.) — this suite checks
 //! the outcome a documented API user cares about.
 //!
-//! [`a_layout_1_store_upgrades_to_layout_2_and_accepts_new_writes`]: https://github.com/weftdb/weftdb/blob/main/weftdb/src/types/segment_store.rs
+//! # On-disk difference between layout 1 and layout 2
+//!
+//! `LEGACY_LAYOUT = 1`, `SUPPORTED_LAYOUT = 2`. The marker (`STORE_FORMAT` JSON) is the
+//! **only** on-disk difference the store makes between layouts — there is no byte-level
+//! marker (`WEFTL1\n`) or separate data format version. The `0001_baseline` migration
+//! creates the control-plane databases (`segment_index.db`, `aspect_catalog.db`,
+//! `metadata.db`, `catalog.db`); later migrations add tables/columns to them. No
+//! migration rewrites existing segment frames, so data preservation across an upgrade is
+//! a weak claim: the frames never change, and the index entries created by
+//! `seal_legacy_layout` survive because no migration drops columns from `SegmentV1`'s
+//! schema.
+//!
+//! **What this means for tests**: the `synthetic_marker_layout_1_detected_and_upgraded`
+//! test rewrites the JSON marker alone — it cannot prove the migrations handle a
+//! genuinely old segment shape. The `pre_v2_store` fixture (a real pre-marker root) does
+//! exercise `seal_legacy_layout` segment paths and the full migration pipeline.
+//!
+//! # Reversibility
+//!
+//! `docs/upgrade-notes.md` (§v0.1.0 → v0.2.0) promises the upgrade is one-way and
+//! warns against running v0.1.0 on a migrated store. The migration is NOT tested for
+//! reversibility — no test in this file or elsewhere verifies that a layout-2 store can
+//! be rolled back to a layout-1-only binary. Doing so would need a v0.1.0 binary in CI.
 //!
 //! # Fixture
 //!
@@ -26,7 +48,7 @@ use std::path::{Path, PathBuf};
 
 use bigdecimal::BigDecimal;
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-use weftdb::{SegmentStore, StoreFormat, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
+use weftdb::{migrations, SegmentStore, StoreFormat, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -230,7 +252,8 @@ async fn write_and_read_after_upgrade_works() {
 }
 
 /// A synthetic store whose marker is rewritten to layout 1 is detected as
-/// migrating from layout 1 on the next open.
+/// migrating from layout 1 on the next open, OR the migration list surprises a
+/// future developer who moved a migration without updating the doc comment.
 ///
 /// This tests the **marker-based** detection path (a `STORE_FORMAT` whose
 /// `layout_version` is 1), which is separate from the no-marker path the
@@ -239,8 +262,25 @@ async fn write_and_read_after_upgrade_works() {
 /// at layout 2 and only its marker was downgraded. A store that was never
 /// migrated needs a fixture written by an older binary — see `compat/fixtures` or
 /// `tests/fixtures/pre_v2_store`.
+///
+/// The `after(REGISTRY, Some("0001_baseline"))` assertion replaces the obvious
+/// `assert_eq!(..layout_version, SUPPORTED_LAYOUT)` — which cannot fail because
+/// `SUPPORTED_LAYOUT` is the constant the code uses — with a check that breaks if
+/// migrations are added, removed, or reordered without updating this list.
 #[tokio::test]
 async fn synthetic_marker_layout_1_detected_and_upgraded() {
+	// First, pin the migrations that run after "0001_baseline" (layout 1's only
+	// migration). Future changes that add or reorder migrations must update this
+	// list or the test fails — it is the developer's signal to check whether the
+	// upgrade doc comment still matches.
+	let after_baseline: Vec<&str> = migrations::after(migrations::REGISTRY, Some("0001_baseline")).iter().map(|m| m.id).collect();
+	assert_eq!(
+		after_baseline,
+		["0002_s6_s7", "0003_fre14_legacy_catalog", "0004_d_s12", "0005_d_s13", "0006_tag5_series", "0007_series_time_index", "0008_upsert_keys",],
+		"the migrations after '0001_baseline' are the ones a layout-1 upgrade runs; \
+		 adding or reordering migrations must update the doc comment and this assertion"
+	);
+
 	let dir = tempfile::TempDir::new().expect("a temp directory");
 	let root = dir.path().join("store");
 
@@ -269,33 +309,33 @@ async fn synthetic_marker_layout_1_detected_and_upgraded() {
 		 migrated_from = Some(1)"
 	);
 	assert_eq!(store2.store_uuid(), original_uuid, "the store_uuid is unchanged after the upgrade");
-	assert_eq!(store2.store_format().layout_version, SUPPORTED_LAYOUT, "after reopening, the store is back to layout {}", SUPPORTED_LAYOUT);
 	drop(store2);
 }
 
-/// The reverse direction is exerciseable only by a binary that knows only layout
-/// 1: the current build supports layout 2, so it never refuses its own store.
+/// A store whose marker says `min_write_layout=2` is refused by a build that
+/// understands only layout 1, via [`StoreFormat::writable_by`].
 ///
-/// What would be needed to test this end-to-end: an older build (tagged at layout
-/// 1) that opens a store whose marker has `min_write_layout` > 1. Until CI is
-/// wired for cross-version compatibility, the gate code path is exercised by
-/// `StoreFormat::writable_by` in unit tests within the crate.
-#[doc(hidden)]
+/// This pins the downgrade-refusal contract in-process. What it cannot exercise:
+/// the actual open path in a layout-1-only binary loading a layout-2 marker — that
+/// needs a cross-version CI job with a v0.1.0 build.
+///
+/// Reversibility of the 1→2 upgrade is **not tested**. `docs/upgrade-notes.md`
+/// (§v0.1.0 → v0.2.0) labels the upgrade one-way and warns against running v0.1.0
+/// on a migrated store, but no test in this file or elsewhere verifies that a
+/// layout-2 store can be safely rolled back.
 #[tokio::test]
-async fn reverse_direction_refusal_is_tested_internally() {
-	// This test exists so the test runner lists it and a reader sees the note.
-	// The actual refusal is pinned by:
-	//
-	// - `StoreFormat::writable_by` unit tests in `store_format.rs`
-	// - The `IncompatibleLayout` error returned by `open_preflight`
-	//
-	// A cross-version binary test would need a layout-1 build and a layout-2 store:
-	//   image A (layout 1 only) → opens store B (min_write_layout=2) → error.
+async fn layout_2_store_is_refused_by_writable_by_1() {
 	let format_v2 = StoreFormat { layout_version: 2, min_read_layout: 2, min_write_layout: 2, last_written_layout: 2, migrating_to: None, applied_through: Some("0008_upsert_keys".into()), store_uuid: "test".into(), kind: "weftdb-store".into(), scope: weftdb::StoreScope { database: "default".into(), subject: "default".into() } };
 	assert!(
 		!format_v2.writable_by(1),
-		"StoreFormat with min_write_layout=2 is NOT writable_by(1) — \
-		 a layout-1-only binary refuses the store before opening anything. \
-		 This is the contract; cross-version integration needs a layout-1 build."
+		"a StoreFormat with min_write_layout=2 is NOT writable_by(1) — \
+		 a layout-1-only binary must refuse the store before opening anything"
+	);
+	// Also verify the symmetric case works (a layout-1 marker IS writable by build 2).
+	let format_v1 = StoreFormat { layout_version: 1, min_read_layout: 1, min_write_layout: 1, last_written_layout: 1, migrating_to: None, applied_through: None, store_uuid: "test".into(), kind: "weftdb-store".into(), scope: weftdb::StoreScope { database: "default".into(), subject: "default".into() } };
+	assert!(
+		format_v1.writable_by(2),
+		"a StoreFormat with min_write_layout=1 IS writable_by(2) — \
+		 a layout-2 build opens a layout-1 store (which triggers the upgrade)"
 	);
 }
