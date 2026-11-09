@@ -133,6 +133,11 @@ struct Recorded {
 /// their own shapes and are left as the record they are, so a parser that met them would
 /// be inventing a meaning. Section kinds that are not row lists keep their bodies out of
 /// `rows`.
+fn colliding_timestamps(rows: &[(i64, Option<String>)]) -> BTreeSet<i64> {
+	let counts: BTreeMap<i64, usize> = rows.iter().fold(Default::default(), |mut m, (t, _)| { *m.entry(*t).or_default() += 1; m });
+	counts.into_iter().filter(|(_, n)| *n > 1).map(|(t, _)| t).collect()
+}
+
 fn recorded_reads() -> Vec<Recorded> {
 	let text = std::fs::read_to_string(fixture().join("expected_reads.txt")).expect("the recorded reads are part of the fixture");
 	let mut sections = Vec::new();
@@ -213,8 +218,30 @@ async fn a_v010_store_migrates_forward_and_keeps_reading_its_own_values() {
 		let (start, end) = (query["start"].parse::<i64>().expect("a recorded start"), query["end"].parse::<i64>().expect("a recorded end"));
 		let (timestamps, values) = store.read_time_range(&section.aspect, start, end).await.unwrap_or_else(|err| panic!("reading {} [{start},{end}] out of the v0.1.0 store: {err}", section.aspect));
 		let got: Vec<(i64, Option<String>)> = timestamps.iter().zip(values.iter()).map(|(ts, value)| (*ts, value.as_ref().map(|v| canonical(&v.to_string())))).collect();
-		let want: Vec<(i64, Option<String>)> = section.rows.iter().map(|(ts, value)| (*ts, value.as_ref().map(|v| canonical(v)))).collect();
-		assert_eq!(got, want, "the window `GET /api/v1/storage/{}/{}?{}` answered one way at v0.1.0 and another here", section.aspect, section.kind, section.query);
+		// v0.1.0 returned a timestamp once per row it saw, so its collide handling (#443's
+		// bug) emitted duplicates. From here the window is checked as a set under
+		// last-writer-wins, not as a positional replay of the v0.1.0 body.
+		let want_ts: BTreeSet<i64> = section.rows.iter().map(|(ts, _)| *ts).collect();
+		assert_eq!(timestamps.len(), want_ts.len(), "each recorded timestamp must answer exactly once (issue #443): {} of {} came back", timestamps.len(), want_ts.len());
+		assert_eq!(timestamps.iter().copied().collect::<BTreeSet<_>>(), want_ts, "the same timestamps v0.1.0 answered must survive the newest-wins fold, nothing gained or lost: `GET /api/v1/storage/{}/{}/{}?{}`", section.aspect, section.kind, section.query);
+
+		// The golden still pins the shared majority byte-for-byte: rows that did NOT collide
+		// must read exactly as v0.1.0 answered them.
+		let colliding = colliding_timestamps(&section.rows);
+		for (ts, value) in &got {
+			if !colliding.contains(ts) {
+				let want = section.rows.iter().find(|(t, _)| t == ts).expect("a non-colliding ts is recorded").1.as_ref().map(|v| canonical(v));
+				assert_eq!(*value, want, "a non-colliding row must read as v0.1.0 answered it: {} @ {}", section.aspect, ts);
+			}
+		}
+
+		// #443's whole point: the range now equals the point beside it. The golden has no
+		// seal order, so the winner is recomputed from this build's point read, not baked in.
+		for ts in colliding {
+			let point = store.read_point(&section.aspect, ts).await.unwrap_or_else(|e| panic!("read_point({ts}): {e:#}")).as_ref().map(|v| canonical(&v.to_string()));
+			let range = got.iter().find(|(t, _)| *t == ts).expect("returned").1.clone();
+			assert_eq!(range, point, "range of {} @ {ts} must equal the point read beside it \u{2014} newest wins (issue #443)", section.aspect);
+		}
 		replay.push((section.aspect, start, end, got));
 	}
 
@@ -251,13 +278,20 @@ async fn a_v010_aspect_keeps_its_declared_encoding_and_its_nulls() {
 	assert_eq!(schema.value, PhysicalType::ScaledI64 { scale: 4 }, "`price` was declared scaled_i64 with scale 4; this build recovered {:?}", schema.value);
 	assert_eq!(schema.value_tolerance.to_string(), "0", "the fixture declared an exact encoding");
 
-	// The fixture's `temp` aspect holds seven null rows, sealed by a version that predates
-	// this build's quality-mask handling; a null must still read as a null, not as zero and
-	// not as a missing row.
+	// The fixture's `temp` aspect holds six distinct null timestamps, sealed by a version
+	// that predates this build's quality-mask handling; a null must still read as a null,
+	// not as zero and not as a missing row.
 	let (timestamps, values) = store.read_time_range("temp", 1_767_225_600, 1_767_232_999).await.expect("reading temp");
 	let nulls = values.iter().filter(|value| value.is_none()).count();
-	assert_eq!(timestamps.len(), 72, "temp holds 60 grid rows plus a 12-row out-of-order batch");
-	assert_eq!(nulls, 7, "seven of them are null; this build reads {nulls}");
+	assert_eq!(timestamps.len(), 60, "temp holds 60 distinct grid timestamps; the 12-row out-of-order batch re-sealed the same instants, and a range read answers each once (issue #443)");
+	assert_eq!(nulls, 6, "six grid rows are null; this build reads {nulls}");
+	let distinct: BTreeSet<i64> = timestamps.iter().copied().collect();
+	assert_eq!(distinct.len(), timestamps.len(), "a range read must not repeat a timestamp across the out-of-order batch (issue #443)");
+	for ts in (0..12).map(|i| 1_767_231_360 + i * 120) {
+		let point = store.read_point("temp", ts).await.expect("point beside range").map(|v| canonical(&v.to_string()));
+		let range = timestamps.iter().position(|&t| t == ts).map(|i| values[i].as_ref().map(|v| canonical(&v.to_string()))).flatten();
+		assert_eq!(range, point, "range of temp @ {ts} must equal the point read beside it (issue #443)");
+	}
 
 	let at = store.read_point("price", 1_767_225_660).await.expect("reading one point").expect("that timestamp is in the fixture");
 	drop(store);

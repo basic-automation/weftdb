@@ -132,6 +132,10 @@ impl SegmentStore {
 	/// [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED). A series with no rows (or an id
 	/// the aspect never registered) reads empty.
 	///
+	/// Cross-segment duplicate timestamps resolve newest-wins, equal to the point read
+	/// and the reconcile merge. A single segment that is internally non-monotonic or
+	/// self-duplicating is a corruption case, not handled by this path.
+	///
 	/// # Errors
 	///
 	/// As [`read_time_range`](Self::read_time_range).

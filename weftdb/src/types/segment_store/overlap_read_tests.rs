@@ -78,13 +78,13 @@ async fn same_series_overlap_newer_wins() {
 /// ------------------------------------------------------------------
 /// Case 2a: newer null over an older value — point read (all-null newer).
 ///
-/// The newer segment is entirely null (null_count == row_count).  The present-value
+/// The newer segment is entirely null (`null_count` == `row_count`).  The present-value
 /// quality prune drops it, so the older segment's value survives.  The deliberate
 /// asymmetry with the range read (where the same data returns `None`) is pinned
 /// by [`asymmetry_newer_all_null_over_older_value`].
 ///
 /// The all-null segment's nulls cannot mask an older value here because the segment
-/// is never opened — present-prune (`null_count < row_count`) drops it from the
+/// is never opened — present-prune (`null_count` < `row_count`) drops it from the
 /// point-read index query.  This is safe because a null row is not a value: the
 /// point-read loop (`if hit.is_some()`) skips `None` anyway.
 #[tokio::test]
@@ -143,7 +143,7 @@ async fn newer_null_over_older_value_range_read() {
 /// ------------------------------------------------------------------
 /// Case 2c: asymmetry — all-null newer segment vs range read (deliberate).
 ///
-/// A newer segment whose every row is null (null_count == row_count) over an older
+/// A newer segment whose every row is null (`null_count` == `row_count`) over an older
 /// value at the same instant.  The range read uses *time* prune so it opens the
 /// all-null segment and the newer-wins merge returns `None`.  The point read uses
 /// *present* prune so it drops the all-null segment and returns the older value.
