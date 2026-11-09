@@ -347,7 +347,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 - [ ] **W11 · Contract candidate, beta tag, calibration**
   - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
   - [ ] **FRE-9b** OpenAPI
-    - [ ] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh` accepts only `vX.Y.Z` and `vX.Y.Z-rc.N` today, so a beta …
+    - [x] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh` accepts only `vX.Y.Z` and `vX.Y.Z-rc.N` today, so a beta …
     - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*
   - [ ] → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh`
   - [ ] **FRE-10b** Contract tests

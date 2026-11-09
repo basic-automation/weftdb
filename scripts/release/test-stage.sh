@@ -105,7 +105,9 @@ refuses reason:"missing file: $tmp/nobundle/THIRD-PARTY-LICENSES.md" \
 refuses "archive with a missing binary" \
 	"$stage" archive x86_64-unknown-linux-gnu v1.2.3 "$tmp/nowhere" "$src" "$tmp/other"
 linux_bin=$tmp/bin/x86_64-unknown-linux-gnu
-for bad in 'v1.2.3;id' v1.2.3-beta.1 v01.2.3 v1.2.3-dryrun-abc v1.2.3-dryrun-0123456789ab-release \
+check "archive with the beta label v1.2.3-beta.1" \
+	"$stage" archive x86_64-unknown-linux-gnu v1.2.3-beta.1 "$linux_bin" "$src" "$tmp/beta"
+for bad in 'v1.2.3;id' v01.2.3 v1.2.3-beta v1.2.3-dryrun-abc v1.2.3-dryrun-0123456789ab-release \
 	v1.2.3-dryrun-0123456789AB; do
 	refuses reason:"not a release tag or a dry-run label" "archive with the label $bad" \
 		"$stage" archive x86_64-unknown-linux-gnu "$bad" "$linux_bin" "$src" "$tmp/other"

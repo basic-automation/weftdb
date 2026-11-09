@@ -172,7 +172,7 @@ anything is built, and fails the run unless:
 
 - the run is on the tag itself, so this workflow and its scripts are the tagged
   commit's (a tag push is; a dispatch must use `--ref <tag>`);
-- the tag is exactly `vX.Y.Z` or `vX.Y.Z-rc.N`;
+- the tag is exactly `vX.Y.Z`, `vX.Y.Z-rc.N` or `vX.Y.Z-beta.N`;
 - the tag already exists (the workflow never creates one);
 - the tag is `v` followed by `weft-server`'s version at that commit;
 - the commit is on `origin/main`, or, for a patch release, on the maintenance branch
