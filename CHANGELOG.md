@@ -10,6 +10,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 ### Added
 - **Operator documentation** ([docs/operations.md](docs/operations.md)) — backup and
   restore, systemd, container, upgrade, and failure modes with what to do.
+- **SOA-15 honest bookkeeping for TTL lane.** `docs/soak.md` and `ROADMAP.md` now
+  document that the TTL lane is blocked because the store has no row-level TTL
+  mechanism (`weftdb/src/types/segment_store.rs:1982-1992` only purges expired
+  quarantine records; the soak driver uses `NullServer` so no endpoint can be
+  exercised). The nightly workflow (parts 1 and 3 of SOA-15) was already present
+  on `origin/main` with active cron, first-night-no-baseline, and SHA-pinned
+  actions.
 
 ### Fixed
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
