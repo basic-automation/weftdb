@@ -833,7 +833,8 @@ async fn ready(axum::extract::State(state): axum::extract::State<AppState>) -> (
 	let body = ReadyResponse { ready, segment_store: true, store_uuid: Some(store.store_uuid().to_string()), durability_class: Some(weftdb::SegmentStore::durability_class()), previous_clean_shutdown: Some(store.previous_clean_shutdown()), quarantined: report.quarantined, suspect: report.suspected, incompatible_store: report.incompatible_store, ..ReadyResponse::default() }.with_poison(poison);
 	// ROB-17: whether the disk guard refuses writes now. `statvfs` is a blocking call, so
 	// it runs off the async runtime; a failed or undescribable read reports `false`, the
-	// same as a guard that is off.
+	// same as a guard that is off.  On Windows there is no `statvfs` (`disk_space_at`
+	// returns `None`), so `disk_refusing` is always `false` there.
 	let store = std::sync::Arc::clone(store);
 	drop(state);
 	let disk_refusing = tokio::task::spawn_blocking(move || store.headroom().is_some_and(|headroom| headroom.refusing())).await.unwrap_or(false);

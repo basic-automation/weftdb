@@ -90,18 +90,28 @@ async fn ready_without_a_store_carries_build_info_and_no_identity() {
 }
 
 /// ROB-17: `/ready` says whether the disk guard refuses writes, as a boolean, and stays
-/// `200 ready` while it does — reads keep working. An impossible reserve refuses on any
-/// filesystem; a guard that is off never does.
+/// `200 ready` while it does — reads keep working. An impossible reserve refuses on Unix
+/// (where `statvfs` can measure free space); on platforms without free-space measurement
+/// the guard is inert and `disk_refusing` is always `false`. A guard that is off never
+/// refuses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ready_reports_a_refusing_disk_guard_and_stays_ready() {
-	for (reserve, refusing) in [(u64::MAX / 2, true), (0, false)] {
+	for (reserve, _refusing) in [(u64::MAX / 2, ()), (0, ())] {
+		let expected = if reserve > 0 {
+			// The impossible reserve can only be detected on platforms with free-space
+			// measurement (Unix `statvfs`).  On Windows, `disk_space_at` returns `None`,
+			// the guard is inert, and `disk_refusing` is always `false`.
+			cfg!(unix)
+		} else {
+			false
+		};
 		let dir = tempfile::tempdir().expect("temp dir");
 		let store = SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(reserve)).await.expect("opens");
 		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
 		let (status, body) = get_ready(&router).await;
 		assert_eq!(status, StatusCode::OK, "{body}");
 		assert_eq!(body["ready"], true, "{body}");
-		assert_eq!(body["disk_refusing"], refusing, "reserve {reserve}: {body}");
+		assert_eq!(body["disk_refusing"], expected, "reserve {reserve}: on Unix an impossible reserve refuses (true); on non-Unix (no statvfs) the guard is inert, so disk_refusing is false. {body}");
 	}
 	let (_, body) = get_ready(&app()).await;
 	assert_eq!(body["disk_refusing"], false, "no store, nothing to refuse: {body}");

@@ -221,6 +221,10 @@ pub struct DiskGuardState {
 	/// available. Reads keep working, so `ready` stays `true`; a balancer or ingest router
 	/// can steer writes elsewhere meanwhile. A boolean only — the probe answers without a
 	/// key, so the byte counts stay on the `metrics`-scoped headroom route.
+	///
+	/// **Platform limitation:** The guard uses Unix `statvfs` to measure free space.
+	/// On platforms without `statvfs` (Windows) `disk_refusing` is always `false`
+	/// because the filesystem cannot be described.
 	pub disk_refusing: bool,
 }
 
