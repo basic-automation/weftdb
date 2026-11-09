@@ -134,7 +134,10 @@ struct Recorded {
 /// be inventing a meaning. Section kinds that are not row lists keep their bodies out of
 /// `rows`.
 fn colliding_timestamps(rows: &[(i64, Option<String>)]) -> BTreeSet<i64> {
-	let counts: BTreeMap<i64, usize> = rows.iter().fold(Default::default(), |mut m, (t, _)| { *m.entry(*t).or_default() += 1; m });
+	let counts: BTreeMap<i64, usize> = rows.iter().fold(Default::default(), |mut m, (t, _)| {
+		*m.entry(*t).or_default() += 1;
+		m
+	});
 	counts.into_iter().filter(|(_, n)| *n > 1).map(|(t, _)| t).collect()
 }
 
