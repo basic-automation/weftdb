@@ -43,3 +43,6 @@ weft-audit.jsonl
 
 # pi-lens telemetry, never source
 .pi-lens-probe-home/
+
+# Build/CI logs a local run wrote into the tree (#649 merged three of them).
+/*.log
