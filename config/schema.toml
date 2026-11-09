@@ -1,0 +1,7 @@
+# Machine-readable configuration schema version (PAC-5a).
+#
+# The version is the authoritative copy of the schema's release number.
+# docs/config-schema.md carries a matching schema_version: line.
+# scripts/config/check_schema.py validates that the two agree.
+[schema]
+version = 1
