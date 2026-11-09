@@ -2,9 +2,10 @@
 
 The nightly soak is a scheduled (`0 7 * * *`) and
 [dispatchable](https://github.com/weftdb/weftdb/actions/workflows/soak.yml)
-workflow defined in `.github/workflows/soak.yml`. It runs a time-boxed soak
-exercise, evaluates the result against the eight SLO rules (R1–R8), and
-compares the outcome with the previous night's successful artifact.
+workflow defined in `.github/workflows/soak.yml`. It builds the soak driver,
+runs a time-boxed soak exercise against a null server (no live store or HTTP
+endpoints), evaluates the result against a skeleton rule set, and compares
+the outcome with the previous night's successful artifact.
 
 ## What the gate checks
 
@@ -28,14 +29,28 @@ The comparison reports three classes of finding:
    baseline" note. The current run's artifact becomes the baseline for
    the next night.
 
-## What is NOT tested: TTL
+## What is NOT tested: TTL lane
 
 The soak workflow's honesty section reports SOA-15's TTL lane as
 **not tested**. The store has no row-level TTL or expiry mechanism today:
-quarantined corrupted records use a TTL-based purge (`purge-expired`), but
-there is no per-row TTL that the soak could exercise at the ingest or
-serve layer. Adding a TTL lane would require a store-side TTL feature
-first.
+`purge_expired_quarantine` (`weftdb/src/types/segment_store.rs:1982-1992`)
+only purges expired corrupt (quarantined) records, not user data. The soak
+driver (`weft-bench/src/main.rs:966`) uses `NullServer` — no live server is
+launched — so no server endpoint (`POST .../quarantine/purge-expired` or
+otherwise) can be exercised at all. Adding a TTL lane requires a store-side
+row-level TTL feature first, and wiring it into the soak driver.
+
+## What is NOT tested: remaining soak fleet (upgrade, read, maint lanes)
+
+The soak-run driver records only harness steps; it does not wire the
+SOA-4 workload model, SOA-5 ingest client, SOA-6 oracle, SOA-8 failure
+deck, SOA-10 derived-read checker, or SOA-11 backup lane. These are listed
+as untested surfaces in the honesty section. SOA-16 (upgrade lane) is also
+untested.
+
+All soak lanes beyond the skeleton are pre-1.0 scope; the nightly
+workflow exists to validate the comparison machinery and catch regressions
+in the soak framework itself.
 
 ## Metrics and tolerances
 
