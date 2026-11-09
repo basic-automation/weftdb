@@ -23,6 +23,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   exercised). The nightly workflow (parts 1 and 3 of SOA-15) was already present
   on `origin/main` with active cron, first-night-no-baseline, and SHA-pinned
   actions.
+- **Configuration schema v2.** `docs/config-schema.md` now documents `WEFT_DISK_RESERVE_BYTES`
+  (one new Tuning variable). `schema_version` is bumped to 2 in both the doc and
+  `config/schema.toml`.
 
 ### Fixed
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
