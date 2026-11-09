@@ -1495,7 +1495,7 @@ mod tests {
 		assert_eq!(api2.code().status(), StatusCode::INSUFFICIENT_STORAGE);
 
 		// 3. Plain `ErrorKind::Other` with no OS error still produces 500 Internal.
-		let plain = std::io::Error::new(std::io::ErrorKind::Other, "some other IO error");
+		let plain = std::io::Error::other("some other IO error");
 		let api3 = classify_ingest(&anyhow::Error::from(plain).context("writing segment"));
 		assert_eq!(api3.code(), Code::Internal);
 		assert_eq!(api3.code().status(), StatusCode::INTERNAL_SERVER_ERROR);
