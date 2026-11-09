@@ -14,6 +14,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   arrived in #596 after that branch was cut. It merged into a tree that already had
   `scripts/ci/check-action-pinning.py`, so `main` went red on the pinning gate the
   moment it landed — the gate works, the merge queue just did not re-run it.
+- **Test suites and refusal lists now accept `vX.Y.Z-beta.N` (TAG-11, #657).** The tag grammar was extended to accept `-beta.N` tags but the two test suites that pin the old grammar were not updated. `scripts/compat/test_releases.py` now parses the new 5-field `semver_key` tuple and asserts the beta-sorts-before-rc-sorts-before-release ordering; `scripts/release/test-stage.sh` accepts `v1.2.3-beta.1` and refuses the malformed `v1.2.3-beta` (no number).
 
 ### Changed
 

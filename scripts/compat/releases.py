@@ -80,11 +80,11 @@ def display(path: Path, repo: Path) -> str:
 
 
 def semver_key(version: str) -> tuple:
-	"""Sort key putting 0.1.0 before 0.9.0 before 1.0.0-rc.1 before 1.0.0."""
+	"""Sort key putting 0.1.0 before 0.9.0 before 1.0.0-beta.1 before 1.0.0-rc.1 before 1.0.0."""
 	match = VERSION_RE.match(version)
 	if not match:
 		raise PinError(f"not a version weftdb releases: {version!r}")
-	major, minor, patch, pre = match.groups()
+	major, minor, patch, pre, _pre_type = match.groups()
 	prerelease = (0, pre) if pre else (1, "")
 	return (int(major), int(minor), int(patch), prerelease)
 
