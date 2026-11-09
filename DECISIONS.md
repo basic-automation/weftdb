@@ -56,6 +56,45 @@ on pull requests that touch crash-path files the workflow stays Linux-only.
 posting). A reference to that file exists in `DECISIONS.md` (this entry) and in
 the platform-gating comment block in `weft-bench/tests/crash_matrix_tests.rs`.
 
+## 2026-11-08 — SOA-16: the soak upgrade lane judges, it does not drive (FOR MERGE REVIEW)
+
+**Context.** The 1.0 plan names SOA-16 only as a W9 line ("Soak upgrade lane") and the
+issue (#327) carries no more than the ROADMAP line, so the slice's shape had to be
+grounded in the sibling lanes rather than invented: SOA-11's backup lane is the
+closest precedent — same "runs X inside a soak" acceptance, same in-process harness —
+and `soak_report.rs` already listed "SOA-16 upgrade (coverage not yet wired)" as an
+unwired surface. PAC-14a (#653, still open) supplies the procedure the lane judges
+(`UPGRADING.md`: stop the old binary, copy the whole store, start the new binary,
+migration on first open) and the legs it runs (A: upgrade from v0.1.0; C: rollback
+after writes, still unwired there).
+
+**Chosen:** the lane is a checker plus a run-record verdict, on the SOA-11 precedent.
+`UpgradeLaneChecker::judge_upgrade` takes the caller-supplied post-upgrade
+read-back and the upgrade step and requires the whole acknowledged history,
+complete and exact — no prefix cut, because the upgraded store is the live store,
+not a snapshot. The step records the versions, the store layouts and the pass
+duration. The verdict is recorded once on the run record (soak schema v7), the
+honesty section drops the "coverage not yet wired" line once a verdict exists, and
+the nightly comparison tracks `upgrade_ticks_judged` (0 %),
+`upgrade_mismatch_count` (0 %) and `upgrade_duration_ms` (10 %, same rationale as
+the backup durations). The lane adds no SLO rule: R1–R8 are fixed by supervisor
+decision 2026-11-06.
+
+**Rejected: performing the binary swap inside the lane.** The soak harness is
+in-process (the null server seam, no real store, no server binary to swap), so a
+lane that spawned binaries would be a driver, not a judge — and the nightly
+skeleton driver records no lane verdicts at all today, backup included. The
+caller performs the upgrade and hands the read-back to the checker, exactly as
+SOA-11's caller performs the backup, the restore and the reads. A driver that
+actually swaps binaries mid-soak is a later launch slice; until one exists the
+nightly honesty section keeps listing the lane as not tested, which is the
+honest statement.
+
+**Rejected: a rollback verdict shape of its own.** Leg C is the same judgement
+with the versions reversed (the step records `from_version`/`to_version` and
+`layout_before`/`layout_after` without constraining direction), so one verdict
+covers both legs; a second type would have duplicated the whole-history check
+for a label.
 ## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
 
 **The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every
