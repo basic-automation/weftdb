@@ -12,6 +12,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   restore, systemd, container, upgrade, and failure modes with what to do.
 
 ### Fixed
+- **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
+
 - **`host-install.yml` carried the one unpinned action on `main` (#626).**
   `.github/workflows/host-install.yml:67` still asked for `Swatinem/rust-cache@v2`
   while every other workflow was pinned to `e9d7b9f1` by #628, because the workflow
