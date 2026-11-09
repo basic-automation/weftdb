@@ -135,7 +135,7 @@ struct Recorded {
 /// be inventing a meaning. Section kinds that are not row lists keep their bodies out of
 /// `rows`.
 fn colliding_timestamps(rows: &[(i64, Option<String>)]) -> BTreeSet<i64> {
-	let counts: BTreeMap<i64, usize> = rows.iter().fold(Default::default(), |mut m, (t, _)| {
+	let counts: BTreeMap<i64, usize> = rows.iter().fold(BTreeMap::default(), |mut m, (t, _)| {
 		*m.entry(*t).or_default() += 1;
 		m
 	});
@@ -344,7 +344,7 @@ async fn a_v010_aspect_keeps_its_declared_encoding_and_its_nulls() {
 	assert_eq!(distinct.len(), timestamps.len(), "a range read must not repeat a timestamp across the out-of-order batch (issue #443)");
 	for ts in (0..12).map(|i| 1_767_231_360 + i * 120) {
 		let point = store.read_point("temp", ts).await.expect("point beside range").map(|v| canonical(&v.to_string()));
-		let range = timestamps.iter().position(|&t| t == ts).map(|i| values[i].as_ref().map(|v| canonical(&v.to_string()))).flatten();
+		let range = timestamps.iter().position(|&t| t == ts).and_then(|i| values[i].as_ref().map(|v| canonical(&v.to_string())));
 		assert_eq!(range, point, "range of temp @ {ts} must equal the point read beside it (issue #443)");
 	}
 
