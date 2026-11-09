@@ -309,7 +309,11 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     drift-gated by `generated_spec_matches_committed_file`, and structurally
     validated by `generated_spec_passes_structural_validation`.*
   - [ ] **ROB-9** Mutation harness for frames, sidecars and Parquet
-  - [ ] **SEC-14** Security documentation, config schema and upgrade notes
+  - [x] **SEC-14** Security documentation, config schema and upgrade notes
+    *Closed 2026-11-09: `docs/security.md` rewritten with source citations, full role table,
+    credential-in-query guard, proxy guard, exit status table, startup enforcement, and
+    known limitations. `docs/upgrade-notes.md` already existed; `docs/config-schema.md`
+    updated by a concurrent PR.
   - [ ] **PAC-10** Publish the multi-arch image (only after API auth)
   - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
   - [x] **EVI-17** Honesty pages II
