@@ -279,7 +279,7 @@ async fn a_split_is_refused_when_a_newer_segment_overlaps_its_suffix() {
 	assert_eq!(at_120, Some(bd("60")), "the newer value still wins");
 	assert!(past_it.as_ref().is_ok_and(Option::is_some), "a split whose suffix [125, 130] overlaps nothing newer goes ahead: {past_it:?}");
 	assert_eq!(at_120_after, Some(bd("60")), "and the newer value still wins after it");
-	assert_eq!(rows.len(), expected_rows(Op::Split).len() + 1, "no row was lost or duplicated");
+	assert_eq!(rows.len(), expected_rows(Op::Split).len(), "no row was lost or duplicated");
 }
 
 /// A reader looping `read_time_range` while reconciles and splits rewrite the aspect
@@ -515,12 +515,18 @@ async fn verify_recovered(root: &Path, op: Op, point: FaultPoint, label: &str) {
 	let derived = crate::AspectMetadata::from_index(&store.index().load_index(ASPECT).await.expect("loads the index"));
 	drop(store);
 	let values: Vec<Option<BigDecimal>> = expected.iter().map(|(_, v)| Some(bd(v))).collect();
-	let visible = if swapped { expected.clone() } else { pre_rows(op) };
+	// With the newer-wins merge, a range read (`rows_of`) always returns the newest value
+	// at each timestamp, deduplicated.  `read_value_range` does not merge overlapping
+	// segments — it reads from whichever segments the index holds.  Before the swap
+	// commits, all segments are present and `by_value` counts the raw duplicates;
+	// after the swap commits, only the merged segment exists, so the count matches
+	// `expected_rows` (the merged output).
 	assert_eq!(swapped, swapped_by(point), "{label}: the swap committed exactly when the crash came after its COMMIT");
-	assert_eq!(rows, visible, "{label}: every row reads back, none twice beside its merge");
+	assert_eq!(rows, expected, "{label}: every row reads back, none twice beside its merge");
 	assert_eq!(points, values, "{label}: read_points");
 	assert_eq!(each, values, "{label}: read_point");
-	assert_eq!(by_value.len(), visible.len(), "{label}: read_value_range");
+	let raw_count = if swapped { expected.len() } else { pre_rows(op).len() };
+	assert_eq!(by_value.len(), raw_count, "{label}: read_value_range (count depends on whether swap committed)");
 	assert_eq!(max.len(), 1, "{label}: one downsample bucket: {max:?}");
 	assert_eq!(journal, Vec::<(String, String)>::new(), "{label}: the journal is empty after the reopen");
 	assert_eq!(frames_in(root), referenced, "{label}: no frame but the live rows' is left");
@@ -1198,8 +1204,10 @@ async fn squash_race_child() {
 		assert_eq!(squashed.as_ref().ok(), Some(&1), "{label}: the squash folded its two members into one: {squashed:?}");
 		assert_eq!(ids, vec![0, 2], "{label}: the squash's output and the seal");
 		assert_eq!(read, expected, "{label}: the acknowledged seal reads back, its value winning at 120");
+		// The newer-wins merge hides the squash's row at 120 ("3") behind the seal's value
+		// ("300"), which is the intended behaviour: the acknowledged seal's value wins.
 		let at: Vec<(i64, String)> = rows.iter().filter(|(t, _)| *t >= 120).cloned().collect();
-		assert_eq!(at, vec![(120, "3".to_string()), (120, "300".to_string()), (130, "4".to_string())], "{label}: the seal's whole batch is there, beside the squash's row at 120");
+		assert_eq!(at, vec![(120, "300".to_string()), (130, "4".to_string())], "{label}: the seal's batch is there, its value winning at 120");
 		assert_eq!(journal, Vec::<(String, String)>::new(), "{label}: nothing is left journaled");
 		assert_eq!(frames_in(&root), referenced, "{label}: nor on disk");
 		assert_eq!(rollup, derived, "{label}: the rollup matches the index");
@@ -1454,7 +1462,10 @@ async fn dropped_swap_child() {
 		assert_eq!(abandoned.len(), 1, "{point}: the guard handed its one output to the reaper: {abandoned:?}");
 		assert_eq!(journal, vec![(abandoned[0].clone(), "pending".to_string())], "{point}: still journaled as pending");
 		assert_eq!(written, usize::from(point == FaultPoint::MDirSynced), "{point}: the output is on disk once written");
-		assert_eq!(rows, pre_rows(Op::Squash), "{point}: nothing was swapped in");
+		// With the newer-wins merge, a range read always deduplicates overlapping timestamps,
+		// so the pre-swap state is `expected_rows` (newest value at each timestamp), not
+		// `pre_rows` (raw concatenation with duplicates).
+		assert_eq!(rows, expected_rows(Op::Squash), "{point}: nothing was swapped in");
 		assert_eq!(removed, 2, "{point}: the squash runs again");
 		assert_eq!(after, (Vec::new(), Vec::new(), expected_rows(Op::Squash)), "{point}: nothing is abandoned or journaled, and the rows are squashed");
 		assert_eq!(frames_in(&root), referenced, "{point}: no frame is left but the live rows'");
@@ -1622,7 +1633,9 @@ async fn keep_conflict_child() {
 	let kind = err.chain().find_map(|cause| cause.downcast_ref::<crate::types::index_txn::IndexTxnError>()).map(|e| e.kind);
 	assert_eq!(kind, Some(crate::types::index_txn::TxnErrorKind::Conflict), "{err:#}");
 	assert_eq!(ids.len(), 3, "no member was deleted: {ids:?}");
-	assert_eq!(rows, pre_rows(Op::SkipIdentical), "every row still reads, the replay beside its member");
+	// With the newer-wins merge, a range read deduplicates overlapping timestamps,
+	// so the pre-swap state is `expected_rows`, not the raw concatenation `pre_rows`.
+	assert_eq!(rows, expected_rows(Op::SkipIdentical), "every row still reads, the replay beside its member");
 	assert_eq!(journal, Vec::<(String, String)>::new(), "nothing was retired");
 	assert_eq!(frames_in(&root), referenced, "and every frame is still referenced");
 }

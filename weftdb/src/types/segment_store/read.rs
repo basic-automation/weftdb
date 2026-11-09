@@ -175,11 +175,14 @@ impl SegmentStore {
 					rows.push((t, v));
 				}
 			}
+			// Sort each segment's rows by timestamp so that `merge_newer_wins` receives
+			// **non-decreasing** inputs, even when a segment's rows are stored out of
+			// order (e.g. a pre-v2 store with out-of-order timestamps `[55, 45, 65]`).
+			// `fold_newest_wins` (`segment_store.rs`) does the same sort before merging.
+			rows.sort_by_key(|(t, _)| *t);
 			if merged.is_empty() {
 				merged = rows;
 			} else {
-				// Each segment's rows are already in file order; `merge_newer_wins` requires
-				// both sides to be **non-decreasing** by timestamp, which sealed segments satisfy.
 				merged = merge_newer_wins(&merged, &rows);
 			}
 		}
