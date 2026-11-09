@@ -1121,7 +1121,8 @@ pub async fn restore_store(backup_dir: &Path, new_root: &Path) -> Result<WholeSt
 
 /// The free bytes on the filesystem holding `path` (or its nearest existing ancestor).
 ///
-/// On Unix uses `libc::statvfs`; on Windows uses [`GetDiskFreeSpaceExW`].
+/// On Unix uses `libc::statvfs`; on Windows uses
+/// [`GetDiskFreeSpaceExW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw).
 /// Returns `None` when the OS refuses to answer or the path has no existing ancestor,
 /// in which case a headroom check has nothing to check against and the backup itself is the test.
 #[must_use]
@@ -1426,7 +1427,7 @@ mod tests {
 		assert!(check_backup_headroom(BackupMode::Copy, 100, 1_000_000, 1_000_100).is_ok());
 	}
 
-	/// #667: free_bytes_at works on every platform (Unix via libc::statvfs, Windows via FFI).
+	/// #667: `free_bytes_at` works on every platform (Unix via `libc::statvfs`, Windows via FFI).
 	#[test]
 	fn free_bytes_at_returns_some_for_an_existing_path() {
 		let dir = tempfile::tempdir().unwrap();
