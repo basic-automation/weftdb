@@ -32,6 +32,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   actions.
 
 ### Fixed
+- **`free_bytes_at` now works on Windows and other platforms (#667).** The disk guard was inert on Windows, making `GET /ready`'s `disk_refusing` permanently false. Implemented via inline FFI to `GetDiskFreeSpaceExW` (no new dependencies).
+
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
 
 - **`host-install.yml` carried the one unpinned action on `main` (#626).**
