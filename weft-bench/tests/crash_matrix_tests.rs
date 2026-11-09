@@ -69,11 +69,7 @@ fn failures_for_platform() -> Vec<Failure> {
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 fn failures_for_platform() -> Vec<Failure> {
-	Failure::ALL
-		.iter()
-		.filter(|failure| !matches!(failure, Failure::KillIngest | Failure::KillCompaction))
-		.copied()
-		.collect()
+	Failure::ALL.iter().filter(|failure| !matches!(failure, Failure::KillIngest | Failure::KillCompaction)).copied().collect()
 }
 
 #[tokio::test]
