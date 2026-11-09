@@ -10,7 +10,7 @@
 //! [`SegmentStore::read_time_range`] sees what the freeze design (§4.3) promises.
 //!
 //! The internal test at `segment_store.rs:6925` is more thorough (it checks schemas,
-//! column-by-column DDL, store_meta mirroring, frame paths, etc.) — this suite checks
+//! column-by-column DDL, `store_meta` mirroring, frame paths, etc.) — this suite checks
 //! the outcome a documented API user cares about.
 //!
 //! # On-disk difference between layout 1 and layout 2
@@ -146,9 +146,9 @@ async fn pre_v2_store_upgrades_from_layout_1_to_2() {
 	assert!(!report.created_new, "the store existed — this is not a new store");
 
 	// The marker is now layout 2.
-	assert_eq!(store.store_format().layout_version, SUPPORTED_LAYOUT, "after the migration the store's layout is {} (SUPPORTED_LAYOUT)", SUPPORTED_LAYOUT);
-	assert_eq!(store.store_format().min_read_layout, SUPPORTED_LAYOUT, "min_read_layout is also raised to {}", SUPPORTED_LAYOUT);
-	assert_eq!(store.store_format().min_write_layout, SUPPORTED_LAYOUT, "min_write_layout is also raised to {}", SUPPORTED_LAYOUT);
+	assert_eq!(store.store_format().layout_version, SUPPORTED_LAYOUT, "after the migration the store's layout is {SUPPORTED_LAYOUT} (SUPPORTED_LAYOUT)");
+	assert_eq!(store.store_format().min_read_layout, SUPPORTED_LAYOUT, "min_read_layout is also raised to {SUPPORTED_LAYOUT}");
+	assert_eq!(store.store_format().min_write_layout, SUPPORTED_LAYOUT, "min_write_layout is also raised to {SUPPORTED_LAYOUT}");
 
 	// Fixture data is readable after the migration.
 	assert_eq!(store.read_point("price", 0).await.expect("reading price at timestamp 0"), Some(bd("0.5")), "price=0.5 at t=0 survived the migration");
@@ -197,7 +197,7 @@ async fn upgraded_store_opens_idempotently() {
 
 	// The on-disk marker after the second open matches the first open's marker.
 	let marker2 = read_marker(&root).await.expect("the marker exists after the second open");
-	assert_eq!(marker2.layout_version, SUPPORTED_LAYOUT, "the on-disk marker is still layout {} after the second open", SUPPORTED_LAYOUT);
+	assert_eq!(marker2.layout_version, SUPPORTED_LAYOUT, "the on-disk marker is still layout {SUPPORTED_LAYOUT} after the second open");
 	assert_eq!(
 		(marker1.layout_version, marker1.min_read_layout, marker1.min_write_layout),
 		(marker2.layout_version, marker2.min_read_layout, marker2.min_write_layout),
@@ -236,18 +236,18 @@ async fn write_and_read_after_upgrade_works() {
 	store.seal("price", &schema, &new_ts, &new_vals).await.expect("sealing new data into the upgraded store — an upgraded store is writable");
 
 	// Read back the new data.
-	let (post_ts, post_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = store.read_time_range("price", 500, 600).await.expect("reading the just-written range");
-	assert_eq!(post_ts, new_ts, "the timestamps written after the upgrade read back correctly");
+	let (post_timestamps, post_values): (Vec<i64>, Vec<Option<BigDecimal>>) = store.read_time_range("price", 500, 600).await.expect("reading the just-written range");
+	assert_eq!(post_timestamps, new_ts, "the timestamps written after the upgrade read back correctly");
 	let expected_vals: Vec<Option<BigDecimal>> = new_vals.into_iter().map(Some).collect();
-	assert_eq!(post_vs, expected_vals, "the values written after the upgrade read back correctly");
+	assert_eq!(post_values, expected_vals, "the values written after the upgrade read back correctly");
 	drop(store);
 
 	// Reopen and verify both old and new data survived.
 	let store2 = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("reopen after writing new data: {e:#}"));
 	assert_eq!(store2.read_point("price", 0).await.expect("reading price at t=0 after reopen"), Some(bd("0.5")), "pre-upgrade data (price=0.5 at t=0) survived the new write and reopen");
-	let (reopen_ts, reopen_vs): (Vec<i64>, Vec<Option<BigDecimal>>) = store2.read_time_range("price", 500, 600).await.expect("reading the post-upgrade range after reopen");
-	assert_eq!(reopen_ts, post_ts, "post-upgrade data persisted through reopen (timestamps match)");
-	assert!(reopen_vs.iter().any(|v| v.is_some()), "post-upgrade data persisted through reopen (at least one value is present)");
+	let (reopen_timestamps, reopen_values): (Vec<i64>, Vec<Option<BigDecimal>>) = store2.read_time_range("price", 500, 600).await.expect("reading the post-upgrade range after reopen");
+	assert_eq!(reopen_timestamps, post_timestamps, "post-upgrade data persisted through reopen (timestamps match)");
+	assert!(reopen_values.iter().any(Option::is_some), "post-upgrade data persisted through reopen (at least one value is present)");
 	drop(store2);
 }
 
