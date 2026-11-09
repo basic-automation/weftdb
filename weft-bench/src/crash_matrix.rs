@@ -45,9 +45,36 @@ impl MatrixCell {
 	}
 }
 
+/// Run a specific set of failures at every seed, in failure-major order (all seeds
+/// of one failure before the next).
+///
+/// Unlike [`run_matrix`] (which always runs [`Failure::ALL`]), this variant accepts
+/// an explicit list of failures so callers can exclude SIGKILL variants on platforms
+/// where the upstream engine refuses to reopen after a mid-checkpoint SIGKILL
+/// (see <https://github.com/tursodatabase/turso/issues/7480>).
+///
+/// # Errors
+///
+/// An empty seed list, or any failure test that cannot start.
+pub async fn run_matrix_cells(profile: &IngestProfile, timestamps: &[i64], values: &[bigdecimal::BigDecimal], value_scale: u8, params: &FailureParams, seeds: &[u64], failures: &[Failure]) -> anyhow::Result<Vec<MatrixCell>> {
+	anyhow::ensure!(!seeds.is_empty(), "a crash matrix needs at least one seed");
+	let mut cells = Vec::with_capacity(failures.len() * seeds.len());
+	for &failure in failures {
+		for &seed in seeds {
+			let cell_params = FailureParams { seed, ..params.clone() };
+			let result = run_failure(failure, profile, timestamps, values, value_scale, &cell_params).await.map_err(|e| anyhow::anyhow!("crash-matrix cell {} seed {seed} failed to run: {e:#}", failure.as_str()))?;
+			cells.push(MatrixCell { failure, seed, result });
+		}
+	}
+	Ok(cells)
+}
+
 /// Run the matrix: every failure in [`Failure::ALL`], at every seed, in
 /// failure-major order (all seeds of one failure before the next, so the
 /// per-cell lines group by failure).
+///
+/// This is the convenience wrapper over [`run_matrix_cells`] that preserves
+/// existing callers — it always passes [`Failure::ALL`].
 ///
 /// # Errors
 ///
@@ -56,16 +83,7 @@ impl MatrixCell {
 /// test that fails to run — a store that misbehaves is not an error, it is
 /// a failing cell, and surfaces through the cell's gate, not here.
 pub async fn run_matrix(profile: &IngestProfile, timestamps: &[i64], values: &[bigdecimal::BigDecimal], value_scale: u8, params: &FailureParams, seeds: &[u64]) -> anyhow::Result<Vec<MatrixCell>> {
-	anyhow::ensure!(!seeds.is_empty(), "a crash matrix needs at least one seed");
-	let mut cells = Vec::with_capacity(Failure::ALL.len() * seeds.len());
-	for &failure in &Failure::ALL {
-		for &seed in seeds {
-			let cell_params = FailureParams { seed, ..params.clone() };
-			let result = run_failure(failure, profile, timestamps, values, value_scale, &cell_params).await.map_err(|e| anyhow::anyhow!("crash-matrix cell {} seed {seed} failed to run: {e:#}", failure.as_str()))?;
-			cells.push(MatrixCell { failure, seed, result });
-		}
-	}
-	Ok(cells)
+	run_matrix_cells(profile, timestamps, values, value_scale, params, seeds, &Failure::ALL).await
 }
 
 /// The matrix passes only when every cell does.
