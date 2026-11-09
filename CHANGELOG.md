@@ -8,8 +8,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 ### Added
+- **Versioned configuration schema (PAC-5a).** `docs/config-schema.md` now carries a
+  `schema_version: 1` marker and a version-change table; `config/schema.toml` stores the
+  machine-readable copy. `scripts/config/check_schema.py` validates that every registered
+  variable is documented, the version markers agree, and the checker runs in the `claims`
+  CI job. (#pending)
+
 - **Operator documentation** ([docs/operations.md](docs/operations.md)) — backup and
   restore, systemd, container, upgrade, and failure modes with what to do.
+- **SOA-15 honest bookkeeping for TTL lane.** `docs/soak.md` and `ROADMAP.md` now
+  document that the TTL lane is blocked because the store has no row-level TTL
+  mechanism (`weftdb/src/types/segment_store.rs:1982-1992` only purges expired
+  quarantine records; the soak driver uses `NullServer` so no endpoint can be
+  exercised). The nightly workflow (parts 1 and 3 of SOA-15) was already present
+  on `origin/main` with active cron, first-night-no-baseline, and SHA-pinned
+  actions.
 
 ### Fixed
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
@@ -21,6 +34,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `scripts/ci/check-action-pinning.py`, so `main` went red on the pinning gate the
   moment it landed — the gate works, the merge queue just did not re-run it.
 - **Test suites and refusal lists now accept `vX.Y.Z-beta.N` (TAG-11, #657).** The tag grammar was extended to accept `-beta.N` tags but the two test suites that pin the old grammar were not updated. `scripts/compat/test_releases.py` now parses the new 5-field `semver_key` tuple and asserts the beta-sorts-before-rc-sorts-before-release ordering; `scripts/release/test-stage.sh` accepts `v1.2.3-beta.1` and refuses the malformed `v1.2.3-beta` (no number).
+
+- **The crash matrix's SIGKILL cells now run on Linux only (turso#7480).** A SIGKILL
+  that lands between Turso's logical-log truncation and its WAL truncation leaves a
+  `.db-wal` holding committed frames with no `.db-log` header, and Turso 0.8.1 refuses
+  to reopen that database:
+  `WAL has committed frames but logical log header is missing`.
+  [tursodatabase/turso#7480](https://github.com/tursodatabase/turso/issues/7480) has
+  been open since 2026-06-12. WeftDB stays fail-closed: no orphan WAL is deleted or
+  quarantined at open (the engine keeps the backfill evidence in internal state, so
+  discarding the file could lose acknowledged writes), and the experimental
+  passive-checkpoint flag stays off. `kill-ingest` and `kill-compaction` now run where
+  the dedicated `crash-matrix.yml` job already ran them — Linux — and the integration
+  test names the cells it skipped and why on every other platform. macOS and Windows
+  runners lose SIGKILL coverage; the Linux job keeps it. See
+  [docs/upstream/turso-7480-reopen-refusal.md](docs/upstream/turso-7480-reopen-refusal.md).
 
 ### Changed
 

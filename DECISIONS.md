@@ -20,6 +20,42 @@ Value-range reads return only present rows, so every value is populated. The cur
 
 **Backwards compatibility: `total` stays populated on every non-cursor page.** An existing client that sends no `cursor` gets the same `total` as before — `Option<usize>` is `Some(total)` on the first page and `None` only on cursor-following pages. The acceptance criterion says "total nullable after the first page": the first page (and every page requested without a cursor) carries the count; cursor pages omit it because the window total was already reported.
 
+## 2026-11-08 — SIGKILL crash cells: stay fail-closed, gate to Linux, document turso#7480
+
+**The upstream Turso MVCC engine (0.8.1) refuses to reopen a database whose checkpoint was
+interrupted by SIGKILL between `TruncateLogicalLog` and `TruncateWal`.** The error is
+`LimboError::Corrupt("WAL has committed frames but logical log header is missing")` —
+the `.db-log` file is absent while the `.db-wal` still reports committed frames. This
+affects the `kill-compaction` (and potentially `kill-ingest`) cells of the crash matrix
+on non-Linux platforms. The defect is tracked upstream as
+[tursodatabase/turso#7480](https://github.com/tursodatabase/turso/issues/7480) (opened
+2026-06-12, still open).
+
+**Chosen: stay fail-closed.** We do **not** auto-delete or quarantine the orphan `.db-wal`
+because the engine gives us no way at open time to prove that its frames were already
+backfilled into the main DB — the engine keeps `max_frame`, `nbackfills`, and
+`checkpoint_seq` in internal shared state, not at a documented on-disk offset — so
+discarding the WAL could lose acknowledged writes whose frames were not yet backfilled.
+
+**Chosen: do not enable the experimental passive-checkpoint flag**
+(`experimental_mvcc_passive_checkpoint_enabled`, see ROADMAP.md:472) because it is
+undocumented, experimental, and the policy against reaching for undocumented flags has
+not changed.
+
+**Chosen: SIGKILL cells are now Linux-only.** The `.github/workflows/crash-matrix.yml`
+workflow already runs `jobs.crash-matrix.runs-on: ubuntu-latest` and declares "Linux
+only" in its header comment — the inconsistency was the `weft-bench` integration test
+that ran the same kill cells on macOS and Windows. The test now uses a platform-gated
+failure list (`FAILURES_FOR_PLATFORM`) that includes `Failure::ALL` on Linux and only
+`Failure::CorruptSegment` elsewhere, with an `eprintln!` naming the excluded cells and
+the issue URL. On Linux the crash-matrix CI job still covers the SIGKILL cells, and
+on pull requests that touch crash-path files the workflow stays Linux-only.
+
+**Documented.** The decision and the upstream defect are recorded in
+`docs/upstream/turso-7480-reopen-refusal.md` (a paste-ready bug report draft for human
+posting). A reference to that file exists in `DECISIONS.md` (this entry) and in
+the platform-gating comment block in `weft-bench/tests/crash_matrix_tests.rs`.
+
 ## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
 
 **The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every

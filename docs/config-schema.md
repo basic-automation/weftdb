@@ -1,5 +1,7 @@
 # Configuration schema
 
+schema_version: 1
+
 WeftDB is configured primarily through environment variables, registered in a single
 source-of-truth registry (`weft-server/src/settings.rs`, 1.0 plan PAC-5a). Every variable
 any crate in the workspace reads is listed there; an unrecognised `WEFT_*` name (a typo such as
@@ -9,6 +11,12 @@ the reader's definition says the value is advisory (e.g. `WEFT_SEGMENT_PARTIAL_T
 unparseable entries).
 
 The registry assigns each variable a **tier** that says how much it is promised.
+
+## How this version changes
+
+| schema_version | Change |
+|----------------|--------|
+| 1 | First versioned schema. Covers every variable the registry names (103 variables: 13 Stable, 41 Tuning, 8 Experimental, 41 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
 
 ## Tier system
 

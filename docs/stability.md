@@ -120,13 +120,16 @@ No CLI-specific compatibility test or schema exists.
 
 **Status: experimental.** Every `WEFT_*` environment variable is documented in
 [`docs/reference.md`](reference.md#configuration) and
-[`docs/config-schema.md`](../docs/config-schema.md), but the configuration system has no
-version marker or schema-level compatibility promise. A variable name, type, accepted
-range, or default may change in a minor release.
+[`docs/config-schema.md`](../docs/config-schema.md). The document now carries a
+`schema_version` marker and `config/schema.toml` holds a machine-readable copy;
+`scripts/config/check_schema.py` validates that both agree and that every registered
+variable is documented. A variable name, type, accepted range, or default may still change
+in a minor release.
 
-**Not yet guaranteed:** A formal configuration schema (JSON Schema, CUE, or similar) with
-versioning. The configuration registry skeleton (PAC-5a) is in place but does not enforce
-stability across releases.
+**Not yet guaranteed:** A formal configuration schema (JSON Schema, CUE, or similar) that
+validates value shapes (types, ranges, accepted-patterns) across releases, rather than
+only name coverage and version alignment. The current schema (PAC-5a) covers versioning
+and completeness but does not enforce structural compatibility.
 
 ### Metrics line protocol (Prometheus `/metrics`)
 
@@ -219,7 +222,7 @@ stability promise for:
 | Rollback after writes | ROADMAP W9: PAC-14a | `rollback` leg in `compat/releases.toml` has no test |
 | Layout-2 baseline fixture | ROADMAP W13: FRE-18 | No freeze cut has been made; no layout-2 fixture set is committed |
 | Binary compatibility | ROADMAP "Compatibility tests" | `binary` leg in `compat/releases.toml` not implemented |
-| Configuration schema | ROADMAP W8: PAC-5a | Skeleton exists but no versioned schema |
+| Configuration schema | ROADMAP W8: PAC-5a | Version marker and name-coverage checker exist (PAC-5a). No formal JSON Schema / CUE that validates value shapes, types, or ranges across releases. |
 
 Every one of these gaps is visible in the roadmap as an unchecked box. When a new check
 is ticked, this document should be updated.
