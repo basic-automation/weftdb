@@ -61,6 +61,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   test names the cells it skipped and why on every other platform. macOS and Windows
   runners lose SIGKILL coverage; the Linux job keeps it. See
   [docs/upstream/turso-7480-reopen-refusal.md](docs/upstream/turso-7480-reopen-refusal.md).
+- **`read_value_range` / `read_value_range_of` now fold overlapping segments newest-wins (#665).** Like `read_time_range` and point reads, the value-range surface merges overlapping segments with `merge_newer_wins` so the result has one row per distinct timestamp, sorted ascending, with the newest segment's value winning at each instant. The value predicate is applied to the winning value only, so a shadowed row cannot pass the bound when the winner does not, and vice versa. Previously the value-range read returned raw rows in segment-seal order with no fold, producing duplicate timestamps and stale values when segments overlapped.
 
 ### Changed
 
