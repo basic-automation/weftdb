@@ -318,7 +318,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
   - [x] **EVI-17** Honesty pages II
   - [ ] Write or approve the honesty-page narrative *(owner)*
-  - [ ] **FRE-13** Layout-1 to layout-2 upgrade test
+  - [x] **FRE-13** Layout-1 to layout-2 upgrade test
+    *Closed 2026-11-09 (#666): `weftdb/tests/layout_upgrade.rs` covers the [layout 1 → 2 upgrade contract](https://github.com/basic-automation/weftdb/pull/666) through the public API.*
   - [x] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
     *Closed 2026-11-07 (#603): `SoakReport`, the R1–R8 evaluator, the coverage floors and the
     honesty section are on main; the report is what #616's nightly comparison reads.*

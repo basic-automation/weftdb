@@ -8,6 +8,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 ### Added
+- **Layout-upgrade integration test (FRE-13).** `weftdb/tests/layout_upgrade.rs` covers:
+  the pre-v2 (layout-1) store upgrade to layout 2 through the public API, including
+  idempotency, data survival, new writes after upgrade, a synthetic marker test, and
+  a reverse-direction contract note.
+
 - **Versioned configuration schema (PAC-5a).** `docs/config-schema.md` now carries a
   `schema_version: 1` marker and a version-change table; `config/schema.toml` stores the
   machine-readable copy. `scripts/config/check_schema.py` validates that every registered
