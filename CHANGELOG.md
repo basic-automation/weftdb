@@ -8,6 +8,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 ### Added
+- **Versioned configuration schema (PAC-5a).** `docs/config-schema.md` now carries a
+  `schema_version: 1` marker and a version-change table; `config/schema.toml` stores the
+  machine-readable copy. `scripts/config/check_schema.py` validates that every registered
+  variable is documented, the version markers agree, and the checker runs in the `claims`
+  CI job. (#pending)
+
 - **Operator documentation** ([docs/operations.md](docs/operations.md)) — backup and
   restore, systemd, container, upgrade, and failure modes with what to do.
 
