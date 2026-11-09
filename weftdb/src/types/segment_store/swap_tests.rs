@@ -475,8 +475,15 @@ impl Op {
 /// Then the operation runs again (a no-op if it had committed): the rows still read back,
 /// its retired frames are reaped, and it never reuses a generation the crashed run had
 /// journaled (I6).
+///
+/// On Windows the open is retried with a bounded backoff because a process that aborted on
+/// the same path holds Turso database handles the OS does not release instantly, so the
+/// first open attempts return `PermissionDenied` (`I/O error (tempdir): permission denied`
+/// from `CreateFile` on the Turso database or its `-log` or `-wal` file).  The retry is at
+/// most 6 attempts 500 ms apart, so it waits no longer than 2.5 s; any other error, or the
+/// sixth attempt's, is propagated unchanged.
 async fn verify_recovered(root: &Path, op: Op, point: FaultPoint, label: &str) {
-	let store = SegmentStore::open(root).await.unwrap_or_else(|e| panic!("{label}: the store opens: {e:#}"));
+	let store = open_store_retry(root).await.unwrap_or_else(|e| panic!("{label}: the store opens: {e:#}"));
 	let expected = expected_rows(op);
 	let instants: Vec<i64> = expected.iter().map(|(t, _)| *t).collect();
 	let rows = rows_of(&store).await.unwrap_or_else(|e| panic!("{label}: read_time_range: {e:#}"));
@@ -643,6 +650,47 @@ async fn run_matrix_child(spec: &str, dir: &Path, fault: Option<&str>) -> std::p
 /// Assert that a matrix child ran its body and passed.
 fn assert_passed(what: &str, out: &std::process::Output) {
 	assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"), "{what}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}
+
+/// Retry `SegmentStore::open(root)` on Windows with a bounded backoff when the child
+/// process that aborted on the same path still holds Turso database handles the OS has not
+/// released.  The error at the failing site is `I/O error (tempdir): permission denied`;
+/// the retry catches every `io::ErrorKind::PermissionDenied` at the `SegmentStore::open`
+/// level.  Up to 6 attempts, 500 ms apart; a non-permission error, or the last attempt's
+/// error, propagates.
+///
+/// On non-Windows platforms this compiles to a single pass-through call.
+async fn open_store_retry(root: &Path) -> anyhow::Result<SegmentStore> {
+	#[cfg(not(windows))]
+	{
+		return SegmentStore::open(root).await;
+	}
+	#[cfg(windows)]
+	{
+		let mut last = None;
+		for i in 0..6u32 {
+			match SegmentStore::open(root).await {
+				Ok(store) => return Ok(store),
+				Err(e) => {
+					if i < 5 && is_open_permission_denied(&e) {
+						last = Some(e);
+						tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+						continue;
+					}
+					return Err(e);
+				}
+			}
+		}
+		Err(last.expect("loop exhausted without storing an error"))
+	}
+}
+
+/// Whether `e` is an I/O permission-denied error at the open-or-begin level, which on
+/// Windows means a Turso database handle still held by a process that was aborted on this
+/// path (issue #625).
+#[cfg(windows)]
+fn is_open_permission_denied(e: &anyhow::Error) -> bool {
+	e.root_cause().downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 /// The frame file name of `id`'s row in `store`'s index: since S10 a seal's frame

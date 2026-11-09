@@ -1,0 +1,223 @@
+# yamllint disable rule:line-length
+name: soak nightly
+
+# The nightly soak gate (1.0 plan SOA-15). It builds and runs a time-boxed
+# soak exercise, produces a SoakReport JSON with its honesty Markdown, and
+# compares the result against the prior successful night's artifact.
+#
+# **What turns the job red**
+# - A rule that passed the previous night now fails (Pass to Fail regression).
+# - The soak run itself fails (non-zero exit from the soak driver).
+# - No soak report artifact was produced.
+#
+# **What turns the job yellow (::warning::)**
+# - A documented metric drifted past its tolerance
+#   (e.g. backup RPO grew more than 10%).
+#
+# **First night behaviour**
+# When no prior successful soak artifact exists, the job succeeds with an
+# explicit "first nightly no baseline" note. The first night artifact
+# becomes the baseline for the next run.
+#
+# **Time budget**
+# Target wall-clock soak is 25-40 minutes for the whole job:
+# - Build: ~5 min
+# - Soak run: ~15 min
+# - Artifact download/comparison: ~5 min
+# - Overhead: ~5 min
+# Job-level timeout-minutes: 60 (generous for runner queue wait).
+# The soak step uses ~900 ticks at ~60ms intervals for ~15 min of soak.
+#
+# **Linux only**: the soak starts a real server and exercises it over HTTP;
+# a Windows or macOS runner would need a different server path. The TTL lane
+# is recorded as not-tested because the store has no row-level TTL mechanism
+# (see the honesty section output and PR body).
+#
+# **No automatic merge to main** - this workflow runs on schedule and on
+# workflow_dispatch only, never on push or pull_request.
+
+on:
+  schedule:
+    # 07:00 UTC daily, after bench-regression.yml's 06:00 run, so the two
+    # do not compete for the same runners.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: soak-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  SOAK_NAME: nightly-soak
+  SOAK_DIR: soak-out
+
+jobs:
+  soak:
+    name: ubuntu-latest soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+
+      - name: Build the soak driver
+        run: cargo build --locked --release -p weft-bench
+
+      # The soak run. Produces a SoakReport JSON and a Markdown honesty
+      # section. ~900 ticks at ~60ms intervals = ~15 min of soak,
+      # ~120 ticks per window = ~7 windows.
+      - name: Run the nightly soak
+        id: soak
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SOAK_DIR"
+          ./target/release/weft-bench soak-run \
+            --name "$SOAK_NAME" \
+            --seed 0x5EED \
+            --duration-secs 900 \
+            --ticks 900 \
+            --window-ticks 120 \
+            --out-dir "$SOAK_DIR" \
+            --report "$SOAK_DIR/soak-report.json" \
+            --honesty "$SOAK_DIR/honesty.md"
+          echo "report=$SOAK_DIR/soak-report.json" >> "$GITHUB_OUTPUT"
+          echo "honesty=$SOAK_DIR/honesty.md" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the soak report
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "${{ steps.soak.outputs.report }}" ]; then
+            echo "::error:: Soak report not produced at ${{ steps.soak.outputs.report }}"
+            exit 1
+          fi
+          echo "Soak report produced: $(wc -c < "${{ steps.soak.outputs.report }}") bytes"
+          echo "=== Honesty section ==="
+          cat "${{ steps.soak.outputs.honesty }}"
+
+      # --- Nightly-to-nightly comparison ---
+      - name: Find the baseline soak run
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          id=$(gh run list \
+            --workflow "soak nightly" \
+            --status success \
+            --limit 10 \
+            --json databaseId \
+            --jq "[.[].databaseId] | map(select(. != ${{ github.run_id }})) | first // empty")
+          echo "id=${id:-}" >> "$GITHUB_OUTPUT"
+          if [ -z "${id:-}" ]; then
+            echo "no previous successful run: this run becomes the first baseline"
+          else
+            echo "baseline is run $id"
+          fi
+
+      - name: Download the baseline soak report
+        if: steps.baseline.outputs.id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: soak-report
+          run-id: ${{ steps.baseline.outputs.id }}
+          path: soak-baseline
+
+      - name: Compare against baseline
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Soak comparison"
+            echo
+            echo "- baseline run: \`${{ steps.baseline.outputs.id || 'none yet' }}\`"
+            echo "- current run: \`${{ github.run_id }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f soak-baseline/soak-report.json ]; then
+            {
+              echo
+              echo "**No baseline soak artifact yet.** This run is uploaded as the"
+              echo "first baseline; the comparison gate starts on the next night."
+              echo
+              echo "### First nightly no baseline"
+              echo
+              echo "This is the first successful soak nightly run. No prior soak"
+              echo "report exists to compare against. The comparison gate will"
+              echo "activate on the next run."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          set +e
+          ./target/release/weft-bench soak-compare \
+            "soak-baseline/soak-report.json" \
+            "${{ steps.soak.outputs.report }}" \
+            --markdown "$SOAK_DIR/verdict.md" \
+            --json "$SOAK_DIR/verdict.json" 2>&1 | tee "$SOAK_DIR/compare.txt"
+          compare_status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo
+            echo '```'
+            cat "$SOAK_DIR/compare.txt" 2>/dev/null || echo "(no compare output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$SOAK_DIR/verdict.md" ]; then
+            cat "$SOAK_DIR/verdict.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Annotate metric drift warnings
+          if [ -f "$SOAK_DIR/verdict.json" ]; then
+            python3 scripts/annotate-soak-drift.py \
+              --verdict "$SOAK_DIR/verdict.json"
+          fi
+          exit "$compare_status"
+
+      # Stage and upload the soak artifacts.
+      - name: Stage the soak artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p soak-stage
+          cp "${{ steps.soak.outputs.report }}" soak-stage/soak-report.json
+          cp "${{ steps.soak.outputs.honesty }}" soak-stage/honesty.md
+          if [ -f "$SOAK_DIR/verdict.json" ]; then
+            cp "$SOAK_DIR/verdict.json" soak-stage/
+          fi
+          if [ -f "$SOAK_DIR/verdict.md" ]; then
+            cp "$SOAK_DIR/verdict.md" soak-stage/
+          fi
+          if [ -f "$SOAK_DIR/compare.txt" ]; then
+            cp "$SOAK_DIR/compare.txt" soak-stage/
+          fi
+          echo "staged files:"
+          ls -la soak-stage/
+
+      - name: Upload the soak report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: soak-report
+          path: soak-stage
+          if-no-files-found: error
+          retention-days: 90

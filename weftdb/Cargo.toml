@@ -1,6 +1,6 @@
 [package]
 name = "weftdb"
-version = "0.3.0"
+version = "0.3.2"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -39,6 +39,12 @@ rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 turso = { workspace = true }
+# Not used directly. turso_core pulls in `branches` 0.4.x with default features off, and on
+# nightly (which docs.rs uses) its no-`std` path calls the removed `core::intrinsics::abort`.
+# Turning `std` on here unifies the feature for turso_core's copy, so the published crate
+# builds on docs.rs; the workspace [patch] does not reach published crates. Remove when
+# turso_core depends on branches >= 0.5.1.
+branches = { version = "0.4.3", default-features = false, features = ["std"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 uuid = { workspace = true, features = ["v4", "serde"] }

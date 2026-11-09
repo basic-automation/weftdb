@@ -533,6 +533,13 @@ fn request_limit(rejection: &JsonRejection) -> Option<u64> {
 	digits.parse().ok()
 }
 
+/// Whether `err`'s chain contains an [`io::Error`] that signals a disk-full condition:
+/// [`ErrorKind::StorageFull`] (stable; what `ENOSPC`/`ERROR_DISK_FULL` map to) or, when
+/// the error arrived through a kind-less wrapper, a raw OS error of 28 (`ENOSPC`).
+fn error_chain_is_disk_full(err: &anyhow::Error) -> bool {
+	err.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull || io.raw_os_error() == Some(28)))
+}
+
 /// A raw-body extractor that answers an unbufferable body with the
 /// envelope (D-S14).
 ///
@@ -841,6 +848,10 @@ pub fn classify_read(err: &anyhow::Error) -> ApiError {
 	if err.to_string().contains("no declared schema") {
 		return ApiError::aspect_not_found(err.to_string());
 	}
+	// A filesystem write that failed because the disk is full.
+	if error_chain_is_disk_full(err) {
+		return ApiError::server(Code::InsufficientStorage, err);
+	}
 	// Anything else here failed inside the server — a decoder on our own frame, a driver
 	// message, an Arrow write. The cause is logged and the client keeps the generic sentence.
 	ApiError::internal(err)
@@ -904,6 +915,12 @@ pub fn classify_ingest(err: &anyhow::Error) -> ApiError {
 	// ingest lane types it (D-S10/D-S14) rather than the router lane rewriting a library call.
 	if message.contains("out-of-order timestamp") {
 		return ApiError::bad_request(message);
+	}
+	// A filesystem write that failed because the disk is full (ENOSPC / ERROR_DISK_FULL)
+	// is the §4 507 `insufficient_storage` — the only 5xx code for a condition the
+	// caller's next action (free space or move the store) determines.
+	if error_chain_is_disk_full(err) {
+		return ApiError::server(Code::InsufficientStorage, err);
 	}
 	ApiError::internal(err)
 }
@@ -1487,5 +1504,33 @@ mod tests {
 		assert_eq!(decoded_too_large(2048, 1024).code(), Code::PayloadTooLarge);
 		assert!(decoded_too_large(2048, 1024).wire_message().contains("WEFT_MAX_INGEST_DECODED_BYTES"));
 		assert_eq!(non_finite_value("a `value` cell").code(), Code::NotFinite);
+	}
+
+	/// A disk-full IO error anywhere in the chain maps to `507 insufficient_storage`.
+	#[test]
+	fn a_disk_full_io_error_maps_to_insufficient_storage() {
+		// 1. Direct `ErrorKind::StorageFull`.
+		let direct = std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left on device");
+		let api = classify_ingest(&anyhow::Error::from(direct).context("ingest of aspect \"price\" failed while WritingFrames"));
+		assert_eq!(api.code(), Code::InsufficientStorage);
+		assert_eq!(api.code().status(), StatusCode::INSUFFICIENT_STORAGE);
+
+		// 2. `io::Error` with `raw_os_error == 28` (ENOSPC) but kind `Other`.
+		let raw = std::io::Error::from_raw_os_error(28);
+		let api2 = classify_ingest(&anyhow::Error::from(raw).context("writing segment"));
+		assert_eq!(api2.code(), Code::InsufficientStorage);
+		assert_eq!(api2.code().status(), StatusCode::INSUFFICIENT_STORAGE);
+
+		// 3. Plain `ErrorKind::Other` with no OS error still produces 500 Internal.
+		let plain = std::io::Error::other("some other IO error");
+		let api3 = classify_ingest(&anyhow::Error::from(plain).context("writing segment"));
+		assert_eq!(api3.code(), Code::Internal);
+		assert_eq!(api3.code().status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+		// 4. The read classifier also maps StorageFull.
+		let read_disk = std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left");
+		let api4 = classify_read(&anyhow::Error::from(read_disk).context("serialising a read response"));
+		assert_eq!(api4.code(), Code::InsufficientStorage);
+		assert_eq!(api4.code().status(), StatusCode::INSUFFICIENT_STORAGE);
 	}
 }

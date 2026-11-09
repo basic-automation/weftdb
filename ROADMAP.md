@@ -245,70 +245,23 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   On the release and identity side, the release pipeline (PAC-1a) and the canonical `TagSet`, `SeriesKey` and `SeriesSelector` types with their frozen caps (TAG-1) are in, and GitHub private vulnerability reporting is turned on (owner step).
 
 - [x] **W1 · Baseline release, server split, goldens**
-  - [x] **FRE-1** Release truth, per-crate versions, single edition, publish split, package hygiene
-  - [x] **FRE-3** Golden frames, golden sidecars and persisted-encoding goldens (gated codecs included)
-  - [x] **TAG-3** Open `ValueKind` in weftdb, provenance scope
-  - [x] **EVI-1** Claims hygiene (2026-10-25: every command, flag, endpoint and link in the README
-    checked against the code; the one over-claim — that any figure is reproducible from a clone —
-    is reworded, and per-figure sourcing becomes EVI-2's job)
-  - [x] **EVI-3** Run manifest (schema v23: the 2026-10-09 routine took v20–v22, so EVI-3 takes the next free number per the plan's rule)
-  - [x] **EVI-9** Block missingness and scale presets
-  - [x] `weft-bench --sparse`: a seeded (series × block) grid of nullable cells, the block-aligned mean scan over it, and the observed missingness recorded in the report beside the grid that produced it
-  - [x] `--scale tiny|small|medium|large` for the sized workloads (`--sparse`, `--gap-fill`, `--downsample`), filling only the size knobs left at their default, and naming the preset in the profile so two grid sizes never compare as one run
-  - [x] **SOA-1** Soak harness skeleton
+
+  Release truth is settled: per-crate versions, a single edition, the publish split and package hygiene (FRE-1). Golden frames, sidecars and persisted-encoding goldens, gated codecs included, are committed (FRE-3), and weftdb's `ValueKind` is open with a provenance scope (TAG-3). The README's commands, flags, endpoints and links were checked against the code on 2026-10-25 and its one over-claim reworded (EVI-1). Bench runs carry a manifest at schema v23 (EVI-3). `weft-bench --sparse` measures a seeded nullable grid and records the observed missingness, and `--scale tiny|small|medium|large` sizes the sparse, gap-fill and downsample workloads and names the preset in the profile (EVI-9). The soak harness skeleton is in (SOA-1).
+
 - [x] **W2 · Error contract, frame format, portable builds**
-  - [x] Legacy lane
-    - [x] **FRE-14c** operator route: `weft-server import-rows-mode` reads one 0.1.x subject into a Storage v2 store, prints what stays behind and why, and records the run so a second read refuses
-    - [x] **FRE-14c** streaming rows-mode read: a whole aspect must not have to fit in memory
-    - [x] **FRE-14c** migrating `metadata.db`'s non-row state
-  - [x] **PAC-2** Portable Linux binaries on a glibc 2.28 baseline
-  - [x] **EVI-5** Nightly benchmark-regression workflow and `weft-bench compare`
-  - [x] **EVI-2** Claims registry and markdown claim/link lint
-  - [x] `bench/claims.json` vouches for each figure the README quotes: the bench or the local corpus behind it, the date, and whether a clone can re-run it
-  - [x] `tools/check_claims.py` in CI pairs every entry with its `<!-- claim:id -->` marker, checks the figure text still sits beside the marker and the source path still exists, fails on a `*Source:*` line no entry claims, and resolves every relative link in the README against the tree
-  - [x] → **EVI-4** Artifact pipeline
-  - [x] **EVI-6** Ingest workload over SegmentStore and the UCI corpus loader
-  - [x] **EVI-8A** Benchmark adapter v2 I
-  - [x] **SOA-2** Soak preflight, device resolution, run metadata and secret redaction
-  - [x] **SOA-3** Open-loop scheduler, HDR interval logs, harness self-monitoring and null server
-  - [x] **SOA-4** Deterministic workload model, lanes, format-exact value grids and body encoders
+
+  The legacy lane closed FRE-14c: `weft-server import-rows-mode` streams one 0.1.x subject into a Storage v2 store, migrates `metadata.db`'s non-row state, reports what stays behind and refuses a second run. Linux binaries are portable on a glibc 2.28 baseline (PAC-2). A nightly regression workflow and `weft-bench compare` watch performance (EVI-5). `bench/claims.json` vouches for every README figure and `tools/check_claims.py` enforces the markers, sources and links in CI (EVI-2), with the artifact pipeline behind it (EVI-4). The ingest workload over SegmentStore with the UCI loader (EVI-6) and benchmark adapter v2 I (EVI-8A) landed. On the soak side: preflight, device resolution, run metadata and secret redaction (SOA-2); the open-loop scheduler, HDR interval logs, self-monitoring and null server (SOA-3); and the deterministic workload model with format-exact value grids and body encoders (SOA-4).
+
 - [x] **W3 · Gate, serve path, input domain**
-  - [x] Store lane
-  - [x] → **EVI-10A** Library stored-range interpolation with input caps (a child module, one `mod` line)
-  - [x] → **D-S11** Rollup into segment_index.db, folded in the seal and swap transactions
-  - [x] **SEC-3** Sealed route registry (`RouteSpec`), frozen scope table and fail-closed gate
-  - [x] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
-  - [x] **ROB-6** Bounded decimals
-  - [x] **EVI-8B** Benchmark adapter v2 II
-  - [x] **SOA-5** Soak ingest client
-  - [x] **SOA-12** Linux system samplers, contamination flags and the strict-mode flush check
+
+  The store lane added library stored-range interpolation with input caps (EVI-10A) and the rollup in `segment_index.db`, folded into the seal and swap transactions (D-S11). Routes live in a sealed registry with a frozen scope table and a fail-closed gate (SEC-3), served by one HTTP/1.1 path with pre-auth listener limits that absorb ROB-23's caps (SEC-4). Decimals are bounded (ROB-6). Benchmark adapter v2 II (EVI-8B), the soak ingest client (SOA-5) and the Linux system samplers with contamination flags and the strict-mode flush check (SOA-12) round it out.
 - [x] **W4 · Auth, config, ILP fix**
-  - [x] Store lane
-  - [x] → **D-S13** Idempotent atomic ingest entry point (library) (+ `groups`, ledger `series_ids`, typed errors)
-  - [x] **SEC-5** TLS listener (rustls with ring) on the shared serve path
-  - [x] **SEC-6** API keys, Bearer authentication, keys file and keygen
-  - [x] **ROB-3** Panic containment, daemon supervision, Daemons registry, `weftdb::exec`
-  - [x] **PAC-5b** Strict server configuration and store filesystem check (the bind guard moves to SEC-8)
-  - [x] **TAG-0** Fix ILP series merging
-  - [x] L-FMT: **ROB-8** Frame decode hardening
-  - [x] **EVI-11** Stored WeftDB benchmark adapter
-  - [x] **SOA-6** Soak oracle core
+
+  The store gained an idempotent atomic ingest entry point with `groups`, ledger `series_ids` and typed errors (D-S13). The server got a rustls/ring TLS listener on the shared serve path (SEC-5), API keys with Bearer auth, a keys file and keygen (SEC-6), panic containment with daemon supervision, the Daemons registry and `weftdb::exec` (ROB-3), and strict configuration with a store filesystem check (PAC-5b; the bind guard moved to SEC-8). ILP series merging is fixed (TAG-0) and frame decoding hardened (ROB-8). The stored WeftDB benchmark adapter (EVI-11) and the soak oracle core (SOA-6) landed.
 - [x] **W5 · Ingest wiring, whole-store backup, legacy seal**
-  - [x] Store lane
-  - [x] → **D-S15** Partial sidecar v4
-  - [x] → **D-S19** Seal-backed legacy aspects
-  - [x] L-INGEST
-  - [x] **ROB-4** Enforced no-panic lint (including asserts) and the weft-arrow Result API
-  - [x] **ROB-10** Admission I
-  - [x] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth
-  - [x] → **SEC-10** Exposure and secrets hygiene
-  - [x] **FRE-5** Compute vocabulary, exact-case tokens and no silent narrowing
-  - [x] **FRE-7b** Immutable declarations, scale rules and schema read-back
-  - [x] **EVI-13** DuckDB adapter I
-  - [x] **EVI-15R** Report renderer with honesty-section generation
-  - [x] **EVI-16** Honesty pages I
-  - [x] **SOA-7** Window digests and the oracle self-test
-  - [x] **SOA-8** Failure deck, phases, recovery windows, SIGTERM verdict and the maintenance driver
+
+  The store lane added the partial sidecar v4 (D-S15) and seal-backed legacy aspects (D-S19), and L-INGEST wired ingest through. The no-panic lint, asserts included, is enforced and weft-arrow exposes a `Result` API (ROB-4); admission I is in (ROB-10). Startup ordering, the exposure matrix, the auth-off guard and metrics auth (SEC-8) shipped with exposure and secrets hygiene (SEC-10). The compute vocabulary uses exact-case tokens with no silent narrowing (FRE-5), and declarations are immutable with scale rules and schema read-back (FRE-7b). DuckDB adapter I (EVI-13), the report renderer with generated honesty sections (EVI-15R) and honesty pages I (EVI-16) landed, as did soak window digests with an oracle self-test (SOA-7) and the failure deck with phases, recovery windows, the SIGTERM verdict and the maintenance driver (SOA-8).
+
 - [ ] **W6 · Durability CI, store split, scheduler**
   - [x] **D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
   - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
@@ -327,34 +280,22 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **EVI-14** DuckDB adapter II
   - [x] **EVI-18** Backup health metrics and catch-up-free ticking
   - [x] **EVI-25** Backup, restore and recovery cost measurement (RTO inputs and backup duration)
-- [ ] **W7 · Post-split lanes open; security and packaging close**
-  - [ ] open lane
-  - [x] → **FRE-12b** Scope pin, `GET /api/v1/version`, incompatible-store mapping and exit code
-    - The pin refuses a start whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` differ from the
-      scope the store root's own `STORE_FORMAT` records (exit 65, the class the exit table has
-      always named for a scope mismatch; `WEFT_STORE_SCOPE_PIN=off` serves the root anyway).
-      `GET /api/v1/version` answers build, layout, scope-pin and exit-code state from process
-      state alone, so it answers while a store is being refused. DECISIONS 2026-11-03
-  - [ ] seal lane
-  - [ ] read lane
-  - [x] → **ROB-13** Bounded stored downsample and point lookups
-  - [x] **ROB-7** Ingest decode bounds
-    *Closed 2026-11-05 (#551): non-finite input is `400 not_finite` in every ingest format (Parquet NaN no longer sealed as a null), plus decoded ceilings `WEFT_MAX_INGEST_ROWS` (413 too_many_rows) and `WEFT_MAX_INGEST_DECODED_BYTES` (413 payload_too_large), checked after parse and before the seal (`weft-server/src/ingest.rs:218`).*
-  - [x] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
-  - [x] **ROB-23r** Probe-only admin listener
-  - [x] **PAC-13** Offline restore CLI over D-S16 (`weft-server restore`)
-  - [x] **ROB-5** Legacy queue-consumer panics
-  - [x] **SEC-13** Security acceptance
-  - [x] **PAC-9** Docker image and container smoke test (with a mounted keys file)
-  - [ ] **PAC-11** systemd unit, user and env files, and host-install CI
-  - [x] **EVI-15** First cross-engine report
-  - [x] Write or approve the cross-engine report narrative *(owner)*
-  - [x] **EVI-19** Documented RPO/RTO
-  - [x] **SOA-11** Soak backup lane, online prefix check, final restore verification, RPO/RTO
+- [x] **W7 · Post-split lanes open; security and packaging close**
+
+  The open lane pinned the store scope: a start whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` differ from the root's `STORE_FORMAT` exits 65 unless `WEFT_STORE_SCOPE_PIN=off`, and `GET /api/v1/version` answers build, layout, scope-pin and exit-code state from process state alone (FRE-12b; DECISIONS 2026-11-03). The read lane bounded stored downsample and point lookups (ROB-13). Ingest rejects non-finite input as `400 not_finite` in every format and enforces `WEFT_MAX_INGEST_ROWS` and `WEFT_MAX_INGEST_DECODED_BYTES` before the seal (ROB-7, #551). GPU configuration, compute limits, interpolation provenance and metrics (ROB-16), the probe-only admin listener (ROB-23r) and the legacy queue-consumer panic fix (ROB-5) landed. Security acceptance closed (SEC-13). Packaging shipped the offline `weft-server restore` CLI (PAC-13), the Docker image with a container smoke test (PAC-9), and the systemd unit with host-install CI (PAC-11). The first cross-engine report and its owner-approved narrative (EVI-15), documented RPO/RTO (EVI-19) and the soak backup lane with final restore verification (SOA-11) close the wave.
 - [ ] **W8 · Tags core, memory budget**
   - [ ] open lane
   - [x] → **TAG-9** Frame error classes in recovery
     *Closed 2026-11-05 (audit): #556 (2026-11-04). Recovery and fsck adopt series-key frames into their series, class a malformed/empty/duplicate SERIES_KEY after a passing CRC as suspect (C5), rebind mismatched keys (`series_rebound`), and settle every held row (`held_cleared`).*
+  - [x] → **TAG-5** Tags core: series table, catalog, and the layout marker
+    *Closed 2026-11-07 by audit (#619): the series catalog and its time index are registered
+    migrations `0006_tag5_series` and `0007_series_time_index`, and the rest of the C1 columns
+    landed earlier in the same registry (`0002_s6_s7`, `0004_d_s12`, `0005_d_s13`). No
+    `0009_*` and no bump: `SUPPORTED_LAYOUT` stays 2 and layout 3 stays unassigned, because every
+    shape of a marker-only migration either makes 0.3.x binaries refuse a store that differs only
+    by a re-run of `CREATE TABLE IF NOT EXISTS series` or teaches that a layout number can move
+    without meaning anything. DECISIONS 2026-11-07; the owner still owes the ruling on whether the
+    literal `layout_version = 3` is a hard 1.0 gate.*
   - [ ] seal lane
   - [x] → **ROB-17** Disk guard, headroom API and space gauges
     - [x] Log the `507 insufficient_storage` refusal once per transition into and out of refusing, not once per request: today every refused ingest logs at ERROR, so a client retrying against a full disk floods the log (the `weft_disk_guard_refusing` gauge already carries the state).
@@ -364,17 +305,31 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] read lane
   - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
   - [ ] **FRE-8b** Stored-value text and one float-input rule across every ingest format
-  - [ ] **FRE-9a** OpenAPI generated from code
+  - [x] **FRE-9a** OpenAPI generated from the route table, committed, drift-checked in CI
+    *Closed 2026-11-07 (#615): generated from the real `RouteTable` via
+    `openapi::from_table`, wired as the `weft-server openapi` subcommand
+    (PAC-7 exit-code contract), committed at `compat/openapi/weftdb.json`,
+    drift-gated by `generated_spec_matches_committed_file`, and structurally
+    validated by `generated_spec_passes_structural_validation`.*
   - [x] **ROB-9** Mutation harness for frames, sidecars and Parquet
     - [ ] Report the three `parquet` 60.0.0 decoder panics upstream to apache/arrow-rs (`offset + len out of bounds`, `column start and length should not be negative`, `Decoder for dict should have been set`; reproducers are one-byte edits found by `weft-arrow-store/tests/parquet_mutation.rs`), plus an `arrow-buffer` 60.0.0 panic at `util/bit_chunk_iterator.rs:235` seen when 4,070 one-bit mutants were posted to a running server *(owner: outward-facing)*. WeftDB contains them in `weft_arrow::read_parquet` meanwhile (DECISIONS 2026-11-05). Before filing, check them against the two malformed-file panics upstream already closed in 2026 — a compact-Thrift bool `unwrap` (https://github.com/apache/arrow-rs/issues/9839, closed 2026-04-28) and a row-count/column-data mismatch index panic (https://github.com/apache/arrow-rs/issues/9992, closed 2026-05-22) — since ours were seen on 60.0.0 and are different messages.
   - [ ] **SEC-14** Security documentation, config schema and upgrade notes
   - [ ] **PAC-10** Publish the multi-arch image (only after API auth)
   - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
-  - [ ] **EVI-17** Honesty pages II
+  - [x] **EVI-17** Honesty pages II
   - [ ] Write or approve the honesty-page narrative *(owner)*
   - [ ] **FRE-13** Layout-1 to layout-2 upgrade test
-  - [ ] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
+  - [x] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
+    *Closed 2026-11-07 (#603): `SoakReport`, the R1–R8 evaluator, the coverage floors and the
+    honesty section are on main; the report is what #616's nightly comparison reads.*
   - [ ] → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
+    *Partial 2026-11-07 (#616): `compare_soak_reports` reports metric drift past tolerance and
+    every rule outcome change (a Pass→Fail turns the job red), `scripts/annotate-soak-drift.py`
+    puts the offending pair on the run summary, and `soak.yml` runs the driver and the comparison
+    on `workflow_dispatch` (`docs/soak.md`). Two pieces of this item are deliberately not claimed:
+    the schedule stays commented out, and the TTL lane is reported as not-tested, because the
+    in-process `soak-run` driver cannot yet produce honest R1–R8 evidence — that needs the
+    SOA-4/6/12 fleet lanes.*
 - [ ] **W9 · Read semantics, limits, upgrade legs**
   - [ ] read lane
   - [ ] maint lane
@@ -382,18 +337,21 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] L-INGEST
   - [x] storage read handlers lane (TAG-10)
   - [ ] **FRE-10a** Contract tests
-  - [ ] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
+  - [x] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [ ] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
   - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
   - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
   - [ ] read lane
-  - [ ] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
-  - [ ] **PAC-15** Operator documentation
+  - [x] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
+    *Closed 2026-11-08: [`docs/stability.md`](docs/stability.md) documents the semver
+    policy, surface stability table, compat-suite coverage and named gaps; linked from
+    README.md and docs/reference.md.*
+  - [x] **PAC-15** Operator documentation
 - [ ] **W11 · Contract candidate, beta tag, calibration**
   - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
   - [ ] **FRE-9b** OpenAPI
-    - [ ] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh` accepts only `vX.Y.Z` and `vX.Y.Z-rc.N` today, so a beta …
+    - [x] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh` accepts only `vX.Y.Z` and `vX.Y.Z-rc.N` today, so a beta …
     - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*
   - [ ] → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh`
   - [ ] **FRE-10b** Contract tests
@@ -515,6 +473,21 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **The three unguarded `weft-orchestration` failures are latent bugs, not flakes — fix them
 - [ ] **Re-measured 2026-10-09 — still unbounded.**
 - [ ] **Bound the seven slow `weft-orchestration` tests the way `db_tests` was bounded.**
+- [ ] **`weft-orchestration`: per-pipeline signal state, not the global `SIGNALS_QUEUE` (filed 2026-11-06, from the fan-controller build).** `SIGNALS_QUEUE` is a process-wide static (`lib.rs:662`); `Pipeline::generate_signals` and `filter_signals_at` clone the whole queue into each pipeline (`pipeline.rs:964`, `:982`). With several sensor pipelines in one process, one sensor's signals reach another's probability queries. Fix: key the queue by aspect (or move it onto `Pipeline`), and add a two-pipeline isolation test. Check whether `create_signals` clears the queue; if not, even running the pipelines one at a time leaks.
+- [ ] **`weft-orchestration`: bounded-window threshold detectors (filed 2026-11-06, from the fan-controller build).** `detect_threshold_crossing_up` (`detectors.rs:504`), and probably its sibling detectors, analyse the aspect from its earliest to its latest measurement on every call, then collect and sort every point. For a 1 Hz daemon that runs for weeks, each tick costs O(history). Fix: an optional `since` start time (or an incremental cursor from the last evaluated point), so a live caller only scans new data. Add a test that the windowed and full-history runs find the same crossings in the window.
+- [ ] **`weftdb` dictionaries: shrink the occurrence footprint without dropping any occurrence (filed 2026-11-06, after the Fan Control 112 GB incident).** Every occurrence must be kept, because the statistics need them all. No `max_patterns` or `max_occurrences` caps: if the dictionary needs a cap, it is under-constrained. The duplicate-on-every-run bug is **fixed 2026-11-07 (#612, 0.3.2)**: `Pipeline::import_windows` rewrites every id, so the old `if exists { continue }` test could not fire and each run re-inserted every occurrence. What remains:
+  - **Lossless compact encoding.** Each `pattern_occurrences` row now repeats `pattern_id`, `aspect_id`, `resolution`, `size`, a JSON `database_info` and two timestamps. Store the per-dictionary constants once. Derive `end` from `start + size·resolution` and store it only when it differs. Store `start` as delta-of-delta varints, reusing the `weft-physical-type` timestamp codecs. Keep each pattern's occurrences in an append-only log on disk.
+  - **Lean patterns in memory.** A pattern in RAM holds its shape, `count` and `first_seen`/`last_seen`. Occurrences are never loaded for matching; statistics and correlation read them as a stream. First check what `correlation.rs` needs from them.
+  - **Restore on reload.** `load_dictionary` restores the stored patterns verbatim, with no re-matching through `import_pattern` and no occurrence load.
+  - **Keep merging into every matching pattern**, as today. Any statistic should be computed per window, not by summing pattern counts.
+  - **Learn the constraints when they are unset.** One shared radius λ, adjusted toward a target rate of new patterns. Each variability kind gets T_k = λ·(online median of that kind's nearest-neighbour distance). Steps and interpolation are learned together once, then frozen. `Steps.Enforced` defaults to true. Sum kinds are derived as N·avg. Percentile kinds are used only when |mean| ≫ noise. The packing number bounds the pattern count; warn if it keeps climbing.
+  - **Tests:** replay the incident (1 window per minute) and check that `preamble.db` grows only linearly, at the compressed rate. Check that save then reload restores the dictionary exactly, and that there are zero duplicate occurrence rows.
+- [ ] **`weftdb` memory per database file: RSS keeps climbing across many small stores (filed 2026-11-08, from the Fan Control daemon on 0.3.2).** The daemon's store holds 529 database files, and its RSS keeps rising after the dictionary-doubling fix. Measure before changing anything; two hypotheses:
+  - **Page cache.** `configure_database_for_mvcc` (`database/connection.rs:119`) sets `PRAGMA cache_size=-256000` (~256 MB). If Turso applies it per *database*, 529 files allow about 135 GB, filled as pages are touched and never evicted below that. But it runs on a throwaway connection, and the comment above it says per-connection pragmas set there change nothing, so it may not apply at all. Confirm how `turso_core` scopes `cache_size`.
+  - **MVCC version store.** Every file opens in `journal_mode=experimental_mvcc`, which keeps row versions in memory until a checkpoint. Many files that are written often and checkpointed rarely would show the same slow climb.
+  - **Fix direction:** a process-wide memory budget split across open databases, not a fixed size per file. A small default `cache_size` (a few MB) on every working connection, raised only for bulk loads. Close or idle out databases that are not in use. Checkpoint the MVCC store on a schedule. Also question why one aspect-heavy app needs 529 files (one per aspect × dictionary): consolidating them is the bigger lever.
+  - **Test:** open N=500 stores, write to each at 1/min for a simulated day, and assert that RSS stays under a configured budget and does not grow with N × cache_size.
+- [ ] **Publish `weft-orchestration` to crates.io, or mark it `publish = false` and document path-dependency use (filed 2026-11-06).** Downstream users who mix a crates.io `weftdb` with a path `weft-orchestration` get two copies of `weftdb` and type mismatches. Confirm the crate's crates.io status first.
 - [x] **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:**
   - *Audit 2026-10-27: checked — this is a historical note and its fix shipped: `[profile.test] debug = 1` is at Cargo.toml:128.*
 - [ ] **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):**
@@ -547,4 +520,4 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - [ ] **Cascade adopt-or-drop into the DEFAULT selector — owner-gated (headline change, as FOR/ALP):**
 - [ ] **NEXT — checkpoint index adopt-or-drop into the DEFAULT policy — owner-gated (bytes/point
 - [ ] **NEXT — a random-access-capable Gorilla/RLE would widen the checkpoint index's reach:**
-- [ ] Publish a methodology document **before** any performance claim
+- [x] Publish a methodology document **before** any performance claim

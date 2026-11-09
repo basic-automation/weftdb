@@ -27,14 +27,14 @@ fn bd(s: &str) -> BigDecimal {
 
 async fn setup() -> Result<(TempDir, Database)> {
 	let temp_dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().unwrap());
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().unwrap());
 	let db_name = format!("seal_db_{}", Uuid::new_v4());
 	let db = Database::new(&db_name).await?;
 	Ok((temp_dir, db))
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 	let (_dir, db) = setup().await?;
@@ -99,8 +99,8 @@ async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn rows_mode_is_the_default_and_compression_forces_it() -> Result<()> {
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	let (_dir, db) = setup().await?;

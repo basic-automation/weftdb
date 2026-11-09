@@ -69,14 +69,14 @@ async fn seal_and_ingest_each_record_one_change_and_ack_deletes_by_epoch() -> Re
 
 async fn setup() -> Result<(TempDir, Database)> {
 	let temp_dir = tempfile::tempdir()?;
-	std::env::set_var("TEST_DATA_DIR", temp_dir.path().to_str().unwrap());
+	std::env::set_var("WEFT_DATA_DIR", temp_dir.path().to_str().unwrap());
 	let db_name = format!("change_db_{}", Uuid::new_v4());
 	let db = Database::new(&db_name).await?;
 	Ok((temp_dir, db))
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn seal_backed_ingest_feeds_the_change_log_not_the_queue() -> Result<()> {
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 	let (_dir, db) = setup().await?;
@@ -120,8 +120,8 @@ async fn seal_backed_ingest_feeds_the_change_log_not_the_queue() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn rows_mode_ingest_still_feeds_the_queue_and_no_change_log() -> Result<()> {
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	let (_dir, db) = setup().await?;

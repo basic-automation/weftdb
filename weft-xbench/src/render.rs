@@ -220,10 +220,16 @@ fn results_section(report: &XbenchReport, b: &mut Vec<Block>) {
 		.map(|r| {
 			let gate = r.correctness.as_ref().map_or_else(
 				|| "—".into(),
-				|c| match (c.passed, r.arm.own_answer.is_some()) {
-					(true, true) => "own answer".into(),
-					(true, false) => "PASS".into(),
-					(false, _) => format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference),
+				|c| {
+					if c.indeterminate {
+						"non-deterministic".into()
+					} else {
+						match (c.passed, r.arm.own_answer.is_some()) {
+							(true, true) => "own answer".into(),
+							(true, false) => "PASS".into(),
+							(false, _) => format!("FAIL (max diff {:.3e})", c.max_abs_diff_vs_reference),
+						}
+					}
 				},
 			);
 			let rmse = r.accuracy.as_ref().map_or_else(|| "—".into(), |a| format!("{:.4}", a.rmse));
@@ -262,10 +268,17 @@ fn honesty_section(report: &XbenchReport, b: &mut Vec<Block>) {
 	b.push(Block::Heading(2, "Honesty".into()));
 	b.push(Block::Para("Generated from the results above. A WeftDB arm wins or loses only when its p50 interval does not overlap the fastest other engine's; overlapping intervals are within noise.".into()));
 
-	let failures: Vec<String> = report.results.iter().filter(|r| !passed(r)).map(|r| format!("`{}` {} `{}` disagrees with the in-memory reference: {:?}.", r.dataset, phase_of(r), r.arm.arm, r.correctness)).collect();
+	let failures: Vec<String> = report.results.iter().filter(|r| !passed(r) && !r.correctness.as_ref().is_some_and(|c| c.indeterminate)).map(|r| format!("`{}` {} `{}` disagrees with the in-memory reference: {:?}.", r.dataset, phase_of(r), r.arm.arm, r.correctness)).collect();
 	if !failures.is_empty() {
 		b.push(Block::Heading(3, "Correctness failures".into()));
 		b.push(Block::List(failures));
+	}
+
+	let indeterminates: Vec<String> = report.results.iter().filter(|r| r.correctness.as_ref().is_some_and(|c| c.indeterminate)).map(|r| format!("`{}` {} `{}`: each run was inside its tolerance, but the pooled digest was dropped because the runs' answers differed (non-deterministic).", r.dataset, phase_of(r), r.arm.arm)).collect();
+	if !indeterminates.is_empty() {
+		b.push(Block::Heading(3, "Non-deterministic within tolerance".into()));
+		b.push(Block::Para("A row whose runs each passed their own tolerance but produced different digests is non-determinism, not a wrong answer. The combined gate is not a pass — it stays out of win/loss verdicts — and the pooled answer digest is dropped.".into()));
+		b.push(Block::List(indeterminates));
 	}
 
 	let verdicts = verdicts(report);
@@ -559,7 +572,7 @@ mod tests {
 
 	fn result(dataset: &str, arm: &str, phase: Phase, samples: &[u64], passed: bool) -> ArmResult {
 		let (latency, latency_ci) = latency(samples, 1);
-		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed, unfilled_points: 0, answer_sha256: None });
+		let correctness = (phase == Phase::Interpolate).then_some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: if passed { 0.0 } else { 1.0 }, tolerance: 1e-9, passed, unfilled_points: 0, answer_sha256: None, indeterminate: false });
 		ArmResult { dataset: dataset.into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: arm.into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None }, phase, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples.to_vec(), between_run: None }
 	}
 
@@ -725,6 +738,26 @@ mod tests {
 		let mut r = report(vec![]);
 		r.optimized = Some(false);
 		assert!(to_markdown(&blocks(&r)).contains("debug build"));
+	}
+
+	#[test]
+	fn an_indeterminate_row_is_rendered_as_non_deterministic_not_a_failure() {
+		let mut indet = result("ds1", "weftdb-memory", Phase::Interpolate, &FAST, true);
+		indet.correctness.as_mut().map(|c| c.indeterminate = true);
+		indet.correctness.as_mut().map(|c| c.passed = false);
+		let regular_fail = result("ds2", "duckdb-double", Phase::Interpolate, &FAST, false);
+		let r = report(vec![indet, regular_fail]);
+		let md = to_markdown(&blocks(&r));
+		assert!(md.contains("Non-deterministic within tolerance"), "indeterminate section present\n{md}");
+		assert!(md.contains("non-deterministic"), "gate cell says non-deterministic\n{md}");
+		let failures_pos = md.find("### Correctness failures").expect("failures header present");
+		let nondet_pos = md.find("### Non-deterministic within tolerance").expect("non-det header present");
+		let ds1_pos = md.find("`ds1`").expect("ds1 in output");
+		let ds2_pos = md.find("`ds2`").expect("ds2 in output");
+		// ds1 (indeterminate) must be in the non-det section, not in the failures section
+		assert!(nondet_pos <= ds1_pos, "ds1 should be in non-det section");
+		// ds2 (real failure) must be in the failures section
+		assert!(failures_pos <= ds2_pos && ds2_pos < nondet_pos, "ds2 should be in failures section, not non-det");
 	}
 
 	#[test]

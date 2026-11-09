@@ -1,13 +1,13 @@
 //! Support for the benches that create legacy [`Database`](weftdb::Database)s.
 //!
 //! `Database::new` creates a database under [`weftdb::data_dir`], which is the user's own
-//! `~/.weftdb/data` unless `TEST_DATA_DIR` or `WEFT_DATA_DIR` names another directory. A bench
+//! `~/.weftdb/data` unless `WEFT_DATA_DIR` names another directory. A bench
 //! binary's databases go to a temporary data dir of that binary instead, set up by the
 //! integration tests' helper (`weftdb/tests/common/mod.rs`, included here by path):
 //! [`criterion_main`] sets it up before the first bench and removes it after the last.
 //!
 //! The benches therefore measure the filesystem of the system temp dir (`TMPDIR`, often a
-//! tmpfs). To measure another one, name a directory on it in `TEST_DATA_DIR`: the benches then
+//! tmpfs). To measure another one, name a directory on it in `WEFT_DATA_DIR`: the benches then
 //! create their databases there and remove each one, but never the directory itself.
 
 #[path = "../../tests/common/mod.rs"]

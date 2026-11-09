@@ -1,6 +1,6 @@
 //! The client against a real `weft-server`: the wire contract.
 //!
-//! Run: `WEFT_SERVER_BIN=target/debug/weft-server cargo test -p weft-client --test live`.
+//! Run: `WEFT_SERVER_BIN=target/debug/weft-server cargo test -p weftdb-client --test live`.
 //! Without `WEFT_SERVER_BIN`, or with it naming no file, every test here passes without
 //! running (the unit and fake-server tests still run). Each test starts its own server
 //! on a free loopback port over a throwaway store and run directory, with a clean
@@ -15,7 +15,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt as _;
-use weft_client::{AspectDeclaration, BigDecimal, Client, ComputePoint, Downsample, ErrorKind, Format, IlpOptions, Interpolate, Page, PointKind, Spline, StoredDownsample, WriteOptions};
+use weftdb_client::{AspectDeclaration, BigDecimal, Client, ComputePoint, Downsample, ErrorKind, Format, IlpOptions, Interpolate, Page, PointKind, Spline, StoredDownsample, WriteOptions};
 
 const MANIFEST: &[u8] = br#"{"schema_version":23,"generated_at":"2026-11-03T00:00:00Z","claim":"sdk-live-rust"}"#;
 
@@ -101,7 +101,7 @@ async fn a_series_round_trips_losslessly() {
 	let got: Vec<(i64, String)> = streamed.iter().map(|p| (p.timestamp, p.value.as_ref().unwrap().to_string())).collect();
 	assert_eq!(got, [(1_000, "1.25".into()), (2_000, "2.50".into()), (3_000, "3.00".into())], "the aspect's scale, every digit");
 	let first = client.points("price", 0, 9_999, &Page::first(2)).await.unwrap();
-	assert_eq!((first.total, first.count, first.next_cursor.is_some()), (3, 2, true));
+	assert_eq!((first.total, first.count, first.next_cursor.is_some()), (Some(3), 2, true));
 
 	assert_eq!(client.at("price", 2_000).await.unwrap().value, Some(decimal("2.50")));
 	assert!(!client.at("price", 2_500).await.unwrap().found);
@@ -174,9 +174,9 @@ async fn columnar_answers_decode() {
 	let Some(server) = server().await else { return };
 	let points = [ComputePoint::new(at("1970-01-01T00:00:00Z"), 0.0), ComputePoint::new(at("1970-01-01T00:01:00Z"), 60.0)];
 	let request = Interpolate::new(points).spline(Spline::Linear);
-	let arrow = weft_client::decode_arrow(&server.client.interpolate_as(&request, Format::Arrow).await.unwrap()).unwrap();
+	let arrow = weftdb_client::decode_arrow(&server.client.interpolate_as(&request, Format::Arrow).await.unwrap()).unwrap();
 	assert_eq!(arrow.iter().map(arrow_array::RecordBatch::num_rows).sum::<usize>(), 61);
-	let parquet = weft_client::decode_parquet(&server.client.interpolate_as(&request, Format::Parquet).await.unwrap()).unwrap();
+	let parquet = weftdb_client::decode_parquet(&server.client.interpolate_as(&request, Format::Parquet).await.unwrap()).unwrap();
 	assert_eq!(parquet.iter().map(arrow_array::RecordBatch::num_rows).sum::<usize>(), 61);
 }
 

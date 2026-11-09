@@ -65,6 +65,7 @@ async fn dispatch() -> anyhow::Result<()> {
 		Ok(weft_server::cli::Command::Keygen(arguments)) => weft_server::keygen::run(arguments),
 		Ok(weft_server::cli::Command::Restore(arguments)) => weft_server::restore::run(arguments.into_iter()).await,
 		Ok(weft_server::cli::Command::ImportRowsMode(arguments)) => weft_server::import_rows_mode::run(arguments).await,
+		Ok(weft_server::cli::Command::Openapi(arguments)) => weft_server::openapi::run(arguments),
 		Err(error) => {
 			eprintln!("weft-server: {error}");
 			std::process::exit(weft_server::settings::USAGE_EXIT_CODE);

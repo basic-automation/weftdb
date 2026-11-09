@@ -83,6 +83,18 @@ else
 	cargo_cmd="rustup run stable cargo"
 fi
 # shellcheck disable=SC2086
+# The matrix builds with the release profile, which the workspace tunes for the
+# smallest, fastest shipped artifact: whole-program LTO, one codegen unit, line
+# tables on. One crate in this workspace — weft-orchestration — does not survive
+# that shape on the hosted runner: the job takes SIGTERM about two minutes after
+# the crate starts compiling, on every branch, control run 42199040596 on plain
+# main included (issue #604). The matrix exercises crash-injection behaviour,
+# which does not depend on codegen, so the memory-hungry knobs are relaxed for
+# this build alone — opt-level stays 3, and Cargo.toml keeps shipping the tight
+# profile untouched.
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+export CARGO_PROFILE_RELEASE_LTO=false
+export CARGO_PROFILE_RELEASE_DEBUG=false
 $cargo_cmd build --locked --release -p weft-bench
 
 out="$work/out"

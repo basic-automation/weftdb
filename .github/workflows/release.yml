@@ -6,7 +6,7 @@ name: Release
 # Releases and dry runs build with Cargo.toml's `dist` profile: the release profile
 # without debug info, and stripped. A dry run with fast=true builds the dev profile.
 #
-# - Pushing a tag vX.Y.Z or vX.Y.Z-rc.N releases that tag.
+# - Pushing a tag vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N releases that tag.
 # - Dispatching (Actions tab, or `gh workflow run release.yml`) is a dry run unless
 #   dry_run is false: it verifies and builds `ref`, uploads the archives and SHA256SUMS
 #   as workflow artifacts, and creates no release. With dry_run=false it releases the

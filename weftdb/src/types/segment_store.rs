@@ -6942,6 +6942,87 @@ mod tests {
 		assert!(migrations[0].starts_with("Text(\"0001_baseline\") Integer(1) ") && migrations[1].starts_with("Text(\"0002_s6_s7\") Integer(2) ") && migrations[2].starts_with("Text(\"0003_fre14_legacy_catalog\") Integer(2) ") && migrations[3].starts_with("Text(\"0004_d_s12\") Integer(2) ") && migrations[4].starts_with("Text(\"0005_d_s13\") Integer(2) ") && migrations[5].starts_with("Text(\"0006_tag5_series\") Integer(2) ") && migrations[6].starts_with("Text(\"0007_series_time_index\") Integer(2) ") && migrations[7].starts_with("Text(\"0008_upsert_keys\") Integer(2) "), "{migrations:?}");
 	}
 
+	/// FRE-13: a pre-v2 (layout-1) store upgrades to layout-2, serves existing data
+	/// correctly, accepts new writes after the migration, and the upgrade is idempotent
+	/// on subsequent opens.
+	#[tokio::test]
+	async fn a_layout_1_store_upgrades_to_layout_2_and_accepts_new_writes() {
+		let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre_v2_store");
+		let expected_reads = std::fs::read_to_string(fixture.join("expected_reads.txt")).expect("reads the expected reads");
+		let dir = TempDir::new().expect("tempdir");
+		let root = dir.path().join("store");
+		copy_tree(&fixture.join("root"), &root);
+		assert!(!root.join(STORE_FORMAT_FILE).exists(), "the fixture predates the marker");
+
+		// First open: migrates layout-1 → layout-2
+		let store = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("first open: {e:#}"));
+		let fresh_reads = fixture_reads(&store).await;
+		assert_eq!(fresh_reads, expected_reads, "migrated store reads exactly what the pre-v2 build read");
+		let report = store.open_report();
+		assert_eq!(report.migrated_from, Some(1), "first open migrates from layout 1");
+		assert_eq!(report.applied.len(), 8, "all migrations applied");
+		assert!(!report.created_new, "not a new store");
+		let format = store.store_format();
+		assert_eq!(format.layout_version, 2, "upgraded to layout 2");
+		assert_eq!(format.min_read_layout, 2);
+		assert_eq!(format.min_write_layout, 2);
+		assert_eq!(format.last_written_layout, 2);
+		assert_eq!(format.applied_through, Some("0008_upsert_keys".into()));
+		let uuid = store.store_uuid().to_string();
+
+		// Write new data into the now-layout-2 store. The timestamps sit outside the
+		// fixture's range on purpose: the series keeps every row it is given, so a
+		// re-used timestamp would read back as two points, not one replaced point.
+		let sch = schema();
+		let new_ts: Vec<i64> = vec![500, 510, 520];
+		let new_vals: Vec<BigDecimal> = vec![bd("55"), bd("66"), bd("77")];
+		store.seal("price", &sch, &new_ts, &new_vals).await.expect("seals new data after migration");
+		let (ts, vs) = store.read_time_range("price", 500, 600).await.expect("reads the just-written range");
+		let expected_new_read: Vec<Option<BigDecimal>> = vec![Some(bd("55")), Some(bd("66")), Some(bd("77"))];
+		assert_eq!(ts, new_ts, "new timestamps readable");
+		assert_eq!(vs, expected_new_read, "new values readable");
+		drop(store);
+
+		// Second open: settled — the marker says layout 2, no migration runs
+		let store2 = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("second open: {e:#}"));
+		let report2 = store2.open_report();
+		assert_eq!(report2.migrated_from, None, "second open finds no pending migration");
+		assert_eq!(report2.applied.len(), 0, "no new migrations");
+		assert!(!report2.created_new);
+
+		// Existing fixture data is still correct (spot-check)
+		assert_eq!(store2.read_point("price", 0).await.expect("reads point 0"), Some(bd("0.5")));
+		assert_eq!(store2.read_point("price", 50).await.expect("reads point 50"), Some(bd("5.5")));
+		assert_eq!(store2.read_point("price", 150).await.expect("reads point 150"), Some(bd("0.125")));
+		assert_eq!(store2.read_point("temp", 0).await.expect("reads point 0"), Some(bd("20.5")));
+		assert_eq!(store2.read_point("temp", 180).await.expect("reads point 180"), Some(bd("22")));
+
+		// New data persisted through reopen
+		let (ts2, vs2) = store2.read_time_range("price", 500, 600).await.expect("reads new data after reopen");
+		assert_eq!(ts2, new_ts, "new timestamps persisted");
+		assert_eq!(vs2, expected_new_read, "new values persisted");
+
+		let format2 = store2.store_format();
+		assert_eq!(format2.layout_version, 2, "still layout 2");
+		assert_eq!(format2.applied_through, Some("0008_upsert_keys".into()));
+		assert_eq!(store2.store_uuid().to_string(), uuid, "store uuid unchanged");
+		drop(store2);
+
+		// Third open: also settled (idempotent on re-reopen)
+		let store3 = SegmentStore::open(&root).await.unwrap_or_else(|e| panic!("third open: {e:#}"));
+		let report3 = store3.open_report();
+		assert_eq!(report3.migrated_from, None);
+		assert_eq!(report3.applied.len(), 0);
+		let format3 = store3.store_format();
+		assert_eq!(format3.layout_version, 2, "layout 2 persists");
+		assert_eq!(store3.store_uuid().to_string(), uuid, "uuid stable");
+		drop(store3);
+
+		// On-disk marker matches
+		let marker = crate::types::store_format::read_marker(&root).await.expect("reads the marker");
+		assert_eq!(marker.map(|f| f.layout_version), Some(2), "on-disk marker is layout 2");
+	}
+
 	/// Every file under `root` with its bytes, but the root's `LOCK` and `LOCK.holder`,
 	/// which every open, even a refused one, takes and rewrites.
 	fn files_but_the_lock(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
@@ -8375,13 +8456,65 @@ mod tests {
 		assert_eq!(report.quarantined, 0);
 		assert!(report.incompatible_store, "a newer-format cause reports incompatible_store");
 		assert!(store.has_suspect_segments());
-		// TTL purge must not touch a suspect record, however old it is: age it by
+		// Behaviour 1: a suspect frame is excluded from reads — the row is gone
+		// and the file is moved to quarantine/, so reads return nothing.
+		assert_eq!(store.segment_count("price").await.expect("counts"), 0, "the suspect row is gone from segment_count");
+		let (ts, vs) = store.read_time_range("price", 0, 20).await.expect("reads range");
+		assert!(ts.is_empty(), "a suspect frame returns no timestamps from read_time_range");
+		assert!(vs.is_empty(), "a suspect frame returns no values from read_time_range");
+		// Behaviour 2: TTL purge must not touch a suspect record, however old it is: age it by
 		// rewriting its record, then purge.
 		let mut record = store.quarantine_list(Some("price")).await.expect("lists").into_iter().next().expect("one record");
 		record.quarantined_ms = 0;
 		store.commit_index(&crate::types::index_txn::IndexTxn::new(vec![crate::types::index_txn::IndexOp::QuarantineInsert { record }])).await.expect("ages record");
 		assert_eq!(store.purge_expired_quarantine().await.expect("purges"), 0, "suspect records never TTL-purge");
 		assert_eq!(store.quarantine_list(Some("price")).await.expect("lists").len(), 1);
+	}
+
+	/// ROB-22/C5: in a mix of a good frame and a suspect frame for the same
+	/// aspect, recovery quarantines only the suspect one, leaves the good one
+	/// readable, and the suspect file is never TTL-purged.
+	#[tokio::test]
+	async fn mixed_good_and_suspect_frames_survive_recovery_with_good_data_readable() {
+		let dir = TempDir::new().expect("tempdir");
+		let frame = {
+			let store = SegmentStore::open(dir.path()).await.expect("opens");
+			// A good segment at [0, 10].
+			let _good = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals good");
+			// A second segment at [20, 30] that recovery will suspect.
+			let desc = store.seal("price", &schema(), &[20, 30], &[bd("3"), bd("4")]).await.expect("seals second");
+			let frame = PathBuf::from(&desc.path);
+			drop(store);
+			frame
+		};
+		let mut bytes = std::fs::read(&frame).expect("reads frame");
+		bytes[7..9].copy_from_slice(&99u16.to_le_bytes());
+		let body = bytes.len() - 4;
+		let checksum = weft_physical_type::crc32(&bytes[..body]);
+		bytes[body..].copy_from_slice(&checksum.to_le_bytes());
+		std::fs::write(&frame, &bytes).expect("rewrites frame as suspect");
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!(report.suspected, 1, "the newer-format frame is suspect");
+		assert_eq!(report.quarantined, 0);
+		assert!(store.has_suspect_segments());
+		// Behaviour 1: only the good frame's data is readable.
+		assert_eq!(store.segment_count("price").await.expect("counts"), 1, "only the good segment remains");
+		let (ts, vs) = store.read_time_range("price", 0, 40).await.expect("reads range");
+		assert_eq!(ts, vec![0, 10], "only the good frame's timestamps appear");
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2"))], "only the good frame's values appear");
+		let records = store.quarantine_list(Some("price")).await.expect("lists");
+		assert_eq!(records.len(), 1);
+		assert_eq!(records[0].class, crate::QuarantineClass::Suspect);
+		// Behaviour 2: TTL purge ignores the suspect record; age it then check.
+		let mut aged = records[0].clone();
+		aged.quarantined_ms = 0;
+		store.commit_index(&crate::types::index_txn::IndexTxn::new(vec![crate::types::index_txn::IndexOp::QuarantineInsert { record: aged }])).await.expect("ages record");
+		assert_eq!(store.purge_expired_quarantine().await.expect("purges"), 0, "suspect records never TTL-purge — the good frame stays readable");
+		let (ts, vs) = store.read_time_range("price", 0, 40).await.expect("reads range after purge attempt");
+		assert_eq!(ts, vec![0, 10], "the good data is still there after the purge attempt");
+		assert_eq!(vs, vec![Some(bd("1")), Some(bd("2"))]);
+		drop(store);
 	}
 
 	/// D-S12: a missing indexed file quarantines as corrupt and reads as gone, and
@@ -8509,6 +8642,43 @@ mod tests {
 		assert_eq!(remaining.len(), 1);
 		assert!(!dir.path().join("segments/quarantine").join(Path::new(&first.path).file_name().unwrap()).exists(), "the purged file is unlinked");
 		assert!(dir.path().join("segments/quarantine").join(Path::new(&second.path).file_name().unwrap()).exists(), "the fresh record's file stays");
+	}
+
+	/// ROB-22/C5: a corrupt frame is excluded from reads immediately and, when its
+	/// TTL has passed, is purged (the file unlinked and the record deleted).
+	#[tokio::test]
+	async fn corrupt_frame_is_excluded_from_reads_and_ttl_purged() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let descriptor = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let frame = PathBuf::from(&descriptor.path);
+		drop(store);
+		let mut bytes = std::fs::read(&frame).expect("reads frame");
+		let middle = bytes.len() / 2;
+		bytes[middle] ^= 0xff;
+		std::fs::write(&frame, &bytes).expect("damages frame");
+		let store = SegmentStore::open(dir.path()).await.expect("reopens");
+		let report = store.recovery_report();
+		assert_eq!(report.quarantined, 1, "the damaged frame quarantines as corrupt");
+		assert_eq!(report.suspected, 0);
+		// Behaviour 1: the corrupt frame is gone from reads.
+		assert_eq!(store.segment_count("price").await.expect("counts"), 0, "no segments readable");
+		let (ts, vs) = store.read_time_range("price", 0, 20).await.expect("reads");
+		assert!(ts.is_empty(), "no data returned from a corrupt frame");
+		assert!(vs.is_empty(), "no values returned from a corrupt frame");
+		let records = store.quarantine_list(Some("price")).await.expect("lists");
+		assert_eq!(records.len(), 1);
+		assert_eq!(records[0].class, crate::QuarantineClass::Corrupt);
+		// Behaviour 3: TTL purge removes an expired corrupt record.
+		let mut aged = records[0].clone();
+		aged.quarantined_ms = 0;
+		store.commit_index(&crate::types::index_txn::IndexTxn::new(vec![crate::types::index_txn::IndexOp::QuarantineInsert { record: aged }])).await.expect("ages record");
+		let purged = store.purge_expired_quarantine().await.expect("purges");
+		assert_eq!(purged, 1, "the expired corrupt record purges");
+		let remaining = store.quarantine_list(Some("price")).await.expect("lists");
+		drop(store);
+		assert_eq!(remaining.len(), 0, "the record is deleted");
+		assert!(!dir.path().join("segments/quarantine").join(Path::new(&descriptor.path).file_name().unwrap()).exists(), "the purged file is unlinked");
 	}
 }
 

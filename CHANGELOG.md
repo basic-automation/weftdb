@@ -7,6 +7,243 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Added
+- **Operator documentation** ([docs/operations.md](docs/operations.md)) — backup and
+  restore, systemd, container, upgrade, and failure modes with what to do.
+
+### Fixed
+- **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
+
+- **`host-install.yml` carried the one unpinned action on `main` (#626).**
+  `.github/workflows/host-install.yml:67` still asked for `Swatinem/rust-cache@v2`
+  while every other workflow was pinned to `e9d7b9f1` by #628, because the workflow
+  arrived in #596 after that branch was cut. It merged into a tree that already had
+  `scripts/ci/check-action-pinning.py`, so `main` went red on the pinning gate the
+  moment it landed — the gate works, the merge queue just did not re-run it.
+- **Test suites and refusal lists now accept `vX.Y.Z-beta.N` (TAG-11, #657).** The tag grammar was extended to accept `-beta.N` tags but the two test suites that pin the old grammar were not updated. `scripts/compat/test_releases.py` now parses the new 5-field `semver_key` tuple and asserts the beta-sorts-before-rc-sorts-before-release ordering; `scripts/release/test-stage.sh` accepts `v1.2.3-beta.1` and refuses the malformed `v1.2.3-beta` (no number).
+
+### Changed
+
+- **Fill tokens are exact-case** (PAC-3, #453). `Fill::from_token` now matches the
+  lowercase wire tokens exactly, so `?fill=`, the downsample JSON body's `fill`,
+  the stored-range `fill=` and `weft-bench --gf-fill` refuse `Linear`, `CUBIC` and
+  `NULL` with a `400` (or a CLI error) that names the token. **This breaks v0.3.x
+  clients** that send mixed-case `?fill=Linear` or `--gf-fill=CUBIC`: send `null`,
+  `prev`, `linear`, `quadratic`, `cubic` or the lowercase spellings. The value arm
+  (a decimal constant) is unchanged.
+- **`/v1` range responses may omit `total` or send it `null` (cursor pages).**
+  The `points`, `range`, `value-points` and `value-range` JSON endpoints no longer
+  promise `total` on every page: it is `null` on cursor-following pages or absent
+  from the response body. The Rust client now models it as `Option<usize>` with
+  `#[serde(default)]`; a strict client of any language must treat it as optional.
+
+### Removed
+
+- **`TEST_DATA_DIR` is gone** (PAC-6, completing the PAC-5a configuration
+  registry). The test-only variable no longer overrides the database root in
+  `weftdb::data_dir`; the test suites are handed their fixture directory
+  through the Stable `WEFT_DATA_DIR` variable instead. Operators were never
+  meant to set it — it was a Test-tier registry entry — but a deployment that
+  did will now find it ignored, with `WEFT_DATA_DIR` as the migration.
+
+### Added
+
+- **Pagination cursor v1 for stored-range reads (ROB-15).** The JSON
+  `{/value-}points` endpoints now emit a selector-hashed cursor (`next_cursor`)
+  on every page until the end of the window. A client follows it by re-issuing
+  the request with `?cursor=…`; the cursor supersedes `offset`/`page`. A cursor
+  whose selector, high-water mark or data fingerprint no longer matches the
+  server's current view returns `410 cursor_stale`. `total` is present on the first page and `null` on
+  cursor-following pages.
+- **Stability and versioning policy (FRE-15).** [`docs/stability.md`](docs/stability.md)
+  documents the semver policy, the surface stability table (query/ingest wire API,
+  `weftdb-client` Rust SDK, storage format, CLI, configuration, metrics), what the compat
+  suite actually tests, and the promises the repo does not yet support. Linked from
+  `README.md` and `docs/reference.md`. (#331)
+- **UPGRADING.md and the upgrade/rollback compat legs (PAC-14a).**
+  [`UPGRADING.md`](UPGRADING.md) documents the layout 1→2 upgrade, rollback
+  procedures and version support window. The v0.1.0 release pin in
+  `compat/releases.toml` carries `legs = ["upgrade", "rollback"]`; the upgrade
+  leg is tested by `weftdb/tests/compat_v010.rs`, and the rollback-after-writes
+  leg is documented as aspirational.
+
+- **The measurement rules are wired to the figures they govern (EVI-6, #430).**
+  `tools/check_claims.py` now fails when the claims document never links
+  `docs/methodology.md`, or when that file is missing under the repository root, so a
+  published number cannot outlive the rules that made it. `README.md` and
+  `docs/reference.md` carry the link; the note in `docs/claims-audit.md` that the
+  methodology "does not yet exist" was stale — it landed in #630 — and now says where the
+  rules live.
+- **Guard the `#[serial]`-above-`#[test]` ordering (#405).**
+  `scripts/ci/check-serial-order.py` scans every tracked `*.rs` file and
+  fails, with `file:line`, on any `#[serial]` that is not immediately above
+  a test attribute (`#[test]` or `#[tokio::test]`). Wired into the `claims`
+  job in `ci.yml` after the action-pinning check.
+
+- **The frame-fault policy is verified (ROB-22/C5).** The three behaviours of
+  the C5 policy are now pinned by tests: a suspect frame is excluded from
+  reads, a suspect frame is never auto-purged by maintenance, and a corrupt
+  frame is quarantined and then TTL-purged. The first was previously asserted
+  only through the recovery report, and the third not at all. (#446)
+
+- **Six-field claims audit of `docs/reference.md` (EVI-6/#430).**
+  `docs/claims-audit.md` audits every published performance number against the
+  six-field provenance rule (source, command, dataset, measured-date,
+  reproducible-from-clone, artifact). 11 registered and 19 unregistered figures
+  are assessed for conformance; three non-recoverable claims carry a
+  pre-six-field note in the reference doc; the single fully-conforming claim
+  (pointread bench) carries its fields inline. Non-conforming figures must be
+  re-measured before they are repeated — they are not deleted.
+ ([EVI-6] audit the reference documentation against the six-field rule (#430))
+
+- **Generated OpenAPI document from the route registry (FRE-9a).** The
+  document at `compat/openapi/weftdb.json` is built from the same
+  `RouteTable` the HTTP router serves, so every path, method, scope,
+  admission class and tier is the one the code registered. The drift
+  gate (`generated_spec_matches_committed_file`) checks the committed
+  file matches the generated output; regenerate with `weft-server openapi
+  --out compat/openapi/weftdb.json`. The subcommand prints to stdout with
+  no `--out`, or writes to a named file.
+- **Nightly soak comparison gate (SOA-15).** A scheduled + dispatchable soak
+  workflow (`soak.yml`) builds the soak driver, runs a 15-minute soak,
+  evaluates the SoakReport against SLO rules R1–R8, and compares the result
+  to the previous night's artifact. A Pass→Fail rule regression turns the job
+  red; metric drift past documented tolerance produces `::warning::`
+  annotations. The comparison function lives in
+  `weft-bench/src/soak_compare.rs`, and the annotator script in
+  `scripts/annotate-soak-drift.py`. Documented in `docs/soak.md`.
+
+- **Performance methodology document.** `docs/methodology.md` defines what
+  counts as a performance claim, what evidence a claim must carry, what
+  disqualifies a claim, and where numbers may be stated. It makes a published
+  number checkable; it does not yet certify that the numbers published before it
+  satisfy it, which is the audit the section on Rust doc comments points to.
+  (#430)
+
+- **Release tag grammar extended to `vX.Y.Z-beta.N` (TAG-11, #336).** The
+  `scripts/release/verify.sh` `TAG_RE`, `scripts/release/stage.sh` `TAG_RE`,
+  `scripts/compat/releases.py`, the inline regex in `.github/workflows/publish.yml`
+  and the tag grammar documentation in `RELEASING.md` now all accept
+  `vX.Y.Z-beta.N` alongside the existing `vX.Y.Z` and `vX.Y.Z-rc.N` shapes.
+  Pre-release ordering follows semver 2.0: `-beta.N < -rc.N < release`. (#336)
+
+### Changed
+
+- **CI now pins every GitHub Action to a commit SHA.** A floating `uses:` (e.g.
+  `Swatinem/rust-cache@v2`) fails the static-check job. A new guard,
+  `scripts/ci/check-action-pinning.py`, scans every workflow on every push and
+  pull request. (#626)
+- **The OpenAPI drift gate no longer fails on a version bump (#620).**
+  `generated_spec_matches_committed_file` now normalises `info.version` on
+  both sides before comparing, so every path, method, scope, tier and schema
+  is still checked but a release version change does not trip the gate.
+  A separate assertion in `info_block_has_service_name_and_version` verifies
+  that `info.version` equals the crate version directly.
+
+- **A benchmark report with more than one result verifies.** `weft-bench`'s run manifest graded
+  each measure by metric name alone, so two results in one report — a crash matrix, a query mix, any
+  cross-adapter run — looked like a duplicated measure and `finish --manifest` refused the
+  evidence (#517). Measures now carry the result they were quoted from (`profile`, `adapter`,
+  `workload`) and uniqueness is checked within a result, so the same metric may appear once per
+  result; a repeat inside one result is still a defect, and the message names both the metric and the
+  result. Manifest schema v23 → v24: a manifest written by an older build is refused with an
+  instruction to re-run the benchmark, since the fields that identify a measure did not exist then.
+
+- **`weft-xbench combine` no longer calls an unreproducible-but-in-tolerance answer a failure (#516).**
+  Two runs that each pass their own tolerance but produce different answer digests are
+  non-deterministic, not wrong. The combined gate is reported as `non-deterministic` and kept out of
+  win/loss verdicts and failure lists; a new `Non-deterministic within tolerance` section in the
+  rendered report explains the row. Report schema v7 → v8: `Correctness` gains an `indeterminate`
+  field.
+
+### Fixed
+
+- `weft-orchestration`'s seven slow tests are bounded by a 1200-second `tokio::time::timeout` each, so a hang names the test and fails the run instead of disappearing at the job's 60-minute cap (#404, #646). The bound is 3x the window in which all seven finished for real on a runner (357 s in the run where the seeded `Crypto` database was present); a push or pull-request run skips them, so the nightly schedule is what exercises them.
+
+- **A competitor result with no adapter report refuses to take part in a
+  comparison (EVI-8B, #452).** `weft-bench compare` compared a `duckdb` arm whose
+  `adapter_info` was `null` with a WeftDB arm and footnoted the missing attribution
+  instead of stopping, so a ratio claim could be published about numbers nobody could
+  attribute to an engine. `provenance` now emits a `hard:` note per such result, which
+  reuses the existing `Incomparable` refusal and the existing `--ignore-provenance`
+  override; the predicate is `adapter_info.is_none() &&
+  !adapter.starts_with("weftdb")`, because `weftdb`, `weftdb-stored` and
+  `weftdb-ingest` measure their own paths and honestly report no adapter, and because
+  `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
+  tested.
+
+- **Slow orchestration tests bounded by timeout (issue #404).** Seven
+  `weft-orchestration` tests that self-skip locally (Crypto-database guard)
+  now wrap their bodies in `tokio::time::timeout` within the CI job budget
+  (3600 s job timeout): `test_api` (60 s), `test_api_precise` (900 s),
+  `test_pipeline_api` (1500 s), `test_pipeline_api_precise` (600 s),
+  `test_batch_processing` (10 s), `test_specific_process_batch` (10 s) and
+  `test_pipeline_api_with_fake_db` (10 s). The predecessor's 3600 s bound
+  for `test_api_precise` could never fire before the job was killed; the
+  two 1800 s bounds triggered `clippy::duration_suboptimal_units`. All
+  corrected. Sum of worst-case sequential bounds: 3090 s, leaving ≈510 s
+  for compilation, teardown and crash verification. Durations measured
+  from run 40886128666.
+## [0.3.2] - 2026-11-06
+
+### Fixed
+
+- **The abort arm of the crash matrix no longer flakes on Windows.** The test aborts a
+  child process mid-operation and then re-opens the same store in the parent, and Windows
+  keeps an aborted process's Turso database handles live for a short window, so those first
+  opens returned `I/O error (tempdir): permission denied` while Linux tolerated them.
+  `verify_recovered` now retries the open on Windows (6 attempts, 500 ms apart) and
+  propagates any other error unchanged; no production path opens a path an aborted process
+  just vacated, so the race was test-only (#625).
+- **A pipeline's pattern dictionary no longer grows without bound.** Each
+  `Pipeline::run` loaded the stored dictionary on top of the patterns it already held
+  and then appended the whole dictionary to the store again (`patterns.id` is not
+  unique), so every run roughly doubled it, and each duplicated row then loaded all of
+  its pattern's occurrence and relative rows. A Fan Control daemon reached 3.5 GB of
+  `preamble.db` and 112 GB of RSS within minutes. `load_dictionary` now starts from the
+  store, extraction writes back with the new atomic
+  `Database::replace_dictionary_patterns`, `Dictionary::import_pattern` ignores a
+  pattern id it already holds, and the dictionary-list cache key now includes the aspect
+  (two aspects with a dictionary of the same name were served each other's patterns).
+
+
+### Fixed
+
+- **The host-install gate that proves gate 4 can fail was pointing at a Stable variable.** Its
+  Test-tier probe name came from `grep -B3 'tier: Tier::Test' weft-server/src/settings.rs`, and
+  every `VarSpec` is one line, so the three context lines above each match returned the *entry
+  above* the Test entry as well. The first name it therefore picked was
+  `OTEL_EXPORTER_OTLP_ENDPOINT` — `Tier::Stable`, meant to be accepted — and the gate reported
+  that a valid variable "was refused for some reason other than its tier". The name is now read
+  off the matched line itself, so the probe carries a real harness channel
+  (`WEFT_BENCH_BACKUP_DIR` today) and the refusal the gate greps for is the one the server
+  actually produces. No server behaviour changed: strict configuration had been refusing
+  Test-tier channels correctly all along.
+
+## [0.3.1] - 2026-11-06
+
+### Fixed
+
+- **docs.rs builds for `weftdb`, `weft-arrow-store` and `weft-orchestration`.** 0.3.0's
+  documentation failed to build: `turso_core` pulls in `branches` 0.4.x with its `std`
+  feature off, and that path calls `core::intrinsics::abort`, which nightly removed on
+  2026-10-15. The workspace `[patch]` only covers local builds, so `weftdb` now depends on
+  `branches` with `std` enabled, which carries into the published crate.
+
+### Changed
+
+- The Rust SDK is published as **`weftdb-client`** (library `weftdb_client`). The
+  `weft-client` name on crates.io belongs to an unrelated crate, so v0.3.0 shipped
+  without the SDK on the registry. The source stays in `weft-client/`.
+### Changed
+
+- **A refused bind address names the variable.** `WEFT_SERVER_ADDR` and `WEFT_ADMIN_ADDR`
+  now refuse to start the server with `WEFT_SERVER_ADDR="127.0.0.1" is not a socket address
+  (invalid socket address syntax); e.g. 127.0.0.1:8080` instead of the parser's bare
+  `invalid socket address syntax`, in the same shape as `WEFT_FLIGHT_ADDR` and the
+  strict-config warnings already use. Exit status is unchanged (78). This is what lets
+  `scripts/packaging/test-host-install.sh` gate 4 prove that the systemd env file it
+  installed is the configuration the running binary read.
 
 ### Added
 
@@ -2426,7 +2663,8 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/basic-automation/weftdb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/basic-automation/weftdb/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/basic-automation/weftdb/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/basic-automation/weftdb/compare/v0.1.0...v0.2.0

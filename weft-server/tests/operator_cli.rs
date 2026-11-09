@@ -20,7 +20,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 /// Variables the surrounding test harness may itself set, removed from
 /// every child so the assertions are about the test's own settings.
-const NEUTRALIZED: &[&str] = &["WEFT_SEGMENT_STORE_ROOT", "WEFT_STORE_DATABASE", "WEFT_STORE_SUBJECT", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_BACKUP_DIR", "OTEL_EXPORTER_OTLP_ENDPOINT", "WEFT_GPU_CALIBRATE", "TEST_DATA_DIR", "WEFT_DATA_DIR", "SKIP_SLOW_TESTS", "WEFT_VERBOSE", "WEFT_REQUIRE_GPU", "WEFT_FAULT"];
+const NEUTRALIZED: &[&str] = &["WEFT_SEGMENT_STORE_ROOT", "WEFT_STORE_DATABASE", "WEFT_STORE_SUBJECT", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_BACKUP_DIR", "OTEL_EXPORTER_OTLP_ENDPOINT", "WEFT_GPU_CALIBRATE", "WEFT_DATA_DIR", "SKIP_SLOW_TESTS", "WEFT_VERBOSE", "WEFT_REQUIRE_GPU", "WEFT_FAULT"];
 
 /// A `weft-server` invocation with the harness's environment neutralized.
 fn invocation(args: &[&str]) -> Command {
@@ -43,7 +43,7 @@ fn help_and_version_exit_zero_and_name_the_contract() {
 	for args in [&["--help"][..], &["-h"][..], &["help"][..]] {
 		let (code, stdout, _) = run(args);
 		assert_eq!(code, Some(0), "{args:?} exits 0");
-		assert!(stdout.contains("keygen") && stdout.contains("restore") && stdout.contains("import-rows-mode"), "the help names every command: {stdout}");
+		assert!(stdout.contains("keygen") && stdout.contains("restore") && stdout.contains("import-rows-mode") && stdout.contains("openapi"), "the help names every command: {stdout}");
 		assert!(stdout.contains("65") && stdout.contains("store needs operator action"), "the help prints the C7 table: {stdout}");
 	}
 	let (code, stdout, _) = run(&["--version"]);
@@ -58,6 +58,22 @@ fn a_command_line_that_names_nothing_exits_with_usage_status_2() {
 		assert_eq!(code, Some(2), "{args:?} is a usage error (plan C7), not an unexpected error: {stderr}");
 		assert!(!stderr.is_empty(), "{args:?} says what was wrong");
 	}
+}
+
+#[test]
+fn an_unparseable_bind_address_is_refused_by_name_and_exits_78() {
+	// PAC-11's host-install gate 4 proves the installed unit's env file reached the process by
+	// recognising this one refusal, so the variable name and the rejected value are asserted on
+	// the binary, not on the parser: a server that refused for some other reason, or refused
+	// without saying which line to fix, would make that gate mean nothing.
+	let dir = tempfile::TempDir::new().expect("tempdir");
+	let mut cmd = invocation(&["serve"]);
+	cmd.env("WEFT_SERVER_ADDR", "127.0.0.1").env("WEFT_SEGMENT_STORE_ROOT", dir.path());
+	let output = cmd.stdin(Stdio::null()).output().expect("runs weft-server");
+	let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+	assert_eq!(output.status.code(), Some(78), "an unusable address is an invalid-configuration refusal (plan C7): {stderr}");
+	assert!(stderr.contains("WEFT_SERVER_ADDR"), "the refusal names the variable the operator must fix: {stderr}");
+	assert!(stderr.contains("\"127.0.0.1\""), "the refusal quotes the value it rejected: {stderr}");
 }
 
 #[test]

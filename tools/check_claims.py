@@ -16,12 +16,18 @@ exist under .github/workflows/ and must contain an upload-artifact step for an
 artifact of that name. The registry never invents provenance, and a workflow
 that stops publishing an artifact it is cited for fails here.
 
-Usage: tools/check_claims.py [--registry bench/claims.json] [--readme README.md] [--root DIR]
+EVI-6 methodology pointer: the registry and the checks above say a figure is real; they do not
+say what it was measured under. `docs/methodology.md` holds those rules, so this lint also
+requires that file to exist and requires the claims document to link it. A figure a reader can
+re-run but not judge is only half auditable: the number needs the rules that made it.
+
+Usage: tools/check_claims.py [--registry bench/claims.json] [--readme README.md]
+                             [--root DIR] [--methodology docs/methodology.md]
 
 `--readme` is the document that carries the figures (CI passes docs/reference.md, where the
-full reference lives). Registry source paths and .github/workflows resolve against `--root`,
-the repository root, which defaults to that document's directory; the document's own relative
-links resolve against its directory.
+full reference lives). Registry source paths, .github/workflows and `--methodology` resolve
+against `--root`, the repository root, which defaults to that document's directory; the
+document's own relative links resolve against its directory.
 """
 
 from __future__ import annotations
@@ -122,10 +128,14 @@ def main() -> int:
     ap.add_argument("--registry", default="bench/claims.json")
     ap.add_argument("--readme", default="README.md")
     ap.add_argument("--root", default=None)
+    ap.add_argument("--methodology", default="docs/methodology.md")
     args = ap.parse_args()
 
     docdir = Path(args.readme).resolve().parent
     root = Path(args.root).resolve() if args.root else docdir
+    # Repository-relative like a registry source path, but usable as an absolute path too.
+    configured = Path(args.methodology)
+    methodology = configured if configured.is_absolute() else root / configured
     lines = Path(args.readme).read_text(encoding="utf-8").splitlines()
     doc = "\n".join(lines)
 
@@ -207,12 +217,37 @@ def main() -> int:
             if path and not (docdir / path).exists():
                 errors.append(f"{args.readme}:{no + 1} links to {target!r}, which is not in the tree")
 
+    # The methodology pointer. `docs/methodology.md` states the harness, the hardware class,
+    # the repetitions and the rounding a number was produced under, so it is part of the
+    # provenance of every figure rather than prose next to them. Two separate failures, so a
+    # repair can be aimed: no rules at all, and rules the reader is never sent to.
+    methodology = methodology.resolve()
+    if not methodology.exists():
+        errors.append(
+            f"methodology: {args.methodology} is not under {root} — every figure needs the "
+            "measurement rules it was produced under, and there is nothing to point at"
+        )
+    elif not any(
+        (docdir / target.split("#", 1)[0]).resolve() == methodology
+        for line in lines
+        for target in LINK.findall(line)
+        if "://" not in target and not target.startswith(("#", "mailto:"))
+        and target.split("#", 1)[0]
+    ):
+        errors.append(
+            f"{args.readme} never links {args.methodology} — a reader who meets a figure must be "
+            "able to reach the rules it was measured under"
+        )
+
     for err in errors:
         print(f"claims: {err}")
     if errors:
         print(f"claims: {len(errors)} problem(s) in {len(claims)} registered figure(s)")
         return 1
-    print(f"claims: {len(claims)} figure(s) registered, every one paired with a marker and a source")
+    print(
+        f"claims: {len(claims)} figure(s) registered, every one paired with a marker and a "
+        f"source, and the document links its measurement rules ({args.methodology})"
+    )
     return 0
 
 

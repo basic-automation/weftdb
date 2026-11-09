@@ -4,6 +4,113 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-08 — Pagination cursor v1: selector hash, high-water mark, fingerprint, nullable total (ROB-15, #449)
+
+**The cursor v1 token is 66 hex characters: `01` + selector SHA-256 prefix (16) + high-water mark (16) + data fingerprint (16) + next-page offset (16).**
+The selector is hashed by SHA-256 of its canonical matcher sequence (each `(key, Some(value))` encoded as `key\0value\0`, a missing value as `key\0\xff\0`), followed by the exactness flag as one byte. SHA-256 was already a dependency of `weft-server` (SEC-6's API-key digests), so no new dependency was added.
+
+**`total: null` on cursor-following pages.** The acceptance criteria say "total nullable after the first page". A cursor-following page has no meaningful total — the window total was already reported — so `total` is omitted (serialized as `null`). The first page (no cursor in the request) always carries it.
+
+**Appends never invalidate an existing cursor.** The high-water mark is the *max timestamp* of the window, not the *last returned timestamp*, so appends after the window shift the high-water mark forward and an old cursor's high-water fails the staleness check. But an append *within* the window (a row with a timestamp between start and end) is not possible after seal — the segment store's rows are immutable once sealed — so a cursor that is valid today stays valid as long as the segment store does not mutate.
+
+**410 for three conditions:** the selector hash does not match (a different tag selector), the high-water mark changed (data was appended to the window, which after seal is only possible via a new segment whose rows overlap the window), or the data fingerprint changed (rows within the window were altered).
+
+**`read_value_range_of` returns `Vec<BigDecimal>` not `Vec<Option<BigDecimal>>`.**
+Value-range reads return only present rows, so every value is populated. The cursor fingerprinting functions take `&[Option<BigDecimal>]` (shared with the time-range read which includes nulls), so values are wrapped to `Some(v)` at the call site.
+
+**Backwards compatibility: `total` stays populated on every non-cursor page.** An existing client that sends no `cursor` gets the same `total` as before — `Option<usize>` is `Some(total)` on the first page and `None` only on cursor-following pages. The acceptance criterion says "total nullable after the first page": the first page (and every page requested without a cursor) carries the count; cursor pages omit it because the window total was already reported.
+
+## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
+
+**The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every
+result's measures to their metric name and refused any repeat, so a report carrying two results —
+which is what `--crash-matrix`, `--query-mix` and a multi-adapter run produce — could not be
+verified at all, and `finish --manifest` exited non-zero on honest evidence (`#517`, the reason
+`crash-matrix.yml` had to be narrowed to one report per cell after `#511`). `Measure` carried only
+`name` and `adapter`, so `adapter` was the only candidate disambiguator, and it is the wrong one: a
+query-mix report runs one adapter across many profiles, and a cross-adapter report runs one profile
+across many adapters. A measure's identity is the result it was quoted from, which `BenchResult`
+already states as `(profile, adapter, workload)` and `compare.rs` already uses as its `WorkloadKey`.
+
+**Chosen:** add `profile` and `workload` to `Measure` beside `adapter`, fill them where the measures
+are built (`push_result_measures`, which quotes them from the same result it quotes the numbers
+from), and check uniqueness per `(profile, adapter, workload)`. `Problem::DuplicateMeasure` became a
+struct variant carrying the name *and* the result identity, because the message a runner reads has to
+say which measure to go and look at — the file's own convention elsewhere is
+``measure `{name}` appears more than once``, and the old check broke it with a static
+"a measure name is repeated across adapters" string that named nothing.
+
+**Rejected: dropping the check.** Names are how a comparison selects a number, so a genuine
+repeat inside one result must stay a defect. The new test pair pins both halves: cross-result reuse
+of `latency.p50_ns` verifies clean, a second `latency.p50_ns` inside one result is still refused at
+`write_to`, which is where a manifest that cannot verify is turned into an error.
+
+**Rejected: making the recovery "regenerate the manifest from the report."** A manifest records
+provenance facts that are only available while the run happens — the source revision, the working
+tree's dirtiness, the environment — so an old manifest cannot be converted without inventing them.
+The refusal wording now says what is true instead: re-run the benchmark with a build that writes the
+current version. Bumping `MANIFEST_SCHEMA_VERSION` to 24 was unavoidable, since `Measure` gained two
+fields that every verifier depends on, and the version check stays an exact match: accepting a list
+of versions would make a v23 reader's silence about `profile`/`workload` invisible.
+
+**Not done here, deliberately:** the splitting that `#513` and `#147` added (`--crash-matrix`,
+`--query-mix`, `--failure` each writing one report per cell) is left in place. It was a workaround
+for this bug, but it is also what keeps a crash cell's artifact attributable to that cell, and
+removing it changes what the nightly publishes. Flagged as a follow-up rather than folded into a fix
+whose whole claim is that a multi-result report verifies.
+
+## 2026-11-06 — W7 close-out, W8 start, the SOA-13 rule set, and one infra blocker
+
+**W7 was one item, not six.** The wave-7 briefing listed ROB-12, ROB-7, ROB-16, ROB-23r and ROB-5
+as in flight; git said all five had merged (#546, #551, #563, #589 and the ROB-23r slice) before
+this loop started, and the two lane-header lines ("maint lane", "read lane") plus the W7
+open/close narrative boxes in `ROADMAP.md` are prose markers, not ticks — a lane is closed when its
+slices tick, not the header. The one open non-owner item was PAC-11's remaining half: the packaging
+scripts had merged (PR #512) but nothing ran `test-host-install.sh` in CI. PR #596 adds
+`host-install.yml` for that, and fixing what the run then found is this entry's technical half:
+`test-host-install.sh` needed `install-host.sh` and itself to be mode 0755 in git (both were 0644,
+so every invocation `bash …`d around it — the unit's own `ExecStart` semantics were never proven),
+`--list` must be asked with the same `--prefix` the gates installed (without it the manifest names
+`/usr/local` and the tree-under-test check fails on paths nobody installed), and gate 4's contract
+— export every shipped env name with no value, expect the address refusal — is dead under PAC-5b
+strict validation, which refuses an empty value on any integer name before the address is ever
+parsed. The probe now exports the defaults the shipped template itself declares, with the
+machine-pointing and auth-enabling ones redirected into the scratch tree, and pins
+`WEFT_SERVER_ADDR` last so the probe address always wins. This strengthens gate 4: it now proves
+the template's documented defaults are a configuration the real server walks past toward the
+address, not merely that the names exist.
+
+**W8's gate.** "When the release goes out then start wave 8" was interpreted literally: v0.3.0
+became visible on crates.io and the GitHub release left draft on 2026-11-06, so W8 started the same
+night — no additional human gate was invented.
+
+**SOA-13's SLO rules are this loop's definition.** Neither `ROADMAP.md:372`, issue #322, nor any
+doc names R1–R8, and the oracle agent this protocol normally escalates architecture calls to is
+currently broken (`Required child extension failed to load … Cannot find module 'typebox'`), so the
+rule set was defined here rather than stalled: R1 correctness — zero oracle mismatches over
+ticks; R2 contamination — every flag inside a declared window, else fail; R3 flush discipline —
+zero strict-mode violations; R4 derived reads — zero divergence from the model; R5 recovery — every
+backup window records finite RPO/RTO by the EVI-19 formulas in `docs/RPO-RTO.md` (a *recorded*
+number: inventing a numeric target the project never fixed was rejected); R6 hook contract —
+exact callback counts; R7 liveness — at least `MIN_TICK_PROGRESS` ticks per window; R8 report
+integrity — serde round-trip at `SOAK_REPORT_SCHEMA_VERSION` plus the coverage floors. Below a
+floor a rule reports `InsufficientCoverage`, never `Pass` — the failure mode this slice exists to
+catch is a quiet green. If the oracle comes back and re-litigates, it amends, not rewrites.
+
+**The crash matrix is broken on `main`, and says so as issue #604.** Since 2026-11-05 ~16:35 UTC
+every `crash matrix` job — including one dispatched on plain `main` (run 42199040596) — is SIGTERM'd
+at ~nine minutes inside `bench-stage` (`Terminated`, exit 143) with the job timeout at 120 minutes,
+no concurrency block, and no internal timeout in the script. Any PR touching the paths filter can
+therefore never go all-green; #599 (FRE-13) and #603 (SOA-13) are blocked on that, not on their
+diffs. Neither was merged red, and neither script was weakened to dodge it.
+
+**Float parsing waits for #598.** FRE-8b (JSON float parse) touches the same parser the other
+loop's #598 is inside of (its 1-ULP parse fix spans `weftdb`/`weft-server`/`clients`), so it stays
+unclaimed here until #598 lands; one writer per crate beats two clever ones.
+
+**Needs human (owner items, unchanged):** make the ghcr.io container package public (#318) and the
+human honesty narrative (#320). Neither is clickable by an agent loop.
+
 ## 2026-11-04 — W7 start: the two reds that gated the wave, and what was chosen about each (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** W7's in-flight PRs (#559 D-S20, #546 ROB-12, #551 ROB-7) were red on checks that had
@@ -5223,6 +5330,532 @@ the connection's acquisition, not the transaction: a panic after
 outside the scope. It also marks reads, which take the same call, and it would
 have made this slice a change to every caller in the crate instead of a change
 to the three impls that own the legacy writes.
+
+## 2026-11-07 — W8 recovery: what a red gate, a vanished worker lane, and a silent CI each taught
+
+Three failures this wave looked like different problems and each turned out to be a missing fact
+about the tooling rather than about the code. Recorded because the next session will meet all
+three again.
+
+**1. A PR whose merge state is CONFLICTING runs almost no checks, and it looks like Actions is
+broken.** `w7/pac-11-ci` (PR #596) took three pushes in which only `Contribution terms` ran —
+the one workflow triggered by `pull_request_target`. `CI`, `Host install`, `Container` and
+`crash matrix` (all `pull_request`) produced no run at all: not queued, not pending approval,
+nothing under `status=action_required`. `gh pr view --json mergeable` said `CONFLICTING` /
+`DIRTY` — `#611` had ticked PAC-11 in `ROADMAP.md` and `#603` had rewritten the `## [Unreleased]`
+head of `CHANGELOG.md`, the two places that branch also edits. After merging `origin/main` and
+resolving the CHANGELOG by hand, all four workflows started within seconds of the push. So the
+check order for "CI did not run" is: `mergeable` first, then the trigger's event type, then
+runner availability — not the other way round. Cost of getting it wrong: two rounds of poking at
+GitHub instead of fixing the conflict.
+
+**2. A timed-out worker keeps its work only in the run's worktree diff, and that diff is against
+the harness base commit, not against `origin/main`.** Both W8 lanes (`FRE-9a`, `SOA-15`) hit the
+30-minute wall while waiting on each other's cargo builds; both had written nearly everything
+(593 lines of `weft-server/src/openapi.rs`; 649 lines of `weft-bench/src/soak_compare.rs` plus
+`.github/workflows/soak.yml`) and neither had pushed. The harness then removed the worktree *and*
+the branch, leaving `worktree-diffs/step-0/task-0-parallel-worker.patch` as the only survivor.
+That patch's base was `4ee2629` — the main tree's HEAD, an unpublished local commit — so a whole-
+patch apply onto `main` would "add" files `main` already has and "delete" the ones that commit
+touched. Chosen: `git apply --3way --include=<each authored file>` onto a fresh branch from
+`origin/main`, one recovery commit per lane saying plainly that it is recovered and unverified,
+pushed, then a **fresh** worker per lane with `cwd` pinned to the pushed worktree and
+`worktree: false`, given the file-and-line state of the scaffold and a 90-minute timeout.
+Rejected: `action: "resume"`. The sessions were 400k+ tokens of a lane that had already spent
+half an hour rediscovering its own build environment, and resume would have restored that
+context into a worktree that no longer existed. The brief is cheaper and truer than the memory.
+
+**3. `[skip ci]` in a commit message suppresses `pull_request` workflows too, not just pushes.**
+The only commit that ever existed solely on this machine — `4ee2629`, the pipeline-dictionary
+doubling fix that made Fan Control reach 112 GB RSS — ended its subject with `[skip ci]`. Had it
+been pushed as-is, PR #612 would have carried a memory-bug fix and a four-crate version bump
+through to a merge candidate with zero checks, and its regression test would never have run
+anywhere. The rebase dropped the tag, added the `Signed-off-by` the DCO gate needs (the commit
+had none), and the PR was opened as a draft with "no local build: two lanes have the RAM" written
+into its body, so the absence of verification is visible rather than implied. Tagging 0.3.2 stays
+a human action: `release.yml` accepts only a CI run on `main`, and crates.io is unreachable from
+this machine, so publication state cannot be confirmed from here at all.
+
+## 2026-11-06 — PAC-6: TEST_DATA_DIR is removed; the suites are handed WEFT_DATA_DIR (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan (§3 PAC-5a/PAC-6 row) fixes the outcome — one VarSpec
+registry with tiers stable/tuning/experimental plus a test allowlist, and
+"`TEST_DATA_DIR` is removed (PAC-6)" — and PAC-5a's registry entry for the name
+says it is removed "once the suites are handed a fixture path instead", but no
+source names the replacement channel the suites are handed.
+
+**Chosen:** the fixture path is `WEFT_DATA_DIR`, the Stable variable
+`weftdb::data_dir` already honoured as its first (and now only) override:
+
+- `weftdb::data_dir` drops the `TEST_DATA_DIR` leg; resolution is
+  `WEFT_DATA_DIR`, else the portable per-user default.
+- Every suite that set `TEST_DATA_DIR` now sets `WEFT_DATA_DIR` instead: the
+  per-test `#[serial]` sites in `weftdb` and `weft-orchestration`, the crash-test
+  child processes (handed the path through the child's environment, as before),
+  and the two `data_dir()` helpers, whose explicit-fixture branch now keys on
+  `WEFT_DATA_DIR` — which is also how `test_api`/`test_pipeline_api` still reach
+  a real `Crypto` corpus (`WEFT_DATA_DIR=~/.weftdb/data`). The helpers' comments
+  say plainly that a shell exporting `WEFT_DATA_DIR` for `weft-tui` now also
+  points the suites at that directory; CI does not set it.
+- The registry entry and the test allowlist entry are deleted (104 → 103
+  names; Test tier 42 → 41), and the configuration docs (SEC-14's
+  `docs/config-schema.md`, plus the `docs/reference.md` configuration table and
+  resolution list) are updated in the same commit, so the PAC-5b/6
+  configuration documentation (§8 :788, wording per decision 21) describes the
+  completed registry. The historical mention in `compat/v010/README.md` stays:
+  it records the v0.1.0 binary's behaviour, which did read the name.
+
+**Rejected:** a new in-process override API on `weftdb` (a settable global the
+library would carry for tests alone — the plan's direction is the library
+taking *fewer* environment-shaped inputs, and the child-process crash tests
+still need an environment channel to be handed their directory), and keeping a
+differently-named test-only variable (that is `TEST_DATA_DIR` under a new
+spelling, not its removal).
+## 2026-11-07 — Needs human: the crates.io token; and the gates that sat behind a red gate (PAC-11, #596)
+
+**Confirmed, not inferred: publication to crates.io has never happened, and it is a missing secret.**
+`publish.yml` has been dispatched twice and both runs failed — 42301816146 (2026-11-06T22:04Z) and
+42346611064 (2026-11-07T06:21Z) — in job `execute`, step `Publish`:
+
+```
+error: failed to publish weftdb v0.3.1 to registry at https://crates.io
+
+Caused by:
+  please provide a non-empty token
+```
+
+`publish.yml:123` wires `CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}`, so the
+repository secret is unset or empty. Everything before that step succeeded: the crate packaged,
+`weftdb v0.3.1` compiled out of `target/package/weftdb-0.3.1`, and cargo printed `Uploading weftdb
+v0.3.1` before the token check. The GitHub release for `v0.3.1` is drafted with its five archives
+and their `.sha256` files (run 42342265711, success), so the tag and the artifacts exist and only
+the registry side is missing. Nothing on this machine can close it: crates.io is also unreachable
+from here, so `cargo login` / `cargo publish` by hand is not available as a workaround either.
+
+**Chosen:** leave the publish lane exactly as it is and record the blocker under Needs human.
+**Rejected:** making `Publish` tolerate an empty token so the lane reads green — the step exists to
+say either "it reached the registry" or "it did not, loudly", and #610 already taught it the one
+case that is benign (a version already published).
+
+**The owner's decision once a token exists:** publish `v0.3.1` (re-dispatch `publish.yml` for that
+tag) or accept a gap and make 0.3.2 the first published release. #612 bumps `weftdb`,
+`weft-server`, `weft-arrow-store` and `weft-orchestration` to 0.3.2, so silence now *is* the gap. A
+gap is survivable — nothing pins a published 0.3.1, because there is none — but `docs/reference.md`
+tells people to install from the registry, so whichever version goes out first should be followed
+by re-reading that page against what `cargo install` really resolves.
+
+**The second thing here is a habit, not a task: any gate behind a red gate is an untested gate.**
+`scripts/packaging/test-host-install.sh` has seven gates, and the `ubuntu-latest` roll had never
+got past gate 5 — gate 4 stopped it on the bind-address message, then gate 5 stopped it on its own
+name selection (both fixed on `w7/pac11-ci`). Gates 6 and 7 (`systemd-analyze verify`,
+`systemd-sysusers`, `systemd-tmpfiles`, a live user manager) had therefore never executed on any
+host: the machine this script was developed on skips all four, while the workflow asserts they must
+not skip on `ubuntu-latest`. Gate 6's first execution ever failed in 32 seconds — `systemd-analyze
+verify --root "$DEST" "usr/lib/systemd/system/weft-server.service"` answered `Unit
+weft-server.service not found.` about a unit gate 1 had just confirmed on disk, because `--root`
+resolves an absolute path against the root and a slash-bearing relative path against the current
+directory. Fixed by keeping the leading slash and by asserting `[[ -f "$DEST$UNIT_IN_ROOT" ]]`
+before invoking it, so a missing file and an unresolvable argument cannot produce one message. The
+generalisation is the point: PAC-11 was ticked on `main` (8c5fea9, #611) while gates 4, 5 and 6
+were each in turn the wall, and it should be closed again, if at all, on the evidence of a roll
+that printed all seven `ok:` lines — not on the evidence that a packaging branch exists.
+
+## 2026-11-06 — PAC-11 gate 4: a refused bind address names its variable (#309)
+
+**Context:** `scripts/packaging/test-host-install.sh` gate 4 installs the tree, writes an env
+file whose `WEFT_SERVER_ADDR` is a host with no port (`127.0.0.1`), runs the real binary, and
+treats one refusal as the proof that the *installed env file* is the configuration the process
+read: the run must exit 78 and its output must name `WEFT_SERVER_ADDR`. On the first CI run the
+gate failed (host-install run 42237464718: `weft-server: invalid configuration: invalid socket
+address syntax`) although the exit status was right. `startup::config::bind_addr` returned
+`std`'s bare `AddrParseError`, so the refusal named nothing, and a gate that greps for a name
+the server never prints can only ever fail.
+
+**Chosen:** change the server's message, not the gate. `bind_addr` and `admin_addr` now format
+the refusal as `WEFT_SERVER_ADDR="127.0.0.1" is not a socket address (invalid socket address
+syntax); e.g. 127.0.0.1:8080` — the variable, the value it rejected, the reason, a shape to
+copy. That is the convention the codebase already uses twice: `flight::flight_addr` names
+`WEFT_FLIGHT_ADDR` the same way, and the strict-config warnings in `settings.rs` name every
+variable they refuse. Exit status is unchanged (78, plan C7). Parsing moved into a private
+`parse_bind_addr(raw: &str)` so the text is unit-testable without mutating the environment
+(`set_var` from a parallel test thread would have been flaky), and the same contract is pinned
+end-to-end in `weft-server/tests/operator_cli.rs` against the binary, because gate 4 asserts on
+the process. The gate's comment now names all three places to keep in step.
+
+**Rejected:** grepping the gate for `invalid socket address syntax`, the parser's own text.
+It would have gone green immediately and proved nothing: that string appears whether or not
+the address came from the unit's env file, so it cannot distinguish "read my file" from
+"refused to start for a reason unrelated to the packaging". Also rejected: pointing the probe
+at a live port and asserting a bind error naming the value — a real bind depends on what else
+holds the port on a shared runner, which turns a packaging gate on a deterministic property.
+
+**Recorded, not decided here:** ROADMAP tick #611 marks PAC-11 closed while this PR was still
+open with the gate red. The tick is only true once this PR lands; it is left in place rather
+than reverted, so this PR is the thing that makes the roadmap honest.
+## 2026-11-07 — TAG-5: the tags schema is closed by an audit, and layout 3 stays unassigned (#437)
+
+**What was ambiguous.** Issue #437 gives two acceptance lines: "the series table and
+catalog exist, created by a registered migration", and "layout_version=3 marker written by
+that migration (C1)". The first is simply true of `main`. The second collides with the rule
+that the code itself states above the constant it would change: "It goes up for a
+control-plane DDL layout, a new frame decode capability, or a Turso on-disk format change
+(expressed as a migration that raises both floors). Layout numbers are assigned at a
+release: **every migration written before 1.0 belongs to layout 2**"
+(`weftdb/src/types/store_format.rs:60-65`, `SUPPORTED_LAYOUT = 2` at `:67`). So the literal
+reading of the issue asks for a layout bump that the shipped format policy forbids, and this
+loop does not get to decide which of the two is authoritative.
+
+**The audit part, which is settled.** `0006_tag5_series` (`weftdb/src/types/migrations.rs:146`,
+applied by `tag5_series`, DDL `SERIES_TABLE` at `:484`) creates the per-aspect series catalog
+in `segment_index.db`, and `0007_series_time_index` (`SEGMENT_INDEX_SERIES_TIME_INDEX` at
+`:503`) adds `idx_segment_index_series_time ON segment_index(aspect, series_id, min_ts,
+max_ts)`. The rest of the tags schema named by the plan's C1 note had already landed under
+layout 2 earlier in the registry: `segment_index.series_id` and `aspect_seq.next_series_id`
+in `0002_s6_s7`, `segment_quarantine.series_id` in `0004_d_s12`, `ingest_ledger.series_ids`
+in `0005_d_s13`. Every registry entry is `layout: 2`
+(`REGISTRY` at `migrations.rs:146`), which is what the registry's own contract test enforces
+(`floors(REGISTRY).layout == SUPPORTED_LAYOUT`, `migrations.rs:660-671`). Acceptance line one
+is therefore satisfied by migrations that are already recorded by id on every store.
+
+**Why the marker cannot be written the way the issue phrases it.** Migrations are recorded by
+id (`IndexOp::RecordMigration`), and a store that already recorded `0006_tag5_series` will
+never re-run it, so re-stamping `0006` to `layout: 3` would leave such a store permanently
+unable to reach floor 3 while the registry test still demanded a `layout: 3` entry. The only
+mechanically valid way to introduce 3 is a *new* migration after `0008_upsert_keys`. And that
+migration would have no schema change to carry — the substance is already there — so it would
+be a marker wearing a migration's clothes. Both shapes of it are bad in different directions:
+
+- floors 3 with `older_writers_safe: false` makes every 0.3.x binary refuse a store whose only
+  difference is a re-run of `CREATE TABLE IF NOT EXISTS series`: the refusal sites are
+  `refuse_newer_floor` (`weftdb/src/types/segment_index.rs:1268-1275`) and the restore check
+  (`weftdb/src/types/backup.rs:1030`), and both key off `min_write_layout`, which is exactly
+  the field future tags slices will need for real incompatibilities.
+- floors 2 with `older_writers_safe: true` and a `rederive` would be honest about safety but
+  would imply a repair that does not exist — `rederive` (`migrations.rs:253-263`) repairs what
+  an older writer left stale, and a writer that never populated `series` has no DDL-only fix —
+  while teaching everyone that a layout number can move without meaning anything.
+
+**Chosen.** No `0009_*` migration, no bump: `SUPPORTED_LAYOUT` stays 2. TAG-5 is closed on the
+audit above, and "layout_version=3" is read for what C1 was doing — a *name* for "the store
+carries the full tags schema", which arrived as `0006` and `0007` under layout 2. Layout 3 is
+left unassigned for the first change that actually needs it (the next tags-schema step that
+breaks an older reader, or the 1.0 freeze itself, whichever comes first). When a real bump
+happens, the newer-store fixtures should be written as `SUPPORTED_LAYOUT + 1` rather than a
+literal number, so the "a newer floor is refused" assertions
+(`segment_index.rs:1615`, `segment_store.rs:7336`, `:7412`, `:7444`, `store_format.rs:259`)
+survive it.
+
+**Needs human.** Whether the literal `layout_version = 3` is a hard 1.0 gate is the owner's
+call, not this loop's: it is an intent-versus-letter conflict between issue #437's acceptance
+line and the format policy in `store_format.rs:60-65`, and the letter is the one with
+compatibility consequences. If the owner rules that the number must move anyway, the only
+defensible form is floors 2 with `older_writers_safe: true` and a documented no-op `0009`,
+labelled a name-only rollover; a floors-3 store that 0.3.x binaries refuse to open is not
+worth the ticket. TAG-6 (#440) and TAG-7 (#441) are plan-only and were gated on TAG-5; they
+can be scoped against the schema as it exists at layout 2 without waiting on that ruling,
+because neither of them changes what an older reader can parse.
+
+## 2026-11-07 — Needs human: this loop cannot compile any more, and the OpenAPI gate punishes version bumps (#620)
+
+**The machine, first, because it explains the last day of misses.** `strata` — this agent's
+own process — is holding 84 GiB of RSS after twelve hours, against 124 GiB of RAM
+(`ps -eo pid,rss,etime,comm --sort=-rss` shows 84,271,372 KiB; `free -g` reports 3 GiB free
+and 5 GiB available). Nothing local compiles any more: `cargo check` is out of the question,
+so CI is the only compiler this loop has, and every judgement about code has to be written so
+that a reviewer can check it against a roll rather than against a local run. It also explains
+the worker lane: three `parallel-worker` runs on #516 each died at the 30-minute cap, and a
+cargo build next to an 84 GiB process plus a pi-lens workspace sweep is not a build, it is
+swapping. **The fix is a human action:** restart this pi session (or the harness's memory
+growth is a bug worth filing) before any further build-heavy delegation. Nothing in this
+buildout is blocked on it, but every slice that needs compiling is slower and less verifiable
+than it should be, and that is the difference between this session's merge rate and the last
+one's.
+
+**The second thing is small and will bite every release.** `compat/openapi/weftdb.json`
+publishes the server's own version as `info.version`, and the FRE-9a drift gate
+(`generated_spec_matches_committed_file`, `weft-server/src/openapi.rs:504`) compares the whole
+document against the committed file. So the 0.3.2 bump on #612 made three platform test jobs
+fail with "66 paths generated, 66 committed" — a message about route counts for a one-field
+version difference. Patched on that branch by hand (`2dfc7b9`), because a dictionary fix should
+not also change what a gate means. Filed as #620 with the two real options: exclude
+`info.version` from the drift comparison and assert it separately against
+`env!("CARGO_PKG_VERSION")`, or keep the gate strict and put "regenerate the spec" in the
+release checklist and accept that every version bump edits a 417 KB fixture that two
+version-bumping PRs will then conflict in. Whoever owns FRE-9a should pick; this loop
+deliberately did neither.
+
+## 2026-11-07 — gate 7 reads a setup-step death from the journal, not from the unit
+
+	**The finding.** The escalation added earlier today (use the system manager when the user
+	manager cannot apply the unit's capability drop) never fired on the runner, so gate 7 still
+	failed with `Failed to drop capabilities: Operation not permitted` and
+	`status=218/CAPABILITIES`. `preexec_step` asked the unit for `ExecMainCode`/`ExecMainStatus`,
+	but the transient unit is submitted with `--collect`: systemd unloads it the moment it exits,
+	so both properties read back as the empty string, `step` stayed empty, and the escalation's
+	`-n $step` test never held. The failure text then named the *user* manager, which is what a
+	reader would need to tell the two environments apart.
+
+	**The decision.** Read the same fact from PID 1's journal when the properties are gone:
+	`unit_log | grep -oE 'status=2[0-4][0-9]/[A-Z]+'`. The journal line survives unloading and
+	carries the identical status code, so the escalation now sees `status=218` and retries under
+	the system manager, which is privileged enough to apply the hardening and is where an operator
+	actually installs this unit.
+
+	**Why not the alternatives.** Dropping `--collect` would leak a unit per run on a shared
+	machine and still leave a race between exit and the query. Querying before exit would mean
+	waiting on the unit, which changes what the gate measures (`systemd-run` returns after the
+	start, and the gate's claim is about the start path). Narrowing the ladder to "trust the
+	verdict string" is what produced the wrong verdict in the first place. The 2xx band check is
+	kept exactly as before, so a server that started and then failed is still the server's problem
+	and is never retried somewhere privileged.
+## 2026-11-07 — #516: a digest disagreement inside tolerance is non-determinism, not a wrong answer
+
+	**The finding.** The pooled Phase 1 report (`bench/reports/phase1-pooled/`) contains two runs of
+	the `timescaledb-double` downsample gate at `mcar-medium`. Both passed their individual tolerance
+	(test-to-reference differences of 7.1e-14 and 1.4e-13 against a 9.2e-8 relative tolerance). But
+	their `answer_sha256` values differed — `DIGEST_DIGITS` (12) significant digits of each bucket's
+	`avg`, computed by TimescaleDB's `avg(double precision)`, which sums in whatever order the
+	parallel scan delivers rows and then divides. The two runs' rows landed in different order, so
+	the 12-significant-digit string of a float that the hash feeds on was different, so the hash
+	differed, so `combine.rs:81` recorded a FAILED gate.
+
+	**Why a hash is the wrong test for a `double precision` `avg` that does not add in a fixed order.**
+	`AVG(double precision)` in PostgreSQL and its derivatives computes a parallel sum whose rounding
+	depends on row arrival order. Two runs that return the same set of rows within tolerance can
+	therefore produce a different floating-point result at the 14th or 15th decimal digit — well
+	short of the 1e-9 tolerance but enough to change a SHA-256 over 12-significant-digit
+	representations. The answer digest was designed to detect a run that answers a *completely
+	different grid*, not the last 1e-14 of a sum, and using it as a pass/fail criterion for a
+	combined report conflates the two.
+
+	**What the third state does.** `Correctness.indeterminate` (report schema v7 → v8) records that
+	the runs' digests disagreed while every run stayed inside its own tolerance. The combined gate's
+	`passed` field is kept `false` — the row stays out of `all_correct()` and out of win/loss
+	verdicts exactly as before — because the answer is not reproducible bit for bit. The rendered
+	report shows `non-deterministic` in the gate cell and lists the row in a new `Non-deterministic
+	within tolerance` section.
+
+	**What it does NOT do.** It does NOT weaken the digest check for out-of-tolerance answers: a run
+	supplying a completely different grid still produces a different hash, and a run that also fails
+	its own tolerance produces `indeterminate = false`. It does NOT let the row into a verdict: a
+	row whose `passed` is false is excluded by the existing `passed(r)` filter — `all_correct()` and
+	the verdict loop never see it.
+
+
+## 2026-11-07 — #452: the adapter string is the predicate; no new field
+**Ambiguity.** The issue says a non-adapter result "cannot carry a cross-engine claim", but a result
+whose `adapter_info` is `None` is precisely the result that cannot say which engine produced it, so
+the enforcement predicate cannot be the obvious "this arm is a competitor and has no report". Two
+candidate readings: a mixture rule (a report that contains both a null-report result and a result
+with `adapter_info` where `native_engine` is true) and a workload rule (the null-report workloads are
+WeftDB-only by construction).
+
+**Choice.** Neither, as written. The predicate is `result.adapter_info.is_none() &&
+!result.adapter.starts_with("weftdb")`, enforced in `weft-bench/src/compare.rs` by a helper called
+from `provenance` (`compare.rs:459`) that pushes `hard:`-prefixed notes, so it reuses the existing
+`CompareError::Incomparable` refusal (`compare.rs:346-351`) and the existing `--ignore-provenance`
+downgrade to `ignored:` with no new machinery.
+
+**Why.** `native_engine`, `engine` and `method` all live *inside* `AdapterInfo`, which is the very
+structure whose absence is under test — a predicate over them can never observe the offending shape.
+`BenchResult::adapter` is the only party field populated on every result. `starts_with` rather than
+equality because the self-measured paths are not all spelled `weftdb`: `stored_weft_adapter.rs:136`
+writes `weftdb-stored` and `soak_client.rs:660` writes `weftdb-ingest`, and an exact-match allow list
+would silently exempt those. Every real adapter implements `adapter_info` because
+`SystemAdapter::adapter_info` (`weft-bench/src/adapter.rs:54`) deliberately has no default, so the
+crate's other names (`baseline-linear`, `baseline-forward-fill`, `null`) cannot reach the branch and
+get no entry in any list. The honest shape the issue concedes — `adapter: "weftdb"` with
+`adapter_info: None` from the seven in-process workloads — keeps comparing.
+
+**Consequence accepted.** The `compare.rs` test helper at `compare.rs:566` builds fixtures with
+`adapter: "weft"` and `adapter_info: None`; under this rule that is a second party without
+provenance, so the fixture becomes `"weftdb"` rather than the rule being widened to cover a name that
+exists only in tests.
+
+**What this does NOT do.** It does not add a field, an `Option<bool>`, or a report-schema bump; a
+new optional boolean is the opposite of the trait's "no default implementation" rule, because the
+caller may simply not set it — which is exactly how the first attempt (#634, in `weft-xbench::ArmInfo`)
+produced a guard that could only fire in tests. It also does not check a lone report at publication
+time: only the compare boundary is guarded, because that is where this repository forms a ratio claim.
+
+## 2026-11-07 — CI-12: a clippy verdict that depends on cache state is not a gate (#635, #636, #637)
+**Ambiguity.** `Run clippy` is green on PRs and red on the commits they merge into. Two mechanisms
+fit the evidence — a restored `target/` whose fingerprints came from `cargo test` rather than clippy,
+and a deny set on the command line that is narrower than the one the crates declare — and a CI log
+does not separate them.
+
+**Choice.** Fix the code first, then the cache, then the blind spot, as three separate changes; and
+in the meantime correct the workflow comment so the next reader is not told something false.
+
+**Why.** `main` at `c04f055` ran clippy on a tree where `weft-bench` was not checked at all (job
+`42432269724`, `Checked 7 crates`) and the same tree failed on a cache-miss runner with 23 errors in
+`weft-bench/src/soak_compare.rs`; #616 was merged on a run that printed `Reusing CI artifacts from a
+previous job`. So #636 makes the code satisfy the lint level the crates themselves declare —
+`weft-bench/src/lib.rs:92` is `#![deny(clippy::pedantic, clippy::nursery, clippy::all)]` and
+`weft-bench/src/main.rs:28` is the `forbid` form, which an inline `allow` cannot downgrade — and that
+is a superset of whatever the CLI flags ask for. Only then does namespacing the clippy job's build
+(`CARGO_TARGET_DIR: target/clippy`, or a distinct rust-cache `key:`) mean anything, and the proof is
+that a warm run on `main` prints `Checking weft-bench` instead of `Reusing CI artifacts`. Deleting the
+cache instead was rejected: the `weftdb` test job is already 13 to 16 minutes warm, and a cold
+`--all-features` clippy pass is the expensive case.
+
+**Deferred deliberately.** A check that the job enumerated every workspace crate — comparing
+`cargo metadata --no-deps` package count against the `Checked N crates` line — is the only thing that
+would detect a false pass, and it is kept out of this change because the first run will fail on
+whatever the poisoned cache has been hiding, and that needs its own fix commit rather than a red
+gate nobody triages.
+
+## 2026-11-08 — Needs human: the box lost its uplink mid-wave (network, not code)
+At about 00:45 the machine stopped routing: `getent hosts github.com` fails,
+`resolvectl` still reports quad9 as current, and `bash -c 'echo > /dev/tcp/1.1.1.1/53'`
+returns `Network is unreachable` with no default route in `ip route show default`. That is
+an uplink or default-route failure, not a resolver failure — a resolver problem would still
+reach 1.1.1.1 over TCP.
+
+**What it cost.** A freshly dispatched `parallel-worker` for #625 died at its first turn with
+`502 cannot resolve tunnel destination openrouter.ai`, and the local `git push` of the clippy
+fixes for #636 could not reach the remote (the commit exists locally as `4882ef1`, so nothing
+is lost). Every CI-dependent claim in this session's open PRs (#636, #637, #638, #639) is
+therefore pending rather than verified, and no PR was merged on the strength of a guess.
+
+**Chosen response.** Keep working on what a machine without a network can still do — local
+`cargo clippy`/`cargo test` verification of the branches already committed — and re-attempt
+the pushes when the route returns, rather than inventing an offline workaround or claiming
+green. Recorded here because if the wave appears to stall again with no explanation, this is
+the reason, and because restarting the interface or the VPN is a human action on this host.
+
+## 2026-11-08 — FRE-15: the stability policy lives in `docs/`, not at the root (#331)
+
+`docs/release/1.0-plan.md` calls the slice "STABILITY.md", which reads like a root-level
+file next to `HONESTY.md` and `SECURITY.md`. **Chosen:** `docs/stability.md`, linked from
+`README.md` and `docs/reference.md`. The root pair exists at the root because GitHub gives
+those two filenames special meaning (a security policy is surfaced in the repository's
+security tab); a versioning policy gets no such treatment, and every other explanatory
+document in this repository lives in `docs/`. A 225-line policy document with an internal
+link graph is also easier to read rendered than as a root landing page.
+
+**Rejected: `STABILITY.md` at the root** — it would be the only long-form policy document
+there, and `SECURITY.md`'s reason for being at the root does not transfer. **Rejected:
+putting it inside `docs/release/`** — that directory holds release *procedures* (the
+checklist, the 1.0 plan), which are internal; this document is addressed to users.
+
+## 2026-11-08 — #430: the methodology pointer is enforced, not offered
+
+**What was ambiguous.** #430 asks for "a methodology document published before any performance
+claim", and `ROADMAP.md:571` had already ticked it: `docs/methodology.md` exists, 318 lines, landed
+in #630. So the deliverable looked finished, and the only literal reading left was "link it from
+somewhere". The gap that actually matters is narrower: the two documents that carry figures —
+`README.md` and `docs/reference.md` — never mentioned the rules at all, and nothing checked that
+they did. Every other claims guarantee in `tools/check_claims.py` (marker pairing, source
+existence, artifact publication, figure-in-window) is machine-enforced; the rules the figures were
+measured under were the one guarantee carried by convention. `docs/claims-audit.md`, merged the same
+day, even asserted in its opening note that the methodology "does not yet exist" — a sentence that
+was already false when it merged, which is what an unchecked pointer costs.
+
+**Chosen enforcement.** Fail the lint when the claims document never links the methodology file, or
+when the file is absent under the repository root. This is unconditional: there is no flag to opt a
+document out, and no "warn if missing" tier. The reasoning is the one #635 just recorded about the
+clippy gate — a guarantee that holds only when someone remembers to ask for it is not a gate, it is
+a suggestion with a nicer error message. `--methodology` exists so a test fixture can point at a
+scratch file, and resolves against `--root` exactly as a registry source path does; links still
+resolve beside the document, which is the distinction `RootTests` exists to hold.
+
+**Rejected.** Making the check opt-in so the four existing test fixtures would keep passing without
+edits — rejected for the reason above, and the fixture edits were four lines. Also rejected: adding
+a new workflow step or a new lint script. The claims lint already runs in CI with the reference
+document as its argument, so the rule belongs inside it, and a second gate would have to be kept
+honest the same way this one is.
+
+**Consequence.** A claims document can no longer lose its pointer to the measurement rules without
+breaking the build, and `docs/claims-audit.md` now says where the rules live instead of claiming
+they do not exist. Closing #430 also removes the last "documentation not yet written" caveat from
+the claims story: from here, an unprovenanced figure fails CI, and a provenanced-but-unjudgeable one
+now has nowhere to hide either.
+## 2026-11-07 — #453: Fill tokens are exact-case like the reduction tokens
+
+**Context.** FRE-5 (2026-10-29, DECISIONS.md:3352) made `Aggregation::from_token` exact-case and
+noted that `Fill::from_token` (`weft-reduce/src/fill.rs:62`) still folded case, left for its own
+decision (#453). `Fill` reaches the same wire surface — `?fill=` on the ILP endpoint
+(`weft-server/src/downsample.rs:134`), the stored-range routes (`weft-server/src/storage.rs`), the
+downsample JSON body, and `weft-bench --gf-fill` (`weft-bench/src/main.rs:2059`) — so the two
+vocabularies cannot be expected to resolve `agg=` one way and `fill=` the other on the same query.
+
+**Chosen:** exact-case word tokens, value arm unchanged. `from_token` trims, matches exactly
+`null | prev | previous | locf | linear | quadratic | cubic`, then falls through to the
+`BigDecimal` parse for the constant arm. The value arm takes no letters, so case rules never touch
+it. Tests at `fill.rs:401-409` now pin `"Linear" -> None` and `"CUBIC" -> None`.
+
+**Rejected:** keeping case folded so the two vocabularies agree in-kind (they would agree only in
+being wrong together); and a deprecation-warning path — the tokens return `Option` and the server
+already 400s unknowns with the accepted spellings, so a separate warning surface would be new API
+on a pre-1.0 crate whose CHANGELOG is the deprecation notice.
+
+**Breaking:** mixed-case `fill` tokens on the HTTP endpoints and `--gf-fill` now 400/CLI-error and
+name the token. No test sends a mixed-case fill, so this is a documentation-level break, recorded
+under `### Changed` in CHANGELOG.md with the same "This breaks v0.3.x clients…" call-out the
+reduction change used.
+
+## 2026-11-07 — a note this session inherited describes an `audit` CI job that does not exist here
+
+**Ambiguity.** Context carried forward from an earlier lane claimed `audit.yml` ran a job named
+`audit (latest)`, that it had been red on main since 2026-10-23 because the container image
+`ghcr.io/rustsec/audit:latest` could not be pulled, that `cargo audit` is yanked upstream so the
+replacement tool is an owner decision, and that the resulting issue should be filed with that
+evidence. Before filing anything, checked it.
+
+**Finding.** None of that is true of this repository. `git grep` over `.github/workflows` at
+`origin/main` finds no `audit` job and no reference to `rustsec/audit`; `git log --all -S
+'rustsec/audit' -- .github` finds nothing in reachable history; and the check list on current
+heads contains no check by that name — the supply-chain checks that do run are `cargo-deny` and
+`third-party licenses`, and both are green on every open PR today.
+
+**Choice.** Record the correction here rather than file the issue. An issue about a workflow that
+does not exist would send a future reader after a phantom, which is the exact failure mode this
+file exists to prevent.
+
+**What is actually true about advisory coverage.** `deny.toml` carries an `[advisories]` section
+whose comment states the policy — "Every RustSec advisory (vulnerability, unmaintained, unsound,
+yanked) fails the check" — with `ignore = []`, so the acceptance list is empty and the check is as
+strict as the tool gets. If advisory coverage is ever judged thin, the change to make is to that
+file (the ignore list and its revisit dates, the advisory database, the yanked/unsound categories),
+not a new tool replacing one that was never here.
+## 2026-11-08 — #445 is parked, and the constraint was the worker budget rather than the design
+
+**Five delegated attempts at slice #445 produced no diff at all**, which is the point at which a
+re-brief stops being the obvious next move. The runs were `32f21b46`, `72939312`, `f0e773e6`,
+`d2cce9ac` and a 45-minute predecessor; the last burned 236 tool calls and 940 k tokens and reported
+"the edits never landed". The slice — maintenance budgets and a k-way merge across overlapping
+segments — sits exactly on the read path that the 13 crash-matrix and layout-migration tests guard,
+and PR #645 in the same window shows how much of that path's behaviour those tests reject when it
+changes. **Chosen:** stop dispatching workers at #445, say so on the issue with the run identifiers so
+the next session does not spend a sixth budget on a guess, and re-enter the slice as two steps: a
+design note that states what the merge must guarantee and where the maintenance budget is charged,
+written by the supervising session or the oracle, then a mechanical implementation step against that
+note. **Rejected:** a sixth brief with a longer timeout. The failure is not wall-clock — native cargo
+is forbidden on this host's RAM, and even with the warm shared Docker target directory a single
+`weftdb` lib-test run costs minutes, so a budget-bounded agent never reaches a trustworthy
+storage-engine feedback loop no matter how the brief is worded.
+
+## 2026-11-08 — Wrong-tree and wrong-base pull requests: the verification moves from the worker to the merge
+
+**Two documentation workers in one day wrote correct documents in the wrong place, and both reported
+that they had checked.** #651 committed every file under `weftdb/` — `weftdb/docs/stability.md`,
+`weftdb/CHANGELOG.md`, `weftdb/README.md` — duplicating top-level files, because the repository root
+is the cargo workspace and `weftdb/` is a crate inside it. #653 branched from #651's branch rather
+than from main, because it cloned a local mirror whose checked-out branch happened to be #651's, and
+so its diff carried that branch's whole nested tree: 5 840 lines that are not that slice. Both final
+reports asserted the tree shape was verified. Both claims were false, and both PRs would have merged
+silently on a green CI — nothing in CI objects to a correctly-named file in the wrong directory.
+
+**Chosen:** #651 is discarded and rebuilt as #652 from `origin/main`; #653 is fixed with
+`git rebase --onto origin/main <the inherited commit>`, which keeps only its own commit; and
+`git diff --name-only origin/main..HEAD` becomes the first thing read on any incoming PR, before any
+content review. Briefs now tell a worker to clone from the GitHub URL rather than a local path or
+mirror, to paste that command's output verbatim into its report, and to stage explicit paths instead
+of `git add -A` (the harness drops `.pi-lens-probe-home/*.log` telemetry into the worktree, and ten
+such files landed on a branch this week). **Rejected:** trusting a worker's own verification section.
+It is the exact artifact that lied twice in one day, and a check the producer performs on its own
+output is not a check.
 
 ## 2026-11-05 — ROB-17: the disk guard's shape, and what it does not guard (FLAGGED FOR MERGE REVIEW)
 

@@ -35,12 +35,14 @@ pub fn default_data_dir() -> String {
 /// Returns the active data directory for WeftDB databases.
 ///
 /// Resolution order:
-/// 1. `TEST_DATA_DIR` — explicit override (used by the test suite).
-/// 2. `WEFT_DATA_DIR` — shared override, also honored by `weft-tui` for its logs.
-/// 3. [`default_data_dir`] — the portable per-user default.
+/// 1. `WEFT_DATA_DIR` — shared override, also honored by `weft-tui` for its logs.
+///    The test suites are handed their fixture directory through this variable
+///    (PAC-6 removed the test-only `TEST_DATA_DIR` override that used to sit
+///    ahead of it).
+/// 2. [`default_data_dir`] — the portable per-user default.
 #[must_use]
 pub fn data_dir() -> String {
-	std::env::var("TEST_DATA_DIR").or_else(|_| std::env::var("WEFT_DATA_DIR")).unwrap_or_else(|_| default_data_dir())
+	std::env::var("WEFT_DATA_DIR").unwrap_or_else(|_| default_data_dir())
 }
 
 // Version information

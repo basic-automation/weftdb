@@ -333,6 +333,12 @@ impl Dictionary {
 			}
 		}
 
+		// A pattern already in the dictionary (by id) is not added again: loading a store
+		// into a dictionary that already holds it must not duplicate it.
+		if self.patterns.iter().any(|p| p.id() == new_pattern.id()) {
+			return Ok(());
+		}
+
 		// Step 2: Check similarity against ALL existing patterns using configured variability constraints
 		// This is the specification-compliant approach - no shortcuts or optimizations that change behavior
 		let mut matching_indices = Vec::new();
@@ -1042,8 +1048,8 @@ mod tests {
 		Dictionary::new("Test Dictionary".to_string(), "A test dictionary for pattern matching".to_string(), constraints)
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_import_new_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -1053,8 +1059,8 @@ mod tests {
 		drop(dictionary);
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_import_similar_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -1070,8 +1076,8 @@ mod tests {
 		drop(dictionary);
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_import_different_pattern() {
 		let mut dictionary = create_test_dictionary();
 
@@ -1088,8 +1094,8 @@ mod tests {
 		drop(dictionary);
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_import_pattern_matches_multiple() {
 		let mut dictionary = create_test_dictionary();
 
@@ -1113,8 +1119,8 @@ mod tests {
 		drop(dictionary);
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_import_pattern_matches_multiple_distinct_patterns() {
 		// Create a dictionary with moderately loose constraints to allow some matches
 		let constraints = DictionaryConstraints {
@@ -1147,8 +1153,8 @@ mod tests {
 		drop(dictionary);
 	}
 
-	#[tokio::test]
 	#[serial]
+	#[tokio::test]
 	async fn test_import_pattern_matches_multiple_existing_patterns() {
 		// Create a dictionary with loose constraints to enable multiple matches
 		let constraints = DictionaryConstraints {

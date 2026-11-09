@@ -41,7 +41,7 @@ observed endpoints marked `raw`, the 59 between them `interpolated`.
 
 **Start here** · [Why WeftDB](#why-weftdb) · [Quickstart](#quickstart) · [Is WeftDB right for you?](#is-weftdb-right-for-you) · [Project status](#project-status)
 
-**Use it** · [What you get](#what-you-get) · [HTTP API](#http-api) · [Migrate a 0.1.x tree](#migrating-a-01x-data-directory) · [Configuration](#configuration) · [Rust library](#rust-library) · [Terminal UI](#terminal-ui)
+**Use it** · [What you get](#what-you-get) · [HTTP API](#http-api) · [Migrate a 0.1.x tree](#migrating-a-01x-data-directory) · [Configuration](#configuration) · [Operations](operations.md) · [Rust library](#rust-library) · [Terminal UI](#terminal-ui)
 
 **Understand it** · [Performance](#performance) · [How it works](#how-it-works) · [Benchmarking](#benchmarking) · [Development](#development)
 
@@ -220,7 +220,7 @@ seven library crates on crates.io at 0.2.0. It closes roadmap Phase 1, the bench
 [known limitations](https://github.com/basic-automation/weftdb/blob/v0.2.0/CHANGELOG.md#known-limitations)
 include a security layer that is new and not yet reviewed, unfinished crash consistency, and a one-way store
 upgrade from v0.1.0. [v0.1.0](https://github.com/basic-automation/weftdb/releases/tag/v0.1.0)
-stays the baseline that upgrade, rollback and compatibility checks run against.
+stays the baseline that upgrade, rollback and compatibility checks run against (see [`UPGRADING.md`](../UPGRADING.md)).
 
 | Area | State |
 |---|---|
@@ -233,11 +233,14 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 | Library crates on crates.io | Not published yet |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
 | Packaging — Helm | Not started |
-| Client SDKs | Rust: [`weft-client`](../weft-client) (not on crates.io yet). R: [`clients/r`](../clients/r) (not on CRAN). Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
+| Client SDKs | Rust: [`weftdb-client`](../weft-client) (on crates.io; the `weft-client` name belongs to an unrelated crate). R: [`clients/r`](../clients/r) (not on CRAN). Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |
 | Per-measurement tags | Not started |
 
 The full work queue lives in [`ROADMAP.md`](../ROADMAP.md). It is the single source of
 truth for status and priorities, and it records negative results alongside wins.
+
+See [`docs/stability.md`](stability.md) for the stability and versioning policy — what
+is stable, what is experimental, and what is not yet guaranteed for code and data.
 
 ---
 
@@ -295,7 +298,7 @@ truth for status and priorities, and it records negative results alongside wins.
   with each panel's buckets reduced in the store.
 - **Arrow Flight** (experimental, read-only) — stream a stored window or value band as
   Arrow record batches to `pyarrow.flight` or any Flight client.
-- **Rust client** ([`weft-client`](../weft-client)) — every HTTP route from async Rust,
+- **Rust client** ([`weftdb-client`](../weft-client)) — every HTTP route from async Rust,
   lossless `BigDecimal` values on the storage paths, cursor-following streams, and
   optional Arrow `RecordBatch` decoding.
 - **Rust libraries** — use the engine, the storage layer or the reductions directly,
@@ -309,11 +312,14 @@ truth for status and priorities, and it records negative results alongside wins.
 
 Every number below was measured by a benchmark in this repo. Where a row names a **Source:**
 path, that is the bench the figure came from and you can re-run it; the run artifacts themselves
-(the manifest and result JSON of schema v23) are not committed, so a figure with no source line is
+(the manifest and result JSON of schema v24) are not committed, so a figure with no source line is
 a *dated local measurement*, not a claim you can reproduce from a clone. Which proof each figure carries is machine-checked, not asserted in prose:
 [`bench/claims.json`](../bench/claims.json) is the per-figure registry and
 [`tools/check_claims.py`](../tools/check_claims.py) runs it in CI, so a figure with no entry, or an
-entry whose text or source path has drifted, fails the build. The exception is any figure measured on
+entry whose text or source path has drifted, fails the build. The rules those numbers were produced
+under — harness, hardware class, repetitions, rounding, and what disqualifies a measurement — are
+in [the performance methodology](methodology.md), and the same lint fails the build if this document
+stops linking it: a figure you can re-run but cannot judge is only half auditable. The exception is any figure measured on
 the real BTC corpus: that input is a local file the repository does not ship (see
 [Ingest](#ingest)), so those figures cannot be reproduced from a clone at all. All were measured on
 one developer workstation — treat them as *shape*, not as a specification for your hardware.
@@ -328,7 +334,8 @@ one developer workstation — treat them as *shape*, not as a specification for 
 | 100-row window over 100k rows | **58 µs** | 2.73 ms | ~47× |
 
 *Source: [`weft-physical-type/benches/pointread.rs`](../weft-physical-type/benches/pointread.rs), <!-- claim:pointread-2026-10-08 -->
-re-measured 2026-10-08 after the word-wise bit reads and the slicing-by-16 frame CRC.*
+re-measured 2026-10-08 after the word-wise bit reads and the slicing-by-16 frame CRC.
+`source: weft-physical-type/benches/pointread.rs; command: cargo bench -p weft-physical-type --bench pointread; dataset: generated; measured: 2026-10-08; reproducible_from_clone: yes`*
 The wins come from skipping the value column entirely until a specific row is needed,
 and from resolving regular timestamp columns in closed form.
 
@@ -336,6 +343,11 @@ and from resolving regular timestamp columns in closed form.
 
 Sealing **1M rows** of a real 1-minute financial series into a columnar segment:
 **4.57 s — 218,963 rows/sec at 4.22 bytes/point.**
+
+> *This figure predates the six-field provenance rule: its source and command are
+> not recoverable from the repository (no bench file or reproduction command is
+> recorded). It must be re-measured before being repeated (see
+> [`docs/claims-audit.md`](claims-audit.md)).*
 
 That corpus (`database/datasets/btc_1min.csv`, a BTC/USD one-minute series) is a local,
 gitignored file, **not distributed with this repository** and not required to build or test —
@@ -426,6 +438,16 @@ Three more results from 2026-10-09 where the obvious answer was wrong:
 
 `weft-server` is the `axum` HTTP surface — Weft-Bench, TSBS-style harnesses, Grafana
 and SDKs all drive the engine through it. It carries no vendor-specific dependencies.
+
+**The OpenAPI document is generated from the code.** Every path, method, scope,
+admission class and tier comes from the real [`RouteTable`] the router serves. The
+committed spec lives at [`compat/openapi/weftdb.json`](../compat/openapi/weftdb.json)
+and is checked by the drift gate (`generated_spec_matches_committed_file`) in CI.
+Regenerate it at any time:
+
+```bash
+weft-server openapi --out compat/openapi/weftdb.json
+```
 
 See the [Quickstart](#quickstart) to start it.
 
@@ -836,6 +858,11 @@ only** — the `.weftseg` measurement frames are not part of a snapshot.
   takes at most one snapshot per interval however far behind it fell. **Set `WEFT_BACKUP_INTERVAL_SECS` from what your storage
   can sustain, not from how much data you have**; point `WEFT_BENCH_BACKUP_DIR`
   at your own volume to measure it.
+
+  > *The tmpfs figures above predate the six-field provenance rule: their measured
+  > date and reproduction command are not recoverable from the repository. They
+  > must be re-measured before being repeated
+  > (see [`docs/claims-audit.md`](claims-audit.md)).*
 - **Unattended backups with retention.** Set `WEFT_BACKUP_INTERVAL_SECS` to run a
   background daemon that snapshots into a fresh `backup-<unix_millis>` directory
   each tick (verifying `snapshot`-only, since it backs up a live store), and
@@ -964,7 +991,6 @@ recovery-point and recovery-time objectives these settings produce, see
 | Variable | Used by | Purpose | Default |
 |----------|---------|---------|---------|
 | `WEFT_DATA_DIR` | `weftdb`, `weft-tui` | Root directory for database files **and** the TUI log (`weft-tui.log`). | portable per-user default (see below) |
-| `TEST_DATA_DIR` | `weftdb` | Highest-priority override for the database root (used by the test suite). | unset |
 | `WEFT_EXTRACTED_BATCH_RETENTION_SECS` | `weftdb` | How long (seconds) a legacy aspect remembers the batches pattern extraction consumed, so the incremental build does not queue them again. Each extraction deletes older records, keeping about one row per resolution step of this period. Set it above the longest interval between pipeline runs of an aspect plus the longest ingest call; a non-positive or unparsable value keeps the default. | `172800` (48 hours) |
 | `WEFT_SERVER_ADDR` | `weft-server` | HTTP bind address. | `127.0.0.1:8080` |
 | `WEFT_ALLOW_ANY_HOST` | `weft-server` | Truthy (`1`/`true`/`yes`/`on`) → turn off the loopback request guard. On a loopback bind the server otherwise answers only requests whose `Host` is `localhost`, `127.0.0.0/8` or `[::1]` (`421` otherwise) and refuses state-changing requests from non-loopback web origins (`403`). Set it behind a local reverse proxy that forwards a different `Host`, or one that forwards the non-loopback `Origin` of a browser UI it fronts. A non-loopback bind is never guarded. | unset (guarded on a loopback bind) |
@@ -1037,9 +1063,9 @@ reads them as the server does.
 
 The database root directory is resolved in this order:
 
-1. `TEST_DATA_DIR`, if set (explicit override for the test suite);
-2. otherwise `WEFT_DATA_DIR`, if set;
-3. otherwise a **portable, per-user default** — `~/.weftdb/data` (falling back to the
+1. `WEFT_DATA_DIR`, if set — the test suites are handed their fixture directory
+   through this variable too (PAC-6 removed the test-only `TEST_DATA_DIR` override);
+2. otherwise a **portable, per-user default** — `~/.weftdb/data` (falling back to the
    platform data directory + `weftdb`, e.g. `%APPDATA%\weftdb` on Windows, if the home
    directory cannot be determined).
 
@@ -2137,6 +2163,13 @@ every comparison with client-side interpolation. Treat a margin under about 1.5�
 
 ---
 
+### Nightly soak comparison gate
+
+See [`docs/soak.md`](soak.md) — the SOA-15 nightly soak comparison schedule,
+metrics, tolerances, and how to regenerate a baseline.
+
+---
+
 ## Development
 
 ```bash
@@ -2164,7 +2197,7 @@ cargo bench -p weftdb --bench cache_performance_benchmarks
 
 These benches create their databases in a temporary data dir of their own, which they
 remove when they finish, never in `~/.weftdb/data`. That dir is under the system temp
-dir, often a tmpfs; to bench another filesystem, set `TEST_DATA_DIR` to a directory on
+dir, often a tmpfs; to bench another filesystem, set `WEFT_DATA_DIR` to a directory on
 it (the benches remove the databases they create there, not the directory).
 
 HTML reports are generated under `target/criterion/`. The interpolation engine's own

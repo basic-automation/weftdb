@@ -1,12 +1,12 @@
-# weft-client
+# weftdb-client
 
 An async Rust client for [WeftDB](https://github.com/basic-automation/weftdb)'s
 `weft-server` HTTP API: one method per route, named for what it does.
 
 ```rust,no_run
-use weft_client::{AspectDeclaration, Client, Interpolate, Spline, WriteOptions};
+use weftdb_client::{AspectDeclaration, Client, Interpolate, Spline, WriteOptions};
 
-# async fn demo() -> weft_client::Result<()> {
+# async fn demo() -> weftdb_client::Result<()> {
 let client = Client::builder("http://127.0.0.1:8080").api_key("weft_…").build()?;
 
 // Lossless storage: values go in as decimal text, BigDecimal or integers, and come back as BigDecimal.

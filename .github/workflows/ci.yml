@@ -37,8 +37,8 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly, 2026-11-07
         with:
           components: rustfmt
       - run: cargo +nightly fmt --all -- --check
@@ -47,7 +47,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Stable jobs build with the release compiler, pinned in one file that the release
       # workflow reads too, so CI tests with the same compiler that builds a release. (Not
       # the same build: CI unifies features across --workspace and uses the dev profile;
@@ -60,10 +60,20 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      # Gated on the categories that catch defects. `style`/`pedantic`/`nursery`
-      # have a large pre-existing backlog in this workspace; they are reported by
-      # running clippy locally, not enforced here, so the gate stays honest.
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      # Gated, on the command line, on the categories that catch defects: correctness,
+      # suspicious, perf. `style`/`pedantic`/`nursery` have a large pre-existing backlog
+      # in this workspace, so this job does not raise them.
+      #
+      # That is not the whole gate, and reading only the flags below is how people get
+      # surprised. Most crates in this workspace set their own levels at the crate root
+      # — `#![deny(clippy::pedantic, clippy::nursery, clippy::all)]` in
+      # `weft-bench/src/lib.rs`, `#![forbid(...)]` of the same three in `weft-arrow`,
+      # `weft-client`, `weft-line-protocol`, `weft-arrow-store` and the `weft-bench`
+      # binaries and integration tests — and a crate-level `deny`/`forbid` is not
+      # overridden by the `-D` list. So a new module in `weft-bench` or `weftdb` fails on
+      # a `pedantic` lint that a new module in `weft-reduce` only warns about, and the
+      # gate is not uniform across the workspace. #635 tracks making it uniform.
       #
       # RUSTFLAGS is cleared for this job on purpose: the workflow-level `-D warnings`
       # reaches clippy-driver as a rustc flag and would deny *every* clippy lint,
@@ -72,6 +82,38 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D clippy::correctness -D clippy::suspicious -D clippy::perf
         env:
           RUSTFLAGS: ""
+      # The gate above is honest about *categories* but silent about *coverage*. A warm
+      # rust-cache hit leaves a crate's fingerprint fresh, cargo never re-runs
+      # clippy-driver for it, and the job passes having linted a subset of the workspace:
+      # `main` sat red because the merge commit that broke it passed a run that restored
+      # a cache and printed `Checked 7 crates`, with `weft-bench` never linted at all, and
+      # the same tree then failed clippy on a cold runner (#635). This step makes every
+      # workspace crate dirty and lints the lot, so the lints the cached gate cannot see
+      # are at least named. Report-only on purpose: the first runs are expected to list
+      # real defects, and a gate that goes red for pre-existing ones stops being a signal.
+      # When this step reports zero errors and full coverage, delete `continue-on-error`
+      # and promote it to the gate, which is the actual fix for #635.
+      - name: Cold re-lint (report only, #635)
+        continue-on-error: true
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+        run: |
+          set -uo pipefail
+          expected=$(cargo metadata --no-deps --format-version 1 | jq '[.packages[] | select(.source == null)] | length')
+          git ls-files -z '*.rs' | xargs -0 --no-run-if-empty touch
+          cargo clippy --workspace --all-targets --all-features --locked > /tmp/relint.log 2>&1
+          status=$?
+          checked=$(grep -c '^ *Checking ' /tmp/relint.log || true)
+          errors=$(grep -c '^error' /tmp/relint.log || true)
+          echo "cold re-lint: $checked of $expected workspace crates compiled, clippy exit $status, $errors error lines"
+          if [ "$checked" -lt "$expected" ]; then
+            echo "::warning::cold re-lint compiled $checked of $expected workspace crates; something is still skipping the lint pass"
+          fi
+          if [ "$errors" -gt 0 ]; then
+            echo "::warning::cold re-lint found $errors error lines that the cached gate above did not see"
+            grep '^error' /tmp/relint.log | head -n 40
+          fi
 
   # Every performance figure in the README is vouched for by an entry in
   # bench/claims.json, which names the bench or the local corpus behind it and says
@@ -82,11 +124,19 @@ jobs:
     name: claims registry
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: python3 tools/check_claims.py --registry bench/claims.json --readme docs/reference.md --root .
+      # Every workflow action must be pinned to a commit SHA (#626).
+      - run: python3 scripts/ci/check-action-pinning.py
+      # Every #[serial] must sit immediately above #[test] or #[tokio::test] (#405).
+      - run: python3 scripts/ci/check-serial-order.py
       # The artifact-reference checks in check_claims.py are part of the gate, so
       # their tests run here too (EVI-4).
       - run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Unit tests for the serial-order guard.
+      - run: python3 -m unittest discover -s scripts/ci -p 'test_check_serial_order.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
 
@@ -97,7 +147,7 @@ jobs:
     name: weft-xbench lock
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: python3 scripts/xbench/check-lock.py
       - run: python3 -m unittest discover -s scripts/xbench -p 'test_*.py' -v
         env:
@@ -110,9 +160,9 @@ jobs:
     name: msrv (1.95)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95.0
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - run: cargo check --workspace --all-targets --locked
 
   # Early warning only: upstream crates break on nightly (e.g. turso_core's `branches` 0.4
@@ -122,9 +172,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly, 2026-11-07
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - run: cargo check --workspace --all-targets --all-features --locked
         env:
           RUSTFLAGS: ""
@@ -138,7 +188,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Linux runners have no GPU. Mesa's lavapipe is a software Vulkan driver, so splimes'
       # wgpu path runs for real under WeftDB's tests. (splimes' own CI requires a GPU
       # adapter; see github.com/basic-automation/splimes.)
@@ -163,7 +213,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Build
         run: cargo build --workspace --all-targets --locked
       # Pull requests and pushes set SKIP_SLOW_TESTS to keep hosted runners inside a sane
@@ -201,9 +251,9 @@ jobs:
           WEFT_SERVER_BIN: target/debug/weft-server
       # The Rust SDK's contract tests against the same server. The workspace run above
       # skips them (no WEFT_SERVER_BIN); `arrow` adds the columnar decode checks.
-      - name: Rust SDK contract (weft-client)
+      - name: Rust SDK contract (weftdb-client)
         if: runner.os == 'Linux'
-        run: cargo test -p weft-client --features arrow --locked --test live -- --test-threads=4
+        run: cargo test -p weftdb-client --features arrow --locked --test live -- --test-threads=4
         env:
           # Absolute: cargo runs an integration test from its package directory.
           WEFT_SERVER_BIN: ${{ github.workspace }}/target/debug/weft-server
@@ -236,7 +286,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Read the release toolchain
         id: toolchain
         shell: bash
@@ -244,7 +294,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Check default features alone (no workspace feature unification)
         run: cargo check -p weft-physical-type -p weftdb --all-targets --locked
       - name: Build docs for default features alone (deny broken intra-doc links)
@@ -274,7 +324,7 @@ jobs:
     name: rustdoc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Read the release toolchain
         id: toolchain
         shell: bash
@@ -282,7 +332,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Build docs (deny broken intra-doc links)
         run: cargo doc --workspace --no-deps --locked
         env:
@@ -293,7 +343,7 @@ jobs:
     name: cargo package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Read the release toolchain
         id: toolchain
         shell: bash
@@ -301,7 +351,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - run: cargo package --workspace --no-verify --locked
 
   # The job above proves each crate builds from its own tarball. This one proves the
@@ -329,8 +379,8 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
         with:
           command: check advisories bans licenses sources
 
@@ -354,7 +404,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       # cargo metadata (which cargo-about runs itself) needs every crate source in the
       # graph for the five shipped targets, so fetch them before generating.
       - name: Fetch the dependency graph
@@ -376,7 +426,7 @@ jobs:
     name: contribution-terms checker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: python3 -m unittest discover -s scripts/contrib -p 'test_*.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"

@@ -47,7 +47,9 @@ the 59 between them `interpolated`.
   as JSON (downsamples as Arrow too), and the endpoints accept InfluxDB Line Protocol, so data
   goes straight into pandas, Polars or DuckDB.
 - **Honest numbers.** Every performance claim comes from a benchmark in this repository that
-  you can re-run, and the results show where WeftDB loses as well as where it wins.
+  you can re-run, and the results show where WeftDB loses as well as where it wins. The
+  [rules behind every published number](docs/methodology.md) — the harness, the hardware class,
+  the repetitions, and what disqualifies a measurement — are written down alongside them.
 
 ## Install
 
@@ -208,8 +210,12 @@ The [changelog](CHANGELOG.md) lists every change and this release's known limita
 
 - [**Reference**](docs/reference.md): every endpoint, configuration variable, the storage
   format, the terminal UI, the Rust API and how it all works.
+- [**Operations**](docs/operations.md): backup and restore, systemd, container, upgrade,
+  failure modes and what to do.
 - [Migrating a 0.1.x data directory](docs/reference.md#migrating-a-01x-data-directory)
 - [Configuration](docs/reference.md#configuration) and [backup and restore](docs/reference.md#backup--restore)
+- [Stability and versioning policy](docs/stability.md): what you may rely on, what is
+  experimental, and what a wire-format change counts as.
 - [SECURITY.md](SECURITY.md), [HONESTY.md](HONESTY.md), [ROADMAP.md](ROADMAP.md),
   [CONTRIBUTING.md](CONTRIBUTING.md)
 

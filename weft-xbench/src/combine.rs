@@ -80,6 +80,7 @@ fn combine_result(runs: &[&ArmResult], seed: u64) -> anyhow::Result<ArmResult> {
 	if let Some(gate) = &mut combined.correctness {
 		gate.passed = runs.iter().all(|run| run.correctness.as_ref().is_some_and(|c| c.passed)) && digests_agree;
 		gate.max_abs_diff_vs_reference = runs.iter().filter_map(|run| run.correctness.as_ref()).map(|c| c.max_abs_diff_vs_reference).fold(0.0, f64::max);
+		gate.indeterminate = !digests_agree && runs.iter().all(|run| run.correctness.as_ref().is_some_and(|c| c.passed));
 		if !digests_agree {
 			gate.answer_sha256 = None;
 		}
@@ -117,7 +118,7 @@ mod tests {
 	fn result(level: u64, digest: &str) -> ArmResult {
 		let samples: Vec<u64> = (0..12).map(|i| level + i % 4).collect();
 		let (latency, latency_ci) = latency(&samples, 7);
-		let correctness = Some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: 0.0, tolerance: 1e-9, passed: true, unfilled_points: 0, answer_sha256: Some(digest.into()) });
+		let correctness = Some(Correctness { expected_points: 3, actual_points: 3, values_finite: true, max_abs_diff_vs_reference: 0.0, tolerance: 1e-9, passed: true, unfilled_points: 0, answer_sha256: Some(digest.into()), indeterminate: false });
 		ArmResult { dataset: "mcar-tiny".into(), kind: DatasetKind::Mcar, scale: "tiny".into(), input_points: 10, output_points: 3, missingness_fraction: 0.2, arm: ArmInfo { arm: "duckdb-double".into(), engine: "e".into(), value_type: "v".into(), method: "m".into(), class: None, own_answer: None }, phase: Phase::Interpolate, reps: samples.len(), latency, latency_ci, correctness, accuracy: None, storage_bytes: None, warmth: Warmth::Warm, samples_ns: samples, between_run: None }
 	}
 
@@ -142,6 +143,40 @@ mod tests {
 		let gate = combined.results[0].correctness.as_ref().expect("gate");
 		assert!(!gate.passed && gate.answer_sha256.is_none());
 		assert!(!combined.all_correct());
+	}
+
+	#[test]
+	fn runs_with_different_digests_but_each_passing_are_indeterminate() {
+		let combined = combine(&[run(1_000, "a"), run(1_000, "b")], vec![]).expect("combines");
+		let gate = combined.results[0].correctness.as_ref().expect("gate");
+		assert!(!gate.passed, "digests differ so passed is false");
+		assert!(gate.indeterminate, "every run passed its own tolerance");
+		assert!(gate.answer_sha256.is_none(), "pooled digest dropped");
+		let between = combined.results[0].between_run.as_ref().expect("between_run");
+		assert!(!between.digests_agree);
+	}
+
+	#[test]
+	fn runs_with_the_same_digest_are_determinate_and_pass() {
+		let combined = combine(&[run(1_000, "a"), run(1_000, "a")], vec![]).expect("combines");
+		let gate = combined.results[0].correctness.as_ref().expect("gate");
+		assert!(gate.passed);
+		assert!(!gate.indeterminate);
+		let between = combined.results[0].between_run.as_ref().expect("between_run");
+		assert!(between.digests_agree);
+	}
+
+	#[test]
+	fn a_run_thats_outside_tolerance_is_not_indeterminate_even_if_digests_differ() {
+		let mut failing = run(1_000, "a");
+		if let Some(c) = failing.results[0].correctness.as_mut() {
+			c.passed = false;
+		}
+		let second = run(1_000, "b");
+		let combined = combine(&[failing, second], vec![]).expect("combines");
+		let gate = combined.results[0].correctness.as_ref().expect("gate");
+		assert!(!gate.passed);
+		assert!(!gate.indeterminate, "a real failure is not indeterminate");
 	}
 
 	#[test]

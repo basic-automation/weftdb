@@ -163,8 +163,21 @@ done < <(manifest)
 # packaged copy is rewritten on the way in rather than carrying a path that happens to be right
 # for a tarball. `--prefix` is the only thing that changes it.
 readonly UNIT="$PREFIX/lib/systemd/system/weft-server.service"
+# The rewritten copy has to be given the manifest's mode, not the shell's. A redirection creates
+# its file with the mode the umask allows, and `mv` keeps whatever mode the temp file had, so an
+# operator whose umask is 077 — the umask a daemon-owning account is often configured with — got a
+# unit file at 0600 while every other file of this install landed at its listed mode. Measured here
+# with `umask 077`: the gate reads the installed tree against the manifest and reported
+# `weft-server.service is mode 600, the manifest says 644`. The mode is read off the manifest rather
+# than repeated here, so the list stays the single source of truth for what this install lays down.
+# The manifest lists the destination as the final path under `--prefix`, which is what `UNIT` holds;
+# `DESTDIR` is prepended only when the file lands, so the lookup matches on `UNIT` itself.
+unit_mode=$(manifest | awk -F'\t' -v want="$UNIT" '$2 == want { print $3 }')
+[[ -n $unit_mode ]] || die "the manifest lists no mode for $UNIT" ""
+readonly unit_mode
 sed -e "s|^ExecStart=.*/bin/weft-server|ExecStart=$PREFIX/bin/weft-server|" \
 	"$DESTDIR$UNIT" >"$DESTDIR$UNIT.tmp" &&
+	chmod "$unit_mode" "$DESTDIR$UNIT.tmp" &&
 	mv "$DESTDIR$UNIT.tmp" "$DESTDIR$UNIT"
 
 # The operator's env file: created once from the template, never replaced. Mode 0640 because the

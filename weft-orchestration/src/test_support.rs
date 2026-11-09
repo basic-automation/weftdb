@@ -1,7 +1,7 @@
 //! Support for the tests that create legacy [`Database`](weftdb::Database)s.
 //!
 //! `Database::new` creates a database under [`weftdb::data_dir`], which is the user's own
-//! `~/.weftdb/data` unless `TEST_DATA_DIR` or `WEFT_DATA_DIR` names another directory. Every
+//! `~/.weftdb/data` unless `WEFT_DATA_DIR` names another directory. Every
 //! test that creates or opens a database calls [`data_dir`] first, so this test binary's
 //! databases go to a temporary directory instead. The same helper serves `weftdb`'s
 //! integration tests (`weftdb/tests/common/mod.rs`).
@@ -15,12 +15,13 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// This test binary's data directory, where `Database::new` creates its databases from the
 /// first call on.
 ///
-/// An explicit `TEST_DATA_DIR` names it, which is how `test_api` and `test_pipeline_api`
-/// reach a real `Crypto` corpus (`TEST_DATA_DIR=~/.weftdb/data`). Otherwise it is a new
-/// temporary directory, which `TEST_DATA_DIR` then names: `WEFT_DATA_DIR` is not a reason
-/// to write into a real data directory, since `weft-tui` users may set it in their shell.
-/// The variable is set once, under the `OnceLock`, before any database of this binary
-/// resolves it, and no test sets it after.
+/// An explicit `WEFT_DATA_DIR` names it, which is how `test_api` and `test_pipeline_api`
+/// reach a real `Crypto` corpus (`WEFT_DATA_DIR=~/.weftdb/data`). That is the fixture
+/// path the suites are handed (PAC-6 removed the test-only `TEST_DATA_DIR` override, so
+/// the one Stable variable is now the channel — a shell that exports it for `weft-tui`
+/// also points the suites at that directory). Otherwise it is a new temporary directory,
+/// which `WEFT_DATA_DIR` then names. The variable is set once, under the `OnceLock`,
+/// before any database of this binary resolves it, and no test sets it after.
 ///
 /// Each test removes the databases it created ([`remove_database`]) when it passes. The
 /// temporary directory itself (`weft-orchestration-test-data-<uuid>` under the system temp dir) is left in
@@ -34,12 +35,12 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// If the directory cannot be created, or `weftdb::data_dir()` does not resolve to it.
 pub fn data_dir() -> &'static Path {
 	let dir = DATA_DIR.get_or_init(|| {
-		let dir = match std::env::var_os("TEST_DATA_DIR") {
+		let dir = match std::env::var_os("WEFT_DATA_DIR") {
 			Some(explicit) if !explicit.is_empty() => PathBuf::from(explicit),
 			_ => {
 				let dir = std::env::temp_dir().join(format!("weft-orchestration-test-data-{}", uuid::Uuid::new_v4()));
 				assert!(!dir.starts_with(weftdb::default_data_dir()), "the temporary test data dir {} is inside the default data dir", dir.display());
-				std::env::set_var("TEST_DATA_DIR", &dir);
+				std::env::set_var("WEFT_DATA_DIR", &dir);
 				dir
 			}
 		};

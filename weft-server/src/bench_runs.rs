@@ -279,7 +279,7 @@ mod tests {
 	#[test]
 	fn the_walk_finds_manifests_and_skips_everything_else() {
 		let dir = tempfile::tempdir().unwrap();
-		std::fs::write(dir.path().join("a.manifest.json"), br#"{"schema_version":23,"generated_at":"2026-11-01T00:00:00Z"}"#).unwrap();
+		std::fs::write(dir.path().join("a.manifest.json"), br#"{"schema_version":24,"generated_at":"2026-11-01T00:00:00Z"}"#).unwrap();
 		std::fs::write(dir.path().join("a.json"), b"{}").unwrap();
 		std::fs::create_dir_all(dir.path().join("nightly/2026-11-02")).unwrap();
 		std::fs::write(dir.path().join("nightly/2026-11-02/b.manifest.json"), br#"{"generated_at":"2026-11-02T00:00:00Z","claim":"p99"}"#).unwrap();
@@ -290,7 +290,7 @@ mod tests {
 		let paths: Vec<&str> = runs.iter().map(|run| run.path.as_str()).collect();
 		assert_eq!(paths, ["nightly/2026-11-02/b.manifest.json", "a.manifest.json"], "newest first, the report and the too-deep file left out");
 		assert_eq!(runs[0].claim.as_deref(), Some("p99"));
-		assert_eq!(runs[1].schema_version, Some(23));
+		assert_eq!(runs[1].schema_version, Some(24));
 	}
 
 	#[cfg(unix)]
@@ -329,7 +329,7 @@ mod tests {
 
 	use crate::auth::{format_key_hash, AuthConfig, KeyStore};
 
-	const MANIFEST: &[u8] = br#"{"schema_version":23,"generated_at":"2026-11-03T00:00:00Z","claim":"interp-latency"}"#;
+	const MANIFEST: &[u8] = br#"{"schema_version":24,"generated_at":"2026-11-03T00:00:00Z","claim":"interp-latency"}"#;
 
 	async fn get(router: axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
 		let mut request = Request::builder().uri(uri);
