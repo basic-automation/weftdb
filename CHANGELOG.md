@@ -20,6 +20,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   moment it landed — the gate works, the merge queue just did not re-run it.
 - **Test suites and refusal lists now accept `vX.Y.Z-beta.N` (TAG-11, #657).** The tag grammar was extended to accept `-beta.N` tags but the two test suites that pin the old grammar were not updated. `scripts/compat/test_releases.py` now parses the new 5-field `semver_key` tuple and asserts the beta-sorts-before-rc-sorts-before-release ordering; `scripts/release/test-stage.sh` accepts `v1.2.3-beta.1` and refuses the malformed `v1.2.3-beta` (no number).
 
+- **The crash matrix's SIGKILL cells now run on Linux only (turso#7480).** A SIGKILL
+  that lands between Turso's logical-log truncation and its WAL truncation leaves a
+  `.db-wal` holding committed frames with no `.db-log` header, and Turso 0.8.1 refuses
+  to reopen that database:
+  `WAL has committed frames but logical log header is missing`.
+  [tursodatabase/turso#7480](https://github.com/tursodatabase/turso/issues/7480) has
+  been open since 2026-06-12. WeftDB stays fail-closed: no orphan WAL is deleted or
+  quarantined at open (the engine keeps the backfill evidence in internal state, so
+  discarding the file could lose acknowledged writes), and the experimental
+  passive-checkpoint flag stays off. `kill-ingest` and `kill-compaction` now run where
+  the dedicated `crash-matrix.yml` job already ran them — Linux — and the integration
+  test names the cells it skipped and why on every other platform. macOS and Windows
+  runners lose SIGKILL coverage; the Linux job keeps it. See
+  [docs/upstream/turso-7480-reopen-refusal.md](docs/upstream/turso-7480-reopen-refusal.md).
+
 ### Changed
 
 - **Fill tokens are exact-case** (PAC-3, #453). `Fill::from_token` now matches the
