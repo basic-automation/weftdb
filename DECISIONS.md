@@ -4,6 +4,22 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-08 — Pagination cursor v1: selector hash, high-water mark, fingerprint, nullable total (ROB-15, #449)
+
+**The cursor v1 token is 66 hex characters: `01` + selector SHA-256 prefix (16) + high-water mark (16) + data fingerprint (16) + next-page offset (16).**
+The selector is hashed by SHA-256 of its canonical matcher sequence (each `(key, Some(value))` encoded as `key\0value\0`, a missing value as `key\0\xff\0`), followed by the exactness flag as one byte. SHA-256 was already a dependency of `weft-server` (SEC-6's API-key digests), so no new dependency was added.
+
+**`total: null` on cursor-following pages.** The acceptance criteria say "total nullable after the first page". A cursor-following page has no meaningful total — the window total was already reported — so `total` is omitted (serialized as `null`). The first page (no cursor in the request) always carries it.
+
+**Appends never invalidate an existing cursor.** The high-water mark is the *max timestamp* of the window, not the *last returned timestamp*, so appends after the window shift the high-water mark forward and an old cursor's high-water fails the staleness check. But an append *within* the window (a row with a timestamp between start and end) is not possible after seal — the segment store's rows are immutable once sealed — so a cursor that is valid today stays valid as long as the segment store does not mutate.
+
+**410 for three conditions:** the selector hash does not match (a different tag selector), the high-water mark changed (data was appended to the window, which after seal is only possible via a new segment whose rows overlap the window), or the data fingerprint changed (rows within the window were altered).
+
+**`read_value_range_of` returns `Vec<BigDecimal>` not `Vec<Option<BigDecimal>>`.**
+Value-range reads return only present rows, so every value is populated. The cursor fingerprinting functions take `&[Option<BigDecimal>]` (shared with the time-range read which includes nulls), so values are wrapped to `Some(v)` at the call site.
+
+**Backwards compatibility: `total` stays populated on every non-cursor page.** An existing client that sends no `cursor` gets the same `total` as before — `Option<usize>` is `Some(total)` on the first page and `None` only on cursor-following pages. The acceptance criterion says "total nullable after the first page": the first page (and every page requested without a cursor) carries the count; cursor pages omit it because the window total was already reported.
+
 ## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
 
 **The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every
@@ -5708,6 +5724,21 @@ the pushes when the route returns, rather than inventing an offline workaround o
 green. Recorded here because if the wave appears to stall again with no explanation, this is
 the reason, and because restarting the interface or the VPN is a human action on this host.
 
+## 2026-11-08 — FRE-15: the stability policy lives in `docs/`, not at the root (#331)
+
+`docs/release/1.0-plan.md` calls the slice "STABILITY.md", which reads like a root-level
+file next to `HONESTY.md` and `SECURITY.md`. **Chosen:** `docs/stability.md`, linked from
+`README.md` and `docs/reference.md`. The root pair exists at the root because GitHub gives
+those two filenames special meaning (a security policy is surfaced in the repository's
+security tab); a versioning policy gets no such treatment, and every other explanatory
+document in this repository lives in `docs/`. A 225-line policy document with an internal
+link graph is also easier to read rendered than as a root landing page.
+
+**Rejected: `STABILITY.md` at the root** — it would be the only long-form policy document
+there, and `SECURITY.md`'s reason for being at the root does not transfer. **Rejected:
+putting it inside `docs/release/`** — that directory holds release *procedures* (the
+checklist, the 1.0 plan), which are internal; this document is addressed to users.
+
 ## 2026-11-08 — #430: the methodology pointer is enforced, not offered
 
 **What was ambiguous.** #430 asks for "a methodology document published before any performance
@@ -5740,3 +5771,88 @@ breaking the build, and `docs/claims-audit.md` now says where the rules live ins
 they do not exist. Closing #430 also removes the last "documentation not yet written" caveat from
 the claims story: from here, an unprovenanced figure fails CI, and a provenanced-but-unjudgeable one
 now has nowhere to hide either.
+## 2026-11-07 — #453: Fill tokens are exact-case like the reduction tokens
+
+**Context.** FRE-5 (2026-10-29, DECISIONS.md:3352) made `Aggregation::from_token` exact-case and
+noted that `Fill::from_token` (`weft-reduce/src/fill.rs:62`) still folded case, left for its own
+decision (#453). `Fill` reaches the same wire surface — `?fill=` on the ILP endpoint
+(`weft-server/src/downsample.rs:134`), the stored-range routes (`weft-server/src/storage.rs`), the
+downsample JSON body, and `weft-bench --gf-fill` (`weft-bench/src/main.rs:2059`) — so the two
+vocabularies cannot be expected to resolve `agg=` one way and `fill=` the other on the same query.
+
+**Chosen:** exact-case word tokens, value arm unchanged. `from_token` trims, matches exactly
+`null | prev | previous | locf | linear | quadratic | cubic`, then falls through to the
+`BigDecimal` parse for the constant arm. The value arm takes no letters, so case rules never touch
+it. Tests at `fill.rs:401-409` now pin `"Linear" -> None` and `"CUBIC" -> None`.
+
+**Rejected:** keeping case folded so the two vocabularies agree in-kind (they would agree only in
+being wrong together); and a deprecation-warning path — the tokens return `Option` and the server
+already 400s unknowns with the accepted spellings, so a separate warning surface would be new API
+on a pre-1.0 crate whose CHANGELOG is the deprecation notice.
+
+**Breaking:** mixed-case `fill` tokens on the HTTP endpoints and `--gf-fill` now 400/CLI-error and
+name the token. No test sends a mixed-case fill, so this is a documentation-level break, recorded
+under `### Changed` in CHANGELOG.md with the same "This breaks v0.3.x clients…" call-out the
+reduction change used.
+
+## 2026-11-07 — a note this session inherited describes an `audit` CI job that does not exist here
+
+**Ambiguity.** Context carried forward from an earlier lane claimed `audit.yml` ran a job named
+`audit (latest)`, that it had been red on main since 2026-10-23 because the container image
+`ghcr.io/rustsec/audit:latest` could not be pulled, that `cargo audit` is yanked upstream so the
+replacement tool is an owner decision, and that the resulting issue should be filed with that
+evidence. Before filing anything, checked it.
+
+**Finding.** None of that is true of this repository. `git grep` over `.github/workflows` at
+`origin/main` finds no `audit` job and no reference to `rustsec/audit`; `git log --all -S
+'rustsec/audit' -- .github` finds nothing in reachable history; and the check list on current
+heads contains no check by that name — the supply-chain checks that do run are `cargo-deny` and
+`third-party licenses`, and both are green on every open PR today.
+
+**Choice.** Record the correction here rather than file the issue. An issue about a workflow that
+does not exist would send a future reader after a phantom, which is the exact failure mode this
+file exists to prevent.
+
+**What is actually true about advisory coverage.** `deny.toml` carries an `[advisories]` section
+whose comment states the policy — "Every RustSec advisory (vulnerability, unmaintained, unsound,
+yanked) fails the check" — with `ignore = []`, so the acceptance list is empty and the check is as
+strict as the tool gets. If advisory coverage is ever judged thin, the change to make is to that
+file (the ignore list and its revisit dates, the advisory database, the yanked/unsound categories),
+not a new tool replacing one that was never here.
+## 2026-11-08 — #445 is parked, and the constraint was the worker budget rather than the design
+
+**Five delegated attempts at slice #445 produced no diff at all**, which is the point at which a
+re-brief stops being the obvious next move. The runs were `32f21b46`, `72939312`, `f0e773e6`,
+`d2cce9ac` and a 45-minute predecessor; the last burned 236 tool calls and 940 k tokens and reported
+"the edits never landed". The slice — maintenance budgets and a k-way merge across overlapping
+segments — sits exactly on the read path that the 13 crash-matrix and layout-migration tests guard,
+and PR #645 in the same window shows how much of that path's behaviour those tests reject when it
+changes. **Chosen:** stop dispatching workers at #445, say so on the issue with the run identifiers so
+the next session does not spend a sixth budget on a guess, and re-enter the slice as two steps: a
+design note that states what the merge must guarantee and where the maintenance budget is charged,
+written by the supervising session or the oracle, then a mechanical implementation step against that
+note. **Rejected:** a sixth brief with a longer timeout. The failure is not wall-clock — native cargo
+is forbidden on this host's RAM, and even with the warm shared Docker target directory a single
+`weftdb` lib-test run costs minutes, so a budget-bounded agent never reaches a trustworthy
+storage-engine feedback loop no matter how the brief is worded.
+
+## 2026-11-08 — Wrong-tree and wrong-base pull requests: the verification moves from the worker to the merge
+
+**Two documentation workers in one day wrote correct documents in the wrong place, and both reported
+that they had checked.** #651 committed every file under `weftdb/` — `weftdb/docs/stability.md`,
+`weftdb/CHANGELOG.md`, `weftdb/README.md` — duplicating top-level files, because the repository root
+is the cargo workspace and `weftdb/` is a crate inside it. #653 branched from #651's branch rather
+than from main, because it cloned a local mirror whose checked-out branch happened to be #651's, and
+so its diff carried that branch's whole nested tree: 5 840 lines that are not that slice. Both final
+reports asserted the tree shape was verified. Both claims were false, and both PRs would have merged
+silently on a green CI — nothing in CI objects to a correctly-named file in the wrong directory.
+
+**Chosen:** #651 is discarded and rebuilt as #652 from `origin/main`; #653 is fixed with
+`git rebase --onto origin/main <the inherited commit>`, which keeps only its own commit; and
+`git diff --name-only origin/main..HEAD` becomes the first thing read on any incoming PR, before any
+content review. Briefs now tell a worker to clone from the GitHub URL rather than a local path or
+mirror, to paste that command's output verbatim into its report, and to stage explicit paths instead
+of `git add -A` (the harness drops `.pi-lens-probe-home/*.log` telemetry into the worktree, and ten
+such files landed on a branch this week). **Rejected:** trusting a worker's own verification section.
+It is the exact artifact that lied twice in one day, and a check the producer performs on its own
+output is not a check.

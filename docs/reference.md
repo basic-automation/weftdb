@@ -41,7 +41,7 @@ observed endpoints marked `raw`, the 59 between them `interpolated`.
 
 **Start here** · [Why WeftDB](#why-weftdb) · [Quickstart](#quickstart) · [Is WeftDB right for you?](#is-weftdb-right-for-you) · [Project status](#project-status)
 
-**Use it** · [What you get](#what-you-get) · [HTTP API](#http-api) · [Migrate a 0.1.x tree](#migrating-a-01x-data-directory) · [Configuration](#configuration) · [Rust library](#rust-library) · [Terminal UI](#terminal-ui)
+**Use it** · [What you get](#what-you-get) · [HTTP API](#http-api) · [Migrate a 0.1.x tree](#migrating-a-01x-data-directory) · [Configuration](#configuration) · [Operations](operations.md) · [Rust library](#rust-library) · [Terminal UI](#terminal-ui)
 
 **Understand it** · [Performance](#performance) · [How it works](#how-it-works) · [Benchmarking](#benchmarking) · [Development](#development)
 
@@ -220,7 +220,7 @@ seven library crates on crates.io at 0.2.0. It closes roadmap Phase 1, the bench
 [known limitations](https://github.com/basic-automation/weftdb/blob/v0.2.0/CHANGELOG.md#known-limitations)
 include a security layer that is new and not yet reviewed, unfinished crash consistency, and a one-way store
 upgrade from v0.1.0. [v0.1.0](https://github.com/basic-automation/weftdb/releases/tag/v0.1.0)
-stays the baseline that upgrade, rollback and compatibility checks run against.
+stays the baseline that upgrade, rollback and compatibility checks run against (see [`UPGRADING.md`](../UPGRADING.md)).
 
 | Area | State |
 |---|---|
@@ -238,6 +238,9 @@ stays the baseline that upgrade, rollback and compatibility checks run against.
 
 The full work queue lives in [`ROADMAP.md`](../ROADMAP.md). It is the single source of
 truth for status and priorities, and it records negative results alongside wins.
+
+See [`docs/stability.md`](stability.md) for the stability and versioning policy — what
+is stable, what is experimental, and what is not yet guaranteed for code and data.
 
 ---
 

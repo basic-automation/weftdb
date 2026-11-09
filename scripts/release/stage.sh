@@ -11,7 +11,7 @@
 #       other archive, checks each against its .sha256, then writes
 #       <dist-dir>/SHA256SUMS over all of them and checks that too.
 #
-# <label> is a release tag (vX.Y.Z or vX.Y.Z-rc.N), or for a dry run
+# <label> is a release tag (vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N), or for a dry run
 # v<version>-dryrun-<12-hex commit>, with -dev appended for a dev-profile build, so a
 # dry run's archives can never be named like a release's.
 #
@@ -23,7 +23,8 @@ set -euo pipefail
 export LC_ALL=C
 
 TARGET_RE='^[a-z0-9_]+(-[a-z0-9_]+){2,3}$'
-TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+# Pre-release ordering (semver 2.0): -beta.N < -rc.N < release
+TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.(0|[1-9][0-9]*))?$'
 DRY_RUN_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?-dryrun-[0-9a-f]{12}(-dev)?$'
 BINARIES=(weft-server weft-tui weft-bench)
 # What every archive carries besides the binaries, as <path in the source tree>:<name in

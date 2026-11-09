@@ -75,8 +75,8 @@ async fn setup() -> Result<(TempDir, Database)> {
 	Ok((temp_dir, db))
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn seal_backed_ingest_feeds_the_change_log_not_the_queue() -> Result<()> {
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 	let (_dir, db) = setup().await?;
@@ -120,8 +120,8 @@ async fn seal_backed_ingest_feeds_the_change_log_not_the_queue() -> Result<()> {
 	Ok(())
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn rows_mode_ingest_still_feeds_the_queue_and_no_change_log() -> Result<()> {
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	let (_dir, db) = setup().await?;

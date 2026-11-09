@@ -146,13 +146,30 @@ fn error_response_entry(status: u16) -> Value {
 	})
 }
 
+/// Whether the operation's 200 response carries a [`PointsPage`] body.
+fn response_is_points_page(operation_id: &str) -> bool {
+	matches!(operation_id, "storage_points_list" | "storage_time_range" | "storage_value_points" | "storage_value_range")
+}
+
 /// Build one operation object for a route entry's spec.
 fn build_operation(spec: &RouteSpec) -> Value {
 	let summary = operation_summary(spec.operation_id);
 	let tag = operation_tag(spec.operation_id);
 
 	let mut responses: Map<String, Value> = Map::new();
-	responses.insert("200".to_string(), json!({"description": "the operation completed successfully"}));
+	let mut response_200 = json!({"description": "the operation completed successfully"});
+	if response_is_points_page(spec.operation_id) {
+		let response_200_obj = response_200.as_object_mut().expect("response_200 is an object");
+		response_200_obj.insert(
+			"content".to_string(),
+			json!({
+				"application/json": {
+					"schema": { "$ref": "#/components/schemas/PointsPage" }
+				}
+			}),
+		);
+	}
+	responses.insert("200".to_string(), response_200);
 	for &status in ERROR_STATUSES {
 		responses.insert(status.to_string(), error_response_entry(status));
 	}
@@ -188,10 +205,32 @@ fn extract_path_parameters(template: &str) -> Vec<Value> {
 	params
 }
 
+/// The `PointsPage` schema — the JSON response body for stored-range reads.
+fn points_page_schema() -> Value {
+	json!({
+		"type": "object",
+		"description": "One page of a stored read.",
+		"properties": {
+			"aspect": { "type": "string" },
+			"tags": { "type": "object", "description": "The tags of the series read (TAG-10)" },
+			"time_unit": { "type": "string", "description": "The aspect's declared timestamp unit token" },
+			"total": { "type": "integer", "nullable": true, "description": "Rows in the whole window, before paging. Present on the first page; omitted or null on cursor-following pages." },
+			"count": { "type": "integer" },
+			"offset": { "type": "integer" },
+			"limit": { "type": "integer", "nullable": true },
+			"page": { "type": "integer", "nullable": true },
+			"next_cursor": { "type": "string", "nullable": true, "description": "Opaque forward-iteration cursor for the next page; absent at the end." },
+			"points": { "type": "array", "items": { "type": "object" } }
+		},
+		"required": ["aspect", "time_unit", "count", "offset", "points"]
+	})
+}
+
 /// Build the `components` section.
 fn build_components() -> Value {
 	let mut schemas: Map<String, Value> = Map::new();
 	schemas.insert("ErrorEnvelope".to_string(), error_envelope_schema());
+	schemas.insert("PointsPage".to_string(), points_page_schema());
 
 	let mut responses: Map<String, Value> = Map::new();
 	for &status in ERROR_STATUSES {

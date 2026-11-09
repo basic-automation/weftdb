@@ -70,9 +70,9 @@ jobs:
           TAG: ${{ inputs.tag }}
           LC_ALL: C # byte-wise [0-9]: no other scripts' digits
         run: |
-          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.(0|[1-9][0-9]*))?$'
           if [[ ! $TAG =~ $re ]]; then
-            echo "::error::tag must be an existing vX.Y.Z or vX.Y.Z-rc.N tag"
+            echo "::error::tag must be an existing vX.Y.Z, vX.Y.Z-rc.N or vX.Y.Z-beta.N tag"
             exit 1
           fi
           # This workflow file and the scripts it runs then come from the tagged commit.

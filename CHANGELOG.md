@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Added
+- **Operator documentation** ([docs/operations.md](docs/operations.md)) — backup and
+  restore, systemd, container, upgrade, and failure modes with what to do.
+
+### Fixed
+- **`host-install.yml` carried the one unpinned action on `main` (#626).**
+  `.github/workflows/host-install.yml:67` still asked for `Swatinem/rust-cache@v2`
+  while every other workflow was pinned to `e9d7b9f1` by #628, because the workflow
+  arrived in #596 after that branch was cut. It merged into a tree that already had
+  `scripts/ci/check-action-pinning.py`, so `main` went red on the pinning gate the
+  moment it landed — the gate works, the merge queue just did not re-run it.
+- **Test suites and refusal lists now accept `vX.Y.Z-beta.N` (TAG-11, #657).** The tag grammar was extended to accept `-beta.N` tags but the two test suites that pin the old grammar were not updated. `scripts/compat/test_releases.py` now parses the new 5-field `semver_key` tuple and asserts the beta-sorts-before-rc-sorts-before-release ordering; `scripts/release/test-stage.sh` accepts `v1.2.3-beta.1` and refuses the malformed `v1.2.3-beta` (no number).
+
+### Changed
+
+- **Fill tokens are exact-case** (PAC-3, #453). `Fill::from_token` now matches the
+  lowercase wire tokens exactly, so `?fill=`, the downsample JSON body's `fill`,
+  the stored-range `fill=` and `weft-bench --gf-fill` refuse `Linear`, `CUBIC` and
+  `NULL` with a `400` (or a CLI error) that names the token. **This breaks v0.3.x
+  clients** that send mixed-case `?fill=Linear` or `--gf-fill=CUBIC`: send `null`,
+  `prev`, `linear`, `quadratic`, `cubic` or the lowercase spellings. The value arm
+  (a decimal constant) is unchanged.
+- **`/v1` range responses may omit `total` or send it `null` (cursor pages).**
+  The `points`, `range`, `value-points` and `value-range` JSON endpoints no longer
+  promise `total` on every page: it is `null` on cursor-following pages or absent
+  from the response body. The Rust client now models it as `Option<usize>` with
+  `#[serde(default)]`; a strict client of any language must treat it as optional.
 
 ### Removed
 
@@ -19,6 +46,25 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Pagination cursor v1 for stored-range reads (ROB-15).** The JSON
+  `{/value-}points` endpoints now emit a selector-hashed cursor (`next_cursor`)
+  on every page until the end of the window. A client follows it by re-issuing
+  the request with `?cursor=…`; the cursor supersedes `offset`/`page`. A cursor
+  whose selector, high-water mark or data fingerprint no longer matches the
+  server's current view returns `410 cursor_stale`. `total` is present on the first page and `null` on
+  cursor-following pages.
+- **Stability and versioning policy (FRE-15).** [`docs/stability.md`](docs/stability.md)
+  documents the semver policy, the surface stability table (query/ingest wire API,
+  `weftdb-client` Rust SDK, storage format, CLI, configuration, metrics), what the compat
+  suite actually tests, and the promises the repo does not yet support. Linked from
+  `README.md` and `docs/reference.md`. (#331)
+- **UPGRADING.md and the upgrade/rollback compat legs (PAC-14a).**
+  [`UPGRADING.md`](UPGRADING.md) documents the layout 1→2 upgrade, rollback
+  procedures and version support window. The v0.1.0 release pin in
+  `compat/releases.toml` carries `legs = ["upgrade", "rollback"]`; the upgrade
+  leg is tested by `weftdb/tests/compat_v010.rs`, and the rollback-after-writes
+  leg is documented as aspirational.
+
 - **The measurement rules are wired to the figures they govern (EVI-6, #430).**
   `tools/check_claims.py` now fails when the claims document never links
   `docs/methodology.md`, or when that file is missing under the repository root, so a
@@ -26,6 +72,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `docs/reference.md` carry the link; the note in `docs/claims-audit.md` that the
   methodology "does not yet exist" was stale — it landed in #630 — and now says where the
   rules live.
+- **Guard the `#[serial]`-above-`#[test]` ordering (#405).**
+  `scripts/ci/check-serial-order.py` scans every tracked `*.rs` file and
+  fails, with `file:line`, on any `#[serial]` that is not immediately above
+  a test attribute (`#[test]` or `#[tokio::test]`). Wired into the `claims`
+  job in `ci.yml` after the action-pinning check.
+
 - **The frame-fault policy is verified (ROB-22/C5).** The three behaviours of
   the C5 policy are now pinned by tests: a suspect frame is excluded from
   reads, a suspect frame is never auto-purged by maintenance, and a corrupt
@@ -66,6 +118,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   satisfy it, which is the audit the section on Rust doc comments points to.
   (#430)
 
+- **Release tag grammar extended to `vX.Y.Z-beta.N` (TAG-11, #336).** The
+  `scripts/release/verify.sh` `TAG_RE`, `scripts/release/stage.sh` `TAG_RE`,
+  `scripts/compat/releases.py`, the inline regex in `.github/workflows/publish.yml`
+  and the tag grammar documentation in `RELEASING.md` now all accept
+  `vX.Y.Z-beta.N` alongside the existing `vX.Y.Z` and `vX.Y.Z-rc.N` shapes.
+  Pre-release ordering follows semver 2.0: `-beta.N < -rc.N < release`. (#336)
+
 ### Changed
 
 - **CI now pins every GitHub Action to a commit SHA.** A floating `uses:` (e.g.
@@ -97,6 +156,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- `weft-orchestration`'s seven slow tests are bounded by a 1200-second `tokio::time::timeout` each, so a hang names the test and fails the run instead of disappearing at the job's 60-minute cap (#404, #646). The bound is 3x the window in which all seven finished for real on a runner (357 s in the run where the seeded `Crypto` database was present); a push or pull-request run skips them, so the nightly schedule is what exercises them.
+
 - **A competitor result with no adapter report refuses to take part in a
   comparison (EVI-8B, #452).** `weft-bench compare` compared a `duckdb` arm whose
   `adapter_info` was `null` with a WeftDB arm and footnoted the missing attribution
@@ -108,10 +169,30 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weftdb-ingest` measure their own paths and honestly report no adapter, and because
   `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
   tested.
+
+- **Slow orchestration tests bounded by timeout (issue #404).** Seven
+  `weft-orchestration` tests that self-skip locally (Crypto-database guard)
+  now wrap their bodies in `tokio::time::timeout` within the CI job budget
+  (3600 s job timeout): `test_api` (60 s), `test_api_precise` (900 s),
+  `test_pipeline_api` (1500 s), `test_pipeline_api_precise` (600 s),
+  `test_batch_processing` (10 s), `test_specific_process_batch` (10 s) and
+  `test_pipeline_api_with_fake_db` (10 s). The predecessor's 3600 s bound
+  for `test_api_precise` could never fire before the job was killed; the
+  two 1800 s bounds triggered `clippy::duration_suboptimal_units`. All
+  corrected. Sum of worst-case sequential bounds: 3090 s, leaving ≈510 s
+  for compilation, teardown and crash verification. Durations measured
+  from run 40886128666.
 ## [0.3.2] - 2026-11-06
 
 ### Fixed
 
+- **The abort arm of the crash matrix no longer flakes on Windows.** The test aborts a
+  child process mid-operation and then re-opens the same store in the parent, and Windows
+  keeps an aborted process's Turso database handles live for a short window, so those first
+  opens returned `I/O error (tempdir): permission denied` while Linux tolerated them.
+  `verify_recovered` now retries the open on Windows (6 attempts, 500 ms apart) and
+  propagates any other error unchanged; no production path opens a path an aborted process
+  just vacated, so the race was test-only (#625).
 - **A pipeline's pattern dictionary no longer grows without bound.** Each
   `Pipeline::run` loaded the stored dictionary on top of the patterns it already held
   and then appended the whole dictionary to the store again (`patterns.id` is not

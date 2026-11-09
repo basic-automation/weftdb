@@ -108,6 +108,10 @@ class Shape(unittest.TestCase):
 		self.assertTrue(any("tag '0.1.0' is not vX.Y.Z" in p for p in found))
 		self.assertTrue(any("commit must be a 40-hex commit id" in p for p in found))
 
+	def test_a_beta_tag_is_accepted(self):
+		blk = block(version="1.2.3-beta.1", tag="v1.2.3-beta.1", assets={"weftdb-v1.2.3-beta.1-x86_64-unknown-linux-gnu.tar.gz": "a" * 64})
+		self.assertEqual(self.problems(blk), [])
+
 	def test_unknown_field_and_leg_are_reported(self):
 		found = self.problems(block(whistle="x", legs=["upgrade", "sideways"]))
 		self.assertIn("release #1: unknown field 'whistle' (known: assets, binaries, commit, crates_io, fixtures, legs, published_at, tag, version)", found)
@@ -126,6 +130,10 @@ class Shape(unittest.TestCase):
 		blk = block(assets={"weftdb-v0.1.0-linux.tar.bz2": "a" * 64})
 		self.assertTrue(any("is not named weftdb-<tag>-<target>" in p for p in self.problems(blk)))
 
+	def test_a_beta_asset_name_is_accepted(self):
+		blk = block(version="1.2.3-beta.1", tag="v1.2.3-beta.1", assets={"weftdb-v1.2.3-beta.1-x86_64-unknown-linux-gnu.tar.gz": "a" * 64})
+		self.assertEqual(self.problems(blk), [])
+
 	def test_fixtures_stays_under_compat(self):
 		self.assertTrue(any("fixtures must point under compat/fixtures/" in p for p in self.problems(block(fixtures="weftdb/tests/fixtures"))))
 
@@ -140,7 +148,9 @@ class Shape(unittest.TestCase):
 		self.assertTrue(any("is pinned twice" in p for p in found))
 
 	def test_prerelease_sorts_before_its_release(self):
+		self.assertLess(releases.semver_key("1.0.0-beta.1"), releases.semver_key("1.0.0-rc.1"))
 		self.assertLess(releases.semver_key("1.0.0-rc.1"), releases.semver_key("1.0.0"))
+		self.assertLess(releases.semver_key("1.0.0-beta.1"), releases.semver_key("1.0.0"))
 		self.assertEqual(releases.newest([block(version="0.1.0", tag="v0.1.0"), block(version="0.9.0", tag="v0.9.0")])["version"], "0.9.0")
 
 

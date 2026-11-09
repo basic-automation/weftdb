@@ -672,7 +672,8 @@ pub struct PointsPage {
 	/// The aspect's timestamp unit.
 	pub time_unit: String,
 	/// Rows in the whole window, before paging.
-	pub total: usize,
+	#[serde(default)]
+	pub total: Option<usize>,
 	/// Rows in this page.
 	pub count: usize,
 	/// Rows skipped before this page.
@@ -790,6 +791,14 @@ mod tests {
 		let at: PointAt = serde_json::from_str(r#"{"aspect":"p","time_unit":"millis","timestamp":5,"found":false}"#).unwrap();
 		assert!(!at.found && at.value.is_none());
 		assert!(serde_json::from_str::<StoredPoint>(r#"{"timestamp":1,"value":"x"}"#).is_err());
+	}
+
+	#[test]
+	fn a_response_without_total_decodes_as_none() {
+		let with_total: PointsPage = serde_json::from_str(r#"{"aspect":"p","time_unit":"millis","total":12,"count":2,"offset":0,"points":[{"timestamp":1,"value":"1.0"}]}"#).unwrap();
+		assert_eq!(with_total.total, Some(12));
+		let without_total: PointsPage = serde_json::from_str(r#"{"aspect":"p","time_unit":"millis","count":2,"offset":0,"points":[{"timestamp":1,"value":"1.0"}]}"#).unwrap();
+		assert_eq!(without_total.total, None);
 	}
 
 	#[test]

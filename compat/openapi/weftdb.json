@@ -190,6 +190,60 @@
           }
         },
         "type": "object"
+      },
+      "PointsPage": {
+        "description": "One page of a stored read.",
+        "properties": {
+          "aspect": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "limit": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Opaque forward-iteration cursor for the next page; absent at the end.",
+            "nullable": true,
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "page": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "description": "The tags of the series read (TAG-10)",
+            "type": "object"
+          },
+          "time_unit": {
+            "description": "The aspect's declared timestamp unit token",
+            "type": "string"
+          },
+          "total": {
+            "description": "Rows in the whole window, before paging. Present on the first page; omitted or null on cursor-following pages.",
+            "nullable": true,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "aspect",
+          "time_unit",
+          "count",
+          "offset",
+          "points"
+        ],
+        "type": "object"
       }
     }
   },
@@ -8836,6 +8890,13 @@
         "operationId": "storage_points_list",
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PointsPage"
+                }
+              }
+            },
             "description": "the operation completed successfully"
           },
           "400": {
@@ -9182,6 +9243,13 @@
         "operationId": "storage_time_range",
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PointsPage"
+                }
+              }
+            },
             "description": "the operation completed successfully"
           },
           "400": {
@@ -10435,6 +10503,13 @@
         "operationId": "storage_value_points",
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PointsPage"
+                }
+              }
+            },
             "description": "the operation completed successfully"
           },
           "400": {
@@ -10614,6 +10689,13 @@
         "operationId": "storage_value_range",
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PointsPage"
+                }
+              }
+            },
             "description": "the operation completed successfully"
           },
           "400": {
