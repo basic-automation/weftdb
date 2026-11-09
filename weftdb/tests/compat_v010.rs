@@ -33,6 +33,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet}, num::NonZeroUsize, path::{Path, PathBuf}
 };
 
+use bigdecimal::BigDecimal;
 use weft_physical_type::{PhysicalType, TimeUnit};
 use weftdb::{SegmentStore, StoreError};
 
@@ -226,7 +227,7 @@ async fn a_v010_store_migrates_forward_and_keeps_reading_its_own_values() {
 		// last-writer-wins, not as a positional replay of the v0.1.0 body.
 		let want_ts: BTreeSet<i64> = section.rows.iter().map(|(ts, _)| *ts).collect();
 		assert_eq!(timestamps.len(), want_ts.len(), "each recorded timestamp must answer exactly once (issue #443): {} of {} came back", timestamps.len(), want_ts.len());
-		assert_eq!(timestamps.iter().copied().collect::<BTreeSet<_>>(), want_ts, "the same timestamps v0.1.0 answered must survive the newest-wins fold, nothing gained or lost: `GET /api/v1/storage/{}/{}/{}?{}`", section.aspect, section.kind, section.query);
+		assert_eq!(timestamps.iter().copied().collect::<BTreeSet<_>>(), want_ts, "the same timestamps v0.1.0 answered must survive the newest-wins fold, nothing gained or lost: `GET /api/v1/storage/{}?{}`", section.aspect, section.query);
 
 		// The golden still pins the shared majority byte-for-byte: rows that did NOT collide
 		// must read exactly as v0.1.0 answered them.
@@ -246,6 +247,76 @@ async fn a_v010_store_migrates_forward_and_keeps_reading_its_own_values() {
 			assert_eq!(range, point, "range of {} @ {ts} must equal the point read beside it \u{2014} newest wins (issue #443)", section.aspect);
 		}
 		replay.push((section.aspect, start, end, got));
+	}
+
+	// value-range leg: the v0.1.0 fixture also recorded a `value-range.csv` price window
+	// that carries every row #443's bug duplicated. It was never replayed because the loop
+	// above filters on `range.csv` only.
+	//
+	// `read_value_range` is a value-constrained scan that returns **every** matching row
+	// without deduplication (unlike `read_time_range` which folds collided timestamps), so
+	// the returned count equals the golden's row count even though every timestamp appears
+	// three times. Set-equality of distinct timestamps is what checks #443's fold.
+	for section in recorded_reads() {
+		if section.kind != "value-range.csv" {
+			continue;
+		}
+		let query = params(&section.query);
+		let lo: BigDecimal = query["lo"].parse().expect("a recorded lo");
+		let hi: BigDecimal = query["hi"].parse().expect("a recorded hi");
+		let (timestamps, values) = store
+			.read_value_range(&section.aspect, &lo, &hi)
+			.await
+			.unwrap_or_else(|err| panic!("reading value range {} [{lo},{hi}] out of the v0.1.0 store: {err}", section.aspect));
+
+		// `read_value_range` returns 570 raw rows (190 distinct × 3 duplicates each). The
+		// fixture's golden also records every row the v0.1.0 server returned (3 per distinct
+		// timestamp, all carrying the same value per #443's behaviour: the collided rows were
+		// identical in the golden, so the record count matches row-for-row even though this
+		// build keeps the raw duplicates too.
+		let want_rows: Vec<(i64, Option<String>)> = section.rows.iter().map(|(ts, v)| (*ts, v.as_ref().map(|s| canonical(s)))).collect();
+		let got_rows: Vec<(i64, Option<String>)> = timestamps.iter().zip(values.iter()).map(|(ts, v)| (*ts, Some(canonical(&v.to_string())))).collect();
+		assert_eq!(
+			got_rows.len(),
+			want_rows.len(),
+			"value-range row count: got {} rows, fixture has {}",
+			got_rows.len(),
+			want_rows.len()
+		);
+
+		// Every returned value falls inside the recorded bounds.
+		for (_, value) in &got_rows {
+			let Some(v) = value else { panic!("value-range returned a null for a window of non-null rows") };
+			let decimal: BigDecimal = v.parse().unwrap_or_else(|e| panic!("value-range value {v:?} is not a decimal: {e}"));
+			assert!(lo <= decimal && decimal <= hi, "value-range returned {v} outside [{lo},{hi}]");
+		}
+
+		// The set of distinct timestamps: v0.1.0 recorded each timestamp three times, the
+		// store returns each timestamp three times, and the distinct set must be the same.
+		let want_ts: BTreeSet<i64> = section.rows.iter().map(|(ts, _)| *ts).collect();
+		let got_ts: BTreeSet<i64> = timestamps.iter().copied().collect();
+		assert_eq!(got_ts, want_ts, "the distinct timestamps v0.1.0's value range answered survive the newest-wins fold: `GET /api/v1/storage/{}?{}`", section.aspect, section.query);
+
+		// Every returned row's value must equal the point read at that timestamp (#443's
+		// whole point: the winner is consistent regardless of read path).
+		for ts in &got_ts {
+			let point = store
+				.read_point(&section.aspect, *ts)
+				.await
+				.unwrap_or_else(|e| panic!("read_point({ts}): {e:#}"))
+				.as_ref()
+				.map(|v| canonical(&v.to_string()));
+			// Each distinct timestamp appears 3 times in the raw result; every copy must
+			// match the point read.
+			for (_, v) in timestamps.iter().zip(values.iter()).filter(|(t, _)| **t == *ts) {
+				assert_eq!(
+					Some(canonical(&v.to_string())),
+					point,
+					"value range of {} @ {ts} must equal the point read beside it \u{2014} newest wins (issue #443)",
+					section.aspect
+				);
+			}
+		}
 	}
 
 	// One guard on the fixture itself: the recorded `price` window has to hold nulls,
