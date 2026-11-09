@@ -52,6 +52,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **Breaking (read shape): a range read now returns each timestamp once, newest value
+  wins (#443).** `read_time_range_of` now opens all segments overlapping the window (including
+  all-null ones) and folds them with `merge_newer_wins`, so a newer segment's null
+  overrides an older value at the same instant.  Point reads keep present-prune and
+  skip `None` from the frame reader, so a newer all-null segment does **not** mask an
+  older value there — the resulting asymmetry between range and point is deliberate
+  and pinned by a test.
+
 - **Fill tokens are exact-case** (PAC-3, #453). `Fill::from_token` now matches the
   lowercase wire tokens exactly, so `?fill=`, the downsample JSON body's `fill`,
   the stored-range `fill=` and `weft-bench --gf-fill` refuse `Linear`, `CUBIC` and
