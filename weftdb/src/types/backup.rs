@@ -1122,7 +1122,7 @@ pub async fn restore_store(backup_dir: &Path, new_root: &Path) -> Result<WholeSt
 /// The free bytes on the filesystem holding `path` (or its nearest existing ancestor),
 /// delegated to [`disk_space_at`](crate::disk_space_at).
 ///
-/// Returns `None` when [`disk_space_at`] returns `None` or the path has no existing ancestor,
+/// Returns `None` when [`crate::disk_space_at`] returns `None` or the path has no existing ancestor,
 /// in which case a headroom check has nothing to check against and the backup itself is the test.
 #[must_use]
 pub fn free_bytes_at(path: &Path) -> Option<u64> {

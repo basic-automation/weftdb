@@ -5987,6 +5987,15 @@ itself refuses. In the interim the `/ready` test states the difference rather th
 off Unix, which is a claim, not a skip. **Rejected:** `#[cfg(unix)]` on the tests, and adding the
 `windows` crate as a dependency for one signature.
 
+**Closed 2026-11-09, same day.** #669 merged and #598 merged `origin/main`, so the interim is over
+and the two platform arms now live beside each other in `weftdb/src/types/disk_guard.rs
+disk_space_at()` (`statvfs` on Unix filling `DiskSpace { total_bytes, available_bytes }`,
+`GetDiskFreeSpaceExW` on Windows with real out-params for both totals, `None` only on a platform
+with no probe); `backup.rs free_bytes_at()` is the one-line delegation to it. The interim claim was
+removed rather than left to rot: the `/ready` test now expects a refusal wherever
+`weftdb::disk_space_at(dir.path())` answers `Some`, so the expectation follows the platform's
+capability instead of naming it, and a platform that loses the probe still fails honestly.
+
 ## 2026-11-05 — ROB-17: the disk guard's shape, and what it does not guard (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the plan names ROB-17 only as "Disk guard, headroom API and space gauges"
