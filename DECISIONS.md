@@ -6158,3 +6158,24 @@ when someone implements them.
 
 **Documents updated:** `compat/releases.toml`, `scripts/compat/releases.py`,
 `docs/stability.md`, `UPGRADING.md`, `CHANGELOG.md`.
+## 2026-11-10 — Per-aspect signal queue: a synchronous guarded pass, not a pure-function refactor (ORCH-SIG #402)
+
+**Ambiguous:** the review BLOCK said the `SIGNALS_QUEUE` guard was held across `.await`s. Two fixes were
+available: split `remove_expired_signals` into a pure decision function so the whole pass is functional
+and stateless, or keep its shape and make the guarded region a synchronous function.
+
+**Chosen: the synchronous guarded pass.** `remove_expired_signals` calls fallible
+`process_correlation_signals` per correlation, so a pure split has to thread
+`Result<(Vec<Correlation>, usize)>` out of the filter and back through its callers — a wider diff for no
+additional safety. The property the review asked for is narrow: no guard may cross an await. A plain
+`fn filter_queue_at(&mut Signals, &[Event], &[Correlation], DateTime<Utc>) -> QueueFilterOutcome` cannot
+await at all, so the property is enforced by the type system rather than by a comment warning the next
+editor. **Cost:** the database reads happen before the lock and the `update_correlation` writes after it,
+so a concurrent pass can observe a queue that is already updated but correlations that are not yet — the
+queue is the authority on what is still pending, and a re-run re-derives the same expired set from the
+correlations it reads.
+
+**Chosen: name the new test for what it proves.** `concurrent_filter_expired_signals_drains_the_queue_without_blocking`
+pins the shape of the critical section. It is not a deadlock reproducer — the async mutex serialised the
+old callers rather than deadlocking them — and its doc says so, because a test named "no_deadlock" that
+would also pass before the fix misinforms the next reader.
