@@ -51,7 +51,7 @@ TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta
 VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.[1-9][0-9]*)?$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 MANIFEST_NAME = "MANIFEST.sha256"
-LEGS = {"upgrade", "rollback", "binary"}
+LEGS = {"upgrade"}
 # name -> (required, type) for a block's fields. `fixtures` is optional: a release is pinned
 # when it is cut, and its fixture set lands later, so the field appears once it exists.
 FIELDS = {
