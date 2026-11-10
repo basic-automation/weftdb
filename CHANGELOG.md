@@ -245,7 +245,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   and `Pipeline::generate_signals` / `Pipeline::filter_signals_at` read
   only their own aspect's signals via `signals_for`. An empty per-aspect
   queue is removed from the map during `filter_expired_signals` so the map
-  does not retain stale entries indefinitely. (#402)
+  does not retain stale entries indefinitely. The same pass no longer holds the
+  queue lock while it talks to the database: the event and correlation reads
+  happen before the lock, one synchronous function mutates the queue, and the
+  correlation writes happen after it is released, so a busy aspect can no longer
+  stall another aspect's pass on I/O. (#402)
 
 - **Slow orchestration tests bounded by timeout (issue #404).** Seven
   `weft-orchestration` tests that self-skip locally (Crypto-database guard)
