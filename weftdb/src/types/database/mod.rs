@@ -614,7 +614,13 @@ impl DatabaseStructure for Database {
 
 		DATABASES.lock().await.insert(db_id, db_info);
 
-		Ok(Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.clone(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())), seal_store: Arc::new(Mutex::new(None)) })
+		let database = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.clone(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())), seal_store: Arc::new(Mutex::new(None)) };
+		// A store written before 0.3.3 can hold millions of rows that are now never written;
+		// pruning them is best effort and never blocks the open.
+		if let Err(e) = database.prune_metadata().await {
+			tracing::warn!("Pruning the metadata database failed; it is left as it was: {e}");
+		}
+		Ok(database)
 	}
 
 	async fn get_database_info(&self) -> Result<DatabaseInfo> {

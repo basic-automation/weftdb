@@ -45,7 +45,7 @@ use weftdb::{
 	database::traits::{DatabaseStructure, Inputs, Outputs, PipelineInputs, PipelineOutputs}, AspectId, Database, DetectorMetadata, DetectorType, EventID, PipelineConfig as DbPipelineConfig, PipelineState as DbPipelineState, Resolution
 };
 
-use crate::{Dictionary, DictionaryConstraints, Event, SignalType, Signals, SIGNALS_QUEUE};
+use crate::{aspect_signals, Dictionary, DictionaryConstraints, Event, SignalType, Signals};
 
 /// Unique identifier for an event detector.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -960,8 +960,8 @@ impl Pipeline {
 		let latest_time = self.database.get_latest_measurement(&self.aspect_id).await?;
 		crate::filter_expired_signals(&self.database, &self.aspect_id, latest_time).await?;
 
-		// Copy signals from global queue to local
-		let signals_lock = SIGNALS_QUEUE.lock().await;
+		// Copy this aspect's signals to the pipeline
+		let signals_lock = aspect_signals(&self.aspect_id).await;
 		self.signals = signals_lock.clone();
 		let signal_count = self.signals.len();
 		drop(signals_lock);
@@ -979,7 +979,7 @@ impl Pipeline {
 		crate::filter_expired_signals(&self.database, &self.aspect_id, Some(query_time)).await?;
 
 		// Refresh local signals copy
-		let signals_lock = SIGNALS_QUEUE.lock().await;
+		let signals_lock = aspect_signals(&self.aspect_id).await;
 		self.signals = signals_lock.clone();
 		drop(signals_lock);
 

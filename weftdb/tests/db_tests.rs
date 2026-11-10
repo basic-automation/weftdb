@@ -932,6 +932,8 @@ async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
 	let batch = |range: std::ops::Range<i64>| -> Vec<InputMeasurement> { range.map(|i| InputMeasurement::new(base + Duration::seconds(i), BigDecimal::from(i))).collect() };
 	let first = batch(0..8);
+	// A consumer has read the queue, so the ingest queues (it does not otherwise).
+	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 0);
 	let mut expected: Vec<DateTime<Utc>> = first.iter().map(InputMeasurement::timestamp).collect();
 	db.batch_capture_measurements(aspect_id, DatasetId::new(), first).await?;
 	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 8, "the batch is queued before the restart");
@@ -1618,4 +1620,53 @@ mod database_new_crash {
 		}
 		Ok(())
 	}
+}
+
+async fn raw_metadata_count(db: &Database, sql: &str) -> Result<i64> {
+	let metadata = Database::get_turso_database(db.metadata_path()).await?;
+	let mut rows = metadata.connect()?.query(sql, ()).await?;
+	Ok(rows.next().await?.context("COUNT(*) returned no row")?.get(0)?)
+}
+
+/// **Regression (Fan Control RSS climb, 0.3.2):** a daemon capturing raw aspects that no
+/// pipeline consumes wrote an audit row and a queue entry per measurement, never removed
+/// (5.7M and 4.9M rows in 3.5 days), all held in memory by the MVCC metadata store.
+#[serial]
+#[tokio::test]
+async fn unconsumed_captures_leave_no_metadata_rows() -> Result<()> {
+	let (_temp, db, _subject, aspect) = setup_test_database().await?;
+	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
+	add_test_measurements(&db, &aspect, base, 20).await?;
+
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM transactions WHERE message LIKE 'Captured measurement at %'").await?, 0, "per-measurement audit rows are opt-in");
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 0, "no consumer has read this aspect's queue, so captures do not queue");
+
+	// Once a consumer reads the queue, captures queue for it.
+	assert!(db.get_unbatched_entries(&aspect.id()).await?.is_empty());
+	add_test_measurements(&db, &aspect, base + Duration::hours(1), 3).await?;
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 3, "a read consumer's captures are queued");
+	Ok(())
+}
+
+/// Opening a store written before the fix prunes the rows that are no longer written.
+#[serial]
+#[tokio::test]
+async fn opening_prunes_dead_metadata_rows() -> Result<()> {
+	let (_temp, db, _subject, aspect) = setup_test_database().await?;
+	let metadata = Database::get_turso_database(db.metadata_path()).await?;
+	let conn = metadata.connect()?;
+	for i in 0..5_i64 {
+		conn.execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![Uuid::new_v4().to_string(), format!("Captured measurement at {i} with value 1 for dataset x"), i]).await?;
+		conn.execute("INSERT INTO unbatched_measurements (aspect_id, data_timestamp, queued_at) VALUES (?, ?, ?)", turso::params![aspect.id().as_uuid().to_string(), i, i]).await?;
+		// queued in 1970: stale
+	}
+	conn.execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![Uuid::new_v4().to_string(), "Added subject 'kept'", 9]).await?;
+	drop((conn, metadata));
+
+	let removed = db.prune_metadata().await?;
+	assert_eq!(removed, 10);
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM transactions WHERE message LIKE 'Captured measurement at %'").await?, 0);
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 0);
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM transactions WHERE message = 'Added subject ''kept'''").await?, 1, "schema events stay");
+	Ok(())
 }

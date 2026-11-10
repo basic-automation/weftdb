@@ -502,7 +502,21 @@ pub async fn detect_all_valleys(database: &Database, aspect: &AspectId, resoluti
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_threshold_crossing_up(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold: BigDecimal, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_threshold_crossing_up_since(database, aspect, resolution, method, threshold, name, None).await
+}
+
+/// [`detect_threshold_crossing_up`] over the measurements from `since` on (all of them for `None`).
+///
+/// A live caller passes the end of the window it last evaluated, so each call scans only the
+/// new data instead of the whole history. It finds exactly the crossings the full run finds
+/// whose two points both lie at or after `since`.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub async fn detect_threshold_crossing_up_since(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold: BigDecimal, name: &str, since: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<Event>> {
+	let earliest = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	let start_time = since.map_or(earliest, |since| since.max(earliest));
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -568,7 +582,21 @@ pub async fn detect_threshold_crossing_up(database: &Database, aspect: &AspectId
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_threshold_crossing_down(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold: BigDecimal, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_threshold_crossing_down_since(database, aspect, resolution, method, threshold, name, None).await
+}
+
+/// [`detect_threshold_crossing_down`] over the measurements from `since` on (all of them for `None`).
+///
+/// A live caller passes the end of the window it last evaluated, so each call scans only the
+/// new data instead of the whole history. It finds exactly the crossings the full run finds
+/// whose two points both lie at or after `since`.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub async fn detect_threshold_crossing_down_since(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold: BigDecimal, name: &str, since: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<Event>> {
+	let earliest = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	let start_time = since.map_or(earliest, |since| since.max(earliest));
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;

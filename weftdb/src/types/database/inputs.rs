@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::{
 	cache::Connection, database::traits::{AspectStructure, Inputs}, error::is_transient_mvcc_error, types::{
 		database::{
-			helpers::safe_usize_to_f64, legacy_metadata_write, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure}
+			helpers::safe_usize_to_f64, legacy_metadata_write, traits::{config::Config, connection::Connection as ConnectionTrait, DatabaseStructure, Outputs}
 		}, durable::{fault, FaultPoint}, TxId
 	}, Aspect, AspectId, Batch, BatchId, Correlation, CorrelationID, Database, DatasetId, DictionaryConstraints, DictionaryId, DictionaryMetadata, Error, Event, EventID, InputMeasurement, Measurement, Pattern, PatternID, UnbatchedEntry
 };
@@ -189,6 +189,8 @@ impl Inputs for Database {
 	/// an [`Error::TransientMvccError`], after which nothing was written and a retry can
 	/// succeed; ingest retries it.
 	async fn enqueue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
+		// A caller queuing by hand uses the queue, so ingest queues for the aspect too.
+		mark_queue_consumer(aspect_id);
 		legacy_metadata_write(async move {
 			if data_timestamps.is_empty() {
 				return Ok(());
@@ -390,6 +392,9 @@ impl Inputs for Database {
 
 			// The transaction log is an audit trail; the measurement row's own id stands in when
 			// it cannot be written.
+			if !measurement_audit_enabled() {
+				return Ok(tx_id);
+			}
 			match self.record_transaction(&format!("Captured measurement at {} with value {} for dataset {}", measurement.timestamp(), measurement.value(), dataset_id)).await {
 				Ok(logged) => Ok(logged),
 				Err(e) => {
@@ -442,6 +447,9 @@ impl Inputs for Database {
 			// design, S18). This path still enqueues only after the commit (see the trait docs).
 			self.enqueue_retrying(aspect_id, &[data_timestamp]).await?;
 
+			if !measurement_audit_enabled() {
+				return Ok(tx_id);
+			}
 			self.record_transaction(&format!("Inserted new measurement at {} for dataset {}", measurement.timestamp(), dataset_id)).await
 		})
 		.await
@@ -2382,6 +2390,10 @@ impl Database {
 	/// conflict would otherwise fail the call. Retrying is safe: a failed attempt wrote
 	/// nothing.
 	async fn enqueue_retrying(&self, aspect_id: &AspectId, timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
+		// Ingest queues only for an aspect a consumer reads (see `queue_has_consumer`).
+		if timestamps.is_empty() || !self.queue_has_consumer(aspect_id).await? {
+			return Ok(());
+		}
 		retry_queue_write("Enqueuing unbatched measurements", || self.enqueue_unbatched_measurements(aspect_id, timestamps)).await
 	}
 
@@ -2782,5 +2794,130 @@ mod tests {
 		for invalid in ["", "0", "-5", "1.5", "2d", "forever"] {
 			assert_eq!(parse_extracted_batch_retention(Some(invalid)), DEFAULT_EXTRACTED_BATCH_RETENTION_SECS, "{invalid:?}");
 		}
+	}
+}
+
+/// Whether each captured measurement also writes a row to the `transactions` audit log.
+///
+/// Off unless `WEFT_MEASUREMENT_AUDIT` is `1`/`true`. The log is never pruned and the
+/// metadata database runs under MVCC, which holds its rows in memory, so a row per
+/// measurement grew a 1 Hz daemon's RSS without bound (5.7M rows in 3.5 days). Schema,
+/// subject and batch events are still always logged.
+pub(crate) fn measurement_audit_enabled() -> bool {
+	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*ENABLED.get_or_init(|| measurement_audit_from(std::env::var("WEFT_MEASUREMENT_AUDIT").ok().as_deref()))
+}
+
+fn measurement_audit_from(raw: Option<&str>) -> bool {
+	matches!(raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1" | "true" | "yes" | "on"))
+}
+
+#[cfg(test)]
+mod measurement_audit_tests {
+	use super::measurement_audit_from;
+
+	#[test]
+	fn measurement_audit_is_opt_in() {
+		assert!(!measurement_audit_from(None));
+		assert!(!measurement_audit_from(Some("0")));
+		assert!(!measurement_audit_from(Some("")));
+		assert!(measurement_audit_from(Some("1")));
+		assert!(measurement_audit_from(Some(" TRUE ")));
+	}
+}
+
+/// Aspects whose unbatched queue a consumer has read in this process.
+static QUEUE_CONSUMERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<AspectId>>> = std::sync::LazyLock::new(Default::default);
+
+/// Record that a consumer reads `aspect_id`'s queue, so captures enqueue for it from now on.
+///
+/// Every queue read calls this before it reads. A consumer's first run reads the queue
+/// (`is_first_run`) before it reads the stored rows, so a row committed after that read is
+/// enqueued, and one committed before it is in the rows the full rebuild batches.
+pub(crate) fn mark_queue_consumer(aspect_id: &AspectId) {
+	QUEUE_CONSUMERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(*aspect_id);
+}
+
+impl Database {
+	/// Whether captures for `aspect_id` need a queue entry.
+	///
+	/// The queue only tells a consumer which windows changed since its last run. Until a
+	/// consumer has run there is nothing to be incremental against: its first run, with an
+	/// empty queue and no batches, rebuilds every window from the stored rows. Queuing for an
+	/// aspect no consumer reads therefore adds rows that are never drained (a daemon's raw
+	/// 1 Hz aspects held 4.9M of them), and under MVCC they stay in memory. A consumer in this
+	/// process marks the aspect when it reads the queue; one in another process is seen by
+	/// its batches.
+	async fn queue_has_consumer(&self, aspect_id: &AspectId) -> Result<bool> {
+		if QUEUE_CONSUMERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(aspect_id) {
+			return Ok(true);
+		}
+		let has_batches = self.queue_has_consumer_from_batches(aspect_id).await?;
+		if has_batches {
+			mark_queue_consumer(aspect_id);
+		}
+		Ok(has_batches)
+	}
+
+	/// Remove the metadata rows that grew without bound before 0.3.3, and return how many.
+	///
+	/// - Per-measurement audit rows, unless `WEFT_MEASUREMENT_AUDIT` keeps them.
+	/// - Queue entries of aspects with no batches whose oldest entry is over a day old. No
+	///   consumer has batched them, and its first run, finding an empty queue and no batches,
+	///   rebuilds every window from the stored rows, so it needs none of them.
+	///
+	/// # Errors
+	/// Returns an error if a metadata read or delete fails.
+	pub async fn prune_metadata(&self) -> Result<u64> {
+		let mut removed = 0;
+		if !measurement_audit_enabled() {
+			removed += self.delete_metadata_rows("DELETE FROM transactions WHERE message LIKE 'Captured measurement at %' OR message LIKE 'Inserted new measurement at %'", turso::params![]).await?;
+		}
+		let aspects: Vec<AspectId> = {
+			let conn = Self::begin_concurrent(self.metadata(), self.metadata_path(), Some(self.cache.clone())).await?;
+			// Only queues a day old: a consumer that has read a younger one may be about to batch it.
+			let stale_before = chrono::Utc::now().timestamp_millis() - 86_400_000;
+			let mut rows = conn.as_ref().query("SELECT aspect_id FROM unbatched_measurements GROUP BY aspect_id HAVING MIN(queued_at) < ?", turso::params![stale_before]).await?;
+			let mut ids = Vec::new();
+			while let Some(row) = rows.next().await? {
+				let raw: String = row.get(0)?;
+				if let Ok(uuid) = uuid::Uuid::parse_str(&raw) {
+					ids.push(AspectId::from_uuid(uuid));
+				}
+			}
+			Self::commit_concurrent(&conn).await?;
+			ids
+		};
+		for aspect_id in aspects {
+			// An aspect whose rows are gone fails its batch count; leave its entries.
+			if matches!(self.queue_has_consumer_from_batches(&aspect_id).await, Ok(false)) {
+				removed += self.delete_metadata_rows("DELETE FROM unbatched_measurements WHERE aspect_id = ?", turso::params![aspect_id.as_uuid().to_string()]).await?;
+			}
+		}
+		if removed > 0 {
+			tracing::info!(removed, "Pruned unbounded metadata rows");
+		}
+		Ok(removed)
+	}
+
+	async fn queue_has_consumer_from_batches(&self, aspect_id: &AspectId) -> Result<bool> {
+		Ok(self.count_unprocessed_batches(aspect_id).await? > 0 || self.count_processed_batches(aspect_id).await? > 0)
+	}
+
+	async fn delete_metadata_rows(&self, sql: &str, params: impl turso::IntoParams + Send) -> Result<u64> {
+		legacy_metadata_write(async move {
+			let conn = Self::begin_concurrent(self.metadata(), self.metadata_path(), Some(self.cache.clone())).await?;
+			match conn.as_ref().execute(sql, params).await {
+				Ok(n) => {
+					Self::commit_concurrent(&conn).await?;
+					Ok(n)
+				}
+				Err(e) => {
+					Self::rollback_after_error(&conn).await;
+					Err(anyhow::anyhow!("Failed to prune metadata rows: {e}"))
+				}
+			}
+		})
+		.await
 	}
 }
