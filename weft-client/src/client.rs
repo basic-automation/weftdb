@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-	error::{Error, ErrorKind, Result}, types::{AspectDeclaration, AspectEnvelope, AspectInfo, AspectList, AspectStats, BenchRun, BenchRunList, ComputePoint, Downsample, Downsampled, Format, IlpOptions, Interpolate, InterpolatePointBody, Interpolated, InterpolatedPoint, Page, PointAt, PointsAt, PointsBody, PointsPage, Spline, StoreStats, StoredDownsample, StoredPoint, StoredValue, WireStoredPoint, WriteOptions, WriteSummary}
+	error::{Error, ErrorKind, Result}, types::{AspectDeclaration, AspectEnvelope, AspectInfo, AspectList, AspectStats, BenchRun, BenchRunList, ComputePoint, Downsample, Downsampled, Format, Headroom, IlpOptions, Interpolate, InterpolatePointBody, Interpolated, InterpolatedPoint, Page, PointAt, PointsAt, PointsBody, PointsPage, Spline, StoreStats, StoredDownsample, StoredPoint, StoredValue, WireStoredPoint, WriteOptions, WriteSummary}
 };
 
 const PARQUET: &str = "application/vnd.apache.parquet";
@@ -544,6 +544,16 @@ impl Client {
 	/// The server's refusal, or a transport failure.
 	pub async fn stats(&self) -> Result<StoreStats> {
 		self.send(Call::get(&["api", "v1", "storage", "stats"])).await?.json()
+	}
+
+	/// `GET /api/v1/storage/headroom`: the store's free-space margin (ROB-17,
+	/// experimental, `metrics` scope).
+	///
+	/// # Errors
+	///
+	/// The server's refusal, or a transport failure.
+	pub async fn headroom(&self) -> Result<Headroom> {
+		self.send(Call::get(&["api", "v1", "storage", "headroom"])).await?.json()
 	}
 
 	/// `GET /api/v1/storage/{aspect}/stats`: one aspect's totals.

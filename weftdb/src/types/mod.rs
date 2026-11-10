@@ -57,6 +57,7 @@ pub mod database;
 pub mod dataset;
 pub mod dictionary;
 pub mod dictionary_name;
+pub mod disk_guard;
 pub mod durable;
 pub mod error;
 pub mod event;
@@ -91,4 +92,5 @@ pub mod trend;
 pub mod upsert_keys;
 pub mod value_kind;
 
+pub use disk_guard::{disk_space_at, DiskGuard, DiskSpace, Headroom, RefusalLatch, RefusalTransition, DEFAULT_DISK_RESERVE_BYTES};
 pub use error::*;

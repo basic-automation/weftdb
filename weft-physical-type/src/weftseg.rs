@@ -1812,6 +1812,14 @@ fn read_range_from_section_with<V>(section: &[u8], stats: &SegmentStats, start: 
 	let Some((first, step)) = stride else {
 		return full_filtered();
 	};
+	// The closed form sizes the window from the header's row count, so it must agree with the
+	// column it stands in for (ROB-8 rule 4, which the full decode applies in
+	// `check_segment_columns`). A resealed frame whose header claims a different count — zero
+	// above all, which would underflow the last-row bound — is refused here, not trusted (ROB-9).
+	let rows = implied_timestamp_rows(&ts_col).unwrap_or(1);
+	if rows != stats.row_count {
+		return Err(WeftSegError::ColumnLengthMismatch { column: "timestamp_column", expected: stats.row_count, found: rows });
+	}
 	// Closed-form row window: lo = first row with ts >= start, hi = last row with ts <= end.
 	let step128 = i128::from(step);
 	let start_off = i128::from(start) - i128::from(first);

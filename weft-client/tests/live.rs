@@ -74,6 +74,12 @@ async fn probes() {
 	assert_eq!(ready["segment_store"], true, "{ready}");
 	assert!(server.client.metrics().await.unwrap().contains("weft_"));
 	assert!(server.client.profile().await.unwrap().is_object());
+	// ROB-17: the disk guard's state on the probe, and the margin behind it.
+	assert_eq!(ready["disk_refusing"], false, "{ready}");
+	let headroom = server.client.headroom().await.unwrap();
+	assert!(headroom.total_bytes >= headroom.available_bytes && headroom.available_bytes > 0, "{headroom:?}");
+	assert_eq!(headroom.writable_bytes, headroom.available_bytes.saturating_sub(headroom.reserve_bytes), "{headroom:?}");
+	assert!(!headroom.refusing, "{headroom:?}");
 }
 
 #[tokio::test]

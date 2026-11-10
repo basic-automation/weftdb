@@ -1,6 +1,6 @@
 # Configuration schema
 
-schema_version: 1
+schema_version: 2
 
 WeftDB is configured primarily through environment variables, registered in a single
 source-of-truth registry (`weft-server/src/settings.rs`, 1.0 plan PAC-5a). Every variable
@@ -17,6 +17,7 @@ The registry assigns each variable a **tier** that says how much it is promised.
 | schema_version | Change |
 |----------------|--------|
 | 1 | First versioned schema. Covers every variable the registry names (103 variables: 13 Stable, 41 Tuning, 8 Experimental, 41 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
+| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. |
 
 ## Tier system
 
@@ -60,7 +61,7 @@ Thirteen variables. Renaming, retyping or removing one is a breaking change.
 
 ## Tuning
 
-Forty-one variables. The name stays forever, but the default or accepted shape may change in
+Forty-two variables. The name stays forever, but the default or accepted shape may change in
 a minor release.
 
 | Variable | Summary | Accepts | Default | Read by |
@@ -69,6 +70,7 @@ a minor release.
 | `WEFT_BACKUP_INTERVAL_SECS` | How often the backup daemon writes a verified `VACUUM INTO` snapshot of the four control-plane databases. | A whole number of seconds; `0` disables the daemon. | Unset or `0`: no scheduled backups. | `weft-server/startup/daemons.rs` |
 | `WEFT_BACKUP_KEEP` | How many daemon-generated snapshots to keep: after each backup the oldest beyond this many are removed. A hand-taken `?label=` snapshot is never a prune candidate. | A whole number of snapshots. | Unset: retain every generated snapshot (packaged deployments set 3). | `weft-server/startup/daemons.rs` |
 | `WEFT_COMPACT_TARGET_ROWS` | The size-aware compaction pass of the maintenance scheduler: each aspect's segments coalesce toward this many rows per segment instead of folding into one. | A positive whole number of rows. | 65,536 (`DEFAULT_COMPACT_TARGET_ROWS` in `startup/daemons.rs`) — compaction is on by default (ROB-19); a non-numeric value stops the server from starting. | `weft-server/startup/daemons.rs` |
+| `WEFT_DISK_RESERVE_BYTES` | The bytes every ingest or seal must leave available on the store's filesystem (ROB-17): a write that would leave less is refused `507 insufficient_storage` before any frame is written. `GET /api/v1/storage/headroom` and the `weft_disk_*` gauges on `/metrics` report the margin. | A non-negative whole number of bytes; `0` turns the guard off. | 268,435,456 (256 MiB, `DEFAULT_DISK_RESERVE_BYTES` in weftdb); a malformed value stops the server from starting. | `weftdb/types/segment_store.rs` (`SegmentStoreOptions::from_env`), read in store_open.rs |
 | `WEFT_EXTRACTED_BATCH_RETENTION_SECS` | How long the queue remembers that a pattern extraction already consumed a batch, which is how long a re-ingested batch is recognised as a duplicate. | A positive whole number of seconds. | 48 h (172,800 s); anything else warns and keeps the default. | `weftdb/types/database/inputs.rs` |
 | `WEFT_HEADER_READ_TIMEOUT_SECS` | How long a peer may take to deliver a complete request header block before the connection is closed (SEC-4's header deadline, pre-auth). | A positive whole number of seconds. | 30 s (`DEFAULT_HEADER_READ_TIMEOUT` in `serve.rs`). | `weft-server/serve.rs` |
 | `WEFT_INGEST_MAX_INFLIGHT_BYTES` | The ingest routes' in-flight byte budget (D-S14): the registry's gate charges each ingest request's `Content-Length` against it, and a request that would push the total past the budget is refused `503 overloaded` with `Retry-After` instead of queueing. | A positive whole number of bytes. | 256 MiB — one maximum-size body in flight. | `weft-server/ingest.rs` |
@@ -194,7 +196,7 @@ the database root remains.
 - A store it cannot open exits `65` (operator action).
 - An unknown write-ambiguous commit mode or an unrecognised `WEFT_STORE_SCOPE_PIN` or
   `WEFT_GPU_*` value stops the server, again with `78`.
-- All 103 names in the registry are tested (by `cargo test`) against every crate's `src/`
+- All 104 names in the registry are tested (by `cargo test`) against every crate's `src/`
   to catch any `env::var("WEFT_…")` that is read without being registered, or registered
   without being read.
 - The env file `packaging/env/weft-server.env` covers the Tuning and Experimental tiers
