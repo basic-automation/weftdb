@@ -77,7 +77,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema, DECIMAL128_MAX_PRECISION};
-use bigdecimal::{num_bigint::BigInt, BigDecimal, FromPrimitive, ToPrimitive};
+use bigdecimal::{num_bigint::BigInt, BigDecimal, ToPrimitive};
 use bytes::Bytes;
 use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
 use weft_physical_type::{Page, PagedSegment, PhysicalType, Segment, SegmentError, TimeUnit};
@@ -498,6 +498,13 @@ fn build_record_batch(unit: TimeUnit, physical_type_name: &str, version: u16, ti
 /// on the column's actual Arrow type, so a batch produced by either path round
 /// trips.
 ///
+/// A float cell lifts to its shortest round-trip decimal (decision 11,
+/// FRE-8b — [`weft_physical_type::decimal_from_f64`] /
+/// [`weft_physical_type::decimal_from_f32`]), the one float-input rule every
+/// ingest format shares: a Parquet `0.1` stores the same decimal as a JSON,
+/// CSV or ILP `0.1`, and an export read back through this function returns
+/// the decimal that entered, not its exact binary expansion.
+///
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if a required column is missing, the value column is
@@ -564,7 +571,7 @@ fn columns_from_batch(batch: &RecordBatch, strict: bool, row_offset: usize) -> R
 				.enumerate()
 				.map(|(row, cell)| match cell {
 					Some(v) if strict && !v.is_finite() => Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: row_offset + row }),
-					other => Ok(other.and_then(BigDecimal::from_f64)),
+					other => Ok(other.and_then(weft_physical_type::decimal_from_f64)),
 				})
 				.collect::<Result<Vec<_>, ConvertError>>()?
 		}
@@ -575,7 +582,7 @@ fn columns_from_batch(batch: &RecordBatch, strict: bool, row_offset: usize) -> R
 				.enumerate()
 				.map(|(row, cell)| match cell {
 					Some(v) if strict && !v.is_finite() => Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: row_offset + row }),
-					other => Ok(other.and_then(BigDecimal::from_f32)),
+					other => Ok(other.and_then(weft_physical_type::decimal_from_f32)),
 				})
 				.collect::<Result<Vec<_>, ConvertError>>()?
 		}
@@ -1859,6 +1866,22 @@ mod tests {
 		check_eq!(values[1], None, "a NaN reads back as the hole the writer meant");
 		check_eq!(values[2], None);
 		check_eq!(record_batch_to_columns_strict(&batch), Err(ConvertError::NonFinite { column: VALUE_COLUMN, row: 1 }));
+		Ok(())
+	}
+
+	#[test]
+	fn float_cells_enter_as_their_shortest_round_trip_decimal() -> TestResult {
+		// FRE-8b (decision 11): a float cell becomes the decimal the sender
+		// wrote, not the exact binary expansion — a Parquet `0.1` stores the
+		// same value a JSON, CSV or ILP `0.1` stores.
+		let batch = build_record_batch(TimeUnit::Seconds, PhysicalType::F64.name(), LOGICAL_EXPORT_VERSION, &[100, 110], Arc::new(Float64Array::from(vec![Some(0.1), Some(99.92)])), VALUE_ENCODING_F64)?;
+		let (_, values) = record_batch_to_columns(&batch)?;
+		check_eq!(values, vec![Some(bd("0.1")?), Some(bd("99.92")?)]);
+		// The f32 arm takes the f32's own shortest form, which for `0.1` is
+		// again `0.1` — not the shortest form of its f64 widening.
+		let batch32 = build_record_batch(TimeUnit::Seconds, PhysicalType::F32.name(), LOGICAL_EXPORT_VERSION, &[100], Arc::new(Float32Array::from(vec![Some(0.1_f32)])), VALUE_ENCODING_F32)?;
+		let (_, values32) = record_batch_to_columns(&batch32)?;
+		check_eq!(values32, vec![Some(bd("0.1")?)]);
 		Ok(())
 	}
 

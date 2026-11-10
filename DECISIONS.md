@@ -6179,3 +6179,53 @@ correlations it reads.
 pins the shape of the critical section. It is not a deadlock reproducer — the async mutex serialised the
 old callers rather than deadlocking them — and its doc says so, because a test named "no_deadlock" that
 would also pass before the fix misinforms the next reader.
+
+## 2026-11-10 — FRE-8b: the one float-input rule lives in weft-physical-type (FOR MERGE REVIEW)
+
+**Spec:** 1.0 plan §6 W8 + §2 L-FMT (lib.rs order: TAG-1 → ROB-6 → FRE-8b) +
+Appendix A decision 11 ("ILP and Parquet float inputs enter as their shortest
+round-trip decimal") + ROADMAP line 307. Closes #313.
+
+**What was still open.** Decision 11's non-finite half landed with ROB-7 (400
+in every format); its shortest-round-trip half had landed only for the JSON
+compute endpoints (weft-server's `widen_json_value`) and, for JSON ingest,
+trivially (values enter as the sender's text through `parse_decimal`). The two
+binary float lifts still widened with `BigDecimal::from_f64`/`from_f32` — the
+exact binary expansion: an ILP or Parquet `0.1` stored
+`0.1000000000000000055511151231257827021181583404541015625` where a JSON or
+CSV `0.1` stored `0.1`. Same number sent, different stored value per format —
+and, per the ROB-6 entry, an exact-expansion subnormal's 1,075-digit plain
+form fell outside the one decimal domain, so the smallest subnormal was
+refused as an ILP float field while its written form `5e-324` (325 digits) is
+well inside it.
+
+**The rule now has one home.** `weft_physical_type::decimal_from_f64` /
+`decimal_from_f32` sit beside `parse_decimal` in weft-physical-type's lib.rs —
+the L-FMT file the plan assigns to this slice — and both remaining lifts call
+them: `FieldValue::as_big_decimal` (weft-line-protocol, which gains a
+dependency on weft-physical-type; the layering already runs that way in
+weft-arrow) and the `Float64`/`Float32` arms of
+`weft_arrow::record_batch_to_columns`. The construction mirrors
+`widen_json_value` (read the `{:e}` shortest text as digits + exponent;
+integral values land at scale 0), so the compute endpoints and the ingest
+lifts cannot drift apart in shape. An f32 enters as the *f32's* shortest form
+(`0.1`), not the shortest form of its f64 widening (`0.10000000149011612`):
+decision 11 judges a decimal against "its nearest float", and an f32 input's
+nearest float is the f32.
+
+**Deliberately unchanged: `PhysicalValue::to_logical`.** It still reconstructs
+an F64/F32 physical value by exact expansion. It is not an input boundary —
+it is the decode `PhysicalType::encode` measures `Exactness` against, and the
+crate's founding rule is that loss is never silent: judging encode(0.1 → F64)
+against the shortest form would report `Exact` for a frame that holds the
+nearest f64, not `0.1`. What changes at read-back is only the Arrow lift
+above: an exported F64 segment re-enters through `record_batch_to_columns`,
+which is an ingest-shaped boundary, so a re-seal no longer inflates values
+into their expansions.
+
+**Consequence worth naming:** the smallest subnormal (and its kin) is now
+*accepted* as an ILP float field and a Parquet float cell, entering as
+`5e-324`; before, the ILP path refused it downstream at the ROB-6 domain
+check. That is decision 11 operating as written — the written form is the
+input — not a loosening of the domain, which still bounds every stored
+value's plain form at 1,024 digits.
