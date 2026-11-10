@@ -80,6 +80,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **One float-input rule across every ingest format (FRE-8b, #313).** ILP float fields
+  and Parquet/Arrow `Float64`/`Float32` cells now enter as their shortest round-trip
+  decimal (decision 11) through the new `weft_physical_type::decimal_from_f64` /
+  `decimal_from_f32`, instead of the exact binary expansion `BigDecimal::from_f64`
+  produced: an ILP or Parquet `0.1` now stores `0.1`, the same value a JSON or CSV
+  `0.1` stores. The smallest subnormal, previously refused because its expansion's
+  plain form exceeds the decimal domain, now enters as `5e-324`.
+
 - **Breaking (read shape): a range read now returns each timestamp once, newest value
   wins (#443).** `read_time_range_of` now opens all segments overlapping the window (including
   all-null ones) and folds them with `merge_newer_wins`, so a newer segment's null
