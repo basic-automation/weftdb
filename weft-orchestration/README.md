@@ -11,6 +11,24 @@ behind one fluent `Pipeline` builder, with built-in detectors and parallel execu
 Each stage is incremental and can also be driven directly (`prepare_data`,
 `extract_patterns`, `detect_events`, `correlate_events`, `generate_signals`).
 
+## Installing
+
+`weft-orchestration` is published to crates.io in lockstep with `weftdb`: every
+release ships both crates at the same version, and this crate pins that exact
+`weftdb` version. Depend on both at the same version:
+
+```toml
+[dependencies]
+weftdb = "0.3.3"
+weft-orchestration = "0.3.3"
+```
+
+A path or git dependency on this crate must point `weftdb` at the same checkout
+(for example with `[patch.crates-io]`). Mixing a crates.io `weftdb` with a local
+`weft-orchestration`, or the reverse, gives two copies of `weftdb`'s types and
+two process-wide database caches, which fails to compile at best and opens the
+same store files twice at worst.
+
 ```rust,ignore
 use weft_orchestration::Pipeline;
 use weftdb::Database;

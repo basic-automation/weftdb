@@ -186,6 +186,7 @@
 //! | [`detect_threshold_crossing_up`] | Detects upward threshold crossings |
 //! | [`detect_threshold_crossing_down`] | Detects downward threshold crossings |
 //! | [`detect_threshold_crossing_up_since`] / [`detect_threshold_crossing_down_since`] | The same, over the data from a start time on (live callers) |
+//! | `detect_*_since` (every detector) | The detector over `[since, latest]` only. Point-local detectors (threshold crossings, `detect_all_peaks`, `detect_all_valleys`) return exactly the full run's manifestations inside the window, apart from a peak or valley on the window's first sample, which needs the sample before it. Path-dependent ones (`detect_peaks`/`detect_valleys` global extremes, `detect_drawdown` running high, `detect_monthly_increase`) are evaluated over the window alone, so they answer "within this window", not "within all history". |
 //! | [`detect_drawdown`] | Detects significant price drops |
 //!
 //! ## Pipeline Persistence
@@ -454,7 +455,7 @@ mod test_support;
 // Re-export main Pipeline API
 // Re-export built-in detectors
 // Re-export compression types for convenience
-pub use detectors::{detect_all_peaks, detect_all_valleys, detect_drawdown, detect_monthly_increase, detect_peaks, detect_threshold_crossing_down, detect_threshold_crossing_down_since, detect_threshold_crossing_up, detect_threshold_crossing_up_since, detect_valleys};
+pub use detectors::{detect_all_peaks, detect_all_peaks_since, detect_all_valleys, detect_all_valleys_since, detect_drawdown, detect_drawdown_since, detect_monthly_increase, detect_monthly_increase_since, detect_peaks, detect_peaks_since, detect_threshold_crossing_down, detect_threshold_crossing_down_since, detect_threshold_crossing_up, detect_threshold_crossing_up_since, detect_valleys, detect_valleys_since};
 pub use pipeline::{DetectorId, DictionaryConfig, EventDetector, EventDetectorFn, Pipeline, PipelineBuilder, PipelineRunConfig, ProbabilityResult};
 pub use weftdb::compression::{AggressivenessScaling, CompressionConfig, CompressionResult, CompressionSummary, SizeBasedCompressionConfig, TimeBasedCompressionConfig};
 

@@ -130,6 +130,15 @@ use weftdb::{
 
 use crate::{Event, Manifestation};
 
+/// Full-history form of [`detect_monthly_increase_since`]: `since = None`.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold_percent: f64) -> Result<Vec<Event>> {
+	detect_monthly_increase_since(database, aspect, resolution, method, threshold_percent, None).await
+}
+
 /// Detects monthly price increases above a threshold percentage.
 ///
 /// Analyzes price movements from the beginning to end of each calendar month.
@@ -158,8 +167,9 @@ use crate::{Event, Manifestation};
 /// // Detect months with 5% or greater price increase
 /// let events = detect_monthly_increase(&db, &aspect, &resolution, &method, 0.05).await?;
 /// ```
-pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold_percent: f64) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+pub async fn detect_monthly_increase_since(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold_percent: f64, since: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<Event>> {
+	let earliest = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	let start_time = since.map_or(earliest, |since| since.max(earliest));
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -215,6 +225,15 @@ pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, res
 	}
 }
 
+/// Full-history form of [`detect_peaks_since`]: `since = None`.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub async fn detect_peaks(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
+	detect_peaks_since(database, aspect, resolution, method, name, None).await
+}
+
 /// Detects peak values (local maxima that equal the global maximum).
 ///
 /// Scans through all data points and identifies local maxima where the value
@@ -236,8 +255,9 @@ pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, res
 /// # Errors
 ///
 /// Returns an error if database operations fail.
-pub async fn detect_peaks(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+pub async fn detect_peaks_since(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str, since: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<Event>> {
+	let earliest = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	let start_time = since.map_or(earliest, |since| since.max(earliest));
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -282,6 +302,15 @@ pub async fn detect_peaks(database: &Database, aspect: &AspectId, resolution: &R
 	}
 }
 
+/// Full-history form of [`detect_all_peaks_since`]: `since = None`.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub async fn detect_all_peaks(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
+	detect_all_peaks_since(database, aspect, resolution, method, name, None).await
+}
+
 /// Detects all local peaks (local maxima), not just global maximum.
 ///
 /// Unlike `detect_peaks` which only finds peaks equal to the global maximum,
@@ -303,8 +332,9 @@ pub async fn detect_peaks(database: &Database, aspect: &AspectId, resolution: &R
 /// # Errors
 ///
 /// Returns an error if database operations fail.
-pub async fn detect_all_peaks(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+pub async fn detect_all_peaks_since(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str, since: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<Event>> {
+	let earliest = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	let start_time = since.map_or(earliest, |since| since.max(earliest));
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -347,6 +377,15 @@ pub async fn detect_all_peaks(database: &Database, aspect: &AspectId, resolution
 	}
 }
 
+/// Full-history form of [`detect_valleys_since`]: `since = None`.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub async fn detect_valleys(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
+	detect_valleys_since(database, aspect, resolution, method, name, None).await
+}
+
 /// Detects valley values (local minima that equal the global minimum).
 ///
 /// Scans through all data points and identifies local minima where the value
@@ -368,8 +407,9 @@ pub async fn detect_all_peaks(database: &Database, aspect: &AspectId, resolution
 /// # Errors
 ///
 /// Returns an error if database operations fail.
-pub async fn detect_valleys(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+pub async fn detect_valleys_since(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str, since: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<Event>> {
+	let earliest = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	let start_time = since.map_or(earliest, |since| since.max(earliest));
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -414,6 +454,15 @@ pub async fn detect_valleys(database: &Database, aspect: &AspectId, resolution: 
 	}
 }
 
+/// Full-history form of [`detect_all_valleys_since`]: `since = None`.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub async fn detect_all_valleys(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
+	detect_all_valleys_since(database, aspect, resolution, method, name, None).await
+}
+
 /// Detects all local valleys (local minima), not just global minimum.
 ///
 /// Unlike `detect_valleys` which only finds valleys equal to the global minimum,
@@ -435,8 +484,9 @@ pub async fn detect_valleys(database: &Database, aspect: &AspectId, resolution: 
 /// # Errors
 ///
 /// Returns an error if database operations fail.
-pub async fn detect_all_valleys(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+pub async fn detect_all_valleys_since(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str, since: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<Event>> {
+	let earliest = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	let start_time = since.map_or(earliest, |since| since.max(earliest));
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -639,6 +689,15 @@ pub async fn detect_threshold_crossing_down_since(database: &Database, aspect: &
 	}
 }
 
+/// Full-history form of [`detect_drawdown_since`]: `since = None`.
+///
+/// # Errors
+///
+/// Returns an error if database operations fail.
+pub async fn detect_drawdown(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, drop_percent: f64, name: &str) -> Result<Vec<Event>> {
+	detect_drawdown_since(database, aspect, resolution, method, drop_percent, name, None).await
+}
+
 /// Detects percentage drops from recent highs (drawdowns).
 ///
 /// Creates a manifestation when the value drops by the specified percentage
@@ -661,8 +720,9 @@ pub async fn detect_threshold_crossing_down_since(database: &Database, aspect: &
 /// # Errors
 ///
 /// Returns an error if database operations fail.
-pub async fn detect_drawdown(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, drop_percent: f64, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+pub async fn detect_drawdown_since(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, drop_percent: f64, name: &str, since: Option<chrono::DateTime<chrono::Utc>>) -> Result<Vec<Event>> {
+	let earliest = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	let start_time = since.map_or(earliest, |since| since.max(earliest));
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;

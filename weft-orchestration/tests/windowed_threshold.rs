@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Windowed threshold detectors: a live caller scans only the data after `since`
 //! and finds the same crossings the full-history run finds in that window.
 
@@ -9,7 +10,7 @@ use chrono::{Duration, TimeZone, Utc};
 use serial_test::serial;
 use splimes::{Resolution, Spline};
 use uuid::Uuid;
-use weft_orchestration::{detect_threshold_crossing_down, detect_threshold_crossing_down_since, detect_threshold_crossing_up, detect_threshold_crossing_up_since};
+use weft_orchestration::{detect_all_peaks, detect_all_peaks_since, detect_all_valleys, detect_all_valleys_since, detect_drawdown, detect_drawdown_since, detect_threshold_crossing_down, detect_threshold_crossing_down_since, detect_threshold_crossing_up, detect_threshold_crossing_up_since};
 use weftdb::{
 	database::traits::{AspectStructure, DatabaseStructure, Inputs}, Database, DatasetId, Event, InputMeasurement
 };
@@ -46,5 +47,36 @@ async fn windowed_runs_find_the_full_runs_crossings_in_the_window() -> Result<()
 
 	// `None` is the full run.
 	assert_eq!(starts(&detect_threshold_crossing_up_since(&db, &aspect, &res, &spline, threshold.clone(), "up", None).await?), starts(&detect_threshold_crossing_up(&db, &aspect, &res, &spline, threshold, "up").await?));
+	Ok(())
+}
+
+#[serial]
+#[tokio::test]
+async fn windowed_local_extrema_match_the_full_run_inside_the_window() -> Result<()> {
+	let dir = tempfile::tempdir()?;
+	std::env::set_var("WEFT_DATA_DIR", dir.path().to_str().unwrap());
+	let db = Database::new(&format!("window_ext_{}", Uuid::new_v4().simple())).await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect = db.track_aspect(&subject.id(), "temp", &Resolution::Minutes, None).await?.id();
+
+	// A triangle wave (period 10): strict peaks at m%10==5, valleys at m%10==0.
+	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
+	let rows: Vec<InputMeasurement> = (0..120).map(|m| { let k = m % 10; InputMeasurement::new(base + Duration::minutes(m), BigDecimal::from(40 + if k <= 5 { k } else { 10 - k } * 3)) }).collect();
+	db.batch_capture_measurements(aspect, DatasetId::new(), rows).await?;
+
+	let since = base + Duration::minutes(62);
+	let (res, spline) = (Resolution::Minutes, Spline::Linear);
+	// An extremum's manifestation starts one sample before it, so the window
+	// reproduces every full-run manifestation that starts at or after `since`.
+	for (full, windowed) in [
+		(detect_all_peaks(&db, &aspect, &res, &spline, "p").await?, detect_all_peaks_since(&db, &aspect, &res, &spline, "p", Some(since)).await?),
+		(detect_all_valleys(&db, &aspect, &res, &spline, "v").await?, detect_all_valleys_since(&db, &aspect, &res, &spline, "v", Some(since)).await?),
+	] {
+		let in_window: Vec<_> = starts(&full).into_iter().filter(|(start, _)| *start >= since).collect();
+		assert!(!in_window.is_empty(), "precondition: the window holds extrema");
+		assert_eq!(starts(&windowed), in_window);
+	}
+	// `None` is the full run for the path-dependent detectors too.
+	assert_eq!(starts(&detect_drawdown_since(&db, &aspect, &res, &spline, 0.1, "d", None).await?), starts(&detect_drawdown(&db, &aspect, &res, &spline, 0.1, "d").await?));
 	Ok(())
 }
