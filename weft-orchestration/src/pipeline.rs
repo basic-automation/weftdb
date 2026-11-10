@@ -45,7 +45,7 @@ use weftdb::{
 	database::traits::{DatabaseStructure, Inputs, Outputs, PipelineInputs, PipelineOutputs}, AspectId, Database, DetectorMetadata, DetectorType, EventID, PipelineConfig as DbPipelineConfig, PipelineState as DbPipelineState, Resolution
 };
 
-use crate::{Dictionary, DictionaryConstraints, Event, SignalType, Signals, SIGNALS_QUEUE};
+use crate::{Dictionary, DictionaryConstraints, Event, SignalType, Signals};
 
 /// Unique identifier for an event detector.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -960,11 +960,9 @@ impl Pipeline {
 		let latest_time = self.database.get_latest_measurement(&self.aspect_id).await?;
 		crate::filter_expired_signals(&self.database, &self.aspect_id, latest_time).await?;
 
-		// Copy signals from global queue to local
-		let signals_lock = SIGNALS_QUEUE.lock().await;
-		self.signals = signals_lock.clone();
+		// Copy this aspect's signals from the process-wide queue to local
+		self.signals = crate::signals_for(&self.aspect_id).await;
 		let signal_count = self.signals.len();
-		drop(signals_lock);
 
 		tracing::info!(signal_count = signal_count, "Signal generation completed");
 		Ok(())
@@ -978,10 +976,8 @@ impl Pipeline {
 	pub async fn filter_signals_at(&mut self, query_time: DateTime<Utc>) -> Result<()> {
 		crate::filter_expired_signals(&self.database, &self.aspect_id, Some(query_time)).await?;
 
-		// Refresh local signals copy
-		let signals_lock = SIGNALS_QUEUE.lock().await;
-		self.signals = signals_lock.clone();
-		drop(signals_lock);
+		// Refresh local signals copy (this aspect's queue only)
+		self.signals = crate::signals_for(&self.aspect_id).await;
 
 		Ok(())
 	}
