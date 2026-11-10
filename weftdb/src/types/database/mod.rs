@@ -23,6 +23,115 @@ pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::n
 // Add connection manager for Turso with connection pools
 static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, turso::Database>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// When each cached handle in [`CONNECTION_DATABASES`] was last handed out, by path.
+/// Kept beside the map (same lock order: map first) so the map's type stays put.
+static LAST_USED: LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Paths this process has opened at least once. A reopen after an idle close must not run
+/// the cold-open sidecar sweep: a clone of the evicted handle may still be alive, and Turso
+/// would hand the reopen that same live database (its registry is keyed by inode), so an
+/// unlinked empty log would orphan the commits that follow.
+static OPENED_ONCE: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// When the last idle sweep ran; sweeps are rate-limited to one per [`IDLE_SWEEP_EVERY`].
+static LAST_SWEEP: LazyLock<std::sync::Mutex<std::time::Instant>> = LazyLock::new(|| std::sync::Mutex::new(std::time::Instant::now()));
+const IDLE_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a cached database file may go unused before its handle is dropped
+/// (`WEFT_DB_IDLE_CLOSE_SECS`, default 300; `0` keeps every file open, the old behaviour).
+/// Each open file costs a fixed ~3 MB Turso buffer arena, so a store with hundreds of
+/// aspect files otherwise holds gigabytes it is not using.
+fn idle_close_after() -> Option<std::time::Duration> {
+	static AFTER: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+	*AFTER.get_or_init(|| idle_close_from(std::env::var("WEFT_DB_IDLE_CLOSE_SECS").ok().as_deref()))
+}
+
+fn idle_close_from(raw: Option<&str>) -> Option<std::time::Duration> {
+	match raw.map(str::trim).filter(|v| !v.is_empty()) {
+		None => Some(std::time::Duration::from_secs(300)),
+		Some(v) => match v.parse::<u64>() {
+			Ok(0) => None,
+			Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+			Err(_) => {
+				tracing::warn!(value = v, "WEFT_DB_IDLE_CLOSE_SECS is not a whole number of seconds; using 300");
+				Some(std::time::Duration::from_secs(300))
+			}
+		},
+	}
+}
+
+fn touch_cached(path: &str) {
+	LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.to_string(), std::time::Instant::now());
+}
+
+/// Whether this cold open is the process's first open of `path` (and record it).
+fn first_open_of(path: &str) -> bool {
+	OPENED_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.to_string())
+}
+
+/// Drop cached handles idle for longer than `after`, except `metadata.db` files, which
+/// every `Database` handle holds for its whole life anyway. Dropping a handle is safe
+/// while clones are still in use: Turso keeps the file open until the last clone drops,
+/// and a reopen in the meantime gets that same live database back. Returns how many
+/// handles were dropped.
+fn sweep_idle(cache: &mut HashMap<String, turso::Database>, after: std::time::Duration, now: std::time::Instant) -> usize {
+	let mut last_used = LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+	let idle: Vec<String> = cache
+		.keys()
+		.filter(|path| !path.ends_with("metadata.db"))
+		.filter(|path| last_used.get(*path).is_none_or(|t| now.saturating_duration_since(*t) >= after))
+		.cloned()
+		.collect();
+	for path in &idle {
+		cache.remove(path);
+		last_used.remove(path);
+	}
+	drop(last_used);
+	if !idle.is_empty() {
+		release_freed_heap();
+		tracing::debug!(closed = idle.len(), open = cache.len(), "Closed idle database files");
+	}
+	idle.len()
+}
+
+/// Hand freed heap pages back to the OS after closing files. glibc keeps a closed file's
+/// arena pages mapped otherwise: on a 558-file store, closing every file freed 1.15 GB of
+/// 2.44 GB RSS, and `malloc_trim` released the other 1.28 GB. Other allocators (mimalloc in
+/// `weft-server`) return pages themselves, and there the call finds nothing to trim.
+fn release_freed_heap() {
+	#[cfg(all(target_os = "linux", target_env = "gnu"))]
+	// SAFETY: `malloc_trim` only releases free heap memory; it touches no live allocation.
+	unsafe {
+		libc::malloc_trim(0);
+	}
+}
+
+fn maybe_sweep_idle(cache: &mut HashMap<String, turso::Database>) {
+	let Some(after) = idle_close_after() else { return };
+	let now = std::time::Instant::now();
+	{
+		let mut last = LAST_SWEEP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		if now.saturating_duration_since(*last) < IDLE_SWEEP_EVERY {
+			return;
+		}
+		*last = now;
+	}
+	sweep_idle(cache, after, now);
+}
+
+/// Drop every cached database handle idle for at least `after` now, regardless of
+/// `WEFT_DB_IDLE_CLOSE_SECS` and the sweep rate limit. Returns how many were dropped.
+/// Long-running hosts can call this from a timer; the cache also sweeps itself on use.
+pub async fn close_idle_databases(after: std::time::Duration) -> usize {
+	let mut cache = CONNECTION_DATABASES.lock().await;
+	sweep_idle(&mut cache, after, std::time::Instant::now())
+}
+
+/// How many database files this process currently holds open through the cache.
+pub async fn open_database_count() -> usize {
+	CONNECTION_DATABASES.lock().await.len()
+}
+
 /// The seal store open over each legacy database's `segments_v2/` root, by
 /// root path (slice D-S20): a root can be open only once in a process, but
 /// several `Database` handles of one database coexist — `analyze_range`
@@ -115,14 +224,18 @@ impl DatabaseStructure for Database {
 		// would be fsynced into an unlinked file. Nothing below re-enters this map, so
 		// holding it cannot deadlock.
 		let mut cache = CONNECTION_DATABASES.lock().await;
+		maybe_sweep_idle(&mut cache);
 
 		// Check if the database is already in the cache, if so return it
 		if let Some(turso_db) = cache.get(db_path) {
+			touch_cached(db_path);
 			return Ok(turso_db.clone());
 		}
 
 		// If not in cache check if the database file exists on disk
 		if Path::new(db_path).exists() {
+			// A reopen after an idle close skips the sidecar sweep (see `OPENED_ONCE`).
+			let first_open = first_open_of(db_path);
 			let log_path = format!("{db_path}-log");
 			let wal_path = format!("{db_path}-wal");
 
@@ -146,6 +259,7 @@ impl DatabaseStructure for Database {
 			//   Turso open fail, but only after this sweep has run.
 			// In both cases unlinking a live, empty log would orphan the commits that follow.
 			match std::fs::metadata(&log_path) {
+				_ if !first_open => {}
 				Ok(meta) if meta.len() == 0 => match std::fs::remove_file(&log_path) {
 					Ok(()) => tracing::debug!("Removed empty MVCC log file: {}", log_path),
 					Err(e) => tracing::warn!("Could not remove empty MVCC log file {}: {}", log_path, e),
@@ -155,7 +269,7 @@ impl DatabaseStructure for Database {
 				Err(e) => tracing::warn!("Could not stat MVCC log file {}: {}; leaving it in place", log_path, e),
 			}
 			// Only remove WAL files if they're empty (indicating incomplete transactions)
-			if Path::new(&wal_path).exists() && std::fs::metadata(&wal_path).is_ok_and(|m| m.len() == 0) {
+			if first_open && Path::new(&wal_path).exists() && std::fs::metadata(&wal_path).is_ok_and(|m| m.len() == 0) {
 				match std::fs::remove_file(&wal_path) {
 					Ok(()) => tracing::debug!("Removed empty WAL file: {}", wal_path),
 					Err(e) => tracing::warn!("Could not remove WAL file {}: {}", wal_path, e),
@@ -185,6 +299,7 @@ impl DatabaseStructure for Database {
 			}
 
 			cache.insert(db_path.to_string(), turso_db.clone());
+			touch_cached(db_path);
 			drop(cache);
 			return Ok(turso_db);
 		}
@@ -198,11 +313,14 @@ impl DatabaseStructure for Database {
 	async fn get_or_create_turso_database(db_path: &str) -> Result<(turso::Database, bool)> {
 		// Use a critical section to prevent race conditions during database creation
 		let mut cache = CONNECTION_DATABASES.lock().await;
+		maybe_sweep_idle(&mut cache);
 
 		// Check if the database is already in the cache, if so return it
 		if let Some(turso_db) = cache.get(db_path) {
+			touch_cached(db_path);
 			return Ok((turso_db.clone(), false)); // From cache, not newly created
 		}
+		first_open_of(db_path);
 
 		// Create the database (file will be created if it doesn't exist)
 		// MVCC is now enabled via PRAGMA journal_mode in Turso 0.4.0+
@@ -215,6 +333,7 @@ impl DatabaseStructure for Database {
 		tokio::task::yield_now().await;
 
 		cache.insert(db_path.to_string(), turso_db.clone());
+		touch_cached(db_path);
 		drop(cache);
 		Ok((turso_db, true)) // Newly created
 	}
@@ -2118,5 +2237,20 @@ impl DatabaseInfo {
 	/// Returns an error if the serialization fails.
 	pub fn to_json_str(&self) -> Result<String> {
 		Ok(serde_json::to_string_pretty(self)?)
+	}
+}
+
+#[cfg(test)]
+mod idle_close_tests {
+	use super::idle_close_from;
+	use std::time::Duration;
+
+	#[test]
+	fn idle_close_defaults_to_five_minutes_and_zero_disables() {
+		assert_eq!(idle_close_from(None), Some(Duration::from_secs(300)));
+		assert_eq!(idle_close_from(Some("")), Some(Duration::from_secs(300)));
+		assert_eq!(idle_close_from(Some("0")), None);
+		assert_eq!(idle_close_from(Some(" 60 ")), Some(Duration::from_secs(60)));
+		assert_eq!(idle_close_from(Some("soon")), Some(Duration::from_secs(300)));
 	}
 }

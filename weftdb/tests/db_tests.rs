@@ -1670,3 +1670,24 @@ async fn opening_prunes_dead_metadata_rows() -> Result<()> {
 	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM transactions WHERE message = 'Added subject ''kept'''").await?, 1, "schema events stay");
 	Ok(())
 }
+
+/// Closing idle store files (the ~3 MB-per-file floor) keeps the store working: reads see
+/// every acknowledged row and new writes land after the reopen.
+#[serial]
+#[tokio::test]
+async fn idle_closed_files_reopen_with_their_data() -> Result<()> {
+	use ::weftdb::database::traits::Outputs;
+	let (_temp, db, _subject, aspect) = setup_test_database().await?;
+	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
+	add_test_measurements(&db, &aspect, base, 20).await?;
+	assert_eq!(db.get_measurements_count(&aspect.id()).await?, 20);
+
+	let closed = ::weftdb::close_idle_databases(std::time::Duration::ZERO).await;
+	assert!(closed > 0, "the aspect's files were open and idle");
+
+	assert_eq!(db.get_measurements_count(&aspect.id()).await?, 20, "a reopened file still holds every row");
+	add_test_measurements(&db, &aspect, base + Duration::hours(1), 5).await?;
+	::weftdb::close_idle_databases(std::time::Duration::ZERO).await;
+	assert_eq!(db.get_measurements_count(&aspect.id()).await?, 25, "writes after a reopen survive the next close");
+	Ok(())
+}
