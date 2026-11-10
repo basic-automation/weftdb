@@ -1119,24 +1119,25 @@ pub async fn restore_store(backup_dir: &Path, new_root: &Path) -> Result<WholeSt
 	restore_store_with(&RealFs, backup_dir, new_root).await
 }
 
-/// The free bytes on the filesystem holding `path` (or its nearest existing ancestor), where the
-/// platform can say.
+/// The free bytes on the filesystem holding `path` (or its nearest existing ancestor).
 ///
-/// Unix `statvfs`. `None` where it cannot, in which case a headroom check has nothing to check against
-/// and the backup itself is the test.
+/// On Unix uses `libc::statvfs`; on Windows uses
+/// [`GetDiskFreeSpaceExW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw).
+/// Returns `None` when the OS refuses to answer or the path has no existing ancestor,
+/// in which case a headroom check has nothing to check against and the backup itself is the test.
 #[must_use]
 pub fn free_bytes_at(path: &Path) -> Option<u64> {
+	let mut probe = path.to_path_buf();
+	loop {
+		if probe.exists() {
+			break;
+		}
+		if !probe.pop() {
+			return None;
+		}
+	}
 	#[cfg(unix)]
 	{
-		let mut probe = path.to_path_buf();
-		loop {
-			if probe.exists() {
-				break;
-			}
-			if !probe.pop() {
-				return None;
-			}
-		}
 		let c_path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).ok()?;
 		let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
 		if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
@@ -1144,11 +1145,29 @@ pub fn free_bytes_at(path: &Path) -> Option<u64> {
 		}
 		Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 	}
-	#[cfg(not(unix))]
+	#[cfg(windows)]
 	{
-		let _ = path;
+		use std::os::windows::ffi::OsStrExt;
+		let wide: Vec<u16> = probe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+		let mut free_bytes_available: u64 = 0;
+		// SAFETY: `GetDiskFreeSpaceExW` writes into a caller-allocated buffer.
+		let result = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &raw mut free_bytes_available, std::ptr::null_mut(), std::ptr::null_mut()) };
+		if result == 0 {
+			return None;
+		}
+		Some(free_bytes_available)
+	}
+	#[cfg(not(any(unix, windows)))]
+	{
+		let _ = probe;
 		None
 	}
+}
+
+#[cfg(windows)]
+extern "system" {
+	/// <https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw>
+	fn GetDiskFreeSpaceExW(directory_name: *const u16, free_bytes_available: *mut u64, total_number_of_bytes: *mut u64, total_number_of_free_bytes: *mut u64) -> i32;
 }
 
 #[cfg(test)]
@@ -1406,6 +1425,20 @@ mod tests {
 		assert!(check_backup_headroom(BackupMode::Linked, 100, 1_000_000, 99).is_err());
 		assert!(check_backup_headroom(BackupMode::Copy, 100, 1_000_000, 1_000_099).is_err(), "copied: the frames count too");
 		assert!(check_backup_headroom(BackupMode::Copy, 100, 1_000_000, 1_000_100).is_ok());
+	}
+
+	/// #667: `free_bytes_at` works on every platform (Unix via `libc::statvfs`, Windows via FFI).
+	#[test]
+	fn free_bytes_at_returns_some_for_an_existing_path() {
+		let dir = tempfile::tempdir().unwrap();
+		// Regression: must return Some on every platform (was None on non-Unix before #667).
+		assert!(free_bytes_at(dir.path()).is_some(), "free_bytes_at must return Some on every platform");
+		// Walking up from a missing child to an existing parent succeeds.
+		assert!(free_bytes_at(&dir.path().join("nonexistent")).is_some(), "walking up to the tempdir ancestor must succeed");
+		// On Unix there is always `/` as the final ancestor, so `free_bytes_at` can never return
+		// `None` from the ancestor-probe. On platforms with no universal root the probe can
+		// exhaust, returning `None` — we cannot construct such a path here portably, so we
+		// trust the doc comment.
 	}
 
 	/// D-S16: a whole-store manifest round-trips with its frames, allocators

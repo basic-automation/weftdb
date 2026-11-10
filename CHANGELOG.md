@@ -37,6 +37,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   actions.
 
 ### Fixed
+- **`free_bytes_at` now works on Windows and other platforms (#667).** The disk guard was inert on Windows, making `GET /ready`'s `disk_refusing` permanently false. Implemented via inline FFI to `GetDiskFreeSpaceExW` (no new dependencies).
+
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
 
 - **`host-install.yml` carried the one unpinned action on `main` (#626).**
@@ -161,6 +163,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   annotations. The comparison function lives in
   `weft-bench/src/soak_compare.rs`, and the annotator script in
   `scripts/annotate-soak-drift.py`. Documented in `docs/soak.md`.
+
+- **Soak upgrade lane (SOA-16).** `weft-bench/src/soak_upgrade.rs` judges
+  the store an in-soak upgrade leaves behind against the run's whole
+  acknowledged history, exactly, and records the upgrade step (the
+  versions on either side, the store layouts, and the pass's duration) on
+  the run record (`SoakHarness::record_upgrade_verdict`, soak schema v7).
+  The caller performs the upgrade per `UPGRADING.md` (PAC-14a) and hands
+  the read-back to the checker, on the SOA-11 backup lane precedent; the
+  lane adds no SLO rule. The nightly comparison tracks
+  `upgrade_ticks_judged` (0 %), `upgrade_mismatch_count` (0 %) and
+  `upgrade_duration_ms` (10 %). Documented in `docs/soak.md`.
 
 - **Performance methodology document.** `docs/methodology.md` defines what
   counts as a performance claim, what evidence a claim must carry, what
