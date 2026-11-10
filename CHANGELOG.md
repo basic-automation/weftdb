@@ -67,6 +67,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   test names the cells it skipped and why on every other platform. macOS and Windows
   runners lose SIGKILL coverage; the Linux job keeps it. See
   [docs/upstream/turso-7480-reopen-refusal.md](docs/upstream/turso-7480-reopen-refusal.md).
+- **The value-band read is documented as a raw scan, with a test pinning it against the point and time-range fold (#665).** The value-band read (`read_value_range`/`read_value_range_of`) is a raw scan: it returns every stored row whose value is in `[lo, hi]` in segment-seal then in-segment order and does **not** fold overlapping segments. Point and time-range reads use newest-wins folding; the value band answers "all raw observations." `docs/upgrade-notes.md` and `docs/reference.md` now state this split explicitly, and a synthetic-collision test (`value_range_is_a_raw_scan_pinned_against_point_and_range`) pins the value-band raw scan beside the point/range fold.
 
 ### Changed
 
