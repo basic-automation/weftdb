@@ -551,6 +551,22 @@ pub struct StoreStats {
 	pub bytes_per_point: f64,
 }
 
+/// The store's free-space margin (`GET /api/v1/storage/headroom`, ROB-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct Headroom {
+	/// The size of the filesystem holding the store, in bytes.
+	pub total_bytes: u64,
+	/// The bytes an unprivileged writer can still use there.
+	pub available_bytes: u64,
+	/// The reserve every ingest or seal must leave (`0`: the disk guard is off).
+	pub reserve_bytes: u64,
+	/// What a write may still take before the guard refuses it.
+	pub writable_bytes: u64,
+	/// Whether the guard refuses every write now (`507 insufficient_storage`).
+	pub refusing: bool,
+}
+
 // ── ingest ────────────────────────────────────────────────────────────────────
 
 /// How a write is sealed.

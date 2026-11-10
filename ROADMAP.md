@@ -297,7 +297,10 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     without meaning anything. DECISIONS 2026-11-07; the owner still owes the ruling on whether the
     literal `layout_version = 3` is a hard 1.0 gate.*
   - [ ] seal lane
-  - [ ] → **ROB-17** Disk guard, headroom API and space gauges
+  - [x] → **ROB-17** Disk guard, headroom API and space gauges
+    - [x] Log the `507 insufficient_storage` refusal once per transition into and out of refusing, not once per request: today every refused ingest logs at ERROR, so a client retrying against a full disk floods the log (the `weft_disk_guard_refusing` gauge already carries the state).
+    - [x] Report the guard's state on `/ready` (a `disk_refusing` field, still `200`) so a balancer or ingest router can steer writes elsewhere while reads keep being served — VictoriaMetrics' `vmstorage` does exactly this: it switches to read-only below `-storage.minFreeDiskSpaceBytes` and `vminsert` re-routes data to the remaining nodes (https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/docs/victoriametrics/Cluster-VictoriaMetrics.md#readonly-mode).
+    - [ ] ROB-18 phase 1: call `weftdb::DiskGuard::admit` with the reserved body size, so a request is refused `507` before its body is read (plan C11; the guard is public for it).
   - [ ] maint lane
   - [ ] read lane
   - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
@@ -308,7 +311,8 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     (PAC-7 exit-code contract), committed at `compat/openapi/weftdb.json`,
     drift-gated by `generated_spec_matches_committed_file`, and structurally
     validated by `generated_spec_passes_structural_validation`.*
-  - [ ] **ROB-9** Mutation harness for frames, sidecars and Parquet
+  - [x] **ROB-9** Mutation harness for frames, sidecars and Parquet
+    - [ ] Report the three `parquet` 60.0.0 decoder panics upstream to apache/arrow-rs (`offset + len out of bounds`, `column start and length should not be negative`, `Decoder for dict should have been set`; reproducers are one-byte edits found by `weft-arrow-store/tests/parquet_mutation.rs`), plus an `arrow-buffer` 60.0.0 panic at `util/bit_chunk_iterator.rs:235` seen when 4,070 one-bit mutants were posted to a running server *(owner: outward-facing)*. WeftDB contains them in `weft_arrow::read_parquet` meanwhile (DECISIONS 2026-11-05). Before filing, check them against the two malformed-file panics upstream already closed in 2026 — a compact-Thrift bool `unwrap` (https://github.com/apache/arrow-rs/issues/9839, closed 2026-04-28) and a row-count/column-data mismatch index panic (https://github.com/apache/arrow-rs/issues/9992, closed 2026-05-22) — since ours were seen on 60.0.0 and are different messages.
   - [x] **SEC-14** Security documentation, config schema and upgrade notes
     *Closed 2026-11-09: `docs/security.md` rewritten with source citations, full role table,
     credential-in-query guard, proxy guard, exit status table, startup enforcement, and
@@ -340,7 +344,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] storage read handlers lane (TAG-10)
   - [ ] **FRE-10a** Contract tests
   - [x] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
-  - [ ] **SOA-16** Soak upgrade lane
+  - [x] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
   - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
   - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
@@ -442,6 +446,14 @@ The decimal-versus-f64 gap was measured at about 43x rather than 2x, which set t
 
 Around that, the read-path arc is done: streaming and batch point lookup (also at the API), closed-form and block-random-access timestamp search, and windowed range reads. The `weft-reduce` crate has mergeable DDSketch quantiles, cross-segment downsample at the store layer and the API (4.7x with concurrent segments), per-segment `.weftpart` partials with a hierarchy of materialised tiers, and size-targeted compaction with a fragmentation gate in the reconcile daemon. Test infrastructure is healthy: the flaky GPU tests, the rustc ICE and the link OOM were root-caused and fixed, `cargo test --workspace` completes (969 passed), and the BTC bulk-load test is runnable. The codec and reconciliation items from Phases 2 to 6 that were tracked here are summarised in those phases.
 
+- [ ] **README `## Status` is stale (noticed 2026-11-05):** it says v0.2.1 (the release is 0.3.0) and lists tags and client SDKs as "Not started", but B-tags (TAG-5..TAG-11) and the Python, Rust and R clients have shipped. Owner-facing wording; EVI-22 rewrites the table at 1.0, but it is wrong today.
+- [ ] **START HERE (filed 2026-11-05 for the next run).** W8 after ROB-17 and ROB-9 (#311, #315): the unclaimed non-owner slices left are ROB-14 (cgroup-aware memory budget), FRE-8b (stored-value text and one float-input rule), FRE-9a (OpenAPI from code), FRE-13 (layout-1 → layout-2 upgrade test), SEC-14 and SOA-13. Check #125 and open PRs for claims first. Builds: the shared `Cargo Target` lock was held for 30+ min by other projects' tests on 2026-11-05; the warm `/mnt/weftbench/target-ci` worked, and clippy needs `RUSTC_WRAPPER=` because the global nightly-threads wrapper breaks `clippy-driver`.
+- [x] **Two `weft-server` bit-exactness tests failed under `cargo test -p weft-server` (found and fixed 2026-11-05):** `interpolate::tests::ilp_values_feed_the_f64_path_unchanged` and `stored_interpolate::tests::a_multi_chunk_stream_is_the_library_result` were 1 ULP off because serde_json's default float parser is not correctly rounded, and only a whole-workspace build (where bigdecimal's `serde-json` feature turns on serde_json's `arbitrary_precision`) parsed correctly. The release workflow and the Docker image build `-p weft-server`, so the shipped binary read some client JSON floats 1 ULP off. Fixed by serde_json's `float_roundtrip` workspace-wide, pinned by `num::json_float_parse_tests`.
+  - [x] Measure what `float_roundtrip` costs the float parse itself: on 1,000,000 values of the compute routes' shape (magnitudes 1e-19..1e15, ryu-formatted, a 20.7 MB body), serde_json 1.0.151 release build pinned to one core of a Ryzen 9 7950X3D under load: 40.0–41.7 ns/value without the feature and 57.0–59.2 with it (≈ +17 ns, ≈ 1.42×, 8 runs each), against 175,103 → 0 values that failed to round-trip. The harness was a scratch crate; the correctness half is committed as `num::json_float_parse_tests::a_seeded_sample_of_json_floats_round_trips_exactly`.
+  - [ ] What that costs a whole JSON compute or ingest request (a `weft-bench` run of the JSON interpolate route before/after): the parse is one stage of several, and no route-level figure has been taken.
+  - [x] Run `cargo test -p weft-server` standalone in CI next to the workspace run (`features` job in `ci.yml`, `--lib`): the release binary is built per package, and feature unification across the workspace hid this bug from every workspace-wide test.
+  - [x] Also test `weftdb`'s lib standalone there: 570 passed in 132 s locally with `SKIP_SLOW_TESTS=1`, including the per-package compile.
+- [ ] **Flaky under GPU contention:** `weft-bench` `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` failed in the 2026-11-05 full suite (`stable: false`, one buffer created after round one while 14 GB of the GPU was in use by other work) and passed alone.
 - [ ] **START HERE (filed 2026-10-11 for the next run).**
 - [ ] **Research (2026-10-11) — the exact TWA is now a measurable differentiator.**
 - [ ] **START HERE (filed 2026-10-09 for the next run).**

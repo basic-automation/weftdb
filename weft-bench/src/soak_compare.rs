@@ -26,6 +26,9 @@
 //! | `backup_rpo_ms` | 10% | backup interval depends on wall clock |
 //! | `backup_rto_ms` | 10% | restore time depends on host load |
 //! | `backup_restore_duration_ms` | 10% | restore time depends on host load |
+//! | `upgrade_ticks_judged` | exact (0%) | deterministic tick budget |
+//! | `upgrade_mismatch_count` | exact (0%) | any mismatch is a regression |
+//! | `upgrade_duration_ms` | 10% | upgrade pass depends on host load |
 //! | `contamination_flags_count` | exact (0%) | same hardware profile each night |
 
 use std::fmt::Write;
@@ -55,7 +58,7 @@ pub struct MetricTolerance {
 /// These are the metrics the workflow checks. Adding a new metric here
 /// requires updating both the workflow's warning logic and the on-call docs
 /// in `RELEASING.md`.
-pub const DEFAULT_METRIC_TOLERANCES: &[MetricTolerance] = &[MetricTolerance { metric_name: "steps", tolerance: 0.0 }, MetricTolerance { metric_name: "oracle_ticks_judged", tolerance: 0.0 }, MetricTolerance { metric_name: "oracle_mismatch_count", tolerance: 0.0 }, MetricTolerance { metric_name: "derived_ticks_judged", tolerance: 0.0 }, MetricTolerance { metric_name: "derived_mismatch_count", tolerance: 0.0 }, MetricTolerance { metric_name: "backup_acknowledged_ticks", tolerance: 0.0 }, MetricTolerance { metric_name: "backup_rpo_ms", tolerance: 0.10 }, MetricTolerance { metric_name: "backup_rto_ms", tolerance: 0.10 }, MetricTolerance { metric_name: "backup_restore_duration_ms", tolerance: 0.10 }, MetricTolerance { metric_name: "contamination_flags_count", tolerance: 0.0 }];
+pub const DEFAULT_METRIC_TOLERANCES: &[MetricTolerance] = &[MetricTolerance { metric_name: "steps", tolerance: 0.0 }, MetricTolerance { metric_name: "oracle_ticks_judged", tolerance: 0.0 }, MetricTolerance { metric_name: "oracle_mismatch_count", tolerance: 0.0 }, MetricTolerance { metric_name: "derived_ticks_judged", tolerance: 0.0 }, MetricTolerance { metric_name: "derived_mismatch_count", tolerance: 0.0 }, MetricTolerance { metric_name: "backup_acknowledged_ticks", tolerance: 0.0 }, MetricTolerance { metric_name: "backup_rpo_ms", tolerance: 0.10 }, MetricTolerance { metric_name: "backup_rto_ms", tolerance: 0.10 }, MetricTolerance { metric_name: "backup_restore_duration_ms", tolerance: 0.10 }, MetricTolerance { metric_name: "upgrade_ticks_judged", tolerance: 0.0 }, MetricTolerance { metric_name: "upgrade_mismatch_count", tolerance: 0.0 }, MetricTolerance { metric_name: "upgrade_duration_ms", tolerance: 0.10 }, MetricTolerance { metric_name: "contamination_flags_count", tolerance: 0.0 }];
 
 // ---------------------------------------------------------------------------
 // Rule outcome change
@@ -340,6 +343,12 @@ fn extract_metrics(report: &SoakReport) -> Vec<(String, f64)> {
 		push_metric(&mut m, "backup_restore_duration_ms", to_f64(backup.timing.restore_duration_ms));
 	}
 
+	if let Some(upgrade) = report.run.upgrade.as_ref() {
+		push_metric(&mut m, "upgrade_ticks_judged", to_f64(upgrade.ticks_judged));
+		push_metric(&mut m, "upgrade_mismatch_count", to_f64(upgrade.mismatch_count));
+		push_metric(&mut m, "upgrade_duration_ms", to_f64(upgrade.step.upgrade_duration_ms));
+	}
+
 	// Contamination flags count is not stored on SoakRun directly.
 	// Default to 0 — the soak workflow can set it from the honesty section.
 	push_metric(&mut m, "contamination_flags_count", 0.0);
@@ -470,7 +479,7 @@ pub fn compare_soak_reports(previous: &SoakReport, current: &SoakReport, toleran
 mod tests {
 	use super::*;
 	use crate::{
-		report::RunMetadata, soak::{SoakConfig, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_report::SoakReport
+		report::RunMetadata, soak::{SoakConfig, SoakRun, SoakState, SOAK_SCHEMA_VERSION}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_report::SoakReport, soak_upgrade::{UpgradeLaneVerdict, UpgradeStep}
 	};
 
 	/// A minimal oracle that judged `ticks` ticks with `mismatches` mismatches.
@@ -488,11 +497,22 @@ mod tests {
 		BackupLaneVerdict { prefix: BackupPrefixVerdict { acknowledged_ticks: 6, ticks_in_backup: 3, cut_tick: Some(2), points_expected: 24, points_in_backup: 24, mismatch_count: 0, mismatches: Vec::new() }, restore: RestoreVerdict { ticks_judged: 6, points_expected: 48, points_restored: 48, mismatch_count: 0, mismatches: Vec::new() }, timing: RecoveryTiming { backup_interval_ms: interval_ms, backup_duration_ms: backup_dur_ms, restore_duration_ms: restore_dur_ms } }
 	}
 
+	/// A minimal upgrade verdict with given duration and mismatch count.
+	fn create_upgrade(duration_ms: u64, mismatches: u64) -> UpgradeLaneVerdict {
+		UpgradeLaneVerdict { ticks_judged: 4, points_expected: 64, points_upgraded: 64, mismatch_count: mismatches, mismatches: Vec::new(), step: UpgradeStep { from_version: "0.1.0".to_string(), to_version: "0.3.2".to_string(), layout_before: 1, layout_after: 2, upgrade_duration_ms: duration_ms } }
+	}
+
+	/// Attach an upgrade verdict to a run built by [`create_run`].
+	fn with_upgrade(mut run: SoakRun, upgrade: UpgradeLaneVerdict) -> SoakRun {
+		run.upgrade = Some(upgrade);
+		run
+	}
+
 	/// Create a minimal `SoakRun` with given steps and verdicts.
 	fn create_run(steps: u64, oracle: Option<OracleVerdict>, derived: Option<DerivedReadVerdict>, backup: Option<BackupLaneVerdict>) -> SoakRun {
 		let config = SoakConfig::new("test".to_string(), "test profile".to_string(), 7, 60).expect("valid test config");
 		let metadata = RunMetadata::capture("2026-10-25T00:00:00+00:00".to_string());
-		SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Finished, steps, oracle, derived, backup, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None }
+		SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Finished, steps, oracle, derived, backup, upgrade: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None }
 	}
 
 	/// Create a `SoakReport` from raw parameters.
@@ -626,6 +646,37 @@ mod tests {
 		assert!(comp.has_drift_warning, "drift past tolerance must set has_drift_warning");
 		let rpo_drift = comp.metric_drifts.iter().find(|d| d.metric_name == "backup_rpo_ms").expect("backup_rpo_ms drift must exist");
 		assert!(rpo_drift.past_tolerance, "50% drift on 10% tolerance must be past");
+	}
+
+	#[test]
+	fn upgrade_duration_drift_past_tolerance_is_flagged() {
+		let run_prev = with_upgrade(create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000))), create_upgrade(1000, 0));
+		let prev = create_report(&run_prev);
+
+		// upgrade_duration_ms: 1000 → 2000 is a 100% drift on a 10%
+		// tolerance — the upgrade pass ran twice as long.
+		let run_curr = with_upgrade(create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000))), create_upgrade(2000, 0));
+		let curr = create_report(&run_curr);
+
+		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
+		assert!(comp.has_drift_warning, "drift past tolerance must set has_drift_warning");
+		let drift = comp.metric_drifts.iter().find(|d| d.metric_name == "upgrade_duration_ms").expect("upgrade_duration_ms drift must exist");
+		assert!(drift.past_tolerance, "100% drift on 10% tolerance must be past");
+	}
+
+	#[test]
+	fn a_new_upgrade_mismatch_is_an_exact_metric_regression() {
+		let run_prev = with_upgrade(create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000))), create_upgrade(1000, 0));
+		let prev = create_report(&run_prev);
+
+		// upgrade_mismatch_count: 0 → 1 on a 0% tolerance — any
+		// mismatch is a regression.
+		let run_curr = with_upgrade(create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000))), create_upgrade(1000, 1));
+		let curr = create_report(&run_curr);
+
+		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
+		let drift = comp.metric_drifts.iter().find(|d| d.metric_name == "upgrade_mismatch_count").expect("upgrade_mismatch_count drift must exist");
+		assert!(drift.past_tolerance, "a new mismatch on a 0% tolerance must be past");
 	}
 
 	// -----------------------------------------------------------------------

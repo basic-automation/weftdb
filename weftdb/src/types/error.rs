@@ -349,4 +349,17 @@ pub enum StoreError {
 		/// The cap in force.
 		limit: usize,
 	},
+	/// A write the store's disk guard refused (ROB-17): it would have left the
+	/// filesystem holding the store with less than the reserve
+	/// ([`SegmentStoreOptions::disk_reserve_bytes`](crate::SegmentStoreOptions::disk_reserve_bytes))
+	/// available. Nothing was written. Free space, or lower the reserve, and retry.
+	#[error("the store's filesystem has {available_bytes} bytes available, and a write of {need_bytes} bytes would leave less than the {reserve_bytes}-byte reserve; free space or lower WEFT_DISK_RESERVE_BYTES, then retry (nothing was written)")]
+	InsufficientStorage {
+		/// The bytes the filesystem reported available.
+		available_bytes: u64,
+		/// The reserve in force.
+		reserve_bytes: u64,
+		/// The bytes the write needed.
+		need_bytes: u64,
+	},
 }

@@ -40,14 +40,16 @@
 //!   ([`crate::soak_failure`]) on the record and takes v4; SOA-10 records
 //!   the derived-read verdict ([`crate::soak_read`]) on the record and
 //!   takes v5; SOA-11 records the backup lane's verdict
-//!   ([`crate::soak_backup`]) on the record and takes v6.
+//!   ([`crate::soak_backup`]) on the record and takes v6; SOA-16 records
+//!   the upgrade lane's verdict ([`crate::soak_upgrade`]) on the record
+//!   and takes v7.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	redaction, report::{DiskInfo, RunMetadata}, soak_backup::BackupLaneVerdict, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict
+	redaction, report::{DiskInfo, RunMetadata}, soak_backup::BackupLaneVerdict, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_upgrade::UpgradeLaneVerdict
 };
 
 /// Version of the soak run record. Bump on any breaking field change to
@@ -65,7 +67,9 @@ use crate::{
 /// the same way.
 /// v6 (SOA-11) adds the optional backup lane verdict on [`SoakRun`],
 /// the same way.
-pub const SOAK_SCHEMA_VERSION: u32 = 6;
+/// v7 (SOA-16) adds the optional upgrade lane verdict on [`SoakRun`],
+/// the same way.
+pub const SOAK_SCHEMA_VERSION: u32 = 7;
 
 /// Configuration for one soak run.
 ///
@@ -192,6 +196,13 @@ pub struct SoakRun {
 	/// which must never read as a passed lane.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub backup: Option<BackupLaneVerdict>,
+	/// The upgrade lane's verdict on this run (SOA-16), recorded through
+	/// [`SoakHarness::record_upgrade_verdict`] once the lane has judged
+	/// the store the upgrade pass left behind against the run's whole
+	/// acknowledged history. `None` until then — and forever for a run
+	/// with no upgrade lane, which must never read as a passed lane.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub upgrade: Option<UpgradeLaneVerdict>,
 }
 
 impl SoakRun {
@@ -356,7 +367,7 @@ impl SoakHarness {
 	/// [`RunMetadata::capture`]), not a second probe.
 	#[must_use]
 	pub const fn new(config: SoakConfig, metadata: RunMetadata) -> Self {
-		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None, derived: None, backup: None } }
+		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None, derived: None, backup: None, upgrade: None } }
 	}
 
 	/// Current lifecycle state.
@@ -503,6 +514,29 @@ impl SoakHarness {
 		anyhow::ensure!(self.run.state == SoakState::Running, "soak backup verdict can only be recorded while Running, not {:?}", self.run.state);
 		anyhow::ensure!(self.run.backup.is_none(), "soak backup verdict has already been recorded for this run");
 		self.run.backup = Some(verdict);
+		Ok(())
+	}
+
+	/// Record the upgrade lane's verdict on this run (SOA-16): the
+	/// judgement of the store the upgrade pass left behind against the
+	/// run's whole acknowledged history, plus the step that produced
+	/// it, kept in the run record beside the oracle, derived-read and
+	/// backup verdicts so a published run carries the evidence that
+	/// its upgrade preserved its data.
+	///
+	/// Recorded exactly once, while `Running` — the driver judges the
+	/// lane, records the verdict, and then finishes the run. A second
+	/// recording is refused rather than overwriting the first: a
+	/// verdict that can be quietly replaced is not evidence.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when a
+	/// verdict has already been recorded.
+	pub fn record_upgrade_verdict(&mut self, verdict: UpgradeLaneVerdict) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak upgrade verdict can only be recorded while Running, not {:?}", self.run.state);
+		anyhow::ensure!(self.run.upgrade.is_none(), "soak upgrade verdict has already been recorded for this run");
+		self.run.upgrade = Some(verdict);
 		Ok(())
 	}
 
@@ -686,7 +720,7 @@ mod tests {
 		harness.start().expect("start");
 		let record = harness.run_record();
 		assert_eq!(record.soak_schema_version, SOAK_SCHEMA_VERSION);
-		assert_eq!(record.soak_schema_version, 6, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, v5 from SOA-10's derived-read field, v6 from SOA-11's backup-lane field, independent of the bench schema");
+		assert_eq!(record.soak_schema_version, 7, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, v5 from SOA-10's derived-read field, v6 from SOA-11's backup-lane field, v7 from SOA-16's upgrade-lane field, independent of the bench schema");
 		// Reuse, not redefinition: the record's metadata is EVI-3's capture,
 		// with the same crate version / OS / arch / timestamp it was built from.
 		assert!(!record.metadata.weft_bench_version.is_empty(), "metadata must carry the bench crate version");
@@ -827,6 +861,29 @@ mod tests {
 		json.as_object_mut().expect("object").remove("backup");
 		let back: SoakRun = serde_json::from_value(json).expect("v5-shaped record deserializes");
 		assert!(back.backup.is_none(), "an absent backup field reads as no verdict, never a pass");
+	}
+
+	#[test]
+	fn upgrade_verdict_is_recorded_once_while_running() {
+		use crate::soak_upgrade::{UpgradeLaneVerdict, UpgradeStep};
+
+		let verdict = UpgradeLaneVerdict { ticks_judged: 4, points_expected: 64, points_upgraded: 64, mismatch_count: 0, mismatches: Vec::new(), step: UpgradeStep { from_version: "0.1.0".to_string(), to_version: "0.3.2".to_string(), layout_before: 1, layout_after: 2, upgrade_duration_ms: 450 } };
+		let mut harness = SoakHarness::new(config(), metadata());
+		assert!(harness.run_record().upgrade.is_none(), "no verdict before one is recorded");
+		assert!(harness.record_upgrade_verdict(verdict.clone()).is_err(), "a verdict cannot be recorded before the run starts");
+		harness.start().expect("start");
+		harness.record_upgrade_verdict(verdict.clone()).expect("record while Running");
+		assert_eq!(harness.run_record().upgrade.as_ref(), Some(&verdict), "the recorded verdict is on the run record");
+		assert_eq!(harness.run_record().upgrade.as_ref().map(|v| v.step.layout_after), Some(2), "the recorded verdict carries the layout the upgrade reached");
+		assert!(harness.record_upgrade_verdict(verdict).is_err(), "a second verdict must not overwrite the first");
+		harness.finish().expect("finish");
+		assert!(harness.run_record().upgrade.is_some(), "the verdict survives the finish");
+		// The field is additive: a v6 artifact without it deserializes
+		// with no verdict.
+		let mut json = serde_json::to_value(harness.run_record().redacted_copy()).expect("record to json");
+		json.as_object_mut().expect("object").remove("upgrade");
+		let back: SoakRun = serde_json::from_value(json).expect("v6-shaped record deserializes");
+		assert!(back.upgrade.is_none(), "an absent upgrade field reads as no verdict, never a pass");
 	}
 
 	#[test]

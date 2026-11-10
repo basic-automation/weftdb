@@ -56,6 +56,45 @@ on pull requests that touch crash-path files the workflow stays Linux-only.
 posting). A reference to that file exists in `DECISIONS.md` (this entry) and in
 the platform-gating comment block in `weft-bench/tests/crash_matrix_tests.rs`.
 
+## 2026-11-08 — SOA-16: the soak upgrade lane judges, it does not drive (FOR MERGE REVIEW)
+
+**Context.** The 1.0 plan names SOA-16 only as a W9 line ("Soak upgrade lane") and the
+issue (#327) carries no more than the ROADMAP line, so the slice's shape had to be
+grounded in the sibling lanes rather than invented: SOA-11's backup lane is the
+closest precedent — same "runs X inside a soak" acceptance, same in-process harness —
+and `soak_report.rs` already listed "SOA-16 upgrade (coverage not yet wired)" as an
+unwired surface. PAC-14a (#653, still open) supplies the procedure the lane judges
+(`UPGRADING.md`: stop the old binary, copy the whole store, start the new binary,
+migration on first open) and the legs it runs (A: upgrade from v0.1.0; C: rollback
+after writes, still unwired there).
+
+**Chosen:** the lane is a checker plus a run-record verdict, on the SOA-11 precedent.
+`UpgradeLaneChecker::judge_upgrade` takes the caller-supplied post-upgrade
+read-back and the upgrade step and requires the whole acknowledged history,
+complete and exact — no prefix cut, because the upgraded store is the live store,
+not a snapshot. The step records the versions, the store layouts and the pass
+duration. The verdict is recorded once on the run record (soak schema v7), the
+honesty section drops the "coverage not yet wired" line once a verdict exists, and
+the nightly comparison tracks `upgrade_ticks_judged` (0 %),
+`upgrade_mismatch_count` (0 %) and `upgrade_duration_ms` (10 %, same rationale as
+the backup durations). The lane adds no SLO rule: R1–R8 are fixed by supervisor
+decision 2026-11-06.
+
+**Rejected: performing the binary swap inside the lane.** The soak harness is
+in-process (the null server seam, no real store, no server binary to swap), so a
+lane that spawned binaries would be a driver, not a judge — and the nightly
+skeleton driver records no lane verdicts at all today, backup included. The
+caller performs the upgrade and hands the read-back to the checker, exactly as
+SOA-11's caller performs the backup, the restore and the reads. A driver that
+actually swaps binaries mid-soak is a later launch slice; until one exists the
+nightly honesty section keeps listing the lane as not tested, which is the
+honest statement.
+
+**Rejected: a rollback verdict shape of its own.** Leg C is the same judgement
+with the versions reversed (the step records `from_version`/`to_version` and
+`layout_before`/`layout_after` without constraining direction), so one verdict
+covers both legs; a second type would have duplicated the whole-history check
+for a label.
 ## 2026-11-07 — X-MANIFEST: a measure belongs to a result, and a v23 manifest stays unreadable (#517)
 
 **The duplicate-measure gate was keyed on the wrong thing.** `RunManifest::verify` flattened every
@@ -5892,3 +5931,194 @@ of `git add -A` (the harness drops `.pi-lens-probe-home/*.log` telemetry into th
 such files landed on a branch this week). **Rejected:** trusting a worker's own verification section.
 It is the exact artifact that lied twice in one day, and a check the producer performs on its own
 output is not a check.
+
+
+## 2026-11-09 — A worker's report is input, not evidence: the review reads the tree, not the prose
+
+**Three verification claims in one day were wrong, and one of them was mine.** A worker's risk list
+cited `weft-server/src/query_planner.rs` and a `weft-client` doctest that do not exist in this
+repository. A brief I wrote asserted `WEFT_DISK_RESERVE_BYTES` defaults to `0`; the registry in
+`weft-server/src/settings.rs` says `268,435,456 (256 MiB, DEFAULT_DISK_RESERVE_BYTES in weftdb)` and
+the worker followed the code rather than the brief, which was the right call. And when I accused a
+worker of inventing a stale-OpenAPI-golden risk, the file it named —
+`weft-server/src/openapi.rs:528 generated_spec_matches_committed_file()` — turned out to be real: my
+own reading had come from a stale detached worktree still parked at `140a5f9`.
+
+**Chosen:** the review order for an incoming PR is `gh pr view --json state,headRefOid,mergeable`,
+then `git diff --name-only origin/main..HEAD`, then `git show <ref>:<path>` for anything the report
+mentions, then a fresh `gh pr checks` — and a claim that no command reproduces is dropped from the
+merge decision rather than argued with. Briefs must not state a default value, an API surface, or a
+file's existence without quoting where that came from, because the worker will rightly trust the tree
+over the brief. **Rejected:** asking a worker to re-verify. It verified, and then misreported what it
+verified; the defect is in the reporting channel, not the amount of checking. This extends the
+2026-11-08 entry on wrong-tree PRs rather than repeating it: there the failure was location, here it
+is assertion, and both are caught by reading the tree instead of the summary.
+
+## 2026-11-09 — Agent scratch space and build caches live on disk, never on `/tmp`
+
+**`/tmp` here is a 63 GB tmpfs that shares its budget with `/home`, and it filled twice.** The first
+fill killed a subagent launch with `ENOSPC: no space left on device, write` before it ran a single
+command; the second killed a cargo build part-way through. Roughly 30 GB of it was regenerable
+`target/` caches, an 8 GB systemd journal, and a 16 GB orphaned subagent run directory from a session
+that had already ended. Separately, `/tmp/w645/target/debug` is owned by root, so a build there dies
+with `failed to open: /tmp/w645/target/debug/.cargo-build-lock — Permission denied (os error 13)`
+and a worker can spend ten turns on `rm -rf` and `chattr +i` before it notices the ownership.
+
+**Chosen:** worker worktrees go under `/mnt/deepmem/wt/<slice>` (15 TB of real disk, 6.9 TB free) and
+every build uses `CARGO_TARGET_DIR=/mnt/deepmem/targets/<slice>`; scratch scripts and fetched CI logs
+stay in `/tmp`, which is fine for kilobytes. **Rejected:** a symlink from `/tmp` to disk, which hides
+the problem instead of naming it, and using the host wrapper's default
+`/mnt/deepmem/Development/Cargo Target`, because two concurrent builds there contend for one cache.
+The rule is cheap enough to state in every brief: kilobytes to `/tmp`, gigabytes to `/mnt/deepmem`.
+
+## 2026-11-09 — clippy on this host needs the rustc-wrapper environment cleared
+
+**Every `cargo clippy` on this machine failed with a message that named rustc rather than the
+code.** `~/.cargo/config.toml` sets `rustc-wrapper = /home/physics515/.cargo/rustc-nightly-threads`,
+a script that adds `-Z threads=8` on nightly by probing `$1 -vV`. Under clippy `$1` is
+`clippy-driver`, so the script ends up exec-ing `clippy-driver …/bin/rustc - --print=file-names …`
+and rustc answers `error: multiple input filenames provided (first two filenames are …/bin/rustc and
+-)`, which cargo reports as `failed to run `rustc` to learn about target-specific information`. It
+looks like a broken toolchain; it is a wrapper that has never been correct for clippy.
+
+**Chosen:** every clippy invocation is prefixed
+`RUSTC_WORKSPACE_WRAPPER="" CARGO_BUILD_RUSTC_WRAPPER="" RUSTC_WRAPPER=""`, which is enough to clear
+both the config key and any inherited `RUSTC_WORKSPACE_WRAPPER` (the config file also carries
+`RUSTC_WORKSPACE_WRAPPER` in its env table). **Rejected:** editing the global wrapper — it is host
+configuration other tools depend on, and a repository whose CI does not use it must not acquire a
+dependency on it either. Worth remembering because the CI gate is
+`cargo clippy --workspace --all-targets --all-features --locked -- -D clippy::correctness -D
+clippy::suspicious -D clippy::perf` and weftdb's tests add `#![forbid(clippy::pedantic,
+clippy::nursery, clippy::all)]`, so a worker that cannot run clippy locally will discover those lints
+only in CI.
+
+## 2026-11-09 — Near-green pull requests are not rebased
+
+**#645 sat eleven commits behind main with nine commits of its own, and every check except one was
+green.** Rebasing looked like tidiness. It is a risk with no buyer: GitHub already runs CI on the
+merge ref, `mergeable` was true, and a rebase throws away a green check history and forces a full
+re-lint and re-test cycle — on a host where a `weftdb` build is refused below roughly 4 GB of free
+RAM, so the rebase cannot even be re-verified locally before it is pushed.
+
+**Chosen:** leave the base alone and take the merge commit GitHub produces; rebase only to resolve a
+real conflict, or when a branch's base predates a change its own code depends on. Where a branch
+genuinely needs main's code, merge `origin/main` into it — which is what #598 does to pick up the
+Windows `free_bytes_at` implementation — rather than rewriting the commits on top. **Rejected:**
+keeping main "linear" as a goal in itself; the history that matters here is which slice closed which
+issue, and a squash merge already records that.
+
+## 2026-11-09 — A platform gap is fixed, not cfg-gated: the disk guard on Windows (#667)
+
+**#598's Windows leg failed in three `disk_guard_tests`, and the cheap fix was to stop asking
+Windows the question.** The tests drive the ROB-17 reserve against a real filesystem and expect
+`StoreError::InsufficientStorage`; `weftdb/src/types/backup.rs free_bytes_at()` had a `#[cfg(unix)]`
+arm using `statvfs` and returned `None` everywhere else, so the guard could not refuse and
+`expect_err("the guard refuses")` failed. Gating the assertions to Unix would have turned the only
+coverage of a storage guard into a Linux-only feature by deleting the test that would notice.
+
+**Chosen:** implement the missing platform. The brief proposed `std::fs::available_space`, which does
+not exist on this toolchain (`error[E0425]: cannot find function `available_space` in module
+`std::fs`` on rustc 1.100.0-nightly) — the worker's `available_space`-free reading of the brief was
+correct, and #669 implements the call through `GetDiskFreeSpaceExW` in a `#[cfg(windows)] extern
+"system"` block with no new dependency and no `#[link]` attribute, keeping `None` only where the OS
+itself refuses. In the interim the `/ready` test states the difference rather than hiding it —
+`let expected = if reserve > 0 { cfg!(unix) } else { false };` asserts that the guard is *inert*
+off Unix, which is a claim, not a skip. **Rejected:** `#[cfg(unix)]` on the tests, and adding the
+`windows` crate as a dependency for one signature.
+
+**Closed 2026-11-09, same day.** #669 merged and #598 merged `origin/main`, so the interim is over
+and the two platform arms now live beside each other in `weftdb/src/types/disk_guard.rs
+disk_space_at()` (`statvfs` on Unix filling `DiskSpace { total_bytes, available_bytes }`,
+`GetDiskFreeSpaceExW` on Windows with real out-params for both totals, `None` only on a platform
+with no probe); `backup.rs free_bytes_at()` is the one-line delegation to it. The interim claim was
+removed rather than left to rot: the `/ready` test now expects a refusal wherever
+`weftdb::disk_space_at(dir.path())` answers `Some`, so the expectation follows the platform's
+capability instead of naming it, and a platform that loses the probe still fails honestly.
+
+## 2026-11-05 — ROB-17: the disk guard's shape, and what it does not guard (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan names ROB-17 only as "Disk guard, headroom API and space gauges"
+(seal lane, after TAG-7) and fixes one boundary in C11: the request-level `507` belongs to
+ROB-18's two-phase body extractor, "via ROB-17's `DiskGuard`, so ROB-17 never edits
+ingest.rs". The reserve, its default, where the guard sits and what the headroom route
+looks like are not specified.
+
+**Chosen:**
+
+1. **`weftdb::DiskGuard` is a reserve, checked before the first frame.** A write of `need`
+   bytes is admitted while `available - need >= reserve` (`statvfs`'s `f_bavail`, the
+   unprivileged figure). `SegmentStore::ingest` decides once per batch, on the whole
+   batch's plain encoding, before any frame is written — a refusal half-way would leave
+   frames for recovery to sweep. The direct seals (`seal*`, through `persist` /
+   `persist_paged`) check their one frame. The refusal is
+   `StoreError::InsufficientStorage`, `507 insufficient_storage` at the API (a `5xx` whose
+   numbers stay in the operator-only cause), and it is not recorded in the idempotency
+   ledger, so the same request succeeds once there is room. `weft-server`'s `ingest.rs` is
+   untouched, as C11 requires; ROB-18's request-level check is left to call the same
+   `DiskGuard::admit` (it is public for that).
+2. **`WEFT_DISK_RESERVE_BYTES`, Tuning tier, default 256 MiB, `0` turns it off.** Enough for
+   the control plane to commit, checkpoint and back itself up after frames stop. The
+   library default (`SegmentStoreOptions::default`) is `0`, so an embedder's open refuses
+   nothing it did not refuse before; the server reads the variable through
+   `SegmentStoreOptions::from_env`, like every other store option.
+3. **Maintenance is not guarded.** A squash or reconciliation writes before it deletes, but
+   it is how a store gets space back; refusing it near the reserve would pin the store
+   full.
+4. **The headroom is a read of the filesystem, not a counter.** `GET
+   /api/v1/storage/headroom` (experimental, `metrics` scope — host numbers are the
+   operator's) answers `total_bytes`, `available_bytes`, `reserve_bytes`, `writable_bytes`
+   and `refusing`; `/metrics` carries the same as `weft_disk_*` gauges plus a 0/1
+   `weft_disk_guard_refusing` (the analogue of VictoriaMetrics' `vm_storage_is_read_only`,
+   which `vmstorage` sets while free space is under `-storage.minFreeDiskSpaceBytes`:
+   https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/docs/victoriametrics/Cluster-VictoriaMetrics.md#readonly-mode).
+   Without a store, or on a platform that cannot describe the filesystem, the gauges are
+   absent rather than zero, so a scrape never reads a made-up full disk.
+
+5. **Logged per transition, not per request.** The store records each guard decision in a
+   `RefusalLatch` and logs WARN when it starts refusing and INFO when it admits again; the
+   server answers the refusal with `ApiError::server_logged_elsewhere`, the `5xx`
+   constructor without the per-request error line. A client retrying against a full disk
+   would otherwise write one error line per attempt into the logs on the disk that is full.
+6. **`/ready` carries `disk_refusing`, a boolean, and stays `200 ready`.** Reads keep
+   working, so the server is still ready; the flag is what lets a balancer or ingest router
+   steer writes elsewhere, as `vminsert` re-routes around a read-only `vmstorage`. The probe
+   answers without a key, so it carries the state only; the byte counts stay on the
+   `metrics`-scoped headroom route.
+
+**Rejected:** guarding every `create_new_write` in `StoreFs` (it would refuse maintenance and
+recovery writes too, and a frame refused half-way through a batch is litter); a
+percentage reserve (a percentage of a 15 TB volume is hundreds of GB nobody asked to keep,
+and of a small volume too little for the control plane).
+
+## 2026-11-05 — ROB-9: the `parquet` decoder's panics are contained at `weft_arrow::read_parquet` (FLAGGED FOR MERGE REVIEW)
+
+**What the harness found.** ROB-9's mutation harness feeds every one-byte substitution,
+every truncation and 2,048 seeded multi-byte mutants of a real WeftDB-written Parquet file
+to the ingest decoder (`weft_arrow_store::decode_parquet_columns_strict`). 15 of 14,161
+mutants panicked inside `parquet` 60.0.0 instead of returning its error: `offset + len out
+of bounds`, `column start and length should not be negative`, and `Decoder for dict should
+have been set`. Before this change such a body reached ROB-3's panic layer and was answered
+`500 commit_failed` — a client's malformed file reported as a server failure, with an
+error-level panic log per request.
+
+**Chosen:** `weft_arrow::read_parquet` runs the decode under `catch_unwind` and answers a
+panic as `ConvertError::Parquet("the Parquet decoder could not read this file (…)")`, which
+the ingest classifier already maps to `400 bad_request`. This amends plan C12 ("ROB-3's
+layer is the only layer that catches panics") for exactly one place, and the argument is
+that C12's reasons do not apply there: C12 exists so a panic in *WeftDB's* request handling
+is reported once, as the envelope, and so a control-plane panic stays a fail-stop. The
+Parquet decode is a third-party pure function of an owned copy of the caller's bytes, run
+before the seal, outside any control-plane write (so ROB-2's abort can never be what it
+would swallow), holding no lock or shared state that an unwind could leave inconsistent.
+
+**The frame and sidecar halves found one bug and fixed it at its source rather than
+containing it:** the windowed range read's closed form sized its window from the header's
+`row_count` without the ROB-8 cross-check the full decode applies, so a resealed frame
+whose header claimed 0 rows underflowed `row_count - 1` (a panic in debug, a wrapped
+`usize::MAX` bound in release). It now refuses a header that disagrees with its timestamp
+column (`ColumnLengthMismatch`, Integrity). No sidecar mutant panicked.
+
+**Rejected:** leaving the panics to ROB-3 (wrong status, and an error log an attacker can
+generate at will); a `catch_unwind` in `weft-server`'s handler (C12's "no handler catches its
+own panics" is about exactly that); waiting for upstream (the fix belongs upstream too, and
+is filed as a to-do for the owner, but the boundary has to hold whatever version is pinned).

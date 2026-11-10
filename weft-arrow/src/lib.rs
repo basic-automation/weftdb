@@ -815,8 +815,26 @@ pub fn write_parquet(batches: &[RecordBatch]) -> Result<Vec<u8>, ConvertError> {
 /// # Errors
 ///
 /// Returns [`ConvertError::Parquet`] if the bytes are not a valid Parquet file or a
-/// batch fails to decode.
+/// batch fails to decode — including when the `parquet` decoder itself panics on a
+/// malformed file (see below).
+///
+/// The bytes are a caller's, so every one of them is hostile. The `parquet` crate
+/// (60.0.0) still panics on some malformed files instead of returning its error —
+/// ROB-9's mutation harness (`weft-arrow-store/tests/parquet_mutation.rs`) found
+/// `offset + len out of bounds`, `column start and length should not be negative` and
+/// `Decoder for dict should have been set` within single-byte edits of a valid file. A
+/// decode is a pure function of an owned copy of the bytes, holding no lock and no shared
+/// state, so such a panic is contained here and answered as the malformed file it is,
+/// rather than reaching the server's panic layer as a `500` (DECISIONS 2026-11-05, ROB-9).
 pub fn read_parquet(bytes: &[u8]) -> Result<Vec<RecordBatch>, ConvertError> {
+	std::panic::catch_unwind(|| read_parquet_unguarded(bytes)).unwrap_or_else(|panic| {
+		let message = panic.downcast_ref::<&str>().map(ToString::to_string).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a non-string panic".to_string());
+		Err(ConvertError::Parquet(format!("the Parquet decoder could not read this file ({message})")))
+	})
+}
+
+/// [`read_parquet`] without the panic containment.
+fn read_parquet_unguarded(bytes: &[u8]) -> Result<Vec<RecordBatch>, ConvertError> {
 	// The builder needs an owned `ChunkReader`; `bytes::Bytes` (re-exported by the
 	// `parquet` crate) implements it, so copy the borrowed slice into one.
 	let input = Bytes::copy_from_slice(bytes);

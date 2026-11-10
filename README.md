@@ -198,7 +198,7 @@ Run it yourself with `weft-xbench`; see [Benchmarking](docs/reference.md#benchma
 |---|---|
 | Interpolation, gap fill, downsampling, HTTP API, Arrow/Parquet | Working, tested, benchmarked |
 | Security: TLS, API keys and roles | Working, with a fsynced audit log; no security review yet |
-| Crash safety | Durable writes and crash recovery; power-loss testing on real hardware still to do |
+| Crash safety | Durable writes and crash recovery; writes are refused (`507`) before they would fill the disk past a reserve; power-loss testing on real hardware still to do |
 | Backup and restore | Working, including `weft-server restore` |
 | Binaries, crates, container image | Binaries and crates released; container image built but not published |
 | Tags, client SDKs, Helm chart | Not started |

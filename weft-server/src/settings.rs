@@ -108,6 +108,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_COMPACT_TARGET_ROWS", tier: Tier::Tuning, summary: "The size-aware compaction pass of the maintenance scheduler: each aspect's segments coalesce toward this many rows per segment instead of folding into one.", accepts: "a positive whole number of rows", default: "65,536 (`DEFAULT_COMPACT_TARGET_ROWS` in startup/daemons.rs) — compaction is on by default (ROB-19); a non-numeric value stops the server from starting", read_by: "weft-server/startup/daemons.rs" },
 	VarSpec { name: "WEFT_DATA_DIR", tier: Tier::Stable, summary: "The database's data directory: where a `Database`'s store directories live, and where `weft-tui` writes its log.", accepts: "a directory path", default: "`~/.weftdb/data`", read_by: "weftdb/types/database/config.rs, weft-tui/main.rs" },
 	VarSpec { name: "WEFT_DB_NEW_CRASH_CHILD", tier: Tier::Test, summary: "Marks the child process the database-new crash test spawns, so the parent can tell its deliberate crash from a real one.", accepts: "a stage name from the test's own list", default: "unset", read_by: "weftdb/tests/db_tests.rs (test child)" },
+	VarSpec { name: "WEFT_DISK_RESERVE_BYTES", tier: Tier::Tuning, summary: "The bytes every ingest or seal must leave available on the store's filesystem (ROB-17): a write that would leave less is refused `507 insufficient_storage` before any frame is written. `GET /api/v1/storage/headroom` and the `weft_disk_*` gauges on `/metrics` report the margin.", accepts: "a non-negative whole number of bytes; `0` turns the guard off", default: "268,435,456 (256 MiB, `DEFAULT_DISK_RESERVE_BYTES` in weftdb); a malformed value stops the server from starting", read_by: "weftdb/types/segment_store.rs (`SegmentStoreOptions::from_env`), read in store_open.rs" },
 	VarSpec { name: "WEFT_EXTRACTED_BATCH_RETENTION_SECS", tier: Tier::Tuning, summary: "How long the queue remembers that a pattern extraction already consumed a batch, which is how long a re-ingested batch is recognised as a duplicate.", accepts: "a positive whole number of seconds", default: "48 h (172800 s); anything else warns and keeps the default", read_by: "weftdb/types/database/inputs.rs" },
 	VarSpec { name: "WEFT_FAULT", tier: Tier::Test, summary: "Arms durable fault points so a test can make a commit, an fsync or a swap fail at a chosen step. Not configuration: it exists to make crashes testable.", accepts: "a comma-separated list of `<point>:abort` or `<point>:err`, e.g. `S-frame-synced:abort`", default: "unset: no fault armed (the points are not even compiled without the `fault-injection` feature)", read_by: "weftdb/types/durable/fault.rs" },
 	VarSpec { name: "WEFT_FAULT_TEST_CHILD", tier: Tier::Test, summary: "Marks the child process a fault-injection test spawns, so its parent can tell a deliberate abort from a real crash.", accepts: "any value", default: "unset", read_by: "weftdb/types/durable/fault.rs" },
@@ -331,7 +332,7 @@ pub const UNEXPECTED_EXIT_CODE: i32 = 1;
 /// Variables whose registry `accepts` shape is a non-negative whole number. A value
 /// outside that shape was, before PAC-5b, refused by some readers and silently
 /// defaulted by others; strict validation refuses it wherever it appears.
-const NON_NEGATIVE_INTS: &[&str] = &["WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS", "WEFT_MAINTENANCE_BREAKER_FAILURES", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_RECONCILE_THRESHOLD", "WEFT_RECONCILE_SPLIT_MIN_BYTES", "WEFT_SEGMENT_CHECKPOINT_STRIDE"];
+const NON_NEGATIVE_INTS: &[&str] = &["WEFT_BACKUP_INTERVAL_SECS", "WEFT_BACKUP_KEEP", "WEFT_DISK_RESERVE_BYTES", "WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS", "WEFT_MAINTENANCE_BREAKER_FAILURES", "WEFT_RECONCILE_INTERVAL_SECS", "WEFT_RECONCILE_THRESHOLD", "WEFT_RECONCILE_SPLIT_MIN_BYTES", "WEFT_SEGMENT_CHECKPOINT_STRIDE"];
 
 /// Variables whose registry `accepts` shape is a positive whole number.
 const POSITIVE_INTS: &[&str] = &["WEFT_COMPACT_TARGET_ROWS", "WEFT_EXTRACTED_BATCH_RETENTION_SECS", "WEFT_HEADER_READ_TIMEOUT_SECS", "WEFT_INGEST_MAX_INFLIGHT_BYTES", "WEFT_KEEP_ALIVE_TIMEOUT_SECS", "WEFT_MAX_CONNECTIONS", "WEFT_MAX_INGEST_BYTES", "WEFT_MAX_INGEST_DECODED_BYTES", "WEFT_MAX_INGEST_ROWS", "WEFT_MAX_INTERPOLATE_POINTS", "WEFT_MAX_SERIES_PER_ASPECT", "WEFT_QUERY_MAX_INFLIGHT", "WEFT_RECONCILE_MAX_SPLITS", "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", "WEFT_SEGMENT_PARTIAL_MIN_ROWS", "WEFT_SHUTDOWN_GRACE_SECS", "WEFT_WORKER_THREADS", "WEFT_WRITE_STALL_TIMEOUT_SECS"];
@@ -521,7 +522,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 103, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 104, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not

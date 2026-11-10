@@ -35,8 +35,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   exercised). The nightly workflow (parts 1 and 3 of SOA-15) was already present
   on `origin/main` with active cron, first-night-no-baseline, and SHA-pinned
   actions.
+- **Configuration schema v2.** `docs/config-schema.md` now documents `WEFT_DISK_RESERVE_BYTES`
+  (one new Tuning variable). `schema_version` is bumped to 2 in both the doc and
+  `config/schema.toml`.
 
 ### Fixed
+- **`free_bytes_at` now works on Windows and other platforms (#667).** The disk guard was inert on Windows, making `GET /ready`'s `disk_refusing` permanently false. Implemented via inline FFI to `GetDiskFreeSpaceExW` (no new dependencies).
+
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
 
 - **`host-install.yml` carried the one unpinned action on `main` (#626).**
@@ -160,6 +165,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   annotations. The comparison function lives in
   `weft-bench/src/soak_compare.rs`, and the annotator script in
   `scripts/annotate-soak-drift.py`. Documented in `docs/soak.md`.
+
+- **Soak upgrade lane (SOA-16).** `weft-bench/src/soak_upgrade.rs` judges
+  the store an in-soak upgrade leaves behind against the run's whole
+  acknowledged history, exactly, and records the upgrade step (the
+  versions on either side, the store layouts, and the pass's duration) on
+  the run record (`SoakHarness::record_upgrade_verdict`, soak schema v7).
+  The caller performs the upgrade per `UPGRADING.md` (PAC-14a) and hands
+  the read-back to the checker, on the SOA-11 backup lane precedent; the
+  lane adds no SLO rule. The nightly comparison tracks
+  `upgrade_ticks_judged` (0 %), `upgrade_mismatch_count` (0 %) and
+  `upgrade_duration_ms` (10 %). Documented in `docs/soak.md`.
 
 - **Performance methodology document.** `docs/methodology.md` defines what
   counts as a performance claim, what evidence a claim must carry, what
@@ -303,6 +319,45 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   strict-config warnings already use. Exit status is unchanged (78). This is what lets
   `scripts/packaging/test-host-install.sh` gate 4 prove that the systemd env file it
   installed is the configuration the running binary read.
+
+### Added
+
+- **Disk guard, headroom API and space gauges** (ROB-17). An ingest or seal that would
+  leave the store's filesystem with less than `WEFT_DISK_RESERVE_BYTES` available (default
+  256 MiB; `0` turns it off) is refused `507 insufficient_storage` before any frame is
+  written (`weftdb::DiskGuard`, `StoreError::InsufficientStorage`). The experimental
+  `GET /api/v1/storage/headroom` (`metrics` scope) reports the filesystem's size, available
+  bytes, the reserve and what is still writable, and `/metrics` carries the same numbers as
+  the `weft_disk_{total,available,reserve,writable}_bytes` gauges plus a 0/1
+  `weft_disk_guard_refusing`. The library default
+  (`SegmentStoreOptions::default`) leaves the guard off. The refusal is logged once when
+  the guard starts refusing (WARN) and once when it admits again (INFO), not per request. `GET /ready`
+  gains `disk_refusing` (a boolean; `ready` stays `true`, since reads keep working).
+  Both SDKs read the headroom: `weft_client::Client::headroom()` (typed `Headroom`) and
+  the Python `Client.headroom()`.
+- **Mutation harness for frames, sidecars and Parquet** (ROB-9). Every committed golden
+  `.weftseg` frame, a tiered `.weftpart` sidecar and a WeftDB-written Parquet file are
+  mutated — every byte substitution, every truncation, and a seeded multi-byte corpus —
+  and **resealed** (CRC recomputed, so the mutation reaches the decoders) before going
+  through every reader; none may panic.
+
+### Fixed
+
+- **A resealed frame whose header claims 0 rows no longer panics the windowed range read**
+  (ROB-9). The closed-form range window now cross-checks the header's row count against
+  the timestamp column, as the full decode already did, and refuses a disagreement as
+  `ColumnLengthMismatch`.
+- **A Parquet body that panics the `parquet` decoder is `400 bad_request`, not
+  `500 commit_failed`** (ROB-9). `weft_arrow::read_parquet` contains the decoder's own
+  panics (three found in `parquet` 60.0.0 within single-byte edits of a valid file) as
+  `ConvertError::Parquet`.
+- **JSON floats are parsed to the nearest `f64` in every build of `weft-server`.** serde_json's
+  default float parser is not correctly rounded, and a `weft-server` built on its own — as
+  the release workflow and the Docker image build it — read some JSON numbers one ULP away
+  from their text (for example `900719925474100.5`; 175,103 of a seeded million values
+  shaped like the compute routes' inputs); a whole-workspace build happened to
+  read them right through another crate's `arbitrary_precision`. The workspace now enables
+  serde_json's `float_roundtrip`.
 
 ## [0.3.0] - 2026-11-05
 
