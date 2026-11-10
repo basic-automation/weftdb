@@ -1433,7 +1433,7 @@ fn filter_queue_at(signals: &mut Signals, events: &[weftdb::Event], correlations
 ///
 /// The queue lock is never held across an await: the database reads happen before it is
 /// taken and the correlation writes after it is released, with the whole guarded pass in
-/// the sync [`filter_queue_at`]. So a pipeline over one aspect cannot stall a pipeline
+/// the synchronous `filter_queue_at` pass. So a pipeline over one aspect cannot stall a pipeline
 /// over another on this lock while either waits on database I/O.
 ///
 /// Two consequences of reading outside the lock, both benign and both in the same
@@ -2981,7 +2981,10 @@ mod tests {
 			// Past-expiration signal
 			signals.insert(Signal::new(correlation.id().clone(), weftdb::ManifestationId::new(), event.id().clone(), start - chrono::Duration::hours(48), SignalType::PredictStart, weftdb::Distance::new(BigDecimal::from(1), Resolution::Hours)));
 			signals.insert(Signal::new(correlation.id().clone(), weftdb::ManifestationId::new(), event.id().clone(), start - chrono::Duration::hours(48), SignalType::PredictEnd, weftdb::Distance::new(BigDecimal::from(1), Resolution::Hours)));
+			drop(queue);
 		}
+		drop(correlation);
+		drop(subject);
 
 		// Concurrent calls on the same aspect: both contend for one queue entry.
 		let db1 = db.clone();
