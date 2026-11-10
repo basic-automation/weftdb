@@ -6134,6 +6134,30 @@ generate at will); a `catch_unwind` in `weft-server`'s handler (C12's "no handle
 own panics" is about exactly that); waiting for upstream (the fix belongs upstream too, and
 is filed as a to-do for the owner, but the boundary has to hold whatever version is pinned).
 
+## 2026-11-10 — Rollback and binary compatibility: unsupported for 1.0 (FRE-16)
+
+**Rollback-after-writes and binary-compatibility legs are explicitly unsupported for 1.0.
+They are removed from `compat/releases.toml` and the `LEGS` constant.**
+
+The brief for FRE-16 decided this: rollback-after-writes is not a 1.0 promise because a
+store written by the current layout is not readable by older binaries (`docs/stability.md`
+already said this). The `rollback` and `binary` legs in `compat/releases.toml` were
+fiction — declared pins with no test runners, and `docs/stability.md` admitted at two
+places that nothing executes them. The new gate (`scripts/compat/test_leg_coverage.py`)
+refuses to let a pin declare a leg that has no test runner, so the fiction had to become
+honest.
+
+**Considered and rejected:** marking the legs `unsupported` in the TOML rather than
+removing them, with the gate checking `supported`/`unsupported` states. That would add
+a new field and a new concept to a file with a single release pin, with no second user
+before 1.0. Simpler to drop the non-existent legs; they can be re-added with a runner
+when someone implements them.
+
+**Boundary:** the `upgrade` leg is the only leg with a real test
+(`weftdb/tests/compat_v010.rs`). The gate treats it as implemented.
+
+**Documents updated:** `compat/releases.toml`, `scripts/compat/releases.py`,
+`docs/stability.md`, `UPGRADING.md`, `CHANGELOG.md`.
 ## 2026-11-10 — Per-aspect signal queue: a synchronous guarded pass, not a pure-function refactor (ORCH-SIG #402)
 
 **Ambiguous:** the review BLOCK said the `SIGNALS_QUEUE` guard was held across `.await`s. Two fixes were

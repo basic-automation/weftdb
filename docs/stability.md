@@ -101,8 +101,8 @@ for upgrade testing.
 
 **Not yet guaranteed:**
 - **Rollback after writes** (PAC-14a, roadmap W9). A store that has been written by a
-  newer release cannot yet be opened by an older one. The rollback leg exists in
-  `compat/releases.toml` as a placeholder but has no test behind it.
+  newer release cannot yet be opened by an older one. Rollback is unsupported for 1.0:
+  a store written by the current layout is not readable by older binaries.
 - **Layout-2 baseline fixtures** (FRE-18, roadmap W13). The freeze cut that writes the
   layout-2 fixture set that 1.0 and later upgrades run against is still in the future.
 
@@ -161,18 +161,20 @@ The compatibility suite lives in two places:
    - The exact commit the tag points at.
    - The fixture set that release wrote (`compat/fixtures/<tag>/`).
    - The `upgrade` leg (the pinned release's store opens on the candidate).
-   - The `rollback` leg (the candidate's writes can be read by the pinned release's
-     binary). **The leg is declared; nothing executes it.**
-   - The `binary` leg (the pinned release's binary runs against the candidate's store).
-     **Declared in `LEGS`, used by no pin, and executed by nothing.**
+   - The `upgrade` leg (the pinned release's store opens on the candidate), which
+     is the only leg the compat suite actually executes.
    - The SHA-256 digest of every archive the release published.
 
    The [`compat` job in `ci.yml`](../.github/workflows/ci.yml) runs `releases.py verify`
    on every CI run. That command re-checks every pin against git and against
-   `compat/fixtures/`, so a fixture that drifts fails CI. It validates the pin metadata
-   only — `LEGS = {"upgrade", "rollback", "binary"}` is checked for unknown names, and no
-   leg is executed by it. The leg that does run as code is the upgrade path, in
-   `tests/compat_v010.rs`.
+   `compat/fixtures/`, so a fixture that drifts fails CI. The leg that does run as code
+   is the upgrade path, in `tests/compat_v010.rs`.
+
+   Since [FRE-16](https://github.com/basic-automation/weftdb/issues/FRE-16), a
+   dedicated gate (`scripts/compat/test_leg_coverage.py`) refuses to let a pin declare
+   a leg that has no test runner — unknown or unexecuted legs are errors, not warnings.
+   The only recognised leg is `upgrade`; `rollback` and `binary` are explicitly
+   unsupported for 1.0.
 
 2. **`tests/compat_v010.rs`** — the Rust integration test that opens a v0.1.0 fixture
    set, reads it under the current build, and checks that the migration is
@@ -184,8 +186,9 @@ The compatibility suite lives in two places:
 - Fixture integrity: no committed fixture drifts from what its release wrote.
 
 **What the suite does NOT cover today (gaps named in ROADMAP.md):**
-- Rollback after writes (PAC-14a).
-- Binary compatibility (the `binary` leg in `compat/releases.toml` is not implemented).
+- Rollback after writes (PAC-14a). Rollback is unsupported for 1.0: a store written
+  by the current layout is not readable by older binaries.
+- Binary compatibility. Explicitly unsupported for 1.0.
 - Layout-2 baseline fixture (FRE-18, W13).
 
 ---
@@ -219,9 +222,9 @@ stability promise for:
 | R client | ROADMAP mentions the R SDK as shipped | Not on CRAN; no release pin, no CI compat job |
 | Arrow Flight | `docs/reference.md` marks it **experimental** | No compat test, no version marker |
 | Grafana datasource | `docs/reference.md` marks it **experimental** | No compat test, no version marker |
-| Rollback after writes | ROADMAP W9: PAC-14a | `rollback` leg in `compat/releases.toml` has no test |
+| Rollback after writes | ROADMAP W9: PAC-14a | Rollback is unsupported for 1.0 — a store written by the current layout is not readable by older binaries |
 | Layout-2 baseline fixture | ROADMAP W13: FRE-18 | No freeze cut has been made; no layout-2 fixture set is committed |
-| Binary compatibility | ROADMAP "Compatibility tests" | `binary` leg in `compat/releases.toml` not implemented |
+| Binary compatibility | ROADMAP "Compatibility tests" | Binary compatibility is explicitly unsupported for 1.0 |
 | Configuration schema | ROADMAP W8: PAC-5a | Version marker and name-coverage checker exist (PAC-5a). No formal JSON Schema / CUE that validates value shapes, types, or ranges across releases. |
 
 Every one of these gaps is visible in the roadmap as an unchecked box. When a new check
