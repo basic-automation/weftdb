@@ -15,9 +15,10 @@
 //! before the guard has to refuse anything.
 //!
 //! What it does not cover: maintenance outputs (compaction, reconciliation) are not
-//! guarded, because a squash is how a store gets its space back; and a filesystem the
-//! platform cannot describe ([`disk_space_at`] answers `None`) is admitted, the write
-//! itself being the test, as for the backup headroom check (D-S16).
+//! guarded, because a squash is how a store gets its space back; and a filesystem on a
+//! platform that cannot describe it ([`disk_space_at`] answers `None` — Unix and Windows
+//! are supported, other platforms return `None`) is admitted, the write itself being the
+//! test, as for the backup headroom check (D-S16).
 
 use std::path::Path;
 
@@ -36,17 +37,20 @@ pub struct DiskSpace {
 /// The filesystem size and available bytes at `path` (or its nearest existing ancestor),
 /// where the platform can say.
 ///
-/// Unix `statvfs`. `None` where it cannot; a guard then has nothing to check against.
+/// On Unix uses `libc::statvfs`; on Windows uses
+/// [`GetDiskFreeSpaceExW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw).
+/// Returns `None` when the OS refuses to answer or the path has no existing ancestor,
+/// in which case a guard has nothing to check against and the write itself is the test.
 #[must_use]
 pub fn disk_space_at(path: &Path) -> Option<DiskSpace> {
+	let mut probe = path.to_path_buf();
+	while !probe.exists() {
+		if !probe.pop() {
+			return None;
+		}
+	}
 	#[cfg(unix)]
 	{
-		let mut probe = path.to_path_buf();
-		while !probe.exists() {
-			if !probe.pop() {
-				return None;
-			}
-		}
 		let c_path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).ok()?;
 		// SAFETY: `statvfs` is a plain C struct of integers, for which all-zero is a valid
 		// value, and the call only writes into it.
@@ -56,16 +60,35 @@ pub fn disk_space_at(path: &Path) -> Option<DiskSpace> {
 		if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
 			return None;
 		}
-		// The field widths differ between platforms, hence the casts (as `free_bytes_at`).
+		// The field widths differ between platforms, hence the casts.
 		let fragment = stat.f_frsize as u64;
 		let (blocks, available) = (stat.f_blocks as u64, stat.f_bavail as u64);
 		Some(DiskSpace { total_bytes: blocks.saturating_mul(fragment), available_bytes: available.saturating_mul(fragment) })
 	}
-	#[cfg(not(unix))]
+	#[cfg(windows)]
 	{
-		let _ = path;
+		use std::os::windows::ffi::OsStrExt;
+		let wide: Vec<u16> = probe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+		let mut free_bytes_available: u64 = 0;
+		let mut total_bytes: u64 = 0;
+		// SAFETY: `GetDiskFreeSpaceExW` writes into caller-allocated buffers.
+		let result = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &raw mut free_bytes_available, &raw mut total_bytes, std::ptr::null_mut()) };
+		if result == 0 {
+			return None;
+		}
+		Some(DiskSpace { total_bytes, available_bytes: free_bytes_available })
+	}
+	#[cfg(not(any(unix, windows)))]
+	{
+		let _ = probe;
 		None
 	}
+}
+
+#[cfg(windows)]
+extern "system" {
+	/// <https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw>
+	fn GetDiskFreeSpaceExW(directory_name: *const u16, free_bytes_available: *mut u64, total_number_of_bytes: *mut u64, total_number_of_free_bytes: *mut u64) -> i32;
 }
 
 /// The store's free-space policy: how many bytes every write must leave available.

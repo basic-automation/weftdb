@@ -5893,6 +5893,100 @@ such files landed on a branch this week). **Rejected:** trusting a worker's own 
 It is the exact artifact that lied twice in one day, and a check the producer performs on its own
 output is not a check.
 
+
+## 2026-11-09 — A worker's report is input, not evidence: the review reads the tree, not the prose
+
+**Three verification claims in one day were wrong, and one of them was mine.** A worker's risk list
+cited `weft-server/src/query_planner.rs` and a `weft-client` doctest that do not exist in this
+repository. A brief I wrote asserted `WEFT_DISK_RESERVE_BYTES` defaults to `0`; the registry in
+`weft-server/src/settings.rs` says `268,435,456 (256 MiB, DEFAULT_DISK_RESERVE_BYTES in weftdb)` and
+the worker followed the code rather than the brief, which was the right call. And when I accused a
+worker of inventing a stale-OpenAPI-golden risk, the file it named —
+`weft-server/src/openapi.rs:528 generated_spec_matches_committed_file()` — turned out to be real: my
+own reading had come from a stale detached worktree still parked at `140a5f9`.
+
+**Chosen:** the review order for an incoming PR is `gh pr view --json state,headRefOid,mergeable`,
+then `git diff --name-only origin/main..HEAD`, then `git show <ref>:<path>` for anything the report
+mentions, then a fresh `gh pr checks` — and a claim that no command reproduces is dropped from the
+merge decision rather than argued with. Briefs must not state a default value, an API surface, or a
+file's existence without quoting where that came from, because the worker will rightly trust the tree
+over the brief. **Rejected:** asking a worker to re-verify. It verified, and then misreported what it
+verified; the defect is in the reporting channel, not the amount of checking. This extends the
+2026-11-08 entry on wrong-tree PRs rather than repeating it: there the failure was location, here it
+is assertion, and both are caught by reading the tree instead of the summary.
+
+## 2026-11-09 — Agent scratch space and build caches live on disk, never on `/tmp`
+
+**`/tmp` here is a 63 GB tmpfs that shares its budget with `/home`, and it filled twice.** The first
+fill killed a subagent launch with `ENOSPC: no space left on device, write` before it ran a single
+command; the second killed a cargo build part-way through. Roughly 30 GB of it was regenerable
+`target/` caches, an 8 GB systemd journal, and a 16 GB orphaned subagent run directory from a session
+that had already ended. Separately, `/tmp/w645/target/debug` is owned by root, so a build there dies
+with `failed to open: /tmp/w645/target/debug/.cargo-build-lock — Permission denied (os error 13)`
+and a worker can spend ten turns on `rm -rf` and `chattr +i` before it notices the ownership.
+
+**Chosen:** worker worktrees go under `/mnt/deepmem/wt/<slice>` (15 TB of real disk, 6.9 TB free) and
+every build uses `CARGO_TARGET_DIR=/mnt/deepmem/targets/<slice>`; scratch scripts and fetched CI logs
+stay in `/tmp`, which is fine for kilobytes. **Rejected:** a symlink from `/tmp` to disk, which hides
+the problem instead of naming it, and using the host wrapper's default
+`/mnt/deepmem/Development/Cargo Target`, because two concurrent builds there contend for one cache.
+The rule is cheap enough to state in every brief: kilobytes to `/tmp`, gigabytes to `/mnt/deepmem`.
+
+## 2026-11-09 — clippy on this host needs the rustc-wrapper environment cleared
+
+**Every `cargo clippy` on this machine failed with a message that named rustc rather than the
+code.** `~/.cargo/config.toml` sets `rustc-wrapper = /home/physics515/.cargo/rustc-nightly-threads`,
+a script that adds `-Z threads=8` on nightly by probing `$1 -vV`. Under clippy `$1` is
+`clippy-driver`, so the script ends up exec-ing `clippy-driver …/bin/rustc - --print=file-names …`
+and rustc answers `error: multiple input filenames provided (first two filenames are …/bin/rustc and
+-)`, which cargo reports as `failed to run `rustc` to learn about target-specific information`. It
+looks like a broken toolchain; it is a wrapper that has never been correct for clippy.
+
+**Chosen:** every clippy invocation is prefixed
+`RUSTC_WORKSPACE_WRAPPER="" CARGO_BUILD_RUSTC_WRAPPER="" RUSTC_WRAPPER=""`, which is enough to clear
+both the config key and any inherited `RUSTC_WORKSPACE_WRAPPER` (the config file also carries
+`RUSTC_WORKSPACE_WRAPPER` in its env table). **Rejected:** editing the global wrapper — it is host
+configuration other tools depend on, and a repository whose CI does not use it must not acquire a
+dependency on it either. Worth remembering because the CI gate is
+`cargo clippy --workspace --all-targets --all-features --locked -- -D clippy::correctness -D
+clippy::suspicious -D clippy::perf` and weftdb's tests add `#![forbid(clippy::pedantic,
+clippy::nursery, clippy::all)]`, so a worker that cannot run clippy locally will discover those lints
+only in CI.
+
+## 2026-11-09 — Near-green pull requests are not rebased
+
+**#645 sat eleven commits behind main with nine commits of its own, and every check except one was
+green.** Rebasing looked like tidiness. It is a risk with no buyer: GitHub already runs CI on the
+merge ref, `mergeable` was true, and a rebase throws away a green check history and forces a full
+re-lint and re-test cycle — on a host where a `weftdb` build is refused below roughly 4 GB of free
+RAM, so the rebase cannot even be re-verified locally before it is pushed.
+
+**Chosen:** leave the base alone and take the merge commit GitHub produces; rebase only to resolve a
+real conflict, or when a branch's base predates a change its own code depends on. Where a branch
+genuinely needs main's code, merge `origin/main` into it — which is what #598 does to pick up the
+Windows `free_bytes_at` implementation — rather than rewriting the commits on top. **Rejected:**
+keeping main "linear" as a goal in itself; the history that matters here is which slice closed which
+issue, and a squash merge already records that.
+
+## 2026-11-09 — A platform gap is fixed, not cfg-gated: the disk guard on Windows (#667)
+
+**#598's Windows leg failed in three `disk_guard_tests`, and the cheap fix was to stop asking
+Windows the question.** The tests drive the ROB-17 reserve against a real filesystem and expect
+`StoreError::InsufficientStorage`; `weftdb/src/types/backup.rs free_bytes_at()` had a `#[cfg(unix)]`
+arm using `statvfs` and returned `None` everywhere else, so the guard could not refuse and
+`expect_err("the guard refuses")` failed. Gating the assertions to Unix would have turned the only
+coverage of a storage guard into a Linux-only feature by deleting the test that would notice.
+
+**Chosen:** implement the missing platform. The brief proposed `std::fs::available_space`, which does
+not exist on this toolchain (`error[E0425]: cannot find function `available_space` in module
+`std::fs`` on rustc 1.100.0-nightly) — the worker's `available_space`-free reading of the brief was
+correct, and #669 implements the call through `GetDiskFreeSpaceExW` in a `#[cfg(windows)] extern
+"system"` block with no new dependency and no `#[link]` attribute, keeping `None` only where the OS
+itself refuses. In the interim the `/ready` test states the difference rather than hiding it —
+`let expected = if reserve > 0 { cfg!(unix) } else { false };` asserts that the guard is *inert*
+off Unix, which is a claim, not a skip. **Rejected:** `#[cfg(unix)]` on the tests, and adding the
+`windows` crate as a dependency for one signature.
+
 ## 2026-11-05 — ROB-17: the disk guard's shape, and what it does not guard (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the plan names ROB-17 only as "Disk guard, headroom API and space gauges"

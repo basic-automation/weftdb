@@ -8,11 +8,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 ### Added
+- **Layout-upgrade integration test (FRE-13).** `weftdb/tests/layout_upgrade.rs` covers:
+  the pre-v2 (layout-1) store upgrade to layout 2 through the public API, including
+  idempotency, data survival, new writes after upgrade, a synthetic marker test, and
+  a reverse-direction contract note.
+
 - **Versioned configuration schema (PAC-5a).** `docs/config-schema.md` now carries a
   `schema_version: 1` marker and a version-change table; `config/schema.toml` stores the
   machine-readable copy. `scripts/config/check_schema.py` validates that every registered
   variable is documented, the version markers agree, and the checker runs in the `claims`
   CI job. (#pending)
+
+- **Security documentation updated (SEC-14).** `docs/security.md` rewritten with source
+  citations to `weft-server/src/auth.rs`, `tls.rs`, `host_guard.rs`, `audit.rs`,
+  `settings.rs`, `routes.rs`, `main.rs`, and `cli.rs`. Adds the full six-role table,
+  credential-in-query guard, proxy guard, exit statuses, startup enforcement section,
+  and a section on security-relevant absences. See the branch diff for the full delta
+  from the previous version of the document.
 
 - **Operator documentation** ([docs/operations.md](docs/operations.md)) — backup and
   restore, systemd, container, upgrade, and failure modes with what to do.
@@ -28,6 +40,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `config/schema.toml`.
 
 ### Fixed
+- **`free_bytes_at` now works on Windows and other platforms (#667).** The disk guard was inert on Windows, making `GET /ready`'s `disk_refusing` permanently false. Implemented via inline FFI to `GetDiskFreeSpaceExW` (no new dependencies).
+
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
 
 - **`host-install.yml` carried the one unpinned action on `main` (#626).**
@@ -54,6 +68,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   [docs/upstream/turso-7480-reopen-refusal.md](docs/upstream/turso-7480-reopen-refusal.md).
 
 ### Changed
+
+- **Breaking (read shape): a range read now returns each timestamp once, newest value
+  wins (#443).** `read_time_range_of` now opens all segments overlapping the window (including
+  all-null ones) and folds them with `merge_newer_wins`, so a newer segment's null
+  overrides an older value at the same instant.  Point reads keep present-prune and
+  skip `None` from the frame reader, so a newer all-null segment does **not** mask an
+  older value there — the resulting asymmetry between range and point is deliberate
+  and pinned by a test.
 
 - **Fill tokens are exact-case** (PAC-3, #453). `Fill::from_token` now matches the
   lowercase wire tokens exactly, so `?fill=`, the downsample JSON body's `fill`,

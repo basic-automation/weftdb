@@ -313,12 +313,17 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     validated by `generated_spec_passes_structural_validation`.*
   - [x] **ROB-9** Mutation harness for frames, sidecars and Parquet
     - [ ] Report the three `parquet` 60.0.0 decoder panics upstream to apache/arrow-rs (`offset + len out of bounds`, `column start and length should not be negative`, `Decoder for dict should have been set`; reproducers are one-byte edits found by `weft-arrow-store/tests/parquet_mutation.rs`), plus an `arrow-buffer` 60.0.0 panic at `util/bit_chunk_iterator.rs:235` seen when 4,070 one-bit mutants were posted to a running server *(owner: outward-facing)*. WeftDB contains them in `weft_arrow::read_parquet` meanwhile (DECISIONS 2026-11-05). Before filing, check them against the two malformed-file panics upstream already closed in 2026 — a compact-Thrift bool `unwrap` (https://github.com/apache/arrow-rs/issues/9839, closed 2026-04-28) and a row-count/column-data mismatch index panic (https://github.com/apache/arrow-rs/issues/9992, closed 2026-05-22) — since ours were seen on 60.0.0 and are different messages.
-  - [ ] **SEC-14** Security documentation, config schema and upgrade notes
+  - [x] **SEC-14** Security documentation, config schema and upgrade notes
+    *Closed 2026-11-09: `docs/security.md` rewritten with source citations, full role table,
+    credential-in-query guard, proxy guard, exit status table, startup enforcement, and
+    known limitations. `docs/upgrade-notes.md` already existed; `docs/config-schema.md`
+    updated by a concurrent PR.
   - [ ] **PAC-10** Publish the multi-arch image (only after API auth)
   - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
   - [x] **EVI-17** Honesty pages II
   - [ ] Write or approve the honesty-page narrative *(owner)*
-  - [ ] **FRE-13** Layout-1 to layout-2 upgrade test
+  - [x] **FRE-13** Layout-1 to layout-2 upgrade test
+    *Closed 2026-11-09 (#666): `weftdb/tests/layout_upgrade.rs` covers the [layout 1 → 2 upgrade contract](https://github.com/basic-automation/weftdb/pull/666) through the public API.*
   - [x] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
     *Closed 2026-11-07 (#603): `SoakReport`, the R1–R8 evaluator, the coverage floors and the
     honesty section are on main; the report is what #616's nightly comparison reads.*

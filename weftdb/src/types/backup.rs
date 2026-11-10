@@ -1119,11 +1119,11 @@ pub async fn restore_store(backup_dir: &Path, new_root: &Path) -> Result<WholeSt
 	restore_store_with(&RealFs, backup_dir, new_root).await
 }
 
-/// The free bytes on the filesystem holding `path` (or its nearest existing ancestor), where the
-/// platform can say.
+/// The free bytes on the filesystem holding `path` (or its nearest existing ancestor),
+/// delegated to [`disk_space_at`](crate::disk_space_at).
 ///
-/// Unix `statvfs`. `None` where it cannot, in which case a headroom check has nothing to check against
-/// and the backup itself is the test.
+/// Returns `None` when [`disk_space_at`] returns `None` or the path has no existing ancestor,
+/// in which case a headroom check has nothing to check against and the backup itself is the test.
 #[must_use]
 pub fn free_bytes_at(path: &Path) -> Option<u64> {
 	crate::disk_space_at(path).map(|space| space.available_bytes)
@@ -1384,6 +1384,20 @@ mod tests {
 		assert!(check_backup_headroom(BackupMode::Linked, 100, 1_000_000, 99).is_err());
 		assert!(check_backup_headroom(BackupMode::Copy, 100, 1_000_000, 1_000_099).is_err(), "copied: the frames count too");
 		assert!(check_backup_headroom(BackupMode::Copy, 100, 1_000_000, 1_000_100).is_ok());
+	}
+
+	/// #667: `free_bytes_at` works on every platform (Unix via `libc::statvfs`, Windows via FFI).
+	#[test]
+	fn free_bytes_at_returns_some_for_an_existing_path() {
+		let dir = tempfile::tempdir().unwrap();
+		// Regression: must return Some on every platform (was None on non-Unix before #667).
+		assert!(free_bytes_at(dir.path()).is_some(), "free_bytes_at must return Some on every platform");
+		// Walking up from a missing child to an existing parent succeeds.
+		assert!(free_bytes_at(&dir.path().join("nonexistent")).is_some(), "walking up to the tempdir ancestor must succeed");
+		// On Unix there is always `/` as the final ancestor, so `free_bytes_at` can never return
+		// `None` from the ancestor-probe. On platforms with no universal root the probe can
+		// exhaust, returning `None` — we cannot construct such a path here portably, so we
+		// trust the doc comment.
 	}
 
 	/// D-S16: a whole-store manifest round-trips with its frames, allocators

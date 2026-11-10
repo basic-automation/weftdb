@@ -1,6 +1,8 @@
 //! Segment-store implementation: this submodule holds the `read` portion of [`SegmentStore`](super::SegmentStore).
 //! Pure move of the former `segment_store.rs` `impl` block; no behaviour change.
 
+use weft_physical_type::merge_newer_wins;
+
 use super::*;
 
 impl SegmentStore {
@@ -130,15 +132,30 @@ impl SegmentStore {
 	/// [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED). A series with no rows (or an id
 	/// the aspect never registered) reads empty.
 	///
+	/// Cross-segment duplicate timestamps resolve newest-wins, equal to the point read
+	/// and the reconcile merge. A single segment that is internally non-monotonic or
+	/// self-duplicating is a corruption case, not handled by this path.
+	///
 	/// # Errors
 	///
 	/// As [`read_time_range`](Self::read_time_range).
 	pub async fn read_time_range_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
+		// Time-only prune (not present-prune): a segment whose every row is null still
+		// contributes its null rows to the answer, because a newer null must be able to
+		// override an older value at the same instant.  Point reads call
+		// `series_present_descriptors` instead (which uses present-prune), so all-null
+		// segments are skipped there — a null row is not a value — making point and
+		// range reads deliberately asymmetric for the all-null-newer case (issue #443).
 		let descriptors: Vec<SegmentDescriptor> = self.index.prune_series_rows_by_time(aspect, series, start, end).await?.into_iter().map(|row| row.desc).collect();
-		let mut timestamps = Vec::new();
-		let mut values = Vec::new();
+		// Fold overlapping segments with **newer-wins** (upsert).  Descriptors are in seal
+		// (id) order, oldest first, matching the contract of `merge_newer_wins` where the
+		// second argument supersedes the first at any shared instant.  This makes a range
+		// read give the same answer as `read_point` / `read_points` across overlapping
+		// segments (last-writer-wins) — and the same answer a later `reconcile_overlaps`
+		// merge would fold them to.
+		let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
 		for descriptor in &descriptors {
 			// Phase 5 memory-mapped reads: with `mmap_reads` on (and the feature compiled in),
 			// the window decodes straight from a read-only mapping of the frame instead of a
@@ -156,14 +173,24 @@ impl SegmentStore {
 			// pages disjoint from the window — instead of the whole segment; any other shape falls
 			// back to a full decode. Already filtered to `[start, end]`.
 			let (ts, vs) = frame_read::read_range(descriptor.path.as_str(), &bytes, start, end)?;
+			let mut rows: Vec<(i64, Option<BigDecimal>)> = Vec::with_capacity(ts.len());
 			for (t, v) in ts.into_iter().zip(vs) {
 				if start <= t && t <= end {
-					timestamps.push(t);
-					values.push(v);
+					rows.push((t, v));
 				}
 			}
+			// Sort each segment's rows by timestamp so that `merge_newer_wins` receives
+			// **non-decreasing** inputs, even when a segment's rows are stored out of
+			// order (e.g. a pre-v2 store with out-of-order timestamps `[55, 45, 65]`).
+			// `fold_newest_wins` (`segment_store.rs`) does the same sort before merging.
+			rows.sort_by_key(|(t, _)| *t);
+			if merged.is_empty() {
+				merged = rows;
+			} else {
+				merged = merge_newer_wins(&merged, &rows);
+			}
 		}
-		Ok((timestamps, values))
+		Ok(merged.into_iter().unzip())
 	}
 
 	/// **Cross-segment downsample** — reduce `aspect`'s `[start, end]` rows into
