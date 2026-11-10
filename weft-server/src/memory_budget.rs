@@ -59,16 +59,25 @@ pub struct MemoryProbe {
 /// `root` is typically `/sys/fs/cgroup` but may be a temp directory
 /// in tests. The function never panics — an unreadable or malformed file
 /// falls through to the next source.
+///
+/// Sources are evaluated in this order:
+///
+/// 1. cgroup v2 `memory.high` (when set below `memory.max` the
+///    deployment intends it as the effective cap).
+/// 2. cgroup v2 `memory.max` (or "max" — effectively unlimited).
+/// 3. cgroup v1 `memory/memory.limit_in_bytes` (sentinel \= unlimited).
+/// 4. Host total RAM from `/proc/meminfo`.
+/// 5. Unknown (0).
 #[must_use]
 pub fn probe(root: &Path) -> MemoryProbe {
-	// 1. cgroup v2: memory.max
-	if let Some(bytes) = read_cgroup_v2_max(root) {
-		return MemoryProbe { bytes, source: "cgroup v2 memory.max" };
-	}
-
-	// 2. cgroup v2: memory.high (effective cap when set below max)
+	// 1. cgroup v2: memory.high (tighter bound when present)
 	if let Some(bytes) = read_cgroup_v2_high(root) {
 		return MemoryProbe { bytes, source: "cgroup v2 memory.high" };
+	}
+
+	// 2. cgroup v2: memory.max
+	if let Some(bytes) = read_cgroup_v2_max(root) {
+		return MemoryProbe { bytes, source: "cgroup v2 memory.max" };
 	}
 
 	// 3. cgroup v1: memory/memory.limit_in_bytes
@@ -187,12 +196,14 @@ pub struct MemoryBudget {
 impl MemoryBudget {
 	/// Create a budget from a probe result. When the probe returned `0`
 	/// (unknown), the budget is created with `0` total and a no-op
-	/// reservation gate.
+	/// reservation gate (identical to [`unknown`](Self::unknown)).
 	#[must_use]
 	pub fn from_probe(probe: MemoryProbe) -> Self {
-		let total = probe.bytes;
-		let available = i64::try_from(total).unwrap_or(i64::MAX);
-		Self { total, available: AtomicI64::new(available) }
+		if probe.bytes == 0 {
+			return Self::unknown();
+		}
+		let available = i64::try_from(probe.bytes).unwrap_or(i64::MAX);
+		Self { total: probe.bytes, available: AtomicI64::new(available) }
 	}
 
 	/// Create a budget with no memory limit (all reservations succeed).
@@ -298,7 +309,6 @@ impl<'a> Drop for MemoryReservation<'a> {
 
 #[cfg(test)]
 mod tests {
-	use std::io::Write;
 
 	use super::*;
 
@@ -415,7 +425,7 @@ mod tests {
 		let budget = MemoryBudget::with_total(1024);
 		assert_eq!(budget.available(), 1024);
 
-		let res = budget.try_reserve(300).expect("reserve 300");
+		let mut res = budget.try_reserve(300).expect("reserve 300");
 		assert_eq!(budget.available(), 724);
 
 		res.release();
@@ -456,7 +466,7 @@ mod tests {
 		assert_eq!(budget.total(), 0);
 		// Unknown budget passes through (preserving the previous
 		// behaviour when no cgroup limit can be read).
-		let res = budget.try_reserve(1).expect("unknown budget passes");
+		let mut res = budget.try_reserve(1).expect("unknown budget passes");
 		assert_eq!(budget.available(), i64::MAX as u64, "no bytes consumed");
 		res.release();
 	}
@@ -464,7 +474,7 @@ mod tests {
 	#[test]
 	fn budget_zero_byte_reservation_passes() {
 		let budget = MemoryBudget::with_total(100);
-		let res = budget.try_reserve(0).expect("zero-byte reservation passes");
+		let mut res = budget.try_reserve(0).expect("zero-byte reservation passes");
 		assert_eq!(budget.available(), 100, "no bytes consumed");
 		res.release();
 		assert_eq!(budget.available(), 100);
@@ -476,7 +486,7 @@ mod tests {
 		let budget = MemoryBudget::from_probe(probe);
 		assert_eq!(budget.total(), 0);
 		// Zero total means unknown budget → pass through.
-		let res = budget.try_reserve(1).expect("zero total passes");
+		let mut res = budget.try_reserve(1).expect("zero total passes");
 		assert_eq!(budget.available(), i64::MAX as u64);
 		res.release();
 	}
