@@ -163,6 +163,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weft-bench/src/soak_compare.rs`, and the annotator script in
   `scripts/annotate-soak-drift.py`. Documented in `docs/soak.md`.
 
+- **Soak upgrade lane (SOA-16).** `weft-bench/src/soak_upgrade.rs` judges
+  the store an in-soak upgrade leaves behind against the run's whole
+  acknowledged history, exactly, and records the upgrade step (the
+  versions on either side, the store layouts, and the pass's duration) on
+  the run record (`SoakHarness::record_upgrade_verdict`, soak schema v7).
+  The caller performs the upgrade per `UPGRADING.md` (PAC-14a) and hands
+  the read-back to the checker, on the SOA-11 backup lane precedent; the
+  lane adds no SLO rule. The nightly comparison tracks
+  `upgrade_ticks_judged` (0 %), `upgrade_mismatch_count` (0 %) and
+  `upgrade_duration_ms` (10 %). Documented in `docs/soak.md`.
+
 - **Performance methodology document.** `docs/methodology.md` defines what
   counts as a performance claim, what evidence a claim must carry, what
   disqualifies a claim, and where numbers may be stated. It makes a published

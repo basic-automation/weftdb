@@ -48,7 +48,7 @@
 //! 3. **Honesty section** — generated Markdown listing wins (rules passed +
 //!    evidence counts), losses (rules failed + evidence pointers),
 //!    contamination (flags/windows/worst values), surfaces not tested
-//!    (including lanes that don't exist yet: SOA-16 upgrade, SOA-15 TTL,
+//!    (including lanes that don't exist yet: SOA-15 TTL,
 //!    hooks none configured), and overrides (any constant changed from
 //!    default, showing old→new).
 //!
@@ -560,6 +560,38 @@ fn compute_overall_outcome(rules: &[RuleResult], coverage: &CoverageReport) -> (
 	}
 }
 
+/// Surfaces the run did not evaluate, for the honesty section's
+/// "Surfaces not tested" list.
+fn untested_surfaces(run: &SoakRun, slo: &SloReport, contamination: Option<&ContaminationVerdict>) -> Vec<&'static str> {
+	let mut untested: Vec<&'static str> = Vec::new();
+
+	if run.oracle.is_none() {
+		untested.push("oracle (data correctness) — SOA-6");
+	}
+	if run.derived.is_none() {
+		untested.push("derived-read (bucket-level checks) — SOA-10");
+	}
+	if run.backup.is_none() {
+		untested.push("backup lane (prefix/restore verification) — SOA-11");
+	}
+	if run.phases.is_empty() {
+		untested.push("failure deck (SIGTERM, injections) — SOA-8");
+	}
+	if contamination.is_none() {
+		untested.push("system contamination monitoring — SOA-12");
+	}
+	// Lanes that do not exist yet:
+	untested.push("SOA-15 TTL (coverage not yet wired)");
+	if run.upgrade.is_none() {
+		untested.push("SOA-16 upgrade (coverage not yet wired)");
+	}
+	// Hooks: if none configured, list as untested
+	if !slo.rules.iter().any(|r| r.id == "R6" && r.outcome != Outcome::NotEvaluated) {
+		untested.push("SOA-14 hooks (none configured)");
+	}
+	untested
+}
+
 // ---------------------------------------------------------------------------
 // Honesty section builder
 // ---------------------------------------------------------------------------
@@ -625,30 +657,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 
 	// --- Surfaces not tested ---
 	out.push_str("### Surfaces not tested\n\n");
-	let mut untested: Vec<&str> = Vec::new();
-
-	if run.oracle.is_none() {
-		untested.push("oracle (data correctness) — SOA-6");
-	}
-	if run.derived.is_none() {
-		untested.push("derived-read (bucket-level checks) — SOA-10");
-	}
-	if run.backup.is_none() {
-		untested.push("backup lane (prefix/restore verification) — SOA-11");
-	}
-	if run.phases.is_empty() {
-		untested.push("failure deck (SIGTERM, injections) — SOA-8");
-	}
-	if contamination.is_none() {
-		untested.push("system contamination monitoring — SOA-12");
-	}
-	// Lanes that do not exist yet:
-	untested.push("SOA-15 TTL (coverage not yet wired)");
-	untested.push("SOA-16 upgrade (coverage not yet wired)");
-	// Hooks: if none configured, list as untested
-	if !slo.rules.iter().any(|r| r.id == "R6" && r.outcome != Outcome::NotEvaluated) {
-		untested.push("SOA-14 hooks (none configured)");
-	}
+	let untested = untested_surfaces(run, slo, contamination);
 
 	if untested.is_empty() {
 		out.push_str("Every surface was tested.\n\n");
@@ -697,7 +706,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 mod tests {
 	use super::*;
 	use crate::{
-		report::RunMetadata, soak::{SoakConfig, SoakHarness, SoakRun}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_system::{ContaminationFlag, FlushCheckResult, FlushFailureKind, WorstValues}
+		report::RunMetadata, soak::{SoakConfig, SoakHarness, SoakRun}, soak_backup::{BackupLaneVerdict, BackupPrefixVerdict, RecoveryTiming, RestoreVerdict}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_system::{ContaminationFlag, FlushCheckResult, FlushFailureKind, WorstValues}, soak_upgrade::{UpgradeLaneVerdict, UpgradeStep}
 	};
 
 	fn config() -> SoakConfig {
@@ -1069,6 +1078,19 @@ mod tests {
 		assert!(verdicts.honesty.contains("Limitations"), "honesty must list limitations");
 		assert!(verdicts.honesty.contains("SOA-15 TTL"), "honesty must mention SOA-15");
 		assert!(verdicts.honesty.contains("SOA-16 upgrade"), "honesty must mention SOA-16");
+	}
+
+	#[test]
+	fn honesty_drops_the_upgrade_lane_once_it_ran() {
+		let mut harness = SoakHarness::new(config(), metadata());
+		harness.start().expect("start");
+		let verdict = UpgradeLaneVerdict { ticks_judged: 4, points_expected: 64, points_upgraded: 64, mismatch_count: 0, mismatches: Vec::new(), step: UpgradeStep { from_version: "0.1.0".to_string(), to_version: "0.3.2".to_string(), layout_before: 1, layout_after: 2, upgrade_duration_ms: 450 } };
+		harness.record_upgrade_verdict(verdict).expect("record upgrade verdict");
+		harness.finish().expect("finish");
+		let run = harness.run_record().clone();
+		let verdicts = SoakReport::evaluate(&run, Some(&oracle_verdict(60, 0)), Some(&derived_verdict(60, 0)), Some(&backup_verdict(1000, 2000)), Some(&contamination_verdict(&[])), Some(&flush_check()), Vec::new(), 60, 240, 1, 1, 1, 1);
+		assert!(!verdicts.honesty.contains("SOA-16 upgrade"), "honesty must stop listing the upgrade lane once it ran: {}", verdicts.honesty);
+		assert!(verdicts.honesty.contains("SOA-15 TTL"), "the TTL lane is still unwired");
 	}
 
 	#[test]

@@ -52,6 +52,32 @@ All soak lanes beyond the skeleton are pre-1.0 scope; the nightly
 workflow exists to validate the comparison machinery and catch regressions
 in the soak framework itself.
 
+## The upgrade lane (SOA-16)
+
+The upgrade lane runs an upgrade inside a soak and judges the store it
+leaves behind. While ingest is running, the driver stops the old server
+binary and starts the new one against the same store root, following
+the procedure `UPGRADING.md` (PAC-14a) pins: copy the whole store
+directory first, start the new binary, let the first open run the
+layout migration, then read every acknowledged point back out of the
+upgraded store. The lane (`weft-bench/src/soak_upgrade.rs`) judges
+that read-back against the run's whole acknowledged history — every
+acknowledged tick, complete and exact, and nothing else — and records
+the upgrade step (the versions on either side, the store layouts, and
+the pass's duration) on the run record
+(`SoakHarness::record_upgrade_verdict`, soak schema v7).
+
+The lane performs no upgrade, stop, start or read itself: the caller
+runs the binaries and hands the read-back to the checker, on the
+SOA-11 backup lane precedent. The nightly skeleton driver performs no
+upgrade, so its honesty section still lists the lane as not tested
+until a caller drives it; a run that records an upgrade verdict drops
+the line. The upgrade duration is recorded, never gated, and the lane
+adds no SLO rule (R1–R8 are fixed). The nightly comparison tracks
+three upgrade metrics: `upgrade_ticks_judged` (0 %), 
+`upgrade_mismatch_count` (0 % — any mismatch is a regression), and
+`upgrade_duration_ms` (10 % — the pass depends on host load).
+
 ## Metrics and tolerances
 
 The comparison uses a fixed set of named tolerances defined in
@@ -68,6 +94,9 @@ The comparison uses a fixed set of named tolerances defined in
 | `backup_rpo_ms` | 10 % | backup interval depends on wall clock |
 | `backup_rto_ms` | 10 % | restore time depends on host load |
 | `backup_restore_duration_ms` | 10 % | restore time depends on host load |
+| `upgrade_ticks_judged` | 0 % | deterministic tick budget |
+| `upgrade_mismatch_count` | 0 % | any mismatch is a regression |
+| `upgrade_duration_ms` | 10 % | upgrade pass depends on host load |
 | `contamination_flags_count` | 0 % | same hardware profile each night |
 
 To update tolerances, edit the constant in `soak_compare.rs` and update
