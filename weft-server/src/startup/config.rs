@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use weft_server::{
-	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ReadLimits, ServeLimits, TlsConfig, AUTH_KEYS_MODE, DEFAULT_PAGE_ROWS, GPU_BACKEND_ENV, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_AT_MULTI_INSTANTS_ENV, MAX_CONNECTIONS_ENV, MAX_DOWNSAMPLE_BUCKETS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, MAX_PAGE_ROWS_ENV, MAX_READ_ROWS_ENV, QUERY_MAX_INFLIGHT_ENV, READ_TIMEOUT_SECS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
+	auth::AuthConfig, host_guard::{self, HostGuard, ALLOW_ANY_HOST_ENV}, memory_budget::{self}, tls::{PlaintextGate, ALLOW_PLAINTEXT_ENV, AUTH_ENV, KEYS_FILE_ENV, TLS_CERT_FILE_ENV, TLS_KEY_FILE_ENV}, AdmissionConfig, IngestConfig, InterpolateConfig, ReadLimits, ServeLimits, TlsConfig, AUTH_KEYS_MODE, DEFAULT_PAGE_ROWS, GPU_BACKEND_ENV, HEADER_READ_TIMEOUT_ENV, INGEST_MAX_INFLIGHT_BYTES_ENV, KEEP_ALIVE_TIMEOUT_ENV, MAX_AT_MULTI_INSTANTS_ENV, MAX_CONNECTIONS_ENV, MAX_DOWNSAMPLE_BUCKETS_ENV, MAX_INGEST_BYTES_ENV, MAX_INTERPOLATE_POINTS_ENV, MAX_PAGE_ROWS_ENV, MAX_READ_ROWS_ENV, QUERY_MAX_INFLIGHT_ENV, READ_TIMEOUT_SECS_ENV, SHUTDOWN_GRACE_SECS_ENV, WRITE_STALL_TIMEOUT_ENV
 };
 
 /// Default bind address when `WEFT_SERVER_ADDR` is unset.
@@ -118,6 +118,10 @@ pub fn ingest_config() -> anyhow::Result<IngestConfig> {
 /// budget is the ingest wiring's, above; probes are never shed and
 /// maintenance is exclusive, so neither takes a setting.)
 ///
+/// Also probes the effective memory limit from the cgroup hierarchy
+/// (ROB-14) and logs it; the probe result becomes the memory budget
+/// the gate enforces per request.
+///
 /// # Errors
 ///
 /// A value that is not a positive integer (a malformed operator config
@@ -125,6 +129,14 @@ pub fn ingest_config() -> anyhow::Result<IngestConfig> {
 pub fn admission_config() -> anyhow::Result<AdmissionConfig> {
 	let config = AdmissionConfig::from_env().map_err(anyhow::Error::msg)?;
 	println!("admission limits: at most {} query-class requests in flight (set {QUERY_MAX_INFLIGHT_ENV} to change); probes are never shed, maintenance is admitted one at a time", config.max_query_inflight());
+	let probe = memory_budget::probe(std::path::Path::new("/sys/fs/cgroup"));
+	match probe.bytes {
+		0 => println!("memory budget: unknown (no cgroup limit detected; the server defaults to no per-request budget)"),
+		bytes => {
+			let gib = bytes as f64 / (1u64 << 30) as f64;
+			println!("memory budget: {bytes} bytes ({gib:.2} GiB) from {source}; reserved against for every request that bufffers rows (ROB-14)", source = probe.source);
+		}
+	}
 	Ok(config)
 }
 

@@ -74,6 +74,8 @@ pub mod interpolate;
 /// reason as [`import_rows_mode`]: its parsing and file handling are testable.
 pub mod keygen;
 pub mod maintain;
+/// ROB-14: cgroup-aware memory budget probe and per-request reservations.
+pub mod memory_budget;
 pub mod metrics;
 mod num;
 /// FRE-9a: OpenAPI 3.1 document generated from the route registry.
@@ -131,6 +133,7 @@ pub use downsample::{downsample, downsample_arrow, downsample_csv, downsample_il
 pub use error::{ApiError, Code};
 pub use host_guard::{HostGuard, ALLOW_ANY_HOST_ENV};
 pub use interpolate::{interpolate, interpolate_arrow, interpolate_csv, interpolate_ilp, interpolate_ilp_arrow, interpolate_ilp_csv, interpolate_ilp_parquet, interpolate_parquet, interpolate_point, InterpolateConfig, InterpolateRequest, InterpolateResponse, PointKind, PointRequest, PointResponse, GPU_BACKEND_ENV, MAX_INTERPOLATE_OUTPUT_POINTS, MAX_INTERPOLATE_POINTS_ENV};
+pub use memory_budget::{MemoryBudget, MemoryProbe, MemoryReservation};
 pub use metrics::{DownsampleProfile, IngestProfile, InterpolateProfile, LatencyHistogram, LatencyHistogramSnapshot, LatencyProfile, Metrics, MetricsSnapshot, ProfileReport, SharedMetrics};
 pub use read_limits::{grid_buckets, ReadLimits, DEFAULT_PAGE_ROWS, DEFAULT_READ_TIMEOUT, MAX_AT_MULTI_INSTANTS, MAX_AT_MULTI_INSTANTS_ENV, MAX_DOWNSAMPLE_BUCKETS, MAX_DOWNSAMPLE_BUCKETS_ENV, MAX_PAGE_ROWS, MAX_PAGE_ROWS_ENV, MAX_READ_ROWS, MAX_READ_ROWS_ENV, READ_TIMEOUT_SECS_ENV};
 pub use reconcile_daemon::{reconcile_tick, reconcile_tick_hot_cold, reconcile_tick_overlaps, spawn_reconcile_daemon, ReconcileDaemonConfig};

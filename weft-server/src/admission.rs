@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::routes::IngestAdmission;
+use crate::{memory_budget::MemoryBudget, routes::IngestAdmission};
 
 /// Environment variable naming the query class's in-flight cap
 /// (ROB-10): a positive whole number of requests, read once at
@@ -144,6 +144,7 @@ pub struct Admission {
 	query: Arc<Semaphore>,
 	query_limit: usize,
 	maintenance: Arc<Semaphore>,
+	memory_budget: MemoryBudget,
 }
 
 impl Admission {
@@ -151,9 +152,13 @@ impl Admission {
 	/// ingest wiring's in-flight byte budget for the write class
 	/// (D-S14) and [`AdmissionConfig`] for the query class (ROB-10).
 	/// The maintenance class is exclusive by definition — one permit.
+	///
+	/// The memory budget is probed from the effective cgroup limit
+	/// (ROB-14).
 	#[must_use]
 	pub fn new(ingest: IngestAdmission, config: AdmissionConfig) -> Self {
-		Self { ingest, query: Arc::new(Semaphore::new(config.max_query_inflight)), query_limit: config.max_query_inflight, maintenance: Arc::new(Semaphore::new(1)) }
+		let memory_budget = MemoryBudget::from_probe(crate::memory_budget::probe(std::path::Path::new("/sys/fs/cgroup")));
+		Self { ingest, query: Arc::new(Semaphore::new(config.max_query_inflight)), query_limit: config.max_query_inflight, maintenance: Arc::new(Semaphore::new(1)), memory_budget }
 	}
 
 	/// The write class's byte-weighted budget (D-S14).
@@ -194,6 +199,13 @@ impl Admission {
 	#[must_use]
 	pub fn maintenance_in_flight(&self) -> bool {
 		self.maintenance.available_permits() == 0
+	}
+
+	/// The memory budget (ROB-14): the effective memory limit from
+	/// cgroup probes, shared across request reservations.
+	#[must_use]
+	pub const fn memory_budget(&self) -> &MemoryBudget {
+		&self.memory_budget
 	}
 }
 
