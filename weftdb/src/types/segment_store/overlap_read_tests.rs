@@ -260,11 +260,7 @@ async fn value_range_is_a_raw_scan_pinned_against_point_and_range() {
 	ingest(&store, "b", &[100], &[bd("2")]).await;
 
 	// POINT read returns the newest value (fold).
-	assert_eq!(
-		store.read_point(ASPECT, 100).await.expect("point at 100"),
-		Some(bd("2")),
-		"point read returns newest value"
-	);
+	assert_eq!(store.read_point(ASPECT, 100).await.expect("point at 100"), Some(bd("2")), "point read returns newest value");
 
 	// TIME-RANGE read returns the instant once, with the newest value (fold).
 	let (ts_tr, vs_tr) = store.read_time_range(ASPECT, 100, 100).await.expect("time-range read");
@@ -295,11 +291,7 @@ async fn value_range_of_is_a_raw_scan_pinned_against_point_of() {
 	let series = store.resolve_series(ASPECT, &crate::SeriesSelector::exact([("host", Some("x"))]).expect("valid")).await.expect("resolves").expect("series x");
 
 	// Tagged point read: newest value.
-	assert_eq!(
-		store.read_point_of(ASPECT, series, 100).await.expect("point_of at 100"),
-		Some(bd("2")),
-		"tagged point returns newest value"
-	);
+	assert_eq!(store.read_point_of(ASPECT, series, 100).await.expect("point_of at 100"), Some(bd("2")), "tagged point returns newest value");
 
 	// Tagged value-range read: raw scan, both rows.
 	let (ts, vs) = store.read_value_range_of(ASPECT, series, &bd("0"), &bd("10")).await.expect("tagged value-range read");
