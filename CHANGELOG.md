@@ -220,6 +220,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
   tested.
 
+- **Prediction signals are now isolated per aspect (issue #402).**
+  `SIGNALS_QUEUE` was a single process-wide `Mutex<Signals>`; two pipelines
+  over different aspects in one process would see each other's signals.
+  The queue is now keyed by `AspectId` (`Mutex<HashMap<AspectId, Signals>>`),
+  `signals_for(aspect_id)` copies out only that aspect's queue,
+  `create_signals` and `filter_expired_signals` touch only their own aspect,
+  and `Pipeline::generate_signals` / `Pipeline::filter_signals_at` read
+  only their own aspect's signals via `signals_for`. An empty per-aspect
+  queue is removed from the map during `filter_expired_signals` so the map
+  does not retain stale entries indefinitely. (#402)
+
 - **Slow orchestration tests bounded by timeout (issue #404).** Seven
   `weft-orchestration` tests that self-skip locally (Crypto-database guard)
   now wrap their bodies in `tokio::time::timeout` within the CI job budget
