@@ -21,6 +21,8 @@ use std::{
 use axum::{extract::State, http::header, response::IntoResponse, Json};
 use serde::Serialize;
 
+use crate::state::AppState;
+
 /// Shared, cheaply-cloneable handle to the server's metrics.
 pub type SharedMetrics = Arc<Metrics>;
 
@@ -627,9 +629,34 @@ pub fn render_gpu_devices(out: &mut String, devices: &[GpuDeviceRow]) {
 	}
 }
 
-/// Handle `GET /metrics`: render the server counters for a Prometheus scrape.
-pub async fn metrics(State(state): State<SharedMetrics>) -> impl IntoResponse {
-	([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], state.render_prometheus())
+/// Render the store's free-space gauges (ROB-17): the filesystem holding the store root,
+/// and the margin the disk guard leaves on it.
+///
+/// Nothing at all for `None` (no store, or a platform that cannot describe the
+/// filesystem), so a scrape never reads a made-up zero as a full disk.
+pub fn render_disk_space(out: &mut String, headroom: Option<weftdb::Headroom>) {
+	use std::fmt::Write as _;
+	let Some(headroom) = headroom else {
+		return;
+	};
+	let gauges = [("weft_disk_total_bytes", "Size of the filesystem holding the store, in bytes.", headroom.total_bytes), ("weft_disk_available_bytes", "Bytes an unprivileged writer can still use on the filesystem holding the store.", headroom.available_bytes), ("weft_disk_reserve_bytes", "Bytes every ingest or seal must leave available (WEFT_DISK_RESERVE_BYTES; 0 means the disk guard is off).", headroom.reserve_bytes), ("weft_disk_writable_bytes", "Bytes a write may still take before the disk guard refuses it with 507 insufficient_storage.", headroom.writable_bytes), ("weft_disk_guard_refusing", "1 while the disk guard refuses every ingest and seal (nothing above the reserve is available), else 0.", u64::from(headroom.refusing()))];
+	for (name, help, value) in gauges {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} gauge");
+		let _ = writeln!(out, "{name} {value}");
+	}
+}
+
+/// Handle `GET /metrics`: render the server counters for a Prometheus scrape, and the
+/// store's free-space gauges when a store is configured (ROB-17).
+pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+	let mut out = state.metrics().render_prometheus();
+	let store = state.store().cloned();
+	drop(state);
+	// `statvfs` is a blocking call, so the headroom is read off the async runtime.
+	let headroom = tokio::task::spawn_blocking(move || store.and_then(|store| store.headroom())).await.ok().flatten();
+	render_disk_space(&mut out, headroom);
+	([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
 }
 
 /// The estimated latency quantiles for one endpoint, in seconds.
@@ -764,6 +791,21 @@ mod tests {
 		assert_eq!(snap.interpolate.requests, 2);
 		assert_eq!(snap.interpolate.errors, 1);
 		assert_eq!(snap.interpolate.output_points, 70);
+	}
+
+	/// ROB-17: no store (or an undescribable filesystem), no disk families; a
+	/// headroom, five gauges carrying its numbers.
+	#[test]
+	fn disk_space_is_rendered_as_five_gauges() {
+		let mut out = String::new();
+		render_disk_space(&mut out, None);
+		assert!(out.is_empty(), "no made-up zero for a filesystem nobody described");
+		render_disk_space(&mut out, Some(weftdb::DiskGuard::new(400).headroom(weftdb::DiskSpace { total_bytes: 10_000, available_bytes: 1_000 })));
+		assert_eq!(out.matches("# TYPE ").count(), 5);
+		assert_eq!(out.matches(" gauge\n").count(), 5);
+		for line in ["weft_disk_total_bytes 10000", "weft_disk_available_bytes 1000", "weft_disk_reserve_bytes 400", "weft_disk_writable_bytes 600", "weft_disk_guard_refusing 0"] {
+			assert!(out.lines().any(|l| l == line), "{line} in {out}");
+		}
 	}
 
 	/// 5.7: no devices, no GPU families; two devices, one series each, labels escaped.

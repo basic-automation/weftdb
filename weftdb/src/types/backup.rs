@@ -1119,55 +1119,14 @@ pub async fn restore_store(backup_dir: &Path, new_root: &Path) -> Result<WholeSt
 	restore_store_with(&RealFs, backup_dir, new_root).await
 }
 
-/// The free bytes on the filesystem holding `path` (or its nearest existing ancestor).
+/// The free bytes on the filesystem holding `path` (or its nearest existing ancestor),
+/// delegated to [`disk_space_at`](crate::disk_space_at).
 ///
-/// On Unix uses `libc::statvfs`; on Windows uses
-/// [`GetDiskFreeSpaceExW`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw).
-/// Returns `None` when the OS refuses to answer or the path has no existing ancestor,
+/// Returns `None` when [`crate::disk_space_at`] returns `None` or the path has no existing ancestor,
 /// in which case a headroom check has nothing to check against and the backup itself is the test.
 #[must_use]
 pub fn free_bytes_at(path: &Path) -> Option<u64> {
-	let mut probe = path.to_path_buf();
-	loop {
-		if probe.exists() {
-			break;
-		}
-		if !probe.pop() {
-			return None;
-		}
-	}
-	#[cfg(unix)]
-	{
-		let c_path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).ok()?;
-		let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-		if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
-			return None;
-		}
-		Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
-	}
-	#[cfg(windows)]
-	{
-		use std::os::windows::ffi::OsStrExt;
-		let wide: Vec<u16> = probe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-		let mut free_bytes_available: u64 = 0;
-		// SAFETY: `GetDiskFreeSpaceExW` writes into a caller-allocated buffer.
-		let result = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &raw mut free_bytes_available, std::ptr::null_mut(), std::ptr::null_mut()) };
-		if result == 0 {
-			return None;
-		}
-		Some(free_bytes_available)
-	}
-	#[cfg(not(any(unix, windows)))]
-	{
-		let _ = probe;
-		None
-	}
-}
-
-#[cfg(windows)]
-extern "system" {
-	/// <https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskfreespaceexw>
-	fn GetDiskFreeSpaceExW(directory_name: *const u16, free_bytes_available: *mut u64, total_number_of_bytes: *mut u64, total_number_of_free_bytes: *mut u64) -> i32;
+	crate::disk_space_at(path).map(|space| space.available_bytes)
 }
 
 #[cfg(test)]

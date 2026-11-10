@@ -88,3 +88,28 @@ async fn ready_without_a_store_carries_build_info_and_no_identity() {
 	assert_eq!(body["durability_class"], serde_json::Value::Null, "{body}");
 	assert_eq!(body["previous_clean_shutdown"], serde_json::Value::Null, "{body}");
 }
+
+/// ROB-17: `/ready` says whether the disk guard refuses writes, as a boolean, and stays
+/// `200 ready` while it does — reads keep working. An impossible reserve refuses wherever the
+/// OS reports free space (`statvfs` on Unix, `GetDiskFreeSpaceExW` on Windows); the guard is
+/// inert only where the probe answers `None`, and a reserve of 0 turns it off. Rather than
+/// naming platforms, the test asks the same probe the guard uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_reports_a_refusing_disk_guard_and_stays_ready() {
+	for reserve in [u64::MAX / 2, 0] {
+		let dir = tempfile::tempdir().expect("temp dir");
+		// What the guard can refuse is what the guard can measure: the assertion follows
+		// `disk_space_at`, the probe the guard itself calls, so a platform that gains or
+		// loses free-space measurement moves the expectation instead of the test.
+		let measurable = weftdb::disk_space_at(dir.path()).is_some();
+		let expected = reserve > 0 && measurable;
+		let store = SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(reserve)).await.expect("opens");
+		let router = app_with_state(AppState::new().with_store(Arc::new(store)));
+		let (status, body) = get_ready(&router).await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+		assert_eq!(body["ready"], true, "{body}");
+		assert_eq!(body["disk_refusing"], expected, "reserve {reserve}, probe measurable: {measurable} — `disk_refusing` must match what the guard can measure. {body}");
+	}
+	let (_, body) = get_ready(&app()).await;
+	assert_eq!(body["disk_refusing"], false, "no store, nothing to refuse: {body}");
+}

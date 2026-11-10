@@ -102,6 +102,11 @@ class ClientTest(unittest.TestCase):
         with self.assertRaises(weftdb.Forbidden):
             self.client.metrics()
 
+    def test_headroom_reads_the_route(self):
+        body = {"total_bytes": 10000, "available_bytes": 1000, "reserve_bytes": 400, "writable_bytes": 600, "refusing": False}
+        self.answer("GET", "/api/v1/storage/headroom", body)
+        self.assertEqual(self.client.headroom(), body)
+
     def test_an_overloaded_read_is_retried_after_retry_after(self):
         self.fake.answers[("GET", "/api/v1/storage/stats")] = lambda n: (503, {"Retry-After": "0"}, {"error": "full", "code": "overloaded"}) if n == 1 else (200, {}, {"aspects": 0})
         self.assertEqual(self.client.stats(), {"aspects": 0})

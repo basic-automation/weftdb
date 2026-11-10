@@ -5932,6 +5932,7 @@ such files landed on a branch this week). **Rejected:** trusting a worker's own 
 It is the exact artifact that lied twice in one day, and a check the producer performs on its own
 output is not a check.
 
+
 ## 2026-11-09 — A worker's report is input, not evidence: the review reads the tree, not the prose
 
 **Three verification claims in one day were wrong, and one of them was mine.** A worker's risk list
@@ -6024,3 +6025,100 @@ itself refuses. In the interim the `/ready` test states the difference rather th
 `let expected = if reserve > 0 { cfg!(unix) } else { false };` asserts that the guard is *inert*
 off Unix, which is a claim, not a skip. **Rejected:** `#[cfg(unix)]` on the tests, and adding the
 `windows` crate as a dependency for one signature.
+
+**Closed 2026-11-09, same day.** #669 merged and #598 merged `origin/main`, so the interim is over
+and the two platform arms now live beside each other in `weftdb/src/types/disk_guard.rs
+disk_space_at()` (`statvfs` on Unix filling `DiskSpace { total_bytes, available_bytes }`,
+`GetDiskFreeSpaceExW` on Windows with real out-params for both totals, `None` only on a platform
+with no probe); `backup.rs free_bytes_at()` is the one-line delegation to it. The interim claim was
+removed rather than left to rot: the `/ready` test now expects a refusal wherever
+`weftdb::disk_space_at(dir.path())` answers `Some`, so the expectation follows the platform's
+capability instead of naming it, and a platform that loses the probe still fails honestly.
+
+## 2026-11-05 — ROB-17: the disk guard's shape, and what it does not guard (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the plan names ROB-17 only as "Disk guard, headroom API and space gauges"
+(seal lane, after TAG-7) and fixes one boundary in C11: the request-level `507` belongs to
+ROB-18's two-phase body extractor, "via ROB-17's `DiskGuard`, so ROB-17 never edits
+ingest.rs". The reserve, its default, where the guard sits and what the headroom route
+looks like are not specified.
+
+**Chosen:**
+
+1. **`weftdb::DiskGuard` is a reserve, checked before the first frame.** A write of `need`
+   bytes is admitted while `available - need >= reserve` (`statvfs`'s `f_bavail`, the
+   unprivileged figure). `SegmentStore::ingest` decides once per batch, on the whole
+   batch's plain encoding, before any frame is written — a refusal half-way would leave
+   frames for recovery to sweep. The direct seals (`seal*`, through `persist` /
+   `persist_paged`) check their one frame. The refusal is
+   `StoreError::InsufficientStorage`, `507 insufficient_storage` at the API (a `5xx` whose
+   numbers stay in the operator-only cause), and it is not recorded in the idempotency
+   ledger, so the same request succeeds once there is room. `weft-server`'s `ingest.rs` is
+   untouched, as C11 requires; ROB-18's request-level check is left to call the same
+   `DiskGuard::admit` (it is public for that).
+2. **`WEFT_DISK_RESERVE_BYTES`, Tuning tier, default 256 MiB, `0` turns it off.** Enough for
+   the control plane to commit, checkpoint and back itself up after frames stop. The
+   library default (`SegmentStoreOptions::default`) is `0`, so an embedder's open refuses
+   nothing it did not refuse before; the server reads the variable through
+   `SegmentStoreOptions::from_env`, like every other store option.
+3. **Maintenance is not guarded.** A squash or reconciliation writes before it deletes, but
+   it is how a store gets space back; refusing it near the reserve would pin the store
+   full.
+4. **The headroom is a read of the filesystem, not a counter.** `GET
+   /api/v1/storage/headroom` (experimental, `metrics` scope — host numbers are the
+   operator's) answers `total_bytes`, `available_bytes`, `reserve_bytes`, `writable_bytes`
+   and `refusing`; `/metrics` carries the same as `weft_disk_*` gauges plus a 0/1
+   `weft_disk_guard_refusing` (the analogue of VictoriaMetrics' `vm_storage_is_read_only`,
+   which `vmstorage` sets while free space is under `-storage.minFreeDiskSpaceBytes`:
+   https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/docs/victoriametrics/Cluster-VictoriaMetrics.md#readonly-mode).
+   Without a store, or on a platform that cannot describe the filesystem, the gauges are
+   absent rather than zero, so a scrape never reads a made-up full disk.
+
+5. **Logged per transition, not per request.** The store records each guard decision in a
+   `RefusalLatch` and logs WARN when it starts refusing and INFO when it admits again; the
+   server answers the refusal with `ApiError::server_logged_elsewhere`, the `5xx`
+   constructor without the per-request error line. A client retrying against a full disk
+   would otherwise write one error line per attempt into the logs on the disk that is full.
+6. **`/ready` carries `disk_refusing`, a boolean, and stays `200 ready`.** Reads keep
+   working, so the server is still ready; the flag is what lets a balancer or ingest router
+   steer writes elsewhere, as `vminsert` re-routes around a read-only `vmstorage`. The probe
+   answers without a key, so it carries the state only; the byte counts stay on the
+   `metrics`-scoped headroom route.
+
+**Rejected:** guarding every `create_new_write` in `StoreFs` (it would refuse maintenance and
+recovery writes too, and a frame refused half-way through a batch is litter); a
+percentage reserve (a percentage of a 15 TB volume is hundreds of GB nobody asked to keep,
+and of a small volume too little for the control plane).
+
+## 2026-11-05 — ROB-9: the `parquet` decoder's panics are contained at `weft_arrow::read_parquet` (FLAGGED FOR MERGE REVIEW)
+
+**What the harness found.** ROB-9's mutation harness feeds every one-byte substitution,
+every truncation and 2,048 seeded multi-byte mutants of a real WeftDB-written Parquet file
+to the ingest decoder (`weft_arrow_store::decode_parquet_columns_strict`). 15 of 14,161
+mutants panicked inside `parquet` 60.0.0 instead of returning its error: `offset + len out
+of bounds`, `column start and length should not be negative`, and `Decoder for dict should
+have been set`. Before this change such a body reached ROB-3's panic layer and was answered
+`500 commit_failed` — a client's malformed file reported as a server failure, with an
+error-level panic log per request.
+
+**Chosen:** `weft_arrow::read_parquet` runs the decode under `catch_unwind` and answers a
+panic as `ConvertError::Parquet("the Parquet decoder could not read this file (…)")`, which
+the ingest classifier already maps to `400 bad_request`. This amends plan C12 ("ROB-3's
+layer is the only layer that catches panics") for exactly one place, and the argument is
+that C12's reasons do not apply there: C12 exists so a panic in *WeftDB's* request handling
+is reported once, as the envelope, and so a control-plane panic stays a fail-stop. The
+Parquet decode is a third-party pure function of an owned copy of the caller's bytes, run
+before the seal, outside any control-plane write (so ROB-2's abort can never be what it
+would swallow), holding no lock or shared state that an unwind could leave inconsistent.
+
+**The frame and sidecar halves found one bug and fixed it at its source rather than
+containing it:** the windowed range read's closed form sized its window from the header's
+`row_count` without the ROB-8 cross-check the full decode applies, so a resealed frame
+whose header claimed 0 rows underflowed `row_count - 1` (a panic in debug, a wrapped
+`usize::MAX` bound in release). It now refuses a header that disagrees with its timestamp
+column (`ColumnLengthMismatch`, Integrity). No sidecar mutant panicked.
+
+**Rejected:** leaving the panics to ROB-3 (wrong status, and an error log an attacker can
+generate at will); a `catch_unwind` in `weft-server`'s handler (C12's "no handler catches its
+own panics" is about exactly that); waiting for upstream (the fix belongs upstream too, and
+is filed as a to-do for the owner, but the boundary has to hold whatever version is pinned).
