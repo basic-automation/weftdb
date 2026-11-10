@@ -263,14 +263,14 @@ async fn value_range_is_a_raw_scan_pinned_against_point_and_range() {
 	assert_eq!(store.read_point(ASPECT, 100).await.expect("point at 100"), Some(bd("2")), "point read returns newest value");
 
 	// TIME-RANGE read returns the instant once, with the newest value (fold).
-	let (ts_tr, vs_tr) = store.read_time_range(ASPECT, 100, 100).await.expect("time-range read");
-	assert_eq!(ts_tr, vec![100], "time range: one instant");
-	assert_eq!(vs_tr, vec![Some(bd("2"))], "time range: newest value");
+	let (range_ts, range_vals) = store.read_time_range(ASPECT, 100, 100).await.expect("time-range read");
+	assert_eq!(range_ts, vec![100], "time range: one instant");
+	assert_eq!(range_vals, vec![Some(bd("2"))], "time range: newest value");
 
 	// VALUE-RANGE read returns BOTH rows (raw scan, older first = seal order).
-	let (ts_vr, vs_vr) = store.read_value_range(ASPECT, &bd("0"), &bd("10")).await.expect("value-range read");
-	assert_eq!(ts_vr, vec![100, 100], "value range: two rows, one per segment");
-	assert_eq!(vs_vr, vec![bd("1"), bd("2")], "value range: both values, older first");
+	let (band_ts, band_vals) = store.read_value_range(ASPECT, &bd("0"), &bd("10")).await.expect("value-range read");
+	assert_eq!(band_ts, vec![100, 100], "value range: two rows, one per segment");
+	assert_eq!(band_vals, vec![bd("1"), bd("2")], "value range: both values, older first");
 
 	drop(store);
 }
