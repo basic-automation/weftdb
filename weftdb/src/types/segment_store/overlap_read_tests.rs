@@ -235,112 +235,76 @@ async fn different_series_are_not_merged() {
 }
 
 /// ------------------------------------------------------------------
-/// Issue #665: value-range read must fold overlapping segments newest-wins.
+/// Pinning test: value-range read is a raw scan, NOT a fold.
 ///
-/// The value-range read (`read_value_range` / `read_value_range_of`) previously
-/// returned raw rows in segment-seal order without folding, so overlapping
-/// segments produced two rows at the same timestamp. Now it folds with
-/// `merge_newer_wins`, matching `read_time_range` and point reads.
+/// The value-band read (`read_value_range` / `read_value_range_of`) MUST return every
+/// stored row whose value falls in `[lo, hi]` in segment-seal then in-segment order,
+/// without deduplicating overlapping segments. This is the deliberate split from
+/// point/time-range reads, which answer "the current value" via newest-wins folding.
+///
+/// A future fold of the value-band read must fold the **whole series** (not only
+/// `prune_by_value` survivors) then filter by value, because value-pruning before
+/// folding would let a newer segment whose value-span misses the band be skipped,
+/// promoting a superseded older value. The fold must operate over the entire series'
+/// segment set, not over `prune_by_value` descriptors — that is the unsoundness that
+/// PR #671's fold had (see DECISIONS.md 2026-11-09 for the full ruling).
 #[tokio::test]
-async fn value_range_folds_newer_wins() {
+async fn value_range_is_a_raw_scan_pinned_against_point_and_range() {
 	let dir = TempDir::new().expect("tempdir");
 	let store = store_at(dir.path()).await;
 
-	// Seal first segment: timestamp 10 -> value 10, timestamp 20 -> value 20
-	ingest(&store, "a", &[10, 20], &[bd("10"), bd("20")]).await;
-	// Seal second, newer segment: timestamp 20 -> value 200 (overlap), timestamp 30 -> value 30
-	ingest(&store, "b", &[20, 30], &[bd("200"), bd("30")]).await;
+	// Two segments with the SAME timestamp 100 but different values:
+	// segment 1 (older):  timestamps [100], values [bd("1")]
+	// segment 2 (newer):  timestamps [100], values [bd("2")]
+	ingest(&store, "a", &[100], &[bd("1")]).await;
+	ingest(&store, "b", &[100], &[bd("2")]).await;
 
-	// Value-range read across the full value span — one row per timestamp, newest wins.
-	let (ts, vs) = store.read_value_range(ASPECT, &bd("0"), &bd("999")).await.expect("value-range read");
-	assert_eq!(ts, vec![10, 20, 30], "value range: timestamps deduplicated");
-	assert_eq!(vs, vec![bd("10"), bd("200"), bd("30")], "value range: newer wins at 20");
+	// POINT read returns the newest value (fold).
+	assert_eq!(
+		store.read_point(ASPECT, 100).await.expect("point at 100"),
+		Some(bd("2")),
+		"point read returns newest value"
+	);
 
-	// Point reads agree at every timestamp.
-	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), Some(bd("10")));
-	assert_eq!(store.read_point(ASPECT, 20).await.expect("point at 20"), Some(bd("200")));
-	assert_eq!(store.read_point(ASPECT, 30).await.expect("point at 30"), Some(bd("30")));
+	// TIME-RANGE read returns the instant once, with the newest value (fold).
+	let (ts_tr, vs_tr) = store.read_time_range(ASPECT, 100, 100).await.expect("time-range read");
+	assert_eq!(ts_tr, vec![100], "time range: one instant");
+	assert_eq!(vs_tr, vec![Some(bd("2"))], "time range: newest value");
+
+	// VALUE-RANGE read returns BOTH rows (raw scan, older first = seal order).
+	let (ts_vr, vs_vr) = store.read_value_range(ASPECT, &bd("0"), &bd("10")).await.expect("value-range read");
+	assert_eq!(ts_vr, vec![100, 100], "value range: two rows, one per segment");
+	assert_eq!(vs_vr, vec![bd("1"), bd("2")], "value range: both values, older first");
 
 	drop(store);
 }
 
 /// ------------------------------------------------------------------
-/// Issue #665: value predicate applied to winning value — shadowed row excluded.
-///
-/// A value bound that only the *shadowed* older row satisfies must exclude that
-/// timestamp. At timestamp 20, the older segment has value 20 and the newer has
-/// value 200. A bound `[15, 25]` matches only the shadowed row's 20, so
-/// timestamp 20 must be absent from the result.
+/// Pinning test: tagged variant (`read_value_range_of`) is also a raw scan.
 #[tokio::test]
-async fn value_range_shadowed_value_excluded() {
-	let dir = TempDir::new().expect("tempdir");
-	let store = store_at(dir.path()).await;
-
-	ingest(&store, "a", &[10, 20], &[bd("10"), bd("20")]).await;
-	ingest(&store, "b", &[20, 30], &[bd("200"), bd("30")]).await;
-
-	// Value bound [15, 25] matches only the shadowed older value 20. The winning
-	// value at 20 is 200 (outside the bound), so the row is excluded.
-	let (ts, _vs) = store.read_value_range(ASPECT, &bd("15"), &bd("25")).await.expect("value-range read");
-	assert!(ts.is_empty(), "no timestamps when only the shadowed value matches");
-
-	drop(store);
-}
-
-/// ------------------------------------------------------------------
-/// Issue #665: value predicate applied to winning value — winning row included.
-///
-/// A value bound that only the *winning* newer row satisfies must include that
-/// timestamp. At timestamp 20, the older segment has value 20 and the newer has
-/// value 200. A bound `[150, 250]` matches only the winning row's 200, so
-/// timestamp 20 must be present with value 200.
-#[tokio::test]
-async fn value_range_winning_value_included() {
-	let dir = TempDir::new().expect("tempdir");
-	let store = store_at(dir.path()).await;
-
-	ingest(&store, "a", &[10, 20], &[bd("10"), bd("20")]).await;
-	ingest(&store, "b", &[20, 30], &[bd("200"), bd("30")]).await;
-
-	// Value bound [150, 250] matches only the winning value 200 at timestamp 20.
-	let (ts, vs) = store.read_value_range(ASPECT, &bd("150"), &bd("250")).await.expect("value-range read");
-	assert_eq!(ts, vec![20], "only the winning timestamp 20 qualifies");
-	assert_eq!(vs, vec![bd("200")], "winning value 200");
-
-	// Point read at timestamp 20 confirms the winner.
-	assert_eq!(store.read_point(ASPECT, 20).await.expect("point at 20"), Some(bd("200")));
-
-	drop(store);
-}
-
-/// ------------------------------------------------------------------
-/// Issue #665: tagged variant (`read_value_range_of`) folds the same way.
-///
-/// A series-scoped value-range read on overlapping segments must fold
-/// newest-wins, identical to the untagged `read_value_range` behaviour.
-#[tokio::test]
-async fn value_range_tagged_folds_newer_wins() {
+async fn value_range_of_is_a_raw_scan_pinned_against_point_of() {
 	let dir = TempDir::new().expect("tempdir");
 	let store = store_at(dir.path()).await;
 
 	let tags = TagSet::from_pairs([("host", "x")]).expect("valid tags");
 
-	// Seal first segment for series X.
-	store.ingest(ASPECT, &IngestBatch::dense("x1", vec![10, 20], vec![bd("10"), bd("20")]).with_groups(tags.clone())).await.expect("ingests first");
-	// Seal second, newer segment for series X, overlapping at 20.
-	store.ingest(ASPECT, &IngestBatch::dense("x2", vec![20, 30], vec![bd("200"), bd("30")]).with_groups(tags.clone())).await.expect("ingests second");
+	// Two segments for series X, same timestamp 100, different values.
+	store.ingest(ASPECT, &IngestBatch::dense("x1", vec![100], vec![bd("1")]).with_groups(tags.clone())).await.expect("ingests first");
+	store.ingest(ASPECT, &IngestBatch::dense("x2", vec![100], vec![bd("2")]).with_groups(tags.clone())).await.expect("ingests second");
 
 	let series = store.resolve_series(ASPECT, &crate::SeriesSelector::exact([("host", Some("x"))]).expect("valid")).await.expect("resolves").expect("series x");
 
-	// Tagged variant: same fold, one row per timestamp, newest wins.
-	let (ts, vs) = store.read_value_range_of(ASPECT, series, &bd("0"), &bd("999")).await.expect("tagged value-range read");
-	assert_eq!(ts, vec![10, 20, 30], "tagged: timestamps deduplicated");
-	assert_eq!(vs, vec![bd("10"), bd("200"), bd("30")], "tagged: newer wins at 20");
+	// Tagged point read: newest value.
+	assert_eq!(
+		store.read_point_of(ASPECT, series, 100).await.expect("point_of at 100"),
+		Some(bd("2")),
+		"tagged point returns newest value"
+	);
 
-	// Point reads through the tagged path agree.
-	assert_eq!(store.read_point_of(ASPECT, series, 10).await.expect("tagged point at 10"), Some(bd("10")));
-	assert_eq!(store.read_point_of(ASPECT, series, 20).await.expect("tagged point at 20"), Some(bd("200")));
-	assert_eq!(store.read_point_of(ASPECT, series, 30).await.expect("tagged point at 30"), Some(bd("30")));
+	// Tagged value-range read: raw scan, both rows.
+	let (ts, vs) = store.read_value_range_of(ASPECT, series, &bd("0"), &bd("10")).await.expect("tagged value-range read");
+	assert_eq!(ts, vec![100, 100], "tagged value range: two rows, one per segment");
+	assert_eq!(vs, vec![bd("1"), bd("2")], "tagged value range: both values, older first");
 
 	drop(store);
 }

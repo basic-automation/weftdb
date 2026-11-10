@@ -504,11 +504,9 @@ impl SegmentStore {
 	/// text), so the pruning runs through the resident
 	/// [`SegmentIndex`](weft_physical_type::SegmentIndex): it is loaded from the
 	/// control plane and pruned by value, and only the surviving descriptors' files
-	/// are opened. Within each opened segment the non-null rows are decoded, then all
-	/// segments' rows are folded **newest-wins** by timestamp, and only the winning
-	/// values that fall in `[lo, hi]` are returned. The result is sorted ascending by
-	/// timestamp, with one row per distinct timestamp. The row count `total` that
-	/// callers report counts these folded rows.
+	/// are opened. Within each opened segment the rows are filtered to those whose
+	/// value is present and in `[lo, hi]`. Returns parallel `(timestamps, values)`
+	/// vectors, in segment-seal then in-segment order.
 	///
 	/// # Errors
 	///
@@ -529,35 +527,17 @@ impl SegmentStore {
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		let index = self.index.load_series_index(aspect, series).await?;
-		// Collect non-null rows per segment (no value filter yet — the predicate must
-		// apply to the *winning* value after folding, not to shadowed rows), sort by
-		// timestamp, and merge newest-wins across segments in seal (id) order.
-		// This mirrors `read_time_range_of` and `fold_newest_wins`.
-		let mut merged: Vec<(i64, BigDecimal)> = Vec::new();
+		let mut timestamps = Vec::new();
+		let mut values = Vec::new();
 		for descriptor in index.prune_by_value(lo, hi) {
 			let (ts, vs) = self.decode_all(descriptor).await?;
-			let mut rows: Vec<(i64, BigDecimal)> = Vec::with_capacity(ts.len());
 			for (t, v) in ts.into_iter().zip(vs) {
 				if let Some(value) = v {
-					rows.push((t, value));
+					if lo <= &value && &value <= hi {
+						timestamps.push(t);
+						values.push(value);
+					}
 				}
-			}
-			// Sort each segment's rows by timestamp so `merge_newer_wins` receives
-			// **non-decreasing** inputs (same pattern as `read_time_range_of`).
-			rows.sort_by_key(|(t, _)| *t);
-			if merged.is_empty() {
-				merged = rows;
-			} else {
-				merged = merge_newer_wins(&merged, &rows);
-			}
-		}
-		// Apply the value predicate to the *winning* values only.
-		let mut timestamps = Vec::with_capacity(merged.len());
-		let mut values = Vec::with_capacity(merged.len());
-		for (t, v) in merged {
-			if lo <= &v && &v <= hi {
-				timestamps.push(t);
-				values.push(v);
 			}
 		}
 		Ok((timestamps, values))

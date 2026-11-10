@@ -5,10 +5,11 @@
 ### Breaking changes
 
 1. **Range reads return each timestamp once, newest-wins across overlapping sealed
-   segments (#443).** A range or value-range read no longer repeats timestamps that
+   segments (#443).** A time-range read no longer repeats timestamps that
    appeared in multiple sealed segments — the v0.1.0 release emitted duplicates where
    overlapping segments carried the same instant, and those windows now collapse.
-   Point-read semantics are unchanged.
+   **Value-band** reads (`/value-range*`) remain a raw, unfolded scan in segment-seal
+   then in-segment order and are unchanged by #443. Point-read semantics are unchanged.
    - v0.1.0 windows with duplicate rows now answer with fewer rows; compatibility
      tests updated for the corrected shape.
 

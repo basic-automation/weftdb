@@ -5892,3 +5892,15 @@ of `git add -A` (the harness drops `.pi-lens-probe-home/*.log` telemetry into th
 such files landed on a branch this week). **Rejected:** trusting a worker's own verification section.
 It is the exact artifact that lied twice in one day, and a check the producer performs on its own
 output is not a check.
+
+## 2026-11-09 — The value-band read stays a raw scan; PR #671's fold is unsound and is closed
+
+**Ambiguous:** #665 reports `read_value_range`/`read_value_range_of` don't fold overlapping segments newest-wins; when a client rewrites an instant it gets both rows back. One unreleased doc line (`docs/upgrade-notes.md`) had overstated #443 as folding value-range too; the code, the changelog, `compat_v010.rs`, and the `read_value_range_of` doc comment always treated the value band as a raw scan.
+
+**Chosen: keep the raw scan, document it, and close PR #671.** The value-band read is a distinct "all raw observations in `[lo,hi]`" operation with no folded replacement, already pinned by `compat_v010.rs` and the crash matrix. The proposed fold (PR #671) is unsound — it value-prunes descriptors before folding, so a newer segment whose value-span misses the band can be skipped and a superseded value promoted — and it changes public read semantics in the last feature waves, breaking the pre-v2 migration byte-equality leg (a sorting-only diff, no collision), the v0.1.0 compat value-range leg (570→190), and the crash-matrix value-range counts. Correct the over-broad sentence in `docs/upgrade-notes.md`, document the read-vs-raw-scan split in `docs/reference.md`, and add a synthetic-collision test pinning the raw scan beside the point/range fold. A folded value-band read, if wanted, is a post-1.0 distinct surface (fold all segments then filter), not a change to this route.
+
+## 2026-11-09 — PR #669 was merged without a dedicated reviewer slot
+
+PR #669 (Windows `free_bytes_at`) was merged on my own read of its diff rather than through the goldfish-reviewer slot, because the change is one platform FFI function with green CI on all three operating systems and a platform-agnostic test, and the reviewer slot was needed for the larger soak slice.
+
+**Residual risk:** nobody independent has read #669's diff.
