@@ -1618,8 +1618,10 @@ impl Inputs for Database {
 
 			Self::commit_concurrent(&conn).await?;
 
-			let log = format!("Inserted correlation '{}' for aspect {}", correlation.id(), aspect_id);
-			let _ = self.record_transaction(&log).await?;
+			if measurement_audit_enabled() {
+				let log = format!("Inserted correlation '{}' for aspect {}", correlation.id(), aspect_id);
+				let _ = self.record_transaction(&log).await?;
+			}
 
 			Ok(tx_id)
 		})
@@ -1709,8 +1711,10 @@ impl Inputs for Database {
 			let cache_key = format!("correlation_{}_{}", aspect_id.as_uuid(), correlation.id().to_uuid());
 			self.cache.lock().await.store(&cache_key, correlation.clone()).await;
 
-			let log = format!("Updated correlation '{}' for aspect {}", correlation.id(), aspect_id);
-			let _ = self.record_transaction(&log).await?;
+			if measurement_audit_enabled() {
+				let log = format!("Updated correlation '{}' for aspect {}", correlation.id(), aspect_id);
+				let _ = self.record_transaction(&log).await?;
+			}
 
 			Ok(tx_id)
 		})
@@ -2797,15 +2801,16 @@ mod tests {
 	}
 }
 
-/// Whether each captured measurement also writes a row to the `transactions` audit log.
+/// Whether each captured measurement and each correlation insert or update also writes a
+/// row to the `transactions` audit log.
 ///
-/// Off unless `WEFT_MEASUREMENT_AUDIT` is `1`/`true`. The log is never pruned and the
-/// metadata database runs under MVCC, which holds its rows in memory, so a row per
-/// measurement grew a 1 Hz daemon's RSS without bound (5.7M rows in 3.5 days). Schema,
-/// subject and batch events are still always logged.
+/// Off unless `WEFT_DATA_AUDIT` is `1`/`true`. The log is never pruned and the metadata
+/// database runs under MVCC, which holds its rows in memory, so a row per measurement and
+/// per correlation write grew a 1 Hz daemon's RSS without bound (6.3M rows in 3.5 days).
+/// Schema, subject, dictionary, event and batch events are still always logged.
 pub(crate) fn measurement_audit_enabled() -> bool {
 	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-	*ENABLED.get_or_init(|| measurement_audit_from(std::env::var("WEFT_MEASUREMENT_AUDIT").ok().as_deref()))
+	*ENABLED.get_or_init(|| measurement_audit_from(std::env::var("WEFT_DATA_AUDIT").ok().as_deref()))
 }
 
 fn measurement_audit_from(raw: Option<&str>) -> bool {
@@ -2861,7 +2866,7 @@ impl Database {
 
 	/// Remove the metadata rows that grew without bound before 0.3.3, and return how many.
 	///
-	/// - Per-measurement audit rows, unless `WEFT_MEASUREMENT_AUDIT` keeps them.
+	/// - Per-measurement audit rows, unless `WEFT_DATA_AUDIT` keeps them.
 	/// - Queue entries of aspects with no batches whose oldest entry is over a day old. No
 	///   consumer has batched them, and its first run, finding an empty queue and no batches,
 	///   rebuilds every window from the stored rows, so it needs none of them.
@@ -2871,7 +2876,15 @@ impl Database {
 	pub async fn prune_metadata(&self) -> Result<u64> {
 		let mut removed = 0;
 		if !measurement_audit_enabled() {
-			removed += self.delete_metadata_rows("DELETE FROM transactions WHERE message LIKE 'Captured measurement at %' OR message LIKE 'Inserted new measurement at %'", turso::params![]).await?;
+			// A bounded transaction at a time: under MVCC one delete of millions of rows
+			// held them all in memory at once (9 GB on a 6M-row log).
+			loop {
+				let n = self.delete_metadata_rows("DELETE FROM transactions WHERE rowid IN (SELECT rowid FROM transactions WHERE message LIKE 'Captured measurement at %' OR message LIKE 'Inserted new measurement at %' OR message LIKE 'Inserted correlation %' OR message LIKE 'Updated correlation %' LIMIT 20000)", turso::params![]).await?;
+				removed += n;
+				if n == 0 {
+					break;
+				}
+			}
 		}
 		let aspects: Vec<AspectId> = {
 			let conn = Self::begin_concurrent(self.metadata(), self.metadata_path(), Some(self.cache.clone())).await?;
@@ -2891,7 +2904,13 @@ impl Database {
 		for aspect_id in aspects {
 			// An aspect whose rows are gone fails its batch count; leave its entries.
 			if matches!(self.queue_has_consumer_from_batches(&aspect_id).await, Ok(false)) {
-				removed += self.delete_metadata_rows("DELETE FROM unbatched_measurements WHERE aspect_id = ?", turso::params![aspect_id.as_uuid().to_string()]).await?;
+				loop {
+					let n = self.delete_metadata_rows("DELETE FROM unbatched_measurements WHERE rowid IN (SELECT rowid FROM unbatched_measurements WHERE aspect_id = ? LIMIT 20000)", turso::params![aspect_id.as_uuid().to_string()]).await?;
+					removed += n;
+					if n == 0 {
+						break;
+					}
+				}
 			}
 		}
 		if removed > 0 {
