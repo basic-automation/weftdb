@@ -54,42 +54,27 @@ async fn cancel_between_aspects_finishes_current_and_reports_cancelled() {
 	let dir = TempDir::new().expect("tempdir");
 	let store = store_with(dir.path(), &["alpha", "beta", "gamma", "delta"]).await;
 
-	// Give enough aspects that the sweep cannot finish all before the cancellor fires.
-	// Each aspect has enough segments to need real work.
 	seal_many(&store, "alpha", 5, 10).await;
 	seal_many(&store, "beta", 5, 10).await;
 	seal_many(&store, "gamma", 5, 10).await;
 	seal_many(&store, "delta", 5, 10).await;
 
-	let cancel = MaintenanceCancel::default();
-	let token = cancel.clone();
+	// Poll-budget token: the sweep is allowed exactly one aspect, then sees a
+	// request. A wall-clock cancellor cannot pin this — four tiny aspects are
+	// swept in well under a millisecond, so a 1 ms sleep either lands after the
+	// last aspect (nothing to cancel) or races the loop.
+	let cancel = MaintenanceCancel::after_polls(1);
 
-	// Fire cancellation after a short delay — the first aspect should be in flight.
-	let jh = tokio::spawn(async move {
-		tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-		token.request();
-	});
+	let sweep = store.squash_all_over_threshold_with_cancel(2, MaintenanceWait::Skip, &cancel).await.expect("sweep succeeds");
 
-	let sweep = store
-		.squash_all_over_threshold_with_cancel(2, MaintenanceWait::Skip, &cancel)
-		.await
-		.expect("sweep succeeds");
-
-	jh.await.expect("cancellor joins");
-
-	// Something was squashed (the in-flight aspect finished), but we were cancelled.
-	assert!(sweep.aspects_squashed >= 1, "at least one aspect completed");
 	assert!(sweep.cancelled, "sweep was cancelled before visiting all aspects");
+	assert_eq!(sweep.aspects_squashed, 1, "exactly the in-flight aspect completed, no later aspect was started");
 
-	// No leaked MaintGuard: a single-aspect call on the last untouched aspect succeeds.
-	let delta_squash = store
-		.squash_aspect_if_exceeds("delta", 2)
-		.await
-		.expect("delta squash succeeds");
-	assert!(
-		delta_squash.is_some(),
-		"delta should still need squashing and succeed"
-	);
+	// No leaked `MaintGuard` and nothing half-done: an uncancelled sweep finishes
+	// the three aspects the cancelled one never reached.
+	let rest = store.squash_all_over_threshold(2, MaintenanceWait::Skip).await.expect("second sweep succeeds");
+	assert_eq!(rest.aspects_squashed, 3, "the remaining aspects were still schedulable and got swept");
+	assert!(!rest.cancelled, "an uncancelled sweep does not report cancellation");
 }
 
 // ---------------------------------------------------------------------------
@@ -106,16 +91,10 @@ async fn cancel_before_sweep_starts_nothing() {
 	let cancel = MaintenanceCancel::default();
 	cancel.request(); // Pre-requested.
 
-	let sweep = store
-		.squash_all_over_threshold_with_cancel(2, MaintenanceWait::Skip, &cancel)
-		.await
-		.expect("sweep succeeds");
+	let sweep = store.squash_all_over_threshold_with_cancel(2, MaintenanceWait::Skip, &cancel).await.expect("sweep succeeds");
 
 	assert!(sweep.cancelled, "sweep should report cancelled");
-	assert_eq!(
-		sweep.aspects_squashed, 0,
-		"no aspect should have been squashed"
-	);
+	assert_eq!(sweep.aspects_squashed, 0, "no aspect should have been squashed");
 
 	// Both aspects untouched.
 	for aspect in &["alpha", "beta"] {
@@ -139,31 +118,19 @@ async fn cancelled_sweep_then_full_sweep_converges() {
 	// Step 1 — cancelled sweep.
 	let cancel = MaintenanceCancel::default();
 	cancel.request();
-	let c1 = store
-		.squash_all_over_threshold_with_cancel(2, MaintenanceWait::Skip, &cancel)
-		.await
-		.expect("cancelled sweep");
+	let c1 = store.squash_all_over_threshold_with_cancel(2, MaintenanceWait::Skip, &cancel).await.expect("cancelled sweep");
 	assert!(c1.cancelled, "first sweep reports cancelled");
 	assert_eq!(c1.aspects_squashed, 0, "nothing squashed on cancelled sweep");
 
 	// Step 2 — full uncancelled sweep.
-	let c2 = store
-		.squash_all_over_threshold(2, MaintenanceWait::Skip)
-		.await
-		.expect("full sweep");
+	let c2 = store.squash_all_over_threshold(2, MaintenanceWait::Skip).await.expect("full sweep");
 	assert!(!c2.cancelled, "full sweep not cancelled");
-	assert_eq!(
-		c2.aspects_squashed, 2,
-		"both aspects should be squashed"
-	);
+	assert_eq!(c2.aspects_squashed, 2, "both aspects should be squashed");
 	assert!(c2.segments_removed > 0, "segments were removed");
 
 	// Both aspects converged: segment count <= 2 (threshold).
 	for aspect in &["alpha", "beta"] {
 		let count = store.segment_count(aspect).await.expect("count");
-		assert!(
-			count <= 2,
-			"{aspect} should be at or below threshold; has {count}"
-		);
+		assert!(count <= 2, "{aspect} should be at or below threshold; has {count}");
 	}
 }
