@@ -345,10 +345,10 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [ ] **FRE-10a** Contract tests
   - [x] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
   - [x] **SOA-16** Soak upgrade lane
-- [ ] **W10 · Tag gate flip, compaction closes**
+- [x] **W10 · Tag gate flip, compaction closes**
   - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
   - [x] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
-  - [ ] read lane
+  - [x] read lane
   - [x] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
     *Closed 2026-11-08: [`docs/stability.md`](docs/stability.md) documents the semver
     policy, surface stability table, compat-suite coverage and named gaps; linked from
