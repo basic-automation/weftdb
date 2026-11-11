@@ -16,6 +16,14 @@
 //! | [`detect_threshold_crossing_up`] | Detects upward threshold crossings |
 //! | [`detect_threshold_crossing_down`] | Detects downward threshold crossings |
 //! | [`detect_drawdown`] | Detects significant price drops from peaks |
+//! | [`detect_monthly_increase_in_window`] | Bounded-window variant of `detect_monthly_increase` |
+//! | [`detect_peaks_in_window`] | Bounded-window variant of `detect_peaks` |
+//! | [`detect_all_peaks_in_window`] | Bounded-window variant of `detect_all_peaks` |
+//! | [`detect_valleys_in_window`] | Bounded-window variant of `detect_valleys` |
+//! | [`detect_all_valleys_in_window`] | Bounded-window variant of `detect_all_valleys` |
+//! | [`detect_threshold_crossing_up_in_window`] | Bounded-window variant of `detect_threshold_crossing_up` |
+//! | [`detect_threshold_crossing_down_in_window`] | Bounded-window variant of `detect_threshold_crossing_down` |
+//! | [`detect_drawdown_in_window`] | Bounded-window variant of `detect_drawdown` |
 //!
 //! ## Usage with Pipeline (Recommended)
 //!
@@ -121,7 +129,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use bigdecimal::{BigDecimal, FromPrimitive};
-use chrono::Datelike;
+use chrono::{DateTime, Datelike, Utc};
 use futures::StreamExt;
 use splimes::Spline;
 use weftdb::{
@@ -159,7 +167,28 @@ use crate::{Event, Manifestation};
 /// let events = detect_monthly_increase(&db, &aspect, &resolution, &method, 0.05).await?;
 /// ```
 pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold_percent: f64) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_monthly_increase_in_window(database, aspect, resolution, method, threshold_percent, None).await
+}
+
+/// # Errors
+///
+/// Returns an error if database operations fail, or if the aspect has no measurement to bound the analysis range with.
+/// Bounded-window variant of [`detect_monthly_increase`].
+///
+/// `Some(since)` starts the analysis at `since` instead of at the aspect's earliest
+/// measurement, so the work is bounded by the window rather than by the whole series.
+/// Read that as the start of the analysed range, **not** as a filter applied to a
+/// full-history result: a feature is reported only when the points that define it
+/// both fall inside the range. A threshold crossing needs the point below the
+/// threshold as well as the one above it, and a peak, valley or drawdown is judged
+/// from the points supplied to it, so a window can legitimately miss a feature that
+/// a full scan of [`detect_monthly_increase`] finds. `None` analyses the whole series and matches
+/// [`detect_monthly_increase`] exactly.
+pub async fn detect_monthly_increase_in_window(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold_percent: f64, since: Option<DateTime<Utc>>) -> Result<Vec<Event>> {
+	let start_time = match since {
+		Some(s) => s,
+		None => database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?,
+	};
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -237,7 +266,28 @@ pub async fn detect_monthly_increase(database: &Database, aspect: &AspectId, res
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_peaks(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_peaks_in_window(database, aspect, resolution, method, name, None).await
+}
+
+/// # Errors
+///
+/// Returns an error if database operations fail, or if the aspect has no measurement to bound the analysis range with.
+/// Bounded-window variant of [`detect_peaks`].
+///
+/// `Some(since)` starts the analysis at `since` instead of at the aspect's earliest
+/// measurement, so the work is bounded by the window rather than by the whole series.
+/// Read that as the start of the analysed range, **not** as a filter applied to a
+/// full-history result: a feature is reported only when the points that define it
+/// both fall inside the range. A threshold crossing needs the point below the
+/// threshold as well as the one above it, and a peak, valley or drawdown is judged
+/// from the points supplied to it, so a window can legitimately miss a feature that
+/// a full scan of [`detect_peaks`] finds. `None` analyses the whole series and matches
+/// [`detect_peaks`] exactly.
+pub async fn detect_peaks_in_window(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str, since: Option<DateTime<Utc>>) -> Result<Vec<Event>> {
+	let start_time = match since {
+		Some(s) => s,
+		None => database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?,
+	};
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -304,7 +354,28 @@ pub async fn detect_peaks(database: &Database, aspect: &AspectId, resolution: &R
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_all_peaks(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_all_peaks_in_window(database, aspect, resolution, method, name, None).await
+}
+
+/// # Errors
+///
+/// Returns an error if database operations fail, or if the aspect has no measurement to bound the analysis range with.
+/// Bounded-window variant of [`detect_all_peaks`].
+///
+/// `Some(since)` starts the analysis at `since` instead of at the aspect's earliest
+/// measurement, so the work is bounded by the window rather than by the whole series.
+/// Read that as the start of the analysed range, **not** as a filter applied to a
+/// full-history result: a feature is reported only when the points that define it
+/// both fall inside the range. A threshold crossing needs the point below the
+/// threshold as well as the one above it, and a peak, valley or drawdown is judged
+/// from the points supplied to it, so a window can legitimately miss a feature that
+/// a full scan of [`detect_all_peaks`] finds. `None` analyses the whole series and matches
+/// [`detect_all_peaks`] exactly.
+pub async fn detect_all_peaks_in_window(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str, since: Option<DateTime<Utc>>) -> Result<Vec<Event>> {
+	let start_time = match since {
+		Some(s) => s,
+		None => database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?,
+	};
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -369,7 +440,28 @@ pub async fn detect_all_peaks(database: &Database, aspect: &AspectId, resolution
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_valleys(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_valleys_in_window(database, aspect, resolution, method, name, None).await
+}
+
+/// # Errors
+///
+/// Returns an error if database operations fail, or if the aspect has no measurement to bound the analysis range with.
+/// Bounded-window variant of [`detect_valleys`].
+///
+/// `Some(since)` starts the analysis at `since` instead of at the aspect's earliest
+/// measurement, so the work is bounded by the window rather than by the whole series.
+/// Read that as the start of the analysed range, **not** as a filter applied to a
+/// full-history result: a feature is reported only when the points that define it
+/// both fall inside the range. A threshold crossing needs the point below the
+/// threshold as well as the one above it, and a peak, valley or drawdown is judged
+/// from the points supplied to it, so a window can legitimately miss a feature that
+/// a full scan of [`detect_valleys`] finds. `None` analyses the whole series and matches
+/// [`detect_valleys`] exactly.
+pub async fn detect_valleys_in_window(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str, since: Option<DateTime<Utc>>) -> Result<Vec<Event>> {
+	let start_time = match since {
+		Some(s) => s,
+		None => database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?,
+	};
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -436,7 +528,28 @@ pub async fn detect_valleys(database: &Database, aspect: &AspectId, resolution: 
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_all_valleys(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_all_valleys_in_window(database, aspect, resolution, method, name, None).await
+}
+
+/// # Errors
+///
+/// Returns an error if database operations fail, or if the aspect has no measurement to bound the analysis range with.
+/// Bounded-window variant of [`detect_all_valleys`].
+///
+/// `Some(since)` starts the analysis at `since` instead of at the aspect's earliest
+/// measurement, so the work is bounded by the window rather than by the whole series.
+/// Read that as the start of the analysed range, **not** as a filter applied to a
+/// full-history result: a feature is reported only when the points that define it
+/// both fall inside the range. A threshold crossing needs the point below the
+/// threshold as well as the one above it, and a peak, valley or drawdown is judged
+/// from the points supplied to it, so a window can legitimately miss a feature that
+/// a full scan of [`detect_all_valleys`] finds. `None` analyses the whole series and matches
+/// [`detect_all_valleys`] exactly.
+pub async fn detect_all_valleys_in_window(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, name: &str, since: Option<DateTime<Utc>>) -> Result<Vec<Event>> {
+	let start_time = match since {
+		Some(s) => s,
+		None => database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?,
+	};
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -502,7 +615,28 @@ pub async fn detect_all_valleys(database: &Database, aspect: &AspectId, resoluti
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_threshold_crossing_up(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold: BigDecimal, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_threshold_crossing_up_in_window(database, aspect, resolution, method, threshold, name, None).await
+}
+
+/// # Errors
+///
+/// Returns an error if database operations fail, or if the aspect has no measurement to bound the analysis range with.
+/// Bounded-window variant of [`detect_threshold_crossing_up`].
+///
+/// `Some(since)` starts the analysis at `since` instead of at the aspect's earliest
+/// measurement, so the work is bounded by the window rather than by the whole series.
+/// Read that as the start of the analysed range, **not** as a filter applied to a
+/// full-history result: a feature is reported only when the points that define it
+/// both fall inside the range. A threshold crossing needs the point below the
+/// threshold as well as the one above it, and a peak, valley or drawdown is judged
+/// from the points supplied to it, so a window can legitimately miss a feature that
+/// a full scan of [`detect_threshold_crossing_up`] finds. `None` analyses the whole series and matches
+/// [`detect_threshold_crossing_up`] exactly.
+pub async fn detect_threshold_crossing_up_in_window(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold: BigDecimal, name: &str, since: Option<DateTime<Utc>>) -> Result<Vec<Event>> {
+	let start_time = match since {
+		Some(s) => s,
+		None => database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?,
+	};
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -568,7 +702,28 @@ pub async fn detect_threshold_crossing_up(database: &Database, aspect: &AspectId
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_threshold_crossing_down(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold: BigDecimal, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_threshold_crossing_down_in_window(database, aspect, resolution, method, threshold, name, None).await
+}
+
+/// # Errors
+///
+/// Returns an error if database operations fail, or if the aspect has no measurement to bound the analysis range with.
+/// Bounded-window variant of [`detect_threshold_crossing_down`].
+///
+/// `Some(since)` starts the analysis at `since` instead of at the aspect's earliest
+/// measurement, so the work is bounded by the window rather than by the whole series.
+/// Read that as the start of the analysed range, **not** as a filter applied to a
+/// full-history result: a feature is reported only when the points that define it
+/// both fall inside the range. A threshold crossing needs the point below the
+/// threshold as well as the one above it, and a peak, valley or drawdown is judged
+/// from the points supplied to it, so a window can legitimately miss a feature that
+/// a full scan of [`detect_threshold_crossing_down`] finds. `None` analyses the whole series and matches
+/// [`detect_threshold_crossing_down`] exactly.
+pub async fn detect_threshold_crossing_down_in_window(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, threshold: BigDecimal, name: &str, since: Option<DateTime<Utc>>) -> Result<Vec<Event>> {
+	let start_time = match since {
+		Some(s) => s,
+		None => database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?,
+	};
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -634,7 +789,28 @@ pub async fn detect_threshold_crossing_down(database: &Database, aspect: &Aspect
 ///
 /// Returns an error if database operations fail.
 pub async fn detect_drawdown(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, drop_percent: f64, name: &str) -> Result<Vec<Event>> {
-	let start_time = database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?;
+	detect_drawdown_in_window(database, aspect, resolution, method, drop_percent, name, None).await
+}
+
+/// # Errors
+///
+/// Returns an error if database operations fail, or if the aspect has no measurement to bound the analysis range with.
+/// Bounded-window variant of [`detect_drawdown`].
+///
+/// `Some(since)` starts the analysis at `since` instead of at the aspect's earliest
+/// measurement, so the work is bounded by the window rather than by the whole series.
+/// Read that as the start of the analysed range, **not** as a filter applied to a
+/// full-history result: a feature is reported only when the points that define it
+/// both fall inside the range. A threshold crossing needs the point below the
+/// threshold as well as the one above it, and a peak, valley or drawdown is judged
+/// from the points supplied to it, so a window can legitimately miss a feature that
+/// a full scan of [`detect_drawdown`] finds. `None` analyses the whole series and matches
+/// [`detect_drawdown`] exactly.
+pub async fn detect_drawdown_in_window(database: &Database, aspect: &AspectId, resolution: &Resolution, method: &Spline, drop_percent: f64, name: &str, since: Option<DateTime<Utc>>) -> Result<Vec<Event>> {
+	let start_time = match since {
+		Some(s) => s,
+		None => database.get_earliest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No earliest measurement found"))?,
+	};
 	let end_time = database.get_latest_measurement(aspect).await?.ok_or_else(|| anyhow::anyhow!("No latest measurement found"))?;
 
 	let mut point_stream = Outputs::analyze_range(database, aspect, start_time, end_time, *resolution, *method).await?;
@@ -687,5 +863,109 @@ pub async fn detect_drawdown(database: &Database, aspect: &AspectId, resolution:
 		    "Drawdown detector found events"
 		);
 		Ok(vec![event])
+	}
+}
+
+#[cfg(test)]
+mod window_tests {
+	//! What a bounded window keeps, and the one way it legitimately disagrees with a
+	//! full-history scan. Written because the `*_in_window` variants had no test and
+	//! `since` had no recorded boundary rule.
+
+	use chrono::{DateTime, TimeZone, Utc};
+	use splimes::Spline;
+	use weftdb::{
+		database::traits::{AspectStructure, DatabaseStructure, Inputs}, AspectId, Database, DatasetId, InputMeasurement, Resolution
+	};
+
+	use super::*;
+	use crate::test_support::remove_database;
+
+	/// Capture `values` one hour apart from 2025-01-01 00:00 UTC and return the aspect.
+	async fn hourly_aspect(db: &Database, name: &str, values: &[i64]) -> AspectId {
+		let subject = db.observe_subject("WindowSubject").await.unwrap();
+		let aspect = db.track_aspect(&subject.id(), name, &Resolution::Hours, None).await.unwrap();
+		let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+		for (index, value) in values.iter().enumerate() {
+			let hours = i64::try_from(index).expect("a test index always fits an i64");
+			let measurement = InputMeasurement::new(start + chrono::Duration::hours(hours), bigdecimal::BigDecimal::from(*value));
+			db.capture_measurement(&aspect.id(), &DatasetId::new(), &measurement).await.unwrap();
+		}
+		aspect.id()
+	}
+
+	fn hour(index: i64) -> DateTime<Utc> {
+		Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::hours(index)
+	}
+
+	/// The `(start, end)` span of every manifestation, which is how a detector records
+	/// the pair of points a feature was found across.
+	/// The spans a detector run returned, as `(start, end)` pairs, sorted
+	/// chronologically.
+	///
+	/// The analysis hands events back newest-first, so the sort is the tests' own
+	/// bookkeeping: these cases pin *which* events a window keeps, not the order
+	/// they arrive in.
+	fn spans(events: &[Event]) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+		let mut found = Vec::new();
+		for event in events {
+			for manifestation in event.manifestations().values() {
+				found.push((*manifestation.start(), *manifestation.end()));
+			}
+		}
+		found.sort();
+		found
+	}
+
+	#[tokio::test]
+	async fn a_window_that_starts_before_a_crossing_matches_a_full_scan() {
+		remove_database("orch_window_equivalence");
+		let db = Database::new("orch_window_equivalence").await.unwrap();
+		let aspect = hourly_aspect(&db, "Level", &[1, 2, 3, 10, 11]).await;
+		let threshold = bigdecimal::BigDecimal::from(5);
+
+		let full = detect_threshold_crossing_up(&db, &aspect, &Resolution::Hours, &Spline::Linear, threshold.clone(), "crossing").await.unwrap();
+		// The crossing is the pair (3 @ hour 2, 10 @ hour 3): a span, not a point.
+		assert_eq!(spans(&full), vec![(hour(2), hour(3))], "the fixture should produce exactly one crossing");
+
+		// `since` at the very beginning of the series bounds the scan without dropping anything.
+		let windowed = detect_threshold_crossing_up_in_window(&db, &aspect, &Resolution::Hours, &Spline::Linear, threshold, "crossing", Some(hour(0))).await.unwrap();
+		assert_eq!(spans(&windowed), spans(&full), "a window starting at the series start must agree with a full scan");
+		drop(db);
+	}
+
+	#[tokio::test]
+	async fn a_crossing_whose_earlier_point_precedes_the_window_is_not_reported() {
+		remove_database("orch_window_boundary");
+		let db = Database::new("orch_window_boundary").await.unwrap();
+		let aspect = hourly_aspect(&db, "Level", &[1, 2, 3, 10, 11]).await;
+		let threshold = bigdecimal::BigDecimal::from(5);
+
+		let full = detect_threshold_crossing_up(&db, &aspect, &Resolution::Hours, &Spline::Linear, threshold.clone(), "crossing").await.unwrap();
+		assert_eq!(spans(&full).len(), 1, "the fixture should produce exactly one crossing");
+
+		// `since` on the hour the level arrives leaves only the points at or above the
+		// threshold, and a crossing needs the point *below* it too. This is the boundary
+		// rule the doc comment states: `since` starts the analysis range, it does not
+		// filter a full-history result down to the window.
+		let windowed = detect_threshold_crossing_up_in_window(&db, &aspect, &Resolution::Hours, &Spline::Linear, threshold, "crossing", Some(hour(3))).await.unwrap();
+		assert!(spans(&windowed).is_empty(), "a crossing whose earlier point is before `since` must not be reported, got {:?}", spans(&windowed));
+		drop(db);
+	}
+
+	#[tokio::test]
+	async fn a_window_drops_features_that_lie_before_it() {
+		remove_database("orch_window_trims");
+		let db = Database::new("orch_window_trims").await.unwrap();
+		// Two crossings upward through 5: hours 2->3 and hours 4->5.
+		let aspect = hourly_aspect(&db, "Level", &[8, 1, 2, 6, 2, 7]).await;
+		let threshold = bigdecimal::BigDecimal::from(5);
+
+		let full = detect_threshold_crossing_up(&db, &aspect, &Resolution::Hours, &Spline::Linear, threshold.clone(), "crossing").await.unwrap();
+		assert_eq!(spans(&full), vec![(hour(2), hour(3)), (hour(4), hour(5))], "the fixture should produce two crossings");
+
+		let windowed = detect_threshold_crossing_up_in_window(&db, &aspect, &Resolution::Hours, &Spline::Linear, threshold, "crossing", Some(hour(3))).await.unwrap();
+		assert_eq!(spans(&windowed), vec![(hour(4), hour(5))], "a window from hour 3 keeps only the later crossing");
+		drop(db);
 	}
 }
