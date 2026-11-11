@@ -6408,3 +6408,32 @@ the name. The exemption is exact-match on two full names, and the wildcard-prefi
 is prefix-equality, not substring, so an unregistered `WEFT_STORE_BACKUP` is still
 caught. **Cost, stated in the comment above the set:** a *new* sentence that uses
 either name as though it were a real setting is invisible to this check.
+
+## 2026-11-11 — #656 is documentation truth, not a new refusal path
+
+**Ambiguous:** the issue asks to "document and test the full-disk contract", and a
+literal reading demands a test that makes the filesystem actually return `ENOSPC` and
+shows the server answering `507`. Two unprivileged ways to do that were tried and both
+failed for reasons that will not change: `unshare -U -m` then
+`mount -t tmpfs -o size=8m` returns `mount: /mnt: must be superuser to use mount`, and a
+`setrlimit(RLIMIT_FSIZE, 64 KiB)` write with `SIGXFSZ` ignored returns
+`write=65536 errno=0` — the kernel reports a **short write with no error**, so an rlimit
+cannot produce the errno the classification looks for either. The other reading is to
+test what the server itself decides, which is already reachable: `top_up_to_decoded` and
+`reserve_disk` take the guard's path with a supplied figure, and #694 made that figure
+injectable at the top-up.
+
+**Chosen: fix the page, and pin it with a contract test — do not invent a privileged
+rig.** The claim that was actually harming operators was in `docs/operations.md`, which
+said the code was unreachable; the refusal logic and its classification were already
+correct and already tested. A test that reads the page (`the_disk_full_contract_is_documented_as_reachable`
+in `weft-server/tests/error_contract.rs`) is the only mechanism that fails when the two
+drift apart again, and it needs no privilege, no mount, and no filesystem.
+
+**Cost, stated plainly:** *no test in this repository produces a literal `ENOSPC`.* The
+`error_chain_is_disk_full` arms (`weft-server/src/error.rs:852`, `:922`) are exercised
+only by synthetic errors built in `error.rs`'s own tests, so an operating-system
+full-disk error reaching the classifier is unverified end to end. Getting that needs a
+privileged CI step (`CAP_SYS_ADMIN` plus a `tmpfs`, or a loopback file); the fault-injection
+rig cannot substitute for it, because `FaultAction::ReturnErr` yields kind `Other`, which
+classifies `500`, not `507`. Left as a follow-up rather than faked here.

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Fixed
+- **`docs/operations.md` no longer tells operators that `507 insufficient_storage`
+  is unreachable (#656).** The "Disk full" section claimed that "as of v0.3.0, this
+  code is not yet raised by any code path" and that the server never checks free
+  space, while the disk guard (ROB-17) had long been refusing writes from three
+  places — before the body is read, after decode, and at the store's seal — and
+  `weft-server/src/error.rs` classified an operating-system `ENOSPC` to the same
+  code. The section now states what the guard covers and what it deliberately does
+  not (maintenance is unguarded because it is how space comes back; a filesystem the
+  OS cannot describe is never refused), where an operator looks
+  (`GET /api/v1/storage/headroom`, `disk_refusing` on `/ready`, the `weft_disk_*`
+  gauges) and what to do about a refusal. A new test in
+  `weft-server/tests/error_contract.rs` pins the section's claims, because a page
+  that contradicts the advertised surface is a contract bug: a client that believed
+  it would never retry a refused write.
 ### Changed
 - **README project-status table: version bump and row accuracy (EVI-22 partial).**
   Lead line now names v0.3.2 (the current release). The "Tags, client SDKs, Helm chart"
