@@ -285,24 +285,56 @@ that is tested and the store format (layout number, floor) is unchanged.
 
 ### Disk full
 
-The `InsufficientStorage` error code (507) is defined in the error table and
-reserved for the case where the filesystem cannot accept a write without
-risking a full disk. **As of v0.3.0, this code is not yet raised by any code
-path.** The server does not, in this release, check available disk space before
-writes. An operator must monitor disk usage independently.
+A full disk is a refusal, not a crash. Every ingest and seal reserves
+`WEFT_DISK_RESERVE_BYTES` (default 256 MiB) of free space and is answered
+`507 insufficient_storage` when it cannot leave that much — with nothing
+written, so a refusal never leaves a half-written frame behind.
 
-To see disk usage for the data path:
+The refusal happens at the first point where the server can see the cost:
+
+- **before the body is read**, against the declared `Content-Length` (the body
+  cap when none is declared), so a request the disk cannot take costs no
+  bandwidth;
+- **after decode**, against what the decoded columns actually weigh, which is
+  what a compressed body's declared length cannot tell you;
+- **at the seal**, by the store's own guard, on the bytes the frame will
+  really write.
+
+The same code answers a filesystem that refuses mid-write: an `ENOSPC` (or
+`ERROR_DISK_FULL`) surfacing from the operating system is classified
+`507 insufficient_storage` rather than a bare `500`. So an operator sees one
+code whether the guard predicted the shortage or the filesystem reported it.
+
+Two deliberate gaps. Maintenance (compaction, reconciliation) is **not**
+guarded — it is how a store gets space back, and refusing it would deadlock
+the recovery. And where the operating system cannot describe free space the
+guard has nothing to check against: it lets the write through, the filesystem
+answers, and `disk_refusing` on `GET /ready` stays `false`.
+
+What to watch, and what to do:
 
 ```bash
 df -h /var/lib/weftdb
 ```
 
-The store's response to a full filesystem depends on the OS: writes return I/O
-errors (`5xx` over HTTP, with no error code more specific than `500`), and the
-journal will show file-system-level errors. The store is designed for crash
-safety — durable writes and crash recovery — but a full disk that prevents any
-write from completing will put the service into a degraded state that requires
-operator action: free space and restart.
+- `GET /api/v1/storage/headroom` — `total_bytes`, `available_bytes`,
+  `reserve_bytes`, `writable_bytes` (what a write may still take) and
+  `refusing` (the guard is refusing every write now).
+- `GET /ready` — `disk_refusing` is `true` while every ingest and seal is
+  refused. Reads keep working, so `ready` stays `true`: a full disk is a
+  write outage, not an outage.
+- `/metrics` — `weft_disk_total_bytes`, `weft_disk_available_bytes`,
+  `weft_disk_reserve_bytes`, `weft_disk_writable_bytes`, and
+  `weft_disk_guard_refusing` (`1` while every write is refused). Alert on
+  `weft_disk_writable_bytes` crossing zero, not on the 507 rate.
+
+A refused ingest is **not** recorded against its `Idempotency-Key`, so the
+client's retry succeeds once there is room; nothing has to be replayed by
+hand. To get room back: free space, let maintenance compact, or lower
+`WEFT_DISK_RESERVE_BYTES` — it is read once at startup, so a change needs a
+restart. A disk that is full enough to refuse maintenance as well is the one
+case that needs operator action beyond freeing space: the journal shows the
+file-system-level errors.
 
 ### Service account and permissions
 

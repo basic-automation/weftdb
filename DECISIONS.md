@@ -6380,6 +6380,65 @@ PR; the standing rule is a narrower brief from the checkpoint or finish it mysel
 budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
 --lib` build, which the two prior worker deaths could not afford.
 
+## 2026-11-11 — `since` starts the analysed range; it is not a filter over a full scan
+
+`ROADMAP.md:483` asked for "an optional `since` start time … so a live caller only scans new
+data" plus "a test that the windowed and full-history runs find the same crossings in the
+window". Both readings were available: keep the full scan and drop results before `since`, or
+start the analysis at `since`. **Chosen: start the analysis at `since`** — it is the only
+variant that actually removes work, which is what the item is about; filtering would still read
+the whole series. The consequence is that the two readings disagree at the boundary, and the
+disagreement is not a bug to smooth over: a threshold crossing is a *pair* of points, so with
+`since` sitting on the first point above the threshold there is no lower neighbour inside the
+range and no crossing to report; the same applies to peaks, valleys and drawdowns judged from
+the points supplied to them. **Recorded rather than hidden**: each of the eight `*_in_window`
+doc comments now states the boundary, and `mod window_tests` in `detectors.rs` asserts it (a
+window from the series start equals a full scan; a crossing whose earlier point precedes `since`
+disappears; a window from hour 3 keeps only the later of two crossings).
+
+Additive API only — the eight originals now delegate with `None`, so `weft-orchestration` 0.3.2
+on crates.io keeps its behaviour and no caller breaks. The item's alternative, an incremental
+cursor from the last evaluated point, is deliberately **not** built: it needs persisted per-detector
+state, which the global `SIGNALS_QUEUE` item (`ROADMAP.md:482`) has to settle first.
+
+**Verification honesty:** the tests were written, not run. The host has 3-8 GB free of 124 GB with
+51 GB of swap in use and three worker runs had each spent a full 45-minute budget on cold `-j 1`
+builds without reaching a test binary, so this slice was finished by the supervisor with no local
+cargo at all; `cargo +nightly fmt` and `rustfmt` are the only tools that ran. CI is the first
+execution of `mod window_tests`, and the PR says so.
+## 2026-11-11 — the soak summary names every mismatch it found, and says what it skipped
+
+Two honesty defects in the nightly soak comparison (follow-ups recorded in issue #688).
+
+**The summary reported one mismatch class when two fired.** `build_summary`
+(`weft-bench/src/soak_compare.rs`) built the headline with an `if` / `else if` chain: when the
+report schema drifted *and* the counterpart series was missing, the schema branch won and the
+counterpart cause vanished from the text, even though both were in the detail lines. Both classes
+are now named in the headline. The substring `MISMATCH (report schema drift)` stays an exact
+prefix, which is what the existing assertions at `:2130` and `:2230` match, and the
+`MISMATCH (counterpart series)` assertion at `:2253` still holds because that class alone is
+unchanged.
+
+**Silently skipped optional metrics now report themselves.** A metric with a tolerance that the
+reports do not both carry was dropped with a code comment and no output. The summary line gains
+`Metrics compared: N of M.` plus `Skipped: <names>.` when `M > N`. It is a `>` prose line, not a
+`-` bullet, because the markdown parser treats a leading `- ` as a regression row — that is the
+one way this change could have manufactured a false regression, and it is the reason the wording
+is prose. A one-sided metric is still **not** compared: comparing values that exist on one side is
+a different question, and answering it silently would be the same class of dishonesty this fixes.
+
+**Deliberately not done here:** the exit code. A drift refusal still exits 0 because
+`weft-bench/src/main.rs` gates `ExitCode::FAILURE` on `has_regression` alone. That is the third
+item of #688 and stays open — changing the meaning of a nightly's exit status is a policy call
+with a paging consequence, not a reporting fix.
+
+`SoakComparison` keeps its fields and `schema_version: 1`: the counts live in the rendered summary
+line, so an existing machine-readable report still parses. The two new tests
+(`a_double_mismatch_names_both_causes`, `skipped_metrics_are_reported_when_optional_metric_is_absent`)
+were **written, not run**: the host has 3-8 GB free of 124 GB and `cargo test -p weft-bench` needs
+roughly 8 GB, so CI is the first execution. Every pre-existing summary assertion was re-read by
+hand against the new code path, which is what makes the `schema drift` prefix claim safe to make
+without running anything.
 ## 2026-11-11 — the config-schema checker keeps its two prose-only names (issue #687, PR #690)
 
 **Ambiguous:** the adversarial review of this slice blocked it on a total-count
@@ -6408,3 +6467,69 @@ the name. The exemption is exact-match on two full names, and the wildcard-prefi
 is prefix-equality, not substring, so an unregistered `WEFT_STORE_BACKUP` is still
 caught. **Cost, stated in the comment above the set:** a *new* sentence that uses
 either name as though it were a real setting is invisible to this check.
+
+## 2026-11-11 — #656 is documentation truth, not a new refusal path
+
+**Ambiguous:** the issue asks to "document and test the full-disk contract", and a
+literal reading demands a test that makes the filesystem actually return `ENOSPC` and
+shows the server answering `507`. Two unprivileged ways to do that were tried and both
+failed for reasons that will not change: `unshare -U -m` then
+`mount -t tmpfs -o size=8m` returns `mount: /mnt: must be superuser to use mount`, and a
+`setrlimit(RLIMIT_FSIZE, 64 KiB)` write with `SIGXFSZ` ignored returns
+`write=65536 errno=0` — the kernel reports a **short write with no error**, so an rlimit
+cannot produce the errno the classification looks for either. The other reading is to
+test what the server itself decides, which is already reachable: `top_up_to_decoded` and
+`reserve_disk` take the guard's path with a supplied figure, and #694 made that figure
+injectable at the top-up.
+
+**Chosen: fix the page, and pin it with a contract test — do not invent a privileged
+rig.** The claim that was actually harming operators was in `docs/operations.md`, which
+said the code was unreachable; the refusal logic and its classification were already
+correct and already tested. A test that reads the page (`the_disk_full_contract_is_documented_as_reachable`
+in `weft-server/tests/error_contract.rs`) is the only mechanism that fails when the two
+drift apart again, and it needs no privilege, no mount, and no filesystem.
+
+**Cost, stated plainly:** *no test in this repository produces a literal `ENOSPC`.* The
+`error_chain_is_disk_full` arms (`weft-server/src/error.rs:852`, `:922`) are exercised
+only by synthetic errors built in `error.rs`'s own tests, so an operating-system
+full-disk error reaching the classifier is unverified end to end. Getting that needs a
+privileged CI step (`CAP_SYS_ADMIN` plus a `tmpfs`, or a loopback file); the fault-injection
+rig cannot substitute for it, because `FaultAction::ReturnErr` yields kind `Other`, which
+classifies `500`, not `507`. Left as a follow-up rather than faked here.
+## 2026-11-11 — Supply the disk figure to the ingest top-up rather than racing the runner (#691, #656)
+**Ambiguous:** #684's flake had two cures on the table — keep widening the test's margin,
+or make the filesystem figure injectable. #691 recorded the first as shipped and the second
+as the real fix, and #656 wants a `507` from a filesystem that is actually full, which a
+margin cannot produce at all.
+**Chosen: inject the figure, one private seam, handler behaviour untouched.**
+`IngestBody::top_up_to_decoded` and `reserve_disk` now both delegate to
+`top_up_to_decoded_with_space` / `reserve_disk_with_space` (`weft-server/src/ingest.rs:~387`,
+`:~418`) taking `Option<weftdb::DiskSpace>`; the public `pub fn top_up_to_decoded` signature,
+the four handler call sites (`:892`, `:1030`, `:1237`, `:1322`) and the phase-1 extractor all
+still pass `weftdb::disk_space_at(store.root())`, so nothing in production reads the figure
+differently. `DiskGuard::admit` already took `Option<DiskSpace>` as a parameter
+(`weftdb/src/types/disk_guard.rs:138`), so the seam stops at the extractor that used to call
+`disk_space_at` itself — the smallest change that makes the number controllable.
+**Chosen: delegation, not `#[cfg(test)]` and not `#[allow(dead_code)]`.** A test-only method
+would be dead code in the binary and an integration test in `weft-server/tests/` could not
+see it; the codebase's pattern is an additive `_with_*` variant whose un-suffixed form
+delegates (`*_with_cancel` in `weftdb/src/types/segment_store/maint.rs`, `*_in_window` in
+`weft-orchestration/src/detectors.rs`). `weft-server` is `publish = false`, so a `pub(crate)`
+method adds no public API.
+**Chosen: rewrite the flaky test's figures rather than delete its bite.** The reserve is a
+fixed 256 MiB and the injected figure is `reserve + 512 MiB`, so `margin / 2` is admitted and
+`margin * 64` is refused by arithmetic; a second test refuses 4097 bytes against a filesystem
+sitting exactly at its reserve and admits `None`, which is `admit`'s documented
+"the write itself is the test" arm. **Cost:** phase 1 still reads live space through
+`FromRequest`, so the test needs a runner with a few KiB free — no margin left to race, but
+not zero dependency on the host. The store's own guard maths stays covered by
+`weftdb/src/types/disk_guard.rs`'s tests; this test's subject is the ingest answer, and the
+PR says so rather than claiming #656's filled-disk case is now proven at the store layer.
+**Chosen: reference #691 and #656, close neither.** #656 asks for a `507` from a genuinely
+filled filesystem; what exists now is the same refusal with the figure supplied, which is the
+testable half. Closing #656 here would claim a disk-full experiment that has not run.
+**Cost, stated plainly: CI is the first execution of every line here.** The host has ~9 GiB
+free of 124 GiB after four concurrent cargo runs, so nothing compiled locally — no `cargo
+check`, no `cargo test`. The likeliest first failure is the new test's import shape
+(`weftdb::DiskSpace` is re-exported at `weftdb/src/types/mod.rs:96`; the `Copy` derive at
+`weftdb/src/types/disk_guard.rs:28` is what lets one `space` value feed two calls).

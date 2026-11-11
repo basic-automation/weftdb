@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Fixed
+- **`docs/operations.md` no longer tells operators that `507 insufficient_storage`
+  is unreachable (#656).** The "Disk full" section claimed that "as of v0.3.0, this
+  code is not yet raised by any code path" and that the server never checks free
+  space, while the disk guard (ROB-17) had long been refusing writes from three
+  places — before the body is read, after decode, and at the store's seal — and
+  `weft-server/src/error.rs` classified an operating-system `ENOSPC` to the same
+  code. The section now states what the guard covers and what it deliberately does
+  not (maintenance is unguarded because it is how space comes back; a filesystem the
+  OS cannot describe is never refused), where an operator looks
+  (`GET /api/v1/storage/headroom`, `disk_refusing` on `/ready`, the `weft_disk_*`
+  gauges) and what to do about a refusal. A new test in
+  `weft-server/tests/error_contract.rs` pins the section's claims, because a page
+  that contradicts the advertised surface is a contract bug: a client that believed
+  it would never retry a refused write.
 ### Changed
 - **README project-status table: version bump and row accuracy (EVI-22 partial).**
   Lead line now names v0.3.2 (the current release). The "Tags, client SDKs, Helm chart"
@@ -32,6 +47,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   sketches' `add` and `merge` on two seeded synthetic inputs; the first figures, taken on
   a loaded host, are in `ROADMAP.md` and are not yet a published claim.
 
+- **Bounded-window detector variants (`weft-orchestration`).** Eight additive
+  functions — `detect_monthly_increase_in_window`, `detect_peaks_in_window`,
+  `detect_all_peaks_in_window`, `detect_valleys_in_window`, `detect_all_valleys_in_window`,
+  `detect_threshold_crossing_up_in_window`, `detect_threshold_crossing_down_in_window`,
+  `detect_drawdown_in_window` — take the same arguments as the originals plus
+  `since: Option<DateTime<Utc>>`, which becomes the start of the range passed to
+  `Outputs::analyze_range`. A live caller that only cares about new data no longer pays
+  O(history) per tick. `since` is the start of the analysed range rather than a filter on a
+  full-history result: a feature is reported only when the points that define it are both
+  inside the window, so a crossing whose point below the threshold precedes `since` is not
+  reported. The originals delegate with `None` and are unchanged.
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
   fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
   handles. Rollback and binary compatibility are now explicitly unsupported for 1.0:
@@ -72,6 +98,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `config/schema.toml`.
 
 ### Fixed
+- **The ingest disk-margin test no longer reads the runner's free space (#691,
+  #684).** `ingest_body_top_up_refuses_when_the_decoded_weight_breaches_the_reserve`
+  sized the store's reserve from `weftdb::disk_space_at` at open time and then raced
+  the reading `reserve_disk` takes again at admit time; ~984 KiB of scratch churn on
+  `windows-latest` ate a 1 MiB margin, and the widened 512 MiB margin only required a
+  roomy runner. `IngestBody::top_up_to_decoded` now delegates to a
+  `top_up_to_decoded_with_space` that takes the `DiskSpace` figure, so the test drives
+  both arms from its own arithmetic and a new test answers a filesystem that is already
+  full and one the OS will not describe — the `507` case #656 asks about, without
+  filling a disk. Behaviour for handlers is unchanged: they still read the live figure.
 - **The `/ready` source comments still described a Windows no-op disk guard (#674).** `DiskGuardState::disk_refusing`'s doc comment and the `/ready` handler comment claimed the guard could not measure free space on Windows, which stopped being true when `disk_space_at` grew its `GetDiskFreeSpaceExW` leg. Both now name the probe per platform and reserve "always false" for platforms with no probe. Comments only; no behaviour change.
 - **The `/ready` platform note contradicted the shipped disk guard (#674).** `docs/reference.md` still claimed the guard uses Unix `statvfs` and that `disk_refusing` is always `false` on Windows, which stopped being true when the `GetDiskFreeSpaceExW` leg landed. The note now says free space is measured on both platforms and the guard is inert only where the OS cannot describe free space.
 - **Soak comparison silently skipped metrics when soak run schema versions diverged (#672).** `compare_soak_reports` now detects a `run.soak_schema_version` mismatch (6→7 from SOA-16) and refuses comparison with the same shape as the existing file-version mismatch: error naming both versions, empty metric-drift table, and a visible entry in the rendered report. A run stamped 0 is read as unstamped and refuses nothing; nothing the harness writes uses 0, because `SoakRun::soak_schema_version` is a required field, so that arm is the defensive floor for hand-built records.
@@ -105,6 +141,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **The value-band read is documented as a raw scan, with a test pinning it against the point and time-range fold (#665).** The value-band read (`read_value_range`/`read_value_range_of`) is a raw scan: it returns every stored row whose value is in `[lo, hi]` in segment-seal then in-segment order and does **not** fold overlapping segments. Point and time-range reads use newest-wins folding; the value band answers "all raw observations." `docs/upgrade-notes.md` and `docs/reference.md` now state this split explicitly, and a synthetic-collision test (`value_range_is_a_raw_scan_pinned_against_point_and_range`) pins the value-band raw scan beside the point/range fold.
 
 ### Changed
+
+- The soak comparison summary now names every mismatch class it found (a report-schema drift and a missing counterpart series used to collapse into one line), and reports `Metrics compared: N of M` plus the skipped tolerance names when an optional metric existed on only one side (`#688`).
 
 - **One float-input rule across every ingest format (FRE-8b, #313).** ILP float fields
   and Parquet/Arrow `Float64`/`Float32` cells now enter as their shortest round-trip
