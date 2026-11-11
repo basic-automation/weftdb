@@ -90,6 +90,10 @@ pub enum SketchError {
 	/// A bucket budget of zero was requested; a sketch needs at least one bucket.
 	#[error("max_bins must be at least 1")]
 	InvalidMaxBins,
+	/// A [`UddSketch`](crate::UddSketch) was asked for fewer buckets than
+	/// [`UDD_MIN_BINS`](crate::UDD_MIN_BINS), below which collapsing cannot fit the budget.
+	#[error("a uniformly collapsing sketch needs max_bins of at least 4")]
+	UniformBudgetTooSmall,
 	/// Two sketches with different relative accuracies cannot be merged: the resulting
 	/// bucket boundaries would not share a mapping, so no error bound would hold.
 	#[error("cannot merge sketches with different relative accuracies")]

@@ -18,6 +18,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   published to ghcr.io to claim.
 
 ### Added
+- **`weft_reduce::UddSketch`: a quantile sketch whose error bound is uniform under collapse.**
+  `DdSketch` fits its bucket budget by folding its lowest buckets, which leaves the low
+  quantiles with no relative bound and makes merging inexact once two sketches have
+  folded different buckets. `UddSketch` (UDDSketch, <https://arxiv.org/abs/2004.08604>)
+  merges every adjacent pair of buckets instead, so every quantile keeps one bound,
+  `tanh(2^k · atanh α)` after `k` collapses, reported by `relative_accuracy()`; and a merge
+  of two sketches with the same accuracy and budget is still exactly the one-pass sketch.
+  The bound loosens on the high quantiles too, which a lowest-bucket collapse leaves
+  alone. Library type only: the `sketch_p*` reductions and the `.weftpart` sidecars still
+  use `DdSketch`, and no speed figure has been taken. `SketchError` gains
+  `UniformBudgetTooSmall` (a budget under `UDD_MIN_BINS`, 4).
+
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
   fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
   handles. Rollback and binary compatibility are now explicitly unsupported for 1.0:

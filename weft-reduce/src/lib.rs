@@ -26,6 +26,7 @@ mod exact;
 pub mod fill;
 mod scaled;
 pub mod sketch;
+pub mod uniform;
 pub mod width;
 
 use std::collections::BTreeMap;
@@ -37,6 +38,7 @@ pub use scaled::{reduce_partial_scaled, reduce_scaled};
 use serde::{Deserialize, Serialize};
 pub use sketch::{decimal_to_f64, DdSketch, SketchError};
 use splimes::{Point, Resolution};
+pub use uniform::{UddSketch, UDD_MIN_BINS};
 pub use width::BucketWidth;
 
 /// A per-bucket reduction over the values that fell in the bucket.

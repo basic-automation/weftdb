@@ -498,6 +498,9 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
   - *Audit 2026-10-27: checked — this is a historical note and its fix shipped: `[profile.test] debug = 1` is at Cargo.toml:128.*
 - [ ] **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):**
 - [ ] **NEXT — UDDSketch (uniform guarantee under collapse):**
+  - [x] The sketch itself, as a library type (2026-11-11): `weft_reduce::UddSketch` (`weft-reduce/src/uniform.rs`). Tests pin the uniform bound after collapse against an exact sort, the closed form of the bound, and exact merging under collapse.
+  - [ ] Measure before wiring it anywhere: `add` and `merge` cost against `DdSketch` (which has a last-bucket cache this type lacks) in `weft-reduce/benches`, and the error each gives at p50/p99 on a real corpus when the budget forces a collapse. No speed figure exists yet.
+  - [ ] Decide whether the `sketch_p*` reductions take it. At `SKETCH_MAX_BINS` = 2048 a realistic column never collapses, so the two differ only on pathological ranges; switching changes the `.weftpart` sidecar bytes (postcard is not self-describing), so it needs a sidecar version step. Owner-gated, like the other default-codec changes.
 - [x] **DONE (2026-07-18) — materialize per-segment partials at seal time (the highest-value
 
   Per-segment `.weftpart` sidecars are written at seal time at a declared base resolution. `downsample_range` merges the sidecars instead of decoding whenever every requested reduction allows it, a fine base can be re-bucketed to a coarser resolution, and the sidecars stay consistent across segment rewrites.
