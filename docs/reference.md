@@ -728,8 +728,11 @@ Two size ceilings bound what one body can become, both enforced on what the pars
 | --- | --- | --- |
 | `WEFT_MAX_INGEST_ROWS` | 10,000,000 rows | `413 too_many_rows`, naming both numbers |
 | `WEFT_MAX_INGEST_DECODED_BYTES` | 1 GiB | `413 payload_too_large`, naming both numbers |
+| `WEFT_INGEST_BODY_TIMEOUT_SECS` | 300 s | `408 body_timeout` |
 
 The byte ceiling counts the decoded timestamp and value columns (a 16-byte slot per timestamp and per value, plus the mantissa bytes the non-null decimals actually need), so it moves with the width of the data rather than its encoding. Both are read once at startup; `0` is refused at startup the way the body cap is, because a zero ceiling would refuse every body. A body that trips one of the three existing ingest guards answers as before: `413 payload_too_large` for the per-request body cap (`WEFT_MAX_INGEST_BYTES`), `503 overloaded` for the in-flight byte budget (`WEFT_INGEST_MAX_INFLIGHT_BYTES`).
+
+Every ingest body is taken by the two-phase `IngestBody` extractor (ROB-18). Phase 1 reserves before a body byte is read: a declared `Content-Length` over the body cap is refused `413` up front, and the disk guard (`WEFT_DISK_RESERVE_BYTES`) must admit the reserved weight — the declared length, or the body cap when none is declared — or the answer is `507 insufficient_storage` and the body is never read. Phase 2 reads the whole body against one total deadline (`WEFT_INGEST_BODY_TIMEOUT_SECS`, not a per-chunk idle bound), and once the body is decoded the reservation is topped up to the decoded weight above: the guard must admit what the decoded columns weigh before anything is sealed, which is the check a compressed Parquet body's phase-1 reservation cannot make. The store's seal-time disk guard still runs on the frame actually written.
 
 ### Grafana (experimental)
 
@@ -1044,6 +1047,7 @@ recovery-point and recovery-time objectives these settings produce, see
 | `WEFT_QUERY_MAX_INFLIGHT` | `weft-server` | Concurrent read and compute requests; past it, `503 overloaded`. | 128 |
 | `WEFT_WORKER_THREADS` | `weft-server` | Worker threads in the process runtime the admitted requests run on. | unset (one per available core) |
 | `WEFT_INGEST_MAX_INFLIGHT_BYTES` | `weft-server` | Byte budget across in-flight writes. | 256 MiB |
+| `WEFT_INGEST_BODY_TIMEOUT_SECS` | `weft-server` | The total deadline one ingest body gets to arrive within; past it, `408 body_timeout`. | 300 s |
 | `WEFT_MAX_INGEST_BYTES` | `weft-server` | Per-request ingest body cap (`413`). | 256 MiB |
 | `WEFT_MAX_INGEST_ROWS` | `weft-server` | How many rows one ingest body may decode to, in any format. Past it, `413 too_many_rows` naming the row count, the limit, and the way to shrink the batch. | 10,000,000 rows |
 | `WEFT_MAX_INGEST_DECODED_BYTES` | `weft-server` | The decoded size of one ingest body — its timestamp and value columns counted as they will sit in memory, not the bytes that arrived. Past it, `413 payload_too_large`. This is the ceiling a compressed Parquet body cannot inflate past. | 1 GiB |

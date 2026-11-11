@@ -61,7 +61,7 @@ Thirteen variables. Renaming, retyping or removing one is a breaking change.
 
 ## Tuning
 
-Forty-two variables. The name stays forever, but the default or accepted shape may change in
+Forty-three variables. The name stays forever, but the default or accepted shape may change in
 a minor release.
 
 | Variable | Summary | Accepts | Default | Read by |
@@ -73,6 +73,7 @@ a minor release.
 | `WEFT_DISK_RESERVE_BYTES` | The bytes every ingest or seal must leave available on the store's filesystem (ROB-17): a write that would leave less is refused `507 insufficient_storage` before any frame is written. `GET /api/v1/storage/headroom` and the `weft_disk_*` gauges on `/metrics` report the margin. | A non-negative whole number of bytes; `0` turns the guard off. | 268,435,456 (256 MiB, `DEFAULT_DISK_RESERVE_BYTES` in weftdb); a malformed value stops the server from starting. | `weftdb/types/segment_store.rs` (`SegmentStoreOptions::from_env`), read in store_open.rs |
 | `WEFT_EXTRACTED_BATCH_RETENTION_SECS` | How long the queue remembers that a pattern extraction already consumed a batch, which is how long a re-ingested batch is recognised as a duplicate. | A positive whole number of seconds. | 48 h (172,800 s); anything else warns and keeps the default. | `weftdb/types/database/inputs.rs` |
 | `WEFT_HEADER_READ_TIMEOUT_SECS` | How long a peer may take to deliver a complete request header block before the connection is closed (SEC-4's header deadline, pre-auth). | A positive whole number of seconds. | 30 s (`DEFAULT_HEADER_READ_TIMEOUT` in `serve.rs`). | `weft-server/serve.rs` |
+| `WEFT_INGEST_BODY_TIMEOUT_SECS` | The total deadline one ingest body gets to arrive within (ROB-18): the two-phase `IngestBody` extractor reads the whole body against this one clock, not a per-chunk idle bound, and a body that misses it is refused `408 body_timeout` — a slow-drip sender cannot hold its phase-1 disk reservation open indefinitely. | A positive whole number of seconds. | 300 s (`DEFAULT_INGEST_BODY_TIMEOUT_SECS` in `ingest.rs`). | `weft-server/ingest.rs` |
 | `WEFT_INGEST_MAX_INFLIGHT_BYTES` | The ingest routes' in-flight byte budget (D-S14): the registry's gate charges each ingest request's `Content-Length` against it, and a request that would push the total past the budget is refused `503 overloaded` with `Retry-After` instead of queueing. | A positive whole number of bytes. | 256 MiB — one maximum-size body in flight. | `weft-server/ingest.rs` |
 | `WEFT_KEEP_ALIVE_TIMEOUT_SECS` | How long a connection may make no read progress before it is closed: the keep-alive idle bound between requests (SEC-4, pre-auth). | A positive whole number of seconds. | 30 s (`DEFAULT_KEEP_ALIVE_TIMEOUT` in `serve.rs`). | `weft-server/serve.rs` |
 | `WEFT_LEGACY_DEFAULT_STORAGE` | Makes every newly created legacy aspect seal-backed (D-S19): its measurements are sealed into the aspect's Storage-v2 segment store instead of its rows-mode `measurements.db`. | Exactly `segments` for seal-backed; anything else is rows mode. | Unset: rows mode — measurements live in the per-aspect `measurements.db`, as before D-S19. | `weftdb/types/database/inputs.rs` |

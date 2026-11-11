@@ -6230,6 +6230,58 @@ check. That is decision 11 operating as written — the written form is the
 input — not a loosening of the domain, which still bounds every stored
 value's plain form at 1,024 digits.
 
+## 2026-11-10 — ROB-18: the two-phase `IngestBody` — what reserves, what the deadline bounds, what the top-up weighs (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** plan C11 fixes the shape — ROB-18's two-phase `IngestBody` (reserve, total
+deadline, top-up to decoded weight) becomes D-S14's extractor in W9, and disk refusal (507)
+runs in phase 1 via ROB-17's `DiskGuard`, whose own entry anticipated this ("ROB-18's
+request-level check is left to call the same `DiskGuard::admit`"). The code table already
+carried `408 body_timeout` with no producer. The points the sources do not pin, chosen here:
+
+1. **The reservation is the declared length, or the cap when none is declared.** Phase 1
+   runs in the extractor, before a body byte is read: a `Content-Length` over
+   `WEFT_MAX_INGEST_BYTES` is refused `413 payload_too_large` with the limit up front, and
+   `store.disk_guard().admit(disk_space_at(store.root()), reserved)` must pass or the
+   answer is `507 insufficient_storage` and the body is never read. An undeclared (chunked)
+   body reserves the cap itself — the most it may arrive as — so a sender cannot dodge the
+   disk check by not declaring. The refusal is answered exactly as the store's seal-time
+   refusal is (`server_logged_elsewhere`, ROB-17's transition logging untouched); the
+   store's own seal-time guard still runs on the frame actually written, so phase 1 is the
+   early refusal C11 asks for, not a replacement check.
+2. **The deadline is one total clock on the read, `WEFT_INGEST_BODY_TIMEOUT_SECS`
+   (Tuning, default 300 s), refused as `408 body_timeout`.** Not a per-chunk idle bound:
+   SEC-4's keep-alive deadline already closes a connection that makes no progress, so an
+   idle bound here would duplicate it; the gap was a sender dripping bytes steadily
+   enough to keep the connection alive while holding its phase-1 reservation and its gate
+   charge without bound. 300 s is a judgement number (a maximum-size body still arrives
+   over a sub-1 MB/s link), reversible at merge review. It joins the VarSpec registry
+   (104 → 105) and the strict-config positive-integer list, read once at startup through
+   `IngestConfig` like its siblings, zero refused at startup.
+3. **The top-up re-admits at the decoded weight, against the same guard.** After each
+   format's decode and ROB-7's caps pass, the handler calls
+   `IngestBody::top_up_to_decoded(store, decoded_column_bytes(..))`: a decoded weight at
+   or under the reservation asks nothing again; a larger one must be admitted by
+   `DiskGuard` for the full decoded weight — the write the seal will make — or the request
+   is refused `507` before anything is sealed. Parquet is the case that matters (its body
+   size says nothing about its expansion); the check runs on all four formats so the rule
+   has no format-shaped hole.
+4. **The gate's charge does not move.** D-S14/ROB-10's byte-weighted admission stays in
+   the gate, keyed on `Content-Length`, permit held by the gate future (the ROB-10 fix).
+   The extractor's reservation is a different thing — it prices the *write* against the
+   disk, where the gate prices the request's *time in flight* against memory — so the two
+   coexist rather than the extractor taking over the charge C10 puts inside the gate.
+   `StrictJson`'s two route-level refusals move into the JSON handler unchanged in code
+   and status (non-JSON content type `415`, unparseable document `400 invalid_json`);
+   `StrictText`'s UTF-8 refusal is `IngestBody::text`. `Strict*` themselves stay in
+   error.rs for the routes that still use them.
+
+**Rejected:** moving the in-flight charge into the extractor (it would reopen the
+permit-lifetime defect ROB-10 fixed, and C10 fixes admission inside the gate); reserving
+only the declared length with no cap fallback for chunked bodies (an undeclared body
+could then write a full-cap frame against an unchecked disk); a per-chunk idle deadline
+(duplicates SEC-4's keep-alive bound and still lets a steady drip hold a reservation for
+the sum of the chunks).
+
 ## 2026-11-10 — Soak schema drift: refuse in the precedent's shape, not with a hard error (SOAK-SCHEMA)
 
 **Ambiguous:** "make the comparison refuse" could mean a hard error out of `compare_soak_reports`, or the
