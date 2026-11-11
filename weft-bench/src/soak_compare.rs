@@ -380,8 +380,12 @@ fn find_metric(metrics: &Vec<(String, f64)>, name: &str) -> Option<f64> {
 // Helper: compute metric drifts
 // ---------------------------------------------------------------------------
 
-fn compute_metric_drifts(previous: &SoakReport, current: &SoakReport, tolerances: &[MetricTolerance], schema_mismatch: Option<(u32, u32)>) -> (Vec<MetricDrift>, usize, Vec<String>) {
-	if schema_mismatch.is_some() {
+/// The third element is the list of tolerated metrics that could **not** be compared, because
+/// one of the two reports does not carry it — which is what makes the compared count honest.
+/// `any_mismatch` is whichever mismatch stopped the comparison, report-schema or soak-run-schema:
+/// both suppress drifts the same way, so the caller passes the one it will name.
+fn compute_metric_drifts(previous: &SoakReport, current: &SoakReport, tolerances: &[MetricTolerance], any_mismatch: Option<(u32, u32)>) -> (Vec<MetricDrift>, usize, Vec<String>) {
+	if any_mismatch.is_some() {
 		return (Vec::new(), 0, Vec::new());
 	}
 
@@ -916,9 +920,16 @@ mod tests {
 		let oracle_mm = comp.metric_drifts.iter().find(|d| d.metric_name == "oracle_mismatch_count");
 		assert_eq!(oracle_mm, None, "oracle_mismatch_count must be absent from drifts (missing in curr)");
 
-		// Summary should have a metrics-comparison figure that names the skipped oracle metrics
-		assert!(comp.summary.contains("Metrics compared:"), "summary includes compared/total figure");
-		assert!(comp.summary.contains("oracle_ticks_judged"), "summary names the skipped oracle_ticks_judged");
-		assert!(comp.summary.contains("oracle_mismatch_count"), "summary names the skipped oracle_mismatch_count");
+		// The figure is the whole point of the change, so it is asserted as a figure and not as a
+		// prefix: an assertion on `"Metrics compared:"` alone passes even when the line reads
+		// `0 of 0`. Thirteen metrics carry a tolerance, five of which cannot be compared here — the
+		// two oracle metrics this report omits, and the three upgrade metrics `create_run` never
+		// fills in. Both numbers come from the table and the fixture rather than from a literal, so
+		// adding a tolerance does not quietly make this test wrong.
+		let total = DEFAULT_METRIC_TOLERANCES.len();
+		let incomparable = ["oracle_ticks_judged", "oracle_mismatch_count", "upgrade_ticks_judged", "upgrade_mismatch_count", "upgrade_duration_ms"];
+		assert_eq!(total, 13, "the tolerance table grew: update `incomparable` and the figure below");
+		assert!(comp.summary.contains(&format!(" Metrics compared: {} of {total}.", total - incomparable.len())), "the summary states the real compared count: {}", comp.summary);
+		assert!(comp.summary.contains(&format!("Skipped: {}.", incomparable.join(", "))), "the summary names every metric it could not compare, in table order: {}", comp.summary);
 	}
 }
