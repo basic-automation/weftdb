@@ -529,7 +529,7 @@ task drain and the store's shutdown have finished.
 |---------------|---------|
 | `GET /health` | Liveness. |
 | `GET /ready` | Readiness, including the segment-store dependency check. With a store, `poisoned` / `restart_required` report that a segment-index COMMIT failed in a way that may still have committed, so the store refuses writes until the server restarts (reads keep working, and `ready` stays `true`); `poison_reason` says which transaction and error. `disk_refusing` is `true` while the disk guard refuses every ingest and seal (`507 insufficient_storage`; ROB-17) — reads keep working, so `ready` stays `true`, and the byte counts are on `GET /api/v1/storage/headroom`. **Platform note:** the guard measures the filesystem holding the store — `statvfs` on Unix, `GetDiskFreeSpaceExW` on Windows — so `disk_refusing` means the same thing on both; where the OS cannot describe free space it stays `false` and the guard never refuses. |
-| `GET /metrics` | Prometheus text exposition — request/error/output counters, ingest counters (`weft_ingest_*`), and **latency histograms** for the compute and storage-ingest paths. |
+| `GET /metrics` | Prometheus text exposition — request/error/output counters, ingest counters (`weft_ingest_*`), maintenance-sweep counters (`weft_maintenance_*`: sweeps run, sweeps cancelled, breaker trips, aspects skipped tripped or busy), and **latency histograms** for the compute and storage-ingest paths. |
 | `GET /api/v1/version` | **Build and store identity** (FRE-12b). `build` — OS, architecture, libc (`gnu`/`musl`), pointer width, and whether this is a debug or a release build (`debug_assertions`, which is the difference between a slow box and a fast one); plus the target triple the binary was **built** for, the `rustc` that produced it and the commit it came from (with `git_dirty` when that tree carried an uncommitted change), all four captured at compile time because a released box has no toolchain and no checkout to ask. `store` — the store UUID `/ready` also reports, the durability class, the layout numbers (`layout_version`, `min_read_layout`, `min_write_layout`, `last_written_layout`) beside `supported_layout` for this build, plus `writable_by_this_build`, `report_only` and `incompatible_store`; null fields when `WEFT_SEGMENT_STORE_ROOT` is unset. `scope_pin` — the `(database, subject)` this process serves, the one the store's own `STORE_FORMAT` records, whether they agree, and whether `WEFT_STORE_SCOPE_PIN` enforces it. `exit_codes` — the process's whole exit-status table, so a supervisor can look the number it just saw up without shell access. Answered from process state alone: no store read, so it answers while a store is being refused. **It takes a key where one is mounted** (read scope, like every `/api/v1` route): it names layout numbers, the store UUID and the served scope, so it is not part of the anonymous probe surface — `/ready` remains the keyless answer for service, version and store UUID. |
 | `GET /debug/profile/current` | Live p50/p95/p99 latency snapshot per instrumented path. |
 | `GET /bench/runs` | *Experimental.* The benchmark runs under `WEFT_BENCH_RUNS_DIR`, newest first: run id, path, `schema_version`, `generated_at`, `claim`. `metrics` scope. |
@@ -798,8 +798,12 @@ streams 5 s, before the store closes. Flight SQL is not served: it needs the SQL
 out-of-order reconciliation passes (manual, store-wide, and the background daemon —
 threshold-held calls excluded) plus `_failed_passes_total`, the per-aspect passes a
 store-wide sweep (daemon tick or `POST /api/v1/storage/reconcile`) skipped after an
-error (the daemon also logs one `WARN` line per failed aspect), `weft_backup_*`
-counters (`_snapshots_total` / `_bytes_written_total` / `_failures_total`) over the
+error (the daemon also logs one `WARN` line per failed aspect), `weft_maintenance_*`
+counters over the sweeps themselves (ROB-21: `_sweeps_total` — every sweep that ran
+to a summary, quiet ones included, so the scheduler's liveness is countable —
+`_sweeps_cancelled_total`, `_breaker_trips_total` for the trip events, and
+`_aspects_tripped_total` / `_aspects_busy_total` for the aspects a sweep skipped),
+`weft_backup_*` counters (`_snapshots_total` / `_bytes_written_total` / `_failures_total`) over the
 online control-plane
 backups, plus the `_last_success_seconds` gauge (unix seconds of the most recent
 verified snapshot, `0` when none has been recorded yet — the daemon seeds it from
@@ -1652,7 +1656,9 @@ holds bulk measurements. `BigDecimal` remains the logical/API type everywhere.
   declared aspect over the threshold, and a background timer daemon
   (`WEFT_RECONCILE_INTERVAL_SECS` / `WEFT_RECONCILE_THRESHOLD`) runs the sweep
   unattended. A threshold of 0 clamps to 1 (any out-of-order segment). Passes and the
-  segments they rewrite are counted in `weft_reconcile_*` metrics.
+  segments they rewrite are counted in `weft_reconcile_*` metrics; the sweeps
+  themselves — runs, cancellations, breaker trips, tripped/busy skips — are
+  counted in `weft_maintenance_*` metrics (ROB-21).
 - **Hot/cold reconciliation** — `reconcile_aspect_hot_cold`/`reconcile_all_hot_cold`
   reconcile every *cold* (sealed) out-of-order segment on each pass but defer the
   *hot tail* (the most-recently-sealed segment) until the backlog reaches the

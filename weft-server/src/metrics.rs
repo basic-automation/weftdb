@@ -45,6 +45,10 @@ pub struct Metrics {
 	pub ingest: IngestMetrics,
 	/// Counters for the out-of-order reconciliation pass (`…/reconcile`).
 	pub reconcile: ReconcileMetrics,
+	/// Counters for the maintenance sweeps themselves (ROB-21): every
+	/// store-wide sweep the daemon or the manual trigger runs, whether it
+	/// rewrote anything or not.
+	pub maintenance: MaintenanceMetrics,
 	/// Counters for the online control-plane backup (`…/storage/backup`).
 	pub backup: BackupMetrics,
 	/// End-to-end latency for the interpolate endpoints (JSON + ILP).
@@ -240,6 +244,34 @@ pub struct ReconcileMetrics {
 	failed_passes: AtomicU64,
 }
 
+/// Counters for the maintenance sweeps themselves (ROB-21): the outcomes
+/// every store-wide sweep reports, whether it is a daemon tick or the manual
+/// `POST /api/v1/storage/reconcile` trigger.
+///
+/// The reconcile counters above count *work done* (passes that rewrote
+/// segments); these count *sweeps run*, including quiet ones, so an operator
+/// can tell a live-but-quiet scheduler from a dead one, see a cancellation
+/// that stopped a sweep early, and see the circuit breaker trip without
+/// waiting for the next tick's skip list.
+#[derive(Debug, Default)]
+pub struct MaintenanceMetrics {
+	/// Store-wide sweeps that ran to a returned summary (daemon tick or manual
+	/// trigger alike). A quiet sweep — nothing to reconcile — counts: it proves
+	/// the scheduler ran.
+	sweeps: AtomicU64,
+	/// Sweeps that stopped early on a cancellation request (their `cancelled`
+	/// flag set). The in-flight aspect still completed; the rest never started.
+	sweeps_cancelled: AtomicU64,
+	/// Circuit-breaker trip events: aspects whose consecutive failures reached
+	/// the threshold during a sweep. Skipping an already-tripped aspect is not
+	/// a trip — that is `aspects_tripped` — so this counts the transition only.
+	breaker_trips: AtomicU64,
+	/// Aspects a sweep skipped because their breaker was already tripped.
+	aspects_tripped: AtomicU64,
+	/// Aspects a sweep skipped because another maintenance operation held them.
+	aspects_busy: AtomicU64,
+}
+
 /// Counters for the online control-plane backup (`POST …/storage/backup`, roadmap
 /// Phase 7.4).
 ///
@@ -272,6 +304,8 @@ pub struct MetricsSnapshot {
 	pub ingest: IngestSnapshot,
 	/// Reconciliation-pass counters.
 	pub reconcile: ReconcileSnapshot,
+	/// Maintenance-sweep counters.
+	pub maintenance: MaintenanceSnapshot,
 	/// Control-plane backup counters.
 	pub backup: BackupSnapshot,
 }
@@ -337,6 +371,21 @@ pub struct ReconcileSnapshot {
 	/// `POST /api/v1/storage/reconcile`). The sweep skips a failed aspect and carries on,
 	/// so this counter is how a permanently failing aspect stays visible.
 	pub failed_passes: u64,
+}
+
+/// A point-in-time read of [`MaintenanceMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MaintenanceSnapshot {
+	/// Store-wide sweeps that ran to a returned summary.
+	pub sweeps: u64,
+	/// Sweeps that stopped early on a cancellation request.
+	pub sweeps_cancelled: u64,
+	/// Circuit-breaker trip events during those sweeps.
+	pub breaker_trips: u64,
+	/// Aspects skipped because their breaker was already tripped.
+	pub aspects_tripped: u64,
+	/// Aspects skipped because another maintenance operation held them.
+	pub aspects_busy: u64,
 }
 
 /// A point-in-time read of [`BackupMetrics`].
@@ -463,6 +512,26 @@ impl Metrics {
 		self.reconcile.failed_passes.fetch_add(failed_passes, Ordering::Relaxed);
 	}
 
+	/// Record one store-wide maintenance sweep that ran to a returned summary
+	/// (ROB-21): a daemon tick or a manual `POST /api/v1/storage/reconcile`,
+	/// whichever kind. Every sweep counts, including a quiet one that rewrote
+	/// nothing — that is what makes the scheduler's liveness countable — and
+	/// including a cancelled one, which also counts in `sweeps_cancelled`.
+	/// `breaker_trips` is the sweep's trip-event count (aspects whose breaker
+	/// opened during the sweep); `aspects_tripped` and `aspects_busy` are the
+	/// aspects it skipped for a tripped breaker or a held lock. Failed aspect
+	/// passes stay in [`record_reconcile_failures`](Self::record_reconcile_failures),
+	/// not here, so a sweep's failures are counted once.
+	pub fn record_maintenance_sweep(&self, cancelled: bool, breaker_trips: u64, aspects_tripped: u64, aspects_busy: u64) {
+		self.maintenance.sweeps.fetch_add(1, Ordering::Relaxed);
+		if cancelled {
+			self.maintenance.sweeps_cancelled.fetch_add(1, Ordering::Relaxed);
+		}
+		self.maintenance.breaker_trips.fetch_add(breaker_trips, Ordering::Relaxed);
+		self.maintenance.aspects_tripped.fetch_add(aspects_tripped, Ordering::Relaxed);
+		self.maintenance.aspects_busy.fetch_add(aspects_busy, Ordering::Relaxed);
+	}
+
 	/// Record one completed, verified control-plane backup snapshot and the bytes it
 	/// wrote (roadmap Phase 7.4). Only a snapshot that succeeded should call this.
 	/// Also stamps the last-success time, so the health gauge tracks the newest
@@ -521,6 +590,7 @@ impl Metrics {
 			downsample: DownsampleSnapshot { requests: self.downsample.requests.load(Ordering::Relaxed), errors: self.downsample.errors.load(Ordering::Relaxed), output_buckets: self.downsample.output_buckets.load(Ordering::Relaxed) },
 			ingest: IngestSnapshot { requests: self.ingest.requests.load(Ordering::Relaxed), errors: self.ingest.errors.load(Ordering::Relaxed), rows_sealed: self.ingest.rows_sealed.load(Ordering::Relaxed), segments_sealed: self.ingest.segments_sealed.load(Ordering::Relaxed) },
 			reconcile: ReconcileSnapshot { passes: self.reconcile.passes.load(Ordering::Relaxed), segments_reconciled: self.reconcile.segments_reconciled.load(Ordering::Relaxed), failed_passes: self.reconcile.failed_passes.load(Ordering::Relaxed) },
+			maintenance: MaintenanceSnapshot { sweeps: self.maintenance.sweeps.load(Ordering::Relaxed), sweeps_cancelled: self.maintenance.sweeps_cancelled.load(Ordering::Relaxed), breaker_trips: self.maintenance.breaker_trips.load(Ordering::Relaxed), aspects_tripped: self.maintenance.aspects_tripped.load(Ordering::Relaxed), aspects_busy: self.maintenance.aspects_busy.load(Ordering::Relaxed) },
 			backup: BackupSnapshot { snapshots: self.backup.snapshots.load(Ordering::Relaxed), bytes_written: self.backup.bytes_written.load(Ordering::Relaxed), failures: self.backup.failures.load(Ordering::Relaxed), last_success_unix_secs: self.backup.last_success_unix_secs.load(Ordering::Relaxed) },
 		}
 	}
@@ -531,7 +601,7 @@ impl Metrics {
 		use std::fmt::Write as _;
 		let snap = self.snapshot();
 		let mut out = String::with_capacity(512);
-		let counters = [("weft_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("weft_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("weft_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("weft_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("weft_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("weft_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("weft_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("weft_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("weft_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("weft_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed), ("weft_reconcile_passes_total", "Out-of-order reconciliation passes that actually ran (threshold-gated holds excluded).", snap.reconcile.passes), ("weft_reconcile_segments_reconciled_total", "Total out-of-order segments rewritten sorted across all reconciliation passes.", snap.reconcile.segments_reconciled), ("weft_reconcile_failed_passes_total", "Per-aspect passes that failed inside a store-wide maintenance sweep (the sweep skipped the aspect and continued).", snap.reconcile.failed_passes), ("weft_backup_snapshots_total", "Control-plane backup snapshots that completed and verified.", snap.backup.snapshots), ("weft_backup_bytes_written_total", "Total bytes written across all control-plane backup snapshots.", snap.backup.bytes_written), ("weft_backup_failures_total", "Backup-daemon ticks that failed to snapshot (a failed tick retries on the next tick).", snap.backup.failures)];
+		let counters = [("weft_interpolate_requests_total", "Total interpolation requests received.", snap.interpolate.requests), ("weft_interpolate_errors_total", "Interpolation requests that returned an error.", snap.interpolate.errors), ("weft_interpolate_output_points_total", "Total interpolated output points served.", snap.interpolate.output_points), ("weft_downsample_requests_total", "Total downsample requests received.", snap.downsample.requests), ("weft_downsample_errors_total", "Downsample requests that returned an error.", snap.downsample.errors), ("weft_downsample_output_buckets_total", "Total downsample buckets served.", snap.downsample.output_buckets), ("weft_ingest_requests_total", "Total storage-ingest requests received.", snap.ingest.requests), ("weft_ingest_errors_total", "Storage-ingest requests that returned an error.", snap.ingest.errors), ("weft_ingest_rows_sealed_total", "Total rows sealed across all storage ingests.", snap.ingest.rows_sealed), ("weft_ingest_segments_sealed_total", "Total segments sealed across all storage ingests.", snap.ingest.segments_sealed), ("weft_reconcile_passes_total", "Out-of-order reconciliation passes that actually ran (threshold-gated holds excluded).", snap.reconcile.passes), ("weft_reconcile_segments_reconciled_total", "Total out-of-order segments rewritten sorted across all reconciliation passes.", snap.reconcile.segments_reconciled), ("weft_reconcile_failed_passes_total", "Per-aspect passes that failed inside a store-wide maintenance sweep (the sweep skipped the aspect and continued).", snap.reconcile.failed_passes), ("weft_maintenance_sweeps_total", "Store-wide maintenance sweeps that ran to a returned summary (daemon tick or manual trigger), including quiet ones that rewrote nothing.", snap.maintenance.sweeps), ("weft_maintenance_sweeps_cancelled_total", "Store-wide maintenance sweeps that stopped early on a cancellation request (the in-flight aspect still completed).", snap.maintenance.sweeps_cancelled), ("weft_maintenance_breaker_trips_total", "Maintenance circuit-breaker trip events: aspects whose consecutive failures reached the threshold during a sweep.", snap.maintenance.breaker_trips), ("weft_maintenance_aspects_tripped_total", "Aspects a store-wide sweep skipped because their maintenance circuit breaker was already tripped.", snap.maintenance.aspects_tripped), ("weft_maintenance_aspects_busy_total", "Aspects a store-wide sweep skipped because another maintenance operation held them.", snap.maintenance.aspects_busy), ("weft_backup_snapshots_total", "Control-plane backup snapshots that completed and verified.", snap.backup.snapshots), ("weft_backup_bytes_written_total", "Total bytes written across all control-plane backup snapshots.", snap.backup.bytes_written), ("weft_backup_failures_total", "Backup-daemon ticks that failed to snapshot (a failed tick retries on the next tick).", snap.backup.failures)];
 		for (name, help, value) in counters {
 			// `writeln!` into a String is infallible.
 			let _ = writeln!(out, "# HELP {name} {help}");
@@ -842,12 +912,12 @@ mod tests {
 		assert!(text.contains("# TYPE weft_interpolate_requests_total counter"));
 		assert!(text.contains("weft_interpolate_requests_total 1"));
 		assert!(text.contains("weft_interpolate_output_points_total 5"));
-		// No value line is left dangling without a preceding TYPE line: 16
+		// No value line is left dangling without a preceding TYPE line: 21
 		// counters + the backup last-success gauge + the 4 latency histograms
 		// (EVI-25 adds the backup one) + ROB-16's 3 provenance series.
 		// (The GPU device families appear only once a GPU has started, which another test
 		// in this process may do, so they are left out of the count.)
-		assert_eq!(text.lines().filter(|line| line.starts_with("# TYPE ") && !line.starts_with("# TYPE weft_gpu_")).count(), 24);
+		assert_eq!(text.lines().filter(|line| line.starts_with("# TYPE ") && !line.starts_with("# TYPE weft_gpu_")).count(), 29);
 		// The downsample counters are exposed too.
 		assert!(text.contains("# TYPE weft_downsample_requests_total counter"));
 		// And the storage-ingest counters.
@@ -1021,5 +1091,32 @@ mod tests {
 		assert_eq!(snap.ingest.errors, 1);
 		assert_eq!(snap.ingest.rows_sealed, 8);
 		assert_eq!(snap.ingest.segments_sealed, 2);
+	}
+
+	/// ROB-21: every sweep counts, including a quiet one and a cancelled one;
+	/// trips count trip events, not skips of already-tripped aspects.
+	#[test]
+	fn maintenance_counters_accumulate() {
+		let m = Metrics::default();
+		// A quiet sweep: nothing rewritten, no trip, nothing skipped — still a sweep.
+		m.record_maintenance_sweep(false, 0, 0, 0);
+		// A sweep that tripped one breaker and skipped one already-tripped aspect
+		// and one busy aspect.
+		m.record_maintenance_sweep(false, 1, 1, 1);
+		// A cancelled sweep: counted as a sweep and as cancelled.
+		m.record_maintenance_sweep(true, 0, 0, 0);
+		let snap = m.snapshot();
+		assert_eq!(snap.maintenance.sweeps, 3, "every sweep counts, quiet ones included");
+		assert_eq!(snap.maintenance.sweeps_cancelled, 1);
+		assert_eq!(snap.maintenance.breaker_trips, 1, "one trip event");
+		assert_eq!(snap.maintenance.aspects_tripped, 1, "one already-tripped skip");
+		assert_eq!(snap.maintenance.aspects_busy, 1, "one busy skip");
+		let text = m.render_prometheus();
+		assert!(text.contains("# TYPE weft_maintenance_sweeps_total counter"));
+		assert!(text.contains("weft_maintenance_sweeps_total 3"));
+		assert!(text.contains("weft_maintenance_sweeps_cancelled_total 1"));
+		assert!(text.contains("weft_maintenance_breaker_trips_total 1"));
+		assert!(text.contains("weft_maintenance_aspects_tripped_total 1"));
+		assert!(text.contains("weft_maintenance_aspects_busy_total 1"));
 	}
 }
