@@ -6406,6 +6406,39 @@ state, which the global `SIGNALS_QUEUE` item (`ROADMAP.md:482`) has to settle fi
 builds without reaching a test binary, so this slice was finished by the supervisor with no local
 cargo at all; `cargo +nightly fmt` and `rustfmt` are the only tools that ran. CI is the first
 execution of `mod window_tests`, and the PR says so.
+## 2026-11-11 — the soak summary names every mismatch it found, and says what it skipped
+
+Two honesty defects in the nightly soak comparison (follow-ups recorded in issue #688).
+
+**The summary reported one mismatch class when two fired.** `build_summary`
+(`weft-bench/src/soak_compare.rs`) built the headline with an `if` / `else if` chain: when the
+report schema drifted *and* the counterpart series was missing, the schema branch won and the
+counterpart cause vanished from the text, even though both were in the detail lines. Both classes
+are now named in the headline. The substring `MISMATCH (report schema drift)` stays an exact
+prefix, which is what the existing assertions at `:2130` and `:2230` match, and the
+`MISMATCH (counterpart series)` assertion at `:2253` still holds because that class alone is
+unchanged.
+
+**Silently skipped optional metrics now report themselves.** A metric with a tolerance that the
+reports do not both carry was dropped with a code comment and no output. The summary line gains
+`Metrics compared: N of M.` plus `Skipped: <names>.` when `M > N`. It is a `>` prose line, not a
+`-` bullet, because the markdown parser treats a leading `- ` as a regression row — that is the
+one way this change could have manufactured a false regression, and it is the reason the wording
+is prose. A one-sided metric is still **not** compared: comparing values that exist on one side is
+a different question, and answering it silently would be the same class of dishonesty this fixes.
+
+**Deliberately not done here:** the exit code. A drift refusal still exits 0 because
+`weft-bench/src/main.rs` gates `ExitCode::FAILURE` on `has_regression` alone. That is the third
+item of #688 and stays open — changing the meaning of a nightly's exit status is a policy call
+with a paging consequence, not a reporting fix.
+
+`SoakComparison` keeps its fields and `schema_version: 1`: the counts live in the rendered summary
+line, so an existing machine-readable report still parses. The two new tests
+(`a_double_mismatch_names_both_causes`, `skipped_metrics_are_reported_when_optional_metric_is_absent`)
+were **written, not run**: the host has 3-8 GB free of 124 GB and `cargo test -p weft-bench` needs
+roughly 8 GB, so CI is the first execution. Every pre-existing summary assertion was re-read by
+hand against the new code path, which is what makes the `schema drift` prefix claim safe to make
+without running anything.
 ## 2026-11-11 — the config-schema checker keeps its two prose-only names (issue #687, PR #690)
 
 **Ambiguous:** the adversarial review of this slice blocked it on a total-count
@@ -6435,6 +6468,34 @@ is prefix-equality, not substring, so an unregistered `WEFT_STORE_BACKUP` is sti
 caught. **Cost, stated in the comment above the set:** a *new* sentence that uses
 either name as though it were a real setting is invisible to this check.
 
+## 2026-11-11 — #656 is documentation truth, not a new refusal path
+
+**Ambiguous:** the issue asks to "document and test the full-disk contract", and a
+literal reading demands a test that makes the filesystem actually return `ENOSPC` and
+shows the server answering `507`. Two unprivileged ways to do that were tried and both
+failed for reasons that will not change: `unshare -U -m` then
+`mount -t tmpfs -o size=8m` returns `mount: /mnt: must be superuser to use mount`, and a
+`setrlimit(RLIMIT_FSIZE, 64 KiB)` write with `SIGXFSZ` ignored returns
+`write=65536 errno=0` — the kernel reports a **short write with no error**, so an rlimit
+cannot produce the errno the classification looks for either. The other reading is to
+test what the server itself decides, which is already reachable: `top_up_to_decoded` and
+`reserve_disk` take the guard's path with a supplied figure, and #694 made that figure
+injectable at the top-up.
+
+**Chosen: fix the page, and pin it with a contract test — do not invent a privileged
+rig.** The claim that was actually harming operators was in `docs/operations.md`, which
+said the code was unreachable; the refusal logic and its classification were already
+correct and already tested. A test that reads the page (`the_disk_full_contract_is_documented_as_reachable`
+in `weft-server/tests/error_contract.rs`) is the only mechanism that fails when the two
+drift apart again, and it needs no privilege, no mount, and no filesystem.
+
+**Cost, stated plainly:** *no test in this repository produces a literal `ENOSPC`.* The
+`error_chain_is_disk_full` arms (`weft-server/src/error.rs:852`, `:922`) are exercised
+only by synthetic errors built in `error.rs`'s own tests, so an operating-system
+full-disk error reaching the classifier is unverified end to end. Getting that needs a
+privileged CI step (`CAP_SYS_ADMIN` plus a `tmpfs`, or a loopback file); the fault-injection
+rig cannot substitute for it, because `FaultAction::ReturnErr` yields kind `Other`, which
+classifies `500`, not `507`. Left as a follow-up rather than faked here.
 ## 2026-11-11 — Supply the disk figure to the ingest top-up rather than racing the runner (#691, #656)
 **Ambiguous:** #684's flake had two cures on the table — keep widening the test's margin,
 or make the filesystem figure injectable. #691 recorded the first as shipped and the second
