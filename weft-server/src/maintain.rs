@@ -265,7 +265,9 @@ pub struct ReconcileStoreResponse {
 /// An aspect whose pass fails (a damaged frame, an I/O error) does not stop the sweep:
 /// it is listed in [`ReconcileStoreResponse::failed`], counted in
 /// `weft_reconcile_failed_passes_total`, and the remaining aspects are still swept; the
-/// response is a `200` either way.
+/// response is a `200` either way. The sweep itself is recorded in the
+/// `weft_maintenance_*` counters (ROB-21), exactly like a daemon tick — a manual
+/// trigger counts as a sweep run, including when it leaves busy aspects behind.
 ///
 /// An aspect another maintenance operation holds (a daemon pass, another request) is
 /// waited for, with one maintenance wait (the store's, 30 s by default) shared by the
@@ -294,7 +296,7 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 	let threshold = threshold.unwrap_or(1).max(1);
 	// Wait out a daemon pass (or another request) on an aspect rather than skip it.
 	let wait = MaintenanceWait::Wait(store.maintenance_wait());
-	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed, busy, tripped) = if overlaps {
+	let (mode, aspects_scanned, aspects_reconciled, segments_reconciled, cold_reconciled, hot_reconciled, failed, busy, tripped, cancelled, breaker_trips) = if overlaps {
 		// `split_min_bytes` selects the store-wide split-not-rewrite floor; absent → the
 		// default 50 MiB floor (every aspect's small components full-rewrite).
 		let sweep = match split_min_bytes {
@@ -304,20 +306,24 @@ async fn reconcile_store_inner(store: &weftdb::SegmentStore, threshold: Option<u
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_removed).unwrap_or(u64::MAX));
 		}
-		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
+		("overlaps", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_removed, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped, sweep.cancelled, sweep.breaker_trips)
 	} else if hot_cold {
 		let sweep = store.reconcile_all_hot_cold(threshold, wait).await.map_err(|err| ApiError::internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled()).unwrap_or(u64::MAX));
 		}
-		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
+		("hot_cold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled(), sweep.cold_reconciled, sweep.hot_reconciled, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped, sweep.cancelled, sweep.breaker_trips)
 	} else {
 		let sweep = store.reconcile_all_over_threshold(threshold, wait).await.map_err(|err| ApiError::internal(err.to_string()))?;
 		if sweep.aspects_reconciled > 0 {
 			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_reconciled).unwrap_or(u64::MAX), u64::try_from(sweep.segments_reconciled).unwrap_or(u64::MAX));
 		}
-		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped)
+		("threshold", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled, 0, 0, SweepFailure::list(&sweep.failed), sweep.busy, sweep.tripped, sweep.cancelled, sweep.breaker_trips)
 	};
+	// The sweep ran (ROB-21): record its maintenance outcome — a manual trigger
+	// counts exactly like a daemon tick, and it counts even when the sweep left
+	// busy aspects behind (the 409 below) since those aspects are in the count.
+	metrics.record_maintenance_sweep(cancelled, u64::try_from(breaker_trips).unwrap_or(u64::MAX), u64::try_from(tripped.len()).unwrap_or(u64::MAX), u64::try_from(busy.len()).unwrap_or(u64::MAX));
 	if !failed.is_empty() {
 		metrics.record_reconcile_failures(u64::try_from(failed.len()).unwrap_or(u64::MAX));
 	}

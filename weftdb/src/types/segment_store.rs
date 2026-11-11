@@ -2762,6 +2762,13 @@ pub struct ReconcileSweep {
 	/// counts only toward `aspects_scanned`; a sweep after the breaker's cooldown
 	/// retries it once.
 	pub tripped: Vec<String>,
+	/// Breakers this sweep tripped (ROB-21): aspects whose consecutive failures
+	/// reached the threshold during this sweep, so the store opened their breaker
+	/// (logged once at `WARN` there). A sweep that only *skips* already-tripped
+	/// aspects counts none here — those are in [`tripped`](Self::tripped) — so this
+	/// is the trip-event count the `weft_maintenance_breaker_trips_total` metric
+	/// reports, not a re-count of skips.
+	pub breaker_trips: usize,
 }
 
 /// The cold-vs-hot split of a hot/cold reconcile pass over one aspect, returned by
@@ -2822,6 +2829,13 @@ pub struct HotColdSweep {
 	/// counts only toward `aspects_scanned`; a sweep after the breaker's cooldown
 	/// retries it once.
 	pub tripped: Vec<String>,
+	/// Breakers this sweep tripped (ROB-21): aspects whose consecutive failures
+	/// reached the threshold during this sweep, so the store opened their breaker
+	/// (logged once at `WARN` there). A sweep that only *skips* already-tripped
+	/// aspects counts none here — those are in [`tripped`](Self::tripped) — so this
+	/// is the trip-event count the `weft_maintenance_breaker_trips_total` metric
+	/// reports, not a re-count of skips.
+	pub breaker_trips: usize,
 }
 
 impl HotColdSweep {
@@ -2867,6 +2881,13 @@ pub struct OverlapSweep {
 	/// counts only toward `aspects_scanned`; a sweep after the breaker's cooldown
 	/// retries it once.
 	pub tripped: Vec<String>,
+	/// Breakers this sweep tripped (ROB-21): aspects whose consecutive failures
+	/// reached the threshold during this sweep, so the store opened their breaker
+	/// (logged once at `WARN` there). A sweep that only *skips* already-tripped
+	/// aspects counts none here — those are in [`tripped`](Self::tripped) — so this
+	/// is the trip-event count the `weft_maintenance_breaker_trips_total` metric
+	/// reports, not a re-count of skips.
+	pub breaker_trips: usize,
 }
 
 /// The outcome of a store-wide squash sweep, returned by
@@ -2905,6 +2926,13 @@ pub struct SquashSweep {
 	/// counts only toward `aspects_scanned`; a sweep after the breaker's cooldown
 	/// retries it once.
 	pub tripped: Vec<String>,
+	/// Breakers this sweep tripped (ROB-21): aspects whose consecutive failures
+	/// reached the threshold during this sweep, so the store opened their breaker
+	/// (logged once at `WARN` there). A sweep that only *skips* already-tripped
+	/// aspects counts none here — those are in [`tripped`](Self::tripped) — so this
+	/// is the trip-event count the `weft_maintenance_breaker_trips_total` metric
+	/// reports, not a re-count of skips.
+	pub breaker_trips: usize,
 }
 
 /// Await one database's snapshot into a backup's build directory, fsync the copy through
@@ -5489,12 +5517,14 @@ mod tests {
 		assert_eq!(sweep.aspects_reconciled, 5, "every healthy aspect is reconciled");
 		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
 		assert!(sweep.tripped.is_empty(), "nothing has tripped yet: {:?}", sweep.tripped);
+		assert_eq!(sweep.breaker_trips, 0, "one failure is below the threshold, so no trip event");
 		assert!(!store.breaker_tripped(SWEEP_BAD), "one failure is below the threshold");
 
 		// Second sweep: the bad aspect fails again and trips. The healthy aspects
 		// have nothing left to reconcile, which still counts as success.
 		let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweeps");
 		assert_only_the_bad_aspect_failed(&sweep.failed, &bad_frame);
+		assert_eq!(sweep.breaker_trips, 1, "the second consecutive failure is the trip event");
 		assert!(store.breaker_tripped(SWEEP_BAD), "the second consecutive failure trips the breaker");
 
 		// Third sweep: the tripped aspect is not attempted at all — no failure is
@@ -5504,6 +5534,7 @@ mod tests {
 		assert_eq!(sweep.aspects_scanned, 6);
 		assert!(sweep.failed.is_empty(), "a tripped aspect records no new failure: {:?}", sweep.failed);
 		assert_eq!(sweep.tripped, vec![SWEEP_BAD.to_string()], "the tripped aspect is named");
+		assert_eq!(sweep.breaker_trips, 0, "skipping an already-tripped aspect is not a trip event");
 
 		// The breaker gates only the store-wide sweeps: the per-aspect entry point
 		// still attempts the aspect (and still meets the truncated frame).

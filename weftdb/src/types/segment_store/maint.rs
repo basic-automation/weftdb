@@ -47,22 +47,31 @@ impl SegmentStore {
 	/// A failure on a half-open trial re-trips at once: the count is already
 	/// at the threshold, so the increment keeps it there. Never called for a
 	/// busy aspect: contention is not a failure.
-	fn breaker_record(&self, aspect: &str, failed: bool) {
+	///
+	/// Returns whether this record tripped (or re-tripped) the breaker, so the
+	/// sweep can count the trip event in its [`breaker_trips`](super::ReconcileSweep::breaker_trips)
+	/// field (ROB-21: the trip is the one breaker outcome the sweep's
+	/// `tripped` list does not already name — that list holds aspects the
+	/// sweep skipped because they were *already* tripped).
+	fn breaker_record(&self, aspect: &str, failed: bool) -> bool {
 		if self.maintenance_breaker.failure_threshold == 0 {
-			return;
+			return false;
 		}
 		let mut state = self.breaker_state.lock().unwrap_or_else(PoisonError::into_inner);
 		if !failed {
 			state.remove(aspect);
-			return;
+			return false;
 		}
-		self.breaker_count_failure(aspect, state.entry(aspect.to_string()).or_default());
+		let tripped = self.breaker_count_failure(aspect, state.entry(aspect.to_string()).or_default());
 		drop(state);
+		tripped
 	}
 
 	/// Count one more failure against `aspect_state`, opening the breaker when the
-	/// count reaches the threshold.
-	fn breaker_count_failure(&self, aspect: &str, aspect_state: &mut AspectBreakerState) {
+	/// count reaches the threshold. Returns whether this failure opened (or
+	/// re-opened) the breaker: a half-open trial that fails re-trips, so it
+	/// counts as a trip too.
+	fn breaker_count_failure(&self, aspect: &str, aspect_state: &mut AspectBreakerState) -> bool {
 		aspect_state.consecutive_failures = aspect_state.consecutive_failures.saturating_add(1);
 		if aspect_state.consecutive_failures >= self.maintenance_breaker.failure_threshold {
 			let was_open = aspect_state.open_until.is_some_and(|until| until > Instant::now());
@@ -70,7 +79,9 @@ impl SegmentStore {
 			if !was_open {
 				tracing::warn!(aspect, failures = aspect_state.consecutive_failures, cooldown = ?self.maintenance_breaker.cooldown, "maintenance circuit breaker tripped: store-wide sweeps skip this aspect until the cooldown passes; per-aspect maintenance is unaffected");
 			}
+			return true;
 		}
+		false
 	}
 
 	/// Take `aspect`'s maintenance lock for a store-wide sweep: at once or not at all with
@@ -799,9 +810,13 @@ impl SegmentStore {
 					sweep.aspects_reconciled += 1;
 					sweep.segments_reconciled += reconciled;
 				}
-				Ok(None) => self.breaker_record(aspect, false),
+				Ok(None) => {
+					self.breaker_record(aspect, false);
+				}
 				Err(err) => {
-					self.breaker_record(aspect, true);
+					if self.breaker_record(aspect, true) {
+						sweep.breaker_trips += 1;
+					}
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
@@ -935,9 +950,13 @@ impl SegmentStore {
 					sweep.cold_reconciled += outcome.cold_reconciled;
 					sweep.hot_reconciled += outcome.hot_reconciled;
 				}
-				Ok(_) => self.breaker_record(aspect, false),
+				Ok(_) => {
+					self.breaker_record(aspect, false);
+				}
 				Err(err) => {
-					self.breaker_record(aspect, true);
+					if self.breaker_record(aspect, true) {
+						sweep.breaker_trips += 1;
+					}
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
@@ -1167,9 +1186,13 @@ impl SegmentStore {
 					sweep.aspects_reconciled += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok(_) => self.breaker_record(aspect, false),
+				Ok(_) => {
+					self.breaker_record(aspect, false);
+				}
 				Err(err) => {
-					self.breaker_record(aspect, true);
+					if self.breaker_record(aspect, true) {
+						sweep.breaker_trips += 1;
+					}
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
@@ -1245,9 +1268,13 @@ impl SegmentStore {
 					sweep.aspects_reconciled += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok((false, _)) => self.breaker_record(aspect, false),
+				Ok((false, _)) => {
+					self.breaker_record(aspect, false);
+				}
 				Err(err) => {
-					self.breaker_record(aspect, true);
+					if self.breaker_record(aspect, true) {
+						sweep.breaker_trips += 1;
+					}
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
@@ -1435,9 +1462,13 @@ impl SegmentStore {
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok(None) => self.breaker_record(aspect, false),
+				Ok(None) => {
+					self.breaker_record(aspect, false);
+				}
 				Err(err) => {
-					self.breaker_record(aspect, true);
+					if self.breaker_record(aspect, true) {
+						sweep.breaker_trips += 1;
+					}
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
@@ -1603,9 +1634,13 @@ impl SegmentStore {
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok(_) => self.breaker_record(aspect, false),
+				Ok(_) => {
+					self.breaker_record(aspect, false);
+				}
 				Err(err) => {
-					self.breaker_record(aspect, true);
+					if self.breaker_record(aspect, true) {
+						sweep.breaker_trips += 1;
+					}
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
@@ -1723,9 +1758,13 @@ impl SegmentStore {
 					sweep.aspects_squashed += 1;
 					sweep.segments_removed += removed;
 				}
-				Ok(_) => self.breaker_record(aspect, false),
+				Ok(_) => {
+					self.breaker_record(aspect, false);
+				}
 				Err(err) => {
-					self.breaker_record(aspect, true);
+					if self.breaker_record(aspect, true) {
+						sweep.breaker_trips += 1;
+					}
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
