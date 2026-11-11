@@ -2806,7 +2806,8 @@ mod tests {
 /// Schema, subject, dictionary, event and batch events are still always logged.
 pub(crate) fn measurement_audit_enabled() -> bool {
 	static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-	*ENABLED.get_or_init(|| measurement_audit_from(std::env::var("WEFT_DATA_AUDIT").ok().as_deref()))
+	let enabled = ENABLED.get_or_init(|| measurement_audit_from(std::env::var("WEFT_DATA_AUDIT").ok().as_deref()));
+	*enabled
 }
 
 fn measurement_audit_from(raw: Option<&str>) -> bool {

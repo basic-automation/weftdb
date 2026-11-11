@@ -43,7 +43,8 @@ const IDLE_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(30)
 /// aspect files otherwise holds gigabytes it is not using.
 fn idle_close_after() -> Option<std::time::Duration> {
 	static AFTER: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-	*AFTER.get_or_init(|| idle_close_from(std::env::var("WEFT_DB_IDLE_CLOSE_SECS").ok().as_deref()))
+	let after = AFTER.get_or_init(|| idle_close_from(std::env::var("WEFT_DB_IDLE_CLOSE_SECS").ok().as_deref()));
+	*after
 }
 
 fn idle_close_from(raw: Option<&str>) -> Option<std::time::Duration> {
