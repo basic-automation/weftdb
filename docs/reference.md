@@ -230,7 +230,7 @@ stays the baseline that upgrade, rollback and compatibility checks run against (
 | Crash consistency — power-loss durability, crash-safe maintenance | In progress ([design](https://basicautomation.io/projects/weftdb/docs/crash-consistency)) |
 | Security — TLS, API-key auth with roles, audit logs | Working, including SIGHUP key reload and the fsynced fail-closed audit log; not yet reviewed |
 | Pre-built binaries (Linux, macOS, Windows) | Released: v0.1.0 and v0.2.1, on GitHub |
-| Library crates on crates.io | Not published yet |
+| Library crates on crates.io | Published: `weft-physical-type`, `weft-reduce`, `weft-line-protocol`, `weft-arrow`, `weftdb`, `weft-arrow-store`, `weft-orchestration`, `weftdb-client` |
 | Packaging — Docker | Image build and container smoke test in CI (not published to a registry yet) |
 | Packaging — Helm | Not started |
 | Client SDKs | Rust: [`weftdb-client`](../weft-client) (on crates.io; the `weft-client` name belongs to an unrelated crate). R: [`clients/r`](../clients/r) (not on CRAN). Python: in the repository ([`clients/python`](../clients/python), not on PyPI yet). TypeScript: not started |

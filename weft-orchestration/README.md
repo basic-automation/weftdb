@@ -29,10 +29,18 @@ let mut pipeline = Pipeline::builder(database.clone(), aspect_id)
 pipeline.run().await?;
 ```
 
+**Depend on both crates from the same source.** Mixing a crates.io `weftdb` with a path
+(workspace) `weft-orchestration` — or the reverse — compiles *two copies of `weftdb`* into
+one binary, and the `weftdb` types will not unify. Either depend on both from crates.io:
+
 ```toml
 [dependencies]
-weft-orchestration = "0.1"
+weftdb = "0.3"
+weft-orchestration = "0.3"
 ```
+
+or vendor both by path. The published `weft-orchestration` depends on the registry
+`weftdb`, so a crates.io build pairs with the crates.io `weftdb`.
 
 ## License
 
