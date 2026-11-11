@@ -210,9 +210,18 @@ jobs:
           df -h /
       - name: Install software Vulkan (lavapipe)
         if: runner.os == 'Linux'
+        # The hosted runners have had hours-long DNS failures for *.ubuntu.com
+        # (2026-11-11), so a failed install retries against the kernel.org mirror.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
+          install() {
+            sudo apt-get update -o Acquire::Retries=3 &&
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 mesa-vulkan-drivers libvulkan1 vulkan-tools
+          }
+          if ! install; then
+            echo "::warning::Ubuntu archive unreachable; retrying through mirrors.edge.kernel.org"
+            sudo find /etc/apt -name '*.list' -o -name '*.sources' | xargs sudo sed -i -E 's#https?://([a-z0-9.-]*\.)?(archive|security)\.ubuntu\.com/ubuntu#http://mirrors.edge.kernel.org/ubuntu#g'
+            install
+          fi
           vulkaninfo --summary || true
       - name: Read the release toolchain
         id: toolchain
