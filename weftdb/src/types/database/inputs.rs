@@ -190,7 +190,6 @@ impl Inputs for Database {
 	/// succeed; ingest retries it.
 	async fn enqueue_unbatched_measurements(&self, aspect_id: &AspectId, data_timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
 		// A caller queuing by hand uses the queue, so ingest queues for the aspect too.
-		mark_queue_consumer(aspect_id);
 		legacy_metadata_write(async move {
 			if data_timestamps.is_empty() {
 				return Ok(());
@@ -2390,8 +2389,7 @@ impl Database {
 	/// conflict would otherwise fail the call. Retrying is safe: a failed attempt wrote
 	/// nothing.
 	async fn enqueue_retrying(&self, aspect_id: &AspectId, timestamps: &[chrono::DateTime<chrono::Utc>]) -> Result<()> {
-		// Ingest queues only for an aspect a consumer reads (see `queue_has_consumer`).
-		if timestamps.is_empty() || !self.queue_has_consumer(aspect_id).await? {
+		if timestamps.is_empty() {
 			return Ok(());
 		}
 		retry_queue_write("Enqueuing unbatched measurements", || self.enqueue_unbatched_measurements(aspect_id, timestamps)).await
@@ -2828,39 +2826,7 @@ mod measurement_audit_tests {
 	}
 }
 
-/// Aspects whose unbatched queue a consumer has read in this process.
-static QUEUE_CONSUMERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<AspectId>>> = std::sync::LazyLock::new(Default::default);
-
-/// Record that a consumer reads `aspect_id`'s queue, so captures enqueue for it from now on.
-///
-/// Every queue read calls this before it reads. A consumer's first run reads the queue
-/// (`is_first_run`) before it reads the stored rows, so a row committed after that read is
-/// enqueued, and one committed before it is in the rows the full rebuild batches.
-pub(crate) fn mark_queue_consumer(aspect_id: &AspectId) {
-	QUEUE_CONSUMERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(*aspect_id);
-}
-
 impl Database {
-	/// Whether captures for `aspect_id` need a queue entry.
-	///
-	/// The queue only tells a consumer which windows changed since its last run. Until a
-	/// consumer has run there is nothing to be incremental against: its first run, with an
-	/// empty queue and no batches, rebuilds every window from the stored rows. Queuing for an
-	/// aspect no consumer reads therefore adds rows that are never drained (a daemon's raw
-	/// 1 Hz aspects held 4.9M of them), and under MVCC they stay in memory. A consumer in this
-	/// process marks the aspect when it reads the queue; one in another process is seen by
-	/// its batches.
-	async fn queue_has_consumer(&self, aspect_id: &AspectId) -> Result<bool> {
-		if QUEUE_CONSUMERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(aspect_id) {
-			return Ok(true);
-		}
-		let has_batches = self.queue_has_consumer_from_batches(aspect_id).await?;
-		if has_batches {
-			mark_queue_consumer(aspect_id);
-		}
-		Ok(has_batches)
-	}
-
 	/// Remove the metadata rows that grew without bound before 0.3.3, and return how many.
 	///
 	/// - Per-measurement audit rows, unless `WEFT_DATA_AUDIT` keeps them.

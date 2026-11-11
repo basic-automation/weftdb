@@ -1630,21 +1630,19 @@ async fn raw_metadata_count(db: &Database, sql: &str) -> Result<i64> {
 
 /// **Regression (Fan Control RSS climb, 0.3.2):** a daemon capturing raw aspects that no
 /// pipeline consumes wrote an audit row and a queue entry per measurement, never removed
-/// (5.7M and 4.9M rows in 3.5 days), all held in memory by the MVCC metadata store.
+/// (5.7M and 4.9M rows in 3.5 days), all held in memory by the MVCC metadata store. The
+/// audit rows are now opt-in. Captures still queue, because skipping the queue before a
+/// consumer's first run could lose a row that commits during that run's rebuild; the stale
+/// entries of aspects with no batches are pruned when the store opens.
 #[serial]
 #[tokio::test]
-async fn unconsumed_captures_leave_no_metadata_rows() -> Result<()> {
+async fn captures_write_no_audit_rows_and_still_queue() -> Result<()> {
 	let (_temp, db, _subject, aspect) = setup_test_database().await?;
 	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
 	add_test_measurements(&db, &aspect, base, 20).await?;
 
 	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM transactions WHERE message LIKE 'Captured measurement at %'").await?, 0, "per-measurement audit rows are opt-in");
-	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 0, "no consumer has read this aspect's queue, so captures do not queue");
-
-	// Once a consumer reads the queue, captures queue for it.
-	assert_eq!(db.get_unbatched_entries(&aspect.id()).await?.len(), 0);
-	add_test_measurements(&db, &aspect, base + Duration::hours(1), 3).await?;
-	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 3, "a read consumer's captures are queued");
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 20, "every capture is queued for the consumer");
 	Ok(())
 }
 

@@ -35,9 +35,9 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
   holds those rows in memory. After 24 hours the daemon's `metadata.db` held 5.7M audit rows
   and 4.9M queue rows. Per-measurement and per-correlation audit rows are now opt-in
   (`WEFT_DATA_AUDIT=1`; schema, subject, dictionary, event and batch entries are always
-  logged). Captures queue only for aspects whose queue something reads, and a pipeline's
-  first run still rebuilds from the stored rows, so nothing is lost. Opening an existing
-  store prunes the dead rows in bounded 20k-row chunks: 175 s and a 3.0 GB peak on that
+  logged). Captures still queue for every aspect, because skipping the queue before a
+  pipeline's first run could lose a row committed during that run's rebuild. Opening an existing
+  store prunes the dead audit rows, and the queue entries of aspects that have no batches, in bounded 20k-row chunks: 175 s and a 3.0 GB peak on that
   store, against 9.3 GB for a single delete. It frees space inside `metadata.db` but does
   not shrink the file.
 - **Each open store file no longer pins ~3 MB for the life of the process.** Aspects kept
