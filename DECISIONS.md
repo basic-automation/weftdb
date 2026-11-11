@@ -6437,3 +6437,40 @@ full-disk error reaching the classifier is unverified end to end. Getting that n
 privileged CI step (`CAP_SYS_ADMIN` plus a `tmpfs`, or a loopback file); the fault-injection
 rig cannot substitute for it, because `FaultAction::ReturnErr` yields kind `Other`, which
 classifies `500`, not `507`. Left as a follow-up rather than faked here.
+## 2026-11-11 — Supply the disk figure to the ingest top-up rather than racing the runner (#691, #656)
+**Ambiguous:** #684's flake had two cures on the table — keep widening the test's margin,
+or make the filesystem figure injectable. #691 recorded the first as shipped and the second
+as the real fix, and #656 wants a `507` from a filesystem that is actually full, which a
+margin cannot produce at all.
+**Chosen: inject the figure, one private seam, handler behaviour untouched.**
+`IngestBody::top_up_to_decoded` and `reserve_disk` now both delegate to
+`top_up_to_decoded_with_space` / `reserve_disk_with_space` (`weft-server/src/ingest.rs:~387`,
+`:~418`) taking `Option<weftdb::DiskSpace>`; the public `pub fn top_up_to_decoded` signature,
+the four handler call sites (`:892`, `:1030`, `:1237`, `:1322`) and the phase-1 extractor all
+still pass `weftdb::disk_space_at(store.root())`, so nothing in production reads the figure
+differently. `DiskGuard::admit` already took `Option<DiskSpace>` as a parameter
+(`weftdb/src/types/disk_guard.rs:138`), so the seam stops at the extractor that used to call
+`disk_space_at` itself — the smallest change that makes the number controllable.
+**Chosen: delegation, not `#[cfg(test)]` and not `#[allow(dead_code)]`.** A test-only method
+would be dead code in the binary and an integration test in `weft-server/tests/` could not
+see it; the codebase's pattern is an additive `_with_*` variant whose un-suffixed form
+delegates (`*_with_cancel` in `weftdb/src/types/segment_store/maint.rs`, `*_in_window` in
+`weft-orchestration/src/detectors.rs`). `weft-server` is `publish = false`, so a `pub(crate)`
+method adds no public API.
+**Chosen: rewrite the flaky test's figures rather than delete its bite.** The reserve is a
+fixed 256 MiB and the injected figure is `reserve + 512 MiB`, so `margin / 2` is admitted and
+`margin * 64` is refused by arithmetic; a second test refuses 4097 bytes against a filesystem
+sitting exactly at its reserve and admits `None`, which is `admit`'s documented
+"the write itself is the test" arm. **Cost:** phase 1 still reads live space through
+`FromRequest`, so the test needs a runner with a few KiB free — no margin left to race, but
+not zero dependency on the host. The store's own guard maths stays covered by
+`weftdb/src/types/disk_guard.rs`'s tests; this test's subject is the ingest answer, and the
+PR says so rather than claiming #656's filled-disk case is now proven at the store layer.
+**Chosen: reference #691 and #656, close neither.** #656 asks for a `507` from a genuinely
+filled filesystem; what exists now is the same refusal with the figure supplied, which is the
+testable half. Closing #656 here would claim a disk-full experiment that has not run.
+**Cost, stated plainly: CI is the first execution of every line here.** The host has ~9 GiB
+free of 124 GiB after four concurrent cargo runs, so nothing compiled locally — no `cargo
+check`, no `cargo test`. The likeliest first failure is the new test's import shape
+(`weftdb::DiskSpace` is re-exported at `weftdb/src/types/mod.rs:96`; the `Copy` derive at
+`weftdb/src/types/disk_guard.rs:28` is what lets one `space` value feed two calls).
