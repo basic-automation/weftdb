@@ -6310,3 +6310,37 @@ PR; the standing rule is a narrower brief from the checkpoint or finish it mysel
 `!is_empty()` instead of `len() > 0` under `-D warnings`, one build); a replacement worker would spend its
 budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
 --lib` build, which the two prior worker deaths could not afford.
+
+## 2026-11-11 — the soak summary names every mismatch it found, and says what it skipped
+
+Two honesty defects in the nightly soak comparison (follow-ups recorded in issue #688).
+
+**The summary reported one mismatch class when two fired.** `build_summary`
+(`weft-bench/src/soak_compare.rs`) built the headline with an `if` / `else if` chain: when the
+report schema drifted *and* the counterpart series was missing, the schema branch won and the
+counterpart cause vanished from the text, even though both were in the detail lines. Both classes
+are now named in the headline. The substring `MISMATCH (report schema drift)` stays an exact
+prefix, which is what the existing assertions at `:2130` and `:2230` match, and the
+`MISMATCH (counterpart series)` assertion at `:2253` still holds because that class alone is
+unchanged.
+
+**Silently skipped optional metrics now report themselves.** A metric with a tolerance that the
+reports do not both carry was dropped with a code comment and no output. The summary line gains
+`Metrics compared: N of M.` plus `Skipped: <names>.` when `M > N`. It is a `>` prose line, not a
+`-` bullet, because the markdown parser treats a leading `- ` as a regression row — that is the
+one way this change could have manufactured a false regression, and it is the reason the wording
+is prose. A one-sided metric is still **not** compared: comparing values that exist on one side is
+a different question, and answering it silently would be the same class of dishonesty this fixes.
+
+**Deliberately not done here:** the exit code. A drift refusal still exits 0 because
+`weft-bench/src/main.rs` gates `ExitCode::FAILURE` on `has_regression` alone. That is the third
+item of #688 and stays open — changing the meaning of a nightly's exit status is a policy call
+with a paging consequence, not a reporting fix.
+
+`SoakComparison` keeps its fields and `schema_version: 1`: the counts live in the rendered summary
+line, so an existing machine-readable report still parses. The two new tests
+(`a_double_mismatch_names_both_causes`, `skipped_metrics_are_reported_when_optional_metric_is_absent`)
+were **written, not run**: the host has 3-8 GB free of 124 GB and `cargo test -p weft-bench` needs
+roughly 8 GB, so CI is the first execution. Every pre-existing summary assertion was re-read by
+hand against the new code path, which is what makes the `schema drift` prefix claim safe to make
+without running anything.

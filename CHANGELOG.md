@@ -82,6 +82,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- The soak comparison summary now names every mismatch class it found (a report-schema drift and a missing counterpart series used to collapse into one line), and reports `Metrics compared: N of M` plus the skipped tolerance names when an optional metric existed on only one side (`#688`).
+
 - **One float-input rule across every ingest format (FRE-8b, #313).** ILP float fields
   and Parquet/Arrow `Float64`/`Float32` cells now enter as their shortest round-trip
   decimal (decision 11) through the new `weft_physical_type::decimal_from_f64` /

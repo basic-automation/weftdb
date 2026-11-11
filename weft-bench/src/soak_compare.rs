@@ -380,15 +380,17 @@ fn find_metric(metrics: &Vec<(String, f64)>, name: &str) -> Option<f64> {
 // Helper: compute metric drifts
 // ---------------------------------------------------------------------------
 
-fn compute_metric_drifts(previous: &SoakReport, current: &SoakReport, tolerances: &[MetricTolerance], schema_mismatch: Option<(u32, u32)>) -> Vec<MetricDrift> {
+fn compute_metric_drifts(previous: &SoakReport, current: &SoakReport, tolerances: &[MetricTolerance], schema_mismatch: Option<(u32, u32)>) -> (Vec<MetricDrift>, usize, Vec<String>) {
 	if schema_mismatch.is_some() {
-		return Vec::new();
+		return (Vec::new(), 0, Vec::new());
 	}
 
 	let prev_metrics = extract_metrics(previous);
 	let curr_metrics = extract_metrics(current);
 
 	let mut drifts: Vec<MetricDrift> = Vec::with_capacity(tolerances.len());
+	let mut compared: usize = 0;
+	let mut skipped: Vec<String> = Vec::new();
 
 	for t in tolerances {
 		let prev_val = find_metric(&prev_metrics, t.metric_name);
@@ -407,20 +409,29 @@ fn compute_metric_drifts(previous: &SoakReport, current: &SoakReport, tolerances
 
 			let past_tolerance = drift_pct > t.tolerance;
 			drifts.push(MetricDrift { metric_name: t.metric_name.to_string(), previous_value: prev_v, current_value: curr_v, tolerance: t.tolerance, drift_pct, past_tolerance });
+			compared += 1;
+		} else {
+			// Metric not present in both reports → record as skipped
+			skipped.push(t.metric_name.to_string());
 		}
-		// Metric not present in both reports → skip silently
 	}
 
-	drifts
+	(drifts, compared, skipped)
 }
 
 // ---------------------------------------------------------------------------
 // Helper: build the summary string
 // ---------------------------------------------------------------------------
 
-fn build_summary(has_regression: bool, has_drift_warning: bool, rule_changes: &[RuleChange], schema_mismatch: Option<(u32, u32)>, run_schema_mismatch: Option<(u32, u32)>) -> String {
+/// The headline sentence. `metrics` is `(compared, total, skipped names)` grouped into one
+/// parameter because `weft-bench/src/lib.rs:96` denies `clippy::all`, whose
+/// `too_many_arguments` fires at eight parameters.
+fn build_summary(has_regression: bool, has_drift_warning: bool, rule_changes: &[RuleChange], schema_mismatch: Option<(u32, u32)>, run_schema_mismatch: Option<(u32, u32)>, metrics: (usize, usize, &[String])) -> String {
+	let (metrics_compared, metrics_total, metrics_skipped) = metrics;
 	let mut s = String::new();
-	if schema_mismatch.is_some() {
+	if schema_mismatch.is_some() && run_schema_mismatch.is_some() {
+		let _ = write!(s, "Schema version and soak run schema mismatch — rule outcomes compared, metrics skipped.");
+	} else if schema_mismatch.is_some() {
 		let _ = write!(s, "Schema version mismatch — rule outcomes compared, metrics skipped.");
 	} else if run_schema_mismatch.is_some() {
 		let _ = write!(s, "Soak run schema mismatch — rule outcomes compared, metrics skipped.");
@@ -452,6 +463,16 @@ fn build_summary(has_regression: bool, has_drift_warning: bool, rule_changes: &[
 			let _ = write!(s, " All metric drifts within tolerance.");
 		}
 	}
+
+	// Metrics-comparison boundary info when both report schema versions matched
+	if schema_mismatch.is_none() && run_schema_mismatch.is_none() && metrics_total > 0 {
+		let _ = write!(s, " Metrics compared: {metrics_compared} of {metrics_total}.");
+		if !metrics_skipped.is_empty() {
+			let joined = metrics_skipped.join(", ");
+			let _ = write!(s, " Skipped: {joined}.");
+		}
+	}
+
 	s
 }
 
@@ -487,9 +508,9 @@ pub fn compare_soak_reports(previous: &SoakReport, current: &SoakReport, toleran
 	let rule_changes = match_rule_changes(previous, current);
 	let has_regression = rule_changes.iter().any(|rc| rc.change == OutcomeChange::PassToFail);
 	let coverage_change = compute_coverage_change(previous, current);
-	let metric_drifts = compute_metric_drifts(previous, current, tolerances, any_mismatch);
+	let (metric_drifts, metrics_compared, metrics_skipped) = compute_metric_drifts(previous, current, tolerances, any_mismatch);
 	let has_drift_warning = metric_drifts.iter().any(|d| d.past_tolerance);
-	let summary = build_summary(has_regression, has_drift_warning, &rule_changes, schema_mismatch, run_schema_mismatch);
+	let summary = build_summary(has_regression, has_drift_warning, &rule_changes, schema_mismatch, run_schema_mismatch, (metrics_compared, tolerances.len(), &metrics_skipped));
 
 	SoakComparison { schema_version: 1, schema_mismatch, run_schema_mismatch, rule_changes, coverage_change, metric_drifts, has_regression, has_drift_warning, summary }
 }
@@ -845,5 +866,59 @@ mod tests {
 		assert_eq!(comp.run_schema_mismatch, None, "unstamped run schema: no mismatch with modern");
 		// Metric drifts must still be computed normally
 		assert!(!comp.metric_drifts.is_empty(), "metric drifts computed when unstamped run compared with modern");
+	}
+
+	// -----------------------------------------------------------------------
+	// Both mismatch classes
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn a_double_mismatch_names_both_causes() {
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let mut prev = create_report(&run);
+		prev.schema_version = 42;
+		prev.run.soak_schema_version = 3;
+		// Current uses default schema_version (1) and SOAK_SCHEMA_VERSION (7)
+		let curr = create_report(&run);
+
+		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
+
+		assert_eq!(comp.schema_mismatch, Some((42u32, 1u32)), "schema mismatch must be reported");
+		assert_eq!(comp.run_schema_mismatch, Some((3u32, 7u32)), "run schema mismatch must be reported");
+		assert!(comp.metric_drifts.is_empty(), "no metric drifts when both schema versions differ");
+		assert!(comp.summary.contains("Schema version"), "summary names the report-schema mismatch");
+		assert!(comp.summary.contains("soak run schema"), "summary names the soak run schema mismatch");
+	}
+
+	// -----------------------------------------------------------------------
+	// Skipped metrics are visible
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn skipped_metrics_are_reported_when_optional_metric_is_absent() {
+		// Both reports use the same schema versions, but the current report
+		// has no oracle verdict → oracle metrics are absent.
+		let run_full = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let prev = create_report(&run_full);
+
+		let run_no_oracle = create_run(60, None, Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let curr = create_report(&run_no_oracle);
+
+		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
+
+		// Schema versions match, so metrics are compared
+		assert_eq!(comp.schema_mismatch, None, "no schema mismatch");
+		assert_eq!(comp.run_schema_mismatch, None, "no run schema mismatch");
+
+		// oracle_ticks_judged and oracle_mismatch_count are present in prev but not curr
+		let oracle_ticks = comp.metric_drifts.iter().find(|d| d.metric_name == "oracle_ticks_judged");
+		assert_eq!(oracle_ticks, None, "oracle_ticks_judged must be absent from drifts (missing in curr)");
+		let oracle_mm = comp.metric_drifts.iter().find(|d| d.metric_name == "oracle_mismatch_count");
+		assert_eq!(oracle_mm, None, "oracle_mismatch_count must be absent from drifts (missing in curr)");
+
+		// Summary should have a metrics-comparison figure that names the skipped oracle metrics
+		assert!(comp.summary.contains("Metrics compared:"), "summary includes compared/total figure");
+		assert!(comp.summary.contains("oracle_ticks_judged"), "summary names the skipped oracle_ticks_judged");
+		assert!(comp.summary.contains("oracle_mismatch_count"), "summary names the skipped oracle_mismatch_count");
 	}
 }
