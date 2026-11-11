@@ -176,11 +176,15 @@ impl SegmentStore {
 	}
 
 	/// As [`reap`](Self::reap), but stops before the next aspect when `cancel` is
-	/// [`requested`](crate::MaintenanceCancel::requested).
+	/// [`request`](crate::MaintenanceCancel::request).
 	///
 	/// The in-flight aspect runs to its natural end and is counted normally in the
 	/// returned [`ReapSweep`]. When the token is pre-requested, the sweep returns
-	/// immediately with [`ReapSweep::cancelled`]` = true` and no aspects reaped.
+	/// immediately sets [`ReapSweep::cancelled`].
+	///
+	/// # Errors
+	///
+	/// As [`reap`](Self::reap).
 	pub async fn reap_with_cancel(&self, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<ReapSweep> {
 		self.writable()?;
 		let aspects: std::collections::BTreeSet<String> = self.index.journal(None).await?.into_iter().map(|entry| entry.aspect).collect();
@@ -762,11 +766,15 @@ impl SegmentStore {
 
 	/// As [`reconcile_all_over_threshold`](Self::reconcile_all_over_threshold), but stops
 	/// before the next aspect when `cancel` is
-	/// [`requested`](crate::MaintenanceCancel::requested).
+	/// [`request`](crate::MaintenanceCancel::request).
 	///
 	/// The in-flight aspect runs to its natural end and is counted normally.
 	/// When the token is pre-requested, the sweep returns immediately with
-	/// [`ReconcileSweep::cancelled`]` = true` and no aspects reconciled.
+	/// [`ReconcileSweep::cancelled`] set and no aspects reconciled.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_over_threshold`](Self::reconcile_all_over_threshold).
 	pub async fn reconcile_all_over_threshold_with_cancel(&self, threshold: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<ReconcileSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
@@ -893,11 +901,15 @@ impl SegmentStore {
 
 	/// As [`reconcile_all_hot_cold`](Self::reconcile_all_hot_cold), but stops
 	/// before the next aspect when `cancel` is
-	/// [`requested`](crate::MaintenanceCancel::requested).
+	/// [`request`](crate::MaintenanceCancel::request).
 	///
 	/// The in-flight aspect runs to its natural end and is counted normally.
 	/// When the token is pre-requested, the sweep returns immediately with
-	/// [`HotColdSweep::cancelled`]` = true` and no aspects reconciled.
+	/// [`HotColdSweep::cancelled`] set and no aspects reconciled.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_hot_cold`](Self::reconcile_all_hot_cold).
 	pub async fn reconcile_all_hot_cold_with_cancel(&self, threshold: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<HotColdSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
@@ -1122,11 +1134,15 @@ impl SegmentStore {
 
 	/// As [`reconcile_all_overlaps`](Self::reconcile_all_overlaps), but stops
 	/// before the next aspect when `cancel` is
-	/// [`requested`](crate::MaintenanceCancel::requested).
+	/// [`request`](crate::MaintenanceCancel::request).
 	///
 	/// The in-flight aspect runs to its natural end and is counted normally.
 	/// When the token is pre-requested, the sweep returns immediately with
-	/// [`OverlapSweep::cancelled`]` = true` and no aspects reconciled.
+	/// [`OverlapSweep::cancelled`] set and no aspects reconciled.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_overlaps`](Self::reconcile_all_overlaps).
 	pub async fn reconcile_all_overlaps_with_cancel(&self, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<OverlapSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
@@ -1191,11 +1207,15 @@ impl SegmentStore {
 
 	/// As [`reconcile_all_overlaps_with_policy`](Self::reconcile_all_overlaps_with_policy),
 	/// but stops before the next aspect when `cancel` is
-	/// [`requested`](crate::MaintenanceCancel::requested).
+	/// [`request`](crate::MaintenanceCancel::request).
 	///
 	/// The in-flight aspect runs to its natural end and is counted normally.
 	/// When the token is pre-requested, the sweep returns immediately with
-	/// [`OverlapSweep::cancelled`]` = true` and no aspects reconciled.
+	/// [`OverlapSweep::cancelled`] set and no aspects reconciled.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_overlaps_with_policy`](Self::reconcile_all_overlaps_with_policy).
 	pub async fn reconcile_all_overlaps_with_policy_and_cancel(&self, policy: SplitPolicy, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<OverlapSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
@@ -1382,11 +1402,15 @@ impl SegmentStore {
 
 	/// As [`squash_all_over_threshold`](Self::squash_all_over_threshold), but stops
 	/// before the next aspect when `cancel` is
-	/// [`requested`](crate::MaintenanceCancel::requested).
+	/// [`request`](crate::MaintenanceCancel::request).
 	///
 	/// The in-flight aspect runs to its natural end and is counted normally.
 	/// When the token is pre-requested, the sweep returns immediately with
-	/// [`SquashSweep::cancelled`]` = true` and no aspects squashed.
+	/// [`SquashSweep::cancelled`] set and no aspects squashed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_all_over_threshold`](Self::squash_all_over_threshold).
 	pub async fn squash_all_over_threshold_with_cancel(&self, max_segments: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
@@ -1546,11 +1570,15 @@ impl SegmentStore {
 
 	/// As [`squash_all_to_target_rows`](Self::squash_all_to_target_rows), but stops
 	/// before the next aspect when `cancel` is
-	/// [`requested`](crate::MaintenanceCancel::requested).
+	/// [`request`](crate::MaintenanceCancel::request).
 	///
 	/// The in-flight aspect runs to its natural end and is counted normally.
 	/// When the token is pre-requested, the sweep returns immediately with
-	/// [`SquashSweep::cancelled`]` = true` and no aspects squashed.
+	/// [`SquashSweep::cancelled`] set and no aspects squashed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_all_to_target_rows`](Self::squash_all_to_target_rows).
 	pub async fn squash_all_to_target_rows_with_cancel(&self, target_rows: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
@@ -1662,11 +1690,15 @@ impl SegmentStore {
 
 	/// As [`squash_all_to_target_rows_if_fragmented`](Self::squash_all_to_target_rows_if_fragmented),
 	/// but stops before the next aspect when `cancel` is
-	/// [`requested`](crate::MaintenanceCancel::requested).
+	/// [`request`](crate::MaintenanceCancel::request).
 	///
 	/// The in-flight aspect runs to its natural end and is counted normally.
 	/// When the token is pre-requested, the sweep returns immediately with
-	/// [`SquashSweep::cancelled`]` = true` and no aspects squashed.
+	/// [`SquashSweep::cancelled`] set and no aspects squashed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_all_to_target_rows_if_fragmented`](Self::squash_all_to_target_rows_if_fragmented).
 	pub async fn squash_all_to_target_rows_if_fragmented_with_cancel(&self, target_rows: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;

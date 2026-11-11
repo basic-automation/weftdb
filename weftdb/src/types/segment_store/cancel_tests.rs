@@ -32,7 +32,7 @@ async fn store_with(root: &std::path::Path, aspects: &[&str]) -> SegmentStore {
 
 /// Seal a multi-row segment into `aspect`.
 async fn seal_seg(aspect: &str, store: &SegmentStore, tag: i64, rows: usize) {
-	let ts: Vec<i64> = (0..rows).map(|i| tag * 1000 + i as i64 * 10).collect();
+	let ts: Vec<i64> = (0..rows).map(|i| tag * 1000 + i64::try_from(i).expect("row index fits") * 10).collect();
 	let vs: Vec<BigDecimal> = ts.iter().map(|t| BigDecimal::from(*t)).collect();
 	let batch = IngestBatch::dense(format!("{aspect}-{tag}"), ts, vs);
 	let receipt = store.ingest(aspect, &batch).await.expect("ingests");
@@ -42,7 +42,7 @@ async fn seal_seg(aspect: &str, store: &SegmentStore, tag: i64, rows: usize) {
 /// Create `count` segments in `aspect`, each with `rows` rows.
 async fn seal_many(store: &SegmentStore, aspect: &str, count: usize, rows: usize) {
 	for i in 0..count {
-		seal_seg(aspect, store, i as i64 + 1, rows).await;
+		seal_seg(aspect, store, i64::try_from(i).expect("count fits") + 1, rows).await;
 	}
 }
 
@@ -75,6 +75,7 @@ async fn cancel_between_aspects_finishes_current_and_reports_cancelled() {
 	let rest = store.squash_all_over_threshold(2, MaintenanceWait::Skip).await.expect("second sweep succeeds");
 	assert_eq!(rest.aspects_squashed, 3, "the remaining aspects were still schedulable and got swept");
 	assert!(!rest.cancelled, "an uncancelled sweep does not report cancellation");
+	drop(store);
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,8 @@ async fn cancel_before_sweep_starts_nothing() {
 		let count = store.segment_count(aspect).await.expect("count");
 		assert_eq!(count, 3, "{aspect} should still have 3 segments");
 	}
+
+	drop(store);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,4 +136,6 @@ async fn cancelled_sweep_then_full_sweep_converges() {
 		let count = store.segment_count(aspect).await.expect("count");
 		assert!(count <= 2, "{aspect} should be at or below threshold; has {count}");
 	}
+
+	drop(store);
 }

@@ -4,7 +4,7 @@
 //! hands to a store-wide sweep. A cancellation request prevents the sweep from starting
 //! the *next* aspect's maintenance; it never interrupts an aspect already in flight.
 //! The check runs at each aspect boundary, before the aspect's maintenance guard is
-//! acquired (the same seam where [`breaker_permits`] is checked).
+//! acquired (the same seam where `breaker_permits` is checked).
 
 use std::sync::{
 	atomic::{AtomicBool, AtomicUsize, Ordering}, Arc
@@ -19,7 +19,7 @@ use std::sync::{
 /// - The in-flight aspect runs to its natural end and is counted normally.
 /// - A swap (`commit_plans` / `finish_swap`) is never interrupted — the existing
 ///   fault-injection matrix (11 fault points, 5 abort points) and the
-///   [`PendingOutputs`] → [`crate::Reaper::abandon`] cleanup chain remain valid.
+///   `PendingOutputs` → `Reaper::abandon` cleanup chain remain valid.
 /// - A fine-grained token threaded into read paths is **not** provided — that is
 ///   deferred to ROB-15.
 ///
