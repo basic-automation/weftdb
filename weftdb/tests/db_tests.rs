@@ -1623,8 +1623,8 @@ mod database_new_crash {
 }
 
 async fn raw_metadata_count(db: &Database, sql: &str) -> Result<i64> {
-	let metadata = Database::get_turso_database(db.metadata_path()).await?;
-	let mut rows = metadata.connect()?.query(sql, ()).await?;
+	let conn = Database::get_turso_database(db.metadata_path()).await?.connect()?;
+	let mut rows = conn.query(sql, ()).await?;
 	Ok(rows.next().await?.context("COUNT(*) returned no row")?.get(0)?)
 }
 
@@ -1642,7 +1642,7 @@ async fn unconsumed_captures_leave_no_metadata_rows() -> Result<()> {
 	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 0, "no consumer has read this aspect's queue, so captures do not queue");
 
 	// Once a consumer reads the queue, captures queue for it.
-	assert!(db.get_unbatched_entries(&aspect.id()).await?.is_empty());
+	assert_eq!(db.get_unbatched_entries(&aspect.id()).await?.len(), 0);
 	add_test_measurements(&db, &aspect, base + Duration::hours(1), 3).await?;
 	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 3, "a read consumer's captures are queued");
 	Ok(())

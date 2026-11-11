@@ -50,6 +50,199 @@ pub struct Dictionary {
 	description: String,
 	patterns: Vec<Pattern>,
 	constraints: DictionaryConstraints,
+	/// Thresholds learned from the data when `constraints` sets no variabilities.
+	#[serde(skip)]
+	learner: LearnedSimilarity,
+}
+
+/// Similarity thresholds learned online, used when a dictionary has no variability
+/// constraints.
+///
+/// Without them nothing is ever similar, so every batch became a new pattern
+/// and a dictionary grew without bound (the fan daemon's `preamble` dictionaries).
+///
+/// Two shape distances are tracked: the mean absolute pointwise difference (what
+/// `AverageStatic` checks) and the difference of maxima (`MaximumStatic`). For each, the
+/// threshold is `λ ·` the median of recent nearest-neighbour distances, with one shared
+/// radius `λ`. `λ` steers toward about [`TARGET_NEW_RATE`] new patterns per import in
+/// bounded steps and is pulled back toward [`LAMBDA_CENTER`], so the pattern count is bounded by how many
+/// λ-balls pack the data rather than by a cap. Every occurrence is still kept, and a
+/// pattern within threshold of several stored ones still merges into all of them.
+#[derive(Clone, Debug, Default)]
+pub struct LearnedSimilarity {
+	lambda: Option<f64>,
+	recent: [std::collections::VecDeque<f64>; 2],
+	window_imports: u32,
+	window_new: u32,
+	warned_at: usize,
+	/// The learned step count, frozen once [`STEP_CALIBRATION_SAMPLES`] shapes are seen.
+	steps: Option<usize>,
+	calibration: Vec<Vec<f64>>,
+}
+
+/// The new-pattern rate the learned radius aims for.
+pub const TARGET_NEW_RATE: f64 = 0.02;
+const RECENT_DISTANCES: usize = 256;
+const RATE_WINDOW: u32 = 50;
+const LAMBDA_STEP: f64 = 1.25;
+/// Where λ starts and is pulled back to.
+///
+/// A new shape merges unless it is more than twice as far from its nearest stored shape
+/// as is typical. At 1 a shape exactly one typical
+/// spacing away sits on the boundary, and evenly spread data never merges.
+pub const LAMBDA_CENTER: f64 = 2.0;
+const LAMBDA_BOUNDS: (f64, f64) = (0.05, 20.0);
+const PATTERN_WARN_EVERY: usize = 10_000;
+/// Shapes observed before the step count is chosen and frozen.
+pub const STEP_CALIBRATION_SAMPLES: usize = 64;
+/// Largest round-trip resampling error, as a fraction of a shape's range, that the
+/// learned step count may introduce for 90% of the calibration shapes.
+pub const STEP_RESAMPLE_TOLERANCE: f64 = 0.02;
+const STEP_SEARCH_LIMIT: usize = 1024;
+
+impl LearnedSimilarity {
+	/// The current shared radius.
+	#[must_use]
+	pub fn lambda(&self) -> f64 {
+		self.lambda.unwrap_or(LAMBDA_CENTER)
+	}
+
+	/// The current thresholds (average distance, maximum distance), or `None` before any
+	/// nearest-neighbour distance has been seen.
+	#[must_use]
+	pub fn thresholds(&self) -> Option<[f64; 2]> {
+		let m0 = median(&self.recent[0])?;
+		let m1 = median(&self.recent[1])?;
+		Some([self.lambda() * m0, self.lambda() * m1])
+	}
+
+	/// The learned step count, once frozen.
+	#[must_use]
+	pub const fn steps(&self) -> Option<usize> {
+		self.steps
+	}
+
+	/// Collect one calibration shape; returns the step count when this one freezes it.
+	fn calibrate(&mut self, shape: Vec<f64>) -> Option<usize> {
+		if self.steps.is_some() {
+			return None;
+		}
+		if shape.len() >= 2 {
+			self.calibration.push(shape);
+		}
+		if self.calibration.len() < STEP_CALIBRATION_SAMPLES {
+			return None;
+		}
+		self.steps = choose_steps(&self.calibration);
+		self.calibration = Vec::new();
+		self.steps
+	}
+
+	fn observe(&mut self, nearest: [f64; 2]) {
+		for (k, d) in nearest.into_iter().enumerate() {
+			// An exact repeat (distance 0) says nothing about the data's scale; counting it
+			// would drag the median, and so the threshold, to 0, after which only exact
+			// repeats merge and every distinct input becomes its own pattern.
+			if d.is_finite() && d > 0.0 {
+				let q = &mut self.recent[k];
+				if q.len() == RECENT_DISTANCES {
+					q.pop_front();
+				}
+				q.push_back(d);
+			}
+		}
+	}
+
+	fn record_outcome(&mut self, was_new: bool, pattern_count: usize) {
+		self.window_imports += 1;
+		self.window_new += u32::from(was_new);
+		if self.window_imports >= RATE_WINDOW {
+			let rate = f64::from(self.window_new) / f64::from(self.window_imports);
+			let mut lambda = self.lambda();
+			if rate > TARGET_NEW_RATE {
+				lambda *= LAMBDA_STEP;
+			} else if rate < TARGET_NEW_RATE {
+				lambda /= LAMBDA_STEP;
+			}
+			// Pull back toward the center so one long quiet or noisy stretch cannot run it away.
+			lambda = LAMBDA_CENTER * (lambda / LAMBDA_CENTER).powf(0.9);
+			self.lambda = Some(lambda.clamp(LAMBDA_BOUNDS.0, LAMBDA_BOUNDS.1));
+			self.window_imports = 0;
+			self.window_new = 0;
+		}
+		if was_new && pattern_count >= self.warned_at + PATTERN_WARN_EVERY {
+			self.warned_at = pattern_count;
+			tracing::warn!(pattern_count, lambda = self.lambda(), "Dictionary keeps adding patterns under learned thresholds; the data may need explicit variability constraints");
+		}
+	}
+}
+
+fn median(values: &std::collections::VecDeque<f64>) -> Option<f64> {
+	if values.is_empty() {
+		return None;
+	}
+	let mut sorted: Vec<f64> = values.iter().copied().collect();
+	sorted.sort_by(f64::total_cmp);
+	Some(sorted[sorted.len() / 2])
+}
+
+/// Linear resampling of `s` to `n` evenly spaced points (the interpolation the step
+/// conversion uses).
+fn resample(s: &[f64], n: usize) -> Vec<f64> {
+	#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+	(0..n).map(|i| {
+		if n == 1 || s.len() == 1 {
+			return s[0];
+		}
+		let x = i as f64 * (s.len() - 1) as f64 / (n - 1) as f64;
+		let lo = (x.floor() as usize).min(s.len() - 1);
+		let hi = (lo + 1).min(s.len() - 1);
+		(s[hi] - s[lo]).mul_add(x - lo as f64, s[lo])
+	})
+	.collect()
+}
+
+/// How much of `s` is lost by storing it at `steps` points: the largest pointwise error
+/// after resampling down and back, as a fraction of the shape's range.
+fn resample_loss(s: &[f64], steps: usize) -> f64 {
+	let range = s.iter().copied().fold(f64::NEG_INFINITY, f64::max) - s.iter().copied().fold(f64::INFINITY, f64::min);
+	if range.is_nan() || range <= 0.0 {
+		return 0.0;
+	}
+	let back = resample(&resample(s, steps), s.len());
+	s.iter().zip(&back).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) / range
+}
+
+/// The smallest step count that keeps 90% of `samples` within
+/// [`STEP_RESAMPLE_TOLERANCE`] of themselves after resampling. Step count and
+/// interpolation are chosen together: the loss is measured under the interpolation the
+/// conversion applies, so a count is only accepted if that interpolation reconstructs
+/// the shapes at it.
+fn choose_steps(samples: &[Vec<f64>]) -> Option<usize> {
+	let longest = samples.iter().map(Vec::len).max()?.min(STEP_SEARCH_LIMIT);
+	for steps in 2..=longest {
+		let mut losses: Vec<f64> = samples.iter().map(|s| resample_loss(s, steps)).collect();
+		losses.sort_by(f64::total_cmp);
+		if losses[(losses.len() * 9 / 10).min(losses.len() - 1)] <= STEP_RESAMPLE_TOLERANCE {
+			return Some(steps);
+		}
+	}
+	Some(longest)
+}
+
+fn amplitudes_f64(pattern: &Pattern) -> Vec<f64> {
+	pattern.amplitudes().iter().filter_map(ToPrimitive::to_f64).collect()
+}
+
+/// (mean absolute pointwise difference, |max − max|), or `None` when the shapes differ in length.
+fn shape_distances(a: &[f64], b: &[f64]) -> Option<[f64; 2]> {
+	if a.is_empty() || a.len() != b.len() {
+		return None;
+	}
+	#[allow(clippy::cast_precision_loss)]
+	let mean = a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>() / a.len() as f64;
+	let max = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+	Some([mean, (max(a) - max(b)).abs()])
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,7 +452,7 @@ impl Dictionary {
 	#[must_use]
 	pub fn new(name: String, description: String, constraints: DictionaryConstraints) -> Self {
 		let id = DictionaryId::new();
-		Self { id, name, description, patterns: Vec::new(), constraints }
+		Self { id, name, description, patterns: Vec::new(), constraints, learner: LearnedSimilarity::default() }
 	}
 
 	/// Get the dictionary ID
@@ -312,6 +505,74 @@ impl Dictionary {
 		self.constraints = constraints;
 	}
 
+	/// Put stored patterns back exactly as they were saved: no step conversion, no
+	/// similarity matching, no merging. A pattern whose id is already present is skipped,
+	/// so restoring twice does not duplicate. This is how a dictionary is reloaded; new
+	/// data goes through [`import_pattern`](Self::import_pattern).
+	pub fn restore_patterns(&mut self, patterns: Vec<Pattern>) {
+		let mut seen: std::collections::HashSet<crate::PatternID> = self.patterns.iter().map(Pattern::id).collect();
+		for pattern in patterns {
+			if seen.insert(pattern.id()) {
+				self.patterns.push(pattern);
+			}
+		}
+		// A reloaded dictionary whose patterns all share one length learned that step count.
+		if self.constraints.steps.is_none() && self.learner.steps.is_none() {
+			let mut lengths = self.patterns.iter().map(|p| p.relatives().len()).filter(|l| *l > 0);
+			if let Some(first) = lengths.next() {
+				if self.patterns.len() >= STEP_CALIBRATION_SAMPLES && lengths.all(|l| l == first) {
+					self.learner.steps = Some(first);
+				}
+			}
+		}
+		self.seed_learner();
+	}
+
+	/// The learned-threshold state (meaningful only without variability constraints).
+	#[must_use]
+	pub const fn learned_similarity(&self) -> &LearnedSimilarity {
+		&self.learner
+	}
+
+	/// Re-seed the learned distances from up to [`RECENT_DISTANCES`] restored patterns, so a
+	/// reloaded dictionary does not start from "nothing is similar" again. λ is kept.
+	fn seed_learner(&mut self) {
+		if self.constraints.variabilities.is_some() || !self.learner.recent[0].is_empty() {
+			return;
+		}
+		let shapes: Vec<Vec<f64>> = self.patterns.iter().map(amplitudes_f64).collect();
+		let step = (shapes.len() / RECENT_DISTANCES).max(1);
+		for i in (0..shapes.len()).step_by(step).take(RECENT_DISTANCES) {
+			let mut nearest = [f64::INFINITY; 2];
+			for (j, other) in shapes.iter().enumerate() {
+				if i != j {
+					if let Some(d) = shape_distances(&shapes[i], other) {
+						nearest = [nearest[0].min(d[0]), nearest[1].min(d[1])];
+					}
+				}
+			}
+			self.learner.observe(nearest);
+		}
+	}
+
+	/// Every stored pattern within the learned thresholds of `new_pattern` (merge-into-all),
+	/// recording its nearest-neighbour distances. Before any distance is known nothing matches.
+	fn learned_matches(&mut self, new_pattern: &Pattern) -> Vec<usize> {
+		let shape = amplitudes_f64(new_pattern);
+		let thresholds = self.learner.thresholds();
+		let mut nearest = [f64::INFINITY; 2];
+		let mut matches = Vec::new();
+		for (idx, existing) in self.patterns.iter().enumerate() {
+			let Some(d) = shape_distances(&shape, &amplitudes_f64(existing)) else { continue };
+			nearest = [nearest[0].min(d[0]), nearest[1].min(d[1])];
+			if thresholds.is_some_and(|t| d[0] <= t[0] && d[1] <= t[1]) {
+				matches.push(idx);
+			}
+		}
+		self.learner.observe(nearest);
+		matches
+	}
+
 	/// Import a new pattern into the dictionary following the exact specification
 	///
 	/// ALL patterns are processed identically regardless of dictionary size:
@@ -323,8 +584,19 @@ impl Dictionary {
 	///
 	/// Returns an error if pattern processing fails due to step conversion or similarity checking.
 	pub fn import_pattern(&mut self, mut new_pattern: Pattern) -> Result<()> {
-		// Step 1: Enforce steps constraint if configured
-		if let Some(steps_config) = &self.constraints.steps {
+		// Without a configured step count, learn one from the first shapes, then convert the
+		// patterns stored so far to it, so shapes of different lengths become comparable.
+		if self.constraints.steps.is_none() {
+			if let Some(count) = self.learner.calibrate(amplitudes_f64(&new_pattern)) {
+				let steps = Steps::new(count, Spline::Linear);
+				tracing::info!(steps = count, dictionary = %self.name, "Learned the dictionary step count");
+				self.patterns = std::mem::take(&mut self.patterns).into_iter().map(|p| Self::convert_pattern_steps(p, &steps)).collect::<Result<_>>()?;
+			}
+		}
+		let learned_steps = self.learner.steps.map(|count| Steps::new(count, Spline::Linear));
+
+		// Step 1: Enforce steps constraint if configured (or learned)
+		if let Some(steps_config) = self.constraints.steps.as_ref().or(learned_steps.as_ref()) {
 			new_pattern = Self::convert_pattern_steps(new_pattern, steps_config)?;
 
 			// Debug: Check after step conversion
@@ -339,22 +611,32 @@ impl Dictionary {
 			return Ok(());
 		}
 
-		// Step 2: Check similarity against ALL existing patterns using configured variability constraints
-		// This is the specification-compliant approach - no shortcuts or optimizations that change behavior
-		let mut matching_indices = Vec::new();
-
-		for (idx, existing_pattern) in self.patterns.iter().enumerate() {
-			if self.patterns_are_similar(&new_pattern, existing_pattern)? {
-				matching_indices.push(idx);
+		// Step 2: Check similarity against ALL existing patterns using configured variability
+		// constraints, or, when none are configured, the learned thresholds.
+		let matching_indices = if self.constraints.variabilities.is_none() {
+			self.learned_matches(&new_pattern)
+		} else {
+			let mut found = Vec::new();
+			for (idx, existing_pattern) in self.patterns.iter().enumerate() {
+				if self.patterns_are_similar(&new_pattern, existing_pattern)? {
+					found.push(idx);
+				}
 			}
-		}
+			found
+		};
 
 		// Step 3: Handle matches according to specification
 		if matching_indices.is_empty() {
 			// "If the new pattern is not found to be efficiently similar to any existing pattern
 			// then the new pattern will be added to the pattern dictionary"
 			self.patterns.push(new_pattern);
+			if self.constraints.variabilities.is_none() {
+				self.learner.record_outcome(true, self.patterns.len());
+			}
 		} else {
+			if self.constraints.variabilities.is_none() {
+				self.learner.record_outcome(false, self.patterns.len());
+			}
 			// "If they are deemed sufficiently similar the new pattern will be converted to an
 			// occurrence of the existing pattern" - merge with ALL matching patterns as specified
 			for &idx in &matching_indices {
@@ -400,7 +682,7 @@ impl Dictionary {
 				new_relatives.push(Relative::new(vector, single_relative.max_x().clone(), single_relative.max_y().clone()));
 			}
 
-			return Ok(Pattern::new(pattern.id(), pattern.occurrences().clone(), new_relatives));
+			return Ok(Pattern::with_log(pattern.id(), pattern.occurrence_log().clone(), new_relatives));
 		}
 
 		let avg_max_x = Self::calculate_average_max_x(relatives);
@@ -421,7 +703,7 @@ impl Dictionary {
 			new_relatives.push(Relative::new(vector, avg_max_x.clone(), avg_max_y.clone()));
 		}
 
-		Ok(Pattern::new(pattern.id(), pattern.occurrences().clone(), new_relatives))
+		Ok(Pattern::with_log(pattern.id(), pattern.occurrence_log().clone(), new_relatives))
 	}
 
 	/// Check if two patterns are similar based on the dictionary's variability constraints
@@ -639,8 +921,8 @@ impl Dictionary {
 	pub fn merge_pattern_occurrences_at_index(&mut self, target_index: usize, source_pattern: &Pattern) -> Result<()> {
 		if let Some(target_pattern) = self.patterns.get_mut(target_index) {
 			// Add all occurrences from source pattern to target pattern
-			for occurrence in source_pattern.occurrences() {
-				target_pattern.add_occurrence(occurrence.clone());
+			for occurrence in source_pattern.occurrence_log().iter() {
+				target_pattern.add_occurrence(occurrence);
 			}
 		}
 		Ok(())
@@ -1007,6 +1289,7 @@ fn interpolate_amplitude_at_location(relatives: &[Relative], target_location: &B
 }
 
 #[cfg(test)]
+#[allow(clippy::significant_drop_tightening)]
 mod tests {
 	use bigdecimal::FromPrimitive;
 	use chrono::Utc;
@@ -1201,5 +1484,58 @@ mod tests {
 			}
 		}
 		assert_eq!(VariablilityType::from_kind("MedianStatic", value()).unwrap_err().to_string(), "Unknown VariabilityType: MedianStatic");
+	}
+
+	#[test]
+	fn learned_thresholds_bound_a_repeating_signal_and_keep_every_occurrence() -> Result<()> {
+		let mut dictionary = Dictionary::new("learned".into(), String::new(), DictionaryConstraints::new(None, None));
+		// Three recurring shapes plus small deterministic noise, 3000 imports.
+		let shapes = [[1.0, 2.0, 3.0, 2.0], [5.0, 5.0, 1.0, 0.0], [0.0, 4.0, 0.0, 4.0]];
+		for i in 0..3000_u32 {
+			let noise = f64::from((i * 7919) % 101) / 1000.0;
+			let shape: Vec<f64> = shapes[(i % 3) as usize].iter().map(|v| v + noise).collect();
+			dictionary.import_pattern(create_test_pattern(shape))?;
+		}
+		let occurrences: usize = dictionary.patterns().iter().map(|p| p.occurrences().len()).sum();
+		assert!(dictionary.len() < 300, "{} patterns for 3 recurring shapes", dictionary.len());
+		assert!(occurrences >= 3000, "every import is kept as an occurrence ({occurrences})");
+		Ok(())
+	}
+
+	#[test]
+	fn a_step_count_is_learned_from_the_first_shapes_and_frozen() {
+		let mut dictionary = Dictionary::new("steps".into(), String::new(), DictionaryConstraints::default());
+		// Smooth ramps of varying length: a few points reconstruct them exactly.
+		for i in 0..(STEP_CALIBRATION_SAMPLES + 20) {
+			let len = 10 + i % 7;
+			#[allow(clippy::cast_precision_loss)]
+			let amps: Vec<f64> = (0..len).map(|j| j as f64 / (len - 1) as f64).collect();
+			dictionary.import_pattern(create_test_pattern(amps)).unwrap();
+		}
+		let steps = dictionary.learned_similarity().steps().expect("frozen after calibration");
+		assert!((2..=4).contains(&steps), "a straight ramp needs few steps, got {steps}");
+		assert!(dictionary.patterns().iter().all(|p| p.relatives().len() == steps), "every stored pattern uses the learned count");
+		let total: usize = dictionary.patterns().iter().map(Pattern::occurrence_count).sum();
+		assert!(total >= STEP_CALIBRATION_SAMPLES + 20, "no occurrence lost");
+	}
+
+	#[test]
+	fn a_detailed_shape_keeps_enough_steps() {
+		let wave: Vec<f64> = (0..40).map(|j| (f64::from(j) * 0.9).sin()).collect();
+		let steps = choose_steps(&vec![wave.clone(); 8]).unwrap();
+		assert!(steps > 20, "a fast wave needs many steps, got {steps}");
+		assert!(resample_loss(&wave, steps) <= STEP_RESAMPLE_TOLERANCE);
+	}
+
+	#[test]
+	#[allow(clippy::unnecessary_wraps)]
+	fn restore_is_verbatim_and_skips_known_ids() -> Result<()> {
+		let a = create_test_pattern(vec![1.0, 2.0]);
+		let b = create_test_pattern(vec![1.0, 2.0]);
+		let mut learned = Dictionary::new("l".into(), String::new(), DictionaryConstraints::new(None, None));
+		learned.restore_patterns(vec![a.clone(), b.clone(), a]);
+		assert_eq!(learned.len(), 2, "restore keeps both identical shapes (no merging) and drops the repeated id");
+		assert_eq!(learned.patterns()[1], b);
+		Ok(())
 	}
 }

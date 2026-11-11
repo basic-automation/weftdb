@@ -922,6 +922,21 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				occurrences.push(occurrence);
 			}
 
+			// Then the compact lists (see `occurrence_codec`), in the order they were saved.
+			// A dictionary file from before the codec has no such table; that is no error.
+			if let Ok(mut blob_rows) = conn.as_ref().query(r"SELECT codec, payload FROM pattern_occurrence_blobs WHERE pattern_id = ? ORDER BY id ASC", turso::params![pattern_id.as_uuid().to_string()]).await {
+				loop {
+					let next = blob_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence list: {e}")))?;
+					let Some(blob_row) = next else { break };
+					let codec = *blob_row.get_value(0)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence codec is not integer".to_string()))?;
+					if codec != crate::types::occurrence_codec::CODEC_V1 {
+						return Err(Error::DatabaseError(format!("Unknown occurrence codec {codec} for pattern {pattern_id}")).into());
+					}
+					let payload = blob_row.get_value(1)?.as_blob().ok_or_else(|| Error::DatabaseError("Occurrence payload is not a blob".to_string()))?.clone();
+					occurrences.extend(crate::types::occurrence_codec::decode(&payload).map_err(|e| Error::DatabaseError(format!("Corrupt occurrence list for pattern {pattern_id}: {e:#}")))?);
+				}
+			}
+
 			// Get relatives from pattern_relatives table
 			let relatives_query_sql = r"
                                 SELECT pattern_id, relative_index, relative_value

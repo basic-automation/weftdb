@@ -61,17 +61,19 @@ async fn windowed_local_extrema_match_the_full_run_inside_the_window() -> Result
 
 	// A triangle wave (period 10): strict peaks at m%10==5, valleys at m%10==0.
 	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
-	let rows: Vec<InputMeasurement> = (0..120).map(|m| { let k = m % 10; InputMeasurement::new(base + Duration::minutes(m), BigDecimal::from(40 + if k <= 5 { k } else { 10 - k } * 3)) }).collect();
+	let rows: Vec<InputMeasurement> = (0..120)
+		.map(|m| {
+			let k = m % 10;
+			InputMeasurement::new(base + Duration::minutes(m), BigDecimal::from(40 + if k <= 5 { k } else { 10 - k } * 3))
+		})
+		.collect();
 	db.batch_capture_measurements(aspect, DatasetId::new(), rows).await?;
 
 	let since = base + Duration::minutes(62);
 	let (res, spline) = (Resolution::Minutes, Spline::Linear);
 	// An extremum's manifestation starts one sample before it, so the window
 	// reproduces every full-run manifestation that starts at or after `since`.
-	for (full, windowed) in [
-		(detect_all_peaks(&db, &aspect, &res, &spline, "p").await?, detect_all_peaks_since(&db, &aspect, &res, &spline, "p", Some(since)).await?),
-		(detect_all_valleys(&db, &aspect, &res, &spline, "v").await?, detect_all_valleys_since(&db, &aspect, &res, &spline, "v", Some(since)).await?),
-	] {
+	for (full, windowed) in [(detect_all_peaks(&db, &aspect, &res, &spline, "p").await?, detect_all_peaks_since(&db, &aspect, &res, &spline, "p", Some(since)).await?), (detect_all_valleys(&db, &aspect, &res, &spline, "v").await?, detect_all_valleys_since(&db, &aspect, &res, &spline, "v", Some(since)).await?)] {
 		let in_window: Vec<_> = starts(&full).into_iter().filter(|(start, _)| *start >= since).collect();
 		assert!(!in_window.is_empty(), "precondition: the window holds extrema");
 		assert_eq!(starts(&windowed), in_window);

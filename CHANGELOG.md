@@ -7,7 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+
+## [0.3.3] - 2026-11-11
+
+Memory and growth fixes for long-running ingest, found on a Fan Control daemon that climbed
+1–1.5 GB of RSS per hour and was restarted every 4 hours.
+
+### Fixed
+
+- **The metadata database no longer grows without bound.** Every captured measurement and
+  every correlation insert or update wrote a row to the `transactions` audit log, and every
+  capture queued a row in `unbatched_measurements` even for aspects no pipeline reads. MVCC
+  holds those rows in memory. After 24 hours the daemon's `metadata.db` held 5.7M audit rows
+  and 4.9M queue rows. Per-measurement and per-correlation audit rows are now opt-in
+  (`WEFT_DATA_AUDIT=1`; schema, subject, dictionary, event and batch entries are always
+  logged). Captures queue only for aspects whose queue something reads, and a pipeline's
+  first run still rebuilds from the stored rows, so nothing is lost. Opening an existing
+  store prunes the dead rows in bounded 20k-row chunks: 175 s and a 3.0 GB peak on that
+  store, against 9.3 GB for a single delete. It frees space inside `metadata.db` but does
+  not shrink the file.
+- **Each open store file no longer pins ~3 MB for the life of the process.** Aspects kept
+  their own database handles, so all 559 files of that store stayed open (~2.4 GB). The
+  process-wide cache is now the only owner and closes files idle for
+  `WEFT_DB_IDLE_CLOSE_SECS` (default 300; `0` keeps the old behaviour), then returns the
+  freed heap to the OS (`malloc_trim` on glibc). Measured on a copy of that store: 2.44 GB
+  with every file open, 21 MB after the sweep. A reopen while a clone is still alive gets
+  Turso's same live instance, and it skips the cold-open sidecar sweep.
+- **Forward signals no longer duplicate on every pipeline run.** They were keyed by a random
+  manifestation id; the id is now derived from the correlation and occurrence end. Signal
+  state is also kept per aspect instead of in one process-wide queue, so two pipelines no
+  longer see or expire each other's signals.
+- **A dictionary with no variability constraints no longer adds a pattern for every batch.**
+  Without constraints nothing was ever similar. Thresholds are now learned online: for the
+  mean pointwise difference and the difference of maxima, `λ ·` the median of recent
+  nearest-neighbour distances, with one shared radius `λ` steered toward about 2% new
+  patterns in bounded steps and pulled back toward 2 (a shape merges unless it is more than
+  twice the typical spacing from its nearest stored shape). Exact repeats are left out of
+  the median, which they would otherwise drag to zero. When no step count is configured,
+  one is learned from the first 64 shapes: the smallest count at which linear resampling
+  reproduces 90% of them within 2% of their range. It is then frozen, and the patterns
+  stored so far are converted to it. A pattern within threshold still merges into every match, there is no cap, and every occurrence is kept. A dictionary that
+  keeps adding patterns logs a warning every 10,000. Configured variabilities behave as
+  before.
+- **Reloading a dictionary restores it as stored.** `load_dictionary` re-ran similarity
+  matching over every stored pattern (O(n²)) and could merge a stored pattern's occurrences
+  into its neighbours again on each reload. It now calls the new
+  `Dictionary::restore_patterns`.
+
+### Changed
+
+- **Dictionary occurrences are stored compactly and losslessly.** Each occurrence row
+  repeated the aspect, resolution, size and a JSON copy of `DatabaseInfo` (the whole subject
+  map). A pattern's occurrence list is now one `pattern_occurrence_blobs` row: the constant
+  fields once per distinct header, then about 3 bytes per occurrence (delta-of-delta
+  start, delta duration, in nanoseconds). Order and every field round-trip exactly. Patterns
+  hold the same compact form in memory (`OccurrenceLog`). `Pattern::occurrences()` still
+  returns `&Vec<Occurrence>`, decoding on first call; `occurrence_count`, `first_occurrence`
+  and `occurrence_log` read the compact form without expanding it. Existing
+  `pattern_occurrences` rows are still read and are replaced on the next save.
+
 ### Added
+
+- **`*_since` variants of every built-in detector** (`detect_threshold_crossing_{up,down}_since`,
+  `detect_all_{peaks,valleys}_since`, `detect_{peaks,valleys}_since`,
+  `detect_drawdown_since`, `detect_monthly_increase_since`) scan only `[since, latest]`, so
+  a live caller's cost per run stays flat instead of growing with history. Point-local
+  detectors return exactly the full run's manifestations inside the window; tests check
+  this for the threshold crossings and local extrema. The path-dependent ones (global
+  extremes, drawdown, monthly increase) answer for the window alone.
+- `weftdb::close_idle_databases` and `weftdb::open_database_count`.
+- `weft-orchestration`'s README documents that the two crates are published in lockstep
+  and how to use a path dependency without getting two copies of `weftdb`.
 - **Layout-upgrade integration test (FRE-13).** `weftdb/tests/layout_upgrade.rs` covers:
   the pre-v2 (layout-1) store upgrade to layout 2 through the public API, including
   idempotency, data survival, new writes after upgrade, a synthetic marker test, and
@@ -2729,7 +2799,9 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/basic-automation/weftdb/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/basic-automation/weftdb/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/basic-automation/weftdb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/basic-automation/weftdb/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/basic-automation/weftdb/compare/v0.2.0...v0.2.1

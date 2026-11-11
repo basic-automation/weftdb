@@ -47,9 +47,9 @@ fn idle_close_after() -> Option<std::time::Duration> {
 }
 
 fn idle_close_from(raw: Option<&str>) -> Option<std::time::Duration> {
-	match raw.map(str::trim).filter(|v| !v.is_empty()) {
-		None => Some(std::time::Duration::from_secs(300)),
-		Some(v) => match v.parse::<u64>() {
+	raw.map(str::trim).filter(|v| !v.is_empty()).map_or_else(
+		|| Some(std::time::Duration::from_secs(300)),
+		|v| match v.parse::<u64>() {
 			Ok(0) => None,
 			Ok(secs) => Some(std::time::Duration::from_secs(secs)),
 			Err(_) => {
@@ -57,7 +57,7 @@ fn idle_close_from(raw: Option<&str>) -> Option<std::time::Duration> {
 				Some(std::time::Duration::from_secs(300))
 			}
 		},
-	}
+	)
 }
 
 fn touch_cached(path: &str) {
@@ -76,12 +76,7 @@ fn first_open_of(path: &str) -> bool {
 /// handles were dropped.
 fn sweep_idle(cache: &mut HashMap<String, turso::Database>, after: std::time::Duration, now: std::time::Instant) -> usize {
 	let mut last_used = LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-	let idle: Vec<String> = cache
-		.keys()
-		.filter(|path| !path.ends_with("metadata.db"))
-		.filter(|path| last_used.get(*path).is_none_or(|t| now.saturating_duration_since(*t) >= after))
-		.cloned()
-		.collect();
+	let idle: Vec<String> = cache.keys().filter(|path| !path.ends_with("metadata.db")).filter(|path| last_used.get(*path).is_none_or(|t| now.saturating_duration_since(*t) >= after)).cloned().collect();
 	for path in &idle {
 		cache.remove(path);
 		last_used.remove(path);
@@ -119,8 +114,9 @@ fn maybe_sweep_idle(cache: &mut HashMap<String, turso::Database>) {
 	sweep_idle(cache, after, now);
 }
 
-/// Drop every cached database handle idle for at least `after` now, regardless of
-/// `WEFT_DB_IDLE_CLOSE_SECS` and the sweep rate limit. Returns how many were dropped.
+/// Drop every cached database handle idle for at least `after`, now.
+///
+/// This ignores `WEFT_DB_IDLE_CLOSE_SECS` and the sweep rate limit. Returns how many were dropped.
 /// Long-running hosts can call this from a timer; the cache also sweeps itself on use.
 pub async fn close_idle_databases(after: std::time::Duration) -> usize {
 	let mut cache = CONNECTION_DATABASES.lock().await;
@@ -167,11 +163,18 @@ pub(crate) async fn legacy_metadata_write<F: std::future::Future>(fut: F) -> F::
 /// This is useful for test cleanup to ensure database connections are released
 /// before deleting the database files.
 pub async fn clear_connection_cache_by_name(name: &str) {
-	let mut cache = CONNECTION_DATABASES.lock().await;
-	let keys_to_remove: Vec<_> = cache.keys().filter(|path| path.contains(name)).cloned().collect();
-	for key in keys_to_remove {
-		cache.remove(&key);
-	}
+	let removed: Vec<String> = {
+		let mut cache = CONNECTION_DATABASES.lock().await;
+		let keys: Vec<String> = cache.keys().filter(|path| path.contains(name)).cloned().collect();
+		for key in &keys {
+			cache.remove(key);
+		}
+		keys
+	};
+	// An explicit release means the caller holds no clones either, so the next open is a
+	// true cold open and runs the sidecar sweep again.
+	OPENED_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path| !removed.contains(path));
+	LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path, _| !removed.contains(path));
 }
 
 pub mod config;
@@ -2242,8 +2245,9 @@ impl DatabaseInfo {
 
 #[cfg(test)]
 mod idle_close_tests {
-	use super::idle_close_from;
 	use std::time::Duration;
+
+	use super::idle_close_from;
 
 	#[test]
 	fn idle_close_defaults_to_five_minutes_and_zero_disables() {

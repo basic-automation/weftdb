@@ -5652,7 +5652,7 @@ dependencies = [
 
 [[package]]
 name = "weft-orchestration"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -5706,7 +5706,7 @@ dependencies = [
 
 [[package]]
 name = "weft-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5771,7 +5771,7 @@ dependencies = [
 
 [[package]]
 name = "weftdb"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-trait",

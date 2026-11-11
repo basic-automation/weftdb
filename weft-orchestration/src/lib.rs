@@ -947,6 +947,8 @@ pub async fn build_patterns_queue(database: &Database, aspect_id: &weftdb::Aspec
 ///   interpolation is one splimes rejects
 /// - Pattern import fails during dictionary loading
 /// - Memory calculation fails
+// `patterns` is moved into the dictionary; the lint misreads the move as a late drop.
+#[allow(clippy::significant_drop_tightening)]
 pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, dictionary: &mut Dictionary) -> Result<()> {
 	// Register the dictionary (its description, steps and variabilities) the first time the
 	// aspect sees it. `register_dictionary_if_absent` checks again inside its write, so a
@@ -989,93 +991,17 @@ pub async fn load_dictionary(database: &Database, aspect_id: &weftdb::AspectId, 
 	let start_time = std::time::Instant::now();
 	tracing::info!(pattern_count = pattern_count, "Loading patterns into dictionary with memory-aware batching");
 
-	// For smaller pattern sets, process directly from the queue
-	if pattern_count <= 1000 {
-		for pattern in &patterns {
-			dictionary.import_pattern(pattern.clone())?;
-		}
-	} else {
-		// Get available memory information
-		let available_memory_mb = get_available_memory_mb();
-		tracing::debug!(available_memory_mb = available_memory_mb, "Available memory");
-
-		// Calculate safe batch size based on available memory
-		// Assume each pattern uses ~1MB when processed (conservative estimate)
-		// Use only 25% of available memory for safety
-		let safe_memory_mb = available_memory_mb / 4;
-		let estimated_pattern_size_mb = 1; // Conservative estimate per pattern
-		let memory_based_batch_size = (safe_memory_mb / estimated_pattern_size_mb).clamp(10, 200);
-
-		let cpu_count = num_cpus::get();
-		let optimal_batch_size = (memory_based_batch_size / cpu_count).max(5);
-
-		tracing::debug!(optimal_batch_size = optimal_batch_size, memory_based_batch_size = memory_based_batch_size, "Using batch size");
-
-		// Process in memory-aware chunks, removing from database queue as processed
-		let mut processed_patterns = Vec::new();
-
-		for chunk in patterns.chunks(memory_based_batch_size) {
-			// Release the lock while processing
-			let chunk_patterns: Vec<Dictionary> = chunk
-				.chunks(optimal_batch_size)
-				.collect::<Vec<_>>()
-				.par_iter()
-				.map(|chunk_patterns| {
-					let mut chunk_dict = Dictionary::new(format!("Chunk Dictionary {}", uuid::Uuid::new_v4()), "Temporary dictionary for parallel processing".to_string(), dictionary.constraints().clone());
-					for pattern in *chunk_patterns {
-						if let Err(e) = chunk_dict.import_pattern(pattern.clone()) {
-							tracing::error!(error = %e, "Failed to import pattern in chunk");
-						}
-					}
-
-					chunk_dict
-				})
-				.collect();
-
-			// Merge chunk dictionaries
-			for chunk_dict in chunk_patterns {
-				dictionary.merge_dictionary(chunk_dict)?;
-			}
-
-			// Track processed patterns for removal from database queue
-			processed_patterns.extend_from_slice(chunk);
-
-			let remaining = pattern_count - processed_patterns.len();
-			if remaining > 0 {
-				// println!("Processed {} patterns, {} remaining", pattern_count - remaining, remaining);
-			}
-
-			// Yield to prevent blocking other tasks
-			tokio::task::yield_now().await;
-		}
-		drop(processed_patterns);
-
-		// Patterns are now stored in dictionary databases and should persist,
-		// so we don't remove them after loading into memory
-		// for pattern in processed_patterns {
-		//     database.dequeue_processed_pattern(&pattern).await?;
-		// }
-	}
-	drop(patterns);
+	// Restore the stored patterns exactly as they were saved. They were already matched
+	// and merged when they were extracted; matching them against each other again on
+	// every load cost O(n²) similarity checks and merged a stored pattern's occurrences
+	// into every similar pattern once more on each reload.
+	dictionary.restore_patterns(patterns);
 
 	let final_elapsed = start_time.elapsed();
 	// A log figure: a count past u32::MAX reads as u32::MAX patterns.
 	let final_rate = f64::from(u32::try_from(pattern_count).unwrap_or(u32::MAX)) / final_elapsed.as_secs_f64();
 	tracing::info!(pattern_count = pattern_count, elapsed = ?final_elapsed, rate = final_rate, "Dictionary loading completed");
 	Ok(())
-}
-
-/// Available system memory in MB, or a conservative 2 GB if the platform won't say.
-///
-/// Uses a memory-only `sysinfo::System`, which reads the real figure on Linux, macOS and
-/// Windows. (This replaced hand-rolled per-platform code: unsafe Windows FFI,
-/// `/proc/meminfo` parsing, and a hard-coded 4 GB guess on macOS.)
-fn get_available_memory_mb() -> usize {
-	let system = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()));
-	match system.available_memory() {
-		0 => 2048,
-		bytes => usize::try_from(bytes / (1024 * 1024)).unwrap_or(usize::MAX),
-	}
 }
 
 /// Detects 5% price increases from month start to month end
@@ -1228,7 +1154,7 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 			// Calculate distances between consecutive manifestations (the cycle period)
 			if manifestation_times.len() >= 2 {
 				// Get resolution from the first occurrence if available
-				if let Some(occurrence) = pattern.occurrences().first() {
+				if let Some(occurrence) = pattern.first_occurrence().as_ref() {
 					pattern_resolution = *occurrence.resolution();
 				}
 
@@ -1266,7 +1192,7 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 			// Assign constant to local variable before borrowing to avoid clippy warning
 			let error_rate = HashMap::new();
 
-			let correlation = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: DictionaryId::from_uuid(pattern.occurrences()[0].database_info().id().as_uuid()), subject_id: aspect.subject_id(), aspect_id: *aspect_id, pattern_id: pattern.id(), event_id: event.id().clone() }, error_rate, pattern.occurrences().clone(), average_distance);
+			let correlation = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: DictionaryId::from_uuid(pattern.first_occurrence().ok_or_else(|| anyhow::anyhow!("pattern has no occurrences"))?.database_info().id().as_uuid()), subject_id: aspect.subject_id(), aspect_id: *aspect_id, pattern_id: pattern.id(), event_id: event.id().clone() }, error_rate, pattern.occurrences().clone(), average_distance);
 			database.insert_correlation(aspect_id, &correlation).await?;
 		}
 	}
@@ -1276,6 +1202,8 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	Ok(())
 }
 
+// `queue` is the per-aspect signal guard, held across the whole insert loop on purpose.
+#[allow(clippy::significant_drop_tightening)]
 async fn process_correlation_signals(correlation: &weftdb::Correlation, events: &[weftdb::Event], aspect_id: &AspectId) -> Result<usize> {
 	let mut signals_count = 0usize;
 	let mut queue = aspect_signals(aspect_id).await;
@@ -1633,7 +1561,7 @@ mod tests {
 			tracing::info!(count = multi_occurrence_count, "Number of correlations with more than 1 occurrence");
 
 			// print the number of patterns with more than 1 occurrence
-			tracing::info!(count = dictionary.patterns().iter().filter(|p| p.occurrences().len() > 1).count(), "Number of patterns with more than 1 occurrence");
+			tracing::info!(count = dictionary.patterns().iter().filter(|p| p.occurrence_count() > 1).count(), "Number of patterns with more than 1 occurrence");
 			drop(patterns);
 
 			let timer = std::time::Instant::now();
@@ -1858,7 +1786,7 @@ mod tests {
 			tracing::info!(count = multi_occurrence_count, "Number of correlations with more than 1 occurrence");
 
 			// Check patterns with multiple occurrences
-			let dict_multi_occ_count = pipeline.get_dictionary("TestDictionary").map_or(0, |d| d.patterns().iter().filter(|p| p.occurrences().len() > 1).count());
+			let dict_multi_occ_count = pipeline.get_dictionary("TestDictionary").map_or(0, |d| d.patterns().iter().filter(|p| p.occurrence_count() > 1).count());
 			drop(patterns);
 			tracing::info!(count = dict_multi_occ_count, "Number of patterns with more than 1 occurrence");
 
@@ -2038,7 +1966,7 @@ mod tests {
 			tracing::info!(count = multi_occurrence_count, "Number of correlations with more than 1 occurrence");
 
 			// print the number of patterns with more than 1 occurrence
-			tracing::info!(count = dictionary.patterns().iter().filter(|p| p.occurrences().len() > 1).count(), "Number of patterns with more than 1 occurrence");
+			tracing::info!(count = dictionary.patterns().iter().filter(|p| p.occurrence_count() > 1).count(), "Number of patterns with more than 1 occurrence");
 			drop(dictionary);
 			drop(patterns);
 
@@ -2235,7 +2163,7 @@ mod tests {
 				}
 			}
 			tracing::info!(count = multi_occurrence_count, "Number of correlations with more than 1 occurrence");
-			let dict_multi_occ_count_2 = pipeline.get_dictionary("TestDictionary").map_or(0, |d| d.patterns().iter().filter(|p| p.occurrences().len() > 1).count());
+			let dict_multi_occ_count_2 = pipeline.get_dictionary("TestDictionary").map_or(0, |d| d.patterns().iter().filter(|p| p.occurrence_count() > 1).count());
 			drop(patterns);
 			tracing::info!(count = dict_multi_occ_count_2, "Number of patterns with more than 1 occurrence");
 
