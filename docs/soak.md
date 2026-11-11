@@ -28,6 +28,15 @@ The comparison reports three classes of finding:
    exists, the comparison step succeeds with an explicit "first nightly no
    baseline" note. The current run's artifact becomes the baseline for
    the next night.
+4. **A refused comparison** — when the two reports' schema versions differ,
+   or the two soak runs' schema versions differ, no metric drift figure is
+   computed at all. That is the absence of a check rather than a clean pass,
+   so `soak-compare` names the cause and exits non-zero, which turns the
+   nightly red through the comparison step's `exit "$compare_status"`. Rule
+   outcomes are still matched by id across a mismatch, so a genuine
+   Pass→Fail regression keeps its own, sharper message and outranks this
+   one. A run stamped `soak_schema_version = 0` counts as unstamped and is
+   compared, not refused.
 
 ## What is NOT tested: TTL lane
 
