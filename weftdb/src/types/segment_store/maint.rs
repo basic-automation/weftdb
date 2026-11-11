@@ -172,11 +172,29 @@ impl SegmentStore {
 	/// [`Poisoned`] when the store is, or a failed journal read; per-aspect failures are
 	/// reported in [`ReapSweep::failed`].
 	pub async fn reap(&self, wait: MaintenanceWait) -> Result<ReapSweep> {
+		self.reap_with_cancel(wait, &crate::MaintenanceCancel::default()).await
+	}
+
+	/// As [`reap`](Self::reap), but stops before the next aspect when `cancel` is
+	/// [`request`](crate::MaintenanceCancel::request).
+	///
+	/// The in-flight aspect runs to its natural end and is counted normally in the
+	/// returned [`ReapSweep`]. When the token is pre-requested, the sweep returns
+	/// immediately sets [`ReapSweep::cancelled`].
+	///
+	/// # Errors
+	///
+	/// As [`reap`](Self::reap).
+	pub async fn reap_with_cancel(&self, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<ReapSweep> {
 		self.writable()?;
 		let aspects: std::collections::BTreeSet<String> = self.index.journal(None).await?.into_iter().map(|entry| entry.aspect).collect();
 		let deadline = wait.deadline();
 		let mut sweep = ReapSweep::default();
 		for aspect in aspects {
+			if cancel.is_requested() {
+				sweep.cancelled = true;
+				break;
+			}
 			let Some(held) = self.sweep_maintain(&aspect, deadline).await else {
 				sweep.busy.push(aspect);
 				continue;
@@ -743,11 +761,30 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`ReconcileSweep::failed`].
 	pub async fn reconcile_all_over_threshold(&self, threshold: usize, wait: MaintenanceWait) -> Result<ReconcileSweep> {
+		self.reconcile_all_over_threshold_with_cancel(threshold, wait, &crate::MaintenanceCancel::default()).await
+	}
+
+	/// As [`reconcile_all_over_threshold`](Self::reconcile_all_over_threshold), but stops
+	/// before the next aspect when `cancel` is
+	/// [`request`](crate::MaintenanceCancel::request).
+	///
+	/// The in-flight aspect runs to its natural end and is counted normally.
+	/// When the token is pre-requested, the sweep returns immediately with
+	/// [`ReconcileSweep::cancelled`] set and no aspects reconciled.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_over_threshold`](Self::reconcile_all_over_threshold).
+	pub async fn reconcile_all_over_threshold_with_cancel(&self, threshold: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<ReconcileSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
 		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
 		for aspect in &aspects {
+			if cancel.is_requested() {
+				sweep.cancelled = true;
+				break;
+			}
 			if !self.breaker_permits(aspect) {
 				sweep.tripped.push(aspect.clone());
 				continue;
@@ -859,11 +896,30 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`HotColdSweep::failed`].
 	pub async fn reconcile_all_hot_cold(&self, threshold: usize, wait: MaintenanceWait) -> Result<HotColdSweep> {
+		self.reconcile_all_hot_cold_with_cancel(threshold, wait, &crate::MaintenanceCancel::default()).await
+	}
+
+	/// As [`reconcile_all_hot_cold`](Self::reconcile_all_hot_cold), but stops
+	/// before the next aspect when `cancel` is
+	/// [`request`](crate::MaintenanceCancel::request).
+	///
+	/// The in-flight aspect runs to its natural end and is counted normally.
+	/// When the token is pre-requested, the sweep returns immediately with
+	/// [`HotColdSweep::cancelled`] set and no aspects reconciled.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_hot_cold`](Self::reconcile_all_hot_cold).
+	pub async fn reconcile_all_hot_cold_with_cancel(&self, threshold: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<HotColdSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
 		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
 		for aspect in &aspects {
+			if cancel.is_requested() {
+				sweep.cancelled = true;
+				break;
+			}
 			if !self.breaker_permits(aspect) {
 				sweep.tripped.push(aspect.clone());
 				continue;
@@ -1073,11 +1129,30 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`OverlapSweep::failed`].
 	pub async fn reconcile_all_overlaps(&self, wait: MaintenanceWait) -> Result<OverlapSweep> {
+		self.reconcile_all_overlaps_with_cancel(wait, &crate::MaintenanceCancel::default()).await
+	}
+
+	/// As [`reconcile_all_overlaps`](Self::reconcile_all_overlaps), but stops
+	/// before the next aspect when `cancel` is
+	/// [`request`](crate::MaintenanceCancel::request).
+	///
+	/// The in-flight aspect runs to its natural end and is counted normally.
+	/// When the token is pre-requested, the sweep returns immediately with
+	/// [`OverlapSweep::cancelled`] set and no aspects reconciled.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_overlaps`](Self::reconcile_all_overlaps).
+	pub async fn reconcile_all_overlaps_with_cancel(&self, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<OverlapSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
+			if cancel.is_requested() {
+				sweep.cancelled = true;
+				break;
+			}
 			if !self.breaker_permits(aspect) {
 				sweep.tripped.push(aspect.clone());
 				continue;
@@ -1127,11 +1202,30 @@ impl SegmentStore {
 	///
 	/// As [`reconcile_all_overlaps`](SegmentStore::reconcile_all_overlaps).
 	pub async fn reconcile_all_overlaps_with_policy(&self, policy: SplitPolicy, wait: MaintenanceWait) -> Result<OverlapSweep> {
+		self.reconcile_all_overlaps_with_policy_and_cancel(policy, wait, &crate::MaintenanceCancel::default()).await
+	}
+
+	/// As [`reconcile_all_overlaps_with_policy`](Self::reconcile_all_overlaps_with_policy),
+	/// but stops before the next aspect when `cancel` is
+	/// [`request`](crate::MaintenanceCancel::request).
+	///
+	/// The in-flight aspect runs to its natural end and is counted normally.
+	/// When the token is pre-requested, the sweep returns immediately with
+	/// [`OverlapSweep::cancelled`] set and no aspects reconciled.
+	///
+	/// # Errors
+	///
+	/// As [`reconcile_all_overlaps_with_policy`](Self::reconcile_all_overlaps_with_policy).
+	pub async fn reconcile_all_overlaps_with_policy_and_cancel(&self, policy: SplitPolicy, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<OverlapSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
 		let mut sweep = OverlapSweep { aspects_scanned: aspects.len(), ..OverlapSweep::default() };
 		for aspect in &aspects {
+			if cancel.is_requested() {
+				sweep.cancelled = true;
+				break;
+			}
 			if !self.breaker_permits(aspect) {
 				sweep.tripped.push(aspect.clone());
 				continue;
@@ -1303,11 +1397,30 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_over_threshold(&self, max_segments: usize, wait: MaintenanceWait) -> Result<SquashSweep> {
+		self.squash_all_over_threshold_with_cancel(max_segments, wait, &crate::MaintenanceCancel::default()).await
+	}
+
+	/// As [`squash_all_over_threshold`](Self::squash_all_over_threshold), but stops
+	/// before the next aspect when `cancel` is
+	/// [`request`](crate::MaintenanceCancel::request).
+	///
+	/// The in-flight aspect runs to its natural end and is counted normally.
+	/// When the token is pre-requested, the sweep returns immediately with
+	/// [`SquashSweep::cancelled`] set and no aspects squashed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_all_over_threshold`](Self::squash_all_over_threshold).
+	pub async fn squash_all_over_threshold_with_cancel(&self, max_segments: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
+			if cancel.is_requested() {
+				sweep.cancelled = true;
+				break;
+			}
 			if !self.breaker_permits(aspect) {
 				sweep.tripped.push(aspect.clone());
 				continue;
@@ -1452,11 +1565,30 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_to_target_rows(&self, target_rows: usize, wait: MaintenanceWait) -> Result<SquashSweep> {
+		self.squash_all_to_target_rows_with_cancel(target_rows, wait, &crate::MaintenanceCancel::default()).await
+	}
+
+	/// As [`squash_all_to_target_rows`](Self::squash_all_to_target_rows), but stops
+	/// before the next aspect when `cancel` is
+	/// [`request`](crate::MaintenanceCancel::request).
+	///
+	/// The in-flight aspect runs to its natural end and is counted normally.
+	/// When the token is pre-requested, the sweep returns immediately with
+	/// [`SquashSweep::cancelled`] set and no aspects squashed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_all_to_target_rows`](Self::squash_all_to_target_rows).
+	pub async fn squash_all_to_target_rows_with_cancel(&self, target_rows: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
+			if cancel.is_requested() {
+				sweep.cancelled = true;
+				break;
+			}
 			if !self.breaker_permits(aspect) {
 				sweep.tripped.push(aspect.clone());
 				continue;
@@ -1553,11 +1685,30 @@ impl SegmentStore {
 	/// Propagates only the aspect-list read; per-aspect failures are reported in
 	/// [`SquashSweep::failed`].
 	pub async fn squash_all_to_target_rows_if_fragmented(&self, target_rows: usize, wait: MaintenanceWait) -> Result<SquashSweep> {
+		self.squash_all_to_target_rows_if_fragmented_with_cancel(target_rows, wait, &crate::MaintenanceCancel::default()).await
+	}
+
+	/// As [`squash_all_to_target_rows_if_fragmented`](Self::squash_all_to_target_rows_if_fragmented),
+	/// but stops before the next aspect when `cancel` is
+	/// [`request`](crate::MaintenanceCancel::request).
+	///
+	/// The in-flight aspect runs to its natural end and is counted normally.
+	/// When the token is pre-requested, the sweep returns immediately with
+	/// [`SquashSweep::cancelled`] set and no aspects squashed.
+	///
+	/// # Errors
+	///
+	/// As [`squash_all_to_target_rows_if_fragmented`](Self::squash_all_to_target_rows_if_fragmented).
+	pub async fn squash_all_to_target_rows_if_fragmented_with_cancel(&self, target_rows: usize, wait: MaintenanceWait, cancel: &crate::MaintenanceCancel) -> Result<SquashSweep> {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
+			if cancel.is_requested() {
+				sweep.cancelled = true;
+				break;
+			}
 			if !self.breaker_permits(aspect) {
 				sweep.tripped.push(aspect.clone());
 				continue;

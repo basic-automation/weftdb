@@ -25,23 +25,41 @@
 //!
 //! The Parquet ingest lives here rather than in [`crate::storage`] so that every
 //! way a batch can arrive shares one ordering gate and one commit.
+//!
+//! The body itself arrives through [`IngestBody`], the two-phase extractor
+//! ROB-18 puts in place of D-S14's raw extractors (plan C11). Phase 1
+//! *reserves*, before a single body byte is read: a declared length over the
+//! one body cap is refused `413` up front, and the store's
+//! [`DiskGuard`](weftdb::DiskGuard) (ROB-17) must admit the reserved weight —
+//! the declared length, or the body cap when the request declares none —
+//! or the request is refused `507 insufficient_storage` without the body
+//! being read at all. Phase 2 reads the body under one *total* deadline
+//! (`408 body_timeout`), and once a handler has decoded the body the
+//! reservation is *topped up to the decoded weight*: the guard must admit
+//! what the decoded columns weigh, which is what a compressed body actually
+//! becomes, before anything is sealed. The registry gate's byte-weighted
+//! admission charge (D-S14, ROB-10) is unchanged — it prices the request's
+//! time in flight; the extractor's reservation prices the write it makes.
 
-use std::sync::{
-	atomic::{AtomicU64, Ordering}, Arc
+use std::{
+	sync::{
+		atomic::{AtomicU64, Ordering}, Arc
+	}, time::Duration
 };
 
 use axum::{
-	body::Bytes, extract::{Path, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json
+	body::Bytes, extract::{FromRequest, Path, Request, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json
 };
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
 use weft_line_protocol::TimestampPrecision;
 use weft_physical_type::{first_order_violation, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION};
 
 use crate::{
-	error::{self, ApiError, StrictBody, StrictJson, StrictQuery, StrictText, TaggedQuery}, panic_catch, state::AppState
+	error::{self, ApiError, StrictQuery, TaggedQuery}, panic_catch, state::AppState
 };
 
 /// Environment variable naming the one body cap for the ingest routes
@@ -81,6 +99,24 @@ pub const MAX_INGEST_ROWS_ENV: &str = "WEFT_MAX_INGEST_ROWS";
 /// socket, which says nothing about what a compressed Parquet body expands to.
 pub const MAX_INGEST_DECODED_BYTES_ENV: &str = "WEFT_MAX_INGEST_DECODED_BYTES";
 
+/// Environment variable naming the ingest routes' total body deadline
+/// (ROB-18).
+///
+/// A positive whole number of seconds the whole body gets to
+/// arrive in, counted from when the extractor starts reading — not a
+/// per-chunk idle bound, so a client dripping one byte at a time cannot
+/// hold its phase-1 reservation open indefinitely. A body that misses it
+/// is refused `408 body_timeout`.
+pub const INGEST_BODY_TIMEOUT_ENV: &str = "WEFT_INGEST_BODY_TIMEOUT_SECS";
+
+/// The default total body deadline when `WEFT_INGEST_BODY_TIMEOUT_SECS`
+/// is unset: 300 seconds.
+///
+/// A maximum-size body (256 MiB) still arrives
+/// over a link slower than 1 MB/s, while a stalled sender holds its
+/// reservation for minutes, not hours.
+pub const DEFAULT_INGEST_BODY_TIMEOUT_SECS: u64 = 300;
+
 /// The default body cap when `WEFT_MAX_INGEST_BYTES` is unset:
 /// 256 MiB (crash-consistency §8).
 pub const DEFAULT_MAX_INGEST_BYTES: usize = 256 * 1024 * 1024;
@@ -110,13 +146,14 @@ pub struct IngestConfig {
 	inflight_bytes: u64,
 	rows: usize,
 	decoded_bytes: u64,
+	body_timeout_secs: u64,
 }
 
 impl IngestConfig {
 	/// The defaults: a 256 MiB body cap, and an in-flight budget of the
 	/// same 256 MiB — one max-size body in flight by default, or any
 	/// number of smaller ones whose bodies sum under it.
-	pub const DEFAULT: Self = Self { body_bytes: DEFAULT_MAX_INGEST_BYTES, inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64, rows: DEFAULT_MAX_INGEST_ROWS, decoded_bytes: DEFAULT_MAX_INGEST_DECODED_BYTES };
+	pub const DEFAULT: Self = Self { body_bytes: DEFAULT_MAX_INGEST_BYTES, inflight_bytes: DEFAULT_MAX_INGEST_BYTES as u64, rows: DEFAULT_MAX_INGEST_ROWS, decoded_bytes: DEFAULT_MAX_INGEST_DECODED_BYTES, body_timeout_secs: DEFAULT_INGEST_BODY_TIMEOUT_SECS };
 
 	/// A configuration with an explicit body cap and the default
 	/// in-flight budget (tests, embedders).
@@ -146,6 +183,13 @@ impl IngestConfig {
 		Self { decoded_bytes: max_decoded_bytes, ..Self::DEFAULT }
 	}
 
+	/// A configuration with an explicit total body deadline and everything
+	/// else at its default (tests, embedders).
+	#[must_use]
+	pub const fn with_body_timeout_secs(body_timeout_secs: u64) -> Self {
+		Self { body_timeout_secs, ..Self::DEFAULT }
+	}
+
 	/// The limits the two `WEFT_*` values describe (`None` for an unset
 	/// variable, which leaves that limit at its default).
 	///
@@ -154,7 +198,7 @@ impl IngestConfig {
 	/// A message naming the variable when a value is not a positive
 	/// whole number, so a malformed setting fails startup instead of
 	/// silently falling back to a default the operator did not ask for.
-	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>, max_rows: Option<&str>, max_decoded_bytes: Option<&str>) -> Result<Self, String> {
+	pub fn from_env_values(max_body_bytes: Option<&str>, max_inflight_bytes: Option<&str>, max_rows: Option<&str>, max_decoded_bytes: Option<&str>, body_timeout_secs: Option<&str>) -> Result<Self, String> {
 		let mut config = Self::DEFAULT;
 		if let Some(raw) = max_body_bytes {
 			config.body_bytes = raw.parse().map_err(|e| format!("{MAX_INGEST_BYTES_ENV}={raw:?} is not a positive integer number of bytes: {e}"))?;
@@ -180,6 +224,12 @@ impl IngestConfig {
 				return Err(format!("{MAX_INGEST_DECODED_BYTES_ENV}={raw:?} is not a positive integer number of bytes: zero would refuse every ingest body"));
 			}
 		}
+		if let Some(raw) = body_timeout_secs {
+			config.body_timeout_secs = raw.parse().map_err(|e| format!("{INGEST_BODY_TIMEOUT_ENV}={raw:?} is not a positive whole number of seconds: {e}"))?;
+			if config.body_timeout_secs == 0 {
+				return Err(format!("{INGEST_BODY_TIMEOUT_ENV}={raw:?} is not a positive whole number of seconds: zero would refuse every ingest body"));
+			}
+		}
 		Ok(config)
 	}
 
@@ -190,7 +240,7 @@ impl IngestConfig {
 	///
 	/// A set variable whose value is not a positive whole number.
 	pub fn from_env() -> Result<Self, String> {
-		Self::from_env_values(std::env::var(MAX_INGEST_BYTES_ENV).ok().as_deref(), std::env::var(INGEST_MAX_INFLIGHT_BYTES_ENV).ok().as_deref(), std::env::var(MAX_INGEST_ROWS_ENV).ok().as_deref(), std::env::var(MAX_INGEST_DECODED_BYTES_ENV).ok().as_deref())
+		Self::from_env_values(std::env::var(MAX_INGEST_BYTES_ENV).ok().as_deref(), std::env::var(INGEST_MAX_INFLIGHT_BYTES_ENV).ok().as_deref(), std::env::var(MAX_INGEST_ROWS_ENV).ok().as_deref(), std::env::var(MAX_INGEST_DECODED_BYTES_ENV).ok().as_deref(), std::env::var(INGEST_BODY_TIMEOUT_ENV).ok().as_deref())
 	}
 
 	/// The one body cap for the ingest routes, in bytes.
@@ -215,6 +265,12 @@ impl IngestConfig {
 	#[must_use]
 	pub const fn max_decoded_bytes(self) -> u64 {
 		self.decoded_bytes
+	}
+
+	/// The total deadline one ingest body gets to arrive within (ROB-18).
+	#[must_use]
+	pub const fn body_timeout(self) -> Duration {
+		Duration::from_secs(self.body_timeout_secs)
 	}
 }
 
@@ -252,6 +308,147 @@ fn decoded_column_bytes(timestamps: &[i64], values: &[Option<BigDecimal>]) -> u6
 impl Default for IngestConfig {
 	fn default() -> Self {
 		Self::DEFAULT
+	}
+}
+
+/// An ingest request body, extracted in two phases (ROB-18, plan C11) —
+/// the extractor that replaces D-S14's `StrictJson` / `StrictText` /
+/// `StrictBody` on the four ingest routes.
+///
+/// **Phase 1 — reserve.** Before a single body byte is read, the request's
+/// reserved weight is fixed: its declared `Content-Length`, or the one
+/// body cap when it declares none (a body that declares nothing may still
+/// arrive at any size up to the cap, so the cap is what it reserves). A
+/// declared length over the cap is refused `413 payload_too_large` with
+/// the limit, up front. The store's [`DiskGuard`](weftdb::DiskGuard)
+/// (ROB-17) must then admit the reserved weight against the filesystem
+/// holding the store root; a refusal is `507 insufficient_storage`, and
+/// the body is never read — a client sending into a disk that cannot take
+/// the write learns so from the headers alone, and the store's own
+/// seal-time guard remains as the check on the frame actually written.
+///
+/// **Phase 2 — read, then top up.** The body is buffered under one total
+/// deadline ([`IngestConfig::body_timeout`]): the whole body must arrive
+/// within it, however it is chunked, or the answer is `408 body_timeout`.
+/// A body that outgrows the cap while arriving is the same `413` the
+/// D-S14 extractors answered. Once a handler has decoded the body, it
+/// calls [`top_up_to_decoded`](Self::top_up_to_decoded): the reservation
+/// is re-checked at the decoded weight, because what gets written is the
+/// decoded columns, not the bytes that arrived — a compressed Parquet
+/// body of a few megabytes can decode to a frame its body size never
+/// announced, and the guard must admit *that* weight before the seal.
+#[derive(Debug)]
+pub struct IngestBody {
+	bytes: Bytes,
+	reserved_bytes: u64,
+}
+
+impl IngestBody {
+	/// The buffered body bytes.
+	#[must_use]
+	pub const fn bytes(&self) -> &Bytes {
+		&self.bytes
+	}
+
+	/// The weight phase 1 reserved: the declared `Content-Length`, or the
+	/// body cap when the request declared none.
+	#[must_use]
+	pub const fn reserved_bytes(&self) -> u64 {
+		self.reserved_bytes
+	}
+
+	/// The body as UTF-8 text, with [`StrictText`](crate::error::StrictText)'s
+	/// envelope refusal for a body that is not text.
+	///
+	/// # Errors
+	///
+	/// `400 bad_request` when the body is not valid UTF-8.
+	pub fn text(&self) -> Result<String, ApiError> {
+		String::from_utf8(self.bytes.to_vec()).map_err(|_| ApiError::bad_request("the request body is not valid UTF-8 text".to_string()))
+	}
+
+	/// Top the phase-1 reservation up to the body's decoded weight: ask
+	/// the store's disk guard to admit a write of `decoded_bytes` (ROB-7's
+	/// decoded-column weight, what the seal will actually write). A weight
+	/// at or under the reservation was already admitted in phase 1 and
+	/// asks nothing again.
+	///
+	/// # Errors
+	///
+	/// `507 insufficient_storage` when the guard refuses the decoded
+	/// weight, with the refusal's numbers kept for the operator, exactly
+	/// as the store's own seal-time refusal is answered (ROB-17).
+	pub fn top_up_to_decoded(&self, store: &weftdb::SegmentStore, decoded_bytes: u64) -> Result<(), ApiError> {
+		if decoded_bytes <= self.reserved_bytes {
+			return Ok(());
+		}
+		reserve_disk(store, decoded_bytes)
+	}
+}
+
+/// Ask `store`'s disk guard to admit a write of `need` bytes onto the
+/// filesystem holding the store root (ROB-18 phase 1 and top-up, via
+/// ROB-17's [`DiskGuard`](weftdb::DiskGuard)).
+///
+/// # Errors
+///
+/// `507 insufficient_storage` when the guard refuses, answered the way
+/// the store's own refusal is answered at commit time
+/// ([`classify_typed`](crate::error::classify_typed)'s arm): the numbers
+/// describe the host, so they stay in the operator-only cause, and the
+/// store logs guard transitions itself.
+fn reserve_disk(store: &weftdb::SegmentStore, need: u64) -> Result<(), ApiError> {
+	store.disk_guard().admit(weftdb::disk_space_at(store.root()), need).map_err(|err| ApiError::server_logged_elsewhere(error::Code::InsufficientStorage, err.to_string()))
+}
+
+impl FromRequest<AppState> for IngestBody {
+	type Rejection = ApiError;
+
+	async fn from_request(request: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+		let limits = state.ingest_config();
+		let cap = limits.max_body_bytes();
+		// Phase 1 — reserve. The declared length is the reservation when
+		// the request declares one; an undeclared (chunked) body reserves
+		// the cap itself, the most it may arrive as.
+		let declared = request.headers().get("content-length").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<u64>().ok());
+		if let Some(declared) = declared {
+			if declared > cap as u64 {
+				return Err(ApiError::new(error::Code::PayloadTooLarge, format!("the request body declares {declared} bytes, over this route's {cap}-byte limit (`{MAX_INGEST_BYTES_ENV}`)")).with_limit(cap as u64));
+			}
+		}
+		let reserved_bytes = declared.unwrap_or(cap as u64);
+		if let Some(store) = state.store() {
+			reserve_disk(store, reserved_bytes)?;
+		}
+		// Phase 2 — read the whole body under one total deadline. The
+		// routes' `DefaultBodyLimit` layer stays as the transport's own
+		// bound; this read enforces the same cap in the envelope, as
+		// D-S14's extractors did. The read is streamed and the cap is
+		// classified here, the moment the arriving bytes pass it: the
+		// buffered-read error's length-limit type is `http_body_util`'s,
+		// not the axum rejection type the envelope's classifier names,
+		// so a body that outgrows the cap while arriving cannot be told
+		// apart from an unreadable one by that error's chain.
+		let read = async {
+			let mut stream = request.into_body().into_data_stream();
+			let mut buffered: Vec<u8> = Vec::new();
+			while let Some(chunk) = stream.next().await {
+				let chunk = chunk.map_err(|err| ApiError::bad_request(format!("the request body could not be read: {err}")))?;
+				if buffered.len() + chunk.len() > cap {
+					return Err(ApiError::new(error::Code::PayloadTooLarge, format!("the request body exceeds this route's {cap}-byte limit (`{MAX_INGEST_BYTES_ENV}`)")).with_limit(cap as u64));
+				}
+				buffered.extend_from_slice(&chunk);
+			}
+			Ok(Bytes::from(buffered))
+		};
+		let body = match tokio::time::timeout(limits.body_timeout(), read).await {
+			Ok(Ok(bytes)) => bytes,
+			Ok(Err(err)) => return Err(err),
+			Err(_elapsed) => {
+				return Err(ApiError::new(error::Code::BodyTimeout, format!("the request body did not arrive within the {}-second ingest body deadline (`{INGEST_BODY_TIMEOUT_ENV}`)", limits.body_timeout().as_secs())));
+			}
+		};
+		Ok(Self { bytes: body, reserved_bytes })
 	}
 }
 
@@ -587,9 +784,15 @@ async fn ingest_response(store: &Arc<weftdb::SegmentStore>, aspect: &str, receip
 /// undeclared), [`ApiError::bad_request`] (empty batch, an unparseable value, or
 /// values unrepresentable under the declared encoding/tolerance), and
 /// [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictJson(request): StrictJson<IngestRequest>) -> Result<Response, ApiError> {
+pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, body: IngestBody) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
+	// The body's own refusals answer ahead of the store check, as they
+	// did when they were the extractor's: ROB-18 moved them into the
+	// handler, and the precedence is part of the wire contract — a
+	// malformed body is refused on a storeless server too, not masked
+	// by the 503 (the strict-parsing tests pin this).
+	let request = parse_json_request(&headers, &body)?;
 	let store = state.store().cloned().ok_or_else(|| {
 		metrics.record_ingest_error();
 		ApiError::unconfigured()
@@ -604,13 +807,34 @@ pub async fn ingest_points(State(state): State<AppState>, Path(aspect): Path<Str
 	// Time the commit path (not the store-unconfigured fast-fail above): this is the
 	// ingest side of the north-star "predictable p95/p99 under ingest + query".
 	let start = std::time::Instant::now();
-	let result = ingest_points_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, request).await;
+	let result = ingest_points_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, &body, request).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
 	}
 	metrics.observe_ingest_latency(start.elapsed());
 	result
+}
+
+/// Parse the JSON ingest body (ROB-18). [`IngestBody`] buffers raw bytes
+/// for every format, so the JSON route makes the two refusals
+/// [`StrictJson`](crate::error::StrictJson) made on its behalf: a body
+/// whose content type is not a JSON one is `415 unsupported_media_type`,
+/// and a body that is not an [`IngestRequest`] document is
+/// `400 invalid_json`.
+///
+/// # Errors
+///
+/// Both refusals above.
+fn parse_json_request(headers: &HeaderMap, body: &IngestBody) -> Result<IngestRequest, ApiError> {
+	let json_content = headers.get("content-type").and_then(|value| value.to_str().ok()).is_some_and(|value| {
+		let essence = value.split(';').next().unwrap_or("").trim();
+		essence.eq_ignore_ascii_case("application/json") || essence.to_ascii_lowercase().ends_with("+json")
+	});
+	if !json_content {
+		return Err(ApiError::new(error::Code::UnsupportedMediaType, "the JSON ingest route takes an `application/json` body".to_string()));
+	}
+	serde_json::from_slice(body.bytes()).map_err(|err| ApiError::new(error::Code::InvalidJson, format!("the request body is not a valid ingest document: {err}")))
 }
 
 /// Where an ingest request commits, and the request headers it carries: the pieces every
@@ -628,7 +852,7 @@ struct IngestTarget<'a> {
 
 /// The body of [`ingest_points`], split out so the handler can record an error
 /// metric for any failure path uniformly.
-async fn ingest_points_inner(target: IngestTarget<'_>, request: IngestRequest) -> Result<Response, ApiError> {
+async fn ingest_points_inner(target: IngestTarget<'_>, body: &IngestBody, request: IngestRequest) -> Result<Response, ApiError> {
 	let IngestTarget { headers, limits, .. } = target;
 	if request.points.is_empty() {
 		return Err(ApiError::bad_request("no points to ingest (`points` is empty)".to_string()));
@@ -663,6 +887,9 @@ async fn ingest_points_inner(target: IngestTarget<'_>, request: IngestRequest) -
 	}
 
 	check_decoded_size(&timestamps, &values, limits)?;
+	// ROB-18: the reservation tops up to what the decoded columns weigh
+	// before anything is sealed.
+	body.top_up_to_decoded(target.store, decoded_column_bytes(&timestamps, &values))?;
 	enforce_order_if_required(request.require_sorted, &timestamps)?;
 	// `storage.ingest.seal` child span (roadmap Phase 3): the typed-column encode +
 	// `.weftseg` write + control-plane index update — the write stage timed apart from
@@ -761,9 +988,12 @@ fn parse_csv_points(body: &str) -> Result<ParsedCsv, ApiError> {
 /// undeclared), [`ApiError::bad_request`] (malformed CSV, empty body, or values
 /// unrepresentable under the declared encoding/tolerance), and
 /// [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, TaggedQuery(params, tags): TaggedQuery<CsvIngestParams>, StrictText(body): StrictText) -> Result<Response, ApiError> {
+pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, TaggedQuery(params, tags): TaggedQuery<CsvIngestParams>, body: IngestBody) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
+	// The body's UTF-8 refusal answers ahead of the store check, as it
+	// did when it was the extractor's (see `ingest_points`).
+	let text = body.text()?;
 	let store = state.store().cloned().ok_or_else(|| {
 		metrics.record_ingest_error();
 		ApiError::unconfigured()
@@ -776,7 +1006,7 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 	let limits = state.ingest_config();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_csv_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, tags, params.rows_per_page, params.require_sorted, &body).await;
+	let result = ingest_csv_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, &body, tags, params.rows_per_page, params.require_sorted, &text).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -789,13 +1019,15 @@ pub async fn ingest_csv(State(state): State<AppState>, Path(aspect): Path<String
 /// any failure path uniformly. Shares the commit path and
 /// `error::classify_ingest` with the JSON ingest path, so a CSV-committed batch
 /// is byte-identical to a JSON-committed one.
-async fn ingest_csv_inner(target: IngestTarget<'_>, tags: weftdb::TagSet, rows_per_page: Option<usize>, require_sorted: bool, body: &str) -> Result<Response, ApiError> {
+async fn ingest_csv_inner(target: IngestTarget<'_>, body: &IngestBody, tags: weftdb::TagSet, rows_per_page: Option<usize>, require_sorted: bool, text: &str) -> Result<Response, ApiError> {
 	let IngestTarget { headers, limits, .. } = target;
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the CSV text → typed
 	// `(timestamp, value)` columns, timed apart from the commit.
-	let ParsedCsv { timestamps, values, any_null } = tracing::info_span!("storage.ingest.parse", format = "csv").in_scope(|| parse_csv_points(body))?;
+	let ParsedCsv { timestamps, values, any_null } = tracing::info_span!("storage.ingest.parse", format = "csv").in_scope(|| parse_csv_points(text))?;
 	check_decoded_size(&timestamps, &values, limits)?;
+	// ROB-18: the reservation tops up to the decoded weight before sealing.
+	body.top_up_to_decoded(target.store, decoded_column_bytes(&timestamps, &values))?;
 	enforce_order_if_required(require_sorted, &timestamps)?;
 	let point_count = timestamps.len();
 	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page).with_groups(tags);
@@ -932,9 +1164,12 @@ fn project_ilp_series(body: &str, measurement: &str, field: &str, precision: Tim
 /// `ambiguous_series` (the field's points span more than one series; TAG-0),
 /// `invalid_tag` (the series' tags break the tag grammar), `series_limit` (a new
 /// series beyond `WEFT_MAX_SERIES_PER_ASPECT`), and [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictQuery(params): StrictQuery<IlpIngestParams>, StrictText(body): StrictText) -> Result<Response, ApiError> {
+pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, StrictQuery(params): StrictQuery<IlpIngestParams>, body: IngestBody) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
+	// The body's UTF-8 refusal answers ahead of the store check, as it
+	// did when it was the extractor's (see `ingest_points`).
+	let text = body.text()?;
 	let store = state.store().cloned().ok_or_else(|| {
 		metrics.record_ingest_error();
 		ApiError::unconfigured()
@@ -947,7 +1182,7 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 	let limits = state.ingest_config();
 	drop(state);
 	let start = std::time::Instant::now();
-	let result = ingest_ilp_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, &params, &body).await;
+	let result = ingest_ilp_inner(IngestTarget { store: &store, metrics: &metrics, audit: audit.as_ref(), aspect: &aspect, headers: &headers, limits }, &params, &body, &text).await;
 	drop(store);
 	if result.is_err() {
 		metrics.record_ingest_error();
@@ -958,7 +1193,7 @@ pub async fn ingest_ilp(State(state): State<AppState>, Path(aspect): Path<String
 
 /// The body of [`ingest_ilp`], split out so the handler records an error metric for
 /// any failure path uniformly.
-async fn ingest_ilp_inner(target: IngestTarget<'_>, params: &IlpIngestParams, body: &str) -> Result<Response, ApiError> {
+async fn ingest_ilp_inner(target: IngestTarget<'_>, params: &IlpIngestParams, body: &IngestBody, text: &str) -> Result<Response, ApiError> {
 	let IngestTarget { store, aspect, headers, limits, .. } = target;
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	let precision = parse_ilp_precision(params.precision.as_deref()).map_err(ApiError::bad_request)?;
@@ -967,7 +1202,7 @@ async fn ingest_ilp_inner(target: IngestTarget<'_>, params: &IlpIngestParams, bo
 	};
 	// `storage.ingest.parse` decode span (roadmap Phase 3): the line-protocol text →
 	// typed points, timed apart from the timestamp normalization and the seal.
-	let (points, tags) = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field, measurement = %params.measurement).in_scope(|| project_ilp_series(body, &params.measurement, &params.field, precision))?;
+	let (points, tags) = tracing::info_span!("storage.ingest.parse", format = "ilp", field = %params.field, measurement = %params.measurement).in_scope(|| project_ilp_series(text, &params.measurement, &params.field, precision))?;
 	if points.is_empty() {
 		return Err(ApiError::bad_request(format!("no points carrying field `{}` with a timestamp in measurement `{}` of the payload", params.field, params.measurement)));
 	}
@@ -998,6 +1233,8 @@ async fn ingest_ilp_inner(target: IngestTarget<'_>, params: &IlpIngestParams, bo
 	// text widened to the nullable shape the one entry point takes.
 	let nullable_values: Vec<Option<BigDecimal>> = values.into_iter().map(Some).collect();
 	check_decoded_size(&timestamps, &nullable_values, limits)?;
+	// ROB-18: the reservation tops up to the decoded weight before sealing.
+	body.top_up_to_decoded(target.store, decoded_column_bytes(&timestamps, &nullable_values))?;
 	let batch = weftdb::IngestBatch::new(key, timestamps.clone(), nullable_values.clone()).with_rows_per_page(params.rows_per_page).with_groups(tags);
 	commit_ingest(target, "ilp", keyed, batch, &timestamps, &nullable_values).instrument(tracing::info_span!("storage.ingest.seal", point_count, format = "ilp")).await
 }
@@ -1032,7 +1269,7 @@ pub struct ParquetIngestParams {
 /// undeclared), [`ApiError::bad_request`] (empty/malformed Parquet body or values
 /// unrepresentable under the declared encoding/tolerance), and
 /// [`ApiError::internal`] on a filesystem/control-plane failure.
-pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, TaggedQuery(params, tags): TaggedQuery<ParquetIngestParams>, StrictBody(body): StrictBody) -> Result<Response, ApiError> {
+pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<String>, headers: HeaderMap, TaggedQuery(params, tags): TaggedQuery<ParquetIngestParams>, body: IngestBody) -> Result<Response, ApiError> {
 	let metrics = state.metrics().clone();
 	metrics.record_ingest_request();
 	let store = state.store().cloned().ok_or_else(|| {
@@ -1058,11 +1295,12 @@ pub async fn ingest_parquet(State(state): State<AppState>, Path(aspect): Path<St
 
 /// The body of [`ingest_parquet`], split out so the handler records an error
 /// metric for any failure path uniformly.
-async fn ingest_parquet_inner(target: IngestTarget<'_>, tags: weftdb::TagSet, rows_per_page: Option<usize>, require_sorted: bool, body: &Bytes) -> Result<Response, ApiError> {
+async fn ingest_parquet_inner(target: IngestTarget<'_>, tags: weftdb::TagSet, rows_per_page: Option<usize>, require_sorted: bool, body: &IngestBody) -> Result<Response, ApiError> {
 	let IngestTarget { aspect, headers, limits, .. } = target;
-	if body.is_empty() {
+	if body.bytes().is_empty() {
 		return Err(ApiError::bad_request("empty Parquet body".to_string()));
 	}
+	let bytes: &Bytes = body.bytes();
 	let (key, keyed) = resolve_idempotency_key(headers, None)?;
 	// `storage.ingest.parquet` stage span (roadmap Phase 3 — the Arrow-decode-on-ingest
 	// analogue of the JSON/CSV/ILP `storage.ingest.parse`+`seal` spans). The decode
@@ -1074,14 +1312,18 @@ async fn ingest_parquet_inner(target: IngestTarget<'_>, tags: weftdb::TagSet, ro
 	let commit = async {
 		// The strict decode (ROB-7): a `NaN` or infinite value in the file is refused
 		// with its row, not mapped to a null the sender never asked for.
-		let (timestamps, values) = weft_arrow_store::decode_parquet_columns_strict(body, require_sorted).map_err(|err| error::classify_ingest(&err))?;
+		let (timestamps, values) = weft_arrow_store::decode_parquet_columns_strict(bytes, require_sorted).map_err(|err| error::classify_ingest(&err))?;
 		// The two ceilings (ROB-7) land here rather than on the body: a Parquet file is
 		// the one format whose body size says nothing about what it decodes to.
 		check_decoded_size(&timestamps, &values, limits)?;
+		// ROB-18: the reservation tops up to the decoded weight before sealing —
+		// Parquet is the format whose expansion the phase-1 body reservation
+		// cannot have priced.
+		body.top_up_to_decoded(target.store, decoded_column_bytes(&timestamps, &values))?;
 		let batch = weftdb::IngestBatch::new(key, timestamps.clone(), values.clone()).with_rows_per_page(rows_per_page).with_groups(tags);
 		commit_ingest(target, "parquet", keyed, batch, &timestamps, &values).await
 	};
-	commit.instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = body.len(), require_sorted, format = "parquet")).await
+	commit.instrument(tracing::info_span!("storage.ingest.parquet", %aspect, byte_len = bytes.len(), require_sorted, format = "parquet")).await
 }
 #[cfg(test)]
 mod tests {
@@ -2091,17 +2333,115 @@ mod tests {
 
 	#[test]
 	fn ingest_config_parses_and_refuses_zero() {
-		let config = super::IngestConfig::from_env_values(Some("1024"), Some("2048"), Some("40"), Some("8192")).expect("valid");
+		let config = super::IngestConfig::from_env_values(Some("1024"), Some("2048"), Some("40"), Some("8192"), Some("90")).expect("valid");
 		assert_eq!(config.max_body_bytes(), 1024);
 		assert_eq!(config.max_inflight_bytes(), 2048);
-		let defaults = super::IngestConfig::from_env_values(None, None, None, None).expect("defaults");
+		assert_eq!(config.body_timeout(), std::time::Duration::from_secs(90));
+		let defaults = super::IngestConfig::from_env_values(None, None, None, None, None).expect("defaults");
 		assert_eq!(defaults.max_body_bytes(), super::DEFAULT_MAX_INGEST_BYTES);
-		assert!(super::IngestConfig::from_env_values(Some("0"), None, None, None).is_err());
-		assert!(super::IngestConfig::from_env_values(None, Some("many"), None, None).is_err());
+		assert_eq!(defaults.body_timeout(), std::time::Duration::from_secs(super::DEFAULT_INGEST_BODY_TIMEOUT_SECS));
+		assert!(super::IngestConfig::from_env_values(Some("0"), None, None, None, None).is_err());
+		assert!(super::IngestConfig::from_env_values(None, Some("many"), None, None, None).is_err());
 		// ROB-7: the two new ceilings refuse a zero the same way, because a zero row
 		// cap or decoded cap refuses every body.
-		assert!(super::IngestConfig::from_env_values(None, None, Some("0"), None).is_err());
-		assert!(super::IngestConfig::from_env_values(None, None, None, Some("0")).is_err());
-		assert_eq!(super::IngestConfig::from_env_values(None, None, Some("40"), Some("8192")).expect("valid").max_rows(), 40);
+		assert!(super::IngestConfig::from_env_values(None, None, Some("0"), None, None).is_err());
+		assert!(super::IngestConfig::from_env_values(None, None, None, Some("0"), None).is_err());
+		assert_eq!(super::IngestConfig::from_env_values(None, None, Some("40"), Some("8192"), None).expect("valid").max_rows(), 40);
+		// ROB-18: a zero body deadline refuses every body the same way.
+		assert!(super::IngestConfig::from_env_values(None, None, None, None, Some("0")).is_err());
+		assert!(super::IngestConfig::from_env_values(None, None, None, None, Some("soon")).is_err());
+	}
+
+	#[tokio::test]
+	async fn ingest_body_phase_one_refuses_507_before_the_body_is_read() {
+		// ROB-18 phase 1 (plan C11): ROB-17's disk guard must admit the
+		// reserved weight before a body byte is read. A store whose
+		// reserve exceeds everything the filesystem holds refuses every
+		// write — and the refusal must arrive even for a body that could
+		// never parse, which is the proof the check ran on the headers,
+		// ahead of the read and the parse. Before ROB-18 this request
+		// answered 400 invalid_json; the store's own guard was only
+		// consulted at seal time.
+		let dir = TempDir::new().unwrap();
+		let store = Arc::new(SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(u64::MAX)).await.unwrap());
+		store.declare("price", &AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)).await.unwrap();
+		let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+		drop(store);
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/points").header("content-type", "application/json").header("content-length", "1024").body(Body::from("this is not json")).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(json["code"], "insufficient_storage", "body: {json}");
+	}
+
+	#[tokio::test]
+	async fn ingest_body_phase_one_refuses_a_declared_length_over_the_cap() {
+		// ROB-18 phase 1: a declared length over the one body cap is
+		// refused 413 with the limit, before the body is read.
+		let dir = TempDir::new().unwrap();
+		let store = store_with_declared_f64(&dir, "price").await;
+		let config = super::IngestConfig::with_max_body_bytes(16);
+		let router = app_with_state(AppState::new().with_store(store).with_ingest_config(config));
+		let payload = serde_json::to_vec(&price_batch()).unwrap();
+		assert!(payload.len() > 16);
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/points").header("content-type", "application/json").header("content-length", payload.len().to_string()).body(Body::from(payload)).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+		assert_eq!(json["code"], "payload_too_large", "body: {json}");
+		assert_eq!(json["limit"], 16, "the refusal names the cap: {json}");
+	}
+
+	#[tokio::test]
+	async fn ingest_body_read_past_the_total_deadline_is_408() {
+		// ROB-18 phase 2: one total deadline for the whole body, not a
+		// per-chunk idle bound. A stream that never delivers a byte
+		// misses any deadline, and the refusal is the code table's
+		// `408 body_timeout`.
+		use axum::extract::FromRequest as _;
+		let config = super::IngestConfig::with_body_timeout_secs(1);
+		let state = AppState::new().with_ingest_config(config);
+		let request = Request::builder().method("POST").uri("/api/v1/storage/price/points").body(Body::from_stream(futures::stream::pending::<Result<axum::body::Bytes, std::io::Error>>())).unwrap();
+		let err = super::IngestBody::from_request(request, &state).await.expect_err("a body that never arrives misses the deadline");
+		drop(state);
+		assert_eq!(err.code(), crate::error::Code::BodyTimeout);
+		assert_eq!(err.code().status(), StatusCode::REQUEST_TIMEOUT);
+	}
+
+	#[tokio::test]
+	async fn ingest_body_top_up_refuses_when_the_decoded_weight_breaches_the_reserve() {
+		// ROB-18 top-up: phase 1 reserves the body weight; after decode
+		// the guard must admit the decoded weight, which is what the seal
+		// writes. Size the store's reserve so the filesystem's writable
+		// margin sits between the two: the 4 KiB body is admitted, a
+		// decoded weight inside the margin is admitted, and a decoded
+		// weight far past it is refused 507 — before any seal.
+		//
+		// The margin has to be far larger than the second weight, because
+		// it is the whole tolerance for a filesystem reading that moves
+		// under the test: `reserve_disk` asks `weftdb::disk_space_at` again
+		// at admit time, so the reserve computed here and the space
+		// measured there are two different instants. A 1 MiB margin failed
+		// on `windows-latest`, where roughly 984 KiB of scratch churn
+		// elapsed between the two calls — see issue #684. 512 MiB is three
+		// orders of magnitude above that churn and still leaves the refusal
+		// case driven by the weight alone.
+		use axum::extract::FromRequest as _;
+		let dir = TempDir::new().unwrap();
+		let space = weftdb::disk_space_at(dir.path()).expect("the test filesystem is describable");
+		let writable = 512_u64 << 20;
+		let reserve = space.available_bytes.checked_sub(writable).expect("the test filesystem holds more than the margin");
+		let store = Arc::new(SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(reserve)).await.unwrap());
+		let state = AppState::new().with_store(store.clone());
+		let payload = vec![b'x'; 4096];
+		let request = Request::builder().method("POST").uri("/api/v1/storage/price/parquet").header("content-length", payload.len().to_string()).body(Body::from(payload)).unwrap();
+		let body = super::IngestBody::from_request(request, &state).await.expect("phase 1 admits a 4 KiB body against a 512 MiB margin");
+		drop(state);
+		assert_eq!(body.reserved_bytes(), 4096);
+		body.top_up_to_decoded(&store, writable / 2).expect("a decoded weight inside the margin is admitted");
+		let err = body.top_up_to_decoded(&store, writable * 64).expect_err("a decoded weight past the margin is refused");
+		drop(store);
+		assert_eq!(err.code(), crate::error::Code::InsufficientStorage);
+		assert_eq!(err.code().status(), StatusCode::INSUFFICIENT_STORAGE);
 	}
 }
