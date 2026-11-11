@@ -2413,19 +2413,29 @@ mod tests {
 		// ROB-18 top-up: phase 1 reserves the body weight; after decode
 		// the guard must admit the decoded weight, which is what the seal
 		// writes. Size the store's reserve so the filesystem's writable
-		// margin (1 MiB) sits between the two: the 4 KiB body is
-		// admitted, a decoded weight inside the margin is admitted, and
-		// a decoded weight far past it is refused 507 — before any seal.
+		// margin sits between the two: the 4 KiB body is admitted, a
+		// decoded weight inside the margin is admitted, and a decoded
+		// weight far past it is refused 507 — before any seal.
+		//
+		// The margin has to be far larger than the second weight, because
+		// it is the whole tolerance for a filesystem reading that moves
+		// under the test: `reserve_disk` asks `weftdb::disk_space_at` again
+		// at admit time, so the reserve computed here and the space
+		// measured there are two different instants. A 1 MiB margin failed
+		// on `windows-latest`, where roughly 984 KiB of scratch churn
+		// elapsed between the two calls — see issue #684. 512 MiB is three
+		// orders of magnitude above that churn and still leaves the refusal
+		// case driven by the weight alone.
 		use axum::extract::FromRequest as _;
 		let dir = TempDir::new().unwrap();
 		let space = weftdb::disk_space_at(dir.path()).expect("the test filesystem is describable");
-		let writable = 1_000_000_u64;
+		let writable = 512_u64 << 20;
 		let reserve = space.available_bytes.checked_sub(writable).expect("the test filesystem holds more than the margin");
 		let store = Arc::new(SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(reserve)).await.unwrap());
 		let state = AppState::new().with_store(store.clone());
 		let payload = vec![b'x'; 4096];
 		let request = Request::builder().method("POST").uri("/api/v1/storage/price/parquet").header("content-length", payload.len().to_string()).body(Body::from(payload)).unwrap();
-		let body = super::IngestBody::from_request(request, &state).await.expect("phase 1 admits a 4 KiB body against a 1 MiB margin");
+		let body = super::IngestBody::from_request(request, &state).await.expect("phase 1 admits a 4 KiB body against a 512 MiB margin");
 		drop(state);
 		assert_eq!(body.reserved_bytes(), 4096);
 		body.top_up_to_decoded(&store, writable / 2).expect("a decoded weight inside the margin is admitted");
