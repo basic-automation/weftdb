@@ -4,6 +4,33 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-10 — `weft-orchestration` stays published; the residue is documentation and one stale member (REL-496)
+
+**The item offered two options — publish `weft-orchestration` or mark it `publish = false` —
+and the tree had already chosen publishing.** The crates.io sparse index
+(`https://index.crates.io/we/ft/<name>`) lists `weft-orchestration` at `0.2.0, 0.3.0, 0.3.1,
+0.3.2`, current with the workspace manifest (`weft-orchestration/Cargo.toml:3` is `0.3.2`);
+the manifest sets no `publish = false`, unlike `weft-server`, `weft-tui`, `weft-bench`,
+`weft-xbench`. `scripts/publish.sh` publishes the non-`publish = false` members in dependency
+order, skipping versions already on the registry, so `weft-orchestration` publishes on every
+release. Marking it `publish = false` now would withdraw a crate people already depend on —
+a regression.
+
+**Chosen: keep publishing; close the item with documentation.** The real hazard the item
+named survives the status check: a consumer who mixes a crates.io `weftdb` with a path
+`weft-orchestration` gets two copies of `weftdb` and the types do not unify. The rule is
+now in `weft-orchestration/README.md` (depend on both from crates.io, or vendor both by
+path). The mechanics check out: the root workspace declares `weftdb = { path = "./weftdb",
+version = "0.3.2" }` (Cargo.toml:100), so the published `weft-orchestration` resolves the
+registry version. `weft-physical-type`, `weft-reduce`, `weft-line-protocol` and `weft-arrow`
+sit at 0.3.0 while `weftdb`, `weft-arrow-store` and `weft-orchestration` are at 0.3.2; that lag is
+release hygiene, not a reason to unpublish anything.
+
+**Evidence and the 403 trap.** Verified 2026-11-10 through the sparse index, which is what
+cargo itself resolves from. `crates.io/api/v1` answers 403 to unauthenticated callers on
+this host, and that alone made one earlier agent conclude nothing was published — an absence
+in a workflow run is likewise not proof of absence.
+
 ## 2026-11-08 — Pagination cursor v1: selector hash, high-water mark, fingerprint, nullable total (ROB-15, #449)
 
 **The cursor v1 token is 66 hex characters: `01` + selector SHA-256 prefix (16) + high-water mark (16) + data fingerprint (16) + next-page offset (16).**
@@ -6281,3 +6308,74 @@ only the declared length with no cap fallback for chunked bodies (an undeclared 
 could then write a full-cap frame against an unchecked disk); a per-chunk idle deadline
 (duplicates SEC-4's keep-alive bound and still lets a steady drip hold a reservation for
 the sum of the chunks).
+
+## 2026-11-10 — Three small honesty calls while clearing the wave's gates (#656, #676, #681, README)
+
+**Adding a configuration variable does not bump `schema_version`.** #681 registered
+`WEFT_INGEST_BODY_TIMEOUT_SECS` in `weft-server/src/settings.rs` and documented it in
+`docs/reference.md`, but not in `docs/config-schema.md`, so the `claims registry` gate refused the
+branch. Adding the row raised the section's prose count 42 -> 43 and left `schema_version` at 2, in
+`docs/config-schema.md` and `config/schema.toml` together. **Why:** only two commits have ever touched
+`config/schema.toml`, and the ROB-19 variable additions (`129ac669`, two Tuning variables) did not
+bump it — the version tracks structural and breaking change in the schema itself, not the population
+of a tier. **Cost:** the document's "How this version changes" table now omits three variables
+(`WEFT_MAINTENANCE_BREAKER_FAILURES`, `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`,
+`WEFT_INGEST_BODY_TIMEOUT_SECS`). Filling it in at the 1.0 schema bump is the follow-up; nothing
+checks it mechanically, which is why it drifted.
+
+**#656 is half closed, and the half that remains is a test.** The issue reported
+`Code::InsufficientStorage` (507) in the error table and the OpenAPI surface with no construction
+site, so the advertised contract promised a status no client could receive. #681 supplies exactly the
+issue's first option: `weft-server/src/ingest.rs:401` maps the phase-1 `DiskGuard::admit` refusal to
+`Code::InsufficientStorage`, with `weft-server/src/ingest.rs:2434` asserting the wire code. What #681
+does *not* do is write to a genuinely full filesystem — it injects the space figure. **Chosen:**
+comment on #656 that the contract mismatch closes with #681 and narrow the issue to the ENOSPC
+crash-matrix test, rather than closing it and re-opening the same work under a new number. **Rejected:**
+closing #656 outright — the honest remaining scope is real and would have been lost.
+
+**The README status table gets today's facts, not the 1.0 story.** `README.md:192-207` still announced
+"v0.2.1 is pre-beta" and "Tags, client SDKs, Helm chart — Not started" while 0.3.2 was released
+(2026-11-06) and `clients/python` and `clients/r` were in the tree. `ROADMAP.md:233` and **EVI-22**
+(`ROADMAP.md:435`) assign that table and the `pre-beta` badge to 1.0. **Chosen:** a partial slice that
+corrects each row to what a file in the tree proves, keeps the pre-1.0 upgrade caveats, and does not
+tick either roadmap box or touch the badge. **Why:** a stale table understates the product and a
+table that claims 1.0 before the tag exists overstates it; the second is the worse error, so the 1.0
+wording waits for the release. **Consequence:** EVI-22 shrinks to the badge, the version lines and a
+re-check of the same rows at tag time.
+
+**A conflict in the decision log is resolved by keeping both entries.** #676 was `CONFLICTING` with
+main and the only conflicted file was this log: ours added the SOAK-SCHEMA entry, main had gained the
+FRE-16, ORCH-SIG and FRE-8b entries since the branch was cut. **Chosen:** `git merge origin/main`
+(never a rebase — the standing decision of 2026-11-09 says a near-green PR is not rebased, and this
+one had a real conflict, which is the exception), keeping main's block first and appending ours,
+because the log is append-only and neither entry supersedes the other. **Cost:** a merge commit in a
+branch that will squash-merge, and one re-run of the full check set for a prose conflict.
+
+## 2026-11-10 — Soak schema drift: refuse in the precedent's shape, not with a hard error (SOAK-SCHEMA)
+
+**Ambiguous:** "make the comparison refuse" could mean a hard error out of `compare_soak_reports`, or the
+shape the code already uses when the *report file* schema versions differ. It could also mean failing the
+nightly job.
+
+**Chosen: copy `schema_mismatch`.** `compare_soak_reports` returns a `SoakComparison` and has no error
+path today; the file-version mismatch already produces a partial comparison — rule outcomes still
+compared, metric drift skipped, a visible `⚠️` line in the rendered report and a named summary — so
+`run_schema_mismatch` behaves identically rather than inventing a second refusal style. **Cost:** the
+nightly job still exits 0 on a mismatch, because `weft-bench/src/main.rs:1082` and `:1106` gate only on
+`comparison.has_regression`. That is pre-existing for `schema_mismatch` too; making either mismatch a
+hard gate is a policy call for the owner and is recorded here as the follow-up, not slipped into a
+benchmark-comparison PR.
+
+**Chosen: treat `run.soak_schema_version == 0` as "unstamped" and refuse nothing, and say plainly that
+nothing writes 0.** The honest framing matters: `SoakRun::soak_schema_version` (`weft-bench/src/soak.rs:143`)
+is a required serde field with no `#[serde(default)]`, so a report missing the key fails to deserialize
+before comparison — the 0 arm is a defensive floor for hand-built or merged records, not a live artifact
+path. The doc comment and CHANGELOG say so instead of implying legacy report files reach it.
+
+**Ambiguous:** the `parallel-worker` for this slice ended mid-run with uncommitted edits, no commit and no
+PR; the standing rule is a narrower brief from the checkpoint or finish it myself.
+
+**Chosen: finish it here.** The remainder was one file plus prose (honest wording for the 0 arm,
+`!is_empty()` instead of `len() > 0` under `-D warnings`, one build); a replacement worker would spend its
+budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
+--lib` build, which the two prior worker deaths could not afford.

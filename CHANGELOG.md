@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Changed
+- **README project-status table: version bump and row accuracy (EVI-22 partial).**
+  Lead line now names v0.3.2 (the current release). The "Tags, client SDKs, Helm chart"
+  row is split into three: "Client SDKs" names the Python, R and Rust clients and
+  their publication status; "Tags (per-measurement series)" reports TAG-5..TAG-11 as
+  shipped; "Helm chart" stays "Not started". The "Binaries, crates, container image"
+  row keeps main's wording for the container image: the
+  `Publish container image` workflow failed for both v0.3.1 and v0.3.2, so nothing is
+  published to ghcr.io to claim.
+
 ### Added
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
   fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
@@ -50,6 +60,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 ### Fixed
 - **The `/ready` source comments still described a Windows no-op disk guard (#674).** `DiskGuardState::disk_refusing`'s doc comment and the `/ready` handler comment claimed the guard could not measure free space on Windows, which stopped being true when `disk_space_at` grew its `GetDiskFreeSpaceExW` leg. Both now name the probe per platform and reserve "always false" for platforms with no probe. Comments only; no behaviour change.
 - **The `/ready` platform note contradicted the shipped disk guard (#674).** `docs/reference.md` still claimed the guard uses Unix `statvfs` and that `disk_refusing` is always `false` on Windows, which stopped being true when the `GetDiskFreeSpaceExW` leg landed. The note now says free space is measured on both platforms and the guard is inert only where the OS cannot describe free space.
+- **Soak comparison silently skipped metrics when soak run schema versions diverged (#672).** `compare_soak_reports` now detects a `run.soak_schema_version` mismatch (6→7 from SOA-16) and refuses comparison with the same shape as the existing file-version mismatch: error naming both versions, empty metric-drift table, and a visible entry in the rendered report. A run stamped 0 is read as unstamped and refuses nothing; nothing the harness writes uses 0, because `SoakRun::soak_schema_version` is a required field, so that arm is the defensive floor for hand-built records.
+
 - **`free_bytes_at` now works on Windows and other platforms (#667).** The disk guard was inert on Windows, making `GET /ready`'s `disk_refusing` permanently false. Implemented via inline FFI to `GetDiskFreeSpaceExW` (no new dependencies).
 
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
