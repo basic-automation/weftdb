@@ -38,6 +38,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Get all unbatched measurement timestamps for an aspect
 	async fn get_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<Vec<DateTime<Utc>>> {
+		crate::types::database::inputs::mark_queue_consumer(aspect_id).await;
 		let db_path = self.metadata_path();
 		let conn = Self::begin_concurrent(self.metadata(), db_path, Some(self.cache.clone())).await?;
 
@@ -62,6 +63,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Get every unbatched queue entry for an aspect, with its `queued_at`
 	async fn get_unbatched_entries(&self, aspect_id: &AspectId) -> Result<Vec<UnbatchedEntry>> {
+		crate::types::database::inputs::mark_queue_consumer(aspect_id).await;
 		let db_path = self.metadata_path();
 		let conn = Self::begin_concurrent(self.metadata(), db_path, Some(self.cache.clone())).await?;
 
@@ -87,6 +89,7 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	/// Count unbatched measurements for an aspect
 	async fn count_unbatched_measurements(&self, aspect_id: &AspectId) -> Result<u64> {
+		crate::types::database::inputs::mark_queue_consumer(aspect_id).await;
 		let db_path = self.metadata_path();
 		let conn = Self::begin_concurrent(self.metadata(), db_path, Some(self.cache.clone())).await?;
 

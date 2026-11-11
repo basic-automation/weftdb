@@ -8,6 +8,26 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-11
+
+### Fixed
+
+- **The queues of aspects no pipeline reads stay bounded while the process runs.** Every
+  capture queues its timestamp, and for a raw aspect no pipeline consumes nothing drained
+  those entries (4.9M in 3.5 days on a 1 Hz daemon, held in memory by the MVCC metadata
+  store); 0.3.3 cleared them only when a store opened. Ingest now starts a background
+  `Database::prune_unread_queues` at most once an hour. It removes every entry of each
+  aspect that has no batches and whose queue no consumer in this process has read, and it
+  holds the same lock every queue read takes, so a consumer's first run either sees its
+  entries or finds an empty queue and rebuilds every window from the stored rows. Captures
+  are never skipped: 0.3.3's attempt to skip the queue for unread aspects could lose a row
+  committed during a consumer's first run, and was withdrawn before release.
+- **The published support crates match their source again.** `weft-physical-type`,
+  `weft-line-protocol`, `weft-arrow` and `weft-reduce` go to 0.3.1 and `weftdb-client` to
+  0.1.1. Their source had changed since 0.3.0 and 0.1.0 were published (the float-input
+  rule of FRE-8b, `UddSketch`, the client's `headroom()`), so the crates.io packages no
+  longer built against each other. Every change is additive.
+
 ## [0.3.3] - 2026-11-11
 
 Memory and growth fixes for long-running ingest, found on a Fan Control daemon that climbed
@@ -2902,7 +2922,8 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/basic-automation/weftdb/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/basic-automation/weftdb/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/basic-automation/weftdb/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/basic-automation/weftdb/compare/v0.3.0...v0.3.1

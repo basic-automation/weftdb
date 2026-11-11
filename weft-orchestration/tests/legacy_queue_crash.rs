@@ -784,3 +784,24 @@ async fn the_consumer_aligns_on_the_stored_earliest_measurement_not_a_cached_one
 	assert!(missing.is_empty(), "the consumer did not batch the backfilled rows {missing:?}");
 	Ok(())
 }
+
+/// Pruning an unread aspect's queue loses no row: the consumer's first run finds an empty
+/// queue and no batches, and rebuilds every window from the stored rows, exactly the
+/// batches a store that kept its queue builds.
+#[serial]
+#[tokio::test]
+async fn a_pruned_unread_queue_still_batches_every_row() -> Result<()> {
+	async fn batched(tag: &str, prune: bool) -> Result<BTreeSet<String>> {
+		let store = Store::new(tag).await?;
+		store.db.batch_capture_measurements(store.aspect, DatasetId::new(), minutes(0..CONSUMER_ROWS)).await?;
+		if prune {
+			assert!(store.db.prune_unread_queues().await? > 0, "precondition: the unread queue was pruned");
+		}
+		store.build().await?;
+		Ok(store.batch_rows(false).await?.into_iter().map(|(_, points)| format!("{points:?}")).collect())
+	}
+	let kept = batched("prune_kept", false).await?;
+	assert!(!kept.is_empty(), "precondition: the rows make batches");
+	assert_eq!(batched("prune_pruned", true).await?, kept, "the pruned store batches the same windows");
+	Ok(())
+}
