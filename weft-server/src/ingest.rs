@@ -379,10 +379,32 @@ impl IngestBody {
 	/// weight, with the refusal's numbers kept for the operator, exactly
 	/// as the store's own seal-time refusal is answered (ROB-17).
 	pub fn top_up_to_decoded(&self, store: &weftdb::SegmentStore, decoded_bytes: u64) -> Result<(), ApiError> {
+		self.top_up_to_decoded_with_space(store, decoded_bytes, weftdb::disk_space_at(store.root()))
+	}
+
+	/// The same top-up with the filesystem figure supplied instead of read here.
+	///
+	/// Handlers call [`top_up_to_decoded`](Self::top_up_to_decoded), which asks the
+	/// operating system what the store's filesystem holds at the moment of the check.
+	/// A test cannot ask a live filesystem for a chosen figure, and should not have to
+	/// race one: a reserve sized from a reading taken at open time is a different
+	/// instant from the reading taken at admit time, which is what made this path flaky
+	/// on `windows-latest` ([#684](https://github.com/basic-automation/weftdb/issues/684)).
+	/// Supplying the figure also answers a filesystem that is already full, the case
+	/// [#656](https://github.com/basic-automation/weftdb/issues/656) still asks for,
+	/// without filling a disk.
+	///
+	/// # Errors
+	///
+	/// As [`top_up_to_decoded`](Self::top_up_to_decoded): `507 insufficient_storage`
+	/// when the guard refuses the decoded weight. A `space` of `None` admits, because a
+	/// guard with nothing to check against lets the write itself be the test
+	/// ([`DiskGuard::admit`](weftdb::DiskGuard::admit)'s contract).
+	pub(crate) fn top_up_to_decoded_with_space(&self, store: &weftdb::SegmentStore, decoded_bytes: u64, space: Option<weftdb::DiskSpace>) -> Result<(), ApiError> {
 		if decoded_bytes <= self.reserved_bytes {
 			return Ok(());
 		}
-		reserve_disk(store, decoded_bytes)
+		reserve_disk_with_space(store, decoded_bytes, space)
 	}
 }
 
@@ -398,7 +420,19 @@ impl IngestBody {
 /// describe the host, so they stay in the operator-only cause, and the
 /// store logs guard transitions itself.
 fn reserve_disk(store: &weftdb::SegmentStore, need: u64) -> Result<(), ApiError> {
-	store.disk_guard().admit(weftdb::disk_space_at(store.root()), need).map_err(|err| ApiError::server_logged_elsewhere(error::Code::InsufficientStorage, err.to_string()))
+	reserve_disk_with_space(store, need, weftdb::disk_space_at(store.root()))
+}
+
+/// [`reserve_disk`]'s check with the filesystem figure supplied rather than read here,
+/// which is the seam [`top_up_to_decoded_with_space`](IngestBody::top_up_to_decoded_with_space)
+/// exposes: the same guard, the same refusal, and a figure the caller controls.
+///
+/// # Errors
+///
+/// `507 insufficient_storage` under the same condition [`reserve_disk`] states, with
+/// the same operator-only cause.
+fn reserve_disk_with_space(store: &weftdb::SegmentStore, need: u64, space: Option<weftdb::DiskSpace>) -> Result<(), ApiError> {
+	store.disk_guard().admit(space, need).map_err(|err| ApiError::server_logged_elsewhere(error::Code::InsufficientStorage, err.to_string()))
 }
 
 impl FromRequest<AppState> for IngestBody {
@@ -2410,38 +2444,63 @@ mod tests {
 
 	#[tokio::test]
 	async fn ingest_body_top_up_refuses_when_the_decoded_weight_breaches_the_reserve() {
-		// ROB-18 top-up: phase 1 reserves the body weight; after decode
-		// the guard must admit the decoded weight, which is what the seal
-		// writes. Size the store's reserve so the filesystem's writable
-		// margin sits between the two: the 4 KiB body is admitted, a
-		// decoded weight inside the margin is admitted, and a decoded
-		// weight far past it is refused 507 — before any seal.
+		// ROB-18 top-up: phase 1 reserves the body weight; after decode the
+		// guard must admit the decoded weight, which is what the seal writes,
+		// and refuse one that breaches the reserve — before any seal.
 		//
-		// The margin has to be far larger than the second weight, because
-		// it is the whole tolerance for a filesystem reading that moves
-		// under the test: `reserve_disk` asks `weftdb::disk_space_at` again
-		// at admit time, so the reserve computed here and the space
-		// measured there are two different instants. A 1 MiB margin failed
-		// on `windows-latest`, where roughly 984 KiB of scratch churn
-		// elapsed between the two calls — see issue #684. 512 MiB is three
-		// orders of magnitude above that churn and still leaves the refusal
-		// case driven by the weight alone.
+		// Both filesystem figures are the test's own, supplied through
+		// [`IngestBody::top_up_to_decoded_with_space`]. Sizing a reserve from a
+		// `weftdb::disk_space_at` reading taken at open time raced the reading
+		// `reserve_disk` takes again at admit time: about 984 KiB of scratch
+		// churn on `windows-latest` ate a 1 MiB margin (#684), and widening the
+		// margin to 512 MiB only traded that flake for a requirement on the
+		// runner's free space (#691). The case is arithmetic now, so it answers
+		// the same way wherever a few KiB can be had.
 		use axum::extract::FromRequest as _;
 		let dir = TempDir::new().unwrap();
-		let space = weftdb::disk_space_at(dir.path()).expect("the test filesystem is describable");
-		let writable = 512_u64 << 20;
-		let reserve = space.available_bytes.checked_sub(writable).expect("the test filesystem holds more than the margin");
+		let reserve = 256_u64 << 20;
+		let margin = 512_u64 << 20;
 		let store = Arc::new(SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(reserve)).await.unwrap());
 		let state = AppState::new().with_store(store.clone());
 		let payload = vec![b'x'; 4096];
 		let request = Request::builder().method("POST").uri("/api/v1/storage/price/parquet").header("content-length", payload.len().to_string()).body(Body::from(payload)).unwrap();
-		let body = super::IngestBody::from_request(request, &state).await.expect("phase 1 admits a 4 KiB body against a 512 MiB margin");
+		let body = super::IngestBody::from_request(request, &state).await.expect("phase 1 admits a 4 KiB body");
 		drop(state);
 		assert_eq!(body.reserved_bytes(), 4096);
-		body.top_up_to_decoded(&store, writable / 2).expect("a decoded weight inside the margin is admitted");
-		let err = body.top_up_to_decoded(&store, writable * 64).expect_err("a decoded weight past the margin is refused");
+
+		// A filesystem holding exactly `margin` bytes above the reserve.
+		let space = Some(weftdb::DiskSpace { total_bytes: reserve + margin, available_bytes: reserve + margin });
+		body.top_up_to_decoded_with_space(&store, margin / 2, space).expect("a decoded weight inside the margin is admitted");
+		let err = body.top_up_to_decoded_with_space(&store, margin * 64, space).expect_err("a decoded weight past the margin is refused");
 		drop(store);
 		assert_eq!(err.code(), crate::error::Code::InsufficientStorage);
 		assert_eq!(err.code().status(), StatusCode::INSUFFICIENT_STORAGE);
+	}
+
+	#[tokio::test]
+	async fn ingest_body_top_up_answers_a_full_filesystem_and_an_unreadable_one() {
+		// The two arms #656 asks about, answered without filling a disk. A
+		// filesystem with nothing left above the reserve is refused the same
+		// `507`, and nothing is written; a filesystem the operating system
+		// refuses to describe is admitted, because a guard with nothing to
+		// check against lets the write itself be the test — the contract
+		// [`weftdb::DiskGuard::admit`] already states.
+		use axum::extract::FromRequest as _;
+		let dir = TempDir::new().unwrap();
+		let reserve = 256_u64 << 20;
+		let store = Arc::new(SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(reserve)).await.unwrap());
+		let state = AppState::new().with_store(store.clone());
+		let payload = vec![b'x'; 4096];
+		let request = Request::builder().method("POST").uri("/api/v1/storage/price/parquet").header("content-length", payload.len().to_string()).body(Body::from(payload)).unwrap();
+		let body = super::IngestBody::from_request(request, &state).await.expect("phase 1 admits a 4 KiB body");
+		drop(state);
+
+		// One byte over the reservation, on a filesystem already at its reserve.
+		let full = Some(weftdb::DiskSpace { total_bytes: reserve * 4, available_bytes: reserve });
+		let err = body.top_up_to_decoded_with_space(&store, 4097, full).expect_err("a filesystem with nothing above the reserve is refused");
+		assert_eq!(err.code(), crate::error::Code::InsufficientStorage);
+		assert_eq!(err.code().status(), StatusCode::INSUFFICIENT_STORAGE);
+		body.top_up_to_decoded_with_space(&store, 1_u64 << 40, None).expect("an unreadable filesystem lets the write itself be the test");
+		drop(store);
 	}
 }
