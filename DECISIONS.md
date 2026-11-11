@@ -6380,6 +6380,32 @@ PR; the standing rule is a narrower brief from the checkpoint or finish it mysel
 budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
 --lib` build, which the two prior worker deaths could not afford.
 
+## 2026-11-11 — `since` starts the analysed range; it is not a filter over a full scan
+
+`ROADMAP.md:483` asked for "an optional `since` start time … so a live caller only scans new
+data" plus "a test that the windowed and full-history runs find the same crossings in the
+window". Both readings were available: keep the full scan and drop results before `since`, or
+start the analysis at `since`. **Chosen: start the analysis at `since`** — it is the only
+variant that actually removes work, which is what the item is about; filtering would still read
+the whole series. The consequence is that the two readings disagree at the boundary, and the
+disagreement is not a bug to smooth over: a threshold crossing is a *pair* of points, so with
+`since` sitting on the first point above the threshold there is no lower neighbour inside the
+range and no crossing to report; the same applies to peaks, valleys and drawdowns judged from
+the points supplied to them. **Recorded rather than hidden**: each of the eight `*_in_window`
+doc comments now states the boundary, and `mod window_tests` in `detectors.rs` asserts it (a
+window from the series start equals a full scan; a crossing whose earlier point precedes `since`
+disappears; a window from hour 3 keeps only the later of two crossings).
+
+Additive API only — the eight originals now delegate with `None`, so `weft-orchestration` 0.3.2
+on crates.io keeps its behaviour and no caller breaks. The item's alternative, an incremental
+cursor from the last evaluated point, is deliberately **not** built: it needs persisted per-detector
+state, which the global `SIGNALS_QUEUE` item (`ROADMAP.md:482`) has to settle first.
+
+**Verification honesty:** the tests were written, not run. The host has 3-8 GB free of 124 GB with
+51 GB of swap in use and three worker runs had each spent a full 45-minute budget on cold `-j 1`
+builds without reaching a test binary, so this slice was finished by the supervisor with no local
+cargo at all; `cargo +nightly fmt` and `rustfmt` are the only tools that ran. CI is the first
+execution of `mod window_tests`, and the PR says so.
 ## 2026-11-11 — the soak summary names every mismatch it found, and says what it skipped
 
 Two honesty defects in the nightly soak comparison (follow-ups recorded in issue #688).
