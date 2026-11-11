@@ -4,6 +4,33 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-10 — `weft-orchestration` stays published; the residue is documentation and one stale member (REL-496)
+
+**The item offered two options — publish `weft-orchestration` or mark it `publish = false` —
+and the tree had already chosen publishing.** The crates.io sparse index
+(`https://index.crates.io/we/ft/<name>`) lists `weft-orchestration` at `0.2.0, 0.3.0, 0.3.1,
+0.3.2`, current with the workspace manifest (`weft-orchestration/Cargo.toml:3` is `0.3.2`);
+the manifest sets no `publish = false`, unlike `weft-server`, `weft-tui`, `weft-bench`,
+`weft-xbench`. `scripts/publish.sh` publishes the non-`publish = false` members in dependency
+order, skipping versions already on the registry, so `weft-orchestration` publishes on every
+release. Marking it `publish = false` now would withdraw a crate people already depend on —
+a regression.
+
+**Chosen: keep publishing; close the item with documentation.** The real hazard the item
+named survives the status check: a consumer who mixes a crates.io `weftdb` with a path
+`weft-orchestration` gets two copies of `weftdb` and the types do not unify. The rule is
+now in `weft-orchestration/README.md` (depend on both from crates.io, or vendor both by
+path). The mechanics check out: the root workspace declares `weftdb = { path = "./weftdb",
+version = "0.3.2" }` (Cargo.toml:100), so the published `weft-orchestration` resolves the
+registry version. `weft-physical-type`, `weft-reduce`, `weft-line-protocol` and `weft-arrow`
+sit at 0.3.0 while `weftdb`, `weft-arrow-store` and `weft-orchestration` are at 0.3.2; that lag is
+release hygiene, not a reason to unpublish anything.
+
+**Evidence and the 403 trap.** Verified 2026-11-10 through the sparse index, which is what
+cargo itself resolves from. `crates.io/api/v1` answers 403 to unauthenticated callers on
+this host, and that alone made one earlier agent conclude nothing was published — an absence
+in a workflow run is likewise not proof of absence.
+
 ## 2026-11-08 — Pagination cursor v1: selector hash, high-water mark, fingerprint, nullable total (ROB-15, #449)
 
 **The cursor v1 token is 66 hex characters: `01` + selector SHA-256 prefix (16) + high-water mark (16) + data fingerprint (16) + next-page offset (16).**
