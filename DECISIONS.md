@@ -4,6 +4,33 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-10 — `weft-orchestration` stays published; the residue is documentation and one stale member (REL-496)
+
+**The item offered two options — publish `weft-orchestration` or mark it `publish = false` —
+and the tree had already chosen publishing.** The crates.io sparse index
+(`https://index.crates.io/we/ft/<name>`) lists `weft-orchestration` at `0.2.0, 0.3.0, 0.3.1,
+0.3.2`, current with the workspace manifest (`weft-orchestration/Cargo.toml:3` is `0.3.2`);
+the manifest sets no `publish = false`, unlike `weft-server`, `weft-tui`, `weft-bench`,
+`weft-xbench`. `scripts/publish.sh` publishes the non-`publish = false` members in dependency
+order, skipping versions already on the registry, so `weft-orchestration` publishes on every
+release. Marking it `publish = false` now would withdraw a crate people already depend on —
+a regression.
+
+**Chosen: keep publishing; close the item with documentation.** The real hazard the item
+named survives the status check: a consumer who mixes a crates.io `weftdb` with a path
+`weft-orchestration` gets two copies of `weftdb` and the types do not unify. The rule is
+now in `weft-orchestration/README.md` (depend on both from crates.io, or vendor both by
+path). The mechanics check out: the root workspace declares `weftdb = { path = "./weftdb",
+version = "0.3.2" }` (Cargo.toml:100), so the published `weft-orchestration` resolves the
+registry version. `weft-physical-type`, `weft-reduce`, `weft-line-protocol` and `weft-arrow`
+sit at 0.3.0 while `weftdb`, `weft-arrow-store` and `weft-orchestration` are at 0.3.2; that lag is
+release hygiene, not a reason to unpublish anything.
+
+**Evidence and the 403 trap.** Verified 2026-11-10 through the sparse index, which is what
+cargo itself resolves from. `crates.io/api/v1` answers 403 to unauthenticated callers on
+this host, and that alone made one earlier agent conclude nothing was published — an absence
+in a workflow run is likewise not proof of absence.
+
 ## 2026-11-08 — Pagination cursor v1: selector hash, high-water mark, fingerprint, nullable total (ROB-15, #449)
 
 **The cursor v1 token is 66 hex characters: `01` + selector SHA-256 prefix (16) + high-water mark (16) + data fingerprint (16) + next-page offset (16).**
@@ -6282,6 +6309,48 @@ could then write a full-cap frame against an unchecked disk); a per-chunk idle d
 (duplicates SEC-4's keep-alive bound and still lets a steady drip hold a reservation for
 the sum of the chunks).
 
+## 2026-11-10 — Three small honesty calls while clearing the wave's gates (#656, #676, #681, README)
+
+**Adding a configuration variable does not bump `schema_version`.** #681 registered
+`WEFT_INGEST_BODY_TIMEOUT_SECS` in `weft-server/src/settings.rs` and documented it in
+`docs/reference.md`, but not in `docs/config-schema.md`, so the `claims registry` gate refused the
+branch. Adding the row raised the section's prose count 42 -> 43 and left `schema_version` at 2, in
+`docs/config-schema.md` and `config/schema.toml` together. **Why:** only two commits have ever touched
+`config/schema.toml`, and the ROB-19 variable additions (`129ac669`, two Tuning variables) did not
+bump it — the version tracks structural and breaking change in the schema itself, not the population
+of a tier. **Cost:** the document's "How this version changes" table now omits three variables
+(`WEFT_MAINTENANCE_BREAKER_FAILURES`, `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`,
+`WEFT_INGEST_BODY_TIMEOUT_SECS`). Filling it in at the 1.0 schema bump is the follow-up; nothing
+checks it mechanically, which is why it drifted.
+
+**#656 is half closed, and the half that remains is a test.** The issue reported
+`Code::InsufficientStorage` (507) in the error table and the OpenAPI surface with no construction
+site, so the advertised contract promised a status no client could receive. #681 supplies exactly the
+issue's first option: `weft-server/src/ingest.rs:401` maps the phase-1 `DiskGuard::admit` refusal to
+`Code::InsufficientStorage`, with `weft-server/src/ingest.rs:2434` asserting the wire code. What #681
+does *not* do is write to a genuinely full filesystem — it injects the space figure. **Chosen:**
+comment on #656 that the contract mismatch closes with #681 and narrow the issue to the ENOSPC
+crash-matrix test, rather than closing it and re-opening the same work under a new number. **Rejected:**
+closing #656 outright — the honest remaining scope is real and would have been lost.
+
+**The README status table gets today's facts, not the 1.0 story.** `README.md:192-207` still announced
+"v0.2.1 is pre-beta" and "Tags, client SDKs, Helm chart — Not started" while 0.3.2 was released
+(2026-11-06) and `clients/python` and `clients/r` were in the tree. `ROADMAP.md:233` and **EVI-22**
+(`ROADMAP.md:435`) assign that table and the `pre-beta` badge to 1.0. **Chosen:** a partial slice that
+corrects each row to what a file in the tree proves, keeps the pre-1.0 upgrade caveats, and does not
+tick either roadmap box or touch the badge. **Why:** a stale table understates the product and a
+table that claims 1.0 before the tag exists overstates it; the second is the worse error, so the 1.0
+wording waits for the release. **Consequence:** EVI-22 shrinks to the badge, the version lines and a
+re-check of the same rows at tag time.
+
+**A conflict in the decision log is resolved by keeping both entries.** #676 was `CONFLICTING` with
+main and the only conflicted file was this log: ours added the SOAK-SCHEMA entry, main had gained the
+FRE-16, ORCH-SIG and FRE-8b entries since the branch was cut. **Chosen:** `git merge origin/main`
+(never a rebase — the standing decision of 2026-11-09 says a near-green PR is not rebased, and this
+one had a real conflict, which is the exception), keeping main's block first and appending ours,
+because the log is append-only and neither entry supersedes the other. **Cost:** a merge commit in a
+branch that will squash-merge, and one re-run of the full check set for a prose conflict.
+
 ## 2026-11-10 — Soak schema drift: refuse in the precedent's shape, not with a hard error (SOAK-SCHEMA)
 
 **Ambiguous:** "make the comparison refuse" could mean a hard error out of `compare_soak_reports`, or the
@@ -6337,3 +6406,69 @@ state, which the global `SIGNALS_QUEUE` item (`ROADMAP.md:482`) has to settle fi
 builds without reaching a test binary, so this slice was finished by the supervisor with no local
 cargo at all; `cargo +nightly fmt` and `rustfmt` are the only tools that ran. CI is the first
 execution of `mod window_tests`, and the PR says so.
+## 2026-11-11 — the config-schema checker keeps its two prose-only names (issue #687, PR #690)
+
+**Ambiguous:** the adversarial review of this slice blocked it on a total-count
+pattern that required a colon (`r"(\d+)\s+variables?:"`), which left the version
+table's other shape — the v2 row's "105 variables total as of this row" — entirely
+unchecked: mutating that 105 reported nothing. It also asked whether the checker's
+`_KNOWN_PROSE_ONLY_NAMES` exemption (`WEFT_BACKUP_DIRS`,
+`WEFT_ALLOW_INSECURE_BIND`) had gutted the name check, offering "reword the examples
+to a fictitious name and drop the exemption" as the alternative.
+
+**Fixed, not argued:** the pattern is now `r"(\d+)\s+variables?\b"` and a test
+(`test_version_table_total_without_colon_reported`) writes exactly the colon-less
+shape, so the regression cannot return quietly. Both were verified: the mutated
+document now exits 1 with `version table claims 99 total variables, but the sum of
+tier tables is 105`, and the shipped document still exits 0.
+
+**Chosen: keep the exemption, and write its cost into the code.** Both names are
+load-bearing in the *code*, not stray prose: `WEFT_BACKUP_DIRS` is the canonical typo
+in the suggestion tests and doc comments (`weft-server/src/settings.rs:6`, `:203`,
+`:572`, `weft-server/tests/config_warnings.rs:143`), and `WEFT_ALLOW_INSECURE_BIND` is
+the dropped-for-never-existing variable that `weft-server/src/settings.rs:612` asserts
+is refused rather than honoured. Reword them and the documentation checker would be
+"fixed" by moving a refusal message and its tests in another crate — a larger change
+than the slice, and one that would make the docs disagree with the code that refuses
+the name. The exemption is exact-match on two full names, and the wildcard-prefix set
+is prefix-equality, not substring, so an unregistered `WEFT_STORE_BACKUP` is still
+caught. **Cost, stated in the comment above the set:** a *new* sentence that uses
+either name as though it were a real setting is invisible to this check.
+
+## 2026-11-11 — Supply the disk figure to the ingest top-up rather than racing the runner (#691, #656)
+**Ambiguous:** #684's flake had two cures on the table — keep widening the test's margin,
+or make the filesystem figure injectable. #691 recorded the first as shipped and the second
+as the real fix, and #656 wants a `507` from a filesystem that is actually full, which a
+margin cannot produce at all.
+**Chosen: inject the figure, one private seam, handler behaviour untouched.**
+`IngestBody::top_up_to_decoded` and `reserve_disk` now both delegate to
+`top_up_to_decoded_with_space` / `reserve_disk_with_space` (`weft-server/src/ingest.rs:~387`,
+`:~418`) taking `Option<weftdb::DiskSpace>`; the public `pub fn top_up_to_decoded` signature,
+the four handler call sites (`:892`, `:1030`, `:1237`, `:1322`) and the phase-1 extractor all
+still pass `weftdb::disk_space_at(store.root())`, so nothing in production reads the figure
+differently. `DiskGuard::admit` already took `Option<DiskSpace>` as a parameter
+(`weftdb/src/types/disk_guard.rs:138`), so the seam stops at the extractor that used to call
+`disk_space_at` itself — the smallest change that makes the number controllable.
+**Chosen: delegation, not `#[cfg(test)]` and not `#[allow(dead_code)]`.** A test-only method
+would be dead code in the binary and an integration test in `weft-server/tests/` could not
+see it; the codebase's pattern is an additive `_with_*` variant whose un-suffixed form
+delegates (`*_with_cancel` in `weftdb/src/types/segment_store/maint.rs`, `*_in_window` in
+`weft-orchestration/src/detectors.rs`). `weft-server` is `publish = false`, so a `pub(crate)`
+method adds no public API.
+**Chosen: rewrite the flaky test's figures rather than delete its bite.** The reserve is a
+fixed 256 MiB and the injected figure is `reserve + 512 MiB`, so `margin / 2` is admitted and
+`margin * 64` is refused by arithmetic; a second test refuses 4097 bytes against a filesystem
+sitting exactly at its reserve and admits `None`, which is `admit`'s documented
+"the write itself is the test" arm. **Cost:** phase 1 still reads live space through
+`FromRequest`, so the test needs a runner with a few KiB free — no margin left to race, but
+not zero dependency on the host. The store's own guard maths stays covered by
+`weftdb/src/types/disk_guard.rs`'s tests; this test's subject is the ingest answer, and the
+PR says so rather than claiming #656's filled-disk case is now proven at the store layer.
+**Chosen: reference #691 and #656, close neither.** #656 asks for a `507` from a genuinely
+filled filesystem; what exists now is the same refusal with the figure supplied, which is the
+testable half. Closing #656 here would claim a disk-full experiment that has not run.
+**Cost, stated plainly: CI is the first execution of every line here.** The host has ~9 GiB
+free of 124 GiB after four concurrent cargo runs, so nothing compiled locally — no `cargo
+check`, no `cargo test`. The likeliest first failure is the new test's import shape
+(`weftdb::DiskSpace` is re-exported at `weftdb/src/types/mod.rs:96`; the `Copy` derive at
+`weftdb/src/types/disk_guard.rs:28` is what lets one `space` value feed two calls).

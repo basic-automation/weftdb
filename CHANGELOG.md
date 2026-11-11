@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Changed
+- **README project-status table: version bump and row accuracy (EVI-22 partial).**
+  Lead line now names v0.3.2 (the current release). The "Tags, client SDKs, Helm chart"
+  row is split into three: "Client SDKs" names the Python, R and Rust clients and
+  their publication status; "Tags (per-measurement series)" reports TAG-5..TAG-11 as
+  shipped; "Helm chart" stays "Not started". The "Binaries, crates, container image"
+  row keeps main's wording for the container image: the
+  `Publish container image` workflow failed for both v0.3.1 and v0.3.2, so nothing is
+  published to ghcr.io to claim.
+
 ### Added
 - **Bounded-window detector variants (`weft-orchestration`).** Eight additive
   functions — `detect_monthly_increase_in_window`, `detect_peaks_in_window`,
@@ -59,6 +69,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `config/schema.toml`.
 
 ### Fixed
+- **The ingest disk-margin test no longer reads the runner's free space (#691,
+  #684).** `ingest_body_top_up_refuses_when_the_decoded_weight_breaches_the_reserve`
+  sized the store's reserve from `weftdb::disk_space_at` at open time and then raced
+  the reading `reserve_disk` takes again at admit time; ~984 KiB of scratch churn on
+  `windows-latest` ate a 1 MiB margin, and the widened 512 MiB margin only required a
+  roomy runner. `IngestBody::top_up_to_decoded` now delegates to a
+  `top_up_to_decoded_with_space` that takes the `DiskSpace` figure, so the test drives
+  both arms from its own arithmetic and a new test answers a filesystem that is already
+  full and one the OS will not describe — the `507` case #656 asks about, without
+  filling a disk. Behaviour for handlers is unchanged: they still read the live figure.
 - **The `/ready` source comments still described a Windows no-op disk guard (#674).** `DiskGuardState::disk_refusing`'s doc comment and the `/ready` handler comment claimed the guard could not measure free space on Windows, which stopped being true when `disk_space_at` grew its `GetDiskFreeSpaceExW` leg. Both now name the probe per platform and reserve "always false" for platforms with no probe. Comments only; no behaviour change.
 - **The `/ready` platform note contradicted the shipped disk guard (#674).** `docs/reference.md` still claimed the guard uses Unix `statvfs` and that `disk_refusing` is always `false` on Windows, which stopped being true when the `GetDiskFreeSpaceExW` leg landed. The note now says free space is measured on both platforms and the guard is inert only where the OS cannot describe free space.
 - **Soak comparison silently skipped metrics when soak run schema versions diverged (#672).** `compare_soak_reports` now detects a `run.soak_schema_version` mismatch (6→7 from SOA-16) and refuses comparison with the same shape as the existing file-version mismatch: error naming both versions, empty metric-drift table, and a visible entry in the rendered report. A run stamped 0 is read as unstamped and refuses nothing; nothing the harness writes uses 0, because `SoakRun::soak_schema_version` is a required field, so that arm is the defensive floor for hand-built records.
