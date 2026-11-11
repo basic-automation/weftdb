@@ -16,8 +16,8 @@ The registry assigns each variable a **tier** that says how much it is promised.
 
 | schema_version | Change |
 |----------------|--------|
-| 1 | First versioned schema. Covers every variable the registry names (107 variables: 13 Stable, 45 Tuning, 8 Experimental, 41 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
-| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). v0.3.3 added two more Tuning variables the same way: `WEFT_DATA_AUDIT` (per-measurement audit rows, off) and `WEFT_DB_IDLE_CLOSE_SECS` (300 s idle close). 107 variables total as of this row. |
+| 1 | First versioned schema. Covers every variable the registry names (108 variables: 13 Stable, 45 Tuning, 8 Experimental, 42 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
+| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). v0.3.3 added two more Tuning variables the same way: `WEFT_DATA_AUDIT` (per-measurement audit rows, off) and `WEFT_DB_IDLE_CLOSE_SECS` (300 s idle close). The ROB-21 test variable brought the total to 108 as of this row. |
 
 ## Tier system
 
@@ -130,7 +130,7 @@ or code path behind a cargo feature.
 
 ## Test
 
-Forty-one variables. Not configuration. A test harness's private channel to the child
+Forty-two variables. Not configuration. A test harness's private channel to the child
 process it spawns, or a switch a test suite reads. Setting one on a real server does
 nothing useful — `weft-server` warns at startup. They are registered precisely so that
 this doc **cannot** carry one by accident; the env file explicitly excludes Test-tier
@@ -169,6 +169,7 @@ the database root remains.
 | `WEFT_TEST_PANIC_CHILD_MODE` |
 | `WEFT_TEST_POISON_EXIT_CHILD_ROOT` |
 | `WEFT_TEST_RACE_CHILD_ROOT` |
+| `WEFT_TEST_ROB21_ABORT_CHILD_ROOT` |
 | `WEFT_TEST_S8_CONFLICT_CHILD_ROOT` |
 | `WEFT_TEST_S8_SPLIT_RACE_ROOT` |
 | `WEFT_TEST_S9_DROPPED_SWAP_DIR` |
@@ -199,7 +200,7 @@ the database root remains.
 - A store it cannot open exits `65` (operator action).
 - An unknown write-ambiguous commit mode or an unrecognised `WEFT_STORE_SCOPE_PIN` or
   `WEFT_GPU_*` value stops the server, again with `78`.
-- All 104 names in the registry are tested (by `cargo test`) against every crate's `src/`
+- All 106 names in the registry are tested (by `cargo test`) against every crate's `src/`
   to catch any `env::var("WEFT_…")` that is read without being registered, or registered
   without being read.
 - The env file `packaging/env/weft-server.env` covers the Tuning and Experimental tiers

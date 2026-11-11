@@ -101,6 +101,15 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
   full-history result: a feature is reported only when the points that define it are both
   inside the window, so a crossing whose point below the threshold precedes `since` is not
   reported. The originals delegate with `None` and are unchanged.
+
+- **Maintenance metrics (ROB-21).** `GET /metrics` gains five `weft_maintenance_*`
+  counters over the store-wide sweeps — sweeps run (quiet ones included),
+  sweeps cancelled, breaker trips, aspects skipped tripped or busy — recorded
+  from every daemon tick and the manual reconcile endpoint. The sweeps now
+  report their breaker trip events (`breaker_trips` on the four sweep
+  summaries), and a child-process test pins that a sweep dropped mid-swap
+  releases its aspect and settles its outputs through the RAII cleanup chain.
+
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
   fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
   handles. Rollback and binary compatibility are now explicitly unsupported for 1.0:

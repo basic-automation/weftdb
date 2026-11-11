@@ -347,7 +347,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - [x] **SOA-16** Soak upgrade lane
 - [ ] **W10 · Tag gate flip, compaction closes**
   - [x] **TAG-11** HTTP ingest with tags and the tagged-write gate flip
-  - [ ] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
+  - [x] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
   - [ ] read lane
   - [x] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
     *Closed 2026-11-08: [`docs/stability.md`](docs/stability.md) documents the semver
