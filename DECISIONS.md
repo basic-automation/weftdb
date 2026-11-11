@@ -6229,3 +6229,45 @@ into their expansions.
 check. That is decision 11 operating as written — the written form is the
 input — not a loosening of the domain, which still bounds every stored
 value's plain form at 1,024 digits.
+
+## 2026-11-10 — Three small honesty calls while clearing the wave's gates (#656, #676, #681, README)
+
+**Adding a configuration variable does not bump `schema_version`.** #681 registered
+`WEFT_INGEST_BODY_TIMEOUT_SECS` in `weft-server/src/settings.rs` and documented it in
+`docs/reference.md`, but not in `docs/config-schema.md`, so the `claims registry` gate refused the
+branch. Adding the row raised the section's prose count 42 -> 43 and left `schema_version` at 2, in
+`docs/config-schema.md` and `config/schema.toml` together. **Why:** only two commits have ever touched
+`config/schema.toml`, and the ROB-19 variable additions (`129ac669`, two Tuning variables) did not
+bump it — the version tracks structural and breaking change in the schema itself, not the population
+of a tier. **Cost:** the document's "How this version changes" table now omits three variables
+(`WEFT_MAINTENANCE_BREAKER_FAILURES`, `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`,
+`WEFT_INGEST_BODY_TIMEOUT_SECS`). Filling it in at the 1.0 schema bump is the follow-up; nothing
+checks it mechanically, which is why it drifted.
+
+**#656 is half closed, and the half that remains is a test.** The issue reported
+`Code::InsufficientStorage` (507) in the error table and the OpenAPI surface with no construction
+site, so the advertised contract promised a status no client could receive. #681 supplies exactly the
+issue's first option: `weft-server/src/ingest.rs:401` maps the phase-1 `DiskGuard::admit` refusal to
+`Code::InsufficientStorage`, with `weft-server/src/ingest.rs:2434` asserting the wire code. What #681
+does *not* do is write to a genuinely full filesystem — it injects the space figure. **Chosen:**
+comment on #656 that the contract mismatch closes with #681 and narrow the issue to the ENOSPC
+crash-matrix test, rather than closing it and re-opening the same work under a new number. **Rejected:**
+closing #656 outright — the honest remaining scope is real and would have been lost.
+
+**The README status table gets today's facts, not the 1.0 story.** `README.md:192-207` still announced
+"v0.2.1 is pre-beta" and "Tags, client SDKs, Helm chart — Not started" while 0.3.2 was released
+(2026-11-06) and `clients/python` and `clients/r` were in the tree. `ROADMAP.md:233` and **EVI-22**
+(`ROADMAP.md:435`) assign that table and the `pre-beta` badge to 1.0. **Chosen:** a partial slice that
+corrects each row to what a file in the tree proves, keeps the pre-1.0 upgrade caveats, and does not
+tick either roadmap box or touch the badge. **Why:** a stale table understates the product and a
+table that claims 1.0 before the tag exists overstates it; the second is the worse error, so the 1.0
+wording waits for the release. **Consequence:** EVI-22 shrinks to the badge, the version lines and a
+re-check of the same rows at tag time.
+
+**A conflict in the decision log is resolved by keeping both entries.** #676 was `CONFLICTING` with
+main and the only conflicted file was this log: ours added the SOAK-SCHEMA entry, main had gained the
+FRE-16, ORCH-SIG and FRE-8b entries since the branch was cut. **Chosen:** `git merge origin/main`
+(never a rebase — the standing decision of 2026-11-09 says a near-green PR is not rebased, and this
+one had a real conflict, which is the exception), keeping main's block first and appending ours,
+because the log is append-only and neither entry supersedes the other. **Cost:** a merge commit in a
+branch that will squash-merge, and one re-run of the full check set for a prose conflict.
