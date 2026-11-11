@@ -16,8 +16,8 @@ The registry assigns each variable a **tier** that says how much it is promised.
 
 | schema_version | Change |
 |----------------|--------|
-| 1 | First versioned schema. Covers every variable the registry names (103 variables: 13 Stable, 41 Tuning, 8 Experimental, 41 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
-| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. |
+| 1 | First versioned schema. Covers every variable the registry names (105 variables: 13 Stable, 43 Tuning, 8 Experimental, 41 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
+| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). 105 variables total as of this row. |
 
 ## Tier system
 

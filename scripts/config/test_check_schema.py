@@ -174,5 +174,261 @@ class Verify(unittest.TestCase):
         self.assertEqual(check_schema.verify(self.doc, self.reg, self.schema_toml), [])
 
 
+class WordToInt(unittest.TestCase):
+    def test_simple(self):
+        self.assertEqual(check_schema.word_to_int("thirteen"), 13)
+
+    def test_compound(self):
+        self.assertEqual(check_schema.word_to_int("forty-three"), 43)
+
+    def test_case_insensitive(self):
+        self.assertEqual(check_schema.word_to_int("Forty-Two"), 42)
+
+    def test_hyphenated(self):
+        self.assertEqual(check_schema.word_to_int("forty-three"), 43)
+
+    def test_unknown(self):
+        self.assertIsNone(check_schema.word_to_int("many"))
+
+    def test_empty(self):
+        self.assertIsNone(check_schema.word_to_int(""))
+
+
+class HeadingSection(unittest.TestCase):
+    def test_extracts_between_headings(self):
+        text = "## Stable\nforty-three variables.\n## Tuning\nother\n"
+        self.assertIn("forty-three", check_schema._heading_section(text, "## Stable"))
+        self.assertNotIn("Tuning", check_schema._heading_section(text, "## Stable"))
+
+    def test_no_section(self):
+        self.assertEqual(check_schema._heading_section("## Other", "## Stable"), "")
+
+
+class CountTableRows(unittest.TestCase):
+    def test_counts_table_rows(self):
+        text = "| `WEFT_A` | d |\n| `WEFT_B` | d |\n"
+        self.assertEqual(check_schema._count_table_rows(text), 2)
+
+    def test_deduplicates(self):
+        text = "| `WEFT_A` | x |\n| `WEFT_A` | y |\n"
+        self.assertEqual(check_schema._count_table_rows(text), 1)
+
+    def test_empty(self):
+        self.assertEqual(check_schema._count_table_rows(""), 0)
+
+
+class ParseLeadInCount(unittest.TestCase):
+    def test_lead_in_matches(self):
+        self.assertEqual(check_schema._parse_lead_in_count("Forty-three variables. Description."), 43)
+
+    def test_lead_in_mismatch(self):
+        text = "Thirteen variables. The name stays forever."
+        self.assertEqual(check_schema._parse_lead_in_count(text), 13)
+
+    def test_no_lead_in(self):
+        self.assertIsNone(check_schema._parse_lead_in_count("no numbers here"))
+
+
+class SectionVariableCounts(unittest.TestCase):
+    def test_returns_counts(self):
+        text = (
+            "## Stable\n"
+            "Three variables.\n"
+            "| `WEFT_A` | d |\n"
+            "| `WEFT_B` | d |\n"
+            "| `WEFT_C` | d |\n"
+            "## Tuning\n"
+            "Forty-one variables.\n"
+            "| `WEFT_X` | d |\n"
+        )
+        counts = check_schema._section_variable_counts(text)
+        self.assertEqual(counts.get("## Stable"), 3)
+        self.assertEqual(counts.get("## Tuning"), 1)
+
+
+class CheckTierCounts(unittest.TestCase):
+    """Verify that version-table totals and lead-in words are checked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.doc = Path(self.tmp.name) / "doc.md"
+        self.reg = Path(self.tmp.name) / "settings.rs"
+        self.toml = Path(self.tmp.name) / "schema.toml"
+        # Write a minimal registry with 3 Tuning variables
+        self.reg.write_text(
+            'VarSpec { name: "WEFT_X", tier: Tier::Tuning },\n'
+            'VarSpec { name: "WEFT_Y", tier: Tier::Tuning },\n'
+            'VarSpec { name: "WEFT_Z", tier: Tier::Tuning },\n'
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_lead_in_mismatch_reported(self):
+        """Lead-in says 'Two' but table has 3 rows."""
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "## Tuning\n"
+            "Two variables.\n"
+            "| `WEFT_X` | d |\n"
+            "| `WEFT_Y` | d |\n"
+            "| `WEFT_Z` | d |\n"
+        )
+        self.toml.write_text("[schema]\nversion = 1\n")
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertTrue(any("lead-in" in p for p in probs))
+
+    def test_version_table_tier_mismatch_reported(self):
+        """Version table says 2 Tuning but table has 3."""
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "| 1 | Covers 5 vars (2 Tuning variables, 3 Stable variables) |\n"
+            "## Tuning\n"
+            "Three variables.\n"
+            "| `WEFT_X` | d |\n"
+            "| `WEFT_Y` | d |\n"
+            "| `WEFT_Z` | d |\n"
+            "## Stable\n"
+            "Three variables.\n"
+            "| `WEFT_A` | d |\n"
+            "| `WEFT_B` | d |\n"
+            "| `WEFT_C` | d |\n"
+        )
+        self.toml.write_text("[schema]\nversion = 1\n")
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertTrue(any("claims 2 Tuning" in p for p in probs))
+
+    def test_version_table_total_mismatch_reported(self):
+        """Version table claims 2 total but actual is 3."""
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "| 1 | Covers 2 variables: 2 Tuning |\n"
+            "## Tuning\n"
+            "Three variables.\n"
+            "| `WEFT_X` | d |\n"
+            "| `WEFT_Y` | d |\n"
+            "| `WEFT_Z` | d |\n"
+        )
+        self.toml.write_text("[schema]\nversion = 1\n")
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertTrue(any("claims 2 total" in p for p in probs))
+
+    def test_version_table_total_without_colon_reported(self):
+        """A "105 variables total as of this row" row is checked too.
+
+        The version table carries the total in two shapes: the v1 row uses
+        "105 variables: 13 Stable, ..." and the v2 row "105 variables total as
+        of this row". A total-check whose pattern needed the colon silently
+        exempted the second shape, which is exactly the drift this check exists
+        to catch.
+        """
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "| 1 | Covers 99 variables total as of this row |\n"
+            "## Tuning\n"
+            "Three variables.\n"
+            "| `WEFT_X` | d |\n"
+            "| `WEFT_Y` | d |\n"
+            "| `WEFT_Z` | d |\n"
+        )
+        self.toml.write_text("[schema]\nversion = 1\n")
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertTrue(any("claims 99 total" in p for p in probs), probs)
+
+    def test_tier_counts_pass_clean(self):
+        """All counts match."""
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "| 1 | Covers 3 variables: 3 Tuning |\n"
+            "## Tuning\n"
+            "Three variables.\n"
+            "| `WEFT_X` | d |\n"
+            "| `WEFT_Y` | d |\n"
+            "| `WEFT_Z` | d |\n"
+        )
+        self.toml.write_text("[schema]\nversion = 1\n")
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertEqual(probs, [])
+
+
+class CheckProseNames(unittest.TestCase):
+    """Verify that prose-only name references are caught."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.doc = Path(self.tmp.name) / "doc.md"
+        self.reg = Path(self.tmp.name) / "settings.rs"
+        self.toml = Path(self.tmp.name) / "schema.toml"
+        self.reg.write_text('VarSpec { name: "WEFT_REAL", tier: Tier::Tuning },\n')
+        self.toml.write_text("[schema]\nversion = 1\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_prose_name_not_in_registry_reported(self):
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "Sentence with `WEFT_NONEXISTENT` in it.\n"
+            "## Tuning\n"
+            "One variable.\n"
+            "| `WEFT_REAL` | d |\n"
+        )
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertTrue(any("WEFT_NONEXISTENT" in p for p in probs))
+
+    def test_prose_name_in_table_is_not_reported(self):
+        """Names inside table cells are not treated as prose names
+        (they are already covered by the coverage check).
+        """
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "## Tuning\n"
+            "One variable.\n"
+            "| `WEFT_REAL` | d |\n"
+            "| `WEFT_ANOTHER` | desc |\n"
+        )
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        # Should NOT add a "prose" problem for a name already in a table cell;
+        # the existing coverage check already handles that.
+        prose_problems = [p for p in probs if "prose" in p.lower()]
+        self.assertFalse(any("WEFT_ANOTHER" in p for p in prose_problems))
+
+    def test_prose_name_in_changelog_reported(self):
+        cl = Path(self.tmp.name) / "CHANGELOG.md"
+        cl.write_text("Added `WEFT_BOGUS` to the parser.\n")
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "## Tuning\n"
+            "One variable.\n"
+            "| `WEFT_REAL` | d |\n"
+        )
+        probs = check_schema.verify(self.doc, self.reg, self.toml, changelog_path=cl)
+        self.assertTrue(any("WEFT_BOGUS" in p for p in probs))
+
+    def test_wildcard_prose_reference_ignored(self):
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "Refer to WEFT_STORE_ series of variables.\n"
+            "## Tuning\n"
+            "One variable.\n"
+            "| `WEFT_REAL` | d |\n"
+        )
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertFalse(any("WEFT_STORE_" in p for p in probs))
+
+    def test_known_prose_only_name_ignored(self):
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "Typo such as `WEFT_BACKUP_DIRS` stops startup.\n"
+            "## Tuning\n"
+            "One variable.\n"
+            "| `WEFT_REAL` | d |\n"
+        )
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertFalse(any("WEFT_BACKUP_DIRS" in p for p in probs))
+
+
 if __name__ == "__main__":
+    import unittest
+    unittest.main()
     unittest.main()

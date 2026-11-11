@@ -12,9 +12,20 @@
 //!
 //! Cases:
 //! 1. Same series, same positions, two segments — newer value wins.
-//! 2. Newer null over an older value — range uses newer-wins, point keeps older.
+//! 2. Newer null over an older value — range uses newer-wins, point keeps older:
+//!    a. all-null newer, point read; b. partially-null newer, range read;
+//!    c. all-null newer vs range; d. older row survives when the newer segment has no row.
 //! 3. Two different series split across overlapping segments (not merged together).
 //! 4. Asymmetry pinned: range returns `None` where point returns the older value.
+//! 5. A single sealed segment serves the range read with nothing to merge.
+//! 6. The fold keys off seal order, not a caller-side write-time.
+//!
+//! This store has no open memtable and no `flush`: every `ingest`/`seal*` call seals its
+//! frames and records one index row per sealed segment immediately. The two-segment
+//! overlap cases therefore pin the boundary itself — each asserts (through
+//! [`SegmentStore::index`] → [`SegmentIndexStore::all`](crate::SegmentIndexStore::all))
+//! that the store really holds two sealed segments with both rows visible in the index
+//! before the read resolves them.
 
 use std::{path::Path, str::FromStr};
 
@@ -23,7 +34,7 @@ use tempfile::TempDir;
 use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
 use super::SegmentStore;
-use crate::{IngestBatch, TagSet};
+use crate::{IngestBatch, SeriesId, TagSet, UpsertKeys};
 
 fn bd(s: &str) -> BigDecimal {
 	BigDecimal::from_str(s).expect("parses")
@@ -36,16 +47,55 @@ fn schema() -> AspectSchema {
 	AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds)
 }
 
-/// A fresh store at `root` with [`ASPECT`] declared (lossless f64, seconds).
+/// The upsert keys every case declares (Phase 4.6): overlap within a key is the store's
+/// newer-wins, so the overlapping writes are an update, not duplicate rows. The pattern
+/// is the one `upsert_keys_tests.rs` uses (lines 35-43).
+fn host_key() -> UpsertKeys {
+	UpsertKeys::new(["host"]).expect("valid keys")
+}
+
+/// A fresh store at `root` with [`ASPECT`] declared (lossless f64, seconds) and the
+/// [`host_key`] upsert keys declared, exactly as a consumer would for an update keyed
+/// by `host`. Empty tag sets (untagged ingests) are inside the declared keys.
 async fn store_at(root: &Path) -> SegmentStore {
 	let store = SegmentStore::open(root).await.expect("opens");
-	store.declare(ASPECT, &schema()).await.expect("declares");
+	store.declare_with_upsert_keys(ASPECT, &schema(), Some(&host_key())).await.expect("declares");
 	store
 }
 
-/// Ingest one dense batch (one segment) of `rows` (value = timestamp as string).
+/// Ingest one dense batch of `rows` (value = timestamp as string). One ingest seals its
+/// own segment immediately — this store has no open memtable — so N ingests are N index
+/// rows, enumerated by [`seal_counts`].
 async fn ingest(store: &SegmentStore, key: &str, ts: &[i64], vs: &[BigDecimal]) {
 	store.ingest(ASPECT, &IngestBatch::dense(key, ts.to_vec(), vs.to_vec())).await.expect("ingests");
+}
+
+/// How many sealed segments [`ASPECT`] holds, and how many of them belong to `series` —
+/// the enumeration a case uses to assert its overlap is really two separate index rows
+/// (`all` = every row, in seal/id order; `series_rows` = that series' rows).
+async fn seal_counts(store: &SegmentStore, series: SeriesId) -> (usize, usize) {
+	let all = store.index().all(ASPECT).await.expect("enumerates index rows");
+	let ours = store.index.series_rows(ASPECT, series).await.expect("enumerates the series' index rows");
+	(all.len(), ours.len())
+}
+
+/// ------------------------------------------------------------------
+/// Assert the overlap a case built is real: two sealed segments exist for `series`
+/// (in the index, in seal/id order — `all`), and both of the case's writes are visible
+/// as separate rows there before any read folds them. `read_time_range_of` is the read
+/// that folds overlapping segments with [`merge_newer_wins`](weft_physical_type::merge_newer_wins).
+///
+/// The newer-wins aspect is asserted per case with its own rows; this helper only pins
+/// the boundary: two rows, both present, foldable.
+async fn assert_sealed_overlap(store: &SegmentStore, series: SeriesId, older_ts: &[i64], newer_ts: &[i64], window: (i64, i64)) {
+	let (all, ours) = seal_counts(store, series).await;
+	assert_eq!(ours, 2, "two sealed segments for the series (seal order: {all} rows in the index, {ours} of them ours)");
+	let (ts, _vs) = store.read_time_range_of(ASPECT, series, window.0, window.1).await.expect("range read");
+	let mut all_ts = older_ts.to_vec();
+	all_ts.extend_from_slice(newer_ts);
+	all_ts.sort_unstable();
+	all_ts.dedup();
+	assert_eq!(ts, all_ts, "every row the two segments hold is visible at the window");
 }
 
 /// ------------------------------------------------------------------
@@ -62,10 +112,17 @@ async fn same_series_overlap_newer_wins() {
 	// This later seal has a higher id, so at timestamp 20 value 200 wins.
 	ingest(&store, "b", &[20, 30], &[bd("200"), bd("30")]).await;
 
-	// Range read: [10, 30] should return (10, 20, 30) with values (10, 200, 30)
+	// The overlap is real: two sealed segments for the untagged series, showing both wins.
+	let (all, ours) = seal_counts(&store, SeriesId::UNTAGGED).await;
+	assert_eq!(ours, 2, "two sealed segments overlap (index holds {all} rows, {ours} of them untagged)");
+	assert_eq!(all, ours, "the suite's cases run untagged, so the index holds exactly the two segments");
 	let (ts, vs) = store.read_time_range(ASPECT, 10, 30).await.expect("range read");
 	assert_eq!(ts, vec![10, 20, 30], "timestamps: no duplicates");
 	assert_eq!(vs, vec![Some(bd("10")), Some(bd("200")), Some(bd("30"))], "newer wins at 20");
+
+	// Both rows visible in the index before the read resolves them.
+	let (ts, _vs) = store.read_time_range_of(ASPECT, SeriesId::UNTAGGED, 10, 30).await.expect("series-range read");
+	assert_eq!(ts, vec![10, 20, 30], "every row of both segments is visible at the window");
 
 	// Point reads agree
 	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), Some(bd("10")));
@@ -97,6 +154,9 @@ async fn newer_null_over_older_value_point_read() {
 	// Seal a second segment: timestamp 10 -> null (the row exists, the value is null)
 	store.seal_nullable(ASPECT, &schema(), &[10], &[None]).await.expect("seals null at 10");
 
+	// The overlap is real: two sealed segments, both rows in the index.
+	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10], &[10], (10, 10)).await;
+
 	// Point read: the newer segment is fully null (null_count == row_count == 1),
 	// so the present-value prune drops it. The older segment's value 10 survives.
 	assert_eq!(store.read_point(ASPECT, 10).await.expect("point read"), Some(bd("10")), "point read: the all-null segment is quality-pruned, so the older value survives");
@@ -120,6 +180,9 @@ async fn newer_null_over_older_value_range_read() {
 	ingest(&store, "a", &[10, 20], &[bd("10"), bd("20")]).await;
 	// Seal second segment: timestamp 10 -> null, timestamp 20 -> value 200
 	store.seal_nullable(ASPECT, &schema(), &[10, 20], &[None, Some(bd("200"))]).await.expect("seals with null");
+
+	// The overlap is real: two sealed segments, partially-null newer segment included.
+	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10, 20], &[10, 20], (10, 20)).await;
 
 	let (ts, vs) = store.read_time_range(ASPECT, 10, 20).await.expect("range read");
 
@@ -158,6 +221,9 @@ async fn asymmetry_newer_all_null_over_older_value() {
 	// Newer segment: timestamp 10 -> null, timestamp 20 -> null (all-null)
 	store.seal_nullable(ASPECT, &schema(), &[10, 20], &[None, None]).await.expect("seals all-null");
 
+	// The overlap is real: two sealed segments, all-null newer one included.
+	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10, 20], &[10, 20], (10, 20)).await;
+
 	// Range read: *time* prune opens the all-null segment, newer-wins gives `None` at both.
 	let (ts, vs) = store.read_time_range(ASPECT, 10, 20).await.expect("range read");
 	assert_eq!(ts, vec![10, 20], "timestamps deduplicated");
@@ -170,12 +236,15 @@ async fn asymmetry_newer_all_null_over_older_value() {
 }
 
 /// ------------------------------------------------------------------
-/// Case 2d: older segment's row survives when newer segment has NO row at that instant.
+/// Case 2d: two segments whose rows do not overlap are concatenated, not arbitrated.
 ///
-/// The newer segment has a row at timestamp 20 but no row at 10.  The older segment's
-/// row at 10 must survive in both range and point reads.
+/// The older segment holds timestamp 10 and the newer holds 20, so no timestamp appears
+/// in both and [`merge_newer_wins`](weft_physical_type::merge_newer_wins) never reaches its
+/// conflict branch — every merge rule would produce this same output.  What the case pins
+/// is the boundary either side of the conflict: a segment with no row for an instant
+/// contributes nothing and does not shadow the other segment's row there.
 #[tokio::test]
-async fn older_row_survives_when_newer_has_no_row() {
+async fn disjoint_segments_concatenate_without_a_conflict() {
 	let dir = TempDir::new().expect("tempdir");
 	let store = store_at(dir.path()).await;
 
@@ -183,6 +252,9 @@ async fn older_row_survives_when_newer_has_no_row() {
 	ingest(&store, "a", &[10], &[bd("10")]).await;
 	// Newer segment: timestamp 20 -> value 20 (no row at 10)
 	ingest(&store, "b", &[20], &[bd("20")]).await;
+
+	// Two segments, non-overlapping rows.
+	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10], &[20], (10, 20)).await;
 
 	// Range read: [10, 20] — both rows survive, no overlap.
 	let (ts, vs) = store.read_time_range(ASPECT, 10, 20).await.expect("range read");
@@ -192,6 +264,60 @@ async fn older_row_survives_when_newer_has_no_row() {
 	// Point reads agree.
 	assert_eq!(store.read_point(ASPECT, 10).await.expect("point at 10"), Some(bd("10")));
 	assert_eq!(store.read_point(ASPECT, 20).await.expect("point at 20"), Some(bd("20")));
+
+	drop(store);
+}
+
+/// ------------------------------------------------------------------
+/// The single-segment path the suite also keeps: one ingest, nothing to merge.
+///
+/// The overlap suite exists for the cross-segment merge, but the read path must keep
+/// serving a lone sealed segment (the common case) identically. The merge loop sees
+/// one descriptor and emits its rows unchanged.
+#[tokio::test]
+async fn single_segment_has_nothing_to_merge() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+
+	// One ingest: one sealed segment.
+	ingest(&store, "a", &[10, 20], &[bd("10"), bd("20")]).await;
+
+	let (all, ours) = seal_counts(&store, SeriesId::UNTAGGED).await;
+	assert_eq!(ours, 1, "one sealed segment (index holds {all} rows, {ours} of them untagged)");
+	assert_eq!(all, ours, "the index holds exactly the one segment");
+	let (ts, vs) = store.read_time_range(ASPECT, 10, 20).await.expect("range read");
+	assert_eq!(ts, vec![10, 20], "the lone segment's rows");
+	assert_eq!(vs, vec![Some(bd("10")), Some(bd("20"))], "a single segment folds to itself");
+
+	drop(store);
+}
+
+/// ------------------------------------------------------------------
+/// The merge keys off seal order, not a caller-side write time.
+///
+/// This store has no lamport/write-time input: an upsert's conflict rule is *newer
+/// seal id wins* at a shared timestamp. So the brief's literal "newer row in the
+/// older-sealed segment" cannot be expressed — whatever row is sealed second is the
+/// newer one, regardless of which value is logically the update. That is the point
+/// this test pins: write the value that is logically the older observation second,
+/// and the second-sealed row still wins, because nothing but seal order decides.
+#[tokio::test]
+async fn seal_order_is_the_conflict_rule_not_write_order() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+
+	// Seal the logically newer observation first: timestamp 10 -> value 200.
+	ingest(&store, "a", &[10], &[bd("200")]).await;
+	// Seal the logically older observation second: timestamp 10 -> value 10.
+	// No write time or lamport travels with the row; the higher seal id wins.
+	ingest(&store, "b", &[10], &[bd("10")]).await;
+
+	let (all, ours) = seal_counts(&store, SeriesId::UNTAGGED).await;
+	assert_eq!(ours, 2, "two sealed segments for one timestamp (index holds {all} rows, {ours} of them untagged)");
+	assert_eq!(all, ours, "the index holds exactly the two segments");
+	let (ts, vs) = store.read_time_range(ASPECT, 10, 10).await.expect("range read");
+	assert_eq!(ts, vec![10], "one timestamp");
+	assert_eq!(vs, vec![Some(bd("10"))], "the later-sealed value wins, not the logically newer one");
 
 	drop(store);
 }
@@ -221,6 +347,16 @@ async fn different_series_are_not_merged() {
 	let (ts_a, vs_a) = store.read_time_range_of(ASPECT, series_a, 10, 30).await.expect("range read series a");
 	assert_eq!(ts_a, vec![10, 20, 30], "series a: timestamps deduplicated");
 	assert_eq!(vs_a, vec![Some(bd("10")), Some(bd("2000")), Some(bd("30"))], "series a: newer wins at 20");
+
+	// The overlap is per series: A holds two sealed segments that overlap, B holds
+	// exactly one. `read_value_range_of` is a raw scan, so it returns all three.
+	let (count_a, a_rows) = seal_counts(&store, series_a).await;
+	let (count_b, b_rows) = seal_counts(&store, series_b).await;
+	assert_eq!(a_rows, 2, "series a: two sealed segments overlap (index holds {count_a} rows, {a_rows} of series a)");
+	assert_eq!(b_rows, 1, "series b: one sealed segment (index holds {count_b} rows, {b_rows} of series b)");
+	let (sts, svs) = store.read_value_range_of(ASPECT, series_a, &bd("0"), &bd("10000")).await.expect("raw scan series a");
+	assert_eq!(sts, vec![10, 20, 20, 30], "raw scan sees both of series a's segments");
+	assert_eq!(svs, vec![bd("10"), bd("20"), bd("2000"), bd("30")], "raw scan keeps both values at 20");
 
 	// Series B is untouched.
 	let (ts_b, vs_b) = store.read_time_range_of(ASPECT, series_b, 10, 30).await.expect("range read series b");
