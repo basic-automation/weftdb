@@ -2392,7 +2392,9 @@ impl Database {
 		if timestamps.is_empty() {
 			return Ok(());
 		}
-		retry_queue_write("Enqueuing unbatched measurements", || self.enqueue_unbatched_measurements(aspect_id, timestamps)).await
+		retry_queue_write("Enqueuing unbatched measurements", || self.enqueue_unbatched_measurements(aspect_id, timestamps)).await?;
+		self.maybe_prune_unread_queues();
+		Ok(())
 	}
 
 	/// One transaction of [`dequeue_unbatched_entries`](Inputs::dequeue_unbatched_entries):
@@ -2826,6 +2828,22 @@ mod measurement_audit_tests {
 	}
 }
 
+/// Aspects whose unbatched queue a consumer in this process has read. Held across a whole
+/// [`Database::prune_unread_queues`], and taken by every queue read to mark its aspect.
+static QUEUE_CONSUMERS: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashSet<AspectId>>> = std::sync::LazyLock::new(Default::default);
+
+/// When the last background prune of unread queues started.
+static LAST_UNREAD_QUEUE_PRUNE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// How often a long-running ingest prunes the queues of aspects no pipeline reads.
+pub const UNREAD_QUEUE_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Record that a consumer reads `aspect_id`'s queue. Every queue read calls this before it
+/// reads, so [`Database::prune_unread_queues`] never removes entries a consumer relies on.
+pub(crate) async fn mark_queue_consumer(aspect_id: &AspectId) {
+	QUEUE_CONSUMERS.lock().await.insert(*aspect_id);
+}
+
 impl Database {
 	/// Remove the metadata rows that grew without bound before 0.3.3, and return how many.
 	///
@@ -2880,6 +2898,93 @@ impl Database {
 			tracing::info!(removed, "Pruned unbounded metadata rows");
 		}
 		Ok(removed)
+	}
+
+	/// Start a background [`prune_unread_queues`](Self::prune_unread_queues) when the last
+	/// one is at least [`UNREAD_QUEUE_PRUNE_EVERY`] old. Called after every enqueue, so a
+	/// long-running ingest keeps the queues of aspects nothing reads bounded.
+	fn maybe_prune_unread_queues(&self) {
+		{
+			let mut last = LAST_UNREAD_QUEUE_PRUNE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+			// The first enqueue starts the clock: opening the store already pruned.
+			match *last {
+				None => {
+					*last = Some(std::time::Instant::now());
+					return;
+				}
+				Some(at) if at.elapsed() < UNREAD_QUEUE_PRUNE_EVERY => return,
+				Some(_) => *last = Some(std::time::Instant::now()),
+			}
+		}
+		let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+		let database = self.clone();
+		runtime.spawn(async move {
+			if let Err(e) = database.prune_unread_queues().await {
+				tracing::warn!(error = %e, "Pruning the queues of unread aspects failed; they are retried next interval");
+			}
+		});
+	}
+
+	/// Delete every queue entry of each aspect that no consumer in this process has read and
+	/// that has no batches, and return how many were removed.
+	///
+	/// Ingest queues every capture, because a capture cannot know whether a consumer is
+	/// about to start: skipping the queue could lose a row committed during a consumer's
+	/// first-run rebuild. For an aspect no pipeline reads, those entries were never drained
+	/// (4.9M of them in 3.5 days on a 1 Hz daemon), and the metadata store holds them in
+	/// memory. Removing them is safe because a consumer's first run is defined by an empty
+	/// queue and no batches, and then rebuilds every window from the stored rows:
+	///
+	/// - All of an aspect's entries go, never some, so a consumer never sees a partial queue
+	///   with no batches and batches only the windows it names.
+	/// - The whole prune holds the consumer set's lock, which every queue read takes to mark its
+	///   aspect first. A consumer that has read the queue is skipped; one that starts during
+	///   the prune waits for it and then finds the queue empty.
+	/// - A capture whose entry is removed while its row is still landing queues it again
+	///   after the commit, so a consumer that started in between batches it next run.
+	///
+	/// One process owns a store (the store lock), so there is no consumer elsewhere to race.
+	///
+	/// # Errors
+	/// Returns an error if a metadata read or delete fails.
+	pub async fn prune_unread_queues(&self) -> Result<u64> {
+		let consumers = QUEUE_CONSUMERS.lock().await;
+		let aspects: Vec<AspectId> = {
+			let conn = Self::begin_concurrent(self.metadata(), self.metadata_path(), Some(self.cache.clone())).await?;
+			let mut rows = conn.as_ref().query("SELECT DISTINCT aspect_id FROM unbatched_measurements", turso::params![]).await?;
+			let mut ids = Vec::new();
+			while let Some(row) = rows.next().await? {
+				let raw: String = row.get(0)?;
+				if let Ok(uuid) = uuid::Uuid::parse_str(&raw) {
+					ids.push(AspectId::from_uuid(uuid));
+				}
+			}
+			Self::commit_concurrent(&conn).await?;
+			ids
+		};
+		let mut removed = 0;
+		for aspect_id in aspects.into_iter().filter(|aspect| !consumers.contains(aspect)) {
+			// An aspect whose rows are gone fails its batch count; leave its entries.
+			if matches!(self.queue_has_consumer_from_batches(&aspect_id).await, Ok(false)) {
+				removed += self.delete_all_queue_entries(&aspect_id).await?;
+			}
+		}
+		drop(consumers);
+		if removed > 0 {
+			tracing::info!(removed, "Pruned the queue entries of aspects no pipeline reads");
+		}
+		Ok(removed)
+	}
+
+	async fn delete_all_queue_entries(&self, aspect_id: &AspectId) -> Result<u64> {
+		let mut removed = 0;
+		loop {
+			let n = self.delete_metadata_rows("DELETE FROM unbatched_measurements WHERE rowid IN (SELECT rowid FROM unbatched_measurements WHERE aspect_id = ? LIMIT 20000)", turso::params![aspect_id.as_uuid().to_string()]).await?;
+			removed += n;
+			if n == 0 {
+				return Ok(removed);
+			}
+		}
 	}
 
 	async fn queue_has_consumer_from_batches(&self, aspect_id: &AspectId) -> Result<bool> {

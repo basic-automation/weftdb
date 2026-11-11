@@ -1646,6 +1646,28 @@ async fn captures_write_no_audit_rows_and_still_queue() -> Result<()> {
 	Ok(())
 }
 
+/// An aspect no pipeline reads has its whole queue pruned while the process runs; once a
+/// consumer has read an aspect's queue, its entries are kept.
+#[serial]
+#[tokio::test]
+async fn unread_queues_are_pruned_and_read_ones_are_kept() -> Result<()> {
+	let (_temp, db, _subject, aspect) = setup_test_database().await?;
+	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
+	add_test_measurements(&db, &aspect, base, 20).await?;
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 20, "every capture is queued");
+
+	assert_eq!(db.prune_unread_queues().await?, 20, "nothing has read this aspect's queue");
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 0);
+
+	// A consumer reads the queue (its first run finds it empty), and from then on its
+	// entries are left for it.
+	assert_eq!(db.count_unbatched_measurements(&aspect.id()).await?, 0);
+	add_test_measurements(&db, &aspect, base + Duration::hours(1), 3).await?;
+	assert_eq!(db.prune_unread_queues().await?, 0, "a read aspect's queue is kept");
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 3);
+	Ok(())
+}
+
 /// Opening a store written before the fix prunes the rows that are no longer written.
 #[serial]
 #[tokio::test]
