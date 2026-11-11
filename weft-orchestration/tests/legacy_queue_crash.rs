@@ -148,10 +148,13 @@ impl Store {
 	}
 }
 
-/// A dictionary for the extraction tests. It has no variability constraints, so every
-/// batch becomes a pattern of its own, with one occurrence.
+/// A dictionary for the extraction tests. Its only constraint is a zero average
+/// difference, so only identical shapes merge and each batch is one occurrence. With no
+/// constraints the dictionary learns its thresholds and merges a batch into every pattern
+/// it matches, which would count one window several times.
 fn dictionary() -> Dictionary {
-	Dictionary::new("crash".to_string(), "S18 crash test".to_string(), DictionaryConstraints::default())
+	let exact = weftdb::VariablilityType::AverageStatic(weftdb::Variability::new(BigDecimal::from(0)));
+	Dictionary::new("crash".to_string(), "S18 crash test".to_string(), DictionaryConstraints::new(None, Some(vec![exact])))
 }
 
 /// An occurrence's span: its beginning and end.

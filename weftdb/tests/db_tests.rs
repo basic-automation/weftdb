@@ -932,6 +932,8 @@ async fn acknowledged_metadata_commits_survive_cold_reopen() -> Result<()> {
 	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
 	let batch = |range: std::ops::Range<i64>| -> Vec<InputMeasurement> { range.map(|i| InputMeasurement::new(base + Duration::seconds(i), BigDecimal::from(i))).collect() };
 	let first = batch(0..8);
+	// A consumer has read the queue, so the ingest queues (it does not otherwise).
+	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 0);
 	let mut expected: Vec<DateTime<Utc>> = first.iter().map(InputMeasurement::timestamp).collect();
 	db.batch_capture_measurements(aspect_id, DatasetId::new(), first).await?;
 	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 8, "the batch is queued before the restart");
@@ -1618,4 +1620,72 @@ mod database_new_crash {
 		}
 		Ok(())
 	}
+}
+
+async fn raw_metadata_count(db: &Database, sql: &str) -> Result<i64> {
+	let conn = Database::get_turso_database(db.metadata_path()).await?.connect()?;
+	let mut rows = conn.query(sql, ()).await?;
+	Ok(rows.next().await?.context("COUNT(*) returned no row")?.get(0)?)
+}
+
+/// **Regression (Fan Control RSS climb, 0.3.2):** a daemon capturing raw aspects that no
+/// pipeline consumes wrote an audit row and a queue entry per measurement, never removed
+/// (5.7M and 4.9M rows in 3.5 days), all held in memory by the MVCC metadata store. The
+/// audit rows are now opt-in. Captures still queue, because skipping the queue before a
+/// consumer's first run could lose a row that commits during that run's rebuild; the stale
+/// entries of aspects with no batches are pruned when the store opens.
+#[serial]
+#[tokio::test]
+async fn captures_write_no_audit_rows_and_still_queue() -> Result<()> {
+	let (_temp, db, _subject, aspect) = setup_test_database().await?;
+	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
+	add_test_measurements(&db, &aspect, base, 20).await?;
+
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM transactions WHERE message LIKE 'Captured measurement at %'").await?, 0, "per-measurement audit rows are opt-in");
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 20, "every capture is queued for the consumer");
+	Ok(())
+}
+
+/// Opening a store written before the fix prunes the rows that are no longer written.
+#[serial]
+#[tokio::test]
+async fn opening_prunes_dead_metadata_rows() -> Result<()> {
+	let (_temp, db, _subject, aspect) = setup_test_database().await?;
+	let metadata = Database::get_turso_database(db.metadata_path()).await?;
+	let conn = metadata.connect()?;
+	for i in 0..5_i64 {
+		conn.execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![Uuid::new_v4().to_string(), format!("Captured measurement at {i} with value 1 for dataset x"), i]).await?;
+		conn.execute("INSERT INTO unbatched_measurements (aspect_id, data_timestamp, queued_at) VALUES (?, ?, ?)", turso::params![aspect.id().as_uuid().to_string(), i, i]).await?;
+		// queued in 1970: stale
+	}
+	conn.execute("INSERT INTO transactions (id, message, created_at) VALUES (?, ?, ?)", turso::params![Uuid::new_v4().to_string(), "Added subject 'kept'", 9]).await?;
+	drop((conn, metadata));
+
+	let removed = db.prune_metadata().await?;
+	assert_eq!(removed, 10);
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM transactions WHERE message LIKE 'Captured measurement at %'").await?, 0);
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM unbatched_measurements").await?, 0);
+	assert_eq!(raw_metadata_count(&db, "SELECT COUNT(*) FROM transactions WHERE message = 'Added subject ''kept'''").await?, 1, "schema events stay");
+	Ok(())
+}
+
+/// Closing idle store files (the ~3 MB-per-file floor) keeps the store working: reads see
+/// every acknowledged row and new writes land after the reopen.
+#[serial]
+#[tokio::test]
+async fn idle_closed_files_reopen_with_their_data() -> Result<()> {
+	use ::weftdb::database::traits::Outputs;
+	let (_temp, db, _subject, aspect) = setup_test_database().await?;
+	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
+	add_test_measurements(&db, &aspect, base, 20).await?;
+	assert_eq!(db.get_measurements_count(&aspect.id()).await?, 20);
+
+	let closed = ::weftdb::close_idle_databases(std::time::Duration::ZERO).await;
+	assert!(closed > 0, "the aspect's files were open and idle");
+
+	assert_eq!(db.get_measurements_count(&aspect.id()).await?, 20, "a reopened file still holds every row");
+	add_test_measurements(&db, &aspect, base + Duration::hours(1), 5).await?;
+	::weftdb::close_idle_databases(std::time::Duration::ZERO).await;
+	assert_eq!(db.get_measurements_count(&aspect.id()).await?, 25, "writes after a reopen survive the next close");
+	Ok(())
 }

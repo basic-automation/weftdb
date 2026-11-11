@@ -16,8 +16,8 @@ The registry assigns each variable a **tier** that says how much it is promised.
 
 | schema_version | Change |
 |----------------|--------|
-| 1 | First versioned schema. Covers every variable the registry names (106 variables: 13 Stable, 43 Tuning, 8 Experimental, 42 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
-| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). 106 variables total as of this row. |
+| 1 | First versioned schema. Covers every variable the registry names (108 variables: 13 Stable, 45 Tuning, 8 Experimental, 42 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
+| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). v0.3.3 added two more Tuning variables the same way: `WEFT_DATA_AUDIT` (per-measurement audit rows, off) and `WEFT_DB_IDLE_CLOSE_SECS` (300 s idle close). The ROB-21 test variable brought the total to 108 as of this row. |
 
 ## Tier system
 
@@ -61,7 +61,7 @@ Thirteen variables. Renaming, retyping or removing one is a breaking change.
 
 ## Tuning
 
-Forty-three variables. The name stays forever, but the default or accepted shape may change in
+Forty-five variables. The name stays forever, but the default or accepted shape may change in
 a minor release.
 
 | Variable | Summary | Accepts | Default | Read by |
@@ -89,6 +89,8 @@ a minor release.
 | `WEFT_MAX_PAGE_ROWS` | The ceiling on a page of the paginated `/points` and `/value-points` reads (ROB-12). | A positive whole number of rows. | 100,000 (`MAX_PAGE_ROWS` in `read_limits.rs`); anything else stops the server from starting. | `weft-server/read_limits.rs` |
 | `WEFT_MAX_READ_ROWS` | The most rows one stored read or export may return — the whole window (ROB-12). | A positive whole number of rows. | 5,000,000 (`MAX_READ_ROWS` in `read_limits.rs`); anything else stops the server from starting. | `weft-server/read_limits.rs` |
 | `WEFT_MAX_SERIES_PER_ASPECT` | The most tagged series one aspect may register (TAG-7, TAG-11). | A positive whole number of series. | 100,000 (`DEFAULT_MAX_SERIES_PER_ASPECT` in `weftdb`); a malformed value stops the server from starting. | `weftdb/types/segment_store.rs` |
+| `WEFT_DATA_AUDIT` | Each captured measurement and each correlation insert or update also writes a row to the metadata `transactions` audit log. That log is never pruned and the metadata database holds its rows in memory, so leave it off for long-running ingest. | `1`/`true`/`yes`/`on` turns it on; anything else is off. | Unset: off. Schema, subject and batch events are always logged. | `weftdb/types/database/inputs.rs` |
+| `WEFT_DB_IDLE_CLOSE_SECS` | How long a legacy store file (an aspect's measurements, batches, events, correlations, pipeline or dictionary database) may go unused before its handle is closed. Each open file holds a fixed ~3 MB Turso buffer arena; `metadata.db` files are never closed. | A whole number of seconds; `0` keeps every file open. | 300. A malformed value warns and uses 300. | `weftdb/types/database/mod.rs` |
 | `WEFT_QUERY_MAX_INFLIGHT` | The query admission class's in-flight cap (ROB-10, Admission I): at most this many read and stateless-compute requests run at once. | A positive whole number of requests. | 128. | `weft-server/startup/config.rs` |
 | `WEFT_READ_TIMEOUT_SECS` | How long the server will keep waiting for one stored read before it answers `504 query_timeout` (ROB-12). | A positive whole number of seconds. | 30 (`DEFAULT_READ_TIMEOUT_SECS` in `read_limits.rs`). | `weft-server/read_limits.rs` |
 | `WEFT_RECONCILE_HOT_COLD` | Reconcile sweep mode: sweep every aspect's cold segments each tick and defer only the hot tail, instead of the all-or-nothing threshold sweep. | `1`/`true`/`yes`/`on` (case-insensitive). | Unset or falsey: threshold sweep. | `weft-server/startup/daemons.rs` |

@@ -4,7 +4,7 @@ use bigdecimal::{BigDecimal, FromPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Occurrence, Relative};
+use crate::{types::occurrence_codec::OccurrenceLog, Occurrence, Relative};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PatternID(Uuid);
@@ -49,7 +49,7 @@ impl Display for PatternID {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pattern {
 	id: PatternID,
-	occurrences: Vec<Occurrence>,
+	occurrences: OccurrenceLog,
 	relatives: Vec<Relative>,
 	amplitudes: Vec<BigDecimal>,
 	sum: BigDecimal,
@@ -64,6 +64,12 @@ pub struct Pattern {
 impl Pattern {
 	#[must_use]
 	pub fn new(id: PatternID, occurrences: Vec<Occurrence>, relatives: Vec<Relative>) -> Self {
+		Self::with_log(id, occurrences.into(), relatives)
+	}
+
+	/// A pattern over an already-compact occurrence list.
+	#[must_use]
+	pub fn with_log(id: PatternID, occurrences: OccurrenceLog, relatives: Vec<Relative>) -> Self {
 		let mut self_ = Self { id, occurrences, relatives, amplitudes: Vec::new(), sum: BigDecimal::zero(), abs_sum: BigDecimal::zero(), max: BigDecimal::zero(), min: BigDecimal::zero(), abs_max: BigDecimal::zero(), avg: BigDecimal::zero(), abs_avg: BigDecimal::zero() };
 		self_.compute_precomputed();
 		self_
@@ -94,9 +100,31 @@ impl Pattern {
 		self.id
 	}
 
+	/// Every occurrence, materialized on first call and cached until the next append.
+	///
+	/// Patterns keep their occurrences compact (about three bytes each); this call
+	/// expands them. Prefer [`occurrence_log`](Self::occurrence_log),
+	/// [`occurrence_count`](Self::occurrence_count) or
+	/// [`first_occurrence`](Self::first_occurrence) where they suffice.
 	#[must_use]
-	pub const fn occurrences(&self) -> &Vec<Occurrence> {
+	pub fn occurrences(&self) -> &Vec<Occurrence> {
+		self.occurrences.as_vec()
+	}
+
+	/// The compact occurrence list.
+	#[must_use]
+	pub const fn occurrence_log(&self) -> &OccurrenceLog {
 		&self.occurrences
+	}
+
+	#[must_use]
+	pub const fn occurrence_count(&self) -> usize {
+		self.occurrences.len()
+	}
+
+	#[must_use]
+	pub fn first_occurrence(&self) -> Option<Occurrence> {
+		self.occurrences.first()
 	}
 
 	#[must_use]
@@ -104,8 +132,10 @@ impl Pattern {
 		&self.relatives
 	}
 
+	// Takes the occurrence by value to keep the public signature; it is stored compactly.
+	#[allow(clippy::needless_pass_by_value)]
 	pub fn add_occurrence(&mut self, occurrence: Occurrence) {
-		self.occurrences.push(occurrence);
+		self.occurrences.push(&occurrence);
 		// Note: adding occurrence doesn't affect precomputed, as they are based on relatives
 	}
 

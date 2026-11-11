@@ -4682,11 +4682,12 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "splimes",
+ "weft-physical-type",
 ]
 
 [[package]]
 name = "weft-orchestration"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -4757,7 +4758,7 @@ dependencies = [
 
 [[package]]
 name = "weftdb"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-trait",

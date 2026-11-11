@@ -130,6 +130,8 @@ async fn rows_mode_ingest_still_feeds_the_queue_and_no_change_log() -> Result<()
 	let aspect_id = aspect.id();
 	assert!(!db.is_seal_backed(&aspect_id).await?);
 
+	// A consumer has read the queue (captures queue only once one has).
+	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 0);
 	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
 	let rows: Vec<InputMeasurement> = (0..3).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd("1.5"))).collect();
 	db.batch_capture_measurements(aspect_id, DatasetId::new(), rows).await?;

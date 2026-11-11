@@ -143,7 +143,11 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 			trace!("Wireframed measurements tables for: {}", measurements_path);
 		}
-		let measurements = Some(measurements);
+		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
+		let measurements: Option<TursoDatabase> = {
+			drop(measurements);
+			None
+		};
 		debug!("Aspect DB initialized: measurements");
 
 		let unprocessed_batches_path = Database::aspect_unprocessed_batches_db_path(&db_name, &subject_name, name);
@@ -158,7 +162,11 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 			trace!("Wireframed batches tables for: {}", unprocessed_batches_path);
 		}
-		let unprocessed_batches = Some(unprocessed_batches);
+		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
+		let unprocessed_batches: Option<TursoDatabase> = {
+			drop(unprocessed_batches);
+			None
+		};
 		debug!("Aspect DB initialized: unprocessed_batches");
 
 		let processed_batches_path = Database::aspect_processed_batches_db_path(&db_name, &subject_name, name);
@@ -174,7 +182,11 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 			trace!("Wireframed batches tables for: {}", processed_batches_path);
 		}
-		let processed_batches = Some(processed_batches);
+		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
+		let processed_batches: Option<TursoDatabase> = {
+			drop(processed_batches);
+			None
+		};
 		debug!("Aspect DB initialized: processed_batches");
 
 		let patterns_path = Database::aspect_patterns_db_path(&db_name, &subject_name, name);
@@ -189,7 +201,11 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 			trace!("Wireframed patterns tables for: {}", patterns_path);
 		}
-		let patterns = Some(patterns);
+		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
+		let patterns: Option<TursoDatabase> = {
+			drop(patterns);
+			None
+		};
 		debug!("Aspect DB initialized: patterns");
 
 		let unprocessed_events_path = Database::aspect_unprocessed_events_db_path(&db_name, &subject_name, name);
@@ -204,7 +220,11 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 			trace!("Wireframed unprocessed_events tables for: {}", unprocessed_events_path);
 		}
-		let unprocessed_events = Some(unprocessed_events);
+		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
+		let unprocessed_events: Option<TursoDatabase> = {
+			drop(unprocessed_events);
+			None
+		};
 		debug!("Aspect DB initialized: unprocessed_events");
 
 		let processed_events_path = Database::aspect_processed_events_db_path(&db_name, &subject_name, name);
@@ -219,7 +239,11 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 			trace!("Wireframed processed_events tables for: {}", processed_events_path);
 		}
-		let processed_events = Some(processed_events);
+		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
+		let processed_events: Option<TursoDatabase> = {
+			drop(processed_events);
+			None
+		};
 		debug!("Aspect DB initialized: processed_events");
 
 		let correlations_path = Database::aspect_correlations_db_path(&db_name, &subject_name, name);
@@ -234,7 +258,11 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 			trace!("Wireframed correlations tables for: {}", correlations_path);
 		}
-		let correlations = Some(correlations);
+		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
+		let correlations: Option<TursoDatabase> = {
+			drop(correlations);
+			None
+		};
 		debug!("Aspect DB initialized: correlations");
 
 		let pipeline_path = Database::aspect_pipeline_db_path(&db_name, &subject_name, name);
@@ -249,7 +277,11 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 			trace!("Wireframed pipeline tables for: {}", pipeline_path);
 		}
-		let pipeline = Some(pipeline);
+		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
+		let pipeline: Option<TursoDatabase> = {
+			drop(pipeline);
+			None
+		};
 		debug!("Aspect DB initialized: pipeline");
 
 		let dictionaries_path = <Database as Config>::aspect_dictionaries_path(&db_name, &subject_name, name);
@@ -443,10 +475,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn measurements(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.measurements {
-			return Ok(db.clone());
-		}
-
 		// Lazily initialize the measurements database
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
 		let (measurements, was_new) = Database::get_or_create_turso_database(&self.measurements_path).await?;
@@ -459,7 +487,6 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 		}
 
-		self.measurements = Some(measurements.clone());
 		Ok(measurements)
 	}
 
@@ -502,10 +529,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn unprocessed_batches(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.unprocessed_batches {
-			return Ok(db.clone());
-		}
-
 		// Lazily initialize the unprocessed_batches database
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
 		let (unprocessed_batches, was_new) = Database::get_or_create_turso_database(&self.unprocessed_batches_path).await?;
@@ -518,7 +541,6 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 		}
 
-		self.unprocessed_batches = Some(unprocessed_batches.clone());
 		Ok(unprocessed_batches)
 	}
 
@@ -565,10 +587,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn processed_batches(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.processed_batches {
-			return Ok(db.clone());
-		}
-
 		// Lazily initialize the processed_batches database
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
 		let (processed_batches, was_new) = Database::get_or_create_turso_database(&self.processed_batches_path).await?;
@@ -581,7 +599,6 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
-		self.processed_batches = Some(processed_batches.clone());
 		Ok(processed_batches)
 	}
 
@@ -600,10 +617,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn patterns(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.patterns {
-			return Ok(db.clone());
-		}
-
 		// Lazily initialize the patterns database
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
 		let (patterns, was_new) = Database::get_or_create_turso_database(&self.patterns_path).await?;
@@ -615,7 +628,6 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
-		self.patterns = Some(patterns.clone());
 		Ok(patterns)
 	}
 
@@ -701,10 +713,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn events(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.unprocessed_events {
-			return Ok(db.clone());
-		}
-
 		// Lazily initialize the events database
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
 		let (events, was_new) = Database::get_or_create_turso_database(&self.unprocessed_events_path).await?;
@@ -716,7 +724,6 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
-		self.unprocessed_events = Some(events.clone());
 		Ok(events)
 	}
 
@@ -735,10 +742,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn unprocessed_events(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.unprocessed_events {
-			return Ok(db.clone());
-		}
-
 		// Lazily initialize the unprocessed events database
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
 		let (events, was_new) = Database::get_or_create_turso_database(&self.unprocessed_events_path).await?;
@@ -750,7 +753,6 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
-		self.unprocessed_events = Some(events.clone());
 		Ok(events)
 	}
 
@@ -769,10 +771,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn processed_events(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.processed_events {
-			return Ok(db.clone());
-		}
-
 		// Lazily initialize the processed events database
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
 		let (events, was_new) = Database::get_or_create_turso_database(&self.processed_events_path).await?;
@@ -784,7 +782,6 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
-		self.processed_events = Some(events.clone());
 		Ok(events)
 	}
 
@@ -840,10 +837,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn correlations(&mut self) -> Result<TursoDatabase> {
-		if let Some(ref db) = self.correlations {
-			return Ok(db.clone());
-		}
-
 		// Lazily initialize the correlations database
 		// Use immediate transaction for DDL (not compatible with BEGIN CONCURRENT)
 		let (correlations, was_new) = Database::get_or_create_turso_database(&self.correlations_path).await?;
@@ -856,7 +849,6 @@ impl AspectStructure for Aspect {
 			drop(schema_conn);
 		}
 
-		self.correlations = Some(correlations.clone());
 		Ok(correlations)
 	}
 
@@ -943,10 +935,6 @@ impl AspectStructure for Aspect {
 
 	#[instrument]
 	async fn pipeline(&mut self) -> Result<turso::Database> {
-		if let Some(turso_db) = &self.pipeline {
-			return Ok(turso_db.clone());
-		}
-
 		let (turso_db, was_new) = Database::get_or_create_turso_database(&self.pipeline_path).await?;
 
 		// Only wireframe if database was newly created (not from cache)
@@ -956,7 +944,6 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
-		self.pipeline = Some(turso_db.clone());
 		Ok(turso_db)
 	}
 
@@ -1176,13 +1163,6 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 		}
 
-		// Cache it
-		if self.dictionaries.is_none() {
-			self.dictionaries = Some(HashMap::new());
-		}
-		if let Some(ref mut dictionaries) = self.dictionaries {
-			dictionaries.insert(name.to_string(), dictionary_db.clone());
-		}
 		// Also cache the path if not already there
 		if !self.dictionaries_paths.contains_key(name) {
 			self.dictionaries_paths.insert(name.to_string(), dictionary_path);
@@ -1426,6 +1406,17 @@ impl Aspect {
 				end_timestamp INTEGER NOT NULL
 			)
 			",
+				turso::params![],
+			)
+			.await?;
+
+		// Compact occurrence lists (see `occurrence_codec`): one row per saved list, read
+		// in rowid order after any legacy `pattern_occurrences` rows of the same pattern.
+		conn.as_ref()
+			.execute(
+				r"CREATE TABLE IF NOT EXISTS pattern_occurrence_blobs (
+				id INTEGER PRIMARY KEY, pattern_id TEXT NOT NULL,
+				codec INTEGER NOT NULL, occurrence_count INTEGER NOT NULL, payload BLOB NOT NULL)",
 				turso::params![],
 			)
 			.await?;
@@ -1726,6 +1717,16 @@ impl Aspect {
 				occurrence_index INTEGER NOT NULL, aspect_id TEXT NOT NULL, resolution TEXT NOT NULL,
 				size INTEGER NOT NULL, database_info TEXT NOT NULL,
 				beginning_timestamp INTEGER NOT NULL, end_timestamp INTEGER NOT NULL)",
+				turso::params![],
+			)
+			.await?;
+		// Compact occurrence lists (see `occurrence_codec`): one row per saved list, read
+		// in rowid order after any legacy `pattern_occurrences` rows of the same pattern.
+		conn.as_ref()
+			.execute(
+				r"CREATE TABLE IF NOT EXISTS pattern_occurrence_blobs (
+				id INTEGER PRIMARY KEY, pattern_id TEXT NOT NULL,
+				codec INTEGER NOT NULL, occurrence_count INTEGER NOT NULL, payload BLOB NOT NULL)",
 				turso::params![],
 			)
 			.await?;

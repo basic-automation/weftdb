@@ -7,8 +7,8 @@
 //! the store again, so the stored rows (and the memory a load took) grew geometrically:
 //! 73 MB to 3.5 GB of `preamble.db` per aspect within ten minutes in the Fan Control
 //! daemon. The dictionary in this test has no variability constraints, like that one, so
-//! nothing merges: each batch is one pattern with one occurrence, and the store must
-//! grow linearly with the batches, never by re-storing what it already holds.
+//! it runs on learned thresholds: similar batches merge, every occurrence is kept, and the
+//! store holds each pattern exactly once.
 
 use anyhow::{Context, Result};
 use bigdecimal::{BigDecimal, FromPrimitive};
@@ -71,18 +71,27 @@ async fn repeated_runs_store_each_pattern_once() -> Result<()> {
 		let in_memory = dictionary.len();
 		let stored = count(&db, &aspect, "preamble", "SELECT COUNT(*) FROM patterns").await?;
 		let distinct = count(&db, &aspect, "preamble", "SELECT COUNT(DISTINCT id) FROM patterns").await?;
-		let occurrences = count(&db, &aspect, "preamble", "SELECT COUNT(*) FROM pattern_occurrences").await?;
+		let legacy_rows = count(&db, &aspect, "preamble", "SELECT COUNT(*) FROM pattern_occurrences").await?;
+		let occurrences = count(&db, &aspect, "preamble", "SELECT COALESCE(SUM(occurrence_count), 0) FROM pattern_occurrence_blobs").await?;
+		let lists = count(&db, &aspect, "preamble", "SELECT COUNT(*) FROM pattern_occurrence_blobs").await?;
 		let relatives = count(&db, &aspect, "preamble", "SELECT COUNT(*) FROM pattern_relatives").await?;
 		println!("run {run}: in memory {in_memory}, stored {stored} ({distinct} distinct), occurrences {occurrences}, relatives {relatives}");
 
 		assert_eq!(stored, distinct, "run {run}: a pattern is stored more than once");
 		assert_eq!(usize::try_from(stored)?, in_memory, "run {run}: the store and memory disagree");
-		assert_eq!(occurrences, stored, "run {run}: an occurrence is stored more than once");
+		assert_eq!(legacy_rows, 0, "run {run}: occurrences are stored compactly, not as rows");
+		assert_eq!(lists, stored, "run {run}: one occurrence list per pattern");
+		let in_memory_occurrences: usize = dictionary.patterns().iter().map(|p| p.occurrences().len()).sum();
+		assert_eq!(usize::try_from(occurrences)?, in_memory_occurrences, "run {run}: the store keeps every occurrence the dictionary holds");
+		assert!(occurrences >= stored, "run {run}: a pattern lost its occurrence");
 		assert_eq!(relatives, stored * 10, "run {run}: each pattern keeps its 10 steps");
 		assert!(in_memory >= prev, "run {run}: patterns were lost");
 		assert!(in_memory - prev <= ROWS_PER_RUN as usize + BATCH_SIZE, "run {run}: grew by {} from {prev}, more than this run could produce (sliding windows)", in_memory - prev);
 		prev = in_memory;
 	}
 	assert!(prev > 0, "no patterns were extracted");
+	let total: usize = dictionary.patterns().iter().map(|p| p.occurrences().len()).sum();
+	println!("final: {prev} patterns, {total} occurrences, lambda {}", dictionary.learned_similarity().lambda());
+	assert!(total > prev, "learned thresholds merged nothing: every batch is still its own pattern");
 	Ok(())
 }
