@@ -8,6 +8,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 ### Added
+- **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
+  fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
+  handles. Rollback and binary compatibility are now explicitly unsupported for 1.0:
+  the `upgrade` leg is the only one that exists. The v0.1.0 pin drops `rollback` from
+  its `legs` array; the `LEGS` constant in `releases.py` shrinks to `{"upgrade"}`.
+  Documents updated accordingly.
+
+### Added
 - **Layout-upgrade integration test (FRE-13).** `weftdb/tests/layout_upgrade.rs` covers:
   the pre-v2 (layout-1) store upgrade to layout 2 through the public API, including
   idempotency, data survival, new writes after upgrade, a synthetic marker test, and
@@ -73,6 +81,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **The value-band read is documented as a raw scan, with a test pinning it against the point and time-range fold (#665).** The value-band read (`read_value_range`/`read_value_range_of`) is a raw scan: it returns every stored row whose value is in `[lo, hi]` in segment-seal then in-segment order and does **not** fold overlapping segments. Point and time-range reads use newest-wins folding; the value band answers "all raw observations." `docs/upgrade-notes.md` and `docs/reference.md` now state this split explicitly, and a synthetic-collision test (`value_range_is_a_raw_scan_pinned_against_point_and_range`) pins the value-band raw scan beside the point/range fold.
 
 ### Changed
+
+- **One float-input rule across every ingest format (FRE-8b, #313).** ILP float fields
+  and Parquet/Arrow `Float64`/`Float32` cells now enter as their shortest round-trip
+  decimal (decision 11) through the new `weft_physical_type::decimal_from_f64` /
+  `decimal_from_f32`, instead of the exact binary expansion `BigDecimal::from_f64`
+  produced: an ILP or Parquet `0.1` now stores `0.1`, the same value a JSON or CSV
+  `0.1` stores. The smallest subnormal, previously refused because its expansion's
+  plain form exceeds the decimal domain, now enters as `5e-324`.
 
 - **Breaking (read shape): a range read now returns each timestamp once, newest value
   wins (#443).** `read_time_range_of` now opens all segments overlapping the window (including
@@ -240,6 +256,21 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weftdb-ingest` measure their own paths and honestly report no adapter, and because
   `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
   tested.
+
+- **Prediction signals are now isolated per aspect (issue #402).**
+  `SIGNALS_QUEUE` was a single process-wide `Mutex<Signals>`; two pipelines
+  over different aspects in one process would see each other's signals.
+  The queue is now keyed by `AspectId` (`Mutex<HashMap<AspectId, Signals>>`),
+  `signals_for(aspect_id)` copies out only that aspect's queue,
+  `create_signals` and `filter_expired_signals` touch only their own aspect,
+  and `Pipeline::generate_signals` / `Pipeline::filter_signals_at` read
+  only their own aspect's signals via `signals_for`. An empty per-aspect
+  queue is removed from the map during `filter_expired_signals` so the map
+  does not retain stale entries indefinitely. The same pass no longer holds the
+  queue lock while it talks to the database: the event and correlation reads
+  happen before the lock, one synchronous function mutates the queue, and the
+  correlation writes happen after it is released, so a busy aspect can no longer
+  stall another aspect's pass on I/O. (#402)
 
 - **Slow orchestration tests bounded by timeout (issue #404).** Seven
   `weft-orchestration` tests that self-skip locally (Crypto-database guard)

@@ -6133,6 +6133,103 @@ column (`ColumnLengthMismatch`, Integrity). No sidecar mutant panicked.
 generate at will); a `catch_unwind` in `weft-server`'s handler (C12's "no handler catches its
 own panics" is about exactly that); waiting for upstream (the fix belongs upstream too, and
 is filed as a to-do for the owner, but the boundary has to hold whatever version is pinned).
+
+## 2026-11-10 — Rollback and binary compatibility: unsupported for 1.0 (FRE-16)
+
+**Rollback-after-writes and binary-compatibility legs are explicitly unsupported for 1.0.
+They are removed from `compat/releases.toml` and the `LEGS` constant.**
+
+The brief for FRE-16 decided this: rollback-after-writes is not a 1.0 promise because a
+store written by the current layout is not readable by older binaries (`docs/stability.md`
+already said this). The `rollback` and `binary` legs in `compat/releases.toml` were
+fiction — declared pins with no test runners, and `docs/stability.md` admitted at two
+places that nothing executes them. The new gate (`scripts/compat/test_leg_coverage.py`)
+refuses to let a pin declare a leg that has no test runner, so the fiction had to become
+honest.
+
+**Considered and rejected:** marking the legs `unsupported` in the TOML rather than
+removing them, with the gate checking `supported`/`unsupported` states. That would add
+a new field and a new concept to a file with a single release pin, with no second user
+before 1.0. Simpler to drop the non-existent legs; they can be re-added with a runner
+when someone implements them.
+
+**Boundary:** the `upgrade` leg is the only leg with a real test
+(`weftdb/tests/compat_v010.rs`). The gate treats it as implemented.
+
+**Documents updated:** `compat/releases.toml`, `scripts/compat/releases.py`,
+`docs/stability.md`, `UPGRADING.md`, `CHANGELOG.md`.
+## 2026-11-10 — Per-aspect signal queue: a synchronous guarded pass, not a pure-function refactor (ORCH-SIG #402)
+
+**Ambiguous:** the review BLOCK said the `SIGNALS_QUEUE` guard was held across `.await`s. Two fixes were
+available: split `remove_expired_signals` into a pure decision function so the whole pass is functional
+and stateless, or keep its shape and make the guarded region a synchronous function.
+
+**Chosen: the synchronous guarded pass.** `remove_expired_signals` calls fallible
+`process_correlation_signals` per correlation, so a pure split has to thread
+`Result<(Vec<Correlation>, usize)>` out of the filter and back through its callers — a wider diff for no
+additional safety. The property the review asked for is narrow: no guard may cross an await. A plain
+`fn filter_queue_at(&mut Signals, &[Event], &[Correlation], DateTime<Utc>) -> QueueFilterOutcome` cannot
+await at all, so the property is enforced by the type system rather than by a comment warning the next
+editor. **Cost:** the database reads happen before the lock and the `update_correlation` writes after it,
+so a concurrent pass can observe a queue that is already updated but correlations that are not yet — the
+queue is the authority on what is still pending, and a re-run re-derives the same expired set from the
+correlations it reads.
+
+**Chosen: name the new test for what it proves.** `concurrent_filter_expired_signals_drains_the_queue_without_blocking`
+pins the shape of the critical section. It is not a deadlock reproducer — the async mutex serialised the
+old callers rather than deadlocking them — and its doc says so, because a test named "no_deadlock" that
+would also pass before the fix misinforms the next reader.
+
+## 2026-11-10 — FRE-8b: the one float-input rule lives in weft-physical-type (FOR MERGE REVIEW)
+
+**Spec:** 1.0 plan §6 W8 + §2 L-FMT (lib.rs order: TAG-1 → ROB-6 → FRE-8b) +
+Appendix A decision 11 ("ILP and Parquet float inputs enter as their shortest
+round-trip decimal") + ROADMAP line 307. Closes #313.
+
+**What was still open.** Decision 11's non-finite half landed with ROB-7 (400
+in every format); its shortest-round-trip half had landed only for the JSON
+compute endpoints (weft-server's `widen_json_value`) and, for JSON ingest,
+trivially (values enter as the sender's text through `parse_decimal`). The two
+binary float lifts still widened with `BigDecimal::from_f64`/`from_f32` — the
+exact binary expansion: an ILP or Parquet `0.1` stored
+`0.1000000000000000055511151231257827021181583404541015625` where a JSON or
+CSV `0.1` stored `0.1`. Same number sent, different stored value per format —
+and, per the ROB-6 entry, an exact-expansion subnormal's 1,075-digit plain
+form fell outside the one decimal domain, so the smallest subnormal was
+refused as an ILP float field while its written form `5e-324` (325 digits) is
+well inside it.
+
+**The rule now has one home.** `weft_physical_type::decimal_from_f64` /
+`decimal_from_f32` sit beside `parse_decimal` in weft-physical-type's lib.rs —
+the L-FMT file the plan assigns to this slice — and both remaining lifts call
+them: `FieldValue::as_big_decimal` (weft-line-protocol, which gains a
+dependency on weft-physical-type; the layering already runs that way in
+weft-arrow) and the `Float64`/`Float32` arms of
+`weft_arrow::record_batch_to_columns`. The construction mirrors
+`widen_json_value` (read the `{:e}` shortest text as digits + exponent;
+integral values land at scale 0), so the compute endpoints and the ingest
+lifts cannot drift apart in shape. An f32 enters as the *f32's* shortest form
+(`0.1`), not the shortest form of its f64 widening (`0.10000000149011612`):
+decision 11 judges a decimal against "its nearest float", and an f32 input's
+nearest float is the f32.
+
+**Deliberately unchanged: `PhysicalValue::to_logical`.** It still reconstructs
+an F64/F32 physical value by exact expansion. It is not an input boundary —
+it is the decode `PhysicalType::encode` measures `Exactness` against, and the
+crate's founding rule is that loss is never silent: judging encode(0.1 → F64)
+against the shortest form would report `Exact` for a frame that holds the
+nearest f64, not `0.1`. What changes at read-back is only the Arrow lift
+above: an exported F64 segment re-enters through `record_batch_to_columns`,
+which is an ingest-shaped boundary, so a re-seal no longer inflates values
+into their expansions.
+
+**Consequence worth naming:** the smallest subnormal (and its kin) is now
+*accepted* as an ILP float field and a Parquet float cell, entering as
+`5e-324`; before, the ILP path refused it downstream at the ROB-6 domain
+check. That is decision 11 operating as written — the written form is the
+input — not a loosening of the domain, which still bounds every stored
+value's plain form at 1,024 digits.
+
 ## 2026-11-10 — Soak schema drift: refuse in the precedent's shape, not with a hard error (SOAK-SCHEMA)
 
 **Ambiguous:** "make the comparison refuse" could mean a hard error out of `compare_soak_reports`, or the

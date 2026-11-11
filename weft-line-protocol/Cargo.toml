@@ -21,3 +21,4 @@ path = "src/lib.rs"
 bigdecimal = { workspace = true }
 chrono = { workspace = true }
 splimes = { workspace = true }
+weft-physical-type = { workspace = true }

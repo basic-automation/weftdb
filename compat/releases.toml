@@ -42,7 +42,7 @@ crates_io = false
 # regenerates it from the tag; `weftdb/tests/compat_v010.rs` opens it with the build under
 # test; `verify` here re-hashes every file in it, so a fixture that drifts fails CI.
 fixtures = "compat/fixtures/v0.1.0"
-legs = ["upgrade", "rollback"]
+legs = ["upgrade"]
 
 [release.assets]
 "weftdb-v0.1.0-aarch64-apple-darwin.tar.gz" = "62f9adc08bdd4442e0dbade1ea95cdc14415340d007e98557ddc1015a6dd5f1f"

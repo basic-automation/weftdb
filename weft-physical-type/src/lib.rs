@@ -31,6 +31,9 @@
 //! - The **one decimal domain** (ROB-6) — every value's plain form is at most
 //!   [`MAX_PLAIN_DIGITS`] digits, enforced by [`parse_decimal`] at parse sites
 //!   and by [`PhysicalType::encode`] at the sink.
+//! - The **one float-input rule** (decision 11, FRE-8b) — a float input enters
+//!   as its shortest round-trip decimal through [`decimal_from_f64`] /
+//!   [`decimal_from_f32`], in every ingest format.
 //! - [`PhysicalValue::to_logical`] — the always-available inverse, reconstructing
 //!   the `BigDecimal` the encoding represents.
 //! - [`PhysicalType::profile`] — declarative per-encoding metadata
@@ -438,6 +441,76 @@ pub fn parse_decimal(text: &str) -> Result<BigDecimal, ParseDecimalError> {
 	Ok(value)
 }
 
+/// The decimal an `f64` float input enters as (decision 11, FRE-8b).
+///
+/// That decimal is the shortest one that round-trips to `value` — the
+/// decimal the sender wrote, whenever their text has at most 15 significant
+/// digits — or `None` when `value` is not finite.
+///
+/// This is the one float-input rule every ingest format shares, so it lives
+/// here, beside [`parse_decimal`]: ILP float fields and Parquet/Arrow
+/// `Float64` cells enter through this conversion, JSON and CSV values enter
+/// as the sender's own text through [`parse_decimal`], and a given number
+/// therefore becomes the same stored decimal in every format.
+/// `BigDecimal::from_f64` is deliberately *not* used: it widens to the exact
+/// binary expansion (a written `0.1` would store as
+/// `0.1000000000000000055511151231257827021181583404541015625`), and for the
+/// subnormals that expansion's plain form exceeds the one decimal domain
+/// (ROB-6), so an exact-expansion input could be refused where the value the
+/// sender wrote is well inside it.
+#[must_use]
+pub fn decimal_from_f64(value: f64) -> Option<BigDecimal> {
+	if !value.is_finite() {
+		return None;
+	}
+	// `{:e}` is Rust's shortest round-trip formatting (`-d.ddde-x`, at most
+	// 17 significant digits, so the mantissa fits an i64). Reading the digits
+	// and the exponent directly avoids `BigDecimal::from_str`'s general
+	// parser — the same construction the compute endpoints' JSON widening
+	// uses (weft-server's `widen_json_value`).
+	decimal_from_shortest_text(&format!("{value:e}"))
+}
+
+/// The `f32` twin of [`decimal_from_f64`]: the shortest decimal that
+/// round-trips to the `f32` itself, not to its `f64` widening (an `f32`
+/// written `0.1` enters as `0.1`, not as the widening's
+/// `0.10000000149011612`).
+#[must_use]
+pub fn decimal_from_f32(value: f32) -> Option<BigDecimal> {
+	if !value.is_finite() {
+		return None;
+	}
+	decimal_from_shortest_text(&format!("{value:e}"))
+}
+
+/// Build the [`BigDecimal`] a shortest round-trip `{:e}` text names:
+/// `-d.dddde±x` read as digits and a decimal exponent, so integral values
+/// keep scale 0 (`100`, not `1e2`), matching `BigDecimal::from_f64`'s shape
+/// for the values both forms agree on.
+fn decimal_from_shortest_text(text: &str) -> Option<BigDecimal> {
+	let (negative, text) = text.strip_prefix('-').map_or((false, text), |rest| (true, rest));
+	let (mantissa_text, exponent_text) = text.split_once('e')?;
+	let mut mantissa: i64 = 0;
+	let mut fraction_digits: i64 = 0;
+	let mut seen_point = false;
+	for b in mantissa_text.bytes() {
+		if b == b'.' {
+			seen_point = true;
+		} else {
+			mantissa = mantissa * 10 + i64::from(b - b'0');
+			fraction_digits += i64::from(seen_point);
+		}
+	}
+	let exponent: i64 = exponent_text.parse().ok()?;
+	let mantissa = if negative { -mantissa } else { mantissa };
+	// value = mantissa x 10^(exponent - fraction_digits); BigDecimal's scale
+	// is the negation of that exponent.
+	let decimal = BigDecimal::new(mantissa.into(), fraction_digits - exponent);
+	// A negative scale is an integral value in exponent dress (`1e2`):
+	// present it at scale 0, as `BigDecimal::from_f64` gives it.
+	Some(if decimal.fractional_digit_count() < 0 { decimal.with_scale(0) } else { decimal })
+}
+
 /// `10^n` as a `BigDecimal`, built without a `Pow` trait import.
 fn pow10(n: u8) -> BigDecimal {
 	let ten = BigInt::from(10);
@@ -683,6 +756,52 @@ mod tests {
 		// The exponent is measured, not materialised: this must return, not
 		// try to allocate a billion-digit string.
 		assert!(matches!(parse_decimal("1e1000000000"), Err(ParseDecimalError::OutOfRange(_))));
+	}
+
+	#[test]
+	fn float_inputs_enter_as_their_shortest_round_trip_decimal() {
+		// The decimal the sender wrote, not the exact binary expansion
+		// `BigDecimal::from_f64` produces (decision 11).
+		assert_eq!(decimal_from_f64(0.1), Some(bd("0.1")));
+		assert_eq!(decimal_from_f64(99.92), Some(bd("99.92")));
+		assert_eq!(decimal_from_f64(-0.3), Some(bd("-0.3")));
+		assert_ne!(decimal_from_f64(0.1), BigDecimal::from_f64(0.1), "the expansion is not the input rule");
+		// Integral values keep scale 0, as `from_f64` gives them.
+		assert_eq!(decimal_from_f64(100.0), Some(bd("100")));
+		assert_eq!(decimal_from_f64(100.0).expect("finite").fractional_digit_count(), 0);
+		assert_eq!(decimal_from_f64(1e300), Some(bd("1e300")));
+		// The extremes of the range, in the form decision 11 names.
+		assert_eq!(decimal_from_f64(f64::MAX), Some(bd("1.7976931348623157e308")));
+		assert_eq!(decimal_from_f64(f64::MIN_POSITIVE), Some(bd("2.2250738585072014e-308")));
+		// The smallest subnormal: its exact expansion needs 1,075 plain
+		// digits (outside the domain, per the ROB-6 entry); its shortest
+		// form needs 325 and is the value the sender wrote.
+		assert_eq!(decimal_from_f64(5e-324), Some(bd("5e-324")));
+		assert!(check_decimal_domain(&decimal_from_f64(5e-324).expect("finite")).is_ok());
+		// Non-finite floats have no decimal form.
+		assert_eq!(decimal_from_f64(f64::NAN), None);
+		assert_eq!(decimal_from_f64(f64::INFINITY), None);
+		assert_eq!(decimal_from_f64(f64::NEG_INFINITY), None);
+		// Every result round-trips: parsing the decimal back to f64 is the
+		// identical float.
+		for v in [0.1, 99.92, -0.3, 100.0, 1e300, f64::MAX, f64::MIN_POSITIVE, 5e-324, -5e-324, 0.0] {
+			assert_eq!(decimal_from_f64(v).expect("finite").to_f64(), Some(v), "{v:e}");
+		}
+	}
+
+	#[test]
+	fn f32_inputs_enter_as_the_f32s_shortest_round_trip_decimal() {
+		// The f32's own shortest form — not the shortest form of its f64
+		// widening, which would name a different (longer) decimal.
+		assert_eq!(decimal_from_f32(0.1_f32), Some(bd("0.1")));
+		assert_eq!(decimal_from_f32(0.1_f32), decimal_from_f64(0.1_f64));
+		assert_eq!(decimal_from_f32(-1.5_f32), Some(bd("-1.5")));
+		assert_eq!(decimal_from_f32(f32::MAX), Some(bd("3.4028235e38")));
+		assert_eq!(decimal_from_f32(f32::NAN), None);
+		assert_eq!(decimal_from_f32(f32::INFINITY), None);
+		for v in [0.1_f32, -1.5_f32, f32::MAX, f32::MIN_POSITIVE, 0.0_f32] {
+			assert_eq!(decimal_from_f32(v).expect("finite").to_f32(), Some(v), "{v:e}");
+		}
 	}
 
 	#[test]

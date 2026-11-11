@@ -36,7 +36,7 @@ def block(**overrides) -> dict:
 		"published_at": "2026-10-09T00:56:59Z",
 		"binaries": True,
 		"crates_io": False,
-		"legs": ["upgrade", "rollback"],
+		"legs": ["upgrade"],
 		"assets": {"weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz": "a" * 64},
 	}
 	base.update(overrides)
@@ -213,7 +213,7 @@ class TagsAndFixtures(unittest.TestCase):
 			write_fixture(repo / "compat" / "fixtures" / "v0.1.0", {"README.md": "docs\n", "store/x.bin": b"\x00\x02"})
 			pin = repo / "compat" / "releases.toml"
 			pin.parent.mkdir(parents=True, exist_ok=True)
-			pin.write_text(f'[[release]]\nversion = "0.1.0"\ntag = "v0.1.0"\ncommit = "{commit}"\npublished_at = "2026-10-09T00:56:59Z"\nbinaries = true\ncrates_io = false\nlegs = ["upgrade", "rollback"]\nfixtures = "compat/fixtures/v0.1.0"\n\n[release.assets]\n"weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz" = "' + "a" * 64 + '"\n')
+			pin.write_text(f'[[release]]\nversion = "0.1.0"\ntag = "v0.1.0"\ncommit = "{commit}"\npublished_at = "2026-10-09T00:56:59Z"\nbinaries = true\ncrates_io = false\nlegs = ["upgrade"]\nfixtures = "compat/fixtures/v0.1.0"\n\n[release.assets]\n"weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz" = "' + "a" * 64 + '"\n')
 			self.assertEqual(releases.verify(repo, pin), [])
 
 
