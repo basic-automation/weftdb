@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use bigdecimal::{BigDecimal, FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 
-use crate::sketch::{decimal_to_f64, SketchError};
+use crate::sketch::{decimal_to_f64, BinCache, SketchError};
 
 /// The smallest bucket budget a [`UddSketch`] accepts.
 ///
@@ -66,6 +66,11 @@ pub struct UddSketch {
 	count: u64,
 	/// Maximum occupied buckets over both sign stores together (the zero counter is extra).
 	max_bins: usize,
+	/// The bucket the last positive sample mapped to, so a run of nearby samples skips the
+	/// logarithm. Emptied by every collapse, since a collapse renumbers the buckets. Not
+	/// part of the sketch's value: never serialized, and ignored by equality.
+	#[serde(skip)]
+	last_bin: BinCache,
 }
 
 /// `⌈i / 2⌉`: the index bucket `i` takes when adjacent pairs merge.
@@ -89,7 +94,7 @@ impl UddSketch {
 			return Err(SketchError::UniformBudgetTooSmall);
 		}
 		let log_gamma = ((1.0 + alpha) / (1.0 - alpha)).ln();
-		Ok(Self { initial_alpha: alpha, log_gamma, collapses: 0, positive: BTreeMap::new(), negative: BTreeMap::new(), zeros: 0, count: 0, max_bins })
+		Ok(Self { initial_alpha: alpha, log_gamma, collapses: 0, positive: BTreeMap::new(), negative: BTreeMap::new(), zeros: 0, count: 0, max_bins, last_bin: BinCache::default() })
 	}
 
 	/// The relative-error bound every quantile carries **now**: the accuracy the sketch was
@@ -139,6 +144,17 @@ impl UddSketch {
 		(v.ln() / self.log_gamma).ceil().to_i32().ok_or(SketchError::ValueRange)
 	}
 
+	/// [`index`](Self::index) for a positive `v`, through the last sample's bucket when `v`
+	/// is safely inside it.
+	fn positive_index(&mut self, v: f64) -> Result<i32, SketchError> {
+		if let Some(i) = self.last_bin.hit(v) {
+			return Ok(i);
+		}
+		let i = self.index(v)?;
+		self.last_bin = BinCache::of(i, self.log_gamma);
+		Ok(i)
+	}
+
 	/// The value reported for bucket `i`: `2γⁱ/(γ+1)`, within the current accuracy of every
 	/// value in the bucket.
 	///
@@ -160,6 +176,7 @@ impl UddSketch {
 		}
 		self.log_gamma *= 2.0;
 		self.collapses += 1;
+		self.last_bin = BinCache::default();
 	}
 
 	/// Collapse until both stores together fit the budget.
@@ -183,7 +200,7 @@ impl UddSketch {
 			return Err(SketchError::ValueRange);
 		}
 		if v > 0.0 {
-			let i = self.index(v)?;
+			let i = self.positive_index(v)?;
 			*self.positive.entry(i).or_insert(0) += 1;
 		} else if v < 0.0 {
 			let i = self.index(-v)?;
@@ -410,6 +427,45 @@ mod tests {
 				assert_eq!(coarse.index(v), Ok(lifted), "{v:e} after {k} collapses");
 			}
 		}
+	}
+
+	/// The last-bucket cache returns the index the logarithm gives, at every collapse level,
+	/// and a collapse empties it.
+	#[test]
+	fn the_bin_cache_gives_the_index_the_logarithm_gives_at_every_level() {
+		let mut next = xorshift(0x6a09_e667_f3bc_c909);
+		let mut s = UddSketch::new(0.01, UDD_MIN_BINS).expect("valid");
+		for level in 0..=12_u32 {
+			let lg = s.log_gamma;
+			let mut values = Vec::new();
+			for k in [-400_i32, -3, -1, 0, 1, 2, 7, 400] {
+				let boundary = (f64::from(k) * lg).exp();
+				if boundary.is_finite() && boundary > 0.0 {
+					values.extend([-1e-6, -1e-9, -1e-12, -1e-15, 0.0, 1e-15, 1e-12, 1e-9, 1e-6].map(|rel| boundary * (1.0 + rel)));
+				}
+			}
+			values.extend((0..5_000).scan(100.0_f64, |price, _| {
+				*price *= (f64::from(u16::try_from(next() % 2_001).expect("below 2001")) - 1_000.0).mul_add(1e-6, 1.0);
+				Some(*price)
+			}));
+			values.extend((0..1_000).map(|_| f64::from_bits(next() % 0x7fef_ffff_ffff_ffff + 1)).filter(|v| v.is_finite() && *v > 0.0));
+			for v in values {
+				if let Ok(expected) = s.index(v) {
+					assert_eq!(s.positive_index(v), Ok(expected), "{v:e} at level {level}");
+				}
+			}
+			// Leave a bucket cached across the collapse: a stale one would answer for the
+			// old numbering.
+			let _ = s.positive_index(1_000.0);
+			s.collapse();
+			assert_eq!(s.positive_index(1_000.0), s.index(1_000.0), "after collapse {}", level + 1);
+		}
+
+		// The cache is invisible to equality and to the persisted form.
+		let (mut warm, cold) = (UddSketch::new(0.01, 16).expect("valid"), UddSketch::new(0.01, 16).expect("valid"));
+		let _ = warm.positive_index(42.0);
+		assert_eq!(warm, cold);
+		assert_eq!(postcard::to_allocvec(&warm).expect("serializes"), postcard::to_allocvec(&cold).expect("serializes"));
 	}
 
 	/// Merging stays exact under collapse, however the samples were split and ordered.

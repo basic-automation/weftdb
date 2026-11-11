@@ -31,3 +31,7 @@ weft-physical-type = { workspace = true }
 [[bench]]
 name = "decimal_tax"
 harness = false
+
+[[bench]]
+name = "sketch_collapse"
+harness = false

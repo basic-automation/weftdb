@@ -148,7 +148,22 @@ pub struct DdSketch {
 /// near a boundary still computes it. Equality always holds and serde skips it, so a sketch's
 /// value, its comparisons and its persisted form do not depend on it.
 #[derive(Debug, Clone, Copy, Default)]
-struct BinCache(Option<(i32, f64, f64)>);
+pub(crate) struct BinCache(Option<(i32, f64, f64)>);
+
+impl BinCache {
+	/// The cached index, when `v` is safely inside the cached bucket.
+	pub(crate) fn hit(self, v: f64) -> Option<i32> {
+		self.0.and_then(|(i, lo, hi)| (lo < v && v < hi).then_some(i))
+	}
+
+	/// The cache for bucket `i` of the mapping whose `ln γ` is `log_gamma`; empty when the
+	/// shrunk interval is not a usable one.
+	pub(crate) fn of(i: i32, log_gamma: f64) -> Self {
+		let (lo, hi) = ((f64::from(i) - 1.0) * log_gamma, f64::from(i) * log_gamma);
+		let (lo, hi) = (lo.exp() * (1.0 + BIN_CACHE_MARGIN), hi.exp() * (1.0 - BIN_CACHE_MARGIN));
+		Self((lo.is_finite() && hi.is_finite() && lo < hi).then_some((i, lo, hi)))
+	}
+}
 
 impl PartialEq for BinCache {
 	fn eq(&self, _: &Self) -> bool {
@@ -293,15 +308,11 @@ impl DdSketch {
 	/// [`index`](Self::index) for a positive `v`, through the [`BinCache`] when `v` is safely
 	/// inside the last sample's bucket.
 	fn positive_index(&mut self, v: f64) -> Result<i32, SketchError> {
-		if let BinCache(Some((i, lo, hi))) = self.last_bin {
-			if lo < v && v < hi {
-				return Ok(i);
-			}
+		if let Some(i) = self.last_bin.hit(v) {
+			return Ok(i);
 		}
 		let i = self.index(v)?;
-		let (lo, hi) = ((f64::from(i) - 1.0) * self.log_gamma, f64::from(i) * self.log_gamma);
-		let (lo, hi) = (lo.exp() * (1.0 + BIN_CACHE_MARGIN), hi.exp() * (1.0 - BIN_CACHE_MARGIN));
-		self.last_bin = BinCache((lo.is_finite() && hi.is_finite() && lo < hi).then_some((i, lo, hi)));
+		self.last_bin = BinCache::of(i, self.log_gamma);
 		Ok(i)
 	}
 

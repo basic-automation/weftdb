@@ -27,8 +27,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   of two sketches with the same accuracy and budget is still exactly the one-pass sketch.
   The bound loosens on the high quantiles too, which a lowest-bucket collapse leaves
   alone. Library type only: the `sketch_p*` reductions and the `.weftpart` sidecars still
-  use `DdSketch`, and no speed figure has been taken. `SketchError` gains
-  `UniformBudgetTooSmall` (a budget under `UDD_MIN_BINS`, 4).
+  use `DdSketch`. `SketchError` gains `UniformBudgetTooSmall` (a budget under
+  `UDD_MIN_BINS`, 4). `cargo bench -p weft-reduce --bench sketch_collapse` times both
+  sketches' `add` and `merge` on two seeded synthetic inputs; the first figures, taken on
+  a loaded host, are in `ROADMAP.md` and are not yet a published claim.
 
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
   fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
