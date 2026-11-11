@@ -453,7 +453,7 @@ mod test_support;
 // Re-export main Pipeline API
 // Re-export built-in detectors
 // Re-export compression types for convenience
-pub use detectors::{detect_all_peaks, detect_all_valleys, detect_drawdown, detect_monthly_increase, detect_peaks, detect_threshold_crossing_down, detect_threshold_crossing_up, detect_valleys};
+pub use detectors::{detect_all_peaks, detect_all_peaks_in_window, detect_all_valleys, detect_all_valleys_in_window, detect_drawdown, detect_drawdown_in_window, detect_monthly_increase, detect_monthly_increase_in_window, detect_peaks, detect_peaks_in_window, detect_threshold_crossing_down, detect_threshold_crossing_down_in_window, detect_threshold_crossing_up, detect_threshold_crossing_up_in_window, detect_valleys, detect_valleys_in_window};
 pub use pipeline::{DetectorId, DictionaryConfig, EventDetector, EventDetectorFn, Pipeline, PipelineBuilder, PipelineRunConfig, ProbabilityResult};
 pub use weftdb::compression::{AggressivenessScaling, CompressionConfig, CompressionResult, CompressionSummary, SizeBasedCompressionConfig, TimeBasedCompressionConfig};
 

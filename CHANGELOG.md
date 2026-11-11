@@ -33,6 +33,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   published to ghcr.io to claim.
 
 ### Added
+- **Bounded-window detector variants (`weft-orchestration`).** Eight additive
+  functions — `detect_monthly_increase_in_window`, `detect_peaks_in_window`,
+  `detect_all_peaks_in_window`, `detect_valleys_in_window`, `detect_all_valleys_in_window`,
+  `detect_threshold_crossing_up_in_window`, `detect_threshold_crossing_down_in_window`,
+  `detect_drawdown_in_window` — take the same arguments as the originals plus
+  `since: Option<DateTime<Utc>>`, which becomes the start of the range passed to
+  `Outputs::analyze_range`. A live caller that only cares about new data no longer pays
+  O(history) per tick. `since` is the start of the analysed range rather than a filter on a
+  full-history result: a feature is reported only when the points that define it are both
+  inside the window, so a crossing whose point below the threshold precedes `since` is not
+  reported. The originals delegate with `None` and are unchanged.
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
   fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
   handles. Rollback and binary compatibility are now explicitly unsupported for 1.0:
