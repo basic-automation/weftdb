@@ -16,10 +16,17 @@
 //!
 //! Before timing, each `UddSketch` is checked against an exact sort: every quantile read
 //! must be inside the bound the sketch reports.
+//!
+//! It also prints, without timing it, what each collapse costs in accuracy on real data: the
+//! relative error of both sketches at p1, p50 and p99 over every BTC/USD one-minute close in
+//! `database/datasets/btc_1min.csv` (`WEFT_BTC_CSV` overrides the path; skipped with a note
+//! when the file is absent), at budgets of 256, 64 and 16 buckets.
 #![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions)]
 
-use std::hint::black_box;
+use std::{
+	hint::black_box, io::{BufRead, BufReader}
+};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use weft_reduce::{DdSketch, UddSketch};
@@ -91,7 +98,39 @@ fn check(values: &[f64], sketch: &UddSketch) {
 	}
 }
 
+/// The exact nearest-rank sample of `sorted` at `per_mille` thousandths.
+fn exact(sorted: &[f64], per_mille: usize) -> f64 {
+	let n = sorted.len();
+	sorted[(per_mille * n).div_ceil(1000).clamp(1, n) - 1]
+}
+
+/// Print each sketch's relative error at p1, p50 and p99 over the BTC closes, per budget.
+fn report_real_corpus() {
+	let path = std::env::var("WEFT_BTC_CSV").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../database/datasets/btc_1min.csv").to_string());
+	let Ok(file) = std::fs::File::open(&path) else {
+		eprintln!("sketch_collapse: {path} not found; the real-corpus error table is skipped");
+		return;
+	};
+	let mut closes: Vec<f64> = BufReader::new(file).lines().skip(1).filter_map(|line| line.ok()?.split(',').nth(4)?.parse().ok()).filter(|v: &f64| v.is_finite() && *v > 0.0).collect();
+	let (dd_all, udd_all): (Vec<DdSketch>, Vec<UddSketch>) = [256, 64, 16].into_iter().map(|bins| (dd(&closes, bins), udd(&closes, bins))).unzip();
+	closes.sort_by(f64::total_cmp);
+	eprintln!("btc closes: {} samples, {} to {}; relative error at p1 / p50 / p99", closes.len(), closes[0], closes[closes.len() - 1]);
+	for (bins, (dd, udd)) in [256, 64, 16].into_iter().zip(dd_all.iter().zip(&udd_all)) {
+		let errors = |quantile: &dyn Fn(f64) -> Option<f64>| {
+			[(10, 0.01), (500, 0.5), (990, 0.99)].map(|(per_mille, q)| {
+				let want = exact(&closes, per_mille);
+				(quantile(q).expect("non-empty") - want).abs() / want
+			})
+		};
+		let (d, u) = (errors(&|q| dd.quantile(q)), errors(&|q| udd.quantile(q)));
+		let bound = udd.relative_accuracy();
+		assert!(u.iter().all(|e| *e <= bound + 1e-12), "UddSketch outside its reported bound {bound} at {bins} buckets: {u:?}");
+		eprintln!("  {bins:>3} buckets: DdSketch {:.4} / {:.4} / {:.4}; UddSketch {:.4} / {:.4} / {:.4} ({} collapse(s), bound {bound:.4})", d[0], d[1], d[2], u[0], u[1], u[2], udd.collapses());
+	}
+}
+
 fn bench_add(c: &mut Criterion) {
+	report_real_corpus();
 	let (walk, wide) = (walk(), wide());
 	let (roomy, tight) = (udd(&walk, ROOMY), udd(&wide, TIGHT));
 	assert_eq!(roomy.collapses(), 0, "the walk fits the roomy budget");
