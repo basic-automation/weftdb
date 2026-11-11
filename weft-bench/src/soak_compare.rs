@@ -64,6 +64,29 @@ pub const DEFAULT_METRIC_TOLERANCES: &[MetricTolerance] = &[MetricTolerance { me
 // Rule outcome change
 // ---------------------------------------------------------------------------
 
+/// Which comparison a refusal came from, and how to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+	/// The two reports were written by different report-schema versions.
+	ReportSchema,
+	/// The two runs were stamped with different `soak_schema_version`s.
+	RunSchema,
+	/// Both of the above, which the headline used to collapse into one cause.
+	Both,
+}
+
+impl Refusal {
+	/// What to print: the cause, and what was therefore not checked.
+	#[must_use]
+	pub const fn message(self) -> &'static str {
+		match self {
+			Self::ReportSchema => "the reports' schema versions differ",
+			Self::RunSchema => "the runs' soak schema versions differ",
+			Self::Both => "both the reports' schema versions and the runs' soak schema versions differ",
+		}
+	}
+}
+
 /// How one rule's outcome changed between two reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -197,6 +220,27 @@ impl SoakComparison {
 	#[must_use]
 	pub const fn has_warnings(&self) -> bool {
 		self.has_drift_warning
+	}
+
+	/// Why the metric comparison was refused, if it was.
+	///
+	/// A mismatch in either schema version means the two reports do not describe
+	/// the same measurement, so no drift figure is computed at all. That is not
+	/// a clean pass: it is the absence of a check. Callers that turn an exit code
+	/// into a verdict have to be able to tell the two apart, which is what this
+	/// is for — the soak nightly ends its comparison step with the CLI's status
+	/// (`.github/workflows/soak.yml`), and until now a refusal could not make
+	/// that step go red. Rule outcomes are still compared across a mismatch, so
+	/// a genuine regression is reported by [`SoakComparison::is_regression`]
+	/// whatever this returns.
+	#[must_use]
+	pub const fn refusal(&self) -> Option<Refusal> {
+		match (self.schema_mismatch, self.run_schema_mismatch) {
+			(Some(_), Some(_)) => Some(Refusal::Both),
+			(Some(_), None) => Some(Refusal::ReportSchema),
+			(None, Some(_)) => Some(Refusal::RunSchema),
+			(None, None) => None,
+		}
 	}
 
 	/// Render the comparison as a Markdown summary for the job summary.
@@ -892,6 +936,65 @@ mod tests {
 		assert!(comp.metric_drifts.is_empty(), "no metric drifts when both schema versions differ");
 		assert!(comp.summary.contains("Schema version"), "summary names the report-schema mismatch");
 		assert!(comp.summary.contains("soak run schema"), "summary names the soak run schema mismatch");
+	}
+
+	// -----------------------------------------------------------------------
+	// A refusal is distinguishable from a clean pass (#688 item 1)
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn a_matched_pair_is_not_a_refusal() {
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let report = create_report(&run);
+		let comp = compare_soak_reports(&report, &report, DEFAULT_METRIC_TOLERANCES);
+		assert_eq!(comp.refusal(), None, "identical reports: nothing was refused");
+		assert!(!comp.metric_drifts.is_empty(), "and the drift figures were computed");
+	}
+
+	#[test]
+	fn a_run_schema_mismatch_is_a_refusal() {
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let mut prev = create_report(&run);
+		prev.run.soak_schema_version = 6;
+		let curr = create_report(&run);
+		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
+		assert_eq!(comp.refusal(), Some(Refusal::RunSchema), "a run schema mismatch refused the drift comparison");
+		assert!(!comp.is_regression(), "and it is reported as the absence of a check, not as a regression");
+		assert!(comp.refusal().is_some_and(|r| !r.message().is_empty()), "naming what went unchecked");
+	}
+
+	#[test]
+	fn a_report_schema_mismatch_is_a_refusal() {
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let mut prev = create_report(&run);
+		prev.schema_version = 42;
+		let curr = create_report(&run);
+		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
+		assert_eq!(comp.refusal(), Some(Refusal::ReportSchema), "a report schema mismatch refused the drift comparison");
+	}
+
+	#[test]
+	fn an_unstamped_run_is_not_a_refusal() {
+		// Stamped 0 means "unstamped" and refuses nothing, so the nightly keeps
+		// working across the stamp's introduction: the exit code must stay clean.
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let modern = create_report(&run);
+		let mut old = create_report(&run);
+		old.run.soak_schema_version = 0;
+		let comp = compare_soak_reports(&old, &modern, DEFAULT_METRIC_TOLERANCES);
+		assert_eq!(comp.refusal(), None, "an unstamped run is compared, not refused");
+	}
+
+	#[test]
+	fn a_double_mismatch_refuses_once_and_names_both_causes() {
+		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
+		let mut prev = create_report(&run);
+		prev.schema_version = 42;
+		prev.run.soak_schema_version = 3;
+		let curr = create_report(&run);
+		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
+		assert_eq!(comp.refusal(), Some(Refusal::Both), "both classes at once is one refusal that names both");
+		assert!(Refusal::Both.message().starts_with("both"), "and its wording says so: {:?}", Refusal::Both.message());
 	}
 
 	// -----------------------------------------------------------------------

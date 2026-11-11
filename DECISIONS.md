@@ -6380,6 +6380,62 @@ PR; the standing rule is a narrower brief from the checkpoint or finish it mysel
 budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
 --lib` build, which the two prior worker deaths could not afford.
 
+## 2026-11-10 — ROB-21 remainder: RAII guards on the abort path, minimal maintenance metrics (loop best-guess, FLAGGED FOR MERGE REVIEW)
+
+**Context:** the peer's #678 landed only the cancellation third of ROB-21
+(`MaintenanceCancel` + `*_with_cancel` variants on the 8 store-wide sweeps).
+The remainder is the other two thirds of the one-liner — RAII cleanup guards
+and minimal maintenance metrics — and the plan names the slice only by title
+(§6 W10; ticks :769, the 1.0 release-criteria box whose 7.5 line is
+"Compaction with query consistency, cancellation, and resource limits"), so
+the shape below is a best-guess grounded in the code, recorded here for merge
+review.
+
+**Chosen — metrics (the ROB-19 deferral, made concrete).** ROB-19's entry
+deferred "breaker metrics counters" to ROB-21, and the sweep structs already
+carried everything else a metric needs (`cancelled`, `tripped`, `busy`) without
+emitting any of it — the daemon tick functions logged those outcomes to spans
+only. This slice adds the minimal set, five counters under `weft_maintenance_*`
+on `GET /metrics`, recorded from every daemon tick function and from the manual
+`POST /api/v1/storage/reconcile` handler alike:
+`sweeps_total` (every sweep that ran to a summary, quiet ones included — the
+scheduler's liveness), `sweeps_cancelled_total`, `breaker_trips_total`,
+`aspects_tripped_total`, `aspects_busy_total`. The trip count is the one number
+the sweeps did not already return, so the store counts it: `breaker_record`
+now returns whether the record tripped (or re-tripped) the breaker, and the
+seven breaker-gated sweep loops accumulate it in a new `breaker_trips` field
+on their four result structs. A sweep that only *skips* already-tripped
+aspects counts none — trips are transition events, skips are
+`aspects_tripped`. The reconcile work counters (`weft_reconcile_*`) are
+untouched and still count only passes that rewrote something, so the two
+halves answer different questions and neither double-counts the other.
+`ReapSweep` gets no `breaker_trips`: the reaper is not breaker-gated.
+
+**Chosen — RAII guards: pin the abort path, add no new guard type.** The
+guards the one-liner names already exist and are attributed to ROB-21 in the
+code (`PendingOutputs`, D-S9, with its drop → `Reaper::abandon`; `MaintGuard`,
+the aspect lock; `GcHold`, the reaper hold) — what was missing was proof they
+cover the *abort* path, the way the daemon supervisor actually stops a sweep
+on shutdown (task dropped mid-swap), as opposed to the cooperative-cancel path
+#678 tested (A1–A3) and the per-aspect dropped-swap path the existing
+child-process test pins. A new child-process test drops a store-wide sweep
+future parked at `M-pending-committed` and asserts the lock is free (a `Skip`
+sweep takes the aspect at once), the guard handed the journaled output to the
+reaper, and the next sweep converges with a clean journal after reopen. No new
+guard type was needed: the test passes on the guards as they stand.
+
+**Not in this slice.** (1) Cooperative cancellation of the daemon itself: the
+daemon never calls the `*_with_cancel` variants, and threading a token through
+it would change nothing — the supervisor aborts the daemon task the moment the
+shutdown watch fires, so a graceful finish would lose the race to the abort.
+Making shutdown cooperative needs a supervisor grace period, which is ROB-3's
+shared machinery (backup, key-reload, GPU daemons all stop the same way) and a
+bigger decision than this slice. The abort path is safe via the RAII guards
+pinned above. (2) No per-aspect labels, durations, or histograms: "minimal"
+means counters only; a sweep's duration is already in its tracing span.
+(3) No `reap` metrics: the reaper runs from recovery and the manual path, not
+the scheduler, so it is outside the sweep surface this slice counts.
+
 ## 2026-11-11 — `since` starts the analysed range; it is not a filter over a full scan
 
 `ROADMAP.md:483` asked for "an optional `since` start time … so a live caller only scans new
@@ -6533,3 +6589,35 @@ free of 124 GiB after four concurrent cargo runs, so nothing compiled locally �
 check`, no `cargo test`. The likeliest first failure is the new test's import shape
 (`weftdb::DiskSpace` is re-exported at `weftdb/src/types/mod.rs:96`; the `Copy` derive at
 `weftdb/src/types/disk_guard.rs:28` is what lets one `space` value feed two calls).
+
+## 2026-11-11 — A refused soak comparison exits non-zero (#688 item 1)
+
+**Ambiguous:** #688 asked for a decision, not a patch — "Either a mismatch exits non-zero, or the lane
+documents itself as advisory and the nightly greps the message. Pick one; today it is neither."
+
+**Chosen: the exit code.** `DECISIONS.md:6354` (SOAK-SCHEMA, 2026-11-10) recorded the 0-exit as a cost and
+deferred the gate as "a policy call for the owner"; this is that call. The lane is *already* a gate —
+`.github/workflows/soak.yml` ends its comparison step with `compare_status=${PIPESTATUS[0]}` …
+`exit "$compare_status"`, so the only thing swallowing a refusal was the CLI. Making the lane
+self-declared-advisory instead would have needed a second, text-coupled check (a nightly grepping English
+out of `compare.txt`) to detect the absence of a check — the same fragility #676 removed from the roadmap.
+
+**Chosen: `SoakComparison::refusal() -> Option<Refusal>` rather than an error path.** The 2026-11-10
+decision to keep `compare_soak_reports` infallible still holds; the refusal is a property of the finished
+comparison, and a pure predicate on it is unit-testable in `cargo test -p weft-bench --lib`, which CI runs
+without a GPU. `Refusal::{ReportSchema, RunSchema, Both}` names the class so the operator sees which
+comparison was refused — the masking that #693 fixed in the summary line must not reappear in the exit
+reason.
+
+**Chosen: a regression still outranks a refusal.** Rule outcomes are matched by id across a mismatch, so a
+genuine `Pass→Fail` keeps its own message and a refusal can never hide one; the refusal branch is therefore
+after the `has_regression` branch in `weft-bench/src/main.rs`, not before it.
+
+**Cost, stated plainly:** a nightly that would previously have been re-run until it looked clean now goes
+red on the first mismatched pair, and the fix is a baseline re-stamp rather than a code change. That is the
+point — but it means the *first* run after this merges may fail for a historical reason, and the operator
+needs `soak-baseline/` to be re-cut deliberately, not silently by a green check.
+
+**Not decided here:** whether the soak lane should also go red on drift past tolerance. The annotator
+(`scripts/annotate-soak-drift.py`) still emits `::warning::` and exits 0, which #688 does not ask to change;
+a refusal is the absence of a measurement, drift is a measurement that moved.

@@ -23,6 +23,20 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   that contradicts the advertised surface is a contract bug: a client that believed
   it would never retry a refused write.
 ### Changed
+- **A refused soak comparison now exits non-zero (#688 item 1).**
+  `weft-bench soak-compare` prints its summary line and ends with the process
+  status, and `.github/workflows/soak.yml` ends its comparison step with
+  `exit "$compare_status"` — yet a refused comparison, where no metric drift
+  figure was computed because the report schema versions or the soak run
+  schema versions differ, exited 0. The nightly therefore printed
+  `soak-compare: OK` over the absence of a check, which is how a drift warning
+  could stay invisible for a whole release cycle. `SoakComparison::refusal()`
+  now names the class (`the reports' schema versions differ`, `the runs' soak
+  schema versions differ`, or both) and the CLI fails on it. Drift past
+  tolerance stays a warning annotation, and a Pass→Fail regression still
+  outranks a refusal, because rule outcomes are matched by id across a
+  mismatch. An unstamped run (`soak_schema_version = 0`) is compared, not
+  refused, so the nightly does not go red across the stamp's own introduction.
 - **README project-status table: version bump and row accuracy (EVI-22 partial).**
   Lead line now names v0.3.2 (the current release). The "Tags, client SDKs, Helm chart"
   row is split into three: "Client SDKs" names the Python, R and Rust clients and
@@ -58,6 +72,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   full-history result: a feature is reported only when the points that define it are both
   inside the window, so a crossing whose point below the threshold precedes `since` is not
   reported. The originals delegate with `None` and are unchanged.
+
+- **Maintenance metrics (ROB-21).** `GET /metrics` gains five `weft_maintenance_*`
+  counters over the store-wide sweeps — sweeps run (quiet ones included),
+  sweeps cancelled, breaker trips, aspects skipped tripped or busy — recorded
+  from every daemon tick and the manual reconcile endpoint. The sweeps now
+  report their breaker trip events (`breaker_trips` on the four sweep
+  summaries), and a child-process test pins that a sweep dropped mid-swap
+  releases its aspect and settles its outputs through the RAII cleanup chain.
+
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
   fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
   handles. Rollback and binary compatibility are now explicitly unsupported for 1.0:
