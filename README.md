@@ -191,7 +191,7 @@ Run it yourself with `weft-xbench`; see [Benchmarking](docs/reference.md#benchma
 
 ## Status
 
-**v0.2.1 is pre-beta.** APIs, configuration and the on-disk format can still change between
+**v0.3.2 is pre-beta.** APIs, configuration and the on-disk format can still change between
 0.x releases, and upgrading a store from v0.1.0 is one-way. What works today:
 
 | | |
@@ -201,7 +201,9 @@ Run it yourself with `weft-xbench`; see [Benchmarking](docs/reference.md#benchma
 | Crash safety | Durable writes and crash recovery; writes are refused (`507`) before they would fill the disk past a reserve; power-loss testing on real hardware still to do |
 | Backup and restore | Working, including `weft-server restore` |
 | Binaries, crates, container image | Binaries and crates released; container image built but not published |
-| Tags, client SDKs, Helm chart | Not started |
+| Client SDKs (Python, R, Rust) | Rust crate on crates.io; Python and R shipped in the tree; not on PyPI or CRAN yet |
+| Tags (per-measurement series) | Working, tested (TAG-5..TAG-11); TAG-12 benchmarks still open |
+| Helm chart | Not started |
 
 The [changelog](CHANGELOG.md) lists every change and this release's known limitations;
 [ROADMAP.md](ROADMAP.md) shows what's next.
