@@ -87,6 +87,17 @@ _WILDCARD_PROSE_SUFFIXES: set[str] = {
 # Names that appear intentionally in prose as examples of what a non-registered
 # (wrong or discussed-but-dropped) name looks like.  They are not registry
 # errors and should not trigger the prose-name check.
+#
+# Both are load-bearing examples in the code, not stray prose: ``WEFT_BACKUP_DIRS``
+# is the canonical typo in the suggestion tests and doc comments
+# (``weft-server/src/settings.rs:6``, ``:203``, ``:572`` and
+# ``weft-server/tests/config_warnings.rs:143``), and
+# ``WEFT_ALLOW_INSECURE_BIND`` is the dropped-for-never-existing variable that
+# ``weft-server/src/settings.rs:612`` asserts is refused rather than honoured.
+# Renaming them to a fictitious name to shrink this exemption would change the
+# wording of a refusal message and its tests, which is outside a documentation
+# checker.  The cost is stated plainly: a *new* sentence that uses either name as
+# a real setting is invisible to this check.
 _KNOWN_PROSE_ONLY_NAMES: set[str] = {
     "WEFT_ALLOW_INSECURE_BIND",
     "WEFT_BACKUP_DIRS",
@@ -333,7 +344,7 @@ def _check_total_count(
     doc_text: str, actual_total: int, problems: list[str]
 ) -> None:
     """Verify overall variable totals claimed in version rows."""
-    for m in re.finditer(r"(\d+)\s+variables?:", doc_text):
+    for m in re.finditer(r"(\d+)\s+variables?\b", doc_text):
         claimed = int(m.group(1))
         if claimed != actual_total:
             problems.append(

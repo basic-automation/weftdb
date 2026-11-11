@@ -313,6 +313,28 @@ class CheckTierCounts(unittest.TestCase):
         probs = check_schema.verify(self.doc, self.reg, self.toml)
         self.assertTrue(any("claims 2 total" in p for p in probs))
 
+    def test_version_table_total_without_colon_reported(self):
+        """A "105 variables total as of this row" row is checked too.
+
+        The version table carries the total in two shapes: the v1 row uses
+        "105 variables: 13 Stable, ..." and the v2 row "105 variables total as
+        of this row". A total-check whose pattern needed the colon silently
+        exempted the second shape, which is exactly the drift this check exists
+        to catch.
+        """
+        self.doc.write_text(
+            "schema_version: 1\n"
+            "| 1 | Covers 99 variables total as of this row |\n"
+            "## Tuning\n"
+            "Three variables.\n"
+            "| `WEFT_X` | d |\n"
+            "| `WEFT_Y` | d |\n"
+            "| `WEFT_Z` | d |\n"
+        )
+        self.toml.write_text("[schema]\nversion = 1\n")
+        probs = check_schema.verify(self.doc, self.reg, self.toml)
+        self.assertTrue(any("claims 99 total" in p for p in probs), probs)
+
     def test_tier_counts_pass_clean(self):
         """All counts match."""
         self.doc.write_text(

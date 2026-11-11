@@ -6379,3 +6379,32 @@ PR; the standing rule is a narrower brief from the checkpoint or finish it mysel
 `!is_empty()` instead of `len() > 0` under `-D warnings`, one build); a replacement worker would spend its
 budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
 --lib` build, which the two prior worker deaths could not afford.
+
+## 2026-11-11 — the config-schema checker keeps its two prose-only names (issue #687, PR #690)
+
+**Ambiguous:** the adversarial review of this slice blocked it on a total-count
+pattern that required a colon (`r"(\d+)\s+variables?:"`), which left the version
+table's other shape — the v2 row's "105 variables total as of this row" — entirely
+unchecked: mutating that 105 reported nothing. It also asked whether the checker's
+`_KNOWN_PROSE_ONLY_NAMES` exemption (`WEFT_BACKUP_DIRS`,
+`WEFT_ALLOW_INSECURE_BIND`) had gutted the name check, offering "reword the examples
+to a fictitious name and drop the exemption" as the alternative.
+
+**Fixed, not argued:** the pattern is now `r"(\d+)\s+variables?\b"` and a test
+(`test_version_table_total_without_colon_reported`) writes exactly the colon-less
+shape, so the regression cannot return quietly. Both were verified: the mutated
+document now exits 1 with `version table claims 99 total variables, but the sum of
+tier tables is 105`, and the shipped document still exits 0.
+
+**Chosen: keep the exemption, and write its cost into the code.** Both names are
+load-bearing in the *code*, not stray prose: `WEFT_BACKUP_DIRS` is the canonical typo
+in the suggestion tests and doc comments (`weft-server/src/settings.rs:6`, `:203`,
+`:572`, `weft-server/tests/config_warnings.rs:143`), and `WEFT_ALLOW_INSECURE_BIND` is
+the dropped-for-never-existing variable that `weft-server/src/settings.rs:612` asserts
+is refused rather than honoured. Reword them and the documentation checker would be
+"fixed" by moving a refusal message and its tests in another crate — a larger change
+than the slice, and one that would make the docs disagree with the code that refuses
+the name. The exemption is exact-match on two full names, and the wildcard-prefix set
+is prefix-equality, not substring, so an unregistered `WEFT_STORE_BACKUP` is still
+caught. **Cost, stated in the comment above the set:** a *new* sentence that uses
+either name as though it were a real setting is invisible to this check.
