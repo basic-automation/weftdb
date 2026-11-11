@@ -13,7 +13,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   row is split into three: "Client SDKs" names the Python, R and Rust clients and
   their publication status; "Tags (per-measurement series)" reports TAG-5..TAG-11 as
   shipped; "Helm chart" stays "Not started". The "Binaries, crates, container image"
-  row now reports the image as published to ghcr.io.
+  row keeps main's wording for the container image: the
+  `Publish container image` workflow failed for both v0.3.1 and v0.3.2, so nothing is
+  published to ghcr.io to claim.
 
 ### Added
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`

@@ -200,7 +200,7 @@ Run it yourself with `weft-xbench`; see [Benchmarking](docs/reference.md#benchma
 | Security: TLS, API keys and roles | Working, with a fsynced audit log; no security review yet |
 | Crash safety | Durable writes and crash recovery; writes are refused (`507`) before they would fill the disk past a reserve; power-loss testing on real hardware still to do |
 | Backup and restore | Working, including `weft-server restore` |
-| Binaries, crates, container image | Binaries and crates released; container image published to ghcr.io |
+| Binaries, crates, container image | Binaries and crates released; container image built but not published |
 | Client SDKs (Python, R, Rust) | Rust crate on crates.io; Python and R shipped in the tree; not on PyPI or CRAN yet |
 | Tags (per-measurement series) | Working, tested (TAG-5..TAG-11); TAG-12 benchmarks still open |
 | Helm chart | Not started |
