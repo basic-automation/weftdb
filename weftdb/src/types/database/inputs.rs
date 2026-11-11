@@ -2937,7 +2937,7 @@ impl Database {
 	///
 	/// - All of an aspect's entries go, never some, so a consumer never sees a partial queue
 	///   with no batches and batches only the windows it names.
-	/// - The whole prune holds [`QUEUE_CONSUMERS`], which every queue read takes to mark its
+	/// - The whole prune holds the consumer set's lock, which every queue read takes to mark its
 	///   aspect first. A consumer that has read the queue is skipped; one that starts during
 	///   the prune waits for it and then finds the queue empty.
 	/// - A capture whose entry is removed while its row is still landing queues it again
