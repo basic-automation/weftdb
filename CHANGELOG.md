@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
+### Changed
+- **README project-status table: version bump and row accuracy (EVI-22 partial).**
+  Lead line now names v0.3.2 (the current release). The "Tags, client SDKs, Helm chart"
+  row is split into three: "Client SDKs" names the Python, R and Rust clients and
+  their publication status; "Tags (per-measurement series)" reports TAG-5..TAG-11 as
+  shipped; "Helm chart" stays "Not started". The "Binaries, crates, container image"
+  row now reports the image as published to ghcr.io.
+
 ### Added
 - **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
   fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
