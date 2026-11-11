@@ -284,7 +284,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
 
   The open lane pinned the store scope: a start whose `WEFT_STORE_DATABASE`/`WEFT_STORE_SUBJECT` differ from the root's `STORE_FORMAT` exits 65 unless `WEFT_STORE_SCOPE_PIN=off`, and `GET /api/v1/version` answers build, layout, scope-pin and exit-code state from process state alone (FRE-12b; DECISIONS 2026-11-03). The read lane bounded stored downsample and point lookups (ROB-13). Ingest rejects non-finite input as `400 not_finite` in every format and enforces `WEFT_MAX_INGEST_ROWS` and `WEFT_MAX_INGEST_DECODED_BYTES` before the seal (ROB-7, #551). GPU configuration, compute limits, interpolation provenance and metrics (ROB-16), the probe-only admin listener (ROB-23r) and the legacy queue-consumer panic fix (ROB-5) landed. Security acceptance closed (SEC-13). Packaging shipped the offline `weft-server restore` CLI (PAC-13), the Docker image with a container smoke test (PAC-9), and the systemd unit with host-install CI (PAC-11). The first cross-engine report and its owner-approved narrative (EVI-15), documented RPO/RTO (EVI-19) and the soak backup lane with final restore verification (SOA-11) close the wave.
 - [ ] **W8 · Tags core, memory budget**
-  - [ ] open lane
+  - [x] open lane
   - [x] → **TAG-9** Frame error classes in recovery
     *Closed 2026-11-05 (audit): #556 (2026-11-04). Recovery and fsck adopt series-key frames into their series, class a malformed/empty/duplicate SERIES_KEY after a passing CRC as suspect (C5), rebind mismatched keys (`series_rebound`), and settle every held row (`held_cleared`).*
   - [x] → **TAG-5** Tags core: series table, catalog, and the layout marker
@@ -301,10 +301,10 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     - [x] Log the `507 insufficient_storage` refusal once per transition into and out of refusing, not once per request: today every refused ingest logs at ERROR, so a client retrying against a full disk floods the log (the `weft_disk_guard_refusing` gauge already carries the state).
     - [x] Report the guard's state on `/ready` (a `disk_refusing` field, still `200`) so a balancer or ingest router can steer writes elsewhere while reads keep being served — VictoriaMetrics' `vmstorage` does exactly this: it switches to read-only below `-storage.minFreeDiskSpaceBytes` and `vminsert` re-routes data to the remaining nodes (https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/docs/victoriametrics/Cluster-VictoriaMetrics.md#readonly-mode).
     - [ ] ROB-18 phase 1: call `weftdb::DiskGuard::admit` with the reserved body size, so a request is refused `507` before its body is read (plan C11; the guard is public for it).
-  - [ ] maint lane
-  - [ ] read lane
+  - [x] maint lane
+  - [x] read lane
   - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
-  - [ ] **FRE-8b** Stored-value text and one float-input rule across every ingest format
+  - [x] **FRE-8b** Stored-value text and one float-input rule across every ingest format
   - [x] **FRE-9a** OpenAPI generated from the route table, committed, drift-checked in CI
     *Closed 2026-11-07 (#615): generated from the real `RouteTable` via
     `openapi::from_table`, wired as the `weft-server openapi` subcommand
@@ -318,7 +318,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     credential-in-query guard, proxy guard, exit status table, startup enforcement, and
     known limitations. `docs/upgrade-notes.md` already existed; `docs/config-schema.md`
     updated by a concurrent PR.
-  - [ ] **PAC-10** Publish the multi-arch image (only after API auth)
+  - [x] **PAC-10** Publish the multi-arch image (only after API auth)
   - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
   - [x] **EVI-17** Honesty pages II
   - [ ] Write or approve the honesty-page narrative *(owner)*
@@ -493,7 +493,7 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
   - **MVCC version store.** Every file opens in `journal_mode=experimental_mvcc`, which keeps row versions in memory until a checkpoint. Many files that are written often and checkpointed rarely would show the same slow climb.
   - **Fix direction:** a process-wide memory budget split across open databases, not a fixed size per file. A small default `cache_size` (a few MB) on every working connection, raised only for bulk loads. Close or idle out databases that are not in use. Checkpoint the MVCC store on a schedule. Also question why one aspect-heavy app needs 529 files (one per aspect × dictionary): consolidating them is the bigger lever.
   - **Test:** open N=500 stores, write to each at 1/min for a simulated day, and assert that RSS stays under a configured budget and does not grow with N × cache_size.
-- [ ] **Publish `weft-orchestration` to crates.io, or mark it `publish = false` and document path-dependency use (filed 2026-11-06).** Downstream users who mix a crates.io `weftdb` with a path `weft-orchestration` get two copies of `weftdb` and type mismatches. Confirm the crate's crates.io status first.
+- [x] **DONE (2026-11-10) — `weft-orchestration` is published, current at 0.3.2, verified through the crates.io sparse index (filed 2026-11-06).** `publish = false` would be a regression: it would withdraw a crate people already depend on. The remaining risk is the path/crates.io mixing hazard — two copies of `weftdb` in one binary, so the types do not unify — now documented in `weft-orchestration/README.md`: depend on **both** `weftdb` and `weft-orchestration` from crates.io, or vendor **both** by path, never one of each. `weft-physical-type`, `weft-reduce`, `weft-line-protocol` and `weft-arrow` sit at 0.3.0 while `weftdb`, `weft-arrow-store` and `weft-orchestration` are at 0.3.2; that lag is release hygiene, not a reason to unpublish.
 - [x] **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:**
   - *Audit 2026-10-27: checked — this is a historical note and its fix shipped: `[profile.test] debug = 1` is at Cargo.toml:128.*
 - [ ] **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):**

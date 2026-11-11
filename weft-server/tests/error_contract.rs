@@ -200,6 +200,45 @@ async fn a_successful_answer_is_left_alone() {
 	assert!(headers["x-request-id"].to_str().is_ok_and(|id| id.starts_with("req-")), "the header is still set on successes: {headers:?}");
 }
 
+#[test]
+fn the_disk_full_contract_is_documented_as_reachable() {
+	// [#656](https://github.com/basic-automation/weftdb/issues/656) was filed from the operator documentation rather than from the code: `operations.md` told an operator that `insufficient_storage` "is not yet raised by any code path" and that the server never checks free space, while the disk guard was by then refusing from three places and classifying an operating-system `ENOSPC` to the same code. A page that contradicts the advertised surface is a contract bug and not a typo — a client that believed it would never retry a refused write. Pin the section's claims, so the next change to the guard has to move the page with it.
+	let doc = std::fs::read_to_string(docs_path("operations.md")).expect("docs/operations.md is part of the repo");
+	let section = markdown_section(&doc, "### Disk full").expect("`## Failure modes` keeps a `### Disk full` section");
+	for promise in ["507", "insufficient_storage", "WEFT_DISK_RESERVE_BYTES", "headroom", "disk_refusing", "Idempotency-Key"] {
+		assert!(section.contains(promise), "the disk-full section no longer tells an operator about {promise}");
+	}
+	// The three sentences that made #656 true of the documentation and false of the server.
+	for stale in ["not yet raised", "no error code more specific", "monitor disk usage independently"] {
+		assert!(!section.contains(stale), "the disk-full section says {stale:?} again, which is the #656 staleness");
+	}
+}
+
+/// `<workspace>/docs/<name>`.
+fn docs_path(name: &str) -> std::path::PathBuf {
+	std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs").join(name)
+}
+
+/// The body under `heading`, up to the next heading at that level or above; [`None`]
+/// when the heading is gone, which is itself a contract change worth a failing test.
+fn markdown_section(doc: &str, heading: &str) -> Option<String> {
+	let level = heading.matches('#').count();
+	let mut body = String::new();
+	let mut started = false;
+	for line in doc.lines() {
+		if !started {
+			started = line.trim_end() == heading;
+			continue;
+		}
+		if line.starts_with('#') && line.matches('#').count() <= level {
+			break;
+		}
+		body.push_str(line);
+		body.push('\n');
+	}
+	started.then_some(body)
+}
+
 #[tokio::test]
 async fn an_empty_route_table_still_answers_the_root() {
 	// The fallback must not swallow the routes that do exist: `/ready` is the one a

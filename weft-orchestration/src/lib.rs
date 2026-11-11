@@ -185,8 +185,6 @@
 //! | [`detect_all_valleys`] | Finds all local minima |
 //! | [`detect_threshold_crossing_up`] | Detects upward threshold crossings |
 //! | [`detect_threshold_crossing_down`] | Detects downward threshold crossings |
-//! | [`detect_threshold_crossing_up_since`] / [`detect_threshold_crossing_down_since`] | The same, over the data from a start time on (live callers) |
-//! | `detect_*_since` (every detector) | The detector over `[since, latest]` only. Point-local detectors (threshold crossings, `detect_all_peaks`, `detect_all_valleys`) return exactly the full run's manifestations inside the window, apart from a peak or valley on the window's first sample, which needs the sample before it. Path-dependent ones (`detect_peaks`/`detect_valleys` global extremes, `detect_drawdown` running high, `detect_monthly_increase`) are evaluated over the window alone, so they answer "within this window", not "within all history". |
 //! | [`detect_drawdown`] | Detects significant price drops |
 //!
 //! ## Pipeline Persistence
@@ -455,7 +453,7 @@ mod test_support;
 // Re-export main Pipeline API
 // Re-export built-in detectors
 // Re-export compression types for convenience
-pub use detectors::{detect_all_peaks, detect_all_peaks_since, detect_all_valleys, detect_all_valleys_since, detect_drawdown, detect_drawdown_since, detect_monthly_increase, detect_monthly_increase_since, detect_peaks, detect_peaks_since, detect_threshold_crossing_down, detect_threshold_crossing_down_since, detect_threshold_crossing_up, detect_threshold_crossing_up_since, detect_valleys, detect_valleys_since};
+pub use detectors::{detect_all_peaks, detect_all_peaks_in_window, detect_all_valleys, detect_all_valleys_in_window, detect_drawdown, detect_drawdown_in_window, detect_monthly_increase, detect_monthly_increase_in_window, detect_peaks, detect_peaks_in_window, detect_threshold_crossing_down, detect_threshold_crossing_down_in_window, detect_threshold_crossing_up, detect_threshold_crossing_up_in_window, detect_valleys, detect_valleys_in_window};
 pub use pipeline::{DetectorId, DictionaryConfig, EventDetector, EventDetectorFn, Pipeline, PipelineBuilder, PipelineRunConfig, ProbabilityResult};
 pub use weftdb::compression::{AggressivenessScaling, CompressionConfig, CompressionResult, CompressionSummary, SizeBasedCompressionConfig, TimeBasedCompressionConfig};
 
@@ -661,13 +659,16 @@ pub static DEFAULT_ERROR_RATE: LazyLock<weftdb::Distance> = LazyLock::new(|| {
 	)
 });
 
-/// Each aspect's live signals, kept apart so that one pipeline's signals never reach
-/// another aspect's probability queries.
+/// Live prediction signals, one queue per aspect.
+///
+/// Keyed by aspect so pipelines over different aspects in one process never see each
+/// other's signals: [`create_signals`] and [`filter_expired_signals`] touch only their own
+/// aspect's queue, and [`signals_for`] copies out only that queue.
 static SIGNALS_QUEUE: LazyLock<Mutex<HashMap<AspectId, Signals>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Lock the signal queue of `aspect_id`.
-pub(crate) async fn aspect_signals(aspect_id: &AspectId) -> tokio::sync::MappedMutexGuard<'static, Signals> {
-	tokio::sync::MutexGuard::map(SIGNALS_QUEUE.lock().await, |queues| queues.entry(*aspect_id).or_default())
+/// A copy of `aspect_id`'s live signal queue (empty if it has none).
+pub(crate) async fn signals_for(aspect_id: &AspectId) -> Signals {
+	SIGNALS_QUEUE.lock().await.get(aspect_id).cloned().unwrap_or_default()
 }
 
 /// The manifestation id of a forward-looking signal: one per correlation and occurrence,
@@ -1202,11 +1203,8 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	Ok(())
 }
 
-// `queue` is the per-aspect signal guard, held across the whole insert loop on purpose.
-#[allow(clippy::significant_drop_tightening)]
-async fn process_correlation_signals(correlation: &weftdb::Correlation, events: &[weftdb::Event], aspect_id: &AspectId) -> Result<usize> {
+fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Correlation, events: &[weftdb::Event]) -> Result<usize> {
 	let mut signals_count = 0usize;
-	let mut queue = aspect_signals(aspect_id).await;
 
 	if let Some(event) = events.iter().find(|e| e.id() == correlation.event_id()) {
 		// For each manifestation of the event, create signals based on pattern occurrences
@@ -1235,7 +1233,7 @@ async fn process_correlation_signals(correlation: &weftdb::Correlation, events: 
 				for (signal_type, distance) in signal_types {
 					let manifestation_id = manifestation.id().clone();
 					let signal = Signal::new(correlation.id().clone(), manifestation_id, correlation.event_id().clone(), occurrence_end, signal_type, distance.clone());
-					queue.insert(signal);
+					signals.insert(signal);
 					signals_count += 1;
 				}
 			}
@@ -1267,7 +1265,7 @@ async fn process_correlation_signals(correlation: &weftdb::Correlation, events: 
 						let pattern_resolution = *occurrence.resolution();
 						let distance = weftdb::Distance::new(BigDecimal::from(pred_distance), pattern_resolution);
 						let signal = Signal::new(correlation.id().clone(), forward_manifestation_id(correlation.id(), occurrence_end), correlation.event_id().clone(), occurrence_end, SignalType::PredictStart, distance);
-						queue.insert(signal);
+						signals.insert(signal);
 						signals_count += 1;
 					}
 				}
@@ -1302,19 +1300,85 @@ pub async fn create_signals(database: &Database, aspect_id: &AspectId) -> Result
 
 	tracing::info!(correlations = correlations.len(), events = events.len(), "Creating signals");
 
+	let mut queue = SIGNALS_QUEUE.lock().await;
+	let signals = queue.entry(*aspect_id).or_default();
 	let mut signals_count = 0usize;
 	for correlation in &correlations {
-		signals_count += process_correlation_signals(correlation, &events, aspect_id).await?;
+		signals_count += process_correlation_signals(signals, correlation, &events)?;
 	}
+	drop(queue);
 
 	tracing::info!(signals_created = signals_count, "Signal creation completed");
 	Ok(())
+}
+
+/// Whether `aspect_id` has anything queued, checked without holding the lock
+/// across an await.
+async fn has_queued_signals(aspect_id: &AspectId) -> bool {
+	SIGNALS_QUEUE.lock().await.get(aspect_id).is_some_and(|signals| !signals.is_empty())
+}
+
+/// What the queue pass decided, applied to the database after the lock is released.
+struct QueueFilterOutcome {
+	initial_count: usize,
+	updated_correlations: Vec<weftdb::Correlation>,
+	removed_count: usize,
+	remaining_count: usize,
+}
+
+/// Expire this aspect's signals against the events and correlations handed in.
+///
+/// Synchronous on purpose: it runs under the `SIGNALS_QUEUE` guard, and a sync function
+/// cannot contain an await, so the guard provably never spans one. Both helpers it calls
+/// ([`collect_expired_signals`] and [`remove_expired_signals`]) are sync for the same reason.
+fn filter_queue_at(signals: &mut Signals, events: &[weftdb::Event], correlations: &[weftdb::Correlation], current_time: chrono::DateTime<chrono::Utc>) -> QueueFilterOutcome {
+	let initial_count = signals.len();
+	tracing::info!(query_time = %current_time.format("%Y-%m-%d %H:%M:%S"), "Starting filter_expired_signals");
+	tracing::debug!(total_signals = initial_count, "Filtering expired signals");
+
+	// Debug: show sample signals before filtering
+	for (idx, sig) in signals.values().take(5).enumerate() {
+		tracing::debug!(
+			index = idx,
+			manifestation_date = %sig.manifestation_date(),
+			distance_value = %sig.distance().value(),
+			distance_units = ?sig.distance().units(),
+			signal_type = ?sig.signal_type(),
+			"Sample signal before filtering"
+		);
+	}
+
+	tracing::debug!(events = events.len(), correlations = correlations.len(), "Found events and correlations");
+
+	let (signals_to_remove, expired_historical, expired_forward) = collect_expired_signals(signals, events, correlations, current_time);
+	tracing::debug!(total = signals_to_remove.len(), historical = expired_historical, forward_looking = expired_forward, "Removing expired signals");
+
+	let (updated_correlations, removed_count) = remove_expired_signals(signals, correlations, signals_to_remove);
+	tracing::debug!(unique_correlations = updated_correlations.len(), "Corrections to write after the lock is released");
+
+	QueueFilterOutcome { initial_count, updated_correlations, removed_count, remaining_count: signals.len() }
 }
 
 /// Filters out expired signals based on event resolution times at a specific time.
 ///
 /// This is the implementation function for `filter_expired_signals` that allows
 /// specifying a custom current time (useful for testing).
+///
+/// # Concurrency
+///
+/// The queue lock is never held across an await: the database reads happen before it is
+/// taken and the correlation writes after it is released, with the whole guarded pass in
+/// the synchronous `filter_queue_at` pass. So a pipeline over one aspect cannot stall a pipeline
+/// over another on this lock while either waits on database I/O.
+///
+/// Two consequences of reading outside the lock, both benign and both in the same
+/// direction — a signal survives to the next call rather than being judged on a mix:
+/// a signal created after the early check but before the pass is filtered normally
+/// against the reads taken above, and a signal whose resolving event was written after
+/// those reads is not expired by this pass. A concurrent pass over the same aspect can
+/// collect the same expired signal before either pass removes it; the write is then
+/// performed twice with the same value, which is what [`Signals::remove_with_error_correction`]
+/// already produces for repeated corrections of one correlation.
 ///
 /// # Errors
 ///
@@ -1326,56 +1390,37 @@ pub async fn filter_expired_signals(database: &Database, aspect_id: &AspectId, c
 	use chrono::Utc;
 
 	let current_time = current_time.unwrap_or_else(Utc::now);
-	let mut signals_lock = aspect_signals(aspect_id).await;
 
-	if signals_lock.is_empty() {
+	// An aspect with nothing queued costs no database reads. The guard is taken and
+	// released inside the helper, so nothing below runs under it.
+	if !has_queued_signals(aspect_id).await {
 		tracing::debug!("No signals found to filter");
 		return Ok(());
 	}
 
-	let initial_count = signals_lock.len();
-	tracing::info!(query_time = %current_time.format("%Y-%m-%d %H:%M:%S"), "Starting filter_expired_signals");
-	tracing::debug!(total_signals = initial_count, "Filtering expired signals");
-
-	// Debug: show sample signals before filtering
-	let sample_signals: Vec<_> = signals_lock.values().take(5).collect();
-	for (idx, sig) in sample_signals.iter().enumerate() {
-		tracing::debug!(
-			index = idx,
-			manifestation_date = %sig.manifestation_date(),
-			distance_value = %sig.distance().value(),
-			distance_units = ?sig.distance().units(),
-			signal_type = ?sig.signal_type(),
-			"Sample signal before filtering"
-		);
-	}
-
-	// Get events and correlations once to avoid database locks during processing
 	let events: Vec<weftdb::Event> = Outputs::get_unprocessed_events(database, aspect_id).await?.try_collect().await?;
 	let correlations: Vec<weftdb::Correlation> = Outputs::get_correlations(database, aspect_id).await?.try_collect().await?;
 
-	tracing::debug!(events = events.len(), correlations = correlations.len(), "Found events and correlations");
+	let outcome = {
+		let mut queue = SIGNALS_QUEUE.lock().await;
+		let Some(signals) = queue.get_mut(aspect_id) else {
+			tracing::debug!("No signals found to filter");
+			return Ok(());
+		};
+		let outcome = filter_queue_at(signals, &events, &correlations, current_time);
+		// Drop the per-aspect entry when empty so the map does not grow
+		// one empty queue per aspect forever.
+		if outcome.remaining_count == 0 {
+			queue.remove(aspect_id);
+		}
+		outcome
+	}; // guard released here; every await below this point is unguarded
 
-	let (signals_to_remove, expired_historical, expired_forward) = collect_expired_signals(&signals_lock, &events, &correlations, current_time);
-
-	// Correlations loaded from database, no lock to release
-
-	tracing::debug!(total = signals_to_remove.len(), historical = expired_historical, forward_looking = expired_forward, "Removing expired signals");
-
-	// Remove expired signals with error correction
-	// Use a HashMap to track correlations by ID so we only update each once
-	let (unique_correlations, removed_count) = remove_expired_signals(&mut signals_lock, &correlations, signals_to_remove);
-	tracing::debug!(unique_correlations = unique_correlations.len(), "Updating modified correlations");
-	for correlation in unique_correlations {
-		database.update_correlation(aspect_id, &correlation).await?;
+	for correlation in &outcome.updated_correlations {
+		database.update_correlation(aspect_id, correlation).await?;
 	}
 
-	let remaining_count = signals_lock.len();
-
-	// Release locks
-	drop(signals_lock);
-
-	tracing::info!(removed = removed_count, remaining = remaining_count, initial = initial_count, "Filtered expired signals");
+	tracing::info!(removed = outcome.removed_count, remaining = outcome.remaining_count, initial = outcome.initial_count, "Filtered expired signals");
 
 	Ok(())
 }
@@ -1570,7 +1615,7 @@ mod tests {
 			tracing::info!(elapsed = ?timer.elapsed(), "Time taken for create_signals");
 
 			// print the number of signals created
-			let signals_lock = aspect_signals(&aspect.id()).await;
+			let signals_lock = signals_for(&aspect.id()).await;
 			tracing::info!(count = signals_lock.len(), "Number of signals created");
 			drop(signals_lock);
 
@@ -1583,7 +1628,7 @@ mod tests {
 			tracing::info!(elapsed = ?timer.elapsed(), "Time taken for filter_expired_signals");
 
 			// print the number of signals after filtering
-			let signals_lock = aspect_signals(&aspect.id()).await;
+			let signals_lock = signals_for(&aspect.id()).await;
 			tracing::info!(count = signals_lock.len(), "Number of signals after filtering");
 
 			// print a random signal probability for verification
@@ -1976,7 +2021,7 @@ mod tests {
 			tracing::info!(elapsed = ?timer.elapsed(), "Time taken for create_signals");
 
 			// print the number of signals created
-			let signals_lock = aspect_signals(&aspect_id).await;
+			let signals_lock = signals_for(&aspect_id).await;
 			tracing::info!(count = signals_lock.len(), "Number of signals created");
 			drop(signals_lock);
 
@@ -1989,7 +2034,7 @@ mod tests {
 			tracing::debug!(last_known_time = %last_known_time, "Filtering expired signals up to last known time");
 			filter_expired_signals(&db, &aspect_id, Some(last_known_time)).await?;
 
-			let signals_lock = aspect_signals(&aspect_id).await;
+			let signals_lock = signals_for(&aspect_id).await;
 			tracing::info!(count = signals_lock.len(), "Number of signals after filtering");
 			// Debug: show sample signals AFTER filtering to understand what remains
 			for (idx, sig) in signals_lock.values().take(5).enumerate() {
@@ -2016,7 +2061,7 @@ mod tests {
 					// E.g., at hour 69 (8 hours after peak at 61), prob = 8hr/4hr = 2.0
 
 					// print the number of signals
-					let signals_lock = aspect_signals(&aspect_id).await;
+					let signals_lock = signals_for(&aspect_id).await;
 					tracing::debug!(hour = hour, count = signals_lock.len(), "Number of signals for hour");
 
 					let Some(sum_probability) = signals_lock.probability_sum(&event_id, &signal_type, query_time, &db, &aspect_id).await? else {
@@ -2833,27 +2878,118 @@ mod tests {
 		remove_database(&db_name);
 		Ok(())
 	}
+
+	/// Interleaved `filter_expired_signals` calls on the same aspect must complete,
+	/// must drain the queue, and must not lose or resurrect a signal.
+	///
+	/// Regression guard for the shape of the critical section. The queue lock used to be
+	/// held while the function awaited its database reads and writes, so a second call —
+	/// for this aspect or any other — could not enter the pass until that I/O finished.
+	/// The pass is synchronous now, so nothing runs under the guard across an await. This
+	/// pins the behaviour the restructure must preserve; it is not a deadlock reproducer,
+	/// because the async mutex serialised the old callers rather than deadlocking them.
+	#[tokio::test]
+	async fn concurrent_filter_expired_signals_drains_the_queue_without_blocking() -> Result<()> {
+		let db_name = format!("filter_concurrent_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let aspect = db.track_aspect(&subject.id(), "a", &Resolution::Seconds, None).await?.id();
+
+		// Insert an event and a correlation so the DB reads in filter_expired_signals
+		// return at least one of each (otherwise the function short-circuits).
+		let dataset_id = db.get_database_info().await?.id().as_uuid();
+		let start = Utc::now() - chrono::Duration::hours(24);
+		let end = Utc::now() - chrono::Duration::hours(23);
+		let mut event = Event::new(None, "test-event".into(), None, None);
+		event.add_manifestation(Manifestation::new(dataset_id, start, end));
+		Inputs::insert_unprocessed_event(&db, &aspect, &event).await?;
+
+		let correlation = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: weftdb::DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id: subject.id(), aspect_id: aspect, pattern_id: weftdb::PatternID::from_uuid(uuid::Uuid::new_v4()), event_id: event.id().clone() }, HashMap::new(), vec![], Some(weftdb::Distance::new(BigDecimal::from(1), Resolution::Hours)));
+		Inputs::insert_correlation(&db, &aspect, &correlation).await?;
+
+		// Lock signals queue, insert signals that are already expired (past their prediction point).
+		// Both filter_expired_signals calls will try to remove them.
+		{
+			let mut queue = SIGNALS_QUEUE.lock().await;
+			let signals = queue.entry(aspect).or_default();
+			// Past-expiration signal
+			signals.insert(Signal::new(correlation.id().clone(), weftdb::ManifestationId::new(), event.id().clone(), start - chrono::Duration::hours(48), SignalType::PredictStart, weftdb::Distance::new(BigDecimal::from(1), Resolution::Hours)));
+			signals.insert(Signal::new(correlation.id().clone(), weftdb::ManifestationId::new(), event.id().clone(), start - chrono::Duration::hours(48), SignalType::PredictEnd, weftdb::Distance::new(BigDecimal::from(1), Resolution::Hours)));
+			drop(queue);
+		}
+		drop(correlation);
+		drop(subject);
+
+		// Concurrent calls on the same aspect: both contend for one queue entry.
+		let db1 = db.clone();
+		let handle1: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move { filter_expired_signals(&db1, &aspect, Some(Utc::now())).await });
+
+		let db2 = db.clone();
+		let handle2: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move { filter_expired_signals(&db2, &aspect, Some(Utc::now())).await });
+
+		tokio::time::timeout(std::time::Duration::from_secs(30), async {
+			handle1.await.expect("task 1 panicked")?;
+			handle2.await.expect("task 2 panicked")?;
+			Ok::<_, anyhow::Error>(())
+		})
+		.await
+		.map_err(|_| anyhow::anyhow!("concurrent filter_expired_signals stalled (timeout)"))??;
+
+		// After both calls return, the queue for this aspect should be empty
+		// (both signals were expired and removed).
+		let remaining = signals_for(&aspect).await;
+		assert!(remaining.is_empty(), "expected empty signals queue, got {} signals", remaining.len());
+
+		SIGNALS_QUEUE.lock().await.remove(&aspect);
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// Two pipelines in one process keep their own signals: a signal queued for one aspect
+	/// never reaches another aspect's pipeline, and creating, filtering or reading another
+	/// aspect's signals leaves it where it is.
+	#[tokio::test]
+	async fn signals_are_isolated_per_aspect() -> Result<()> {
+		let db_name = format!("signals_per_aspect_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let aspect_a = db.track_aspect(&subject.id(), "a", &Resolution::Seconds, None).await?.id();
+		let aspect_b = db.track_aspect(&subject.id(), "b", &Resolution::Seconds, None).await?.id();
+
+		let signal = Signal::new(weftdb::CorrelationID::new(), weftdb::ManifestationId::new(), weftdb::EventID::new(), Utc::now(), SignalType::PredictStart, weftdb::Distance::new(BigDecimal::from(5), Resolution::Seconds));
+		SIGNALS_QUEUE.lock().await.entry(aspect_a).or_default().insert(signal);
+
+		assert_eq!(signals_for(&aspect_a).await.len(), 1);
+		assert!(signals_for(&aspect_b).await.is_empty(), "aspect b must not see aspect a's signal");
+
+		// Creating and filtering b's signals touches only b's queue.
+		create_signals(&db, &aspect_b).await?;
+		filter_expired_signals(&db, &aspect_b, Some(Utc::now())).await?;
+		assert_eq!(signals_for(&aspect_a).await.len(), 1, "work on aspect b must leave aspect a's queue alone");
+
+		// A pipeline over b copies out b's signals only.
+		let mut pipeline_b = crate::pipeline::Pipeline::load_or_create(db.clone(), &aspect_b).await?;
+		pipeline_b.generate_signals().await?;
+		assert!(pipeline_b.signals().is_empty(), "pipeline b picked up {} foreign signal(s)", pipeline_b.signals().len());
+		assert_eq!(signals_for(&aspect_a).await.len(), 1);
+
+		SIGNALS_QUEUE.lock().await.remove(&aspect_a);
+		drop(pipeline_b);
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
 }
 
 #[cfg(test)]
 mod signal_queue_tests {
-	use bigdecimal::BigDecimal;
 	use chrono::{TimeZone, Utc};
-	use weftdb::{AspectId, CorrelationID, Distance, EventID, ManifestationId, Signal, SignalType};
+	use weftdb::CorrelationID;
 
-	use super::{aspect_signals, forward_manifestation_id};
-
-	/// **Regression (fan-controller build, 2026-11-06):** two pipelines in one process shared
-	/// one signal queue, so one sensor's signals reached another's probability queries.
-	#[tokio::test]
-	async fn each_aspect_has_its_own_signal_queue() {
-		let (first, second) = (AspectId::new(), AspectId::new());
-		let at = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
-		let signal = Signal::new(CorrelationID::new(), ManifestationId::new(), EventID::new(), at, SignalType::PredictStart, Distance::new(BigDecimal::from(5), splimes::Resolution::Minutes));
-		aspect_signals(&first).await.insert(signal);
-		assert_eq!(aspect_signals(&first).await.len(), 1);
-		assert!(aspect_signals(&second).await.is_empty(), "the other aspect's queue holds none of the first aspect's signals");
-	}
+	use super::forward_manifestation_id;
 
 	/// A forward signal re-created by a later run replaces itself instead of adding a copy.
 	#[test]

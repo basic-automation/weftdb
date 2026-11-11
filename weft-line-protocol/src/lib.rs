@@ -38,7 +38,7 @@
 #![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bigdecimal::{BigDecimal, FromPrimitive};
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::Point;
 
@@ -103,12 +103,17 @@ impl FieldValue {
 	/// The numeric value as a [`BigDecimal`], or `None` for non-numeric fields
 	/// (booleans and strings).
 	///
+	/// A `Float` enters as its shortest round-trip decimal (decision 11,
+	/// FRE-8b — [`weft_physical_type::decimal_from_f64`], the one float-input
+	/// rule every ingest format shares), not as the exact binary expansion
+	/// `BigDecimal::from_f64` would give.
+	///
 	/// `Float`s that are NaN or infinite yield `None`, since they cannot be
 	/// represented as a finite decimal measurement.
 	#[must_use]
 	pub fn as_big_decimal(&self) -> Option<BigDecimal> {
 		match self {
-			Self::Float(f) => BigDecimal::from_f64(*f),
+			Self::Float(f) => weft_physical_type::decimal_from_f64(*f),
 			Self::Integer(i) => Some(BigDecimal::from(*i)),
 			Self::Unsigned(u) => Some(BigDecimal::from(*u)),
 			Self::Boolean(_) | Self::Str(_) => None,
@@ -494,7 +499,13 @@ fn unescape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+	use std::str::FromStr;
+
 	use super::*;
+
+	fn bd(s: &str) -> BigDecimal {
+		BigDecimal::from_str(s).expect("test literal parses")
+	}
 
 	#[test]
 	fn parses_a_full_line_with_tags_fields_and_timestamp() {
@@ -589,8 +600,27 @@ mod tests {
 		let points = parse_points(input, "load", TimestampPrecision::Nanoseconds).expect("parse");
 		assert_eq!(points.len(), 2);
 		assert!(points[0].timestamp < points[1].timestamp);
-		assert_eq!(points[0].value, BigDecimal::from_f64(0.1).unwrap());
-		assert_eq!(points[1].value, BigDecimal::from_f64(0.9).unwrap());
+		assert_eq!(points[0].value, bd("0.1"));
+		assert_eq!(points[1].value, bd("0.9"));
+	}
+
+	#[test]
+	fn float_fields_enter_as_their_shortest_round_trip_decimal() {
+		// Decision 11 (FRE-8b): an ILP float field becomes the decimal the
+		// sender wrote, not the exact binary expansion of the parsed f64 —
+		// so `load=0.1` stores the same value a JSON or CSV `0.1` stores.
+		assert_eq!(FieldValue::Float(0.1).as_big_decimal(), Some(bd("0.1")));
+		assert_eq!(FieldValue::Float(99.92).as_big_decimal(), Some(bd("99.92")));
+		// The smallest subnormal enters as `5e-324` (325 plain digits, inside
+		// the one decimal domain); its exact expansion needs 1,075 and the
+		// ROB-6 domain check downstream would have refused the line.
+		let smallest = FieldValue::Float(5e-324).as_big_decimal().expect("finite");
+		assert_eq!(smallest, bd("5e-324"));
+		assert!(weft_physical_type::check_decimal_domain(&smallest).is_ok());
+		// Non-finite floats still have no decimal form (ROB-7 refuses the
+		// line before this projection runs).
+		assert_eq!(FieldValue::Float(f64::NAN).as_big_decimal(), None);
+		assert_eq!(FieldValue::Float(f64::INFINITY).as_big_decimal(), None);
 	}
 
 	#[test]
@@ -623,8 +653,8 @@ mod tests {
 		let input = concat!("cpu,host=a,region=us load=0.2 2000000000\n", "cpu,region=us,host=a load=0.1 1000000000\n");
 		let points = parse_points(input, "load", TimestampPrecision::Nanoseconds).expect("one series, reordered tags");
 		assert_eq!(points.len(), 2);
-		assert_eq!(points[0].value, BigDecimal::from_f64(0.1).unwrap());
-		assert_eq!(points[1].value, BigDecimal::from_f64(0.2).unwrap());
+		assert_eq!(points[0].value, bd("0.1"));
+		assert_eq!(points[1].value, bd("0.2"));
 	}
 
 	#[test]
@@ -635,8 +665,8 @@ mod tests {
 		let input = concat!("cpu,host=a load=0.1 1000000000\n", "cpu,host=b other=5i 2000000000\n", "mem,host=b load=0.9\n", "cpu,host=a load=0.3 3000000000\n");
 		let points = parse_points(input, "load", TimestampPrecision::Nanoseconds).expect("only host=a contributes");
 		assert_eq!(points.len(), 2);
-		assert_eq!(points[0].value, BigDecimal::from_f64(0.1).unwrap());
-		assert_eq!(points[1].value, BigDecimal::from_f64(0.3).unwrap());
+		assert_eq!(points[0].value, bd("0.1"));
+		assert_eq!(points[1].value, bd("0.3"));
 	}
 
 	#[test]

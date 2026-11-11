@@ -4,6 +4,33 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-10 — `weft-orchestration` stays published; the residue is documentation and one stale member (REL-496)
+
+**The item offered two options — publish `weft-orchestration` or mark it `publish = false` —
+and the tree had already chosen publishing.** The crates.io sparse index
+(`https://index.crates.io/we/ft/<name>`) lists `weft-orchestration` at `0.2.0, 0.3.0, 0.3.1,
+0.3.2`, current with the workspace manifest (`weft-orchestration/Cargo.toml:3` is `0.3.2`);
+the manifest sets no `publish = false`, unlike `weft-server`, `weft-tui`, `weft-bench`,
+`weft-xbench`. `scripts/publish.sh` publishes the non-`publish = false` members in dependency
+order, skipping versions already on the registry, so `weft-orchestration` publishes on every
+release. Marking it `publish = false` now would withdraw a crate people already depend on —
+a regression.
+
+**Chosen: keep publishing; close the item with documentation.** The real hazard the item
+named survives the status check: a consumer who mixes a crates.io `weftdb` with a path
+`weft-orchestration` gets two copies of `weftdb` and the types do not unify. The rule is
+now in `weft-orchestration/README.md` (depend on both from crates.io, or vendor both by
+path). The mechanics check out: the root workspace declares `weftdb = { path = "./weftdb",
+version = "0.3.2" }` (Cargo.toml:100), so the published `weft-orchestration` resolves the
+registry version. `weft-physical-type`, `weft-reduce`, `weft-line-protocol` and `weft-arrow`
+sit at 0.3.0 while `weftdb`, `weft-arrow-store` and `weft-orchestration` are at 0.3.2; that lag is
+release hygiene, not a reason to unpublish anything.
+
+**Evidence and the 403 trap.** Verified 2026-11-10 through the sparse index, which is what
+cargo itself resolves from. `crates.io/api/v1` answers 403 to unauthenticated callers on
+this host, and that alone made one earlier agent conclude nothing was published — an absence
+in a workflow run is likewise not proof of absence.
+
 ## 2026-11-08 — Pagination cursor v1: selector hash, high-water mark, fingerprint, nullable total (ROB-15, #449)
 
 **The cursor v1 token is 66 hex characters: `01` + selector SHA-256 prefix (16) + high-water mark (16) + data fingerprint (16) + next-page offset (16).**
@@ -6133,3 +6160,376 @@ column (`ColumnLengthMismatch`, Integrity). No sidecar mutant panicked.
 generate at will); a `catch_unwind` in `weft-server`'s handler (C12's "no handler catches its
 own panics" is about exactly that); waiting for upstream (the fix belongs upstream too, and
 is filed as a to-do for the owner, but the boundary has to hold whatever version is pinned).
+
+## 2026-11-10 — Rollback and binary compatibility: unsupported for 1.0 (FRE-16)
+
+**Rollback-after-writes and binary-compatibility legs are explicitly unsupported for 1.0.
+They are removed from `compat/releases.toml` and the `LEGS` constant.**
+
+The brief for FRE-16 decided this: rollback-after-writes is not a 1.0 promise because a
+store written by the current layout is not readable by older binaries (`docs/stability.md`
+already said this). The `rollback` and `binary` legs in `compat/releases.toml` were
+fiction — declared pins with no test runners, and `docs/stability.md` admitted at two
+places that nothing executes them. The new gate (`scripts/compat/test_leg_coverage.py`)
+refuses to let a pin declare a leg that has no test runner, so the fiction had to become
+honest.
+
+**Considered and rejected:** marking the legs `unsupported` in the TOML rather than
+removing them, with the gate checking `supported`/`unsupported` states. That would add
+a new field and a new concept to a file with a single release pin, with no second user
+before 1.0. Simpler to drop the non-existent legs; they can be re-added with a runner
+when someone implements them.
+
+**Boundary:** the `upgrade` leg is the only leg with a real test
+(`weftdb/tests/compat_v010.rs`). The gate treats it as implemented.
+
+**Documents updated:** `compat/releases.toml`, `scripts/compat/releases.py`,
+`docs/stability.md`, `UPGRADING.md`, `CHANGELOG.md`.
+## 2026-11-10 — Per-aspect signal queue: a synchronous guarded pass, not a pure-function refactor (ORCH-SIG #402)
+
+**Ambiguous:** the review BLOCK said the `SIGNALS_QUEUE` guard was held across `.await`s. Two fixes were
+available: split `remove_expired_signals` into a pure decision function so the whole pass is functional
+and stateless, or keep its shape and make the guarded region a synchronous function.
+
+**Chosen: the synchronous guarded pass.** `remove_expired_signals` calls fallible
+`process_correlation_signals` per correlation, so a pure split has to thread
+`Result<(Vec<Correlation>, usize)>` out of the filter and back through its callers — a wider diff for no
+additional safety. The property the review asked for is narrow: no guard may cross an await. A plain
+`fn filter_queue_at(&mut Signals, &[Event], &[Correlation], DateTime<Utc>) -> QueueFilterOutcome` cannot
+await at all, so the property is enforced by the type system rather than by a comment warning the next
+editor. **Cost:** the database reads happen before the lock and the `update_correlation` writes after it,
+so a concurrent pass can observe a queue that is already updated but correlations that are not yet — the
+queue is the authority on what is still pending, and a re-run re-derives the same expired set from the
+correlations it reads.
+
+**Chosen: name the new test for what it proves.** `concurrent_filter_expired_signals_drains_the_queue_without_blocking`
+pins the shape of the critical section. It is not a deadlock reproducer — the async mutex serialised the
+old callers rather than deadlocking them — and its doc says so, because a test named "no_deadlock" that
+would also pass before the fix misinforms the next reader.
+
+## 2026-11-10 — FRE-8b: the one float-input rule lives in weft-physical-type (FOR MERGE REVIEW)
+
+**Spec:** 1.0 plan §6 W8 + §2 L-FMT (lib.rs order: TAG-1 → ROB-6 → FRE-8b) +
+Appendix A decision 11 ("ILP and Parquet float inputs enter as their shortest
+round-trip decimal") + ROADMAP line 307. Closes #313.
+
+**What was still open.** Decision 11's non-finite half landed with ROB-7 (400
+in every format); its shortest-round-trip half had landed only for the JSON
+compute endpoints (weft-server's `widen_json_value`) and, for JSON ingest,
+trivially (values enter as the sender's text through `parse_decimal`). The two
+binary float lifts still widened with `BigDecimal::from_f64`/`from_f32` — the
+exact binary expansion: an ILP or Parquet `0.1` stored
+`0.1000000000000000055511151231257827021181583404541015625` where a JSON or
+CSV `0.1` stored `0.1`. Same number sent, different stored value per format —
+and, per the ROB-6 entry, an exact-expansion subnormal's 1,075-digit plain
+form fell outside the one decimal domain, so the smallest subnormal was
+refused as an ILP float field while its written form `5e-324` (325 digits) is
+well inside it.
+
+**The rule now has one home.** `weft_physical_type::decimal_from_f64` /
+`decimal_from_f32` sit beside `parse_decimal` in weft-physical-type's lib.rs —
+the L-FMT file the plan assigns to this slice — and both remaining lifts call
+them: `FieldValue::as_big_decimal` (weft-line-protocol, which gains a
+dependency on weft-physical-type; the layering already runs that way in
+weft-arrow) and the `Float64`/`Float32` arms of
+`weft_arrow::record_batch_to_columns`. The construction mirrors
+`widen_json_value` (read the `{:e}` shortest text as digits + exponent;
+integral values land at scale 0), so the compute endpoints and the ingest
+lifts cannot drift apart in shape. An f32 enters as the *f32's* shortest form
+(`0.1`), not the shortest form of its f64 widening (`0.10000000149011612`):
+decision 11 judges a decimal against "its nearest float", and an f32 input's
+nearest float is the f32.
+
+**Deliberately unchanged: `PhysicalValue::to_logical`.** It still reconstructs
+an F64/F32 physical value by exact expansion. It is not an input boundary —
+it is the decode `PhysicalType::encode` measures `Exactness` against, and the
+crate's founding rule is that loss is never silent: judging encode(0.1 → F64)
+against the shortest form would report `Exact` for a frame that holds the
+nearest f64, not `0.1`. What changes at read-back is only the Arrow lift
+above: an exported F64 segment re-enters through `record_batch_to_columns`,
+which is an ingest-shaped boundary, so a re-seal no longer inflates values
+into their expansions.
+
+**Consequence worth naming:** the smallest subnormal (and its kin) is now
+*accepted* as an ILP float field and a Parquet float cell, entering as
+`5e-324`; before, the ILP path refused it downstream at the ROB-6 domain
+check. That is decision 11 operating as written — the written form is the
+input — not a loosening of the domain, which still bounds every stored
+value's plain form at 1,024 digits.
+
+## 2026-11-10 — ROB-18: the two-phase `IngestBody` — what reserves, what the deadline bounds, what the top-up weighs (FLAGGED FOR MERGE REVIEW)
+
+**Grounded:** plan C11 fixes the shape — ROB-18's two-phase `IngestBody` (reserve, total
+deadline, top-up to decoded weight) becomes D-S14's extractor in W9, and disk refusal (507)
+runs in phase 1 via ROB-17's `DiskGuard`, whose own entry anticipated this ("ROB-18's
+request-level check is left to call the same `DiskGuard::admit`"). The code table already
+carried `408 body_timeout` with no producer. The points the sources do not pin, chosen here:
+
+1. **The reservation is the declared length, or the cap when none is declared.** Phase 1
+   runs in the extractor, before a body byte is read: a `Content-Length` over
+   `WEFT_MAX_INGEST_BYTES` is refused `413 payload_too_large` with the limit up front, and
+   `store.disk_guard().admit(disk_space_at(store.root()), reserved)` must pass or the
+   answer is `507 insufficient_storage` and the body is never read. An undeclared (chunked)
+   body reserves the cap itself — the most it may arrive as — so a sender cannot dodge the
+   disk check by not declaring. The refusal is answered exactly as the store's seal-time
+   refusal is (`server_logged_elsewhere`, ROB-17's transition logging untouched); the
+   store's own seal-time guard still runs on the frame actually written, so phase 1 is the
+   early refusal C11 asks for, not a replacement check.
+2. **The deadline is one total clock on the read, `WEFT_INGEST_BODY_TIMEOUT_SECS`
+   (Tuning, default 300 s), refused as `408 body_timeout`.** Not a per-chunk idle bound:
+   SEC-4's keep-alive deadline already closes a connection that makes no progress, so an
+   idle bound here would duplicate it; the gap was a sender dripping bytes steadily
+   enough to keep the connection alive while holding its phase-1 reservation and its gate
+   charge without bound. 300 s is a judgement number (a maximum-size body still arrives
+   over a sub-1 MB/s link), reversible at merge review. It joins the VarSpec registry
+   (104 → 105) and the strict-config positive-integer list, read once at startup through
+   `IngestConfig` like its siblings, zero refused at startup.
+3. **The top-up re-admits at the decoded weight, against the same guard.** After each
+   format's decode and ROB-7's caps pass, the handler calls
+   `IngestBody::top_up_to_decoded(store, decoded_column_bytes(..))`: a decoded weight at
+   or under the reservation asks nothing again; a larger one must be admitted by
+   `DiskGuard` for the full decoded weight — the write the seal will make — or the request
+   is refused `507` before anything is sealed. Parquet is the case that matters (its body
+   size says nothing about its expansion); the check runs on all four formats so the rule
+   has no format-shaped hole.
+4. **The gate's charge does not move.** D-S14/ROB-10's byte-weighted admission stays in
+   the gate, keyed on `Content-Length`, permit held by the gate future (the ROB-10 fix).
+   The extractor's reservation is a different thing — it prices the *write* against the
+   disk, where the gate prices the request's *time in flight* against memory — so the two
+   coexist rather than the extractor taking over the charge C10 puts inside the gate.
+   `StrictJson`'s two route-level refusals move into the JSON handler unchanged in code
+   and status (non-JSON content type `415`, unparseable document `400 invalid_json`);
+   `StrictText`'s UTF-8 refusal is `IngestBody::text`. `Strict*` themselves stay in
+   error.rs for the routes that still use them.
+
+**Rejected:** moving the in-flight charge into the extractor (it would reopen the
+permit-lifetime defect ROB-10 fixed, and C10 fixes admission inside the gate); reserving
+only the declared length with no cap fallback for chunked bodies (an undeclared body
+could then write a full-cap frame against an unchecked disk); a per-chunk idle deadline
+(duplicates SEC-4's keep-alive bound and still lets a steady drip hold a reservation for
+the sum of the chunks).
+
+## 2026-11-10 — Three small honesty calls while clearing the wave's gates (#656, #676, #681, README)
+
+**Adding a configuration variable does not bump `schema_version`.** #681 registered
+`WEFT_INGEST_BODY_TIMEOUT_SECS` in `weft-server/src/settings.rs` and documented it in
+`docs/reference.md`, but not in `docs/config-schema.md`, so the `claims registry` gate refused the
+branch. Adding the row raised the section's prose count 42 -> 43 and left `schema_version` at 2, in
+`docs/config-schema.md` and `config/schema.toml` together. **Why:** only two commits have ever touched
+`config/schema.toml`, and the ROB-19 variable additions (`129ac669`, two Tuning variables) did not
+bump it — the version tracks structural and breaking change in the schema itself, not the population
+of a tier. **Cost:** the document's "How this version changes" table now omits three variables
+(`WEFT_MAINTENANCE_BREAKER_FAILURES`, `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`,
+`WEFT_INGEST_BODY_TIMEOUT_SECS`). Filling it in at the 1.0 schema bump is the follow-up; nothing
+checks it mechanically, which is why it drifted.
+
+**#656 is half closed, and the half that remains is a test.** The issue reported
+`Code::InsufficientStorage` (507) in the error table and the OpenAPI surface with no construction
+site, so the advertised contract promised a status no client could receive. #681 supplies exactly the
+issue's first option: `weft-server/src/ingest.rs:401` maps the phase-1 `DiskGuard::admit` refusal to
+`Code::InsufficientStorage`, with `weft-server/src/ingest.rs:2434` asserting the wire code. What #681
+does *not* do is write to a genuinely full filesystem — it injects the space figure. **Chosen:**
+comment on #656 that the contract mismatch closes with #681 and narrow the issue to the ENOSPC
+crash-matrix test, rather than closing it and re-opening the same work under a new number. **Rejected:**
+closing #656 outright — the honest remaining scope is real and would have been lost.
+
+**The README status table gets today's facts, not the 1.0 story.** `README.md:192-207` still announced
+"v0.2.1 is pre-beta" and "Tags, client SDKs, Helm chart — Not started" while 0.3.2 was released
+(2026-11-06) and `clients/python` and `clients/r` were in the tree. `ROADMAP.md:233` and **EVI-22**
+(`ROADMAP.md:435`) assign that table and the `pre-beta` badge to 1.0. **Chosen:** a partial slice that
+corrects each row to what a file in the tree proves, keeps the pre-1.0 upgrade caveats, and does not
+tick either roadmap box or touch the badge. **Why:** a stale table understates the product and a
+table that claims 1.0 before the tag exists overstates it; the second is the worse error, so the 1.0
+wording waits for the release. **Consequence:** EVI-22 shrinks to the badge, the version lines and a
+re-check of the same rows at tag time.
+
+**A conflict in the decision log is resolved by keeping both entries.** #676 was `CONFLICTING` with
+main and the only conflicted file was this log: ours added the SOAK-SCHEMA entry, main had gained the
+FRE-16, ORCH-SIG and FRE-8b entries since the branch was cut. **Chosen:** `git merge origin/main`
+(never a rebase — the standing decision of 2026-11-09 says a near-green PR is not rebased, and this
+one had a real conflict, which is the exception), keeping main's block first and appending ours,
+because the log is append-only and neither entry supersedes the other. **Cost:** a merge commit in a
+branch that will squash-merge, and one re-run of the full check set for a prose conflict.
+
+## 2026-11-10 — Soak schema drift: refuse in the precedent's shape, not with a hard error (SOAK-SCHEMA)
+
+**Ambiguous:** "make the comparison refuse" could mean a hard error out of `compare_soak_reports`, or the
+shape the code already uses when the *report file* schema versions differ. It could also mean failing the
+nightly job.
+
+**Chosen: copy `schema_mismatch`.** `compare_soak_reports` returns a `SoakComparison` and has no error
+path today; the file-version mismatch already produces a partial comparison — rule outcomes still
+compared, metric drift skipped, a visible `⚠️` line in the rendered report and a named summary — so
+`run_schema_mismatch` behaves identically rather than inventing a second refusal style. **Cost:** the
+nightly job still exits 0 on a mismatch, because `weft-bench/src/main.rs:1082` and `:1106` gate only on
+`comparison.has_regression`. That is pre-existing for `schema_mismatch` too; making either mismatch a
+hard gate is a policy call for the owner and is recorded here as the follow-up, not slipped into a
+benchmark-comparison PR.
+
+**Chosen: treat `run.soak_schema_version == 0` as "unstamped" and refuse nothing, and say plainly that
+nothing writes 0.** The honest framing matters: `SoakRun::soak_schema_version` (`weft-bench/src/soak.rs:143`)
+is a required serde field with no `#[serde(default)]`, so a report missing the key fails to deserialize
+before comparison — the 0 arm is a defensive floor for hand-built or merged records, not a live artifact
+path. The doc comment and CHANGELOG say so instead of implying legacy report files reach it.
+
+**Ambiguous:** the `parallel-worker` for this slice ended mid-run with uncommitted edits, no commit and no
+PR; the standing rule is a narrower brief from the checkpoint or finish it myself.
+
+**Chosen: finish it here.** The remainder was one file plus prose (honest wording for the 0 arm,
+`!is_empty()` instead of `len() > 0` under `-D warnings`, one build); a replacement worker would spend its
+budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
+--lib` build, which the two prior worker deaths could not afford.
+
+## 2026-11-11 — `since` starts the analysed range; it is not a filter over a full scan
+
+`ROADMAP.md:483` asked for "an optional `since` start time … so a live caller only scans new
+data" plus "a test that the windowed and full-history runs find the same crossings in the
+window". Both readings were available: keep the full scan and drop results before `since`, or
+start the analysis at `since`. **Chosen: start the analysis at `since`** — it is the only
+variant that actually removes work, which is what the item is about; filtering would still read
+the whole series. The consequence is that the two readings disagree at the boundary, and the
+disagreement is not a bug to smooth over: a threshold crossing is a *pair* of points, so with
+`since` sitting on the first point above the threshold there is no lower neighbour inside the
+range and no crossing to report; the same applies to peaks, valleys and drawdowns judged from
+the points supplied to them. **Recorded rather than hidden**: each of the eight `*_in_window`
+doc comments now states the boundary, and `mod window_tests` in `detectors.rs` asserts it (a
+window from the series start equals a full scan; a crossing whose earlier point precedes `since`
+disappears; a window from hour 3 keeps only the later of two crossings).
+
+Additive API only — the eight originals now delegate with `None`, so `weft-orchestration` 0.3.2
+on crates.io keeps its behaviour and no caller breaks. The item's alternative, an incremental
+cursor from the last evaluated point, is deliberately **not** built: it needs persisted per-detector
+state, which the global `SIGNALS_QUEUE` item (`ROADMAP.md:482`) has to settle first.
+
+**Verification honesty:** the tests were written, not run. The host has 3-8 GB free of 124 GB with
+51 GB of swap in use and three worker runs had each spent a full 45-minute budget on cold `-j 1`
+builds without reaching a test binary, so this slice was finished by the supervisor with no local
+cargo at all; `cargo +nightly fmt` and `rustfmt` are the only tools that ran. CI is the first
+execution of `mod window_tests`, and the PR says so.
+## 2026-11-11 — the soak summary names every mismatch it found, and says what it skipped
+
+Two honesty defects in the nightly soak comparison (follow-ups recorded in issue #688).
+
+**The summary reported one mismatch class when two fired.** `build_summary`
+(`weft-bench/src/soak_compare.rs`) built the headline with an `if` / `else if` chain: when the
+report schema drifted *and* the counterpart series was missing, the schema branch won and the
+counterpart cause vanished from the text, even though both were in the detail lines. Both classes
+are now named in the headline. The substring `MISMATCH (report schema drift)` stays an exact
+prefix, which is what the existing assertions at `:2130` and `:2230` match, and the
+`MISMATCH (counterpart series)` assertion at `:2253` still holds because that class alone is
+unchanged.
+
+**Silently skipped optional metrics now report themselves.** A metric with a tolerance that the
+reports do not both carry was dropped with a code comment and no output. The summary line gains
+`Metrics compared: N of M.` plus `Skipped: <names>.` when `M > N`. It is a `>` prose line, not a
+`-` bullet, because the markdown parser treats a leading `- ` as a regression row — that is the
+one way this change could have manufactured a false regression, and it is the reason the wording
+is prose. A one-sided metric is still **not** compared: comparing values that exist on one side is
+a different question, and answering it silently would be the same class of dishonesty this fixes.
+
+**Deliberately not done here:** the exit code. A drift refusal still exits 0 because
+`weft-bench/src/main.rs` gates `ExitCode::FAILURE` on `has_regression` alone. That is the third
+item of #688 and stays open — changing the meaning of a nightly's exit status is a policy call
+with a paging consequence, not a reporting fix.
+
+`SoakComparison` keeps its fields and `schema_version: 1`: the counts live in the rendered summary
+line, so an existing machine-readable report still parses. The two new tests
+(`a_double_mismatch_names_both_causes`, `skipped_metrics_are_reported_when_optional_metric_is_absent`)
+were **written, not run**: the host has 3-8 GB free of 124 GB and `cargo test -p weft-bench` needs
+roughly 8 GB, so CI is the first execution. Every pre-existing summary assertion was re-read by
+hand against the new code path, which is what makes the `schema drift` prefix claim safe to make
+without running anything.
+## 2026-11-11 — the config-schema checker keeps its two prose-only names (issue #687, PR #690)
+
+**Ambiguous:** the adversarial review of this slice blocked it on a total-count
+pattern that required a colon (`r"(\d+)\s+variables?:"`), which left the version
+table's other shape — the v2 row's "105 variables total as of this row" — entirely
+unchecked: mutating that 105 reported nothing. It also asked whether the checker's
+`_KNOWN_PROSE_ONLY_NAMES` exemption (`WEFT_BACKUP_DIRS`,
+`WEFT_ALLOW_INSECURE_BIND`) had gutted the name check, offering "reword the examples
+to a fictitious name and drop the exemption" as the alternative.
+
+**Fixed, not argued:** the pattern is now `r"(\d+)\s+variables?\b"` and a test
+(`test_version_table_total_without_colon_reported`) writes exactly the colon-less
+shape, so the regression cannot return quietly. Both were verified: the mutated
+document now exits 1 with `version table claims 99 total variables, but the sum of
+tier tables is 105`, and the shipped document still exits 0.
+
+**Chosen: keep the exemption, and write its cost into the code.** Both names are
+load-bearing in the *code*, not stray prose: `WEFT_BACKUP_DIRS` is the canonical typo
+in the suggestion tests and doc comments (`weft-server/src/settings.rs:6`, `:203`,
+`:572`, `weft-server/tests/config_warnings.rs:143`), and `WEFT_ALLOW_INSECURE_BIND` is
+the dropped-for-never-existing variable that `weft-server/src/settings.rs:612` asserts
+is refused rather than honoured. Reword them and the documentation checker would be
+"fixed" by moving a refusal message and its tests in another crate — a larger change
+than the slice, and one that would make the docs disagree with the code that refuses
+the name. The exemption is exact-match on two full names, and the wildcard-prefix set
+is prefix-equality, not substring, so an unregistered `WEFT_STORE_BACKUP` is still
+caught. **Cost, stated in the comment above the set:** a *new* sentence that uses
+either name as though it were a real setting is invisible to this check.
+
+## 2026-11-11 — #656 is documentation truth, not a new refusal path
+
+**Ambiguous:** the issue asks to "document and test the full-disk contract", and a
+literal reading demands a test that makes the filesystem actually return `ENOSPC` and
+shows the server answering `507`. Two unprivileged ways to do that were tried and both
+failed for reasons that will not change: `unshare -U -m` then
+`mount -t tmpfs -o size=8m` returns `mount: /mnt: must be superuser to use mount`, and a
+`setrlimit(RLIMIT_FSIZE, 64 KiB)` write with `SIGXFSZ` ignored returns
+`write=65536 errno=0` — the kernel reports a **short write with no error**, so an rlimit
+cannot produce the errno the classification looks for either. The other reading is to
+test what the server itself decides, which is already reachable: `top_up_to_decoded` and
+`reserve_disk` take the guard's path with a supplied figure, and #694 made that figure
+injectable at the top-up.
+
+**Chosen: fix the page, and pin it with a contract test — do not invent a privileged
+rig.** The claim that was actually harming operators was in `docs/operations.md`, which
+said the code was unreachable; the refusal logic and its classification were already
+correct and already tested. A test that reads the page (`the_disk_full_contract_is_documented_as_reachable`
+in `weft-server/tests/error_contract.rs`) is the only mechanism that fails when the two
+drift apart again, and it needs no privilege, no mount, and no filesystem.
+
+**Cost, stated plainly:** *no test in this repository produces a literal `ENOSPC`.* The
+`error_chain_is_disk_full` arms (`weft-server/src/error.rs:852`, `:922`) are exercised
+only by synthetic errors built in `error.rs`'s own tests, so an operating-system
+full-disk error reaching the classifier is unverified end to end. Getting that needs a
+privileged CI step (`CAP_SYS_ADMIN` plus a `tmpfs`, or a loopback file); the fault-injection
+rig cannot substitute for it, because `FaultAction::ReturnErr` yields kind `Other`, which
+classifies `500`, not `507`. Left as a follow-up rather than faked here.
+## 2026-11-11 — Supply the disk figure to the ingest top-up rather than racing the runner (#691, #656)
+**Ambiguous:** #684's flake had two cures on the table — keep widening the test's margin,
+or make the filesystem figure injectable. #691 recorded the first as shipped and the second
+as the real fix, and #656 wants a `507` from a filesystem that is actually full, which a
+margin cannot produce at all.
+**Chosen: inject the figure, one private seam, handler behaviour untouched.**
+`IngestBody::top_up_to_decoded` and `reserve_disk` now both delegate to
+`top_up_to_decoded_with_space` / `reserve_disk_with_space` (`weft-server/src/ingest.rs:~387`,
+`:~418`) taking `Option<weftdb::DiskSpace>`; the public `pub fn top_up_to_decoded` signature,
+the four handler call sites (`:892`, `:1030`, `:1237`, `:1322`) and the phase-1 extractor all
+still pass `weftdb::disk_space_at(store.root())`, so nothing in production reads the figure
+differently. `DiskGuard::admit` already took `Option<DiskSpace>` as a parameter
+(`weftdb/src/types/disk_guard.rs:138`), so the seam stops at the extractor that used to call
+`disk_space_at` itself — the smallest change that makes the number controllable.
+**Chosen: delegation, not `#[cfg(test)]` and not `#[allow(dead_code)]`.** A test-only method
+would be dead code in the binary and an integration test in `weft-server/tests/` could not
+see it; the codebase's pattern is an additive `_with_*` variant whose un-suffixed form
+delegates (`*_with_cancel` in `weftdb/src/types/segment_store/maint.rs`, `*_in_window` in
+`weft-orchestration/src/detectors.rs`). `weft-server` is `publish = false`, so a `pub(crate)`
+method adds no public API.
+**Chosen: rewrite the flaky test's figures rather than delete its bite.** The reserve is a
+fixed 256 MiB and the injected figure is `reserve + 512 MiB`, so `margin / 2` is admitted and
+`margin * 64` is refused by arithmetic; a second test refuses 4097 bytes against a filesystem
+sitting exactly at its reserve and admits `None`, which is `admit`'s documented
+"the write itself is the test" arm. **Cost:** phase 1 still reads live space through
+`FromRequest`, so the test needs a runner with a few KiB free — no margin left to race, but
+not zero dependency on the host. The store's own guard maths stays covered by
+`weftdb/src/types/disk_guard.rs`'s tests; this test's subject is the ingest answer, and the
+PR says so rather than claiming #656's filled-disk case is now proven at the store layer.
+**Chosen: reference #691 and #656, close neither.** #656 asks for a `507` from a genuinely
+filled filesystem; what exists now is the same refusal with the figure supplied, which is the
+testable half. Closing #656 here would claim a disk-full experiment that has not run.
+**Cost, stated plainly: CI is the first execution of every line here.** The host has ~9 GiB
+free of 124 GiB after four concurrent cargo runs, so nothing compiled locally — no `cargo
+check`, no `cargo test`. The likeliest first failure is the new test's import shape
+(`weftdb::DiskSpace` is re-exported at `weftdb/src/types/mod.rs:96`; the `Copy` derive at
+`weftdb/src/types/disk_guard.rs:28` is what lets one `space` value feed two calls).

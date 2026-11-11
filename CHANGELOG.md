@@ -15,6 +15,20 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
 
 ### Fixed
 
+- **`docs/operations.md` no longer tells operators that `507 insufficient_storage`
+  is unreachable (#656).** The "Disk full" section claimed that "as of v0.3.0, this
+  code is not yet raised by any code path" and that the server never checks free
+  space, while the disk guard (ROB-17) had long been refusing writes from three
+  places — before the body is read, after decode, and at the store's seal — and
+  `weft-server/src/error.rs` classified an operating-system `ENOSPC` to the same
+  code. The section now states what the guard covers and what it deliberately does
+  not (maintenance is unguarded because it is how space comes back; a filesystem the
+  OS cannot describe is never refused), where an operator looks
+  (`GET /api/v1/storage/headroom`, `disk_refusing` on `/ready`, the `weft_disk_*`
+  gauges) and what to do about a refusal. A new test in
+  `weft-server/tests/error_contract.rs` pins the section's claims, because a page
+  that contradicts the advertised surface is a contract bug: a client that believed
+  it would never retry a refused write.
 - **The metadata database no longer grows without bound.** Every captured measurement and
   every correlation insert or update wrote a row to the `transactions` audit log, and every
   capture queued a row in `unbatched_measurements` even for aspects no pipeline reads. MVCC
@@ -56,6 +70,14 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
 
 ### Changed
 
+- **README project-status table: version bump and row accuracy (EVI-22 partial).**
+  Lead line now names v0.3.2 (the current release). The "Tags, client SDKs, Helm chart"
+  row is split into three: "Client SDKs" names the Python, R and Rust clients and
+  their publication status; "Tags (per-measurement series)" reports TAG-5..TAG-11 as
+  shipped; "Helm chart" stays "Not started". The "Binaries, crates, container image"
+  row keeps main's wording for the container image: the
+  `Publish container image` workflow failed for both v0.3.1 and v0.3.2, so nothing is
+  published to ghcr.io to claim.
 - **Dictionary occurrences are stored compactly and losslessly.** Each occurrence row
   repeated the aspect, resolution, size and a JSON copy of `DatabaseInfo` (the whole subject
   map). A pattern's occurrence list is now one `pattern_occurrence_blobs` row: the constant
@@ -68,16 +90,24 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
 
 ### Added
 
-- **`*_since` variants of every built-in detector** (`detect_threshold_crossing_{up,down}_since`,
-  `detect_all_{peaks,valleys}_since`, `detect_{peaks,valleys}_since`,
-  `detect_drawdown_since`, `detect_monthly_increase_since`) scan only `[since, latest]`, so
-  a live caller's cost per run stays flat instead of growing with history. Point-local
-  detectors return exactly the full run's manifestations inside the window; tests check
-  this for the threshold crossings and local extrema. The path-dependent ones (global
-  extremes, drawdown, monthly increase) answer for the window alone.
+- **Bounded-window detector variants (`weft-orchestration`).** Eight additive
+  functions — `detect_monthly_increase_in_window`, `detect_peaks_in_window`,
+  `detect_all_peaks_in_window`, `detect_valleys_in_window`, `detect_all_valleys_in_window`,
+  `detect_threshold_crossing_up_in_window`, `detect_threshold_crossing_down_in_window`,
+  `detect_drawdown_in_window` — take the same arguments as the originals plus
+  `since: Option<DateTime<Utc>>`, which becomes the start of the range passed to
+  `Outputs::analyze_range`. A live caller that only cares about new data no longer pays
+  O(history) per tick. `since` is the start of the analysed range rather than a filter on a
+  full-history result: a feature is reported only when the points that define it are both
+  inside the window, so a crossing whose point below the threshold precedes `since` is not
+  reported. The originals delegate with `None` and are unchanged.
+- **Compatibility leg coverage gate (FRE-16).** `scripts/compat/test_leg_coverage.py`
+  fails CI when a pin in `compat/releases.toml` declares a leg that no executing test
+  handles. Rollback and binary compatibility are now explicitly unsupported for 1.0:
+  the `upgrade` leg is the only one that exists. The v0.1.0 pin drops `rollback` from
+  its `legs` array; the `LEGS` constant in `releases.py` shrinks to `{"upgrade"}`.
+  Documents updated accordingly.
 - `weftdb::close_idle_databases` and `weftdb::open_database_count`.
-- `weft-orchestration`'s README documents that the two crates are published in lockstep
-  and how to use a path dependency without getting two copies of `weftdb`.
 - **Layout-upgrade integration test (FRE-13).** `weftdb/tests/layout_upgrade.rs` covers:
   the pre-v2 (layout-1) store upgrade to layout 2 through the public API, including
   idempotency, data survival, new writes after upgrade, a synthetic marker test, and
@@ -110,7 +140,20 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
   `config/schema.toml`.
 
 ### Fixed
-- **The `/ready` platform note contradicted the shipped disk guard (#pending).** `docs/reference.md` still claimed the guard uses Unix `statvfs` and that `disk_refusing` is always `false` on Windows, which stopped being true when the `GetDiskFreeSpaceExW` leg landed. The note now says free space is measured on both platforms and the guard is inert only where the OS cannot describe free space.
+- **The ingest disk-margin test no longer reads the runner's free space (#691,
+  #684).** `ingest_body_top_up_refuses_when_the_decoded_weight_breaches_the_reserve`
+  sized the store's reserve from `weftdb::disk_space_at` at open time and then raced
+  the reading `reserve_disk` takes again at admit time; ~984 KiB of scratch churn on
+  `windows-latest` ate a 1 MiB margin, and the widened 512 MiB margin only required a
+  roomy runner. `IngestBody::top_up_to_decoded` now delegates to a
+  `top_up_to_decoded_with_space` that takes the `DiskSpace` figure, so the test drives
+  both arms from its own arithmetic and a new test answers a filesystem that is already
+  full and one the OS will not describe — the `507` case #656 asks about, without
+  filling a disk. Behaviour for handlers is unchanged: they still read the live figure.
+- **The `/ready` source comments still described a Windows no-op disk guard (#674).** `DiskGuardState::disk_refusing`'s doc comment and the `/ready` handler comment claimed the guard could not measure free space on Windows, which stopped being true when `disk_space_at` grew its `GetDiskFreeSpaceExW` leg. Both now name the probe per platform and reserve "always false" for platforms with no probe. Comments only; no behaviour change.
+- **The `/ready` platform note contradicted the shipped disk guard (#674).** `docs/reference.md` still claimed the guard uses Unix `statvfs` and that `disk_refusing` is always `false` on Windows, which stopped being true when the `GetDiskFreeSpaceExW` leg landed. The note now says free space is measured on both platforms and the guard is inert only where the OS cannot describe free space.
+- **Soak comparison silently skipped metrics when soak run schema versions diverged (#672).** `compare_soak_reports` now detects a `run.soak_schema_version` mismatch (6→7 from SOA-16) and refuses comparison with the same shape as the existing file-version mismatch: error naming both versions, empty metric-drift table, and a visible entry in the rendered report. A run stamped 0 is read as unstamped and refuses nothing; nothing the harness writes uses 0, because `SoakRun::soak_schema_version` is a required field, so that arm is the defensive floor for hand-built records.
+
 - **`free_bytes_at` now works on Windows and other platforms (#667).** The disk guard was inert on Windows, making `GET /ready`'s `disk_refusing` permanently false. Implemented via inline FFI to `GetDiskFreeSpaceExW` (no new dependencies).
 
 - **A disk-full IO error anywhere in the chain now produces `507 insufficient_storage` instead of a generic 500 (#656).** `error.rs` adds `error_chain_is_disk_full`, checked in `classify_ingest` and `classify_read` before the fallback to `Internal`.
@@ -140,6 +183,16 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
 - **The value-band read is documented as a raw scan, with a test pinning it against the point and time-range fold (#665).** The value-band read (`read_value_range`/`read_value_range_of`) is a raw scan: it returns every stored row whose value is in `[lo, hi]` in segment-seal then in-segment order and does **not** fold overlapping segments. Point and time-range reads use newest-wins folding; the value band answers "all raw observations." `docs/upgrade-notes.md` and `docs/reference.md` now state this split explicitly, and a synthetic-collision test (`value_range_is_a_raw_scan_pinned_against_point_and_range`) pins the value-band raw scan beside the point/range fold.
 
 ### Changed
+
+- The soak comparison summary now names every mismatch class it found (a report-schema drift and a missing counterpart series used to collapse into one line), and reports `Metrics compared: N of M` plus the skipped tolerance names when an optional metric existed on only one side (`#688`).
+
+- **One float-input rule across every ingest format (FRE-8b, #313).** ILP float fields
+  and Parquet/Arrow `Float64`/`Float32` cells now enter as their shortest round-trip
+  decimal (decision 11) through the new `weft_physical_type::decimal_from_f64` /
+  `decimal_from_f32`, instead of the exact binary expansion `BigDecimal::from_f64`
+  produced: an ILP or Parquet `0.1` now stores `0.1`, the same value a JSON or CSV
+  `0.1` stores. The smallest subnormal, previously refused because its expansion's
+  plain form exceeds the decimal domain, now enters as `5e-324`.
 
 - **Breaking (read shape): a range read now returns each timestamp once, newest value
   wins (#443).** `read_time_range_of` now opens all segments overlapping the window (including
@@ -307,6 +360,21 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
   `weftdb-ingest` measure their own paths and honestly report no adapter, and because
   `native_engine` lives inside the `AdapterInfo` whose absence is the thing being
   tested.
+
+- **Prediction signals are now isolated per aspect (issue #402).**
+  `SIGNALS_QUEUE` was a single process-wide `Mutex<Signals>`; two pipelines
+  over different aspects in one process would see each other's signals.
+  The queue is now keyed by `AspectId` (`Mutex<HashMap<AspectId, Signals>>`),
+  `signals_for(aspect_id)` copies out only that aspect's queue,
+  `create_signals` and `filter_expired_signals` touch only their own aspect,
+  and `Pipeline::generate_signals` / `Pipeline::filter_signals_at` read
+  only their own aspect's signals via `signals_for`. An empty per-aspect
+  queue is removed from the map during `filter_expired_signals` so the map
+  does not retain stale entries indefinitely. The same pass no longer holds the
+  queue lock while it talks to the database: the event and correlation reads
+  happen before the lock, one synchronous function mutates the queue, and the
+  correlation writes happen after it is released, so a busy aspect can no longer
+  stall another aspect's pass on I/O. (#402)
 
 - **Slow orchestration tests bounded by timeout (issue #404).** Seven
   `weft-orchestration` tests that self-skip locally (Crypto-database guard)

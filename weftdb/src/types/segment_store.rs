@@ -1513,6 +1513,10 @@ pub(crate) struct DecodedFrame {
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct ReapSweep {
+	/// Whether the sweep was cancelled before it finished (see
+	/// [`MaintenanceCancel`](crate::MaintenanceCancel)). `true` means a cancellation request
+	/// was received and the sweep stopped before the next aspect could start.
+	pub cancelled: bool,
 	/// Aspects whose journal the pass worked through.
 	pub aspects_reaped: usize,
 	/// Retired frames (and abandoned maintenance outputs) unlinked.
@@ -2731,6 +2735,10 @@ impl SegmentStore {
 /// [`anyhow::Error`]s, which are neither.
 #[derive(Debug, Default)]
 pub struct ReconcileSweep {
+	/// Whether the sweep was cancelled before it finished (see
+	/// [`MaintenanceCancel`](crate::MaintenanceCancel)). `true` means a cancellation request
+	/// was received and the sweep stopped before the next aspect could start.
+	pub cancelled: bool,
 	/// Number of declared aspects the sweep visited.
 	pub aspects_scanned: usize,
 	/// Number of aspects whose backlog was at or above the threshold and were
@@ -2786,6 +2794,10 @@ impl HotColdReconcile {
 /// [`anyhow::Error`]s, which are neither.
 #[derive(Debug, Default)]
 pub struct HotColdSweep {
+	/// Whether the sweep was cancelled before it finished (see
+	/// [`MaintenanceCancel`](crate::MaintenanceCancel)). `true` means a cancellation request
+	/// was received and the sweep stopped before the next aspect could start.
+	pub cancelled: bool,
 	/// Number of declared aspects the sweep visited.
 	pub aspects_scanned: usize,
 	/// Number of aspects that rewrote at least one segment (cold or hot) this sweep.
@@ -2828,6 +2840,10 @@ impl HotColdSweep {
 /// [`anyhow::Error`]s, which are neither.
 #[derive(Debug, Default)]
 pub struct OverlapSweep {
+	/// Whether the sweep was cancelled before it finished (see
+	/// [`MaintenanceCancel`](crate::MaintenanceCancel)). `true` means a cancellation request
+	/// was received and the sweep stopped before the next aspect could start.
+	pub cancelled: bool,
 	/// Number of declared aspects the sweep visited.
 	pub aspects_scanned: usize,
 	/// Number of aspects that merged at least one overlap group this sweep.
@@ -2861,6 +2877,10 @@ pub struct OverlapSweep {
 /// [`anyhow::Error`]s, which are neither.
 #[derive(Debug, Default)]
 pub struct SquashSweep {
+	/// Whether the sweep was cancelled before it finished (see
+	/// [`MaintenanceCancel`](crate::MaintenanceCancel)). `true` means a cancellation request
+	/// was received and the sweep stopped before the next aspect could start.
+	pub cancelled: bool,
 	/// Number of declared aspects the sweep visited.
 	pub aspects_scanned: usize,
 	/// Number of aspects that were squashed this sweep (their segment count exceeded the
@@ -8719,6 +8739,10 @@ mod disk_guard_tests;
 /// Phase 5 memory-mapped GPU I/O: a mapped range read returns exactly the buffered read's rows.
 #[cfg(test)]
 mod mapped_read_tests;
+
+/// ROB-21a: cooperative between-aspect maintenance cancellation.
+#[cfg(test)]
+mod cancel_tests;
 
 /// Issue #443: overlapping reads across pruned segments — a range read merges with newer-wins.
 #[cfg(test)]

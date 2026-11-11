@@ -92,13 +92,12 @@ not see the tagged rows.
 marker records `layout_version: 2` is refused by any build whose `SUPPORTED_LAYOUT`
 is 1. No such build exists after v0.1.0, and the repository does not test this path.
 
-**No CI job performs a real rollback after writes today.** The `compat_v010.rs` test
+**No CI job performs a real rollback after writes.** The `compat_v010.rs` test
 (which opens the v0.1.0 fixture with the current build) tests only the upgrade leg:
 it verifies that a v0.1.0 store is migrated forward and that the same values read back.
 It does **not** run the v0.1.0 binary against a store that the current build has written
-to. The `releases.toml` pin for v0.1.0 declares `legs = ["upgrade", "rollback"]`, but
-the rollback leg has no concrete test implementation — only the upgrade fixture and
-test exist.
+to. Rollback-after-writes is unsupported for 1.0 — a store written by the current layout
+is not readable by older binaries.
 
 ### Rollback procedure for layout 2
 
@@ -159,8 +158,8 @@ a 1.0 compatibility promise.
 
 - **A real rollback-after-writes CI test.** No CI job today downloads the previous
   release's binary, writes data with the current build, and reads it back with the
-  older binary. The `compat_v010.rs` test verifies only the forward (upgrade)
-  direction. The rollback half of the `releases.toml` pin is aspirational.
+  older binary. Rollback-after-writes is unsupported for 1.0: a store written by the
+  current layout is not readable by older binaries.
 - **Cross-version binary compatibility for the server binary itself.** The v0.1.0
   `weft-server` binary cannot be swapped in for v0.2.x: its configuration variables,
   its command-line flags and its HTTP routes differ. The store-format compatibility

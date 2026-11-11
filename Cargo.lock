@@ -5648,6 +5648,7 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "splimes",
+ "weft-physical-type",
 ]
 
 [[package]]

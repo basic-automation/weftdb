@@ -222,9 +222,11 @@ pub struct DiskGuardState {
 	/// can steer writes elsewhere meanwhile. A boolean only — the probe answers without a
 	/// key, so the byte counts stay on the `metrics`-scoped headroom route.
 	///
-	/// **Platform limitation:** The guard uses Unix `statvfs` to measure free space.
-	/// On platforms without `statvfs` (Windows) `disk_refusing` is always `false`
-	/// because the filesystem cannot be described.
+	/// **Platforms:** free space is measured through `weftdb::disk_space_at` —
+	/// `statvfs` on Unix, `GetDiskFreeSpaceExW` on Windows — so the field means the
+	/// same thing on both. Where no probe exists (`not(any(unix, windows))`) the
+	/// probe answers `None` and this is `false`, the same value a disabled guard
+	/// reports.
 	pub disk_refusing: bool,
 }
 
