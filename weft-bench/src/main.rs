@@ -1107,6 +1107,14 @@ fn compare_soak(previous: &Path, current: &Path, markdown: Option<&Path>, json: 
 		eprintln!("{PROG}: SOAK COMPARISON: regression detected — a rule that previously passed now fails");
 		return ExitCode::FAILURE;
 	}
+	// A refused comparison is not a clean pass. Rule outcomes were still checked
+	// (that is why a regression above outranks this), but no drift figure exists,
+	// and the soak nightly ends its comparison step with this exit code: exiting
+	// success here would print "OK" over the absence of a check.
+	if let Some(refusal) = comparison.refusal() {
+		eprintln!("{PROG}: SOAK COMPARISON: metric drift was not compared — {}; rule outcomes above still stand", refusal.message());
+		return ExitCode::FAILURE;
+	}
 	println!("{PROG}: soak-compare: OK");
 	ExitCode::SUCCESS
 }
