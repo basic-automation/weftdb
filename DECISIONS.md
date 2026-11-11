@@ -6380,14 +6380,40 @@ PR; the standing rule is a narrower brief from the checkpoint or finish it mysel
 budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
 --lib` build, which the two prior worker deaths could not afford.
 
+## 2026-11-11 — the config-schema checker keeps its two prose-only names (issue #687, PR #690)
+
+**Ambiguous:** the adversarial review of this slice blocked it on a total-count
+pattern that required a colon (`r"(\d+)\s+variables?:"`), which left the version
+table's other shape — the v2 row's "105 variables total as of this row" — entirely
+unchecked: mutating that 105 reported nothing. It also asked whether the checker's
+`_KNOWN_PROSE_ONLY_NAMES` exemption (`WEFT_BACKUP_DIRS`,
+`WEFT_ALLOW_INSECURE_BIND`) had gutted the name check, offering "reword the examples
+to a fictitious name and drop the exemption" as the alternative.
+
+**Fixed, not argued:** the pattern is now `r"(\d+)\s+variables?\b"` and a test
+(`test_version_table_total_without_colon_reported`) writes exactly the colon-less
+shape, so the regression cannot return quietly. Both were verified: the mutated
+document now exits 1 with `version table claims 99 total variables, but the sum of
+tier tables is 105`, and the shipped document still exits 0.
+
+**Chosen: keep the exemption, and write its cost into the code.** Both names are
+load-bearing in the *code*, not stray prose: `WEFT_BACKUP_DIRS` is the canonical typo
+in the suggestion tests and doc comments (`weft-server/src/settings.rs:6`, `:203`,
+`:572`, `weft-server/tests/config_warnings.rs:143`), and `WEFT_ALLOW_INSECURE_BIND` is
+the dropped-for-never-existing variable that `weft-server/src/settings.rs:612` asserts
+is refused rather than honoured. Reword them and the documentation checker would be
+"fixed" by moving a refusal message and its tests in another crate — a larger change
+than the slice, and one that would make the docs disagree with the code that refuses
+the name. The exemption is exact-match on two full names, and the wildcard-prefix set
+is prefix-equality, not substring, so an unregistered `WEFT_STORE_BACKUP` is still
+caught. **Cost, stated in the comment above the set:** a *new* sentence that uses
+either name as though it were a real setting is invisible to this check.
 
 ## 2026-11-11 — Supply the disk figure to the ingest top-up rather than racing the runner (#691, #656)
-
 **Ambiguous:** #684's flake had two cures on the table — keep widening the test's margin,
 or make the filesystem figure injectable. #691 recorded the first as shipped and the second
 as the real fix, and #656 wants a `507` from a filesystem that is actually full, which a
 margin cannot produce at all.
-
 **Chosen: inject the figure, one private seam, handler behaviour untouched.**
 `IngestBody::top_up_to_decoded` and `reserve_disk` now both delegate to
 `top_up_to_decoded_with_space` / `reserve_disk_with_space` (`weft-server/src/ingest.rs:~387`,
@@ -6397,14 +6423,12 @@ still pass `weftdb::disk_space_at(store.root())`, so nothing in production reads
 differently. `DiskGuard::admit` already took `Option<DiskSpace>` as a parameter
 (`weftdb/src/types/disk_guard.rs:138`), so the seam stops at the extractor that used to call
 `disk_space_at` itself — the smallest change that makes the number controllable.
-
 **Chosen: delegation, not `#[cfg(test)]` and not `#[allow(dead_code)]`.** A test-only method
 would be dead code in the binary and an integration test in `weft-server/tests/` could not
 see it; the codebase's pattern is an additive `_with_*` variant whose un-suffixed form
 delegates (`*_with_cancel` in `weftdb/src/types/segment_store/maint.rs`, `*_in_window` in
 `weft-orchestration/src/detectors.rs`). `weft-server` is `publish = false`, so a `pub(crate)`
 method adds no public API.
-
 **Chosen: rewrite the flaky test's figures rather than delete its bite.** The reserve is a
 fixed 256 MiB and the injected figure is `reserve + 512 MiB`, so `margin / 2` is admitted and
 `margin * 64` is refused by arithmetic; a second test refuses 4097 bytes against a filesystem
@@ -6414,11 +6438,9 @@ sitting exactly at its reserve and admits `None`, which is `admit`'s documented
 not zero dependency on the host. The store's own guard maths stays covered by
 `weftdb/src/types/disk_guard.rs`'s tests; this test's subject is the ingest answer, and the
 PR says so rather than claiming #656's filled-disk case is now proven at the store layer.
-
 **Chosen: reference #691 and #656, close neither.** #656 asks for a `507` from a genuinely
 filled filesystem; what exists now is the same refusal with the figure supplied, which is the
 testable half. Closing #656 here would claim a disk-full experiment that has not run.
-
 **Cost, stated plainly: CI is the first execution of every line here.** The host has ~9 GiB
 free of 124 GiB after four concurrent cargo runs, so nothing compiled locally — no `cargo
 check`, no `cargo test`. The likeliest first failure is the new test's import shape
