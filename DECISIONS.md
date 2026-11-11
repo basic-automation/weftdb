@@ -6323,3 +6323,32 @@ FRE-16, ORCH-SIG and FRE-8b entries since the branch was cut. **Chosen:** `git m
 one had a real conflict, which is the exception), keeping main's block first and appending ours,
 because the log is append-only and neither entry supersedes the other. **Cost:** a merge commit in a
 branch that will squash-merge, and one re-run of the full check set for a prose conflict.
+
+## 2026-11-10 — Soak schema drift: refuse in the precedent's shape, not with a hard error (SOAK-SCHEMA)
+
+**Ambiguous:** "make the comparison refuse" could mean a hard error out of `compare_soak_reports`, or the
+shape the code already uses when the *report file* schema versions differ. It could also mean failing the
+nightly job.
+
+**Chosen: copy `schema_mismatch`.** `compare_soak_reports` returns a `SoakComparison` and has no error
+path today; the file-version mismatch already produces a partial comparison — rule outcomes still
+compared, metric drift skipped, a visible `⚠️` line in the rendered report and a named summary — so
+`run_schema_mismatch` behaves identically rather than inventing a second refusal style. **Cost:** the
+nightly job still exits 0 on a mismatch, because `weft-bench/src/main.rs:1082` and `:1106` gate only on
+`comparison.has_regression`. That is pre-existing for `schema_mismatch` too; making either mismatch a
+hard gate is a policy call for the owner and is recorded here as the follow-up, not slipped into a
+benchmark-comparison PR.
+
+**Chosen: treat `run.soak_schema_version == 0` as "unstamped" and refuse nothing, and say plainly that
+nothing writes 0.** The honest framing matters: `SoakRun::soak_schema_version` (`weft-bench/src/soak.rs:143`)
+is a required serde field with no `#[serde(default)]`, so a report missing the key fails to deserialize
+before comparison — the 0 arm is a defensive floor for hand-built or merged records, not a live artifact
+path. The doc comment and CHANGELOG say so instead of implying legacy report files reach it.
+
+**Ambiguous:** the `parallel-worker` for this slice ended mid-run with uncommitted edits, no commit and no
+PR; the standing rule is a narrower brief from the checkpoint or finish it myself.
+
+**Chosen: finish it here.** The remainder was one file plus prose (honest wording for the 0 arm,
+`!is_empty()` instead of `len() > 0` under `-D warnings`, one build); a replacement worker would spend its
+budget re-deriving what was already on disk. **Cost:** coordinator turns and one `cargo test -p weft-bench
+--lib` build, which the two prior worker deaths could not afford.
