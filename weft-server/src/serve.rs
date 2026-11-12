@@ -26,7 +26,12 @@
 //! - **Keep-alive deadline.** A connection that makes no read progress for
 //!   [`ServeLimits::keep_alive_timeout`] is closed. Between requests that is
 //!   exactly the idle keep-alive bound; the deadline only ever fires when no
-//!   bytes are arriving, because available input is always taken first.
+//!   bytes are arriving, because available input is always taken first. It
+//!   does not run while a request on the connection is being handled: a
+//!   maintenance request (fsck, reconcile, compact) can take minutes with
+//!   the client rightly sending nothing, and closing the connection then
+//!   dropped the handler and cancelled the work. The deadline restarts when
+//!   the response is ready.
 //! - **Write-stall timeout.** A connection whose writes make no progress for
 //!   [`ServeLimits::write_stall_timeout`] is closed, so a peer that stops
 //!   reading cannot pin a connection task (and its cap permit) forever.
@@ -47,6 +52,8 @@
 use std::{
 	future::Future, io, num::NonZeroUsize, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration
 };
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use hyper::server::conn::http1;
@@ -420,7 +427,20 @@ async fn serve(listener: TcpListener, router: Router, limits: ServeLimits, shutd
 			() = &mut shutdown => break,
 			accepted = listener.accept() => accepted?,
 		};
-		let service = TowerToHyperService::new(router.clone());
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		let service = {
+			let inner = TowerToHyperService::new(router.clone());
+			let in_flight = Arc::clone(&in_flight);
+			hyper::service::service_fn(move |request| {
+				let guard = InFlight::enter(&in_flight);
+				let response = hyper::service::Service::call(&inner, request);
+				async move {
+					let response = response.await;
+					drop(guard);
+					response
+				}
+			})
+		};
 		let transport = transport.clone();
 		connections.spawn(async move {
 			// The permit moves into the connection task: the slot is held
@@ -428,12 +448,12 @@ async fn serve(listener: TcpListener, router: Router, limits: ServeLimits, shutd
 			let _permit = permit;
 			let served = match transport {
 				Transport::Plain => {
-					let io = DeadlineIo::new(stream, limits.keep_alive_timeout(), limits.write_stall_timeout());
+					let io = DeadlineIo::new(stream, limits.keep_alive_timeout(), limits.write_stall_timeout()).with_in_flight(in_flight);
 					http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(limits.header_read_timeout()).serve_connection(io, service).await.map_err(io::Error::other)
 				}
 				Transport::Tls(acceptor) => match tokio::time::timeout(limits.keep_alive_timeout(), acceptor.accept(stream)).await {
 					Ok(Ok(tls_stream)) => {
-						let io = DeadlineIo::new(tls_stream, limits.keep_alive_timeout(), limits.write_stall_timeout());
+						let io = DeadlineIo::new(tls_stream, limits.keep_alive_timeout(), limits.write_stall_timeout()).with_in_flight(in_flight);
 						http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(limits.header_read_timeout()).serve_connection(io, service).await.map_err(io::Error::other)
 					}
 					Ok(Err(err)) => Err(err),
@@ -474,11 +494,39 @@ struct DeadlineIo<T> {
 	write_stall_timeout: Duration,
 	read_deadline: Pin<Box<Sleep>>,
 	write_deadline: Pin<Box<Sleep>>,
+	/// Requests on this connection whose response is not ready yet; the read
+	/// deadline is suspended while it is above zero.
+	in_flight: Arc<AtomicUsize>,
+	/// Whether the last pending read saw a request in flight, so the deadline
+	/// restarts from the moment the connection goes idle again.
+	was_busy: bool,
+}
+
+/// One request being handled on a connection: counted in on entry, out on drop
+/// (the response is ready, or the handler was dropped).
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+	fn enter(count: &Arc<AtomicUsize>) -> Self {
+		count.fetch_add(1, Ordering::AcqRel);
+		Self(Arc::clone(count))
+	}
+}
+
+impl Drop for InFlight {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::AcqRel);
+	}
 }
 
 impl<T> DeadlineIo<T> {
 	fn new(stream: T, keep_alive_timeout: Duration, write_stall_timeout: Duration) -> Self {
-		Self { inner: TokioIo::new(stream), keep_alive_timeout, write_stall_timeout, read_deadline: Box::pin(tokio::time::sleep(keep_alive_timeout)), write_deadline: Box::pin(tokio::time::sleep(write_stall_timeout)) }
+		Self { inner: TokioIo::new(stream), keep_alive_timeout, write_stall_timeout, read_deadline: Box::pin(tokio::time::sleep(keep_alive_timeout)), write_deadline: Box::pin(tokio::time::sleep(write_stall_timeout)), in_flight: Arc::new(AtomicUsize::new(0)), was_busy: false }
+	}
+
+	fn with_in_flight(mut self, in_flight: Arc<AtomicUsize>) -> Self {
+		self.in_flight = in_flight;
+		self
 	}
 
 	fn reset_read_deadline(&mut self) {
@@ -502,6 +550,16 @@ where
 			}
 			Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
 			Poll::Pending => {
+				if self.in_flight.load(Ordering::Acquire) > 0 {
+					// A handler is running: the peer is waiting on us, not
+					// stalled. The socket waker is registered, and hyper
+					// polls again once the response is written.
+					self.was_busy = true;
+					return Poll::Pending;
+				}
+				if std::mem::take(&mut self.was_busy) {
+					self.reset_read_deadline();
+				}
 				if self.read_deadline.as_mut().poll(cx).is_ready() {
 					return Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "connection made no read progress within the keep-alive deadline")));
 				}
@@ -633,6 +691,36 @@ mod tests {
 		.expect("the deadline fires well inside the test timeout");
 		let err = stalled.expect_err("a peer that never reads cannot accept the write");
 		assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+	}
+
+	/// A request whose handler runs longer than the keep-alive deadline still
+	/// gets its response: the deadline does not run while a request is in
+	/// flight (it used to close the connection and cancel a long fsck).
+	#[tokio::test]
+	async fn a_slow_handler_outlives_the_keep_alive_deadline() {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		let router = Router::new().route(
+			"/slow",
+			axum::routing::get(|| async {
+				tokio::time::sleep(Duration::from_millis(400)).await;
+				"done"
+			}),
+		);
+		let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+		let addr = listener.local_addr().expect("addr");
+		let limits = ServeLimits::new(std::num::NonZeroUsize::new(8).expect("non-zero")).with_keep_alive_timeout(Duration::from_millis(50));
+		let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+		let server = tokio::spawn(run(listener, router, limits, async move {
+			let _ = stopped.await;
+		}));
+		let mut client = tokio::net::TcpStream::connect(addr).await.expect("connects");
+		client.write_all(b"GET /slow HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").await.expect("sends");
+		let mut response = String::new();
+		tokio::time::timeout(Duration::from_secs(5), client.read_to_string(&mut response)).await.expect("answers in time").expect("reads");
+		assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+		assert!(response.ends_with("done"), "{response}");
+		let _ = stop.send(());
+		server.await.expect("joins").expect("serves");
 	}
 
 	/// A read from a peer that never sends makes no progress, and the
