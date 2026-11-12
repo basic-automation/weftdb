@@ -80,9 +80,13 @@ RUN dnf install -y cmake nasm curl && dnf clean all
 # The release compiler is the one CI's stable jobs test, pinned in one file. Copy the file
 # alone first so a source edit does not re-download a toolchain.
 COPY .github/release-toolchain /tmp/release-toolchain
+# PATH is extended, never replaced: the baseline puts its gcc-toolset first, and that is the
+# `cc` every C dependency must see. Replacing PATH fell back to the system gcc 8, which cannot
+# compile any of simsimd's aarch64 backends (no arm_sve.h, no bf16/i8mm target pragmas), so its
+# build script produced no library and the arm64 image failed to link `-lsimsimd`.
 ENV CARGO_HOME=/usr/local/cargo \
 	RUSTUP_HOME=/usr/local/rustup \
-	PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+	PATH=/usr/local/cargo/bin:${PATH}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
 		--profile minimal --default-toolchain "$(tr -d '[:space:]' < /tmp/release-toolchain)" \
 		--target "${RUST_TARGET}" \
