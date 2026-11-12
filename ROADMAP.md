@@ -272,7 +272,7 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 - [ ] **Compatibility tests** (FRE-13 + PAC-14a)
 - [ ] Ship honesty pages / **Honesty pages shipped** (EVI-16, EVI-17 and the owner narrative)
 - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
-- [ ] **FRE-9b** OpenAPI: storage and operator endpoints — the last change before the beta tag
+- [x] **FRE-9b** OpenAPI: storage and operator endpoints — the last change before the beta tag
   - [x] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh`)
 - [ ] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
 - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
