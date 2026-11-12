@@ -909,17 +909,17 @@ Used by:
     https://github.com/basic-automation/weftdb
   * weft-line-protocol 0.3.1
     https://github.com/basic-automation/weftdb
-  * weft-orchestration 0.3.6
+  * weft-orchestration 0.3.7
     https://github.com/basic-automation/weftdb
   * weft-physical-type 0.3.1
     https://github.com/basic-automation/weftdb
   * weft-reduce 0.3.1
     https://github.com/basic-automation/weftdb
-  * weft-server 0.3.6
+  * weft-server 0.3.7
     https://github.com/basic-automation/weftdb
   * weft-tui 0.3.0
     https://github.com/basic-automation/weftdb
-  * weftdb 0.3.6
+  * weftdb 0.3.7
     https://github.com/basic-automation/weftdb
   * arrow-array 60.0.0
     https://github.com/apache/arrow-rs

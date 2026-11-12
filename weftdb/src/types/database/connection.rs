@@ -7,6 +7,10 @@ use super::Database;
 pub use crate::types::database::traits::config::Config;
 use crate::{cache, database::traits::Connection, DatabaseCache};
 
+/// Log size, in bytes, at which a commit checkpoints its database (Turso's own default is
+/// 4.12 MB). Overridable with `WEFT_MVCC_CHECKPOINT_BYTES`; `-1` turns auto-checkpoint off.
+const DEFAULT_MVCC_CHECKPOINT_BYTES: i64 = 64 * 1024;
+
 /// `COMMIT` the connection's open transaction; on failure, roll it back before returning
 /// the error.
 ///
@@ -116,7 +120,17 @@ impl Connection for Database {
 
 		conn.execute("PRAGMA temp_store=memory", turso::params![]).await.ok();
 		conn.execute("PRAGMA wal_autocheckpoint=1000", turso::params![]).await.ok(); // Better WAL handling for large writes
-		conn.execute("PRAGMA cache_size=-256000", turso::params![]).await.ok(); // 256MB cache for large batch operations
+
+		// No `PRAGMA cache_size` here either: it is per connection too, so it never reached the
+		// connections that do the work.
+
+		// Turso keeps every row version that is in the `-log` but not yet checkpointed in
+		// memory (about 3 bytes of RSS per log byte), and only checkpoints a database once its
+		// log passes 4.12 MB. A process holding hundreds of small stores never gets one there,
+		// so its memory grows with every commit and never levels off. The threshold lives on
+		// the shared MVCC store, so setting it on this connection applies to the database.
+		let threshold = std::env::var("WEFT_MVCC_CHECKPOINT_BYTES").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(DEFAULT_MVCC_CHECKPOINT_BYTES);
+		conn.execute(&format!("PRAGMA mvcc_checkpoint_threshold={threshold}"), turso::params![]).await.ok();
 
 		// Explicitly drop connection to ensure it's closed before returning
 		drop(conn);
