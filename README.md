@@ -83,7 +83,7 @@ published image yet. See [Running in a container](docs/reference.md#running-in-a
 
 ```bash
 WEFT_SEGMENT_STORE_ROOT=./store weft-server
-# weft-server v0.3.4 listening on http://127.0.0.1:8080
+# weft-server v0.3.5 listening on http://127.0.0.1:8080
 ```
 
 It listens on localhost only by default. `WEFT_SEGMENT_STORE_ROOT` is where your data is
@@ -191,7 +191,7 @@ Run it yourself with `weft-xbench`; see [Benchmarking](docs/reference.md#benchma
 
 ## Status
 
-**v0.3.4 is pre-beta.** APIs, configuration and the on-disk format can still change between
+**v0.3.5 is pre-beta.** APIs, configuration and the on-disk format can still change between
 0.x releases, and upgrading a store from v0.1.0 is one-way. What works today:
 
 | | |
