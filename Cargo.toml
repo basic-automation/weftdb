@@ -97,8 +97,8 @@ sysinfo = "0.39"
 # dependency by its version, so bumping one side and not the other fails `cargo publish` at
 # the tag with a message about the workspace layout. `python3 scripts/crates/check.py check`
 # names the crate that is out of step, on the PR. FRE-1.
-weftdb = { path = "./weftdb", version = "0.3.6" }
-weft-orchestration = { path = "./weft-orchestration", version = "0.3.6" }
+weftdb = { path = "./weftdb", version = "0.3.7" }
+weft-orchestration = { path = "./weft-orchestration", version = "0.3.7" }
 # Developed in its own repository (github.com/basic-automation/splimes), on its own roadmap.
 # `default-features = false` because splimes' defaults turn on its `gpu` backend, which pulls
 # `wgpu` — Vulkan, Metal, DX12 and a shader compiler — into every crate that links a library

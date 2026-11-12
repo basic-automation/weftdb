@@ -8,6 +8,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-11-12
+
+### Fixed
+
+- **Memory no longer grows without bound in a process that holds many small stores.**
+  Turso keeps every row version still in an MVCC `-log` in memory (about 3 bytes of RSS
+  per log byte) and only checkpoints a database once its log passes 4.12 MB, so a process
+  with hundreds of stores that each take small commits never checkpointed any of them: a
+  fan-control daemon with 559 stores grew ~540 MB/h of anon memory, and its logs grew
+  ~50 MB/h on disk. Every database now checkpoints once its log passes 64 KB
+  (`WEFT_MVCC_CHECKPOINT_BYTES` overrides it; `-1` turns auto-checkpoint off). Measured
+  with `examples/many_store_rss` (559 stores, 400 rounds of small commits): growth above the
+  open baseline went from +1.84 GB and still climbing to +235 MB and flat, with no change
+  in run time.
+- The `PRAGMA cache_size=-256000` WeftDB issued at open is gone: it is per connection and
+  only ever reached a throwaway one, so it never sized any cache.
+
 ## [0.3.6] - 2026-11-12
 
 ### Fixed
@@ -2952,7 +2969,8 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/basic-automation/weftdb/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/basic-automation/weftdb/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/basic-automation/weftdb/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/basic-automation/weftdb/compare/v0.3.3...v0.3.4
