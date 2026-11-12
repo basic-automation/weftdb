@@ -8,6 +8,28 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-11-12
+
+### Fixed
+
+- **A request that runs longer than the keep-alive deadline is no longer cancelled.** The
+  connection's read-idle deadline (`WEFT_KEEP_ALIVE_TIMEOUT_SECS`, 30 s by default) kept
+  running while a handler worked, so any request over 30 s (fsck, reconcile or compact on a
+  large store) had its connection closed and its handler dropped partway, with an empty
+  reply. The deadline is now suspended while a request on the connection is in flight, and
+  restarts once the response is ready; idle and slow-loris peers are bounded as before.
+
+## [0.3.5] - 2026-11-12
+
+### Fixed
+
+- **fsck repairs a row whose recorded length no longer matches its frame.** A store written
+  by v0.1.0, which rewrote reconciled frames in place without fsync, can hold a row whose
+  frame decodes cleanly but whose `byte_len` (and range) describe an earlier version of the
+  file. Compaction and reconcile check the length and failed on such a row on every sweep,
+  while fsck passed it. fsck now rebuilds the row's descriptor from the frame itself,
+  keeping its id and path, and counts it in `rebound`; the data is kept.
+
 ## [0.3.4] - 2026-11-11
 
 ### Fixed
@@ -2930,7 +2952,9 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/basic-automation/weftdb/compare/v0.3.5...v0.3.6
+[0.3.5]: https://github.com/basic-automation/weftdb/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/basic-automation/weftdb/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/basic-automation/weftdb/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/basic-automation/weftdb/compare/v0.3.1...v0.3.2

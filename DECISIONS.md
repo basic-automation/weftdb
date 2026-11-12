@@ -6622,6 +6622,72 @@ needs `soak-baseline/` to be re-cut deliberately, not silently by a green check.
 (`scripts/annotate-soak-drift.py`) still emits `::warning::` and exits 0, which #688 does not ask to change;
 a refusal is the absence of a measurement, drift is a measurement that moved.
 
+## 2026-11-11 — FRE-9b: the OpenAPI document becomes the contract candidate (FLAGGED FOR MERGE REVIEW)
+
+**Ambiguous:** the 1.0 plan (§6 W11) says only that "FRE-9b's annotations land
+before the beta tag", and the ROADMAP line says only "OpenAPI". Neither
+enumerates what an annotation is, and the tag-grammar sub-item (#336) was
+already ticked via #657, so the remaining work is the annotations alone.
+
+**Chosen:** the annotations complete the wire contract `docs/stability.md`
+defines as "routes, request bodies, query parameters, and response schemas
+documented in the committed OpenAPI spec". FRE-9a documented the routes (plus
+the error table and four `PointsPage` success schemas); this slice adds the
+other three, for every one of the 73 operations, read off the handlers' own
+extractor types in `weft-server/src/openapi.rs`:
+
+- a `description` per operation, from the handler's own doc comment;
+- the query parameters from the handler's `StrictQuery` / `SelectorQuery` /
+  `TaggedQuery` struct — including the dynamic `tag.*` family and `tag_match`
+  (TAG-10's DECISIONS entry, 2026-11-04 item 7, names "OpenAPI does not
+  describe the dynamic `tag.*` family" as explicitly not done; this slice
+  closes it, as one `tag.*` parameter stating the grammar, since OpenAPI
+  cannot enumerate dynamic names);
+- a `requestBody` for every POST that takes a body, with a component schema
+  for every JSON body, and an explicit no-body statement (pinned by test) for
+  the 14 query-only / empty POSTs;
+- a success response with content for every operation — including the `201`
+  the declare and ingest handlers actually answer (ingest also answers `200`
+  on an idempotent replay), which corrects the FRE-9a shape that said `200`
+  for every operation;
+- a `BearerAuth` security scheme (SEC-6: the anonymous principal holds only
+  the probe scope), applied to every non-probe operation and explicitly
+  `[]` on the four probes; plus `info.description` and the default `servers`
+  entry.
+
+**Enforcement, not prose:** the annotation table is exhaustive — a route
+added without an annotation fails `every_operation_is_annotated`; the
+no-body POST set is pinned; the selector and security assignments are pinned
+against the registry itself; `validate()` now also requires a description, a
+`security` entry and content on every `2xx` response. The drift gate still
+pins the whole committed document to what the code generates.
+
+**Rejected:** migrating to utoipa/utoipa-axum (the plan §3 row says FRE-9a
+would feed `routes!()` output into the router, but FRE-9a as landed built the
+hand-rolled generator instead, and the drift gate, the subcommand and the
+committed spec all pin that shape — a migration would re-open the document's
+shape the week before the beta freeze); serving the document at runtime
+(plan §10 defers that past 1.0); per-operation error applicability (the error
+table stays the whole table the server can produce — FRE-10b's contract tests
+cover wire behaviour per operation).
+
+**Not decided here:** whether FRE-18's breaking-change check compares the
+beta spec byte-for-byte or semantically; the beta tag freezes this document
+as the candidate either way.
+
+**Salvage correction (2026-11-11):** the timed-out implement run left the four
+stored-interpolate GETs flagged `selector: true`, but their handlers take
+`StrictQuery<StoredInterpolateParams>` — they never read the `tag.*` family,
+so the document advertised parameters the wire ignores. The flags are `false`
+now, and `selector_routes_document_tag_selectors` pins the exact 20-operation
+selector set from the handlers' signatures, so a wrong flag fails the build
+instead of shipping a false parameter. The operation count above is 73 (the
+registry's `route()` calls), not 75. The same salvage pass fixed two clippy
+errors the timed-out run never saw: `build_components` had grown to 963 lines
+(`too_many_lines`, denied by the crate-level `forbid`), so the schema table is
+now sixteen `add_*_schemas` helpers of at most 91 lines each, and one doc
+comment needed backticks around `OpenAPI` (`doc_markdown`).
+
 ## 2026-11-12 — FRE-16 remainder: the asset-digest gate runs in the release workflow (FOR MERGE REVIEW)
 
 **Spec:** 1.0 plan §6 W11 (FRE-10b → FRE-16, tests and CI only) + ROADMAP line 364.
