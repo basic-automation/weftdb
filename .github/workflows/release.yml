@@ -123,6 +123,20 @@ jobs:
             scripts/release/verify.sh ref "${INPUT_REF:-${INPUT_TAG:-$DISPATCH_SHA}}"
           fi
 
+      # The asset-digest gate the pin file promises: `releases.py verify-assets`
+      # compares every pinned release's asset digests against the SHA256SUMS the
+      # release publishes today. Both ci.yml's compat job comment and releases.py's
+      # own docstring say this runs here, in the release workflow — but it ran
+      # nowhere, so a release whose published assets drifted from its pin would ship
+      # uncaught. It runs in this job, not the CI compat job, because it needs
+      # GitHub: a fork's CI run has no v0.1.0 release to download, so its compat job
+      # would go red on every outside pull request. The release workflow runs only
+      # on tag pushes and dispatches, on the canonical repository, with the token.
+      - name: Check pinned release assets against GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/compat/releases.py verify-assets
+
       - name: Assert a release runs from the verified commit
         if: steps.mode.outputs.release == 'true'
         env:
