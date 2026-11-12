@@ -456,12 +456,22 @@ The backup cost was measured on 2026-09-23, and the diagnosis on record at the t
 
 ## Six-month execution plan
 
-- **Month 1 — Benchmark truth:**
-- **Month 2 — Public API & observability:**
-- **Months 3–4 — Hot-path optimization:**
-- **Months 4–5 — GPU flagship:**
-- **Month 5 — Compression v2 prototype:**
-- **Month 6 — Commercial beta:**
+The bodies of these six lines were cut off in #99. The text below is restored from the version of the roadmap before that change.
+
+- **Month 1 — Benchmark truth:** external-engine adapters (WeftDB + DuckDB minimum, then ClickHouse/InfluxDB 3/QuestDB/TimescaleDB); first cross-engine report (no aggressive claims); methodology + anti-Goodhart policy + hardware-reporting template + correctness rules published
+  - Closed 2026-11-12. All of the adapters live in `weft-xbench/src` and were run in the pooled Phase 1 report (`bench/reports/phase1-pooled`, #508, 2026-11-02), which also includes IoTDB. The first cross-engine report is EVI-15 (`bench/reports/evi-15`). The methodology, hardware reporting and correctness rules are in `docs/methodology.md`, and the anti-Goodhart policy is in `HONESTY.md`.
+- **Month 2 — Public API & observability:** OTel; Parquet bench output; cold/warm separation; GPU timing breakdown *(server, REST, ILP, Prometheus, p50/p95/p99 shipped)*
+  - Closed 2026-11-12. `weft-server` exports OTel. Bench output goes to Parquet through `weft-bench/src/parquet_report.rs`. Cross-engine phases are marked `os-cold`, `restarted` or warm. The GPU benches (`gpu_economics`, `e2e_interpolation`) time device open and kernel compilation separately from the timed cells.
+- **Months 3–4 — Hot-path optimization:** batch-ingest rewrite; minimized `BigDecimal` hot-loop use; typed-array interpolation streaming; nightly benchmark-regression CI. *Goal: establish whether storage or conversion is the dominant bottleneck.*
+- **Months 4–5 — GPU flagship:** command batching; true async handles; CPU/GPU overlap; hardware auto-tuning; end-to-end interpolation benchmarks; CPU-only vs GPU cost/performance report; portability/determinism matrix. *Publish only if strong and reproducible.*
+  - Closed 2026-11-12. Command batching (5.1) and async handles (5.2) were measured and dropped rather than built. The rest shipped:
+    - CPU/GPU overlap: streamed interpolation (#585)
+    - Hardware auto-tuning: startup calibration for `Backend::Auto`
+    - End-to-end interpolation benchmarks: `weft-e2e-interp` (#586)
+    - CPU vs GPU cost/performance report: `--gpu-economics` (#569)
+    - Portability/determinism matrix: the conformance matrix (#573)
+- **Month 5 — Compression v2 prototype:** scaled-int compression; f64 codec prototype; random-access blocks; model-based prototype; accuracy benchmarks
+- **Month 6 — Commercial beta:** Docker image; API keys/TLS; backup/restore MVP; Python SDK; Grafana dashboard; benchmark report; customer-runnable Weft-Bench; design-partner onboarding docs. *Goal: a "WeftDB Performance Preview" for 3–5 partners.*
 
 ## Legal review
 
