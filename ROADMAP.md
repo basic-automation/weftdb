@@ -360,7 +360,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     - [x] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh` accepts only `vX.Y.Z` and `vX.Y.Z-rc.N` today, so a beta …
     - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*
   - [ ] → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh`
-  - [ ] **FRE-10b** Contract tests
+  - [x] **FRE-10b** Contract tests
   - [ ] → **FRE-16** CI compatibility gates
   - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
   - [ ] **ROB-24** Limits and overload evidence
