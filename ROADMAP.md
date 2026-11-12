@@ -166,8 +166,8 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 - [x] **SOA-11** Soak backup lane with final restore verification
 - [x] Weft-Bench: `weft-bench` and `weft-xbench`, fair protocol, reports, Grafana dashboard, pooled cross-engine run (#140–#150, #393, #505–#508)
 - [x] DONE (2026-11-02) — External-engine adapter fairness — three concrete rules from the 2026 landscape (#393)
-- [ ] Add the **DuckDB** adapter
-- [ ] Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters
+- [x] Add the **DuckDB** adapter
+- [x] Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters
 - [x] Stored-read `.serialize` spans
 - [x] Seal-path `control_plane.index.insert` span with `rows_changed`
 - [x] Bench-run routes (`/bench/runs`)
@@ -184,9 +184,9 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 - [x] `weft-bench --gpu-memory` device-memory soak (#583)
 - [x] 5.1 command batching and 5.2 async handles measured and dropped
 - [x] **B-interp** Interpolate-on-read, single-instant lookup, out-of-range extrapolation
-- [ ] Month 1 — Benchmark truth
-- [ ] Month 2 — Public API & observability
-- [ ] Months 4–5 — GPU flagship
+- [x] Month 1 — Benchmark truth
+- [x] Month 2 — Public API & observability
+- [x] Months 4–5 — GPU flagship
 
 ## Phase 10 — Tags core (was W8)
 
