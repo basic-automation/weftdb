@@ -361,7 +361,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
     - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*
   - [ ] → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh`
   - [ ] **FRE-10b** Contract tests
-  - [ ] → **FRE-16** CI compatibility gates
+  - [x] → **FRE-16** CI compatibility gates
   - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
   - [ ] **ROB-24** Limits and overload evidence
 - [ ] **W12 · Phase 7 acceptance**

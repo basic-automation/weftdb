@@ -6621,3 +6621,57 @@ needs `soak-baseline/` to be re-cut deliberately, not silently by a green check.
 **Not decided here:** whether the soak lane should also go red on drift past tolerance. The annotator
 (`scripts/annotate-soak-drift.py`) still emits `::warning::` and exits 0, which #688 does not ask to change;
 a refusal is the absence of a measurement, drift is a measurement that moved.
+
+## 2026-11-12 — FRE-16 remainder: the asset-digest gate runs in the release workflow (FOR MERGE REVIEW)
+
+**Spec:** 1.0 plan §6 W11 (FRE-10b → FRE-16, tests and CI only) + ROADMAP line 364.
+Acceptance: "CI compatibility gates run on the contract candidate". Closes #340.
+
+**What #677 left.** #677 landed the leg-coverage gate, but two compat gates still
+executed nothing:
+
+1. `scripts/compat/releases.py verify-assets` — the check that a pinned release's
+   asset digests still match the SHA256SUMS the release publishes — was invoked by
+   no workflow. Both `.github/workflows/ci.yml:500` ("runs in the release workflow,
+   which has the token") and `releases.py`'s own docstring ("the release workflow's
+   job does this") say it runs in the release workflow; a repo-wide grep for
+   `verify-assets` found only those two claims and the subcommand itself. A release
+   whose published assets drifted from its pin would have shipped uncaught.
+2. `pin_block` still emitted `legs = ["upgrade", "rollback"]` after #677 removed
+   `rollback` from the recognised legs (`LEGS = {"upgrade"}`). The block `pin
+   --write` prints for the next release fails `check_block` with `unknown leg(s)
+   ['rollback']` and would fail the leg-coverage gate too — the generator was
+   broken for its only purpose, pinning the beta.
+
+**Chosen: wire `verify-assets` into the release workflow's `verify` job, not the CI
+`compat` job.** The placement follows the two doc statements, and the release
+workflow is where a release-asset check belongs: it runs only on tag pushes and
+dispatches, on the canonical repository, with `GH_TOKEN` already set. The CI compat
+job cannot host it: `release_sha256sums` resolves the repository from
+`GITHUB_REPOSITORY`, and a fork's CI run has no v0.1.0 release to download, so
+`gh release download` would 404 and the compat job would go red on every outside
+pull request. The chain is now: the CI compat job and the upgrade leg run on the
+candidate commit; the release workflow refuses to release unless that CI run went
+green (`verify.sh`); and its `verify` job re-checks the pins against live GitHub
+before anything builds.
+
+**Chosen: `pin_block` emits `legs = ["upgrade"]`.** The only leg with a runner.
+A new test (`test_pin_block_emits_only_legs_the_gate_recognises`) runs `pin v0.1.0`
+against a stub `gh` and asserts the emitted block parses and passes `check_block`
+with no problems, so the generator cannot drift from the gate again.
+
+**Also fixed:** `docs/stability.md` linked the OpenAPI drift check to a
+`#compatopenapiweftdbjson` anchor that exists nowhere in the document, and its
+Basis line credited the drift check to the CI `compat` job — the drift test
+(`generated_spec_matches_committed_file` in `weft-server/src/openapi.rs`) runs in
+the CI `test` job via `cargo test --workspace`, not in `compat`. Both now name the
+test.
+
+**Deliberate-red proof.** Before the fix, `python3 scripts/compat/releases.py pin
+v0.1.0` printed `legs = ["upgrade", "rollback"]` and `check_block` on that output
+reported `unknown leg(s) ['rollback']`; after it, the emitted block passes
+`check_block` cleanly. `verify-assets` was run live against GitHub and passes
+("every pinned release's assets match its SHA256SUMS") — the gate itself works; it
+was the wiring that was missing. The release-workflow step cannot be executed
+locally (it runs on tag push/dispatch); its first real run is the next release or
+dry run, which is also the first time the gate's wiring is proven end to end.
