@@ -50,10 +50,10 @@
 //! after `run` returns, in startup's shutdown sequence.
 
 use std::{
-	future::Future, io, num::NonZeroUsize, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration
+	future::Future, io, num::NonZeroUsize, pin::Pin, sync::{
+		atomic::{AtomicUsize, Ordering}, Arc
+	}, task::{Context, Poll}, time::Duration
 };
-
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use hyper::server::conn::http1;
