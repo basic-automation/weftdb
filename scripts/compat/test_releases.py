@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -229,6 +230,24 @@ class Assets(unittest.TestCase):
 			self.assertIn(f'commit = "{head}"', out.stdout)
 			self.assertIn('tag = "v0.1.0"', out.stdout)
 			self.assertNotIn("fixtures", out.stdout, "a pin gets its fixtures line when the fixture set lands")
+
+	def test_pin_block_emits_only_legs_the_gate_recognises(self):
+		"""A pin `pin --write` appends must pass the gate that reads it.
+
+		`pin_block` still emitted `legs = ["upgrade", "rollback"]` after FRE-16
+		removed `rollback` from the recognised legs, so the block it printed
+		failed `check_block` with `unknown leg(s) ['rollback']` — and the
+		leg-coverage gate would have failed it too. The generator's output has to
+		be a block the gates accept, not just text shaped like one.
+		"""
+		sums = "a" * 64 + "  weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz\n"
+		with tempfile.TemporaryDirectory() as tmp:
+			env = dict(os.environ, PATH=stub_gh(Path(tmp), sums))
+			out = subprocess.run([sys.executable, str(HERE / "releases.py"), "pin", "v0.1.0"], capture_output=True, text=True, env=env)
+			self.assertEqual(out.returncode, 0, out.stderr)
+			self.assertIn('legs = ["upgrade"]', out.stdout)
+			emitted = tomllib.loads(out.stdout)["release"][0]
+			self.assertEqual(releases.check_block(emitted, 1), [], "the emitted pin must pass the shape gate")
 
 	def test_asset_drift_is_reported(self):
 		pinned = block(assets={"weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz": "a" * 64, "weftdb-v0.1.0-gone-target.tar.gz": "c" * 64})

@@ -306,7 +306,7 @@ def pin_block(tag: str) -> str:
 		f'published_at = "{published}"',
 		"binaries = true",
 		"crates_io = false",
-		'legs = ["upgrade", "rollback"]',
+		'legs = ["upgrade"]',
 		"",
 		"[release.assets]",
 	]

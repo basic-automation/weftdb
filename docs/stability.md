@@ -21,7 +21,7 @@ latest development, depend on `0.y` and read the changelog before each upgrade.
 The wire format (HTTP API) is the set of routes, request bodies, query parameters, and
 response schemas documented in the [committed OpenAPI
 spec](../compat/openapi/weftdb.json), which is [generated from `weft-server`'s real
-`RouteTable` and drift-checked in CI](#compatopenapiweftdbjson). Any change that would
+`RouteTable` and drift-checked in CI](../weft-server/src/openapi.rs). Any change that would
 require a client to modify a request or reinterpret a response is a **breaking change**
 and requires a major (or, pre-1.0, a minor) version bump:
 
@@ -62,8 +62,9 @@ breaking change between pre-1.0 releases is permitted with a minor version bump.
 freeze is the 1.0 milestone — before it, treat additions as safe and removals or
 reinterpretations as announced in the changelog.
 
-**Basis:** [`compat/openapi/weftdb.json`](../compat/openapi/weftdb.json) and the CI job
-[`compat` job in `ci.yml`](../.github/workflows/ci.yml) that runs `releases.py verify`.
+**Basis:** [`compat/openapi/weftdb.json`](../compat/openapi/weftdb.json) and the drift
+test [`generated_spec_matches_committed_file`](../weft-server/src/openapi.rs), which
+the CI `test` job runs on every push and pull request (`cargo test --workspace`).
 
 ### `weftdb-client` (the Rust SDK, crate directory `weft-client/`)
 

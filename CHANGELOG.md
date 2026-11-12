@@ -183,7 +183,15 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
   handles. Rollback and binary compatibility are now explicitly unsupported for 1.0:
   the `upgrade` leg is the only one that exists. The v0.1.0 pin drops `rollback` from
   its `legs` array; the `LEGS` constant in `releases.py` shrinks to `{"upgrade"}`.
-  Documents updated accordingly.
+  Documents updated accordingly. The remainder of the slice wires the asset-digest
+  gate into the release workflow: `releases.py verify-assets` — which compares every
+  pinned release's asset digests against the SHA256SUMS the release publishes — now
+  runs in the release workflow's `verify` job, where both `ci.yml` and the script's
+  docstring already said it runs; until now it ran nowhere. `pin_block` also stops
+  emitting the removed `rollback` leg, so a pin `pin --write` prints passes the
+  shape gate (regression test added). `docs/stability.md` no longer links the
+  OpenAPI drift check to a nonexistent anchor, and now credits it to the CI `test`
+  job that actually runs it.
 - `weftdb::close_idle_databases` and `weftdb::open_database_count`.
 - **Layout-upgrade integration test (FRE-13).** `weftdb/tests/layout_upgrade.rs` covers:
   the pre-v2 (layout-1) store upgrade to layout 2 through the public API, including

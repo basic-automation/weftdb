@@ -282,7 +282,7 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 ## Phase 14 — Beta tag (was W11)
 
 - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*
-- [ ] **FRE-16** CI compatibility gates: OpenAPI breaking-change check, fixture guard, golden coverage
+- [x] **FRE-16** CI compatibility gates: OpenAPI breaking-change check, fixture guard, golden coverage
 - [ ] **7.6 Quotas/limits** (ROB-14 + ROB-24 evidence)
 - [ ] **Panic audit on server paths** (ROB-2/3/4 + ROB-24)
 
