@@ -2341,8 +2341,8 @@ impl SegmentStore {
 			Err(error) => return Err(error).with_context(|| format!("reading segment {}", path.display())),
 		};
 		match frame_read::read_full(file_name, &bytes) {
-			Ok(_) => {
-				aspect_changed |= self.fsck_rebind_row(pass, aspect, row, (file_name, &path), &bytes).await?;
+			Ok(frame) => {
+				aspect_changed |= self.fsck_rebind_row(pass, aspect, row, (file_name, &path), &bytes, &frame).await?;
 			}
 			Err(error) => {
 				let source = error.downcast_ref::<frame_read::FrameFaultError>().map(|fault| fault.source().clone());
@@ -2365,7 +2365,7 @@ impl SegmentStore {
 
 	/// A row whose frame decoded: re-bind it to what the frame's name, CRC and series key
 	/// say, or quarantine it suspect when the key cannot be bound. Whether the aspect changed.
-	async fn fsck_rebind_row(&self, pass: &mut FsckPass, aspect: &str, row: &IndexRow, (file_name, path): (&str, &Path), bytes: &[u8]) -> Result<bool> {
+	async fn fsck_rebind_row(&self, pass: &mut FsckPass, aspect: &str, row: &IndexRow, (file_name, path): (&str, &Path), bytes: &[u8], frame: &frame_read::FullFrame) -> Result<bool> {
 		let mut aspect_changed = false;
 		// TAG-9: the frame's own series key. A SERIES_KEY payload that is
 		// malformed, empty or repeated, in a frame whose CRC verified and
@@ -2386,7 +2386,7 @@ impl SegmentStore {
 				return Ok(aspect_changed);
 			}
 		};
-		let (mut rebound, mut changed, new_aspect) = Self::rebound_from_frame(aspect, row, file_name, bytes);
+		let (mut rebound, mut changed, new_aspect) = Self::rebound_from_frame(aspect, row, file_name, bytes, frame);
 		// TAG-9: the row's series must be the one the frame's key names in
 		// the aspect the row ends up in. Catalogs are per aspect (D2), so a
 		// row moving to another aspect has its key resolved again there
@@ -2439,7 +2439,13 @@ impl SegmentStore {
 	/// What a row's frame says the row should be, from its name and its CRC trailer:
 	/// the re-bound row, whether it differs, and the aspect the frame's name names when
 	/// that is not `aspect`.
-	fn rebound_from_frame(aspect: &str, row: &IndexRow, file_name: &str, bytes: &[u8]) -> (IndexRow, bool, Option<String>) {
+	///
+	/// A row whose recorded length differs from the frame on disk describes some other
+	/// version of the file (a pre-0.2 store rewrote reconciled frames in place, and a crash
+	/// between the rewrite and the index commit left the old row behind). The frame
+	/// decoded, so it is the data: the row's descriptor is rebuilt from the frame itself,
+	/// keeping its id and path, so maintenance reads (which check the length) work again.
+	fn rebound_from_frame(aspect: &str, row: &IndexRow, file_name: &str, bytes: &[u8], frame: &frame_read::FullFrame) -> (IndexRow, bool, Option<String>) {
 		let computed_crc = bytes.len().checked_sub(4).map(|body| {
 			let trailer = &bytes[body..];
 			u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]])
@@ -2469,6 +2475,11 @@ impl SegmentStore {
 		}
 		if row.frame_crc != computed_crc {
 			rebound.frame_crc = computed_crc;
+			changed = true;
+		}
+		let on_disk = bytes.len() as u64;
+		if row.desc.byte_len != on_disk {
+			rebound.desc = frame.descriptor(row.desc.id, row.desc.path.clone(), on_disk);
 			changed = true;
 		}
 		(rebound, changed, new_aspect)
@@ -8631,6 +8642,36 @@ mod tests {
 		let report = store.fsck(false).await.expect("fsck again");
 		drop(store);
 		assert_eq!(report.rebound, 0, "a bound row is untouched");
+	}
+
+	/// A pre-0.2 store rewrote a frame in place and crashed before the index
+	/// commit, leaving a row whose length (and range) describe the old file.
+	/// fsck rebuilds the row from the frame that decodes, so the length-checked
+	/// maintenance reads work again, and keeps the data.
+	#[tokio::test]
+	async fn fsck_rebuilds_a_row_whose_length_is_stale() {
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let sealed = store.seal("price", &schema(), &[0, 10], &[bd("1"), bd("2")]).await.expect("seals");
+		let other_dir = TempDir::new().expect("tempdir");
+		let other = SegmentStore::open(other_dir.path()).await.expect("opens");
+		let bigger = other.seal("price", &schema(), &[0, 10, 20, 30], &[bd("1"), bd("2"), bd("3"), bd("4")]).await.expect("seals");
+		// Rewrite the frame in place with a different, valid frame: the row is now stale.
+		std::fs::copy(&bigger.path, &sealed.path).expect("rewrites in place");
+		drop(other);
+		let row = store.index().rows("price").await.expect("rows").into_iter().next().expect("row");
+		assert!(store.read_bound_frame(&row).await.is_err(), "the stale row fails the length check");
+		let report = store.fsck(false).await.expect("fsck");
+		assert_eq!(report.rebound, 1);
+		assert_eq!(report.quarantined, 0, "a frame that decodes is kept");
+		let row = store.index().rows("price").await.expect("rows").into_iter().next().expect("row");
+		assert_eq!(row.desc.byte_len, std::fs::metadata(&sealed.path).expect("stat").len());
+		assert_eq!((row.desc.row_count, row.desc.max_ts), (4, Some(30)), "the range comes from the frame");
+		assert_eq!(row.desc.id, sealed.id);
+		store.read_bound_frame(&row).await.expect("the rebuilt row reads");
+		let report = store.fsck(false).await.expect("fsck again");
+		drop(store);
+		assert_eq!(report.rebound, 0);
 	}
 
 	/// D-S12: a clean shutdown marks the flag the next open reports, and a
