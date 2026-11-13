@@ -111,7 +111,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [x] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh`)
 - [x] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
 - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
-- [ ] **ROB-24** Limits and overload evidence; frozen configuration documentation
+- [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
 - [ ] **SOA-15** part 2: TTL lane
 
 ## Phase 14 — Beta tag (was W11)

@@ -873,14 +873,14 @@ pub fn non_finite_value(what: impl std::fmt::Display) -> ApiError {
 /// rows the seal has to write, not the bytes that arrived.
 #[must_use]
 pub fn too_many_ingest_rows(rows: usize, limit: usize) -> ApiError {
-	ApiError::new(Code::TooManyRows, format!("this body decodes to {rows} rows, over the {limit}-row ingest limit; split it into smaller batches or raise `WEFT_MAX_INGEST_ROWS`"))
+	ApiError::new(Code::TooManyRows, format!("this body decodes to {rows} rows, over the {limit}-row ingest limit; split it into smaller batches or raise `WEFT_MAX_INGEST_ROWS`")).with_limit(u64::try_from(limit).unwrap_or(u64::MAX))
 }
 
 /// A decoded ingest body over the decoded-byte cap (`WEFT_MAX_INGEST_DECODED_BYTES`,
 /// ROB-7 / plan C11). A body cap cannot bound this: a Parquet body is compressed.
 #[must_use]
 pub fn decoded_too_large(decoded: u64, limit: u64) -> ApiError {
-	ApiError::new(Code::PayloadTooLarge, format!("this body decodes to about {} MiB of columns, over the {} MiB decoded limit; split it into smaller batches or raise `WEFT_MAX_INGEST_DECODED_BYTES`", decoded / (1024 * 1024), limit / (1024 * 1024)))
+	ApiError::new(Code::PayloadTooLarge, format!("this body decodes to about {} MiB of columns, over the {} MiB decoded limit; split it into smaller batches or raise `WEFT_MAX_INGEST_DECODED_BYTES`", decoded / (1024 * 1024), limit / (1024 * 1024))).with_limit(limit)
 }
 
 /// Map a library failure from an **ingest** route: the bytes being refused came from the
