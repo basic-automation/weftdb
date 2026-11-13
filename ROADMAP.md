@@ -263,7 +263,8 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
 - [x] What `float_roundtrip` costs a whole JSON compute or ingest request
 - [ ] Flaky under GPU contention: `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu`
-- [ ] Guard the `#[serial]`-above-`#[test]` ordering
+- [x] Guard the `#[serial]`-above-`#[test]` ordering (`scripts/ci/check-serial-order.py`, #405; keyed `#[serial(key)]` covered 2026-11-13)
+  - [ ] Contribute the minimal ordering repro upstream to rust-lang/rust#100263, still open (last updated 2024-12-10) *(owner: outward-facing)*
 - [ ] Shared Cargo target dir aliases workspace crates across worktrees (found 2026-11-13): a `main` worktree built into the same `target-dir` left its `weft-reduce` artifact in place, and the branch's next `cargo build --release -p weft-server` linked it as fresh, so the binary ran `main`'s reduction under the branch's `weftdb` (caught by a gdb backtrace into the other checkout's source). Give each worktree its own `CARGO_TARGET_DIR`, or `touch` the workspace crates after switching
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)

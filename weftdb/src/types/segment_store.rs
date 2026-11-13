@@ -3417,8 +3417,8 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn backup_then_restore_round_trips_a_working_store() {
 		// The Phase 7.4 drill: back the control plane up, restore it into a fresh root
 		// beside the original's segment frames, and prove the restored store still
@@ -3466,8 +3466,8 @@ mod tests {
 	/// its manifest embeds the store's `STORE_FORMAT` and allocators, a
 	/// control-plane restore refuses it, and `restore_store` round-trips it
 	/// into a fresh root that opens and reads — with the live root gone.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn whole_store_backup_links_frames_and_restores() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3512,8 +3512,8 @@ mod tests {
 
 	/// D-S16: a backup whose embedded `STORE_FORMAT` floor is newer than this
 	/// build is refused before anything is staged.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn whole_store_restore_refuses_a_newer_floor() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3535,8 +3535,8 @@ mod tests {
 	/// carrying a canonical `SERIES_KEY` extension is adopted into the series its
 	/// key names — registered in the catalog in the same transaction — rather
 	/// than held.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn restore_mode_adopts_series_key_frames_into_their_series() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3584,8 +3584,8 @@ mod tests {
 	/// TAG-9: a tagged orphan of an aspect the restored store has not declared
 	/// is held at the restore; once the aspect is declared, the next open
 	/// adopts it into its series and clears the journal row.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_held_frame_is_adopted_on_the_next_open() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3636,8 +3636,8 @@ mod tests {
 
 	/// TAG-9: a held frame whose `SERIES_KEY` payload is malformed is quarantined
 	/// suspect on the next open, its journal row cleared in the same pass.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_held_frame_with_a_malformed_key_is_suspect() {
 		let dir = TempDir::new().unwrap();
 		let (root, held, store) = restored_with_held_frame(&dir).await;
@@ -3654,8 +3654,8 @@ mod tests {
 
 	/// TAG-9: a held frame that decayed (its CRC no longer verifies) is
 	/// quarantined under its decode class rather than kept held forever.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_decayed_held_frame_is_quarantined() {
 		let dir = TempDir::new().unwrap();
 		let (root, held, store) = restored_with_held_frame(&dir).await;
@@ -3674,8 +3674,8 @@ mod tests {
 	}
 
 	/// TAG-9: a held row whose frame is gone is cleared and counted, not kept.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_held_row_without_its_frame_is_cleared() {
 		let dir = TempDir::new().unwrap();
 		let (root, held, store) = restored_with_held_frame(&dir).await;
@@ -3690,8 +3690,8 @@ mod tests {
 
 	/// TAG-9: a report-only pass over a held row counts the adoption it would
 	/// make and leaves the journal row, the catalog and the index untouched.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn report_only_leaves_a_held_row_alone() {
 		let dir = TempDir::new().unwrap();
 		let (_, _, store) = restored_with_held_frame(&dir).await;
@@ -3706,8 +3706,8 @@ mod tests {
 
 	/// TAG-9: a restore-mode orphan whose `SERIES_KEY` payload is malformed is
 	/// quarantined suspect, not adopted.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_restore_orphan_with_a_malformed_key_is_suspect() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3890,8 +3890,8 @@ mod tests {
 		drop(store);
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn restore_refuses_to_clobber_an_existing_control_plane() {
 		let dir = TempDir::new().unwrap();
 		let schema = AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds);
@@ -3932,8 +3932,8 @@ mod tests {
 		names
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_published_backup_carries_a_manifest_and_leaves_no_build_directory() {
 		let dir = TempDir::new().unwrap();
 		let store = populated_store(&dir.path().join("live")).await;
@@ -3960,8 +3960,8 @@ mod tests {
 	/// The regression for an empty snapshot verifying: a pre-manifest backup whose
 	/// `catalog.db` is an empty database (a crash mid-`VACUUM INTO`, say) restored as a
 	/// valid control plane with no databases or subjects in it.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn restore_rejects_an_empty_catalog_snapshot() {
 		let dir = TempDir::new().unwrap();
 		let store = populated_store(&dir.path().join("live")).await;
@@ -3983,8 +3983,8 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_legacy_backup_without_a_manifest_still_restores() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -4010,8 +4010,8 @@ mod tests {
 		assert_eq!(times, vec![0_i64, 10, 20]);
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn restore_refuses_a_staging_directory_and_a_backup_changed_since_its_manifest() {
 		let dir = TempDir::new().unwrap();
 		let store = populated_store(&dir.path().join("live")).await;
@@ -4043,9 +4043,9 @@ mod tests {
 	/// restorable, and no build directory. The live store's own databases are trusted
 	/// (Turso commits them FULL); everything the backup writes, including the snapshots
 	/// Turso vacuums into it, counts only once made durable through `StoreFs`.
+	#[serial(backup_fault_points)]
 	#[tokio::test]
 	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
-	#[serial(backup_fault_points)]
 	async fn a_power_cut_after_a_reported_backup_leaves_it_complete() {
 		fn live_database(rel: &Path) -> bool {
 			rel.parent() == Some(Path::new("")) && crate::durable::SimFs::turso_file(rel)
@@ -4076,8 +4076,8 @@ mod tests {
 	/// each complete, and no `.tmp` copy. The restore root is new, so its own entry must
 	/// be durable too. Nothing in the restore root is exempt: Turso's reopen to verify a
 	/// copy is trusted only if it leaves the synced bytes as they were.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_power_cut_after_a_reported_restore_leaves_every_database_complete() {
 		let dir = TempDir::new().unwrap();
 		let store = populated_store(&dir.path().join("live")).await;
@@ -4120,8 +4120,8 @@ mod tests {
 	/// The crash is a backup parked at the point and dropped there. Unlike an error, that
 	/// runs none of the backup's own cleanup, so what is left is what a process crash
 	/// leaves (the OS keeps every write; power loss is the `SimFs` tests' job).
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_crash_at_any_backup_point_leaves_nothing_incomplete_counted_or_restorable() {
 		use std::sync::Arc;
 
@@ -4178,8 +4178,8 @@ mod tests {
 	/// without the backup daemon (whose sweep removes what a crash leaves) does not
 	/// collect hidden database copies. Stopped by one after the publishing rename, it is
 	/// already whole under its label, which stays taken.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn an_error_at_any_backup_point_removes_what_it_built() {
 		use crate::durable::fault::{arm, injected_point, FaultAction};
 
@@ -4205,8 +4205,8 @@ mod tests {
 		drop(store);
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn backup_control_plane_snapshots_and_verifies_every_db() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open_scoped(dir.path(), "market", "btc").await.expect("opens");
@@ -7962,9 +7962,9 @@ mod tests {
 	/// then fails with `Poisoned` before touching anything, while every read keeps
 	/// serving, including the phantom transaction's row, which did commit. A restart
 	/// clears the poison.
+	#[serial(index_txn_fault_points)]
 	#[tokio::test]
 	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
-	#[serial(index_txn_fault_points)]
 	async fn a_phantom_commit_poisons_writes_and_leaves_reads_up() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
@@ -8026,8 +8026,8 @@ mod tests {
 	/// poison. `S-txn-begun`, paused, holds the first attempt until the poison is set and
 	/// counts the attempts: a second one would park there for good, and the timeout
 	/// would fail the test.
-	#[tokio::test]
 	#[serial(index_txn_fault_points)]
+	#[tokio::test]
 	async fn a_transaction_waiting_to_retry_stops_at_the_poison() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");

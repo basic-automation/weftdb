@@ -54,7 +54,26 @@ class SerialOrderTest(unittest.TestCase):
         src = "#[tokio::test]\nasync fn no_serial() {}"
         self.assertEqual(check(src), [])
 
+    def test_keyed_serial_above_tokio_test_accepts(self):
+        src = '#[serial(build_publish)]\n#[tokio::test(flavor = "multi_thread", worker_threads = 2)]\nasync fn it_works() {}'
+        self.assertEqual(check(src), [])
+
+    def test_path_qualified_serial_above_test_accepts(self):
+        src = "#[serial_test::serial]\n#[test]\nfn it_works() {}"
+        self.assertEqual(check(src), [])
+
     # --- Wrong order (reject) ---
+    def test_keyed_serial_below_tokio_test_rejects(self):
+        """A keyed #[serial(key)] is the same macro: below the test attribute it is flagged."""
+        src = "#[tokio::test]\n#[serial(build_publish)]\nasync fn it_works() {}"
+        errs = check(src)
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0][1], 2)
+
+    def test_path_qualified_serial_below_test_rejects(self):
+        src = "#[test]\n#[serial_test::serial(key)]\nfn it_works() {}"
+        self.assertEqual(len(check(src)), 1)
+
 
     def test_test_before_serial_rejects(self):
         src = "#[tokio::test]\n#[serial]\nasync fn it_works() {}"

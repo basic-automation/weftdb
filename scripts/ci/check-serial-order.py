@@ -35,8 +35,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Match #[serial] exactly — the attribute, not inside a comment or string.
-_SERIAL_RE = re.compile(r"^\s*#\s*\[\s*serial\s*\]\s*(.*)$")
+# Match #[serial] — bare, keyed (`#[serial(build_publish)]`, `#[serial(a, b)]`) or path-qualified
+# (`#[serial_test::serial]`) — the attribute, not inside a comment or string. A keyed one is
+# the same proc macro in the same position, so it gets the same rule.
+_SERIAL_RE = re.compile(r"^\s*#\s*\[\s*(?:serial_test\s*::\s*)?serial\s*(?:\([^)]*\))?\s*\]\s*(.*)$")
 
 # Match #[test], #[tokio::test], #[tokio::test(...)]
 _TEST_ATTR_RE = re.compile(r"^\s*#\s*\[\s*(?:tokio::)?test\b")
