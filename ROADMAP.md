@@ -81,24 +81,24 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] (2026-10-08 list.) The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
 - [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
-- [ ] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
+- [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
 - [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames
-- [ ] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
-- [ ] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
+- [x] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
+- [x] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
 - [ ] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [ ] Restoring *into a chosen new root* over HTTP (7.3)
 - [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane)
 - [ ] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
-- [ ] **CI**
-- [ ] Packaging (1.0 minimum)
+- [x] **CI**
+- [x] Packaging (1.0 minimum)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
 - [ ] What `float_roundtrip` costs a whole JSON compute or ingest request
 - [ ] Flaky under GPU contention: `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu`
-- [ ] Guard the `#[serial]`-above-`#[test]` ordering
+- [x] Guard the `#[serial]`-above-`#[test]` ordering
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)
 
