@@ -102,7 +102,7 @@ async fn a_disabled_guard_still_reports_headroom() {
 /// private to the child and goes with it.
 ///
 /// Where unprivileged user namespaces are unavailable (some CI kernels restrict them) the
-/// parent says so on stderr and passes; `WEFT_REQUIRE_TMPFS_TESTS=1` turns that into a
+/// parent says so on stderr and passes; `WEFT_REQUIRE_TMPFS=1` turns that into a
 /// failure.
 #[cfg(target_os = "linux")]
 mod full_filesystem {
@@ -117,7 +117,7 @@ mod full_filesystem {
 	use crate::{disk_space_at, IngestBatch, StoreError};
 
 	/// Set in the child: the body runs only there.
-	const CHILD: &str = "WEFT_TMPFS_CHILD";
+	const CHILD: &str = "WEFT_TEST_TMPFS_CHILD";
 	/// The tmpfs every child mounts.
 	const TMPFS_BYTES: u64 = 64 * 1024 * 1024;
 	/// Rows per ingest: one frame of noisy integers, near 800 KB.
@@ -130,18 +130,18 @@ mod full_filesystem {
 		let exe = std::env::current_exe().expect("finds the test binary");
 		let name = format!("types::segment_store::disk_guard_tests::full_filesystem::{child}");
 		let out = Command::new("unshare").args(["--user", "--map-root-user", "--mount", "--"]).arg(exe).args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"]).env(CHILD, "1").output();
-		let required = std::env::var_os("WEFT_REQUIRE_TMPFS_TESTS").is_some_and(|v| v == "1");
+		let required = std::env::var_os("WEFT_REQUIRE_TMPFS").is_some_and(|v| v == "1");
 		let out = match out {
 			Ok(out) => out,
 			Err(e) => {
-				assert!(!required, "WEFT_REQUIRE_TMPFS_TESTS=1 but `unshare` could not run: {e}");
+				assert!(!required, "WEFT_REQUIRE_TMPFS=1 but `unshare` could not run: {e}");
 				eprintln!("{child}: skipped, `unshare` could not run: {e}");
 				return;
 			}
 		};
 		let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 		if !stdout.contains("running 1 test") {
-			assert!(!required, "WEFT_REQUIRE_TMPFS_TESTS=1 but the namespace could not be made: {stderr}");
+			assert!(!required, "WEFT_REQUIRE_TMPFS=1 but the namespace could not be made: {stderr}");
 			eprintln!("{child}: skipped, no unprivileged user and mount namespace here: {}", stderr.trim());
 			return;
 		}
