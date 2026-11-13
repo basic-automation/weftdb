@@ -704,6 +704,8 @@ pub fn run_in_process_lanes(profile: &GpuEconomicsProfile, gpu: bool, baseline: 
 
 #[cfg(test)]
 mod tests {
+	use serial_test::serial;
+
 	use super::*;
 
 	fn smoke() -> GpuEconomicsProfile {
@@ -780,6 +782,8 @@ mod tests {
 	}
 
 	/// Runs on a hardware GPU only (skips otherwise, unless `WEFT_REQUIRE_GPU` is set).
+	/// Serialized with the other GPU tests on splimes' process-wide buffer pool.
+	#[serial(gpu_pool)]
 	#[test]
 	fn the_gpu_lanes_pass_on_a_real_gpu() {
 		if let Err(e) = start_gpu() {

@@ -1495,8 +1495,8 @@ mod tests {
 		assert!(!is_complete_backup(&dir.path().join("missing")).await.unwrap());
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn retiring_a_backup_renames_it_away_before_removing_it() {
 		let dir = tempfile::tempdir().unwrap();
 		let victim = dir.path().join("backup-1");
@@ -1602,8 +1602,8 @@ mod tests {
 	/// cut right after `retire_backup` could leave lacks the name, because the rename to
 	/// `.deleting-*` is made durable before any file goes. Without the base fsync between
 	/// them, an image could keep the name and lose some of its files.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_power_cut_after_a_retire_never_leaves_the_backup_half_removed() {
 		let dir = tempfile::tempdir().unwrap();
 		let base = dir.path().join("backups");

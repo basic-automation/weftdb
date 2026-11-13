@@ -285,18 +285,45 @@ fn scaled_rows(ts: &[i64], vs: &[Option<PhysicalValue>], start: i64, end: i64, u
 /// Pure and synchronous: it takes the frame bytes and returns the partial, so it holds
 /// no store state and the whole call is `spawn_blocking`-safe.
 fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
+	match segment_fold(descriptor, bytes, (start, end), unit, resolution, aggregations, None)? {
+		Some(Folded::Partial(partial)) => Ok(Some(partial)),
+		Some(Folded::Finished(_)) => bail!("reducing segment {}: a fold that may not finish returned finished buckets", descriptor.path),
+		None => Ok(None),
+	}
+}
+
+/// What one segment's fold produced: the mergeable partial, or, for a read that merges
+/// nothing and finishes on the integer path, the finished buckets themselves.
+enum Folded {
+	Partial(PartialReduction),
+	Finished(Vec<Bucket>),
+}
+
+/// [`segment_partial`], or with `finish` the buckets at that width (whose unit is
+/// `resolution`) when the integer path can produce them directly: a read whose one segment
+/// is its whole answer has no partial to merge, so [`weft_reduce::reduce_scaled_width`]
+/// reduces the stored mantissas to buckets, selecting the exact percentiles and weighting the
+/// time-weighted averages on them, instead of `reduce_partial_scaled` building a `BigDecimal`
+/// per sample for the partial to carry (#401). The buckets are the ones finishing the
+/// partial, coarsened to the width, gives. One physical decode either way.
+fn segment_fold(descriptor: &SegmentDescriptor, bytes: &[u8], (start, end): (i64, i64), unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation], finish: Option<weft_reduce::BucketWidth>) -> Result<Option<Folded>> {
 	// Read the window in its physical encoding, so a ScaledI64 column can be reduced on its
 	// stored mantissas without building a BigDecimal per row.
 	let (ts, vs) = frame_read::read_range_physical(descriptor.path.as_str(), bytes, start, end)?;
-	// Integer-native path: every present in-window value is ScaledI64 at one scale and every
-	// requested reduction is a streaming one. `reduce_partial_scaled` then builds the same
-	// mergeable partial `reduce_partial` would, from integer accumulators.
+	// Integer-native path: every present in-window value is ScaledI64 at one scale.
+	// `reduce_partial_scaled` then builds the same mergeable partial `reduce_partial` would,
+	// from integer accumulators; `reduce_scaled` the finished buckets.
 	if let Some((nanos, mantissas, scale)) = scaled_rows(&ts, &vs, start, end, unit) {
 		if nanos.is_empty() {
 			return Ok(None);
 		}
+		if let Some(width) = finish {
+			if let Some(buckets) = weft_reduce::reduce_scaled_width(&nanos, &mantissas, u32::from(scale), width, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))? {
+				return Ok(Some(Folded::Finished(buckets)));
+			}
+		}
 		if let Some(partial) = weft_reduce::reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))? {
-			return Ok(Some(partial));
+			return Ok(Some(Folded::Partial(partial)));
 		}
 	}
 	// Null rows carry no value to reduce; present rows lift to absolute instants.
@@ -312,7 +339,7 @@ fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end
 		return Ok(None);
 	}
 	let partial = weft_reduce::reduce_partial(&points, resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))?;
-	Ok(Some(partial))
+	Ok(Some(Folded::Partial(partial)))
 }
 
 /// Whether the inclusive query window `[start, end]` fully covers `descriptor`'s segment
@@ -3391,8 +3418,8 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn backup_then_restore_round_trips_a_working_store() {
 		// The Phase 7.4 drill: back the control plane up, restore it into a fresh root
 		// beside the original's segment frames, and prove the restored store still
@@ -3440,8 +3467,8 @@ mod tests {
 	/// its manifest embeds the store's `STORE_FORMAT` and allocators, a
 	/// control-plane restore refuses it, and `restore_store` round-trips it
 	/// into a fresh root that opens and reads — with the live root gone.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn whole_store_backup_links_frames_and_restores() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3486,8 +3513,8 @@ mod tests {
 
 	/// D-S16: a backup whose embedded `STORE_FORMAT` floor is newer than this
 	/// build is refused before anything is staged.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn whole_store_restore_refuses_a_newer_floor() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3509,8 +3536,8 @@ mod tests {
 	/// carrying a canonical `SERIES_KEY` extension is adopted into the series its
 	/// key names — registered in the catalog in the same transaction — rather
 	/// than held.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn restore_mode_adopts_series_key_frames_into_their_series() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3558,8 +3585,8 @@ mod tests {
 	/// TAG-9: a tagged orphan of an aspect the restored store has not declared
 	/// is held at the restore; once the aspect is declared, the next open
 	/// adopts it into its series and clears the journal row.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_held_frame_is_adopted_on_the_next_open() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3610,8 +3637,8 @@ mod tests {
 
 	/// TAG-9: a held frame whose `SERIES_KEY` payload is malformed is quarantined
 	/// suspect on the next open, its journal row cleared in the same pass.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_held_frame_with_a_malformed_key_is_suspect() {
 		let dir = TempDir::new().unwrap();
 		let (root, held, store) = restored_with_held_frame(&dir).await;
@@ -3628,8 +3655,8 @@ mod tests {
 
 	/// TAG-9: a held frame that decayed (its CRC no longer verifies) is
 	/// quarantined under its decode class rather than kept held forever.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_decayed_held_frame_is_quarantined() {
 		let dir = TempDir::new().unwrap();
 		let (root, held, store) = restored_with_held_frame(&dir).await;
@@ -3648,8 +3675,8 @@ mod tests {
 	}
 
 	/// TAG-9: a held row whose frame is gone is cleared and counted, not kept.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_held_row_without_its_frame_is_cleared() {
 		let dir = TempDir::new().unwrap();
 		let (root, held, store) = restored_with_held_frame(&dir).await;
@@ -3664,8 +3691,8 @@ mod tests {
 
 	/// TAG-9: a report-only pass over a held row counts the adoption it would
 	/// make and leaves the journal row, the catalog and the index untouched.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn report_only_leaves_a_held_row_alone() {
 		let dir = TempDir::new().unwrap();
 		let (_, _, store) = restored_with_held_frame(&dir).await;
@@ -3680,8 +3707,8 @@ mod tests {
 
 	/// TAG-9: a restore-mode orphan whose `SERIES_KEY` payload is malformed is
 	/// quarantined suspect, not adopted.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_restore_orphan_with_a_malformed_key_is_suspect() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3864,8 +3891,8 @@ mod tests {
 		drop(store);
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn restore_refuses_to_clobber_an_existing_control_plane() {
 		let dir = TempDir::new().unwrap();
 		let schema = AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds);
@@ -3906,8 +3933,8 @@ mod tests {
 		names
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_published_backup_carries_a_manifest_and_leaves_no_build_directory() {
 		let dir = TempDir::new().unwrap();
 		let store = populated_store(&dir.path().join("live")).await;
@@ -3934,8 +3961,8 @@ mod tests {
 	/// The regression for an empty snapshot verifying: a pre-manifest backup whose
 	/// `catalog.db` is an empty database (a crash mid-`VACUUM INTO`, say) restored as a
 	/// valid control plane with no databases or subjects in it.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn restore_rejects_an_empty_catalog_snapshot() {
 		let dir = TempDir::new().unwrap();
 		let store = populated_store(&dir.path().join("live")).await;
@@ -3957,8 +3984,8 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_legacy_backup_without_a_manifest_still_restores() {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("live");
@@ -3984,8 +4011,8 @@ mod tests {
 		assert_eq!(times, vec![0_i64, 10, 20]);
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn restore_refuses_a_staging_directory_and_a_backup_changed_since_its_manifest() {
 		let dir = TempDir::new().unwrap();
 		let store = populated_store(&dir.path().join("live")).await;
@@ -4017,9 +4044,9 @@ mod tests {
 	/// restorable, and no build directory. The live store's own databases are trusted
 	/// (Turso commits them FULL); everything the backup writes, including the snapshots
 	/// Turso vacuums into it, counts only once made durable through `StoreFs`.
+	#[serial(backup_fault_points)]
 	#[tokio::test]
 	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
-	#[serial(backup_fault_points)]
 	async fn a_power_cut_after_a_reported_backup_leaves_it_complete() {
 		fn live_database(rel: &Path) -> bool {
 			rel.parent() == Some(Path::new("")) && crate::durable::SimFs::turso_file(rel)
@@ -4050,8 +4077,8 @@ mod tests {
 	/// each complete, and no `.tmp` copy. The restore root is new, so its own entry must
 	/// be durable too. Nothing in the restore root is exempt: Turso's reopen to verify a
 	/// copy is trusted only if it leaves the synced bytes as they were.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_power_cut_after_a_reported_restore_leaves_every_database_complete() {
 		let dir = TempDir::new().unwrap();
 		let store = populated_store(&dir.path().join("live")).await;
@@ -4094,8 +4121,8 @@ mod tests {
 	/// The crash is a backup parked at the point and dropped there. Unlike an error, that
 	/// runs none of the backup's own cleanup, so what is left is what a process crash
 	/// leaves (the OS keeps every write; power loss is the `SimFs` tests' job).
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn a_crash_at_any_backup_point_leaves_nothing_incomplete_counted_or_restorable() {
 		use std::sync::Arc;
 
@@ -4152,8 +4179,8 @@ mod tests {
 	/// without the backup daemon (whose sweep removes what a crash leaves) does not
 	/// collect hidden database copies. Stopped by one after the publishing rename, it is
 	/// already whole under its label, which stays taken.
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn an_error_at_any_backup_point_removes_what_it_built() {
 		use crate::durable::fault::{arm, injected_point, FaultAction};
 
@@ -4179,8 +4206,8 @@ mod tests {
 		drop(store);
 	}
 
-	#[tokio::test]
 	#[serial(backup_fault_points)]
+	#[tokio::test]
 	async fn backup_control_plane_snapshots_and_verifies_every_db() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open_scoped(dir.path(), "market", "btc").await.expect("opens");
@@ -6616,14 +6643,32 @@ mod tests {
 		// fall back, and must agree on the same scaled store too.
 		let integer = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP99];
 		let fallback = [Aggregation::Avg, Aggregation::P99, Aggregation::Twa];
+		// Every full-bucket reduction, which several segments now finish on their mantissas (#401).
+		let full = [Aggregation::P50, Aggregation::TwaLinear, Aggregation::P95, Aggregation::TwaBucketEnd, Aggregation::Last, Aggregation::P90];
 		let whole = (i64::MIN, i64::MAX);
 		// A window that trims inside the first, second and nullable segments.
 		let window = (base + 1_000_000, base + 6_500_000);
 
 		assert_integer_path(&store, &integer).await;
+		let descriptors = store.index.prune_by_time(ASPECT, i64::MIN, i64::MAX).await.expect("prunes");
+		assert!(descriptors.len() > 1);
+		for aggs in [&fallback[..], &full[..]] {
+			assert!(store.downsample_scaled_rows(ASPECT, &descriptors, whole, TimeUnit::Millis, weft_reduce::BucketWidth::from(Resolution::Minutes), aggs).await.expect("decodes").is_some(), "several one-scale segments finish {aggs:?} on their mantissas");
+		}
 		for (start, end) in [whole, window] {
 			assert_single_pass(&store, start, end, &integer, "sealed, integer path").await;
 			assert_single_pass(&store, start, end, &fallback, "sealed, fallback").await;
+			assert_single_pass(&store, start, end, &full, "sealed, several segments on mantissas").await;
+			// At a multi-step width, against the single pass at the unit coarsened to it.
+			let (ts, vs) = store.read_time_range(ASPECT, start, end).await.expect("reads");
+			let points: Vec<Point> = ts.iter().zip(vs).filter_map(|(t, v)| v.map(|v| Point::new(DateTime::<Utc>::from_timestamp_millis(*t).expect("instant"), v))).collect();
+			let width = weft_reduce::BucketWidth::parse("7m").expect("parses");
+			for aggs in [&full[..], &fallback[..], &integer[..]] {
+				let coarse = weft_reduce::reduce_partial(&points, Resolution::Minutes, None, None, aggs).expect("reduces").coarsen(7).expect("coarsens").finish_width(width, aggs).expect("finishes");
+				let got = store.downsample_range_width(ASPECT, start, end, width, aggs).await.expect("downsamples");
+				assert!(got.len() > 1);
+				assert_eq!(got, coarse, "7m {aggs:?}");
+			}
 		}
 
 		// Maintenance sorts the out-of-order segment and merges the overlapping ones; the
@@ -6636,6 +6681,81 @@ mod tests {
 		for (start, end) in [whole, window] {
 			assert_single_pass(&store, start, end, &integer, "maintained, integer path").await;
 			assert_single_pass(&store, start, end, &fallback, "maintained, fallback").await;
+			assert_single_pass(&store, start, end, &full, "maintained, on mantissas").await;
+		}
+		drop(store);
+	}
+
+	/// #401: a downsample whose window prunes to one `ScaledI64` segment is finished on the
+	/// integer path, the exact percentiles selected and the time-weighted averages weighted on
+	/// the mantissas, and must equal `read_time_range` followed by one `reduce` to the digit and
+	/// exponent, whole and trimmed, alone and beside streaming reductions; a sketch still takes
+	/// the partial route.
+	/// The finished grid is held to the store's bucket cap like a partial.
+	#[tokio::test]
+	async fn a_single_scaled_segment_finishes_percentiles_and_twa_on_its_mantissas() {
+		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
+
+		const ASPECT: &str = "px";
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let scaled = AspectSchema::new(PhysicalType::ScaledI64 { scale: 3 }, bd("0"), TimeUnit::Millis);
+		store.declare(ASPECT, &scaled).await.expect("declares");
+		// Few distinct values, so a bucket's percentiles land on ties.
+		let base = 1_700_000_000_000_i64;
+		let ts: Vec<i64> = (0..2_000).map(|i| base + i * 1_700).collect();
+		let values: Vec<BigDecimal> = (0..2_000_i64).map(|i| bd(&format!("{}.{:03}", (i * 37) % 23 - 11, (i * 7) % 3 * 250))).collect();
+		store.seal(ASPECT, &scaled, &ts, &values).await.expect("seals");
+
+		let descriptor = store.index.prune_by_time(ASPECT, i64::MIN, i64::MAX).await.expect("prunes").pop().expect("one segment");
+		let bytes = store.read_frame(&descriptor).await.expect("reads the frame");
+		let percentiles = [Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99];
+		let mixed = [Aggregation::Min, Aggregation::P99, Aggregation::Avg, Aggregation::Sum, Aggregation::P50, Aggregation::Last];
+		let with_twa = [Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd];
+		let with_sketch = [Aggregation::P99, Aggregation::SketchP99];
+		let finished = |aggs: &[Aggregation]| matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, aggs, Some(weft_reduce::BucketWidth::from(Resolution::Minutes))).expect("folds"), Some(Folded::Finished(_)));
+		assert!(finished(&percentiles) && finished(&mixed) && finished(&[Aggregation::P95]) && finished(&with_twa), "percentiles, time-weighted averages and streaming reductions finish on the mantissas");
+		assert!(!finished(&with_sketch), "a sketch takes the partial route");
+		assert!(matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, &percentiles, None).expect("folds"), Some(Folded::Partial(_))), "a fold for merging never finishes");
+		assert!(matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, &with_twa, Some(weft_reduce::BucketWidth::parse("5m").expect("parses"))).expect("folds"), Some(Folded::Finished(_))), "a multi-step width finishes on the mantissas");
+
+		for (start, end) in [(i64::MIN, i64::MAX), (base + 300_000, base + 2_900_000)] {
+			for aggs in [&percentiles[..], &mixed[..], &with_twa[..], &with_sketch[..], &[Aggregation::P90][..]] {
+				let (rts, rvs) = store.read_time_range(ASPECT, start, end).await.expect("reads");
+				let points: Vec<Point> = rts.iter().zip(rvs).filter_map(|(t, v)| v.map(|v| Point::new(DateTime::<Utc>::from_timestamp_millis(*t).expect("instant"), v))).collect();
+				let single = reduce(&points, Resolution::Minutes, None, None, aggs).expect("reduces");
+				let got = store.downsample_range(ASPECT, start, end, Resolution::Minutes, aggs).await.expect("downsamples");
+				assert!(got.len() > 10, "several buckets");
+				assert_eq!(got, single, "{start}..{end} {aggs:?}");
+				// A one-step width (the server's route for `?resolution=minutes`) is the same grid.
+				let width = store.downsample_range_width(ASPECT, start, end, weft_reduce::BucketWidth::from(Resolution::Minutes), aggs).await.expect("downsamples");
+				assert_eq!(width, single, "a one-step width, {start}..{end} {aggs:?}");
+				// A multi-step width finishes on the mantissas too, as the coarsened single pass.
+				let five = weft_reduce::BucketWidth::parse("5m").expect("parses");
+				let coarse = weft_reduce::reduce_partial(&points, Resolution::Minutes, None, None, aggs).expect("reduces").coarsen(5).expect("coarsens").finish_width(five, aggs).expect("finishes");
+				let got_five = store.downsample_range_width(ASPECT, start, end, five, aggs).await.expect("downsamples");
+				assert_eq!(got_five, coarse, "5m, {start}..{end} {aggs:?}");
+				for (g, c) in got_five.iter().zip(&coarse) {
+					for (name, value) in &g.values {
+						assert_eq!(Some(value.as_bigint_and_exponent()), c.values.get(name).map(BigDecimal::as_bigint_and_exponent), "5m {name} at {}", g.timestamp);
+					}
+				}
+				for (g, s) in got.iter().zip(&single) {
+					for (name, value) in &g.values {
+						assert_eq!(Some(value.as_bigint_and_exponent()), s.values.get(name).map(BigDecimal::as_bigint_and_exponent), "{name} at {} carries reduce's digits and exponent", g.timestamp);
+					}
+				}
+			}
+		}
+		drop(store);
+
+		// The bucket cap holds on the finished grid as it does on a partial.
+		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_max_downsample_buckets(5)).await.expect("reopens");
+		let err = store.downsample_range(ASPECT, i64::MIN, i64::MAX, Resolution::Minutes, &percentiles).await.expect_err("over the cap");
+		let width_err = store.downsample_range_width(ASPECT, i64::MIN, i64::MAX, weft_reduce::BucketWidth::from(Resolution::Minutes), &percentiles).await.expect_err("over the cap");
+		for err in [err, width_err] {
+			assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::DownsampleTooLarge { limit: 5, .. })), "{err:#}");
 		}
 		drop(store);
 	}
@@ -7873,9 +7993,9 @@ mod tests {
 	/// then fails with `Poisoned` before touching anything, while every read keeps
 	/// serving, including the phantom transaction's row, which did commit. A restart
 	/// clears the poison.
+	#[serial(index_txn_fault_points)]
 	#[tokio::test]
 	#[cfg_attr(windows, ignore = "Windows file locks are mandatory: this test images or reads the files of a store that is still open, which Turso holds locked (ERROR_LOCK_VIOLATION). Linux and macOS CI run it; Windows crash coverage is the process-kill tests")]
-	#[serial(index_txn_fault_points)]
 	async fn a_phantom_commit_poisons_writes_and_leaves_reads_up() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");
@@ -7937,8 +8057,8 @@ mod tests {
 	/// poison. `S-txn-begun`, paused, holds the first attempt until the poison is set and
 	/// counts the attempts: a second one would park there for good, and the timeout
 	/// would fail the test.
-	#[tokio::test]
 	#[serial(index_txn_fault_points)]
+	#[tokio::test]
 	async fn a_transaction_waiting_to_retry_stops_at_the_poison() {
 		let dir = TempDir::new().expect("tempdir");
 		let store = SegmentStore::open(dir.path()).await.expect("opens");

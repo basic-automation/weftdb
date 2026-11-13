@@ -239,8 +239,9 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 
 ## Phase 12 — Close the pre-beta lanes (was W6, W8 and W9 open items)
 
-- [ ] START HERE (filed 2026-11-11 for the next run)
-- [ ] START HERE (rewritten 2026-11-11 for the next run)
+- [ ] START HERE (filed 2026-11-13 for the next run)
+- [x] START HERE (filed 2026-11-11 for the next run) — all three items done 2026-11-13
+- [x] START HERE (rewritten 2026-11-11 for the next run) — its unclaimed queue is closed (0.3.3, 0.3.7, and the 2026-11-13 run)
 - [ ] START HERE (filed 2026-10-11 for the next run)
 - [ ] START HERE (filed 2026-10-09 for the next run)
 - [ ] (2026-10-08 list.) The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
@@ -254,16 +255,19 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [ ] Restoring *into a chosen new root* over HTTP (7.3)
 - [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane)
-- [ ] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
+- [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
 - [ ] **CI**
 - [ ] Packaging (1.0 minimum)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
-- [ ] What `float_roundtrip` costs a whole JSON compute or ingest request
-- [ ] Flaky under GPU contention: `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu`
-- [ ] Guard the `#[serial]`-above-`#[test]` ordering
+- [x] What `float_roundtrip` costs a whole JSON compute or ingest request
+- [x] Flaky under GPU contention: `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` (in-process: `gpu_economics`' GPU lanes shared splimes' one buffer pool; both now `#[serial(gpu_pool)]`)
+- [x] Guard the `#[serial]`-above-`#[test]` ordering (`scripts/ci/check-serial-order.py`, #405; keyed `#[serial(key)]` covered 2026-11-13)
+  - [ ] Contribute the minimal ordering repro upstream to rust-lang/rust#100263, still open (last updated 2024-12-10) *(owner: outward-facing)*
+  - [x] Say in the guard's docstring that serial_test's own README orders the other way (`#[tokio::test]` above `#[serial]`), and that with the `async` feature both orders serialize, so the rule is about the ICE, not about correctness (research 2026-11-13: serial_test 4.0.1 README, https://docs.rs/crate/serial_test/latest/source/README.md; derive `fn_setup` wraps an async fn whichever attribute runs first)
+- [ ] Shared Cargo target dir aliases workspace crates across worktrees (found 2026-11-13): a `main` worktree built into the same `target-dir` left its `weft-reduce` artifact in place, and the branch's next `cargo build --release -p weft-server` linked it as fresh, so the binary ran `main`'s reduction under the branch's `weftdb` (caught by a gdb backtrace into the other checkout's source). Give each worktree its own `CARGO_TARGET_DIR`, or `touch` the workspace crates after switching
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)
 
@@ -388,7 +392,7 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
   - [x] The sketch itself, as a library type (2026-11-11)
   - [x] A bench for the cost against `DdSketch` (2026-11-11)
   - [x] The accuracy each collapse costs on real data (2026-11-11)
-  - [ ] Repeat the timing figures on a quiet host with pinned cores before citing any of them
+  - [x] Repeat the timing figures on a quiet host with pinned cores before citing any of them
   - [ ] **Research (2026-11-11) — TimescaleDB's default percentile aggregate is a UDDSketch, so it is the like-for-like comparison.**
   - [ ] Decide whether the `sketch_p*` reductions take it (owner-gated; needs a sidecar version step)
 - [ ] **Research (2026-10-11) — the exact TWA is now a measurable differentiator.**
@@ -403,7 +407,12 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
     - [ ] **FOUND (2026-10-09) — `sketch_p99`'s published ~2.6× speed-up over exact `p99` was the generator's.**
       - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - [ ] **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
-      - [ ] **NEXT — select on the mantissas when a partial is not merged.** (#401)
+      - [ ] **Research (2026-11-13) — ClickHouse's exact quantiles are not nearest-rank.** Its reference examples give `quantileExactLow(0.1)` of `numbers(10)` = 1, where WeftDB's nearest-rank `p10` is 0, so the ClickHouse arm must compare against the matching definition (or report both) before calling exact `p*` faster or equal (https://clickhouse.com/docs/sql-reference/aggregate-functions/reference/quantileExactLow)
+      - [x] **NEXT — select on the mantissas when a partial is not merged.** (#401)
+        - [x] TWA on the finish-only route (`twa`, `twa_linear`, `twa_bucket_end` weighted on the mantissas)
+        - [x] Several segments of one scale: their mantissas concatenated in segment order and finished once (no partial, no format step)
+        - [x] A multi-step width (`15m`) buckets on the mantissas directly (`reduce_scaled_width`)
+        - [ ] *(low value, measured 2026-11-13)* `sketch_p*` on the integer route: the partial's per-bucket accumulators cost 2.6–3.4 ms of a 39–40 ms `avg,sketch_p99` per real 1 Mi-row segment (about 7%), so build it only alongside other sketch work
 - [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
 - [ ] **Research (2026-10-09) — DuckDB has a native linear-interpolation arm**
 - [ ] **NEXT — (3c) materialized tiers, remaining**

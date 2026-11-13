@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 pub use fill::{fill, fill_width, Fill, FillError};
-pub use scaled::{reduce_partial_scaled, reduce_scaled};
+pub use scaled::{reduce_partial_scaled, reduce_scaled, reduce_scaled_width};
 use serde::{Deserialize, Serialize};
 pub use sketch::{decimal_to_f64, DdSketch, SketchError};
 use splimes::{Point, Resolution};

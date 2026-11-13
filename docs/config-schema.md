@@ -16,8 +16,8 @@ The registry assigns each variable a **tier** that says how much it is promised.
 
 | schema_version | Change |
 |----------------|--------|
-| 1 | First versioned schema. Covers every variable the registry names (109 variables: 13 Stable, 46 Tuning, 8 Experimental, 42 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
-| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). v0.3.3 added two more Tuning variables the same way: `WEFT_DATA_AUDIT` (per-measurement audit rows, off) and `WEFT_DB_IDLE_CLOSE_SECS` (300 s idle close). The ROB-21 test variable brought the total to 108. v0.3.7 added one more Tuning variable the same way: `WEFT_MVCC_CHECKPOINT_BYTES` (64 KiB MVCC checkpoint threshold), bringing the total to 109 (46 Tuning) as of this row. |
+| 1 | First versioned schema. Covers every variable the registry names (112 variables: 13 Stable, 46 Tuning, 8 Experimental, 45 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
+| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). v0.3.3 added two more Tuning variables the same way: `WEFT_DATA_AUDIT` (per-measurement audit rows, off) and `WEFT_DB_IDLE_CLOSE_SECS` (300 s idle close). The ROB-21 test variable brought the total to 108. v0.3.7 added one more Tuning variable the same way: `WEFT_MVCC_CHECKPOINT_BYTES` (64 KiB MVCC checkpoint threshold), bringing the total to 109 (46 Tuning) as of this row. Three Test variables followed the same way on 2026-11-13: `WEFT_REQUIRE_TMPFS` and `WEFT_TEST_TMPFS_CHILD` (the full-filesystem disk-guard tests) and `WEFT_TEST_GPU_POOL_CHILD` (the GPU pool-stability child), bringing the total to 112 (45 Test). |
 
 ## Tier system
 
@@ -131,7 +131,7 @@ or code path behind a cargo feature.
 
 ## Test
 
-Forty-two variables. Not configuration. A test harness's private channel to the child
+Forty-five variables. Not configuration. A test harness's private channel to the child
 process it spawns, or a switch a test suite reads. Setting one on a real server does
 nothing useful — `weft-server` warns at startup. They are registered precisely so that
 this doc **cannot** carry one by accident; the env file explicitly excludes Test-tier
@@ -156,6 +156,7 @@ the database root remains.
 | `WEFT_LEGACY_CONSUMER_CRASH_CHILD` |
 | `WEFT_LEGACY_INGEST_CRASH_CHILD` |
 | `WEFT_REQUIRE_GPU` |
+| `WEFT_REQUIRE_TMPFS` |
 | `WEFT_SERVER_BIN` |
 | `WEFT_SI_KNOTS` |
 | `WEFT_SI_REPS` |
@@ -164,6 +165,7 @@ the database root remains.
 | `WEFT_TEST_AUDIT_FULL_CHILD` |
 | `WEFT_TEST_AUDIT_REFUSAL_CHILD` |
 | `WEFT_TEST_GLOBAL_POISON_CHILD_ROOT` |
+| `WEFT_TEST_GPU_POOL_CHILD` |
 | `WEFT_TEST_KEEP_CONFLICT_CHILD_ROOT` |
 | `WEFT_TEST_OPEN_CHILD_ROOT` |
 | `WEFT_TEST_ORPHAN_CHILD_ROOT` |
@@ -179,6 +181,7 @@ the database root remains.
 | `WEFT_TEST_SWAP_MATRIX` |
 | `WEFT_TEST_SWAP_MATRIX_DIR` |
 | `WEFT_TEST_TAG_SEAL_CRASH_ROOT` |
+| `WEFT_TEST_TMPFS_CHILD` |
 | `WEFT_TEST_TXN_CHILD_INDEX` |
 | `WEFT_UPDATE_GOLDENS` |
 | `WEFT_VERBOSE` |

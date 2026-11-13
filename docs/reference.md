@@ -416,6 +416,19 @@ stored-range downsample went from 127.6 ms to 59.7 ms. The server's `GET
 every reduction (exact percentiles and time-weighted averages collect their samples from the stored
 mantissas, ~1.4× faster per segment for `avg,p99,twa` than before, 2026-10-09)
 ([`weft-reduce/benches/decimal_tax.rs`](../weft-reduce/benches/decimal_tax.rs), load average ~11).
+A read that prunes to a single segment merges nothing, so since 2026-11-13 it finishes its <!-- claim:finish-only-percentiles-2026-11-13 -->
+buckets on the mantissas directly: it selects the exact percentiles and weights the
+time-weighted averages there, building one `BigDecimal` per result instead of one per sample
+(#401). On the same real 1 Mi-row frame (decode + reduction, one pinned core, three runs):
+`avg,p99` 40.4 ms → 24.9 ms, `p50,p95,p99` 70.8 ms → 27.6 ms and `avg,p99,twa` 56.2 ms → 38.3 ms
+(`finish_only_*` against `scaled_*` in `decimal_tax`). Against a release `weft-server` holding
+that frame as one segment, the request median went from 50.7 ms to 34.5 ms for `p99`, from
+88.1 ms to 47.2 ms for `p50,p95,p99` and from 74.7 ms to 57.0 ms for `avg,p99,twa`, with the
+JSON and CSV responses byte-identical to the previous release's. Several one-scale segments
+finish the same way, their mantissas concatenated in segment order: split into 16 segments,
+`p50,p95,p99` went from 65.3 ms to 31.2 ms and `p99` from 26.4 ms to 19.7 ms. A width
+(`?resolution=15m`) is bucketed on the mantissas directly instead of coarsening a partial:
+`p99` at `15m` over the one segment went from 512.0 ms to 94.7 ms.
 
 Three more results from 2026-10-09 where the obvious answer was wrong:
 

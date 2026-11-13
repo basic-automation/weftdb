@@ -331,6 +331,8 @@ pub fn run_gpu_memory(profile: &GpuMemoryProfile) -> anyhow::Result<BenchResult>
 
 #[cfg(test)]
 mod tests {
+	use serial_test::serial;
+
 	use super::*;
 
 	#[test]
@@ -377,10 +379,26 @@ mod tests {
 		assert_eq!(summary.device_memory, None);
 	}
 
+	/// Set in the child [`the_pool_stays_bounded_and_stable_on_a_real_gpu`] starts.
+	const POOL_CHILD: &str = "WEFT_TEST_GPU_POOL_CHILD";
+
 	/// Runs on a hardware GPU only (skips otherwise, as splimes' own GPU tests do unless
-	/// `WEFT_REQUIRE_GPU` is set).
+	/// `WEFT_REQUIRE_GPU` is set). The pool it measures is splimes' one per process, so any
+	/// other test in this binary that reaches the GPU (directly, as `gpu_economics`' lanes do,
+	/// or through an `Auto` backend once the GPU is started) creates and parks buffer sets
+	/// inside its rounds and fails the stability gate for no fault of the pool. So the
+	/// measurement runs in a child process of its own, where it is the pool's only user;
+	/// `gpu_pool` also keeps the two GPU tests off the device at the same time.
+	#[serial(gpu_pool)]
 	#[test]
 	fn the_pool_stays_bounded_and_stable_on_a_real_gpu() {
+		if std::env::var_os(POOL_CHILD).is_none() {
+			let exe = std::env::current_exe().expect("finds the test binary");
+			let out = std::process::Command::new(exe).args(["gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu", "--exact", "--nocapture", "--test-threads=1"]).env(POOL_CHILD, "1").output().expect("runs the child");
+			let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+			assert!(out.status.success() && stdout.contains("1 passed"), "the pool-stability child failed:\n{stdout}\n{stderr}");
+			return;
+		}
 		let profile = GpuMemoryProfile::new("gm-test", GpuMemoryParams { rounds: 3, sizes: vec![1_024, 65_536], knots: 100, ..GpuMemoryParams::default() });
 		if let Err(e) = start_gpu(&profile) {
 			assert!(std::env::var_os("WEFT_REQUIRE_GPU").is_none(), "WEFT_REQUIRE_GPU is set but: {e}");

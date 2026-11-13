@@ -323,7 +323,7 @@ impl App {
 						}
 					}
 					LoadingMessage::CompleteMeasurements(measurements) => {
-						new_measurements = Some(measurements.clone());
+						new_measurements = Some(measurements);
 						self.loading_in_progress = false;
 						// Clear CSV import progress when done
 						if matches!(self.state, AppState::Plotting) {

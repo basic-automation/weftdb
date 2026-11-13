@@ -6,9 +6,14 @@ Scan every tracked ``*.rs`` file in the repository and verify that every
 ``#[serial]`` attribute appears immediately above a test attribute
 (``#[test]``, ``#[tokio::test]``, ``#[tokio::test(...)]``).
 
-A ``#[serial]`` below its test attribute silently loses the serialisation —
-the test still compiles and passes, but runs concurrently with others and
-produces an unrelated flake. This checker catches the wrong order statically.
+Why this order, when serial_test's own README writes the other one
+(``#[tokio::test]`` above ``#[serial]``): with the ``async`` feature this
+workspace enables, serial_test 4's derive wraps an async test either way, so
+both orders serialise. The rule exists for rust-lang/rust#100263, an ICE when
+a test-harness attribute sits above a proc-macro attribute on one function
+(open as of 2026-11-13), and so that one order is used everywhere. Do not
+"fix" a site to the README's order. Keyed (``#[serial(key)]``) and
+path-qualified (``#[serial_test::serial]``) forms follow the same rule.
 
 Exits non-zero when a violation is found, printing ``file:line`` of each
 misplaced ``#[serial]``.
@@ -35,8 +40,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Match #[serial] exactly — the attribute, not inside a comment or string.
-_SERIAL_RE = re.compile(r"^\s*#\s*\[\s*serial\s*\]\s*(.*)$")
+# Match #[serial] — bare, keyed (`#[serial(build_publish)]`, `#[serial(a, b)]`) or path-qualified
+# (`#[serial_test::serial]`) — the attribute, not inside a comment or string. A keyed one is
+# the same proc macro in the same position, so it gets the same rule.
+_SERIAL_RE = re.compile(r"^\s*#\s*\[\s*(?:serial_test\s*::\s*)?serial\s*(?:\([^)]*\))?\s*\]\s*(.*)$")
 
 # Match #[test], #[tokio::test], #[tokio::test(...)]
 _TEST_ATTR_RE = re.compile(r"^\s*#\s*\[\s*(?:tokio::)?test\b")

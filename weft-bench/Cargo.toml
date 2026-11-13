@@ -61,3 +61,5 @@ tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
+# The GPU tests share splimes' one process-wide buffer pool, so they run one at a time.
+serial_test = { workspace = true }

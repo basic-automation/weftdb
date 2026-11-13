@@ -355,8 +355,8 @@ mod tests {
 
 	// Every test that publishes runs serially: one of them arms `L-new-renamed`, which is
 	// process-global.
-	#[tokio::test]
 	#[serial(build_publish)]
+	#[tokio::test]
 	async fn a_stale_build_is_swept_and_other_entries_are_kept() {
 		let root = tempfile::tempdir().unwrap();
 		assert_eq!(sweep_stale_build_dirs(root.path()).await.unwrap(), 0, "no lock file: nothing was ever built here");
@@ -376,8 +376,8 @@ mod tests {
 		assert!(root.path().join("kept").is_dir(), "a published database is not swept");
 	}
 
-	#[tokio::test]
 	#[serial(build_publish)]
+	#[tokio::test]
 	async fn publish_refuses_an_existing_target_and_cleans_up() {
 		let root = tempfile::tempdir().unwrap();
 		let target = root.path().join("taken");
@@ -396,8 +396,8 @@ mod tests {
 	/// rename is the commit point: a concurrent `existing` can already have opened the
 	/// database, and renaming it back and removing it, as this used to, deleted the files
 	/// under that handle.
-	#[tokio::test]
 	#[serial(build_publish)]
+	#[tokio::test]
 	async fn a_failure_after_the_rename_leaves_the_database_published() {
 		let root = tempfile::tempdir().unwrap();
 		let target = root.path().join("db");
@@ -434,8 +434,8 @@ mod tests {
 	/// nothing, no sweep runs until the task ends (it holds the creator lock), and the task
 	/// completes the publish. Before, the `Build`'s drop removed the directory while its
 	/// rename could be in flight, and released the lock to a sweep.
-	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	#[serial(build_publish)]
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn a_dropped_publish_is_finished_by_its_task() {
 		let root = tempfile::tempdir().unwrap();
 		let target = root.path().join("db");
