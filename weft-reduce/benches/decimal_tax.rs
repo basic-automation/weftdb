@@ -220,6 +220,7 @@ fn bench_segment_downsample(c: &mut Criterion) {
 	group.bench_function("read_logical_only", |b| b.iter(|| black_box(read_segment_range(black_box(&bytes), i64::MIN, i64::MAX).expect("reads"))));
 	group.bench_function("bigdecimal_streaming6", |b| b.iter(|| black_box(segment_bigdecimal(black_box(&bytes), &streaming))));
 	group.bench_function("scaled_streaming6", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &streaming))));
+	group.bench_function("finish_only_streaming6", |b| b.iter(|| black_box(segment_finish_only(black_box(&bytes), &streaming))));
 	group.bench_function("bigdecimal_avg_sketch_p99", |b| b.iter(|| black_box(segment_bigdecimal(black_box(&bytes), &with_sketch))));
 	group.bench_function("scaled_avg_sketch_p99", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &with_sketch))));
 	group.bench_function("bigdecimal_avg_p99_twa", |b| b.iter(|| black_box(segment_bigdecimal(black_box(&bytes), &with_exact))));

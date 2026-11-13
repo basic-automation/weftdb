@@ -412,6 +412,7 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
         - [x] TWA on the finish-only route (`twa`, `twa_linear`, `twa_bucket_end` weighted on the mantissas)
         - [x] Several segments of one scale: their mantissas concatenated in segment order and finished once (no partial, no format step)
         - [x] A multi-step width (`15m`) buckets on the mantissas directly (`reduce_scaled_width`)
+        - [ ] *(low value, measured 2026-11-13)* `sketch_p*` on the integer route: the partial's per-bucket accumulators cost 2.6–3.4 ms of a 39–40 ms `avg,sketch_p99` per real 1 Mi-row segment (about 7%), so build it only alongside other sketch work
 - [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
 - [ ] **Research (2026-10-09) — DuckDB has a native linear-interpolation arm**
 - [ ] **NEXT — (3c) materialized tiers, remaining**
