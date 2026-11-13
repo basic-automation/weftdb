@@ -18,8 +18,9 @@
 //! sealed segment: the window read as `BigDecimal` and reduced by `reduce_partial`, against the
 //! window read physically and reduced by `reduce_partial_scaled`. It covers decode plus
 //! reduction for one real 1 Mi-row `.weftseg` frame. `finish_only_*` times the route a read
-//! that merges nothing can take instead: `reduce_scaled`, selecting exact percentiles on the
-//! mantissas, against `scaled_*`, the partial route that carries a `BigDecimal` per sample.
+//! that merges nothing can take instead: `reduce_scaled`, selecting exact percentiles and
+//! weighting time-weighted averages on the mantissas, against `scaled_*`, the partial route that
+//! carries a `BigDecimal` per sample.
 //!
 //! Before timing, the three are checked against each other: the integer sums must equal the
 //! `BigDecimal` sums exactly, and the `f64` averages must agree to 1e-9 relative.
@@ -174,7 +175,8 @@ fn segment_scaled(bytes: &[u8], aggs: &[Aggregation]) -> Vec<Bucket> {
 
 /// The finish-only integer route a single-segment read can take, because it merges no
 /// partial: physical windowed read, mantissas, `reduce_scaled`, which selects the exact
-/// percentiles on the mantissas (falling back to the partial route when it declines).
+/// percentiles and weights the time-weighted averages on the mantissas (falling back to the
+/// partial route when it declines).
 fn segment_finish_only(bytes: &[u8], aggs: &[Aggregation]) -> Vec<Bucket> {
 	let (nanos, mantissas, scale) = physical_mantissas(bytes);
 	reduce_scaled(&nanos, &mantissas, u32::from(scale), Resolution::Hours, None, None, aggs).expect("reduces").unwrap_or_else(|| segment_scaled(bytes, aggs))
@@ -222,6 +224,7 @@ fn bench_segment_downsample(c: &mut Criterion) {
 	group.bench_function("scaled_avg_sketch_p99", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &with_sketch))));
 	group.bench_function("bigdecimal_avg_p99_twa", |b| b.iter(|| black_box(segment_bigdecimal(black_box(&bytes), &with_exact))));
 	group.bench_function("scaled_avg_p99_twa", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &with_exact))));
+	group.bench_function("finish_only_avg_p99_twa", |b| b.iter(|| black_box(segment_finish_only(black_box(&bytes), &with_exact))));
 	group.bench_function("scaled_avg_p99", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &with_p99))));
 	group.bench_function("finish_only_avg_p99", |b| b.iter(|| black_box(segment_finish_only(black_box(&bytes), &with_p99))));
 	group.bench_function("scaled_p50_p95_p99", |b| b.iter(|| black_box(segment_scaled(black_box(&bytes), &with_three))));

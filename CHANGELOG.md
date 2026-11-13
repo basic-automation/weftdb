@@ -11,14 +11,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 ### Changed
 
 - **A stored downsample that prunes to one `ScaledI64` segment computes its exact percentiles
-  on the stored integers.** Such a read merges nothing, so it now finishes its buckets directly
-  from the mantissas and selects `p50`/`p90`/`p95`/`p99` there, building one `BigDecimal` per
-  percentile per bucket instead of one per sample (#401). Answers are unchanged — a release
-  server's JSON and CSV responses were byte-identical before and after — and on a real 1 Mi-row
-  segment a `p99` request went from 50.7 ms to 34.5 ms and `p50,p95,p99` from 88.1 ms to
-  47.2 ms. `GET /api/v1/storage/{aspect}/downsample` with a plain `resolution` reaches it; a
-  multi-step width (`15m`), a time-weighted average or a read over several segments takes the
-  previous route.
+  and time-weighted averages on the stored integers.** Such a read merges nothing, so it now
+  finishes its buckets directly from the mantissas, selecting `p50`/`p90`/`p95`/`p99` and
+  weighting `twa`/`twa_linear`/`twa_bucket_end` there, and builds one `BigDecimal` per result
+  instead of one per sample (#401). Answers are unchanged — a release server's JSON and CSV
+  responses were byte-identical before and after — and on a real 1 Mi-row segment a `p99`
+  request went from 50.7 ms to 34.5 ms, `p50,p95,p99` from 88.1 ms to 47.2 ms and
+  `avg,p99,twa` from 74.7 ms to 57.0 ms. `GET /api/v1/storage/{aspect}/downsample` with a plain
+  `resolution` reaches it; a multi-step width (`15m`), a sketch or a read over several segments
+  takes the previous route.
 
 ## [0.3.7] - 2026-11-12
 

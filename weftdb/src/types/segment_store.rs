@@ -6667,12 +6667,13 @@ mod tests {
 	}
 
 	/// #401: a downsample whose window prunes to one `ScaledI64` segment is finished on the
-	/// integer path, the exact percentiles selected on the mantissas, and must equal
-	/// `read_time_range` followed by one `reduce` to the digit and exponent, whole and trimmed,
-	/// percentiles alone and beside streaming reductions; TWA still takes the partial route.
+	/// integer path, the exact percentiles selected and the time-weighted averages weighted on
+	/// the mantissas, and must equal `read_time_range` followed by one `reduce` to the digit and
+	/// exponent, whole and trimmed, alone and beside streaming reductions; a sketch still takes
+	/// the partial route.
 	/// The finished grid is held to the store's bucket cap like a partial.
 	#[tokio::test]
-	async fn a_single_scaled_segment_finishes_percentiles_on_its_mantissas() {
+	async fn a_single_scaled_segment_finishes_percentiles_and_twa_on_its_mantissas() {
 		use splimes::{Point, Resolution};
 		use weft_reduce::{reduce, Aggregation};
 
@@ -6691,14 +6692,15 @@ mod tests {
 		let bytes = store.read_frame(&descriptor).await.expect("reads the frame");
 		let percentiles = [Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99];
 		let mixed = [Aggregation::Min, Aggregation::P99, Aggregation::Avg, Aggregation::Sum, Aggregation::P50, Aggregation::Last];
-		let with_twa = [Aggregation::P99, Aggregation::Twa];
+		let with_twa = [Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd];
+		let with_sketch = [Aggregation::P99, Aggregation::SketchP99];
 		let finished = |aggs: &[Aggregation]| matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, aggs, true).expect("folds"), Some(Folded::Finished(_)));
-		assert!(finished(&percentiles) && finished(&mixed) && finished(&[Aggregation::P95]), "percentiles and streaming reductions finish on the mantissas");
-		assert!(!finished(&with_twa), "TWA takes the partial route");
+		assert!(finished(&percentiles) && finished(&mixed) && finished(&[Aggregation::P95]) && finished(&with_twa), "percentiles, time-weighted averages and streaming reductions finish on the mantissas");
+		assert!(!finished(&with_sketch), "a sketch takes the partial route");
 		assert!(matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, &percentiles, false).expect("folds"), Some(Folded::Partial(_))), "a fold for merging never finishes");
 
 		for (start, end) in [(i64::MIN, i64::MAX), (base + 300_000, base + 2_900_000)] {
-			for aggs in [&percentiles[..], &mixed[..], &with_twa[..], &[Aggregation::P90][..]] {
+			for aggs in [&percentiles[..], &mixed[..], &with_twa[..], &with_sketch[..], &[Aggregation::P90][..]] {
 				let (rts, rvs) = store.read_time_range(ASPECT, start, end).await.expect("reads");
 				let points: Vec<Point> = rts.iter().zip(rvs).filter_map(|(t, v)| v.map(|v| Point::new(DateTime::<Utc>::from_timestamp_millis(*t).expect("instant"), v))).collect();
 				let single = reduce(&points, Resolution::Minutes, None, None, aggs).expect("reduces");

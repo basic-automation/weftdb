@@ -405,7 +405,7 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
       - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - [ ] **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
       - [x] **NEXT — select on the mantissas when a partial is not merged.** (#401)
-        - [ ] TWA on the finish-only route: `reduce_scaled` still declines `twa*`, so `avg,p99,twa` over one segment keeps the partial route (`twa_scaled` already works on mantissas)
+        - [x] TWA on the finish-only route (`twa`, `twa_linear`, `twa_bucket_end` weighted on the mantissas)
         - [ ] Several segments of one scale: carry mantissas, not `BigDecimal` samples, in the in-memory partial so a multi-segment exact percentile selects on integers too (the `.weftpart` sidecar never holds exact-percentile samples, so no format step)
 - [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
 - [ ] **Research (2026-10-09) — DuckDB has a native linear-interpolation arm**
