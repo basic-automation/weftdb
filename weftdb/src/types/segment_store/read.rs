@@ -231,9 +231,13 @@ impl SegmentStore {
 	/// As [`downsample_range`](Self::downsample_range).
 	pub async fn downsample_range_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
 		// At a plain resolution the finished grid is the partial's own buckets,
-		// so the decision 12 cap is the fold's cap unchanged (ROB-13).
-		let partial = self.downsample_partial(aspect, series, (start, end), resolution, aggregations, self.max_downsample_buckets).await?;
-		partial.map_or_else(|| Ok(Vec::new()), |p| p.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")))
+		// so the decision 12 cap is the fold's cap unchanged (ROB-13). The grid is
+		// finished here, so a single segment may come back already finished (#401).
+		match self.downsample_fold(aspect, series, (start, end), resolution, aggregations, FoldFor::Finish).await? {
+			None => Ok(Vec::new()),
+			Some(Folded::Finished(buckets)) => Ok(buckets),
+			Some(Folded::Partial(partial)) => partial.finish(resolution, aggregations).map_err(|e| anyhow::anyhow!("finishing downsample of {aspect:?}: {e}")),
+		}
 	}
 
 	/// [`downsample_range`](Self::downsample_range) into buckets of a
@@ -259,6 +263,12 @@ impl SegmentStore {
 	///
 	/// As [`downsample_range`](Self::downsample_range).
 	pub async fn downsample_range_width_of(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, width: weft_reduce::BucketWidth, aggregations: &[Aggregation]) -> Result<Vec<Bucket>> {
+		// A width of one step is its unit's own grid, finished as it is: the plain
+		// resolution's route, where a single segment may finish on the integer path
+		// (#401). The server reaches every stored downsample through here.
+		if width == weft_reduce::BucketWidth::from(width.unit()) {
+			return self.downsample_range_of(aspect, series, start, end, width.unit(), aggregations).await;
+		}
 		// The fold runs at the width's unit, where one output bucket is `count`
 		// unit buckets, so the fold's cap is the decision 12 cap scaled by the
 		// count; the cap itself is then enforced exactly on the coarsened
@@ -285,6 +295,21 @@ impl SegmentStore {
 	/// and the state is dropped, rather than the grid being counted for the
 	/// first time once it has been built.
 	pub(crate) async fn downsample_partial(&self, aspect: &str, series: crate::SeriesId, (start, end): (i64, i64), resolution: Resolution, aggregations: &[Aggregation], max_buckets: usize) -> Result<Option<PartialReduction>> {
+		match self.downsample_fold(aspect, series, (start, end), resolution, aggregations, FoldFor::Merge(max_buckets)).await? {
+			Some(Folded::Partial(partial)) => Ok(Some(partial)),
+			Some(Folded::Finished(_)) => bail!("downsample of {aspect:?}: a fold that may not finish returned finished buckets"),
+			None => Ok(None),
+		}
+	}
+
+	/// [`downsample_partial`](Self::downsample_partial), or for [`FoldFor::Finish`] the
+	/// finished buckets when one segment answers the read on the integer path: see
+	/// `segment_fold`.
+	async fn downsample_fold(&self, aspect: &str, series: crate::SeriesId, (start, end): (i64, i64), resolution: Resolution, aggregations: &[Aggregation], wanted: FoldFor) -> Result<Option<Folded>> {
+		let (max_buckets, finish_only) = match wanted {
+			FoldFor::Merge(max_buckets) => (max_buckets, false),
+			FoldFor::Finish => (self.max_downsample_buckets, true),
+		};
 		aspect_name::validate(aspect)?;
 		let _pin = self.pin_reads();
 		let schema = self.require_schema(aspect).await?;
@@ -321,12 +346,16 @@ impl SegmentStore {
 			if sidecar_eligible && window_covers_segment(descriptor, start, end) {
 				if let Some(sidecar) = self.load_partial_sidecar(aspect, descriptor, frame_crc).await? {
 					if let Some(partial) = sidecar.partial_for(resolution).map_err(|e| anyhow::anyhow!("re-keying the sidecar of {aspect:?}: {e}"))? {
-						return check_partial_len(aspect, partial, max_buckets).map(Some);
+						return check_partial_len(aspect, partial, max_buckets).map(|partial| Some(Folded::Partial(partial)));
 					}
 				}
 			}
 			let bytes = self.read_frame(descriptor).await?;
-			return segment_partial(descriptor, &bytes, start, end, schema.timestamp_unit, resolution, aggregations)?.map_or(Ok(None), |partial| check_partial_len(aspect, partial, max_buckets).map(Some));
+			return match segment_fold(descriptor, &bytes, (start, end), schema.timestamp_unit, resolution, aggregations, finish_only)? {
+				Some(Folded::Partial(partial)) => check_partial_len(aspect, partial, max_buckets).map(|partial| Some(Folded::Partial(partial))),
+				Some(Folded::Finished(buckets)) if buckets.len() > max_buckets => Err(StoreError::DownsampleTooLarge { aspect: aspect.to_string(), buckets: buckets.len(), limit: max_buckets }.into()),
+				finished => Ok(finished),
+			};
 		}
 
 		// Each pruned segment folds into its own `PartialReduction` **concurrently**: the
@@ -373,7 +402,7 @@ impl SegmentStore {
 				}
 			}
 		}
-		Ok(merged)
+		Ok(merged.map(Folded::Partial))
 	}
 
 	/// **Point lookup** (roadmap Phase 4.6 read-planner): the present value of
@@ -627,6 +656,16 @@ impl SegmentStore {
 /// A single segment's partial against the fold's bucket bound (ROB-13): the
 /// partial passes unchanged at or under `max_buckets`, and is refused —
 /// dropped, with the count it reached — over it.
+/// What a caller of `downsample_fold` does with the fold.
+#[derive(Debug, Clone, Copy)]
+enum FoldFor {
+	/// Merges or coarsens it further: a partial, of at most this many buckets.
+	Merge(usize),
+	/// Finishes it at the fold's resolution as it is, under the store's bucket cap, so a
+	/// single segment may come back as finished buckets.
+	Finish,
+}
+
 fn check_partial_len(aspect: &str, partial: PartialReduction, max_buckets: usize) -> Result<PartialReduction> {
 	if partial.len() > max_buckets {
 		return Err(StoreError::DownsampleTooLarge { aspect: aspect.to_string(), buckets: partial.len(), limit: max_buckets }.into());

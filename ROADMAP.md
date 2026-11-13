@@ -264,6 +264,7 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 - [ ] What `float_roundtrip` costs a whole JSON compute or ingest request
 - [ ] Flaky under GPU contention: `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu`
 - [ ] Guard the `#[serial]`-above-`#[test]` ordering
+- [ ] Shared Cargo target dir aliases workspace crates across worktrees (found 2026-11-13): a `main` worktree built into the same `target-dir` left its `weft-reduce` artifact in place, and the branch's next `cargo build --release -p weft-server` linked it as fresh, so the binary ran `main`'s reduction under the branch's `weftdb` (caught by a gdb backtrace into the other checkout's source). Give each worktree its own `CARGO_TARGET_DIR`, or `touch` the workspace crates after switching
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)
 
@@ -403,7 +404,9 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
     - [ ] **FOUND (2026-10-09) — `sketch_p99`'s published ~2.6× speed-up over exact `p99` was the generator's.**
       - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - [ ] **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
-      - [ ] **NEXT — select on the mantissas when a partial is not merged.** (#401)
+      - [x] **NEXT — select on the mantissas when a partial is not merged.** (#401)
+        - [ ] TWA on the finish-only route: `reduce_scaled` still declines `twa*`, so `avg,p99,twa` over one segment keeps the partial route (`twa_scaled` already works on mantissas)
+        - [ ] Several segments of one scale: carry mantissas, not `BigDecimal` samples, in the in-memory partial so a multi-segment exact percentile selects on integers too (the `.weftpart` sidecar never holds exact-percentile samples, so no format step)
 - [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
 - [ ] **Research (2026-10-09) — DuckDB has a native linear-interpolation arm**
 - [ ] **NEXT — (3c) materialized tiers, remaining**

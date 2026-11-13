@@ -68,6 +68,19 @@
       "notes": "Before reduce took the integer path for values that fit."
     },
     {
+      "id": "finish-only-percentiles-2026-11-13",
+      "artifact": null,
+      "section": "Where it doesn't pay off",
+      "kind": "local-measurement",
+      "figures": ["40.4 ms → 24.9 ms", "70.8 ms → 27.6 ms", "50.7 ms to 34.5 ms", "88.1 ms to 47.2 ms"],
+      "source": "weft-reduce/benches/decimal_tax.rs",
+      "command": "taskset -c 2 cargo bench -p weft-reduce --bench decimal_tax -- segment_downsample",
+      "dataset": "btc_1min.csv (local, gitignored, not distributed)",
+      "measured": "2026-11-13",
+      "reproducible_from_clone": false,
+      "notes": "Ryzen 9 7950X3D at a load average of 10 to 12. The server figures are request medians of 7 per reduction set against release builds of main (3b183c1) and of this change, each run twice, with GPU calibration off."
+    },
+    {
       "id": "decimal-path-before",
       "artifact": null,
       "section": "Where it doesn't pay off",

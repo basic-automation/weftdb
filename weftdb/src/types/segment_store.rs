@@ -285,18 +285,44 @@ fn scaled_rows(ts: &[i64], vs: &[Option<PhysicalValue>], start: i64, end: i64, u
 /// Pure and synchronous: it takes the frame bytes and returns the partial, so it holds
 /// no store state and the whole call is `spawn_blocking`-safe.
 fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
+	match segment_fold(descriptor, bytes, (start, end), unit, resolution, aggregations, false)? {
+		Some(Folded::Partial(partial)) => Ok(Some(partial)),
+		Some(Folded::Finished(_)) => bail!("reducing segment {}: a fold that may not finish returned finished buckets", descriptor.path),
+		None => Ok(None),
+	}
+}
+
+/// What one segment's fold produced: the mergeable partial, or, for a read that merges
+/// nothing (`finish_only`), the finished buckets themselves.
+enum Folded {
+	Partial(PartialReduction),
+	Finished(Vec<Bucket>),
+}
+
+/// [`segment_partial`], or with `finish_only` the finished buckets when the integer path
+/// can produce them directly: a read whose one segment is its whole answer has no partial
+/// to merge, so [`weft_reduce::reduce_scaled`] reduces the stored mantissas to buckets and
+/// selects the exact percentiles on them, instead of `reduce_partial_scaled` building a
+/// `BigDecimal` per sample for the partial to carry (#401). The buckets are the ones
+/// finishing the partial gives. One physical decode either way.
+fn segment_fold(descriptor: &SegmentDescriptor, bytes: &[u8], (start, end): (i64, i64), unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation], finish_only: bool) -> Result<Option<Folded>> {
 	// Read the window in its physical encoding, so a ScaledI64 column can be reduced on its
 	// stored mantissas without building a BigDecimal per row.
 	let (ts, vs) = frame_read::read_range_physical(descriptor.path.as_str(), bytes, start, end)?;
-	// Integer-native path: every present in-window value is ScaledI64 at one scale and every
-	// requested reduction is a streaming one. `reduce_partial_scaled` then builds the same
-	// mergeable partial `reduce_partial` would, from integer accumulators.
+	// Integer-native path: every present in-window value is ScaledI64 at one scale.
+	// `reduce_partial_scaled` then builds the same mergeable partial `reduce_partial` would,
+	// from integer accumulators; `reduce_scaled` the finished buckets.
 	if let Some((nanos, mantissas, scale)) = scaled_rows(&ts, &vs, start, end, unit) {
 		if nanos.is_empty() {
 			return Ok(None);
 		}
+		if finish_only {
+			if let Some(buckets) = weft_reduce::reduce_scaled(&nanos, &mantissas, u32::from(scale), resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))? {
+				return Ok(Some(Folded::Finished(buckets)));
+			}
+		}
 		if let Some(partial) = weft_reduce::reduce_partial_scaled(&nanos, &mantissas, u32::from(scale), resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))? {
-			return Ok(Some(partial));
+			return Ok(Some(Folded::Partial(partial)));
 		}
 	}
 	// Null rows carry no value to reduce; present rows lift to absolute instants.
@@ -312,7 +338,7 @@ fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end
 		return Ok(None);
 	}
 	let partial = weft_reduce::reduce_partial(&points, resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))?;
-	Ok(Some(partial))
+	Ok(Some(Folded::Partial(partial)))
 }
 
 /// Whether the inclusive query window `[start, end]` fully covers `descriptor`'s segment
@@ -6636,6 +6662,67 @@ mod tests {
 		for (start, end) in [whole, window] {
 			assert_single_pass(&store, start, end, &integer, "maintained, integer path").await;
 			assert_single_pass(&store, start, end, &fallback, "maintained, fallback").await;
+		}
+		drop(store);
+	}
+
+	/// #401: a downsample whose window prunes to one `ScaledI64` segment is finished on the
+	/// integer path, the exact percentiles selected on the mantissas, and must equal
+	/// `read_time_range` followed by one `reduce` to the digit and exponent, whole and trimmed,
+	/// percentiles alone and beside streaming reductions; TWA still takes the partial route.
+	/// The finished grid is held to the store's bucket cap like a partial.
+	#[tokio::test]
+	async fn a_single_scaled_segment_finishes_percentiles_on_its_mantissas() {
+		use splimes::{Point, Resolution};
+		use weft_reduce::{reduce, Aggregation};
+
+		const ASPECT: &str = "px";
+		let dir = TempDir::new().expect("tempdir");
+		let store = SegmentStore::open(dir.path()).await.expect("opens");
+		let scaled = AspectSchema::new(PhysicalType::ScaledI64 { scale: 3 }, bd("0"), TimeUnit::Millis);
+		store.declare(ASPECT, &scaled).await.expect("declares");
+		// Few distinct values, so a bucket's percentiles land on ties.
+		let base = 1_700_000_000_000_i64;
+		let ts: Vec<i64> = (0..2_000).map(|i| base + i * 1_700).collect();
+		let values: Vec<BigDecimal> = (0..2_000_i64).map(|i| bd(&format!("{}.{:03}", (i * 37) % 23 - 11, (i * 7) % 3 * 250))).collect();
+		store.seal(ASPECT, &scaled, &ts, &values).await.expect("seals");
+
+		let descriptor = store.index.prune_by_time(ASPECT, i64::MIN, i64::MAX).await.expect("prunes").pop().expect("one segment");
+		let bytes = store.read_frame(&descriptor).await.expect("reads the frame");
+		let percentiles = [Aggregation::P50, Aggregation::P90, Aggregation::P95, Aggregation::P99];
+		let mixed = [Aggregation::Min, Aggregation::P99, Aggregation::Avg, Aggregation::Sum, Aggregation::P50, Aggregation::Last];
+		let with_twa = [Aggregation::P99, Aggregation::Twa];
+		let finished = |aggs: &[Aggregation]| matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, aggs, true).expect("folds"), Some(Folded::Finished(_)));
+		assert!(finished(&percentiles) && finished(&mixed) && finished(&[Aggregation::P95]), "percentiles and streaming reductions finish on the mantissas");
+		assert!(!finished(&with_twa), "TWA takes the partial route");
+		assert!(matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, &percentiles, false).expect("folds"), Some(Folded::Partial(_))), "a fold for merging never finishes");
+
+		for (start, end) in [(i64::MIN, i64::MAX), (base + 300_000, base + 2_900_000)] {
+			for aggs in [&percentiles[..], &mixed[..], &with_twa[..], &[Aggregation::P90][..]] {
+				let (rts, rvs) = store.read_time_range(ASPECT, start, end).await.expect("reads");
+				let points: Vec<Point> = rts.iter().zip(rvs).filter_map(|(t, v)| v.map(|v| Point::new(DateTime::<Utc>::from_timestamp_millis(*t).expect("instant"), v))).collect();
+				let single = reduce(&points, Resolution::Minutes, None, None, aggs).expect("reduces");
+				let got = store.downsample_range(ASPECT, start, end, Resolution::Minutes, aggs).await.expect("downsamples");
+				assert!(got.len() > 10, "several buckets");
+				assert_eq!(got, single, "{start}..{end} {aggs:?}");
+				// A one-step width (the server's route for `?resolution=minutes`) is the same grid.
+				let width = store.downsample_range_width(ASPECT, start, end, weft_reduce::BucketWidth::from(Resolution::Minutes), aggs).await.expect("downsamples");
+				assert_eq!(width, single, "a one-step width, {start}..{end} {aggs:?}");
+				for (g, s) in got.iter().zip(&single) {
+					for (name, value) in &g.values {
+						assert_eq!(Some(value.as_bigint_and_exponent()), s.values.get(name).map(BigDecimal::as_bigint_and_exponent), "{name} at {} carries reduce's digits and exponent", g.timestamp);
+					}
+				}
+			}
+		}
+		drop(store);
+
+		// The bucket cap holds on the finished grid as it does on a partial.
+		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_max_downsample_buckets(5)).await.expect("reopens");
+		let err = store.downsample_range(ASPECT, i64::MIN, i64::MAX, Resolution::Minutes, &percentiles).await.expect_err("over the cap");
+		let width_err = store.downsample_range_width(ASPECT, i64::MIN, i64::MAX, weft_reduce::BucketWidth::from(Resolution::Minutes), &percentiles).await.expect_err("over the cap");
+		for err in [err, width_err] {
+			assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::DownsampleTooLarge { limit: 5, .. })), "{err:#}");
 		}
 		drop(store);
 	}
