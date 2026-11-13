@@ -2,240 +2,75 @@
 
 One checklist, in phases. Each phase starts only when the phase before it is done, and nothing in a phase depends on an item in a later one. Item IDs (`7.2`, `6.1`, `S17`, `FRE-9b`, …) are stable and match DECISIONS.md, issues and PRs. Prose, measurements, audit notes and research notes are in [docs/roadmap-notes.md](docs/roadmap-notes.md).
 
-Sub-items run top to bottom under their parent. In Phases 1–11, `→` marks an item that followed the one above it.
+Phases 1–11 are complete and are summarized in prose; the item IDs they name still match DECISIONS.md, issues and PRs. In the open phases, sub-items run top to bottom under their parent.
 
-Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to 1.0.0. Phases 22–30 follow 1.0.
+Phases 1–11 record shipped work. Phases 12–21 lead to 1.0.0. Phases 22–30 follow 1.0.
 
 ## Phase 1 — Benchmark thesis and foundations
 
-- [x] Design-partner stand-in datasets chosen ([DESIGN-PARTNERS.md](DESIGN-PARTNERS.md))
-- [x] Willingness-to-pay hypotheses documented ([WILLINGNESS-TO-PAY.md](WILLINGNESS-TO-PAY.md))
-- [x] Publish a methodology document **before** any performance claim
-- [x] `axum` server with `POST /api/v1/interpolate` over `splimes`, ILP ingest, downsample/aggregation, point, stored-range and single-instant reads, maintenance, HTTP catalog with batch ingest
-- [x] Parquet and CSV in, Arrow/Parquet out, cursor paging on stored-range reads
-- [x] Prometheus latency histograms, OpenTelemetry trace export and `/metrics`
-- [x] `splimes` 1.0 released and depended on
-- [x] Control-plane engine decision: Turso 0.4 → 0.6 → 0.8.1, plain `INTEGER PRIMARY KEY` for MVCC, 0.7 evaluation settled
-- [x] Online control-plane backups over `VACUUM INTO`, concurrent-write-safe verify, background daemon, no stray sidecars
-- [x] Restore and the backup/restore drill, exposed at the API
-- [x] `Statement::n_change()` row accounting on the aspect-metadata and seal index writes
-- [x] Confirm the snapshot verifier does not depend on MVCC-broken pragmas
-- [x] **4.1** Time policy: POSIX UTC ticks, no zone, no leap seconds
-- [x] **S1** Legacy MVCC logs preserved, no-op sync pragmas dropped
-- [x] **S2** Durable I/O layer with fault points and a power-cut simulator
-- [x] **S4** Store-wide sweep isolation
-- [x] Integer-native reduction path wired into `SegmentStore::downsample_range`
-- [x] Read-path arc: streaming and batch point lookup, timestamp search, windowed range reads
-- [x] `weft-reduce`: mergeable DDSketch, cross-segment downsample, size-targeted compaction with a fragmentation gate
-- [x] DONE (2026-07-18) — materialize per-segment partials at seal time
-- [x] Compression v2 codecs through adopt-or-drop and realised on disk (Gorilla+RLE, adaptive bit-packing, scaled-integer bit-pack, FOR, f64 best-of selector, cascades, FastLanes layout)
-- [x] Test infrastructure: GPU flakes, rustc ICE and link OOM root-caused; `cargo test --workspace` completes
-- [x] Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix
-- [ ] Months 3–4 — Hot-path optimization
+**Complete.** Phase 1 set out the benchmark thesis and built the foundations everything else stands on. The design-partner stand-in datasets, willingness-to-pay hypotheses and a methodology document were published before any performance claim. The first `axum` server shipped `POST /api/v1/interpolate` over `splimes` 1.0, ILP and batch ingest, downsample and aggregation, point, stored-range and single-instant reads, maintenance and an HTTP catalog. It took Parquet and CSV in, put Arrow and Parquet out, paged stored-range reads by cursor, and exported Prometheus histograms, OpenTelemetry traces and `/metrics`.
+
+The control plane settled on Turso (0.4 → 0.6 → 0.8.1, with plain `INTEGER PRIMARY KEY` for MVCC). It gained online `VACUUM INTO` backups with a concurrent-write-safe verifier and a background daemon, restore and a drill exposed at the API, and exact `n_change()` row accounting. The storage groundwork landed as well: the UTC time policy (**4.1**), preserved legacy MVCC logs (**S1**), a durable I/O layer with fault points and a power-cut simulator (**S2**), and store-wide sweep isolation (**S4**). On the read and reduction side it delivered the integer-native downsample path, streaming and batch point lookups, windowed range reads, `weft-reduce` (mergeable DDSketch, cross-segment downsample, size-targeted compaction), per-segment partials at seal time, and the first Compression v2 codecs realised on disk (Gorilla+RLE, bit-packing, scaled-integer, FOR, an f64 best-of selector, cascades, FastLanes layout). Test infrastructure was made reliable: GPU flakes, a rustc ICE and link OOMs were root-caused, and `cargo test --workspace` completes. The one unfinished line, Months 3–4 hot-path optimization, moved to Phase 25.
 
 ## Phase 2 — Lock the store shapes (was W0)
 
-- [x] **INT-0** Land the splimes-1, legal and durability branches into main
-- [x] **S3 / D-S3** Storage-v2 open hardening
-- [x] **S5 / D-S5 + SEC-1** Atomic backup publish with manifest, retention and drill hygiene; backup-label grammar
-- [x] **S6 / D-S6** Schema v2 with `IndexTxn`, write poison and root-relative frame paths
-- [x] **S7 / D-S7** Persistent per-aspect id allocator with commit and maintenance locks
-- [x] **S18 / D-S18** Legacy rows-mode hygiene
-- [x] Decision 1: the store shapes S6 and S7 rely on
-- [x] **PAC-1a** Release pipeline
-- [x] **TAG-1** Canonical `TagSet`, `SeriesKey`, `SeriesSelector` with frozen caps
-- [x] **Security process**
-  - [x] Private vulnerability reporting is off *(owner switch; now on)*
+**Complete.** Phase 2 (W0) locked the store shapes later work depends on. The splimes-1, legal and durability branches landed on main (**INT-0**), and storage v2 gained hardened open (**S3**), atomic backup publish with a manifest, retention and drill hygiene plus the backup-label grammar (**S5**, **SEC-1**), schema v2 with `IndexTxn`, write poison and root-relative frame paths (**S6**), a persistent per-aspect id allocator with commit and maintenance locks (**S7**), and legacy rows-mode hygiene (**S18**). Decision 1 recorded the shapes S6 and S7 rely on.
+
+The phase also stood up the release pipeline (**PAC-1a**), the canonical tag types (`TagSet`, `SeriesKey`, `SeriesSelector`) with frozen caps (**TAG-1**), and the security process, including private vulnerability reporting, which is now on.
 
 ## Phase 3 — Baseline release, server split, goldens (was W1)
 
-- [x] **FRE-1** Per-crate versions, single edition, publish split, package hygiene
-- [x] **FRE-3** Golden frames, sidecars and persisted-encoding goldens
-- [x] **TAG-3** Open `ValueKind` with a provenance scope
-- [x] **EVI-1** README commands, flags, endpoints and links checked
-- [x] **EVI-3** Bench run manifest
-- [x] **EVI-9** `--sparse` and `--scale` workloads
-- [x] **SOA-1** Soak harness skeleton
-- [x] **PAC-4** v0.1.0 baseline release (GitHub release only); stale draft prerelease deleted
-- [x] **X-FX** Fixture set written by the v0.1.0 binary
-- [x] **X-SPLIT-SRV** `manage.rs` and `main.rs` split
-- [x] **PAC-5a** Configuration registry skeleton
-- [x] **S8 / D-S8** Write-once maintenance I
-- [x] **S9 / D-S9** Write-once maintenance II
+**Complete.** Phase 3 (W1) cut the v0.1.0 baseline (**PAC-4**, a GitHub release) and froze what it wrote: golden frames, sidecars and persisted encodings (**FRE-3**) and a fixture set written by the v0.1.0 binary (**X-FX**). Crates got per-crate versions, a single edition, a publish split and package hygiene (**FRE-1**); `ValueKind` became open with a provenance scope (**TAG-3**); and the server was split into `manage.rs` and `main.rs` (**X-SPLIT-SRV**) with a configuration-registry skeleton (**PAC-5a**).
+
+Write-once maintenance landed in two parts (**S8**, **S9**). On the evidence side, README commands and links were checked (**EVI-1**), bench runs got a manifest (**EVI-3**) and `--sparse`/`--scale` workloads (**EVI-9**), and the soak harness got its skeleton (**SOA-1**).
 
 ## Phase 4 — Error contract, frame format, portable builds (was W2)
 
-- [x] **X-ERR** One error envelope and code table
-- [x] **X-NAME** `aspect_name::encode` and `validate_new` at declare
-- [x] **ROB-2** Storage-engine panic fail-stop
-- [x] **X-FRAME** Frame registry with its v7 envelope
-- [x] **PAC-1b** Stripped dist profile with a third-party licence bundle
-- [x] **PAC-3** Library crates impose no global allocator or wgpu features
-- [x] **Crate publishing split**
-- [x] **FRE-14c** `weft-server import-rows-mode`
-- [x] **PAC-2** Portable Linux binaries on a glibc 2.28 baseline
-- [x] **EVI-5** Nightly regression workflow and `weft-bench compare`
-- [x] **EVI-2** `bench/claims.json` and `tools/check_claims.py` in CI
-- [x] **EVI-4** Artifact pipeline
-- [x] **EVI-6** Ingest workload over SegmentStore with the UCI loader
-- [x] **EVI-8A** Benchmark adapter v2 I
-- [x] **SOA-2** Preflight, device resolution, run metadata, secret redaction
-- [x] **SOA-3** Open-loop scheduler, HDR interval logs, self-monitoring, null server
-- [x] **SOA-4** Deterministic workload model and body encoders
-- [x] **S10** Write-once durable seal with id assigned at commit
+**Complete.** Phase 4 (W2) fixed the external contracts. Every error goes through one envelope and code table (**X-ERR**); aspect names are encoded and validated at declare (**X-NAME**); a storage-engine panic fails stop (**ROB-2**); and frames have a registry with the v7 envelope (**X-FRAME**). The durable write-once seal assigns segment ids at commit (**S10**). Builds became portable: a stripped dist profile with a third-party licence bundle (**PAC-1b**), library crates that impose no global allocator or wgpu features (**PAC-3**), the crate publishing split, Linux binaries on a glibc 2.28 baseline (**PAC-2**), and `weft-server import-rows-mode` for 0.1.x data (**FRE-14c**).
+
+Benchmark evidence became automated: a nightly regression workflow with `weft-bench compare` (**EVI-5**), `bench/claims.json` checked in CI (**EVI-2**), the artifact pipeline (**EVI-4**), an ingest workload over `SegmentStore` with the UCI loader (**EVI-6**) and benchmark adapter v2 part I (**EVI-8A**). The soak harness gained preflight, device resolution, run metadata and secret redaction (**SOA-2**), an open-loop scheduler with HDR interval logs (**SOA-3**), and a deterministic workload model (**SOA-4**).
 
 ## Phase 5 — Gate, serve path, input domain (was W3)
 
-- [x] **EVI-10A** Library stored-range interpolation with input caps
-- [x] **S11 / D-S11** Rollup into `segment_index.db`, folded in the seal and swap transactions
-- [x] **SEC-3** Sealed route registry, frozen scope table, fail-closed gate
-- [x] **SEC-4** One HTTP/1.1 serve path with pre-auth listener limits (absorbs ROB-23's caps)
-- [x] **ROB-6** Bounded decimals
-- [x] **EVI-8B** Benchmark adapter v2 II
-- [x] **SOA-5** Soak ingest client
-- [x] **SOA-12** Linux system samplers, contamination flags, strict-mode flush check
+**Complete.** Phase 5 (W3) put the gate and the serve path in place. Routes live in a sealed registry with a frozen scope table and a fail-closed gate (**SEC-3**), and every request goes through one HTTP/1.1 serve path with pre-auth listener limits (**SEC-4**, absorbing ROB-23's caps). Rollups moved into `segment_index.db`, folded into the seal and swap transactions (**S11**); decimals are bounded (**ROB-6**); and the library gained stored-range interpolation with input caps (**EVI-10A**).
+
+Benchmark adapter v2 was finished (**EVI-8B**), and the soak harness gained its ingest client (**SOA-5**) and Linux system samplers with contamination flags and a strict-mode flush check (**SOA-12**).
 
 ## Phase 6 — Auth, config, ILP fix (was W4)
 
-- [x] **S12** Startup recovery, quarantine with TTL, fsck endpoint, `/ready` report
-- [x] **S13 / D-S13** Idempotent atomic ingest entry point (library)
-- [x] **SEC-5** rustls/ring TLS listener
-- [x] **SEC-6** API keys, Bearer auth, keys file and keygen
-- [x] **ROB-3** Panic containment, daemon supervision, Daemons registry, `weftdb::exec`
-- [x] **PAC-5b** Strict configuration with a store filesystem check
-- [x] **TAG-0** ILP series merging fixed
-- [x] **ROB-8** Frame decoding hardened
-- [x] **EVI-11** Stored WeftDB benchmark adapter
-- [x] **SOA-6** Soak oracle core
+**Complete.** Phase 6 (W4) added auth, strict configuration and recovery. The server gained a rustls/ring TLS listener (**SEC-5**) and API keys with Bearer auth, a keys file and `keygen` (**SEC-6**); configuration became strict with a store filesystem check (**PAC-5b**). Startup recovery, quarantine with a TTL, the fsck endpoint and the `/ready` report shipped (**S12**), along with an idempotent atomic ingest entry point in the library (**S13**).
+
+Robustness work contained panics, supervised daemons through a `Daemons` registry and added `weftdb::exec` (**ROB-3**), and hardened frame decoding (**ROB-8**). ILP series merging was fixed (**TAG-0**), the stored WeftDB benchmark adapter landed (**EVI-11**), and the soak oracle core was built (**SOA-6**).
 
 ## Phase 7 — Ingest wiring, whole-store backup, legacy seal (was W5)
 
-- [x] **S14 / L-INGEST** HTTP ingest wiring
-- [x] **S15 / D-S15** Partial sidecar v4
-- [x] **S16 / D-S16** Whole-store backup with hard-linked frames
-- [x] Whole-store backup manifest (7.3/7.4; Turso backup residue (d))
-- [x] **S19 / D-S19** Seal-backed legacy aspects
-- [x] **ROB-4** No-panic lint; weft-arrow `Result` API
-- [x] **ROB-10** Admission I
-- [x] **SEC-8** Startup ordering, exposure matrix, auth-off guard, metrics auth
-- [x] **SEC-10** Exposure and secrets hygiene
-- [x] **FRE-5** Exact-case compute vocabulary, no silent narrowing
-- [x] **FRE-7b** Immutable declarations, scale rules, schema read-back
-- [x] **EVI-13** DuckDB adapter I
-- [x] **EVI-15R** Report renderer with generated honesty sections
-- [x] **EVI-16** Honesty pages I
-- [x] **SOA-7** Soak window digests with an oracle self-test
-- [x] **SOA-8** Failure deck, recovery windows, SIGTERM verdict, maintenance driver
+**Complete.** Phase 7 (W5) wired HTTP ingest into the segment store (**S14**) and made backups whole-store: hard-linked frames (**S16**) with a manifest covering items 7.3/7.4 and the Turso backup residue. Partial sidecars moved to v4 (**S15**), and legacy aspects became seal-backed (**S19**). Ingest gained admission control (**ROB-10**), a no-panic lint with a `Result` API in `weft-arrow` (**ROB-4**), an exact-case compute vocabulary with no silent narrowing (**FRE-5**), and immutable declarations with scale rules and schema read-back (**FRE-7b**).
+
+On security, startup ordering, the exposure matrix, the auth-off guard and metrics auth landed (**SEC-8**), along with exposure and secrets hygiene (**SEC-10**). Evidence work added DuckDB adapter part I (**EVI-13**), a report renderer with generated honesty sections (**EVI-15R**) and honesty pages part I (**EVI-16**). The soak harness gained window digests with an oracle self-test (**SOA-7**) and a failure deck with recovery windows, a SIGTERM verdict and a maintenance driver (**SOA-8**).
 
 ## Phase 8 — Durability CI, store split, scheduler (was W6)
 
-- [x] **S20** Change log replaces the per-timestamp unbatched queue for seal-backed aspects
-- [x] **S21 / D-S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and re-baseline, with **SOA-9** (`crash_kill9`)
-- [x] **X-SPLIT-STORE** Split `segment_store.rs` into `open`/`read`/`seal`/`maint`/`stats`
-- [x] → **TAG-4** weftdb read sites on the frame-reader API with typed errors
-- [x] **FRE-6b** Strict request parsing and caller updates
-- [x] **SEC-7** Key reload
-- [x] **SEC-9** Audit
-- [x] **SEC-11** Aspect-name traversal HTTP regression tests
-- [x] **PAC-7** Operator CLI, exit-code contract and store identity at startup
-- [x] → **ROB-11** Admission II
-- [x] **ROB-19** Maintenance scheduler, compaction on by default, per-aspect circuit breaker
-- [x] **SOA-10** Derived-read checks
-- [x] **SOA-14** Server hooks
-- [x] **EVI-14** DuckDB adapter II
-- [x] **EVI-18** Backup health metrics and catch-up-free ticking
-- [x] **EVI-25** Backup, restore and recovery cost measurement
-- [x] **4.3** Quality pruning: point reads and downsample skip all-null segments and pages
+**Complete.** Phase 8 (W6) made durability testable and split the store. A change log replaced the per-timestamp unbatched queue for seal-backed aspects (**S20**). Crash-matrix CI, a subprocess SIGKILL soak (**SOA-9**, `crash_kill9`), a durability benchmark and a re-baseline landed together (**S21**). `segment_store.rs` was split into `open`/`read`/`seal`/`maint`/`stats` (**X-SPLIT-STORE**), after which weftdb's read sites moved to the frame-reader API with typed errors (**TAG-4**). The maintenance scheduler shipped with compaction on by default and a per-aspect circuit breaker (**ROB-19**), followed by admission part II (**ROB-11**). Point reads and downsample skip all-null segments and pages (**4.3** quality pruning).
+
+The server gained strict request parsing (**FRE-6b**), key reload (**SEC-7**), an audit log (**SEC-9**), aspect-name traversal regression tests (**SEC-11**), and an operator CLI with an exit-code contract and store identity at startup (**PAC-7**). The soak harness added derived-read checks (**SOA-10**) and server hooks (**SOA-14**). Evidence work added DuckDB adapter part II (**EVI-14**), backup health metrics with catch-up-free ticking (**EVI-18**), and measured backup, restore and recovery costs (**EVI-25**).
 
 ## Phase 9 — Security and packaging close; Weft-Bench, SDKs and GPU flagship land (was W7)
 
-- [x] **FRE-12b** Scope pin and `GET /api/v1/version`
-- [x] **ROB-13** Bounded stored downsample and point lookups
-- [x] **ROB-7** Ingest decode bounds and `400 not_finite`
-- [x] **ROB-16** GPU configuration, compute limits, interpolation provenance and metrics
-- [x] **ROB-23r** Probe-only admin listener
-- [x] **ROB-5** Legacy queue-consumer panic fix
-- [x] **SEC-13** Security acceptance
-- [x] TLS on `weft-server`
-- [x] API-key/token auth + basic RBAC + audit log
-- [x] **PAC-13** Offline `weft-server restore` CLI
-- [x] **PAC-9** Docker image and container smoke test
-- [x] **PAC-11** systemd unit and host-install CI
-- [x] **EVI-15** First cross-engine report and its owner-approved narrative
-- [x] **EVI-19** Document RPO/RTO against the measured snapshot cadence (7.4)
-- [x] **SOA-11** Soak backup lane with final restore verification
-- [x] Weft-Bench: `weft-bench` and `weft-xbench`, fair protocol, reports, Grafana dashboard, pooled cross-engine run (#140–#150, #393, #505–#508)
-- [x] DONE (2026-11-02) — External-engine adapter fairness — three concrete rules from the 2026 landscape (#393)
-- [x] Add the **DuckDB** adapter
-- [x] Add ClickHouse, InfluxDB 3, QuestDB, TimescaleDB adapters
-- [x] Stored-read `.serialize` spans
-- [x] Seal-path `control_plane.index.insert` span with `rows_changed`
-- [x] Bench-run routes (`/bench/runs`)
-- [x] **Python SDK** (2026-11-03)
-- [x] **Rust SDK** (2026-11-04)
-- [x] **Arrow Flight** (2026-11-04)
-- [x] **Grafana** (2026-11-04)
-- [x] **R/Arrow workflows** (2026-11-04)
-- [x] Streamed stored interpolation `GET /api/v1/storage/{aspect}/interpolate` (#572, #585)
-- [x] Startup hardware calibration for `Backend::Auto`
-- [x] Float handling: shortest round-trip widening (#553) and `run_f64` range output (#575)
-- [x] GPU benches: `--gpu-economics` (#569), conformance matrix (#573), `weft-e2e-interp` (#586)
-- [x] Opt-in multi-GPU (#584) and mmap segment reads (#587)
-- [x] `weft-bench --gpu-memory` device-memory soak (#583)
-- [x] 5.1 command batching and 5.2 async handles measured and dropped
-- [x] **B-interp** Interpolate-on-read, single-instant lookup, out-of-range extrapolation
-- [x] Month 1 — Benchmark truth
-- [x] Month 2 — Public API & observability
-- [x] Months 4–5 — GPU flagship
+**Complete.** Phase 9 (W7) closed security and packaging and landed the benchmark suite, the SDKs and the GPU flagship. On security and limits: the scope pin and `GET /api/v1/version` (**FRE-12b**); bounded stored downsample and point lookups (**ROB-13**); ingest decode bounds with `400 not_finite` (**ROB-7**); GPU configuration, compute limits, interpolation provenance and metrics (**ROB-16**); a probe-only admin listener (**ROB-23r**); the legacy queue-consumer panic fix (**ROB-5**); and security acceptance (**SEC-13**), covering TLS, API keys with basic RBAC, and the audit log. Packaging shipped the offline `weft-server restore` CLI (**PAC-13**), a Docker image with a container smoke test (**PAC-9**), and a systemd unit with host-install CI (**PAC-11**). RPO/RTO is documented against the measured snapshot cadence (**EVI-19**), and the soak harness gained a backup lane with final restore verification (**SOA-11**).
+
+Weft-Bench shipped as `weft-bench` and `weft-xbench`, with a fair protocol and adapter-fairness rules (#393), reports, a Grafana dashboard and a pooled cross-engine run against DuckDB, ClickHouse, InfluxDB 3, QuestDB and TimescaleDB (#140–#150, #505–#508). The first cross-engine report and its approved narrative followed (**EVI-15**). Tracing gained stored-read `.serialize` spans and a seal-path index span with `rows_changed`, and the server gained `/bench/runs`. The Python and Rust SDKs, Arrow Flight, Grafana integration and R/Arrow workflows shipped between 2026-11-03 and 11-04. The GPU flagship delivered streamed stored interpolation (#572, #585), interpolate-on-read with single-instant lookup and extrapolation (**B-interp**), startup hardware calibration for `Backend::Auto`, shortest round-trip float widening (#553, #575), the GPU economics, conformance and end-to-end benches (#569, #573, #586), opt-in multi-GPU (#584), mmap segment reads (#587) and a device-memory soak (#583). Command batching (5.1) and async handles (5.2) were measured and dropped. With this phase, the Month 1, Month 2 and Months 4–5 milestones closed.
 
 ## Phase 10 — Tags core (was W8)
 
-- [x] open lane: **PAC-6** Library store options, generated configuration reference and registry scan
-- [x] → **TAG-9** Frame error classes in recovery
-- [x] → **TAG-5** Tags core: series table, catalog, and the layout marker
-- [x] seal lane: **TAG-7** Tagged seal in the library
-- [x] → **ROB-17** Disk guard, headroom API and space gauges
-  - [x] Log the `507 insufficient_storage` refusal once per transition
-  - [x] Report the guard's state on `/ready`
-  - [x] ROB-18 phase 1: `DiskGuard::admit` with the reserved body size (#681)
-- [x] maint lane: **TAG-6** Series-partitioned maintenance with multi-plan swaps
-- [x] read lane: **TAG-8** Library series reads
-- [x] **4.3** Tag pruning: single-series reads prune in SQL (`0007_series_time_index`, #158)
-- [x] **4.6** Skip-identical reconciliation and upsert keys `timestamp + K` (`0008_upsert_keys`)
-- [x] **FRE-8b** Stored-value text and one float-input rule across every ingest format
-- [x] **FRE-9a** OpenAPI generated from the route table, committed, drift-checked in CI
-- [x] **ROB-9** Mutation harness for frames, sidecars and Parquet
-- [x] **SEC-14** Security documentation, config schema and upgrade notes
-- [x] **PAC-10** Publish the multi-arch image (only after API auth)
-- [x] **EVI-17** Honesty pages II
-- [x] **FRE-13** Layout-1 to layout-2 upgrade test
-- [x] **SOA-13** SoakReport, SLO evaluator R1–R8, coverage floors, honesty section
-- [x] → **SOA-15** parts 1 and 3: nightly soak workflow and nightly-to-nightly comparison (#616)
+**Complete.** Phase 10 (W8) built the tags core. The library gained store options, a generated configuration reference and a registry scan (**PAC-6**). Recovery learned the frame error classes (**TAG-9**). The series table, catalog and layout marker landed (**TAG-5**), followed by the tagged seal (**TAG-7**), series-partitioned maintenance with multi-plan swaps (**TAG-6**) and library series reads (**TAG-8**). Single-series reads prune in SQL (**4.3** tag pruning, #158), reconciliation skips identical rows, and upserts key on `timestamp + K` (**4.6**). A disk guard with a headroom API and space gauges shipped (**ROB-17**): it logs the `507 insufficient_storage` refusal once per transition, reports on `/ready`, and admits ingest bodies against their reserved size (ROB-18 phase 1, #681).
+
+Stored-value text and one float-input rule now cover every ingest format (**FRE-8b**). OpenAPI is generated from the route table, committed and drift-checked in CI (**FRE-9a**). A mutation harness covers frames, sidecars and Parquet (**ROB-9**). Security documentation, the config schema and upgrade notes were written (**SEC-14**), and the multi-arch image was published after API auth (**PAC-10**). The phase also added honesty pages part II (**EVI-17**), the layout-1 to layout-2 upgrade test (**FRE-13**), the SoakReport with the R1–R8 SLO evaluator, coverage floors and an honesty section (**SOA-13**), and the nightly soak workflow with nightly-to-nightly comparison (**SOA-15** parts 1 and 3, #616).
 
 ## Phase 11 — Tag read surface, tag gate flip, compaction closes (was W9 shipped lanes and W10)
 
-- [x] storage read handlers lane: **TAG-10** HTTP read surface
-- [x] **PAC-14a** UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (absorbs FRE-19)
-- [x] **SOA-16** Soak upgrade lane
-- [x] → **TAG-11** HTTP ingest with tags and the tagged-write gate flip
-- [x] → **B-tags** (TAG-5..TAG-11)
-- [x] **ROB-21** Maintenance cancellation, RAII cleanup guards, minimal maintenance metrics
-- [x] read lane: **ROB-15** Pagination contract freeze
-- [x] **FRE-15** STABILITY.md, semver policy and the release-criteria wording
-- [x] **PAC-15** Operator documentation
-- [x] README `## Status` is stale (fixed 2026-11-10 by #682)
-- [x] Two `weft-server` bit-exactness tests failed under `cargo test -p weft-server` (fixed with serde_json `float_roundtrip`)
-  - [x] Measure what `float_roundtrip` costs the float parse itself
-  - [x] Run `cargo test -p weft-server` standalone in CI
-  - [x] Also test `weftdb`'s lib standalone there
-- [x] The seven slow `weft-orchestration` tests are bounded; #402 closed on erasure
-  - [x] The bound exists
-  - [x] #402 is closed as completed
-- [x] `weft-orchestration`: per-pipeline signal state (#673)
-- [x] `weft-orchestration`: bounded-window threshold detectors (#692)
-- [x] `weftdb` dictionaries: lossless `OccurrenceLog` (#612, #699)
-- [x] `weftdb` memory per database file: idle close and heap trim (#699)
-- [x] DONE (2026-11-10) — `weft-orchestration` is published
+**Complete.** Phase 11 (W9 and W10) put tags on the HTTP surface and closed compaction. The HTTP read surface for tags shipped (**TAG-10**), followed by tagged HTTP ingest and the tagged-write gate flip (**TAG-11**), which completed **B-tags** (TAG-5 through TAG-11). Upgrades got UPGRADING.md and compat legs A (upgrade) and C (rollback after writes) (**PAC-14a**, absorbing FRE-19), plus a soak upgrade lane (**SOA-16**). Maintenance gained cancellation, RAII cleanup guards and minimal metrics (**ROB-21**). The pagination contract was frozen (**ROB-15**), STABILITY.md set the semver policy and release-criteria wording (**FRE-15**), and operator documentation was written (**PAC-15**).
+
+The phase also cleared the remaining loose ends. The stale README status was fixed (#682). Two bit-exactness test failures were fixed with serde_json `float_roundtrip`, its parse cost was measured, and `weft-server` and `weftdb` now run standalone in CI. The seven slow `weft-orchestration` tests were bounded and #402 closed. `weft-orchestration` gained per-pipeline signal state (#673) and bounded-window threshold detectors (#692), and was published (2026-11-10). `weftdb` gained a lossless `OccurrenceLog` for dictionaries (#612, #699), and idle close with heap trim for memory per database file (#699).
 
 ## Phase 12 — Close the pre-beta lanes (was W6, W8 and W9 open items)
 
@@ -381,6 +216,7 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
 
 ## Phase 25 — Reduction, sketch, codec and benchmark research
 
+- [ ] Months 3–4 — Hot-path optimization: batch-ingest rewrite, minimized `BigDecimal` hot-loop use, typed-array interpolation streaming; establish whether storage or conversion is the dominant bottleneck (moved from Phase 1, 2026-11-13)
 - [ ] **ALP now has a FROZEN wire layout to mirror — do not invent a container (research 2026-09-23).**
 - [ ] **Set the ALP acceptance bar from upstream's own ablation, and be willing to DECLINE.**
 - [ ] **GPU-decode ALP — retarget to G-ALP (DaMoN'25), and decide the exception layout BEFORE the CPU ALP block is frozen on disk.**
