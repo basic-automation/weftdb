@@ -20,7 +20,9 @@
 //! It also prints, without timing it, what each collapse costs in accuracy on real data: the
 //! relative error of both sketches at p1, p50 and p99 over every BTC/USD one-minute close in
 //! `database/datasets/btc_1min.csv` (`WEFT_BTC_CSV` overrides the path; skipped with a note
-//! when the file is absent), at budgets of 256, 64 and 16 buckets.
+//! when the file is absent), at budgets of 256, 64 and 16 buckets. On the same corpus it
+//! prints the bound a `UddSketch` reaches at the defaults of Timescale's `percentile_agg()` (200
+//! buckets at 0.1%), the like-for-like comparison for the 1% that `sketch_p99` holds.
 #![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions)]
 
@@ -127,6 +129,23 @@ fn report_real_corpus() {
 		assert!(u.iter().all(|e| *e <= bound + 1e-12), "UddSketch outside its reported bound {bound} at {bins} buckets: {u:?}");
 		eprintln!("  {bins:>3} buckets: DdSketch {:.4} / {:.4} / {:.4}; UddSketch {:.4} / {:.4} / {:.4} ({} collapse(s), bound {bound:.4})", d[0], d[1], d[2], u[0], u[1], u[2], udd.collapses());
 	}
+	report_timescale_defaults(&closes);
+}
+
+/// Timescale's `percentile_agg()` is `uddsketch(200, 0.001)`. Print the bound that reaches
+/// on `sorted` and the error it actually has at p1, p50 and p99.
+fn report_timescale_defaults(sorted: &[f64]) {
+	let mut udd = UddSketch::new(0.001, 200).expect("valid");
+	for &v in sorted {
+		udd.add(v).expect("in range");
+	}
+	let bound = udd.relative_accuracy();
+	let u = [(10, 0.01), (500, 0.5), (990, 0.99)].map(|(per_mille, q)| {
+		let want = exact(sorted, per_mille);
+		(udd.quantile(q).expect("non-empty") - want).abs() / want
+	});
+	assert!(u.iter().all(|e| *e <= bound + 1e-12), "UddSketch outside its reported bound {bound} at TimescaleDB's defaults: {u:?}");
+	eprintln!("  TimescaleDB percentile_agg defaults (200 buckets at 0.1%): UddSketch {:.4} / {:.4} / {:.4} ({} collapse(s), bound {bound:.4})", u[0], u[1], u[2], udd.collapses());
 }
 
 fn bench_add(c: &mut Criterion) {

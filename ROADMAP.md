@@ -388,7 +388,7 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
   - [x] The sketch itself, as a library type (2026-11-11)
   - [x] A bench for the cost against `DdSketch` (2026-11-11)
   - [x] The accuracy each collapse costs on real data (2026-11-11)
-  - [ ] Repeat the timing figures on a quiet host with pinned cores before citing any of them
+  - [x] Repeat the timing figures on a quiet host with pinned cores before citing any of them
   - [ ] **Research (2026-11-11) — TimescaleDB's default percentile aggregate is a UDDSketch, so it is the like-for-like comparison.**
   - [ ] Decide whether the `sketch_p*` reductions take it (owner-gated; needs a sidecar version step)
 - [ ] **Research (2026-10-11) — the exact TWA is now a measurable differentiator.**
