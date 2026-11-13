@@ -331,6 +331,8 @@ pub fn run_gpu_memory(profile: &GpuMemoryProfile) -> anyhow::Result<BenchResult>
 
 #[cfg(test)]
 mod tests {
+	use serial_test::serial;
+
 	use super::*;
 
 	#[test]
@@ -378,7 +380,11 @@ mod tests {
 	}
 
 	/// Runs on a hardware GPU only (skips otherwise, as splimes' own GPU tests do unless
-	/// `WEFT_REQUIRE_GPU` is set).
+	/// `WEFT_REQUIRE_GPU` is set). The pool it measures is splimes' one per process, so a GPU
+	/// test running beside it (`gpu_economics`' lanes) creates and parks buffer sets inside
+	/// its rounds and fails the stability gate for no fault of the pool: `gpu_pool` keeps
+	/// them apart.
+	#[serial(gpu_pool)]
 	#[test]
 	fn the_pool_stays_bounded_and_stable_on_a_real_gpu() {
 		let profile = GpuMemoryProfile::new("gm-test", GpuMemoryParams { rounds: 3, sizes: vec![1_024, 65_536], knots: 100, ..GpuMemoryParams::default() });
