@@ -72,7 +72,7 @@
       "artifact": null,
       "section": "Where it doesn't pay off",
       "kind": "local-measurement",
-      "figures": ["40.4 ms → 24.9 ms", "70.8 ms → 27.6 ms", "56.2 ms → 38.3 ms", "50.7 ms to 34.5 ms", "88.1 ms to 47.2 ms", "74.7 ms to 57.0 ms", "65.3 ms to 31.2 ms", "26.4 ms to 19.7 ms"],
+      "figures": ["40.4 ms → 24.9 ms", "70.8 ms → 27.6 ms", "56.2 ms → 38.3 ms", "50.7 ms to 34.5 ms", "88.1 ms to 47.2 ms", "74.7 ms to 57.0 ms", "65.3 ms to 31.2 ms", "26.4 ms to 19.7 ms", "512.0 ms to 94.7 ms"],
       "source": "weft-reduce/benches/decimal_tax.rs",
       "command": "taskset -c 2 cargo bench -p weft-reduce --bench decimal_tax -- segment_downsample",
       "dataset": "btc_1min.csv (local, gitignored, not distributed)",

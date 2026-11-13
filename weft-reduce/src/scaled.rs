@@ -25,7 +25,7 @@ use bigdecimal::{
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
 
-use crate::{bucket_start, resolution_step_secs, Aggregation, Bucket, BucketAcc, DdSketch, PartialReduction, ReduceError};
+use crate::{resolution_step_secs, Aggregation, Bucket, BucketAcc, BucketWidth, DdSketch, PartialReduction, ReduceError};
 
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
@@ -61,6 +61,28 @@ fn base_range(resolution: Resolution, base: i64) -> Option<(i64, i64)> {
 		_ => (anchor.checked_sub(step - 1)?, anchor),
 	};
 	Some((lo_secs.checked_mul(NANOS_PER_SECOND)?, hi_secs.checked_mul(NANOS_PER_SECOND)?.checked_add(NANOS_PER_SECOND - 1)?))
+}
+
+/// The bucket grid an integer reduction keys on: `count` steps of `unit`, the key of an instant
+/// being its `unit` bucket index divided by `count` with `div_euclid`, exactly as
+/// [`BucketWidth::index`] keys it. `count` is 1 for a plain resolution.
+#[derive(Debug, Clone, Copy)]
+struct Grid {
+	unit: Resolution,
+	count: i64,
+}
+
+impl Grid {
+	fn of(width: BucketWidth) -> Self {
+		Self { unit: width.unit(), count: i64::from(width.count()) }
+	}
+
+	/// The key of the instant `nanos`, and the nanosecond range of its `unit` bucket: every
+	/// instant in that range has the same key, so a caller can skip indexing them.
+	fn locate(self, nanos: i64) -> (i64, Option<(i64, i64)>) {
+		let base = base_of(self.unit, nanos);
+		(base.div_euclid(self.count), base_range(self.unit, base))
+	}
 }
 
 /// Running integer state for one bucket. `first`/`last` carry their instant and resolve ties
@@ -393,7 +415,7 @@ const fn is_streaming(aggregation: Aggregation) -> bool {
 /// Fold `(epoch_nanos, mantissa)` pairs into integer per-bucket state, applying the inclusive
 /// `[start, end]` filter, and return the buckets in ascending key order. `None` when a bound cannot be expressed in epoch nanoseconds or the
 /// slices differ in length (the caller falls back to the `BigDecimal` path).
-fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<Vec<(i64, ScaledAcc)>> {
+fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], grid: Grid, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<Vec<(i64, ScaledAcc)>> {
 	if epoch_nanos.len() != mantissas.len() {
 		return None;
 	}
@@ -425,7 +447,7 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 				continue;
 			}
 		}
-		let base = base_of(resolution, nanos);
+		let (base, unit_span) = grid.locate(nanos);
 		match current.as_mut() {
 			Some((key, acc)) if *key == base => acc.push(nanos, mantissa),
 			_ => {
@@ -433,9 +455,9 @@ fn accumulate(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, st
 					close(key, acc);
 				}
 				current = Some((base, ScaledAcc::new(nanos, mantissa)));
-				span = base_range(resolution, base);
 			}
 		}
+		span = unit_span;
 	}
 	if let Some((key, acc)) = current {
 		close(key, acc);
@@ -491,11 +513,26 @@ fn in_key_order<A>(closed: Vec<(i64, A)>, ordered: bool, merge: impl Fn(&mut A, 
 /// [`ReduceError::BucketStartOverflow`] if a bucket's grid start scales past the representable
 /// time range.
 pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolution: Resolution, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<Vec<Bucket>>, ReduceError> {
+	reduce_scaled_width(epoch_nanos, mantissas, scale, BucketWidth::from(resolution), start, end, aggregations)
+}
+
+/// [`reduce_scaled`] into buckets of a [`BucketWidth`] (`15m`).
+///
+/// The buckets are the ones [`PartialReduction::finish_width`] gives for the equivalent
+/// partial at the width's unit, [`coarsen`](PartialReduction::coarsen)ed by its count,
+/// computed on the mantissas without a partial. A one-step width is [`reduce_scaled`] at its
+/// unit.
+///
+/// # Errors
+///
+/// As [`reduce_scaled`].
+pub fn reduce_scaled_width(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, width: BucketWidth, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, aggregations: &[Aggregation]) -> Result<Option<Vec<Bucket>>, ReduceError> {
+	let grid = Grid::of(width);
 	let aggregations = if aggregations.is_empty() { &Aggregation::DEFAULT[..] } else { aggregations };
 	if !aggregations.iter().all(|&a| is_streaming(a) || a.needs_full_bucket()) {
 		return Ok(None);
 	}
-	let Some(buckets) = accumulate(epoch_nanos, mantissas, resolution, start, end) else {
+	let Some(buckets) = accumulate(epoch_nanos, mantissas, grid, start, end) else {
 		return Ok(None);
 	};
 	// One percentile selects in linear time; several sort the bucket's mantissas once.
@@ -504,11 +541,11 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 	let weighting = aggregations.iter().any(|a| a.needs_full_bucket() && a.percentile_rank().is_none());
 	let window = (start, end);
 	// The time-weighted averages need each sample's instant; the percentiles only its mantissa.
-	let timed = if weighting { bucket_samples(epoch_nanos, mantissas, resolution, window, &buckets, |nanos, m| (nanos, m)) } else { Vec::new() };
+	let timed = if weighting { bucket_samples(epoch_nanos, mantissas, grid, window, &buckets, |nanos, m| (nanos, m)) } else { Vec::new() };
 	let mut ranked = match (percentiles > 0, weighting) {
 		(false, _) => Vec::new(),
 		(true, true) => timed.iter().map(|bucket| bucket.iter().map(|&(_, m)| m).collect()).collect(),
-		(true, false) => bucket_samples(epoch_nanos, mantissas, resolution, window, &buckets, |_, m| m),
+		(true, false) => bucket_samples(epoch_nanos, mantissas, grid, window, &buckets, |_, m| m),
 	};
 
 	let scale = i64::from(scale);
@@ -516,7 +553,7 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 	// A loop rather than a `Result` collect, which cannot size the output from its input.
 	let mut out = Vec::with_capacity(buckets.len());
 	for (position, (base, acc)) in buckets.into_iter().enumerate() {
-		let timestamp = bucket_start(resolution, base).ok_or(ReduceError::BucketStartOverflow)?;
+		let timestamp = width.start(base).ok_or(ReduceError::BucketStartOverflow)?;
 		let mut values: BTreeMap<String, BigDecimal> = BTreeMap::new();
 		let bucket = ranked.get_mut(position).map_or(&mut [][..], Vec::as_mut_slice);
 		if sorted {
@@ -534,7 +571,7 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 				Aggregation::TwaLinear => Some((true, None)),
 				// The grid end of *this* bucket: the start of the next one. A bucket with no
 				// representable end has no value, as `finish` leaves it.
-				Aggregation::TwaBucketEnd => match bucket_start(resolution, base.wrapping_add(1)) {
+				Aggregation::TwaBucketEnd => match width.start(base.wrapping_add(1)) {
 					Some(end) => Some((false, Some(end))),
 					None => continue,
 				},
@@ -567,7 +604,7 @@ pub fn reduce_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32, resolut
 /// with `buckets` (ascending keys, as [`accumulate`] returns them). A second pass over the
 /// input, finding a sample's bucket by its nanosecond range and looking one up only when the
 /// range is left, as [`reduce_partial_scaled`] does.
-fn bucket_samples<T>(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolution, (start, end): (Option<DateTime<Utc>>, Option<DateTime<Utc>>), buckets: &[(i64, ScaledAcc)], item: impl Fn(i64, i64) -> T) -> Vec<Vec<T>> {
+fn bucket_samples<T>(epoch_nanos: &[i64], mantissas: &[i64], grid: Grid, (start, end): (Option<DateTime<Utc>>, Option<DateTime<Utc>>), buckets: &[(i64, ScaledAcc)], item: impl Fn(i64, i64) -> T) -> Vec<Vec<T>> {
 	let mut ranked: Vec<Vec<T>> = buckets.iter().map(|(_, acc)| Vec::with_capacity(usize::try_from(acc.count).unwrap_or(0))).collect();
 	let bound = |b: Option<DateTime<Utc>>| b.and_then(|t| t.timestamp_nanos_opt());
 	let (lo, hi) = (bound(start), bound(end));
@@ -579,9 +616,9 @@ fn bucket_samples<T>(epoch_nanos: &[i64], mantissas: &[i64], resolution: Resolut
 		let position = match current {
 			Some((position, Some((from, to)))) if from <= nanos && nanos <= to => position,
 			_ => {
-				let base = base_of(resolution, nanos);
+				let (base, unit_span) = grid.locate(nanos);
 				let Ok(position) = buckets.binary_search_by_key(&base, |(b, _)| *b) else { continue };
-				current = Some((position, base_range(resolution, base)));
+				current = Some((position, unit_span));
 				position
 			}
 		};
@@ -654,7 +691,7 @@ pub fn reduce_partial_scaled(epoch_nanos: &[i64], mantissas: &[i64], scale: u32,
 	}
 	let sketching = aggregations.iter().any(|a| a.sketch_quantile().is_some());
 	let collecting = aggregations.iter().any(|a| a.needs_full_bucket());
-	let Some(buckets) = accumulate(epoch_nanos, mantissas, resolution, start, end) else {
+	let Some(buckets) = accumulate(epoch_nanos, mantissas, Grid::of(BucketWidth::from(resolution)), start, end) else {
 		return Ok(None);
 	};
 	let scale = i64::from(scale);
@@ -1100,6 +1137,45 @@ mod tests {
 									assert_eq!(got.as_bigint_and_scale(), want.as_bigint_and_scale(), "{} keeps reduce's representation", p.as_str());
 								}
 							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn reduce_scaled_width_is_the_coarsened_partial_to_the_digit() {
+		// A multi-step width keys on the unit index divided by the count (negative epochs
+		// included, where the second-and-coarser grids' bucket 0 straddles zero), and must give
+		// the buckets the decimal partial at the unit gives once coarsened and finished at the
+		// width, for every reduction it answers, in value and representation.
+		let mut next = noise(0x6a09_e667_f3bc_c909);
+		let mut t = -9_000 * NANOS_PER_SECOND;
+		let mut nanos: Vec<i64> = (0..4_000)
+			.map(|_| {
+				t += (next() % 7_000_000_000).cast_signed();
+				t
+			})
+			.collect();
+		for i in (0..nanos.len()).step_by(17) {
+			nanos.swap(i, (i + 5) % 4_000);
+		}
+		let mantissas: Vec<i64> = (0..4_000).map(|_| (next() % 2_001).cast_signed() - 1_000).collect();
+		let pts = points(&nanos, &mantissas, 2);
+		let window = (Some(DateTime::from_timestamp_nanos(-3_000 * NANOS_PER_SECOND)), Some(DateTime::from_timestamp_nanos(5_000 * NANOS_PER_SECOND)));
+		let sets: [&[Aggregation]; 4] = [&[Aggregation::P50, Aggregation::P99], &[Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd], &[Aggregation::Min, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::P90], &[]];
+		for token in ["15s", "7s", "5m", "2h", "3d", "250ms", "1m"] {
+			let width = BucketWidth::parse(token).expect("parses");
+			for (start, end) in [(None, None), window] {
+				for aggs in sets {
+					let expected = crate::reduce_partial_decimal(&pts, width.unit(), start, end, aggs).expect("reduces").coarsen(width.count()).expect("coarsens").finish_width(width, aggs).expect("finishes");
+					let actual = reduce_scaled_width(&nanos, &mantissas, 2, width, start, end, aggs).expect("reduces").expect("answered");
+					assert_ne!(actual.len(), 0, "{token}: the fixture fills buckets");
+					assert_eq!(actual, expected, "{token} {start:?}..{end:?} {aggs:?}");
+					for (got, want) in actual.iter().zip(&expected) {
+						for (name, value) in &got.values {
+							assert_eq!(Some(value.as_bigint_and_scale()), want.values.get(name).map(BigDecimal::as_bigint_and_scale), "{token} {name} at {}", got.timestamp);
 						}
 					}
 				}

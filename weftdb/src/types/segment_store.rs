@@ -285,7 +285,7 @@ fn scaled_rows(ts: &[i64], vs: &[Option<PhysicalValue>], start: i64, end: i64, u
 /// Pure and synchronous: it takes the frame bytes and returns the partial, so it holds
 /// no store state and the whole call is `spawn_blocking`-safe.
 fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
-	match segment_fold(descriptor, bytes, (start, end), unit, resolution, aggregations, false)? {
+	match segment_fold(descriptor, bytes, (start, end), unit, resolution, aggregations, None)? {
 		Some(Folded::Partial(partial)) => Ok(Some(partial)),
 		Some(Folded::Finished(_)) => bail!("reducing segment {}: a fold that may not finish returned finished buckets", descriptor.path),
 		None => Ok(None),
@@ -293,19 +293,20 @@ fn segment_partial(descriptor: &SegmentDescriptor, bytes: &[u8], start: i64, end
 }
 
 /// What one segment's fold produced: the mergeable partial, or, for a read that merges
-/// nothing (`finish_only`), the finished buckets themselves.
+/// nothing and finishes on the integer path, the finished buckets themselves.
 enum Folded {
 	Partial(PartialReduction),
 	Finished(Vec<Bucket>),
 }
 
-/// [`segment_partial`], or with `finish_only` the finished buckets when the integer path
-/// can produce them directly: a read whose one segment is its whole answer has no partial
-/// to merge, so [`weft_reduce::reduce_scaled`] reduces the stored mantissas to buckets and
-/// selects the exact percentiles on them, instead of `reduce_partial_scaled` building a
-/// `BigDecimal` per sample for the partial to carry (#401). The buckets are the ones
-/// finishing the partial gives. One physical decode either way.
-fn segment_fold(descriptor: &SegmentDescriptor, bytes: &[u8], (start, end): (i64, i64), unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation], finish_only: bool) -> Result<Option<Folded>> {
+/// [`segment_partial`], or with `finish` the buckets at that width (whose unit is
+/// `resolution`) when the integer path can produce them directly: a read whose one segment
+/// is its whole answer has no partial to merge, so [`weft_reduce::reduce_scaled_width`]
+/// reduces the stored mantissas to buckets, selecting the exact percentiles and weighting the
+/// time-weighted averages on them, instead of `reduce_partial_scaled` building a `BigDecimal`
+/// per sample for the partial to carry (#401). The buckets are the ones finishing the
+/// partial, coarsened to the width, gives. One physical decode either way.
+fn segment_fold(descriptor: &SegmentDescriptor, bytes: &[u8], (start, end): (i64, i64), unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation], finish: Option<weft_reduce::BucketWidth>) -> Result<Option<Folded>> {
 	// Read the window in its physical encoding, so a ScaledI64 column can be reduced on its
 	// stored mantissas without building a BigDecimal per row.
 	let (ts, vs) = frame_read::read_range_physical(descriptor.path.as_str(), bytes, start, end)?;
@@ -316,8 +317,8 @@ fn segment_fold(descriptor: &SegmentDescriptor, bytes: &[u8], (start, end): (i64
 		if nanos.is_empty() {
 			return Ok(None);
 		}
-		if finish_only {
-			if let Some(buckets) = weft_reduce::reduce_scaled(&nanos, &mantissas, u32::from(scale), resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))? {
+		if let Some(width) = finish {
+			if let Some(buckets) = weft_reduce::reduce_scaled_width(&nanos, &mantissas, u32::from(scale), width, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing segment {}: {e}", descriptor.path))? {
 				return Ok(Some(Folded::Finished(buckets)));
 			}
 		}
@@ -6652,12 +6653,22 @@ mod tests {
 		let descriptors = store.index.prune_by_time(ASPECT, i64::MIN, i64::MAX).await.expect("prunes");
 		assert!(descriptors.len() > 1);
 		for aggs in [&fallback[..], &full[..]] {
-			assert!(store.downsample_scaled_rows(ASPECT, &descriptors, whole, TimeUnit::Millis, Resolution::Minutes, aggs).await.expect("decodes").is_some(), "several one-scale segments finish {aggs:?} on their mantissas");
+			assert!(store.downsample_scaled_rows(ASPECT, &descriptors, whole, TimeUnit::Millis, weft_reduce::BucketWidth::from(Resolution::Minutes), aggs).await.expect("decodes").is_some(), "several one-scale segments finish {aggs:?} on their mantissas");
 		}
 		for (start, end) in [whole, window] {
 			assert_single_pass(&store, start, end, &integer, "sealed, integer path").await;
 			assert_single_pass(&store, start, end, &fallback, "sealed, fallback").await;
 			assert_single_pass(&store, start, end, &full, "sealed, several segments on mantissas").await;
+			// At a multi-step width, against the single pass at the unit coarsened to it.
+			let (ts, vs) = store.read_time_range(ASPECT, start, end).await.expect("reads");
+			let points: Vec<Point> = ts.iter().zip(vs).filter_map(|(t, v)| v.map(|v| Point::new(DateTime::<Utc>::from_timestamp_millis(*t).expect("instant"), v))).collect();
+			let width = weft_reduce::BucketWidth::parse("7m").expect("parses");
+			for aggs in [&full[..], &fallback[..], &integer[..]] {
+				let coarse = weft_reduce::reduce_partial(&points, Resolution::Minutes, None, None, aggs).expect("reduces").coarsen(7).expect("coarsens").finish_width(width, aggs).expect("finishes");
+				let got = store.downsample_range_width(ASPECT, start, end, width, aggs).await.expect("downsamples");
+				assert!(got.len() > 1);
+				assert_eq!(got, coarse, "7m {aggs:?}");
+			}
 		}
 
 		// Maintenance sorts the out-of-order segment and merges the overlapping ones; the
@@ -6703,10 +6714,11 @@ mod tests {
 		let mixed = [Aggregation::Min, Aggregation::P99, Aggregation::Avg, Aggregation::Sum, Aggregation::P50, Aggregation::Last];
 		let with_twa = [Aggregation::P99, Aggregation::Twa, Aggregation::TwaLinear, Aggregation::TwaBucketEnd];
 		let with_sketch = [Aggregation::P99, Aggregation::SketchP99];
-		let finished = |aggs: &[Aggregation]| matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, aggs, true).expect("folds"), Some(Folded::Finished(_)));
+		let finished = |aggs: &[Aggregation]| matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, aggs, Some(weft_reduce::BucketWidth::from(Resolution::Minutes))).expect("folds"), Some(Folded::Finished(_)));
 		assert!(finished(&percentiles) && finished(&mixed) && finished(&[Aggregation::P95]) && finished(&with_twa), "percentiles, time-weighted averages and streaming reductions finish on the mantissas");
 		assert!(!finished(&with_sketch), "a sketch takes the partial route");
-		assert!(matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, &percentiles, false).expect("folds"), Some(Folded::Partial(_))), "a fold for merging never finishes");
+		assert!(matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, &percentiles, None).expect("folds"), Some(Folded::Partial(_))), "a fold for merging never finishes");
+		assert!(matches!(segment_fold(&descriptor, &bytes, (i64::MIN, i64::MAX), TimeUnit::Millis, Resolution::Minutes, &with_twa, Some(weft_reduce::BucketWidth::parse("5m").expect("parses"))).expect("folds"), Some(Folded::Finished(_))), "a multi-step width finishes on the mantissas");
 
 		for (start, end) in [(i64::MIN, i64::MAX), (base + 300_000, base + 2_900_000)] {
 			for aggs in [&percentiles[..], &mixed[..], &with_twa[..], &with_sketch[..], &[Aggregation::P90][..]] {
@@ -6719,6 +6731,16 @@ mod tests {
 				// A one-step width (the server's route for `?resolution=minutes`) is the same grid.
 				let width = store.downsample_range_width(ASPECT, start, end, weft_reduce::BucketWidth::from(Resolution::Minutes), aggs).await.expect("downsamples");
 				assert_eq!(width, single, "a one-step width, {start}..{end} {aggs:?}");
+				// A multi-step width finishes on the mantissas too, as the coarsened single pass.
+				let five = weft_reduce::BucketWidth::parse("5m").expect("parses");
+				let coarse = weft_reduce::reduce_partial(&points, Resolution::Minutes, None, None, aggs).expect("reduces").coarsen(5).expect("coarsens").finish_width(five, aggs).expect("finishes");
+				let got_five = store.downsample_range_width(ASPECT, start, end, five, aggs).await.expect("downsamples");
+				assert_eq!(got_five, coarse, "5m, {start}..{end} {aggs:?}");
+				for (g, c) in got_five.iter().zip(&coarse) {
+					for (name, value) in &g.values {
+						assert_eq!(Some(value.as_bigint_and_exponent()), c.values.get(name).map(BigDecimal::as_bigint_and_exponent), "5m {name} at {}", g.timestamp);
+					}
+				}
 				for (g, s) in got.iter().zip(&single) {
 					for (name, value) in &g.values {
 						assert_eq!(Some(value.as_bigint_and_exponent()), s.values.get(name).map(BigDecimal::as_bigint_and_exponent), "{name} at {} carries reduce's digits and exponent", g.timestamp);
