@@ -11,3 +11,8 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+    # rust-toolchain picks the toolchain from the ref it is pinned to (master, nightly,
+    # 1.95.0 are separate commits); Dependabot collapses them to one SHA and breaks
+    # the msrv and nightly jobs (#704). Bump these by hand.
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
