@@ -6642,14 +6642,22 @@ mod tests {
 		// fall back, and must agree on the same scaled store too.
 		let integer = [Aggregation::Min, Aggregation::Max, Aggregation::Avg, Aggregation::Sum, Aggregation::First, Aggregation::Last, Aggregation::SketchP99];
 		let fallback = [Aggregation::Avg, Aggregation::P99, Aggregation::Twa];
+		// Every full-bucket reduction, which several segments now finish on their mantissas (#401).
+		let full = [Aggregation::P50, Aggregation::TwaLinear, Aggregation::P95, Aggregation::TwaBucketEnd, Aggregation::Last, Aggregation::P90];
 		let whole = (i64::MIN, i64::MAX);
 		// A window that trims inside the first, second and nullable segments.
 		let window = (base + 1_000_000, base + 6_500_000);
 
 		assert_integer_path(&store, &integer).await;
+		let descriptors = store.index.prune_by_time(ASPECT, i64::MIN, i64::MAX).await.expect("prunes");
+		assert!(descriptors.len() > 1);
+		for aggs in [&fallback[..], &full[..]] {
+			assert!(store.downsample_scaled_rows(ASPECT, &descriptors, whole, TimeUnit::Millis, Resolution::Minutes, aggs).await.expect("decodes").is_some(), "several one-scale segments finish {aggs:?} on their mantissas");
+		}
 		for (start, end) in [whole, window] {
 			assert_single_pass(&store, start, end, &integer, "sealed, integer path").await;
 			assert_single_pass(&store, start, end, &fallback, "sealed, fallback").await;
+			assert_single_pass(&store, start, end, &full, "sealed, several segments on mantissas").await;
 		}
 
 		// Maintenance sorts the out-of-order segment and merges the overlapping ones; the
@@ -6662,6 +6670,7 @@ mod tests {
 		for (start, end) in [whole, window] {
 			assert_single_pass(&store, start, end, &integer, "maintained, integer path").await;
 			assert_single_pass(&store, start, end, &fallback, "maintained, fallback").await;
+			assert_single_pass(&store, start, end, &full, "maintained, on mantissas").await;
 		}
 		drop(store);
 	}

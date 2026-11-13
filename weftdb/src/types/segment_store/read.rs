@@ -358,6 +358,20 @@ impl SegmentStore {
 			};
 		}
 
+		// #401, several segments: a read finished here that asks for a reduction needing every
+		// sample (a percentile, a time-weighted average) holds all of them anyway, as the
+		// merged partial's `BigDecimal` samples. On a `ScaledI64` aspect it holds the mantissas
+		// instead and finishes them once on the integer path; a sketch, or a segment off the
+		// aspect's one scale, takes the partial route below.
+		if finish_only && matches!(schema.value, weft_physical_type::PhysicalType::ScaledI64 { .. }) && aggregations.iter().any(|a| a.needs_full_bucket()) && aggregations.iter().all(|a| a.sketch_quantile().is_none()) {
+			if let Some(buckets) = self.downsample_scaled_rows(aspect, &descriptors, (start, end), schema.timestamp_unit, resolution, aggregations).await? {
+				if buckets.len() > max_buckets {
+					return Err(StoreError::DownsampleTooLarge { aspect: aspect.to_string(), buckets: buckets.len(), limit: max_buckets }.into());
+				}
+				return Ok(Some(Folded::Finished(buckets)));
+			}
+		}
+
 		// Each pruned segment folds into its own `PartialReduction` **concurrently**: the
 		// file read is async I/O and the decode + reduce is CPU-bound, so each segment's
 		// CPU half runs on the blocking pool and the reads overlap rather than queueing
@@ -403,6 +417,37 @@ impl SegmentStore {
 			}
 		}
 		Ok(merged.map(Folded::Partial))
+	}
+
+	/// Every pruned segment's in-window rows of `aspect` as `(epoch nanos, mantissa)`,
+	/// decoded concurrently on the blocking pool and concatenated in descriptor order — the
+	/// order the partial route merges in, so each bucket sees its samples in the same order —
+	/// then reduced once by [`weft_reduce::reduce_scaled`]. The buckets are the ones the merged
+	/// partials finish to. `Ok(None)` when a segment holds anything but `ScaledI64` values, or
+	/// a scale other than the first segment's, or `reduce_scaled` declines: the caller then
+	/// takes the partial route.
+	pub(crate) async fn downsample_scaled_rows(&self, aspect: &str, descriptors: &[SegmentDescriptor], (start, end): (i64, i64), unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<Vec<Bucket>>> {
+		let tasks = descriptors.iter().cloned().map(|descriptor| async move {
+			let bytes = self.read_frame(&descriptor).await?;
+			tokio::task::spawn_blocking(move || frame_read::read_range_physical(descriptor.path.as_str(), &bytes, start, end).map(|(ts, vs)| scaled_rows(&ts, &vs, start, end, unit))).await.context("segment decode task panicked")?
+		});
+		let decoded = futures::future::try_join_all(tasks).await?;
+		let (mut nanos, mut mantissas, mut scale) = (Vec::new(), Vec::new(), None::<u8>);
+		for rows in decoded {
+			let Some((segment_nanos, segment_mantissas, segment_scale)) = rows else { return Ok(None) };
+			if segment_nanos.is_empty() {
+				continue;
+			}
+			if *scale.get_or_insert(segment_scale) != segment_scale {
+				return Ok(None);
+			}
+			nanos.extend(segment_nanos);
+			mantissas.extend(segment_mantissas);
+		}
+		let Some(scale) = scale else { return Ok(Some(Vec::new())) };
+		let aggregations = aggregations.to_vec();
+		let reduced = tokio::task::spawn_blocking(move || weft_reduce::reduce_scaled(&nanos, &mantissas, u32::from(scale), resolution, None, None, &aggregations)).await.context("downsample reduce task panicked")?;
+		reduced.map_err(|e| anyhow::anyhow!("reducing {aspect:?}: {e}"))
 	}
 
 	/// **Point lookup** (roadmap Phase 4.6 read-planner): the present value of

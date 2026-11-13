@@ -424,7 +424,9 @@ time-weighted averages there, building one `BigDecimal` per result instead of on
 (`finish_only_*` against `scaled_*` in `decimal_tax`). Against a release `weft-server` holding
 that frame as one segment, the request median went from 50.7 ms to 34.5 ms for `p99`, from
 88.1 ms to 47.2 ms for `p50,p95,p99` and from 74.7 ms to 57.0 ms for `avg,p99,twa`, with the
-JSON and CSV responses byte-identical to the previous release's.
+JSON and CSV responses byte-identical to the previous release's. Several one-scale segments
+finish the same way, their mantissas concatenated in segment order: split into 16 segments,
+`p50,p95,p99` went from 65.3 ms to 31.2 ms and `p99` from 26.4 ms to 19.7 ms.
 
 Three more results from 2026-10-09 where the obvious answer was wrong:
 

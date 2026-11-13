@@ -407,7 +407,8 @@ Phases 1–11 record shipped work in the order it landed. Phases 12–21 lead to
       - [ ] **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
       - [x] **NEXT — select on the mantissas when a partial is not merged.** (#401)
         - [x] TWA on the finish-only route (`twa`, `twa_linear`, `twa_bucket_end` weighted on the mantissas)
-        - [ ] Several segments of one scale: carry mantissas, not `BigDecimal` samples, in the in-memory partial so a multi-segment exact percentile selects on integers too (the `.weftpart` sidecar never holds exact-percentile samples, so no format step)
+        - [x] Several segments of one scale: their mantissas concatenated in segment order and finished once (no partial, no format step)
+        - [ ] A multi-step width (`15m`) still takes the partial route: coarsen the integer buckets, or reduce at the width directly
 - [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
 - [ ] **Research (2026-10-09) — DuckDB has a native linear-interpolation arm**
 - [ ] **NEXT — (3c) materialized tiers, remaining**
