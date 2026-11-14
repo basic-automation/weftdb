@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use weftdb::{
-	durable::{RealFs, StoreFs}, VerifyMode, RESTORE_DRILL_PREFIX
+	disk_space_at, durable::{RealFs, StoreFs}, BackupManifest, DiskGuard, VerifyMode, RESTORE_DRILL_PREFIX
 };
 
 use crate::{
@@ -105,6 +105,143 @@ pub async fn restore_drill(State(state): State<AppState>, StrictQuery(params): S
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
 
+/// Handle `POST /api/v1/storage/restore/into?label=&name=`: restore a backup
+/// into a caller-chosen new root under the configured restore base.
+///
+/// The caller picks a `name` which must be a single safe path segment (non-empty, ≤ 200
+/// bytes, `[A-Za-z0-9._-]+`, no `/`, no `\`, no `..`, no leading `.`, no NUL). The
+/// destination is `<WEFT_RESTORE_BASE_DIR>/<name>`. The restore base defaults to the
+/// parent of the live store root. The route restores the backup — control plane or whole
+/// store, chosen by the backup's manifest — into the destination, verifies every
+/// restored database at its destination, and reports the outcome.
+///
+/// Adoption is deliberately not an option here: this route never opens the restored root,
+/// so frame adoption runs and the restore intent marker clears on that root's first server
+/// open, or now with the CLI's `--adopt`. The live store is never touched.
+///
+/// # Errors
+///
+/// [`ApiError::unconfigured`] when no store is attached, [`ApiError::bad_request`] when
+/// the label is malformed, names a staging directory, does not exist, or the destination
+/// name is invalid. [`ApiError::already_exists`] when the destination already exists.
+/// [`ApiError::internal`] when the restore or verification fails.
+pub async fn restore_into(State(state): State<AppState>, StrictQuery(params): StrictQuery<RestoreIntoParams>) -> Result<Response, ApiError> {
+	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
+
+	// Validate the backup label.
+	if !valid_backup_label(&params.label) {
+		return Err(invalid_backup_label(&params.label));
+	}
+	if weftdb::is_staging_name(&params.label) {
+		return Err(ApiError::bad_request(format!("`{}` names an unfinished backup, prune or drill (a name starting with one of {:?}), not a backup", params.label, weftdb::STAGING_PREFIXES)));
+	}
+
+	// Validate the destination name.
+	if !valid_destination_name(&params.name) {
+		return Err(ApiError::bad_request(format!("invalid destination name `{}` — use 1 to 200 safe path characters: letters, digits, '.', '_' or '-', no `/`, no `\\`, no `..`, no leading '.'", params.name)));
+	}
+
+	// Locate the backup directory.
+	let backup_base = std::env::var_os("WEFT_BACKUP_DIR").map_or_else(|| store.root().join("backups"), std::path::PathBuf::from);
+	let backup_dir = backup_base.join(&params.label);
+	if !backup_dir.is_dir() {
+		return Err(ApiError::aspect_not_found(format!("no backup named `{}` under {}", params.label, backup_base.display())));
+	}
+
+	// Determine the restore base.
+	let restore_base = std::env::var_os("WEFT_RESTORE_BASE_DIR").map_or_else(
+		|| {
+			let root = store.root();
+			root.parent().map_or_else(|| root.join(".."), std::path::Path::to_path_buf)
+		},
+		std::path::PathBuf::from,
+	);
+
+	// Canonicalize both the restore base and backup base for containment checks.
+	let restore_base = restore_base.canonicalize().map_err(|err| ApiError::internal(format!("restore base cannot be canonicalized: {err}")))?;
+	let backup_base = backup_base.canonicalize().unwrap_or(backup_base);
+
+	// Amendment #4: refuse a restore base that sits inside or equals the backup base,
+	// because a restored root named e.g. `backup-123` could be pruned by the daemon.
+	if restore_base == backup_base || backup_base.starts_with(&restore_base) || restore_base.starts_with(&backup_base) {
+		return Err(ApiError::bad_request(format!("restore base `{}` sits inside or equals the backup base `{}`; a restored root named e.g. `backup-123` could be pruned by the backup daemon", restore_base.display(), backup_base.display())));
+	}
+
+	// Join the caller-chosen destination name.
+	let dest = restore_base.join(&params.name);
+	if dest.exists() {
+		return Err(ApiError::already_exists(format!("restore destination already exists: {}; choose a fresh destination name, or remove it first", dest.display())));
+	}
+
+	// Refuse if the destination is or contains the live store root.
+	let live_root = store.root();
+	let live_root = live_root.canonicalize().unwrap_or_else(|_| live_root.to_path_buf());
+	if dest.starts_with(&live_root) || live_root.starts_with(&dest) {
+		return Err(ApiError::bad_request(format!("destination `{}` would overlap the live store root `{}`; a restore must go elsewhere", params.name, live_root.display())));
+	}
+
+	drop(store);
+
+	// Read the backup's manifest to determine the mode.
+	let manifest = BackupManifest::read(&backup_dir).await.map_err(|err| ApiError::internal(format!("reading backup manifest: {err:#}")))?;
+	let Some(manifest) = manifest else {
+		return Err(ApiError::internal(format!("backup `{}` has no manifest — it was taken before manifests were introduced; take a fresh backup and retry", params.label)));
+	};
+	let whole = manifest.is_whole_store();
+
+	// Amendment #2: reserve disk before writing.
+	let manifest_bytes: u64 = manifest.files.iter().map(|f| f.bytes).sum::<u64>() + manifest.frames.iter().map(|f| f.bytes).sum::<u64>();
+	let disk_reserve = std::env::var("WEFT_DISK_RESERVE_BYTES").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(weftdb::DEFAULT_DISK_RESERVE_BYTES);
+	let guard = DiskGuard::new(disk_reserve);
+	if let Err(err) = guard.admit(disk_space_at(&dest), manifest_bytes) {
+		use crate::error::Code;
+		return Err(match err {
+			weftdb::StoreError::InsufficientStorage { available_bytes: _, reserve_bytes: _, need_bytes: _ } => ApiError::server(Code::InsufficientStorage, format!("restore needs the manifest's declared {manifest_bytes} bytes but the disk guard refuses; check the store's headroom")),
+			other => ApiError::internal(format!("disk guard refused: {other}")),
+		});
+	}
+
+	// EVI-25: time the restore itself.
+	let started = std::time::Instant::now();
+	let (root, databases, _frames) = if whole {
+		let restored = weftdb::restore_store(&backup_dir, &dest).await.map_err(|err| ApiError::internal(format!("restoring whole-store backup `{}` failed: {err:#}", params.label)))?;
+		(restored.root, restored.restored, restored.frames)
+	} else {
+		let restored = weftdb::restore_control_plane(&backup_dir, &dest).await.map_err(|err| ApiError::internal(format!("restoring control-plane backup `{}` failed: {err:#}", params.label)))?;
+		(restored.root, restored.restored, 0)
+	};
+	let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+	let dbs: Vec<BackupDbReport> = databases.iter().map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes }).collect();
+	let rows_verified: i64 = dbs.iter().map(|r| r.rows).sum();
+	let bytes: u64 = dbs.iter().map(|r| r.bytes).sum();
+
+	let mode = if whole { "whole_store".to_string() } else { "control_plane".to_string() };
+	let next_step = format!("serve it with WEFT_SEGMENT_STORE_ROOT={}", root.display());
+
+	let response = RestoreIntoResponse { backup_label: params.label, restored_root: root.display().to_string(), mode, databases: dbs, rows_verified, bytes, elapsed_ms, next_step };
+	Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Validate a destination name against the grammar: non-empty, ≤ 200 bytes,
+/// `[A-Za-z0-9._-]+`, no `/`, no `\`, no `..`, no leading `.`, no NUL.
+fn valid_destination_name(name: &str) -> bool {
+	let bytes = name.as_bytes();
+	if bytes.is_empty() || bytes.len() > 200 {
+		return false;
+	}
+	if bytes[0] == b'.' {
+		return false;
+	}
+	for &b in bytes {
+		if !b.is_ascii_alphanumeric() && !matches!(b, b'.' | b'_' | b'-') {
+			return false;
+		}
+	}
+	// Check for `..` substring.
+	!name.contains("..")
+}
+
 /// Rehearse restoring `backup_dir` into the throwaway directory `target` through `fs`,
 /// remove `target` again whatever the outcome, and build the drill's answer.
 ///
@@ -139,6 +276,44 @@ async fn drill_response(fs: &dyn StoreFs, label: String, backup_dir: &std::path:
 
 	let databases = report.restored.iter().map(|r| BackupDbReport { name: r.dest.file_name().map_or_else(|| "?".to_string(), |n| n.to_string_lossy().into_owned()), tables: r.tables, rows: r.rows, bytes: r.bytes }).collect();
 	Ok(RestoreDrillResponse { label, databases, total_rows: report.total_rows(), total_bytes: report.total_bytes(), duration_ms, restorable: true, cleanup_error })
+}
+
+/// Query parameters for `POST /api/v1/storage/restore/into`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreIntoParams {
+	/// The backup subdirectory to restore, under the backup root, in the
+	/// label grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`).
+	pub label: String,
+	/// A single safe path segment naming the destination under the restore base
+	/// directory. Non-empty, at most 200 bytes, `[A-Za-z0-9._-]+`, no `/`, no `\`,
+	/// no `..`, no leading `.`, no NUL: the same traversability guarantee the
+	/// backup label grammar gives, but without the trailing-dot restriction.
+	pub name: String,
+}
+
+/// Response body for `POST /api/v1/storage/restore/into` — the outcome of restoring
+/// a backup into a caller-chosen new root.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreIntoResponse {
+	/// The backup label that was restored.
+	pub backup_label: String,
+	/// The absolute path of the restored root directory.
+	pub restored_root: String,
+	/// `"whole_store"` or `"control_plane"`, chosen by the backup's manifest.
+	pub mode: String,
+	/// Per-database verification of each restored file, read back at its destination.
+	pub databases: Vec<BackupDbReport>,
+	/// Total rows verified readable across the restored control plane.
+	pub rows_verified: i64,
+	/// Total on-disk size of the restored files in bytes.
+	pub bytes: u64,
+	/// Wall-clock milliseconds the restore itself took.
+	pub elapsed_ms: u64,
+	/// What the operator should do next to serve the restored store.
+	/// Adoption is deferred to the restored root's first server open, or the offline
+	/// CLI's `--adopt`; the restore itself never opens the restored root.
+	pub next_step: String,
 }
 
 /// Query parameters for `POST /api/v1/storage/backup`.
@@ -330,8 +505,10 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
+	use serial_test::serial;
 	use tempfile::TempDir;
 	use tower::ServiceExt;
+	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use weftdb::SegmentStore;
 
 	use crate::{
@@ -691,6 +868,115 @@ mod tests {
 			assert!(!target.join(name).exists(), "nothing was restored into it: {name}");
 		}
 		assert!(!fs.ops().iter().any(|op| matches!(op, FsOp::RemoveDirAll(_))), "nothing was removed: {:?}", fs.ops());
+	}
+
+	#[test]
+	fn valid_destination_name_rejects_traversal_and_bad_chars() {
+		use super::valid_destination_name;
+		assert!(valid_destination_name("my-restore-1"));
+		assert!(valid_destination_name("backup.123"));
+		assert!(valid_destination_name("a"));
+		assert!(valid_destination_name(&"a".repeat(200)), "200 bytes is the limit");
+		assert!(!valid_destination_name(""), "empty");
+		assert!(!valid_destination_name(".hidden"), "leading dot");
+		assert!(!valid_destination_name(".."), "dot-dot");
+		assert!(!valid_destination_name("a/b"), "slash");
+		assert!(!valid_destination_name("a\\b"), "backslash");
+		assert!(!valid_destination_name("a b"), "space");
+		assert!(!valid_destination_name(&"a".repeat(201)), "201 bytes is one too many");
+		assert!(!valid_destination_name("café"), "non-ASCII");
+		assert!(!valid_destination_name("a\0b"), "NUL");
+		assert!(!valid_destination_name("a..b"), ".. inside");
+	}
+
+	// The endpoint takes its restore base from the process env, so this test cannot run
+	// concurrently with itself or with the integration tests in `tests/restore_into.rs`; and the
+	// `TempDir` handles must outlive the paths the assertions reopen, so the lint's early-drop
+	// suggestion would delete the tree underneath the test.
+	#[serial]
+	#[allow(clippy::significant_drop_tightening)]
+	#[tokio::test]
+	async fn restore_into_publishes_the_backup_under_the_chosen_name() {
+		let dir = TempDir::new().unwrap();
+		let sc = AspectSchema::new(PhysicalType::F64, bd("0"), TimeUnit::Seconds);
+		let store = Arc::new(SegmentStore::open(dir.path()).await.expect("opens"));
+		store.declare("price", &sc).await.expect("declares");
+		store.seal("price", &sc, &[0_i64, 10, 20], &["1".parse().unwrap(), "2".parse().unwrap(), "3".parse().unwrap()]).await.expect("seals");
+
+		let backups = dir.path().join("backups");
+		// Restore base: a separate temp dir outside the store root, so the handler's
+		// containment check (dest may not overlap live root) passes.
+		let restore_root_dir = TempDir::new().unwrap();
+		let restore_root = restore_root_dir.path().to_path_buf();
+
+		// Take a control-plane backup.
+		let state = AppState::new().with_store(store.clone());
+		let router = app_with_state(state.clone());
+		let (status, body) = post_empty(router, "/api/v1/storage/backup?label=nightly&verify=snapshot").await;
+		assert_eq!(status, StatusCode::OK, "backup: {body}");
+		let backup_dir = backups.join("nightly");
+		assert!(backup_dir.join(weftdb::BACKUP_MANIFEST).exists(), "manifest written");
+
+		// Restore into a fresh name under our restore root.
+		let router = app_with_state(AppState::new().with_store(store.clone()));
+		let r2 = router.clone();
+		let (status, body) = post_empty_with_env(router, "/api/v1/storage/restore/into?label=nightly&name=my-restore-1", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
+		assert_eq!(status, StatusCode::OK, "restore_into: {body}");
+		assert_eq!(body["backup_label"], "nightly", "body: {body}");
+		let restored_dir = restore_root.join("my-restore-1");
+		assert!(restored_dir.exists(), "restored root exists");
+		for name in weftdb::CONTROL_PLANE_FILES {
+			assert!(restored_dir.join(name).exists(), "{name} restored");
+		}
+		assert_eq!(body["mode"], "control_plane", "body: {body}");
+		assert!(body["rows_verified"].as_i64().unwrap_or(0) >= 2, "body: {body}");
+		assert!(body["elapsed_ms"].is_u64(), "body: {body}");
+		assert!(body["next_step"].as_str().unwrap().contains(&*restored_dir.to_string_lossy()), "body: {body}");
+
+		// Restore again into the same name is refused.
+		let (status, body) = post_empty_with_env(r2, "/api/v1/storage/restore/into?label=nightly&name=my-restore-1", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
+		assert_eq!(status, StatusCode::CONFLICT, "duplicate dest: {body}");
+		assert_eq!(body["code"], "already_exists", "body: {body}");
+
+		// Restore with an invalid destination name.
+		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=nightly&name=../bad", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "traversal name: {body}");
+		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=nightly&name=", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "empty name: {body}");
+
+		// Restore of a missing backup.
+		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=no-such-backup&name=dest", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
+		assert_eq!(status, StatusCode::NOT_FOUND, "missing backup: {body}");
+		assert_eq!(body["code"], "aspect_not_found", "body: {body}");
+
+		drop(store);
+	}
+
+	/// POST an empty body with extra env vars injected for the handler. This module-level
+	/// helper runs the request in a child env so the caller's env is not polluted.
+	async fn post_empty_with_env(router: axum::Router, uri: &str, extra_env: &[(&str, &str)]) -> (StatusCode, serde_json::Value) {
+		use axum::body::Body;
+		use tower::ServiceExt;
+
+		// We set the extra env vars in the current process for the handler to see.
+		// Save and restore to keep tests hermetic.
+		let mut saved = Vec::new();
+		for &(key, value) in extra_env {
+			let old = std::env::var_os(key);
+			saved.push((key, old));
+			std::env::set_var(key, value);
+		}
+		let response = router.oneshot(Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+		for (key, old) in saved {
+			match old {
+				Some(v) => std::env::set_var(key, v),
+				None => std::env::remove_var(key),
+			}
+		}
+		(status, body)
 	}
 
 	#[test]

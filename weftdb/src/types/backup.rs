@@ -452,12 +452,15 @@ pub const PARTIAL_PREFIX: &str = ".partial-";
 pub const DELETING_PREFIX: &str = ".deleting-";
 /// Prefix of the throwaway directory a restore drill restores into.
 pub const RESTORE_DRILL_PREFIX: &str = ".restore-drill-";
-/// The names only an unfinished backup, prune or drill leaves behind.
+/// The names only an unfinished backup, prune, drill or restore leaves behind.
 ///
 /// An entry under a backup base whose name starts with one of these is never a backup:
 /// it is never counted, listed or restored, and [`sweep_backup_staging`] removes it once
 /// stale.
-pub const STAGING_PREFIXES: [&str; 3] = [PARTIAL_PREFIX, DELETING_PREFIX, RESTORE_DRILL_PREFIX];
+///
+/// A whole-store restore stages into `.restoring-*` (see [`RESTORING_PREFIX`]), defined
+/// beside the restore intent marker.
+pub const STAGING_PREFIXES: [&str; 4] = [PARTIAL_PREFIX, DELETING_PREFIX, RESTORE_DRILL_PREFIX, RESTORING_PREFIX];
 
 /// How long the daemon leaves a staging entry untouched before sweeping it: one hour.
 ///
@@ -1438,10 +1441,10 @@ mod tests {
 			assert!(expected_tables(name).is_some_and(|tables| !tables.is_empty()), "{name}");
 		}
 		assert_eq!(expected_tables("other.db"), None);
-		for name in [".partial-backup-1-00ff", ".deleting-backup-1-00ff", ".restore-drill-17"] {
+		for name in [".partial-backup-1-00ff", ".deleting-backup-1-00ff", ".restore-drill-17", ".restoring-some-name"] {
 			assert!(is_staging_name(name), "{name}");
 		}
-		for name in ["backup-1", "nightly", ".hidden", "partial-1"] {
+		for name in ["backup-1", "nightly", ".hidden", "partial-1", "restoring-123"] {
 			assert!(!is_staging_name(name), "{name}");
 		}
 	}
@@ -1548,7 +1551,7 @@ mod tests {
 	async fn the_sweep_removes_only_stale_staging_entries() {
 		let dir = tempfile::tempdir().unwrap();
 		let base = dir.path();
-		for name in [".partial-backup-1-00", ".deleting-backup-2-00", ".restore-drill-3", "backup-4", "nightly"] {
+		for name in [".partial-backup-1-00", ".deleting-backup-2-00", ".restore-drill-3", ".restoring-4", "backup-5", "nightly"] {
 			std::fs::create_dir(base.join(name)).unwrap();
 			std::fs::write(base.join(name).join("catalog.db"), b"x").unwrap();
 		}
@@ -1564,8 +1567,8 @@ mod tests {
 		assert!(swept.failed.is_empty(), "{:?}", swept.failed);
 		let mut removed: Vec<String> = swept.removed.iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
 		removed.sort();
-		assert_eq!(removed, [".deleting-backup-2-00", ".partial-backup-1-00", ".partial-stray-file", ".restore-drill-3"], "two hours on, every staging entry, file or directory");
-		assert_eq!(names_in(base), ["backup-4", "nightly"], "backups are never swept");
+		assert_eq!(removed, [".deleting-backup-2-00", ".partial-backup-1-00", ".partial-stray-file", ".restore-drill-3", ".restoring-4"], "two hours on, every staging entry, file or directory");
+		assert_eq!(names_in(base), ["backup-5", "nightly"], "backups are never swept");
 		assert!(sweep_backup_staging(&RealFs, &base.join("missing"), Duration::ZERO).await.unwrap().removed.is_empty(), "a missing base is empty");
 	}
 

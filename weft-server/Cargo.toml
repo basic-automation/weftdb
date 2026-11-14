@@ -120,6 +120,7 @@ tonic = { version = "0.14", default-features = false, features = ["channel"] }  
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
 tempfile = { workspace = true }
+serial_test = { workspace = true }  # the restore-into tests mutate process env, so they must not overlap
 
 [[bench]]
 name = "interpolate_wire"

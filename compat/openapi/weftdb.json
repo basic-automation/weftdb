@@ -2047,6 +2047,57 @@
         ],
         "type": "object"
       },
+      "RestoreIntoResponse": {
+        "description": "Response body for `POST /api/v1/storage/restore/into` — the outcome of restoring a backup into a caller-chosen new root.",
+        "properties": {
+          "backup_label": {
+            "description": "The backup label that was restored.",
+            "type": "string"
+          },
+          "bytes": {
+            "description": "Total on-disk size of the restored files in bytes.",
+            "type": "integer"
+          },
+          "databases": {
+            "description": "Per-database verification of each restored file, read back at its destination.",
+            "items": {
+              "$ref": "#/components/schemas/BackupDbReport"
+            },
+            "type": "array"
+          },
+          "elapsed_ms": {
+            "description": "Wall-clock milliseconds the restore itself took.",
+            "type": "integer"
+          },
+          "mode": {
+            "description": "`\"whole_store\"` or `\"control_plane\"`, chosen by the backup's manifest.",
+            "type": "string"
+          },
+          "next_step": {
+            "description": "What the operator should do next to serve the restored store.",
+            "type": "string"
+          },
+          "restored_root": {
+            "description": "The absolute path of the restored root directory.",
+            "type": "string"
+          },
+          "rows_verified": {
+            "description": "Total rows verified readable across the restored control plane.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "backup_label",
+          "restored_root",
+          "mode",
+          "databases",
+          "rows_verified",
+          "bytes",
+          "elapsed_ms",
+          "next_step"
+        ],
+        "type": "object"
+      },
       "RunListResponse": {
         "description": "Response body for `GET /bench/runs`.",
         "properties": {
@@ -8998,6 +9049,208 @@
         "x-weft-audit": "attempt_outcome",
         "x-weft-operator-detail": true,
         "x-weft-scope": "maintain",
+        "x-weft-tier": "stable"
+      }
+    },
+    "/api/v1/storage/restore/into": {
+      "post": {
+        "description": "Restore a backup into a caller-chosen new root under the restore base directory, verify every restored database at its destination, and report what came back. The live store is never touched. Adoption is deferred to the restored root's first server open, or the offline CLI's `--adopt`.",
+        "operationId": "storage_restore_into",
+        "parameters": [
+          {
+            "description": "The backup subdirectory to restore, under the backup root, in the label grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`).",
+            "in": "query",
+            "name": "label",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A single safe path segment naming the destination under the restore base directory. Non-empty, ≤ 200 bytes, `[A-Za-z0-9._-]+`, no `/`, no `\\`, no `..`, no leading `.`.",
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestoreIntoResponse"
+                }
+              }
+            },
+            "description": "The backup restored, the mode (whole_store or control_plane), the restored root, the per-database verification of each restored file, the total rows and bytes, and the next-step guidance."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Bad Request — the request body or query is malformed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthenticated — the request carries no `Authorization` header, or the token is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden — the caller's key does not hold the scope this route requires"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not Found — no route matches the path, or the named resource does not exist"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Method Not Allowed — the path exists but not under this HTTP method"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Request Timeout — the client did not send the body within the server's configured deadline"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict — the request would create a duplicate, a schema mismatch, or the resource is busy"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Gone — the cursor the request refers to is stale and cannot be advanced"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Payload Too Large — the request body exceeds the server's configured limit"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unsupported Media Type — the `Content-Type` is not one the route accepts"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unprocessable Entity — the result exceeds the server's configured output limit"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal Server Error — the server could not complete the request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Service Unavailable — a subsystem is not configured, not ready, overloaded, or poisoned"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Gateway Timeout — the operation did not finish within its configured deadline"
+          },
+          "507": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Insufficient Storage — the filesystem cannot safely accept the write"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "summary": "Storage restore into",
+        "tags": [
+          "Backup"
+        ],
+        "x-weft-admission-class": "maintenance",
+        "x-weft-audit": "attempt_outcome",
+        "x-weft-operator-detail": true,
+        "x-weft-scope": "backup",
         "x-weft-tier": "stable"
       }
     },
