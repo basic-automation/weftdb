@@ -538,7 +538,17 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - **DONE (2026-11-10) — `weft-orchestration` is published, current at 0.3.2, verified through the crates.io sparse index (filed 2026-11-06).** `publish = false` would be a regression: it would withdraw a crate people already depend on. The remaining risk is the path/crates.io mixing hazard — two copies of `weftdb` in one binary, so the types do not unify — now documented in `weft-orchestration/README.md`: depend on **both** `weftdb` and `weft-orchestration` from crates.io, or vendor **both** by path, never one of each. `weft-physical-type`, `weft-reduce`, `weft-line-protocol` and `weft-arrow` sit at 0.3.0 while `weftdb`, `weft-arrow-store` and `weft-orchestration` are at 0.3.2; that lag is release hygiene, not a reason to unpublish.
 - **Historical note — the LNK1102 research that produced the `[profile.test] debug = 1` fix:**
   - *Audit 2026-10-27: checked — this is a historical note and its fix shipped: `[profile.test] debug = 1` is at Cargo.toml:128.*
-- **Guard the `#[serial]`-above-`#[test]` ordering (research 2026-07-20):**
+- **DONE (2026-11-13) — Guard the `#[serial]`-above-`#[test]` ordering (#726).** The keyed form is what
+  the guard was missing: its regex was `#\[\s*serial\s*\]`, which matches only the plain attribute, so the
+  28 `#[serial(key)]` sites — the ones that guard the process-global fault injectors — were outside it
+  entirely. What the guard now enforces is "a `#[serial]` shares an attribute block with `#[test]` or
+  `#[tokio::test]`", not "immediately above". `#[tokio::test]` re-emits the item's outer attributes before
+  the `#[test]` it generates (`tokio-macros/src/entry.rs`), so `#[tokio::test]` + `#[serial(k)]` expands to
+  `#[serial(k)]` + `#[test]` over a sync body and serialises through `local_serial_core`; `#[serial]` above
+  `#[tokio::test]` serialises through `local_async_serial_core`. The old docstring's "silently loses the
+  serialisation" was therefore wrong. The real silent failure is a `#[serial]` in a block with no test
+  attribute at all — it compiles, passes, and runs concurrently — and that is what fails CI now. Scan of
+  all 355 tracked `.rs` files: no violations, so no site needed moving.
 - **NEXT — UDDSketch (uniform guarantee under collapse):**
   - The sketch itself, as a library type (2026-11-11): `weft_reduce::UddSketch` (`weft-reduce/src/uniform.rs`). Tests pin the uniform bound after collapse against an exact sort, the closed form of the bound, and exact merging under collapse.
   - A bench for the cost against `DdSketch` (2026-11-11): `cargo bench -p weft-reduce --bench sketch_collapse`, two seeded synthetic inputs of 100,000 samples at 1%. First figures, criterion medians on a Ryzen 9 7950X3D **while the host ran at a load average near 100**, so they are indicative and not a claim. `add`, random walk, no collapse at 2048 buckets: `DdSketch` 0.65 ms, `UddSketch` 0.44 ms (three runs each, within 1%); `UddSketch` took 1.83 ms in the one run before it had `DdSketch`'s last-bucket cache. `add`, eighteen decades at a 256-bucket budget, both collapsing: 6.7 to 9.6 ms against 6.2 to 7.0 ms over five runs, no clear difference. `merge` of 64 collapsed sketches: 0.67 to 0.75 ms against 78 to 101 µs. What the speed buys on that input: `UddSketch` collapsed four times and reports a 15.9% bound on every quantile, where `DdSketch` keeps 1% on the quantiles above its folded buckets and no bound below.

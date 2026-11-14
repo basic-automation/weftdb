@@ -6755,3 +6755,27 @@ dry run, which is also the first time the gate's wiring is proven end to end.
 5. **The :799 disposition is behavioural, not static.** ROB-2/3/4 are the handling (abort, mapping + supervision, the `weft-arrow` no-panic lint); this slice is the demonstration that under overload the server answers typed errors, the probes keep answering, and the server keeps serving — no `500` from a panic anywhere in the battery. What it does not prove is also stated in the doc: there is no workspace-wide unwrap ban (`weft-server` alone carries over a thousand call sites, mostly tests/startup/daemons outside the request path), so a static audit of every reachable site would be a separate slice. The box is ticked on handling plus this evidence, if the audit agrees.
 
 **Not decided here:** whether the maintenance budgets (ROB-20) or a resident-memory budget (ROB-14) ever land — both stay with their existing dispositions (parked / skipped per Justin's calls), and this slice's evidence must not be read as covering them.
+
+## 2026-11-13 — What the `#[serial]` guard really protects, and a coordination correction (#726)
+
+**Ambiguity 1 — the item's title asserts an ordering that is not required.** `ROADMAP.md:101` and issue
+#726 both say "Guard the `#[serial]`-above-`#[test]` ordering", and `scripts/ci/check-serial-order.py`
+claimed a `#[serial]` below its test attribute "silently loses the serialisation". `tokio-macros`
+`src/entry.rs` says otherwise: `#[tokio::test]` streams the item's outer attributes as-is and only then
+emits `#[::core::prelude::v1::test]`, so `#[tokio::test]` + `#[serial(k)]` expands to `#[serial(k)]` +
+`#[test]` over a sync body and serialises through `local_serial_core`, while `#[serial]` above
+`#[tokio::test]` serialises through `local_async_serial_core`. serial_test's README documents the below
+order. **Chosen:** the guard accepts either position inside one attribute block and fails only on the
+shape that is genuinely dead — a `#[serial]` (now including the keyed `#[serial(key)]` form, which the old
+regex `#\[\s*serial\s*\]` could not match, leaving the 28 fault-injector sites unchecked) with no test
+attribute in its block. An advisor argued for keeping "above only" on an ICE rationale
+(rust-lang/rust#100263); that rationale is nowhere in this repository's history or docs, and both orders
+are in daily use here (plain sites above, keyed sites below) with CI green — so the ordering rule was
+dropped rather than kept as a style fence that would have forced a 28-site churn for no behavioural gain.
+
+**Ambiguity 2 — how to avoid double work in a shared repo.** **Chosen:** claim by assigning the roadmap
+issue to self plus a claim comment naming the exact scope, then verify state with
+`gh pr view <n> --json state,mergeCommit` before building on anything. This session initially reasoned
+from local `origin/main` reads and unverified branch names, which produced claims about PRs that did not
+exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
+is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
