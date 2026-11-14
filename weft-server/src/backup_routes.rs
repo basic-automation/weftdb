@@ -8,11 +8,11 @@
 //! nobody has restored is a hope, not a plan.
 
 use axum::{
-	extract::State, http::StatusCode, response::{IntoResponse, Response}, Json
+	Json, extract::State, http::StatusCode, response::{IntoResponse, Response}
 };
 use serde::{Deserialize, Serialize};
 use weftdb::{
-	disk_space_at, durable::{RealFs, StoreFs}, BackupManifest, DiskGuard, VerifyMode, RESTORE_DRILL_PREFIX
+	BackupManifest, DiskGuard, RESTORE_DRILL_PREFIX, VerifyMode, disk_space_at, durable::{RealFs, StoreFs}
 };
 
 use crate::{
@@ -526,7 +526,7 @@ mod tests {
 	use weftdb::SegmentStore;
 
 	use crate::{
-		app_with_state, error::Code, test_fs::{FsOp, RecordingFs, INJECTED_CLEANUP_FAILURE}, test_support::*, AppState
+		AppState, app_with_state, error::Code, test_fs::{FsOp, INJECTED_CLEANUP_FAILURE, RecordingFs}, test_support::*
 	};
 
 	#[test]
