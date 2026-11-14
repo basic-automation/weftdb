@@ -8,6 +8,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Testing
+
+- **Real-filesystem ENOSPC evidence (#723).** Two integration tests pin the
+  server's `507 insufficient_storage` on top of the injectable space source #694:
+  `space_source_reports_a_full_filesystem_and_the_server_says_507` (unconditional,
+  uses an impossible reserve via `SegmentStoreOptions::with_disk_reserve_bytes`) and
+  `a_real_full_filesystem_produces_enospc_end_to_end` (skips honestly on hosts without
+  user+mount namespaces, mounts a 1 MiB tmpfs inside a namespace on capable hosts).
+
 ### Fixed
 
 - **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched
