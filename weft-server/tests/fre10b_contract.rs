@@ -1119,7 +1119,8 @@ async fn ingest_admission_refuses_over_cap_and_no_headroom() {
 	let router = app_with_state(weft_server::AppState::new().with_store(Arc::clone(&store)).with_ingest_config(config));
 	let body = "timestamp,value\n100,1.5\n110,2.5\n120,3.5\n130,4.5\n";
 	assert!(body.len() > 32, "the CSV body must exceed the cap");
-	let (status, _, json) = send_json(router, post_text("/api/v1/storage/r18/csv", None, body)).await;
+	let request = Request::builder().method("POST").uri("/api/v1/storage/r18/csv").header(header::CONTENT_TYPE, "text/csv").header(header::CONTENT_LENGTH, body.len().to_string()).body(Body::from(body.to_string())).unwrap();
+	let (status, _, json) = send_json(router, request).await;
 	assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json}");
 	assert_eq!(json["code"], "payload_too_large", "{json}");
 	assert_eq!(json["limit"], 32, "the refusal names the cap: {json}");
