@@ -8,6 +8,20 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Suspect-frame policy and a decode crash-loop breaker (#720, ROB-22).** Three new
+  Tuning variables: `WEFT_SUSPECT_FRAME_POLICY` (closed enum: `skip`, `quarantine`,
+  `fail`; default `quarantine` — a suspect frame is quarantined under its C5 class,
+  preserving the pre-ROB-22 outcome); `WEFT_DECODE_BREAKER_FAILURES` (3, how many
+  consecutive decode failures trip the breaker per aspect);
+  `WEFT_DECODE_BREAKER_COOLDOWN_SECS` (300 s, how long a tripped breaker waits
+  before one trial decode is allowed). The decode breaker state is a separate map
+  with its own mutex from the maintenance `BreakerState`: a decode failure poisons a
+  file, a maintenance failure poisons a whole aspect, and the blast radii do not
+  merge. The breaker trips per segment path with a cooldown, so one corrupt frame
+  cannot spin the background decode loop forever.
+
 ### Fixed
 
 - **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched

@@ -532,7 +532,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 109, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 112, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
