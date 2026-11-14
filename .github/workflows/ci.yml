@@ -132,7 +132,7 @@ jobs:
       - run: python3 scripts/config/check_schema.py
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-      # Every #[serial] must sit immediately above #[test] or #[tokio::test] (#405).
+      # Every #[serial] (plain or keyed) must share an attribute block with a test attribute (#405, #726).
       - run: python3 scripts/ci/check-serial-order.py
       # The artifact-reference checks in check_claims.py are part of the gate, so
       # their tests run here too (EVI-4).

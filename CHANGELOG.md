@@ -8,6 +8,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched
+  only the plain `#[serial]` form, so the keyed form — the one that guards the process-global fault
+  injectors — was never checked, and the rule it enforced ("must sit immediately above `#[test]`") was
+  based on a claim that does not hold: `#[tokio::test]` re-emits the item's outer attributes before the
+  `#[test]` it generates, so either position in the attribute block serialises. The guard now covers both
+  forms and fails when a `#[serial]` shares no attribute block with a test attribute, which is the shape
+  that compiles, passes, and quietly runs concurrently with the tests it meant to exclude (#726).
+
 ## [0.3.7] - 2026-11-12
 
 ### Fixed
