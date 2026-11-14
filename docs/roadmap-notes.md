@@ -179,7 +179,7 @@ Backups are online: control-plane snapshots over `VACUUM INTO` with per-database
   - **S21** Crash-matrix CI, subprocess SIGKILL soak, durability benchmark and ROADMAP re-baseline *(~7 h; after S14, S16)*
 - **7.3 Corruption detection**
   - Restoring *into a chosen new root* over HTTP
-    *The offline path exists: `weft-server restore <BACKUP> --into <NEW_ROOT>` (PAC-13, `weft-server/src/restore.rs:65`); only the HTTP route is missing.*
+    *Landed 2026-11-14 (#213): `POST /v1/storage/backups/restore?label=...&name=...` restores a whole store into `WEFT_RESTORE_BASE_DIR/<name>`. The offline drill at `weft-server/src/restore.rs:65` is unchanged — the HTTP route delegates to the same `restore_store` library call.*
   - Whole-store backup manifest (fold the `.weftseg` frames in beside the control plane)
     *Closed 2026-11-05 (audit): done 2026-11-01 (D-S16, #483). The `weftdb-whole-store-backup/1` manifest (`weftdb/src/types/backup.rs:412`) lists the hard-linked `.weftseg` frames beside the four control-plane databases; `restore_store` and `weft-server restore` read it.*
   - Document RPO/RTO against the measured snapshot cadence

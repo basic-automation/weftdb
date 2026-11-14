@@ -975,6 +975,7 @@ fn register_maintenance_routes(routes: &mut Routes) {
 fn register_backup_routes(routes: &mut Routes) {
 	routes.route(Method::POST, "/api/v1/storage/backup", RouteSpec::stable(Scope::Backup, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_backup"), post(backup_routes::backup_store));
 	routes.route(Method::POST, "/api/v1/storage/restore/drill", RouteSpec::stable(Scope::Backup, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_restore_drill"), post(backup_routes::restore_drill));
+	routes.route(Method::POST, "/api/v1/storage/restore/into", RouteSpec::stable(Scope::Backup, Audit::AttemptOutcome, true, AdmissionClass::Maintenance, "storage_restore_into"), post(backup_routes::restore_into));
 }
 
 #[cfg(test)]

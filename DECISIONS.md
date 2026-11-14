@@ -6779,3 +6779,78 @@ issue to self plus a claim comment naming the exact scope, then verify state wit
 from local `origin/main` reads and unverified branch names, which produced claims about PRs that did not
 exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
 is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
+
+## 2026-11-13 — P12 #213 restore-into HTTP route: staging cleanup and design decisions
+
+**Spec:** ROADMAP line 90, "Restoring *into a chosen new root* over HTTP (7.3)", part of umbrella #212.
+Closes #213. Previous work: amendments 1-4 (adopt dropped, disk guard, destination containment,
+restore-base/backup-base separation) landed in the previous run as uncommitted code.
+
+**Chosen: the library's staging cleanup is sufficient; the handler does nothing extra.**
+`restore_store_with` (backup.rs:1042–1049) removes its `.restoring-*` sibling directory on every
+error path before returning the error. The handler delegates all writes to the library and never
+opens the destination until the library returns success, so no additional cleanup is needed at
+the HTTP layer. A crash during the restore — between the library's staging-rename and the HTTP
+response — leaves a `.restoring-*` sibling that the daemon's `sweep_backup_staging` removes once
+it is an hour stale (the sweep checks `STAGING_PREFIXES`, which already includes `RESTORING_PREFIX`).
+The daemon's sweep is the same mechanism that cleans up orphaned `.partial-*` directories, so no
+new GC hook is needed.
+
+**Contrast with the handoff's reading (now resolved).** The previous run's handoff noted that
+`.restoring-*` was missing from `STAGING_PREFIXES`. It is present: the existing code at
+`backup.rs:463` lists `RESTORING_PREFIX` as the fourth element, and the existing test
+`the_sweep_removes_only_stale_staging_entries` (backup.rs:1551) already names `.restoring-4` among
+its test entries. No code change was needed.
+
+**Reconciliation with the PAC-13 CLI entry** (DECISIONS.md:3874, `2026-11-02 — PAC-13 offline restore
+CLI`). The CLI entry says "any HTTP route that restores over a live control plane [is] Not in this
+slice — still a deployment decision; the drill remains the only live-server restore." This route
+is consistent with that statement: `restore/into` restores into a *new* root under a caller-chosen
+name, never over the live store, and the existing containment checks (amendments 3 and 4 from the
+oracle steering) refuse destinations that overlap the backup base or the live store root.
+
+**Chosen: no `adopt` parameter.** The CLI has `--adopt` because a foreground CLI user expects finality
+after a multi-minute command. An HTTP restore-into publishes to a fresh root and defers adoption
+to the first server open (or the CLI's `--adopt`), matching the drill's model. Adding adoption to
+the HTTP route would extend the request lifetime by a full control-plane open, and restoring a
+disposable root is cheap enough that an operator can point `WEFT_SEGMENT_STORE_ROOT` at it and
+restart the server to trigger adoption — the same next-step the REST response already carries.
+
+**Chosen: `RestoreIntoResponse` follows `RestoreDrillResponse`'s shape rather than `BackupResponse`'s.**
+Three backup-like fields needed different names (`backup_label` vs `dir`, `rows_verified` vs
+`total_rows`, `elapsed_ms` vs `duration_ms`) because a restore produces a new root rather than
+a label under the backup root, and counting the restored-into files is more specific than an
+average. A single `mode` field (`whole_store` / `control_plane`) replaces the CLI's prose
+printout. The response includes a `next_step` string because knowing *what to do next* is
+the restore route's point: without it the operator has a new root and no instruction.
+
+**Chosen: disk guard (amendment 2) reserves against the manifest's declared bytes, not the
+freshly-calculated backup size.** The manifest is already on disk and declares exact file and
+frame sizes; summing them is cheaper than reading each backup file again, and the sizes cannot
+change between the backup being taken and the restore, because the backup is read-only. The guard
+is checked against the destination volume (by `disk_space_at(&dest)`), not the live store's
+volume, because the restore writes to a different location.
+
+**Not decided here:** a region-aware disk guard that accounts for shared-vs-different filesystems
+(the simple `disk_space_at` call works for both). The rescue-network semantics of a restore-into
+that bridges two servers are not in this slice.
+
+**Summary — three design positions this section records:**
+
+(a) **`adopt` was deliberately dropped from the HTTP contract.** The CLI's `--adopt`
+runs a foreground open of the restored root to finalise adoption; the HTTP route returns
+immediately after the library call, deferring adoption to the next server open (or the
+CLI `--adopt`).
+
+(b) **`.restoring-*` is in `STAGING_PREFIXES` and is swept after one hour.** The library
+cleans its `.restoring-*` sibling on every error path. If the process crashes mid-restore,
+the orphaned staging directory is cleaned by `sweep_backup_staging` once it is an hour
+stale (same mechanism as `.partial-*`). The corollary is that a restore running longer
+than `STAGING_SWEEP_AGE` (one hour) risks having its staging directory reaped by the
+daemon mid-operation. This is a known limitation; the shutdown path for a long restore
+should either shorten the staging window or ensure the staging mtime is refreshed.
+
+(c) **The restore base (`WEFT_RESTORE_BASE_DIR`) is refused when it falls inside the
+backup base.** This prevents a restored root named `backup-<digits>` from being placed
+where the retention sweep could prune it. The containment check is in
+`backup_routes.rs` and returns 422 Unprocessable Entity with a descriptive message.

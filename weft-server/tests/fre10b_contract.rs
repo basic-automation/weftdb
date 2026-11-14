@@ -233,7 +233,7 @@ fn the_fre10b_families_are_the_frozen_size() {
 	assert_eq!(family(Scope::Ingest).len(), 4, "ingest: json, ilp, csv, parquet");
 	assert_eq!(family(Scope::Declare).len(), 1, "declare: POST /api/v1/storage/aspects");
 	assert_eq!(family(Scope::Maintain).len(), 9, "maintain: reconcile x2, squash, compact, fsck, quarantine x4");
-	assert_eq!(family(Scope::Backup).len(), 2, "backup: snapshot and restore drill");
+	assert_eq!(family(Scope::Backup).len(), 3, "backup: snapshot, restore drill and restore-into");
 }
 
 #[test]
@@ -243,14 +243,14 @@ fn the_contract_coverage_spans_the_whole_registry() {
 	// surface. A route added anywhere moves one of these counts, and the
 	// file that owns its scope is where its contract gets pinned.
 	let table = build_registry().table();
-	assert_eq!(table.entries().len(), 73, "the registry's whole surface");
+	assert_eq!(table.entries().len(), 74, "the registry's whole surface");
 	let halves: [(Scope, &str); 8] = [(Scope::Probe, "fre10a"), (Scope::Metrics, "fre10a"), (Scope::Compute, "fre10a"), (Scope::Read, "fre10b"), (Scope::Ingest, "fre10b"), (Scope::Declare, "fre10b"), (Scope::Maintain, "fre10b"), (Scope::Backup, "fre10b")];
 	let mut seen = BTreeSet::new();
 	for (scope, _) in &halves {
 		assert!(seen.insert(scope), "each scope is claimed by exactly one half");
 	}
 	assert_eq!(seen.len(), Scope::ALL.len(), "every scope in the frozen table is claimed");
-	let sizes: [(Scope, usize); 8] = [(Scope::Probe, 4), (Scope::Metrics, 5), (Scope::Compute, 17), (Scope::Read, 31), (Scope::Ingest, 4), (Scope::Declare, 1), (Scope::Maintain, 9), (Scope::Backup, 2)];
+	let sizes: [(Scope, usize); 8] = [(Scope::Probe, 4), (Scope::Metrics, 5), (Scope::Compute, 17), (Scope::Read, 31), (Scope::Ingest, 4), (Scope::Declare, 1), (Scope::Maintain, 9), (Scope::Backup, 3)];
 	let mut total = 0;
 	for (scope, size) in sizes {
 		assert_eq!(family(scope).len(), size, "scope {} holds {size} routes", scope.as_str());
@@ -259,7 +259,7 @@ fn the_contract_coverage_spans_the_whole_registry() {
 	assert_eq!(total, table.entries().len(), "the halves sum to the registry");
 	let first_half: usize = halves.iter().filter(|(_, half)| *half == "fre10a").map(|(scope, _)| family(*scope).len()).sum();
 	let second_half: usize = halves.iter().filter(|(_, half)| *half == "fre10b").map(|(scope, _)| family(*scope).len()).sum();
-	assert_eq!((first_half, second_half), (26, 47), "fre10a 4+5+17, fre10b 31+4+1+9+2");
+	assert_eq!((first_half, second_half), (26, 48), "fre10a 4+5+17, fre10b 31+4+1+9+3");
 }
 
 /// The concrete path for a registry entry: the templates carry `{aspect}`,
@@ -317,6 +317,9 @@ fn family_request(entry: &RouteEntry, key: Option<&str>, parquet: &[u8]) -> Requ
 	if path == "/api/v1/storage/restore/drill" {
 		return post_empty("/api/v1/storage/restore/drill?label=fre10b-no-such-backup", key);
 	}
+	if path == "/api/v1/storage/restore/into" {
+		return post_empty("/api/v1/storage/restore/into?label=fre10b-no-such-backup&name=fre10b-restore-dest", key);
+	}
 	if path == "/api/v1/grafana/metrics" {
 		return post_json(&path, key, &serde_json::json!({}));
 	}
@@ -345,7 +348,7 @@ fn grafana_query_body() -> serde_json::Value {
 fn expected_pass_status(entry: &RouteEntry) -> StatusCode {
 	match entry.spec.operation_id {
 		"storage_aspect_declare" | "storage_ingest_points" | "storage_ingest_ilp" | "storage_ingest_csv" | "storage_ingest_parquet" => StatusCode::CREATED,
-		"storage_quarantine_release" | "storage_quarantine_purge" | "storage_restore_drill" => StatusCode::NOT_FOUND,
+		"storage_quarantine_release" | "storage_quarantine_purge" | "storage_restore_drill" | "storage_restore_into" => StatusCode::NOT_FOUND,
 		_ => StatusCode::OK,
 	}
 }
@@ -395,7 +398,7 @@ async fn the_gate_holds_for_every_route_in_the_families() {
 	let (_dir, router) = secured_seeded_router().await;
 	let parquet = parquet_bytes();
 	let entries: Vec<RouteEntry> = [Scope::Read, Scope::Ingest, Scope::Declare, Scope::Maintain, Scope::Backup].iter().flat_map(|scope| family(*scope)).collect();
-	assert_eq!(entries.len(), 47, "the whole FRE-10b surface, enumerated from the registry");
+	assert_eq!(entries.len(), 48, "the whole FRE-10b surface, enumerated from the registry");
 	for entry in &entries {
 		check_route_gate(router.clone(), entry, &parquet).await;
 	}
@@ -1005,7 +1008,7 @@ async fn without_a_store_every_storage_and_operator_route_is_unconfigured() {
 	let router = app_with_state(AppState::new());
 	let parquet = parquet_bytes();
 	let entries: Vec<RouteEntry> = [Scope::Read, Scope::Ingest, Scope::Declare, Scope::Maintain, Scope::Backup].iter().flat_map(|scope| family(*scope)).collect();
-	assert_eq!(entries.len(), 47, "the whole FRE-10b surface, enumerated from the registry");
+	assert_eq!(entries.len(), 48, "the whole FRE-10b surface, enumerated from the registry");
 	for entry in &entries {
 		if entry.spec.operation_id == "get_version" || entry.spec.operation_id == "grafana_test" {
 			let (status, _headers, _body) = send(router.clone(), family_request(entry, None, &parquet)).await;
