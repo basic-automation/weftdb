@@ -36,7 +36,6 @@ use axum::{
 };
 use bigdecimal::BigDecimal;
 use tempfile::TempDir;
-use tower::ServiceExt as _;
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use weft_server::{app_with_state, AppState};
 use weftdb::{SegmentStore, SegmentStoreOptions};
@@ -52,20 +51,17 @@ fn schema() -> AspectSchema {
 ///
 /// `u64::MAX` guarantees refusal regardless of the host's free space, so this
 /// is unconditional: every write gets `507 insufficient_storage`.
-fn router_with_impossible_reserve() -> (TempDir, Router) {
+async fn router_with_impossible_reserve() -> (TempDir, Router) {
 	let dir = TempDir::new().expect("tempdir");
-	let store = Arc::new(tokio::runtime::Runtime::new().expect("a runtime for setup").block_on(async {
-		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_disk_reserve_bytes(u64::MAX)).await.expect("opens the store");
-		store.declare(ASPECT, &schema()).await.expect("declares the aspect");
-		store
-	}));
+	let store = Arc::new(SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_disk_reserve_bytes(u64::MAX)).await.expect("opens the store"));
+	store.declare(ASPECT, &schema()).await.expect("declares the aspect");
 	let router = app_with_state(AppState::new().with_store(store));
 	(dir, router)
 }
 
 /// POST a JSON points body (a single point at timestamp 1, value 1.0).
 fn ingest_points_request() -> Request<Body> {
-	Request::builder().method("POST").uri(&format!("/api/v1/storage/{ASPECT}/points")).header("content-type", "application/json").body(Body::from(r#"{"points":[{"t":1,"v":1.0}]}"#)).expect("builds the request")
+	Request::builder().method("POST").uri(format!("/api/v1/storage/{ASPECT}/points")).header("content-type", "application/json").body(Body::from(r#"{"points":[{"t":1,"v":1.0}]}"#)).expect("builds the request")
 }
 
 #[tokio::test]
@@ -73,7 +69,7 @@ async fn space_source_reports_a_full_filesystem_and_the_server_says_507() {
 	// Act: the guard's reserve is set above what any real filesystem holds.
 	// The guard checks disk_space_at(store.root()), finds the real
 	// filesystem's available bytes below u64::MAX, and refuses.
-	let (_dir, router) = router_with_impossible_reserve();
+	let (_dir, router) = router_with_impossible_reserve().await;
 	let response = router.oneshot(ingest_points_request()).await.expect("the router answers");
 	// Read the status before the body moves out of the response.
 	let status = response.status();
