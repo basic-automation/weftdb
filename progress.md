@@ -71,3 +71,25 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out.
 ### What still may fail
 
 Unknown — these are the first CI runs after the fixes. The three test jobs and clippy may now pass, or new issues may surface.
+
+## Handoff — 2026-11-14 16:01 UTC
+
+### Changes in this commit (P0 fixes from goldfish review)
+
+**Commit will be pushed as:** a single `-s` signed commit on `p12/enospc-real-fs`.
+
+**P0 fix 1** — Restored `use tower::ServiceExt as _;` in `weft-server/tests/enospc_real_fs.rs`.
+The import was deleted by 93558b2 when `router_with_impossible_reserve()` was made async but `tower::ServiceExt` is still needed for `.oneshot()` on a `Router` (even though the fn itself is async, the _call site_ uses `router.oneshot(...)` which is a `ServiceExt` method).
+
+**P0 fix 2** — Rewrote `a_real_full_filesystem_produces_enospc_end_to_end` so it genuinely proves a real-filesystem ENOSPC reaches the client as `507 insufficient_storage`.
+
+- The old test only ran `dd` inside a namespace shell script and printed a NOTE that a real end-to-end check needs a compiled binary.
+- The new test uses the child-process re-exec pattern (same pattern as `poison_exit.rs` and `ready_poisoned.rs`). The parent mounts a 1 MiB tmpfs inside the namespace, sets `WEFT_ENOSPC_CHILD_ROOT`, and `exec`s the test binary filtered to the new `enospc_real_fs_child` test.
+- `enospc_real_fs_child` opens a `SegmentStore` with the default guard (256 MiB reserve), fills the tmpfs with `dd` (expected to fail with ENOSPC), then sends an ingest and asserts `507 insufficient_storage`.
+- If the guard were bypassed, the actual I/O ENOSPC would produce `500 internal_error` (the error classifier maps ENOSPC to 507 only for ingest/read errors, not generic store errors), which would fail the `assert_eq!(status, INSUFFICIENT_STORAGE)` assertion, proving the guard is the only source of 507 on this path.
+
+**Disposition of the re-exec design:** We chose `unshare sh -c` + `exec` (set an env var, use `current_exe()`, run the child test directly) over the full `Command`-based child-process approach used in `poison_exit.rs`/`ready_poisoned.rs` because the mount namespace requires a shell to run `mount` before the binary. The child receives its tmpfs root via `CHILD_ROOT` env var rather than a command-line `--child-path` argument, keeping the script simple.
+
+**No product-code changes.** Only `weft-server/tests/enospc_real_fs.rs` was modified (test file only).
+
+**CI is the first execution** — never ran `cargo build/check/test/clippy` locally by instruction.
