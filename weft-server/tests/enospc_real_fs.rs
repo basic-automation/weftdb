@@ -32,13 +32,13 @@
 use std::sync::Arc;
 
 use axum::{
-	Router, body::Body, http::{Request, StatusCode}
+	body::Body, http::{Request, StatusCode}, Router
 };
 use bigdecimal::BigDecimal;
 use tempfile::TempDir;
 use tower::ServiceExt as _;
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-use weft_server::{AppState, app_with_state};
+use weft_server::{app_with_state, AppState};
 use weftdb::{SegmentStore, SegmentStoreOptions};
 
 /// The aspect every test writes.
