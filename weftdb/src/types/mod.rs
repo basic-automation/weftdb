@@ -35,7 +35,7 @@ pub use segment_index::{SegmentChange, SegmentIndexStore};
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;
-pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBreaker, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_DECODE_BREAKER_COOLDOWN, DEFAULT_DECODE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, DEFAULT_MAINTENANCE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_WAIT, DEFAULT_MAX_DOWNSAMPLE_BUCKETS, DEFAULT_MAX_POINT_BATCH, DEFAULT_MAX_SERIES_PER_ASPECT};
+pub use segment_store::{AspectStorageStats, CheckpointPolicy, ControlPlaneBackup, HotColdReconcile, HotColdSweep, MaintenanceBreaker, MaintenanceBusy, MaintenanceWait, OpenReport, OverlapSweep, Poisoned, ReapSweep, ReconcileSweep, SegmentStore, SegmentStoreOptions, SquashSweep, StoreLocked, StoreStorageStats, TransposedPolicy, WholeStoreBackup, AMBIGUOUS_COMMIT_ENV, AMBIGUOUS_COMMIT_EXIT_CODE, DEFAULT_CHECKPOINT_MIN_ROWS, DEFAULT_DECODE_BREAKER_COOLDOWN, DEFAULT_DECODE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, DEFAULT_MAINTENANCE_BREAKER_FAILURES, DEFAULT_MAINTENANCE_WAIT, DEFAULT_MAX_DOWNSAMPLE_BUCKETS, DEFAULT_MAX_POINT_BATCH, DEFAULT_MAX_SERIES_PER_ASPECT, DEFAULT_SUSPECT_FRAME_POLICY};
 pub use signal::{units_between, Distance, ErrVal, Signal, SignalType, Signals};
 pub use store_format::{StoreFormat, StoreScope, LEGACY_LAYOUT, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
 pub use subject::{Subject, SubjectId};

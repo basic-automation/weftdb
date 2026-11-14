@@ -108,3 +108,105 @@ check:
   point needs the daemon author's input — it was too speculative to commit without it.
 - **No HTTP routes** — PR #213 owns routes.rs, openapi.rs and the OpenAPI golden.
 - **No `cargo build/check/test/clippy`** — the host has insufficient memory; CI is the compiler.
+
+## Handoff — CI fix round, 2026-11-14
+
+### What changed
+
+- `weftdb/src/types/segment_store/maint.rs` — wired `decode_breaker_permits` as gate and
+  `decode_breaker_record` as success/failure callback into all three store-wide maintenance
+  sweeps (`reconcile_all_over_threshold_with_cancel`, `reconcile_all_hot_cold_with_cancel`,
+  `reconcile_all_overlaps_with_cancel`)
+- `weftdb/src/types/quarantine.rs` — fixed `Self::classify_decode_failure` → `classify_decode_failure
+  (rustdoc resolution); shortened first doc paragraph on `SuspectFramePolicy` and
+  `decode_failure_action` (clippy `too_long_first_doc_paragraph`); eliminated `bytes.clone()`
+  redundant clone (clippy `redundant_clone`)
+- `weftdb/src/types/segment_store.rs` — shortened first doc paragraph on
+  `DEFAULT_DECODE_BREAKER_FAILURES` (clippy `too_long_first_doc_paragraph`)
+
+### Commit
+
+- `28ba54c` on `p12/rob-22-suspect-frames`, signed-off, pushed.
+
+### What remains
+
+- **CI must re-run all 8 failing checks to confirm green.** The dead-code fix and rustdoc fix
+  are syntax-level; the clippy issues are doc-string-level. Only pushes from here trigger CI,
+  and the checks auto-run.
+- **No local verification** — host memory limits prevented clippy/rustdoc from running locally.
+  Build compiles (`cargo check -p weftdb -j 1` passes).
+
+### Resume commands
+
+```
+cd /mnt/deepmem/wt/p12-720
+git log --oneline -1
+gh pr checks 740     # wait for CI to finish
+gh run view --log-failed <run-id>   # if any still fail
+```
+
+## Step Zero — maintenance sweep Err arm analysis
+
+### The three sweep `Err` arms (maint.rs ~:874-880, ~:1021-1027, ~:1264-1270)
+
+Each arm catches errors from `reconcile_aspect_if_unsorted_exceeds_held`,
+`reconcile_aspect_hot_cold_held`, or `reconcile_overlaps_held`. These methods
+internally call `read_bound_frame` → `frame_read::read_full`, which is the frame-decode
+call site. But the `Err` arm also catches libSQL MVCC conflicts, filesystem errors,
+adoption failures, and any other error that arises during reconciliation.
+
+**Finding**: the sweep `Err` arm is a *reconcile* failure catcher, not a *frame-decode*
+catcher. The frame decode is one of several failure modes. Hanging the policy on the
+blanket `Err` arm would apply it to non-decode errors, which is wrong per the brief.
+
+### The three fsck `classify_decode_failure` sites (segment_store.rs:2394, 2572, 2690)
+
+These are startup recovery code and do NOT go through the maintenance sweep. The brief
+says recovery MUST NOT consult the policy (a `skip` must not let recovery drop a frame
+the index will need). The per-rule comment on `SuspectFramePolicy` already says this.
+
+### Where the policy should be wired
+
+The interactive read path (`read_time_range_of` in `read.rs:126`) reads each segment's
+frame and calls `frame_read::read_range(…)`. On decode failure, the `?` propagates the
+`FrameFaultError` to the caller. This is the site to consult `decode_failure_action`:
+
+- **Fail**: propagate the error (today's behaviour, unchanged).
+- **Quarantine**: propagate the error (default = byte-identical to today; the quarantine
+  action is reserved for the fsck path, which does not consult the policy).
+- **Skip**: log the condition and `continue` the segment loop, returning data from the
+  readable segments only.
+
+### Breaker orthogonality
+`decode_breaker_record` is called in the sweep loop arms on success/failure, correctly
+counting every decode attempt regardless of disposition. No change needed.
+
+### Decode breaker on reconcile Err arm?
+The `decode_breaker_record` call on the `Err` arm records *reconcile* failures, which
+include decode failures among other things. This is discussed in the original ROB-22
+spec — the decode breaker is a coarse fuse, not frame-grained. No change to that in
+this slice.
+
+## Handoff — p12-720 policy wiring, 2026-11-14
+
+### What changed
+
+- `weftdb/src/types/segment_store.rs` — added `suspect_frame_policy` field to
+  `SegmentStoreOptions` (next to `decode_breaker`), `DEFAULT_SUSPECT_FRAME_POLICY`,
+  import of `SuspectFramePolicy` / `decode_failure_action`, `from_env` reads the
+  env var, `with_suspect_frame_policy` builder; added `suspect_frame_policy` field
+  to `SegmentStore` struct; added re-export of `SuspectFramePolicy` / `decode_failure_action`.
+- `weftdb/src/types/segment_store/open.rs` — wired `suspect_frame_policy` from options
+  into store constructor.
+- `weftdb/src/types/segment_store/read.rs` — wired `decode_failure_action` into
+  `read_time_range_of` so decode errors consult the policy.
+- `weft-server/src/settings.rs` — fixed `read_by` string.
+- `docs/config-schema.md` — fixed `read_by` column.
+
+### Tests added
+
+- **Variable-reaches-store tests**: env set → `from_env().suspect_frame_policy == …`,
+  unset → default, garbage → default; opened `SegmentStore` exposes the same value.
+- **Behaviour tests**: corrupt frame + Fail policy → read surfaces the decode error;
+  Skip policy → read succeeds without the corrupt frame; Quarantine (default) →
+  today's outcome (error propagated).

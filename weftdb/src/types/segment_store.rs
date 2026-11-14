@@ -93,7 +93,7 @@ use crate::{
 	aspect_name, types::{
 		aspect_locks::{AspectLocks, AspectState, CommitGuard, MaintGuard}, durable::{
 			create_dir_all_durable, fault::{self, FaultPoint}, poison_global, write_new_durable, LockHolder, RealFs, RootLock, RootLockError, StoreFs, SyncPolicy, WritePoints
-		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, segment_index::SegmentChange, store_format::{self, StoreFormat, StoreScope}
+		}, frame_name, frame_read, index_txn::{IndexOp, IndexRow, IndexTxn, IndexTxnError, RowVersion, TxnApplied, TxnErrorKind, TxnPoints}, ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry}, migrations, quarantine::{classify_decode_failure, decode_failure_action, is_newer_format, QuarantineClass, QuarantineRecord, QuarantinedRow, RecoveryReport, SuspectFramePolicy, QUARANTINE_TTL_MS}, reaper::{LiveFrames, ReadPin, Reaper}, segment_index::SegmentChange, store_format::{self, StoreFormat, StoreScope}
 	}, AspectCatalog, AspectMetadata, AspectMetadataStore, CatalogStore, PartialSidecar, PartialSidecarPolicy, SegmentIndexStore, SnapshotReport, StoreError, CONTROL_PLANE_FILES, SIDECAR_AGGREGATIONS, SUPPORTED_LAYOUT
 };
 
@@ -399,6 +399,12 @@ pub struct SegmentStoreOptions {
 	/// a decode crash loop on a damaged frame stops the retries without affecting
 	/// the maintenance breaker's sweep-level tripped-aspect list.
 	pub decode_breaker: MaintenanceBreaker,
+	/// The suspect frame policy (ROB-22): what to do when a frame's decode fails
+	/// with a C5-suspect class.
+	/// [`DEFAULT_SUSPECT_FRAME_POLICY`] (Quarantine) means a suspect frame is always
+	/// quarantined, unchanged from the first ROB-22 deployment, so the policy is an
+	/// opt-in relaxation towards `skip` or a tightening towards `fail`.
+	pub suspect_frame_policy: SuspectFramePolicy,
 	/// The most series one aspect may register (TAG-7):
 	/// [`DEFAULT_MAX_SERIES_PER_ASPECT`] unless changed. An ingest that would register
 	/// one more is refused with [`StoreError::SeriesLimit`](crate::StoreError::SeriesLimit);
@@ -457,9 +463,15 @@ pub const DEFAULT_MAX_DOWNSAMPLE_BUCKETS: usize = 1_000_000;
 /// 10,000 instants (1.0 plan decision 12).
 pub const DEFAULT_MAX_POINT_BATCH: usize = 10_000;
 
+/// The default suspect frame policy, [`SegmentStoreOptions::suspect_frame_policy`]:
+/// quarantine — a suspect frame is always quarantined, unchanged from the first
+/// ROB-22 deployment, so the policy is an opt-in relaxation towards `skip` or
+/// a tightening towards `fail`.
+pub const DEFAULT_SUSPECT_FRAME_POLICY: SuspectFramePolicy = SuspectFramePolicy::Quarantine;
+
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0 }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0 }
 	}
 }
 
@@ -477,7 +489,7 @@ impl SegmentStoreOptions {
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(|v| SuspectFramePolicy::parse(v)).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()) }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -514,6 +526,15 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_decode_breaker(mut self, breaker: MaintenanceBreaker) -> Self {
 		self.decode_breaker = breaker;
+		self
+	}
+
+	/// Suspect frame policy (ROB-22), builder form of
+	/// [`SegmentStoreOptions::suspect_frame_policy`]. A store that decodes
+	/// suspect frames uses this to decide whether to skip, quarantine, or fail.
+	#[must_use]
+	pub const fn with_suspect_frame_policy(mut self, policy: SuspectFramePolicy) -> Self {
+		self.suspect_frame_policy = policy;
 		self
 	}
 
@@ -1671,6 +1692,10 @@ pub struct SegmentStore {
 	/// decode crash loop on a damaged frame stops the retries without affecting
 	/// the maintenance breaker's sweep-level tripped-aspect list.
 	decode_breaker: MaintenanceBreaker,
+	/// The suspect frame policy (ROB-22): what to do when a frame's decode fails
+	/// with a C5-suspect class, from the open options
+	/// ([`SegmentStoreOptions::suspect_frame_policy`]).
+	suspect_frame_policy: SuspectFramePolicy,
 	/// The most series one aspect may register, from the open options
 	/// ([`SegmentStoreOptions::max_series_per_aspect`]).
 	max_series_per_aspect: usize,
@@ -8864,3 +8889,7 @@ mod cancel_tests;
 /// Issue #443: overlapping reads across pruned segments — a range read merges with newer-wins.
 #[cfg(test)]
 mod overlap_read_tests;
+
+/// ROB-22: the suspect frame policy reaches the store and the interactive read path honours it.
+#[cfg(test)]
+mod suspect_frame_policy_tests;
